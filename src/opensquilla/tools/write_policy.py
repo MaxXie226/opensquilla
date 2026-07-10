@@ -216,7 +216,11 @@ def gate_workspace_scratch_artifact(
     )
     if match is None:
         return
-    raise SafeToolError(str(workspace_scratch_artifact_block(tool_name, match)["message"]))
+    # The mark lets opensquilla.tools.envelope apply the policy-deny
+    # user_message cap override to this error; str(error) is unaffected.
+    error = SafeToolError(str(workspace_scratch_artifact_block(tool_name, match)["message"]))
+    error.policy_gate_denial = True
+    raise error
 
 
 def workspace_write_deny_block(
@@ -255,7 +259,9 @@ def gate_workspace_write_deny(
     match = match_workspace_write_deny(path, original_path=original_path, workspace=workspace)
     if match is None:
         return
-    raise SafeToolError(str(workspace_write_deny_block(tool_name, match)["message"]))
+    error = SafeToolError(str(workspace_write_deny_block(tool_name, match)["message"]))
+    error.policy_gate_denial = True
+    raise error
 
 
 def _deny_retry_guidance(ctx: ToolContext | None = None) -> str:

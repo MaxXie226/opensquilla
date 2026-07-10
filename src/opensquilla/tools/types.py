@@ -222,6 +222,10 @@ class SafeToolUserMessage:
 class SafeToolError(SafeToolUserMessage, ToolError):
     """ToolError variant that may expose a sanitized user-actionable message."""
 
+    # Set True by policy gates before raising; read by the failure envelope
+    # to select the policy-deny user_message cap.
+    policy_gate_denial: bool = False
+
     def __init__(self, user_message: str | None = None, *raw_details: object) -> None:
         super().__init__(*(raw_details or (user_message or self.user_message,)))
         if user_message is not None and user_message.strip():

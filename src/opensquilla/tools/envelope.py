@@ -20,6 +20,7 @@ keys are a breaking change; additions go through a new slice.
 from __future__ import annotations
 
 import json
+import os
 import re
 from typing import Any, Final
 
@@ -94,6 +95,23 @@ _USER_MESSAGES: Final[dict[str, str]] = {
 
 _TRACEBACK_FRAME_RE = re.compile(r'^\s+File ".+?", line \d+, in .+$', re.MULTILINE)
 _USER_MESSAGE_MAX_CHARS: Final[int] = 500
+# Opt-in cap override for policy-gate denial envelopes (off by default).
+# Policy gates author remediation guidance whose tail carries the binding
+# instruction; the default cap can sever it while the sibling block-payload
+# path delivers the same text in full. Gates mark their SafeToolError with a
+# ``policy_gate_denial`` attribute before raising; non-marked errors keep the
+# default cap even when the lever is set.
+_POLICY_DENY_MAX_CHARS_ENV = "OPENSQUILLA_TOOL_ENVELOPE_POLICY_DENY_MAX_CHARS"
+
+
+def _policy_deny_max_chars() -> int:
+    raw = os.environ.get(_POLICY_DENY_MAX_CHARS_ENV, "").strip()
+    if not raw:
+        return 0
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 0
 
 
 def _exception_class_name(exc: BaseException) -> str:
@@ -183,8 +201,15 @@ def build_tool_failure_envelope(
     # pre-rendering a traceback into the sanitiser output.
     user_message = _TRACEBACK_FRAME_RE.sub("", user_message).strip()
     user_message = user_message.replace("\n", " ").strip() or (f"The tool {tool_name!r} failed.")
-    if len(user_message) > _USER_MESSAGE_MAX_CHARS:
-        user_message = user_message[: _USER_MESSAGE_MAX_CHARS - len("...[truncated]")]
+    max_chars = _USER_MESSAGE_MAX_CHARS
+    if getattr(exc, "policy_gate_denial", False):
+        override_max_chars = _policy_deny_max_chars()
+        # Caps that cannot fit the truncation marker would replace content
+        # with marker text; treat them as off like the other invalid values.
+        if override_max_chars > len("...[truncated]"):
+            max_chars = override_max_chars
+    if len(user_message) > max_chars:
+        user_message = user_message[: max_chars - len("...[truncated]")]
         user_message = f"{user_message}...[truncated]"
 
     return {
