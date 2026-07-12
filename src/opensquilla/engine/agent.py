@@ -417,8 +417,8 @@ def _finalize_variant_challenge_message() -> str:
 
     Same text for every task and every fire: the wording names failure
     classes in the abstract (alternate spellings of a construct, boundary
-    values, sibling shapes handled by the same logic) and never any
-    task-specific content.
+    values, sibling shapes handled by the same logic, and reworks that
+    change contracts callers observe) and never any task-specific content.
     """
 
     return (
@@ -429,8 +429,12 @@ def _finalize_variant_challenge_message() -> str:
         "values, and sibling types or code shapes handled by the same logic). "
         "Then run your verification against each class you listed, not only "
         "the case from the task description. If any class fails, fix your "
-        "change and re-run until green. If every class passes, finish and "
-        "briefly note which classes you checked."
+        "change and re-run until green. If this leads you to rework your "
+        "approach, preserve the behavior contracts callers can observe "
+        "unless the task itself asks to change them: the types of raised or "
+        "propagated errors, public signatures and return types, and output "
+        "formats. If every class passes, finish and briefly note which "
+        "classes you checked."
     )
 
 
