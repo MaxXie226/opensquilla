@@ -206,6 +206,31 @@ def _submit_review_from_env(config_value: bool = False) -> bool:
     )
 
 
+_PATCH_HYGIENE_BLOCK_ENV = "OPENSQUILLA_PATCH_HYGIENE_BLOCK"
+_PATCH_HYGIENE_BLOCK_MODES = ("off", "test_paths")
+
+
+def _patch_hygiene_block_from_env(
+    config_value: Literal["off", "test_paths"] = "off",
+) -> Literal["off", "test_paths"]:
+    """Resolve the finalize-time patch hygiene hard-block mode.
+
+    Default off. A non-blank ``OPENSQUILLA_PATCH_HYGIENE_BLOCK`` overrides
+    ``config_value``. Unrecognized env values raise instead of being silently
+    ignored so a run manifest cannot record an override the run did not
+    actually apply.
+    """
+    raw = os.environ.get(_PATCH_HYGIENE_BLOCK_ENV, "").strip().lower()
+    if not raw:
+        return config_value
+    if raw in _PATCH_HYGIENE_BLOCK_MODES:
+        return raw  # type: ignore[return-value]
+    raise ValueError(
+        f"{_PATCH_HYGIENE_BLOCK_ENV} must be one of: "
+        + ", ".join(_PATCH_HYGIENE_BLOCK_MODES)
+    )
+
+
 def _positive_int_from_env(name: str, default: int) -> int:
     raw = os.environ.get(name)
     if raw is None:
@@ -766,6 +791,9 @@ class AgentBootstrapStage:
             submit_review_diff_max_chars=_positive_int_from_env(
                 "OPENSQUILLA_SUBMIT_REVIEW_DIFF_MAX_CHARS",
                 AgentConfig().submit_review_diff_max_chars,
+            ),
+            patch_hygiene_block_mode=_patch_hygiene_block_from_env(
+                AgentConfig().patch_hygiene_block_mode
             ),
             provider_context_block_feedback=_bool_from_env(
                 "OPENSQUILLA_PROVIDER_CONTEXT_BLOCK_FEEDBACK",

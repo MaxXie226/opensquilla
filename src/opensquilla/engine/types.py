@@ -594,6 +594,12 @@ class AgentConfig:
     # body echoed into context (the per-file summary is always shown in full).
     submit_review_enabled: bool = False
     submit_review_diff_max_chars: int = 20000
+    # Finalize-time patch hygiene hard block. "off" (default) leaves patch
+    # hygiene as warn-only text; "test_paths" challenges a finalizing response
+    # while the live workspace diff still touches test-classified paths, so
+    # test edits are reverted before the patch is collected. Set via
+    # OPENSQUILLA_PATCH_HYGIENE_BLOCK.
+    patch_hygiene_block_mode: Literal["off", "test_paths"] = "off"
     # Keep rejection feedback visible when blocked compacted-placeholder tool
     # calls are projected out of provider requests: the blocked tool_use keeps
     # a placeholder input and its error tool_result stays in the projection.

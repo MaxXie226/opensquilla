@@ -3325,6 +3325,15 @@ _MUTATOR_WRITE_TARGET_EXTRACTORS: dict[str, Callable[[list[str]], list[str]]] = 
 }
 
 
+def _strip_command_prefix_tokens(argv: list[str]) -> list[str]:
+    while argv and (
+        _ENV_ASSIGNMENT_RE.match(argv[0])
+        or argv[0].lower() in _COMMAND_PREFIX_WORDS
+    ):
+        argv = argv[1:]
+    return argv
+
+
 def _mutating_command_write_targets(command: str) -> list[str]:
     """Best-effort write targets of common in-place file mutators.
 
@@ -3332,16 +3341,13 @@ def _mutating_command_write_targets(command: str) -> list[str]:
     OPENSQUILLA_WORKSPACE_WRITE_DENY_COMMAND_TARGETS is enabled; plain
     redirection and tee targets are covered by _shell_write_targets_from_inputs
     unconditionally. Variable expansion, command substitution, and interpreter
-    one-liners are out of scope.
+    one-liners are out of scope (the latter behind
+    OPENSQUILLA_WORKSPACE_WRITE_DENY_INTERPRETER_TARGETS).
     """
 
     targets: list[str] = []
     for segment in _mutator_command_segments(command):
-        argv = _segment_argv(segment)
-        while argv and (
-            _ENV_ASSIGNMENT_RE.match(argv[0]) or argv[0].lower() in _COMMAND_PREFIX_WORDS
-        ):
-            argv = argv[1:]
+        argv = _strip_command_prefix_tokens(_segment_argv(segment))
         if not argv:
             continue
         name = argv[0].replace("\\", "/").rsplit("/", 1)[-1].lower()
@@ -3365,6 +3371,187 @@ def _mutating_command_write_targets_from_inputs(
     ):
         for stdin_chunk in _iter_stdin_guard_chunks(stdin):
             for target in _mutating_command_write_targets(stdin_chunk):
+                if target not in targets:
+                    targets.append(target)
+    return targets
+
+
+_INTERPRETER_CODE_FLAGS: dict[str, frozenset[str]] = {
+    "python": frozenset({"-c"}),
+    "ruby": frozenset({"-e"}),
+    "perl": frozenset({"-e", "-E"}),
+    "php": frozenset({"-r"}),
+    "node": frozenset({"-e", "--eval", "-p", "--print"}),
+    "nodejs": frozenset({"-e", "--eval", "-p", "--print"}),
+}
+
+_INTERPRETER_WRITE_MODE_CHARS = frozenset("wax+")
+
+# Literal-path write forms inside interpreter code strings. Only string
+# literals are extractable; variables and computed paths stay out of scope.
+_INTERPRETER_OPEN_CALL_RE = re.compile(
+    r"\b(?:open|fopen)\s*\(\s*(?P<pq>['\"])(?P<path>(?:(?!(?P=pq)).)+)(?P=pq)"
+    r"\s*,\s*(?:mode\s*=\s*)?(?P<mq>['\"])(?P<mode>(?:(?!(?P=mq)).)*)(?P=mq)"
+)
+_INTERPRETER_PATH_MUTATE_RE = re.compile(
+    r"\bPath\s*\(\s*(?P<pq>['\"])(?P<path>(?:(?!(?P=pq)).)+)(?P=pq)\s*\)"
+    r"\s*\.\s*(?:write_text|write_bytes|unlink|rmdir|touch|rename|replace)\s*\("
+)
+_INTERPRETER_FS_WRITE_RE = re.compile(
+    r"\b(?:writeFileSync|appendFileSync|writeFile|appendFile"
+    r"|unlinkSync|rmSync|rmdirSync|renameSync|truncateSync)"
+    r"\s*\(\s*(?P<pq>['\"])(?P<path>(?:(?!(?P=pq)).)+)(?P=pq)"
+)
+_INTERPRETER_FILE_WRITE_RE = re.compile(
+    r"\b(?:(?:File|IO)\s*\.\s*(?:write|binwrite|append|delete|unlink|truncate)"
+    r"|FileUtils\s*\.\s*(?:rm_rf|rm_r|rm|remove|mv|move|touch)"
+    r"|file_put_contents"
+    r"|os\s*\.\s*(?:remove|unlink|rename|replace|truncate)"
+    r"|shutil\s*\.\s*(?:rmtree|move))"
+    r"\s*\(\s*(?P<pq>['\"])(?P<path>(?:(?!(?P=pq)).)+)(?P=pq)"
+)
+# Perl two-arg open with the mode fused into the path string: open(FH, '>f').
+_INTERPRETER_PERL_OPEN2_RE = re.compile(
+    r"\bopen\s*\([^()]*?(?P<pq>['\"])\s*>{1,2}\s*(?P<path>(?:(?!(?P=pq)).)+)(?P=pq)"
+)
+# Perl three-arg open: open(FH, '>', 'f').
+_INTERPRETER_PERL_OPEN3_RE = re.compile(
+    r"\bopen\s*\([^()]*?(?P<mq>['\"])\s*>{1,2}\s*(?P=mq)"
+    r"\s*,\s*(?P<pq>['\"])(?P<path>(?:(?!(?P=pq)).)+)(?P=pq)"
+)
+
+
+def _normalized_command_name(token: str) -> str:
+    return token.replace("\\", "/").rsplit("/", 1)[-1].lower()
+
+
+def _interpreter_code_flag_set(name: str) -> frozenset[str] | None:
+    flags = _INTERPRETER_CODE_FLAGS.get(name)
+    if flags is not None:
+        return flags
+    return _INTERPRETER_CODE_FLAGS.get(name.rstrip("0123456789."))
+
+
+def _interpreter_code_strings(
+    argv: list[str],
+    code_flags: frozenset[str],
+) -> list[str]:
+    codes: list[str] = []
+    tokens = argv[1:]
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            break
+        if token in code_flags:
+            if index + 1 < len(tokens):
+                codes.append(tokens[index + 1])
+                index += 2
+                continue
+        elif token.startswith("-"):
+            for flag in code_flags:
+                if len(flag) == 2 and len(token) > 2 and token.startswith(flag):
+                    codes.append(token[2:])
+                    break
+                if flag.startswith("--") and token.startswith(flag + "="):
+                    codes.append(token[len(flag) + 1 :])
+                    break
+        index += 1
+    return codes
+
+
+def _interpreter_code_write_targets(code: str) -> list[str]:
+    targets: list[str] = []
+
+    def add(path: str) -> None:
+        cleaned = path.strip()
+        if (
+            cleaned
+            and not _is_special_shell_write_target(cleaned)
+            and cleaned not in targets
+        ):
+            targets.append(cleaned)
+
+    for match in _INTERPRETER_OPEN_CALL_RE.finditer(code):
+        mode = match.group("mode").lower()
+        if any(char in _INTERPRETER_WRITE_MODE_CHARS for char in mode):
+            add(match.group("path"))
+    for pattern in (
+        _INTERPRETER_PATH_MUTATE_RE,
+        _INTERPRETER_FS_WRITE_RE,
+        _INTERPRETER_FILE_WRITE_RE,
+        _INTERPRETER_PERL_OPEN2_RE,
+        _INTERPRETER_PERL_OPEN3_RE,
+    ):
+        for match in pattern.finditer(code):
+            add(match.group("path"))
+    return targets
+
+
+def _interpreter_write_targets(argv: list[str]) -> list[str]:
+    argv = _strip_command_prefix_tokens(argv)
+    if not argv:
+        return []
+    code_flags = _interpreter_code_flag_set(_normalized_command_name(argv[0]))
+    if code_flags is None:
+        return []
+    targets: list[str] = []
+    for code in _interpreter_code_strings(argv, code_flags):
+        for target in _interpreter_code_write_targets(code):
+            if target not in targets:
+                targets.append(target)
+    return targets
+
+
+def _command_reads_interpreter_program_from_stdin(command: str) -> bool:
+    for segment in _mutator_command_segments(command):
+        argv = _strip_command_prefix_tokens(_segment_argv(segment))
+        if not argv:
+            continue
+        code_flags = _interpreter_code_flag_set(_normalized_command_name(argv[0]))
+        if code_flags is None:
+            continue
+        if _interpreter_code_strings(argv, code_flags):
+            # Program came from -c/-e; stdin is data for it.
+            continue
+        positionals = _positional_args(argv[1:], value_flags=code_flags)
+        if not positionals or positionals[0] == "-":
+            # Bare `python3` / `python3 -`: stdin is the program text.
+            return True
+    return False
+
+
+def _interpreter_write_targets_from_command(command: str) -> list[str]:
+    """Best-effort write targets of interpreter one-liners.
+
+    Only consulted by the workspace write deny gate when
+    OPENSQUILLA_WORKSPACE_WRITE_DENY_INTERPRETER_TARGETS is enabled. Covers
+    literal write-path forms in -c/-e/-r code strings; variable expansion and
+    computed paths remain out of scope.
+    """
+
+    targets: list[str] = []
+    for segment in _mutator_command_segments(command):
+        for target in _interpreter_write_targets(_segment_argv(segment)):
+            if target not in targets:
+                targets.append(target)
+    return targets
+
+
+def _interpreter_write_targets_from_inputs(
+    command: str,
+    stdin: str | None = None,
+) -> list[str]:
+    targets = _interpreter_write_targets_from_command(command)
+    if stdin is not None:
+        stdin_is_program = _command_reads_interpreter_program_from_stdin(command)
+        for stdin_chunk in _iter_stdin_guard_chunks(stdin):
+            extra = _interpreter_write_targets_from_command(stdin_chunk)
+            if stdin_is_program:
+                # `python3 - <<EOF` / piped program text: the stdin itself is
+                # interpreter code, not shell commands.
+                extra = extra + _interpreter_code_write_targets(stdin_chunk)
+            for target in extra:
                 if target not in targets:
                     targets.append(target)
     return targets
@@ -3891,6 +4078,13 @@ def _workspace_write_deny_shell_block(
     mutator_targets: set[str] = set()
     if _write_deny_lever_enabled("OPENSQUILLA_WORKSPACE_WRITE_DENY_COMMAND_TARGETS"):
         for extra_target in _mutating_command_write_targets_from_inputs(command, stdin):
+            if extra_target not in candidate_targets:
+                candidate_targets.append(extra_target)
+                mutator_targets.add(extra_target)
+    if _write_deny_lever_enabled(
+        "OPENSQUILLA_WORKSPACE_WRITE_DENY_INTERPRETER_TARGETS"
+    ):
+        for extra_target in _interpreter_write_targets_from_inputs(command, stdin):
             if extra_target not in candidate_targets:
                 candidate_targets.append(extra_target)
                 mutator_targets.add(extra_target)

@@ -217,6 +217,7 @@ from opensquilla.tool_boundary import AgentToolHandler as ToolHandler
 from opensquilla.tools.projected_arguments import find_projected_tool_argument
 from opensquilla.tools.registry import ToolRegistry
 from opensquilla.tools.types import ToolContext, current_tool_context
+from opensquilla.tools.write_tracking import classify_workspace_path
 from opensquilla.usage_reasons import (
     normalize_usage_unknown_reason,
     provider_error_usage_reason,
@@ -358,6 +359,33 @@ _CLEAN_PASSED_FAILED_SUMMARY_RE = re.compile(
 _PLAIN_PASSED_SUMMARY_RE = re.compile(r"\b\d+\s+passed\b", re.IGNORECASE)
 _CLEAN_ERROR_COUNT_RE = re.compile(r"\b0\s+error\(s\)(?:\W|$)", re.IGNORECASE)
 _FAILED_FINALIZATION_RECOVERY_LIMIT = 3
+_PATCH_HYGIENE_BLOCK_CHALLENGE_LIMIT = 2
+
+
+def _patch_hygiene_block_key(test_paths: list[str]) -> str:
+    """Dedup key: the same set of offending test paths never re-fires."""
+
+    encoded = json.dumps(sorted(test_paths), ensure_ascii=False)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
+
+
+def _patch_hygiene_block_message(test_paths: list[str]) -> str:
+    rendered = ", ".join(test_paths[:5])
+    if len(test_paths) > 5:
+        rendered += f" (and {len(test_paths) - 5} more)"
+    return (
+        "[Patch hygiene check]\n"
+        "You are about to finish, but the workspace diff still changes test "
+        f"files: {rendered}. The final change must live in the project source; "
+        "the repository's test suite is managed separately and modifications "
+        "to it do not count as part of the fix. Do not finalize yet. Revert "
+        "the listed test-file changes (restore modified or deleted test files "
+        "to their original content and remove newly added ones) so the diff "
+        "contains only non-test changes. If editing a test was your only "
+        "change, implement the actual fix in the source code instead. Keeping "
+        "a copy of any reproduction script under the scratch directory is "
+        "fine; test directories are not."
+    )
 _CODE_CHANGE_TASK_MARKERS: tuple[str, ...] = (
     "bug",
     "fix",
@@ -4486,6 +4514,10 @@ class Agent:
         submit_review_diff_max_chars = int(
             getattr(self.config, "submit_review_diff_max_chars", 20000)
         )
+        patch_hygiene_block_mode = str(
+            getattr(self.config, "patch_hygiene_block_mode", "off") or "off"
+        )
+        patch_hygiene_block_keys: set[str] = set()
         recent_failure_anchor_summaries: list[str] = []
         progress_watchdog_mode = getattr(self.config, "progress_watchdog_mode", "log")
         progress_watchdog = ProgressWatchdog(
@@ -7696,6 +7728,92 @@ class Agent:
                                 )
                                 continue
                     if (
+                        patch_hygiene_block_mode == "test_paths"
+                        and not max_iterations_finalization_pending
+                        and not artifact_delivery_final_response_pending
+                        and not post_write_convergence_finalization_pending
+                    ):
+                        hygiene_status = await self._workspace_git_status_porcelain()
+                        hygiene_test_paths = self._porcelain_status_test_paths(
+                            hygiene_status
+                        )
+                        if hygiene_test_paths:
+                            hygiene_key = _patch_hygiene_block_key(hygiene_test_paths)
+                            # Same headroom rule as the evidence gate: never
+                            # spend the run's last LLM call or deadline slack
+                            # on a challenge.
+                            hygiene_headroom = _turn_llm_call_budget_error(
+                                turn_llm_calls + 1
+                            ) is None and (
+                                _total_deadline is None or _loop.time() < _total_deadline
+                            )
+                            hygiene_suppressed = (
+                                hygiene_key in patch_hygiene_block_keys
+                                or len(patch_hygiene_block_keys)
+                                >= _PATCH_HYGIENE_BLOCK_CHALLENGE_LIMIT
+                                or not hygiene_headroom
+                            )
+                            self.config.metadata["patch_hygiene_block_detections"] = (
+                                self.config.metadata.get(
+                                    "patch_hygiene_block_detections",
+                                    0,
+                                )
+                                + 1
+                            )
+                            hygiene_message = (
+                                None
+                                if hygiene_suppressed
+                                else _patch_hygiene_block_message(hygiene_test_paths)
+                            )
+                            self._record_runtime_event(
+                                "patch_hygiene_block.challenge",
+                                feature="patch_hygiene_block",
+                                reason="test_paths_in_final_diff",
+                                iteration=iterations,
+                                provider_call_count=turn_llm_calls,
+                                injected_to_model=bool(hygiene_message),
+                                recovery_key=hygiene_key,
+                                details={
+                                    "test_paths": hygiene_test_paths[:20],
+                                    "test_path_count": len(hygiene_test_paths),
+                                },
+                            )
+                            if hygiene_message is not None:
+                                patch_hygiene_block_keys.add(hygiene_key)
+                                if visible_text and final_text_parts:
+                                    final_text_parts.pop()
+                                turn_messages.append(
+                                    Message(role="user", content=hygiene_message)
+                                )
+                                self.config.metadata[
+                                    "patch_hygiene_block_recoveries"
+                                ] = (
+                                    self.config.metadata.get(
+                                        "patch_hygiene_block_recoveries",
+                                        0,
+                                    )
+                                    + 1
+                                )
+                                self._write_turn_call_log(
+                                    "patch_hygiene_block",
+                                    action="warn",
+                                    mode=patch_hygiene_block_mode,
+                                    reason="test_paths_in_final_diff",
+                                    details={
+                                        "test_paths": hygiene_test_paths[:20],
+                                        "test_path_count": len(hygiene_test_paths),
+                                    },
+                                )
+                                yield WarningEvent(
+                                    code="patch_hygiene_block_recovery",
+                                    message=(
+                                        "The model attempted to finish with test "
+                                        "files still changed in the workspace "
+                                        "diff; asking it to revert them once."
+                                    ),
+                                )
+                                continue
+                    if (
                         progress_watchdog_mode == "warn_model"
                         and not workspace_diff_recovery_attempted
                         and not max_iterations_finalization_pending
@@ -9795,6 +9913,40 @@ class Agent:
     def _porcelain_status_is_new_file(line: str) -> bool:
         code = Agent._porcelain_status_code(line)
         return code == "??" or "A" in code
+
+    @staticmethod
+    def _porcelain_status_test_paths(status: str | None) -> list[str]:
+        """Test-classified paths with a live diff, per porcelain-v1 status.
+
+        Renames count both sides: moving a test file away still mutates the
+        test tree. Scratch-classified paths never count even when their name
+        looks test-like (classify_workspace_path puts the scratch check first
+        only for the scratch directory; root scratch artifacts are already
+        filtered out of the status upstream).
+        """
+
+        if not status:
+            return []
+        test_paths: list[str] = []
+        for line in status.splitlines():
+            if not line.strip():
+                continue
+            raw = line.rstrip()
+            text = raw[3:].strip() if len(raw) > 3 else raw.strip()
+            sides = (
+                [side.strip() for side in text.split(" -> ", 1)]
+                if " -> " in text
+                else [text]
+            )
+            for side in sides:
+                path = side.replace("\\", "/").lstrip("./")
+                if not path:
+                    continue
+                if classify_workspace_path(path) != "test-like":
+                    continue
+                if path not in test_paths:
+                    test_paths.append(path)
+        return test_paths
 
     @staticmethod
     def _is_root_scratch_artifact_path(path: str | None) -> bool:
@@ -14090,6 +14242,7 @@ class Agent:
                 self.config.deadline_thinking_off_margin_seconds
             ),
             reasoning_stream_char_cap=self.config.reasoning_stream_char_cap,
+            patch_hygiene_block_mode=self.config.patch_hygiene_block_mode,
             final_diff_salvage=self.config.final_diff_salvage,
             endgame_git_freeze_margin_seconds=(
                 self.config.endgame_git_freeze_margin_seconds
