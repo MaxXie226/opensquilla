@@ -203,6 +203,54 @@ def _finalize_evidence_strict_from_env(config_value: bool = False) -> bool:
     )
 
 
+_SCRATCH_VERIFY_MIRROR_ENV = "OPENSQUILLA_SCRATCH_VERIFY_MIRROR"
+
+
+def _scratch_verify_mirror_from_env(config_value: bool = False) -> bool:
+    """Resolve the opt-in scratch verify-mirror flag.
+
+    Default off. A non-blank ``OPENSQUILLA_SCRATCH_VERIFY_MIRROR`` overrides
+    ``config_value``. Unrecognized env values raise instead of being silently
+    ignored so a run manifest cannot record an override the run did not
+    actually apply.
+    """
+    raw = os.environ.get(_SCRATCH_VERIFY_MIRROR_ENV, "").strip().lower()
+    if not raw:
+        return bool(config_value)
+    if raw in _FINALIZE_EVIDENCE_GATE_ON:
+        return True
+    if raw in _FINALIZE_EVIDENCE_GATE_OFF:
+        return False
+    raise ValueError(
+        f"{_SCRATCH_VERIFY_MIRROR_ENV} must be one of: "
+        + ", ".join(sorted(_FINALIZE_EVIDENCE_GATE_ON | _FINALIZE_EVIDENCE_GATE_OFF))
+    )
+
+
+_FINALIZE_VARIANT_CHALLENGE_ENV = "OPENSQUILLA_FINALIZE_VARIANT_CHALLENGE"
+
+
+def _finalize_variant_challenge_from_env(config_value: bool = False) -> bool:
+    """Resolve the opt-in finalize-time variant-sweep challenge flag.
+
+    Default off. A non-blank ``OPENSQUILLA_FINALIZE_VARIANT_CHALLENGE``
+    overrides ``config_value``. Unrecognized env values raise instead of
+    being silently ignored so a run manifest cannot record an override the
+    run did not actually apply.
+    """
+    raw = os.environ.get(_FINALIZE_VARIANT_CHALLENGE_ENV, "").strip().lower()
+    if not raw:
+        return bool(config_value)
+    if raw in _FINALIZE_EVIDENCE_GATE_ON:
+        return True
+    if raw in _FINALIZE_EVIDENCE_GATE_OFF:
+        return False
+    raise ValueError(
+        f"{_FINALIZE_VARIANT_CHALLENGE_ENV} must be one of: "
+        + ", ".join(sorted(_FINALIZE_EVIDENCE_GATE_ON | _FINALIZE_EVIDENCE_GATE_OFF))
+    )
+
+
 _SUBMIT_REVIEW_ENV = "OPENSQUILLA_SUBMIT_REVIEW"
 _SUBMIT_REVIEW_ON = frozenset({"on", "1", "true", "yes"})
 _SUBMIT_REVIEW_OFF = frozenset({"off", "0", "false", "no"})
@@ -822,6 +870,12 @@ class AgentBootstrapStage:
             ),
             patch_hygiene_block_mode=_patch_hygiene_block_from_env(
                 AgentConfig().patch_hygiene_block_mode
+            ),
+            scratch_verify_mirror=_scratch_verify_mirror_from_env(
+                AgentConfig().scratch_verify_mirror
+            ),
+            finalize_variant_challenge=_finalize_variant_challenge_from_env(
+                AgentConfig().finalize_variant_challenge
             ),
             provider_context_block_feedback=_bool_from_env(
                 "OPENSQUILLA_PROVIDER_CONTEXT_BLOCK_FEEDBACK",

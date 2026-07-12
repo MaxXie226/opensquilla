@@ -1057,8 +1057,16 @@ class FinalizeEvidenceTracker:
         status_reason: str | None = None,
         failure_anchors: Sequence[str] = (),
         iteration: int = 0,
+        evidence_credit: bool = True,
     ) -> None:
-        """Record an execution-tool call (``exec_command``-like)."""
+        """Record an execution-tool call (``exec_command``-like).
+
+        ``evidence_credit=False`` (scratch verify-mirror hash guard) keeps
+        side-effect tracking — deletions and stash state — but withholds all
+        verification crediting: the command ran against mirror copies that
+        no longer match their workspace originals, so its outcome says
+        nothing about the workspace in either polarity.
+        """
 
         command_text = str(command or "")
         if status_reason in _NON_VERIFICATION_STATUS_REASONS:
@@ -1078,6 +1086,13 @@ class FinalizeEvidenceTracker:
             command_text, initially_stashed=self._tree_stashed
         )
         if classify_gate_command(command_text) != "execution":
+            return
+        if not evidence_credit:
+            # Hash-guarded mirror run against diverged copies: side effects
+            # above still counted, but the outcome is not verification
+            # evidence — no verification count, no red-first candidacy, no
+            # post-edit record. Green here must not satisfy red-first and
+            # red here must not become an outstanding failure.
             return
         if ran_while_stashed:
             # The fix is deliberately stashed away: red here confirms the bug

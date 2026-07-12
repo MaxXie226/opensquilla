@@ -606,6 +606,22 @@ class AgentConfig:
     # test edits are reverted before the patch is collected. Set via
     # OPENSQUILLA_PATCH_HYGIENE_BLOCK.
     patch_hygiene_block_mode: Literal["off", "test_paths"] = "off"
+    # Scratch verify-mirror for deny-blocked in-package test edits. When on,
+    # workspace write-deny rejections point the model at a writable mirror
+    # under <scratch>/verify-mirror/<workspace-relative-path>, and the
+    # finalize-time evidence gate credits executions that reference mirror
+    # files ONLY while every mirror copy hash-matches its workspace original
+    # (a diverged mirror would otherwise let weakened tests count as
+    # verification). Off by default; set via
+    # OPENSQUILLA_SCRATCH_VERIFY_MIRROR.
+    scratch_verify_mirror: bool = False
+    # Finalize-time variant-sweep challenge. When on, the first finalizing
+    # response after source edits receives ONE uniform challenge turn asking
+    # the model to enumerate the distinct input/construct classes reachable
+    # by its changed code paths and run its verification against each. Fires
+    # at most once per turn and never spends the last LLM call or deadline
+    # slack. Off by default; set via OPENSQUILLA_FINALIZE_VARIANT_CHALLENGE.
+    finalize_variant_challenge: bool = False
     # Keep rejection feedback visible when blocked compacted-placeholder tool
     # calls are projected out of provider requests: the blocked tool_use keeps
     # a placeholder input and its error tool_result stays in the projection.

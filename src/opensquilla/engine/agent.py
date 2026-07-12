@@ -360,6 +360,11 @@ _PLAIN_PASSED_SUMMARY_RE = re.compile(r"\b\d+\s+passed\b", re.IGNORECASE)
 _CLEAN_ERROR_COUNT_RE = re.compile(r"\b0\s+error\(s\)(?:\W|$)", re.IGNORECASE)
 _FAILED_FINALIZATION_RECOVERY_LIMIT = 3
 _PATCH_HYGIENE_BLOCK_CHALLENGE_LIMIT = 2
+# Scratch verify-mirror (OPENSQUILLA_SCRATCH_VERIFY_MIRROR): directory name
+# under the scratch dir, and the fail-closed cap on mirror files the hash
+# guard will inspect per execution.
+_VERIFY_MIRROR_DIR_NAME = "verify-mirror"
+_VERIFY_MIRROR_MAX_FILES = 200
 
 
 def _patch_hygiene_block_key(test_paths: list[str]) -> str:
@@ -386,6 +391,30 @@ def _patch_hygiene_block_message(test_paths: list[str]) -> str:
         "a copy of any reproduction script under the scratch directory is "
         "fine; test directories are not."
     )
+
+
+def _finalize_variant_challenge_message() -> str:
+    """Uniform one-shot variant-sweep challenge (finalize_variant_challenge).
+
+    Same text for every task and every fire: the wording names failure
+    classes in the abstract (alternate spellings of a construct, boundary
+    values, sibling shapes handled by the same logic) and never any
+    task-specific content.
+    """
+
+    return (
+        "[Variant sweep check]\n"
+        "Before you finish: enumerate the distinct input or construct classes "
+        "that can reach the code paths you changed (for example alternate "
+        "syntaxes or spellings of the same construct, boundary or edge-case "
+        "values, and sibling types or code shapes handled by the same logic). "
+        "Then run your verification against each class you listed, not only "
+        "the case from the task description. If any class fails, fix your "
+        "change and re-run until green. If every class passes, finish and "
+        "briefly note which classes you checked."
+    )
+
+
 _CODE_CHANGE_TASK_MARKERS: tuple[str, ...] = (
     "bug",
     "fix",
@@ -4524,6 +4553,20 @@ class Agent:
             getattr(self.config, "patch_hygiene_block_mode", "off") or "off"
         )
         patch_hygiene_block_keys: set[str] = set()
+        scratch_verify_mirror_enabled = bool(
+            getattr(self.config, "scratch_verify_mirror", False)
+        )
+        if self._tool_context is not None:
+            # Rides the ToolContext in place (endgame_git_freeze precedent):
+            # deny messages append the verify-mirror guidance only while on,
+            # and the flag is reset each turn because the context outlives it.
+            self._tool_context.scratch_verify_mirror_active = (
+                scratch_verify_mirror_enabled
+            )
+        finalize_variant_challenge_enabled = bool(
+            getattr(self.config, "finalize_variant_challenge", False)
+        )
+        finalize_variant_challenge_fired = False
         recent_failure_anchor_summaries: list[str] = []
         progress_watchdog_mode = getattr(self.config, "progress_watchdog_mode", "log")
         progress_watchdog = ProgressWatchdog(
@@ -7820,6 +7863,83 @@ class Agent:
                                 )
                                 continue
                     if (
+                        finalize_variant_challenge_enabled
+                        and not finalize_variant_challenge_fired
+                        and not max_iterations_finalization_pending
+                        and not artifact_delivery_final_response_pending
+                        and not post_write_convergence_finalization_pending
+                    ):
+                        variant_status = await self._workspace_git_status_porcelain()
+                        if variant_status and variant_status.strip():
+                            # Same headroom rule as the evidence gate: never
+                            # spend the run's last LLM call or deadline slack
+                            # on a challenge.
+                            variant_headroom = _turn_llm_call_budget_error(
+                                turn_llm_calls + 1
+                            ) is None and (
+                                _total_deadline is None or _loop.time() < _total_deadline
+                            )
+                            variant_message = (
+                                _finalize_variant_challenge_message()
+                                if variant_headroom
+                                else None
+                            )
+                            self.config.metadata[
+                                "finalize_variant_challenge_detections"
+                            ] = (
+                                self.config.metadata.get(
+                                    "finalize_variant_challenge_detections",
+                                    0,
+                                )
+                                + 1
+                            )
+                            self._record_runtime_event(
+                                "finalize_variant_challenge.challenge",
+                                feature="finalize_variant_challenge",
+                                reason="finalize_with_workspace_diff",
+                                iteration=iterations,
+                                provider_call_count=turn_llm_calls,
+                                injected_to_model=bool(variant_message),
+                            )
+                            if variant_message is not None:
+                                # One challenge per turn, fired or not again:
+                                # the sweep is uniform and non-escalating, so
+                                # a second injection would only burn budget.
+                                finalize_variant_challenge_fired = True
+                                if visible_text and final_text_parts:
+                                    final_text_parts.pop()
+                                turn_messages.append(
+                                    Message(role="user", content=variant_message)
+                                )
+                                self.config.metadata[
+                                    "finalize_variant_challenge_recoveries"
+                                ] = (
+                                    self.config.metadata.get(
+                                        "finalize_variant_challenge_recoveries",
+                                        0,
+                                    )
+                                    + 1
+                                )
+                                self._write_turn_call_log(
+                                    "finalize_variant_challenge",
+                                    action="warn",
+                                    mode="on",
+                                    reason="finalize_with_workspace_diff",
+                                    details={
+                                        "iteration": iterations,
+                                        "provider_call_count": turn_llm_calls,
+                                    },
+                                )
+                                yield WarningEvent(
+                                    code="finalize_variant_challenge_recovery",
+                                    message=(
+                                        "The model attempted to finish; asking it "
+                                        "once to sweep the input classes reachable "
+                                        "by its change."
+                                    ),
+                                )
+                                continue
+                    if (
                         progress_watchdog_mode == "warn_model"
                         and not workspace_diff_recovery_attempted
                         and not max_iterations_finalization_pending
@@ -8639,6 +8759,21 @@ class Agent:
                                 is_error=bool(result.is_error),
                             )
                         )
+                        gate_evidence_credit = True
+                        if scratch_verify_mirror_enabled:
+                            gate_evidence_credit = (
+                                self._scratch_verify_mirror_evidence_credit(
+                                    gate_command
+                                )
+                            )
+                            if not gate_evidence_credit:
+                                self._record_runtime_event(
+                                    "scratch_verify_mirror.credit_withheld",
+                                    feature="scratch_verify_mirror",
+                                    reason="mirror_diverged_from_workspace",
+                                    iteration=iterations,
+                                    command=gate_command[:500],
+                                )
                         finalize_evidence_tracker.observe_execution(
                             gate_command,
                             red=gate_red,
@@ -8651,6 +8786,7 @@ class Agent:
                                 else []
                             ),
                             iteration=iterations,
+                            evidence_credit=gate_evidence_credit,
                         )
                 focused_verification_success_before_results = (
                     post_write_focused_verification_success_observed
@@ -9829,6 +9965,93 @@ class Agent:
         if not workspace.exists():
             return None
         return workspace
+
+    def _scratch_verify_mirror_root(self) -> Path | None:
+        ctx = self._tool_context or current_tool_context.get()
+        scratch_dir = getattr(ctx, "scratch_dir", None) if ctx is not None else None
+        if not scratch_dir:
+            return None
+        return (
+            Path(scratch_dir).expanduser().resolve(strict=False)
+            / _VERIFY_MIRROR_DIR_NAME
+        )
+
+    @staticmethod
+    def _command_references_verify_mirror(command: str, mirror_root: Path) -> bool:
+        if not command:
+            return False
+        if f"{_VERIFY_MIRROR_DIR_NAME}/" in command:
+            return True
+        return mirror_root.as_posix() in command
+
+    @staticmethod
+    def _git_head_blob(workspace: Path, relative_path: str) -> bytes | None:
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(workspace), "show", f"HEAD:{relative_path}"],
+                capture_output=True,
+                timeout=2.0,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if result.returncode != 0:
+            return None
+        return result.stdout
+
+    def _scratch_verify_mirror_evidence_credit(self, command: str) -> bool:
+        """Anti-weakening hash guard for scratch verify-mirror runs.
+
+        A command that references the verify-mirror tree earns verification
+        credit ONLY while every mirror file that shadows a workspace path is
+        byte-identical to that workspace file (or to its HEAD blob when the
+        workspace copy is gone). Mirror files with no counterpart in either
+        place are the model's own new checks and stay allowed — they shadow
+        nothing. Any unreadable or unverifiable state withholds credit: the
+        guard must fail closed, not open.
+        """
+
+        mirror_root = self._scratch_verify_mirror_root()
+        if mirror_root is None or not self._command_references_verify_mirror(
+            command, mirror_root
+        ):
+            return True
+        if not mirror_root.is_dir():
+            return True
+        workspace = self._workspace_dir_for_status()
+        if workspace is None:
+            return False
+        checked = 0
+        for mirror_file in sorted(mirror_root.rglob("*")):
+            if not mirror_file.is_file():
+                continue
+            checked += 1
+            if checked > _VERIFY_MIRROR_MAX_FILES:
+                return False
+            try:
+                relative = mirror_file.relative_to(mirror_root)
+            except ValueError:
+                continue
+            try:
+                mirror_digest = hashlib.sha256(mirror_file.read_bytes()).digest()
+            except OSError:
+                return False
+            original = workspace / relative
+            if original.is_file():
+                try:
+                    original_digest = hashlib.sha256(original.read_bytes()).digest()
+                except OSError:
+                    return False
+                if mirror_digest != original_digest:
+                    return False
+                continue
+            head_blob = self._git_head_blob(workspace, relative.as_posix())
+            if head_blob is None:
+                # Tracked nowhere: a new check file, not a shadowed original.
+                continue
+            if mirror_digest != hashlib.sha256(head_blob).digest():
+                return False
+        return True
 
     async def _workspace_git_status_porcelain(self) -> str | None:
         workspace = self._workspace_dir_for_status()

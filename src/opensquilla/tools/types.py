@@ -113,6 +113,10 @@ class ToolContext:
     # historical positional constructor contract for embedded callers.
     sandbox_file_system_profile: Any | None = None
     on_sandbox_auto_review: Callable[[dict[str, object]], Awaitable[Any]] | None = None
+    # Armed by the engine (mutated in place, pattern above) when the scratch
+    # verify-mirror lever is on: workspace write-deny messages then append
+    # guidance pointing at <scratch_dir>/verify-mirror/<workspace-relative-path>.
+    scratch_verify_mirror_active: bool = False
 
 
 # Request-scoped context — set by build_tool_handler before each dispatch.
