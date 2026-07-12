@@ -111,12 +111,12 @@ def test_replay_fires_on_finalize_attempt_with_red_evidence(tmp_path) -> None:
     assert report["triggers"] == ["red_execution_after_final_edit"]
     assert report["has_workspace_diff_source"] == "git.patch"
     # Both-modes reporting: strict fields ride the same line. The base
-    # trigger set is a prefix of the strict one (strict only appends), and
-    # this trace never showed red-then-green so strict adds red_first_missing.
+    # trigger set is a prefix of the strict one (strict only appends);
+    # red-first state is reported but never a trigger, so with one
+    # verification command strict adds nothing here.
     assert report["strict_should_challenge"] is True
     assert report["strict_triggers"] == [
         "red_execution_after_final_edit",
-        "red_first_missing",
     ]
     assert report["strict_primary_reason"] == "red_execution_after_final_edit"
     assert report["strict_red_first_satisfied"] is False
@@ -171,7 +171,6 @@ def test_replay_strict_fires_on_zero_execution_trace(tmp_path) -> None:
     assert report["triggers"] == ["no_execution_after_final_edit"]
     assert report["strict_triggers"] == [
         "no_execution_after_final_edit",
-        "red_first_missing",
         "zero_verification",
     ]
     assert report["strict_verification_command_count"] == 0

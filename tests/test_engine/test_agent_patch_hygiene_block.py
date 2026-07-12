@@ -1,10 +1,12 @@
 """Agent-loop tests for the finalize-time patch hygiene hard block.
 
 Scripted-provider tests covering the loop-level contract of
-OPENSQUILLA_PATCH_HYGIENE_BLOCK=test_paths: off by default, challenge
-injection while the live diff still touches test-classified paths, dedup on
-the same offending path set, the challenge cap, headroom suppression, and
-that the block never fires on source-only diffs.
+OPENSQUILLA_PATCH_HYGIENE_BLOCK: off by default, challenge injection while
+the live diff still touches offending paths (test-classified in
+``test_paths`` mode; deployment write-deny-glob matches in
+``protected_paths`` mode), dedup on the same offending path set, the
+challenge cap, headroom suppression, and that the block never fires on
+diffs the mode does not cover.
 """
 
 from __future__ import annotations
@@ -232,7 +234,7 @@ async def test_block_challenges_test_diff_then_accepts_reverted_final(tmp_path) 
     assert recorded[0]["feature"] == "patch_hygiene_block"
     assert recorded[0]["reason"] == "test_paths_in_final_diff"
     assert recorded[0]["injected_to_model"] is True
-    assert recorded[0]["details"]["test_paths"] == ["tests/test_a.py"]
+    assert recorded[0]["details"]["offending_paths"] == ["tests/test_a.py"]
     done_events = [event for event in events if isinstance(event, DoneEvent)]
     assert done_events[-1].text == "final attempt 5"
     # The source fix survives; the test edit is reverted.
@@ -424,3 +426,181 @@ def test_patch_hygiene_block_env_parsing(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setenv("OPENSQUILLA_PATCH_HYGIENE_BLOCK", "bogus")
     with pytest.raises(ValueError):
         _patch_hygiene_block_from_env()
+
+
+# ---------------------------------------------------------------------------
+# protected_paths mode: offending set comes from the deployment's
+# workspace write-deny globs, not any built-in path taxonomy
+# ---------------------------------------------------------------------------
+
+
+def test_patch_hygiene_block_env_parsing_protected_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_PATCH_HYGIENE_BLOCK", "protected_paths")
+    assert _patch_hygiene_block_from_env() == "protected_paths"
+    assert _patch_hygiene_block_from_env("test_paths") == "protected_paths"
+
+
+@pytest.mark.asyncio
+async def test_protected_paths_challenges_deny_glob_diff_then_accepts_revert(
+    tmp_path,
+) -> None:
+    _init_git_workspace(tmp_path)
+    runtime_events_path = tmp_path / "runtime_events.jsonl"
+    provider = _ScriptedProvider(
+        [
+            ("edit", "tests/test_a.py"),
+            ("edit", "src.py"),
+            ("final",),
+            ("restore", "tests/test_a.py"),
+            ("final",),
+        ]
+    )
+    tool_context = ToolContext(
+        workspace_dir=str(tmp_path),
+        workspace_write_deny_globs=["tests/**"],
+    )
+    agent = Agent(
+        provider=provider,
+        config=_block_config(
+            tmp_path,
+            mode="protected_paths",
+            runtime_events_path=str(runtime_events_path),
+        ),
+        tool_handler=_make_tool_handler(tmp_path, tool_context),
+        tool_context=tool_context,
+    )
+
+    events = [event async for event in agent.run_turn("Fix the bug")]
+
+    assert len(provider.calls) == 5
+    warnings = _block_warnings(events)
+    assert len(warnings) == 1
+    assert "write-policy-protected" in warnings[0].message
+    challenge = provider.calls[3][-1]
+    assert challenge.role == "user"
+    assert challenge.content.startswith("[Patch hygiene check]")
+    assert "write policy protects" in challenge.content
+    assert "tests/test_a.py" in challenge.content
+    assert "src.py," not in challenge.content
+    recorded = _challenge_events(runtime_events_path)
+    assert len(recorded) == 1
+    assert recorded[0]["reason"] == "protected_paths_in_final_diff"
+    assert recorded[0]["details"]["offending_paths"] == ["tests/test_a.py"]
+    done_events = [event for event in events if isinstance(event, DoneEvent)]
+    assert done_events[-1].text == "final attempt 5"
+    assert (tmp_path / "src.py").read_text(encoding="utf-8") == "new\n"
+    assert (tmp_path / "tests" / "test_a.py").read_text(encoding="utf-8") == "old\n"
+
+
+@pytest.mark.asyncio
+async def test_protected_paths_quiet_without_deny_globs(tmp_path) -> None:
+    # No deny globs configured -> the mode has nothing to protect and the
+    # same test-file diff sails through: policy lives in deployment config.
+    _init_git_workspace(tmp_path)
+    provider = _ScriptedProvider(
+        [
+            ("edit", "tests/test_a.py"),
+            ("final",),
+        ]
+    )
+    tool_context = ToolContext(workspace_dir=str(tmp_path))
+    agent = Agent(
+        provider=provider,
+        config=_block_config(tmp_path, mode="protected_paths"),
+        tool_handler=_make_tool_handler(tmp_path, tool_context),
+        tool_context=tool_context,
+    )
+
+    events = [event async for event in agent.run_turn("Fix the bug")]
+
+    assert len(provider.calls) == 2
+    assert _block_warnings(events) == []
+    assert "patch_hygiene_block_detections" not in agent.config.metadata
+
+
+@pytest.mark.asyncio
+async def test_protected_paths_ignores_unprotected_diff(tmp_path) -> None:
+    _init_git_workspace(tmp_path)
+    provider = _ScriptedProvider(
+        [
+            ("edit", "src.py"),
+            ("final",),
+        ]
+    )
+    tool_context = ToolContext(
+        workspace_dir=str(tmp_path),
+        workspace_write_deny_globs=["tests/**"],
+    )
+    agent = Agent(
+        provider=provider,
+        config=_block_config(tmp_path, mode="protected_paths"),
+        tool_handler=_make_tool_handler(tmp_path, tool_context),
+        tool_context=tool_context,
+    )
+
+    events = [event async for event in agent.run_turn("Fix the bug")]
+
+    assert len(provider.calls) == 2
+    assert _block_warnings(events) == []
+    assert "patch_hygiene_block_detections" not in agent.config.metadata
+
+
+@pytest.mark.asyncio
+async def test_protected_paths_untracked_new_file_is_challenged(tmp_path) -> None:
+    _init_git_workspace(tmp_path)
+    provider = _ScriptedProvider(
+        [
+            ("edit", "src.py"),
+            ("edit", "tests/test_new_case.py"),
+            ("final",),
+        ]
+    )
+    tool_context = ToolContext(
+        workspace_dir=str(tmp_path),
+        workspace_write_deny_globs=["tests/**"],
+    )
+    agent = Agent(
+        provider=provider,
+        config=_block_config(tmp_path, mode="protected_paths"),
+        tool_handler=_make_tool_handler(tmp_path, tool_context),
+        tool_context=tool_context,
+    )
+
+    events = [event async for event in agent.run_turn("Fix the bug")]
+
+    warnings = _block_warnings(events)
+    assert len(warnings) == 1
+    challenge = provider.calls[3][-1]
+    assert "tests/test_new_case.py" in challenge.content
+
+
+def test_porcelain_status_protected_paths_classification(tmp_path) -> None:
+    (tmp_path / "tests").mkdir()
+    status = (
+        " M src/core.py\n"
+        " M tests/test_a.py\n"
+        "?? tests/test_new.py\n"
+        "?? docs/notes.md\n"
+        "R  tests/test_b.py -> aside/kept_b.py\n"
+        "?? repro-check.py\n"
+    )
+    ctx = ToolContext(
+        workspace_dir=str(tmp_path),
+        workspace_write_deny_globs=["tests/**", "repro-*"],
+    )
+    agent = Agent(
+        provider=_ScriptedProvider([]),
+        config=_block_config(tmp_path, mode="protected_paths"),
+        tool_handler=_make_tool_handler(tmp_path, ctx),
+        tool_context=ctx,
+    )
+    assert agent._porcelain_status_protected_paths(status) == [
+        "tests/test_a.py",
+        "tests/test_new.py",
+        "tests/test_b.py",
+        "repro-check.py",
+    ]
+    assert agent._porcelain_status_protected_paths(None) == []
+    assert agent._porcelain_status_protected_paths("") == []

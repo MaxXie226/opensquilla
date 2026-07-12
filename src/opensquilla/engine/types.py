@@ -587,10 +587,11 @@ class AgentConfig:
     # Off by default; enabled per run via OPENSQUILLA_FINALIZE_EVIDENCE_GATE.
     finalize_evidence_gate_enabled: bool = False
     # Strict mode for the finalize-time evidence gate: adds the
-    # red_first_missing and zero_verification triggers. Implies the gate
-    # itself (strict on activates the tracker even when the base flag is
-    # off). Off by default; enabled per run via
-    # OPENSQUILLA_FINALIZE_EVIDENCE_STRICT.
+    # zero_verification trigger (a change shipped without ever running a
+    # verification-level command draws one bounded challenge). Red-first
+    # state stays report-only. Implies the gate itself (strict on activates
+    # the tracker even when the base flag is off). Off by default; enabled
+    # per run via OPENSQUILLA_FINALIZE_EVIDENCE_STRICT.
     finalize_evidence_strict: bool = False
     # Review-on-submit checkpoint (see engine.submit_review). Surfaces a
     # ``submit`` tool and, when the model finishes with a non-empty diff, shows
@@ -603,9 +604,12 @@ class AgentConfig:
     # Finalize-time patch hygiene hard block. "off" (default) leaves patch
     # hygiene as warn-only text; "test_paths" challenges a finalizing response
     # while the live workspace diff still touches test-classified paths, so
-    # test edits are reverted before the patch is collected. Set via
-    # OPENSQUILLA_PATCH_HYGIENE_BLOCK.
-    patch_hygiene_block_mode: Literal["off", "test_paths"] = "off"
+    # test edits are reverted before the patch is collected;
+    # "protected_paths" instead challenges while the diff touches paths
+    # matching the deployment's workspace write-deny globs — the same
+    # configured policy the write gates enforce, with no built-in path
+    # taxonomy. Set via OPENSQUILLA_PATCH_HYGIENE_BLOCK.
+    patch_hygiene_block_mode: Literal["off", "test_paths", "protected_paths"] = "off"
     # Scratch verify-mirror for deny-blocked in-package test edits. When on,
     # workspace write-deny rejections point the model at a writable mirror
     # under <scratch>/verify-mirror/<workspace-relative-path>, and the

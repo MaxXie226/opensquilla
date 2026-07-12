@@ -945,7 +945,7 @@ def test_challenge_limit_constant() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Strict mode: red_first_missing / zero_verification
+# Strict mode: zero_verification trigger; red-first tracked but report-only
 # ---------------------------------------------------------------------------
 
 
@@ -972,7 +972,6 @@ def test_strict_zero_verification_fires_on_zero_execution_run() -> None:
     )
     assert observation.triggers == [
         "no_execution_after_final_edit",
-        "red_first_missing",
         "zero_verification",
     ]
     assert observation.primary_reason == "no_execution_after_final_edit"
@@ -991,15 +990,18 @@ def test_strict_zero_verification_ignores_inspection_and_denied_commands() -> No
     assert observation.verification_command_count == 0
 
 
-def test_strict_red_first_missing_fires_on_green_only_run() -> None:
-    # print-stub / never-red signature: every verification passed, so nothing
-    # shows the check can fail at all.
+def test_strict_green_only_run_does_not_challenge() -> None:
+    # Green-only runs are routinely legitimate (direct fix + existing suite
+    # green), so red-first state is reported for diagnostics but never gates.
+    # Replay over real runs measured 41% of stable solved traces as
+    # never-red; a trigger here would challenge correct finishes constantly.
     tracker = _strict_tracker_with_source_edit()
     tracker.observe_execution("pytest tests/test_a.py", red=False, exit_code=0, iteration=2)
     observation = tracker.build_observation(has_workspace_diff=True)
-    assert observation.triggers == ["red_first_missing"]
-    assert observation.should_challenge is True
+    assert observation.triggers == []
+    assert observation.should_challenge is False
     assert observation.verification_command_count == 1
+    assert observation.red_first_satisfied is False
     assert observation.red_first_candidate_count == 0
 
 
@@ -1049,8 +1051,8 @@ def test_strict_red_first_not_satisfied_by_deselecting_green() -> None:
     )
     observation = tracker.build_observation(has_workspace_diff=True)
     assert observation.red_first_satisfied is False
-    assert "red_first_missing" in observation.triggers
-    # The deselection trigger stays primary; strict appends after base ones.
+    # The base deselection trigger still fires and stays primary; red-first
+    # state itself adds nothing.
     assert observation.primary_reason == "red_evidence_deselected_after_final_edit"
 
 
@@ -1087,7 +1089,7 @@ def test_strict_red_first_unmatched_green_does_not_satisfy() -> None:
     tracker.observe_execution("make build", red=False, exit_code=0, iteration=3)
     observation = tracker.build_observation(has_workspace_diff=True)
     assert observation.red_first_satisfied is False
-    assert "red_first_missing" in observation.triggers
+    assert observation.triggers == []
 
 
 def test_strict_triggers_suppressed_without_diff_or_source_edit() -> None:
@@ -1147,20 +1149,6 @@ def test_green_profiles_recover_red_covers_directory_prefix() -> None:
     red = command_execution_profiles("pytest tests/test_a.py::test_bad")
     green = command_execution_profiles("pytest tests")
     assert green_profiles_recover_red(green, red) is True
-
-
-def test_strict_challenge_message_red_first_missing() -> None:
-    tracker = _strict_tracker_with_source_edit()
-    tracker.observe_execution("pytest tests/test_a.py", red=False, exit_code=0, iteration=2)
-    observation = tracker.build_observation(has_workspace_diff=True)
-    assert observation.primary_reason == "red_first_missing"
-    message = finalize_evidence_challenge_message(observation)
-    assert message.startswith("[Finalize evidence check]")
-    assert "failing and then passing" in message
-    assert "passes both with and without your change" in message
-    assert "Do not finalize yet" in message
-    # Escape hatch mirrors the red-family shape.
-    assert "explain in your final answer" in message
 
 
 def test_strict_challenge_message_zero_verification() -> None:

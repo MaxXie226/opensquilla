@@ -280,12 +280,12 @@ def _submit_review_from_env(config_value: bool = False) -> bool:
 
 
 _PATCH_HYGIENE_BLOCK_ENV = "OPENSQUILLA_PATCH_HYGIENE_BLOCK"
-_PATCH_HYGIENE_BLOCK_MODES = ("off", "test_paths")
+_PATCH_HYGIENE_BLOCK_MODES = ("off", "test_paths", "protected_paths")
 
 
 def _patch_hygiene_block_from_env(
-    config_value: Literal["off", "test_paths"] = "off",
-) -> Literal["off", "test_paths"]:
+    config_value: Literal["off", "test_paths", "protected_paths"] = "off",
+) -> Literal["off", "test_paths", "protected_paths"]:
     """Resolve the finalize-time patch hygiene hard-block mode.
 
     Default off. A non-blank ``OPENSQUILLA_PATCH_HYGIENE_BLOCK`` overrides

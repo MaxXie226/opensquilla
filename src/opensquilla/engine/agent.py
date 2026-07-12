@@ -217,6 +217,7 @@ from opensquilla.tool_boundary import AgentToolHandler as ToolHandler
 from opensquilla.tools.projected_arguments import find_projected_tool_argument
 from opensquilla.tools.registry import ToolRegistry
 from opensquilla.tools.types import ToolContext, current_tool_context
+from opensquilla.tools.write_policy import match_workspace_write_deny
 from opensquilla.tools.write_tracking import classify_workspace_path
 from opensquilla.usage_reasons import (
     normalize_usage_unknown_reason,
@@ -367,10 +368,10 @@ _VERIFY_MIRROR_DIR_NAME = "verify-mirror"
 _VERIFY_MIRROR_MAX_FILES = 200
 
 
-def _patch_hygiene_block_key(test_paths: list[str]) -> str:
-    """Dedup key: the same set of offending test paths never re-fires."""
+def _patch_hygiene_block_key(offending_paths: list[str]) -> str:
+    """Dedup key: the same set of offending paths never re-fires."""
 
-    encoded = json.dumps(sorted(test_paths), ensure_ascii=False)
+    encoded = json.dumps(sorted(offending_paths), ensure_ascii=False)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
 
 
@@ -390,6 +391,24 @@ def _patch_hygiene_block_message(test_paths: list[str]) -> str:
         "change, implement the actual fix in the source code instead. Keeping "
         "a copy of any reproduction script under the scratch directory is "
         "fine; test directories are not."
+    )
+
+
+def _patch_hygiene_block_protected_message(protected_paths: list[str]) -> str:
+    rendered = ", ".join(protected_paths[:5])
+    if len(protected_paths) > 5:
+        rendered += f" (and {len(protected_paths) - 5} more)"
+    return (
+        "[Patch hygiene check]\n"
+        "You are about to finish, but the workspace diff still changes files "
+        f"that this deployment's write policy protects: {rendered}. Protected "
+        "paths must stay unchanged in the final diff; edits to them do not "
+        "count as part of the fix. Do not finalize yet. Revert the listed "
+        "changes (restore modified or deleted files to their original content "
+        "and remove newly added ones) so the diff no longer touches protected "
+        "paths. If a protected file was the only thing you changed, implement "
+        "the actual fix in unprotected project source instead. Keeping copies "
+        "or new files under the scratch directory is fine."
     )
 
 
@@ -7777,17 +7796,26 @@ class Agent:
                                 )
                                 continue
                     if (
-                        patch_hygiene_block_mode == "test_paths"
+                        patch_hygiene_block_mode in ("test_paths", "protected_paths")
                         and not max_iterations_finalization_pending
                         and not artifact_delivery_final_response_pending
                         and not post_write_convergence_finalization_pending
                     ):
                         hygiene_status = await self._workspace_git_status_porcelain()
-                        hygiene_test_paths = self._porcelain_status_test_paths(
-                            hygiene_status
-                        )
-                        if hygiene_test_paths:
-                            hygiene_key = _patch_hygiene_block_key(hygiene_test_paths)
+                        if patch_hygiene_block_mode == "protected_paths":
+                            hygiene_offending_paths = (
+                                self._porcelain_status_protected_paths(hygiene_status)
+                            )
+                            hygiene_reason = "protected_paths_in_final_diff"
+                        else:
+                            hygiene_offending_paths = self._porcelain_status_test_paths(
+                                hygiene_status
+                            )
+                            hygiene_reason = "test_paths_in_final_diff"
+                        if hygiene_offending_paths:
+                            hygiene_key = _patch_hygiene_block_key(
+                                hygiene_offending_paths
+                            )
                             # Same headroom rule as the evidence gate: never
                             # spend the run's last LLM call or deadline slack
                             # on a challenge.
@@ -7809,22 +7837,31 @@ class Agent:
                                 )
                                 + 1
                             )
-                            hygiene_message = (
-                                None
-                                if hygiene_suppressed
-                                else _patch_hygiene_block_message(hygiene_test_paths)
-                            )
+                            if hygiene_suppressed:
+                                hygiene_message = None
+                            elif patch_hygiene_block_mode == "protected_paths":
+                                hygiene_message = (
+                                    _patch_hygiene_block_protected_message(
+                                        hygiene_offending_paths
+                                    )
+                                )
+                            else:
+                                hygiene_message = _patch_hygiene_block_message(
+                                    hygiene_offending_paths
+                                )
                             self._record_runtime_event(
                                 "patch_hygiene_block.challenge",
                                 feature="patch_hygiene_block",
-                                reason="test_paths_in_final_diff",
+                                reason=hygiene_reason,
                                 iteration=iterations,
                                 provider_call_count=turn_llm_calls,
                                 injected_to_model=bool(hygiene_message),
                                 recovery_key=hygiene_key,
                                 details={
-                                    "test_paths": hygiene_test_paths[:20],
-                                    "test_path_count": len(hygiene_test_paths),
+                                    "offending_paths": hygiene_offending_paths[:20],
+                                    "offending_path_count": len(
+                                        hygiene_offending_paths
+                                    ),
                                 },
                             )
                             if hygiene_message is not None:
@@ -7847,19 +7884,32 @@ class Agent:
                                     "patch_hygiene_block",
                                     action="warn",
                                     mode=patch_hygiene_block_mode,
-                                    reason="test_paths_in_final_diff",
+                                    reason=hygiene_reason,
                                     details={
-                                        "test_paths": hygiene_test_paths[:20],
-                                        "test_path_count": len(hygiene_test_paths),
+                                        "offending_paths": hygiene_offending_paths[
+                                            :20
+                                        ],
+                                        "offending_path_count": len(
+                                            hygiene_offending_paths
+                                        ),
                                     },
                                 )
-                                yield WarningEvent(
-                                    code="patch_hygiene_block_recovery",
-                                    message=(
+                                if patch_hygiene_block_mode == "protected_paths":
+                                    hygiene_warning = (
+                                        "The model attempted to finish with "
+                                        "write-policy-protected files still "
+                                        "changed in the workspace diff; asking "
+                                        "it to revert them once."
+                                    )
+                                else:
+                                    hygiene_warning = (
                                         "The model attempted to finish with test "
                                         "files still changed in the workspace "
                                         "diff; asking it to revert them once."
-                                    ),
+                                    )
+                                yield WarningEvent(
+                                    code="patch_hygiene_block_recovery",
+                                    message=hygiene_warning,
                                 )
                                 continue
                     if (
@@ -10176,6 +10226,52 @@ class Agent:
                 if path not in test_paths:
                     test_paths.append(path)
         return test_paths
+
+    def _porcelain_status_protected_paths(self, status: str | None) -> list[str]:
+        """Deny-glob-protected paths with a live diff, per porcelain-v1 status.
+
+        The ``protected_paths`` hygiene mode reuses the deployment's
+        workspace write-deny globs verbatim — the engine carries no path
+        taxonomy of its own here, so whatever the configuration protects
+        from writes is also what the final diff must leave untouched.
+        Renames count both sides: moving a protected file away still
+        mutates the protected tree.
+        """
+
+        if not status:
+            return []
+        workspace = self._workspace_dir_for_status()
+        if workspace is None:
+            return []
+        ctx = self._tool_context or current_tool_context.get()
+        if ctx is None or not getattr(ctx, "workspace_write_deny_globs", None):
+            return []
+        protected: list[str] = []
+        for line in status.splitlines():
+            if not line.strip():
+                continue
+            raw = line.rstrip()
+            text = raw[3:].strip() if len(raw) > 3 else raw.strip()
+            sides = (
+                [side.strip() for side in text.split(" -> ", 1)]
+                if " -> " in text
+                else [text]
+            )
+            for side in sides:
+                path = side.replace("\\", "/").lstrip("./")
+                if not path:
+                    continue
+                match = match_workspace_write_deny(
+                    workspace / path,
+                    original_path=path,
+                    workspace=workspace,
+                    ctx=ctx,
+                )
+                if match is None:
+                    continue
+                if path not in protected:
+                    protected.append(path)
+        return protected
 
     @staticmethod
     def _is_root_scratch_artifact_path(path: str | None) -> bool:

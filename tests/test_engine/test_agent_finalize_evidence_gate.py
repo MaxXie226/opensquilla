@@ -593,23 +593,16 @@ async def test_gate_quiet_when_trailing_execution_was_denied(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_strict_gate_challenges_never_red_run_then_accepts_red_green(
-    tmp_path,
-) -> None:
-    """Green-only verification (the print-stub signature) draws a
-    red_first_missing challenge; demonstrating red-then-green on the same
-    target satisfies strict and the next final is accepted."""
+async def test_strict_gate_accepts_green_only_run(tmp_path) -> None:
+    """A green-only run (edit, suite passes, finalize) must sail through
+    strict mode unchallenged: red-first state is report-only because
+    never-red is a routine signature of legitimately solved runs."""
 
     _init_git_workspace(tmp_path)
     runtime_events_path = tmp_path / "runtime_events.jsonl"
     provider = _ScriptedProvider(
         [
             ("edit", "src.py"),
-            ("exec", "pytest tests/test_src.py"),
-            ("final",),
-            # The focused node still fails (red), then the whole file passes:
-            # a matching red-then-green pair that satisfies red-first.
-            ("exec", "pytest tests/test_src.py::fail-run"),
             ("exec", "pytest tests/test_src.py"),
             ("final",),
         ]
@@ -628,31 +621,21 @@ async def test_strict_gate_challenges_never_red_run_then_accepts_red_green(
 
     events = [event async for event in agent.run_turn("Fix the bug")]
 
-    assert len(provider.calls) == 6
-    challenge_messages = [
-        message.content
-        for message in provider.calls[3]
-        if isinstance(message.content, str)
-        and message.content.startswith("[Finalize evidence check]")
-    ]
-    assert len(challenge_messages) == 1
-    assert "failing and then passing" in challenge_messages[0]
-    assert "minimal" not in challenge_messages[0].lower()
-    assert len(_gate_warnings(events)) == 1
+    assert len(provider.calls) == 3
+    assert _gate_warnings(events) == []
+    assert "finalize_evidence_gate_detections" not in agent.config.metadata
     done_events = [event for event in events if isinstance(event, DoneEvent)]
-    assert done_events[-1].text == "final attempt 6"
+    assert done_events[-1].text == "final attempt 3"
 
-    logged = [
-        json.loads(line) for line in runtime_events_path.read_text().splitlines()
-    ]
-    challenges = [
-        event for event in logged if event.get("name") == "finalize_evidence_gate.challenge"
-    ]
-    assert len(challenges) == 1
-    assert challenges[0]["reason"] == "red_first_missing"
-    assert challenges[0]["details"]["strict"] is True
-    assert challenges[0]["details"]["red_first_satisfied"] is False
-    assert challenges[0]["details"]["verification_command_count"] == 1
+    if runtime_events_path.exists():
+        logged = [
+            json.loads(line) for line in runtime_events_path.read_text().splitlines()
+        ]
+        assert not [
+            event
+            for event in logged
+            if event.get("name") == "finalize_evidence_gate.challenge"
+        ]
 
 
 @pytest.mark.asyncio
@@ -707,11 +690,13 @@ async def test_strict_gate_zero_verification_challenge_never_blocks(tmp_path) ->
 
 @pytest.mark.asyncio
 async def test_strict_flag_activates_tracker_without_base_gate(tmp_path) -> None:
+    # zero_verification is the only strict trigger; an edit-then-finalize run
+    # with no execution at all must draw the challenge even when the base
+    # gate flag is off.
     _init_git_workspace(tmp_path)
     provider = _ScriptedProvider(
         [
             ("edit", "src.py"),
-            ("exec", "pytest tests/test_src.py"),
             ("final",),
             ("final",),
         ]
@@ -726,11 +711,11 @@ async def test_strict_flag_activates_tracker_without_base_gate(tmp_path) -> None
 
     events = [event async for event in agent.run_turn("Fix the bug")]
 
-    assert len(provider.calls) == 4
+    assert len(provider.calls) == 3
     assert len(_gate_warnings(events)) == 1
     assert agent.config.metadata["finalize_evidence_gate_detections"] == 2
     done_events = [event for event in events if isinstance(event, DoneEvent)]
-    assert done_events[-1].text == "final attempt 4"
+    assert done_events[-1].text == "final attempt 3"
 
 
 @pytest.mark.asyncio

@@ -9,20 +9,16 @@ execution-level command ran after its final source edit, or (e) a
 self-written reproduction/diagnostic script never passed (still red, or
 deleted before a passing run was observed).
 
-Strict mode (``OPENSQUILLA_FINALIZE_EVIDENCE_STRICT``) adds two finalize-time
-triggers on top of the same machinery: (f) ``red_first_missing`` — the run
-never demonstrated the failure and then its resolution (no execution was ever
-observed red — before the first source edit, after it, or on a
-stash-reverted tree — and later matched by a passing run on the patched
-tree), and (g) ``zero_verification`` — no execution-level command survived
-skip filtering at any point in the run. Both err toward suppression: any
-surviving red registers a candidate (a verification that passes both with
-and without the change is the print-stub signature; one observed red proves
-the check can fail), red/green matching reuses the deselection profile
-machinery WITHOUT requiring deselection and compares pytest-style node ids
-by base path with directory-prefix coverage, a red run of a tracked artifact
-is resolved by any later patched-tree green run of the same artifact, and a
-red with no comparable shape is resolved by any later patched-tree green.
+Strict mode (``OPENSQUILLA_FINALIZE_EVIDENCE_STRICT``) adds one finalize-time
+trigger on top of the same machinery: (f) ``zero_verification`` — no
+execution-level command survived skip filtering at any point in the run, so
+the change being shipped was never exercised at all. Red-first bookkeeping
+(``red_first_satisfied`` / candidate counts, fed by the same deselection
+profile machinery) is still tracked and reported for offline replay
+diagnostics, but it does NOT gate: transcript replay over real runs showed
+that "never observed failing then passing" is common on legitimately solved
+runs (direct fix + existing suite green), so a trigger on it would challenge
+correct finishes far too often.
 
 Polarity contract: a failing self-written reproduction is BINDING evidence and
 green results from unrelated suites do not override it; the challenge never
@@ -1236,10 +1232,10 @@ class FinalizeEvidenceTracker:
             if not self._post_edit_executions:
                 triggers.append("no_execution_after_final_edit")
             if self._strict:
-                # Strict triggers append AFTER the base ones so base-mode
+                # The strict trigger appends AFTER the base ones so base-mode
                 # primary reasons (and their dedup keys) are unperturbed.
-                if not self._red_first_satisfied:
-                    triggers.append("red_first_missing")
+                # Red-first state is reported but deliberately not a trigger:
+                # green-only runs are routinely legitimate.
                 if self._verification_command_count == 0:
                     triggers.append("zero_verification")
         return FinalizeEvidenceObservation(
@@ -1456,22 +1452,6 @@ def finalize_evidence_challenge_message(observation: FinalizeEvidenceObservation
             "re-run a reproduction that follows the issue report against the "
             "current workspace state and confirm it passes; if it fails, use its "
             "output to revise the source fix first." + _ONE_SHOT_NOTICE
-        )
-    if reason == "red_first_missing":
-        return (
-            "[Finalize evidence check]\n"
-            "You are about to finish, but no command in this run was ever "
-            "observed failing and then passing again after your change: nothing "
-            "demonstrates that your reproduction or verification actually "
-            "exercises the reported issue. A check that passes both with and "
-            "without your change proves nothing about it. Do not finalize yet. "
-            "Demonstrate the failure first: temporarily set your change aside "
-            "(for example with `git stash`), run your reproduction or the most "
-            "relevant focused test and confirm it FAILS, then restore your "
-            "change (`git stash pop`) and re-run the same command to confirm it "
-            "passes. If the failure genuinely cannot be demonstrated that way, "
-            "explain in your final answer exactly how you verified the fix "
-            "instead."
         )
     if "zero_verification" in observation.triggers:
         # ``zero_verification`` implies ``no_execution_after_final_edit`` (a
