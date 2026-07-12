@@ -13,6 +13,7 @@ from opensquilla.engine.runtime import (
 )
 from opensquilla.engine.turn_runner.agent_bootstrap_stage import (
     _finalize_evidence_gate_from_env,
+    _finalize_evidence_strict_from_env,
 )
 from opensquilla.gateway.config import GatewayConfig
 
@@ -187,6 +188,62 @@ def test_bootstrap_finalize_evidence_gate_env_off_overrides_config_on(monkeypatc
     monkeypatch.setenv("OPENSQUILLA_FINALIZE_EVIDENCE_GATE", "off")
 
     assert _finalize_evidence_gate_from_env(True) is False
+
+
+def test_bootstrap_finalize_evidence_strict_env_defaults_off(monkeypatch) -> None:
+    monkeypatch.delenv("OPENSQUILLA_FINALIZE_EVIDENCE_STRICT", raising=False)
+
+    assert _finalize_evidence_strict_from_env() is False
+
+
+@pytest.mark.parametrize("value", ["on", "1", "true", "YES"])
+def test_bootstrap_finalize_evidence_strict_env_on(monkeypatch, value: str) -> None:
+    monkeypatch.setenv("OPENSQUILLA_FINALIZE_EVIDENCE_STRICT", value)
+
+    assert _finalize_evidence_strict_from_env() is True
+
+
+@pytest.mark.parametrize("value", ["off", "0", "false", "NO", "  "])
+def test_bootstrap_finalize_evidence_strict_env_off_or_blank(
+    monkeypatch, value: str
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_FINALIZE_EVIDENCE_STRICT", value)
+
+    assert _finalize_evidence_strict_from_env() is False
+
+
+def test_bootstrap_finalize_evidence_strict_env_rejects_unrecognized_value(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_FINALIZE_EVIDENCE_STRICT", "enabled")
+
+    with pytest.raises(ValueError, match="OPENSQUILLA_FINALIZE_EVIDENCE_STRICT"):
+        _finalize_evidence_strict_from_env()
+
+
+def test_bootstrap_finalize_evidence_strict_uses_config_value_when_env_absent(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("OPENSQUILLA_FINALIZE_EVIDENCE_STRICT", raising=False)
+
+    assert _finalize_evidence_strict_from_env(True) is True
+    assert _finalize_evidence_strict_from_env(False) is False
+
+
+def test_bootstrap_finalize_evidence_strict_env_blank_falls_through_to_config(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_FINALIZE_EVIDENCE_STRICT", "  ")
+
+    assert _finalize_evidence_strict_from_env(True) is True
+
+
+def test_bootstrap_finalize_evidence_strict_env_off_overrides_config_on(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_FINALIZE_EVIDENCE_STRICT", "off")
+
+    assert _finalize_evidence_strict_from_env(True) is False
 
 
 def test_legacy_prompt_style_defaults_off(monkeypatch) -> None:

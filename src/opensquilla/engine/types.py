@@ -586,6 +586,12 @@ class AgentConfig:
     # Finalize-time red-evidence gate (see engine.finalize_evidence_gate).
     # Off by default; enabled per run via OPENSQUILLA_FINALIZE_EVIDENCE_GATE.
     finalize_evidence_gate_enabled: bool = False
+    # Strict mode for the finalize-time evidence gate: adds the
+    # red_first_missing and zero_verification triggers. Implies the gate
+    # itself (strict on activates the tracker even when the base flag is
+    # off). Off by default; enabled per run via
+    # OPENSQUILLA_FINALIZE_EVIDENCE_STRICT.
+    finalize_evidence_strict: bool = False
     # Review-on-submit checkpoint (see engine.submit_review). Surfaces a
     # ``submit`` tool and, when the model finishes with a non-empty diff, shows
     # it a general hygiene checklist plus its own diff exactly once before the

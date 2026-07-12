@@ -4501,9 +4501,15 @@ class Agent:
         post_write_focused_verification_observed = False
         post_write_focused_verification_success_observed = False
         last_post_write_failed_verification: dict[str, Any] | None = None
+        finalize_evidence_strict = bool(
+            getattr(self.config, "finalize_evidence_strict", False)
+        )
         finalize_evidence_tracker = (
-            FinalizeEvidenceTracker()
-            if bool(getattr(self.config, "finalize_evidence_gate_enabled", False))
+            FinalizeEvidenceTracker(strict=finalize_evidence_strict)
+            if (
+                bool(getattr(self.config, "finalize_evidence_gate_enabled", False))
+                or finalize_evidence_strict
+            )
             else None
         )
         finalize_evidence_gate_keys: set[str] = set()
