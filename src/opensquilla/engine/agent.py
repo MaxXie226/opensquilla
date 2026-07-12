@@ -4978,6 +4978,31 @@ class Agent:
                         ),
                         margin_seconds=thinking_off_margin_seconds,
                     )
+                    # The turn-call log is a raw debug stream that run
+                    # harnesses do not collect; the runtime event is what
+                    # lets delivery gates tell this designed endgame
+                    # thinking cutoff (every later call runs
+                    # thinking-disabled) apart from a treatment delivery
+                    # failure.
+                    append_runtime_event(
+                        self.config.runtime_events_path,
+                        {
+                            "feature": "deadline_thinking_off",
+                            "name": "deadline_thinking_off.armed",
+                            "action": "disable_thinking_until_deadline",
+                            "reason": "deadline_margin",
+                            "iteration": iterations,
+                            "remaining_seconds": int(
+                                max(0.0, _total_deadline - _loop.time())
+                            ),
+                            "margin_seconds": thinking_off_margin_seconds,
+                            "session_key": self._session_key,
+                            "agent_id": (
+                                self.config.tool_result_store_agent_id
+                                or self.config.metadata.get("agent_id")
+                            ),
+                        },
+                    )
 
                 # Endgame git freeze arming; re-checked before tool execution
                 # because a long provider stream can cross the margin
