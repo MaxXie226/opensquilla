@@ -27,6 +27,7 @@ from opensquilla.engine.runtime_recovery import (
     normalize_reasoning_prefill_recovery_mode,
     normalize_runtime_recovery_mode,
 )
+from opensquilla.tools.write_policy import validate_workspace_write_deny_env
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -759,6 +760,12 @@ class AgentBootstrapStage:
         agent_metadata["agent_max_iterations_source"] = budgets.max_iterations_source
 
         # 4. Construct AgentConfig (declarative, single call site)
+        #
+        # Validation-only gate: the workspace write deny env levers are read
+        # at dispatch time in the tools layer (no AgentConfig fields), but a
+        # typo there must stop the run at startup, not silently disable
+        # enforcement mid-run.
+        validate_workspace_write_deny_env()
         #
         # ``workspace_dir`` is sourced from the per-turn metadata key
         # ``bootstrap_workspace_dir`` (written by ``_run_pipeline`` from
