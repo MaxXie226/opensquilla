@@ -276,6 +276,120 @@ async def test_exec_command_blocks_checkout_when_frozen_under_host_execution(
     assert target.read_text(encoding="utf-8") == "value = 2\n"
 
 
+# ---------------------------------------------------------------------------
+# Instrumentation exemption (OPENSQUILLA_ENDGAME_GIT_FREEZE_INSTRUMENTATION_EXEMPT)
+# ---------------------------------------------------------------------------
+
+
+def _exempt_ctx(workspace: Path | None = None) -> ToolContext:
+    ctx = _configure_ctx(workspace, frozen=True)
+    ctx.endgame_git_freeze_instrumentation_exempt = True
+    return ctx
+
+
+def test_decision_exempts_instrumentation_only_revert(tmp_path: Path) -> None:
+    # Cleaning up diagnostic prints is exactly what the wrap-up window is
+    # for: a revert whose targeted diff only added print lines goes through.
+    repo, target = _init_repo(tmp_path)
+    target.write_text('value = 1\nprint("debug")\n', encoding="utf-8")
+    ctx = _exempt_ctx(repo)
+    events: list[dict] = []
+    ctx.on_runtime_event = events.append
+
+    assert endgame_git_freeze_decision(command="git checkout -- pkg.py") is None
+    assert [event["name"] for event in events] == ["endgame_git_freeze.exempted"]
+    assert events[0]["feature"] == "endgame_git_freeze"
+    assert events[0]["reason"] == "instrumentation_only_diff"
+    assert events[0]["status"] == "exempted"
+    assert events[0]["matched_operation"] == "git_checkout"
+    assert events[0]["target_paths"] == ["pkg.py"]
+
+
+def test_decision_blocks_substantive_revert_despite_exemption(tmp_path: Path) -> None:
+    repo, target = _init_repo(tmp_path)
+    target.write_text("value = 2\n", encoding="utf-8")
+    _exempt_ctx(repo)
+
+    payload = endgame_git_freeze_decision(command="git checkout -- pkg.py")
+
+    assert payload is not None
+    assert payload["status"] == "blocked"
+    assert payload["reason"] == "endgame_git_freeze"
+
+
+def test_decision_blocks_instrumentation_revert_when_exemption_off(
+    tmp_path: Path,
+) -> None:
+    # Documents the flag gate: without the exemption lever the freeze blocks
+    # instrumentation-only reverts like any other.
+    repo, target = _init_repo(tmp_path)
+    target.write_text('value = 1\nprint("debug")\n', encoding="utf-8")
+    _configure_ctx(repo, frozen=True)
+
+    payload = endgame_git_freeze_decision(command="git checkout -- pkg.py")
+
+    assert payload is not None
+    assert payload["status"] == "blocked"
+
+
+def test_decision_exempts_per_target_but_blocks_whole_worktree(tmp_path: Path) -> None:
+    # The probed diff follows the command's targets: a checkout of the
+    # instrumented file is exempt while a whole-worktree reset that would also
+    # revert the substantive file stays blocked.
+    repo, target = _init_repo(tmp_path)
+    other = repo / "other.py"
+    other.write_text("keep = 1\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "add other"], check=True)
+    target.write_text('value = 1\nprint("debug")\n', encoding="utf-8")
+    other.write_text("keep = 2\n", encoding="utf-8")
+    _exempt_ctx(repo)
+
+    assert endgame_git_freeze_decision(command="git checkout -- pkg.py") is None
+    payload = endgame_git_freeze_decision(command="git reset --hard")
+    assert payload is not None
+    assert payload["status"] == "blocked"
+
+
+def test_decision_keeps_blocking_untracked_only_clean(tmp_path: Path) -> None:
+    # git clean removes untracked files; `git diff HEAD` cannot classify what
+    # it would destroy, so the exemption never applies to untracked-only ops.
+    repo, target = _init_repo(tmp_path)
+    target.write_text('value = 1\nprint("debug")\n', encoding="utf-8")
+    (repo / "scratch.txt").write_text("scratch\n", encoding="utf-8")
+    _exempt_ctx(repo)
+
+    payload = endgame_git_freeze_decision(command="git clean -fd")
+
+    assert payload is not None
+    assert payload["status"] == "blocked"
+
+
+def test_decision_keeps_blocking_when_workspace_unresolvable() -> None:
+    # Probe failure fails conservative: no workspace to diff means the freeze
+    # stays in force.
+    _exempt_ctx(workspace=None)
+
+    payload = endgame_git_freeze_decision(command="git checkout -- pkg.py")
+
+    assert payload is not None
+    assert payload["status"] == "blocked"
+
+
+@pytest.mark.asyncio
+async def test_exec_command_executes_exempted_instrumentation_revert(
+    tmp_path: Path,
+) -> None:
+    repo, target = _init_repo(tmp_path)
+    target.write_text('value = 1\nprint("debug")\n', encoding="utf-8")
+    _exempt_ctx(repo)
+
+    result = await shell.exec_command("git checkout -- pkg.py", workdir=str(repo))
+
+    assert result.startswith("exit_code=0")
+    assert target.read_text(encoding="utf-8") == "value = 1\n"
+
+
 @pytest.mark.asyncio
 async def test_freeze_short_circuits_before_source_diff_bookkeeping(
     tmp_path: Path,

@@ -214,6 +214,7 @@ from opensquilla.session.compaction_lifecycle import (
 )
 from opensquilla.session.terminal_reply import build_terminal_reply
 from opensquilla.tool_boundary import AgentToolHandler as ToolHandler
+from opensquilla.tools.patch_classification import is_instrumentation_only_patch
 from opensquilla.tools.projected_arguments import find_projected_tool_argument
 from opensquilla.tools.registry import ToolRegistry
 from opensquilla.tools.types import ToolContext, current_tool_context
@@ -994,6 +995,30 @@ _MID_BUDGET_NO_DIFF_NUDGE_TEMPLATE = (
 _MID_BUDGET_NO_DIFF_NUDGE_PREFIX = _MID_BUDGET_NO_DIFF_NUDGE_TEMPLATE.split(
     "{percent}", 1
 )[0]
+_REASONING_ONLY_ACT_NOW_DIRECTIVE = (
+    "Your previous response was internal reasoning only, so nothing was "
+    "delivered or executed. Act now: issue the tool call that carries out "
+    "your current best next step, or state your final answer directly. "
+    "Decide with the analysis you already have instead of reasoning further."
+)
+_PLAN_ONLY_ACT_NOW_DIRECTIVE = (
+    "The last several responses only updated the plan without acting on it. "
+    "Planning further will not move the task forward. Act now: issue the "
+    "tool call that carries out the current in-progress step, and update "
+    "the plan again only after real progress."
+)
+# One-shot endgame fix directive (OPENSQUILLA_ENDGAME_FIX_DIRECTIVE_MARGIN_
+# SECONDS). The prefix is distinct from the wrap-up's "Time check: roughly "
+# so the nudge-identity predicates can tell them apart.
+_ENDGAME_FIX_DIRECTIVE_TEMPLATE = (
+    "Time check: about {minutes} minute(s) remain and the workspace contains "
+    "no source fix yet beyond diagnostic instrumentation. Stop investigating "
+    "now. Decide on the most likely root cause from the evidence you already "
+    "have, remove leftover debug output, apply your best-supported fix to "
+    "the source code, and verify it directly. An imperfect fix you can "
+    "defend beats no fix."
+)
+_ENDGAME_FIX_DIRECTIVE_PREFIX = "Time check: about "
 _LARGE_CONTEXT_INVALID_RESPONSE_INPUT_TOKENS = 30_000
 _COMPACTED_TOOL_ARGUMENT_MARKERS = frozenset(
     {
@@ -1544,16 +1569,33 @@ def _is_mid_budget_nudge_message(message: Message) -> bool:
     )
 
 
+def _is_runtime_nudge_message(message: Message) -> bool:
+    """Whether a message is a runtime-injected nudge, not conversation history.
+
+    Covers the mid-budget progress nudge, the plan-only act-now directive,
+    and the endgame fix directive — everything the engine appends after tool
+    results that the post-tool shape predicates must see through.
+    """
+
+    if message.role != "user" or not isinstance(message.content, str):
+        return False
+    return (
+        message.content.startswith(_MID_BUDGET_NO_DIFF_NUDGE_PREFIX)
+        or message.content == _PLAN_ONLY_ACT_NOW_DIRECTIVE
+        or message.content.startswith(_ENDGAME_FIX_DIRECTIVE_PREFIX)
+    )
+
+
 def _tail_has_tool_result_ignoring_nudges(messages: list[Message]) -> bool:
     """Post-tool shape of the turn with runtime-injected nudges removed.
 
-    A mid-budget nudge stacked after watchdog or pending-input messages
-    pushes the tool results out of the plain lookback window; the nudge is
-    not conversation history, so the shape is judged as if it were absent.
+    A nudge stacked after watchdog or pending-input messages pushes the tool
+    results out of the plain lookback window; the nudge is not conversation
+    history, so the shape is judged as if it were absent.
     """
 
     return _tail_has_tool_result(
-        [message for message in messages[-4:] if not _is_mid_budget_nudge_message(message)]
+        [message for message in messages[-4:] if not _is_runtime_nudge_message(message)]
     )
 
 
@@ -1689,12 +1731,13 @@ class _ProviderRetryPolicy:
         max_provider_retries: int,
         *,
         length_capped_continuations: int = 3,
+        reasoning_only_retries: int = 1,
     ) -> _ProviderRetryPolicy:
         length_capped_continuations = max(1, length_capped_continuations)
         return cls(
             max_provider_retries=max_provider_retries,
             attempt_budgets={
-                _ProviderAttemptKind.REASONING_ONLY: 1,
+                _ProviderAttemptKind.REASONING_ONLY: max(1, reasoning_only_retries),
                 _ProviderAttemptKind.MALFORMED_EMPTY: 1,
                 _ProviderAttemptKind.STREAM_INCOMPLETE: 1,
                 _ProviderAttemptKind.LENGTH_CAPPED: length_capped_continuations,
@@ -4809,6 +4852,7 @@ class Agent:
         max_iterations_finalization_attempted = False
         max_iterations_finalization_pending = False
         max_iterations_finalization_message: Message | None = None
+        max_iterations_deadline_extension_logged = False
         post_write_convergence_finalization_pending = False
         post_write_convergence_finalization_message: Message | None = None
         placeholder_offense_iterations = 0
@@ -4816,6 +4860,9 @@ class Agent:
         deadline_wrapup_message: Message | None = None
         deadline_thinking_off_armed = False
         endgame_git_freeze_armed = False
+        endgame_fix_directive_fired = False
+        plan_only_iteration_streak = 0
+        reasoning_only_act_now_message: Message | None = None
         mid_budget_nudge_fired_fractions: set[float] = set()
         workspace_diff_recovery_attempted = False
         failed_tool_finalization_recovery_keys: set[str] = set()
@@ -4981,6 +5028,9 @@ class Agent:
         )
         if endgame_git_freeze_margin_seconds > 0 and self._tool_context is not None:
             self._tool_context.endgame_git_freeze_active = False
+            self._tool_context.endgame_git_freeze_instrumentation_exempt = bool(
+                getattr(self.config, "endgame_git_freeze_instrumentation_exempt", False)
+            )
 
         def _arm_endgame_git_freeze_if_due() -> None:
             nonlocal endgame_git_freeze_armed
@@ -5003,6 +5053,62 @@ class Agent:
                 remaining_seconds=int(max(0.0, _total_deadline - _loop.time())),
                 margin_seconds=endgame_git_freeze_margin_seconds,
             )
+
+        def _defer_max_iterations_cap() -> bool:
+            """Whether the iteration cap yields to remaining wall-clock time.
+
+            True keeps the loop running normal iterations past the cap while
+            more than the extension margin remains before the total deadline;
+            the cap re-applies once the margin is reached. A finalization
+            attempt that already happened is never reopened.
+            """
+            nonlocal max_iterations_deadline_extension_logged
+            extend_seconds = max(
+                0,
+                int(
+                    getattr(self.config, "max_iterations_deadline_extend_seconds", 0)
+                    or 0
+                ),
+            )
+            if (
+                extend_seconds <= 0
+                or _total_deadline is None
+                or max_iterations_finalization_attempted
+                or _loop.time() >= _total_deadline - extend_seconds
+            ):
+                return False
+            if not max_iterations_deadline_extension_logged:
+                max_iterations_deadline_extension_logged = True
+                remaining_seconds = int(max(0.0, _total_deadline - _loop.time()))
+                self._write_turn_call_log(
+                    "turn_policy_decision",
+                    action="max_iterations_deadline_extension",
+                    reason="deadline_headroom",
+                    code="max_iterations_deadline_extension",
+                    iteration=iterations,
+                    max_iterations=self.config.max_iterations,
+                    remaining_seconds=remaining_seconds,
+                    extend_margin_seconds=extend_seconds,
+                )
+                append_runtime_event(
+                    self.config.runtime_events_path,
+                    {
+                        "feature": "max_iterations_deadline_extension",
+                        "name": "max_iterations_deadline_extension.active",
+                        "action": "defer_finalization",
+                        "reason": "deadline_headroom",
+                        "iteration": iterations,
+                        "max_iterations": self.config.max_iterations,
+                        "remaining_seconds": remaining_seconds,
+                        "extend_margin_seconds": extend_seconds,
+                        "session_key": self._session_key,
+                        "agent_id": (
+                            self.config.tool_result_store_agent_id
+                            or self.config.metadata.get("agent_id")
+                        ),
+                    },
+                )
+            return True
 
         tools_supported = True
         if self.config.model_capabilities is not None:
@@ -5133,7 +5239,11 @@ class Agent:
 
         try:
             while True:
-                if self.config.max_iterations > 0 and iterations >= self.config.max_iterations:
+                if (
+                    self.config.max_iterations > 0
+                    and iterations >= self.config.max_iterations
+                    and not _defer_max_iterations_cap()
+                ):
                     max_iterations_source = str(
                         self.config.metadata.get("agent_max_iterations_source", "agent_config")
                     )
@@ -5299,6 +5409,9 @@ class Agent:
                 _arm_endgame_git_freeze_if_due()
 
                 iterations += 1
+                # The act-now message answers one reasoning-only failure; a
+                # fresh iteration starts from a clean request.
+                reasoning_only_act_now_message = None
 
                 # ------ THINKING → STREAMING ------
                 yield self._transition(AgentState.STREAMING)
@@ -5322,6 +5435,14 @@ class Agent:
                 _retry_policy = _ProviderRetryPolicy.from_provider_budget(
                     _fallback.max_retries,
                     length_capped_continuations=self.config.length_capped_continuations,
+                    # The act-now lever injects a directive on the first
+                    # reasoning-only retry; the second budgeted retry gives the
+                    # directive one delivery attempt of its own.
+                    reasoning_only_retries=(
+                        2
+                        if bool(getattr(self.config, "reasoning_only_act_now", False))
+                        else 1
+                    ),
                 )
                 _attempt_retries_used = _retry_policy.used_attempts()
                 _invalid_response_fallback_done = False
@@ -5405,6 +5526,15 @@ class Agent:
                         and max_iterations_finalization_message is not None
                     ):
                         request_suffix_messages = [max_iterations_finalization_message]
+                    elif reasoning_only_act_now_message is not None and (
+                        not turn_messages or turn_messages[-1].role != "assistant"
+                    ):
+                        # Act-now beats the wrap-up directive for this retry:
+                        # it answers the reasoning-only failure that just
+                        # happened, and the wrap-up splice resumes on the next
+                        # request. Withheld on an assistant tail for the same
+                        # reasoning-prefill reason as below.
+                        request_suffix_messages = [reasoning_only_act_now_message]
                     elif deadline_wrapup_message is not None and (
                         not turn_messages or turn_messages[-1].role != "assistant"
                     ):
@@ -5729,6 +5859,55 @@ class Agent:
                                         ),
                                     )
                                     deadline_wrapup_armed = True
+                                    # The retry runs thinking-disabled: the
+                                    # margin exists to spend the last stretch
+                                    # answering, and a thinking-on retry can
+                                    # burn the entire remainder on another
+                                    # reasoning mega-stream that the hard
+                                    # deadline then kills with nothing
+                                    # delivered.
+                                    _disable_thinking_for_next_provider_call = True
+                                    if bool(
+                                        getattr(
+                                            self.config,
+                                            "deadline_wrapup_sticky_thinking_off",
+                                            False,
+                                        )
+                                    ):
+                                        # Sticky variant: the one-shot above
+                                        # covers only the retry; the next
+                                        # iteration re-enables thinking and can
+                                        # spend the rest of the margin on
+                                        # another mega-stream. Arming the
+                                        # deadline cutoff keeps every remaining
+                                        # call thinking-disabled.
+                                        deadline_thinking_off_armed = True
+                                        append_runtime_event(
+                                            self.config.runtime_events_path,
+                                            {
+                                                "feature": "deadline_wrapup",
+                                                "name": (
+                                                    "deadline_wrapup"
+                                                    ".sticky_thinking_off"
+                                                ),
+                                                "action": (
+                                                    "disable_thinking"
+                                                    "_until_deadline"
+                                                ),
+                                                "reason": (
+                                                    "reasoning_stream_preempt"
+                                                ),
+                                                "iteration": iterations,
+                                                "attempt": _call_attempt,
+                                                "session_key": self._session_key,
+                                                "agent_id": (
+                                                    self.config.tool_result_store_agent_id
+                                                    or self.config.metadata.get(
+                                                        "agent_id"
+                                                    )
+                                                ),
+                                            },
+                                        )
                                     self._write_turn_call_log(
                                         "turn_policy_decision",
                                         action="deadline_wrapup",
@@ -6425,25 +6604,48 @@ class Agent:
                     post_tool_turn = _tail_has_tool_result(request_messages)
                     if (
                         not post_tool_turn
-                        and deadline_wrapup_message is not None
                         and request_turn_messages
-                        and request_turn_messages[-1] is deadline_wrapup_message
+                        and (
+                            (
+                                deadline_wrapup_message is not None
+                                and request_turn_messages[-1] is deadline_wrapup_message
+                            )
+                            or (
+                                reasoning_only_act_now_message is not None
+                                and request_turn_messages[-1]
+                                is reasoning_only_act_now_message
+                            )
+                        )
                     ):
-                        # The spliced wrap-up directive is not conversation
-                        # history; empty-response recovery must still see the
-                        # post-tool shape of the underlying turn. A mid-budget
-                        # nudge stacked after the tool results is likewise
-                        # runtime-injected and must not hide that shape.
+                        # The spliced wrap-up or act-now directive is not
+                        # conversation history; empty-response recovery must
+                        # still see the post-tool shape of the underlying
+                        # turn. A nudge stacked after the tool results is
+                        # likewise runtime-injected and must not hide that
+                        # shape.
                         tail_index = len(turn_messages) - 1
-                        while tail_index >= 0 and _is_mid_budget_nudge_message(
+                        while tail_index >= 0 and _is_runtime_nudge_message(
                             turn_messages[tail_index]
                         ):
                             tail_index -= 1
                         post_tool_turn = tail_index >= 0 and _message_has_tool_result(
                             turn_messages[tail_index]
                         )
-                    if not post_tool_turn and bool(
-                        getattr(self.config, "mid_budget_no_diff_nudge", False)
+                    if not post_tool_turn and (
+                        bool(getattr(self.config, "mid_budget_no_diff_nudge", False))
+                        or int(
+                            getattr(self.config, "plan_only_act_now_threshold", 0) or 0
+                        )
+                        > 0
+                        or int(
+                            getattr(
+                                self.config,
+                                "endgame_fix_directive_margin_seconds",
+                                0,
+                            )
+                            or 0
+                        )
+                        > 0
                     ):
                         # A nudge stacked after watchdog or recovery guidance
                         # pushes the tool results out of the lookback window,
@@ -6796,6 +6998,42 @@ class Agent:
                             )
                         ):
                             _attempt_retries_used[_ProviderAttemptKind.REASONING_ONLY] += 1
+                            if (
+                                bool(
+                                    getattr(
+                                        self.config, "reasoning_only_act_now", False
+                                    )
+                                )
+                                and reasoning_only_act_now_message is None
+                            ):
+                                # Today's bare retry re-sends the identical
+                                # request; the model that just answered it with
+                                # reasoning only usually does so again. Splice
+                                # in an explicit act-now instruction so the
+                                # retry differs where it matters.
+                                reasoning_only_act_now_message = Message(
+                                    role="user",
+                                    content=_REASONING_ONLY_ACT_NOW_DIRECTIVE,
+                                )
+                                append_runtime_event(
+                                    self.config.runtime_events_path,
+                                    {
+                                        "feature": "reasoning_only_act_now",
+                                        "name": "reasoning_only_act_now.injected",
+                                        "action": "retry_with_act_now_directive",
+                                        "reason": "provider_reasoning_only",
+                                        "iteration": iterations,
+                                        "attempt": _call_attempt,
+                                        "reasoning_chars": len(
+                                            iter_reasoning_content or ""
+                                        ),
+                                        "session_key": self._session_key,
+                                        "agent_id": (
+                                            self.config.tool_result_store_agent_id
+                                            or self.config.metadata.get("agent_id")
+                                        ),
+                                    },
+                                )
                             if getattr(
                                 self.config, "reasoning_only_thinking_fallback", False
                             ):
@@ -9610,6 +9848,117 @@ class Agent:
                                 budget_fraction=nudge_fraction,
                                 elapsed_fraction=round(elapsed_fraction, 3),
                             )
+                # One-shot endgame fix directive: inside the margin with no
+                # source fix beyond diagnostic instrumentation, direct the
+                # model to commit to its best-supported fix now. The margin
+                # crossing is consumed whether or not the directive fires —
+                # a fix present at crossing time that is reverted later must
+                # not trigger a late directive.
+                endgame_fix_margin_seconds = max(
+                    0,
+                    int(
+                        getattr(self.config, "endgame_fix_directive_margin_seconds", 0)
+                        or 0
+                    ),
+                )
+                if (
+                    endgame_fix_margin_seconds > 0
+                    and _total_deadline is not None
+                    and not endgame_fix_directive_fired
+                    and _loop.time() > _total_deadline - endgame_fix_margin_seconds
+                ):
+                    endgame_fix_directive_fired = True
+                    # The probe shells out to git; keep it off the event loop.
+                    has_source_fix = await asyncio.to_thread(
+                        self._workspace_source_fix_beyond_instrumentation
+                    )
+                    if not has_source_fix:
+                        remaining_seconds = max(0.0, _total_deadline - _loop.time())
+                        turn_messages.append(
+                            Message(
+                                role="user",
+                                content=_ENDGAME_FIX_DIRECTIVE_TEMPLATE.format(
+                                    minutes=max(1, int(remaining_seconds // 60)),
+                                ),
+                            )
+                        )
+                        self._write_turn_call_log(
+                            "turn_policy_decision",
+                            action="endgame_fix_directive",
+                            reason="deadline_margin_no_fix",
+                            code="endgame_fix_directive",
+                            iteration=iterations,
+                            remaining_seconds=int(remaining_seconds),
+                            margin_seconds=endgame_fix_margin_seconds,
+                        )
+                        append_runtime_event(
+                            self.config.runtime_events_path,
+                            {
+                                "feature": "endgame_fix_directive",
+                                "name": "endgame_fix_directive.injected",
+                                "action": "append_fix_directive",
+                                "reason": "deadline_margin_no_fix",
+                                "iteration": iterations,
+                                "remaining_seconds": int(remaining_seconds),
+                                "margin_seconds": endgame_fix_margin_seconds,
+                                "session_key": self._session_key,
+                                "agent_id": (
+                                    self.config.tool_result_store_agent_id
+                                    or self.config.metadata.get("agent_id")
+                                ),
+                            },
+                        )
+                # Plan-only act-now directive: consecutive iterations whose
+                # executed tool calls are all update_plan mean the model is
+                # narrating progress instead of making it.
+                plan_only_threshold = max(
+                    0,
+                    int(getattr(self.config, "plan_only_act_now_threshold", 0) or 0),
+                )
+                if plan_only_threshold > 0:
+                    if executed_results and all(
+                        getattr(result, "tool_name", None) == "update_plan"
+                        for result in executed_results
+                    ):
+                        plan_only_iteration_streak += 1
+                    else:
+                        plan_only_iteration_streak = 0
+                    if plan_only_iteration_streak >= plan_only_threshold:
+                        turn_messages.append(
+                            Message(
+                                role="user",
+                                content=_PLAN_ONLY_ACT_NOW_DIRECTIVE,
+                            )
+                        )
+                        self._write_turn_call_log(
+                            "turn_policy_decision",
+                            action="plan_only_act_now",
+                            reason="plan_only_streak",
+                            code="plan_only_act_now",
+                            iteration=iterations,
+                            streak=plan_only_iteration_streak,
+                            threshold=plan_only_threshold,
+                        )
+                        append_runtime_event(
+                            self.config.runtime_events_path,
+                            {
+                                "feature": "plan_only_act_now",
+                                "name": "plan_only_act_now.injected",
+                                "action": "append_act_now_directive",
+                                "reason": "plan_only_streak",
+                                "iteration": iterations,
+                                "streak": plan_only_iteration_streak,
+                                "threshold": plan_only_threshold,
+                                "session_key": self._session_key,
+                                "agent_id": (
+                                    self.config.tool_result_store_agent_id
+                                    or self.config.metadata.get("agent_id")
+                                ),
+                            },
+                        )
+                        # Reset so the directive re-fires only after another
+                        # full streak, not on every subsequent iteration.
+                        plan_only_iteration_streak = 0
                 # Count iterations that blocked a compacted-placeholder reuse
                 # (preflight or dispatch path) and escalate the recovery
                 # directive once the configured threshold is reached. This
@@ -9942,6 +10291,45 @@ class Agent:
                 return True
         return bool(self._workspace_tracked_diff_paths_for_nudge())
 
+    def _workspace_source_fix_beyond_instrumentation(self) -> bool:
+        """Whether the tracked diff contains more than diagnostic output.
+
+        Used by the endgame fix directive: an instrumentation-only diff
+        (added print/log lines, nothing removed) means the model has been
+        investigating, not fixing. Probe failures count as a fix existing —
+        the conservative direction, since the directive tells the model to
+        stop investigating and a misfire on a real fix wastes the message.
+        """
+
+        paths = self._workspace_tracked_diff_paths_for_nudge()
+        if not paths:
+            return False
+        ctx = self._tool_context
+        raw_workspace = getattr(ctx, "workspace_dir", None) if ctx is not None else None
+        if not raw_workspace:
+            raw_workspace = self.config.workspace_dir
+        if not raw_workspace:
+            return True
+        workspace_dir = Path(raw_workspace).expanduser().resolve(strict=False)
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(workspace_dir), "diff", "HEAD", "--", *paths],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=5.0,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return True
+        if result.returncode != 0:
+            return True
+        patch = result.stdout or ""
+        if not patch.strip():
+            return False
+        return not is_instrumentation_only_patch(patch)
+
     def _workspace_tracked_diff_paths_for_nudge(self) -> list[str]:
         ctx = self._tool_context
         raw_workspace = getattr(ctx, "workspace_dir", None) if ctx is not None else None
@@ -10210,6 +10598,28 @@ class Agent:
             patch = candidate.get("patch")
             if not isinstance(patch, str) or not patch.strip():
                 continue
+            if bool(getattr(self.config, "final_diff_salvage_veto", False)):
+                # Vetoed candidates stay out of handled_paths on purpose: an
+                # older, non-vetoed candidate for the same path may still be
+                # worth salvaging.
+                if candidate.get("lost") is True:
+                    # The agent explicitly reverted this patch; resurrecting
+                    # it would score edits the agent chose to abandon.
+                    self._record_final_diff_salvage_event(
+                        candidate,
+                        trigger=trigger,
+                        iteration=iteration,
+                        action="vetoed_lost",
+                    )
+                    continue
+                if is_instrumentation_only_patch(patch):
+                    self._record_final_diff_salvage_event(
+                        candidate,
+                        trigger=trigger,
+                        iteration=iteration,
+                        action="vetoed_instrumentation",
+                    )
+                    continue
             if time.monotonic() >= deadline:
                 self._record_final_diff_salvage_event(
                     candidate,
@@ -14911,6 +15321,21 @@ class Agent:
             endgame_git_freeze_margin_seconds=(
                 self.config.endgame_git_freeze_margin_seconds
             ),
+            max_iterations_deadline_extend_seconds=(
+                self.config.max_iterations_deadline_extend_seconds
+            ),
+            final_diff_salvage_veto=self.config.final_diff_salvage_veto,
+            endgame_git_freeze_instrumentation_exempt=(
+                self.config.endgame_git_freeze_instrumentation_exempt
+            ),
+            deadline_wrapup_sticky_thinking_off=(
+                self.config.deadline_wrapup_sticky_thinking_off
+            ),
+            endgame_fix_directive_margin_seconds=(
+                self.config.endgame_fix_directive_margin_seconds
+            ),
+            reasoning_only_act_now=self.config.reasoning_only_act_now,
+            plan_only_act_now_threshold=self.config.plan_only_act_now_threshold,
             mid_budget_no_diff_nudge=self.config.mid_budget_no_diff_nudge,
             repeated_tool_call_recovery_threshold=(
                 self.config.repeated_tool_call_recovery_threshold

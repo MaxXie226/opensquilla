@@ -934,6 +934,34 @@ class AgentBootstrapStage:
                 "OPENSQUILLA_ENDGAME_GIT_FREEZE_MARGIN_SECONDS",
                 AgentConfig().endgame_git_freeze_margin_seconds,
             ),
+            max_iterations_deadline_extend_seconds=_nonnegative_int_from_env(
+                "OPENSQUILLA_MAX_ITERATIONS_DEADLINE_EXTEND_SECONDS",
+                AgentConfig().max_iterations_deadline_extend_seconds,
+            ),
+            final_diff_salvage_veto=_bool_from_env(
+                "OPENSQUILLA_FINAL_DIFF_SALVAGE_VETO",
+                AgentConfig().final_diff_salvage_veto,
+            ),
+            endgame_git_freeze_instrumentation_exempt=_bool_from_env(
+                "OPENSQUILLA_ENDGAME_GIT_FREEZE_INSTRUMENTATION_EXEMPT",
+                AgentConfig().endgame_git_freeze_instrumentation_exempt,
+            ),
+            deadline_wrapup_sticky_thinking_off=_bool_from_env(
+                "OPENSQUILLA_DEADLINE_WRAPUP_STICKY_THINKING_OFF",
+                AgentConfig().deadline_wrapup_sticky_thinking_off,
+            ),
+            endgame_fix_directive_margin_seconds=_nonnegative_int_from_env(
+                "OPENSQUILLA_ENDGAME_FIX_DIRECTIVE_MARGIN_SECONDS",
+                AgentConfig().endgame_fix_directive_margin_seconds,
+            ),
+            reasoning_only_act_now=_bool_from_env(
+                "OPENSQUILLA_REASONING_ONLY_ACT_NOW",
+                AgentConfig().reasoning_only_act_now,
+            ),
+            plan_only_act_now_threshold=_nonnegative_int_from_env(
+                "OPENSQUILLA_PLAN_ONLY_ACT_NOW_THRESHOLD",
+                AgentConfig().plan_only_act_now_threshold,
+            ),
             mid_budget_no_diff_nudge=_bool_from_env(
                 "OPENSQUILLA_MID_BUDGET_NO_DIFF_NUDGE",
                 AgentConfig().mid_budget_no_diff_nudge,

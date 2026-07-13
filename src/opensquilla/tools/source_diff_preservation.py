@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 import shlex
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
+from opensquilla.tools.patch_classification import is_instrumentation_only_patch
 from opensquilla.tools.types import ToolContext, current_tool_context
 from opensquilla.tools.write_tracking import (
     classify_workspace_path,
@@ -165,6 +167,14 @@ def endgame_git_freeze_decision(
     parsed = _parse_endgame_frozen_git_command(command)
     if parsed is None:
         return None
+    if (
+        getattr(active, "endgame_git_freeze_instrumentation_exempt", False)
+        and not parsed.untracked_only
+    ):
+        exempt_diff = _freeze_exemption_diff(active, parsed)
+        if exempt_diff is not None and is_instrumentation_only_patch(exempt_diff):
+            _emit_freeze_exemption_event(active, parsed, command=command)
+            return None
     payload: dict[str, Any] = {
         "status": "blocked",
         "reason": "endgame_git_freeze",
@@ -327,6 +337,64 @@ def _emit_freeze_event(
                 "matched_operation": payload.get("matched_operation"),
                 "target_paths": payload.get("target_paths", []),
                 "status": payload.get("status"),
+                "command": command,
+                "session_key": getattr(active, "session_key", None),
+                "agent_id": getattr(active, "agent_id", None),
+            }
+        )
+    except Exception:
+        return
+
+
+def _freeze_exemption_diff(
+    active: ToolContext,
+    parsed: _ParsedDestructiveGitCommand,
+) -> str | None:
+    """Diff of what the frozen command would revert, or None to keep blocking.
+
+    Untracked-only operations never reach here (nothing tracked to classify);
+    any probe failure also returns None so the freeze stays in force.
+    """
+
+    workspace = _workspace_root(active, None)
+    if workspace is None:
+        return None
+    argv = ["git", "diff", "HEAD"]
+    if parsed.targets and not parsed.whole_worktree:
+        argv.extend(["--", *parsed.targets])
+    try:
+        result = subprocess.run(
+            argv,
+            cwd=workspace,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout
+
+
+def _emit_freeze_exemption_event(
+    active: ToolContext,
+    parsed: _ParsedDestructiveGitCommand,
+    *,
+    command: str,
+) -> None:
+    callback = getattr(active, "on_runtime_event", None)
+    if callback is None:
+        return
+    try:
+        callback(
+            {
+                "feature": "endgame_git_freeze",
+                "name": "endgame_git_freeze.exempted",
+                "reason": "instrumentation_only_diff",
+                "matched_operation": parsed.operation,
+                "target_paths": list(parsed.targets),
+                "status": "exempted",
                 "command": command,
                 "session_key": getattr(active, "session_key", None),
                 "agent_id": getattr(active, "agent_id", None),

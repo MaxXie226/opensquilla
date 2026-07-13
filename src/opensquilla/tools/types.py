@@ -114,6 +114,11 @@ class ToolContext:
     # router_control_turn_hold_applied) once the endgame git freeze margin is
     # reached; shell tools then block workspace-reverting git commands.
     endgame_git_freeze_active: bool = False
+    # Set by the engine alongside the freeze margin reset: when True, a frozen
+    # git revert whose targeted diff is instrumentation-only (added print/log
+    # lines, nothing removed) is allowed through — cleaning up diagnostic
+    # output is exactly what the wrap-up window is for.
+    endgame_git_freeze_instrumentation_exempt: bool = False
     # New runtime-only fields stay at the end to preserve the public dataclass's
     # historical positional constructor contract for embedded callers.
     sandbox_file_system_profile: Any | None = None

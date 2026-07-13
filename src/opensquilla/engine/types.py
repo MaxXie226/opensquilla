@@ -686,6 +686,47 @@ class AgentConfig:
     # revert cannot empty the collected diff. Set via
     # OPENSQUILLA_ENDGAME_GIT_FREEZE_MARGIN_SECONDS.
     endgame_git_freeze_margin_seconds: int = 0
+    # Let the iteration cap yield to remaining wall-clock time. 0 = off. When
+    # positive and a total turn timeout is configured, hitting max_iterations
+    # does NOT enter finalization while more than this many seconds remain;
+    # the loop keeps running normal iterations until the deadline margin is
+    # reached, then the cap applies as usual. Set via
+    # OPENSQUILLA_MAX_ITERATIONS_DEADLINE_EXTEND_SECONDS.
+    max_iterations_deadline_extend_seconds: int = 0
+    # Veto for final-diff salvage: skip candidates the agent explicitly
+    # reverted (marked lost) and candidates whose patch only adds diagnostic
+    # print/log lines — both re-apply abandoned or throwaway edits into the
+    # scored patch. Off by default; only meaningful with final_diff_salvage.
+    # Set via OPENSQUILLA_FINAL_DIFF_SALVAGE_VETO.
+    final_diff_salvage_veto: bool = False
+    # Endgame git freeze exemption: a frozen revert whose targeted diff is
+    # instrumentation-only (added print/log lines, nothing removed) is allowed
+    # through — cleaning up diagnostic output is what the wrap-up window is
+    # for. Off by default; only meaningful with the freeze margin. Set via
+    # OPENSQUILLA_ENDGAME_GIT_FREEZE_INSTRUMENTATION_EXEMPT.
+    endgame_git_freeze_instrumentation_exempt: bool = False
+    # Make the wrap-up preempt's thinking-off sticky: when the wrap-up
+    # directive preempts a reasoning stream, disable thinking for every
+    # remaining provider call this turn instead of the next call only. Off by
+    # default. Set via OPENSQUILLA_DEADLINE_WRAPUP_STICKY_THINKING_OFF.
+    deadline_wrapup_sticky_thinking_off: bool = False
+    # One-shot endgame fix directive. 0 = off. When positive, a total turn
+    # timeout is configured, and remaining wall-clock time drops below this
+    # many seconds while the workspace still shows no source change beyond
+    # diagnostic instrumentation, a single user message directs the model to
+    # commit to its best-supported fix now. Set via
+    # OPENSQUILLA_ENDGAME_FIX_DIRECTIVE_MARGIN_SECONDS.
+    endgame_fix_directive_margin_seconds: int = 0
+    # Inject an act-now user message when a provider response is reasoning
+    # only (no visible text, no tool calls) and grant one extra retry for that
+    # failure kind. Off by default (the bare retry re-requests with nothing
+    # added). Set via OPENSQUILLA_REASONING_ONLY_ACT_NOW.
+    reasoning_only_act_now: bool = False
+    # Consecutive update_plan-only iterations before an act-now directive is
+    # appended after the tool results. 0 = off. Counts iterations whose
+    # executed tool calls are all update_plan; any other tool call resets the
+    # streak. Set via OPENSQUILLA_PLAN_ONLY_ACT_NOW_THRESHOLD.
+    plan_only_act_now_threshold: int = 0
     # Mid-budget progress nudges. Off by default. When enabled and the turn
     # has a wall-clock budget (timeout > 0), a one-shot user message is
     # appended after tool results the first time elapsed time crosses 50% and
