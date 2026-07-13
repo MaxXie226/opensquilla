@@ -3052,6 +3052,22 @@ def _write_deny_lever_enabled(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in _WRITE_DENY_TRUE_ENV_VALUES
 
 
+# Screen widenings that shipped alongside effect enforcement: ln/link link
+# names, sh -c wrapper unwrapping, deno eval, and the bun/lua interpreter
+# code flags. They stay behind the effect lever so a deployment that leaves
+# OPENSQUILLA_WORKSPACE_WRITE_DENY_EFFECT unset keeps the pre-lever screen
+# surface byte-for-byte, even with the older COMMAND_TARGETS/
+# INTERPRETER_TARGETS screens enabled.
+_HARDENED_ONLY_MUTATORS = frozenset({"ln", "link"})
+_HARDENED_ONLY_INTERPRETERS = frozenset({"bun", "lua", "luajit"})
+
+
+def _write_deny_matcher_hardening_enabled() -> bool:
+    from opensquilla.tools.write_policy import workspace_write_deny_effect_mode
+
+    return workspace_write_deny_effect_mode() != "off"
+
+
 _SHORT_OPTIONS_WITH_I_RE = re.compile(r"^-[A-Za-z]*i")
 _ENV_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _COMMAND_PREFIX_WORDS = frozenset({"command", "env", "nohup", "sudo", "time"})
@@ -3377,17 +3393,20 @@ def _mutating_command_write_targets(command: str, depth: int = 0) -> list[str]:
     OPENSQUILLA_WORKSPACE_WRITE_DENY_INTERPRETER_TARGETS).
     """
 
+    hardened = _write_deny_matcher_hardening_enabled()
     targets: list[str] = []
     for segment in _mutator_command_segments(command):
         argv = _strip_command_prefix_tokens(_segment_argv(segment))
         if not argv:
             continue
-        if depth < _SHELL_WRAPPER_MAX_DEPTH:
+        if hardened and depth < _SHELL_WRAPPER_MAX_DEPTH:
             for inner_command in _shell_wrapper_inner_commands(argv):
                 for target in _mutating_command_write_targets(inner_command, depth + 1):
                     if target and target not in targets:
                         targets.append(target)
         name = argv[0].replace("\\", "/").rsplit("/", 1)[-1].lower()
+        if not hardened and name in _HARDENED_ONLY_MUTATORS:
+            continue
         extractor = _MUTATOR_WRITE_TARGET_EXTRACTORS.get(name)
         if extractor is None:
             continue
@@ -3571,9 +3590,13 @@ def _interpreter_write_targets(argv: list[str]) -> list[str]:
     argv = _strip_command_prefix_tokens(argv)
     if not argv:
         return []
-    codes = _deno_eval_code_strings(argv)
+    hardened = _write_deny_matcher_hardening_enabled()
+    codes = _deno_eval_code_strings(argv) if hardened else []
     if not codes:
-        code_flags = _interpreter_code_flag_set(_normalized_command_name(argv[0]))
+        name = _normalized_command_name(argv[0])
+        if not hardened and name in _HARDENED_ONLY_INTERPRETERS:
+            return []
+        code_flags = _interpreter_code_flag_set(name)
         if code_flags is None:
             return []
         codes = _interpreter_code_strings(argv, code_flags)
@@ -3612,10 +3635,11 @@ def _interpreter_write_targets_from_command(command: str, depth: int = 0) -> lis
     computed paths remain out of scope.
     """
 
+    hardened = _write_deny_matcher_hardening_enabled()
     targets: list[str] = []
     for segment in _mutator_command_segments(command):
         argv = _segment_argv(segment)
-        if depth < _SHELL_WRAPPER_MAX_DEPTH:
+        if hardened and depth < _SHELL_WRAPPER_MAX_DEPTH:
             for inner_command in _shell_wrapper_inner_commands(argv):
                 for target in _interpreter_write_targets_from_command(
                     inner_command, depth + 1

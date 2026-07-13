@@ -237,6 +237,13 @@ def enforce_workspace_write_deny_effects(
         )
         if match is None:
             continue
+        if tracked_only and not _workspace_path_present_at_head(workspace, relative_path):
+            # Tracked-only scopes enforcement to the committed suite. A file
+            # the agent created has no HEAD version to protect, and staging it
+            # (`git add`) must not turn the creation into a violation: the
+            # index is not HEAD, and a revert here would delete the agent's
+            # own new file.
+            continue
         violations.append({**entry, "pattern": match.pattern})
     if not violations:
         return output
@@ -316,6 +323,26 @@ def _effect_enforcement_message(
         f"{described}.{revert_note}{guidance} Output below that reports a "
         "successful update to those file(s) is stale; do not rely on it."
     )
+
+
+def _workspace_path_present_at_head(workspace: Path, relative_path: str) -> bool:
+    """Return True when the path has a committed version at HEAD.
+
+    Errors resolve to False: with no HEAD version to restore, enforcement
+    (and any revert) is skipped rather than risking deletion of a file the
+    agent created.
+    """
+
+    try:
+        completed = subprocess.run(
+            ["git", "ls-tree", "--name-only", "HEAD", "--", relative_path],
+            cwd=workspace,
+            capture_output=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return completed.returncode == 0 and bool(completed.stdout.strip())
 
 
 def _revert_workspace_path(workspace: Path, relative_path: str, status: str) -> bool:

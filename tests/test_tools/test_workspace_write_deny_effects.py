@@ -231,6 +231,52 @@ async def test_tracked_only_allows_untracked_creation_but_reverts_tracked_edit(
 
 
 @pytest.mark.asyncio
+async def test_tracked_only_spares_staged_new_file(effect_context, monkeypatch):
+    """Staging an agent-created file must not turn its creation into a
+    violation: under tracked-only the enforced set is the suite committed at
+    HEAD, and the index is not HEAD."""
+
+    workspace, scratch, _ctx, events = effect_context
+    monkeypatch.setenv(_EFFECT_ENV, "revert")
+    monkeypatch.setenv(_TRACKED_ONLY_ENV, "on")
+    script = _helper_script(
+        scratch,
+        "helper.sh",
+        "mkdir -p tests && printf 'x\\n' > tests/test_staged.py\n"
+        "git add tests/test_staged.py\n",
+    )
+    result = await exec_command(f"sh {script}", workdir=str(workspace))
+
+    assert "[workspace write deny]" not in result
+    assert (workspace / "tests" / "test_staged.py").read_text(encoding="utf-8") == "x\n"
+    assert _effect_events(events) == []
+
+
+@pytest.mark.asyncio
+async def test_tracked_only_still_reverts_head_tracked_edit_when_staged(
+    effect_context, monkeypatch
+):
+    """Staging a mutation of a HEAD-tracked protected file must not dodge
+    enforcement: the HEAD-presence skip only covers paths with no committed
+    version."""
+
+    workspace, scratch, _ctx, events = effect_context
+    monkeypatch.setenv(_EFFECT_ENV, "revert")
+    monkeypatch.setenv(_TRACKED_ONLY_ENV, "on")
+    script = _helper_script(
+        scratch,
+        "helper.sh",
+        "printf 'hacked\\n' > replacer_test.go\n"
+        "git add replacer_test.go\n",
+    )
+    result = await exec_command(f"sh {script}", workdir=str(workspace))
+
+    assert "[workspace write deny]" in result
+    assert (workspace / "replacer_test.go").read_text(encoding="utf-8") == "original\n"
+    assert _effect_events(events)[0]["reverted_paths"] == ["replacer_test.go"]
+
+
+@pytest.mark.asyncio
 async def test_staged_new_protected_file_falls_back_to_unstage_and_unlink(
     effect_context, monkeypatch
 ):
@@ -444,7 +490,31 @@ def test_symlink_guard_matches_lexical_spelling(effect_context, monkeypatch, tmp
         ("sh script.sh", []),
     ],
 )
-def test_ln_and_wrapper_write_target_extraction(command: str, expected: list[str]) -> None:
+def test_ln_and_wrapper_write_target_extraction(
+    monkeypatch, command: str, expected: list[str]
+) -> None:
+    # The ln/link extractors and the wrapper unwrap ride the effect lever.
+    monkeypatch.setenv(_EFFECT_ENV, "warn")
+    assert shell._mutating_command_write_targets(command) == expected
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        # Hardened-only surfaces are inert while the effect lever is unset,
+        # keeping the pre-lever screen byte-for-byte (ARM-L12 guarantee).
+        ("ln -s /tmp/x tests/test_a.py", []),
+        ("link /tmp/x tests/test_a.py", []),
+        ("sh -c 'rm tests/test_a.py'", []),
+        ("busybox sh -c 'rm tests/test_a.py'", []),
+        # Pre-lever extractors keep working without the lever.
+        ("rm tests/test_a.py", ["tests/test_a.py"]),
+        ("sed -i s/a/b/ tests/test_a.py", ["tests/test_a.py"]),
+    ],
+)
+def test_hardened_extraction_inert_without_effect_lever(
+    command: str, expected: list[str]
+) -> None:
     assert shell._mutating_command_write_targets(command) == expected
 
 
@@ -469,6 +539,36 @@ def test_ln_and_wrapper_write_target_extraction(command: str, expected: list[str
     ],
 )
 def test_interpreter_extension_write_target_extraction(
+    monkeypatch, command: str, expected: list[str]
+) -> None:
+    # deno eval, the bun/lua code flags, and the wrapper unwrap ride the
+    # effect lever.
+    monkeypatch.setenv(_EFFECT_ENV, "warn")
+    assert shell._interpreter_write_targets_from_command(command) == expected
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        # Hardened-only interpreter surfaces are inert with the lever unset.
+        (
+            'bun -e \'require("fs").writeFileSync("tests/test_a.js", "x")\'',
+            [],
+        ),
+        ('deno eval \'Deno.writeTextFileSync("tests/test_b.ts", "x")\'', []),
+        ('lua -e \'io.open("tests/test_c.lua", "w")\'', []),
+        (
+            'sh -c "python3 -c \\"open(\'tests/test_d.py\', \'w\')\\""',
+            [],
+        ),
+        # Pre-lever interpreter flags keep working without the lever.
+        (
+            "python3 -c \"open('tests/test_d.py', 'w')\"",
+            ["tests/test_d.py"],
+        ),
+    ],
+)
+def test_interpreter_extension_inert_without_effect_lever(
     command: str, expected: list[str]
 ) -> None:
     assert shell._interpreter_write_targets_from_command(command) == expected
