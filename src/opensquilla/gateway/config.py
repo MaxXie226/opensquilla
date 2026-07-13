@@ -244,6 +244,12 @@ class ToolsConfig(BaseModel):
     allow: list[str] = Field(default_factory=list)
     deny: list[str] = Field(default_factory=list)
     also_allow: list[str] = Field(default_factory=list)
+    # Model-facing tool description overrides. Keys name a tool
+    # ("exec_command") or a parameter ("exec_command.command" — dotted keys
+    # must be quoted in TOML); values replace the matching description
+    # verbatim. Inert unless the OPENSQUILLA_TOOL_DESCRIPTION_OVERRIDES env
+    # var enables them ("config"/"on", or a .toml/.json override file path).
+    description_overrides: dict[str, str] = Field(default_factory=dict)
     workspace_write_deny_globs: list[str] = Field(default_factory=list)
     file_edit_requires_fresh_read: bool | None = None
     file_edit_flexible_recovery: bool | None = None
@@ -2567,6 +2573,11 @@ class GatewayConfig(BaseSettings):
             data.pop("search_api_key_env", None)
         elif not data.get("search_api_key"):
             data.pop("search_api_key", None)
+        tools_table = data.get("tools")
+        if isinstance(tools_table, dict) and not tools_table.get("description_overrides"):
+            # Keep written configs byte-identical to pre-mechanism output when
+            # no overrides are configured.
+            tools_table.pop("description_overrides", None)
         # Heuristic guard for the pre-provenance era: a value equal to the
         # env var is assumed env-sourced and dropped. Skipped when the
         # operator explicitly entered the key (recorded by

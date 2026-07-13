@@ -258,6 +258,7 @@ from opensquilla.session.terminal_reply import (
     build_terminal_reply,
     sanitize_agent_error,
 )
+from opensquilla.tools.description_overrides import resolve_tool_description_overrides
 from opensquilla.tools.types import CallerKind, InteractionMode, ToolContext
 
 if TYPE_CHECKING:
@@ -3074,6 +3075,9 @@ class TurnRunner:
         agent_id = normalize_agent_id(agent_id)
         normalized_input_provenance = self._normalize_input_provenance(input_provenance)
         lock = self.get_session_lock(session_key)
+        # Resolved once per turn; ValueError propagates so a run manifest
+        # cannot record an override the run did not actually apply.
+        resolved_description_overrides = resolve_tool_description_overrides(self._config)
         effective_tool_context = replace(
             tool_context,
             session_key=session_key,
@@ -3082,6 +3086,16 @@ class TurnRunner:
             router_control_hold_store=self._router_control_hold_store,
             router_control_replay_depth=router_control_replay_depth,
             router_control_turn_hold_applied=False,
+            tool_description_overrides=(
+                resolved_description_overrides[0]
+                if resolved_description_overrides
+                else None
+            ),
+            tool_description_overrides_source=(
+                resolved_description_overrides[1]
+                if resolved_description_overrides
+                else None
+            ),
         )
         # Re-entry detection: check whether this call chain already serializes
         # the turn lifecycle. On the gateway path TaskRuntime marks ownership

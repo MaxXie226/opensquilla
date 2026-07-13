@@ -105,6 +105,11 @@ class ToolContext:
     # tools consult it so a concurrent catalog publish cannot change the
     # definitions visible halfway through a tool loop.
     skill_catalog: Any | None = None
+    # Resolved per turn by the engine (see tools.description_overrides).
+    # Keys name a tool or a "tool.param" parameter; values replace the
+    # matching model-facing description verbatim. None = mechanism off.
+    tool_description_overrides: dict[str, str] | None = None
+    tool_description_overrides_source: str | None = None  # "config" | "env_file"
     # Armed by the engine (mutated in place, same pattern as
     # router_control_turn_hold_applied) once the endgame git freeze margin is
     # reached; shell tools then block workspace-reverting git commands.
