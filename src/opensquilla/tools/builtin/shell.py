@@ -124,6 +124,7 @@ from opensquilla.tools.types import (
 )
 from opensquilla.tools.write_tracking import (
     classify_workspace_path,
+    enforce_workspace_write_deny_effects,
     mutation_ledger_text_hash,
     record_observed_workspace_mutations,
     snapshot_current_workspace_mutations,
@@ -3308,6 +3309,35 @@ def _git_write_targets(argv: list[str]) -> list[str]:
     return _positional_args(sub_args)
 
 
+def _ln_write_targets(argv: list[str]) -> list[str]:
+    # ln writes the link NAME (a symlink or hardlink appearing at a protected
+    # path is a mutation of that path); the link target is only read.
+    options = argv[1:]
+    targets = [
+        token.split("=", 1)[1]
+        for token in options
+        if token.startswith("--target-directory=")
+    ]
+    targets.extend(
+        options[index + 1]
+        for index, token in enumerate(options)
+        if token in ("-t", "--target-directory") and index + 1 < len(options)
+    )
+    positionals = _positional_args(
+        options,
+        value_flags=frozenset({"-t", "--target-directory", "-S", "--suffix"}),
+    )
+    if targets:
+        return targets
+    if len(positionals) >= 2:
+        return [positionals[-1]]
+    if len(positionals) == 1:
+        # `ln [-s] TARGET` creates ./<basename of TARGET> in the cwd.
+        base = positionals[0].replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+        return [base] if base else []
+    return []
+
+
 _MUTATOR_WRITE_TARGET_EXTRACTORS: dict[str, Callable[[list[str]], list[str]]] = {
     "sed": _sed_write_targets,
     "gsed": _sed_write_targets,
@@ -3322,6 +3352,8 @@ _MUTATOR_WRITE_TARGET_EXTRACTORS: dict[str, Callable[[list[str]], list[str]]] = 
     "mkdir": _rm_write_targets,
     "rmdir": _rm_write_targets,
     "git": _git_write_targets,
+    "ln": _ln_write_targets,
+    "link": _ln_write_targets,
 }
 
 
@@ -3334,7 +3366,7 @@ def _strip_command_prefix_tokens(argv: list[str]) -> list[str]:
     return argv
 
 
-def _mutating_command_write_targets(command: str) -> list[str]:
+def _mutating_command_write_targets(command: str, depth: int = 0) -> list[str]:
     """Best-effort write targets of common in-place file mutators.
 
     Only consulted by the workspace write deny gate when
@@ -3350,6 +3382,11 @@ def _mutating_command_write_targets(command: str) -> list[str]:
         argv = _strip_command_prefix_tokens(_segment_argv(segment))
         if not argv:
             continue
+        if depth < _SHELL_WRAPPER_MAX_DEPTH:
+            for inner_command in _shell_wrapper_inner_commands(argv):
+                for target in _mutating_command_write_targets(inner_command, depth + 1):
+                    if target and target not in targets:
+                        targets.append(target)
         name = argv[0].replace("\\", "/").rsplit("/", 1)[-1].lower()
         extractor = _MUTATOR_WRITE_TARGET_EXTRACTORS.get(name)
         if extractor is None:
@@ -3383,6 +3420,9 @@ _INTERPRETER_CODE_FLAGS: dict[str, frozenset[str]] = {
     "php": frozenset({"-r"}),
     "node": frozenset({"-e", "--eval", "-p", "--print"}),
     "nodejs": frozenset({"-e", "--eval", "-p", "--print"}),
+    "bun": frozenset({"-e", "--eval", "-p", "--print"}),
+    "lua": frozenset({"-e"}),
+    "luajit": frozenset({"-e"}),
 }
 
 _INTERPRETER_WRITE_MODE_CHARS = frozenset("wax+")
@@ -3399,7 +3439,8 @@ _INTERPRETER_PATH_MUTATE_RE = re.compile(
 )
 _INTERPRETER_FS_WRITE_RE = re.compile(
     r"\b(?:writeFileSync|appendFileSync|writeFile|appendFile"
-    r"|unlinkSync|rmSync|rmdirSync|renameSync|truncateSync)"
+    r"|writeTextFileSync|writeTextFile"
+    r"|unlinkSync|rmSync|rmdirSync|renameSync|truncateSync|removeSync)"
     r"\s*\(\s*(?P<pq>['\"])(?P<path>(?:(?!(?P=pq)).)+)(?P=pq)"
 )
 _INTERPRETER_FILE_WRITE_RE = re.compile(
@@ -3430,6 +3471,44 @@ def _interpreter_code_flag_set(name: str) -> frozenset[str] | None:
     if flags is not None:
         return flags
     return _INTERPRETER_CODE_FLAGS.get(name.rstrip("0123456789."))
+
+
+def _deno_eval_code_strings(argv: list[str]) -> list[str]:
+    # deno delivers inline code via the `eval` subcommand instead of a flag.
+    if not argv or _normalized_command_name(argv[0]) != "deno":
+        return []
+    tokens = argv[1:]
+    if not tokens or tokens[0] != "eval":
+        return []
+    positionals = _positional_args(tokens[1:], value_flags=frozenset({"--ext"}))
+    return positionals[:1]
+
+
+_SHELL_WRAPPER_NAMES = frozenset({"sh", "bash", "zsh", "dash", "ksh"})
+_SHELL_WRAPPER_DASH_C_RE = re.compile(r"^-[A-Za-z]*c$")
+_SHELL_WRAPPER_MAX_DEPTH = 3
+
+
+def _shell_wrapper_inner_commands(argv: list[str]) -> list[str]:
+    """Command strings run by a `sh -c` style wrapper, if any.
+
+    Handles busybox indirection and bundled short options (`bash -lc cmd`).
+    Only the first -c operand is the command string; later positionals become
+    $0/$@ for it.
+    """
+
+    argv = _strip_command_prefix_tokens(argv)
+    if argv and _normalized_command_name(argv[0]) == "busybox":
+        argv = argv[1:]
+    if not argv or _normalized_command_name(argv[0]) not in _SHELL_WRAPPER_NAMES:
+        return []
+    tokens = argv[1:]
+    for index, token in enumerate(tokens):
+        if token == "--":
+            break
+        if _SHELL_WRAPPER_DASH_C_RE.match(token) and index + 1 < len(tokens):
+            return [tokens[index + 1]]
+    return []
 
 
 def _interpreter_code_strings(
@@ -3492,11 +3571,14 @@ def _interpreter_write_targets(argv: list[str]) -> list[str]:
     argv = _strip_command_prefix_tokens(argv)
     if not argv:
         return []
-    code_flags = _interpreter_code_flag_set(_normalized_command_name(argv[0]))
-    if code_flags is None:
-        return []
+    codes = _deno_eval_code_strings(argv)
+    if not codes:
+        code_flags = _interpreter_code_flag_set(_normalized_command_name(argv[0]))
+        if code_flags is None:
+            return []
+        codes = _interpreter_code_strings(argv, code_flags)
     targets: list[str] = []
-    for code in _interpreter_code_strings(argv, code_flags):
+    for code in codes:
         for target in _interpreter_code_write_targets(code):
             if target not in targets:
                 targets.append(target)
@@ -3521,7 +3603,7 @@ def _command_reads_interpreter_program_from_stdin(command: str) -> bool:
     return False
 
 
-def _interpreter_write_targets_from_command(command: str) -> list[str]:
+def _interpreter_write_targets_from_command(command: str, depth: int = 0) -> list[str]:
     """Best-effort write targets of interpreter one-liners.
 
     Only consulted by the workspace write deny gate when
@@ -3532,7 +3614,15 @@ def _interpreter_write_targets_from_command(command: str) -> list[str]:
 
     targets: list[str] = []
     for segment in _mutator_command_segments(command):
-        for target in _interpreter_write_targets(_segment_argv(segment)):
+        argv = _segment_argv(segment)
+        if depth < _SHELL_WRAPPER_MAX_DEPTH:
+            for inner_command in _shell_wrapper_inner_commands(argv):
+                for target in _interpreter_write_targets_from_command(
+                    inner_command, depth + 1
+                ):
+                    if target not in targets:
+                        targets.append(target)
+        for target in _interpreter_write_targets(argv):
             if target not in targets:
                 targets.append(target)
     return targets
@@ -5116,7 +5206,13 @@ async def exec_command(
             before=mutation_before,
             metadata=metadata,
         )
-        return output
+        # Effect enforcement runs after the ledger so the raw escape stays
+        # honestly recorded before any revert rewrites the workspace.
+        return enforce_workspace_write_deny_effects(
+            tool_name="exec_command",
+            before=mutation_before,
+            output=output,
+        )
 
     if runtime is not None and runtime.effective.sandbox_enabled and not host_execution:
         if windows_process_sandbox:
