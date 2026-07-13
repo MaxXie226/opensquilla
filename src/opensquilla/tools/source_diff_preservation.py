@@ -170,6 +170,7 @@ def endgame_git_freeze_decision(
     if (
         getattr(active, "endgame_git_freeze_instrumentation_exempt", False)
         and not parsed.untracked_only
+        and not _freeze_exemption_scope_beyond_head(command)
     ):
         exempt_diff = _freeze_exemption_diff(active, parsed)
         if exempt_diff is not None and is_instrumentation_only_patch(exempt_diff):
@@ -344,6 +345,95 @@ def _emit_freeze_event(
         )
     except Exception:
         return
+
+
+def _freeze_exemption_scope_beyond_head(command: str, depth: int = 0) -> bool:
+    """True when a frozen command's revert scope exceeds worktree-vs-HEAD.
+
+    The instrumentation exemption models the command's damage as
+    ``git diff HEAD``; a command that restores content from another ref
+    (``checkout <ref> --``, ``restore --source=<ref>``) or moves HEAD itself
+    (``reset --hard HEAD~n``, force switch) destroys committed state that
+    diff cannot see, so the exemption must never apply. Every shell segment
+    and wrapper level is checked, because the freeze blocks the whole
+    compound command on its first destructive segment while a later segment
+    may be the ref-moving one. Ambiguous forms count as beyond-HEAD: the
+    result is the ordinary freeze block, never a lost exemption of committed
+    work.
+    """
+
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return True
+    for raw_segment in _shell_sequence_segments(tokens):
+        segment = _strip_git_global_options(_strip_shell_redirections(raw_segment))
+        if _git_segment_scope_beyond_head(segment):
+            return True
+        if depth < 2:
+            wrapped = _shell_wrapper_command(segment)
+            if wrapped is not None and _freeze_exemption_scope_beyond_head(
+                wrapped, depth + 1
+            ):
+                return True
+    return False
+
+
+def _git_segment_scope_beyond_head(segment: list[str]) -> bool:
+    if len(segment) < 2 or segment[0] != "git":
+        return False
+    verb = segment[1]
+    args = segment[2:]
+    if verb == "checkout":
+        return _checkout_scope_beyond_head(args)
+    if verb == "restore":
+        return _restore_scope_beyond_head(args)
+    if verb == "switch":
+        # The freeze only parses the change-discarding forms; all of them
+        # exist to move HEAD to another branch.
+        return any(arg in {"-f", "--force", "--discard-changes"} for arg in args)
+    if verb == "reset":
+        if not _has_reset_hard(args):
+            return False
+        return any(token != "HEAD" for token in _pathspecs_after_options(args))
+    return False
+
+
+def _checkout_scope_beyond_head(args: list[str]) -> bool:
+    if "-" in args:
+        # `git checkout [-f] -` switches to the previous branch.
+        return True
+    if "--" in args:
+        marker = args.index("--")
+        before = _pathspecs_after_options(args[:marker])
+        return any(token != "HEAD" for token in before)
+    remaining = _pathspecs_after_options(args)
+    if not remaining:
+        return False
+    if remaining[0] == "HEAD":
+        return False
+    # Without `--` the first bare token can be a branch, a tag, a -B start
+    # point, or a path restored from the index; only the path form stays
+    # within worktree-vs-HEAD scope and it cannot be told apart
+    # syntactically.
+    return True
+
+
+def _restore_scope_beyond_head(args: list[str]) -> bool:
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            break
+        if arg in {"--source", "-s"}:
+            source = args[index + 1] if index + 1 < len(args) else None
+            return source != "HEAD"
+        if arg.startswith("--source="):
+            return arg.split("=", 1)[1] != "HEAD"
+        if arg.startswith("-s") and arg not in {"-s"} and not arg.startswith("--"):
+            return arg[2:] != "HEAD"
+        index += 1
+    return False
 
 
 def _freeze_exemption_diff(

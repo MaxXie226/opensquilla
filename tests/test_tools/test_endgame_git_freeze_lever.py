@@ -18,6 +18,7 @@ import pytest
 
 from opensquilla.gateway.approval_queue import reset_approval_queue
 from opensquilla.sandbox.integration import reset_runtime
+from opensquilla.tools import source_diff_preservation
 from opensquilla.tools.builtin import shell
 from opensquilla.tools.source_diff_preservation import (
     endgame_git_freeze_block_json,
@@ -374,6 +375,89 @@ def test_decision_keeps_blocking_when_workspace_unresolvable() -> None:
 
     assert payload is not None
     assert payload["status"] == "blocked"
+
+
+def _add_second_commit(repo: Path, target: Path) -> None:
+    target.write_text("value = 2\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "second"], check=True)
+
+
+def test_decision_blocks_ref_source_revert_despite_instrumentation_only(
+    tmp_path: Path,
+) -> None:
+    # `git diff HEAD` cannot see what `checkout <older ref> --` destroys:
+    # the worktree diff is instrumentation-only, but the command rewrites the
+    # target to pre-HEAD content. The exemption must never model that as a
+    # clean instrumentation revert.
+    repo, target = _init_repo(tmp_path)
+    _add_second_commit(repo, target)
+    target.write_text('value = 2\nprint("debug")\n', encoding="utf-8")
+    _exempt_ctx(repo)
+
+    # Positive control: the same command with HEAD as the source is exactly
+    # worktree-vs-HEAD scoped and stays exempt.
+    assert endgame_git_freeze_decision(command="git checkout HEAD -- pkg.py") is None
+
+    for command in (
+        "git checkout HEAD~1 -- pkg.py",
+        "git restore --source=HEAD~1 pkg.py",
+        "git reset --hard HEAD~1",
+        "sh -c 'git checkout HEAD~1 -- pkg.py'",
+        "git checkout -- pkg.py && git reset --hard HEAD~1",
+    ):
+        payload = endgame_git_freeze_decision(command=command)
+        assert payload is not None, command
+        assert payload["status"] == "blocked", command
+    assert target.read_text(encoding="utf-8") == 'value = 2\nprint("debug")\n'
+
+
+def test_decision_blocks_force_switch_despite_instrumentation_only(
+    tmp_path: Path,
+) -> None:
+    # A force switch moves HEAD to another branch; the instrumentation-only
+    # worktree diff says nothing about that damage.
+    repo, target = _init_repo(tmp_path)
+    subprocess.run(["git", "-C", str(repo), "branch", "other"], check=True)
+    target.write_text('value = 1\nprint("debug")\n', encoding="utf-8")
+    _exempt_ctx(repo)
+
+    payload = endgame_git_freeze_decision(command="git switch -f other")
+
+    assert payload is not None
+    assert payload["status"] == "blocked"
+
+
+@pytest.mark.parametrize(
+    ("command", "beyond"),
+    [
+        ("git checkout -- pkg.py", False),
+        ("git checkout HEAD -- pkg.py", False),
+        ("git checkout HEAD~1 -- pkg.py", True),
+        ("git checkout abc1234 -- pkg.py", True),
+        ("git checkout -f", False),
+        ("git checkout -f main", True),
+        ("git checkout -", True),
+        ("git restore pkg.py", False),
+        ("git restore --source=HEAD pkg.py", False),
+        ("git restore --source=HEAD~2 pkg.py", True),
+        ("git restore -s HEAD~2 pkg.py", True),
+        ("git restore -sHEAD~2 pkg.py", True),
+        ("git reset --hard", False),
+        ("git reset --hard HEAD", False),
+        ("git reset --hard HEAD~1", True),
+        ("git switch -f main", True),
+        ("git switch --discard-changes main", True),
+        ("git stash", False),
+        ("sh -c 'git checkout HEAD~1 -- pkg.py'", True),
+        ("git checkout -- pkg.py && git reset --hard HEAD~1", True),
+        ("git -C . checkout HEAD~1 -- pkg.py", True),
+    ],
+)
+def test_freeze_exemption_scope_beyond_head(command: str, beyond: bool) -> None:
+    assert (
+        source_diff_preservation._freeze_exemption_scope_beyond_head(command) is beyond
+    )
 
 
 @pytest.mark.asyncio
