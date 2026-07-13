@@ -704,6 +704,12 @@ class AgentConfig:
     # elides the older ones (keeps the newest copy full). Set via
     # OPENSQUILLA_PROVIDER_HISTORY_DEDUP_MIN_REPEATS.
     provider_history_dedup_min_repeats: int = 2
+    # Append a failure-signal scan header to tool-result projection notices:
+    # the omitted region of the original output is scanned for failure-pattern
+    # lines and the notice gains a signal_scan summary plus a ready-to-copy
+    # retrieve_tool_result call for the first match. Off by default; enabled
+    # via OPENSQUILLA_PROJECTION_SIGNAL_HINTS.
+    projection_signal_hints: bool = False
     tool_loop_observer_mode: Literal["off", "log"] = "off"
     runtime_recovery_mode: Literal["off", "log", "warn_model"] = "log"
     runtime_recovery_source_loop_max_nudges: int = 1

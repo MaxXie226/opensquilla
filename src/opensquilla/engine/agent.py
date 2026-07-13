@@ -895,6 +895,67 @@ _TOOL_RESULT_HINT_PATTERN = re.compile(
 _TOOL_RESULT_HINT_PATH_PATTERN = re.compile(
     r"(?:[A-Za-z]:)?[./\\]?[A-Za-z0-9_.-]+(?:[/\\][A-Za-z0-9_.-]+)+(?::\d+)?"
 )
+_PROJECTION_SIGNAL_HINTS_ENV = "OPENSQUILLA_PROJECTION_SIGNAL_HINTS"
+_PROJECTION_SIGNAL_PATTERNS_ENV = "OPENSQUILLA_PROJECTION_SIGNAL_PATTERNS"
+_PROJECTION_SIGNAL_HINTS_ON = frozenset({"on", "1", "true", "yes"})
+_PROJECTION_SIGNAL_HINTS_OFF = frozenset({"off", "0", "false", "no"})
+# Default failure-signal pattern for the projection signal scan. Kept separate
+# from _TOOL_RESULT_HINT_PATTERN so the env override below can never perturb
+# search_hints selection. Case-sensitive on purpose: the anchors target the
+# capitalized/tool-emitted forms (FAILED, Traceback, AssertionError, ...).
+_PROJECTION_SIGNAL_DEFAULT_PATTERN = re.compile(
+    r"(?:\bFAILED\b|\bFAIL:|\bError\b|\bException\b|\bTraceback\b"
+    r"|\bAssertionError\b|\berror:|\bwarnings? summary\b"
+    r"|\bpanic(?:ked)?\b|\bfatal\b)"
+)
+_PROJECTION_SIGNAL_PATTERN_CACHE: dict[str, re.Pattern[str]] = {}
+
+
+def _projection_signal_hints_enabled(config_value: bool = False) -> bool:
+    """Resolve the projection signal-scan gate.
+
+    Unset defers to ``config_value`` (the AgentConfig field threaded from the
+    same env by the bootstrap stage; off by default). Recognized on/off values
+    override it; unrecognized values raise instead of being silently ignored
+    so a run manifest cannot record an override the run did not actually
+    apply.
+    """
+    raw = os.environ.get(_PROJECTION_SIGNAL_HINTS_ENV, "").strip().lower()
+    if not raw:
+        return bool(config_value)
+    if raw in _PROJECTION_SIGNAL_HINTS_ON:
+        return True
+    if raw in _PROJECTION_SIGNAL_HINTS_OFF:
+        return False
+    raise ValueError(
+        f"{_PROJECTION_SIGNAL_HINTS_ENV} must be one of: "
+        + ", ".join(sorted(_PROJECTION_SIGNAL_HINTS_ON | _PROJECTION_SIGNAL_HINTS_OFF))
+    )
+
+
+def _projection_signal_pattern() -> re.Pattern[str]:
+    """Return the failure-signal regex, honoring the env override.
+
+    A non-blank ``OPENSQUILLA_PROJECTION_SIGNAL_PATTERNS`` value replaces the
+    default pattern wholesale (write alternations into one regex). Compiled
+    overrides are cached by raw string; invalid regexes raise ValueError per
+    the manifest-honesty convention rather than silently falling back.
+    """
+    raw = os.environ.get(_PROJECTION_SIGNAL_PATTERNS_ENV, "").strip()
+    if not raw:
+        return _PROJECTION_SIGNAL_DEFAULT_PATTERN
+    cached = _PROJECTION_SIGNAL_PATTERN_CACHE.get(raw)
+    if cached is not None:
+        return cached
+    try:
+        compiled = re.compile(raw)
+    except re.error as exc:
+        raise ValueError(
+            f"{_PROJECTION_SIGNAL_PATTERNS_ENV} must be a valid regular "
+            f"expression: {exc}"
+        ) from exc
+    _PROJECTION_SIGNAL_PATTERN_CACHE[raw] = compiled
+    return compiled
 _PROVIDER_CONTEXT_REPAIR_PROMPT = (
     "A previous tool call was rejected because it reused provider-only compacted "
     "tool arguments. Regenerate the complete tool arguments from the available "
@@ -976,6 +1037,95 @@ def _tool_result_search_hints(content: str) -> str:
     if not lines:
         return ""
     return "search_hints:\n" + "\n".join(lines) + "\n"
+
+
+def _tool_result_signal_scan(
+    content: str,
+    *,
+    handle: str | None,
+    head_chars: int | None = None,
+    tail_chars: int | None = None,
+    preview_lines: frozenset[str] | None = None,
+) -> tuple[str, int, int | None]:
+    """Scan the omitted region of a projected tool result for failure signals.
+
+    Returns ``(rendered_lines, match_count, first_line_number)``. Line numbers
+    are 1-based over the FULL original ``content`` (the same coordinates
+    search_hints renders and retrieve_tool_result's ``L<num>`` query resolves
+    against the byte-identical stored record).
+
+    Omission model: with ``head_chars``/``tail_chars`` the omitted region is
+    the contiguous char span between the preserved head and tail; otherwise a
+    line counts as omitted when its exact text is absent from
+    ``preview_lines`` (the reducer-summarized preview). The membership check
+    is an approximation — a reducer that rewrites a matching line makes it
+    count as omitted even though a variant survives — but the rendered line
+    number still points at a real failure line in the original.
+
+    Returns ``("", 0, None)`` when there is nothing to report or no handle
+    exists to retrieve against.
+    """
+    if handle is None or not content:
+        return "", 0, None
+    pattern = _projection_signal_pattern()
+    omitted_start: int | None = None
+    omitted_end: int | None = None
+    if head_chars is not None:
+        omitted_start = max(0, int(head_chars))
+        omitted_end = len(content) - max(0, int(tail_chars or 0))
+        if omitted_end <= omitted_start:
+            return "", 0, None
+    match_count = 0
+    first_line_number: int | None = None
+    offset = 0
+    for line_number, line in enumerate(content.splitlines(), start=1):
+        line_start = offset
+        offset += len(line) + 1
+        if omitted_start is not None and omitted_end is not None:
+            if line_start + len(line) <= omitted_start or line_start >= omitted_end:
+                continue
+        elif preview_lines is not None and line in preview_lines:
+            continue
+        if not pattern.search(line[:_TOOL_RESULT_HINT_SCAN_MAX_CHARS]):
+            continue
+        match_count += 1
+        if first_line_number is None:
+            first_line_number = line_number
+    if match_count == 0 or first_line_number is None:
+        return "", 0, None
+    rendered = _render_projection_signal_lines(
+        handle=handle,
+        match_count=match_count,
+        first_line_number=first_line_number,
+    )
+    return rendered, match_count, first_line_number
+
+
+def _render_projection_signal_lines(
+    *,
+    handle: str | None,
+    match_count: int,
+    first_line_number: int | None,
+) -> str:
+    """Render the signal_scan notice lines for an already-computed scan.
+
+    Kept separate from the scan so the fresh-result path can scan once with
+    the size-gate probe's placeholder handle and re-render with the real
+    stored handle (both handle forms have identical length, so the probe
+    measures the true envelope size).
+    """
+    if handle is None or match_count <= 0 or first_line_number is None:
+        return ""
+    next_call_arguments = json.dumps(
+        {"handle": handle, "mode": "query", "query": f"L{first_line_number}"},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return (
+        f"signal_scan: {match_count} lines matching failure patterns in the "
+        f"omitted region (first at L{first_line_number})\n"
+        f"signal_next_call: retrieve_tool_result {next_call_arguments}\n"
+    )
 
 
 def _projection_event_argument_value(value: Any, *, key: str) -> Any:
@@ -2647,6 +2797,46 @@ class Agent:
             event["saved_chars"] = max(0, original_chars - projected_chars)
         append_runtime_event(self.config.runtime_events_path, event)
 
+    def _projection_signal_hints_active(self) -> bool:
+        return _projection_signal_hints_enabled(
+            bool(getattr(self.config, "projection_signal_hints", False))
+        )
+
+    def _record_projection_signal_hint_event(
+        self,
+        *,
+        builder: str,
+        tool_name: str,
+        tool_use_id: str,
+        tool_result_handle: str | None,
+        original_chars: int,
+        signal_match_lines: int,
+        signal_first_line: int | None,
+    ) -> None:
+        self.config.metadata["tool_projection_signal_hints"] = (
+            self.config.metadata.get("tool_projection_signal_hints", 0) + 1
+        )
+        append_runtime_event(
+            self.config.runtime_events_path,
+            {
+                "feature": "tool_result_projection",
+                "name": "projection_signal_hints",
+                "action": "hint_appended",
+                "mechanism": "signal_scan",
+                "mode": "log",
+                "session_key": self._session_key,
+                "agent_id": self.config.tool_result_store_agent_id
+                or self.config.metadata.get("agent_id"),
+                "tool_name": tool_name,
+                "tool_use_id": tool_use_id,
+                "tool_result_handle": tool_result_handle,
+                "original_chars": original_chars,
+                "signal_match_lines": signal_match_lines,
+                "signal_first_line": signal_first_line,
+                "builder": builder,
+            },
+        )
+
     @staticmethod
     def _count_image_blocks(messages: list[Message]) -> int:
         count = 0
@@ -2897,6 +3087,24 @@ class Agent:
             handle_line = f"tool_result_handle: {stored.handle}\n" if stored is not None else ""
             retrieve_hint = _TOOL_RESULT_RETRIEVE_HINT if stored is not None else ""
             search_hints = _tool_result_search_hints(content) if stored is not None else ""
+            signal_lines = ""
+            if stored is not None and self._projection_signal_hints_active():
+                signal_lines, signal_matches, signal_first_line = _tool_result_signal_scan(
+                    content,
+                    handle=stored.handle,
+                    head_chars=len(head),
+                    tail_chars=len(tail),
+                )
+                if signal_lines:
+                    self._record_projection_signal_hint_event(
+                        builder="aggregate",
+                        tool_name=tool_name_by_use_id.get(block.tool_use_id, "tool"),
+                        tool_use_id=block.tool_use_id,
+                        tool_result_handle=stored.handle,
+                        original_chars=len(content),
+                        signal_match_lines=signal_matches,
+                        signal_first_line=signal_first_line,
+                    )
             compacted = (
                 "[aggregate_tool_result_compacted]\n"
                 f"tool_use_id: {block.tool_use_id}\n"
@@ -2906,6 +3114,7 @@ class Agent:
                 f"{handle_line}"
                 f"{retrieve_hint}"
                 f"{search_hints}"
+                f"{signal_lines}"
                 f"omitted_chars: {omitted}\n"
                 f"preview_complete: {str(omitted == 0).lower()}\n"
                 "reason: older non-error tool result compacted for provider context budget.\n"
@@ -3246,6 +3455,24 @@ class Agent:
             head = content[:head_chars]
             tail = content[-tail_chars:] if tail_chars else ""
         omitted = max(0, len(content) - len(head) - len(tail))
+        signal_lines = ""
+        if stored is not None and self._projection_signal_hints_active():
+            signal_lines, signal_matches, signal_first_line = _tool_result_signal_scan(
+                content,
+                handle=stored.handle,
+                head_chars=len(head),
+                tail_chars=len(tail),
+            )
+            if signal_lines:
+                self._record_projection_signal_hint_event(
+                    builder="provider_single",
+                    tool_name=tool_name,
+                    tool_use_id=tool_use_id,
+                    tool_result_handle=stored.handle,
+                    original_chars=len(content),
+                    signal_match_lines=signal_matches,
+                    signal_first_line=signal_first_line,
+                )
         projection = (
             "[tool_result_projection]\n"
             f"tool: {tool_name}\n"
@@ -3255,6 +3482,7 @@ class Agent:
             f"{handle_line}"
             f"{retrieve_hint}"
             f"{search_hints}"
+            f"{signal_lines}"
             f"omitted_chars: {omitted}\n"
             f"preview_complete: {str(omitted == 0).lower()}\n"
             f"reason: {reason}.\n"
@@ -3432,12 +3660,13 @@ class Agent:
         self._tool_result_snapshot_cache[cache_key] = record
         return record
 
-    @staticmethod
     def _tool_result_projection_payload(
+        self,
         stored: ToolResultRecord,
         *,
         raw_content: str,
         projected_content: str,
+        signal_lines: str = "",
     ) -> str:
         return (
             "[tool_result_projection]\n"
@@ -3447,6 +3676,7 @@ class Agent:
             "preview_complete: false\n"
             f"{_TOOL_RESULT_RETRIEVE_HINT}"
             f"{_tool_result_search_hints(raw_content)}"
+            f"{signal_lines}"
             f"{projected_content}"
         )
 
@@ -3495,10 +3725,20 @@ class Agent:
         raw_content: str,
         arguments: dict[str, Any] | None = None,
     ) -> ToolResult:
+        signal_lines = ""
+        signal_matches = 0
+        signal_first_line: int | None = None
+        if self._projection_signal_hints_active():
+            signal_lines, signal_matches, signal_first_line = _tool_result_signal_scan(
+                raw_content,
+                handle=stored.handle,
+                preview_lines=frozenset(guarded_result.content.splitlines()),
+            )
         projected_content = self._tool_result_projection_payload(
             stored,
             raw_content=raw_content,
             projected_content=guarded_result.content,
+            signal_lines=signal_lines,
         )
         if len(projected_content) >= len(raw_content):
             return self._tool_result_projection_store_unavailable_noop(
@@ -3507,6 +3747,16 @@ class Agent:
                 arguments=arguments,
                 projected_chars=len(projected_content),
                 json_guard_applied=True,
+            )
+        if signal_lines:
+            self._record_projection_signal_hint_event(
+                builder="json_guard",
+                tool_name=guarded_result.tool_name,
+                tool_use_id=guarded_result.tool_use_id,
+                tool_result_handle=stored.handle,
+                original_chars=len(raw_content),
+                signal_match_lines=signal_matches,
+                signal_first_line=signal_first_line,
             )
 
         tokens_before = get_approx_tokens(raw_content)
@@ -3766,8 +4016,24 @@ class Agent:
 
         stored: ToolResultRecord | None = None
         stored_handle: str | None = None
+        signal_matches = 0
+        signal_first_line: int | None = None
         if self.config.tool_result_store_dir:
             placeholder_handle = "tr-" + ("0" * 32)
+            # Scan once here and re-render with the real handle after the
+            # store write: placeholder and stored handles have identical
+            # length, so the probe below measures the true envelope size.
+            probe_signal_lines = ""
+            if self._projection_signal_hints_active():
+                (
+                    probe_signal_lines,
+                    signal_matches,
+                    signal_first_line,
+                ) = _tool_result_signal_scan(
+                    raw_snapshot_content,
+                    handle=placeholder_handle,
+                    preview_lines=frozenset(projected_content.splitlines()),
+                )
             candidate_with_envelope = (
                 "[tool_result_projection]\n"
                 f"tool_result_handle: {placeholder_handle}\n"
@@ -3775,6 +4041,7 @@ class Agent:
                 f"original_chars: {len(raw_snapshot_content)}\n"
                 f"{_TOOL_RESULT_RETRIEVE_HINT}"
                 f"{_tool_result_search_hints(raw_snapshot_content)}"
+                f"{probe_signal_lines}"
                 f"{projected_content}"
             )
             if len(candidate_with_envelope) >= len(raw_snapshot_content):
@@ -3823,11 +4090,18 @@ class Agent:
                     reducer=reduction.reducer,
                     json_guard_applied=json_guard_applied,
                 )
+        signal_lines = ""
         if stored is not None:
+            signal_lines = _render_projection_signal_lines(
+                handle=stored.handle,
+                match_count=signal_matches,
+                first_line_number=signal_first_line,
+            )
             projected_content = self._tool_result_projection_payload(
                 stored,
                 raw_content=raw_snapshot_content,
                 projected_content=projected_content,
+                signal_lines=signal_lines,
             )
 
         if len(projected_content) >= len(raw_snapshot_content):
@@ -3856,6 +4130,17 @@ class Agent:
                 json_guard_applied=json_guard_applied,
             )
             return original_result
+
+        if signal_lines and stored is not None:
+            self._record_projection_signal_hint_event(
+                builder="fresh",
+                tool_name=result.tool_name,
+                tool_use_id=result.tool_use_id,
+                tool_result_handle=stored.handle,
+                original_chars=len(raw_snapshot_content),
+                signal_match_lines=signal_matches,
+                signal_first_line=signal_first_line,
+            )
 
         tokens_before = get_approx_tokens(raw_snapshot_content)
         tokens_after = get_approx_tokens(projected_content)
@@ -9325,22 +9610,13 @@ class Agent:
                                 budget_fraction=nudge_fraction,
                                 elapsed_fraction=round(elapsed_fraction, 3),
                             )
-                if source_loop_recovery_guidance is not None:
-                    # Appended last: _drop_runtime_recovery_scaffolding pops
-                    # the one-shot directive from the end of the turn, so no
-                    # other runtime-injected message may follow it.
-                    turn_messages.append(
-                        Message(role="user", content=source_loop_recovery_guidance)
-                    )
-                if terminal_projection_preflight_error:
-                    self._write_turn_call_log(
-                        "tool_argument_projection_rehydrate_recovery",
-                        iteration=iterations,
-                        tool_use_ids=sorted(preflight_tool_results),
-                    )
                 # Count iterations that blocked a compacted-placeholder reuse
                 # (preflight or dispatch path) and escalate the recovery
-                # directive once the configured threshold is reached.
+                # directive once the configured threshold is reached. This
+                # runs before the source-loop recovery guidance append below:
+                # that guidance must stay the final runtime-injected message
+                # of the turn so _drop_runtime_recovery_scaffolding can pop it
+                # from the end.
                 if terminal_projection_preflight_error or any(
                     self._is_provider_context_projection_reuse_result(result)
                     for result in executed_results
@@ -9370,6 +9646,40 @@ class Agent:
                             offense_iterations=placeholder_offense_iterations,
                             threshold=placeholder_escalation_threshold,
                         )
+                        # The turn-call log is a raw debug stream that run
+                        # harnesses do not collect; the runtime event is what
+                        # lets delivery gates tell this designed escalation
+                        # apart from a treatment delivery failure.
+                        append_runtime_event(
+                            self.config.runtime_events_path,
+                            {
+                                "feature": "placeholder_escalation",
+                                "name": "placeholder_escalation.injected",
+                                "action": "append_escalation_directive",
+                                "reason": "placeholder_offense_threshold",
+                                "iteration": iterations,
+                                "offense_iterations": placeholder_offense_iterations,
+                                "threshold": placeholder_escalation_threshold,
+                                "session_key": self._session_key,
+                                "agent_id": (
+                                    self.config.tool_result_store_agent_id
+                                    or self.config.metadata.get("agent_id")
+                                ),
+                            },
+                        )
+                if source_loop_recovery_guidance is not None:
+                    # Appended last: _drop_runtime_recovery_scaffolding pops
+                    # the one-shot directive from the end of the turn, so no
+                    # other runtime-injected message may follow it.
+                    turn_messages.append(
+                        Message(role="user", content=source_loop_recovery_guidance)
+                    )
+                if terminal_projection_preflight_error:
+                    self._write_turn_call_log(
+                        "tool_argument_projection_rehydrate_recovery",
+                        iteration=iterations,
+                        tool_use_ids=sorted(preflight_tool_results),
+                    )
                 if terminal_artifacts:
                     _finish_artifact_delivery_without_provider()
                     break
@@ -14612,6 +14922,7 @@ class Agent:
             provider_history_dedup_min_repeats=(
                 self.config.provider_history_dedup_min_repeats
             ),
+            projection_signal_hints=self.config.projection_signal_hints,
             progress_watchdog_mode=self.config.progress_watchdog_mode,
             progress_watchdog_repeated_tool_error_threshold=(
                 self.config.progress_watchdog_repeated_tool_error_threshold

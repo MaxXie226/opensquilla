@@ -336,6 +336,20 @@ def _name_tuple_from_env(name: str) -> tuple[str, ...]:
     return tuple(item.strip() for item in raw.split(",") if item.strip())
 
 
+def _projection_signal_hints_from_env() -> bool:
+    """Parse OPENSQUILLA_PROJECTION_SIGNAL_HINTS through the runtime gate.
+
+    Delegating keeps bootstrap and per-request resolution on one on/off
+    vocabulary: an unrecognized value raises here, at bootstrap, instead of
+    surviving as False and then raising mid-turn when the agent re-reads the
+    env. Local import; the engine.agent module is import-cycle-safe from
+    this stage only at call time.
+    """
+    from opensquilla.engine.agent import _projection_signal_hints_enabled
+
+    return _projection_signal_hints_enabled(False)
+
+
 # ---------------------------------------------------------------------------
 # Value objects returned by the ports — typed frozen tuples that collapse
 # the multi-call slice into declarative single-call shapes.
@@ -932,6 +946,7 @@ class AgentBootstrapStage:
                 "OPENSQUILLA_PROVIDER_HISTORY_DEDUP_MIN_REPEATS",
                 AgentConfig().provider_history_dedup_min_repeats,
             ),
+            projection_signal_hints=_projection_signal_hints_from_env(),
             tool_loop_observer_mode=_tool_loop_observer_mode_from_env(),
             runtime_recovery_mode=_runtime_recovery_mode_from_env(),
             runtime_recovery_source_loop_max_nudges=_positive_int_from_env(
