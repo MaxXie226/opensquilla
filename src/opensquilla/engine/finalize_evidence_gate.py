@@ -259,7 +259,7 @@ _REPRO_STEM_MARKERS: frozenset[str] = frozenset(
 )
 _STEM_TOKEN_SPLIT_RE = re.compile(r"[^a-z0-9]+")
 _SCRIPT_EXTENSION_RE = re.compile(
-    r"\.(py|js|mjs|cjs|ts|rb|php|sh|bash|zsh|pl|go|rs|java|c|cc|cpp|exp)$",
+    r"\.(py|js|mjs|cjs|ts|rb|php|sh|bash|zsh|pl|go|rs|java|c|cc|cpp|exp|tcl)$",
     re.I,
 )
 _SCRATCH_DIR_MARKERS: tuple[str, ...] = ("/squilla-scratch/", "/tmp/", "/var/tmp/")
@@ -290,6 +290,13 @@ def _basename_marks_repro(basename: str) -> bool:
     stem = basename.rsplit(".", 1)[0].lower()
     tokens = [token for token in _STEM_TOKEN_SPLIT_RE.split(stem) if token]
     return any(token in _REPRO_STEM_MARKERS for token in tokens)
+
+
+def is_repro_script_path(path: str) -> bool:
+    """Return whether *path* has an executable repro-script extension."""
+
+    normalized = str(path or "").strip().replace("\\", "/")
+    return bool(normalized and _SCRIPT_EXTENSION_RE.search(normalized))
 
 
 def looks_repro_artifact_path(path: str) -> bool:

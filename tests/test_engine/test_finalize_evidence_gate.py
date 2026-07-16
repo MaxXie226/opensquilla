@@ -41,6 +41,7 @@ from opensquilla.engine.finalize_evidence_gate import (
         ("debug_overlap.java", True),
         ("verify_fix.sh", True),
         ("/tmp/squilla-scratch/test_fix.py", True),
+        ("/tmp/squilla-scratch/repro_case.tcl", True),
         ("/tmp/anything.js", True),
         ("/tmp/notes.txt", False),
         ("src/main.py", False),
@@ -433,7 +434,7 @@ def test_source_edit_resets_post_edit_window() -> None:
 def test_scratch_write_does_not_reset_window() -> None:
     tracker = _tracker_with_source_edit()
     tracker.observe_execution("pytest tests/", red=False, exit_code=0, iteration=2)
-    tracker.observe_write("/tmp/squilla-scratch/inspect_state.py", iteration=3, scratch=True)
+    tracker.observe_write("/data/custom-scratch/inspect_state.py", iteration=3, scratch=True)
     observation = tracker.build_observation(has_workspace_diff=True)
     assert observation.triggers == []
     assert observation.post_edit_execution_count == 1

@@ -1355,7 +1355,6 @@ async def read_source(path: str, start_line: int = 1, end_line: int | None = Non
         raise FileNotFoundError(f"File not found: {path}")
     if not p.is_file():
         raise IsADirectoryError(f"Path is a directory: {path}")
-
     loop = asyncio.get_event_loop()
     sample: bytes = await loop.run_in_executor(None, _read_binary_sample, p)
     if sample:
@@ -1779,6 +1778,25 @@ def _resolve_scratch_write_path(path: str) -> tuple[Path, str]:
         ) from exc
     if not relative_path or relative_path == ".":
         raise ToolError("write_scratch requires a file path inside the scratch directory.")
+    if ctx.workspace_dir:
+        workspace = Path(ctx.workspace_dir).expanduser().resolve(strict=False)
+        try:
+            resolved.relative_to(workspace)
+        except ValueError:
+            pass
+        else:
+            try:
+                scratch_relative = scratch.relative_to(workspace)
+            except ValueError as exc:
+                raise ToolError(
+                    "write_scratch refused a workspace target because scratch_dir "
+                    "contains the active workspace."
+                ) from exc
+            if not scratch_relative.parts:
+                raise ToolError(
+                    "write_scratch refused a workspace target because scratch_dir "
+                    "equals the active workspace."
+                )
     return resolved, relative_path
 
 
@@ -2340,6 +2358,8 @@ async def edit_source(
         raise FileNotFoundError(f"File not found: {path}")
     if not p.is_file():
         raise IsADirectoryError(f"Path is a directory: {path}")
+    if _is_under_configured_scratch_dir(p):
+        raise ToolError("edit_source refused a scratch path; use edit_file instead.")
 
     loop = asyncio.get_event_loop()
     try:

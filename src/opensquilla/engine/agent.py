@@ -13,6 +13,7 @@ import json
 import math
 import os
 import re
+import stat
 import subprocess
 import time
 import uuid
@@ -22,7 +23,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import structlog
 
@@ -50,6 +51,7 @@ from opensquilla.engine.finalize_evidence_gate import (
     execution_signals_from_result,
     finalize_evidence_challenge_message,
     finalize_evidence_gate_key,
+    is_repro_script_path,
 )
 from opensquilla.engine.finalize_evidence_gate import (
     WRITE_TOOL_NAMES as _GATE_WRITE_TOOL_NAMES,
@@ -545,6 +547,13 @@ _meta_invoke_depth: ContextVar[int] = ContextVar("opensquilla_meta_invoke_depth"
 _meta_invoke_turn_count: ContextVar[int] = ContextVar(
     "opensquilla_meta_invoke_turn_count", default=0
 )
+
+
+def _normalize_workspace_relative_path(path: str) -> str:
+    normalized = str(path or "").replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized.lstrip("/")
 
 
 def _progress_watchdog_guidance_message(reason: str, details: Mapping[str, Any]) -> str:
@@ -2048,6 +2057,7 @@ class Agent:
             )
         if tool_context is not None:
             tool_context = self._apply_configured_tool_result_budget(tool_context)
+            tool_context.validate_path_roots()
         self._tool_context: ToolContext | None = tool_context
         # Test-only offline failure seam. ``None`` on every production path,
         # so the provider chat call below stays byte-identical to before when
@@ -8757,6 +8767,8 @@ class Agent:
 
                 # Map tool_use_id -> ToolResult built up below.
                 results_by_id: dict[str, ToolResult] = {}
+                executed_tool_calls_by_id: dict[str, ToolCall] = {}
+                path_patch_snapshots_by_id: dict[str, ToolCall] = {}
 
                 def _cap_timeout_by_deadlines(timeout: float) -> float:
                     remaining = min(timeout, max(0.0, tool_deadline - _loop.time()))
@@ -8776,14 +8788,56 @@ class Agent:
                         name=tc.tool_name,
                         arguments=tc.arguments,
                     )
-                    tool_timeout = _cap_timeout_by_deadlines(self._tool_execution_timeout(tc))
-                    preflight_result = preflight_tool_results.get(tc.tool_use_id)
+                    execution_tc = path_patch_snapshots_by_id.get(tc.tool_use_id)
+                    if execution_tc is None:
+                        execution_tc = self._snapshot_apply_patch_path_call(tc)
+                        if execution_tc is not tc:
+                            path_patch_snapshots_by_id[tc.tool_use_id] = execution_tc
+                    approval_id = self._tool_call_string_arg(tc, "approval_id")
+                    if approval_id is not None and execution_tc is not tc:
+                        execution_arguments = dict(execution_tc.arguments)
+                        execution_arguments["approval_id"] = approval_id
+                        execution_tc = replace(
+                            execution_tc,
+                            arguments=execution_arguments,
+                        )
+                    executed_tool_calls_by_id[tc.tool_use_id] = execution_tc
+                    tool_timeout = _cap_timeout_by_deadlines(
+                        self._tool_execution_timeout(execution_tc)
+                    )
+                    snapshot_failure: ToolResult | None = None
+                    if (
+                        tc.tool_name == "apply_patch"
+                        and self._tool_call_string_arg(tc, "path") is not None
+                        and not (
+                            self._tool_call_string_arg(tc, "patch") or ""
+                        ).strip()
+                        and execution_tc is tc
+                    ):
+                        snapshot_failure = ToolResult(
+                            tool_use_id=tc.tool_use_id,
+                            tool_name=tc.tool_name,
+                            content=(
+                                "apply_patch could not securely snapshot the patch file "
+                                "before execution. Retry with inline patch text or a "
+                                "readable UTF-8 patch file under the workspace or "
+                                "configured scratch directory."
+                            ),
+                            is_error=True,
+                            execution_status=runtime_execution_status(
+                                "error",
+                                reason="patch_snapshot_failed",
+                            ),
+                        )
+                    preflight_result = (
+                        preflight_tool_results.get(tc.tool_use_id) or snapshot_failure
+                    )
                     gate_recovery_read = self._workspace_edit_gate_allows_recovery_read(
-                        tc,
+                        execution_tc,
                         workspace_edit_gate_recovery_read_paths,
                     )
                     gate_result = self._workspace_edit_gate_tool_result(
-                        tc,
+                        execution_tc,
                         workspace_edit_gate_details,
                         recovery_read_paths=workspace_edit_gate_recovery_read_paths,
                         recovery_reads_remaining=(
@@ -8791,7 +8845,7 @@ class Agent:
                         ),
                     )
                     diagnostic_retrieval_gate_result = (
-                        self._projected_diagnostic_retrieval_gate_tool_result(tc)
+                        self._projected_diagnostic_retrieval_gate_tool_result(execution_tc)
                     )
                     if gate_result is not None:
                         self._record_tool_loop_runtime_event(
@@ -8823,7 +8877,7 @@ class Agent:
                     else:
                         try:
                             res = await asyncio.wait_for(
-                                self._execute_tool(tc), timeout=tool_timeout
+                                self._execute_tool(execution_tc), timeout=tool_timeout
                             )
                         except TimeoutError:
                             res = ToolResult(
@@ -8838,7 +8892,7 @@ class Agent:
                                 ),
                             )
                     duration_ms = int((time.monotonic() - started) * 1000)
-                    self._record_focused_diagnostic_retrieval(tc, res)
+                    self._record_focused_diagnostic_retrieval(execution_tc, res)
                     if len(self._effective_workspace_write_records()) > 0:
                         workspace_edit_gate_details = None
                         workspace_edit_gate_recovery_read_paths.clear()
@@ -8849,7 +8903,7 @@ class Agent:
                         and res.is_error
                         and self._workspace_edit_gate_edit_error_allows_read(res)
                     ):
-                        target_paths = self._workspace_edit_gate_target_paths(tc)
+                        target_paths = self._workspace_edit_gate_target_paths(execution_tc)
                         if target_paths:
                             workspace_edit_gate_recovery_read_paths = {
                                 str(path) for path in target_paths
@@ -8884,7 +8938,7 @@ class Agent:
                             workspace_edit_gate_recovery_read_paths.clear()
                     self._record_patch_evidence_tool_result(
                         iteration=iterations,
-                        tool_call=tc,
+                        tool_call=execution_tc,
                         result=res,
                         duration_ms=duration_ms,
                     )
@@ -9339,17 +9393,21 @@ class Agent:
                     last_post_write_failed_verification = None
                 if finalize_evidence_tracker is not None:
                     for tc, result in zip(tool_calls, executed_results, strict=False):
+                        executed_tc = executed_tool_calls_by_id.get(tc.tool_use_id, tc)
                         if tc.tool_name in _GATE_WRITE_TOOL_NAMES:
-                            finalize_evidence_tracker.observe_write(
-                                self._tool_call_string_arg(tc, "path", "file_path"),
-                                is_error=bool(result.is_error),
-                                iteration=iterations,
-                                scratch=(tc.tool_name == "write_scratch"),
-                            )
+                            for write_path, is_scratch in (
+                                self._finalize_evidence_write_targets(executed_tc)
+                            ):
+                                finalize_evidence_tracker.observe_write(
+                                    write_path,
+                                    is_error=bool(result.is_error),
+                                    iteration=iterations,
+                                    scratch=is_scratch,
+                                )
                             continue
                         if tc.tool_name not in _GATE_EXECUTION_TOOL_NAMES:
                             continue
-                        gate_command = self._execution_command_for_progress(tc)
+                        gate_command = self._execution_command_for_progress(executed_tc)
                         if not gate_command:
                             continue
                         gate_result_text = self._tool_result_text_for_anchor(result.content)
@@ -10284,6 +10342,7 @@ class Agent:
             if any(
                 isinstance(record, dict)
                 and not self._workspace_write_record_looks_synthetic(record)
+                and not self._workspace_write_record_targets_configured_scratch(record)
                 for record in records
             ):
                 return True
@@ -10360,8 +10419,10 @@ class Agent:
             for line in (result.stdout or "").splitlines():
                 text = line.strip()
                 if text:
-                    normalized = text.replace("\\", "/").lstrip("./")
+                    normalized = _normalize_workspace_relative_path(text)
                     if normalized in ignored_paths:
+                        continue
+                    if self._workspace_relative_path_targets_scratch(normalized):
                         continue
                     paths.add(normalized)
         return sorted(paths)
@@ -10371,14 +10432,29 @@ class Agent:
             record
             for record in self._workspace_write_records()
             if not self._workspace_write_record_looks_synthetic(record)
+            and not self._workspace_write_record_targets_configured_scratch(record)
         ]
+
+    def _workspace_write_record_targets_configured_scratch(
+        self,
+        record: Mapping[str, Any],
+    ) -> bool:
+        raw_path = str(record.get("path") or record.get("relative_path") or "")
+        return self._workspace_relative_path_targets_scratch(raw_path)
+
+    def _workspace_relative_path_targets_scratch(self, raw_path: str) -> bool:
+        resolved, _ = self._configured_scratch_path_candidate(
+            raw_path,
+            relative_to="workspace",
+        )
+        return resolved is not None
 
     @staticmethod
     def _workspace_write_record_looks_synthetic(record: Mapping[str, Any]) -> bool:
         if not bool(record.get("created")):
             return False
         raw_path = str(record.get("relative_path") or record.get("path") or "")
-        normalized = raw_path.replace("\\", "/").lstrip("./")
+        normalized = _normalize_workspace_relative_path(raw_path)
         if not normalized:
             return False
         name = Path(normalized).name.lower()
@@ -10422,10 +10498,15 @@ class Agent:
             receipt
             for receipt in self._workspace_mutation_receipts()
             if receipt.get("changed") is True
+            and receipt.get("classification") != "scratch"
         ]
 
     def _workspace_mutation_receipt_counts(self) -> dict[str, int]:
-        receipts = self._workspace_mutation_receipts()
+        receipts = [
+            receipt
+            for receipt in self._workspace_mutation_receipts()
+            if receipt.get("classification") != "scratch"
+        ]
         return {
             "changed_receipt_count": len(self._changed_workspace_mutation_receipts()),
             "noop_receipt_count": sum(
@@ -10469,15 +10550,16 @@ class Agent:
 
     def _final_diff_contract_observation(self) -> FinalDiffContractObservation | None:
         diff_paths = self._workspace_diff_paths_for_final_diff_contract()
-        write_records = self._workspace_write_records()
+        known_scratch_paths = [
+            path for path in diff_paths if self._workspace_relative_path_targets_scratch(path)
+        ]
+        write_records = self._effective_workspace_write_records()
         mutation_receipts = self._workspace_mutation_receipts()
         source_diff_candidates = []
         if self.config.source_diff_candidate_mode != "off" and self._tool_context:
             source_diff_candidates = list(
                 getattr(self._tool_context, "source_diff_candidates", []) or []
             )
-        if not diff_paths:
-            write_records = self._effective_workspace_write_records()
         if not diff_paths and not write_records and not mutation_receipts:
             return None
         return build_final_diff_contract_observation(
@@ -10487,6 +10569,7 @@ class Agent:
             mutation_records=self._workspace_mutation_records(),
             mutation_receipts=mutation_receipts,
             source_diff_candidates=source_diff_candidates,
+            known_scratch_paths=known_scratch_paths,
         )
 
     def _record_final_diff_contract_event(
@@ -10935,7 +11018,7 @@ class Agent:
         )
         if " -> " in text:
             text = text.split(" -> ", 1)[1].strip()
-        return text.replace("\\", "/").lstrip("./") or None
+        return _normalize_workspace_relative_path(text) or None
 
     @staticmethod
     def _porcelain_status_is_new_file(line: str) -> bool:
@@ -10967,7 +11050,7 @@ class Agent:
                 else [text]
             )
             for side in sides:
-                path = side.replace("\\", "/").lstrip("./")
+                path = _normalize_workspace_relative_path(side)
                 if not path:
                     continue
                 if classify_workspace_path(path) != "test-like":
@@ -11007,7 +11090,7 @@ class Agent:
                 else [text]
             )
             for side in sides:
-                path = side.replace("\\", "/").lstrip("./")
+                path = _normalize_workspace_relative_path(side)
                 if not path:
                     continue
                 match = match_workspace_write_deny(
@@ -11026,7 +11109,7 @@ class Agent:
     def _is_root_scratch_artifact_path(path: str | None) -> bool:
         if not path:
             return False
-        normalized = path.replace("\\", "/").lstrip("./")
+        normalized = _normalize_workspace_relative_path(path)
         if not normalized or "/" in normalized:
             return False
         name = Path(normalized).name
@@ -11081,7 +11164,7 @@ class Agent:
         for line in (result.stdout or "").splitlines():
             parts = line.split(None, 3)
             if len(parts) == 4 and parts[0] == "160000":
-                paths.add(parts[3].replace("\\", "/").lstrip("./"))
+                paths.add(_normalize_workspace_relative_path(parts[3]))
         return paths
 
     def _workspace_ignored_diff_paths(self, workspace_dir: Path) -> set[str]:
@@ -11322,7 +11405,7 @@ class Agent:
             if not candidate.is_absolute() and workspace is not None:
                 candidate = workspace / candidate
             resolved = candidate.resolve(strict=False)
-        except OSError:
+        except (OSError, RuntimeError, ValueError):
             return None
         if workspace is None:
             return resolved
@@ -11330,30 +11413,223 @@ class Agent:
             return resolved
         return None
 
-    def _workspace_edit_gate_apply_patch_target_paths(self, tc: ToolCall) -> list[Path]:
+    def _configured_scratch_path_candidate(
+        self,
+        raw_path: str | None,
+        *,
+        relative_to: Literal["scratch", "workspace"] | None = None,
+    ) -> tuple[Path | None, bool]:
+        """Return a contained path and whether it targets configured scratch."""
+
+        if not raw_path:
+            return None, False
+
+        ctx = self._tool_context or current_tool_context.get()
+        raw_scratch = getattr(ctx, "scratch_dir", None) if ctx is not None else None
+        if not raw_scratch:
+            return None, False
+        try:
+            scratch = Path(raw_scratch).expanduser()
+            if not scratch.is_absolute():
+                scratch = Path.cwd() / scratch
+
+            candidate = Path(raw_path).expanduser()
+            if not candidate.is_absolute():
+                if relative_to == "scratch":
+                    candidate = scratch / candidate
+                elif relative_to == "workspace":
+                    workspace = self._workspace_dir_for_status()
+                    if workspace is None:
+                        return None, False
+                    candidate = workspace / candidate
+                else:
+                    return None, False
+        except (OSError, RuntimeError, ValueError):
+            return None, False
+
+        lexical_scratch_target = False
+        try:
+            lexical_relative = candidate.relative_to(scratch)
+            lexical_scratch_target = True
+        except ValueError:
+            lexical_relative = None
+        if lexical_relative is not None and (
+            not lexical_relative.parts or ".." in lexical_relative.parts
+        ):
+            return None, True
+
+        try:
+            resolved_scratch = scratch.resolve(strict=False)
+            resolved = candidate.resolve(strict=False)
+            resolved_relative = resolved.relative_to(resolved_scratch)
+        except (OSError, RuntimeError, ValueError):
+            return None, lexical_scratch_target
+        if not resolved_relative.parts:
+            return None, True
+
+        workspace = self._workspace_dir_for_status()
+        if workspace is not None:
+            try:
+                resolved.relative_to(workspace)
+            except ValueError:
+                pass
+            else:
+                try:
+                    scratch_relative = resolved_scratch.relative_to(workspace)
+                except ValueError:
+                    return None, False
+                if not scratch_relative.parts:
+                    return None, False
+
+        return resolved, True
+
+    def _workspace_edit_gate_external_scratch_repro_target(
+        self,
+        tc: ToolCall,
+    ) -> tuple[Path | None, bool]:
+        """Return an allowed repro target and whether the path claimed scratch."""
+
+        if tc.tool_name not in {"edit_file", "write_file", "write_scratch"}:
+            return None, False
+        resolved, claimed_scratch = self._configured_scratch_path_candidate(
+            self._tool_call_string_arg(tc, "path"),
+            relative_to=("scratch" if tc.tool_name == "write_scratch" else "workspace"),
+        )
+        if resolved is None or not is_repro_script_path(str(resolved)):
+            return None, claimed_scratch
+
+        workspace = self._workspace_dir_for_status()
+        if workspace is not None and (resolved == workspace or workspace in resolved.parents):
+            return None, True
+        return resolved, True
+
+    def _workspace_edit_gate_apply_patch_text(self, tc: ToolCall) -> str | None:
         patch = self._tool_call_string_arg(tc, "patch")
+        if patch and patch.strip():
+            return patch
+        raw_path = self._tool_call_string_arg(tc, "path")
+        workspace = self._workspace_dir_for_status()
+        if not raw_path or workspace is None:
+            return None
+        try:
+            candidate = Path(raw_path).expanduser()
+            if not candidate.is_absolute():
+                candidate = workspace / candidate
+            resolved = candidate.resolve(strict=False)
+            allowed_roots = [workspace]
+            ctx = self._tool_context or current_tool_context.get()
+            raw_scratch = getattr(ctx, "scratch_dir", None) if ctx is not None else None
+            if raw_scratch:
+                allowed_roots.append(Path(raw_scratch).expanduser().resolve(strict=False))
+            if not any(resolved.is_relative_to(root) for root in allowed_roots):
+                return None
+            open_flags = os.O_RDONLY
+            open_flags |= getattr(os, "O_NONBLOCK", 0)
+            open_flags |= getattr(os, "O_CLOEXEC", 0)
+            open_flags |= getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(resolved, open_flags)
+            try:
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    return None
+                with os.fdopen(fd, encoding="utf-8") as patch_file:
+                    fd = -1
+                    return patch_file.read()
+            finally:
+                if fd >= 0:
+                    os.close(fd)
+        except (OSError, RuntimeError, UnicodeError, ValueError):
+            return None
+
+    def _snapshot_apply_patch_path_call(self, tc: ToolCall) -> ToolCall:
+        """Bind a path-mode patch to the exact text used by this execution."""
+
+        if tc.tool_name != "apply_patch":
+            return tc
+        inline_patch = self._tool_call_string_arg(tc, "patch")
+        if inline_patch and inline_patch.strip():
+            return tc
+        if self._tool_call_string_arg(tc, "path") is None:
+            return tc
+        patch = self._workspace_edit_gate_apply_patch_text(tc)
+        if patch is None or not patch.strip():
+            return tc
+        arguments = dict(tc.arguments)
+        arguments["patch"] = patch
+        return replace(tc, arguments=arguments)
+
+    def _workspace_edit_gate_apply_patch_raw_target_paths(self, tc: ToolCall) -> list[str]:
+        patch = self._workspace_edit_gate_apply_patch_text(tc)
         if not patch:
             return []
-        paths: list[Path] = []
-        seen: set[Path] = set()
+        paths: list[str] = []
+        in_patch = False
         prefixes = (
             "*** Add File: ",
             "*** Update File: ",
             "*** Delete File: ",
         )
         for raw_line in patch.splitlines():
-            line = raw_line.strip()
-            for prefix in prefixes:
-                if not line.startswith(prefix):
-                    continue
-                raw_path = line.removeprefix(prefix).strip()
-                if not raw_path:
-                    continue
-                resolved = self._resolve_workspace_path_candidate(raw_path)
-                if resolved is not None and resolved not in seen:
-                    seen.add(resolved)
-                    paths.append(resolved)
+            line = raw_line.rstrip("\r")
+            marker = line.strip()
+            if marker == "*** Begin Patch":
+                in_patch = True
+                continue
+            if marker == "*** End Patch":
                 break
+            if not in_patch:
+                continue
+            for prefix in prefixes:
+                if line.startswith(prefix):
+                    raw_path = line.removeprefix(prefix).strip()
+                    if raw_path:
+                        paths.append(raw_path)
+                    break
+        return paths
+
+    def _finalize_evidence_write_targets(
+        self,
+        tc: ToolCall,
+    ) -> list[tuple[str | None, bool]]:
+        if tc.tool_name == "apply_patch":
+            patch_targets = self._workspace_edit_gate_apply_patch_raw_target_paths(tc)
+            if patch_targets:
+                return [
+                    (
+                        raw_path,
+                        self._configured_scratch_path_candidate(
+                            raw_path,
+                            relative_to="workspace",
+                        )[0]
+                        is not None,
+                    )
+                    for raw_path in patch_targets
+                ]
+            # A successful apply_patch with unknown targets must invalidate prior
+            # verification instead of treating its input patch file as a write.
+            return [(None, False)]
+
+        raw_path = self._tool_call_string_arg(tc, "path", "file_path")
+        configured_scratch_path: Path | None = None
+        if tc.tool_name in {"edit_file", "edit_source", "write_file", "write_scratch"}:
+            configured_scratch_path, _ = self._configured_scratch_path_candidate(
+                raw_path,
+                relative_to=("scratch" if tc.tool_name == "write_scratch" else "workspace"),
+            )
+        return [
+            (
+                raw_path,
+                tc.tool_name == "write_scratch" or configured_scratch_path is not None,
+            )
+        ]
+
+    def _workspace_edit_gate_apply_patch_target_paths(self, tc: ToolCall) -> list[Path]:
+        paths: list[Path] = []
+        seen: set[Path] = set()
+        for raw_path in self._workspace_edit_gate_apply_patch_raw_target_paths(tc):
+            resolved = self._resolve_workspace_path_candidate(raw_path)
+            if resolved is not None and resolved not in seen:
+                seen.add(resolved)
+                paths.append(resolved)
         return paths
 
     def _workspace_edit_gate_target_paths(self, tc: ToolCall) -> list[Path]:
@@ -11369,6 +11645,17 @@ class Agent:
 
     def _workspace_edit_gate_edit_block_detail(self, tc: ToolCall) -> str | None:
         if tc.tool_name == "apply_patch":
+            if any(
+                self._configured_scratch_path_candidate(
+                    raw_path,
+                    relative_to="workspace",
+                )[1]
+                for raw_path in self._workspace_edit_gate_apply_patch_raw_target_paths(tc)
+            ):
+                return (
+                    "The apply_patch call targets configured scratch. Scratch files do "
+                    "not count as the requested project source fix."
+                )
             if self._workspace_edit_gate_apply_patch_target_paths(tc):
                 return None
             return (
@@ -11378,8 +11665,24 @@ class Agent:
                 "then '@@' hunks, then '*** End Patch'. Do not put the path on the "
                 "Begin Patch or End Patch line."
             )
-        if tc.tool_name not in {"edit_file", "write_file"}:
+        if tc.tool_name not in {"edit_file", "write_file", "write_scratch"}:
             return None
+        scratch_target, claimed_scratch = (
+            self._workspace_edit_gate_external_scratch_repro_target(tc)
+        )
+        if tc.tool_name == "write_scratch":
+            if scratch_target is not None:
+                return None
+            return (
+                "The write_scratch call must target a contained executable reproduction "
+                "script under an external scratch directory before the source fix."
+            )
+        if claimed_scratch:
+            return (
+                f"The {tc.tool_name} call targets configured scratch, but only a "
+                "contained executable reproduction script under an external scratch "
+                "directory may be written before the source fix."
+            )
         raw_path = self._tool_call_string_arg(tc, "path") or "<missing path>"
         resolved = self._resolve_workspace_path_candidate(raw_path)
         if resolved is None:
@@ -11463,15 +11766,21 @@ class Agent:
             and self._workspace_edit_gate_allows_recovery_read(tc, recovery_read_paths)
         ):
             return None
+        scratch_target, _ = self._workspace_edit_gate_external_scratch_repro_target(tc)
+        if scratch_target is not None:
+            return None
+        gate_write_tool = (
+            tc.tool_name in _WORKSPACE_EDIT_TOOL_NAMES or tc.tool_name == "write_scratch"
+        )
         edit_block_detail = (
             self._workspace_edit_gate_edit_block_detail(tc)
-            if tc.tool_name in _WORKSPACE_EDIT_TOOL_NAMES
+            if gate_write_tool
             else None
         )
-        if tc.tool_name in _WORKSPACE_EDIT_TOOL_NAMES and edit_block_detail is None:
+        if gate_write_tool and edit_block_detail is None:
             return None
 
-        if tc.tool_name in _WORKSPACE_EDIT_TOOL_NAMES:
+        if gate_write_tool:
             detail = edit_block_detail or f"The {tc.tool_name} call is not allowed here."
         elif tc.tool_name == "read_file" and recovery_reads_remaining > 0:
             detail = (
@@ -11809,7 +12118,7 @@ class Agent:
             raw = record.get("relative_path")
             if not isinstance(raw, str) or not raw:
                 continue
-            normalized = raw.replace("\\", "/").lstrip("./")
+            normalized = _normalize_workspace_relative_path(raw)
             if normalized and normalized not in seen:
                 seen.add(normalized)
                 paths.append(normalized)
@@ -11844,7 +12153,7 @@ class Agent:
                 else:
                     text = line.strip()
                 if text:
-                    normalized = text.replace("\\", "/").lstrip("./")
+                    normalized = _normalize_workspace_relative_path(text)
                     if normalized in ignored_paths:
                         continue
                     paths.add(normalized)
@@ -11885,7 +12194,7 @@ class Agent:
                 else:
                     text = line.strip()
                 if text:
-                    normalized = text.replace("\\", "/").lstrip("./")
+                    normalized = _normalize_workspace_relative_path(text)
                     if normalized in ignored_paths:
                         continue
                     paths.add(normalized)

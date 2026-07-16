@@ -70,6 +70,13 @@ _SCRATCH_ONLY_NUDGE_COUNTS = frozenset({3, 6, 10})
 _WORKSPACE_WRITE_PROGRESS_COUNTS = frozenset({1, 3, 6, 10})
 
 
+def _normalize_relative_path(path: str) -> str:
+    normalized = path.replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized.lstrip("/")
+
+
 def record_workspace_file_write(
     path: Path,
     *,
@@ -393,7 +400,7 @@ def _revert_workspace_path(workspace: Path, relative_path: str, status: str) -> 
 
 
 def classify_workspace_path(relative_path: str) -> str:
-    normalized = relative_path.replace("\\", "/").lstrip("./")
+    normalized = _normalize_relative_path(relative_path)
     if _path_is_inside_scratch(normalized):
         return "scratch"
     path = Path(normalized)
@@ -665,7 +672,7 @@ def workspace_write_note(path: Path) -> str:
     if relative_path is None:
         return ""
 
-    normalized = relative_path.replace("\\", "/").lstrip("./")
+    normalized = _normalize_relative_path(relative_path)
     notes: list[str] = []
     if _looks_generated_or_derived(path, normalized):
         notes.append(
@@ -694,7 +701,7 @@ def summarize_workspace_write_notes(paths: list[Path]) -> str:
         relative_path = _workspace_relative_path(path)
         if relative_path is None:
             continue
-        normalized = relative_path.replace("\\", "/").lstrip("./")
+        normalized = _normalize_relative_path(relative_path)
         saw_generated = saw_generated or _looks_generated_or_derived(path, normalized)
         saw_docs = saw_docs or _matches_any(normalized, _DOCUMENTATION_PATH_PATTERNS)
         saw_tests = saw_tests or _looks_test_file(normalized)
@@ -727,7 +734,7 @@ def summarize_patch_hygiene_warning(paths: list[Path]) -> str:
         relative_path = _workspace_relative_path(path)
         if relative_path is None:
             continue
-        normalized = relative_path.replace("\\", "/").lstrip("./")
+        normalized = _normalize_relative_path(relative_path)
         saw_generated = saw_generated or _looks_generated_or_derived(path, normalized)
         saw_docs = saw_docs or _matches_any(normalized, _DOCUMENTATION_PATH_PATTERNS)
         saw_tests = saw_tests or _looks_test_file(normalized)

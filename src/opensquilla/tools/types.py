@@ -6,6 +6,7 @@ import contextvars
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
+from pathlib import Path
 from typing import Any
 
 from opensquilla.sandbox.operation_runtime import SandboxToolDescriptor
@@ -127,6 +128,27 @@ class ToolContext:
     # verify-mirror lever is on: workspace write-deny messages then append
     # guidance pointing at <scratch_dir>/verify-mirror/<workspace-relative-path>.
     scratch_verify_mirror_active: bool = False
+
+    def __post_init__(self) -> None:
+        self.validate_path_roots()
+
+    def validate_path_roots(self) -> None:
+        """Reject scratch roots that equal or contain the active workspace."""
+
+        if not self.workspace_dir or not self.scratch_dir:
+            return
+        try:
+            workspace = Path(self.workspace_dir).expanduser().resolve(strict=False)
+            scratch = Path(self.scratch_dir).expanduser().resolve(strict=False)
+            workspace.relative_to(scratch)
+        except ValueError:
+            return
+        except (OSError, RuntimeError) as exc:
+            raise ValueError("workspace_dir and scratch_dir must resolve safely") from exc
+        raise ValueError(
+            "scratch_dir must not equal or contain workspace_dir; use a disjoint "
+            "scratch root or a dedicated scratch subdirectory inside the workspace"
+        )
 
 
 # Request-scoped context — set by build_tool_handler before each dispatch.

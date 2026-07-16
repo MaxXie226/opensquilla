@@ -1380,6 +1380,8 @@ def build_tool_handler(
     ``tool_hooks`` defaults to empty so callers that do not pass hooks are
     bit-for-bit equivalent to the legacy path.
     """
+    if ctx is not None:
+        ctx.validate_path_roots()
     known = frozenset(known_skill_names or ())
     hooks: tuple[ToolHook, ...] = tuple(tool_hooks or ())
     fallback_budget_tracker = _build_budget_tracker(ctx)
