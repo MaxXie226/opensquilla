@@ -586,6 +586,14 @@ class AgentConfig:
     # Finalize-time red-evidence gate (see engine.finalize_evidence_gate).
     # Off by default; enabled per run via OPENSQUILLA_FINALIZE_EVIDENCE_GATE.
     finalize_evidence_gate_enabled: bool = False
+    # Review-on-submit checkpoint (see engine.submit_review). Surfaces a
+    # ``submit`` tool and, when the model finishes with a non-empty diff, shows
+    # it a general hygiene checklist plus its own diff exactly once before the
+    # turn finalizes. Off by default; enabled per run via
+    # OPENSQUILLA_SUBMIT_REVIEW. ``submit_review_diff_max_chars`` bounds the diff
+    # body echoed into context (the per-file summary is always shown in full).
+    submit_review_enabled: bool = False
+    submit_review_diff_max_chars: int = 20000
     # Keep rejection feedback visible when blocked compacted-placeholder tool
     # calls are projected out of provider requests: the blocked tool_use keeps
     # a placeholder input and its error tool_result stays in the projection.

@@ -178,6 +178,34 @@ def _finalize_evidence_gate_from_env(config_value: bool = False) -> bool:
     )
 
 
+_SUBMIT_REVIEW_ENV = "OPENSQUILLA_SUBMIT_REVIEW"
+_SUBMIT_REVIEW_ON = frozenset({"on", "1", "true", "yes"})
+_SUBMIT_REVIEW_OFF = frozenset({"off", "0", "false", "no"})
+
+
+def _submit_review_from_env(config_value: bool = False) -> bool:
+    """Resolve the opt-in review-on-submit checkpoint flag.
+
+    Default off. A non-blank ``OPENSQUILLA_SUBMIT_REVIEW`` overrides
+    ``config_value``. Unlike the finalize-evidence gate there is no gateway aux
+    mirror: the review has no system-prompt section that could disagree with the
+    loop behaviour. Unrecognized env values raise instead of being silently
+    ignored so an experiment manifest cannot record a lever the run did not
+    actually apply.
+    """
+    raw = os.environ.get(_SUBMIT_REVIEW_ENV, "").strip().lower()
+    if not raw:
+        return bool(config_value)
+    if raw in _SUBMIT_REVIEW_ON:
+        return True
+    if raw in _SUBMIT_REVIEW_OFF:
+        return False
+    raise ValueError(
+        f"{_SUBMIT_REVIEW_ENV} must be one of: "
+        + ", ".join(sorted(_SUBMIT_REVIEW_ON | _SUBMIT_REVIEW_OFF))
+    )
+
+
 def _positive_int_from_env(name: str, default: int) -> int:
     raw = os.environ.get(name)
     if raw is None:
@@ -733,6 +761,11 @@ class AgentBootstrapStage:
             ),
             finalize_evidence_gate_enabled=_finalize_evidence_gate_from_env(
                 aux.finalize_evidence_gate
+            ),
+            submit_review_enabled=_submit_review_from_env(),
+            submit_review_diff_max_chars=_positive_int_from_env(
+                "OPENSQUILLA_SUBMIT_REVIEW_DIFF_MAX_CHARS",
+                AgentConfig().submit_review_diff_max_chars,
             ),
             provider_context_block_feedback=_bool_from_env(
                 "OPENSQUILLA_PROVIDER_CONTEXT_BLOCK_FEEDBACK",

@@ -83,6 +83,30 @@ from opensquilla.engine.session_sanitize import (
     sanitize_session_messages,
     session_payload_chars,
 )
+from opensquilla.engine.submit_review import (
+    SubmitAction,
+    SubmitReviewState,
+    build_submit_review_message,
+    evaluate_explicit_submit,
+)
+from opensquilla.engine.submit_review import (
+    confirmation_message as submit_review_confirmation_message,
+)
+from opensquilla.engine.submit_review import (
+    diff_is_truncated as submit_review_diff_is_truncated,
+)
+from opensquilla.engine.submit_review import (
+    empty_diff_note as submit_review_empty_diff_note,
+)
+from opensquilla.engine.submit_review import (
+    nudge_message as submit_review_nudge_message,
+)
+from opensquilla.engine.submit_review import (
+    observe_tool_activity as submit_review_observe_tool_activity,
+)
+from opensquilla.engine.submit_review import (
+    should_fire_implicit as submit_review_should_fire_implicit,
+)
 from opensquilla.engine.thinking import drop_reasoning
 from opensquilla.engine.tokenjuice_adapter import reduce_tool_result_with_tokenjuice
 from opensquilla.engine.tool_result_store import (
@@ -4455,6 +4479,13 @@ class Agent:
             else None
         )
         finalize_evidence_gate_keys: set[str] = set()
+        submit_review_enabled = bool(
+            getattr(self.config, "submit_review_enabled", False)
+        )
+        submit_review_state = SubmitReviewState()
+        submit_review_diff_max_chars = int(
+            getattr(self.config, "submit_review_diff_max_chars", 20000)
+        )
         recent_failure_anchor_summaries: list[str] = []
         progress_watchdog_mode = getattr(self.config, "progress_watchdog_mode", "log")
         progress_watchdog = ProgressWatchdog(
@@ -7580,6 +7611,7 @@ class Agent:
                                 ),
                             )
                             continue
+                    submit_review_red_detected = False
                     if (
                         finalize_evidence_tracker is not None
                         and not max_iterations_finalization_pending
@@ -7591,6 +7623,7 @@ class Agent:
                             has_workspace_diff=bool(gate_status and gate_status.strip()),
                         )
                         if gate_observation.should_challenge:
+                            submit_review_red_detected = True
                             gate_key = finalize_evidence_gate_key(gate_observation)
                             # Never spend the run's last LLM call or deadline
                             # slack on a challenge: with no headroom for a
@@ -7713,6 +7746,83 @@ class Agent:
                                 message=(
                                     "The model attempted to finish without a clear "
                                     "workspace diff; asking it to reassess once."
+                                ),
+                            )
+                            continue
+                    if (
+                        submit_review_enabled
+                        and submit_review_state.stage == 0
+                        and not submit_review_red_detected
+                        and not max_iterations_finalization_pending
+                        and not artifact_delivery_final_response_pending
+                        and not post_write_convergence_finalization_pending
+                    ):
+                        submit_implicit_headroom_ok = _turn_llm_call_budget_error(
+                            turn_llm_calls + 1
+                        ) is None and (
+                            _total_deadline is None or _loop.time() < _total_deadline
+                        )
+                        (
+                            implicit_file_index,
+                            implicit_diff_text,
+                        ) = await self._workspace_submit_review_capture()
+                        implicit_diff_empty = not (
+                            implicit_file_index.strip() or implicit_diff_text.strip()
+                        )
+                        if submit_review_should_fire_implicit(
+                            submit_review_state,
+                            enabled=submit_review_enabled,
+                            diff_empty=implicit_diff_empty,
+                            headroom_ok=submit_implicit_headroom_ok,
+                            other_gate_injected=False,
+                            red_detected=submit_review_red_detected,
+                            pending_flags_clear=True,
+                        ):
+                            submit_review_message = build_submit_review_message(
+                                implicit_file_index,
+                                implicit_diff_text,
+                                implicit=True,
+                                max_chars=submit_review_diff_max_chars,
+                            )
+                            submit_review_state.mark_reviewed("implicit")
+                            if visible_text and final_text_parts:
+                                final_text_parts.pop()
+                            turn_messages.append(
+                                Message(role="user", content=submit_review_message)
+                            )
+                            self.config.metadata["submit_review_implicit_recoveries"] = (
+                                self.config.metadata.get(
+                                    "submit_review_implicit_recoveries",
+                                    0,
+                                )
+                                + 1
+                            )
+                            self._record_runtime_event(
+                                "submit_review.implicit",
+                                feature="submit_review",
+                                reason="finalize_on_green_diff",
+                                iteration=iterations,
+                                provider_call_count=turn_llm_calls,
+                                injected_to_model=True,
+                                details={
+                                    "diff_truncated": submit_review_diff_is_truncated(
+                                        implicit_diff_text,
+                                        submit_review_diff_max_chars,
+                                    ),
+                                },
+                            )
+                            self._write_turn_call_log(
+                                "submit_review",
+                                action="warn",
+                                mode="implicit",
+                                reason="finalize_on_green_diff",
+                            )
+                            yield WarningEvent(
+                                code="submit_review_implicit",
+                                message=(
+                                    "The model finished with unreviewed workspace "
+                                    "changes; showing it a review of its own diff "
+                                    "once before finalizing."
                                 ),
                             )
                             continue
@@ -8109,6 +8219,68 @@ class Agent:
                         yield event
 
                 for tc in tool_calls:
+                    if submit_review_enabled and tc.tool_name == "submit":
+                        # Control-only tool: never dispatched to the registry
+                        # (its body raises). Flush prior work so the captured
+                        # diff reflects every edit in this batch, then answer
+                        # the submit with the review/confirm text directly.
+                        async for event in _flush_parallel_batch(parallel_batch):
+                            yield event
+                        parallel_batch = []
+                        (
+                            submit_file_index,
+                            submit_diff_text,
+                        ) = await self._workspace_submit_review_capture()
+                        submit_diff_empty = not (
+                            submit_file_index.strip() or submit_diff_text.strip()
+                        )
+                        submit_headroom_ok = _turn_llm_call_budget_error(
+                            turn_llm_calls + 1
+                        ) is None and (
+                            _total_deadline is None or _loop.time() < _total_deadline
+                        )
+                        submit_action = evaluate_explicit_submit(
+                            submit_review_state,
+                            diff_empty=submit_diff_empty,
+                            headroom_ok=submit_headroom_ok,
+                        )
+                        if submit_action is SubmitAction.SHOW_CHECKLIST:
+                            submit_content = build_submit_review_message(
+                                submit_file_index,
+                                submit_diff_text,
+                                implicit=False,
+                                max_chars=submit_review_diff_max_chars,
+                            )
+                        elif submit_action is SubmitAction.NUDGE:
+                            submit_content = submit_review_nudge_message()
+                        elif submit_action is SubmitAction.EMPTY_DIFF_NOTE:
+                            submit_content = submit_review_empty_diff_note()
+                        else:
+                            submit_content = submit_review_confirmation_message()
+                        self._record_runtime_event(
+                            "submit_review.explicit",
+                            feature="submit_review",
+                            reason=submit_action.value,
+                            iteration=iterations,
+                            provider_call_count=turn_llm_calls,
+                            injected_to_model=True,
+                            details={
+                                "stage": submit_review_state.stage,
+                                "nudges": submit_review_state.nudges,
+                                "diff_empty": submit_diff_empty,
+                                "diff_truncated": submit_review_diff_is_truncated(
+                                    submit_diff_text,
+                                    submit_review_diff_max_chars,
+                                ),
+                            },
+                        )
+                        results_by_id[tc.tool_use_id] = ToolResult(
+                            tool_use_id=tc.tool_use_id,
+                            tool_name="submit",
+                            content=submit_content,
+                            is_error=False,
+                        )
+                        continue
                     if tc.tool_name == "meta_invoke":
                         async for event in _flush_parallel_batch(parallel_batch):
                             yield event
@@ -8122,6 +8294,11 @@ class Agent:
                             else:
                                 yield ev
                         continue
+                    if submit_review_enabled:
+                        # Any real (non-submit) tool counts as work after a
+                        # review was shown; distinguishes continued work from an
+                        # immediate rubber-stamp re-submit.
+                        submit_review_observe_tool_activity(submit_review_state)
                     policy = _get_tool_concurrency_policy(
                         tc.tool_name,
                         tc.arguments,
@@ -9548,6 +9725,39 @@ class Agent:
             return self._filter_ignored_porcelain_status(result.stdout, gitlink_paths)
 
         return await asyncio.to_thread(_run_status)
+
+    async def _workspace_submit_review_capture(self) -> tuple[str, str]:
+        """Capture ``(per-file summary, unified diff)`` for the submit review.
+
+        The per-file summary comes from ``git status`` (so untracked scratch
+        files appear even though they are absent from ``git diff``); the diff
+        body is ``git diff HEAD`` for tracked changes. Best-effort: any failure
+        yields an empty diff and the review degrades to the summary alone.
+        """
+        workspace = self._workspace_dir_for_status()
+        if workspace is None:
+            return "", ""
+
+        def _run_diff() -> str:
+            try:
+                result = subprocess.run(
+                    ["git", "-C", str(workspace), "diff", "HEAD"],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=4.0,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                return ""
+            if result.returncode != 0:
+                return ""
+            return result.stdout
+
+        file_index = await self._workspace_git_status_porcelain() or ""
+        diff_text = await asyncio.to_thread(_run_diff)
+        return file_index, diff_text
 
     @staticmethod
     def _porcelain_status_code(line: str) -> str:
