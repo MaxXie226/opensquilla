@@ -2501,6 +2501,39 @@ def _resolve_legacy_prompt_style(config: object) -> bool:
     return bool(getattr(prompt_cfg, "legacy_prompt_style", False))
 
 
+_SUBMIT_REVIEW_ENV = "OPENSQUILLA_SUBMIT_REVIEW"
+_SUBMIT_REVIEW_ON = {"on", "1", "true", "yes"}
+_SUBMIT_REVIEW_OFF = {"off", "0", "false", "no"}
+
+
+def _resolve_submit_review(config: object) -> bool:
+    """Resolve the opt-in review-on-submit checkpoint flag at surface time.
+
+    ``OPENSQUILLA_SUBMIT_REVIEW`` ("on"/"off") overrides
+    ``config.submit_review_enabled``; default is off. The env read mirrors
+    ``engine.turn_runner.agent_bootstrap_stage._submit_review_from_env`` so the
+    tool-surfacing decision here agrees with the loop-side gate: the loop config
+    (``AgentConfig`` built in agent_bootstrap_stage) and the TurnRunner
+    ``self._config`` are distinct objects, so reading the config field alone
+    surfaces ``submit`` only when the two happen to share provenance. Reading the
+    same env var directly keeps surfacing and loop behaviour in lockstep.
+    Unrecognized env values raise instead of being silently ignored so an
+    experiment manifest cannot record a lever the run did not actually apply.
+    """
+    env_value = os.environ.get(_SUBMIT_REVIEW_ENV, "").strip().lower()
+    if env_value:
+        if env_value in _SUBMIT_REVIEW_ON:
+            return True
+        if env_value in _SUBMIT_REVIEW_OFF:
+            return False
+        raise ValueError(
+            f"{_SUBMIT_REVIEW_ENV} must be one of: "
+            + ", ".join(sorted(_SUBMIT_REVIEW_ON | _SUBMIT_REVIEW_OFF))
+        )
+
+    return bool(getattr(config, "submit_review_enabled", False))
+
+
 class TurnRunner:
     """Orchestrates a complete agent turn: provider → tools → prompt → pipeline → Agent.
 
@@ -4802,7 +4835,7 @@ class TurnRunner:
                 ctx.surfaced_tools.add("meta_invoke")
             else:
                 ctx.denied_tools.add("meta_invoke")
-            if bool(getattr(self._config, "submit_review_enabled", False)):
+            if _resolve_submit_review(self._config):
                 if ctx.surfaced_tools is None:
                     ctx.surfaced_tools = set()
                 ctx.surfaced_tools.add("submit")
