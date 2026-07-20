@@ -327,6 +327,47 @@ async def test_explicit_submit_returns_checklist_then_confirms(tmp_path) -> None
 
 
 @pytest.mark.asyncio
+async def test_confirming_submit_terminates_the_turn(tmp_path) -> None:
+    ws = tmp_path / "ws"
+    _init_git_workspace(ws)
+    runtime_events_path = tmp_path / "runtime_events.jsonl"
+    # edit -> submit (checklist) -> edit (acts on the checklist) -> submit
+    # (confirm). The confirming submit must end the turn on the current diff, so
+    # the trailing scripted ("final",) call is never requested. A run that did
+    # not terminate would fall through to it and make five provider calls.
+    provider = _ScriptedProvider(
+        [("edit", "src.py"), ("submit",), ("edit", "src.py"), ("submit",), ("final",)]
+    )
+    tool_context = ToolContext(workspace_dir=str(ws))
+    agent = Agent(
+        provider=provider,
+        config=_config(tmp_path, runtime_events_path=str(runtime_events_path)),
+        tool_handler=_make_tool_handler(ws, tool_context),
+        tool_context=tool_context,
+    )
+
+    events = [event async for event in agent.run_turn("Fix the bug")]
+
+    # Four provider calls, not five: the confirming submit terminated the turn
+    # before the scripted final text could be reached.
+    assert len(provider.calls) == 4
+    submit_results = _submit_results(events)
+    assert len(submit_results) == 2
+    assert submit_results[0].result.startswith("[Submit review]")
+    assert "Submission received" in submit_results[1].result
+    # The implicit gate never fired; the explicit confirm owned the finish.
+    assert _review_warnings(events) == []
+    assert "submit_review_implicit_recoveries" not in agent.config.metadata
+
+    logged = [json.loads(line) for line in runtime_events_path.read_text().splitlines()]
+    explicit = [event for event in logged if event.get("name") == "submit_review.explicit"]
+    assert [event["reason"] for event in explicit] == ["show_checklist", "confirm"]
+    # Only the confirming submit carries the terminate flag.
+    assert explicit[0]["details"]["terminates_turn"] is False
+    assert explicit[-1]["details"]["terminates_turn"] is True
+
+
+@pytest.mark.asyncio
 async def test_implicit_review_suppressed_by_unresolved_red_evidence(tmp_path) -> None:
     ws = tmp_path / "ws"
     _init_git_workspace(ws)

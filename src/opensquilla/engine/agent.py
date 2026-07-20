@@ -8257,6 +8257,16 @@ class Agent:
                             submit_content = submit_review_empty_diff_note()
                         else:
                             submit_content = submit_review_confirmation_message()
+                        # A confirming submit finalizes the turn: the model has
+                        # cleared the review handshake and asked to submit, so its
+                        # current workspace changes become the final answer and the
+                        # loop ends here — the same outcome as the model going quiet
+                        # with a non-empty diff. Ending on confirm (rather than
+                        # replying and looping) is what makes a repeated submit
+                        # unable to re-enter this branch, so the confirmed state can
+                        # never re-fire. The checklist/nudge/empty-diff replies keep
+                        # the turn open so the model can act on them.
+                        submit_terminates_turn = submit_action is SubmitAction.CONFIRM
                         self._record_runtime_event(
                             "submit_review.explicit",
                             feature="submit_review",
@@ -8272,6 +8282,7 @@ class Agent:
                                     submit_diff_text,
                                     submit_review_diff_max_chars,
                                 ),
+                                "terminates_turn": submit_terminates_turn,
                             },
                         )
                         results_by_id[tc.tool_use_id] = ToolResult(
@@ -8279,6 +8290,7 @@ class Agent:
                             tool_name="submit",
                             content=submit_content,
                             is_error=False,
+                            terminates_turn=submit_terminates_turn,
                         )
                         continue
                     if tc.tool_name == "meta_invoke":
