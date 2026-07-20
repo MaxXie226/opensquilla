@@ -4828,6 +4828,7 @@ class TurnRunner:
             and not getattr(skill, "disable_model_invocation", False)
             for skill in loaded_skills
         )
+        submit_review_enabled = _resolve_submit_review(self._config)
         if ctx is not None:
             if meta_skill_enabled and meta_auto_trigger and has_invokable_meta_skill:
                 if ctx.surfaced_tools is None:
@@ -4835,7 +4836,7 @@ class TurnRunner:
                 ctx.surfaced_tools.add("meta_invoke")
             else:
                 ctx.denied_tools.add("meta_invoke")
-            if _resolve_submit_review(self._config):
+            if submit_review_enabled:
                 if ctx.surfaced_tools is None:
                     ctx.surfaced_tools = set()
                 ctx.surfaced_tools.add("submit")
@@ -4863,6 +4864,15 @@ class TurnRunner:
                     hard_denied=None,
                 )
             ctx = self._apply_runtime_capability_denies(ctx)
+            # Surfacing (surfaced_tools) lifts the exposed_by_default gate but,
+            # by design, does NOT relax the allowed_tools allowlist (see
+            # ToolContext.surfaced_tools). When submit-review is enabled the
+            # active profile allowlist (e.g. repo_coding_scaffold_edit) omits
+            # "submit", so surfacing alone left it filtered as not_allowed and
+            # the tool never reached the provider schema. Add it to the
+            # allowlist here so the surfaced tool is actually exposed.
+            if submit_review_enabled and ctx.allowed_tools is not None:
+                ctx.allowed_tools = set(ctx.allowed_tools) | {"submit"}
             from opensquilla.tools.policy_config import coding_mode_denied_tools
 
             skills_cfg = getattr(self._config, "skills", None)
