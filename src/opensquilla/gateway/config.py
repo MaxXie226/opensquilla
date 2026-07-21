@@ -480,7 +480,11 @@ class LlmEnsembleConfig(BaseSettings):
     # Expose tool schemas to proposers as advisory vocabulary only. Proposer
     # output is never dispatched; only the aggregator owns an executable tool
     # boundary.
-    ranking_user_profile_enabled: bool = True
+    # User-profile generation and application are independent, opt-in parts of
+    # router_dynamic. Other ensemble modes neither generate nor consume it.
+    ranking_user_profile_generation_enabled: bool = False
+    # Kept under its existing name for explicit-config compatibility.
+    ranking_user_profile_enabled: bool = False
     proposer_tools: bool = False
     aggregator_tools: bool = True
     min_successful_proposers: int = Field(default=1, ge=1)
