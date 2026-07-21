@@ -79,6 +79,7 @@ function panel(overrides: Record<string, unknown> = {}) {
       activeModel: 'deepseek/deepseek-v4-pro',
       selectionMode: 'custom_b5',
       scheme: 'custom',
+      legacyMigratable: false,
       schemeCardsAvailable: true,
       modelOptions: [],
       candidates: [],
@@ -1020,6 +1021,7 @@ describe('SetupModelStrategyPanel', () => {
           enabled: true,
           selectionMode: 'router_dynamic',
           scheme: 'legacy',
+          legacyMigratable: true,
           schemeCardsAvailable: true,
           customCandidates: [
             sharedProposer,
@@ -1056,6 +1058,32 @@ describe('SetupModelStrategyPanel', () => {
     el.querySelector<HTMLButtonElement>('[data-testid="ensemble-migrate-legacy"]')?.click()
     await nextTick()
     expect(onMigrateEnsembleLegacy).toHaveBeenCalledOnce()
+
+    app.unmount()
+  })
+
+  it('shows the tree baseline as config-only and offers no migration action', async () => {
+    const onMigrateEnsembleLegacy = vi.fn()
+    const { app, el } = await mountPanel(
+      {
+        activeStrategy: 'ensemble',
+        ensemble: {
+          enabled: true,
+          selectionMode: 'router_tree_baseline',
+          scheme: 'legacy',
+          legacyMigratable: false,
+          schemeCardsAvailable: true,
+          customCandidates: [],
+        },
+      },
+      { onMigrateEnsembleLegacy },
+    )
+
+    const banner = el.querySelector('[data-testid="ensemble-legacy-banner"]')
+    expect(banner?.textContent).toContain('router_tree_baseline')
+    expect(el.querySelector('[data-testid="ensemble-migrate-legacy"]')).toBeNull()
+    expect(el.querySelector('[data-testid="ensemble-scheme-preset"]')).toBeNull()
+    expect(onMigrateEnsembleLegacy).not.toHaveBeenCalled()
 
     app.unmount()
   })

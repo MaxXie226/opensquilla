@@ -595,6 +595,11 @@ def _rollup_cost_source(rows: Sequence[dict[str, Any]]) -> str:
         return "provider_billed"
     if billed:
         return "mixed"
+    meaningful = sources - {"none", "unavailable"}
+    if len(sources) == 1 and len(meaningful) == 1:
+        return next(iter(meaningful))
+    if meaningful:
+        return "mixed"
     return "none"
 
 
@@ -1893,7 +1898,9 @@ class EnsembleProvider:
             fallback_reason=reason,
             final_request_role="fallback_single",
             selected_candidates=[candidate for candidate in candidates if candidate.ok],
-            final_request_model=_provider_model_id(self.fallback_provider),
+            final_request_model=(
+                self.fallback_model or _provider_model_id(self.fallback_provider)
+            ),
             final_request_config=fallback_config,
             final_request_tools=tools,
             final_request_messages=messages,
@@ -1939,19 +1946,27 @@ class EnsembleProvider:
                         or getattr(self.fallback_provider, "provider_name", "fallback")
                     )
                     executed_model = event.model or self.fallback_model
+                    configured_fallback_model = (
+                        self.fallback_model
+                        or _provider_model_id(self.fallback_provider)
+                        or executed_model
+                    )
+                    # ``final_request.execution.model`` is the configured model
+                    # identity used for feedback attribution.  Do not replace it
+                    # with a provider-reported alias/snapshot; the latter already
+                    # lives in ``final_request.usage.model`` and the DoneEvent.
                     final_request = trace.get("final_request")
                     if isinstance(final_request, dict):
                         execution = final_request.get("execution")
                         if isinstance(execution, dict):
                             execution["provider"] = executed_provider
-                            execution["model"] = executed_model
                     fallback_row = _done_usage_row(
                         event,
                         role="fallback_single",
                         profile=self.profile_name,
                         label="fallback",
                         provider=executed_provider,
-                        model=executed_model,
+                        model=configured_fallback_model,
                     )
                     rows = [*proposer_rows, fallback_row]
                     yield replace(

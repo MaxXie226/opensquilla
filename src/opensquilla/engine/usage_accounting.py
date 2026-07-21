@@ -533,27 +533,32 @@ def _item_from_row(
         else row.get("cached_tokens")
     )
     cache_write_tokens = _usage_int(row.get("cache_write_tokens"))
-    billed = _usage_float(row.get("billed_cost"))
+    reported_source = str(row.get("cost_source") or "none").strip().lower()
+    reported_billed = _usage_float(row.get("billed_cost"))
     receipt = _coerce_billing_receipt(row.get("billing_receipt"))
-    row_source = str(row.get("cost_source") or "none").strip().lower()
     receipt_pending = receipt is not None and receipt.status == "pending"
     confirmed_receipt = receipt is not None and receipt.status == "confirmed"
-    # Explicit source retains compatibility with provider adapters and test
-    # doubles that have not yet attached the additive receipt object. Amount is
-    # only the final legacy fallback; confirmed zero relies on source/receipt.
-    provider_billed = (
+    # Explicitly unverified/BYOK sources must never enter the exact billed
+    # bucket merely because they contain a positive provider-reported number.
+    # Preserve compatibility only for legacy rows that carry no source marker.
+    legacy_implicit_bill = (
+        reported_source in {"", "none", "unavailable"}
+        and reported_billed > 0.0
+    )
+    trusted_provider_bill = (
         not receipt_pending
         and (
             confirmed_receipt
-            or row_source in {"provider_billed", "openrouter_usage"}
-            or billed > 0.0
+            or reported_source in {"provider_billed", "openrouter_usage"}
+            or legacy_implicit_bill
         )
     )
+    billed = reported_billed if trusted_provider_bill else 0.0
 
     estimate_usd = 0.0
     estimate_basis: str | None = None
     price_source: str | None = None
-    if not provider_billed:
+    if not trusted_provider_bill and reported_source != "free":
         resolved = resolve_model_price(model, provider)
         estimate = estimate_cost(
             input_tokens=input_tokens,
@@ -570,20 +575,20 @@ def _item_from_row(
         max(0, int(receipt.usd_equivalent_nanos or 0))
         if confirmed_receipt and receipt is not None
         else usd_to_nanos(billed)
-        if provider_billed
+        if trusted_provider_bill
         else 0
     )
     estimated_nanos = usd_to_nanos(estimate_usd)
-    if provider_billed and estimated_nanos:
-        source = "mixed"
-    elif provider_billed:
+    if trusted_provider_bill:
+        # Explicit zero-dollar receipts are still exact.  Do not replace them
+        # with a list-price estimate merely because ``billed_cost`` is zero.
         source = "provider_billed"
     elif estimated_nanos:
         source = "opensquilla_estimate"
     elif estimate_basis == "free":
         source = "free"
     else:
-        source = str(row.get("cost_source") or "unavailable")
+        source = reported_source or "unavailable"
         if source == "none":
             source = "unavailable"
 
@@ -660,16 +665,23 @@ def normalize_provider_usage(
     billed_nanos = sum(item.billed_cost_nanos for item in items)
     estimated_nanos = sum(item.estimated_cost_nanos for item in items)
     item_sources = {item.cost_source for item in items}
-    has_billed = "provider_billed" in item_sources
-    has_estimated = bool(item_sources & {"opensquilla_estimate", "mixed"})
-    has_unavailable = "unavailable" in item_sources
-    if "mixed" in item_sources or has_billed and (has_estimated or has_unavailable):
+    known_sources = item_sources & {
+        "provider_billed",
+        "opensquilla_estimate",
+        "free",
+    }
+    has_unknown_source = bool(item_sources - known_sources)
+    if has_unknown_source and known_sources:
         cost_source = "mixed"
-    elif has_billed:
+    elif has_unknown_source:
+        cost_source = "unavailable"
+    elif len(known_sources) > 1:
+        cost_source = "mixed"
+    elif known_sources == {"provider_billed"}:
         cost_source = "provider_billed"
-    elif has_estimated:
+    elif known_sources == {"opensquilla_estimate"}:
         cost_source = "opensquilla_estimate"
-    elif items and all(item.cost_source == "free" for item in items):
+    elif known_sources == {"free"}:
         cost_source = "free"
     else:
         cost_source = "unavailable"

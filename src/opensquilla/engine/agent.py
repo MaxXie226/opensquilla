@@ -95,6 +95,7 @@ from opensquilla.engine.tool_token_estimate import estimate_tokens as get_approx
 from opensquilla.engine.usage import model_usage_cost_fields
 from opensquilla.engine.usage_accounting import (
     UsageAccountingScope,
+    UsageCallResult,
     UsageCallStart,
     UsageEventSink,
     UsageExecutionContext,
@@ -600,41 +601,86 @@ def _with_model_usage_cost_fields(rows: list[dict[str, Any]]) -> list[dict[str, 
         item = dict(row)
         model_id = str(item.get("model") or "")
         if model_id:
+            provider_cost_source = str(
+                item.get("cost_source") or item.get("costSource") or "none"
+            ).strip().lower()
+            reported_billed_cost = _usage_float(
+                item.get("billed_cost")
+                or item.get("billedCost")
+                or item.get("billed_cost_usd")
+                or item.get("billedCostUsd")
+            )
+            usage_receipt = item.get(
+                "billing_receipt",
+                item.get("billingReceipt"),
+            )
+            if isinstance(usage_receipt, dict):
+                receipt_status = str(
+                    usage_receipt.get("status") or ""
+                ).strip().lower()
+            else:
+                receipt_status = str(
+                    getattr(usage_receipt, "status", "") or ""
+                ).strip().lower()
+            legacy_implicit_bill = (
+                provider_cost_source in {"", "none", "unavailable"}
+                and reported_billed_cost > 0.0
+            )
+            has_billed_receipt = (
+                receipt_status == "confirmed"
+                or provider_cost_source in {"provider_billed", "openrouter_usage"}
+                or legacy_implicit_bill
+            )
+            trusted_billed_cost = (
+                reported_billed_cost if has_billed_receipt else 0.0
+            )
             cache_read = (
                 item.get("cache_read_tokens")
                 if "cache_read_tokens" in item
                 else item.get("cached_tokens")
             )
-            item.update(
-                model_usage_cost_fields(
-                    model_id=model_id,
-                    provider=str(item.get("provider") or ""),
-                    input_tokens=_usage_int(item.get("input_tokens") or item.get("inputTokens")),
-                    output_tokens=_usage_int(
-                        item.get("output_tokens") or item.get("outputTokens")
-                    ),
-                    billed_cost=_usage_float(
-                        item.get("billed_cost")
-                        or item.get("billedCost")
-                        or item.get("billed_cost_usd")
-                        or item.get("billedCostUsd")
-                    ),
-                    # Unbilled rows must be priced with their own cache counts,
-                    # not cache-blind — otherwise the legacy-inference path in
-                    # model_usage_cost_fields treats every cache token as fresh
-                    # input while still labeling the estimate "cache_aware".
-                    cache_read_tokens=_usage_int(cache_read or 0),
-                    cache_write_tokens=_usage_int(item.get("cache_write_tokens") or 0),
-                    has_billed_receipt=(
-                        True
-                        if str(
-                            item.get("cost_source") or item.get("costSource") or ""
-                        ).strip().lower()
-                        in {"provider_billed", "openrouter_usage"}
-                        else None
-                    ),
-                )
+            cost_fields = model_usage_cost_fields(
+                model_id=model_id,
+                provider=str(item.get("provider") or ""),
+                input_tokens=_usage_int(item.get("input_tokens") or item.get("inputTokens")),
+                output_tokens=_usage_int(
+                    item.get("output_tokens") or item.get("outputTokens")
+                ),
+                billed_cost=trusted_billed_cost,
+                # Unbilled rows must be priced with their own cache counts,
+                # not cache-blind — otherwise the legacy-inference path in
+                # model_usage_cost_fields treats every cache token as fresh
+                # input while still labeling the estimate "cache_aware".
+                cache_read_tokens=_usage_int(cache_read or 0),
+                cache_write_tokens=_usage_int(item.get("cache_write_tokens") or 0),
+                has_billed_receipt=True if has_billed_receipt else None,
             )
+            if has_billed_receipt and reported_billed_cost <= 0.0:
+                # An explicit zero-cost provider receipt is exact; list pricing
+                # must not turn it into an estimate.
+                cost_fields.update(
+                    {
+                        "costUsd": 0.0,
+                        "cost_usd": 0.0,
+                        "billedCostUsd": 0.0,
+                        "billed_cost_usd": 0.0,
+                        "estimatedCostUsd": 0.0,
+                        "estimated_cost_usd": 0.0,
+                        "costSource": "provider_billed",
+                        "cost_source": "provider_billed",
+                        "estimateBasis": None,
+                        "estimate_basis": None,
+                        "priceSource": None,
+                        "price_source": None,
+                    }
+                )
+            item.update(cost_fields)
+            # Keep canonical billed fields trustworthy.  Raw positive numbers
+            # from BYOK/unverified responses are evidence, not a bill, and
+            # must not be re-summed into a later provider-billed envelope.
+            item["provider_reported_billed_cost"] = reported_billed_cost
+            item["billed_cost"] = trusted_billed_cost
+            item["provider_cost_source"] = provider_cost_source
         enriched.append(item)
     return enriched
 
@@ -4351,6 +4397,7 @@ class Agent:
             *,
             default_provider: str,
             default_model: str,
+            normalized_usage: UsageCallResult | None = None,
         ) -> None:
             nonlocal total_cost_usd_accum
             nonlocal total_cost_usd_accum_has_billed
@@ -4358,7 +4405,7 @@ class Agent:
 
             if not turn_cost_budget_enabled:
                 return
-            budget_usage = normalize_provider_usage(
+            budget_usage = normalized_usage or normalize_provider_usage(
                 event,
                 default_provider=default_provider,
                 default_model=default_model,
@@ -4891,6 +4938,7 @@ class Agent:
                     attempt_reasoning_stream_chars = 0
                     provider_done_for_log: ProviderDoneEvent | None = None
                     provider_error_for_log: ProviderErrorEvent | None = None
+                    provider_error_usage_for_log: dict[str, Any] | None = None
                     cost_receipt_counted = False
                     call_id = f"{iterations}.{_call_attempt}"
                     call_started_at = time.monotonic()
@@ -5574,7 +5622,14 @@ class Agent:
                                 iter_reasoning_tokens = raw_ev.reasoning_tokens
                                 iter_reasoning_content = raw_ev.reasoning_content
                                 iter_thinking_signature = raw_ev.thinking_signature
-                                total_billed_cost += raw_ev.billed_cost
+                                raw_cost_source = str(
+                                    getattr(raw_ev, "cost_source", "none") or "none"
+                                ).strip().lower()
+                                trusted_billed_cost = (
+                                    raw_ev.billed_cost
+                                    if raw_cost_source == "provider_billed"
+                                    else 0.0
+                                )
                                 total_input_tokens += raw_ev.input_tokens
                                 total_output_tokens += raw_ev.output_tokens
                                 total_reasoning_tokens += raw_ev.reasoning_tokens
@@ -5613,6 +5668,7 @@ class Agent:
                                         }
                                     ]
                                 )
+                                trusted_billed_cost = 0.0
                                 for usage_source_row in usage_source_rows:
                                     usage_source = str(
                                         usage_source_row.get("cost_source")
@@ -5631,7 +5687,7 @@ class Agent:
                                         receipt_status = str(
                                             getattr(usage_receipt, "status", "") or ""
                                         ).strip().lower()
-                                    legacy_billed_cost = _usage_float(
+                                    reported_row_cost = _usage_float(
                                         usage_source_row.get(
                                             "billed_cost",
                                             usage_source_row.get("billedCost", 0.0),
@@ -5640,7 +5696,8 @@ class Agent:
                                     if usage_source == "mixed":
                                         total_provider_billed_entries += 1
                                         total_unbilled_entries += 1
-                                    elif (
+                                        continue
+                                    trusted_row = (
                                         usage_source in {
                                             "provider_billed",
                                             "openrouter_usage",
@@ -5648,13 +5705,18 @@ class Agent:
                                         or receipt_status == "confirmed"
                                         # Compatibility bridge for adapters and
                                         # test doubles predating native receipts.
-                                        # Zero remains ambiguous and therefore
-                                        # requires an explicit source/receipt.
-                                        or legacy_billed_cost > 0.0
-                                    ):
+                                        or (
+                                            usage_source
+                                            in {"", "none", "unavailable"}
+                                            and reported_row_cost > 0.0
+                                        )
+                                    )
+                                    if trusted_row:
                                         total_provider_billed_entries += 1
+                                        trusted_billed_cost += reported_row_cost
                                     else:
                                         total_unbilled_entries += 1
+                                total_billed_cost += trusted_billed_cost
                                 _accumulate_turn_cost(
                                     raw_ev,
                                     default_provider=executed_provider_id,
@@ -5702,8 +5764,15 @@ class Agent:
                                                 cache_write_tokens=_usage_int(
                                                     usage_row.get("cache_write_tokens") or 0
                                                 ),
-                                                billed_cost=_usage_float(
-                                                    usage_row.get("billed_cost") or 0.0
+                                                billed_cost=(
+                                                    _usage_float(
+                                                        usage_row.get("billed_cost") or 0.0
+                                                    )
+                                                    if str(
+                                                        usage_row.get("cost_source") or "none"
+                                                    ).strip().lower()
+                                                    == "provider_billed"
+                                                    else 0.0
                                                 ),
                                                 provider=str(
                                                     usage_row.get("provider")
@@ -5724,7 +5793,7 @@ class Agent:
                                             model_id=physical_usage_model,
                                             cache_read_tokens=raw_ev.cached_tokens,
                                             cache_write_tokens=raw_ev.cache_write_tokens,
-                                            billed_cost=raw_ev.billed_cost,
+                                            billed_cost=trusted_billed_cost,
                                             provider=executed_provider_id,
                                             cost_source=getattr(raw_ev, "cost_source", "none"),
                                         )
@@ -5749,26 +5818,130 @@ class Agent:
                                     usage_call_terminal = True
                                     await self._usage_call_finalize(usage_call, raw_ev)
                                 if known_usage_receipt and not cost_receipt_counted:
+                                    error_default_provider = (
+                                        usage_call.provider
+                                        if usage_call is not None
+                                        else str(
+                                            self.config.provider_id
+                                            or getattr(self.provider, "provider_name", "")
+                                            or ""
+                                        )
+                                    )
+                                    error_default_model = (
+                                        usage_call.model
+                                        if usage_call is not None
+                                        else str(self.config.model_id or "")
+                                    )
+                                    error_rows = [
+                                        dict(usage_row)
+                                        for usage_row in raw_ev.model_usage_breakdown
+                                        if isinstance(usage_row, dict)
+                                    ]
+                                    normalized_error_usage = normalize_provider_usage(
+                                        raw_ev,
+                                        default_provider=error_default_provider,
+                                        default_model=error_default_model,
+                                        completed_at_ms=0,
+                                    )
+                                    total_input_tokens += normalized_error_usage.input_tokens
+                                    total_output_tokens += normalized_error_usage.output_tokens
+                                    total_reasoning_tokens += (
+                                        normalized_error_usage.reasoning_tokens
+                                    )
+                                    total_cached_tokens += (
+                                        normalized_error_usage.cache_read_tokens
+                                    )
+                                    total_cache_write_tokens += (
+                                        normalized_error_usage.cache_write_tokens
+                                    )
+                                    total_billed_cost += (
+                                        normalized_error_usage.billed_cost_nanos
+                                        / 1_000_000_000
+                                    )
+                                    turn_model_usage_breakdown.extend(error_rows)
+                                    if error_rows:
+                                        last_error_row = error_rows[-1]
+                                        last_actual_model = str(
+                                            last_error_row.get("model")
+                                            or error_default_model
+                                        )
+                                        last_actual_provider = str(
+                                            last_error_row.get("provider")
+                                            or error_default_provider
+                                        )
+                                    if self._usage_tracker and self._session_key:
+                                        for usage_row in error_rows:
+                                            cache_read = (
+                                                usage_row.get("cache_read_tokens")
+                                                if "cache_read_tokens" in usage_row
+                                                else usage_row.get("cached_tokens")
+                                            )
+                                            self._usage_tracker.add(
+                                                self._session_key,
+                                                input_tokens=_usage_int(
+                                                    usage_row.get("input_tokens") or 0
+                                                ),
+                                                output_tokens=_usage_int(
+                                                    usage_row.get("output_tokens") or 0
+                                                ),
+                                                model_id=str(
+                                                    usage_row.get("model")
+                                                    or error_default_model
+                                                ),
+                                                cache_read_tokens=_usage_int(cache_read or 0),
+                                                cache_write_tokens=_usage_int(
+                                                    usage_row.get("cache_write_tokens") or 0
+                                                ),
+                                                billed_cost=(
+                                                    _usage_float(
+                                                        usage_row.get("billed_cost") or 0.0
+                                                    )
+                                                    if str(
+                                                        usage_row.get("cost_source") or "none"
+                                                    ).strip().lower()
+                                                    == "provider_billed"
+                                                    else 0.0
+                                                ),
+                                                provider=str(
+                                                    usage_row.get("provider")
+                                                    or error_default_provider
+                                                ),
+                                            )
+                                    provider_error_usage_for_log = {
+                                        "provider": error_default_provider,
+                                        "model": last_actual_model or error_default_model,
+                                        "input_tokens": normalized_error_usage.input_tokens,
+                                        "output_tokens": normalized_error_usage.output_tokens,
+                                        "reasoning_tokens": (
+                                            normalized_error_usage.reasoning_tokens
+                                        ),
+                                        "cached_tokens": (
+                                            normalized_error_usage.cache_read_tokens
+                                        ),
+                                        "cache_write_tokens": (
+                                            normalized_error_usage.cache_write_tokens
+                                        ),
+                                        "billed_cost": (
+                                            normalized_error_usage.billed_cost_nanos
+                                            / 1_000_000_000
+                                        ),
+                                        "estimated_cost_usd": (
+                                            normalized_error_usage.estimated_cost_nanos
+                                            / 1_000_000_000
+                                        ),
+                                        "cost_usd": (
+                                            normalized_error_usage.billed_cost_nanos
+                                            + normalized_error_usage.estimated_cost_nanos
+                                        )
+                                        / 1_000_000_000,
+                                        "cost_source": normalized_error_usage.cost_source,
+                                        "model_usage_breakdown": error_rows,
+                                    }
                                     _accumulate_turn_cost(
                                         raw_ev,
-                                        default_provider=(
-                                            usage_call.provider
-                                            if usage_call is not None
-                                            else str(
-                                                self.config.provider_id
-                                                or getattr(
-                                                    self.provider,
-                                                    "provider_name",
-                                                    "",
-                                                )
-                                                or ""
-                                            )
-                                        ),
-                                        default_model=(
-                                            usage_call.model
-                                            if usage_call is not None
-                                            else str(self.config.model_id or "")
-                                        ),
+                                        default_provider=error_default_provider,
+                                        default_model=error_default_model,
+                                        normalized_usage=normalized_error_usage,
                                     )
                                     cost_receipt_counted = True
                                 # One-shot thinking/reasoning fallback
@@ -5897,6 +6070,13 @@ class Agent:
                                 or ""
                             ),
                         }
+                        provider_usage = getattr(
+                            provider_done_for_log,
+                            "provider_usage",
+                            None,
+                        )
+                        if isinstance(provider_usage, dict):
+                            usage_payload["provider_usage"] = dict(provider_usage)
                         response_payload["usage"] = usage_payload
                         model_usage_breakdown = getattr(
                             provider_done_for_log,
@@ -5909,6 +6089,8 @@ class Agent:
                         if ensemble_trace:
                             response_payload["ensemble_trace"] = ensemble_trace
                     if provider_error_for_log is not None:
+                        if provider_error_usage_for_log is not None:
+                            response_payload["usage"] = provider_error_usage_for_log
                         response_payload["error"] = {
                             "message": provider_error_for_log.message,
                             "code": provider_error_for_log.code,
