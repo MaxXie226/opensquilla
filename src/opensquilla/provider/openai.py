@@ -273,6 +273,13 @@ def _is_inert_post_terminal_stream_frame(
     if usage_present and not has_usage and not has_null_usage_noop:
         return False
 
+    # OpenRouter attaches routing/billing evidence to its final usage trailer.
+    if (
+        "openrouter_metadata" in chunk
+        and not isinstance(chunk["openrouter_metadata"], Mapping)
+    ):
+        return False
+
     if not raw_choices:
         return has_usage
     if not policy.allow_post_terminal_noop_choice or len(raw_choices) != 1:
@@ -1835,9 +1842,13 @@ def _mark_stream_fallback_cost_unknown(
     The abandoned stream may still be billed even when it returned no usable
     usage payload. Marking the successful fallback as mixed prevents strict
     benchmark accounting from treating two physical requests as one exact
-    request.
+    request. An exact provider billing receipt is the exception: it is
+    authoritative evidence for the completed fallback and must remain usable
+    as an exact billed result.
     """
     if not isinstance(event, DoneEvent):
+        return event
+    if event.billing_receipt is not None:
         return event
     known_rows = list(event.model_usage_breakdown or [])
     if not known_rows:
