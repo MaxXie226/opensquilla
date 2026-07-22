@@ -2232,7 +2232,7 @@ def test_b2_provider_alignment_pins_effective_member_configuration() -> None:
         fallback_provider=None,
     )
     assert provider.min_successful_proposers == 3
-    assert provider.quorum_grace_seconds == 5.0
+    assert provider.quorum_grace_seconds == 10.0
 
     provider = runner.align_b2_provider_to_g12(provider, _experiment_config())
 
