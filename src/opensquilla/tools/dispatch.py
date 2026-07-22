@@ -445,6 +445,7 @@ def _record_invalid_tool_arguments_event(
     required: list[str] | None = None,
     errors: list[str] | None = None,
     shape_guidance_enabled: bool | None = None,
+    example_guidance_emitted: bool | None = None,
 ) -> None:
     if effective_ctx is None or effective_ctx.on_runtime_event is None:
         return
@@ -470,6 +471,8 @@ def _record_invalid_tool_arguments_event(
         event["errors"] = errors
     if shape_guidance_enabled is not None:
         event["shape_guidance_enabled"] = shape_guidance_enabled
+    if example_guidance_emitted is not None:
+        event["example_guidance_emitted"] = example_guidance_emitted
     try:
         effective_ctx.on_runtime_event(event)
     except Exception:
@@ -884,6 +887,13 @@ def _check_schema_valid_arguments(
         f"schema: {'; '.join(errors[:5])}. Reissue the tool call with corrected "
         "JSON arguments."
     )
+    guidance = _invalid_argument_guidance(
+        tool_call.tool_name,
+        missing=[],
+        effective_ctx=effective_ctx,
+    )
+    if guidance:
+        user_message = f"{user_message}{guidance}"
     log.warning(
         "dispatch.invalid_tool_arguments",
         tool=tool_call.tool_name,
@@ -893,12 +903,14 @@ def _check_schema_valid_arguments(
         reason="schema_validation_failed",
         errors=errors[:5],
         argument_keys=sorted(str(name) for name in tool_call.arguments if str(name)),
+        example_guidance_emitted=bool(guidance),
     )
     _record_invalid_tool_arguments_event(
         effective_ctx,
         tool_call,
         reason="schema_validation_failed",
         errors=errors[:5],
+        example_guidance_emitted=bool(guidance),
     )
     return _build_invalid_attempt_result(
         tool_call,

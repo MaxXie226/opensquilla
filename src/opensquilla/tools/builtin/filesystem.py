@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import csv
+import difflib
 import fnmatch
 import hashlib
 import json
@@ -2519,11 +2520,22 @@ def _apply_edit_replacements(
                 path=path,
             )
             if recovered is None:
+                hint = _edit_file_closest_lines_hint(replacement.old_text, original)
+                if hint:
+                    _record_edit_recovery_event(
+                        name="edit_file.no_match_hint",
+                        path=path,
+                        replacement=replacement,
+                        outcome="hint",
+                        reason="closest_lines",
+                        matches=hint.count("\n---\n") + 1,
+                    )
                 raise RetryableToolInputError(
                     f"edit_file could not find {replacement.label} in {path}. "
                     "Read the current file content, then retry with exact text from that file. "
                     "Do not include read_file line-number prefixes like '12\\t', "
                     f"{_edit_file_retry_guidance()}"
+                    f"{hint}"
                 )
             start, end, replacement_text = recovered
             spans.append((start, end, replacement_text, replacement))
@@ -2758,6 +2770,85 @@ def _unescape_edit_search_text(value: str) -> str:
         output.append(replacement)
         index += 2
     return "".join(output)
+
+
+_EDIT_HINT_MAX_CHARS = 1200
+_EDIT_HINT_MAX_LINE_CHARS = 200
+
+
+def _edit_file_closest_lines_hint(
+    old_text: str,
+    original: str,
+    *,
+    context_lines: int = 2,
+    max_results: int = 3,
+) -> str:
+    """Build a "did you mean" hint for an edit_file exact-match failure.
+
+    Scores every non-blank source line against the first non-blank line of
+    ``old_text`` (difflib similarity) and returns up to ``max_results`` numbered,
+    context-padded snippets of the closest regions, or "" when nothing is close
+    enough. Only meant for the count==0 no-match path; the returned string is
+    already formatted for appending to the retry error (leading blank line and
+    header included). Output length is bounded so it never floods the turn.
+    """
+    if not old_text or not original:
+        return ""
+    old_lines = old_text.splitlines()
+    content_lines = original.splitlines()
+    if not old_lines or not content_lines:
+        return ""
+
+    anchor = ""
+    for line in old_lines:
+        if line.strip():
+            anchor = line.strip()
+            break
+    if not anchor:
+        return ""
+
+    matcher = difflib.SequenceMatcher(autojunk=False)
+    matcher.set_seq2(anchor)
+    scored: list[tuple[float, int]] = []
+    for i, line in enumerate(content_lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        matcher.set_seq1(stripped)
+        if matcher.real_quick_ratio() <= 0.3 or matcher.quick_ratio() <= 0.3:
+            continue
+        ratio = matcher.ratio()
+        if ratio > 0.3:
+            scored.append((ratio, i))
+    if not scored:
+        return ""
+    scored.sort(key=lambda item: (-item[0], item[1]))
+
+    parts: list[str] = []
+    seen_ranges: set[tuple[int, int]] = set()
+    for _ratio, line_idx in scored:
+        if len(parts) >= max_results:
+            break
+        start = max(0, line_idx - context_lines)
+        end = min(len(content_lines), line_idx + len(old_lines) + context_lines)
+        key = (start, end)
+        if key in seen_ranges:
+            continue
+        seen_ranges.add(key)
+        snippet_lines = []
+        for j in range(start, end):
+            text = content_lines[j]
+            if len(text) > _EDIT_HINT_MAX_LINE_CHARS:
+                text = text[:_EDIT_HINT_MAX_LINE_CHARS] + "…"
+            snippet_lines.append(f"{j + 1:4d}| {text}")
+        parts.append("\n".join(snippet_lines))
+    if not parts:
+        return ""
+
+    body = "\n---\n".join(parts)
+    if len(body) > _EDIT_HINT_MAX_CHARS:
+        body = body[:_EDIT_HINT_MAX_CHARS] + "\n… (truncated)"
+    return "\n\nDid you mean one of these sections?\n" + body
 
 
 def _record_edit_recovery_event(
