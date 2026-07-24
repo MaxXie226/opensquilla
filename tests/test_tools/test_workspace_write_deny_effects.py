@@ -31,6 +31,7 @@ _GUIDANCE_ENV = "OPENSQUILLA_WORKSPACE_WRITE_DENY_GUIDANCE"
 _HOST_SHELL_ENV = "OPENSQUILLA_WORKSPACE_WRITE_DENY_HOST_SHELL"
 _COMMAND_TARGETS_ENV = "OPENSQUILLA_WORKSPACE_WRITE_DENY_COMMAND_TARGETS"
 _INTERPRETER_TARGETS_ENV = "OPENSQUILLA_WORKSPACE_WRITE_DENY_INTERPRETER_TARGETS"
+_SANDBOX_FULL_HOST_ENV = "OPENSQUILLA_SANDBOX_DISABLED_FULL_HOST"
 _ALL_ENVS = (
     _EFFECT_ENV,
     _TRACKED_ONLY_ENV,
@@ -39,6 +40,7 @@ _ALL_ENVS = (
     _HOST_SHELL_ENV,
     _COMMAND_TARGETS_ENV,
     _INTERPRETER_TARGETS_ENV,
+    _SANDBOX_FULL_HOST_ENV,
 )
 
 # The deny glob list shipped by the SWE arm configs; the effect layer must
@@ -83,7 +85,10 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.fixture
-def effect_context(tmp_path: Path):
+def effect_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    # These policies run in deployments that disable the sandbox but opt out
+    # of the Full Host Access fallback; the fixture mirrors that setup.
+    monkeypatch.setenv(_SANDBOX_FULL_HOST_ENV, "off")
     reset_runtime()
     workspace = tmp_path / "workspace"
     workspace.mkdir()

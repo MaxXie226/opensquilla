@@ -2593,7 +2593,11 @@ def test_configured_hidden_scratch_diff_is_not_source_progress(tmp_path) -> None
 @pytest.mark.asyncio
 async def test_workspace_edit_gate_allows_real_configured_scratch_edit_file(
     tmp_path,
+    monkeypatch,
 ) -> None:
+    # Scratch write tracking is a workspace policy layer; opt out of the
+    # sandbox-disabled Full Host Access fallback so it stays active.
+    monkeypatch.setenv("OPENSQUILLA_SANDBOX_DISABLED_FULL_HOST", "off")
     workspace = tmp_path / "workspace"
     scratch = tmp_path / "scratch"
     workspace.mkdir()
@@ -3519,7 +3523,13 @@ async def test_workspace_edit_gate_preserves_source_tools_after_repeated_no_writ
 
 
 @pytest.mark.asyncio
-async def test_workspace_edit_gate_scratch_repro_does_not_clear_gate(tmp_path) -> None:
+async def test_workspace_edit_gate_scratch_repro_does_not_clear_gate(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    # Scratch write tracking is a workspace policy layer; opt out of the
+    # sandbox-disabled Full Host Access fallback so it stays active.
+    monkeypatch.setenv("OPENSQUILLA_SANDBOX_DISABLED_FULL_HOST", "off")
     workspace = tmp_path / "workspace"
     scratch = tmp_path / "scratch"
     workspace.mkdir()
