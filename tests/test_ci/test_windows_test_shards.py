@@ -125,6 +125,9 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_session/test_storage_transactions.py",
     "tests/test_session/test_turn_acceptance_storage.py",
     "tests/test_skills/test_hub_deps_subprocess.py",
+    "tests/test_envelope_policy_deny_cap.py",
+    "tests/test_request_proof_levers.py",
+    "tests/test_toolcomp_matcher_levers.py",
 }
 
 
