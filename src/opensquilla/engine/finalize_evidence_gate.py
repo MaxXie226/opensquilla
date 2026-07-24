@@ -1155,7 +1155,17 @@ class FinalizeEvidenceTracker:
 
 
 def finalize_evidence_gate_key(observation: FinalizeEvidenceObservation) -> str:
-    """Dedup key: the same unresolved red state never re-fires the gate."""
+    """Dedup key: the same unresolved red state never re-fires the gate.
+
+    The key is derived purely from the red *evidence* (reason, triggers, the
+    failing command and its exit code, failure anchors, and deleted-repro
+    paths). It deliberately excludes volatile progress counters such as
+    ``post_edit_execution_count``: once the caller has challenged a given red
+    state and recorded its key, running further commands that leave the same
+    evidence in place must not mint a fresh key and re-fire the challenge. This
+    is what makes the caller's ``keys.add(key)`` guard a genuine one-shot latch
+    per red state rather than a counter that quietly resets on every execution.
+    """
 
     payload = {
         "primary_reason": observation.primary_reason,
@@ -1164,7 +1174,6 @@ def finalize_evidence_gate_key(observation: FinalizeEvidenceObservation) -> str:
         "red_exit_code": observation.red_exit_code,
         "red_failure_anchors": observation.red_failure_anchors,
         "deleted_never_green_repro_paths": observation.deleted_never_green_repro_paths,
-        "post_edit_execution_count": observation.post_edit_execution_count,
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
@@ -1174,6 +1183,15 @@ _BINDING_SENTENCE = (
     "A failing reproduction or verification you ran yourself is binding evidence "
     "that the issue is not fixed yet; green results from other tests, builds, or "
     "suites do not override it."
+)
+
+# Model-visible one-shot contract. Paired with the caller's per-red-state latch
+# (see finalize_evidence_gate_key), this tells the model the check will not
+# repeat for the same failing state, so it should resolve or justify it now
+# instead of treating a recurring challenge as pressure to keep re-finalizing.
+_ONE_SHOT_NOTICE = (
+    " This evidence check is one-shot for this exact failing state: it will not "
+    "repeat for the same evidence, so resolve it or justify finishing now."
 )
 
 
@@ -1230,7 +1248,7 @@ def finalize_evidence_challenge_message(observation: FinalizeEvidenceObservation
             "use its output to revise the source fix and re-run until it passes. "
             "Only if the command itself is invalid (wrong path, stale script, or "
             "expectations that contradict the issue report) may you finish, and "
-            "then explicitly justify that in your final answer."
+            "then explicitly justify that in your final answer." + _ONE_SHOT_NOTICE
         )
     if reason == "never_green_repro_deleted":
         paths = ", ".join(observation.deleted_never_green_repro_paths[:3])
@@ -1241,7 +1259,7 @@ def finalize_evidence_challenge_message(observation: FinalizeEvidenceObservation
             f"observed. {_BINDING_SENTENCE} Do not finalize yet. Recreate or "
             "re-run a reproduction that follows the issue report against the "
             "current workspace state and confirm it passes; if it fails, use its "
-            "output to revise the source fix first."
+            "output to revise the source fix first." + _ONE_SHOT_NOTICE
         )
     return (
         "[Finalize evidence check]\n"
@@ -1249,5 +1267,5 @@ def finalize_evidence_challenge_message(observation: FinalizeEvidenceObservation
         "final source edit, so the patch you are shipping is unverified in its "
         "current state. Do not finalize yet. Re-run your reproduction of the "
         "issue, or the most relevant focused test, against the current workspace "
-        f"state and confirm it passes. {_BINDING_SENTENCE}"
+        f"state and confirm it passes. {_BINDING_SENTENCE}" + _ONE_SHOT_NOTICE
     )

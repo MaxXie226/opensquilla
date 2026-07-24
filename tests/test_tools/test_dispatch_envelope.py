@@ -222,6 +222,115 @@ async def test_dispatch_unknown_bash_tool_points_to_exec_command() -> None:
 
 
 @pytest.mark.asyncio
+async def test_dispatch_missing_tool_suggests_close_match_for_trusted_caller() -> None:
+    # A near-miss tool name (typo of a registered tool) should surface an
+    # advisory "did you mean" hint to a trusted caller plus a structured
+    # ``dispatch.registry_miss`` runtime event carrying the suggestions.
+    events: list[dict[str, object]] = []
+    handler = build_tool_handler(
+        _build_registry(),
+        ToolContext(
+            is_owner=True,
+            caller_kind=CallerKind.CLI,
+            agent_id="main",
+            session_key="cli:main:suggest",
+            on_runtime_event=events.append,
+        ),
+    )
+
+    result = await handler(
+        ToolCall(
+            tool_use_id="tc-suggest",
+            tool_name="requred_echo",
+            arguments={},
+        )
+    )
+
+    assert result.is_error is True
+    payload = json.loads(result.content)
+    assert payload["error_class"] == "ToolNotFound"
+    assert "Did you mean: required_echo?" in payload["user_message"]
+
+    miss_events = [e for e in events if e.get("name") == "dispatch.registry_miss"]
+    assert len(miss_events) == 1
+    event = miss_events[0]
+    assert event["tool_name"] == "requred_echo"
+    assert event["suggestions"] == ["required_echo"]
+    assert event["suggestion_emitted"] is True
+    assert event["untrusted_caller"] is False
+    assert event["executed"] is False
+
+
+@pytest.mark.asyncio
+async def test_dispatch_missing_tool_untrusted_caller_omits_suggestion() -> None:
+    # Untrusted CHANNEL callers must receive an opaque envelope that never
+    # echoes real tool names, so the "did you mean" hint is withheld and the
+    # runtime event records that nothing was suggested.
+    events: list[dict[str, object]] = []
+    handler = build_tool_handler(
+        _build_registry(),
+        ToolContext(
+            is_owner=False,
+            caller_kind=CallerKind.CHANNEL,
+            agent_id="chan",
+            session_key="chan:suggest",
+            on_runtime_event=events.append,
+        ),
+    )
+
+    result = await handler(
+        ToolCall(
+            tool_use_id="tc-untrusted",
+            tool_name="requred_echo",
+            arguments={},
+        )
+    )
+
+    assert result.is_error is True
+    payload = json.loads(result.content)
+    assert "required_echo" not in payload["user_message"]
+    assert "Did you mean" not in payload["user_message"]
+
+    miss_events = [e for e in events if e.get("name") == "dispatch.registry_miss"]
+    assert len(miss_events) == 1
+    event = miss_events[0]
+    assert event["untrusted_caller"] is True
+    assert event["suggestions"] == []
+    assert event["suggestion_emitted"] is False
+
+
+@pytest.mark.asyncio
+async def test_dispatch_unknown_bash_tool_omits_did_you_mean_suggestion() -> None:
+    # ``bash`` has a targeted exec_command redirect; it must not additionally
+    # accrue a generic "did you mean" hint even for a trusted caller.
+    events: list[dict[str, object]] = []
+    handler = build_tool_handler(
+        _build_registry(),
+        ToolContext(
+            is_owner=True,
+            caller_kind=CallerKind.CLI,
+            agent_id="main",
+            session_key="cli:main:bash",
+            on_runtime_event=events.append,
+        ),
+    )
+
+    result = await handler(
+        ToolCall(
+            tool_use_id="tc-bash-suggest",
+            tool_name="bash",
+            arguments={"cmd": "echo hi"},
+        )
+    )
+
+    payload = json.loads(result.content)
+    assert "Did you mean" not in payload["user_message"]
+    miss_events = [e for e in events if e.get("name") == "dispatch.registry_miss"]
+    assert len(miss_events) == 1
+    assert miss_events[0]["suggestions"] == []
+
+
+@pytest.mark.asyncio
 async def test_dispatch_tool_exception_envelope_is_canonical_five_key_shape() -> None:
     handler = build_tool_handler(_build_registry())
 

@@ -17,6 +17,7 @@ by every caller (gateway, CLI, cron, channel adapters). The pipeline is:
 from __future__ import annotations
 
 import asyncio
+import difflib
 import json
 import os
 import time
@@ -475,6 +476,55 @@ def _record_invalid_tool_arguments_event(
         event["example_guidance_emitted"] = example_guidance_emitted
     try:
         effective_ctx.on_runtime_event(event)
+    except Exception:
+        return
+
+
+def _closest_tool_names(
+    target: str,
+    candidates: list[str],
+    *,
+    limit: int = 3,
+    cutoff: float = 0.6,
+) -> list[str]:
+    """Return up to ``limit`` registered tool names closest to ``target``.
+
+    Used to offer an advisory "did you mean" hint on a registry miss so the
+    model can recover a mistyped or glued tool name instead of blindly
+    retrying an unavailable one. Pure stdlib difflib; returns an empty list
+    when nothing clears the similarity ``cutoff``.
+    """
+    if not target or not candidates:
+        return []
+    return difflib.get_close_matches(target, candidates, n=limit, cutoff=cutoff)
+
+
+def _record_registry_miss_event(
+    ctx: ToolContext | None,
+    tool_call: ToolCall,
+    *,
+    is_skill: bool,
+    untrusted: bool,
+    suggestions: list[str],
+) -> None:
+    if ctx is None or ctx.on_runtime_event is None:
+        return
+    event: dict[str, Any] = {
+        "feature": "tool_dispatch",
+        "name": "dispatch.registry_miss",
+        "tool": tool_call.tool_name,
+        "tool_name": tool_call.tool_name,
+        "tool_use_id": tool_call.tool_use_id,
+        "is_skill": is_skill,
+        "untrusted_caller": untrusted,
+        "suggestions": suggestions,
+        "suggestion_emitted": bool(suggestions),
+        "executed": False,
+        "agent_id": ctx.agent_id,
+        "session_key": ctx.session_key,
+    }
+    try:
+        ctx.on_runtime_event(event)
     except Exception:
         return
 
@@ -1011,9 +1061,18 @@ def _resolve_registry_miss(
     tool_call: ToolCall,
     known_skill_names: frozenset[str],
     ctx: ToolContext | None,
+    registry: ToolRegistry,
 ) -> ToolResult:
     untrusted = _is_untrusted_caller(ctx)
     is_skill = tool_call.tool_name in known_skill_names
+
+    # Advisory "did you mean" recovery hint. Only computed for trusted callers
+    # on the generic path: untrusted callers receive an opaque envelope (below)
+    # and must not be able to enumerate the catalogue, skills have their own
+    # redirect, and ``bash`` has a targeted exec_command redirect.
+    suggestions: list[str] = []
+    if not untrusted and not is_skill and tool_call.tool_name != "bash":
+        suggestions = _closest_tool_names(tool_call.tool_name, registry.list_names())
 
     # Always record the actual tool name in the structured log so operators
     # retain debug visibility regardless of what the caller is allowed to see.
@@ -1025,6 +1084,13 @@ def _resolve_registry_miss(
         untrusted_caller=untrusted,
         agent_id=ctx.agent_id if ctx else None,
         session_key=ctx.session_key if ctx else None,
+    )
+    _record_registry_miss_event(
+        ctx,
+        tool_call,
+        is_skill=is_skill,
+        untrusted=untrusted,
+        suggestions=suggestions,
     )
 
     if untrusted:
@@ -1063,6 +1129,8 @@ def _resolve_registry_miss(
             f"Tool not found: {tool_call.tool_name}. Do not retry unavailable tools; "
             "use only tools listed in Available Tools."
         )
+        if suggestions:
+            user_message += " Did you mean: " + ", ".join(suggestions) + "?"
     return _build_envelope_result(
         tool_call,
         exc=KeyError(tool_call.tool_name),
@@ -1087,7 +1155,7 @@ async def preflight_tool_call(
 
     registered = registry.get(tool_call.tool_name)
     if registered is None:
-        return _resolve_registry_miss(tool_call, known, ctx)
+        return _resolve_registry_miss(tool_call, known, ctx, registry)
 
     tool_call = _unwrap_nested_json_arguments(tool_call, registered, ctx)
     injection_envelope = _check_injection_guard(tool_call, ctx)
@@ -1216,7 +1284,7 @@ def build_tool_handler(
         # 2. Registry lookup.
         registered = registry.get(tool_call.tool_name)
         if registered is None:
-            return _resolve_registry_miss(tool_call, known, effective_ctx)
+            return _resolve_registry_miss(tool_call, known, effective_ctx, registry)
 
         tool_call = _unwrap_nested_json_arguments(tool_call, registered, effective_ctx)
         injection_envelope = _check_injection_guard(tool_call, effective_ctx)

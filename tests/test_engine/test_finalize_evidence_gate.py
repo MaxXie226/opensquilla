@@ -7,6 +7,8 @@ so these tests pin the exact detector semantics that both callers rely on.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from opensquilla.engine.finalize_evidence_gate import (
@@ -834,6 +836,42 @@ def test_gate_key_stable_for_same_state_and_distinct_for_new_red() -> None:
     third = _observation_with_red("pytest tests/test_b.py")
     assert finalize_evidence_gate_key(first) == finalize_evidence_gate_key(second)
     assert finalize_evidence_gate_key(first) != finalize_evidence_gate_key(third)
+
+
+def test_gate_key_ignores_volatile_post_edit_execution_count() -> None:
+    # Regression: the dedup key must be derived from the red *evidence* only, not
+    # from progress counters. If it hashed ``post_edit_execution_count`` the
+    # caller's ``keys.add(key)`` guard would mint a fresh key on every execution
+    # and re-fire the one-shot challenge indefinitely for the same failing state.
+    base = _observation_with_red("pytest tests/test_a.py")
+    later = replace(base, post_edit_execution_count=base.post_edit_execution_count + 5)
+    assert later.post_edit_execution_count != base.post_edit_execution_count
+    assert finalize_evidence_gate_key(base) == finalize_evidence_gate_key(later)
+
+
+def test_challenge_messages_include_one_shot_notice() -> None:
+    # Every challenge variant tells the model the check is one-shot for this
+    # exact failing state, so a recurring challenge is not read as pressure to
+    # keep re-finalizing.
+    red = _observation_with_red("pytest tests/test_a.py")
+
+    deleted_tracker = _tracker_with_source_edit()
+    deleted_tracker.observe_write("/tmp/squilla-scratch/repro.py", iteration=2)
+    deleted_tracker.observe_execution(
+        "python /tmp/squilla-scratch/repro.py", red=True, exit_code=1, iteration=3
+    )
+    deleted_tracker.observe_execution(
+        "rm /tmp/squilla-scratch/repro.py", red=False, iteration=4
+    )
+    deleted_tracker.observe_execution("pytest tests/", red=False, exit_code=0, iteration=5)
+    deleted = deleted_tracker.build_observation(has_workspace_diff=True)
+
+    no_execution = _tracker_with_source_edit().build_observation(has_workspace_diff=True)
+
+    for observation in (red, deleted, no_execution):
+        message = finalize_evidence_challenge_message(observation)
+        assert "one-shot for this exact failing state" in message
+        assert "it will not repeat for the same evidence" in message
 
 
 def test_challenge_message_red_execution_polarity() -> None:
