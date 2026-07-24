@@ -150,6 +150,7 @@ _EXEC_STDIN_WRITE_CHUNK_BYTES = 64 * 1024
 _EXEC_STDIN_GUARD_CHUNK_CHARS = 64 * 1024
 _EXEC_STDIN_GUARD_OVERLAP_CHARS = 1024
 _COMMAND_AUDIT_MAX_CHARS = 4096
+_EXEC_TIMEOUT_OUTPUT_TAIL_CHARS = 20000
 _POWERSHELL_SCRIPT_PROFILE_MAX_CHARS = 128 * 1024
 _WINDOWS_ENV_CANONICAL_KEYS = {
     "COMSPEC": "ComSpec",
@@ -4517,6 +4518,24 @@ async def _await_bg_output_task(output_task: asyncio.Task[None]) -> None:
             await output_task
 
 
+def _exec_timeout_output(effective_timeout: float, command: str, raw: bytes | str) -> str:
+    """Build the exec-timeout result, preserving partial output captured so far.
+
+    Keeps the ``[timeout after Ns]`` marker (asserted by tests and recognised by the
+    model as a timeout signal) and appends a tail slice of whatever the command
+    emitted before it was killed, so the model can see which test hung instead of a
+    bare marker with no evidence.
+    """
+    text = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
+    text = text.strip()
+    base = f"[timeout after {effective_timeout}s]\ncommand: {command}"
+    if not text:
+        return base
+    if len(text) > _EXEC_TIMEOUT_OUTPUT_TAIL_CHARS:
+        text = "...[partial output truncated]...\n" + text[-_EXEC_TIMEOUT_OUTPUT_TAIL_CHARS:]
+    return f"{base}\n--- partial output before timeout ---\n{text}"
+
+
 async def _run_host_shell_command(
     command: str,
     *,
@@ -4543,31 +4562,37 @@ async def _run_host_shell_command(
 
             loop = asyncio.get_running_loop()
             deadline = loop.time() + effective_timeout
-            timeout_result = f"[timeout after {effective_timeout}s]\ncommand: {command}"
+
+            def timeout_result() -> str:
+                output_file.flush()
+                output_file.seek(0)
+                return _exec_timeout_output(
+                    effective_timeout, command, output_file.read()
+                )
 
             proc = await _create_host_shell_subprocess(command, **subprocess_kwargs)
             stdin_writer: asyncio.Task[None] | None = None
             remaining = deadline - loop.time()
             if remaining <= 0:
                 await _terminate_exec_process_tree(proc)
-                return timeout_result
+                return timeout_result()
             try:
                 if stdin_bytes is not None:
                     stdin_writer = asyncio.create_task(_write_exec_stdin(proc, stdin_bytes))
                     if not await _wait_exec_stdin_writer(stdin_writer, remaining):
                         await _cancel_exec_stdin_writer(proc, stdin_writer)
                         await _terminate_exec_process_tree(proc)
-                        return timeout_result
+                        return timeout_result()
             except TimeoutError:
                 await _cancel_exec_stdin_writer(proc, stdin_writer)
                 await _terminate_exec_process_tree(proc)
-                return timeout_result
+                return timeout_result()
 
             remaining = deadline - loop.time()
             if remaining <= 0 or not await _wait_exec_process(proc, remaining):
                 await _cancel_exec_stdin_writer(proc, stdin_writer)
                 await _terminate_exec_process_tree(proc)
-                return timeout_result
+                return timeout_result()
             if os.name == "posix":
                 _signal_exec_process_tree(proc, signal.SIGTERM)
 
@@ -4636,7 +4661,10 @@ async def _create_host_shell_subprocess(
     params={
         "command": {"type": "string", "description": "Shell command to execute."},
         "workdir": {"type": "string", "description": "Working directory (default: cwd)."},
-        "timeout": {"type": "number", "description": "Timeout in seconds (default 60)."},
+        "timeout": {
+            "type": "number",
+            "description": "Timeout in seconds (default 60, max 600).",
+        },
         "env": {
             "type": "object",
             "description": "Extra environment variable overrides.",

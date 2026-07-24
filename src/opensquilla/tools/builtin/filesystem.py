@@ -2501,6 +2501,11 @@ def _normalize_edit_replacements(
                 f"edit_file {replacement.label} must not be empty. "
                 "Retry with exact non-empty text from the file."
             )
+        if replacement.old_text == replacement.new_text:
+            raise RetryableToolInputError(
+                f"edit_file {replacement.label} is unchanged: old_text and new_text are "
+                "identical, so the edit would do nothing. Retry with the intended new_text."
+            )
     return replacements
 
 
@@ -2569,6 +2574,31 @@ def _apply_edit_replacements(
     return "".join(chunks)
 
 
+_READ_FILE_LINE_PREFIX_RE = re.compile(r"^\s*\d+\t")
+
+
+def _strip_read_file_line_prefixes(value: str) -> str:
+    """Strip ``{lineno}\\t`` prefixes left when read_file output is pasted as old_text.
+
+    read_file renders lines as ``{lineno}\\t{line}``; models frequently copy that
+    rendered block straight into edit_file.old_text, which then fails to match the
+    real source. Only strip when *every* non-empty line carries the prefix, so
+    ordinary source that merely starts a line with a number+tab is never mangled.
+    """
+    lines = value.split("\n")
+    non_empty = 0
+    prefixed = 0
+    for line in lines:
+        if line == "":
+            continue
+        non_empty += 1
+        if _READ_FILE_LINE_PREFIX_RE.match(line):
+            prefixed += 1
+    if non_empty == 0 or prefixed != non_empty:
+        return value
+    return "\n".join(_READ_FILE_LINE_PREFIX_RE.sub("", line) for line in lines)
+
+
 def _recover_edit_replacement(
     original: str,
     replacement: _EditReplacement,
@@ -2587,21 +2617,26 @@ def _recover_edit_replacement(
         )
         return None
 
-    candidates = [replacement.old_text]
+    candidates: list[tuple[str, str]] = [("original", replacement.old_text)]
     unescaped = _unescape_edit_search_text(replacement.old_text)
     if unescaped != replacement.old_text:
-        candidates.append(unescaped)
+        candidates.append(("unescape", unescaped))
+    line_prefix_stripped = _strip_read_file_line_prefixes(replacement.old_text)
+    if line_prefix_stripped != replacement.old_text:
+        candidates.append(("line_prefix", line_prefix_stripped))
 
-    for index, candidate in enumerate(candidates):
-        if index > 0:
+    for kind, candidate in candidates:
+        transformed = kind != "original"
+        repair_event = f"edit_file.{kind}_repair_used"
+        if transformed:
             count = original.count(candidate)
             if count == 1:
                 _record_edit_recovery_event(
-                    name="edit_file.unescape_repair_used",
+                    name=repair_event,
                     path=path,
                     replacement=replacement,
                     outcome="used",
-                    reason="exact_match_after_unescape",
+                    reason=f"exact_match_after_{kind}",
                     matches=count,
                 )
                 start = original.index(candidate)
@@ -2612,7 +2647,7 @@ def _recover_edit_replacement(
                     path=path,
                     replacement=replacement,
                     outcome="rejected",
-                    reason="multiple_matches_after_unescape",
+                    reason=f"multiple_matches_after_{kind}",
                     matches=count,
                 )
                 return None
@@ -2635,13 +2670,13 @@ def _recover_edit_replacement(
             )
             return None
         _tag, start, end, replacement_text = flexible
-        if index > 0:
+        if transformed:
             _record_edit_recovery_event(
-                name="edit_file.unescape_repair_used",
+                name=repair_event,
                 path=path,
                 replacement=replacement,
                 outcome="used",
-                reason="flexible_match_after_unescape",
+                reason=f"flexible_match_after_{kind}",
                 matches=1,
             )
         _record_edit_recovery_event(
@@ -2681,7 +2716,7 @@ def _find_unique_flexible_edit_match(
     if not any(stripped_search):
         return None
 
-    source_lines = original.replace("\r\n", "\n").splitlines(keepends=True)
+    source_lines = original.splitlines(keepends=True)
     if len(search_lines) > len(source_lines):
         return None
 

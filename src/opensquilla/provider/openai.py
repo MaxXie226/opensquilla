@@ -176,7 +176,9 @@ def _candidate_malformed_tool_wrapper(
     return {"malformed_tool_call": sanitized}
 
 
-_OPENAI_TOOL_STATUS_OUTPUT_MAX_CHARS = 4000
+_OPENAI_TOOL_STATUS_OUTPUT_MAX_CHARS = 10000
+_OPENAI_TOOL_STATUS_OUTPUT_HEAD_CHARS = 2000
+_OPENAI_TOOL_STATUS_OUTPUT_TAIL_CHARS = 8000
 _OPENAI_STREAM_USAGE_ONLY_KEYS = frozenset(
     {
         "id",
@@ -328,18 +330,31 @@ def _is_inert_post_terminal_stream_frame(
     )
 
 
+def _truncate_tool_status_output(output: str) -> str:
+    """Bound an error tool-result while preserving the failing tail.
+
+    Test/build failures put the actionable evidence (assertion message, ``FAILED``
+    summary, traceback) at the END of the output. The previous head-only slice
+    dropped exactly that tail, so keep a head slice for context plus a larger tail
+    slice, joined by a visible marker that names how many chars were removed.
+    """
+    if len(output) <= _OPENAI_TOOL_STATUS_OUTPUT_MAX_CHARS:
+        return output
+    head = output[:_OPENAI_TOOL_STATUS_OUTPUT_HEAD_CHARS]
+    tail = output[-_OPENAI_TOOL_STATUS_OUTPUT_TAIL_CHARS:]
+    dropped = len(output) - len(head) - len(tail)
+    return f"{head}\n...[{dropped} chars truncated]...\n{tail}"
+
+
 def _openai_tool_result_content(block: Any) -> str:
     content = block.content if isinstance(block.content, str) else json.dumps(block.content)
     status = getattr(block, "execution_status", None)
     if status is None or not derive_is_error(status):
         return content
-    output = content
-    if len(output) > _OPENAI_TOOL_STATUS_OUTPUT_MAX_CHARS:
-        output = output[:_OPENAI_TOOL_STATUS_OUTPUT_MAX_CHARS]
     return json.dumps(
         {
             "execution_status": compact_provider_status(status),
-            "output": output,
+            "output": _truncate_tool_status_output(content),
         },
         ensure_ascii=False,
     )

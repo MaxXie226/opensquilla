@@ -30,35 +30,35 @@ _GUIDANCE_FILLER = (
     "reviewers can trace the change. "
 )
 
-# Golden 500-char truncation of the 576-char deny message below, captured
-# from the default-cap envelope so the lever-off path is pinned exactly.
-_BASELINE_TRUNCATED_USER_MESSAGE = (
-    "write_file blocked by workspace write deny policy: config/pinned.txt"
-    " matches config/*.txt. Pinned configuration files are read-only in t"
-    "his workspace; add an override file under overrides/ and register it"
-    " in manifest.toml so reviewers can trace the change. Pinned configur"
-    "ation files are read-only in this workspace; add an override file un"
-    "der overrides/ and register it in manifest.toml so reviewers can tra"
-    "ce the change. Pinned configuration files are read-only in this work"
-    "space; add...[truncated]"
-)
+# Engine-authored (curated) messages get this wider default cap; a valid
+# lever value still overrides it — in either direction — for policy denials.
+_CURATED_CAP = 2000
+# Long enough to overflow the curated cap so the truncation path stays covered.
+_LONG_TOTAL = 2576
 
 
-def _deny_guidance() -> str:
-    needed = 576 - len(_DENY_MESSAGE_BASE) - 1
-    return (_GUIDANCE_FILLER * (needed // len(_GUIDANCE_FILLER) + 1))[:needed]
+def _deny_guidance(total: int = 576) -> str:
+    needed = total - len(_DENY_MESSAGE_BASE) - 1
+    guidance = (_GUIDANCE_FILLER * (needed // len(_GUIDANCE_FILLER) + 1))[:needed]
+    # write_policy strips the env override, so keep the tail non-whitespace
+    # to preserve the exact target length.
+    return guidance.rstrip().ljust(needed, "x")
 
 
-def _deny_message() -> str:
-    return f"{_DENY_MESSAGE_BASE} {_deny_guidance()}"
+def _deny_message(total: int = 576) -> str:
+    return f"{_DENY_MESSAGE_BASE} {_deny_guidance(total)}"
+
+
+def _truncated(message: str, cap: int) -> str:
+    return message[: cap - len(_TRUNCATION_MARKER)] + _TRUNCATION_MARKER
 
 
 def _raise_write_deny_error(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, total: int = 576
 ) -> SafeToolError:
     """Trip the real workspace write deny gate and return the raised error."""
     workspace = tmp_path.resolve()
-    monkeypatch.setenv(_GUIDANCE_ENV, _deny_guidance())
+    monkeypatch.setenv(_GUIDANCE_ENV, _deny_guidance(total))
     ctx = ToolContext(
         workspace_dir=str(workspace),
         workspace_write_deny_globs=["config/*.txt"],
@@ -99,11 +99,11 @@ def _raise_scratch_artifact_error(tmp_path: Path) -> SafeToolError:
 
 def test_fixture_message_shape() -> None:
     assert len(_deny_message()) == 576
-    assert len(_BASELINE_TRUNCATED_USER_MESSAGE) == 500
-    assert _BASELINE_TRUNCATED_USER_MESSAGE.endswith(_TRUNCATION_MARKER)
+    assert len(_deny_message(_LONG_TOTAL)) == _LONG_TOTAL
+    assert _LONG_TOTAL > _CURATED_CAP
 
 
-def test_unset_lever_matches_baseline_truncation(
+def test_unset_lever_delivers_curated_policy_message(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv(_LEVER_ENV, raising=False)
@@ -114,19 +114,32 @@ def test_unset_lever_matches_baseline_truncation(
         "status": "error",
         "tool": "write_file",
         "error_class": "SafeToolError",
-        "user_message": _BASELINE_TRUNCATED_USER_MESSAGE,
+        "user_message": _deny_message(),
         "retry_allowed": False,
     }
 
 
+def test_unset_lever_truncates_at_curated_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(_LEVER_ENV, raising=False)
+    error = _raise_write_deny_error(tmp_path, monkeypatch, total=_LONG_TOTAL)
+    envelope = build_tool_failure_envelope(error, "write_file")
+    expected = _truncated(_deny_message(_LONG_TOTAL), _CURATED_CAP)
+    assert envelope["user_message"] == expected
+    assert len(envelope["user_message"]) == _CURATED_CAP
+
+
 @pytest.mark.parametrize("raw", ["", "  ", "0", "-1", "not-a-number", "12.5"])
-def test_off_values_keep_baseline_truncation(
+def test_off_values_keep_curated_cap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raw: str
 ) -> None:
     monkeypatch.setenv(_LEVER_ENV, raw)
-    error = _raise_write_deny_error(tmp_path, monkeypatch)
+    error = _raise_write_deny_error(tmp_path, monkeypatch, total=_LONG_TOTAL)
     envelope = build_tool_failure_envelope(error, "write_file")
-    assert envelope["user_message"] == _BASELINE_TRUNCATED_USER_MESSAGE
+    assert envelope["user_message"] == _truncated(
+        _deny_message(_LONG_TOTAL), _CURATED_CAP
+    )
 
 
 def test_lever_delivers_full_policy_message(
@@ -141,10 +154,14 @@ def test_lever_delivers_full_policy_message(
 
 
 def test_lever_ignores_non_policy_errors(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(_LEVER_ENV, "1200")
-    error = SafeToolError(_deny_message())
+    # A cap wide enough for the whole message: if the lever wrongly applied
+    # to a non-policy error, the message would arrive untruncated.
+    monkeypatch.setenv(_LEVER_ENV, str(_LONG_TOTAL + 100))
+    error = SafeToolError(_deny_message(_LONG_TOTAL))
     envelope = build_tool_failure_envelope(error, "write_file")
-    assert envelope["user_message"] == _BASELINE_TRUNCATED_USER_MESSAGE
+    assert envelope["user_message"] == _truncated(
+        _deny_message(_LONG_TOTAL), _CURATED_CAP
+    )
 
 
 def test_lever_truncates_at_configured_cap(
@@ -161,14 +178,16 @@ def test_lever_truncates_at_configured_cap(
 
 
 @pytest.mark.parametrize("raw", ["1", "5", "13", "14"])
-def test_caps_below_marker_width_fall_back_to_default(
+def test_caps_below_marker_width_fall_back_to_curated_cap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raw: str
 ) -> None:
     monkeypatch.setenv(_LEVER_ENV, raw)
-    error = _raise_write_deny_error(tmp_path, monkeypatch)
+    error = _raise_write_deny_error(tmp_path, monkeypatch, total=_LONG_TOTAL)
     envelope = build_tool_failure_envelope(error, "write_file")
-    assert envelope["user_message"] == _BASELINE_TRUNCATED_USER_MESSAGE
-    assert len(envelope["user_message"]) <= 500
+    assert envelope["user_message"] == _truncated(
+        _deny_message(_LONG_TOTAL), _CURATED_CAP
+    )
+    assert len(envelope["user_message"]) == _CURATED_CAP
 
 
 def test_smallest_active_cap_is_honored(
