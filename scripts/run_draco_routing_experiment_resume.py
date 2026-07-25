@@ -12726,6 +12726,7 @@ async def amain(args: argparse.Namespace) -> int:
                 ),
                 require_openrouter_non_byok=bool(
                     getattr(args, "require_openrouter_non_byok", False)
+                    and not getattr(args, "dry_run", False)
                 ),
             )
         current_attempts = coerce_metric_int(row.get("generation_attempt_count"))
@@ -12823,7 +12824,11 @@ async def amain(args: argparse.Namespace) -> int:
             )
             metadata_repaired = bool(identity_repaired or cost_metadata_repaired)
             preexisting_non_byok_ready = True
-            if getattr(args, "require_openrouter_non_byok", False):
+            if getattr(
+                args,
+                "require_openrouter_non_byok",
+                False,
+            ) and not getattr(args, "dry_run", False):
                 # A new Judge call cannot repair historical BYOK/unverified
                 # spend because prior attempts remain part of actual spend.
                 # Refuse to add more cost unless every existing generation and
@@ -13091,7 +13096,11 @@ async def amain(args: argparse.Namespace) -> int:
                         "model_or_judge_started": bool(resume_completion.get("judge_reran")),
                     }
                 )
-            if getattr(args, "require_openrouter_non_byok", False):
+            if getattr(
+                args,
+                "require_openrouter_non_byok",
+                False,
+            ) and not getattr(args, "dry_run", False):
                 audit = openrouter_non_byok_audit(
                     row,
                     provider_routing=inherited.provider_routing,

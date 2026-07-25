@@ -10773,6 +10773,7 @@ async def amain(args: argparse.Namespace) -> int:
                 ),
                 require_openrouter_non_byok=bool(
                     getattr(args, "require_openrouter_non_byok", False)
+                    and not getattr(args, "dry_run", False)
                 ),
             )
 
@@ -10787,7 +10788,11 @@ async def amain(args: argparse.Namespace) -> int:
         for row_index, coro in enumerate(asyncio.as_completed(pending), start=1):
             row = await coro
             row["row_index"] = row_index
-            if getattr(args, "require_openrouter_non_byok", False):
+            if getattr(
+                args,
+                "require_openrouter_non_byok",
+                False,
+            ) and not getattr(args, "dry_run", False):
                 audit = openrouter_non_byok_audit(
                     row,
                     provider_routing=inherited.provider_routing,

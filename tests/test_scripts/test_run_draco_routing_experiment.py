@@ -2116,10 +2116,10 @@ async def test_preflight_failure_writes_audit_manifest_before_any_model(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("continue_after_failure", "expected_rows"),
-    [(False, 1), (True, 1)],
-    ids=["fail-fast-default", "deprecated-continue-cannot-override-policy"],
+    [(False, 2), (True, 2)],
+    ids=["default", "deprecated-continue-flag"],
 )
-async def test_cost_audit_recovery_mode_finishes_independent_rows(
+async def test_strict_non_byok_dry_run_skips_receipt_audit_but_keeps_contract(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     continue_after_failure: bool,
@@ -2154,7 +2154,7 @@ async def test_cost_audit_recovery_mode_finishes_independent_rows(
 
     status = await runner.amain(args)
 
-    assert status == 2
+    assert status == 0
     result_paths = list(output_dir.glob("draco_ensemble_*.jsonl"))
     manifest_paths = list(output_dir.glob("draco_run_*.manifest.json"))
     assert len(result_paths) == 1
@@ -2167,9 +2167,15 @@ async def test_cost_audit_recovery_mode_finishes_independent_rows(
     manifest = json.loads(manifest_paths[0].read_text(encoding="utf-8"))
     assert len(rows) == expected_rows
     assert manifest["rows_written"] == expected_rows
-    assert manifest["status"] == "cost_audit_failed"
-    assert all(row["error"] == "openrouter_non_byok_policy_violation" for row in rows)
-    assert manifest["failure"]["task_id"] in {"task-a", "task-b"}
+    assert manifest["status"] == "complete"
+    assert (
+        manifest["run_compatibility"]["contracts"]["B0"]["cost_policy"][
+            "require_openrouter_non_byok"
+        ]
+        is True
+    )
+    assert all(not row["error"] for row in rows)
+    assert all("openrouter_non_byok_audit" not in row for row in rows)
 
 
 def test_local_web_fetch_runtime_disables_hidden_firecrawl_by_default(
@@ -6869,6 +6875,7 @@ def test_g1_dry_cli_main_exits_zero_with_frozen_registry_contract(
             "--max-tasks",
             "1",
             "--dry-run",
+            "--require-openrouter-non-byok",
             "--experiment-config-set",
             "benchmark_input.enforce_reference_input=false",
             "--experiment-config-set",
@@ -6890,6 +6897,13 @@ def test_g1_dry_cli_main_exits_zero_with_frozen_registry_contract(
     row = json.loads(result_paths[0].read_text(encoding="utf-8").splitlines()[0])
     plan = row["ensemble_trace"]["calls"][0]["selection_plan"]
     assert manifest["status"] == "complete"
+    assert (
+        manifest["run_compatibility"]["contracts"]["G1"]["cost_policy"][
+            "require_openrouter_non_byok"
+        ]
+        is True
+    )
+    assert "openrouter_non_byok_audit" not in row
     assert len(plan["candidate_pool"]) == 20
     assert (
         plan["registry_snapshot_version"]
