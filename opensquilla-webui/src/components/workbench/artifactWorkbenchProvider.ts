@@ -14,6 +14,7 @@ import {
 import { downloadBlob } from '@/utils/browser'
 import {
   artifactFromWorkbenchItem,
+  artifactsFromWorkbenchItem,
   sessionKeyFromWorkbenchItem,
 } from '@/workbench/artifactItems'
 import type {
@@ -31,6 +32,7 @@ import type {
   NativeWorkbenchSurfaceRectRequest,
 } from '@/platform/types'
 import type { NativeHtmlArtifactResource } from '@/composables/workbench/useArtifactPreviewResource'
+import ArtifactCollectionPanel from './ArtifactCollectionPanel.vue'
 import ArtifactPreviewPanel from './ArtifactPreviewPanel.vue'
 
 type Translate = (key: string, params?: Record<string, unknown>) => string
@@ -43,6 +45,7 @@ export interface ArtifactWorkbenchProviderOptions {
   authToken(): string
   baseOrigin: string
   currentSessionId(): string
+  openArtifact(artifact: ArtifactPayload, sessionKey: string): void
   platform: Platform
   pushToast(message: string, options?: { tone: 'danger' }): void
   t: Translate
@@ -327,6 +330,22 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
   }
 }
 
+class ArtifactCollectionRuntime implements WorkbenchPanelRuntime {
+  constructor(
+    private readonly options: ArtifactWorkbenchProviderOptions,
+  ) {}
+
+  handleComponentEvent(event: WorkbenchComponentEvent, item: WorkbenchItem) {
+    if (event.type !== 'artifact-open') return
+    const artifact = artifactEventPayload(event)
+    if (!artifact) return
+    this.options.openArtifact(
+      artifact,
+      artifactSessionKey(item, this.options),
+    )
+  }
+}
+
 function artifactHeader(
   item: WorkbenchItem,
 ): { title: string; subtitle?: string; icon?: ReturnType<typeof artifactIconName> } {
@@ -395,6 +414,29 @@ export function createArtifactWorkbenchDefinitions(
   options: ArtifactWorkbenchProviderOptions,
 ): readonly WorkbenchPanelDefinition[] {
   return [
+    {
+      kind: 'artifact-collection',
+      component: ArtifactCollectionPanel,
+      supports: item => item.kind === 'artifact-collection',
+      getHeader: item => ({
+        title: options.t('chat.deliverablesCount', {
+          count: artifactsFromWorkbenchItem(item).length,
+        }),
+      }),
+      getProps: item => ({
+        artifacts: artifactsFromWorkbenchItem(item),
+        emptyLabel: options.t('chat.noDeliverables'),
+        label: options.t('chat.sessionDeliverables'),
+        openArtifactLabel: (artifact: ArtifactPayload) => options.t(
+          'chat.openArtifact',
+          {
+            title: artifactFileTitle(artifact),
+            subtitle: artifactFileSubtitle(artifact),
+          },
+        ),
+      }),
+      createRuntime: () => new ArtifactCollectionRuntime(options),
+    },
     {
       kind: 'artifact-preview',
       component: ArtifactPreviewPanel,

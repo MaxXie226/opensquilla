@@ -18,12 +18,13 @@
       :width="effectiveWidth"
       :min="WORKBENCH_MIN_WIDTH"
       :max="dynamicMaximumWidth"
+      :reset-width="defaultWidth"
       :aria-label="resizeLabel"
       :unit-label="pixelsLabel"
       aria-controls="app-main workbench-panel"
       @preview="previewWidth = $event"
       @commit="commitWidth"
-      @reset="commitWidth"
+      @reset="resetWidth"
       @cancel="previewWidth = null"
       @resize-end="previewWidth = null"
     />
@@ -55,7 +56,7 @@
           <button
             class="workbench-host__tab-close"
             type="button"
-            :aria-label="`${closeLabel}: ${item.title}`"
+            :aria-label="`${closeItemLabel}: ${item.title}`"
             @click="closeWorkbenchItem(item.id)"
           >
             <Icon name="x" :size="13" aria-hidden="true" />
@@ -72,6 +73,7 @@
       <div class="workbench-host__actions">
         <slot name="actions" :item="store.activeItem" />
         <button
+          v-if="layoutMode === 'mobile-dialog'"
           ref="collapseButtonRef"
           class="workbench-host__icon-button"
           type="button"
@@ -84,8 +86,8 @@
           v-if="store.activeItem"
           class="workbench-host__icon-button"
           type="button"
-          :aria-label="`${closeLabel}: ${store.activeItem.title}`"
-          @click="closeWorkbenchItem(store.activeItem.id)"
+          :aria-label="closeLabel"
+          @click="closeWorkbench"
         >
           <Icon name="x" :size="17" aria-hidden="true" />
         </button>
@@ -154,6 +156,7 @@ import Icon from '@/components/Icon.vue'
 import { useDialogA11y } from '@/composables/useDialogA11y'
 import {
   WORKBENCH_MIN_WIDTH,
+  defaultWorkbenchWidthPreference,
   workbenchDynamicMax,
   workbenchEffectiveWidth,
   workbenchLayoutMode,
@@ -175,6 +178,7 @@ const props = withDefaults(defineProps<{
   openItemsLabel?: string
   collapseLabel?: string
   closeLabel?: string
+  closeItemLabel?: string
   resizeLabel?: string
   pixelsLabel?: string
 }>(), {
@@ -188,6 +192,7 @@ const props = withDefaults(defineProps<{
   openItemsLabel: 'Open workbench items',
   collapseLabel: 'Collapse workbench',
   closeLabel: 'Close',
+  closeItemLabel: 'Close tab',
   resizeLabel: 'Resize workbench',
   pixelsLabel: 'pixels',
 })
@@ -226,6 +231,11 @@ const layoutMode = computed(() => workbenchLayoutMode({
 }))
 const dynamicMaximumWidth = computed(() =>
   workbenchDynamicMax(measuredAvailableWidth.value))
+const defaultWidth = computed(() => workbenchEffectiveWidth(
+  defaultWorkbenchWidthPreference(),
+  layoutMode.value,
+  measuredAvailableWidth.value,
+))
 const effectiveWidth = computed(() => previewWidth.value ?? workbenchEffectiveWidth(
   store.widthPreference,
   layoutMode.value,
@@ -267,6 +277,11 @@ function commitWidth(width: number) {
   store.setWidth(width)
 }
 
+function resetWidth() {
+  previewWidth.value = null
+  store.resetWidth()
+}
+
 function collapseWorkbench() {
   store.setExpanded(false)
   emit('collapsed')
@@ -284,6 +299,11 @@ function closeWorkbenchItem(id: string) {
     )
     ;(activeTab || collapseButtonRef.value)?.focus({ preventScroll: true })
   })
+}
+
+function closeWorkbench() {
+  store.closeAllItems()
+  emit('emptied')
 }
 
 function onTabKeydown(event: KeyboardEvent, currentIndex: number) {

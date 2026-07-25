@@ -74,6 +74,7 @@
     "expand": "Ouvrir l’espace de travail",
     "collapse": "Réduire l’espace de travail",
     "close": "Fermer l’espace de travail",
+    "closeItem": "Fermer l’onglet",
     "refresh": "Actualiser",
     "openExternal": "Ouvrir dans une autre application",
     "openItems": "Éléments ouverts dans l’espace de travail",

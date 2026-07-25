@@ -258,7 +258,6 @@ function resetToDefault(event: MouseEvent) {
   event.preventDefault()
   const startWidth = currentWidth.value
   const next = clampWidth(props.resetWidth)
-  if (startWidth === next) return
   emit('resize-start', startWidth)
   emit('preview', next)
   emit('reset', next)

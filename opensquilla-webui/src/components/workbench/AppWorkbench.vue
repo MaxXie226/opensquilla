@@ -8,6 +8,7 @@
     :open-items-label="t('workbench.openItems')"
     :collapse-label="t('workbench.collapse')"
     :close-label="t('workbench.close')"
+    :close-item-label="t('workbench.closeItem')"
     :resize-label="t('workbench.resize')"
     :pixels-label="t('workbench.pixels')"
     @collapsed="restoreWorkbenchFocus"
@@ -106,6 +107,7 @@ import { useToasts } from '@/composables/useToasts'
 import { usePlatform } from '@/platform'
 import type { NativeWorkbenchSurfaceEvent } from '@/platform/types'
 import { workbenchPanelRegistry } from '@/workbench/registry'
+import { createArtifactPreviewWorkbenchItem } from '@/workbench/artifactItems'
 import {
   attachWorkbenchRuntime,
   WorkbenchRuntimeManager,
@@ -165,6 +167,16 @@ for (const definition of createArtifactWorkbenchDefinitions({
   authToken: readAuthToken,
   baseOrigin,
   currentSessionId: () => store.activeSessionId || props.sessionId,
+  openArtifact: (artifact, sessionKey) => {
+    store.openItem(createArtifactPreviewWorkbenchItem({
+      artifact,
+      nativeHtml: Boolean(
+        platform.capabilities.hasNativeWorkbenchSurfaces
+        && platform.workbench.native,
+      ),
+      sessionKey,
+    }))
+  },
   platform,
   pushToast: (message, options) => pushToast(message, options),
   t: (key, params) => String(t(key, params || {})),

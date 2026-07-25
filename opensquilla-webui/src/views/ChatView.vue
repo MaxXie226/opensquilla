@@ -621,8 +621,11 @@ import type {
 import type { ModelRoutingMode } from '@/types/modelRouting'
 import type { SandboxRunMode } from '@/types/sandbox'
 import type { ChatPart, InterruptViewState } from '@/types/parts'
-import { artifactDownloadUrl, canPreview } from '@/utils/chat/artifacts'
-import { createArtifactPreviewWorkbenchItem } from '@/workbench/artifactItems'
+import { artifactDownloadUrl } from '@/utils/chat/artifacts'
+import {
+  createArtifactCollectionWorkbenchItem,
+  createArtifactPreviewWorkbenchItem,
+} from '@/workbench/artifactItems'
 import { fetchDisplayAttachmentBlob } from '@/utils/chat/attachmentAccess'
 import { createHistoryNavigationScrollLock } from '@/utils/chat/historyNavigationScrollLock'
 import {
@@ -729,8 +732,7 @@ const sessionKey = ref('')
 const workbenchEnabled = computed(() => appStore.features.artifactWorkbench === true)
 const workbenchAvailable = computed(() =>
   workbenchEnabled.value
-  && workbenchStore.items.some(item =>
-    item.scope.type === 'session' && item.scope.id === sessionKey.value))
+  && workbenchStore.hasAvailableItemForSession(sessionKey.value || null))
 const inputText = ref('')
 const aborted = ref(false)
 const autoScroll = ref(true)
@@ -2022,25 +2024,26 @@ function focusHeaderAction(
 function openDeliverables() {
   if (sessionArtifacts.value.length === 0) return
   if (workbenchEnabled.value) {
-    const recentPreview = workbenchStore.findMostRecentItem(item =>
-      item.kind === 'artifact-preview'
-      && item.scope.type === 'session'
-      && item.scope.id === sessionKey.value,
-    )
-    if (recentPreview) {
-      workbenchStore.activateItem(recentPreview.id)
-      workbenchStore.setExpanded(true)
-      return
-    }
-    for (let index = sessionArtifacts.value.length - 1; index >= 0; index -= 1) {
-      const artifact = sessionArtifacts.value[index]
-      if (!canPreview(artifact)) continue
-      if (openArtifactInWorkbench(artifact)) return
-      break
-    }
+    workbenchStore.openItem(createArtifactCollectionWorkbenchItem({
+      artifacts: sessionArtifacts.value,
+      sessionKey: sessionKey.value,
+      title: t('chat.deliverablesCount', {
+        count: sessionArtifacts.value.length,
+      }),
+    }))
+    return
   }
   deliverablesOpen.value = true
 }
+
+watch(sessionArtifacts, artifacts => {
+  if (!workbenchEnabled.value || !sessionKey.value) return
+  workbenchStore.updateItem(createArtifactCollectionWorkbenchItem({
+    artifacts,
+    sessionKey: sessionKey.value,
+    title: t('chat.deliverablesCount', { count: artifacts.length }),
+  }))
+})
 
 function openArtifactInWorkbench(artifact: ArtifactPayload): boolean {
   if (!workbenchEnabled.value || !sessionKey.value) return false

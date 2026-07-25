@@ -130,6 +130,17 @@ afterEach(() => {
 })
 
 describe('WorkbenchHost', () => {
+  it('opens with an even split and keeps an explicit user width', async () => {
+    const mounted = await mountHost(1200)
+    const panel = mounted.host.querySelector<HTMLElement>('[data-testid="workbench-host"]')!
+
+    expect(panel.style.getPropertyValue('--workbench-width')).toBe('600px')
+
+    mounted.store.setWidth(614)
+    await nextTick()
+    expect(panel.style.getPropertyValue('--workbench-width')).toBe('614px')
+  })
+
   it('keeps a single item light and adds a tab strip only for multiple items', async () => {
     const mounted = await mountHost(1200)
 
@@ -149,6 +160,24 @@ describe('WorkbenchHost', () => {
       cancelable: true,
     }))
     expect(mounted.store.activeItemId).toBe('one')
+  })
+
+  it('keeps one desktop collapse control and lets the global close clear all tabs', async () => {
+    const mounted = await mountHost(1200)
+    mounted.store.openItem(item('two'))
+    await nextTick()
+    const panel = mounted.host.querySelector<HTMLElement>('[data-testid="workbench-host"]')!
+
+    expect(panel.querySelector('[aria-label="Collapse workbench"]')).toBeNull()
+    expect(panel.querySelector('[aria-label="Close tab: one.html"]')).not.toBeNull()
+    expect(panel.querySelector('[aria-label="Close tab: two.html"]')).not.toBeNull()
+    const close = panel.querySelector<HTMLButtonElement>('[aria-label="Close"]')!
+    close.click()
+    await nextTick()
+
+    expect(mounted.store.items).toEqual([])
+    expect(mounted.store.expanded).toBe(false)
+    expect(mounted.host.querySelector('[data-testid="workbench-host"]')).toBeNull()
   })
 
   it('keeps inactive retained panels mounted and removes them from the accessibility tree', async () => {
@@ -224,7 +253,7 @@ describe('WorkbenchHost', () => {
     const collapse = panel.querySelector<HTMLButtonElement>(
       '[aria-label="Collapse workbench"]',
     )!
-    const close = panel.querySelector<HTMLButtonElement>('[aria-label="Close: one.html"]')!
+    const close = panel.querySelector<HTMLButtonElement>('[aria-label="Close"]')!
 
     expect(panel.getAttribute('role')).toBe('dialog')
     expect(hasOpenDialogLayer()).toBe(true)

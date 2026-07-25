@@ -74,6 +74,7 @@
     "expand": "ワークベンチを開く",
     "collapse": "ワークベンチを折りたたむ",
     "close": "ワークベンチを閉じる",
+    "closeItem": "タブを閉じる",
     "refresh": "更新",
     "openExternal": "外部で開く",
     "openItems": "開いているワークベンチ項目",

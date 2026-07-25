@@ -1,7 +1,6 @@
 import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
 import {
-  WORKBENCH_DEFAULT_WIDTH,
   WORKBENCH_WIDTH_STORAGE_KEY,
   defaultWorkbenchWidthPreference,
   normalizeWorkbenchWidthPreference,
@@ -98,6 +97,11 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     return null
   }
 
+  function hasAvailableItemForSession(sessionId: string | null): boolean {
+    return items.value.some(item =>
+      item.scope.type !== 'session' || item.scope.id === sessionId)
+  }
+
   function suspendItem(item: WorkbenchItem | null) {
     if (item) notify({ type: 'suspend', item })
   }
@@ -174,6 +178,12 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     closeMatchingItems(item => sameScope(item.scope, scope), reason)
   }
 
+  function closeAllItems(
+    reason: WorkbenchDisposeReason = 'closed',
+  ) {
+    closeMatchingItems(() => true, reason)
+  }
+
   function closeMatchingItems(
     predicate: (item: WorkbenchItem) => boolean,
     reason: WorkbenchDisposeReason,
@@ -231,6 +241,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     const next = normalizeWorkbenchWidthPreference({
       version: 1,
       width,
+      source: 'user',
     })
     widthPreference.value = next
     try {
@@ -241,7 +252,12 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   }
 
   function resetWidth() {
-    setWidth(WORKBENCH_DEFAULT_WIDTH)
+    widthPreference.value = defaultWorkbenchWidthPreference()
+    try {
+      localStorage.removeItem(WORKBENCH_WIDTH_STORAGE_KEY)
+    } catch {
+      // The in-memory default still restores an even split.
+    }
   }
 
   function reset() {
@@ -268,10 +284,12 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     hasMultipleItems,
     onLifecycle,
     findMostRecentItem,
+    hasAvailableItemForSession,
     openItem,
     updateItem,
     activateItem,
     closeItem,
+    closeAllItems,
     closeScope,
     setSessionScope,
     setExpanded,

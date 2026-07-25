@@ -74,6 +74,7 @@
     "expand": "Abrir área de trabajo",
     "collapse": "Contraer área de trabajo",
     "close": "Cerrar área de trabajo",
+    "closeItem": "Cerrar pestaña",
     "refresh": "Actualizar",
     "openExternal": "Abrir externamente",
     "openItems": "Elementos abiertos del área de trabajo",

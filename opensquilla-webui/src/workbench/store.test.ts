@@ -54,6 +54,18 @@ describe('workbench store', () => {
     expect(store.activeItemId).toBe('c')
   })
 
+  it('closes every open item when the Workbench itself is closed', () => {
+    const store = useWorkbenchStore()
+    store.openItem(item('a'))
+    store.openItem(item('b'))
+
+    store.closeAllItems()
+
+    expect(store.items).toEqual([])
+    expect(store.activeItemId).toBeNull()
+    expect(store.expanded).toBe(false)
+  })
+
   it('finds the most recently used item inside a requested scope', () => {
     const store = useWorkbenchStore()
     store.openItem(item('session-a-old'))
@@ -107,6 +119,20 @@ describe('workbench store', () => {
     ])
   })
 
+  it('keeps workspace and app panels available from any chat session', () => {
+    const store = useWorkbenchStore()
+    store.openItem(item('other-session', { type: 'session', id: 'other' }))
+
+    expect(store.hasAvailableItemForSession('current')).toBe(false)
+
+    store.openItem(item('workspace', { type: 'workspace', id: 'repo' }))
+    expect(store.hasAvailableItemForSession('current')).toBe(true)
+
+    store.closeItem('workspace')
+    store.openItem(item('global', { type: 'app' }))
+    expect(store.hasAvailableItemForSession('current')).toBe(true)
+  })
+
   it('announces suspend and resume when the pane or host changes visibility', () => {
     const store = useWorkbenchStore()
     const events: string[] = []
@@ -133,8 +159,22 @@ describe('workbench store', () => {
     expect(setItem).toHaveBeenCalledOnce()
     expect(setItem).toHaveBeenCalledWith(
       WORKBENCH_WIDTH_STORAGE_KEY,
-      '{"version":1,"width":614}',
+      '{"version":1,"width":614,"source":"user"}',
     )
     expect(localStorage.getItem(WORKBENCH_WIDTH_STORAGE_KEY)).not.toContain('secret-artifact')
+  })
+
+  it('restores the responsive default without persisting content', () => {
+    const store = useWorkbenchStore()
+    store.setWidth(614)
+
+    store.resetWidth()
+
+    expect(store.widthPreference).toEqual({
+      version: 1,
+      width: 520,
+      source: 'default',
+    })
+    expect(localStorage.getItem(WORKBENCH_WIDTH_STORAGE_KEY)).toBeNull()
   })
 })

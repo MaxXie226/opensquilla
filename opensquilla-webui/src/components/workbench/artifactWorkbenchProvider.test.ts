@@ -4,7 +4,10 @@ import type {
   Platform,
 } from '@/platform/types'
 import type { ArtifactPayload } from '@/types/rpc'
-import { createArtifactPreviewWorkbenchItem } from '@/workbench/artifactItems'
+import {
+  createArtifactCollectionWorkbenchItem,
+  createArtifactPreviewWorkbenchItem,
+} from '@/workbench/artifactItems'
 import type {
   WorkbenchPanelRenderState,
   WorkbenchRuntimeContext,
@@ -51,6 +54,7 @@ describe('artifact Workbench provider', () => {
       authToken: () => '',
       baseOrigin: 'http://localhost',
       currentSessionId: () => 'session-a',
+      openArtifact: vi.fn(),
       platform: {
         capabilities: { canOpenArtifactsNatively: false },
         files: {},
@@ -165,6 +169,7 @@ describe('artifact Workbench provider', () => {
       authToken: () => '',
       baseOrigin: 'http://localhost',
       currentSessionId: () => 'session-a',
+      openArtifact: vi.fn(),
       platform: {
         capabilities: { canOpenArtifactsNatively: false },
         files: {},
@@ -192,5 +197,47 @@ describe('artifact Workbench provider', () => {
     expect(destroySurface).toHaveBeenCalledWith(item.id)
     expect(pushToast).not.toHaveBeenCalled()
     expect(renderState.nativeSurfaceState).not.toBe('crashed')
+  })
+
+  it('routes collection selections to a preview without losing the full list', async () => {
+    const openArtifact = vi.fn()
+    const item = createArtifactCollectionWorkbenchItem({
+      artifacts: [artifact],
+      sessionKey: 'session-a',
+      title: 'Deliverables (1)',
+    })
+    const definition = createArtifactWorkbenchDefinitions({
+      authToken: () => '',
+      baseOrigin: 'http://localhost',
+      currentSessionId: () => 'session-a',
+      openArtifact,
+      platform: {
+        capabilities: { canOpenArtifactsNatively: false },
+        files: {},
+      } as unknown as Platform,
+      pushToast: vi.fn(),
+      t: key => key,
+    }).find(candidate => candidate.kind === 'artifact-collection')!
+    const context: WorkbenchRuntimeContext = {
+      getRenderState: () => ({}),
+      updateRenderState: vi.fn(),
+      isItemOpen: () => true,
+      setExpanded: vi.fn(),
+      reportError: vi.fn(),
+    }
+    const runtime = await definition.createRuntime!(item, context)
+
+    await runtime.handleComponentEvent?.({
+      type: 'artifact-open',
+      payload: artifact,
+    }, item)
+
+    expect(openArtifact).toHaveBeenCalledWith(artifact, 'session-a')
+    expect(definition.getProps?.(item, {
+      active: true,
+      hostAvailable: true,
+      nativeSurface: false,
+      runtimeState: {},
+    })).toMatchObject({ artifacts: [artifact] })
   })
 })

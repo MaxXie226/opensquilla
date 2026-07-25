@@ -74,6 +74,7 @@
     "expand": "展开工作区",
     "collapse": "收起工作区",
     "close": "关闭工作区",
+    "closeItem": "关闭标签",
     "refresh": "刷新",
     "openExternal": "在外部打开",
     "openItems": "已打开的工作区项目",

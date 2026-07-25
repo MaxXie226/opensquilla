@@ -10,6 +10,7 @@ async function mountResizer() {
   const commit = vi.fn<(value: number) => void>()
   const preview = vi.fn<(value: number) => void>()
   const cancel = vi.fn<(value: number) => void>()
+  const reset = vi.fn<(value: number) => void>()
   const host = document.createElement('div')
   document.body.appendChild(host)
   const Root = defineComponent(() => () => h(WorkbenchResizer, {
@@ -21,6 +22,7 @@ async function mountResizer() {
     },
     onCommit: commit,
     onCancel: cancel,
+    onReset: reset,
   }))
   const app = createApp(Root)
   app.mount(host)
@@ -33,6 +35,7 @@ async function mountResizer() {
     commit,
     preview,
     cancel,
+    reset,
   }
 }
 
@@ -112,5 +115,17 @@ describe('WorkbenchResizer', () => {
     }))
     expect(mounted.cancel).toHaveBeenLastCalledWith(520)
     expect(document.documentElement.classList.contains('is-workbench-resizing')).toBe(false)
+  })
+
+  it('resets the saved preference when the responsive width is visually unchanged', async () => {
+    const mounted = await mountResizer()
+
+    mounted.handle.dispatchEvent(new MouseEvent('dblclick', {
+      bubbles: true,
+      button: 0,
+    }))
+
+    expect(mounted.reset).toHaveBeenCalledOnce()
+    expect(mounted.reset).toHaveBeenCalledWith(520)
   })
 })

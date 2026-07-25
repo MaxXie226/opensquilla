@@ -74,6 +74,7 @@
     "expand": "Open workbench",
     "collapse": "Collapse workbench",
     "close": "Close workbench",
+    "closeItem": "Close tab",
     "refresh": "Refresh",
     "openExternal": "Open externally",
     "openItems": "Open workbench items",

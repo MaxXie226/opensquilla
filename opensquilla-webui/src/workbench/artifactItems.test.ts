@@ -2,7 +2,9 @@ import { describe, expect, it } from 'vitest'
 import type { ArtifactPayload } from '@/types/rpc'
 import {
   artifactFromWorkbenchItem,
+  artifactsFromWorkbenchItem,
   artifactWorkbenchItemId,
+  createArtifactCollectionWorkbenchItem,
   createArtifactPreviewWorkbenchItem,
 } from './artifactItems'
 
@@ -52,5 +54,19 @@ describe('artifact Workbench items', () => {
     expect(html.hostKind).toBe('native-webcontents')
     expect(image.hostKind).toBe('dom')
     expect(artifactFromWorkbenchItem(html)).toEqual(artifact)
+  })
+
+  it('creates one stable session collection containing every artifact', () => {
+    const second = { ...artifact, id: 'artifact-2', name: 'notes.txt' }
+    const collection = createArtifactCollectionWorkbenchItem({
+      artifacts: [artifact, second],
+      sessionKey: 'session-a',
+      title: 'Deliverables (2)',
+    })
+
+    expect(collection.kind).toBe('artifact-collection')
+    expect(collection.id).not.toContain('session-a')
+    expect(collection.title).toBe('Deliverables (2)')
+    expect(artifactsFromWorkbenchItem(collection)).toEqual([artifact, second])
   })
 })

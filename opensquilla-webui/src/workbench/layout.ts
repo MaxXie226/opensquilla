@@ -8,10 +8,12 @@ export const WORKBENCH_SPLIT_MIN_WIDTH = 960
 export const WORKBENCH_MOBILE_MAX_WIDTH = 720
 
 export type WorkbenchLayoutMode = 'split' | 'overlay' | 'mobile-dialog'
+export type WorkbenchWidthSource = 'default' | 'user'
 
 export interface WorkbenchWidthPreference {
   version: 1
   width: number
+  source: WorkbenchWidthSource
 }
 
 export interface WorkbenchLayoutInput {
@@ -28,7 +30,11 @@ function clamp(value: number, minimum: number, maximum: number): number {
 }
 
 export function defaultWorkbenchWidthPreference(): WorkbenchWidthPreference {
-  return { version: WORKBENCH_WIDTH_VERSION, width: WORKBENCH_DEFAULT_WIDTH }
+  return {
+    version: WORKBENCH_WIDTH_VERSION,
+    width: WORKBENCH_DEFAULT_WIDTH,
+    source: 'default',
+  }
 }
 
 export function normalizeWorkbenchWidthPreference(
@@ -40,9 +46,11 @@ export function normalizeWorkbenchWidthPreference(
   ) {
     return defaultWorkbenchWidthPreference()
   }
+  if (preference.source === 'default') return defaultWorkbenchWidthPreference()
   return {
     version: WORKBENCH_WIDTH_VERSION,
     width: Math.max(WORKBENCH_MIN_WIDTH, Math.round(preference.width)),
+    source: 'user',
   }
 }
 
@@ -59,7 +67,17 @@ export function parseWorkbenchWidthPreference(
     ) {
       return defaultWorkbenchWidthPreference()
     }
-    return normalizeWorkbenchWidthPreference(value as WorkbenchWidthPreference)
+    if (value.source === 'default') return defaultWorkbenchWidthPreference()
+    if (value.source !== undefined && value.source !== 'user') {
+      return defaultWorkbenchWidthPreference()
+    }
+    return normalizeWorkbenchWidthPreference({
+      version: WORKBENCH_WIDTH_VERSION,
+      width: value.width,
+      // Preferences written before `source` was introduced represent a user
+      // choice and must keep their fixed width across upgrades.
+      source: 'user',
+    })
   } catch {
     return defaultWorkbenchWidthPreference()
   }
@@ -99,8 +117,11 @@ export function workbenchEffectiveWidth(
   if (mode === 'overlay') {
     return Math.min(normalized.width, Math.max(0, width - 24))
   }
+  const preferredWidth = normalized.source === 'default'
+    ? Math.round(width / 2)
+    : normalized.width
   return clamp(
-    normalized.width,
+    preferredWidth,
     WORKBENCH_MIN_WIDTH,
     workbenchDynamicMax(width),
   )

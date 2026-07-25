@@ -74,6 +74,7 @@
     "expand": "Arbeitsbereich öffnen",
     "collapse": "Arbeitsbereich einklappen",
     "close": "Arbeitsbereich schließen",
+    "closeItem": "Tab schließen",
     "refresh": "Aktualisieren",
     "openExternal": "Extern öffnen",
     "openItems": "Geöffnete Arbeitsbereich-Elemente",
