@@ -425,9 +425,9 @@ describe('ConversationMinimap', () => {
     expect(markers(host)).toHaveLength(8)
   })
 
-  it('enters only at the 1104px conversation-pane threshold', async () => {
+  it('enters only at the 1120px conversation-pane threshold', async () => {
     const rendered = messages(8)
-    const narrowThread = makeThread(rendered, 1103)
+    const narrowThread = makeThread(rendered, 1119)
     const narrowHost = document.createElement('div')
     document.body.appendChild(narrowHost)
     const narrowApp = createApp(ConversationMinimap, {
@@ -441,13 +441,13 @@ describe('ConversationMinimap', () => {
     await new Promise(resolve => window.setTimeout(resolve, 20))
 
     expect(narrowHost.querySelector('[data-testid="conversation-minimap"]')).toBeNull()
-    const wide = await mountMinimap(8, {}, { clientWidth: 1104 })
+    const wide = await mountMinimap(8, {}, { clientWidth: 1120 })
     expect(markers(wide.host)).toHaveLength(8)
   })
 
-  it('keeps the rail mounted until the pane crosses the 1056px exit threshold', async () => {
+  it('keeps the rail mounted until the pane crosses the 1104px collision floor', async () => {
     const observers = stubResizeObservers()
-    const { host, thread } = await mountMinimap(8, {}, { clientWidth: 1104 })
+    const { host, thread } = await mountMinimap(8, {}, { clientWidth: 1120 })
     const shellObserver = observers.find(observer => observer.targets.has(thread.container))!
     const resizeTo = async (width: number) => {
       Object.defineProperty(thread.container, 'clientWidth', { configurable: true, value: width })
@@ -455,13 +455,13 @@ describe('ConversationMinimap', () => {
       await nextTick()
     }
 
-    await resizeTo(1057)
+    await resizeTo(1105)
     expect(markers(host)).toHaveLength(8)
-    await resizeTo(1056)
-    await vi.waitFor(() => expect(host.querySelector('[data-testid="conversation-minimap"]')).toBeNull())
-    await resizeTo(1103)
-    expect(host.querySelector('[data-testid="conversation-minimap"]')).toBeNull()
     await resizeTo(1104)
+    await vi.waitFor(() => expect(host.querySelector('[data-testid="conversation-minimap"]')).toBeNull())
+    await resizeTo(1119)
+    expect(host.querySelector('[data-testid="conversation-minimap"]')).toBeNull()
+    await resizeTo(1120)
     await vi.waitFor(() => expect(markers(host)).toHaveLength(8))
   })
 

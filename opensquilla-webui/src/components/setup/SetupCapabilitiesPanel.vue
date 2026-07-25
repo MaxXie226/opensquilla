@@ -100,7 +100,7 @@ const emit = defineEmits<{
   updateField: [group: 'search' | 'memory' | 'image' | 'audio', key: string, value: string | number | boolean]
   searchProviderChange: []
   memoryProviderChange: []
-  imageProviderChange: []
+  imageProviderChange: [providerId: string]
   saveSearch: []
   saveMemory: []
   saveImage: []
@@ -119,8 +119,7 @@ function onMemoryProviderSelect(event: Event) {
 }
 
 function onImageProviderSelect(event: Event) {
-  emit('updateField', 'image', 'provider', (event.target as HTMLSelectElement).value)
-  emit('imageProviderChange')
+  emit('imageProviderChange', (event.target as HTMLSelectElement).value)
 }
 </script>
 
