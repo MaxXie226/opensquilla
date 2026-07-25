@@ -7811,6 +7811,341 @@ def test_resume_expected_manifest_rejects_incompatible_contract(tmp_path: Path) 
         )
 
 
+def _repair_source_drift_compatibility(
+    module,
+    *,
+    git_head: str,
+    source_tree_sha256: str,
+    contract_marker: str = "same",
+) -> dict[str, object]:
+    contract = {
+        "schema": module.RUN_COMPATIBILITY_SCHEMA,
+        "benchmark": "DRACO",
+        "group": "B0",
+        "source_identity": {
+            "git_head": git_head,
+            "source_tree_sha256": source_tree_sha256,
+        },
+        "contract_marker": contract_marker,
+        "resolved_llm_runtime": {"provider": "openrouter"},
+    }
+    return {
+        "schema": module.RUN_COMPATIBILITY_SCHEMA,
+        "contracts": {"B0": contract},
+        "fingerprints": {"B0": module.canonical_json_sha256(contract)},
+    }
+
+
+def test_repair_only_source_drift_inherits_expected_contract_and_actions(
+    tmp_path: Path,
+) -> None:
+    module = _load_resume_runner()
+    expected = _repair_source_drift_compatibility(
+        module,
+        git_head="a" * 40,
+        source_tree_sha256="b" * 64,
+    )
+    actual = _repair_source_drift_compatibility(
+        module,
+        git_head="c" * 40,
+        source_tree_sha256="d" * 64,
+    )
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps({"run_compatibility": expected}),
+        encoding="utf-8",
+    )
+
+    inherited, audit = (
+        module.validate_repair_only_source_drift_compatibility(
+            path=manifest,
+            actual=actual,
+            groups=["B0"],
+        )
+    )
+
+    assert inherited == expected
+    assert audit["groups"]["B0"]["source_identity_changed"] is True
+    assert audit["groups"]["B0"]["non_source_contract_match"] is True
+    action_audit = module.repair_only_resume_classification_audit(
+        selected_keys={("B2", "task-1"), ("G1", "task-1")},
+        resume_states={
+            ("B2", "task-1"): {"action": "judge_only"},
+            ("G1", "task-1"): {"action": "metadata_only"},
+        },
+    )
+    assert action_audit["status"] == "repair_actions_validated"
+    assert action_audit["action_counts"] == {
+        "judge_only": 1,
+        "metadata_only": 1,
+    }
+    assert action_audit["regenerate_pair_count"] == 0
+    assert action_audit["generation_allowed"] is False
+
+
+@pytest.mark.parametrize(
+    ("mutate_expected", "match"),
+    [
+        (
+            lambda expected: expected["contracts"]["B0"].__setitem__(
+                "contract_marker",
+                "different",
+            ),
+            "non_source_contract_mismatch",
+        ),
+        (
+            lambda expected: expected["fingerprints"].__setitem__(
+                "B0",
+                "sha256:not-canonical",
+            ),
+            "expected_fingerprint_not_canonical",
+        ),
+    ],
+    ids=["non-source-contract", "non-canonical-fingerprint"],
+)
+def test_repair_only_source_drift_rejects_every_other_difference(
+    tmp_path: Path,
+    mutate_expected,
+    match: str,
+) -> None:
+    module = _load_resume_runner()
+    expected = _repair_source_drift_compatibility(
+        module,
+        git_head="a" * 40,
+        source_tree_sha256="b" * 64,
+    )
+    actual = _repair_source_drift_compatibility(
+        module,
+        git_head="c" * 40,
+        source_tree_sha256="d" * 64,
+    )
+    mutate_expected(expected)
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps({"run_compatibility": expected}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=match):
+        module.validate_repair_only_source_drift_compatibility(
+            path=manifest,
+            actual=actual,
+            groups=["B0"],
+        )
+
+
+def test_repair_only_source_drift_requires_all_safeguards(tmp_path: Path) -> None:
+    module = _load_resume_runner()
+    input_path = tmp_path / "tasks.jsonl"
+    input_path.write_text("", encoding="utf-8")
+    args = module.build_parser().parse_args(
+        [
+            "--input",
+            str(input_path),
+            "--groups",
+            "B0",
+            "--repair-only-source-drift",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="all repair-only safeguards") as exc:
+        module.validate_repair_only_source_drift_prerequisites(args)
+
+    message = str(exc.value)
+    assert "--require-clean-source" in message
+    assert "--expected-compatibility-manifest" in message
+    assert "--resume-from-jsonl" in message
+    assert "--only-group-task-keys" in message
+
+
+def test_repair_only_classification_rejects_regenerate_and_budget_exhaustion() -> None:
+    module = _load_resume_runner()
+    audit = module.repair_only_resume_classification_audit(
+        selected_keys={("B0", "missing"), ("B1", "budget")},
+        resume_states={
+            ("B1", "budget"): {
+                "action": "regenerate",
+                "prior_generation_attempts_used": module.GENERATION_MAX_ATTEMPTS,
+                "generation_reasons": ["empty_final_text"],
+            }
+        },
+    )
+
+    assert audit["status"] == "rejected_regeneration_required"
+    assert audit["regenerate_pair_count"] == 2
+    assert {
+        item["reason"] for item in audit["regenerate_pairs"]
+    } == {"missing_resume_state", "generation_budget_exhausted"}
+
+
+@pytest.mark.asyncio
+async def test_repair_only_regenerate_fails_before_provider_or_judge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_resume_runner()
+    task = {"id": "task-1", "prompt": "prompt"}
+    input_path = tmp_path / "tasks.jsonl"
+    input_path.write_text(json.dumps(task) + "\n", encoding="utf-8")
+    resume_path = tmp_path / "resume.jsonl"
+    resume_path.write_text("", encoding="utf-8")
+    only_keys = tmp_path / "only.jsonl"
+    only_keys.write_text(
+        json.dumps({"group": "B0", "task_id": "task-1"}) + "\n",
+        encoding="utf-8",
+    )
+    expected = _repair_source_drift_compatibility(
+        module,
+        git_head="a" * 40,
+        source_tree_sha256="b" * 64,
+    )
+    actual = _repair_source_drift_compatibility(
+        module,
+        git_head="c" * 40,
+        source_tree_sha256="d" * 64,
+    )
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps({"run_compatibility": expected}),
+        encoding="utf-8",
+    )
+    args = module.build_parser().parse_args(
+        [
+            "--input",
+            str(input_path),
+            "--output-dir",
+            str(tmp_path / "output"),
+            "--groups",
+            "B0",
+            "--resume-from-jsonl",
+            str(resume_path),
+            "--only-group-task-keys",
+            str(only_keys),
+            "--expected-compatibility-manifest",
+            str(manifest),
+            "--require-clean-source",
+            "--repair-only-source-drift",
+            "--judge-model",
+            "judge-model",
+        ]
+    )
+    monkeypatch.setattr(
+        module,
+        "source_provenance",
+        lambda: {
+            "git_head": "c" * 40,
+            "source_tree_sha256": "d" * 64,
+            "git_dirty": False,
+        },
+    )
+    monkeypatch.setattr(
+        module.GatewayConfig,
+        "load",
+        lambda _path: GatewayConfig(),
+    )
+    monkeypatch.setattr(
+        module,
+        "build_run_compatibility",
+        lambda **_kwargs: actual,
+    )
+    calls = {"preflight": 0, "provider": 0, "generation": 0, "judge": 0}
+
+    async def forbidden_preflight(*_args, **_kwargs):
+        calls["preflight"] += 1
+        raise AssertionError("preflight must not start")
+
+    def forbidden_provider(*_args, **_kwargs):
+        calls["provider"] += 1
+        raise AssertionError("provider must not be built")
+
+    async def forbidden_generation(*_args, **_kwargs):
+        calls["generation"] += 1
+        raise AssertionError("generation must not start")
+
+    async def forbidden_judge(*_args, **_kwargs):
+        calls["judge"] += 1
+        raise AssertionError("Judge must not start")
+
+    monkeypatch.setattr(
+        module,
+        "run_local_web_tools_preflight",
+        forbidden_preflight,
+    )
+    monkeypatch.setattr(module, "build_single_provider", forbidden_provider)
+    monkeypatch.setattr(module, "run_one", forbidden_generation)
+    monkeypatch.setattr(module, "judge_text", forbidden_judge)
+
+    with pytest.raises(
+        ValueError,
+        match="refuses every generation path",
+    ):
+        await module.amain(args)
+
+    assert calls == {
+        "preflight": 0,
+        "provider": 0,
+        "generation": 0,
+        "judge": 0,
+    }
+    assert args._run_compatibility == expected
+    assert args._repair_compatibility_audit["status"] == (
+        "rejected_regeneration_required"
+    )
+    assert not (tmp_path / "output").exists()
+
+
+def test_repair_manifest_keeps_current_source_and_inherited_compatibility(
+    tmp_path: Path,
+) -> None:
+    module = _load_resume_runner()
+    input_path = tmp_path / "tasks.jsonl"
+    input_path.write_text("", encoding="utf-8")
+    args = module.build_parser().parse_args(
+        [
+            "--input",
+            str(input_path),
+            "--groups",
+            "B0",
+            "--repair-only-source-drift",
+        ]
+    )
+    inherited = _repair_source_drift_compatibility(
+        module,
+        git_head="a" * 40,
+        source_tree_sha256="b" * 64,
+    )
+    args._source_provenance = {
+        "git_head": "c" * 40,
+        "source_tree_sha256": "d" * 64,
+        "git_dirty": False,
+    }
+    args._run_compatibility = inherited
+    args._repair_compatibility_audit = {
+        "schema": module.REPAIR_ONLY_SOURCE_DRIFT_SCHEMA,
+        "status": "repair_actions_validated",
+    }
+    manifest = tmp_path / "repair.manifest.json"
+
+    module.write_manifest(
+        manifest,
+        args=args,
+        stamp="repair-test",
+        status="running",
+        started_at=1.0,
+        tasks=[],
+        groups=["B0"],
+        artifacts={},
+        tool_policy={"tool_mode": "provider_only"},
+    )
+
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    assert payload["source_provenance"]["git_head"] == "c" * 40
+    assert payload["run_compatibility"] == inherited
+    assert payload["repair_compatibility_audit"]["status"] == (
+        "repair_actions_validated"
+    )
+
+
 def test_task_input_hash_covers_rubric_not_only_prompt() -> None:
     first = {"id": "task-1", "prompt": "same", "rubric": {"criteria": ["a"]}}
     second = {"id": "task-1", "prompt": "same", "rubric": {"criteria": ["b"]}}

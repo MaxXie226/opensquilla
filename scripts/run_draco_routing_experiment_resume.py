@@ -19,6 +19,7 @@ import subprocess
 import sys
 import time
 import uuid
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from functools import cache
@@ -285,6 +286,9 @@ GENERATION_EMPTY_OUTPUT_ERROR = "empty_generation_output"
 GENERATION_MISSING_DONE_ERROR = "generation_missing_done"
 RUNNER_STREAM_CLEANUP_TIMEOUT_SECONDS = 1.0
 RUN_COMPATIBILITY_SCHEMA = "opensquilla.draco.run-compatibility/v1"
+REPAIR_ONLY_SOURCE_DRIFT_SCHEMA = (
+    "opensquilla.draco.repair-only-source-drift/v1"
+)
 
 
 def normalized_agent_finalization_policy(
@@ -10033,6 +10037,7 @@ def manifest_args(args: argparse.Namespace) -> dict[str, Any]:
         "agent_max_iterations",
         *AGENT_FINALIZATION_POLICY_FIELDS,
         "require_clean_source",
+        "repair_only_source_drift",
         "dry_run",
         "judge_model",
         "judge_repeats",
@@ -10556,6 +10561,222 @@ def validate_expected_run_compatibility(
         )
 
 
+def validate_repair_only_source_drift_prerequisites(
+    args: argparse.Namespace,
+) -> dict[str, Any] | None:
+    """Require an explicitly bounded, file-backed repair-only invocation."""
+
+    if not bool(getattr(args, "repair_only_source_drift", False)):
+        return None
+    missing: list[str] = []
+    if not bool(getattr(args, "require_clean_source", False)):
+        missing.append("--require-clean-source")
+    expected_manifest = getattr(args, "expected_compatibility_manifest", None)
+    if expected_manifest is None:
+        missing.append("--expected-compatibility-manifest")
+    elif not Path(expected_manifest).is_file():
+        missing.append("existing --expected-compatibility-manifest")
+    resume_paths = list(getattr(args, "resume_from_jsonl", []) or [])
+    if not resume_paths:
+        missing.append("--resume-from-jsonl")
+    elif any(not Path(path).is_file() for path in resume_paths):
+        missing.append("existing --resume-from-jsonl files")
+    only_keys = getattr(args, "only_group_task_keys", None)
+    if only_keys is None:
+        missing.append("--only-group-task-keys")
+    elif not Path(only_keys).is_file():
+        missing.append("existing --only-group-task-keys")
+    if missing:
+        raise ValueError(
+            "--repair-only-source-drift requires all repair-only safeguards: "
+            + ", ".join(missing)
+        )
+    return {
+        "require_clean_source": True,
+        "expected_compatibility_manifest": str(Path(expected_manifest)),
+        "resume_source_count": len(resume_paths),
+        "only_group_task_keys": str(Path(only_keys)),
+    }
+
+
+def validate_repair_only_source_drift_compatibility(
+    *,
+    path: Path,
+    actual: Mapping[str, Any],
+    groups: list[str],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Allow only source_identity drift and inherit the original contracts."""
+
+    if not path.is_file():
+        raise ValueError(f"expected compatibility manifest does not exist: {path}")
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    expected = manifest.get("run_compatibility") if isinstance(manifest, Mapping) else None
+    if not isinstance(expected, Mapping):
+        raise ValueError(f"manifest lacks run_compatibility: {path}")
+    expected_contracts = expected.get("contracts")
+    expected_fingerprints = expected.get("fingerprints")
+    actual_contracts = actual.get("contracts")
+    actual_fingerprints = actual.get("fingerprints")
+    if (
+        set(expected) != {"schema", "fingerprints", "contracts"}
+        or set(actual) != {"schema", "fingerprints", "contracts"}
+        or expected.get("schema") != RUN_COMPATIBILITY_SCHEMA
+        or actual.get("schema") != RUN_COMPATIBILITY_SCHEMA
+        or not isinstance(expected_contracts, Mapping)
+        or not isinstance(expected_fingerprints, Mapping)
+        or not isinstance(actual_contracts, Mapping)
+        or not isinstance(actual_fingerprints, Mapping)
+    ):
+        raise ValueError(
+            "repair-only source drift requires complete canonical run compatibility "
+            f"contracts and fingerprints in both the current run and {path}"
+        )
+
+    group_audits: dict[str, Any] = {}
+    mismatch_reasons: dict[str, list[str]] = {}
+    for group in groups:
+        reasons: list[str] = []
+        expected_contract = expected_contracts.get(group)
+        actual_contract = actual_contracts.get(group)
+        expected_fingerprint = str(expected_fingerprints.get(group) or "")
+        actual_fingerprint = str(actual_fingerprints.get(group) or "")
+        if not isinstance(expected_contract, Mapping):
+            reasons.append("missing_expected_contract")
+        if not isinstance(actual_contract, Mapping):
+            reasons.append("missing_current_contract")
+        if reasons:
+            mismatch_reasons[group] = reasons
+            continue
+        expected_contract_copy = json.loads(
+            json.dumps(dict(expected_contract), ensure_ascii=False)
+        )
+        actual_contract_copy = json.loads(
+            json.dumps(dict(actual_contract), ensure_ascii=False)
+        )
+        expected_canonical_fingerprint = canonical_json_sha256(
+            expected_contract_copy
+        )
+        actual_canonical_fingerprint = canonical_json_sha256(
+            actual_contract_copy
+        )
+        if expected_fingerprint != expected_canonical_fingerprint:
+            reasons.append("expected_fingerprint_not_canonical")
+        if actual_fingerprint != actual_canonical_fingerprint:
+            reasons.append("current_fingerprint_not_canonical")
+        expected_source = expected_contract_copy.pop("source_identity", None)
+        actual_source = actual_contract_copy.pop("source_identity", None)
+        if not isinstance(expected_source, Mapping):
+            reasons.append("missing_expected_source_identity")
+        if not isinstance(actual_source, Mapping):
+            reasons.append("missing_current_source_identity")
+        non_source_fingerprint = canonical_json_sha256(expected_contract_copy)
+        current_non_source_fingerprint = canonical_json_sha256(
+            actual_contract_copy
+        )
+        if (
+            expected_contract_copy != actual_contract_copy
+            or non_source_fingerprint != current_non_source_fingerprint
+        ):
+            reasons.append("non_source_contract_mismatch")
+        if reasons:
+            mismatch_reasons[group] = list(dict.fromkeys(reasons))
+            continue
+        group_audits[group] = {
+            "expected_fingerprint": expected_fingerprint,
+            "current_fingerprint": actual_fingerprint,
+            "inherited_fingerprint": expected_fingerprint,
+            "non_source_contract_fingerprint": non_source_fingerprint,
+            "source_identity_changed": dict(expected_source) != dict(actual_source),
+            "expected_source_identity": dict(expected_source),
+            "current_source_identity": dict(actual_source),
+            "non_source_contract_match": True,
+            "canonical_fingerprints_verified": True,
+        }
+    if mismatch_reasons:
+        details = "; ".join(
+            f"{group}={','.join(reasons)}"
+            for group, reasons in sorted(mismatch_reasons.items())
+        )
+        raise ValueError(
+            "repair-only source drift rejected a non-source or non-canonical "
+            f"compatibility difference: {details}"
+        )
+
+    inherited = json.loads(json.dumps(dict(expected), ensure_ascii=False))
+    audit = {
+        "schema": REPAIR_ONLY_SOURCE_DRIFT_SCHEMA,
+        "mode": "repair_only_source_drift",
+        "status": "compatibility_validated",
+        "expected_manifest": str(path),
+        "allowed_difference": "per-group contract.source_identity only",
+        "runtime_run_compatibility": "inherited_from_expected_manifest",
+        "groups": group_audits,
+    }
+    return inherited, audit
+
+
+def repair_only_resume_classification_audit(
+    *,
+    selected_keys: set[tuple[str, str]],
+    resume_states: Mapping[tuple[str, str], Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Describe whether a repair-only wave can proceed without generation."""
+
+    action_counts: Counter[str] = Counter()
+    regenerate_pairs: list[dict[str, Any]] = []
+    allowed_actions = {
+        "complete",
+        "judge_only",
+        "metadata_only",
+        "policy_violation",
+    }
+    for group, task_id in sorted(selected_keys):
+        state = resume_states.get((group, task_id))
+        action = str(state.get("action") or "") if isinstance(state, Mapping) else ""
+        if not action:
+            action = "regenerate"
+        action_counts[action] += 1
+        if action in allowed_actions:
+            continue
+        attempts_used = (
+            coerce_metric_int(state.get("prior_generation_attempts_used"))
+            if isinstance(state, Mapping)
+            else 0
+        )
+        regenerate_pairs.append(
+            {
+                "group": group,
+                "task_id": task_id,
+                "reason": (
+                    "missing_resume_state"
+                    if not isinstance(state, Mapping)
+                    else "unsupported_resume_action"
+                    if action != "regenerate"
+                    else "generation_budget_exhausted"
+                    if attempts_used >= GENERATION_MAX_ATTEMPTS
+                    else "generation_invalid"
+                ),
+                "prior_generation_attempts_used": attempts_used,
+                "generation_reasons": (
+                    list(state.get("generation_reasons") or [])
+                    if isinstance(state, Mapping)
+                    else []
+                ),
+            }
+        )
+    return {
+        "status": "rejected_regeneration_required"
+        if regenerate_pairs
+        else "repair_actions_validated",
+        "selected_pair_count": len(selected_keys),
+        "action_counts": dict(sorted(action_counts.items())),
+        "regenerate_pair_count": len(regenerate_pairs),
+        "regenerate_pairs": regenerate_pairs,
+        "generation_allowed": False,
+        "judge_allowed_for_judge_only": True,
+    }
+
+
 def write_command_file(
     path: Path,
     *,
@@ -10696,6 +10917,15 @@ def write_manifest(
     resume_selection = getattr(args, "_resume_selection", None)
     if isinstance(resume_selection, dict):
         payload["resume_selection"] = resume_selection
+    repair_compatibility_audit = getattr(
+        args,
+        "_repair_compatibility_audit",
+        None,
+    )
+    if isinstance(repair_compatibility_audit, Mapping):
+        payload["repair_compatibility_audit"] = dict(
+            repair_compatibility_audit
+        )
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
@@ -12905,6 +13135,9 @@ async def amain(args: argparse.Namespace) -> int:
         raise ValueError(
             "--require-clean-source requires a clean, readable Git worktree before launch"
         )
+    repair_only_prerequisites = (
+        validate_repair_only_source_drift_prerequisites(args)
+    )
     groups = parse_groups(args.groups)
     alignment = apply_b2_g12_argument_alignment(args, groups)
     bundle = getattr(args, "_draco_experiment_config_bundle", None)
@@ -13026,14 +13259,31 @@ async def amain(args: argparse.Namespace) -> int:
         groups,
         args=args,
     )
-    args._run_compatibility = build_run_compatibility(
+    current_run_compatibility = build_run_compatibility(
         args=args,
         config=config,
         groups=groups,
         group_tool_policies=stable_group_tool_policies,
         generation_policy=generation_policy,
     )
-    if expected_compatibility_manifest is not None:
+    if repair_only_prerequisites is not None:
+        (
+            args._run_compatibility,
+            args._repair_compatibility_audit,
+        ) = validate_repair_only_source_drift_compatibility(
+            path=expected_compatibility_manifest,
+            actual=current_run_compatibility,
+            groups=groups,
+        )
+        args._repair_compatibility_audit["preconditions"] = (
+            repair_only_prerequisites
+        )
+    else:
+        args._run_compatibility = current_run_compatibility
+    if (
+        expected_compatibility_manifest is not None
+        and repair_only_prerequisites is None
+    ):
         validate_expected_run_compatibility(
             path=expected_compatibility_manifest,
             actual=args._run_compatibility,
@@ -13105,6 +13355,29 @@ async def amain(args: argparse.Namespace) -> int:
         ],
         **resume_audit,
     }
+    if repair_only_prerequisites is not None:
+        repair_action_audit = repair_only_resume_classification_audit(
+            selected_keys=selected_keys,
+            resume_states=resume_states,
+        )
+        args._repair_compatibility_audit["classification_gate"] = (
+            repair_action_audit
+        )
+        if repair_action_audit["regenerate_pair_count"]:
+            args._repair_compatibility_audit["status"] = (
+                "rejected_regeneration_required"
+            )
+            preview = ", ".join(
+                f"{item['group']}/{item['task_id']} ({item['reason']})"
+                for item in repair_action_audit["regenerate_pairs"][:10]
+            )
+            raise ValueError(
+                "--repair-only-source-drift refuses every generation path; "
+                f"resume classification requires regeneration for: {preview}"
+            )
+        args._repair_compatibility_audit["status"] = (
+            "repair_actions_validated"
+        )
     if fatal_policy_keys:
         output_dir = args.output_dir
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -14208,6 +14481,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--require-clean-source",
         action="store_true",
         help="Refuse to start unless the benchmark source worktree is clean and identifiable.",
+    )
+    parser.add_argument(
+        "--repair-only-source-drift",
+        action="store_true",
+        help=(
+            "Permit a clean repair commit to reuse an expected manifest only when "
+            "source_identity is the sole compatibility difference. Requires "
+            "--require-clean-source, --expected-compatibility-manifest, at least one "
+            "--resume-from-jsonl, and --only-group-task-keys; any generation action "
+            "then fails before provider or Judge construction."
+        ),
     )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
