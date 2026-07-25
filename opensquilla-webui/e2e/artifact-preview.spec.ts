@@ -74,6 +74,16 @@ function fulfillPng(route: Route) {
 }
 
 async function openSeeded(page: Page, artifacts?: object[]) {
+  // This suite pins the one-release legacy lightbox fallback. Workbench
+  // coverage lives in workbench.spec.ts; keeping the flag explicit prevents
+  // the fallback contract from silently disappearing while the kill switch is
+  // still supported.
+  await page.addInitScript(() => {
+    window.OPENSQUILLA_FEATURES = {
+      ...(window.OPENSQUILLA_FEATURES || {}),
+      artifactWorkbench: false,
+    }
+  })
   await seedHistory(page, artifacts)
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
   await page.waitForSelector('.conn-pill', { timeout: 10000 })
