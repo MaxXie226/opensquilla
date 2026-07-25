@@ -1237,7 +1237,7 @@ async def test_dispatch_rejects_mid_string_compacted_marker_before_handler() -> 
 
 
 @pytest.mark.asyncio
-async def test_dispatch_unsupported_surface_approval_payload_is_pending_status() -> None:
+async def test_dispatch_channel_approval_payload_is_pending_status() -> None:
     handler = build_tool_handler(_build_registry())
     token = current_tool_context.set(
         ToolContext(
@@ -1265,10 +1265,9 @@ async def test_dispatch_unsupported_surface_approval_payload_is_pending_status()
     assert result.execution_status["reason"] == "approval_pending"
     assert result.execution_status["preservation_class"] == "ephemeral"
     payload = json.loads(result.content)
-    assert payload["status"] == "error"
-    assert payload["tool"] == "pending"
-    assert payload["error_class"] == "UnsupportedSurface"
-    assert payload["retry_allowed"] is False
+    assert payload["status"] == "approval_required"
+    assert payload["approval_id"] == "abc123"
+    assert payload.get("error_class") != "UnsupportedSurface"
 
 
 @pytest.mark.asyncio
@@ -1606,6 +1605,8 @@ async def test_dispatch_execution_policy_stores_raw_snapshot_for_truncated_exec_
     assert len(payload["preview"]) + len(payload["tail"]) <= 10_000
     assert payload["tool_result_handle"].startswith("tr-")
     assert "retrieve_tool_result" in payload["retrieve_hint"]
+    assert "handle=<tool_result_handle>" in payload["retrieve_hint"]
+    assert "with tool_result_handle" not in payload["retrieve_hint"]
     assert len(result.content) < 12_000
 
     stored = ToolResultStore(tmp_path / "tool-results").read(

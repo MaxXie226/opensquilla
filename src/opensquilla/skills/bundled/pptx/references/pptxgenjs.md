@@ -8,9 +8,15 @@ PptxGenJS is MIT-licensed upstream.
 ## Install
 
 ```bash
-npm install -g pptxgenjs            # global, for ad-hoc scripts
-npm install pptxgenjs                # local, in a Node project
+mkdir -p /tmp/opensquilla-pptxgenjs
+cd /tmp/opensquilla-pptxgenjs
+npm install --ignore-scripts --no-save pptxgenjs
 ```
+
+Keep the authoring script in this disposable directory so Node resolves the
+local `node_modules/pptxgenjs`. Do not use `npm install -g`: global packages
+are not a reliable `require()` search path. Write the final `.pptx` into the
+active workspace, then remove the temporary directory.
 
 ## Boilerplate
 

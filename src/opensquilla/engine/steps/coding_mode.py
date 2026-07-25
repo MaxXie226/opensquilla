@@ -35,6 +35,7 @@ log = structlog.get_logger(__name__)
 
 _CODE_TASK_PREFLIGHT_TIMEOUT = 15.0
 _PACKAGED_GATEWAY_EXECUTABLES = {"opensquilla-gateway", "opensquilla-gateway.exe"}
+_CODE_TASK_REQUIRED_TOOLS = frozenset({"background_process", "exec_command", "process"})
 
 
 def _runs_code_task(argv: list[str]) -> bool:
@@ -296,9 +297,27 @@ def _coding_mode_on(ctx: TurnContext) -> bool:
     return bool(getattr(skills_cfg, "coding_mode", False))
 
 
+def _missing_code_task_tools(ctx: TurnContext) -> set[str]:
+    """Return launch tools absent from this turn's already-filtered surface."""
+    available_tools = {
+        str(getattr(tool, "name", ""))
+        for tool in (getattr(ctx, "tool_defs", None) or [])
+    }
+    return set(_CODE_TASK_REQUIRED_TOOLS - available_tools)
+
+
 async def enforce_coding_mode(ctx: TurnContext) -> TurnContext:
     """Inject the coding-mode directive + pin code-task while the toggle is on."""
     if not _coding_mode_on(ctx):
+        return ctx
+
+    missing_tools = _missing_code_task_tools(ctx)
+    if missing_tools:
+        # `filter_skills` independently gates the manifest on the same three
+        # tools. Do not leave a conflicting, mandatory code-task instruction
+        # on restricted callers such as ordinary channel users.
+        ctx.metadata["enforce_coding_mode__applied"] = False
+        log.info("coding_mode.skipped", missing_tools=sorted(missing_tools))
         return ctx
 
     # Resolve the code-task invocation off the event loop (cached after first).

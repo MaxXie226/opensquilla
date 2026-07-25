@@ -23,3 +23,8 @@ def test_pptx_skill_instructs_artifact_delivery() -> None:
     assert "Ignore the Path B, Path C, and Visual QA sections below" in spec.content
     assert "Do not paste OOXML" in spec.content
     assert "final `.pptx`" in spec.content
+    assert "Emoji, colored boxes,\n  and decorative lines do not satisfy" in spec.content
+    assert "Do not pass `--range` for final QA" in spec.content
+    assert "every rendered page" in spec.content
+    assert "do not use a global npm\n  install" in spec.content
+    assert "npm install -g pptxgenjs" not in spec.content
