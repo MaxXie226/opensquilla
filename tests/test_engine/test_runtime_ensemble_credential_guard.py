@@ -8,6 +8,7 @@ import pytest
 import structlog.testing
 
 from opensquilla.engine.runtime import TurnRunner
+from opensquilla.engine.types import DoneEvent
 from opensquilla.gateway.config import GatewayConfig, SquillaRouterConfig
 from opensquilla.provider import ChatConfig, EnsembleProvider, Message
 from opensquilla.provider.ranking_router import (
@@ -15,6 +16,7 @@ from opensquilla.provider.ranking_router import (
     TASK_ANALYZER_PROVIDER_ID,
     DynamicRankingError,
     TaskAnalysisResult,
+    TaskAnalyzerStreamCleanupError,
     fallback_task_profile,
 )
 from opensquilla.provider.selector import ProviderConfig
@@ -578,6 +580,12 @@ async def test_router_dynamic_carries_the_previous_route_into_the_next_turn(
         "system prompt",
         [],
     )
+    assert runner._previous_router_dynamic_route(session_key) is None
+    assert first_turn.metadata["router_dynamic_pending_route_plan"]["selected_P"]
+    assert runner._commit_pending_router_dynamic_route(
+        first_turn,
+        DoneEvent(ensemble_trace={"fallback_used": False}),
+    )
     second_turn, _ = await runner._run_pipeline(
         "continue",
         session_key,
@@ -603,8 +611,110 @@ async def test_router_dynamic_carries_the_previous_route_into_the_next_turn(
     ] is True
 
 
-async def test_router_dynamic_ranking_failure_fails_open_to_the_single_provider(
+async def test_router_dynamic_failed_turn_does_not_replace_previous_route(
     monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def analyzed_task(**kwargs: Any) -> TaskAnalysisResult:
+        return TaskAnalysisResult(
+            profile=fallback_task_profile(
+                routed_tier=str(kwargs["routed_tier"]),
+                request_context=kwargs["request_context"],
+            ),
+            source="test",
+            schema_valid=True,
+            confidence=1.0,
+        )
+
+    monkeypatch.setattr(
+        "opensquilla.provider.ranking_router.analyze_task_with_provider",
+        analyzed_task,
+    )
+    runner = TurnRunner(
+        provider_selector=None,
+        config=_static_b5_config(selection_mode="router_dynamic"),
+    )
+    selector = _FakeSelector(provider="groq", api_key="sk-groq-synthetic")
+    session_key = "agent:main:router-dynamic-failed-route"
+    previous = {
+        "selected_P": ["old-provider:old-proposer"],
+        "selected_A": "old-provider:old-aggregator",
+        "session": {},
+    }
+    runner._remember_router_dynamic_route(session_key, previous)
+
+    turn, _ = await runner._run_pipeline(
+        "new route that later fails",
+        session_key,
+        _Provider(),
+        selector,
+        [],
+        "system prompt",
+        [],
+    )
+    assert turn.metadata["router_dynamic_pending_route_plan"]["selected_P"]
+    assert not runner._commit_pending_router_dynamic_route(turn, None)
+
+    remembered = runner._previous_router_dynamic_route(session_key)
+    assert remembered is not None
+    assert remembered["selected_P"] == previous["selected_P"]
+    assert remembered["selected_A"] == previous["selected_A"]
+
+
+async def test_router_dynamic_fallback_turn_does_not_replace_previous_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def analyzed_task(**kwargs: Any) -> TaskAnalysisResult:
+        return TaskAnalysisResult(
+            profile=fallback_task_profile(
+                routed_tier=str(kwargs["routed_tier"]),
+                request_context=kwargs["request_context"],
+            ),
+            source="test",
+            schema_valid=True,
+            confidence=1.0,
+        )
+
+    monkeypatch.setattr(
+        "opensquilla.provider.ranking_router.analyze_task_with_provider",
+        analyzed_task,
+    )
+    runner = TurnRunner(
+        provider_selector=None,
+        config=_static_b5_config(selection_mode="router_dynamic"),
+    )
+    selector = _FakeSelector(provider="groq", api_key="sk-groq-synthetic")
+    session_key = "agent:main:router-dynamic-fallback-route"
+    previous = {
+        "selected_P": ["old-provider:old-proposer"],
+        "selected_A": "old-provider:old-aggregator",
+        "session": {},
+    }
+    runner._remember_router_dynamic_route(session_key, previous)
+
+    turn, _ = await runner._run_pipeline(
+        "new route that falls back",
+        session_key,
+        _Provider(),
+        selector,
+        [],
+        "system prompt",
+        [],
+    )
+    assert not runner._commit_pending_router_dynamic_route(
+        turn,
+        DoneEvent(ensemble_trace={"fallback_used": True}),
+    )
+
+    remembered = runner._previous_router_dynamic_route(session_key)
+    assert remembered is not None
+    assert remembered["selected_P"] == previous["selected_P"]
+    assert remembered["selected_A"] == previous["selected_A"]
+
+
+@pytest.mark.parametrize("failure_type", [DynamicRankingError, RuntimeError])
+async def test_router_dynamic_selection_failure_fails_open_to_the_single_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_type: type[Exception],
 ) -> None:
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
 
@@ -626,9 +736,7 @@ async def test_router_dynamic_ranking_failure_fails_open_to_the_single_provider(
     )
 
     def fail_ranking(**_kwargs: Any) -> None:
-        raise DynamicRankingError(
-            "router_dynamic has no proposer after hard filtering"
-        )
+        raise failure_type("router_dynamic has no proposer after hard filtering")
 
     monkeypatch.setattr(
         "opensquilla.provider.ranking_router.rank_models",
@@ -657,6 +765,72 @@ async def test_router_dynamic_ranking_failure_fails_open_to_the_single_provider(
         "router_dynamic_ranking_unavailable"
     )
     assert "no proposer" in turn.metadata["router_dynamic_ranking_error"]
+
+
+async def test_router_dynamic_analyzer_cleanup_failure_aborts_the_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_analysis(**_kwargs: Any) -> TaskAnalysisResult:
+        raise TaskAnalyzerStreamCleanupError("cleanup not proven")
+
+    monkeypatch.setattr(
+        "opensquilla.provider.ranking_router.analyze_task_with_provider",
+        fail_analysis,
+    )
+    runner = TurnRunner(
+        provider_selector=None,
+        config=_static_b5_config(selection_mode="router_dynamic"),
+    )
+    selector = _FakeSelector(provider="groq", api_key="sk-groq-synthetic")
+
+    with pytest.raises(TaskAnalyzerStreamCleanupError, match="cleanup not proven"):
+        await runner._run_pipeline(
+            "hello",
+            "agent:main:router-dynamic-cleanup-fail-closed",
+            _Provider(),
+            selector,
+            [],
+            "system prompt",
+            [],
+        )
+
+
+async def test_router_dynamic_unbounded_candidates_fail_open_before_analysis(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def analysis_must_not_start(**_kwargs: Any) -> TaskAnalysisResult:
+        raise AssertionError("unbounded candidate config must fail before analysis")
+
+    monkeypatch.setattr(
+        "opensquilla.provider.ranking_router.analyze_task_with_provider",
+        analysis_must_not_start,
+    )
+    runner = TurnRunner(
+        provider_selector=None,
+        config=_static_b5_config(
+            selection_mode="router_dynamic",
+            candidate_max_chars=0,
+        ),
+    )
+    selector = _FakeSelector(provider="groq", api_key="sk-groq-synthetic")
+
+    turn, provider = await runner._run_pipeline(
+        "hello",
+        "agent:main:router-dynamic-unbounded-candidate",
+        _Provider(),
+        selector,
+        [],
+        "system prompt",
+        [],
+    )
+
+    assert isinstance(provider, _Provider)
+    assert not isinstance(provider, EnsembleProvider)
+    assert "ensemble_enabled" not in turn.metadata
+    assert turn.metadata["ensemble_wrap_skipped_reason"] == (
+        "router_dynamic_ranking_unavailable"
+    )
+    assert "candidate_max_chars > 0" in turn.metadata["router_dynamic_ranking_error"]
 
 
 async def test_router_dynamic_config_load_failure_fails_open_before_analysis(

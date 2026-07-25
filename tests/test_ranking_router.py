@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from typing import Any
@@ -20,6 +21,7 @@ from opensquilla.provider.ranking_router import (
     TASK_ANALYZER_PROVIDER_ID,
     DynamicRankingError,
     TaskAnalysisResult,
+    TaskAnalyzerStreamCleanupError,
     analyze_task_with_provider,
     build_model_registry_snapshot,
     build_request_context,
@@ -439,7 +441,28 @@ def test_request_context_uses_bounded_history_and_attachment_facts() -> None:
     assert len(context["snapshot_hash"]) == 64
 
 
-def test_request_context_bounds_supplied_history_and_preserves_media_modalities() -> None:
+@pytest.mark.parametrize(
+    "media_type",
+    [
+        "image/gif",
+        "image/jpg",
+        "IMAGE/PNG; charset=binary",
+        "image/webp",
+    ],
+)
+def test_request_context_normalizes_native_image_mime(media_type: str) -> None:
+    context = build_request_context(
+        message="review the image",
+        turn_metadata={},
+        attachments=[{"name": "diagram", "media_type": media_type}],
+        candidate_output_tokens=2_000,
+        aggregator_output_tokens=3_000,
+    )
+
+    assert context["input_modalities"] == ["text", "image"]
+
+
+def test_request_context_bounds_history_and_projects_attachments_like_runtime() -> None:
     context = build_request_context(
         message="current request",
         turn_metadata={
@@ -464,7 +487,7 @@ def test_request_context_bounds_supplied_history_and_preserves_media_modalities(
     assert len(context["conversation"]["recent_turns"]) == 6
     assert context["conversation"]["recent_turns"][0].startswith("turn-3-")
     assert all(len(turn) <= 2_000 for turn in context["conversation"]["recent_turns"])
-    assert context["input_modalities"] == ["text", "audio", "video", "file"]
+    assert context["input_modalities"] == ["text"]
     assert context["attachment_refs"] == ["voice.wav", "clip.mp4", "brief.pdf"]
     assert context["routing_budget"]["estimated_input_tokens"] >= 12_345
 
@@ -867,6 +890,89 @@ class _AnalyzerProvider:
 
     async def list_models(self) -> list[Any]:
         return []
+
+
+@pytest.mark.asyncio
+async def test_task_analyzer_hanging_stream_close_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _HangingStream:
+        def __init__(self) -> None:
+            self.close_started = False
+
+        def __aiter__(self) -> _HangingStream:
+            return self
+
+        async def __anext__(self) -> Any:
+            await asyncio.Event().wait()
+
+        async def aclose(self) -> None:
+            self.close_started = True
+            await asyncio.Event().wait()
+
+    class _HangingProvider:
+        provider_name = "hanging-analyzer"
+        model = "hanging-model"
+        accounts_physical_usage = True
+
+        def __init__(self) -> None:
+            self.stream = _HangingStream()
+
+        def chat(
+            self,
+            messages: list[Message],
+            tools: list[Any] | None = None,
+            config: ChatConfig | None = None,
+        ) -> AsyncIterator[Any]:
+            return self.stream
+
+    config = load_ranking_config()
+    config["task_analyzer"]["max_retries"] = 0
+    monkeypatch.setattr(
+        ranking_router,
+        "_TASK_ANALYZER_STREAM_CLOSE_TIMEOUT_SECONDS",
+        0.01,
+    )
+    provider = _HangingProvider()
+
+    with pytest.raises(TaskAnalyzerStreamCleanupError):
+        await asyncio.wait_for(
+            analyze_task_with_provider(
+                provider=provider,
+                message="classify this",
+                user_profile_enabled=False,
+                request_context=_context(),
+                routed_tier="c1",
+                routing_confidence=0.8,
+                timeout_seconds=0.01,
+                ranking_config=config,
+            ),
+            timeout=0.2,
+        )
+
+    assert provider.stream.close_started is True
+
+
+@pytest.mark.asyncio
+async def test_task_analyzer_missing_aclose_requires_a_terminal_stream() -> None:
+    stream = object()
+
+    assert (
+        await ranking_router._bounded_close_task_analyzer_stream(
+            stream,
+            timeout_seconds=0.01,
+            require_aclose=False,
+        )
+        is True
+    )
+    assert (
+        await ranking_router._bounded_close_task_analyzer_stream(
+            stream,
+            timeout_seconds=0.01,
+            require_aclose=True,
+        )
+        is False
+    )
 
 
 @pytest.mark.asyncio

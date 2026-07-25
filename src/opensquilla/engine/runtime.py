@@ -2949,6 +2949,33 @@ class TurnRunner:
             oldest_session = next(iter(self._router_dynamic_last_routes))
             self._router_dynamic_last_routes.pop(oldest_session, None)
 
+    def _commit_pending_router_dynamic_route(
+        self,
+        turn: TurnContext,
+        done_event: DoneEvent | None,
+    ) -> bool:
+        """Remember a dynamic route only after its aggregator completed successfully."""
+
+        pending = turn.metadata.pop("router_dynamic_pending_route_plan", None)
+        if not isinstance(pending, Mapping) or done_event is None:
+            return False
+        ensemble_trace = getattr(done_event, "ensemble_trace", None)
+        if not isinstance(ensemble_trace, Mapping):
+            return False
+        if ensemble_trace.get("fallback_used") is not False:
+            return False
+        try:
+            self._remember_router_dynamic_route(turn.session_key, pending)
+        except Exception:  # noqa: BLE001 - continuity memory must not fail the turn
+            log.warning(
+                "llm_ensemble.router_dynamic.route_memory_failed",
+                decision_id=turn.metadata.get("ensemble_decision_id"),
+                session_key=turn.session_key,
+                exc_info=True,
+            )
+            return False
+        return True
+
     def refresh_memory_snapshot(self, agent_id: str) -> None:
         """Refresh frozen snapshots for all sessions of the given agent.
 
@@ -3960,6 +3987,10 @@ class TurnRunner:
                 turn_obj=turn_obj,
                 message=message,
             )
+            if pending_error_event is None:
+                self._commit_pending_router_dynamic_route(turn, done_event)
+            else:
+                turn.metadata.pop("router_dynamic_pending_route_plan", None)
             if pending_error_event is not None:
                 yield pending_error_event
 
@@ -5985,11 +6016,22 @@ class TurnRunner:
                 else None
             )
             selection_mode = str(getattr(ensemble_cfg, "selection_mode", "") or "")
-            dynamic_ranking_errors: tuple[type[Exception], ...] = ()
+            dynamic_cleanup_errors: tuple[type[Exception], ...] = ()
+            dynamic_selection_errors: tuple[type[Exception], ...] = ()
             if selection_mode == "router_dynamic":
-                from opensquilla.provider.ranking_router import DynamicRankingError
+                from opensquilla.provider.ranking_router import (
+                    TaskAnalyzerStreamCleanupError,
+                )
 
-                dynamic_ranking_errors = (DynamicRankingError,)
+                # Dynamic selection spans analysis, ranking, credential
+                # resolution, and member materialization. Any ordinary
+                # exception in that optional wrapper must fail open to the
+                # already resolved single provider. Cancellation and other
+                # BaseException subclasses intentionally still propagate.
+                # Unproven analyzer cleanup is also explicitly fail-closed so
+                # the turn cannot start a second, overlapping billed request.
+                dynamic_cleanup_errors = (TaskAnalyzerStreamCleanupError,)
+                dynamic_selection_errors = (Exception,)
             # The shared deployment resolver marks an unexecutable member
             # unavailable before any network call. Keep the ensemble wrapper so
             # custom lineups can retain quorum semantics when only one provider
@@ -6105,6 +6147,7 @@ class TurnRunner:
                         from opensquilla.provider.ranking_router import (
                             TASK_ANALYZER_MODEL_ID,
                             TASK_ANALYZER_PROVIDER_ID,
+                            DynamicRankingError,
                             analyze_task_with_provider,
                             build_request_context,
                             dynamic_output_token_budgets,
@@ -6137,6 +6180,11 @@ class TurnRunner:
                         candidate_max_chars = int(
                             getattr(ensemble_cfg, "candidate_max_chars", 24_000) or 0
                         )
+                        if candidate_max_chars <= 0:
+                            raise DynamicRankingError(
+                                "router_dynamic requires candidate_max_chars > 0 "
+                                "to prove aggregator context feasibility"
+                            )
                         (
                             candidate_output_tokens,
                             aggregator_output_tokens,
@@ -6230,7 +6278,15 @@ class TurnRunner:
                         _session_key=turn.session_key,
                         _fallback_selector=cloned_selector,
                     )
-                except dynamic_ranking_errors as exc:
+                except dynamic_cleanup_errors as exc:
+                    log_ensemble_decision_failed(
+                        decision_id=ensemble_decision_id,
+                        selection_mode=selection_mode,
+                        reason="ensemble_selection_error",
+                        error=exc,
+                    )
+                    raise
+                except dynamic_selection_errors as exc:
                     log_ensemble_decision_failed(
                         decision_id=ensemble_decision_id,
                         selection_mode=selection_mode,
@@ -6285,7 +6341,7 @@ class TurnRunner:
                         selection_plan=plan,
                     )
                     if selection_mode == "router_dynamic":
-                        self._remember_router_dynamic_route(turn.session_key, plan)
+                        turn.metadata["router_dynamic_pending_route_plan"] = plan
                         turn.metadata["router_dynamic_decision"] = {
                             "decision_id": ensemble_decision_id,
                             "ranking_version": plan.get("ranking_version"),

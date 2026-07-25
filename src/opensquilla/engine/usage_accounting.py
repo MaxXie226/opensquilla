@@ -50,6 +50,52 @@ _MISSING_REQUEST_PLACEHOLDER_ROLES = frozenset(
 log = structlog.get_logger(__name__)
 
 
+async def _finish_required_task[T](task: asyncio.Future[T]) -> T:
+    """Settle owned cleanup work before forwarding caller cancellation.
+
+    Shielding only the first wait is insufficient: a second cancellation can
+    otherwise cancel the cleanup task while it is closing a still-billable
+    provider stream or committing its terminal usage record.
+    """
+
+    cancellation: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as exc:
+            cancellation = cancellation or exc
+    if cancellation is not None:
+        # Cancellation wins for the interrupted caller, but always observe the
+        # settled child result so failures are not left un-retrieved.
+        with contextlib.suppress(BaseException):
+            task.result()
+        raise cancellation
+    return task.result()
+
+
+async def _close_owned_provider_stream(
+    stream: AsyncIterator[Any],
+    *,
+    require_aclose: bool,
+) -> None:
+    """Close one physical provider stream without abandoning it on cancellation."""
+
+    try:
+        aclose = getattr(stream, "aclose", None)
+    except BaseException:
+        if require_aclose:
+            raise
+        return
+    if not callable(aclose):
+        if require_aclose:
+            raise RuntimeError(
+                "provider stream ended before a terminal event but does not support aclose"
+            )
+        return
+    close_task = asyncio.ensure_future(aclose())
+    await _finish_required_task(close_task)
+
+
 class UsageAccountingUnavailableError(RuntimeError):
     """A provider request was withheld because its ledger start did not commit.
 
@@ -255,19 +301,18 @@ async def start_usage_call(
     call = scope.new_call(provider=provider, model=model)
     start_task = asyncio.create_task(scope.sink.start(call))
     try:
-        await asyncio.shield(start_task)
+        await _finish_required_task(start_task)
     except asyncio.CancelledError:
         # Cancellation raced the fail-closed barrier.  Resolve the durable
         # decision before unwinding; a committed row is explicitly closed.
-        committed = False
-        try:
-            await start_task
-            committed = True
-        except Exception:
-            pass
+        committed = (
+            not start_task.cancelled()
+            and start_task.exception() is None
+        )
         if committed:
             with contextlib.suppress(Exception):
-                await scope.sink.mark_unknown(
+                await mark_usage_call_unknown(
+                    scope,
                     call,
                     "cancelled_before_provider_request",
                 )
@@ -290,11 +335,7 @@ async def finalize_usage_call(
     )
     finalize_task = asyncio.create_task(scope.sink.finalize(call, result))
     try:
-        await asyncio.shield(finalize_task)
-    except asyncio.CancelledError:
-        with contextlib.suppress(Exception):
-            await finalize_task
-        raise
+        await _finish_required_task(finalize_task)
     except Exception as exc:  # noqa: BLE001 - sink owns its retry policy
         log.warning(
             "usage_accounting.finalize_failed",
@@ -313,11 +354,7 @@ async def mark_usage_call_unknown(
     stable_reason = normalize_usage_unknown_reason(reason)
     unknown_task = asyncio.create_task(scope.sink.mark_unknown(call, stable_reason))
     try:
-        await asyncio.shield(unknown_task)
-    except asyncio.CancelledError:
-        with contextlib.suppress(Exception):
-            await unknown_task
-        raise
+        await _finish_required_task(unknown_task)
     except Exception as exc:  # noqa: BLE001 - preserve the provider outcome
         log.warning(
             "usage_accounting.mark_unknown_failed",
@@ -340,18 +377,23 @@ async def account_provider_stream(
     """
 
     scope = current_usage_accounting_scope()
-    if scope is None:
-        async for event in stream_factory():
-            yield event
-        return
-
-    call = await start_usage_call(scope, provider=provider, model=model)
-    terminal = False
+    call = (
+        await start_usage_call(scope, provider=provider, model=model)
+        if scope is not None
+        else None
+    )
+    usage_terminal = False
+    physical_terminal_observed = False
+    physical_stream_exhausted = False
     unknown_reason = "provider_stream_ended_without_usage"
+    physical_stream: AsyncIterator[Any] | None = None
     try:
-        async for event in stream_factory():
+        physical_stream = stream_factory()
+        async for event in physical_stream:
             kind = str(getattr(event, "kind", "") or "")
-            if kind == "done" and not terminal:
+            if kind in {"done", "error"}:
+                physical_terminal_observed = True
+            if call is not None and kind == "done" and not usage_terminal:
                 # ``provider`` is the selector's physically chosen adapter
                 # leg, captured immediately before invoking it.  Preserve
                 # that authoritative leg identity for downstream compatibility
@@ -359,16 +401,21 @@ async def account_provider_stream(
                 # an actual deployment model.
                 with contextlib.suppress(Exception):
                     setattr(event, "_opensquilla_usage_provider", call.provider)
-                terminal = True
+                usage_terminal = True
                 await finalize_usage_call(scope, call, event)
             elif kind == "error":
                 unknown_reason = provider_error_usage_reason(
                     getattr(event, "code", None)
                 )
-                if has_known_provider_usage_receipt(event) and not terminal:
-                    terminal = True
+                if (
+                    call is not None
+                    and has_known_provider_usage_receipt(event)
+                    and not usage_terminal
+                ):
+                    usage_terminal = True
                     await finalize_usage_call(scope, call, event)
             yield event
+        physical_stream_exhausted = True
     except asyncio.CancelledError:
         unknown_reason = "cancelled"
         raise
@@ -376,8 +423,17 @@ async def account_provider_stream(
         unknown_reason = "provider_exception"
         raise
     finally:
-        if not terminal:
-            await mark_usage_call_unknown(scope, call, unknown_reason)
+        try:
+            if physical_stream is not None:
+                await _close_owned_provider_stream(
+                    physical_stream,
+                    require_aclose=not (
+                        physical_terminal_observed or physical_stream_exhausted
+                    ),
+                )
+        finally:
+            if call is not None and not usage_terminal:
+                await mark_usage_call_unknown(scope, call, unknown_reason)
 
 
 def _usage_int(value: Any) -> int:

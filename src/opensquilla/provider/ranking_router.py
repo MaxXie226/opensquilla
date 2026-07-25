@@ -35,6 +35,16 @@ TASK_ANALYZER_MODEL_ID = "anthropic/claude-opus-4.8"
 TASK_ANALYZER_VERSION = "opus-4.8-json-v3"
 TASK_PROFILE_SCHEMA_VERSION = "step2-task-profile-v1"
 GENERATION_POLICY_FILTER_REASON_PREFIX = "generation_policy_"
+_TASK_ANALYZER_STREAM_CLOSE_TIMEOUT_SECONDS = 1.0
+_NATIVE_IMAGE_ATTACHMENT_MIMES = frozenset(
+    {
+        "image/gif",
+        "image/jpeg",
+        "image/png",
+        "image/webp",
+    }
+)
+_ATTACHMENT_MIME_ALIASES = {"image/jpg": "image/jpeg"}
 
 CAPABILITIES = (
     "reasoning",
@@ -101,8 +111,21 @@ class DynamicRankingError(ValueError):
     """Raised when no feasible Step2 ``(P, A)`` decision can be built."""
 
 
+class TaskAnalyzerStreamCleanupError(RuntimeError):
+    """Raised when analyzer stream cleanup cannot be proven within its bound."""
+
+
 class _ValidatedRankingConfig(dict[str, Any]):
     """Internal marker for a detached config that already passed full validation."""
+
+
+def _normalize_attachment_mime(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.split(";", 1)[0].strip().lower()
+    if not normalized:
+        return None
+    return _ATTACHMENT_MIME_ALIASES.get(normalized, normalized)
 
 
 @dataclass(frozen=True)
@@ -1839,8 +1862,17 @@ def build_request_context(
             if isinstance(value, str) and value:
                 media_type = value.lower()
                 break
-        media_family = media_type.split("/", 1)[0]
-        modality = media_family if media_family in {"image", "audio", "video"} else "file"
+        # Match the provider-facing projection in ``engine.runtime``. Supported
+        # images remain native image blocks; PDF, Office, email, text, audio,
+        # video, and opaque attachments are rendered as text/context markers
+        # before any provider call. Treating those as native ``file``/media
+        # requirements would incorrectly exclude otherwise capable text models.
+        normalized_media_type = _normalize_attachment_mime(media_type)
+        modality = (
+            "image"
+            if normalized_media_type in _NATIVE_IMAGE_ATTACHMENT_MIMES
+            else "text"
+        )
         if modality not in modalities:
             modalities.append(modality)
         attachment_refs.append(
@@ -2187,6 +2219,46 @@ def _extract_json_object(text: str) -> Any:
     raise ValueError("task analyzer returned no JSON object")
 
 
+def _consume_task_result(task: asyncio.Future[Any]) -> None:
+    with contextlib.suppress(BaseException):
+        task.result()
+
+
+async def _bounded_close_task_analyzer_stream(
+    stream: Any,
+    *,
+    timeout_seconds: float,
+    require_aclose: bool,
+) -> bool:
+    """Close an analyzer stream without allowing provider cleanup to block routing."""
+
+    aclose = getattr(stream, "aclose", None)
+    if not callable(aclose):
+        return not require_aclose
+    try:
+        close_task = asyncio.ensure_future(aclose())
+    except Exception:
+        return False
+    try:
+        done, _ = await asyncio.wait(
+            {close_task},
+            timeout=max(0.0, timeout_seconds),
+        )
+    except BaseException:
+        close_task.cancel()
+        close_task.add_done_callback(_consume_task_result)
+        raise
+    if close_task in done:
+        try:
+            close_task.result()
+        except BaseException:
+            return False
+        return True
+    close_task.cancel()
+    close_task.add_done_callback(_consume_task_result)
+    return False
+
+
 async def analyze_task_with_provider(
     *,
     provider: LLMProvider | None,
@@ -2381,6 +2453,8 @@ async def analyze_task_with_provider(
         text_parts: list[str] = []
         total_chars = 0
         got_done = False
+        terminal_observed = False
+        stream_exhausted = False
         try:
             async with asyncio.timeout(effective_timeout):
                 async for event in stream:
@@ -2391,6 +2465,7 @@ async def analyze_task_with_provider(
                         text_parts.append(event.text)
                     elif isinstance(event, DoneEvent):
                         got_done = True
+                        terminal_observed = True
                         usage = {
                             "model": event.model,
                             "input_tokens": event.input_tokens,
@@ -2427,12 +2502,33 @@ async def analyze_task_with_provider(
                                 )
                         break
                     elif isinstance(event, ErrorEvent):
+                        terminal_observed = True
                         raise RuntimeError(f"provider_error:{event.code or 'unknown'}")
+                else:
+                    stream_exhausted = True
         finally:
-            aclose = getattr(stream, "aclose", None)
-            if callable(aclose):
-                with contextlib.suppress(Exception):
-                    await aclose()
+            close_timeout = min(
+                _TASK_ANALYZER_STREAM_CLOSE_TIMEOUT_SECONDS,
+                max(0.0, effective_timeout),
+            )
+            closed = await _bounded_close_task_analyzer_stream(
+                stream,
+                timeout_seconds=close_timeout,
+                require_aclose=not (terminal_observed or stream_exhausted),
+            )
+            if not closed:
+                log.warning(
+                    "llm_ensemble.router_dynamic.task_analyzer_stream_close_failed",
+                    decision_id=decision_id,
+                    analyzer_version=TASK_ANALYZER_VERSION,
+                    provider=provider_id or "unknown",
+                    model=model_id,
+                    timeout_seconds=close_timeout,
+                    attempt=_attempt,
+                )
+                raise TaskAnalyzerStreamCleanupError(
+                    "task analyzer stream cleanup was not proven"
+                )
         if not got_done:
             raise RuntimeError("task analyzer stream ended before DoneEvent")
         payload = _extract_json_object("".join(text_parts))
@@ -2444,6 +2540,10 @@ async def analyze_task_with_provider(
         )
         if not schema_valid:
             raise ValueError(";".join(normalization_issues) or "invalid task profile")
+    except TaskAnalyzerStreamCleanupError:
+        # A replacement request must not begin while the previous physical
+        # provider stream may still be billed in the background.
+        raise
     except Exception as exc:  # noqa: BLE001 - analysis must fail open to a safe profile
         reason = type(exc).__name__
         accumulated_usage = _merge_task_analyzer_usage(_accumulated_usage, usage)
