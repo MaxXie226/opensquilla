@@ -162,17 +162,12 @@ _ATTENTION_ACTIONS = (
     "browse-workspace",
 )
 _RECOVERY_ACTIONS = (
-    "continue-recovery-profile",
-    "create-recovery-profile",
-    "retry-primary-profile",
     "show-backups",
     "copy-diagnostics",
 )
 _CLEANUP_RECOVERY_ACTIONS = ("abandon-cleanup", *_RECOVERY_ACTIONS)
 _WORKSPACE_RECOVERY_ACTIONS = ("choose-workspace", *_RECOVERY_ACTIONS)
 _UNSAFE_RECOVERY_PROFILE_ACTIONS = (
-    "create-recovery-profile",
-    "retry-primary-profile",
     "show-backups",
     "copy-diagnostics",
 )
@@ -2000,7 +1995,7 @@ def inspect_profile(
                 "fresh_recovery_profile" if outcome == "recovery_profile" else "fresh_profile"
             ),
             effective_workspace=effective,
-            allowed_actions=("retry-primary-profile",) if outcome == "recovery_profile" else (),
+            allowed_actions=(),
         )
 
     # An otherwise implicit profile with only unrecognized top-level content is
@@ -2184,12 +2179,12 @@ def inspect_profile(
         code = "configured_workspace"
     safe_actions: tuple[str, ...]
     if config.workspace_from_env:
-        safe_actions = ("retry-primary-profile",) if outcome == "recovery_profile" else ()
+        safe_actions = ()
     elif outcome == "recovery_profile":
-        # A recovery profile is the durable safe fallback.  Its workspace is
-        # intentionally fixed to H/workspace so a choice made for the primary
-        # profile can never turn the fallback into another unsafe profile.
-        safe_actions = ("retry-primary-profile",)
+        # Legacy recovery identities remain inspectable for read-only
+        # diagnostics and cleanup compatibility, but are never offered as a
+        # runtime target after primary-only consolidation.
+        safe_actions = ()
     else:
         safe_actions = ("choose-workspace",)
     return _with_marker_inspection_status(

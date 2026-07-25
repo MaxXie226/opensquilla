@@ -309,13 +309,13 @@ def test_readme_contract_check_uses_the_pinned_node_version() -> None:
     assert check["run"] == "node scripts/check-readme-locales.mjs"
 
 
-def test_desktop_ci_runs_profile_substrate_unit_tests() -> None:
+def test_desktop_ci_runs_primary_profile_substrate_unit_tests() -> None:
     data = _workflow("ci.yml")
     desktop_steps = data["jobs"]["desktop-check"]["steps"]
     unit_step = next(step for step in desktop_steps if step.get("name") == "Run desktop unit tests")
 
     assert "node scripts/test-desktop-profile-substrate.mjs" in unit_step["run"]
-    assert "node scripts/test-desktop-profile-context.mjs" in unit_step["run"]
+    assert "node scripts/test-desktop-profile-consolidation.mjs" in unit_step["run"]
 
 
 def test_pr_target_validator_allows_main_pull_requests(tmp_path: Path) -> None:
@@ -1079,10 +1079,11 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
     )
     assert build["run"] == "npm run build"
     assert "xvfb-run -a node" in run["run"]
-    assert "test-profile-recovery-flow.mjs" in run["run"]
-    assert "test-profile-recovery-accessibility.mjs" in run["run"]
+    assert "test-profile-consolidation-flow.mjs" in run["run"]
+    assert "test-primary-repair-accessibility.mjs" in run["run"]
     assert "test-profile-import-flow.mjs" in run["run"]
-    assert "test-unsafe-profile-no-write.mjs" in run["run"]
+    assert "test-desktop-cleanup-flow.mjs" in run["run"]
+    assert "test-unsafe-legacy-recovery-no-write.mjs" in run["run"]
     assert "exit 1" in run["run"]
     assert upload["if"] == "${{ always() }}"
     assert "github.run_attempt" in upload["with"]["name"]

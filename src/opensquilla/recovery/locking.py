@@ -264,9 +264,7 @@ def _prepare_posix_lock_file(path: Path, root: Path) -> int:
             child_stat = os.fstat(child_fd)
             if not stat.S_ISDIR(child_stat.st_mode):
                 os.close(child_fd)
-                raise UnsafePathError(
-                    f"profile lock directory must be real: {current_path / name}"
-                )
+                raise UnsafePathError(f"profile lock directory must be real: {current_path / name}")
             current_path /= name
             child_identity = (int(child_stat.st_dev), int(child_stat.st_ino))
             opened.append((current_path, child_fd, child_identity))
@@ -298,9 +296,7 @@ def _prepare_posix_lock_file(path: Path, root: Path) -> int:
                 or (int(lock_path_stat.st_dev), int(lock_path_stat.st_ino))
                 != (int(value.st_dev), int(value.st_ino))
             ):
-                raise UnsafePathError(
-                    f"profile lock is not a regular single-link file: {path}"
-                )
+                raise UnsafePathError(f"profile lock is not a regular single-link file: {path}")
             with contextlib.suppress(OSError):
                 _chmod_open_file(fd, 0o600)
             os.lseek(fd, 0, os.SEEK_SET)
@@ -312,9 +308,7 @@ def _prepare_posix_lock_file(path: Path, root: Path) -> int:
         for opened_path, _opened_fd, expected in opened:
             if _assert_real_lock_directory(opened_path) != expected:
                 os.close(fd)
-                raise UnsafePathError(
-                    f"profile lock directory identity changed: {opened_path}"
-                )
+                raise UnsafePathError(f"profile lock directory identity changed: {opened_path}")
         return fd
     finally:
         closed: set[int] = set()
@@ -374,11 +368,7 @@ def _windows_nt_create_relative(
     status_value = int(status)
     handle_value = getattr(handle, "value", None)
     invalid_handle = ctypes.c_void_p(-1).value
-    if (
-        status_value < 0
-        or status_value & 0x80000000
-        or handle_value in {None, 0, invalid_handle}
-    ):
+    if status_value < 0 or status_value & 0x80000000 or handle_value in {None, 0, invalid_handle}:
         raise UnsafePathError(
             "cannot create profile lock component safely "
             f"(NTSTATUS 0x{status_value & 0xFFFFFFFF:08x}): {name}"
@@ -404,9 +394,7 @@ def _windows_assert_lock_handle(
         ctypes.sizeof(attributes),
     ):
         error_number = getattr(ctypes, "get_last_error")()
-        raise UnsafePathError(
-            f"cannot inspect {label} handle (Windows error {error_number})"
-        )
+        raise UnsafePathError(f"cannot inspect {label} handle (Windows error {error_number})")
     if attributes.file_attributes & 0x400:
         raise UnsafePathError(f"{label} must not be a reparse point")
     is_directory = bool(attributes.file_attributes & _WINDOWS_FILE_ATTRIBUTE_DIRECTORY)
@@ -422,9 +410,7 @@ def _windows_assert_lock_handle(
         ctypes.sizeof(file_id),
     ):
         error_number = getattr(ctypes, "get_last_error")()
-        raise UnsafePathError(
-            f"cannot inspect {label} identity (Windows error {error_number})"
-        )
+        raise UnsafePathError(f"cannot inspect {label} identity (Windows error {error_number})")
     actual = (
         int(file_id.volume_serial_number),
         int.from_bytes(bytes(file_id.file_id.identifier), "little"),
@@ -1127,6 +1113,9 @@ def move_profile_no_replace(
     destination: str | Path,
     *,
     move: Callable[..., None] | None = None,
+    link_leaf_manifest_directories: frozenset[str] = frozenset(),
+    opaque_manifest_directories: frozenset[str] = frozenset(),
+    use_profile_manifest_policy: bool = True,
 ) -> None:
     """Move a locked profile without dropping old-gateway exclusion silently.
 
@@ -1166,7 +1155,9 @@ def move_profile_no_replace(
                 destination_path,
             ),
             _allowed_manifest_mtime_changes=allowed_mtime_changes,
-            _use_profile_manifest_policy=True,
+            _link_leaf_manifest_directories=link_leaf_manifest_directories,
+            _opaque_manifest_directories=opaque_manifest_directories,
+            _use_profile_manifest_policy=use_profile_manifest_policy,
         )
         return
     with _LOCKS_GUARD:
@@ -1175,7 +1166,9 @@ def move_profile_no_replace(
         move(
             source_path,
             destination_path,
-            _use_profile_manifest_policy=True,
+            _link_leaf_manifest_directories=link_leaf_manifest_directories,
+            _opaque_manifest_directories=opaque_manifest_directories,
+            _use_profile_manifest_policy=use_profile_manifest_policy,
         )
         rebound: list[_LegacyLockMove] = []
         try:
@@ -1363,8 +1356,7 @@ class LegacyGatewayLock:
             specs = _effective_state_root_specs(self.home)
         else:
             specs = tuple(
-                (Path(root).expanduser().absolute(), allow_state_symlinks)
-                for root in state_roots
+                (Path(root).expanduser().absolute(), allow_state_symlinks) for root in state_roots
             )
         unique: dict[str, tuple[Path, bool]] = {}
         for root, explicit in specs:
@@ -1375,9 +1367,7 @@ class LegacyGatewayLock:
                 explicit if previous is None else previous[1] or explicit,
             )
         self.state_roots = tuple(unique[key][0] for key in sorted(unique))
-        self._allow_symlink_by_key = {
-            key: unique[key][1] for key in sorted(unique)
-        }
+        self._allow_symlink_by_key = {key: unique[key][1] for key in sorted(unique)}
         self.paths = tuple(root / "gateway.pid.lock" for root in self.state_roots)
         # Compatibility with callers/tests that historically inspected the one
         # canonical lock path.
@@ -1409,9 +1399,7 @@ class LegacyGatewayLock:
         already present and locked without creating it as a side effect.
         """
 
-        expected = _normalized_path(
-            Path(state_root).expanduser().absolute() / "gateway.pid.lock"
-        )
+        expected = _normalized_path(Path(state_root).expanduser().absolute() / "gateway.pid.lock")
         owner_thread = threading.get_ident()
         with _LOCKS_GUARD:
             _refresh_after_fork()
@@ -1435,9 +1423,7 @@ class LegacyGatewayLock:
         older gateway.
         """
 
-        expected = _normalized_path(
-            Path(state_root).expanduser().absolute() / "gateway.pid.lock"
-        )
+        expected = _normalized_path(Path(state_root).expanduser().absolute() / "gateway.pid.lock")
         owner_thread = threading.get_ident()
         with _LOCKS_GUARD:
             _refresh_after_fork()
@@ -1769,18 +1755,27 @@ def release_gateway_legacy_lease(lease: GatewayLegacyLease | None) -> None:
 def acquire_legacy_gateway_locks(
     *homes: str | Path,
     read_only_homes: Iterable[str | Path] = (),
+    canonical_only_homes: Iterable[str | Path] = (),
+    required_state_roots: Iterable[str | Path] = (),
     timeout: float = 0.0,
 ) -> Iterator[tuple[LegacyGatewayLock, ...]]:
     """Acquire all source/target legacy leases in globally sorted root order."""
 
     read_only_keys = {_normalized_path(home) for home in read_only_homes}
+    canonical_only_keys = {_normalized_path(home) for home in canonical_only_homes}
     roots: dict[str, tuple[Path, bool, bool]] = {}
     for home in homes:
-        home_is_read_only = _normalized_path(home) in read_only_keys
-        for root, explicit in _effective_state_root_specs(
-            home,
-            include_process_environment=not home_is_read_only,
-        ):
+        home_key = _normalized_path(home)
+        home_is_read_only = home_key in read_only_keys
+        root_specs = (
+            ((Path(home).expanduser().absolute() / "state", False),)
+            if home_key in canonical_only_keys
+            else _effective_state_root_specs(
+                home,
+                include_process_environment=not home_is_read_only,
+            )
+        )
+        for root, explicit in root_specs:
             key = _normalized_path(root)
             create = not home_is_read_only
             previous = roots.get(key)
@@ -1790,12 +1785,21 @@ def acquire_legacy_gateway_locks(
                 create if previous is None else previous[1] and create,
                 explicit if previous is None else previous[2] or explicit,
             )
-    if not homes:
+    for required_root in required_state_roots:
+        root = Path(required_root).expanduser().absolute()
+        key = _normalized_path(root)
+        roots[key] = (
+            root,
+            True,
+            False,
+        )
+    if not homes and not roots:
         yield ()
         return
+    lock_home = homes[0] if homes else next(iter(roots.values()))[0]
     locks = tuple(
         LegacyGatewayLock(
-            homes[0],
+            lock_home,
             state_roots=(roots[key][0],),
             create_if_missing=roots[key][1],
             allow_state_symlinks=roots[key][2],

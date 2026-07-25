@@ -64,11 +64,18 @@ def _patch_manager_dependencies(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
     )
     monkeypatch.setattr(
         "opensquilla.agents.scope.resolve_agent_data_dir",
-        lambda agent_id: tmp_path / "data" / agent_id,
+        lambda agent_id, state_dir=None: (
+            (Path(state_dir) if state_dir is not None else tmp_path / "data") / "agents" / agent_id
+        ),
     )
     monkeypatch.setattr(
         "opensquilla.agents.scope.resolve_agent_memory_dir",
-        lambda agent_id: tmp_path / "memory" / agent_id,
+        lambda agent_id, state_dir=None: (
+            (Path(state_dir) if state_dir is not None else tmp_path / "memory")
+            / "agents"
+            / agent_id
+            / "memory"
+        ),
     )
 
 
@@ -123,6 +130,33 @@ async def test_build_memory_enables_session_source_indexer_when_configured(
     )
     try:
         assert managers["main"].sync_manager.kwargs["session_indexer"] is not None
+    finally:
+        for manager in managers.values():
+            await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_state_memory_source_uses_configured_external_state_root(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(_LOCAL_AVAILABLE_PATH, lambda *_: True)
+    external_state = tmp_path / "external-state"
+    _provider, managers = await _build_one(
+        GatewayConfig(
+            state_dir=str(external_state),
+            memory={"source": "state"},
+        ),
+        monkeypatch,
+        tmp_path,
+    )
+    try:
+        manager = managers["main"]
+        assert manager.memory_dir == external_state / "agents" / "main" / "memory"
+        assert manager.workspace_dir == external_state / "agents" / "main"
+        assert manager.sync_manager.kwargs["memory_dir"] == str(
+            external_state / "agents" / "main" / "memory"
+        )
     finally:
         for manager in managers.values():
             await manager.close()
@@ -359,7 +393,11 @@ def test_resolver_explicit_remote_requires_memory_api_key() -> None:
 
 def test_resolver_auto_never_uses_llm_openrouter_key() -> None:
     cfg = GatewayConfig(
-        llm={"provider": "openrouter", "api_key": "or-key", "base_url": "https://openrouter.ai/api/v1"}
+        llm={
+            "provider": "openrouter",
+            "api_key": "or-key",
+            "base_url": "https://openrouter.ai/api/v1",
+        }
     )
     decision = resolve_memory_embedding(cfg.memory, local_available=lambda *_: False)
     assert decision.effective_provider == "none"

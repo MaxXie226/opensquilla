@@ -33,12 +33,15 @@ from opensquilla.recovery.errors import (
 
 WORKSPACE_OVERRIDE_ENV_VARS = (
     "OPENSQUILLA_GATEWAY_WORKSPACE_DIR",
-    # Kept for the standalone TUI compatibility spelling. It is not a
-    # GatewayConfig source today, but treating it as an override is safer than
-    # silently writing a setting the visible runtime may ignore.
+    # GatewayConfig keeps the standalone/TUI spelling as a public compatibility
+    # alias, with the canonical Gateway spelling taking precedence.
     "OPENSQUILLA_WORKSPACE_DIR",
 )
 STATE_OVERRIDE_ENV_VARS = ("OPENSQUILLA_GATEWAY_STATE_DIR",)
+MEDIA_OVERRIDE_ENV_VARS = (
+    "OPENSQUILLA_GATEWAY_ATTACHMENTS__MEDIA_ROOT",
+    "OPENSQUILLA_ATTACHMENTS_MEDIA_ROOT",
+)
 _DOTENV_MAX_BYTES = 1024 * 1024
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 _COPYFILE_ACL = 1 << 0
@@ -188,7 +191,7 @@ def _parse_dotenv_value(
         if quote == '"':
             replacements = {
                 r"\\": "\\",
-                r'\"': '"',
+                r"\"": '"',
                 r"\n": "\n",
                 r"\r": "\r",
                 r"\t": "\t",
@@ -256,9 +259,7 @@ def _profile_dotenv_override(
         ) from exc
     parsed: dict[str, str] = {}
     key_pattern = "|".join(re.escape(name) for name in names)
-    assignment = re.compile(
-        rf"^\s*(?:export\s+)?(?P<key>{key_pattern})\s*=\s*(?P<value>.*)$"
-    )
+    assignment = re.compile(rf"^\s*(?:export\s+)?(?P<key>{key_pattern})\s*=\s*(?P<value>.*)$")
     for raw_line in text.splitlines():
         stripped = raw_line.strip()
         if not stripped or stripped.startswith("#"):
@@ -283,6 +284,8 @@ def workspace_override(
     home: str | Path | None = None,
     *,
     include_legacy_dotenv: bool = False,
+    include_process_environment: bool = True,
+    include_standalone_alias: bool = True,
 ) -> tuple[str, str] | None:
     """Resolve only workspace overrides without loading a general dotenv.
 
@@ -291,16 +294,22 @@ def workspace_override(
     proven reconciliation would publish) with a narrow, no-follow parser.
     """
 
-    for name in WORKSPACE_OVERRIDE_ENV_VARS:
-        value = os.environ.get(name, "").strip()
-        if value:
-            return name, value
+    names = (
+        WORKSPACE_OVERRIDE_ENV_VARS
+        if include_standalone_alias
+        else ("OPENSQUILLA_GATEWAY_WORKSPACE_DIR",)
+    )
+    if include_process_environment:
+        for name in names:
+            value = os.environ.get(name, "").strip()
+            if value:
+                return name, value
     if home is None:
         return None
     return _profile_dotenv_override(
         Path(home).expanduser().absolute(),
         include_legacy=include_legacy_dotenv,
-        names=WORKSPACE_OVERRIDE_ENV_VARS,
+        names=names,
         label="workspace",
         error_type=WorkspaceOverrideError,
         stable_code="workspace_env_override_unsafe",
@@ -329,6 +338,31 @@ def state_override(
         label="state",
         error_type=RecoveryError,
         stable_code="state_env_override_unsafe",
+    )
+
+
+def media_override(
+    home: str | Path | None = None,
+    *,
+    include_legacy_dotenv: bool = False,
+    include_process_environment: bool = True,
+) -> tuple[str, str] | None:
+    """Resolve the attachment media root without loading a general dotenv."""
+
+    if include_process_environment:
+        for name in MEDIA_OVERRIDE_ENV_VARS:
+            value = os.environ.get(name, "").strip()
+            if value:
+                return name, value
+    if home is None:
+        return None
+    return _profile_dotenv_override(
+        Path(home).expanduser().absolute(),
+        include_legacy=include_legacy_dotenv,
+        names=MEDIA_OVERRIDE_ENV_VARS,
+        label="media",
+        error_type=RecoveryError,
+        stable_code="media_env_override_unsafe",
     )
 
 
@@ -659,14 +693,10 @@ def _park_workspace_config(
     expected_old: object,
 ) -> None:
     if not _identity_matches(config, expected_old):
-        raise AtomicStateUnknownError(
-            "workspace config changed before it could be parked"
-        )
+        raise AtomicStateUnknownError("workspace config changed before it could be parked")
     native_move_no_replace(config, backup)
     if not _identity_matches(backup, expected_old):
-        raise AtomicStateUnknownError(
-            "workspace config changed while it was being parked"
-        )
+        raise AtomicStateUnknownError("workspace config changed while it was being parked")
     _make_owner_only(backup, expected_old)
 
 
@@ -678,9 +708,7 @@ def _publish_workspace_config(
     if not _identity_matches(staged, expected_staged):
         raise AtomicStateUnknownError("workspace config candidate identity is ambiguous")
     if os.path.lexists(config):
-        raise AtomicStateUnknownError(
-            "workspace config destination changed before publication"
-        )
+        raise AtomicStateUnknownError("workspace config destination changed before publication")
     native_move_no_replace(staged, config)
     if not _identity_matches(config, expected_staged):
         raise AtomicStateUnknownError("workspace config publication state is ambiguous")
@@ -721,9 +749,7 @@ def _finish_workspace_patch(home: Path) -> Path | None:
                 )
         elif _parked_config_matches(paths["backup"], old_identity):
             if os.path.lexists(paths["config"]):
-                raise AtomicStateUnknownError(
-                    "workspace config destination changed after parking"
-                )
+                raise AtomicStateUnknownError("workspace config destination changed after parking")
             _make_owner_only(paths["backup"], old_identity)
         elif _identity_matches(paths["config"], old_identity) and not os.path.lexists(
             paths["backup"]
@@ -767,21 +793,20 @@ def _copy_macos_config_metadata(snapshot: ConfigSnapshot, destination_fd: int) -
     try:
         source_fd = os.open(snapshot.path, flags)
     except OSError as exc:
-        raise ConfigChangedError(
-            "config changed before its ACLs could be preserved"
-        ) from exc
+        raise ConfigChangedError("config changed before its ACLs could be preserved") from exc
     try:
         current = PathIdentity.from_stat(os.fstat(source_fd))
         if current.metadata_tuple() != snapshot.identity.metadata_tuple():
-            raise ConfigChangedError(
-                "config changed before its ACLs could be preserved"
+            raise ConfigChangedError("config changed before its ACLs could be preserved")
+        if (
+            fcopyfile(
+                source_fd,
+                destination_fd,
+                None,
+                _COPYFILE_ACL | _COPYFILE_XATTR,
             )
-        if fcopyfile(
-            source_fd,
-            destination_fd,
-            None,
-            _COPYFILE_ACL | _COPYFILE_XATTR,
-        ) != 0:
+            != 0
+        ):
             error_number = ctypes.get_errno()
             raise RecoveryError(
                 f"macOS ACL or extended metadata could not be preserved ({error_number})",
@@ -965,9 +990,11 @@ def patch_workspace_dir(
 
 __all__ = [
     "ConfigSnapshot",
+    "MEDIA_OVERRIDE_ENV_VARS",
     "STATE_OVERRIDE_ENV_VARS",
     "WORKSPACE_OVERRIDE_ENV_VARS",
     "patch_workspace_dir",
+    "media_override",
     "recover_workspace_patch",
     "state_override",
     "workspace_override",

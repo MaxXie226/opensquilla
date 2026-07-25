@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- Desktop now consolidates data from legacy recovery profiles into the single
+  primary profile before startup. Existing primary settings remain
+  authoritative; when the primary profile has no settings, the newest legacy
+  recovery settings are adopted automatically. Desktop no longer creates or
+  asks users to confirm isolated recovery profiles.
+
 ## [0.5.0] - 2026-07-23
 
 OpenSquilla 0.5.0 is the first stable release of the 0.5 line, collecting the

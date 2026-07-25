@@ -249,7 +249,9 @@ def test_recovery_profile_rejects_external_primary_data_roots(
     assert report.stable_code == stable_code
     assert report.effective_workspace is None
     assert "continue-recovery-profile" not in report.allowed_actions
-    assert "create-recovery-profile" in report.allowed_actions
+    assert "create-recovery-profile" not in report.allowed_actions
+    assert "retry-primary-profile" not in report.allowed_actions
+    assert "show-backups" in report.allowed_actions
 
 
 def test_healthy_recovery_profile_cannot_be_repointed_to_external_workspace(

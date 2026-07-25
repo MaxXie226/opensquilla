@@ -254,12 +254,8 @@ def effective_retrieval_metadata(
     vector_weight: float,
     text_weight: float,
 ) -> dict[str, str]:
-    configured_mode = _metadata_value(
-        _nested_value(memory_config, "retrieval_mode", "hybrid")
-    )
-    effective_provider = _metadata_value(
-        getattr(embedding_decision, "effective_provider", "none")
-    )
+    configured_mode = _metadata_value(_nested_value(memory_config, "retrieval_mode", "hybrid"))
+    effective_provider = _metadata_value(getattr(embedding_decision, "effective_provider", "none"))
     effective_mode = "fts_only" if effective_provider == "none" else configured_mode
     return {
         "configured_retrieval_mode": configured_mode,
@@ -508,8 +504,8 @@ async def build_memory_managers(
                 mem_dir = os.environ["OPENSQUILLA_MEMORY_DIR"]
                 agent_workspace = resolve_agent_data_dir(agent_id)
             else:
-                mem_dir = str(resolve_agent_memory_dir(agent_id))
-                agent_workspace = resolve_agent_data_dir(agent_id)
+                mem_dir = str(resolve_agent_memory_dir(agent_id, config.state_dir))
+                agent_workspace = resolve_agent_data_dir(agent_id, config.state_dir)
             Path(mem_dir).mkdir(parents=True, exist_ok=True)
             agent_workspace.mkdir(parents=True, exist_ok=True)
 
@@ -539,8 +535,7 @@ async def build_memory_managers(
                     store=in_flight_store,
                     agent_id=agent_id,
                 )
-                if session_storage is not None
-                and getattr(cfg, "session_source_enabled", False)
+                if session_storage is not None and getattr(cfg, "session_source_enabled", False)
                 else None
             )
 
@@ -551,19 +546,13 @@ async def build_memory_managers(
                 memory_dir=mem_dir,
                 interval_minutes=getattr(cfg, "sync_interval_minutes", 0.0),
                 ttl_days=int(getattr(cfg, "entry_ttl_days", 0) or 0),
-                ttl_sweep_interval_minutes=getattr(
-                    cfg, "ttl_sweep_interval_minutes", 0.0
-                ),
+                ttl_sweep_interval_minutes=getattr(cfg, "ttl_sweep_interval_minutes", 0.0),
                 session_indexer=session_indexer,
             )
             await in_flight_sync.start()
 
-            effective_vector_weight = (
-                0.0 if _force_fts_only else getattr(cfg, "vector_weight", 0.7)
-            )
-            effective_text_weight = (
-                1.0 if _force_fts_only else getattr(cfg, "text_weight", 0.3)
-            )
+            effective_vector_weight = 0.0 if _force_fts_only else getattr(cfg, "vector_weight", 0.7)
+            effective_text_weight = 1.0 if _force_fts_only else getattr(cfg, "text_weight", 0.3)
             retrieval_metadata = effective_retrieval_metadata(
                 cfg,
                 embedding_decision,

@@ -18,7 +18,6 @@ import { _electron as electron } from 'playwright'
 const scriptDir = dirname(fileURLToPath(import.meta.url))
 const packageRoot = resolve(scriptDir, '..')
 const repoRoot = resolve(packageRoot, '../..')
-const RECOVERY_ID = '31234567-89ab-4cde-8fab-0123456789ab'
 
 async function exists(path) {
   try {
@@ -82,20 +81,30 @@ const isolatedHome = join(root, 'home')
 const primaryHome = join(userData, 'opensquilla')
 const workspace = join(primaryHome, 'workspace')
 const state = join(primaryHome, 'state')
-const recoveryRoot = join(userData, 'recovery-profiles', RECOVERY_ID)
-const recoveryHome = join(recoveryRoot, 'opensquilla')
-const recoveryMarker = join(recoveryHome, 'keep-recovery-profile.txt')
+const consolidationBackupRoot = join(
+  userData,
+  'backups',
+  'profile-consolidation',
+  'synthetic-transaction',
+)
+const consolidationBackupMarker = join(
+  consolidationBackupRoot,
+  'recovery-profiles',
+  '31234567-89ab-4cde-8fab-0123456789ab',
+  'opensquilla',
+  'archived-recovery-data.txt',
+)
 const cleanupJournal = join(userData, '.opensquilla.profile-cleanup.json')
 let desktopApp
 
 try {
   await mkdir(workspace, { recursive: true })
   await mkdir(state, { recursive: true })
-  await mkdir(recoveryHome, { recursive: true })
+  await mkdir(dirname(consolidationBackupMarker), { recursive: true })
   await mkdir(isolatedHome, { recursive: true })
   await writeFile(join(workspace, 'IDENTITY.md'), 'synthetic cleanup identity\n', 'utf8')
   await writeFile(join(state, 'sessions.db.keep'), 'synthetic chat state\n', 'utf8')
-  await writeFile(recoveryMarker, 'must remain\n', 'utf8')
+  await writeFile(consolidationBackupMarker, 'recorded backup must remain\n', 'utf8')
   await writeFile(
     join(primaryHome, 'config.toml'),
     `workspace_dir = ${JSON.stringify(join(root, 'missing-workspace'))}\n`,
@@ -123,10 +132,10 @@ try {
       }
     }
     return null
-  }, 'cleanup test recovery page')
+  }, 'cleanup test primary repair page')
 
   // Keep production confirmation intact; cancel the first click and accept the
-  // second so the real recovery-page button proves its busy state is cleared.
+  // second so the real primary-repair button proves its busy state is cleared.
   await desktopApp.evaluate(({ dialog }) => {
     let cleanupDialogCount = 0
     dialog.showMessageBox = async () => ({
@@ -148,7 +157,7 @@ try {
   await waitFor(async () => !await exists(cleanupJournal), 'cleanup journal abandonment')
   await waitFor(async () => (
     await page.locator('#recoveryCode').textContent() === 'effective_workspace_missing'
-  ), 'post-abandon recovery inspection')
+  ), 'post-abandon primary repair inspection')
   assert.equal(await page.locator('#cleanupAbandonGroup').isHidden(), true)
   assert((await readdir(userData)).some((name) => (
     name.startsWith('.opensquilla.profile-cleanup.abandoned.') && name.endsWith('.json')
@@ -186,7 +195,10 @@ try {
   assert.equal(await exists(join(userData, 'desktop-credential.json')), false)
   assert.equal(await exists(join(userData, 'desktop-profile-context.json')), false)
   assert.equal(await exists(join(userData, 'logs')), false, 'app.exit must not recreate desktop logs')
-  assert.equal(await readFile(recoveryMarker, 'utf8'), 'must remain\n')
+  assert.equal(
+    await readFile(consolidationBackupMarker, 'utf8'),
+    'recorded backup must remain\n',
+  )
 
   // Recreate a synthetic primary profile, then verify delete-all is handed to
   // the detached offline helper and does not begin until this second Electron
@@ -222,7 +234,7 @@ try {
       }
     }
     return null
-  }, 'delete-all test recovery page')
+  }, 'delete-all test primary repair page')
   await desktopApp.evaluate(({ dialog }) => {
     dialog.showMessageBox = async () => ({ response: 1, checkboxChecked: false })
   })
@@ -231,7 +243,11 @@ try {
   ))
   assert.equal(deleteAllPreview.ok, true)
   assert.equal(await exists(primaryHome), true, 'inspection must remain read-only')
-  assert.equal(await exists(recoveryRoot), true, 'inspection must not touch recovery data')
+  assert.equal(
+    await exists(consolidationBackupRoot),
+    true,
+    'inspection must not touch recorded consolidation backups',
+  )
   const deleteAllProcess = desktopApp.process()
   const deleteAllExited = new Promise((resolveExit) => deleteAllProcess.once('exit', resolveExit))
   void deleteAllPage.evaluate((previewId) => (
@@ -249,7 +265,7 @@ try {
   ])
   await waitFor(async () => (
     !await exists(primaryHome)
-    && !await exists(recoveryRoot)
+    && !await exists(consolidationBackupRoot)
     && !await exists(join(userData, 'logs'))
   ), 'post-exit delete-all helper completion', 30_000)
 
@@ -258,11 +274,11 @@ try {
     trustedPreviewVerified: true,
     postStopReinspectionVerified: true,
     currentProfileDeleted: true,
-    recoveryProfilePreserved: true,
+    recordedBackupPreservedByCurrentDelete: true,
     noLogWritebackAfterDelete: true,
     abandonCleanupVerified: true,
     deleteAllStartedAfterExit: true,
-    allProfilesDeletedByOfflineHelper: true,
+    allPrimaryDataAndBackupsDeletedByOfflineHelper: true,
   }))
 } catch (error) {
   const desktopLog = await readFile(join(userData, 'logs', 'desktop.log'), 'utf8').catch(() => '')
