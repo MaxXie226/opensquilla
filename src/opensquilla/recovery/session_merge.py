@@ -840,7 +840,19 @@ def _merge_session_database_from_private(
                         )
                     remapped_keys[source_key] = target_key
 
-                if source_session_id in reserved_ids or target_key != source_key:
+                # Renumber only on a real identifier collision. A colliding
+                # session KEY does not require a new id: `session_key` is the
+                # primary key while `session_id` carries no unique constraint and
+                # no reverse lookup, so the imported session stays addressable
+                # under its original id. That matters because several stores are
+                # keyed by session id on disk — artifacts under
+                # `media/artifacts/s/<sha256(session_id)>/`, tool results under
+                # `media/tool-results/s/<session_id>/`, transcript material under
+                # `media/transcripts/<session_id>/` — and each also records the id
+                # inside its metadata and rejects a mismatch on read. Renumbering
+                # a session whose id never collided would strand every one of the
+                # user's recovered attachments and generated files.
+                if source_session_id in reserved_ids:
                     target_session_id = _remapped_session_id(source_session_id, source_id)
                     ordinal = 1
                     while target_session_id in reserved_ids:

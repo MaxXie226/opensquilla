@@ -935,10 +935,14 @@ def test_consolidate_cli_emits_fixed_json_and_blocks_unsafe_recovery(
         "credential_adoption_status",
         "revision",
         "errors",
+        "primary_home_intact",
     }
     assert payload["outcome"] == "blocked"
     assert payload["stable_code"] == "profile_consolidation_unsafe_recovery_root"
     assert (recovery_root / "not-a-recovery-uuid").is_dir()
+    # This primary is an empty shell, so booting it would show an empty app while
+    # the real conversations sit in the legacy container.
+    assert payload["primary_home_intact"] is False
 
 
 def test_consolidate_allows_regular_finder_metadata_in_recovery_root(
@@ -1623,11 +1627,19 @@ def test_only_legacy_prepared_journal_changed_by_sqlite_sidecars_restarts(
             assert not any(old_backup.iterdir())
         assert (primary / "workspace" / "sqlite-sidecar.txt").is_file()
     else:
-        assert resumed.outcome == "blocked"
-        assert resumed.stable_code == "profile_consolidation_source_changed"
-        assert journal_path.is_file()
-        assert old_staging.is_dir()
-        assert old_backup.is_dir()
+        # Refusing a drifted current-protocol plan was right while a blocked
+        # fan-in still gated startup: nothing should have been touching the
+        # source, so drift meant something unexpected did. Startup now continues
+        # whenever the primary profile is usable, which makes the user's own
+        # activity the likeliest cause of drift — so the stale plan is discarded
+        # and re-prepared instead of refusing on every launch forever, which
+        # would mean the recovered conversations never arrive. Re-preparing
+        # re-measures every source under the profile locks and re-merges
+        # idempotently, so nothing is lost.
+        assert resumed.outcome == "consolidated", resumed
+        assert not journal_path.exists()
+        assert not old_staging.exists()
+        assert (primary / "workspace" / "sqlite-sidecar.txt").is_file()
 
 
 @pytest.mark.parametrize(
@@ -3522,3 +3534,182 @@ def test_consolidate_still_rejects_stray_symlink(
     assert result.stable_code == "profile_consolidation_unsafe_recovery_root"
     assert stray.is_symlink()
     assert outside.read_text(encoding="utf-8") == "outside\n"
+
+
+def test_key_collision_keeps_session_id_so_artifacts_stay_downloadable(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """A recovered conversation must keep its generated files.
+
+    Artifacts live under a directory derived from the session id and record that
+    id inside ``meta.json``, which the download path validates. Renumbering a
+    session whose id never collided would leave every artifact unreachable even
+    though the conversation itself came back, so the production store is used as
+    the oracle here rather than asserting on paths.
+    """
+
+    from opensquilla.artifacts import ArtifactNotFoundError, ArtifactStore
+
+    monkeypatch.setenv("OPENSQUILLA_USER_STATE_DIR", str(tmp_path / "locks"))
+    user_data = tmp_path / "user-data"
+    primary = user_data / "opensquilla"
+    (primary / "workspace").mkdir(parents=True)
+    (primary / "config.toml").write_text("log_file_backup_count = 1\n", encoding="utf-8")
+    # The primary owns the same deterministic session key, which is what forces a
+    # key collision during the merge.
+    _session_database(
+        primary / "state" / "sessions.db",
+        "agent:main:main",
+        "primary-session",
+        "primary",
+    )
+
+    recovery_id = str(uuid.uuid4())
+    _recovery(
+        user_data,
+        recovery_id,
+        config="log_file_backup_count = 2\n",
+        credential="{}\n",
+        memory="memory\n",
+        conflict="recovery",
+        extra_name="recovery.txt",
+        session_key="agent:main:main",
+    )
+    recovery_home = user_data / "recovery-profiles" / recovery_id / "opensquilla"
+    recovered_session_id = f"session-{recovery_id}"
+
+    source_store = ArtifactStore(recovery_home / "media")
+    published = source_store.publish_bytes(
+        b"generated chart bytes",
+        session_id=recovered_session_id,
+        session_key="agent:main:main",
+        name="chart.bin",
+        mime="application/octet-stream",
+        source="code_exec",
+    )
+    # The file must be reachable in the source profile before consolidation.
+    source_store.resolve_for_download(published.id, session_id=recovered_session_id)
+
+    result = consolidate_recovery_profiles(user_data, primary)
+
+    assert result.outcome == "consolidated", result
+    assert result.consumed_recovery_ids == (recovery_id,)
+
+    with sqlite3.connect(primary / "state" / "sessions.db") as merged:
+        rows = dict(merged.execute("SELECT session_key, session_id FROM sessions").fetchall())
+    # The colliding key was renamed; the identifier was left alone.
+    assert rows["agent:main:main"] == "primary-session"
+    recovered_key = next(key for key in rows if key.startswith("agent:main:main:recovered:"))
+    assert rows[recovered_key] == recovered_session_id
+
+    merged_store = ArtifactStore(primary / "media")
+    ref, material = merged_store.resolve_for_download(
+        published.id,
+        session_id=recovered_session_id,
+    )
+    assert material.read_bytes() == b"generated chart bytes"
+    assert ref.session_id == recovered_session_id
+
+    # A different session must not be able to reach it.
+    with pytest.raises(ArtifactNotFoundError):
+        merged_store.resolve_for_download(published.id, session_id="primary-session")
+
+
+def test_unreadable_recovery_source_defers_startup_and_still_converges(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """A broken legacy source must cost the fan-in, never access to the product.
+
+    One unreadable recovery database aborts the whole transaction, and the result
+    has to tell Desktop that the primary profile is still usable so startup can
+    continue silently. It then has to actually converge: the failed attempt leaves
+    a pre-park journal, and a resume rebuilds its staging tree from the primary and
+    refuses to continue if the primary changed. Because deferring startup lets the
+    gateway write to the primary, that refusal would otherwise be permanent and
+    the legacy conversations would never arrive.
+    """
+
+    monkeypatch.setenv("OPENSQUILLA_USER_STATE_DIR", str(tmp_path / "locks"))
+    user_data = tmp_path / "user-data"
+    primary = user_data / "opensquilla"
+    (primary / "workspace").mkdir(parents=True)
+    (primary / "config.toml").write_text("log_file_backup_count = 1\n", encoding="utf-8")
+    _session_database(
+        primary / "state" / "sessions.db",
+        "agent:main:primary",
+        "primary-session",
+        "primary",
+    )
+    recovery_id = str(uuid.uuid4())
+    _recovery(
+        user_data,
+        recovery_id,
+        config="log_file_backup_count = 2\n",
+        credential="{}\n",
+        memory="memory\n",
+        conflict="recovery",
+        extra_name="recovery.txt",
+        session_key="agent:main:recovered",
+    )
+    source_db = (
+        user_data / "recovery-profiles" / recovery_id / "opensquilla" / "state" / "sessions.db"
+    )
+    original_mode = source_db.stat().st_mode
+
+    os.chmod(source_db, 0o000)
+    try:
+        blocked = consolidate_recovery_profiles(user_data, primary)
+    finally:
+        os.chmod(source_db, original_mode)
+
+    assert blocked.outcome == "blocked", blocked
+    # The primary is healthy, so Desktop may start against it and retry later.
+    assert blocked.primary_home_intact is True
+    assert primary.is_dir()
+    assert (primary / "config.toml").read_text(encoding="utf-8") == "log_file_backup_count = 1\n"
+
+    # Deferred startup means the gateway runs and writes into the primary, which
+    # is precisely what invalidates the prepared transaction's baseline.
+    (primary / "state" / "gateway.log").write_text("started after deferral\n", encoding="utf-8")
+
+    resumed = consolidate_recovery_profiles(user_data, primary)
+
+    assert resumed.outcome == "consolidated", resumed
+    assert resumed.consumed_recovery_ids == (recovery_id,)
+    assert not (user_data / "recovery-profiles").exists()
+    with sqlite3.connect(primary / "state" / "sessions.db") as merged:
+        keys = {row[0] for row in merged.execute("SELECT session_key FROM sessions").fetchall()}
+    assert "agent:main:primary" in keys
+    assert "agent:main:recovered" in keys
+
+
+def test_parked_primary_keeps_blocking_startup(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """While the primary is parked mid-commit there is nothing to start.
+
+    Reporting the primary as usable here would let the profile inspector treat the
+    absent home as a fresh install and seed an empty one, presenting an empty
+    application while the real data sits in the transaction backup.
+    """
+
+    monkeypatch.setenv("OPENSQUILLA_USER_STATE_DIR", str(tmp_path / "locks"))
+    user_data = tmp_path / "user-data"
+    primary = user_data / "opensquilla"
+    (primary / "workspace").mkdir(parents=True)
+    (primary / "config.toml").write_text("log_file_backup_count = 1\n", encoding="utf-8")
+
+    from opensquilla.recovery.consolidate import _primary_home_survives_failure
+
+    assert _primary_home_survives_failure(user_data, primary) is True
+
+    # An absent primary can never be started.
+    shutil.move(str(primary), str(user_data / "parked-primary"))
+    assert _primary_home_survives_failure(user_data, primary) is False
+
+    # An empty shell is not a profile worth booting either.
+    primary.mkdir(parents=True)
+    assert _primary_home_survives_failure(user_data, primary) is False

@@ -335,7 +335,11 @@ def test_merge_session_database_remaps_divergent_collision_and_is_idempotent(
             "SELECT session_id FROM sessions WHERE session_key=?",
             (remapped_key,),
         ).fetchone()[0]
-        assert remapped_id != "recovery-session"
+        # The key collided, the identifier did not, so the imported session keeps
+        # its original id. Renumbering it would strand the artifacts, tool
+        # results, and transcript material stored on disk under that id.
+        assert remapped_id == "recovery-session"
+        assert "recovery-session" not in first.remapped_session_ids
         assert merged.execute(
             "SELECT content, session_id FROM transcript_entries WHERE session_key=?",
             (remapped_key,),
@@ -946,3 +950,50 @@ async def test_merge_session_database_supports_current_production_schema_and_fts
             table: merged.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
             for table in counts_before
         } == counts_before
+
+
+def test_true_identifier_collision_still_renumbers_the_import(tmp_path: Path) -> None:
+    """Keeping the source id on a key collision must not weaken id uniqueness.
+
+    Recovery profiles are historical copies of one install, so a diverged copy of
+    the same conversation can legitimately carry the same identifier. That case
+    must still be renumbered, otherwise two distinct sessions would share an id
+    and every id-keyed lookup in the merged database would become ambiguous.
+    """
+
+    target_path = tmp_path / "target.db"
+    source_path = tmp_path / "source.db"
+    target = _database(target_path)
+    source = _database(source_path)
+    _add_session(
+        target,
+        key="agent:alpha:main",
+        session_id="shared-identifier",
+        content="primary",
+        suffix="primary",
+    )
+    _add_session(
+        source,
+        key="agent:beta:main",
+        session_id="shared-identifier",
+        content="recovery",
+        suffix="recovery",
+    )
+    target.close()
+    source.close()
+
+    result = merge_session_database(
+        target_path,
+        source_path,
+        source_id="33333333-3333-4333-8333-333333333333",
+    )
+
+    assert result.imported_sessions == 1
+    assert "shared-identifier" in result.remapped_session_ids
+    # The key did not collide, so only the identifier moved.
+    assert result.remapped_session_keys == {}
+    with sqlite3.connect(target_path) as merged:
+        rows = dict(merged.execute("SELECT session_key, session_id FROM sessions").fetchall())
+    assert rows["agent:alpha:main"] == "shared-identifier"
+    assert rows["agent:beta:main"] == result.remapped_session_ids["shared-identifier"]
+    assert len(set(rows.values())) == 2

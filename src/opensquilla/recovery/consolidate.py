@@ -50,6 +50,10 @@ _CONFIG_NAMES = ("config.toml", ".env")
 _CONTEXT_NAME = "desktop-profile-context.json"
 _CREDENTIAL_NAME = "desktop-credential.json"
 _JOURNAL_NAME = ".opensquilla-profile-consolidation.json"
+#: Records that startup was allowed to continue while a specific transaction was
+#: still outstanding. Kept beside the journal rather than inside it so the journal
+#: contract and its validation stay untouched.
+_DEFERRAL_MARKER_NAME = ".opensquilla-profile-consolidation-deferred"
 _BACKUPS_RELATIVE = Path("backups") / "profile-consolidation"
 _STAGING_PREFIX = ".opensquilla.profile-consolidation."
 _SOURCE_READ_PROTOCOL = "private-sqlite-v1"
@@ -145,6 +149,12 @@ class ConsolidationResult:
     credential_adoption_status: CredentialAdoptionStatus
     revision: int
     errors: tuple[str, ...] = ()
+    #: Whether the canonical primary profile is physically usable despite this
+    #: result. Only meaningful when ``outcome`` is ``blocked``: it tells Desktop
+    #: that startup may continue against the existing primary and retry the
+    #: fan-in later, instead of stranding the user on a repair page. Defaults to
+    #: ``False`` so every construction site stays fail-closed.
+    primary_home_intact: bool = False
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -166,6 +176,7 @@ class ConsolidationResult:
             "credential_adoption_status": self.credential_adoption_status,
             "revision": self.revision,
             "errors": list(self.errors),
+            "primary_home_intact": self.primary_home_intact,
         }
 
 
@@ -254,6 +265,18 @@ class _ConsolidationBlockedError(RecoveryError):
     pass
 
 
+class _StagingBaselineDriftedError(UnsafePathError):
+    """A resume cannot continue because the primary changed since it was prepared.
+
+    Resume rebuilds its staging tree from the current primary profile and requires
+    the rebuilt content to still match the journal's recorded baseline. Any write
+    into the primary between attempts — which is exactly what happens once startup
+    is allowed to proceed after a failed fan-in — makes that impossible forever.
+    Distinguished from other unsafe-path refusals so the caller can discard the
+    unusable transaction and start a fresh one instead of blocking every launch.
+    """
+
+
 def _absolute(path: str | Path) -> Path:
     return Path(path).expanduser().absolute()
 
@@ -264,6 +287,7 @@ def _blocked(
     error: BaseException | str,
     *,
     revision: int = 0,
+    primary_home_intact: bool = False,
 ) -> ConsolidationResult:
     return ConsolidationResult(
         schema_version=1,
@@ -280,6 +304,7 @@ def _blocked(
         credential_adoption_status="not_required",
         revision=revision,
         errors=(str(error),),
+        primary_home_intact=primary_home_intact,
     )
 
 
@@ -2702,7 +2727,9 @@ def _rebuild_staging_from_authority(
         workspace_root=routes.workspace.path,
     )
     if _profile_content_token(staging) != payload.get("staging_baseline"):
-        raise UnsafePathError("rebuilt consolidation staging does not match its journal baseline")
+        raise _StagingBaselineDriftedError(
+            "rebuilt consolidation staging does not match its journal baseline"
+        )
 
 
 def _merge_prepared_profiles(
@@ -2846,6 +2873,8 @@ def _archive_and_finish(
     if phase != "context_written":
         raise UnsafePathError(f"unsupported consolidation journal phase: {phase}")
     journal_path.unlink()
+    # The transaction finished, so any record of having deferred past it is stale.
+    _clear_startup_deferral(user_data)
     return result
 
 
@@ -2911,6 +2940,68 @@ def _load_journal(path: Path, user_data: Path, primary_home: Path) -> dict[str, 
     return payload
 
 
+def _primary_profile_is_populated(primary_home: Path) -> bool:
+    """Whether the primary profile already holds work worth booting into.
+
+    An empty primary shell must not be treated as usable. Booting it would show
+    an empty application while the real conversations sit in legacy recovery
+    profiles, and the first write into it would make the next consolidation treat
+    that fresh configuration as authoritative — which is exactly the rule that
+    reserves configuration adoption for a primary with nothing in it.
+    """
+
+    # Only ask about a config that is actually there.
+    # ``_primary_config_has_user_configuration`` answers ``True`` for an
+    # unreadable file on purpose — malformed bytes may hold the user's only
+    # settings, so its authority is preserved — and that includes a missing file,
+    # which for this question means the opposite.
+    config = primary_home / "config.toml"
+    if _lexists(config) and _primary_config_has_user_configuration(config):
+        return True
+    for dotenv in (primary_home / ".env", primary_home / "state" / ".env"):
+        if _lexists(dotenv) and _dotenv_has_user_configuration(dotenv):
+            return True
+    sessions = primary_home / "state" / "sessions.db"
+    try:
+        value = sessions.lstat()
+    except OSError:
+        return False
+    return not _is_link_or_reparse(value) and stat.S_ISREG(value.st_mode)
+
+
+def _primary_home_survives_failure(user_data: Path, primary_home: Path) -> bool:
+    """Whether Desktop may start against the primary despite a blocked fan-in.
+
+    Deliberately decided from physical state rather than from ``stable_code``: the
+    same codes are raised both when the primary was never touched and when it sits
+    half-moved, so a code-based rule would eventually let the caller boot a
+    profile that is not there.
+
+    The one transaction phase that must keep blocking is ``primary_parked``, where
+    the primary has been moved into the transaction backup and the replacement is
+    not yet published, so the canonical home does not exist and only a successful
+    resume can restore it. Every other phase either has not moved the primary yet
+    or has already published it.
+
+    Fails closed on anything unexpected, including an unreadable or invalid
+    journal.
+    """
+
+    try:
+        journal_path = user_data / _JOURNAL_NAME
+        if _lexists(journal_path):
+            payload = _load_journal(journal_path, user_data, primary_home)
+            if payload is None or str(payload.get("phase")) == "primary_parked":
+                return False
+        stat_result = primary_home.lstat()
+        if _is_link_or_reparse(stat_result) or not stat.S_ISDIR(stat_result.st_mode):
+            return False
+        profile_no_follow_manifest(primary_home)
+        return _primary_profile_is_populated(primary_home)
+    except Exception:
+        return False
+
+
 def _all_routes_are_profile_relative(routes: _PrimaryDataRoutes) -> bool:
     return not routes.external_bindings and all(
         route.profile_relative is not None
@@ -2927,6 +3018,188 @@ def _directory_is_empty(path: Path) -> bool:
     _plain_directory(path, label="profile consolidation transaction backup")
     with os.scandir(path) as entries:
         return next(entries, None) is None
+
+
+def _abort_pre_park_journal(
+    user_data: Path,
+    primary_home: Path,
+    journal_path: Path,
+    payload: dict[str, Any],
+) -> bool:
+    """Discard a failed transaction that never reached the primary profile.
+
+    Required for a deferred startup to ever converge. A resume rebuilds its
+    staging tree from the current primary and refuses to continue unless the
+    rebuilt content token still equals the journal's ``staging_baseline``. Once
+    Desktop boots and the gateway writes anything into the primary, that token can
+    never match again, so leaving the journal in place would make consolidation
+    permanently impossible while every launch silently reported success — the
+    user's legacy conversations would never arrive.
+
+    Only pre-park phases qualify, so no authoritative path has moved: the primary
+    is untouched and everything this transaction produced lives in the disposable
+    staging tree. Unlike :func:`_restart_legacy_prepared_journal_if_safe` this does
+    not require the routes to be free of external bindings, because a pre-park
+    transaction's only non-staging writes are the additive external-root merges,
+    and a fresh transaction re-merges them idempotently — the worst case is a
+    duplicated conversation, never a lost one.
+    """
+
+    if payload.get("phase") not in {"prepared", "external_roots_merged"}:
+        return False
+    if "source_read_protocol" not in payload:
+        # Journals from before the private-SQLite protocol stay the exclusive
+        # business of _restart_legacy_prepared_journal_if_safe, which knows the
+        # narrower conditions under which those are safe to discard.
+        return False
+    if not _startup_was_deferred_for(user_data, payload):
+        # Under the current protocol a source is never touched, so drift normally
+        # means something unexpected did it and refusing is right. That reasoning
+        # only holds while a failed fan-in still gates startup. Once this exact
+        # transaction was allowed to defer, the gateway writes to the primary and
+        # repairing whatever broke the merge changes the source — the drift is
+        # self-inflicted and expected, so only then may the plan be discarded.
+        return False
+    if _primary_config_authority(primary_home) != payload.get("primary_config"):
+        # The primary configuration decides both the data routes and which profile
+        # supplies configuration. If it changed, re-preparing could resolve a
+        # different destination or a different configuration source, so the
+        # decision belongs to a human rather than to automatic cleanup.
+        return False
+    try:
+        recovery_homes = tuple(profile.home for profile in _enumerate_recoveries(user_data))
+    except RecoveryError:
+        # The container itself is unusable. Still safe to drop a pre-park
+        # transaction; just lock the primary alone.
+        recovery_homes = ()
+
+    with acquire_profile_locks(primary_home, *recovery_homes, timeout=0.0):
+        # Re-read under every participating lock so a concurrently started
+        # transaction or an advanced phase can never inherit this cleanup.
+        if _load_journal(journal_path, user_data, primary_home) != payload:
+            return False
+        if bool(payload["primary_existed"]) != primary_home.is_dir():
+            # The primary moved after all; only a resume may touch it.
+            return False
+
+        staging = Path(str(payload["staging"]))
+        backup_path = Path(str(payload["backup_path"]))
+        if _lexists(backup_path) and not _directory_is_empty(backup_path):
+            # A populated transaction backup means something authoritative was
+            # already parked, which contradicts a pre-park phase.
+            return False
+        staging_exists = _lexists(staging)
+        if staging_exists:
+            _plain_directory(staging, label="profile consolidation staging directory")
+            profile_no_follow_manifest(staging)
+        journal_authority = _file_authority(
+            journal_path,
+            label="profile consolidation journal",
+        )
+        if not bool(journal_authority.get("exists")):
+            return False
+
+        # Keep the journal until the staging tree is gone, so an interruption
+        # here retries this same guarded cleanup instead of mistaking a partial
+        # staging tree for authoritative data.
+        if staging_exists:
+            shutil.rmtree(staging)
+            _fsync_directory(user_data)
+        # The empty transaction backup directory stays: its parent chain is not
+        # descriptor-bound here, and deleting through a concurrently replaced
+        # parent could target an unrelated directory.
+        if (
+            _file_authority(
+                journal_path,
+                label="profile consolidation journal",
+            )
+            != journal_authority
+        ):
+            raise UnsafePathError("profile consolidation journal changed before abort")
+        journal_path.unlink()
+        _clear_startup_deferral(user_data)
+        _fsync_directory(user_data)
+        return True
+
+
+def _deferral_marker_path(user_data: Path) -> Path:
+    return user_data / _DEFERRAL_MARKER_NAME
+
+
+def _startup_was_deferred_for(user_data: Path, payload: dict[str, Any]) -> bool:
+    """Whether startup already proceeded with this exact transaction outstanding."""
+
+    marker = _deferral_marker_path(user_data)
+    if not _plain_optional_file(marker, label="profile consolidation deferral marker"):
+        return False
+    try:
+        recorded = marker.read_text(encoding="utf-8").strip()
+    except OSError:
+        return False
+    return bool(recorded) and recorded == str(payload.get("transaction_id"))
+
+
+def _record_startup_deferral(user_data: Path, payload: dict[str, Any] | None) -> None:
+    """Note that startup is being allowed to proceed past this transaction.
+
+    Read on a later launch to decide whether a refused resume is drift this change
+    caused, rather than drift that should still fail closed. Best effort: losing the
+    marker only means the stricter original behavior applies.
+    """
+
+    if payload is None:
+        return
+    transaction_id = payload.get("transaction_id")
+    if not isinstance(transaction_id, str) or not transaction_id:
+        return
+    with contextlib.suppress(OSError, UnsafePathError):
+        marker = _deferral_marker_path(user_data)
+        marker.write_text(f"{transaction_id}\n", encoding="utf-8")
+        _fsync_directory(user_data)
+
+
+def _clear_startup_deferral(user_data: Path) -> None:
+    with contextlib.suppress(OSError):
+        _deferral_marker_path(user_data).unlink(missing_ok=True)
+
+
+def _is_stale_prepared_plan(error: BaseException) -> bool:
+    """Whether a resume refused because the inputs it pinned have since moved.
+
+    These are not corruption; the recorded plan simply no longer describes the
+    world. Only the phase guard in :func:`_abort_pre_park_journal` decides whether
+    discarding it is safe.
+    """
+
+    if isinstance(error, _StagingBaselineDriftedError):
+        return True
+    return (
+        isinstance(error, _ConsolidationBlockedError)
+        and error.stable_code == "profile_consolidation_source_changed"
+    )
+
+
+def _recover_from_failure(user_data: Path, primary_home: Path) -> bool:
+    """Report whether startup may continue, recording the deferral if it may.
+
+    Never raises: bookkeeping about a failure must not become a second failure
+    that hides the first.
+    """
+
+    intact = _primary_home_survives_failure(user_data, primary_home)
+    if not intact:
+        return False
+    with contextlib.suppress(Exception):
+        journal_path = user_data / _JOURNAL_NAME
+        if _lexists(journal_path):
+            # Remember which transaction was outstanding when startup was allowed
+            # to continue, so a later refused resume can tell self-inflicted drift
+            # apart from drift that must still fail closed.
+            _record_startup_deferral(
+                user_data,
+                _load_journal(journal_path, user_data, primary_home),
+            )
+    return True
 
 
 def _restart_legacy_prepared_journal_if_safe(
@@ -3189,7 +3462,27 @@ def consolidate_recovery_profiles(
                 journal_path,
                 journal,
             ):
-                return _resume(user_data_path, primary_path, journal_path, journal)
+                try:
+                    return _resume(user_data_path, primary_path, journal_path, journal)
+                except (_StagingBaselineDriftedError, _ConsolidationBlockedError) as exc:
+                    # A prepared plan pins both the primary it was cloned from and
+                    # the recovery sources it measured. Either drifting makes every
+                    # future resume refuse, permanently — and both drift in exactly
+                    # the situation this needs to survive: deferring startup lets
+                    # the gateway write to the primary, and repairing whatever broke
+                    # the fan-in (a permission, an antivirus hold) changes the
+                    # source's metadata identity. Discard the dead plan and prepare
+                    # a fresh one below. The abort refuses unless the transaction is
+                    # still pre-park, so a half-committed primary keeps blocking.
+                    if not _is_stale_prepared_plan(exc):
+                        raise
+                    if not _abort_pre_park_journal(
+                        user_data_path,
+                        primary_path,
+                        journal_path,
+                        journal,
+                    ):
+                        raise
 
         profiles = _enumerate_recoveries(user_data_path)
         recovery_root = user_data_path / "recovery-profiles"
@@ -3390,12 +3683,18 @@ def consolidate_recovery_profiles(
                     shutil.rmtree(staging)
             raise
     except RecoveryError as exc:
-        return _blocked(primary_path, exc.stable_code, exc)
+        return _blocked(
+            primary_path,
+            exc.stable_code,
+            exc,
+            primary_home_intact=_recover_from_failure(user_data_path, primary_path),
+        )
     except Exception as exc:
         return _blocked(
             primary_path,
             "profile_consolidation_failed",
             exc,
+            primary_home_intact=_recover_from_failure(user_data_path, primary_path),
         )
 
 

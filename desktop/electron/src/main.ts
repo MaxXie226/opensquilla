@@ -222,6 +222,10 @@ interface DesktopProfileConsolidationResult {
   credential_adoption_status: DesktopCredentialAdoptionStatus
   revision: number
   errors: string[]
+  // Only meaningful when `outcome` is 'blocked': the canonical primary profile is
+  // physically usable, so startup may continue against it and retry the fan-in on
+  // a later launch instead of stranding the user.
+  primary_home_intact: boolean
 }
 
 interface DesktopRecoveryViewState {
@@ -5396,6 +5400,22 @@ function parseDesktopProfileConsolidationProtocol(
     credential_adoption_status: credentialAdoptionStatus,
     revision: Number(record.revision),
     errors: record.errors as string[],
+    // Optional so an older runtime that predates the field still parses; absent
+    // means "assume not intact", which keeps the stricter blocking behavior.
+    primary_home_intact: record.primary_home_intact === true,
+  }
+}
+
+// A boolean second opinion on the consolidation protocol's own verdict that the
+// primary profile survived a failed fan-in. Intentionally shallow: the protocol
+// owns the journal contract, and duplicating that here would create a second copy
+// to drift out of sync.
+function isPlainDesktopDirectory(path: string): boolean {
+  try {
+    const info = lstatSync(path)
+    return info.isDirectory() && !info.isSymbolicLink()
+  } catch {
+    return false
   }
 }
 
@@ -6004,16 +6024,26 @@ let pendingDesktopCredentialConsolidation: DesktopProfileConsolidationResult | n
 // re-runs the same work, so a profile layout it cannot process leaves the user
 // with no in-app way forward. Opting out skips the fan-in entirely: the primary
 // profile starts untouched, every legacy recovery profile stays byte-for-byte on
-// disk, and a later launch without the opt-out retries. This is deliberately
-// manual — an automatic fallback would start writing into a profile the audited
-// inspector never verified.
+// disk, and a later launch without the opt-out retries.
+//
+// This remains useful alongside the automatic deferral below, which only applies
+// when the fan-in reports the primary profile as physically usable. The opt-out
+// skips the fan-in outright, so it also covers a primary the protocol refuses to
+// judge — and it lets support and CI take the same path deliberately.
 function profileConsolidationOptOut(): boolean {
   const raw = (process.env.OPENSQUILLA_DESKTOP_SKIP_PROFILE_CONSOLIDATION || '').trim()
   return ['1', 'true', 'yes', 'on'].includes(raw.toLowerCase())
 }
 
+// Set when a blocked fan-in was allowed to defer. Deliberately separate from
+// `desktopProfilesConsolidatedThisProcess`, which must stay false so a blocked
+// attempt is never recorded as a completed consolidation; this one only stops a
+// window-reopen loop from re-spawning the same failing CLI within one process.
+let desktopProfileConsolidationDeferredThisProcess = false
+
 async function consolidateLegacyRecoveryProfilesBeforeStartup(
 ): Promise<RecoveryProtocolResult | null> {
+  if (desktopProfileConsolidationDeferredThisProcess) return null
   if (profileConsolidationOptOut()) {
     // Logged every launch, never once: a silently skipped consolidation would
     // leave sessions split across profiles with no trace of why.
@@ -6051,6 +6081,20 @@ async function consolidateLegacyRecoveryProfilesBeforeStartup(
         consumedRecoveryProfileCount: result.consumed_recovery_ids.length,
       })
       if (result.outcome === 'blocked') {
+        if (result.primary_home_intact && isPlainDesktopDirectory(primary.home)) {
+          // The legacy fan-in failed but the primary profile itself is usable, so
+          // reaching the product matters more than completing the merge right
+          // now. Nothing was moved: every recovery profile is still on disk and a
+          // later launch retries. The local directory check is a second opinion
+          // on the protocol's own verdict, deliberately narrow so this does not
+          // grow a duplicate of the journal contract.
+          desktopProfileConsolidationDeferredThisProcess = true
+          desktopLog('desktop_profile_consolidation_deferred', {
+            stableCode: result.stable_code,
+            recoveryProfileCount: recoveryProfiles.length,
+          })
+          return null
+        }
         // A protocol-level block is a primary-profile repair state, not an
         // unexpected Electron boot failure. Keep the operation retryable and
         // expose only the stable diagnostic plus the safe repair actions.

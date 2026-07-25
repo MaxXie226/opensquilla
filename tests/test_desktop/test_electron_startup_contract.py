@@ -2833,3 +2833,40 @@ def test_profile_consolidation_has_a_manual_operator_escape_hatch() -> None:
     assert "profileConsolidationOptOut()" not in consolidation.split(
         "desktop_profile_consolidation_skipped",
     )[1]
+
+
+def test_blocked_consolidation_defers_startup_when_the_primary_survives() -> None:
+    """A failed legacy fan-in must not cost the user access to a healthy primary.
+
+    The repair page's only forward action re-runs the same work, so blocking on a
+    profile the fan-in cannot process is a dead end. Deferral is silent by design:
+    it writes nothing, records the reason only in the desktop log, and leaves every
+    recovery profile on disk for a later launch to retry.
+    """
+
+    main_ts = _read("desktop/electron/src/main.ts")
+    consolidation = _section(
+        main_ts,
+        "async function consolidateLegacyRecoveryProfilesBeforeStartup",
+        "function recoveryStateSnapshot",
+    )
+
+    # The protocol carries the verdict, and an older runtime that omits it must be
+    # treated as "not intact" so the stricter blocking path stays the default.
+    assert "primary_home_intact: boolean" in main_ts
+    assert "primary_home_intact: record.primary_home_intact === true" in main_ts
+
+    assert "if (result.primary_home_intact && isPlainDesktopDirectory(primary.home)) {" in (
+        consolidation
+    )
+    assert "desktop_profile_consolidation_deferred" in consolidation
+    # Still fails closed for every state the protocol does not vouch for.
+    assert "return recoveryFailureResult(primary.home, result.stable_code)" in consolidation
+    # A blocked attempt must never be recorded as a completed consolidation.
+    deferral = consolidation.split("desktop_profile_consolidation_deferred")[1]
+    assert "desktopProfilesConsolidatedThisProcess = true" not in deferral.split("return null")[0]
+    assert "let desktopProfileConsolidationDeferredThisProcess = false" in main_ts
+
+    # Silent: the deferral must not reach the renderer, the boot splash, or a dialog.
+    for surface in ("sendBootStatus", "sendBootError", "publishRecoveryState", "dialog."):
+        assert surface not in deferral.split("return null")[0], surface
