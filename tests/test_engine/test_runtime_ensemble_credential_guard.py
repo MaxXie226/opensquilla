@@ -608,12 +608,11 @@ async def test_router_dynamic_ranking_failure_fails_open_to_the_single_provider(
 ) -> None:
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
 
-    async def extra_long_task(**kwargs: Any) -> TaskAnalysisResult:
+    async def analyzed_task(**kwargs: Any) -> TaskAnalysisResult:
         profile = fallback_task_profile(
             routed_tier=str(kwargs["routed_tier"]),
             request_context=kwargs["request_context"],
         )
-        profile["constraints"]["context"] = "extra_long"
         return TaskAnalysisResult(
             profile=profile,
             source="test",
@@ -623,7 +622,17 @@ async def test_router_dynamic_ranking_failure_fails_open_to_the_single_provider(
 
     monkeypatch.setattr(
         "opensquilla.provider.ranking_router.analyze_task_with_provider",
-        extra_long_task,
+        analyzed_task,
+    )
+
+    def fail_ranking(**_kwargs: Any) -> None:
+        raise DynamicRankingError(
+            "router_dynamic has no proposer after hard filtering"
+        )
+
+    monkeypatch.setattr(
+        "opensquilla.provider.ranking_router.rank_models",
+        fail_ranking,
     )
     runner = TurnRunner(
         provider_selector=None,
