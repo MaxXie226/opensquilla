@@ -21,10 +21,15 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote, unquote, urlparse
 
+import structlog
 from yoyo import exceptions, get_backend, read_migrations
 from yoyo import migrations as yoyo_migrations
 
 log = logging.getLogger(__name__)
+#: Separate structured logger: migration-directory resolution emits an
+#: operator-facing event whose fields are asserted by contract tests, while the
+#: rest of this module logs through the standard library.
+_structured_log = structlog.get_logger(__name__)
 
 #: PROCESS_QUERY_LIMITED_INFORMATION — the minimal access right needed to
 #: probe whether a Windows process exists.
@@ -55,6 +60,55 @@ class SchemaAheadError(RuntimeError):
     yoyo down-migration is invoked at boot), so we refuse loudly instead of
     risking silent corruption.
     """
+
+
+def resolve_migrations_dir() -> Path:
+    """Locate yoyo migrations in env override, installed package, or checkout.
+
+    Lives beside :func:`apply_pending` because every caller that applies
+    migrations needs it, including offline profile consolidation.  Keeping it in
+    the gateway would force lower layers to import the gateway back.
+    """
+
+    env_dir = os.environ.get("OPENSQUILLA_MIGRATIONS_DIR")
+    if env_dir:
+        candidate = Path(env_dir)
+        if any(candidate.glob("V*.py")):
+            return candidate
+        # A pinned-but-unusable override silently falling through to a
+        # different migration set is a misconfiguration operators must see.
+        # Structured rather than this module's stdlib logger: the event name and
+        # its ``path``/``reason`` fields are a pinned operator-facing contract.
+        _structured_log.warning(
+            "resolve_migrations_dir.env_override_ignored",
+            path=str(candidate),
+            reason=(
+                "directory does not exist"
+                if not candidate.is_dir()
+                else "no V*.py migration files found"
+            ),
+        )
+
+    try:
+        from importlib import resources as importlib_resources
+
+        package_dir = importlib_resources.files("opensquilla").joinpath("_migrations")
+        if package_dir.is_dir():
+            path = Path(str(package_dir))
+            if any(path.glob("V*.py")):
+                return path
+    except Exception:
+        pass
+
+    repo_dir = Path(__file__).resolve().parents[3] / "migrations"
+    if any(repo_dir.glob("V*.py")):
+        return repo_dir
+
+    raise RuntimeError(
+        "opensquilla migrations directory not found "
+        "(checked OPENSQUILLA_MIGRATIONS_DIR, opensquilla/_migrations, "
+        "and repo migrations/)"
+    )
 
 
 def _adapt_sqlite_datetime(value: datetime) -> str:

@@ -2801,3 +2801,35 @@ def test_consolidation_e2e_covers_receipt_replay_and_inactive_state_archival() -
     assert "'recovered-data'" in source
     assert "pathExists(join(primaryHome, 'state'" in source
     assert "archivedProfiles" in source
+
+
+def test_profile_consolidation_has_a_manual_operator_escape_hatch() -> None:
+    """A layout consolidation cannot process must not be a dead end.
+
+    Consolidation gates startup and its retry action re-runs the same work, so
+    without an opt-out the only remaining recovery is editing the profile
+    directory by hand. The opt-out must stay manual: an automatic fallback would
+    begin writing into a profile the audited inspector never verified.
+    """
+
+    main_ts = _read("desktop/electron/src/main.ts")
+
+    assert "OPENSQUILLA_DESKTOP_SKIP_PROFILE_CONSOLIDATION" in main_ts
+    assert "function profileConsolidationOptOut()" in main_ts
+
+    consolidation = main_ts.split(
+        "async function consolidateLegacyRecoveryProfilesBeforeStartup(",
+    )[1]
+    guard = consolidation.split("desktopProfilesConsolidatedThisProcess")[0]
+    # The opt-out is checked before any writer lock or CLI spawn, so a wedged
+    # profile cannot block the check that exists to get past it.
+    assert "profileConsolidationOptOut()" in guard
+    assert "desktop_profile_consolidation_skipped" in guard
+
+    # Skipping silently would leave sessions split across profiles with no trace.
+    assert "reason: 'operator_opt_out'" in main_ts
+
+    # No automatic fallback: the opt-out is only ever read from the environment.
+    assert "profileConsolidationOptOut()" not in consolidation.split(
+        "desktop_profile_consolidation_skipped",
+    )[1]

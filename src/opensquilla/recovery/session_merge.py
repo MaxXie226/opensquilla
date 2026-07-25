@@ -671,10 +671,9 @@ def _run_session_schema_initialization(path: Path) -> None:
 def _upgrade_target_session_schema(path: Path) -> None:
     """Apply the same schema upgrade sequence used by gateway boot."""
 
-    from opensquilla.gateway.boot import _resolve_migrations_dir
-    from opensquilla.persistence.migrator import apply_pending
+    from opensquilla.persistence.migrator import apply_pending, resolve_migrations_dir
 
-    apply_pending(str(path), _resolve_migrations_dir())
+    apply_pending(str(path), resolve_migrations_dir())
     _run_session_schema_initialization(path)
 
 

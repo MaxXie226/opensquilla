@@ -222,45 +222,16 @@ def _make_auto_propose_tool_context(
 
 
 def _resolve_migrations_dir() -> Path:
-    """Locate yoyo migrations in env override, installed package, or checkout."""
+    """Locate yoyo migrations; kept as a name callers and tests already import.
 
-    env_dir = os.environ.get("OPENSQUILLA_MIGRATIONS_DIR")
-    if env_dir:
-        candidate = Path(env_dir)
-        if any(candidate.glob("V*.py")):
-            return candidate
-        # A pinned-but-unusable override silently falling through to a
-        # different migration set is a misconfiguration operators must see.
-        log.warning(
-            "resolve_migrations_dir.env_override_ignored",
-            path=str(candidate),
-            reason=(
-                "directory does not exist"
-                if not candidate.is_dir()
-                else "no V*.py migration files found"
-            ),
-        )
+    The implementation lives in :mod:`opensquilla.persistence.migrator` so that
+    offline profile consolidation can resolve migrations without importing the
+    gateway, which would close a package import cycle.
+    """
 
-    try:
-        from importlib import resources as importlib_resources
+    from opensquilla.persistence.migrator import resolve_migrations_dir
 
-        package_dir = importlib_resources.files("opensquilla").joinpath("_migrations")
-        if package_dir.is_dir():
-            path = Path(str(package_dir))
-            if any(path.glob("V*.py")):
-                return path
-    except Exception:
-        pass
-
-    repo_dir = Path(__file__).resolve().parents[3] / "migrations"
-    if any(repo_dir.glob("V*.py")):
-        return repo_dir
-
-    raise RuntimeError(
-        "opensquilla migrations directory not found "
-        "(checked OPENSQUILLA_MIGRATIONS_DIR, opensquilla/_migrations, "
-        "and repo migrations/)"
-    )
+    return resolve_migrations_dir()
 
 
 class TaskRuntimeStreamError(RuntimeError):

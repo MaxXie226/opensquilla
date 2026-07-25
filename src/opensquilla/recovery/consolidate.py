@@ -1575,7 +1575,7 @@ def _transformed_config(raw: bytes, workspace_root: Path) -> bytes:
                 if normalized_id == "main"
                 else workspace_root / "agents" / normalized_id
             )
-    from opensquilla.migration.lossless_toml import patch_import_config
+    from opensquilla.lossless_toml import patch_import_config
 
     return patch_import_config(raw, original, transformed)
 

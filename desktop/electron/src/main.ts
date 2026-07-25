@@ -6000,8 +6000,30 @@ let desktopProfilesConsolidatedThisProcess = false
 let desktopProfileConsolidationPromise: Promise<RecoveryProtocolResult | null> | null = null
 let pendingDesktopCredentialConsolidation: DesktopProfileConsolidationResult | null = null
 
+// Operator escape hatch. Consolidation gates startup, and its own retry path
+// re-runs the same work, so a profile layout it cannot process leaves the user
+// with no in-app way forward. Opting out skips the fan-in entirely: the primary
+// profile starts untouched, every legacy recovery profile stays byte-for-byte on
+// disk, and a later launch without the opt-out retries. This is deliberately
+// manual — an automatic fallback would start writing into a profile the audited
+// inspector never verified.
+function profileConsolidationOptOut(): boolean {
+  const raw = (process.env.OPENSQUILLA_DESKTOP_SKIP_PROFILE_CONSOLIDATION || '').trim()
+  return ['1', 'true', 'yes', 'on'].includes(raw.toLowerCase())
+}
+
 async function consolidateLegacyRecoveryProfilesBeforeStartup(
 ): Promise<RecoveryProtocolResult | null> {
+  if (profileConsolidationOptOut()) {
+    // Logged every launch, never once: a silently skipped consolidation would
+    // leave sessions split across profiles with no trace of why.
+    desktopLog('desktop_profile_consolidation_skipped', {
+      reason: 'operator_opt_out',
+      variable: 'OPENSQUILLA_DESKTOP_SKIP_PROFILE_CONSOLIDATION',
+      legacyRecoveryProfileCount: legacyRecoveryProfiles().length,
+    })
+    return null
+  }
   if (desktopProfilesConsolidatedThisProcess) return null
   if (desktopProfileConsolidationPromise) return await desktopProfileConsolidationPromise
 
