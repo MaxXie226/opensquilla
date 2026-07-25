@@ -8,7 +8,8 @@ export type IconName =
   | 'refresh' | 'download' | 'save' | 'menu' | 'moreHorizontal' | 'user' | 'search' | 'eye' | 'eye-off'
   | 'edit' | 'info' | 'settings' | 'gear' | 'gauge' | 'router' | 'regenerate'
   | 'pencil' | 'fork' | 'listChecks' | 'chevronDown' | 'chevronRight' | 'arrowUp'
-  | 'panel-left-open' | 'panel-left-close' | 'sidebar-visible' | 'sidebar-hidden'
+  | 'panel-left-open' | 'panel-left-close' | 'panel-right-open' | 'panel-right-close'
+  | 'sidebar-visible' | 'sidebar-hidden'
   | 'clock' | 'microphone'
   | 'cloud' | 'fileText' | 'fileCode' | 'image' | 'table' | 'externalLink'
   | 'keyboard' | 'languages' | 'shield' | 'lock'
@@ -73,6 +74,14 @@ const ICONS: Record<IconName, IconDef> = {
   arrowUp:    { path: '<path d="M12 19V5"/><path d="M5 12l7-7 7 7"/>', strokeWidth: 2 },
   'panel-left-open':  { path: '<rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 3v18"/><path d="M14 9l6 6-6 6"/>' },
   'panel-left-close': { path: '<rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 3v18"/><path d="M20 9l-6 6 6 6"/>' },
+  'panel-right-open': {
+    path: '<rect x="3.5" y="4.5" width="17" height="15" rx="3"/><path d="M14.5 4.5v15"/>',
+    strokeWidth: 1.5,
+  },
+  'panel-right-close': {
+    path: '<rect x="3.5" y="4.5" width="17" height="15" rx="3"/><path d="M15.5 9v6"/>',
+    strokeWidth: 1.5,
+  },
   'sidebar-visible': {
     path: '<rect x="3.5" y="4.5" width="17" height="15" rx="3"/><path d="M9.5 4.5v15"/>',
     strokeWidth: 1.5,
