@@ -3653,16 +3653,24 @@ def test_unreadable_recovery_source_defers_startup_and_still_converges(
         extra_name="recovery.txt",
         session_key="agent:main:recovered",
     )
-    source_db = (
-        user_data / "recovery-profiles" / recovery_id / "opensquilla" / "state" / "sessions.db"
-    )
-    original_mode = source_db.stat().st_mode
+    # Fail the merge itself rather than by removing read permission from the
+    # source: a POSIX mode bit does not deny the owner a read on Windows, so a
+    # permission-based fixture would silently succeed there and assert nothing.
+    # This also aims at the behavior under test instead of at the filesystem.
+    consolidate_module = importlib.import_module("opensquilla.recovery.consolidate")
+    original_merge = consolidate_module._merge_recovery_data
 
-    os.chmod(source_db, 0o000)
+    def fail_once(*args, **kwargs):
+        # The journal is written before the merge runs, so this leaves exactly the
+        # pre-park transaction that a later launch has to recover from.
+        assert (user_data / ".opensquilla-profile-consolidation.json").is_file()
+        raise OSError("simulated unreadable recovery source")
+
+    monkeypatch.setattr(consolidate_module, "_merge_recovery_data", fail_once)
     try:
         blocked = consolidate_recovery_profiles(user_data, primary)
     finally:
-        os.chmod(source_db, original_mode)
+        monkeypatch.setattr(consolidate_module, "_merge_recovery_data", original_merge)
 
     assert blocked.outcome == "blocked", blocked
     # The primary is healthy, so Desktop may start against it and retry later.
