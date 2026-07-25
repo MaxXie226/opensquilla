@@ -166,7 +166,7 @@ async function deliverablesHeaderAction(page: Page): Promise<Locator> {
 }
 
 test.describe('Application Workbench', () => {
-  test('header opens the newest preview and restores the most recent concrete tab', async ({ page }) => {
+  test('header opens the complete collection and concrete previews reuse tabs', async ({ page }) => {
     const requests = new Map<string, number>()
     await openWorkbenchSession(page, requests)
 
@@ -177,16 +177,21 @@ test.describe('Application Workbench', () => {
     await expect(workbench).toBeVisible()
     await expect(workbench).toHaveAttribute('role', 'complementary')
     await expect(workbench.locator('.workbench-host__single-title'))
-      .toContainText('demo.html')
+      .toContainText('Deliverables (3)')
     await expect(workbench.locator('[data-workbench-item-id]')).toHaveCount(1)
+    await expect(workbench.locator('.artifact-collection__item')).toHaveCount(3)
+    expect(requests.size).toBe(0)
+
+    await workbench.getByRole('button', { name: 'Open demo.html' }).click()
+    await expect(workbench.getByRole('tablist')).toBeVisible()
+    await expect(workbench.getByRole('tab')).toHaveCount(2)
     await expect(workbench.locator('.artifact-preview__frame--html')).toBeVisible()
     expect(requests.get('/api/v1/artifacts/workbench-demo')).toBe(1)
 
     await page.locator('.msg-artifact-chip', { hasText: 'notes.txt' })
       .getByRole('button', { name: 'Open notes.txt' })
       .click()
-    await expect(workbench.getByRole('tablist')).toBeVisible()
-    await expect(workbench.getByRole('tab')).toHaveCount(2)
+    await expect(workbench.getByRole('tab')).toHaveCount(3)
     await expect(workbench.locator('.artifact-preview__text'))
       .toContainText('Workbench notes stay mounted.')
     expect(requests.get('/api/v1/artifacts/workbench-notes')).toBe(1)
@@ -194,28 +199,26 @@ test.describe('Application Workbench', () => {
     await page.locator('.msg-artifact-chip', { hasText: 'notes.txt' })
       .getByRole('button', { name: 'Open notes.txt' })
       .click()
-    await expect(workbench.getByRole('tab')).toHaveCount(2)
+    await expect(workbench.getByRole('tab')).toHaveCount(3)
     expect(requests.get('/api/v1/artifacts/workbench-notes')).toBe(1)
 
     await page.locator('.msg-artifact-chip', { hasText: 'guide.md' })
       .getByRole('button', { name: 'Open guide.md' })
       .click()
-    await expect(workbench.getByRole('tab')).toHaveCount(3)
+    await expect(workbench.getByRole('tab')).toHaveCount(4)
     await expect(workbench.locator('.artifact-preview__markdown')).toContainText('Guide')
     expect(requests.get('/api/v1/artifacts/workbench-guide')).toBe(1)
 
-    await workbench.getByRole('button', { name: 'Collapse workbench' }).click()
-    await expect(workbench).toBeHidden()
-    await expect(page.getByTestId('workbench-host')).toHaveCount(1)
-    await expect(page.locator('[data-workbench-item-id]')).toHaveCount(3)
+    await workbench.getByRole('button', { name: 'Close workbench' }).click()
+    await expect(page.getByTestId('workbench-host')).toHaveCount(0)
 
     await (await deliverablesHeaderAction(page)).click()
     await expect(workbench).toBeVisible()
-    await expect(workbench.locator('.artifact-preview__markdown')).toContainText('Guide')
+    await expect(workbench.locator('.artifact-collection__item')).toHaveCount(3)
     expect(requests.get('/api/v1/artifacts/workbench-guide')).toBe(1)
   })
 
-  test('header falls back to the legacy deliverables drawer when nothing is previewable', async ({ page }) => {
+  test('header collection includes download-only deliverables', async ({ page }) => {
     const downloadOnlyArtifacts = [{
       id: 'workbench-data',
       name: 'data.json',
@@ -227,11 +230,14 @@ test.describe('Application Workbench', () => {
 
     await (await deliverablesHeaderAction(page)).click()
 
-    await expect(page.getByTestId('workbench-host')).toHaveCount(0)
-    await expect(page.getByRole('dialog', { name: 'Deliverables (1)' })).toBeVisible()
+    const workbench = page.getByTestId('workbench-host')
+    await expect(workbench).toBeVisible()
+    await expect(workbench.locator('.artifact-collection__item')).toHaveCount(1)
+    await expect(workbench.getByRole('button', { name: 'Open data.json' })).toBeVisible()
+    await expect(page.getByRole('dialog', { name: 'Deliverables (1)' })).toHaveCount(0)
   })
 
-  test('opening the same artifact card activates one existing item', async ({ page }) => {
+  test('opening the same artifact card reuses one tab until the workbench is closed', async ({ page }) => {
     await openWorkbenchSession(page)
     const notes = page.locator('.msg-artifact-chip', { hasText: 'notes.txt' })
     const open = notes.getByRole('button', { name: 'Open notes.txt' })
@@ -241,11 +247,17 @@ test.describe('Application Workbench', () => {
     await expect(workbench).toBeVisible()
     await expect(workbench.locator('[data-workbench-item-id]')).toHaveCount(1)
 
-    await workbench.getByRole('button', { name: 'Collapse workbench' }).click()
     await open.click()
     await expect(workbench).toBeVisible()
     await expect(workbench.locator('[data-workbench-item-id]')).toHaveCount(1)
     await expect(workbench.locator('.workbench-host__tabs')).toHaveCount(0)
+
+    await workbench.getByRole('button', { name: 'Close workbench' }).click()
+    await expect(page.getByTestId('workbench-host')).toHaveCount(0)
+
+    await open.click()
+    await expect(page.getByTestId('workbench-host')).toBeVisible()
+    await expect(page.locator('[data-workbench-item-id]')).toHaveCount(1)
   })
 
   test('mobile Workbench is a dialog and Escape collapses it with focus restored', async ({ page }) => {
