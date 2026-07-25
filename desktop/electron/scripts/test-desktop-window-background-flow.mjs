@@ -154,7 +154,14 @@ try {
     assert.equal(hidden.destroyed, false)
     assert.equal(hidden.browserWindowId, before.browserWindowId)
     assert.equal(hidden.webContentsId, before.webContentsId)
-    assert.equal(hidden.url, before.url)
+    // The live SPA may move between client-side routes while hidden (e.g.
+    // /control/chat -> /control/chat/new), so only require that the window was
+    // not navigated away from the Control UI or reloaded to the boot splash.
+    // Renderer continuity itself is proven by the marker check below.
+    assert.ok(
+      hidden.url.includes('/control/'),
+      `hidden window must stay on the Control UI, got ${hidden.url}`,
+    )
     assert.equal(page.isClosed(), false)
 
     await desktopApp.evaluate(({ app }) => {
@@ -170,7 +177,10 @@ try {
     )
     assert.equal(revealed.browserWindowId, before.browserWindowId)
     assert.equal(revealed.webContentsId, before.webContentsId)
-    assert.equal(revealed.url, before.url)
+    assert.ok(
+      revealed.url.includes('/control/'),
+      `revealed window must stay on the Control UI, got ${revealed.url}`,
+    )
     assert.equal(
       await page.evaluate(() => window.__opensquillaWindowLifecycleMarker),
       marker,
