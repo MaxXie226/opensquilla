@@ -1605,6 +1605,8 @@ async def test_dispatch_execution_policy_stores_raw_snapshot_for_truncated_exec_
     assert len(payload["preview"]) + len(payload["tail"]) <= 10_000
     assert payload["tool_result_handle"].startswith("tr-")
     assert "retrieve_tool_result" in payload["retrieve_hint"]
+    assert "handle=<tool_result_handle>" in payload["retrieve_hint"]
+    assert "with tool_result_handle" not in payload["retrieve_hint"]
     assert len(result.content) < 12_000
 
     stored = ToolResultStore(tmp_path / "tool-results").read(

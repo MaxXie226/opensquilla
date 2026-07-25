@@ -45,7 +45,7 @@ _PENDING_APPROVAL_STATUSES: frozenset[str] = frozenset(
 
 _DISPATCH_TRUNCATION_RETRIEVE_HINT = (
     "This tool result was truncated before entering model context. "
-    "Use retrieve_tool_result with tool_result_handle to inspect the original raw output."
+    "Use retrieve_tool_result with handle=<tool_result_handle> to inspect the original raw output."
 )
 
 

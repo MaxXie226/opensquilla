@@ -193,6 +193,10 @@ class TestDirectiveInjection:
             config=SimpleNamespace(skills=SimpleNamespace(coding_mode=coding_mode)),
             system_prompt="BASE",
             metadata={},
+            tool_defs=[
+                SimpleNamespace(name=name)
+                for name in ("background_process", "exec_command", "process")
+            ],
         )
 
     @pytest.mark.asyncio
@@ -205,6 +209,19 @@ class TestDirectiveInjection:
         assert "DISABLED while coding mode is on" in suffix
         assert "code-task" in ctx.metadata["pinned_skills"]
         assert ctx.metadata["coding_mode"] is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("missing_tool", ["background_process", "exec_command", "process"])
+    async def test_on_skips_directive_and_pin_without_required_launch_tool(self, missing_tool):
+        ctx = self._ctx(True)
+        ctx.tool_defs = [tool for tool in ctx.tool_defs if tool.name != missing_tool]
+
+        out = await enforce_coding_mode(ctx)
+
+        assert out.system_prompt == "BASE"
+        assert "pinned_skills" not in out.metadata
+        assert "coding_mode" not in out.metadata
+        assert out.metadata["enforce_coding_mode__applied"] is False
 
     @pytest.mark.asyncio
     async def test_directive_clarify_gate_asks_when_only_a_category(self):
