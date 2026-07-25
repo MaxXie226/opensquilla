@@ -727,10 +727,16 @@ if not isinstance(cost_attribution, Mapping):
 account_windows = cost_attribution.get("account_windows")
 if not isinstance(account_windows, list) or not account_windows:
     raise SystemExit("formal manifest lacks account windows")
-window_kinds = [window.get("kind") for window in account_windows if isinstance(window, Mapping)]
-if window_kinds.count("current") != 1 or any(
-    kind not in {"current", "prior_aborted"} for kind in window_kinds
-):
+allowed_window_kinds = {"current", "prior_aborted", "prior_campaign"}
+window_kinds: list[str] = []
+for window in account_windows:
+    if not isinstance(window, Mapping):
+        raise SystemExit("formal account window is not an object")
+    kind = window.get("kind")
+    if not isinstance(kind, str) or kind not in allowed_window_kinds:
+        raise SystemExit("formal account window kind differs")
+    window_kinds.append(kind)
+if window_kinds.count("current") != 1:
     raise SystemExit("formal account window kinds differ")
 try:
     has_positive_prior = any(
@@ -748,8 +754,6 @@ if has_positive_prior and (
 ):
     raise SystemExit("formal positive-prior attribution semantics differ")
 for window_index, window in enumerate(account_windows):
-    if not isinstance(window, Mapping):
-        raise SystemExit("formal account window is not an object")
     sources = window.get("sources")
     if not isinstance(sources, list) or len(sources) != 4:
         raise SystemExit("formal account window source inventory differs")
