@@ -110,7 +110,9 @@
           :navigation-artifacts="artifactNavigationItems"
           :session-key="sessionKey"
           :auth-token="authToken"
+          :prefer-workbench="workbenchEnabled"
           @download="$emit('downloadArtifact', $event)"
+          @open="$emit('openArtifact', $event)"
         />
 
         <SourcesRow v-if="message.toolCalls?.length" ref="sourcesRowRef" :calls="message.toolCalls" :sources="message.sources ?? []" />
@@ -316,6 +318,7 @@ const props = defineProps<{
   artifactNavigationItems?: ArtifactPayload[]
   sessionKey?: string
   authToken?: string
+  workbenchEnabled?: boolean
   /** True on the thread's last assistant message — the only place the whole-conversation fork action renders. */
   isTip?: boolean
   forkBusy?: boolean
@@ -325,6 +328,7 @@ const emit = defineEmits<{
   regenerate: [message: ChatRenderedMessage]
   toggleShare: [messageId: string]
   downloadArtifact: [artifact: ArtifactPayload]
+  openArtifact: [artifact: ArtifactPayload]
   toggleToolGroup: [groupId: string]
   toggleToolItem: [renderKey: string]
   showToolResult: [content: string, title: string, context?: ToolResultContext]

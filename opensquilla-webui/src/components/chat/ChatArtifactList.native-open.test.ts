@@ -22,7 +22,9 @@ async function settle() {
 async function mountList(options: {
   isOwner: boolean
   artifact?: ArtifactPayload
+  preferWorkbench?: boolean
   onDownload?: (artifact: ArtifactPayload) => void
+  onOpen?: (artifact: ArtifactPayload) => void
 }) {
   const el = document.createElement('div')
   document.body.appendChild(el)
@@ -34,7 +36,9 @@ async function mountList(options: {
     artifacts: [options.artifact || htmlArtifact],
     sessionKey: 'agent:main:webchat:ok',
     authToken: 'secret',
+    preferWorkbench: options.preferWorkbench,
     onDownload: options.onDownload,
+    onOpen: options.onOpen,
   })
   app.use(pinia)
   app.use(i18n)
@@ -85,6 +89,25 @@ describe('ChatArtifactList native HTML open', () => {
     await nextTick()
 
     expect(onDownload).toHaveBeenCalledWith(htmlArtifact)
+    expect(fetchImpl).not.toHaveBeenCalled()
+    app.unmount()
+  })
+
+  it('routes previewable artifacts to the Workbench without fetching or opening a popup', async () => {
+    const fetchImpl = vi.fn()
+    vi.stubGlobal('fetch', fetchImpl)
+    const onOpen = vi.fn()
+    const { app, el } = await mountList({
+      isOwner: false,
+      preferWorkbench: true,
+      onOpen,
+    })
+
+    expect(el.textContent).toContain('Open')
+    el.querySelector<HTMLButtonElement>('.msg-artifact-body')?.click()
+    await nextTick()
+
+    expect(onOpen).toHaveBeenCalledWith(htmlArtifact)
     expect(fetchImpl).not.toHaveBeenCalled()
     app.unmount()
   })

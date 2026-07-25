@@ -63,6 +63,20 @@
         <Icon name="share" :size="14" />
         <span class="chat-share-btn__label">{{ t('chat.share') }}</span>
       </button>
+      <button
+        v-if="workbenchAvailable"
+        ref="wideWorkbenchRef"
+        type="button"
+        class="chat-header__action chat-header__action--icon"
+        :title="workbenchLabel"
+        :aria-label="workbenchLabel"
+        :aria-expanded="workbenchExpanded"
+        aria-controls="workbench-panel"
+        data-testid="chat-session-action-workbench"
+        @click="emit('toggle-workbench')"
+      >
+        <Icon :name="workbenchExpanded ? 'panel-right-open' : 'panel-right-close'" :size="16" />
+      </button>
     </div>
 
     <div v-else ref="compactActionsRef" class="chat-header__actions chat-header__actions--compact">
@@ -81,6 +95,21 @@
         @click="invoke(primaryAction)"
       >
         <Icon :name="primaryAction === 'deliverables' ? 'download' : 'share'" :size="16" />
+      </button>
+
+      <button
+        v-if="workbenchAvailable"
+        ref="compactWorkbenchRef"
+        type="button"
+        class="chat-header__action chat-header__action--icon"
+        :title="workbenchLabel"
+        :aria-label="workbenchLabel"
+        :aria-expanded="workbenchExpanded"
+        aria-controls="workbench-panel"
+        data-testid="chat-session-action-workbench"
+        @click="emit('toggle-workbench')"
+      >
+        <Icon :name="workbenchExpanded ? 'panel-right-open' : 'panel-right-close'" :size="16" />
       </button>
 
       <button
@@ -167,11 +196,12 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
+import { useDialogLayer } from '@/composables/useDialogA11y'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
 import type { IconName } from '@/utils/icons'
 
 type Layout = 'wide' | 'compact' | 'tight'
-type Action = 'deliverables' | 'runs' | 'share' | 'copy-session-key'
+type Action = 'deliverables' | 'runs' | 'share' | 'copy-session-key' | 'workbench'
 
 const props = defineProps<{
   title: string
@@ -183,6 +213,8 @@ const props = defineProps<{
   runHistoryVisible: boolean
   shareMode: boolean
   shareableMessageCount: number
+  workbenchAvailable?: boolean
+  workbenchExpanded?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -190,6 +222,7 @@ const emit = defineEmits<{
   'open-run-history': []
   'start-share': []
   'copy-session-key': []
+  'toggle-workbench': []
 }>()
 
 const { t } = useI18n()
@@ -202,12 +235,17 @@ const wideDeliverablesRef = ref<HTMLButtonElement | null>(null)
 const wideRunsRef = ref<HTMLButtonElement | null>(null)
 const wideShareRef = ref<HTMLButtonElement | null>(null)
 const wideCopyRef = ref<HTMLButtonElement | null>(null)
+const wideWorkbenchRef = ref<HTMLButtonElement | null>(null)
+const compactWorkbenchRef = ref<HTMLButtonElement | null>(null)
 const layout = ref<Layout>('wide')
 const menuOpen = ref(false)
+useDialogLayer(computed(() => menuOpen.value))
 let resizeObserver: ResizeObserver | null = null
 
 const copyLabel = computed(() => props.copyState === 'ok' ? t('chat.copied') : t('chat.copySessionKey'))
 const deliverablesLabel = computed(() => t('chat.deliverablesCount', { count: props.deliverableCount }))
+const workbenchLabel = computed(() =>
+  t(props.workbenchExpanded ? 'workbench.collapse' : 'workbench.expand'))
 const shareLabel = computed(() => props.shareableMessageCount === 0
   ? t('chat.shareSendFirst')
   : t('chat.shareSelectHint'))
@@ -258,6 +296,7 @@ function syncLayout() {
       const fallback = wideDeliverablesRef.value
         || wideRunsRef.value
         || wideShareRef.value
+        || wideWorkbenchRef.value
         || wideCopyRef.value
       fallback?.focus()
     })
@@ -298,6 +337,7 @@ function invoke(action: Action, fromMenu = false) {
   if (action === 'runs') emit('open-run-history')
   if (action === 'share') emit('start-share')
   if (action === 'copy-session-key') emit('copy-session-key')
+  if (action === 'workbench') emit('toggle-workbench')
 }
 
 function onMenuKeydown(event: KeyboardEvent) {
@@ -330,7 +370,9 @@ function focusAction(action: Action): boolean {
       ? wideRunsRef.value
       : action === 'share'
         ? wideShareRef.value
-        : wideCopyRef.value
+        : action === 'workbench'
+          ? (wideWorkbenchRef.value || compactWorkbenchRef.value)
+          : wideCopyRef.value
   if (isVisible(direct)) {
     direct.focus()
     return true
@@ -365,6 +407,8 @@ watch(() => [
   props.runHistoryVisible,
   props.shareMode,
   props.shareableMessageCount,
+  props.workbenchAvailable,
+  props.workbenchExpanded,
 ], () => {
   if (menuOpen.value) closeMenu(true)
 })

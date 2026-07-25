@@ -111,8 +111,17 @@ async function seedHistory(
 }
 
 async function openSeeded(page: Page) {
-  await page.route('**/api/v1/artifacts/**', route =>
-    route.fulfill({ status: 200, contentType: 'image/png', body: PNG_1x1 }))
+  await page.route('**/api/v1/artifacts/**', route => {
+    const pathname = new URL(route.request().url()).pathname
+    if (pathname.endsWith('/art-card-pdf')) {
+      return route.fulfill({
+        status: 200,
+        contentType: 'application/pdf',
+        body: '%PDF-1.4\n%%EOF',
+      })
+    }
+    return route.fulfill({ status: 200, contentType: 'image/png', body: PNG_1x1 })
+  })
   await seedHistory(page)
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
   await page.waitForSelector('.conn-pill', { timeout: 10000 })
@@ -186,7 +195,7 @@ test.describe('Artifact deliverable cards', () => {
     expect(requested.some(url => url.includes('art-card-img') && url.includes('variant=thumb'))).toBe(true)
   })
 
-  test('previewable file card splits Open from Download', async ({ page }) => {
+  test('previewable file card opens the Workbench without downloading', async ({ page }) => {
     await openSeeded(page)
 
     const pdfCard = page.locator('.msg-artifact-chip', { hasText: 'report-q2.pdf' })
@@ -201,12 +210,16 @@ test.describe('Artifact deliverable cards', () => {
     await expect(openBtn).toBeVisible()
     await expect(downloadBtn).toBeVisible()
 
-    // Open opens a new tab; it never downloads.
-    const popupPromise = page.waitForEvent('popup')
+    let popupCount = 0
+    page.on('popup', () => { popupCount += 1 })
     await openBtn.click()
-    const popup = await popupPromise
-    expect(popup).toBeTruthy()
-    await popup.close()
+    const workbench = page.getByTestId('workbench-host')
+    await expect(workbench).toBeVisible()
+    await expect(workbench).toHaveAttribute('role', 'complementary')
+    await expect(workbench.locator('.workbench-host__single-title')).toContainText('report-q2.pdf')
+    await expect(workbench.locator('.workbench-host__single-title')).toContainText('PDF')
+    await expect(workbench.locator('.artifact-preview__frame--pdf')).toBeVisible()
+    expect(popupCount).toBe(0)
   })
 
   test('download-only file card has a Download control and no Open', async ({ page }) => {
@@ -221,7 +234,7 @@ test.describe('Artifact deliverable cards', () => {
     await expect(csvCard.getByRole('button', { name: 'Download pricing.csv' })).toBeVisible()
   })
 
-  test('html file card is download-only and never invokes the native-open endpoint', async ({ page }) => {
+  test('html file card opens the offline Workbench preview and downloads separately', async ({ page }) => {
     let nativeOpenCount = 0
     let htmlDownloadCount = 0
     await page.route('**/api/v1/artifacts/**', async route => {
@@ -255,14 +268,22 @@ test.describe('Artifact deliverable cards', () => {
 
     const htmlCard = page.locator('.msg-artifact-chip', { hasText: 'interactive.html' })
     await expect(htmlCard).toBeVisible()
-    await expect(htmlCard.getByRole('button', { name: 'Open interactive.html' })).toHaveCount(0)
+    await htmlCard.getByRole('button', { name: 'Open interactive.html' }).click()
+    const workbench = page.getByTestId('workbench-host')
+    await expect(workbench).toBeVisible()
+    await expect(workbench.locator('.workbench-host__single-title')).toContainText('interactive.html')
+    await expect(workbench.locator('.workbench-host__single-title')).toContainText('HTML')
+    const preview = workbench.locator('.artifact-preview__frame--html')
+    await expect(preview).toBeVisible()
+    await expect(preview).toHaveAttribute('sandbox', 'allow-scripts')
+
     const downloadPromise = page.waitForEvent('download')
     await htmlCard.getByRole('button', { name: 'Download interactive.html' }).click()
     const download = await downloadPromise
 
     expect(download.suggestedFilename()).toBe('interactive.html')
     expect(nativeOpenCount).toBe(0)
-    expect(htmlDownloadCount).toBe(1)
+    expect(htmlDownloadCount).toBe(2)
   })
 
   test('audio performs zero initial requests and fetches authenticated bytes only after Play', async ({ page }) => {

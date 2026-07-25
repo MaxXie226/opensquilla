@@ -35,10 +35,13 @@
         :run-history-visible="appStore.features.metaRuns"
         :share-mode="shareMode"
         :shareable-message-count="shareableMessageCount"
+        :workbench-available="workbenchAvailable"
+        :workbench-expanded="workbenchStore.expanded"
         @open-deliverables="openDeliverables"
         @open-run-history="openMetaRunHistory"
         @start-share="startShareMode"
         @copy-session-key="onSessionCopyClick"
+        @toggle-workbench="toggleWorkbench"
       />
     </Teleport>
 
@@ -123,6 +126,7 @@
           :session-key="sessionKey"
           :auth-token="readAuthToken()"
           :artifact-navigation-items="sessionArtifacts"
+          :workbench-enabled="workbenchEnabled"
           :share-mode="shareMode"
           :selected-message-ids="selectedShareMessageIds"
           :strip-time-prefix="stripTimePrefix"
@@ -144,6 +148,7 @@
           @regenerate-message="regenerateMessage"
           @toggle-share-message="toggleShareMessage"
           @download-artifact="downloadArtifact"
+          @open-artifact="openArtifactInWorkbench"
           @toggle-tool-group="toggleToolGroup"
           @toggle-tool-item="toggleToolItem"
           @show-tool-result="showToolResultModal"
@@ -267,7 +272,9 @@
               :navigation-artifacts="sessionArtifacts"
               :session-key="sessionKey"
               :auth-token="readAuthToken()"
+              :prefer-workbench="workbenchEnabled"
               @download="downloadArtifact"
+              @open="openArtifactInWorkbench"
             />
 
           </div>
@@ -523,6 +530,8 @@ import { useRouter } from 'vue-router'
 import { useRpcStore } from '@/stores/rpc'
 import { useRpcCall } from '@/composables/useRpc'
 import { useAppStore } from '@/stores/app'
+import { useWorkbenchStore } from '@/workbench/store'
+import { usePlatform } from '@/platform'
 import ApprovalCard from '@/components/chat/ApprovalCard.vue'
 import ActivityDisclosure from '@/components/chat/ActivityDisclosure.vue'
 import AssistantActivityTimeline from '@/components/chat/AssistantActivityTimeline.vue'
@@ -612,7 +621,8 @@ import type {
 import type { ModelRoutingMode } from '@/types/modelRouting'
 import type { SandboxRunMode } from '@/types/sandbox'
 import type { ChatPart, InterruptViewState } from '@/types/parts'
-import { artifactDownloadUrl } from '@/utils/chat/artifacts'
+import { artifactDownloadUrl, canPreview } from '@/utils/chat/artifacts'
+import { createArtifactPreviewWorkbenchItem } from '@/workbench/artifactItems'
 import { fetchDisplayAttachmentBlob } from '@/utils/chat/attachmentAccess'
 import { createHistoryNavigationScrollLock } from '@/utils/chat/historyNavigationScrollLock'
 import {
@@ -688,6 +698,8 @@ const toolResultModal = ref<{
 
 const rpc = useRpcStore()
 const appStore = useAppStore()
+const workbenchStore = useWorkbenchStore()
+const platform = usePlatform()
 const router = useRouter()
 const { t, locale } = useI18n()
 const { pushToast } = useToasts()
@@ -707,13 +719,18 @@ const pendingAutoSend = ref('')
 const threadRef = ref<HTMLElement | null>(null)
 const composerRef = ref<ChatComposerHandle | null>(null)
 type ChatHeaderActionsHandle = {
-  focusAction: (action: 'deliverables' | 'runs' | 'share' | 'copy-session-key') => boolean
+  focusAction: (action: 'deliverables' | 'runs' | 'share' | 'copy-session-key' | 'workbench') => boolean
 }
 const chatHeaderActionsRef = ref<ChatHeaderActionsHandle | null>(null)
 
 /* ── State ─────────────────────────────────────────────────────────── */
 
 const sessionKey = ref('')
+const workbenchEnabled = computed(() => appStore.features.artifactWorkbench === true)
+const workbenchAvailable = computed(() =>
+  workbenchEnabled.value
+  && workbenchStore.items.some(item =>
+    item.scope.type === 'session' && item.scope.id === sessionKey.value))
 const inputText = ref('')
 const aborted = ref(false)
 const autoScroll = ref(true)
@@ -1996,13 +2013,51 @@ const sessionArtifacts = computed<ArtifactPayload[]>(() => {
 const deliverablesOpen = ref(false)
 const metaRunsHistoryOpen = ref(false)
 
-function focusHeaderAction(action: 'deliverables' | 'runs' | 'share' | 'copy-session-key') {
+function focusHeaderAction(
+  action: 'deliverables' | 'runs' | 'share' | 'copy-session-key' | 'workbench',
+) {
   void nextTick(() => chatHeaderActionsRef.value?.focusAction(action))
 }
 
 function openDeliverables() {
   if (sessionArtifacts.value.length === 0) return
+  if (workbenchEnabled.value) {
+    const recentPreview = workbenchStore.findMostRecentItem(item =>
+      item.kind === 'artifact-preview'
+      && item.scope.type === 'session'
+      && item.scope.id === sessionKey.value,
+    )
+    if (recentPreview) {
+      workbenchStore.activateItem(recentPreview.id)
+      workbenchStore.setExpanded(true)
+      return
+    }
+    for (let index = sessionArtifacts.value.length - 1; index >= 0; index -= 1) {
+      const artifact = sessionArtifacts.value[index]
+      if (!canPreview(artifact)) continue
+      if (openArtifactInWorkbench(artifact)) return
+      break
+    }
+  }
   deliverablesOpen.value = true
+}
+
+function openArtifactInWorkbench(artifact: ArtifactPayload): boolean {
+  if (!workbenchEnabled.value || !sessionKey.value) return false
+  workbenchStore.openItem(createArtifactPreviewWorkbenchItem({
+    artifact,
+    nativeHtml: Boolean(
+      platform.capabilities.hasNativeWorkbenchSurfaces
+      && platform.workbench.native,
+    ),
+    sessionKey: sessionKey.value,
+  }))
+  return true
+}
+
+function toggleWorkbench() {
+  workbenchStore.toggleExpanded()
+  if (!workbenchStore.expanded) focusHeaderAction('workbench')
 }
 
 function closeDeliverables() {
@@ -2512,7 +2567,8 @@ watch(pendingSessionIntent, (intent, previous) => {
   persistSession(sessionKey.value, { source: 'chatView.draftMaterialized' })
 })
 
-watch(sessionKey, () => {
+watch(sessionKey, key => {
+  if (workbenchEnabled.value) workbenchStore.setSessionScope(key || null)
   pendingForkBeforeMessageId.value = null
   if (shareMode.value) endShareMode()
   deliverablesOpen.value = false

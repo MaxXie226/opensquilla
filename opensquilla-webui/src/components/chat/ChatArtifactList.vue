@@ -264,10 +264,14 @@ const props = defineProps<{
   navigationArtifacts?: ArtifactPayload[]
   sessionKey?: string
   authToken?: string
+  /** Route previewable artifacts into the app-level Workbench. False keeps the
+   * one-release lightbox/native-open fallback intact. */
+  preferWorkbench?: boolean
 }>()
 
-defineEmits<{
+const emit = defineEmits<{
   download: [artifact: ArtifactPayload]
+  open: [artifact: ArtifactPayload]
 }>()
 
 const { t } = useI18n()
@@ -303,6 +307,7 @@ const webOwnerCanNativeOpen = computed(() => {
 
 function artifactCanOpen(artifact: ArtifactPayload): boolean {
   if (!canPreview(artifact)) return false
+  if (props.preferWorkbench) return true
   if (!isActiveDocumentArtifactCandidate(artifact)) return true
   if (platform.capabilities.canOpenArtifactsNatively && platform.files.openArtifact) return true
   return webOwnerCanNativeOpen.value
@@ -378,6 +383,10 @@ function retryPreview(artifact: ArtifactPayload) {
 // away. The lightbox fetches the FULL download URL (never the thumbnail);
 // Download stays fully decoupled from this preview path.
 function openPreview(artifact: ArtifactPayload) {
+  if (props.preferWorkbench) {
+    emit('open', artifact)
+    return
+  }
   lightboxInvoker = document.activeElement instanceof HTMLElement ? document.activeElement : null
   active.value = artifact
   loadFull(artifact)
@@ -393,6 +402,10 @@ function openPreview(artifact: ArtifactPayload) {
 // default app. Web keeps the in-browser new-tab path and its active-document
 // guard.
 async function openFile(artifact: ArtifactPayload) {
+  if (props.preferWorkbench) {
+    emit('open', artifact)
+    return
+  }
   if (platform.capabilities.canOpenArtifactsNatively && platform.files.openArtifact) {
     const fetched = await fetchArtifactBlob(artifact, {
       baseOrigin: window.location.origin,
