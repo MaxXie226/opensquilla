@@ -24,6 +24,22 @@ DEDUPE_MAX_ENTRIES = 1000
 # Graceful shutdown WS close code
 WS_CLOSE_SERVICE_RESTART = 1012
 
+# Events advertised in every successful Hello frame. This is intentionally
+# not a complete event inventory: dynamic ``session.event.*`` and ``task.*``
+# families exist outside this stable advertised set.
+DECLARED_EVENTS = (
+    "connect.challenge",
+    "agent",
+    "session.message",
+    "sessions.changed",
+    "presence",
+    "tick",
+    "shutdown",
+    "health",
+    "heartbeat",
+    "cron",
+)
+
 
 # ---------------------------------------------------------------------------
 # Client → Server frames

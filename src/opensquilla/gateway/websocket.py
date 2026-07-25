@@ -20,6 +20,7 @@ from opensquilla.gateway.config import (
     effective_webui_stream_idle_grace_seconds,
 )
 from opensquilla.gateway.protocol import (
+    DECLARED_EVENTS,
     PREAUTH_TIMEOUT_MS,
     PROTOCOL_VERSION,
     WS_CLOSE_SERVICE_RESTART,
@@ -956,16 +957,4 @@ def _build_features(dispatcher: RpcDispatcher) -> Any:
     from opensquilla.gateway.protocol import FeaturesInfo
 
     methods = dispatcher.list_methods()
-    events = [
-        "connect.challenge",
-        "agent",
-        "session.message",
-        "sessions.changed",
-        "presence",
-        "tick",
-        "shutdown",
-        "health",
-        "heartbeat",
-        "cron",
-    ]
-    return FeaturesInfo(methods=methods, events=events)
+    return FeaturesInfo(methods=methods, events=list(DECLARED_EVENTS))

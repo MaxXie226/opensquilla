@@ -1,0 +1,20 @@
+{
+  "id": "contract-connect-1",
+  "method": "connect",
+  "params": {
+    "auth": {
+      "token": "<synthetic>"
+    },
+    "client": {
+      "name": "opensquilla-contract-client"
+    },
+    "maxProtocol": 3,
+    "minProtocol": 1,
+    "role": "operator",
+    "scopes": [
+      "operator.read",
+      "operator.write"
+    ]
+  },
+  "type": "req"
+}

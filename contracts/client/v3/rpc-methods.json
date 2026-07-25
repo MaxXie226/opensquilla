@@ -1,0 +1,833 @@
+{
+  "completeness": "method-names-and-required-scopes-only",
+  "method_count": 206,
+  "methods": [
+    {
+      "name": "agent",
+      "required_scope": "operator.write"
+    },
+    {
+      "name": "agent.identity.get",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "agent.wait",
+      "required_scope": "operator.write"
+    },
+    {
+      "name": "agents.create",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "agents.delete",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "agents.files.get",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "agents.files.list",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "agents.files.set",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "agents.list",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "agents.update",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "channels.admin.set",
+      "required_scope": "operator.pairing"
+    },
+    {
+      "name": "channels.get",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "channels.logout",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "channels.pairing.approve",
+      "required_scope": "operator.pairing"
+    },
+    {
+      "name": "channels.pairing.revoke",
+      "required_scope": "operator.pairing"
+    },
+    {
+      "name": "channels.pairings",
+      "required_scope": "operator.pairing"
+    },
+    {
+      "name": "channels.probe",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "channels.restart",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "channels.status",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "chat.abort",
+      "required_scope": "operator.write"
+    },
+    {
+      "name": "chat.clarify_submit",
+      "required_scope": "operator.write"
+    },
+    {
+      "name": "chat.history",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "chat.inject",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "chat.send",
+      "required_scope": "operator.write"
+    },
+    {
+      "name": "commands.list_for_surface",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "config.apply",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "config.effective",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "config.get",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "config.patch",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "config.patch.safe",
+      "required_scope": "operator.write"
+    },
+    {
+      "name": "config.reload",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "config.schema",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "config.schema.lookup",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "config.set",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "cron.add",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "cron.create",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "cron.list",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "cron.remove",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "cron.run",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "cron.runs",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "cron.status",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "cron.subscribe",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "cron.unsubscribe",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "cron.update",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "diagnostics.set",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "diagnostics.status",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "doctor.memory.status",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "doctor.status",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "exec.approval.extend",
+      "required_scope": "operator.approvals"
+    },
+    {
+      "name": "exec.approval.forget",
+      "required_scope": "operator.approvals"
+    },
+    {
+      "name": "exec.approval.request",
+      "required_scope": "operator.approvals"
+    },
+    {
+      "name": "exec.approval.resolve",
+      "required_scope": "operator.approvals"
+    },
+    {
+      "name": "exec.approval.snapshot",
+      "required_scope": "operator.approvals"
+    },
+    {
+      "name": "exec.approval.status",
+      "required_scope": "operator.approvals"
+    },
+    {
+      "name": "exec.approval.waitDecision",
+      "required_scope": "operator.approvals"
+    },
+    {
+      "name": "exec.approvals.get",
+      "required_scope": "operator.approvals"
+    },
+    {
+      "name": "exec.approvals.node.get",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "exec.approvals.node.set",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "exec.approvals.set",
+      "required_scope": "operator.approvals"
+    },
+    {
+      "name": "exec.proposals.accept",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "exec.proposals.auto_enabled.disable",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "exec.proposals.auto_enabled.list",
+      "required_scope": "operator.proposals"
+    },
+    {
+      "name": "exec.proposals.list",
+      "required_scope": "operator.proposals"
+    },
+    {
+      "name": "exec.proposals.pending_count",
+      "required_scope": "operator.proposals"
+    },
+    {
+      "name": "exec.proposals.reject",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "exec.proposals.settings.get",
+      "required_scope": "operator.proposals"
+    },
+    {
+      "name": "exec.proposals.settings.set",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "exec.proposals.show",
+      "required_scope": "operator.proposals"
+    },
+    {
+      "name": "gateway.identity.get",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "health",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "last-heartbeat",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "logs.status",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "logs.tail",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "logs.trace",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "memory.index",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "memory.list",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "memory.raw_fallbacks.list",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "memory.raw_fallbacks.show",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "memory.repair.list",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "memory.repair.run",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "memory.repair.show",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "memory.search",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "memory.show",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "meta.list",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "meta.run",
+      "required_scope": "operator.write"
+    },
+    {
+      "name": "meta.runs.confirm_preflight",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "meta.runs.cost",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "meta.runs.diff",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "meta.runs.draft",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "meta.runs.eval_baseline",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "meta.runs.failures",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "meta.runs.list",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "meta.runs.replay",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "meta.runs.show",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "meta.runs.validate",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "migration.sources.list",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "migration.sources.preview",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "models.list",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "models.routing.get",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "models.routing.set",
+      "required_scope": "operator.write"
+    },
+    {
+      "name": "onboarding.audio.configure",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "onboarding.catalog",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "onboarding.channel.disable",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "onboarding.channel.enable",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "onboarding.channel.probe",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "onboarding.channel.remove",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "onboarding.channel.upsert",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "onboarding.ensemble.configure",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "onboarding.imageGeneration.configure",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "onboarding.llmProfile.activate",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "onboarding.llmProfile.credential.clear",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "onboarding.llmProfile.draft.models.discover",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "onboarding.llmProfile.draft.probe",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "onboarding.llmProfile.models.discover",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "onboarding.llmProfile.probe",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "onboarding.llmProfile.remove",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "onboarding.llmProfile.upsert",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "onboarding.memory_embedding.configure",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "onboarding.models.discover",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "onboarding.provider.configure",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "onboarding.provider.credential.clear",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "onboarding.provider.credential.reveal",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "onboarding.provider.probe",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "onboarding.router.catalog",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "onboarding.router.configure",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "onboarding.search.configure",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "onboarding.status",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "plugin.approval.extend",
+      "required_scope": "operator.approvals"
+    },
+    {
+      "name": "plugin.approval.request",
+      "required_scope": "operator.approvals"
+    },
+    {
+      "name": "plugin.approval.resolve",
+      "required_scope": "operator.approvals"
+    },
+    {
+      "name": "plugin.approval.status",
+      "required_scope": "operator.approvals"
+    },
+    {
+      "name": "plugin.approval.waitDecision",
+      "required_scope": "operator.approvals"
+    },
+    {
+      "name": "providers.status",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "router.decisions.list",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "router.feedback.submit",
+      "required_scope": "operator.write"
+    },
+    {
+      "name": "router.selflearning.status",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "routing.hold.clear",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "routing.hold.get",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "routing.hold.set",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "sandbox.bundle.disable",
+      "required_scope": "operator.write"
+    },
+    {
+      "name": "sandbox.bundle.enable",
+      "required_scope": "operator.write"
+    },
+    {
+      "name": "sandbox.domain.add",
+      "required_scope": "operator.write"
+    },
+    {
+      "name": "sandbox.domain.remove",
+      "required_scope": "operator.write"
+    },
+    {
+      "name": "sandbox.explain",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "sandbox.mount.add",
+      "required_scope": "operator.write"
+    },
+    {
+      "name": "sandbox.mount.remove",
+      "required_scope": "operator.write"
+    },
+    {
+      "name": "sandbox.path.list",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "sandbox.path.pick",
+      "required_scope": "operator.write"
+    },
+    {
+      "name": "sandbox.resume",
+      "required_scope": "operator.write"
+    },
+    {
+      "name": "sandbox.run_context.get",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "sandbox.run_context.set",
+      "required_scope": "operator.write"
+    },
+    {
+      "name": "sandbox.setup.ensure",
+      "required_scope": "operator.write"
+    },
+    {
+      "name": "sandbox.setup.status",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "sandbox.status",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "sandbox.workspace.set",
+      "required_scope": "operator.write"
+    },
+    {
+      "name": "search.query",
+      "required_scope": "operator.write"
+    },
+    {
+      "name": "search.status",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "secrets.reload",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "secrets.resolve",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "send",
+      "required_scope": "operator.write"
+    },
+    {
+      "name": "sessions.abort",
+      "required_scope": "operator.write"
+    },
+    {
+      "name": "sessions.bootstrap",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "sessions.compact",
+      "required_scope": "operator.write"
+    },
+    {
+      "name": "sessions.contextCompact",
+      "required_scope": "operator.write"
+    },
+    {
+      "name": "sessions.create",
+      "required_scope": "operator.write"
+    },
+    {
+      "name": "sessions.delete",
+      "required_scope": "operator.write"
+    },
+    {
+      "name": "sessions.fork",
+      "required_scope": "operator.write"
+    },
+    {
+      "name": "sessions.get",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "sessions.list",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "sessions.messages.subscribe",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "sessions.messages.unsubscribe",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "sessions.patch",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "sessions.preview",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "sessions.reset",
+      "required_scope": "operator.write"
+    },
+    {
+      "name": "sessions.resolve",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "sessions.search",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "sessions.send",
+      "required_scope": "operator.write"
+    },
+    {
+      "name": "sessions.steer",
+      "required_scope": "operator.write"
+    },
+    {
+      "name": "sessions.subscribe",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "sessions.truncate",
+      "required_scope": "operator.write"
+    },
+    {
+      "name": "sessions.unsubscribe",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "set-heartbeats",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "skills.bins",
+      "required_scope": "node"
+    },
+    {
+      "name": "skills.deps.install",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "skills.get",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "skills.install",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "skills.list",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "skills.reload",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "skills.search",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "skills.status",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "skills.uninstall",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "skills.update",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "status",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "system-event",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "system-presence",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "tools.catalog",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "tools.effective",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "tools.search_provider",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "usage.cost",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "usage.query",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "usage.status",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "wake",
+      "required_scope": "operator.write"
+    },
+    {
+      "name": "wizard.cancel",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "wizard.next",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "wizard.start",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "wizard.status",
+      "required_scope": "operator.admin"
+    }
+  ],
+  "payload_schemas": "not-available-in-protocol-v3-baseline",
+  "schema_version": 1,
+  "source": "locked-rpc-registry"
+}

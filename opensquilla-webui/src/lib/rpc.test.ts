@@ -42,6 +42,33 @@ describe('RpcClient error responses', () => {
     vi.unstubAllGlobals()
   })
 
+  it('sends the frozen protocol-v3 connect frame after the challenge', () => {
+    const client = new RpcClient()
+    client.connect('ws://rpc.test', '<synthetic>')
+    const socket = MockWebSocket.instances[0]
+
+    socket.receive({
+      type: 'event',
+      event: 'connect.challenge',
+      payload: { nonce: 'synthetic-nonce' },
+    })
+
+    expect(JSON.parse(socket.sent[0])).toEqual({
+      type: 'req',
+      id: '1',
+      method: 'connect',
+      params: {
+        minProtocol: 3,
+        maxProtocol: 3,
+        client: { name: 'opensquilla-web' },
+        auth: { token: '<synthetic>' },
+      },
+    })
+
+    socket.receive({ type: 'hello-ok', protocol: 3, policy: {} })
+    client.disconnect()
+  })
+
   it('preserves structured retry and acceptance metadata on the rejected error', async () => {
     const client = new RpcClient()
     client.connect('ws://rpc.test')

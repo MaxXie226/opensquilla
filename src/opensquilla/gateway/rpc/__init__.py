@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from opensquilla.gateway.rpc.registry import (
     RpcContext,
+    RpcContractEntry,
     RpcDispatcher,
     RpcHandlerError,
     RpcHandlerFn,
@@ -32,6 +33,7 @@ from opensquilla.gateway.rpc.registry import (
 
 __all__ = [
     "RpcContext",
+    "RpcContractEntry",
     "RpcDispatcher",
     "RpcHandlerError",
     "RpcHandlerFn",

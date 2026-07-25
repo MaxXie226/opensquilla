@@ -26,6 +26,8 @@ from opensquilla.artifacts import (
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.origin_guard import (
     forbidden_origin_response,
+    mark_client_auth_handler,
+    mark_same_origin_handler,
     request_origin_allowed,
 )
 from opensquilla.gateway.origin_guard import (
@@ -258,7 +260,17 @@ def register_artifact_routes(
         return JSONResponse({"ok": True, "status": "accepted"}, status_code=202)
 
     app.router.routes.append(
-        Route("/api/v1/artifacts/{artifact_id}/open", open_handler, methods=["POST"])
+        Route(
+            "/api/v1/artifacts/{artifact_id}/open",
+            mark_same_origin_handler(
+                mark_client_auth_handler(
+                    open_handler,
+                    credential_transport="header-or-query",
+                    owner_required=True,
+                )
+            ),
+            methods=["POST"],
+        )
     )
     app.router.routes.append(
         Route("/api/v1/artifacts/{artifact_id}", download_handler, methods=["GET", "HEAD"])

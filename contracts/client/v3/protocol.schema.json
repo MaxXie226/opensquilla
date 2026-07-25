@@ -1,0 +1,927 @@
+{
+  "$defs": {
+    "ClientFrame": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/ReqFrame"
+        },
+        {
+          "$ref": "#/$defs/PingFrame"
+        },
+        {
+          "$ref": "#/$defs/PongFrame"
+        }
+      ]
+    },
+    "ErrorShape": {
+      "properties": {
+        "accepted": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Accepted"
+        },
+        "code": {
+          "title": "Code",
+          "type": "string"
+        },
+        "details": {
+          "anyOf": [
+            {},
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Details"
+        },
+        "message": {
+          "title": "Message",
+          "type": "string"
+        },
+        "retry_after_ms": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Retry After Ms"
+        },
+        "retryable": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Retryable"
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ],
+      "title": "ErrorShape",
+      "type": "object"
+    },
+    "EventFrame": {
+      "description": "Server-pushed event frame.",
+      "properties": {
+        "event": {
+          "title": "Event",
+          "type": "string"
+        },
+        "meta": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Meta"
+        },
+        "payload": {
+          "anyOf": [
+            {},
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Payload"
+        },
+        "seq": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Seq"
+        },
+        "state_version": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StateVersion"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "type": {
+          "const": "event",
+          "default": "event",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "event",
+        "type"
+      ],
+      "title": "EventFrame",
+      "type": "object"
+    },
+    "FeaturesInfo": {
+      "properties": {
+        "events": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Events",
+          "type": "array"
+        },
+        "methods": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Methods",
+          "type": "array"
+        }
+      },
+      "required": [
+        "methods",
+        "events"
+      ],
+      "title": "FeaturesInfo",
+      "type": "object"
+    },
+    "Frame": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/ReqFrame"
+        },
+        {
+          "$ref": "#/$defs/ResFrame"
+        },
+        {
+          "$ref": "#/$defs/EventFrame"
+        },
+        {
+          "$ref": "#/$defs/HelloOk"
+        },
+        {
+          "$ref": "#/$defs/PingFrame"
+        },
+        {
+          "$ref": "#/$defs/PongFrame"
+        }
+      ]
+    },
+    "HelloOk": {
+      "properties": {
+        "auth": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Auth"
+        },
+        "features": {
+          "$ref": "#/$defs/FeaturesInfo"
+        },
+        "policy": {
+          "$ref": "#/$defs/PolicyInfo"
+        },
+        "protocol": {
+          "title": "Protocol",
+          "type": "integer"
+        },
+        "server": {
+          "$ref": "#/$defs/ServerInfo"
+        },
+        "snapshot": {
+          "$ref": "#/$defs/SnapshotInfo"
+        },
+        "type": {
+          "const": "hello-ok",
+          "default": "hello-ok",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "features",
+        "policy",
+        "protocol",
+        "server",
+        "snapshot",
+        "type"
+      ],
+      "title": "HelloOk",
+      "type": "object"
+    },
+    "LegacyClientInfo": {
+      "properties": {
+        "device_family": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Device Family"
+        },
+        "display_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Display Name"
+        },
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "instance_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Instance Id"
+        },
+        "mode": {
+          "title": "Mode",
+          "type": "string"
+        },
+        "model_identifier": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Model Identifier"
+        },
+        "platform": {
+          "title": "Platform",
+          "type": "string"
+        },
+        "version": {
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "version",
+        "platform",
+        "mode"
+      ],
+      "title": "ClientInfo",
+      "type": "object"
+    },
+    "LegacyConnectParams": {
+      "properties": {
+        "auth": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Auth"
+        },
+        "caps": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Caps"
+        },
+        "client": {
+          "$ref": "#/$defs/LegacyClientInfo"
+        },
+        "commands": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Commands"
+        },
+        "locale": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Locale"
+        },
+        "max_protocol": {
+          "title": "Max Protocol",
+          "type": "integer"
+        },
+        "min_protocol": {
+          "title": "Min Protocol",
+          "type": "integer"
+        },
+        "path_env": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Path Env"
+        },
+        "permissions": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "type": "boolean"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Permissions"
+        },
+        "role": {
+          "default": "operator",
+          "title": "Role",
+          "type": "string"
+        },
+        "scopes": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Scopes"
+        },
+        "user_agent": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "User Agent"
+        }
+      },
+      "required": [
+        "min_protocol",
+        "max_protocol",
+        "client"
+      ],
+      "title": "ConnectParams",
+      "type": "object"
+    },
+    "PingFrame": {
+      "properties": {
+        "type": {
+          "const": "ping",
+          "default": "ping",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "title": "PingFrame",
+      "type": "object"
+    },
+    "PolicyInfo": {
+      "properties": {
+        "agent_stream_heartbeat_interval_ms": {
+          "default": 15000,
+          "title": "Agent Stream Heartbeat Interval Ms",
+          "type": "integer"
+        },
+        "agent_stream_idle_timeout_ms": {
+          "default": 600000,
+          "title": "Agent Stream Idle Timeout Ms",
+          "type": "integer"
+        },
+        "client_ws_keepalive_timeout_ms": {
+          "default": 120000,
+          "title": "Client Ws Keepalive Timeout Ms",
+          "type": "integer"
+        },
+        "max_buffered_bytes": {
+          "default": 52428800,
+          "title": "Max Buffered Bytes",
+          "type": "integer"
+        },
+        "max_payload": {
+          "default": 26214400,
+          "title": "Max Payload",
+          "type": "integer"
+        },
+        "tick_interval_ms": {
+          "default": 30000,
+          "title": "Tick Interval Ms",
+          "type": "integer"
+        },
+        "webui_stream_idle_grace_ms": {
+          "default": 630000,
+          "title": "Webui Stream Idle Grace Ms",
+          "type": "integer"
+        }
+      },
+      "title": "PolicyInfo",
+      "type": "object"
+    },
+    "PongFrame": {
+      "properties": {
+        "type": {
+          "const": "pong",
+          "default": "pong",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "title": "PongFrame",
+      "type": "object"
+    },
+    "ReqFrame": {
+      "description": "RPC request frame sent by client.",
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "method": {
+          "title": "Method",
+          "type": "string"
+        },
+        "params": {
+          "anyOf": [
+            {},
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Params"
+        },
+        "type": {
+          "const": "req",
+          "default": "req",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "method",
+        "type"
+      ],
+      "title": "ReqFrame",
+      "type": "object"
+    },
+    "ResFrame": {
+      "description": "RPC response frame sent by server.",
+      "properties": {
+        "error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ErrorShape"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "ok": {
+          "title": "Ok",
+          "type": "boolean"
+        },
+        "payload": {
+          "anyOf": [
+            {},
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Payload"
+        },
+        "type": {
+          "const": "res",
+          "default": "res",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "ok",
+        "type"
+      ],
+      "title": "ResFrame",
+      "type": "object"
+    },
+    "ServerFrame": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/ResFrame"
+        },
+        {
+          "$ref": "#/$defs/EventFrame"
+        },
+        {
+          "$ref": "#/$defs/HelloOk"
+        },
+        {
+          "$ref": "#/$defs/PingFrame"
+        },
+        {
+          "$ref": "#/$defs/PongFrame"
+        }
+      ]
+    },
+    "ServerInfo": {
+      "properties": {
+        "conn_id": {
+          "title": "Conn Id",
+          "type": "string"
+        },
+        "version": {
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "version",
+        "conn_id"
+      ],
+      "title": "ServerInfo",
+      "type": "object"
+    },
+    "SnapshotInfo": {
+      "properties": {
+        "auth_mode": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Auth Mode"
+        },
+        "config_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Config Path"
+        },
+        "health": {
+          "default": null,
+          "title": "Health"
+        },
+        "presence": {
+          "default": [],
+          "items": {},
+          "title": "Presence",
+          "type": "array"
+        },
+        "state_dir": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "State Dir"
+        },
+        "state_version": {
+          "$ref": "#/$defs/StateVersion",
+          "default": {
+            "health": 0,
+            "presence": 0
+          }
+        },
+        "uptime_ms": {
+          "default": 0,
+          "title": "Uptime Ms",
+          "type": "integer"
+        }
+      },
+      "title": "SnapshotInfo",
+      "type": "object"
+    },
+    "StateVersion": {
+      "properties": {
+        "health": {
+          "default": 0,
+          "title": "Health",
+          "type": "integer"
+        },
+        "presence": {
+          "default": 0,
+          "title": "Presence",
+          "type": "integer"
+        }
+      },
+      "title": "StateVersion",
+      "type": "object"
+    }
+  },
+  "$id": "urn:opensquilla:client-contract:v3",
+  "$ref": "#/$defs/Frame",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Machine-valid protocol-v3 frame schema with descriptive baseline metadata.",
+  "title": "OpenSquilla Gateway client protocol v3 baseline",
+  "x-opensquilla-contract": {
+    "connect": {
+      "accepted_currently": {
+        "auth": "non-object values are treated as an empty object",
+        "client": "accepted but not validated or consumed",
+        "id": "optional; scalar ids are stringified and other values use 'handshake'",
+        "maxProtocol": "optional integer excluding booleans; defaults to 3",
+        "minProtocol": "optional integer excluding booleans; defaults to 1",
+        "params": "non-object values are treated as an empty object",
+        "required_frame_fields": [
+          "method=connect",
+          "type=req"
+        ],
+        "role": "non-string values fall back to operator",
+        "scope_claims": "accepted but authorization scopes come from the resolved principal",
+        "version_lower_bound": "the current parser does not reject values below 1; canonical clients must use the advertised supported range"
+      },
+      "canonical_client_frame": {
+        "additionalProperties": true,
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "method": {
+            "const": "connect"
+          },
+          "params": {
+            "additionalProperties": true,
+            "properties": {
+              "auth": {
+                "type": "object"
+              },
+              "client": {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              "maxProtocol": {
+                "maximum": 3,
+                "minimum": 1,
+                "type": "integer"
+              },
+              "minProtocol": {
+                "maximum": 3,
+                "minimum": 1,
+                "type": "integer"
+              },
+              "role": {
+                "type": "string"
+              },
+              "scopes": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            },
+            "type": "object"
+          },
+          "type": {
+            "const": "req"
+          }
+        },
+        "required": [
+          "type",
+          "id",
+          "method",
+          "params"
+        ],
+        "type": "object"
+      },
+      "legacy_declared_model": {
+        "schema": {
+          "$ref": "#/$defs/LegacyConnectParams"
+        },
+        "status": "not-used-by-websocket-parser",
+        "wire_name_difference": "min_protocol/max_protocol vs minProtocol/maxProtocol"
+      },
+      "sequence": [
+        "server event connect.challenge",
+        "client request connect",
+        "server hello-ok or error response followed by close"
+      ]
+    },
+    "errors": {
+      "declared_codes": [
+        "AGENT_TIMEOUT",
+        "APPROVAL_NOT_FOUND",
+        "INVALID_REQUEST",
+        "METHOD_NOT_FOUND",
+        "NOT_FOUND",
+        "NOT_LINKED",
+        "NOT_PAIRED",
+        "UNAUTHORIZED",
+        "UNAVAILABLE"
+      ],
+      "open_set": true,
+      "schema": {
+        "$ref": "#/$defs/ErrorShape"
+      }
+    },
+    "frames": {
+      "client_to_server_declared": {
+        "$ref": "#/$defs/ClientFrame"
+      },
+      "server_to_client": {
+        "$ref": "#/$defs/ServerFrame"
+      }
+    },
+    "hello": {
+      "features_events_completeness": "declared-stable-subset",
+      "features_methods_source": "locked-rpc-registry",
+      "schema": {
+        "$ref": "#/$defs/HelloOk"
+      },
+      "snapshot_uptime_ms_current_semantics": "epoch-milliseconds-despite-field-name"
+    },
+    "limits": {
+      "max_buffered_bytes": {
+        "advertised_in_hello": true,
+        "application_enforced": false,
+        "value": 52428800
+      },
+      "max_payload_bytes": {
+        "advertised_in_hello": true,
+        "application_enforced": false,
+        "value": 26214400
+      },
+      "max_preauth_payload_bytes": {
+        "advertised_in_hello": false,
+        "application_enforced": false,
+        "status": "defined-only",
+        "value": 65536
+      },
+      "transport_frame_limit": {
+        "source": "ASGI-server/backend default; Gateway does not pin a value",
+        "value": null
+      },
+      "writer_queue": {
+        "unit": "frames-not-bytes",
+        "value_source": "GatewayConfig.ws_writer_queue_maxsize"
+      }
+    },
+    "other_declared_defaults": {
+      "dedupe_max_entries": {
+        "status": "defined-only",
+        "value": 1000
+      },
+      "websocket_close_service_restart": 1012
+    },
+    "protocol": {
+      "current": 3,
+      "maximum_supported": 3,
+      "minimum_supported": 1
+    },
+    "runtime_validation": {
+      "inbound": "hand-written JSON parsing; Pydantic request models are descriptive",
+      "outbound": "Pydantic response/event/hello serialization"
+    },
+    "schema_version": 1,
+    "timing_defaults_ms": {
+      "agent_stream_heartbeat": {
+        "advertised_in_hello": true,
+        "value": 15000
+      },
+      "agent_stream_idle": {
+        "advertised_in_hello": true,
+        "value": 600000
+      },
+      "client_ws_keepalive": {
+        "advertised_in_hello": true,
+        "enforced": true,
+        "value": 120000
+      },
+      "dedupe_ttl": {
+        "status": "defined-only",
+        "value": 300000
+      },
+      "health_refresh": {
+        "status": "defined-only",
+        "value": 60000
+      },
+      "preauth_timeout": {
+        "enforced": true,
+        "value": 10000
+      },
+      "tick_interval": {
+        "advertised_in_hello": true,
+        "enforced": true,
+        "value": 30000
+      },
+      "webui_stream_idle_grace": {
+        "advertised_in_hello": true,
+        "value": 630000
+      }
+    }
+  }
+}
