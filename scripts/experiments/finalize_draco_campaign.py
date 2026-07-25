@@ -1425,8 +1425,10 @@ def _formal_openrouter_model_aliases() -> dict[str, frozenset[str]]:
             continue
         model = str(facts.get("model_id") or "").strip().casefold()
         version = str(facts.get("version") or "").strip().casefold()
-        if model not in aliases:
+        provider = str(facts.get("provider") or "").strip().casefold()
+        if not model or provider != "openrouter":
             continue
+        aliases.setdefault(model, {model})
         if version:
             aliases[model].add(version)
     return {model: frozenset(values) for model, values in aliases.items()}

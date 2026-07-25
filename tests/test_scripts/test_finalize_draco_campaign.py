@@ -118,7 +118,7 @@ def test_selected_endpoint_receipt_binds_serving_alias_and_provider(module) -> N
         module.B0_MODEL,
         "anthropic/claude-4.8-opus-20260528",
     )
-    assert not module._formal_openrouter_models_equivalent(
+    assert module._formal_openrouter_models_equivalent(
         "anthropic/claude-sonnet-5",
         "anthropic/claude-sonnet-5-20260630",
     )
@@ -153,6 +153,75 @@ def test_selected_endpoint_receipt_binds_serving_alias_and_provider(module) -> N
     )
     assert "conflicting_successful_router_receipt" in reasons
     assert module.unit_exact_non_byok(unit) is False
+
+
+@pytest.mark.parametrize(
+    ("requested_model", "serving_model", "upstream_provider"),
+    [
+        (
+            "x-ai/grok-4.5",
+            "x-ai/grok-4.5-20260708",
+            "xai",
+        ),
+        (
+            "anthropic/claude-sonnet-5",
+            "anthropic/claude-sonnet-5-20260630",
+            "anthropic",
+        ),
+    ],
+)
+def test_frozen_g1_serving_aliases_bind_router_receipts(
+    module,
+    requested_model: str,
+    serving_model: str,
+    upstream_provider: str,
+) -> None:
+    unit = {
+        "role": "proposer",
+        "provider": "openrouter",
+        "model": requested_model,
+        "requested_provider": "openrouter",
+        "requested_model": requested_model,
+        "provider_usage": {
+            "router_metadata": {
+                "requested": requested_model,
+                "attempts": [
+                    {
+                        "provider": upstream_provider,
+                        "model": serving_model,
+                        "status": 200,
+                    }
+                ],
+            },
+        },
+    }
+
+    assert module.usage_route_reasons(
+        {"model_usage_breakdown": [unit]},
+        allowed_models={requested_model},
+        provider_pins={requested_model: upstream_provider},
+    ) == []
+    assert module._formal_openrouter_models_equivalent(
+        requested_model,
+        serving_model,
+    )
+
+    outside_snapshot = deepcopy(unit)
+    outside_model = f"{serving_model}-outside-snapshot"
+    outside_snapshot["provider_usage"]["router_metadata"]["attempts"][0][
+        "model"
+    ] = outside_model
+    assert not module._formal_openrouter_models_equivalent(
+        requested_model,
+        outside_model,
+    )
+    assert "router_receipt_model_not_bound_to_formal_route" in (
+        module.usage_route_reasons(
+            {"model_usage_breakdown": [outside_snapshot]},
+            allowed_models={requested_model},
+            provider_pins={requested_model: upstream_provider},
+        )
+    )
 
 
 def _owner_json(path: Path, value: object) -> None:
