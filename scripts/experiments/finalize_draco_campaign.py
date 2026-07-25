@@ -48,7 +48,7 @@ JUDGE_ATTEMPT_EVIDENCE_SCHEMA = "opensquilla.draco-judge-attempt/v1"
 JUDGE_ATTEMPT_BUDGET_SCOPE = "criterion_repeat_campaign"
 JUDGE_ATTEMPT_BUDGET_LIMIT = 3
 JUDGE_ATTEMPT_BUDGET_EXHAUSTED_ERROR = "judge_attempt_budget_exhausted"
-FINALIZER_VERSION = 2
+FINALIZER_VERSION = 3
 FROZEN_DRACO_MINI_TASK_COUNT = 10
 FROZEN_DRACO_MINI_SHA256 = "1eb4e618c8df8e7f68bded3d2b6f77a541744aa1072eb338835b776183188a8d"
 FORMAL_REQUIRED_STABLE_POLL_COUNT = 6
@@ -662,6 +662,92 @@ def load_manifest_contracts(
             raise FinalizationError(
                 f"manifest groups/task_ids do not cover its result shard: {path}"
             )
+        raw_resume_selection = payload.get("resume_selection")
+        if raw_resume_selection is not None and not isinstance(raw_resume_selection, Mapping):
+            raise FinalizationError(f"manifest resume_selection is malformed: {path}")
+        raw_scheduled_pairs = (
+            raw_resume_selection.get("scheduled_pairs", [])
+            if isinstance(raw_resume_selection, Mapping)
+            else []
+        )
+        if not isinstance(raw_scheduled_pairs, list):
+            raise FinalizationError(f"manifest scheduled_pairs is malformed: {path}")
+        resume_scheduled_pairs: list[dict[str, str]] = []
+        resume_schedule_contract_verified = False
+        seen_scheduled_pairs: set[tuple[str, str]] = set()
+        for scheduled in raw_scheduled_pairs:
+            if not isinstance(scheduled, Mapping):
+                raise FinalizationError(f"manifest scheduled pair is malformed: {path}")
+            scheduled_group = str(scheduled.get("group") or "")
+            scheduled_task = str(scheduled.get("task_id") or "")
+            scheduled_action = str(scheduled.get("action") or "")
+            scheduled_key = (scheduled_group, scheduled_task)
+            if (
+                scheduled_group not in manifest_groups
+                or scheduled_task not in manifest_task_ids
+                or scheduled_action
+                not in {"regenerate", "model_regenerate", "judge_only", "metadata_only"}
+                or scheduled_key in seen_scheduled_pairs
+            ):
+                raise FinalizationError(
+                    f"manifest scheduled pair is not uniquely bound to its shard: {path}"
+                )
+            seen_scheduled_pairs.add(scheduled_key)
+            resume_scheduled_pairs.append(
+                {
+                    "group": scheduled_group,
+                    "task_id": scheduled_task,
+                    "action": scheduled_action,
+                }
+            )
+        if resume_scheduled_pairs:
+            assert isinstance(raw_resume_selection, Mapping)
+            result_pairs = {
+                (str(row.get("group") or ""), str(row.get("task_id") or ""))
+                for row in result_rows
+                if isinstance(row, Mapping)
+            }
+            action_counts = Counter(
+                (
+                    "regenerate"
+                    if scheduled["action"] in {"regenerate", "model_regenerate"}
+                    else scheduled["action"]
+                )
+                for scheduled in resume_scheduled_pairs
+            )
+            declared_action_counts = raw_resume_selection.get("resume_action_counts")
+            expected_counts = {
+                "selected_pair_count": len(resume_scheduled_pairs),
+                "scheduled_pair_count": len(resume_scheduled_pairs),
+                "regenerate_pair_count": action_counts["regenerate"],
+                "model_regenerate_pair_count": action_counts["regenerate"],
+                "judge_only_pair_count": action_counts["judge_only"],
+                "metadata_only_pair_count": action_counts["metadata_only"],
+                "policy_violation_pair_count": 0,
+            }
+            if (
+                seen_scheduled_pairs != result_pairs
+                or any(
+                    isinstance(raw_resume_selection.get(field_name), bool)
+                    or raw_resume_selection.get(field_name) != expected
+                    for field_name, expected in expected_counts.items()
+                )
+                or not isinstance(declared_action_counts, Mapping)
+                or any(
+                    isinstance(declared_action_counts.get(action), bool)
+                    or declared_action_counts.get(action) != expected
+                    for action, expected in {
+                        "policy_violation": 0,
+                        "regenerate": action_counts["regenerate"],
+                        "judge_only": action_counts["judge_only"],
+                        "metadata_only": action_counts["metadata_only"],
+                    }.items()
+                )
+            ):
+                raise FinalizationError(
+                    f"manifest resume schedule counters differ from its result shard: {path}"
+                )
+            resume_schedule_contract_verified = True
         compatibility = payload.get("run_compatibility")
         if not isinstance(compatibility, dict):
             raise FinalizationError(f"manifest lacks run compatibility: {path}")
@@ -720,6 +806,8 @@ def load_manifest_contracts(
                         for tool_name in ("web_search", "web_fetch")
                     },
                 },
+                "resume_scheduled_pairs": resume_scheduled_pairs,
+                "resume_schedule_contract_verified": (resume_schedule_contract_verified),
             }
         )
     assert authoritative_fingerprints is not None
@@ -754,9 +842,7 @@ def validate_formal_campaign_contracts(
     if not isinstance(b1_spec, Mapping) or b1_spec.get("kind") != "router_single":
         raise FinalizationError("B1 formal contract must be router_single")
     if not isinstance(tiers, Mapping) or set(tiers) != set(B1_TIER_MODELS):
-        raise FinalizationError(
-            "B1 formal tier set differs from c0/c1/c2/c3/image_model"
-        )
+        raise FinalizationError("B1 formal tier set differs from c0/c1/c2/c3/image_model")
     for tier, expected_model in B1_TIER_MODELS.items():
         value = tiers.get(tier)
         if (
@@ -1190,13 +1276,10 @@ def usage_route_reasons(
         )
         if role in MISSING_USAGE_PLACEHOLDER_ROLES:
             unknown_analyzer_allowed = (
-                allow_unknown_task_analyzer_attempts
-                and _is_unknown_task_analyzer_placeholder(unit)
+                allow_unknown_task_analyzer_attempts and _is_unknown_task_analyzer_placeholder(unit)
             )
             provider = str(unit.get("provider") or "").strip().casefold()
-            requested_provider = str(
-                unit.get("requested_provider") or ""
-            ).strip().casefold()
+            requested_provider = str(unit.get("requested_provider") or "").strip().casefold()
             model = str(unit.get("model") or "").strip()
             requested_model = str(unit.get("requested_model") or "").strip()
             provider_usage = unit.get("provider_usage")
@@ -1288,14 +1371,11 @@ def usage_route_reasons(
                     ),
                     "",
                 )
-                expected_pin = str(
-                    provider_pins.get(pin_model) or ""
-                ).strip().casefold()
+                expected_pin = str(provider_pins.get(pin_model) or "").strip().casefold()
                 if not expected_pin:
                     reasons.append("missing_formal_upstream_provider_pin")
                 elif successful and any(
-                    upstream_provider
-                    != _normalize_openrouter_provider_identity(expected_pin)
+                    upstream_provider != _normalize_openrouter_provider_identity(expected_pin)
                     for upstream_provider, _ in successful
                 ):
                     reasons.append("router_receipt_provider_not_bound_to_formal_route")
@@ -1998,7 +2078,9 @@ def ensemble_physical_call_reasons(
             reasons.append("successful_proposer_count_mismatch")
         if actual_successful < math.ceil(2 * expected_total / 3):
             reasons.append("insufficient_actual_proposer_quorum")
-        for candidate, expected_model in zip(candidates, expected_proposers, strict=True):
+        for candidate, expected_model, candidate_proven in zip(
+            candidates, expected_proposers, proven, strict=True
+        ):
             if not isinstance(candidate, Mapping):
                 continue
             execution = candidate.get("execution")
@@ -2034,9 +2116,17 @@ def ensemble_physical_call_reasons(
                 or (execution.get("requested_model") if isinstance(execution, Mapping) else "")
                 or ""
             ).strip()
-            if actual_provider != "openrouter" or requested_provider != "openrouter":
+            if (
+                requested_provider != "openrouter"
+                or (actual_provider and actual_provider != "openrouter")
+                or (candidate_proven and not actual_provider)
+            ):
                 reasons.append("wrong_actual_proposer_provider")
-            if actual_model != expected_model or requested_model != expected_model:
+            if (
+                requested_model != expected_model
+                or (actual_model and actual_model != expected_model)
+                or (candidate_proven and not actual_model)
+            ):
                 reasons.append("wrong_actual_proposer_model")
 
     final_request = call.get("final_request")
@@ -2200,10 +2290,7 @@ def admissible_empty_nonterminal_fallback_reasons(
         reasons.append("wrong_intermediate_fallback_model")
     if str(execution.get("role") or "") != "fallback_single":
         reasons.append("wrong_intermediate_fallback_execution_role")
-    if (
-        not isinstance(usage, Mapping)
-        or not str(usage.get("stop_reason") or "").strip()
-    ):
+    if not isinstance(usage, Mapping) or not str(usage.get("stop_reason") or "").strip():
         reasons.append("missing_intermediate_fallback_stop_reason")
     return list(dict.fromkeys(reasons))
 
@@ -2221,11 +2308,7 @@ def agent_call_output_sequence_reasons(
     offset = 0
     for call in calls:
         final_request = call.get("final_request")
-        output = (
-            final_request.get("output")
-            if isinstance(final_request, Mapping)
-            else None
-        )
+        output = final_request.get("output") if isinstance(final_request, Mapping) else None
         if not isinstance(output, Mapping):
             reasons.append("missing_agent_call_output_binding")
             continue
@@ -2572,8 +2655,7 @@ def matching_saved_generation_attempts(
     execution = row.get("execution")
     attempts = (
         execution.get("generation_attempts")
-        if isinstance(execution, Mapping)
-        and isinstance(execution.get("generation_attempts"), list)
+        if isinstance(execution, Mapping) and isinstance(execution.get("generation_attempts"), list)
         else []
     )
     return [
@@ -2582,8 +2664,7 @@ def matching_saved_generation_attempts(
         if isinstance(attempt, Mapping)
         and isinstance(attempt.get("run"), Mapping)
         and str(attempt["run"].get("final_text_sha256") or "") == final_sha
-        and usage_generation_identity_contract(attempt["run"].get("usage"))
-        == selected_usage
+        and usage_generation_identity_contract(attempt["run"].get("usage")) == selected_usage
     ]
 
 
@@ -2615,10 +2696,7 @@ def effective_g1_lifecycle_routing(
         return {}, {}, list(dict.fromkeys(reasons))
     physical = physical_plans[0]
     for plan in physical_plans[1:]:
-        if any(
-            plan.get(field) != physical.get(field)
-            for field in _G1_LIFECYCLE_PLAN_MATCH_FIELDS
-        ):
+        if any(plan.get(field) != physical.get(field) for field in _G1_LIFECYCLE_PLAN_MATCH_FIELDS):
             reasons.append("conflicting_g1_physical_selection_plans")
 
     routing = row.get("routing_trace")
@@ -2628,8 +2706,7 @@ def effective_g1_lifecycle_routing(
         top_reasons, _, _ = g1_registry_plan_reasons(top_plan, contract=registry)
         reasons.extend(top_reasons)
         if any(
-            top_plan.get(field) != physical.get(field)
-            for field in _G1_LIFECYCLE_PLAN_MATCH_FIELDS
+            top_plan.get(field) != physical.get(field) for field in _G1_LIFECYCLE_PLAN_MATCH_FIELDS
         ):
             reasons.append("g1_routing_plan_differs_from_physical_plan")
         return top_routing, {}, list(dict.fromkeys(reasons))
@@ -2646,8 +2723,7 @@ def effective_g1_lifecycle_routing(
     execution = row.get("execution")
     attempts = (
         execution.get("generation_attempts")
-        if isinstance(execution, Mapping)
-        and isinstance(execution.get("generation_attempts"), list)
+        if isinstance(execution, Mapping) and isinstance(execution.get("generation_attempts"), list)
         else []
     )
     candidates: list[tuple[Mapping[str, Any], Mapping[str, Any]]] = []
@@ -2657,9 +2733,7 @@ def effective_g1_lifecycle_routing(
         run = attempt.get("run")
         attempt_routing = run.get("routing_trace") if isinstance(run, Mapping) else None
         plan = (
-            attempt_routing.get("selection_plan")
-            if isinstance(attempt_routing, Mapping)
-            else None
+            attempt_routing.get("selection_plan") if isinstance(attempt_routing, Mapping) else None
         )
         plan_reasons, _, _ = g1_registry_plan_reasons(plan, contract=registry)
         if plan_reasons:
@@ -2667,8 +2741,7 @@ def effective_g1_lifecycle_routing(
                 reasons.extend(plan_reasons)
             continue
         if not isinstance(plan, Mapping) or any(
-            plan.get(field) != physical.get(field)
-            for field in _G1_LIFECYCLE_PLAN_MATCH_FIELDS
+            plan.get(field) != physical.get(field) for field in _G1_LIFECYCLE_PLAN_MATCH_FIELDS
         ):
             reasons.append("g1_lifecycle_plan_differs_from_physical_plan")
             continue
@@ -2706,8 +2779,7 @@ def g1_provider_lifecycle_analyzer_reasons(
     execution = row.get("execution")
     attempts = (
         execution.get("generation_attempts")
-        if isinstance(execution, Mapping)
-        and isinstance(execution.get("generation_attempts"), list)
+        if isinstance(execution, Mapping) and isinstance(execution.get("generation_attempts"), list)
         else []
     )
     request_attempts = [
@@ -2736,8 +2808,7 @@ def g1_provider_lifecycle_analyzer_reasons(
         for analyzer in analyzers:
             if (
                 str(analyzer.get("provider") or "").strip().casefold() != "openrouter"
-                or str(analyzer.get("requested_provider") or "").strip().casefold()
-                != "openrouter"
+                or str(analyzer.get("requested_provider") or "").strip().casefold() != "openrouter"
                 or not _formal_openrouter_models_equivalent(
                     analyzer.get("model"),
                     B0_MODEL,
@@ -2836,11 +2907,9 @@ def route_reasons(
         allowed = set(routes) if isinstance(routes, Mapping) else set()
         if registry.get("selection_mode") != "router_dynamic" or not allowed:
             reasons.append("invalid_g1_registry_contract")
-        effective_routing, _, lifecycle_routing_reasons = (
-            effective_g1_lifecycle_routing(
-                row,
-                contract=contract,
-            )
+        effective_routing, _, lifecycle_routing_reasons = effective_g1_lifecycle_routing(
+            row,
+            contract=contract,
         )
         reasons.extend(lifecycle_routing_reasons)
         routing = effective_routing
@@ -3232,6 +3301,202 @@ def judge_reasons(
     return reasons
 
 
+RETROSPECTIVE_RECLASSIFICATION_RECOVERY_SCHEMA = (
+    "opensquilla.draco.retrospective-reclassification-recovery/v1"
+)
+
+
+def source_manifest_resume_action(
+    manifest_sources: Sequence[Mapping[str, Any]],
+    *,
+    source_index: int,
+    group: str,
+    task_id: str,
+) -> str:
+    if source_index < 0 or source_index >= len(manifest_sources):
+        return ""
+    if manifest_sources[source_index].get("resume_schedule_contract_verified") is not True:
+        return ""
+    scheduled = manifest_sources[source_index].get("resume_scheduled_pairs")
+    if not isinstance(scheduled, list):
+        return ""
+    matches = [
+        str(pair.get("action") or "")
+        for pair in scheduled
+        if isinstance(pair, Mapping)
+        and str(pair.get("group") or "") == group
+        and str(pair.get("task_id") or "") == task_id
+    ]
+    return matches[0] if len(matches) == 1 else ""
+
+
+def g1_retrospective_reclassification_recovery(
+    record: SourceRecord,
+    *,
+    pre_retry_record: SourceRecord,
+    contract: Mapping[str, Any],
+    post_accept_invalid_rows: Sequence[Mapping[str, Any]],
+    max_attempts: int,
+) -> dict[str, Any]:
+    """Authenticate one legacy retry caused by a later G1 reclassification."""
+
+    row = record.row
+    execution = row.get("execution")
+    if (
+        record.key[0] != "G1"
+        or not isinstance(execution, Mapping)
+        or not repair_evidence(row, execution)
+        or execution.get("resume_action") != "metadata_only"
+        or execution.get("judge_reran") is not False
+        or execution.get("metadata_repair_attempted") is not True
+        or execution.get("metadata_repaired") is not True
+        or len(post_accept_invalid_rows) != 1
+        or pre_retry_record.key != record.key
+    ):
+        return {}
+    stored = execution.get("g1_provider_lifecycle_routing_recovery")
+    restored_routing = row.get("routing_trace")
+    replay_row = copy.deepcopy(row)
+    replay_row["routing_trace"] = {}
+    recovered_routing, recomputed, reasons = effective_g1_lifecycle_routing(
+        replay_row,
+        contract=contract,
+    )
+    if (
+        reasons
+        or not isinstance(restored_routing, Mapping)
+        or dict(restored_routing) != recovered_routing
+        or not isinstance(stored, Mapping)
+        or not recomputed
+        or dict(stored) != recomputed
+    ):
+        return {}
+    pre_routing = pre_retry_record.row.get("routing_trace")
+    pre_recovered, pre_recomputed, pre_reasons = effective_g1_lifecycle_routing(
+        pre_retry_record.row,
+        contract=contract,
+    )
+    if (
+        not isinstance(pre_routing, Mapping)
+        or bool(pre_routing)
+        or pre_reasons
+        or not pre_recomputed
+        or pre_recovered != recovered_routing
+        or pre_recomputed != recomputed
+        or pre_retry_record.row.get("ensemble_trace") != row.get("ensemble_trace")
+        or generation_identity(pre_retry_record.row) != generation_identity(row)
+        or (pre_retry_record.source_index, pre_retry_record.line)
+        >= (
+            nonnegative_int(post_accept_invalid_rows[0].get("source_index")),
+            nonnegative_int(post_accept_invalid_rows[0].get("line")),
+        )
+    ):
+        return {}
+    matching = matching_saved_generation_attempts(row)
+    if len(matching) != 1:
+        return {}
+    selected = matching[0]
+    selected_attempt_id = str(selected.get("attempt_id") or "")
+    selected_attempt = nonnegative_int(selected.get("attempt"))
+    if (
+        recomputed.get("selected_attempt_id") != selected_attempt_id
+        or nonnegative_int(recomputed.get("selected_attempt")) != selected_attempt
+    ):
+        return {}
+    resume_completion = row.get("resume_completion")
+    if (
+        not isinstance(resume_completion, Mapping)
+        or resume_completion.get("action") != "metadata_only"
+        or resume_completion.get("generation_reused") is not True
+        or resume_completion.get("metadata_repaired") is not True
+        or resume_completion.get("judge_reran") is not False
+    ):
+        return {}
+
+    repair_attempts = (
+        execution.get("generation_attempts")
+        if isinstance(execution.get("generation_attempts"), list)
+        else []
+    )
+    repair_ids = {
+        str(attempt.get("attempt_id") or "")
+        for attempt in repair_attempts
+        if isinstance(attempt, Mapping)
+    }
+    post_attempts = [
+        attempt
+        for invalid in post_accept_invalid_rows
+        for attempt in invalid.get("new_attempts", [])
+        if isinstance(attempt, Mapping)
+    ]
+    post_ids = {str(attempt.get("attempt_id") or "") for attempt in post_attempts}
+    post_row = post_accept_invalid_rows[0]
+    post_attempt = post_attempts[0] if len(post_attempts) == 1 else {}
+    post_error = str(post_row.get("row_error") or "")
+    post_run = post_attempt.get("run")
+    post_run_error = str(post_run.get("error") or "") if isinstance(post_run, Mapping) else ""
+    budget_used = nonnegative_int(row.get("generation_attempt_budget_used"))
+    ordinals = {
+        nonnegative_int(attempt.get("attempt"))
+        for attempt in (*repair_attempts, *post_attempts)
+        if isinstance(attempt, Mapping)
+    }
+    if (
+        not selected_attempt_id
+        or len(post_attempts) != 1
+        or post_row.get("resume_manifest_action") != "regenerate"
+        or post_row.get("selected_generation_succeeded") is not False
+        or post_error != "aggregator_fallback_used_or_unknown"
+        or str(post_attempt.get("attempt_kind") or "") != "generation"
+        or not isinstance(post_attempt.get("run"), Mapping)
+        or post_run_error != post_error
+        or str(post_attempt.get("retry_reason") or "") != post_error
+        or post_attempt.get("will_retry") is not False
+        or selected_attempt_id in post_ids
+        or repair_ids & post_ids
+        or not post_ids
+        or nonnegative_int(post_attempt.get("attempt")) != selected_attempt + 1
+        or nonnegative_int(post_attempt.get("attempt")) != max_attempts
+        or any(HEX32.fullmatch(attempt_id) is None for attempt_id in repair_ids | post_ids)
+        or len(repair_ids) != len(repair_attempts)
+        or len(post_ids) != len(post_attempts)
+        or len(ordinals) != len(repair_attempts) + len(post_attempts)
+        or budget_used <= 0
+        or budget_used > max_attempts
+        or nonnegative_int(row.get("generation_max_attempts")) != max_attempts
+        or nonnegative_int(execution.get("generation_max_attempts")) != max_attempts
+        or nonnegative_int(row.get("generation_attempt_count")) != len(repair_attempts)
+        or nonnegative_int(execution.get("prior_generation_attempts_used")) != budget_used
+        or len(repair_attempts) + len(post_attempts) != budget_used
+        or ordinals != set(range(1, budget_used + 1))
+    ):
+        return {}
+    invalid_sources = [
+        {
+            **{key: value.get(key) for key in ("path", "source_index", "line")},
+            "new_attempt_ids": sorted(
+                str(attempt.get("attempt_id") or "")
+                for attempt in value.get("new_attempts", [])
+                if isinstance(attempt, Mapping)
+            ),
+            "reasons": list(value.get("reasons") or []),
+            "resume_manifest_action": value.get("resume_manifest_action"),
+        }
+        for value in post_accept_invalid_rows
+    ]
+    return {
+        "schema": RETROSPECTIVE_RECLASSIFICATION_RECOVERY_SCHEMA,
+        "status": "accepted",
+        "policy": "g1-provider-lifecycle-retrospective-reclassification/v1",
+        "selected_attempt_id": selected_attempt_id,
+        "selected_attempt": selected_attempt,
+        "generation_attempt_budget_used": budget_used,
+        "invalid_post_accept_attempt_ids": sorted(post_ids),
+        "invalid_post_accept_sources": invalid_sources,
+        "lifecycle_reclassification": recomputed,
+    }
+
+
 def select_results(
     records: Sequence[SourceRecord],
     *,
@@ -3240,6 +3505,7 @@ def select_results(
     fingerprints: Mapping[str, str],
     contracts: Mapping[str, Mapping[str, Any]],
     max_attempts: int,
+    manifest_sources: Sequence[Mapping[str, Any]] = (),
 ) -> tuple[list[SourceRecord], dict[str, Any]]:
     expected_keys = {(group, str(task["id"])) for task in tasks for group in groups}
     by_key: dict[tuple[str, str], list[SourceRecord]] = defaultdict(list)
@@ -3274,6 +3540,7 @@ def select_results(
             invalid_rows: list[dict[str, Any]] = []
             seen_pair_attempt_ids: set[str] = set()
             accepted_generation_seen = False
+            post_accept_invalid_rows: list[dict[str, Any]] = []
             for record in sorted(candidates, key=lambda item: (item.source_index, item.line)):
                 execution = record.row.get("execution")
                 attempts = (
@@ -3295,9 +3562,32 @@ def select_results(
                     contract=contracts[group],
                 )
                 if accepted_generation_seen and new_attempt_ids:
-                    raise FinalizationError(
-                        f"{group}/{task_id} started a new generation attempt after "
-                        "an already valid generation"
+                    if not reasons:
+                        raise FinalizationError(
+                            f"{group}/{task_id} started a new generation attempt after "
+                            "an already valid generation"
+                        )
+                    post_accept_invalid_rows.append(
+                        record.reference
+                        | {
+                            "new_attempts": [
+                                dict(attempt)
+                                for attempt in attempts
+                                if isinstance(attempt, Mapping)
+                                and str(attempt.get("attempt_id") or "") in new_attempt_ids
+                            ],
+                            "reasons": reasons,
+                            "resume_manifest_action": source_manifest_resume_action(
+                                manifest_sources,
+                                source_index=record.source_index,
+                                group=group,
+                                task_id=task_id,
+                            ),
+                            "selected_generation_succeeded": record.row.get(
+                                "selected_generation_succeeded"
+                            ),
+                            "row_error": record.row.get("error"),
+                        }
                     )
                 identity = generation_identity(record.row)
                 identity_attempts[identity] = max(
@@ -3329,13 +3619,54 @@ def select_results(
                 identity_rows,
                 key=lambda record: (record.source_index, record.line),
             )
+            retrospective_recovery: dict[str, Any] = {}
+            if post_accept_invalid_rows:
+                repaired_order = (repaired.source_index, repaired.line)
+                if len(identities) != 1 or any(
+                    (
+                        nonnegative_int(value.get("source_index")),
+                        nonnegative_int(value.get("line")),
+                    )
+                    >= repaired_order
+                    for value in post_accept_invalid_rows
+                ):
+                    raise FinalizationError(
+                        f"{group}/{task_id} started a new generation attempt after "
+                        "an already valid generation"
+                    )
+                pre_retry_candidates = [
+                    candidate
+                    for candidate in identity_rows
+                    if (candidate.source_index, candidate.line)
+                    < (
+                        nonnegative_int(post_accept_invalid_rows[0].get("source_index")),
+                        nonnegative_int(post_accept_invalid_rows[0].get("line")),
+                    )
+                ]
+                if len(pre_retry_candidates) != 1:
+                    raise FinalizationError(
+                        f"{group}/{task_id} lacks one unique pre-retry valid generation record"
+                    )
+                pre_retry_record = pre_retry_candidates[0]
+                retrospective_recovery = g1_retrospective_reclassification_recovery(
+                    repaired,
+                    pre_retry_record=pre_retry_record,
+                    contract=contracts[group],
+                    post_accept_invalid_rows=post_accept_invalid_rows,
+                    max_attempts=max_attempts,
+                )
+                if not retrospective_recovery:
+                    raise FinalizationError(
+                        f"{group}/{task_id} started a new generation attempt after "
+                        "an already valid generation"
+                    )
             judge_failures = judge_reasons(repaired.row, task=task)
             if judge_failures:
                 raise FinalizationError(
                     f"{group}/{task_id} latest repair lacks a complete Judge: {judge_failures}"
                 )
             selected.append(repaired)
-            pair_audit[f"{group}/{task_id}"] = {
+            selection_audit = {
                 "source": repaired.reference,
                 "generation_identity_sha256": latest_identity,
                 "candidate_row_count": len(candidates),
@@ -3344,6 +3675,9 @@ def select_results(
                 "generation_attempt_budget_used": budget_used,
                 "invalid_row_count": len(invalid_rows),
             }
+            if retrospective_recovery:
+                selection_audit["retrospective_reclassification_recovery"] = retrospective_recovery
+            pair_audit[f"{group}/{task_id}"] = selection_audit
     return selected, pair_audit
 
 
@@ -3375,14 +3709,12 @@ def selected_legacy_attempt_error_is_reclassified(
     if (
         not isinstance(provenance, Mapping)
         or provenance.get("schema") != GENERATION_TERMINAL_RECLASSIFICATION_SCHEMA
-        or provenance.get("policy")
-        != "terminal_aggregator_with_empty_intermediate_fallback/v1"
+        or provenance.get("policy") != "terminal_aggregator_with_empty_intermediate_fallback/v1"
         or provenance.get("original_error") != LEGACY_TERMINAL_POLICY_ERROR
         or not isinstance(run, Mapping)
         or str(run.get("error") or "") != LEGACY_TERMINAL_POLICY_ERROR
         or str(attempt.get("retry_reason") or "") != LEGACY_TERMINAL_POLICY_ERROR
-        or str(provenance.get("selected_attempt_id") or "")
-        != str(attempt.get("attempt_id") or "")
+        or str(provenance.get("selected_attempt_id") or "") != str(attempt.get("attempt_id") or "")
         or nonnegative_int(provenance.get("selected_attempt"))
         != nonnegative_int(attempt.get("attempt"))
         or nonnegative_int(execution.get("selected_generation_attempt"))
@@ -3391,10 +3723,7 @@ def selected_legacy_attempt_error_is_reclassified(
     ):
         return False
     completion = selected_row.get("completion_status")
-    if (
-        not isinstance(completion, Mapping)
-        or completion.get("generation_accepted") is not True
-    ):
+    if not isinstance(completion, Mapping) or completion.get("generation_accepted") is not True:
         return False
     trace = selected_row.get("ensemble_trace")
     calls, sequence_reasons = ensemble_call_trace_sequence(
@@ -3410,8 +3739,7 @@ def selected_legacy_attempt_error_is_reclassified(
     terminal = calls[-1]
     if (
         not expected_intermediate
-        or provenance.get("intermediate_fallback_call_indexes")
-        != expected_intermediate
+        or provenance.get("intermediate_fallback_call_indexes") != expected_intermediate
         or nonnegative_int(provenance.get("terminal_call_index"))
         != nonnegative_int(terminal.get("agent_call_index"))
         or terminal.get("fallback_used") is not False
@@ -3509,8 +3837,7 @@ def run_expected_request_count(run: Mapping[str, Any]) -> int:
     represented_missing = sum(
         1
         for unit in units
-        if str(unit.get("role") or "").strip().casefold()
-        in MISSING_USAGE_PLACEHOLDER_ROLES
+        if str(unit.get("role") or "").strip().casefold() in MISSING_USAGE_PLACEHOLDER_ROLES
     )
     represented = len(units) + max(0, usage_missing - represented_missing)
     trace_events = run.get("trace_events")
@@ -3729,6 +4056,10 @@ def build_actual_spend_ledger(
     # immutable attempt.  Retain exactly one physical request set, but choose
     # the most enriched monotonic copy instead of freezing the first wave.
     for attempt_id, versions in generation_attempt_versions.items():
+        physical_record = min(
+            (version[0] for version in versions),
+            key=lambda candidate: (candidate.source_index, candidate.line),
+        )
         record, run = validate_and_select_monotonic_run_version(
             [
                 (candidate_record, attempt.get("run"))
@@ -3764,6 +4095,12 @@ def build_actual_spend_ledger(
                 "selected_generation": attempt_id in selected_attempt_ids,
                 "receipt_version_count": len(versions),
                 "receipt_version_selected": True,
+                "physical_source_index": physical_record.source_index,
+                "physical_source_path": str(physical_record.path),
+                "physical_source_line": physical_record.line,
+                "receipt_source_index": record.source_index,
+                "receipt_source_path": str(record.path),
+                "receipt_source_line": record.line,
             },
             occurrence_counter=Counter(),
         )
@@ -3772,6 +4109,10 @@ def build_actual_spend_ledger(
     # enriched monotonic copy for each path; newly appended retry paths remain
     # independent physical calls.
     for identity, versions in judge_run_versions.items():
+        physical_record = min(
+            (version[0] for version in versions),
+            key=lambda candidate: (candidate.source_index, candidate.line),
+        )
         record, run = validate_and_select_monotonic_run_version(
             [(version[0], version[2]) for version in versions],
             label=identity,
@@ -3796,6 +4137,12 @@ def build_actual_spend_ledger(
                 "judge_path": path,
                 "receipt_version_count": len(versions),
                 "receipt_version_selected": True,
+                "physical_source_index": physical_record.source_index,
+                "physical_source_path": str(physical_record.path),
+                "physical_source_line": physical_record.line,
+                "receipt_source_index": record.source_index,
+                "receipt_source_path": str(record.path),
+                "receipt_source_line": record.line,
             },
             occurrence_counter=Counter(),
         )
@@ -3873,6 +4220,69 @@ def build_actual_spend_ledger(
         ),
     }
     return ledger_rows, summary
+
+
+def attach_retrospective_recovery_spend(
+    pair_audit: Mapping[tuple[str, str] | str, Any],
+    ledger_rows: Sequence[Mapping[str, Any]],
+) -> None:
+    """Bind any accepted post-valid retry exception to its actual failed spend."""
+
+    for selection in pair_audit.values():
+        if not isinstance(selection, dict):
+            continue
+        recovery = selection.get("retrospective_reclassification_recovery")
+        if not isinstance(recovery, dict):
+            continue
+        invalid_ids = {
+            str(value)
+            for value in recovery.get("invalid_post_accept_attempt_ids", [])
+            if HEX32.fullmatch(str(value))
+        }
+        if not invalid_ids:
+            raise FinalizationError("retrospective recovery lacks invalid attempt identifiers")
+        matched: list[Mapping[str, Any]] = []
+        matched_ids: set[str] = set()
+        for ledger_row in ledger_rows:
+            references = ledger_row.get("source_references")
+            row_ids = {
+                str(reference.get("attempt_id") or "")
+                for reference in references or []
+                if isinstance(reference, Mapping)
+            }
+            overlap = row_ids & invalid_ids
+            if not overlap:
+                continue
+            if ledger_row.get("generation_disposition") != "failed":
+                raise FinalizationError(
+                    "retrospective invalid attempt is not failed in the actual-spend ledger"
+                )
+            matched.append(ledger_row)
+            matched_ids.update(overlap)
+        if matched_ids != invalid_ids or not matched:
+            raise FinalizationError(
+                "retrospective invalid attempts are not fully represented in the ledger"
+            )
+        known_costs = [
+            required_decimal(
+                row.get("recorded_cost_usd"),
+                label="retrospective failed-attempt ledger cost",
+            )
+            for row in matched
+            if row.get("recorded_cost_usd") is not None
+        ]
+        precision_counts = Counter(str(row.get("cost_precision") or "unknown") for row in matched)
+        recovery["invalid_post_accept_spend"] = {
+            "physical_request_count": len(matched),
+            "recorded_cost_usd": str(sum(known_costs, Decimal(0))),
+            "exact_request_count": precision_counts["exact"],
+            "non_exact_request_count": len(matched)
+            - precision_counts["exact"]
+            - precision_counts["unknown"],
+            "unknown_cost_request_count": precision_counts["unknown"],
+            "cost_complete": len(known_costs) == len(matched),
+            "cost_exact": precision_counts["exact"] == len(matched),
+        }
 
 
 def ledger_model_metrics(
@@ -4294,10 +4704,7 @@ def unit_exact_non_byok(unit: Mapping[str, Any]) -> bool:
     router_metadata = provider_usage.get("router_metadata")
     ids = response_ids(unit)
     routed_model = str(unit.get("requested_model") or unit.get("model") or "").strip()
-    successful_models = {
-        upstream_model
-        for _, upstream_model in _successful_router_bindings(unit)
-    }
+    successful_models = {upstream_model for _, upstream_model in _successful_router_bindings(unit)}
     if (
         provider_usage.get("is_byok") is not False
         or not isinstance(router_metadata, Mapping)
@@ -4390,8 +4797,7 @@ def ledger_entry_payload(entry: LedgerEntry) -> dict[str, Any]:
     for unit in entry.units:
         provider_usage = unit.get("provider_usage")
         declared_unknown = (
-            str(unit.get("role") or "").strip().casefold()
-            in MISSING_USAGE_PLACEHOLDER_ROLES
+            str(unit.get("role") or "").strip().casefold() in MISSING_USAGE_PLACEHOLDER_ROLES
         ) or (isinstance(provider_usage, Mapping) and provider_usage.get("usage_unknown") is True)
         reported = (
             provider_usage.get("provider_reported_cost")
@@ -4474,6 +4880,20 @@ def ledger_entry_payload(entry: LedgerEntry) -> dict[str, Any]:
             if reference.get("group") and reference.get("task_id")
         }
     )
+    physical_sources = {
+        (
+            nonnegative_int(reference.get("physical_source_index")),
+            str(reference.get("physical_source_path") or ""),
+            nonnegative_int(reference.get("physical_source_line")),
+        )
+        for reference in entry.references
+        if reference.get("physical_source_index") is not None
+    }
+    if len(physical_sources) != 1:
+        raise FinalizationError(
+            f"ledger entry is not bound to one physical source shard: {entry.identity}"
+        )
+    physical_source_index, physical_source_path, physical_source_line = next(iter(physical_sources))
     return {
         "schema": LEDGER_SCHEMA,
         "ledger_id": f"sha256:{canonical_sha256(entry.identity)}",
@@ -4498,6 +4918,18 @@ def ledger_entry_payload(entry: LedgerEntry) -> dict[str, Any]:
         ],
         "non_byok_evidence": category,
         "receipt_conflict_fields": sorted(conflicts),
+        "physical_source": {
+            "source_index": physical_source_index,
+            "path": physical_source_path,
+            "line": physical_source_line,
+        },
+        "receipt_source_indexes": sorted(
+            {
+                nonnegative_int(reference.get("receipt_source_index"))
+                for reference in entry.references
+                if reference.get("receipt_source_index") is not None
+            }
+        ),
         "source_references": sorted(
             {canonical_sha256(reference): reference for reference in entry.references}.values(),
             key=lambda reference: (
@@ -4714,6 +5146,222 @@ def selected_time_window(
     return min(starts), max(completions)
 
 
+def manifest_source_window_coverage(
+    manifest_sources: Sequence[Mapping[str, Any]],
+    *,
+    source_records: Sequence[SourceRecord],
+    campaign_windows: Sequence[Mapping[str, Any]],
+) -> tuple[datetime, datetime, list[dict[str, Any]]]:
+    """Bind each live shard to exactly one settled campaign account window."""
+
+    if not manifest_sources or not campaign_windows:
+        raise FinalizationError("campaign source/account windows are incomplete")
+    source_indexes = {record.source_index for record in source_records}
+    if source_indexes != set(range(len(manifest_sources))):
+        raise FinalizationError("source rows are not bound to every source manifest")
+
+    starts: list[datetime] = []
+    completions: list[datetime] = []
+    coverage: list[dict[str, Any]] = []
+    seen_generation_attempt_ids: set[str] = set()
+    for source_index, manifest in enumerate(manifest_sources):
+        raw_started = manifest.get("started_at")
+        raw_finished = manifest.get("finished_at")
+        started = (
+            datetime.fromtimestamp(float(raw_started), tz=UTC)
+            if finite_number(raw_started)
+            else parse_iso(raw_started, label="source manifest started_at")
+        )
+        finished = (
+            datetime.fromtimestamp(float(raw_finished), tz=UTC)
+            if finite_number(raw_finished)
+            else parse_iso(raw_finished, label="source manifest finished_at")
+        )
+        if started >= finished:
+            raise FinalizationError("source manifest has a non-positive execution window")
+        shard_records = sorted(
+            (record for record in source_records if record.source_index == source_index),
+            key=lambda record: record.line,
+        )
+        shard_completion_times: list[datetime] = []
+        new_generation_attempt_count = 0
+        for record in shard_records:
+            raw_completed = record.row.get("completed_at")
+            if not finite_number(raw_completed):
+                raise FinalizationError("source result row lacks a numeric completion timestamp")
+            row_completed = datetime.fromtimestamp(float(raw_completed), tz=UTC)
+            if not started <= row_completed <= finished:
+                raise FinalizationError(
+                    "source result row completion is outside its manifest execution window"
+                )
+            shard_completion_times.append(row_completed)
+            execution = record.row.get("execution")
+            attempts = (
+                execution.get("generation_attempts")
+                if isinstance(execution, Mapping)
+                and isinstance(execution.get("generation_attempts"), list)
+                else []
+            )
+            for attempt in attempts:
+                if not isinstance(attempt, Mapping):
+                    continue
+                attempt_id = str(attempt.get("attempt_id") or "")
+                if attempt_id in seen_generation_attempt_ids:
+                    continue
+                raw_attempt_started = attempt.get("started_at")
+                raw_attempt_completed = attempt.get("completed_at")
+                if (
+                    HEX32.fullmatch(attempt_id) is None
+                    or not finite_number(raw_attempt_started)
+                    or not finite_number(raw_attempt_completed)
+                ):
+                    raise FinalizationError(
+                        "physical-first generation attempt lacks immutable timing evidence"
+                    )
+                attempt_started = datetime.fromtimestamp(float(raw_attempt_started), tz=UTC)
+                attempt_completed = datetime.fromtimestamp(float(raw_attempt_completed), tz=UTC)
+                if (
+                    attempt_started > attempt_completed
+                    or attempt_started < started
+                    or attempt_completed > finished
+                ):
+                    raise FinalizationError(
+                        "physical-first generation attempt is outside its source manifest"
+                    )
+                seen_generation_attempt_ids.add(attempt_id)
+                new_generation_attempt_count += 1
+        matches = [
+            window
+            for window in campaign_windows
+            if parse_iso(
+                window.get("account_before_at"),
+                label="campaign account before",
+            )
+            <= started
+            and parse_iso(
+                window.get("account_after_at"),
+                label="campaign account after",
+            )
+            >= finished
+        ]
+        if len(matches) != 1:
+            raise FinalizationError(
+                "source manifest is not covered by exactly one campaign account window"
+            )
+        starts.append(started)
+        completions.append(finished)
+        coverage.append(
+            {
+                "source_index": source_index,
+                "manifest_path": manifest.get("path"),
+                "result_path": manifest.get("result_path"),
+                "started_at": started.isoformat(),
+                "finished_at": finished.isoformat(),
+                "source_row_count": len(shard_records),
+                "source_row_completed_at_min": min(shard_completion_times).isoformat(),
+                "source_row_completed_at_max": max(shard_completion_times).isoformat(),
+                "physical_first_generation_attempt_count": (new_generation_attempt_count),
+                "account_window_path": matches[0].get("path"),
+                "account_window_kind": matches[0].get("kind"),
+            }
+        )
+    return min(starts), max(completions), coverage
+
+
+def reconcile_ledger_campaign_windows(
+    ledger_rows: Sequence[Mapping[str, Any]],
+    *,
+    source_window_coverage: Sequence[Mapping[str, Any]],
+    campaign_windows: Sequence[Mapping[str, Any]],
+    tolerance: Decimal,
+) -> list[dict[str, Any]]:
+    """Reconcile physical-first request origins inside each account window."""
+
+    source_to_window: dict[int, str] = {}
+    for coverage in source_window_coverage:
+        source_index = nonnegative_int(coverage.get("source_index"))
+        window_path = str(coverage.get("account_window_path") or "")
+        if source_index in source_to_window or not window_path:
+            raise FinalizationError("source manifest account-window binding is ambiguous")
+        source_to_window[source_index] = window_path
+
+    rows_by_window: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    for row in ledger_rows:
+        physical_source = row.get("physical_source")
+        if not isinstance(physical_source, Mapping):
+            raise FinalizationError("ledger row lacks physical-first source evidence")
+        source_index = nonnegative_int(physical_source.get("source_index"))
+        window_path = source_to_window.get(source_index)
+        if not window_path:
+            raise FinalizationError("ledger physical source is outside campaign manifests")
+        rows_by_window[window_path].append(row)
+
+    reconciliations: list[dict[str, Any]] = []
+    campaign_paths: set[str] = set()
+    for window in campaign_windows:
+        window_path = str(window.get("path") or "")
+        if not window_path or window_path in campaign_paths:
+            raise FinalizationError("campaign account window path is missing or duplicated")
+        campaign_paths.add(window_path)
+        source_indexes = sorted(
+            source_index
+            for source_index, bound_path in source_to_window.items()
+            if bound_path == window_path
+        )
+        if not source_indexes:
+            raise FinalizationError("campaign account window is not bound to a source manifest")
+        rows = rows_by_window.pop(window_path, [])
+        delta = required_decimal(
+            window.get("usage_delta_usd"),
+            label="campaign window usage delta",
+        )
+        recorded = Decimal(0)
+        exact = Decimal(0)
+        unknown = 0
+        non_exact = 0
+        for row in rows:
+            raw_cost = row.get("recorded_cost_usd")
+            if raw_cost is None:
+                unknown += 1
+                continue
+            cost = required_decimal(raw_cost, label="campaign window ledger cost")
+            recorded += cost
+            if row.get("cost_precision") == "exact":
+                exact += cost
+            else:
+                non_exact += 1
+        if exact > delta + tolerance:
+            raise FinalizationError("campaign window exact receipts exceed its account usage delta")
+        gap = delta - recorded
+        if abs(gap) > tolerance and unknown == 0 and non_exact == 0:
+            raise FinalizationError(
+                "campaign window ledger does not reconcile to its account usage delta"
+            )
+        status = (
+            "exact"
+            if abs(gap) <= tolerance and unknown == 0 and non_exact == 0
+            else "account_exact_per_request_incomplete"
+        )
+        reconciliations.append(
+            {
+                "account_window_path": window_path,
+                "account_window_kind": window.get("kind"),
+                "source_indexes": source_indexes,
+                "physical_request_count": len(rows),
+                "ledger_recorded_cost_usd": str(recorded),
+                "ledger_exact_cost_usd": str(exact),
+                "unknown_cost_request_count": unknown,
+                "non_exact_cost_request_count": non_exact,
+                "account_usage_delta_usd": str(delta),
+                "reconciliation_gap_usd": str(gap),
+                "reconciliation_status": status,
+            }
+        )
+    if rows_by_window:
+        raise FinalizationError("ledger rows were assigned to a non-campaign account window")
+    return reconciliations
+
+
 def validate_prior_account_window(
     *,
     window_dir: Path,
@@ -4721,7 +5369,14 @@ def validate_prior_account_window(
     current_before_time: datetime,
     current_before_usage: Decimal,
     current_before_byok: Decimal,
+    kind: str = "prior_aborted",
+    admission_basis: str = "operator_supplied_unallocated_window",
+    expected_runtime_fingerprint: str = "",
+    expected_lock_file: str = "",
+    expected_lock_inode: int = 0,
 ) -> dict[str, Any]:
+    if kind not in {"prior_aborted", "prior_campaign"} or not admission_basis:
+        raise FinalizationError("prior account window kind is invalid")
     raw_window_dir = Path(window_dir)
     if raw_window_dir.is_symlink() or not raw_window_dir.is_dir():
         raise FinalizationError("prior account window must be a non-symlink directory")
@@ -4797,6 +5452,17 @@ def validate_prior_account_window(
         raise FinalizationError("prior reconciliation runtime fingerprint differs")
     if reconciliation.get("runtime_environment_file_sha256") != file_sha256(runtime_path):
         raise FinalizationError("prior reconciliation runtime file hash differs")
+    if kind == "prior_campaign" and (
+        runtime_fingerprint != expected_runtime_fingerprint
+        or not expected_lock_file
+        or Path(str(reconciliation.get("lock_file") or "")).resolve(strict=False)
+        != Path(expected_lock_file).resolve(strict=False)
+        or nonnegative_int(reconciliation.get("lock_inode")) != expected_lock_inode
+        or expected_lock_inode <= 0
+    ):
+        raise FinalizationError(
+            "prior campaign account window is not bound to the same runtime/lock"
+        )
     stability = validate_stable_observations(
         reconciliation,
         before_usage=before_usage,
@@ -4831,8 +5497,8 @@ def validate_prior_account_window(
         "runtime_environment": file_sha256(runtime_path),
     }
     return {
-        "kind": "prior_aborted",
-        "admission_basis": "operator_supplied_unallocated_window",
+        "kind": kind,
+        "admission_basis": admission_basis,
         "path": str(window_dir),
         "usage_before_usd": str(before_usage),
         "usage_after_usd": str(after_usage),
@@ -4867,9 +5533,11 @@ def validate_account_proof(
     lock_fd: int,
     runtime_key_fingerprint: str,
     source_records: Sequence[SourceRecord],
+    manifest_sources: Sequence[Mapping[str, Any]],
     ledger_rows: Sequence[Mapping[str, Any]],
     ledger_summary: Mapping[str, Any],
     prior_account_window_dirs: Sequence[Path] = (),
+    prior_campaign_account_window_dirs: Sequence[Path] = (),
 ) -> dict[str, Any]:
     before_path = require_regular_file(before_path, owner_only=True)
     after_path = require_regular_file(after_path, owner_only=True)
@@ -4952,7 +5620,6 @@ def validate_account_proof(
     )
     before_time = parse_iso(before.get("captured_at"), label="account before captured_at")
     after_time = parse_iso(after.get("captured_at"), label="account after captured_at")
-    earliest_start, latest_completion = selected_time_window(source_records)
     last_stable = parse_iso(
         stability["last_stable_observation_at"],
         label="last stable observation",
@@ -4965,10 +5632,36 @@ def validate_account_proof(
         raise FinalizationError("account before snapshot does not precede settlement observations")
     if after_time != last_stable:
         raise FinalizationError("account after timestamp differs from the final stable observation")
-    if before_time > earliest_start:
-        raise FinalizationError("account before snapshot does not precede every source call")
-    if after_time < latest_completion or last_stable < latest_completion:
-        raise FinalizationError("account after evidence does not cover every source call")
+
+    prior_campaign_windows = [
+        validate_prior_account_window(
+            window_dir=Path(window_dir),
+            expected_key_fingerprint=next(iter(fingerprints)),
+            current_before_time=before_time,
+            current_before_usage=before_usage,
+            current_before_byok=before_byok,
+            kind="prior_campaign",
+            admission_basis="operator_supplied_source_bound_campaign_window",
+            expected_runtime_fingerprint=runtime_fingerprint,
+            expected_lock_file=str(lock.get("lock_file") or ""),
+            expected_lock_inode=nonnegative_int(lock.get("lock_inode")),
+        )
+        for window_dir in prior_campaign_account_window_dirs
+    ]
+    campaign_usage_delta = usage_delta + sum(
+        (
+            required_decimal(window["usage_delta_usd"], label="campaign account usage delta")
+            for window in prior_campaign_windows
+        ),
+        Decimal(0),
+    )
+    campaign_byok_delta = byok_delta + sum(
+        (
+            required_decimal(window["byok_usage_delta_usd"], label="campaign BYOK delta")
+            for window in prior_campaign_windows
+        ),
+        Decimal(0),
+    )
 
     local_counts = Counter(str(row.get("non_byok_evidence") or "") for row in ledger_rows)
     explicit = local_counts["explicit_byok"]
@@ -4996,11 +5689,11 @@ def validate_account_proof(
     )
     if tolerance > Decimal("0.000001"):
         raise FinalizationError("cost reconciliation tolerance exceeds 0.000001 USD")
-    if exact_ledger_cost > usage_delta + tolerance:
+    if exact_ledger_cost > campaign_usage_delta + tolerance:
         raise FinalizationError(
             "exact physical receipt cost exceeds the settled account usage delta"
         )
-    gap = usage_delta - recorded_ledger_cost
+    gap = campaign_usage_delta - recorded_ledger_cost
     unknown_cost_count = nonnegative_int(ledger_summary.get("unknown_cost_request_count"))
     non_exact_cost_count = nonnegative_int(ledger_summary.get("non_exact_cost_request_count"))
     if gap < -tolerance and unknown_cost_count == 0 and non_exact_cost_count == 0:
@@ -5020,16 +5713,19 @@ def validate_account_proof(
         if campaign_attributable_exact
         else "account_window_only_external-use-not-provable"
     )
-    prior_windows = [
+    prior_aborted_windows = [
         validate_prior_account_window(
             window_dir=Path(window_dir),
             expected_key_fingerprint=next(iter(fingerprints)),
             current_before_time=before_time,
             current_before_usage=before_usage,
             current_before_byok=before_byok,
+            kind="prior_aborted",
+            admission_basis="operator_supplied_unallocated_window",
         )
         for window_dir in prior_account_window_dirs
     ]
+    prior_windows = [*prior_aborted_windows, *prior_campaign_windows]
     ordered_windows = sorted(
         prior_windows,
         key=lambda window: parse_iso(
@@ -5078,6 +5774,42 @@ def validate_account_proof(
         },
         **stability,
     }
+    campaign_windows = [
+        *sorted(
+            prior_campaign_windows,
+            key=lambda window: parse_iso(
+                window["account_before_at"],
+                label="campaign account before",
+            ),
+        ),
+        current_window,
+    ]
+    for earlier, later in zip(campaign_windows, campaign_windows[1:], strict=False):
+        if required_decimal(
+            earlier.get("usage_after_usd"),
+            label="earlier campaign account usage after",
+        ) != required_decimal(
+            later.get("usage_before_usd"),
+            label="later campaign account usage before",
+        ) or required_decimal(
+            earlier.get("byok_usage_after_usd"),
+            label="earlier campaign account BYOK after",
+        ) != required_decimal(
+            later.get("byok_usage_before_usd"),
+            label="later campaign account BYOK before",
+        ):
+            raise FinalizationError("campaign account counters are not continuous between windows")
+    earliest_start, latest_completion, source_window_coverage = manifest_source_window_coverage(
+        manifest_sources,
+        source_records=source_records,
+        campaign_windows=campaign_windows,
+    )
+    ledger_window_reconciliation = reconcile_ledger_campaign_windows(
+        ledger_rows,
+        source_window_coverage=source_window_coverage,
+        campaign_windows=campaign_windows,
+        tolerance=tolerance,
+    )
     current_window["sources"] = [
         {"path": str(before_path), "sha256": current_window["source_sha256"]["account_before"]},
         {"path": str(after_path), "sha256": current_window["source_sha256"]["account_after"]},
@@ -5094,11 +5826,11 @@ def validate_account_proof(
     aborted_total = sum(
         (
             required_decimal(window["usage_delta_usd"], label="prior account usage delta")
-            for window in ordered_windows
+            for window in prior_aborted_windows
         ),
         Decimal(0),
     )
-    account_window_total = aborted_total + usage_delta
+    account_window_total = aborted_total + campaign_usage_delta
     current_window_campaign_attributable_exact = campaign_attributable_exact
     if aborted_total > 0:
         campaign_attributable_exact = False
@@ -5126,7 +5858,9 @@ def validate_account_proof(
         "account_windows": account_windows,
         "account_window_total_usd": str(account_window_total),
         "unallocated_aborted_window_usd": str(aborted_total),
-        "result_row_account_window_scope": "current_window_only",
+        "result_row_account_window_scope": (
+            "campaign_windows" if prior_campaign_windows else "current_window_only"
+        ),
         "account": {
             "usage_before_usd": str(before_usage),
             "usage_after_usd": str(after_usage),
@@ -5134,6 +5868,9 @@ def validate_account_proof(
             "byok_usage_before_usd": str(before_byok),
             "byok_usage_after_usd": str(after_byok),
             "byok_usage_delta_usd": str(byok_delta),
+            "campaign_byok_usage_delta_usd": str(campaign_byok_delta),
+            "campaign_usage_delta_usd": str(campaign_usage_delta),
+            "campaign_window_count": len(campaign_windows),
             "is_free_tier": False,
         },
         "window": {
@@ -5141,6 +5878,8 @@ def validate_account_proof(
             "earliest_source_started_at": earliest_start.isoformat(),
             "latest_source_completed_at": latest_completion.isoformat(),
             "account_after_at": after_time.isoformat(),
+            "source_window_coverage": source_window_coverage,
+            "ledger_window_reconciliation": ledger_window_reconciliation,
             **stability,
             **lock,
         },
@@ -5156,8 +5895,13 @@ def validate_account_proof(
         "cost_scope": {
             "ledger_recorded_cost_usd": ledger_summary.get("recorded_cost_usd"),
             "ledger_exact_cost_usd": ledger_summary.get("exact_cost_usd"),
-            "account_usage_delta_usd": str(usage_delta),
-            "account_window_delta_usd": str(usage_delta),
+            "account_usage_delta_usd": str(campaign_usage_delta),
+            "account_window_delta_usd": str(campaign_usage_delta),
+            "current_account_window_delta_usd": str(usage_delta),
+            "campaign_bound_account_window_total_usd": str(campaign_usage_delta),
+            "unallocated_account_window_total_usd": str(aborted_total),
+            "all_account_window_total_usd": str(account_window_total),
+            "ledger_window_reconciliation": ledger_window_reconciliation,
             "account_windows": account_windows,
             "account_window_total_usd": str(account_window_total),
             "unallocated_aborted_window_usd": str(aborted_total),
@@ -5172,7 +5916,7 @@ def validate_account_proof(
                 current_window_campaign_attributable_exact
             ),
             "campaign_attributable_cost_usd": (
-                str(usage_delta) if campaign_attributable_exact else None
+                str(campaign_usage_delta) if campaign_attributable_exact else None
             ),
             "account_total_precision": (
                 attribution_precision
@@ -5358,23 +6102,36 @@ def selected_generation_costs_from_ledger(
             for item in physical
             if item.get("recorded_cost_usd") is not None
         ]
+        non_estimated_known = [
+            required_decimal(
+                item.get("recorded_cost_usd"),
+                label=f"{key} selected non-estimated ledger cost",
+            )
+            for item in physical
+            if item.get("recorded_cost_usd") is not None
+            and item.get("cost_precision") != "estimated"
+        ]
         precision_counts = Counter(
             str(item.get("cost_precision") or "unknown") for item in physical
         )
-        complete = len(known) == len(physical)
+        recorded_request_count = len(known)
+        estimated_request_count = precision_counts["estimated"]
+        complete = recorded_request_count == len(physical) and estimated_request_count == 0
         exact = complete and precision_counts["exact"] == len(physical)
-        lower_bound = sum(known, Decimal(0))
+        lower_bound = sum(non_estimated_known, Decimal(0))
         value = lower_bound if complete else None
         summary = {
             "value": value,
             "recorded_cost_usd": str(value) if value is not None else None,
             "recorded_cost_usd_lower_bound": str(lower_bound),
             "request_count": len(physical),
-            "known_cost_request_count": len(known),
-            "unknown_cost_request_count": len(physical) - len(known),
+            "known_cost_request_count": recorded_request_count,
+            "non_estimated_known_cost_request_count": len(non_estimated_known),
+            "estimated_cost_request_count": estimated_request_count,
+            "unknown_cost_request_count": len(physical) - recorded_request_count,
             "precision_counts": dict(sorted(precision_counts.items())),
             "precision": (
-                "exact" if exact else "recorded_or_estimated" if complete else "partial_or_unknown"
+                "exact" if exact else "recorded" if complete else "partial_estimated_or_unknown"
             ),
             "complete": complete,
             "exact": exact,
@@ -5852,12 +6609,80 @@ def experiment_results_markdown(
     account = proof["account"]
     evidence = proof["local_physical_request_evidence"]
     cost_scope = proof["cost_scope"]
+    result_window_scope = str(proof.get("result_row_account_window_scope") or "")
+    account_windows = list(cost_scope["account_windows"])
+    campaign_windows = [
+        window for window in account_windows if window.get("kind") in {"prior_campaign", "current"}
+    ]
+    aborted_windows = [
+        window for window in account_windows if window.get("kind") == "prior_aborted"
+    ]
+    campaign_bound_total = cost_scope.get(
+        "campaign_bound_account_window_total_usd",
+        cost_scope["account_window_delta_usd"],
+    )
+    all_window_total = cost_scope.get(
+        "all_account_window_total_usd",
+        cost_scope["account_window_total_usd"],
+    )
+    if cost_scope["campaign_attributable_exact"]:
+        attribution_note = (
+            "- 每个物理请求均有 exact receipt 且账本与 campaign-bound 账户窗口"
+            "增量一致，因此该增量可作为 campaign attributable exact cost。"
+        )
+    elif result_window_scope == "campaign_windows":
+        attribution_note = (
+            "- Campaign-bound 账本总额与账户 counter 精确对账；但仍有 "
+            f"{evidence['campaign_covered_unverified_request_count']} 个物理请求缺少完整的"
+            "逐请求费用/provider 元数据，且本机锁不能证明跨主机 key 独占。因此"
+            f"${campaign_bound_total} 是 counter-exact campaign-bound 总额，"
+            "但 `campaign_attributable_exact=false`，也不分摊到任务或实验组。"
+        )
+    elif (
+        cost_scope["current_window_campaign_attributable_exact"]
+        and Decimal(cost_scope["unallocated_aborted_window_usd"]) > 0
+    ):
+        attribution_note = (
+            "- 当前正式窗口的物理回执与账户 counter 已精确对账；但 prior "
+            "aborted window 成本未分配到请求或任务，因此多窗口合计不能称为 "
+            "campaign attributable exact cost。"
+        )
+    else:
+        attribution_note = (
+            "- 当前正式窗口存在 non-exact/unknown 物理请求；该数值仅是"
+            "共享 key 的账户窗口增量，跨主机外部使用无法证明不存在，不能称为 "
+            "campaign total，也不会分摊到任务或实验组。"
+        )
+    physical_request_count = nonnegative_int(ledger_summary.get("physical_request_count"))
+    unknown_request_count = nonnegative_int(ledger_summary.get("unknown_cost_request_count"))
+    non_exact_request_count = nonnegative_int(ledger_summary.get("non_exact_cost_request_count"))
+    exact_request_count = physical_request_count - unknown_request_count - non_exact_request_count
+    window_reconciliations = cost_scope.get("ledger_window_reconciliation")
+    window_detail = "；".join(
+        f"{item.get('account_window_kind')}="
+        f"{item.get('physical_request_count')} requests/"
+        f"${item.get('account_usage_delta_usd')}/"
+        f"{item.get('reconciliation_status')}"
+        for item in window_reconciliations or []
+        if isinstance(item, Mapping)
+    )
     scope_costs = ledger_summary["scope_recorded_cost_usd"]
     judge_scope_cost = sum(
         (Decimal(value) for key, value in scope_costs.items() if "judge" in key),
         Decimal(0),
     )
     disposition_costs = ledger_summary["generation_disposition_recorded_cost_usd"]
+    retrospective_recoveries: list[tuple[Mapping[str, Any], Mapping[str, Any]]] = []
+    for row in final_rows:
+        finalization = row.get("campaign_finalization")
+        selection = finalization.get("selection") if isinstance(finalization, Mapping) else None
+        recovery = (
+            selection.get("retrospective_reclassification_recovery")
+            if isinstance(selection, Mapping)
+            else None
+        )
+        if isinstance(recovery, Mapping):
+            retrospective_recoveries.append((row, recovery))
     lines = [
         "# DRACO Mini B0/B1/B2/B4/G1 实验结果",
         "",
@@ -6010,6 +6835,36 @@ def experiment_results_markdown(
             )
     else:
         lines.append("| — | — | `direct` | 否 | 否 | 否 | 无后处理修复。 |")
+    lines.extend(["", "### 协议偏差与恢复", ""])
+    if retrospective_recoveries:
+        for recovery_row, recovery in retrospective_recoveries:
+            spend = recovery.get("invalid_post_accept_spend")
+            if not isinstance(spend, Mapping):
+                raise FinalizationError("retrospective recovery lacks spend disclosure")
+            invalid_ids = ", ".join(
+                f"`{str(attempt_id)[:12]}…`"
+                for attempt_id in recovery.get("invalid_post_accept_attempt_ids", [])
+            )
+            lines.append(
+                "- {group}/`{task}`：旧分类器在 attempt {selected} 已有效后，"
+                "仍误发了后续无效 attempt（{invalid}）。最终结果继续绑定 "
+                "attempt {selected}；后续 attempt 的 {requests} 个物理请求均保留在 "
+                "`actual-spend-ledger.jsonl`，其中 exact={exact}、non-exact="
+                "{non_exact}、unknown={unknown}，已记录成本 ${cost}（unknown 不按 "
+                "$0 冒充完整成本），且不计入 selected-generation 指标。".format(
+                    group=str(recovery_row.get("group") or ""),
+                    task=str(recovery_row.get("task_id") or "")[:12],
+                    selected=recovery.get("selected_attempt"),
+                    invalid=invalid_ids or "未知",
+                    requests=spend.get("physical_request_count"),
+                    exact=spend.get("exact_request_count"),
+                    non_exact=spend.get("non_exact_request_count"),
+                    unknown=spend.get("unknown_cost_request_count"),
+                    cost=spend.get("recorded_cost_usd"),
+                )
+            )
+    else:
+        lines.append("- 无“有效 generation 后仍启动新 attempt”的历史协议偏差。")
     lines.extend(["", "### 同题 Domain 矩阵", ""])
     lines.append("| Domain | Task | " + " | ".join(GROUPS) + " |")
     lines.append("|---|---|" + "---:|" * len(GROUPS))
@@ -6131,36 +6986,40 @@ def experiment_results_markdown(
             "- `actual-spend-ledger.jsonl` 从所有 wave 的 generation attempts "
             "与 Judge attempts 重建，"
             "失败或被替换 attempt 仍计入真实花费，复制到 repair row 的请求按物理回执去重。",
-            f"- Campaign 物理 LLM 请求：{ledger_summary['physical_request_count']}；"
+            f"- Campaign 物理 LLM 请求：{physical_request_count}；"
+            f"exact={exact_request_count}、non-exact={non_exact_request_count}、"
+            f"unknown={unknown_request_count}；"
             f"账本已记录成本：${ledger_summary['recorded_cost_usd']}；"
-            f"其中精确成本：${ledger_summary['exact_cost_usd']}。",
-            f"- OpenRouter account window delta："
-            f"${cost_scope['account_window_delta_usd']}；"
+            f"exact 请求金额合计：${ledger_summary['exact_cost_usd']}。金额相同不表示"
+            "所有请求都具备完整逐请求成本证据。",
+            f"- Campaign-bound 分窗：{window_detail}。",
+            f"- Campaign-bound OpenRouter account delta：${campaign_bound_total}；"
             f"归因精度：`{cost_scope['attribution_precision']}`。",
-            f"- 纳入审计的账户窗口：{len(cost_scope['account_windows'])}；"
-            f"各窗口 counter 精确增量合计：${cost_scope['account_window_total_usd']}；"
-            f"其中中止窗口未分配成本：${cost_scope['unallocated_aborted_window_usd']}。",
-            "- `results.jsonl` 的任务行只绑定当前正式窗口；中止窗口成本仅在 "
-            "campaign 级 proof/audit/manifest/report 中归档，窗口间 gap 不计费。",
+            f"- 纳入审计的账户窗口：{len(account_windows)}；其中 campaign-bound "
+            f"{len(campaign_windows)} 个，counter 精确增量合计 ${campaign_bound_total}；"
+            f"unallocated aborted {len(aborted_windows)} 个，增量合计 "
+            f"${cost_scope['unallocated_aborted_window_usd']}；全部窗口合计 "
+            f"${all_window_total}。",
             (
-                "- 每个物理请求均有 exact receipt 且账本与账户窗口增量一致，"
-                "因此该窗口增量可作为 campaign attributable exact cost。"
-                if cost_scope["campaign_attributable_exact"]
-                else (
-                    "- 当前正式窗口的物理回执与账户 counter 已精确对账；但 prior "
-                    "aborted window 成本未分配到请求或任务，因此多窗口合计不能称为 "
-                    "campaign attributable exact cost。"
-                    if cost_scope["current_window_campaign_attributable_exact"]
-                    and Decimal(cost_scope["unallocated_aborted_window_usd"]) > 0
-                    else "- 当前正式窗口存在 non-exact/unknown 物理请求；该数值仅是"
-                    "共享 key 的账户窗口增量，跨主机外部使用无法证明不存在，不能称为 "
-                    "campaign total，也不会分摊到任务或实验组。"
-                )
+                "- Unallocated aborted 窗口没有正式 ledger 行与之绑定；其实际调用数未知，"
+                "不能把“0 条正式 ledger 行”解释为“0 次调用”。"
+                if aborted_windows
+                else "- 没有 unallocated aborted 账户窗口。"
             ),
+            (
+                "- `results.jsonl` 的每个 source manifest 均绑定到且只绑定到一个 "
+                "campaign account window；中止窗口不参与结果或 ledger 归因，"
+                "窗口间 gap 不计费。"
+                if result_window_scope == "campaign_windows"
+                else "- `results.jsonl` 的任务行只绑定当前正式窗口；中止窗口成本仅在 "
+                "campaign 级 proof/audit/manifest/report 中归档，窗口间 gap 不计费。"
+            ),
+            attribution_note,
             "",
             "## Non-BYOK 与 Web 成本说明",
             "",
-            f"- OpenRouter BYOK 增量（Decimal 精确值）：{account['byok_usage_delta_usd']}；"
+            f"- OpenRouter BYOK 增量（Decimal 精确值）："
+            f"{account.get('campaign_byok_usage_delta_usd', account['byok_usage_delta_usd'])}；"
             "同一 paid key、本机文件锁、完整 before→stable-after 窗口证明通过；"
             "本机锁不证明跨主机独占。",
             f"- 本地 exact non-BYOK 请求：{evidence['exact_non_byok_request_count']}；"
@@ -6353,6 +7212,16 @@ def final_audit(
         "openrouter_non_byok_campaign_proof_sha256": proof.get("proof_sha256"),
         "account_windows": proof.get("account_windows"),
         "account_window_total_usd": proof.get("account_window_total_usd"),
+        "result_row_account_window_scope": proof.get("result_row_account_window_scope"),
+        "campaign_bound_account_window_total_usd": proof.get("cost_scope", {}).get(
+            "campaign_bound_account_window_total_usd"
+        ),
+        "all_account_window_total_usd": proof.get("cost_scope", {}).get(
+            "all_account_window_total_usd"
+        ),
+        "ledger_window_reconciliation": proof.get("cost_scope", {}).get(
+            "ledger_window_reconciliation"
+        ),
         "unallocated_aborted_window_usd": proof.get("unallocated_aborted_window_usd"),
         "physical_request_count": ledger_summary.get("physical_request_count"),
         "external_tool_cost": dict(external_tool_cost),
@@ -6364,10 +7233,17 @@ def final_audit(
             "unknown_costs_are_zero": False,
             "account_delta_allocated_to_tasks": False,
             "account_window_delta_usd": proof.get("cost_scope", {}).get("account_window_delta_usd"),
-            "account_windows": proof.get("cost_scope", {}).get("account_windows"),
-            "account_window_total_usd": proof.get("cost_scope", {}).get(
-                "account_window_total_usd"
+            "campaign_bound_account_window_total_usd": proof.get("cost_scope", {}).get(
+                "campaign_bound_account_window_total_usd"
             ),
+            "unallocated_account_window_total_usd": proof.get("cost_scope", {}).get(
+                "unallocated_account_window_total_usd"
+            ),
+            "all_account_window_total_usd": proof.get("cost_scope", {}).get(
+                "all_account_window_total_usd"
+            ),
+            "account_windows": proof.get("cost_scope", {}).get("account_windows"),
+            "account_window_total_usd": proof.get("cost_scope", {}).get("account_window_total_usd"),
             "unallocated_aborted_window_usd": proof.get("cost_scope", {}).get(
                 "unallocated_aborted_window_usd"
             ),
@@ -6417,6 +7293,17 @@ def build_parser() -> argparse.ArgumentParser:
             "stable-after, reconciliation, and runtime-environment evidence."
         ),
     )
+    parser.add_argument(
+        "--campaign-account-window-dir",
+        type=Path,
+        action="append",
+        default=[],
+        help=(
+            "Archived prior source-bound campaign account window directory "
+            "containing before, stable-after, reconciliation, and "
+            "runtime-environment evidence."
+        ),
+    )
     parser.add_argument("--runtime-environment", type=Path, required=True)
     parser.add_argument("--lock-file", type=Path, required=True)
     parser.add_argument("--lock-fd", type=int, default=9)
@@ -6447,7 +7334,10 @@ def run_finalization(args: argparse.Namespace) -> dict[str, Any]:
         source_path = require_regular_file(Path(raw_path), owner_only=False)
         critical_source_snapshots[str(source_path)] = file_sha256(source_path)
     prior_account_window_dirs = list(getattr(args, "prior_account_window_dir", ()) or ())
-    for prior_dir in prior_account_window_dirs:
+    prior_campaign_account_window_dirs = list(
+        getattr(args, "campaign_account_window_dir", ()) or ()
+    )
+    for prior_dir in (*prior_account_window_dirs, *prior_campaign_account_window_dirs):
         for name in (
             "openrouter-account-before.json",
             "openrouter-account-after.json",
@@ -6475,6 +7365,7 @@ def run_finalization(args: argparse.Namespace) -> dict[str, Any]:
         fingerprints=fingerprints,
         contracts=contracts,
         max_attempts=args.max_generation_attempts,
+        manifest_sources=manifest_sources,
     )
     selected_attempt_bindings = bind_selected_generation_attempts(
         source_records,
@@ -6487,6 +7378,7 @@ def run_finalization(args: argparse.Namespace) -> dict[str, Any]:
         selected=selected,
         selected_attempt_bindings=selected_attempt_bindings,
     )
+    attach_retrospective_recovery_spend(pair_audit, ledger_rows)
     model_metrics = ledger_model_metrics(ledger_rows)
     external_tool_cost = build_external_tool_cost_summary(
         source_records,
@@ -6501,9 +7393,11 @@ def run_finalization(args: argparse.Namespace) -> dict[str, Any]:
         lock_fd=args.lock_fd,
         runtime_key_fingerprint=runtime_key,
         source_records=source_records,
+        manifest_sources=manifest_sources,
         ledger_rows=ledger_rows,
         ledger_summary=ledger_summary,
         prior_account_window_dirs=prior_account_window_dirs,
+        prior_campaign_account_window_dirs=prior_campaign_account_window_dirs,
     )
     final_rows = finalize_rows(
         selected,
@@ -6599,16 +7493,23 @@ def run_finalization(args: argparse.Namespace) -> dict[str, Any]:
         "external_tool_cost": external_tool_cost,
         "openrouter_non_byok_campaign_proof_sha256": proof["proof_sha256"],
         "account_windows": proof["account_windows"],
+        "result_row_account_window_scope": proof["result_row_account_window_scope"],
         "account_window_total_usd": proof["account_window_total_usd"],
         "unallocated_aborted_window_usd": proof["unallocated_aborted_window_usd"],
         "cost_attribution": {
             "account_window_delta_usd": proof["cost_scope"]["account_window_delta_usd"],
+            "campaign_bound_account_window_total_usd": proof["cost_scope"][
+                "campaign_bound_account_window_total_usd"
+            ],
+            "unallocated_account_window_total_usd": proof["cost_scope"][
+                "unallocated_account_window_total_usd"
+            ],
+            "all_account_window_total_usd": proof["cost_scope"]["all_account_window_total_usd"],
             "account_windows": proof["cost_scope"]["account_windows"],
             "account_window_total_usd": proof["cost_scope"]["account_window_total_usd"],
-            "unallocated_aborted_window_usd": proof["cost_scope"][
-                "unallocated_aborted_window_usd"
-            ],
+            "unallocated_aborted_window_usd": proof["cost_scope"]["unallocated_aborted_window_usd"],
             "attribution_precision": proof["cost_scope"]["attribution_precision"],
+            "ledger_window_reconciliation": proof["cost_scope"]["ledger_window_reconciliation"],
             "campaign_attributable_exact": proof["cost_scope"]["campaign_attributable_exact"],
             "campaign_attributable_cost_usd": proof["cost_scope"]["campaign_attributable_cost_usd"],
             "account_delta_allocated_to_tasks": False,

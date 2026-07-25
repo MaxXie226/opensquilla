@@ -103,16 +103,19 @@ def test_selected_endpoint_receipt_binds_serving_alias_and_provider(module) -> N
         },
     }
 
-    assert module.usage_route_reasons(
-        {
-            "model_usage_breakdown": [
-                unit,
-                {"role": "agent_llm_request_unknown"},
-            ]
-        },
-        allowed_models={module.B0_MODEL},
-        provider_pins={module.B0_MODEL: "anthropic"},
-    ) == []
+    assert (
+        module.usage_route_reasons(
+            {
+                "model_usage_breakdown": [
+                    unit,
+                    {"role": "agent_llm_request_unknown"},
+                ]
+            },
+            allowed_models={module.B0_MODEL},
+            provider_pins={module.B0_MODEL: "anthropic"},
+        )
+        == []
+    )
     assert module.unit_exact_non_byok(unit) is True
     assert module._formal_openrouter_models_equivalent(
         module.B0_MODEL,
@@ -196,11 +199,14 @@ def test_frozen_g1_serving_aliases_bind_router_receipts(
         },
     }
 
-    assert module.usage_route_reasons(
-        {"model_usage_breakdown": [unit]},
-        allowed_models={requested_model},
-        provider_pins={requested_model: upstream_provider},
-    ) == []
+    assert (
+        module.usage_route_reasons(
+            {"model_usage_breakdown": [unit]},
+            allowed_models={requested_model},
+            provider_pins={requested_model: upstream_provider},
+        )
+        == []
+    )
     assert module._formal_openrouter_models_equivalent(
         requested_model,
         serving_model,
@@ -208,9 +214,7 @@ def test_frozen_g1_serving_aliases_bind_router_receipts(
 
     outside_snapshot = deepcopy(unit)
     outside_model = f"{serving_model}-outside-snapshot"
-    outside_snapshot["provider_usage"]["router_metadata"]["attempts"][0][
-        "model"
-    ] = outside_model
+    outside_snapshot["provider_usage"]["router_metadata"]["attempts"][0]["model"] = outside_model
     assert not module._formal_openrouter_models_equivalent(
         requested_model,
         outside_model,
@@ -974,9 +978,7 @@ def test_ensemble_gate_allows_only_empty_nonterminal_fallback(module) -> None:
     )
 
     boolean_chars = deepcopy(row)
-    boolean_chars["ensemble_trace"]["calls"][0]["final_request"]["output"]["chars"] = (
-        False
-    )
+    boolean_chars["ensemble_trace"]["calls"][0]["final_request"]["output"]["chars"] = False
     assert "intermediate_fallback_visible_output" in (
         module.admissible_empty_nonterminal_fallback_reasons(
             boolean_chars["ensemble_trace"]["calls"][0],
@@ -1016,9 +1018,9 @@ def test_ensemble_gate_allows_only_empty_nonterminal_fallback(module) -> None:
         )
         == []
     )
-    visible_intermediate["ensemble_trace"]["calls"][0]["final_request"]["output"][
-        "text"
-    ] = "tampered"
+    visible_intermediate["ensemble_trace"]["calls"][0]["final_request"]["output"]["text"] = (
+        "tampered"
+    )
     assert "wrong_agent_call_output_binding" in module.ensemble_gate(
         visible_intermediate,
         expected_proposers=module.B2_PROPOSERS,
@@ -1527,6 +1529,254 @@ def _prior_account_window(
     return window
 
 
+def _bind_prior_campaign_window(
+    module,
+    args: argparse.Namespace,
+    tmp_path: Path,
+) -> Path:
+    prior = _prior_account_window(
+        module,
+        args,
+        tmp_path,
+        before_usage="6.4",
+        suffix="prior-campaign",
+    )
+    prior_reconciliation_path = prior / "openrouter-account-reconciliation.json"
+    prior_reconciliation = json.loads(prior_reconciliation_path.read_text())
+    prior_reconciliation.update(
+        {
+            "lock_file": str(args.lock_file.resolve()),
+            "lock_inode": args.lock_file.stat().st_ino,
+        }
+    )
+    _owner_json(prior_reconciliation_path, prior_reconciliation)
+
+    for source_index, result_path in enumerate(args.result):
+        rows = [json.loads(line) for line in result_path.read_text().splitlines()]
+        for row_index, row in enumerate(rows):
+            # Both waves retain the immutable timing of the generation that
+            # physically ran in wave 1.  Only the repair row completion belongs
+            # to the current window.
+            row["started_at"] = 660.0
+            row["generation_completed_at"] = 665.0
+            if source_index == 0:
+                row["completed_at"] = 870.0
+            execution = row["execution"]
+            assert isinstance(execution, dict)
+            attempts = execution["generation_attempts"]
+            assert isinstance(attempts, list)
+            for attempt in attempts:
+                assert isinstance(attempt, dict)
+                attempt["started_at"] = 660.0
+                attempt["completed_at"] = 665.0
+            rows[row_index] = module.seal_result_row(row)
+        result_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        result_path.chmod(0o600)
+
+    wave1_manifest = json.loads(args.manifest[0].read_text())
+    wave1_manifest.update(
+        {
+            "started_at": 600.0,
+            "finished_at": 900.0,
+        }
+    )
+    _owner_json(args.manifest[0], wave1_manifest)
+
+    account_after = json.loads(args.account_after.read_text())
+    account_after["usage"] = "10"
+    _owner_json(args.account_after, account_after)
+    current_reconciliation = json.loads(args.account_reconciliation.read_text())
+    current_reconciliation.update(
+        {
+            "usage_before_usd": "10",
+            "usage_after_usd": "10",
+            "usage_delta_usd": "0",
+        }
+    )
+    for observation in current_reconciliation["stable_observations"]:
+        observation["usage"] = "10"
+    _owner_json(args.account_reconciliation, current_reconciliation)
+    args.campaign_account_window_dir = [prior]
+    return prior
+
+
+def _prior_campaign_window_reconciliation(
+    proof: dict[str, object],
+) -> dict[str, dict[str, object]]:
+    cost_scope = proof["cost_scope"]
+    assert isinstance(cost_scope, dict)
+    reconciliations = cost_scope["ledger_window_reconciliation"]
+    assert isinstance(reconciliations, list)
+    return {
+        str(value["account_window_kind"]): value
+        for value in reconciliations
+        if isinstance(value, dict)
+    }
+
+
+def test_prior_campaign_window_reconciles_physical_first_sources(
+    module,
+    tmp_path: Path,
+) -> None:
+    args, _, lock_fd = _campaign(module, tmp_path)
+    prior = _bind_prior_campaign_window(module, args, tmp_path)
+    try:
+        manifest = module.run_finalization(args)
+    finally:
+        os.close(lock_fd)
+
+    proof = json.loads((args.output_dir / "openrouter-non-byok-campaign-proof.json").read_text())
+    assert [window["kind"] for window in proof["account_windows"]] == [
+        "prior_campaign",
+        "current",
+    ]
+    assert proof["result_row_account_window_scope"] == "campaign_windows"
+    assert proof["account"]["campaign_usage_delta_usd"] == "3.6"
+    assert proof["account"]["campaign_window_count"] == 2
+    scope = proof["cost_scope"]
+    assert scope["campaign_bound_account_window_total_usd"] == "3.6"
+    assert scope["campaign_attributable_exact"] is True
+    assert scope["campaign_attributable_cost_usd"] == "3.6"
+
+    coverage = proof["window"]["source_window_coverage"]
+    assert [
+        (
+            value["source_index"],
+            value["account_window_kind"],
+            value["physical_first_generation_attempt_count"],
+        )
+        for value in coverage
+    ] == [
+        (0, "prior_campaign", 5),
+        (1, "current", 0),
+    ]
+    assert coverage[0]["account_window_path"] == str(prior.resolve())
+    assert coverage[1]["account_window_path"] == str(tmp_path.resolve())
+
+    reconciliations = _prior_campaign_window_reconciliation(proof)
+    assert reconciliations["prior_campaign"] == {
+        "account_window_path": str(prior.resolve()),
+        "account_window_kind": "prior_campaign",
+        "source_indexes": [0],
+        "physical_request_count": 36,
+        "ledger_recorded_cost_usd": "3.600000000",
+        "ledger_exact_cost_usd": "3.600000000",
+        "unknown_cost_request_count": 0,
+        "non_exact_cost_request_count": 0,
+        "account_usage_delta_usd": "3.6",
+        "reconciliation_gap_usd": "0E-9",
+        "reconciliation_status": "exact",
+    }
+    assert reconciliations["current"] == {
+        "account_window_path": str(tmp_path.resolve()),
+        "account_window_kind": "current",
+        "source_indexes": [1],
+        "physical_request_count": 0,
+        "ledger_recorded_cost_usd": "0",
+        "ledger_exact_cost_usd": "0",
+        "unknown_cost_request_count": 0,
+        "non_exact_cost_request_count": 0,
+        "account_usage_delta_usd": "0",
+        "reconciliation_gap_usd": "0",
+        "reconciliation_status": "exact",
+    }
+
+    ledger = [
+        json.loads(line)
+        for line in (args.output_dir / "actual-spend-ledger.jsonl").read_text().splitlines()
+    ]
+    assert len(ledger) == 36
+    assert {
+        (
+            row["physical_source"]["source_index"],
+            row["physical_source"]["path"],
+            tuple(row["receipt_source_indexes"]),
+        )
+        for row in ledger
+    } == {
+        (0, str(args.result[0]), (1,)),
+    }
+
+    report = (args.output_dir / "EXPERIMENT_RESULTS.md").read_text()
+    assert "Generation disposition 成本：selected=$0.600000000" in report
+    assert "账本已记录成本：$3.600000000" in report
+    assert "Campaign-bound OpenRouter account delta：$3.6" in report
+    assert "prior_campaign=36 requests/$3.6/exact" in report
+    assert "current=0 requests/$0/exact" in report
+    assert manifest["cost_attribution"]["campaign_bound_account_window_total_usd"] == "3.6"
+
+
+@pytest.mark.parametrize(
+    ("outside_evidence", "error_pattern"),
+    [
+        (
+            "physical_attempt",
+            "physical-first generation attempt is outside its source manifest",
+        ),
+        (
+            "row_completion",
+            "source result row completion is outside its manifest execution window",
+        ),
+    ],
+)
+def test_prior_campaign_rejects_source_timing_outside_manifest(
+    module,
+    tmp_path: Path,
+    outside_evidence: str,
+    error_pattern: str,
+) -> None:
+    args, _, lock_fd = _campaign(module, tmp_path)
+    _bind_prior_campaign_window(module, args, tmp_path)
+    result_paths = args.result if outside_evidence == "physical_attempt" else args.result[:1]
+    for result_path in result_paths:
+        rows = [json.loads(line) for line in result_path.read_text().splitlines()]
+        if outside_evidence == "physical_attempt":
+            rows[0]["execution"]["generation_attempts"][0]["started_at"] = 599.0
+        else:
+            rows[0]["completed_at"] = 901.0
+        rows[0] = module.seal_result_row(rows[0])
+        result_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        result_path.chmod(0o600)
+    try:
+        with pytest.raises(module.FinalizationError, match=error_pattern):
+            module.run_finalization(args)
+    finally:
+        os.close(lock_fd)
+    assert not args.output_dir.exists()
+
+
+@pytest.mark.parametrize("binding", ["lock", "runtime"])
+def test_prior_campaign_requires_same_runtime_and_lock(
+    module,
+    tmp_path: Path,
+    binding: str,
+) -> None:
+    args, _, lock_fd = _campaign(module, tmp_path)
+    prior = _bind_prior_campaign_window(module, args, tmp_path)
+    reconciliation_path = prior / "openrouter-account-reconciliation.json"
+    reconciliation = json.loads(reconciliation_path.read_text())
+    if binding == "lock":
+        reconciliation["lock_inode"] = args.lock_file.stat().st_ino + 1
+    else:
+        runtime_path = prior / "runtime-environment.json"
+        runtime = json.loads(runtime_path.read_text())
+        runtime["environment"]["python"]["version"] = "different"
+        runtime["environment_sha256"] = module.canonical_sha256(runtime["environment"])
+        _owner_json(runtime_path, runtime)
+        reconciliation["runtime_environment_sha256"] = runtime["environment_sha256"]
+        reconciliation["runtime_environment_file_sha256"] = module.file_sha256(runtime_path)
+    _owner_json(reconciliation_path, reconciliation)
+    try:
+        with pytest.raises(
+            module.FinalizationError,
+            match="not bound to the same runtime/lock",
+        ):
+            module.run_finalization(args)
+    finally:
+        os.close(lock_fd)
+    assert not args.output_dir.exists()
+
+
 def test_full_offline_finalization_is_atomic_and_preserves_contracts(
     module, tmp_path: Path
 ) -> None:
@@ -1637,9 +1887,7 @@ def test_prior_aborted_account_window_is_preserved_without_fake_ledger_rows(
         manifest = module.run_finalization(args)
     finally:
         os.close(lock_fd)
-    proof = json.loads(
-        (args.output_dir / "openrouter-non-byok-campaign-proof.json").read_text()
-    )
+    proof = json.loads((args.output_dir / "openrouter-non-byok-campaign-proof.json").read_text())
     scope = proof["cost_scope"]
     assert [window["kind"] for window in scope["account_windows"]] == [
         "prior_aborted",
@@ -1648,8 +1896,7 @@ def test_prior_aborted_account_window_is_preserved_without_fake_ledger_rows(
     assert scope["account_window_total_usd"] == "8.198438756"
     assert scope["unallocated_aborted_window_usd"] == "4.598438756"
     assert (
-        scope["attribution_precision"]
-        == "multi-window-counter-exact-campaign-attribution-unproven"
+        scope["attribution_precision"] == "multi-window-counter-exact-campaign-attribution-unproven"
     )
     assert scope["campaign_attributable_exact"] is False
     assert scope["campaign_attributable_cost_usd"] is None
@@ -1662,9 +1909,7 @@ def test_prior_aborted_account_window_is_preserved_without_fake_ledger_rows(
     assert manifest["cost_attribution"]["account_windows"] == scope["account_windows"]
     assert manifest["cost_attribution"]["account_window_total_usd"] == "8.198438756"
     audit = json.loads((args.output_dir / "audit.json").read_text())
-    assert audit["selected_generation_cost"]["unallocated_aborted_window_usd"] == (
-        "4.598438756"
-    )
+    assert audit["selected_generation_cost"]["unallocated_aborted_window_usd"] == ("4.598438756")
     report = (args.output_dir / "EXPERIMENT_RESULTS.md").read_text()
     assert "multi-window-counter-exact-campaign-attribution-unproven" in report
     assert "4.598438756" in report
@@ -1713,12 +1958,8 @@ def test_prior_account_window_overlap_is_rejected(
     after = json.loads((prior / "openrouter-account-after.json").read_text())
     after["captured_at"] = "1970-01-01T00:17:00+00:00"
     _owner_json(prior / "openrouter-account-after.json", after)
-    reconciliation = json.loads(
-        (prior / "openrouter-account-reconciliation.json").read_text()
-    )
-    reconciliation["stable_observations"][-1]["captured_at"] = (
-        "1970-01-01T00:17:00+00:00"
-    )
+    reconciliation = json.loads((prior / "openrouter-account-reconciliation.json").read_text())
+    reconciliation["stable_observations"][-1]["captured_at"] = "1970-01-01T00:17:00+00:00"
     reconciliation["observation_span_seconds"] = 360.0
     reconciliation["stable_tail_span_seconds"] = 360.0
     _owner_json(prior / "openrouter-account-reconciliation.json", reconciliation)
@@ -1787,9 +2028,7 @@ def test_prior_windows_require_monotonic_cumulative_byok_counter(
         before_usage="1",
         suffix="prior-earlier",
     )
-    earlier_before = json.loads(
-        (earlier / "openrouter-account-before.json").read_text()
-    )
+    earlier_before = json.loads((earlier / "openrouter-account-before.json").read_text())
     earlier_before.update(
         captured_at="1970-01-01T00:03:00+00:00",
         byok_usage="2",
@@ -1884,9 +2123,7 @@ def test_prior_account_window_delta_is_not_hard_coded(
         module.run_finalization(args)
     finally:
         os.close(lock_fd)
-    proof = json.loads(
-        (args.output_dir / "openrouter-non-byok-campaign-proof.json").read_text()
-    )
+    proof = json.loads((args.output_dir / "openrouter-non-byok-campaign-proof.json").read_text())
     assert proof["unallocated_aborted_window_usd"] == "4"
     assert proof["account_window_total_usd"] == "7.6"
     assert proof["cost_scope"]["campaign_attributable_exact"] is False
@@ -2198,6 +2435,120 @@ def test_b2_illegal_quorum_leaves_no_partial_output(module, tmp_path: Path) -> N
     finally:
         os.close(lock_fd)
     assert not args.output_dir.exists()
+
+
+def _b2_physical_call(
+    module,
+    *,
+    proven_successes: int,
+    declared_successes: int | None = None,
+) -> dict[str, object]:
+    trace = _ensemble_trace(
+        list(module.B2_PROPOSERS),
+        module.B2_AGGREGATOR,
+        final_text="bound final answer",
+        selection_mode="fixed",
+        successful=(proven_successes if declared_successes is None else declared_successes),
+    )
+    call = trace["calls"][0]
+    assert isinstance(call, dict)
+    candidates = call["candidates"]
+    assert isinstance(candidates, list)
+    for candidate in candidates[proven_successes:]:
+        assert isinstance(candidate, dict)
+        candidate.update(
+            {
+                "ok": False,
+                "error": "test proposer failure",
+                "provider": "",
+                "model": "",
+                "content": {"text": "", "chars": 0, "truncated": False},
+            }
+        )
+    return call
+
+
+def _b2_physical_call_reasons(module, call: dict[str, object]) -> list[str]:
+    return module.ensemble_physical_call_reasons(
+        call,
+        expected_proposers=module.B2_PROPOSERS,
+        expected_aggregator=module.B2_AGGREGATOR,
+        final_text="bound final answer",
+        require_output_binding=True,
+    )
+
+
+def test_b2_physical_call_accepts_failed_candidate_without_actual_route(
+    module,
+) -> None:
+    call = _b2_physical_call(module, proven_successes=3)
+
+    assert _b2_physical_call_reasons(module, call) == []
+
+
+def test_b2_physical_call_rejects_wrong_failed_candidate_requested_route(
+    module,
+) -> None:
+    call = _b2_physical_call(module, proven_successes=3)
+    candidate = call["candidates"][-1]
+    assert isinstance(candidate, dict)
+    candidate["requested_provider"] = "direct"
+    candidate["requested_model"] = "vendor/wrong-model"
+
+    reasons = _b2_physical_call_reasons(module, call)
+    assert "wrong_actual_proposer_provider" in reasons
+    assert "wrong_actual_proposer_model" in reasons
+
+
+def test_b2_physical_call_rejects_failed_candidate_conflicting_actual_route(
+    module,
+) -> None:
+    call = _b2_physical_call(module, proven_successes=3)
+    candidate = call["candidates"][-1]
+    assert isinstance(candidate, dict)
+    candidate["provider"] = "direct"
+    candidate["model"] = "vendor/wrong-model"
+
+    reasons = _b2_physical_call_reasons(module, call)
+    assert "wrong_actual_proposer_provider" in reasons
+    assert "wrong_actual_proposer_model" in reasons
+
+
+def test_b2_physical_call_rejects_successful_candidate_without_actual_route(
+    module,
+) -> None:
+    call = _b2_physical_call(module, proven_successes=3)
+    candidate = call["candidates"][0]
+    assert isinstance(candidate, dict)
+    candidate["provider"] = ""
+    candidate["model"] = ""
+
+    reasons = _b2_physical_call_reasons(module, call)
+    assert "wrong_actual_proposer_provider" in reasons
+    assert "wrong_actual_proposer_model" in reasons
+
+
+def test_b2_physical_call_rejects_declared_success_count_above_proven_count(
+    module,
+) -> None:
+    call = _b2_physical_call(
+        module,
+        proven_successes=3,
+        declared_successes=4,
+    )
+
+    assert "successful_proposer_count_mismatch" in _b2_physical_call_reasons(
+        module,
+        call,
+    )
+
+
+def test_b2_physical_call_rejects_two_of_four_below_quorum(module) -> None:
+    call = _b2_physical_call(module, proven_successes=2)
+
+    reasons = _b2_physical_call_reasons(module, call)
+    assert "proposer_quorum_not_met" in reasons
+    assert "insufficient_actual_proposer_quorum" in reasons
 
 
 def test_nonzero_decimal_byok_delta_is_fatal(module, tmp_path: Path) -> None:
@@ -3048,5 +3399,412 @@ def test_selected_generation_cost_is_reconciled_to_physical_ledger(module, tmp_p
     try:
         with pytest.raises(module.FinalizationError, match="cost conflicts with ledger"):
             module.run_finalization(args)
+    finally:
+        os.close(lock_fd)
+
+
+def _g1_retrospective_fixture(module, tmp_path: Path):
+    task = {
+        "id": "g1-retrospective-task",
+        "prompt": "research this",
+        "rubric": {
+            "id": "rubric-1",
+            "sections": [
+                {
+                    "id": "quality",
+                    "title": "Quality",
+                    "criteria": [
+                        {"id": "core", "weight": 85, "requirement": "core"},
+                        {"id": "extra", "weight": 15, "requirement": "extra"},
+                    ],
+                }
+            ],
+        },
+    }
+    module.FORMAL_G1_RANKING_CONFIG_SHA256 = module.canonical_sha256(_test_ranking_config(module))
+    contract = _contract(module, "G1", "a" * 64)
+    fingerprint = module.canonical_sha256(contract, prefix=True)
+    pre = deepcopy(
+        _row(
+            module,
+            group="G1",
+            task=task,
+            fingerprint=fingerprint,
+            response_prefix="g1-retrospective",
+        )
+    )
+    restored_routing = deepcopy(pre["routing_trace"])
+    original_attempt = pre["execution"]["generation_attempts"][0]
+    analyzer = deepcopy(pre["usage"]["model_usage_breakdown"][0])
+    selected_unit = deepcopy(pre["usage"]["model_usage_breakdown"][1])
+    selected_attempt_id = "2" * 32
+    post_attempt_id = "3" * 32
+    attempt_1 = {
+        **deepcopy(original_attempt),
+        "attempt_id": "1" * 32,
+        "attempt": 1,
+        "retry_reason": "provider_lifecycle_setup_retry",
+        "will_retry": True,
+        "run": {
+            "error": "provider_lifecycle_setup_retry",
+            "final_text_sha256": module.text_sha256("discarded setup answer"),
+            "llm_request_count": 1,
+            "routing_trace": deepcopy(restored_routing),
+            "usage": {"model_usage_breakdown": [analyzer]},
+        },
+    }
+    attempt_2 = {
+        **deepcopy(original_attempt),
+        "attempt_id": selected_attempt_id,
+        "attempt": 2,
+        "started_at": 1_006.0,
+        "completed_at": 1_007.0,
+        "retry_reason": "",
+        "will_retry": False,
+        "run": {
+            "error": "",
+            "final_text_sha256": pre["final_text_sha256"],
+            "llm_request_count": 1,
+            "routing_trace": {},
+            "usage": {"model_usage_breakdown": [selected_unit]},
+        },
+    }
+    pre.update(
+        {
+            "routing_trace": {},
+            "llm_request_count": 1,
+            "usage": {
+                "model_usage_breakdown": [selected_unit],
+                "billed_cost": 0.1,
+            },
+            "generation_attempt_count": 2,
+            "generation_attempt_budget_used": 2,
+            "generation_attempt_total_billed_cost": 0.2,
+            "generation_max_attempts": 3,
+        }
+    )
+    pre["actual_spend_metrics"]["generation_attempt_count"] = 2
+    pre["cost_accounting"]["selected_generation_attempt"].update(
+        {
+            "recorded_cost_usd": 0.1,
+            "request_count": 1,
+        }
+    )
+    pre["execution"].update(
+        {
+            "prior_generation_attempts_used": 0,
+            "selected_generation_attempt": 2,
+            "generation_max_attempts": 3,
+            "generation_attempts": [attempt_1, attempt_2],
+        }
+    )
+    recovered_routing, recovery_evidence, recovery_reasons = module.effective_g1_lifecycle_routing(
+        pre, contract=contract
+    )
+    assert recovery_reasons == []
+    assert recovered_routing == restored_routing
+    assert (
+        module.generation_reasons(
+            module.SourceRecord(tmp_path / "pre.jsonl", 0, 1, pre),
+            task=task,
+            expected_fingerprint=fingerprint,
+            contract=contract,
+        )
+        == []
+    )
+
+    post = deepcopy(pre)
+    post_attempt = {
+        "attempt_id": post_attempt_id,
+        "attempt_kind": "generation",
+        "attempt": 3,
+        "started_at": 1_020.0,
+        "completed_at": 1_021.0,
+        "retry_reason": module.LEGACY_TERMINAL_POLICY_ERROR,
+        "will_retry": False,
+        "run": {
+            "error": module.LEGACY_TERMINAL_POLICY_ERROR,
+            "final_text_sha256": module.text_sha256("failed attempt three"),
+            "llm_request_count": 1,
+            "routing_trace": {},
+            "usage": {
+                "model_usage_breakdown": [
+                    _receipt(
+                        "g1-retrospective-attempt-3",
+                        "z-ai/glm-5.2",
+                        cost=0.3,
+                    )
+                ]
+            },
+        },
+    }
+    post.update(
+        {
+            "selected_generation_succeeded": False,
+            "error": module.LEGACY_TERMINAL_POLICY_ERROR,
+            "generation_attempt_count": 1,
+            "generation_attempt_budget_used": 3,
+            "generation_attempt_total_billed_cost": 0.3,
+            "completed_at": 1_022.0,
+        }
+    )
+    post["completion_status"]["generation_accepted"] = False
+    post["actual_spend_metrics"]["generation_attempt_count"] = 1
+    post["execution"].update(
+        {
+            "run_error": module.LEGACY_TERMINAL_POLICY_ERROR,
+            "prior_generation_attempts_used": 2,
+            "selected_generation_attempt": 3,
+            "generation_attempts": [post_attempt],
+        }
+    )
+
+    repair = deepcopy(pre)
+    repair["routing_trace"] = recovered_routing
+    repair["completed_at"] = 1_030.0
+    repair["generation_attempt_budget_used"] = 3
+    repair["execution"].update(
+        {
+            "prior_generation_attempts_used": 3,
+            "resume_action": "metadata_only",
+            "generation_reused": True,
+            "metadata_repair_attempted": True,
+            "metadata_repaired": True,
+            "judge_reran": False,
+            "g1_provider_lifecycle_routing_recovery": recovery_evidence,
+        }
+    )
+    repair["resume_completion"] = {
+        "action": "metadata_only",
+        "generation_reused": True,
+        "metadata_repaired": True,
+        "judge_reran": False,
+        "post_repair_action": "complete",
+        "status": "complete",
+        "incomplete_reasons": [],
+    }
+    records = [
+        module.SourceRecord(tmp_path / "pre.jsonl", 0, 1, module.seal_result_row(pre)),
+        module.SourceRecord(tmp_path / "post.jsonl", 1, 1, module.seal_result_row(post)),
+        module.SourceRecord(tmp_path / "repair.jsonl", 2, 1, module.seal_result_row(repair)),
+    ]
+    manifest_sources = [
+        {
+            "resume_schedule_contract_verified": False,
+            "resume_scheduled_pairs": [],
+        },
+        {
+            "resume_schedule_contract_verified": True,
+            "resume_scheduled_pairs": [
+                {
+                    "group": "G1",
+                    "task_id": task["id"],
+                    "action": "regenerate",
+                }
+            ],
+        },
+        {
+            "resume_schedule_contract_verified": True,
+            "resume_scheduled_pairs": [
+                {
+                    "group": "G1",
+                    "task_id": task["id"],
+                    "action": "metadata_only",
+                }
+            ],
+        },
+    ]
+    return (
+        task,
+        contract,
+        fingerprint,
+        records,
+        manifest_sources,
+        selected_attempt_id,
+        post_attempt_id,
+        restored_routing,
+    )
+
+
+def _select_g1_retrospective(
+    module,
+    task,
+    contract,
+    fingerprint,
+    records,
+    manifest_sources,
+):
+    return module.select_results(
+        records,
+        tasks=[task],
+        groups=["G1"],
+        fingerprints={"G1": fingerprint},
+        contracts={"G1": contract},
+        max_attempts=3,
+        manifest_sources=manifest_sources,
+    )
+
+
+def test_g1_retrospective_selects_attempt_two_and_keeps_attempt_three_spend(
+    module,
+    tmp_path: Path,
+) -> None:
+    (
+        task,
+        contract,
+        fingerprint,
+        records,
+        manifest_sources,
+        selected_attempt_id,
+        post_attempt_id,
+        _,
+    ) = _g1_retrospective_fixture(module, tmp_path)
+
+    selected, pair_audit = _select_g1_retrospective(
+        module,
+        task,
+        contract,
+        fingerprint,
+        records,
+        manifest_sources,
+    )
+    assert selected == [records[2]]
+    recovery = pair_audit[f"G1/{task['id']}"]["retrospective_reclassification_recovery"]
+    assert recovery["selected_attempt"] == 2
+    assert recovery["selected_attempt_id"] == selected_attempt_id
+    assert recovery["invalid_post_accept_attempt_ids"] == [post_attempt_id]
+
+    bindings = module.bind_selected_generation_attempts(records, selected)
+    assert bindings == {f"G1/{task['id']}": selected_attempt_id}
+    ledger, _ = module.build_actual_spend_ledger(
+        records,
+        selected=selected,
+        selected_attempt_bindings=bindings,
+    )
+    by_attempt = {
+        str(reference["attempt_id"]): row
+        for row in ledger
+        for reference in row["source_references"]
+        if reference.get("phase") == "generation"
+    }
+    assert by_attempt[selected_attempt_id]["generation_disposition"] == "selected"
+    assert by_attempt[selected_attempt_id]["physical_source"]["source_index"] == 0
+    assert by_attempt[selected_attempt_id]["receipt_source_indexes"] == [2]
+    assert by_attempt[post_attempt_id]["generation_disposition"] == "failed"
+    assert by_attempt[post_attempt_id]["physical_source"]["source_index"] == 1
+    assert by_attempt[post_attempt_id]["receipt_source_indexes"] == [1]
+    assert by_attempt[post_attempt_id]["recorded_cost_usd"] == "0.300000000"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "wrong_manifest_action",
+        "wrong_post_error",
+        "post_will_retry",
+        "extra_post_attempt",
+        "pre_top_routing_present",
+    ],
+)
+def test_g1_retrospective_exception_fails_closed(
+    module,
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    (
+        task,
+        contract,
+        fingerprint,
+        records,
+        manifest_sources,
+        _,
+        _,
+        restored_routing,
+    ) = _g1_retrospective_fixture(module, tmp_path)
+    if mutation == "wrong_manifest_action":
+        manifest_sources[1]["resume_scheduled_pairs"][0]["action"] = "metadata_only"
+    elif mutation == "wrong_post_error":
+        records[1].row["error"] = "different_error"
+    elif mutation == "post_will_retry":
+        records[1].row["execution"]["generation_attempts"][0]["will_retry"] = True
+    elif mutation == "extra_post_attempt":
+        extra = deepcopy(records[1].row["execution"]["generation_attempts"][0])
+        extra["attempt_id"] = "4" * 32
+        records[1].row["execution"]["generation_attempts"].append(extra)
+    else:
+        records[0].row["routing_trace"] = deepcopy(restored_routing)
+
+    with pytest.raises(module.FinalizationError):
+        _select_g1_retrospective(
+            module,
+            task,
+            contract,
+            fingerprint,
+            records,
+            manifest_sources,
+        )
+
+
+def _install_complete_metadata_schedule(module, args: argparse.Namespace) -> dict:
+    manifest = json.loads(args.manifest[1].read_text())
+    rows = [json.loads(line) for line in args.result[1].read_text().splitlines()]
+    scheduled_pairs = [
+        {
+            "group": str(row["group"]),
+            "task_id": str(row["task_id"]),
+            "action": "metadata_only",
+        }
+        for row in rows
+    ]
+    pair_count = len(scheduled_pairs)
+    manifest["resume_selection"] = {
+        "selected_pair_count": pair_count,
+        "scheduled_pair_count": pair_count,
+        "regenerate_pair_count": 0,
+        "model_regenerate_pair_count": 0,
+        "judge_only_pair_count": 0,
+        "metadata_only_pair_count": pair_count,
+        "policy_violation_pair_count": 0,
+        "scheduled_pairs": scheduled_pairs,
+        "resume_action_counts": {
+            "policy_violation": 0,
+            "regenerate": 0,
+            "judge_only": 0,
+            "metadata_only": pair_count,
+        },
+    }
+    _owner_json(args.manifest[1], manifest)
+    return manifest
+
+
+@pytest.mark.parametrize("tamper", ["counter", "result_pair_set"])
+def test_manifest_resume_schedule_contract_rejects_counter_or_set_tamper(
+    module,
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    args, _, lock_fd = _campaign(module, tmp_path)
+    try:
+        manifest = _install_complete_metadata_schedule(module, args)
+        resume = manifest["resume_selection"]
+        if tamper == "counter":
+            resume["scheduled_pair_count"] -= 1
+        else:
+            resume["scheduled_pairs"].pop()
+            resume["selected_pair_count"] -= 1
+            resume["scheduled_pair_count"] -= 1
+            resume["metadata_only_pair_count"] -= 1
+            resume["resume_action_counts"]["metadata_only"] -= 1
+        _owner_json(args.manifest[1], manifest)
+
+        with pytest.raises(
+            module.FinalizationError,
+            match="resume schedule counters differ from its result shard",
+        ):
+            module.load_manifest_contracts(
+                args.manifest,
+                result_paths=args.result,
+                groups=module.GROUPS,
+            )
     finally:
         os.close(lock_fd)
