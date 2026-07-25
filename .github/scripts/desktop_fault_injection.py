@@ -628,10 +628,11 @@ SCENARIOS: dict[str, dict[str, Any]] = {
     },
     "readonly-recovery-source": {
         "build": _readonly_recovery_source,
-        "expect": "any",
+        "expect": "entered",
         "why": (
-            "An unreadable legacy source should not cost the user their healthy primary. "
-            "Recorded rather than asserted until per-source fault isolation lands."
+            "An unreadable legacy source must not cost the user their healthy primary: "
+            "the fan-in fails, startup continues silently against the primary, and a "
+            "later launch retries."
         ),
     },
 }
