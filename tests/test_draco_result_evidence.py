@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from opensquilla.eval.draco_artifact_integrity import (
     RESULT_EVIDENCE_SCHEMA,
     compact_tool_result_diagnostic,
@@ -7,6 +9,7 @@ from opensquilla.eval.draco_artifact_integrity import (
     trace_row_from_result,
     verify_result_row_evidence,
 )
+from opensquilla.provider.types import ProviderBillingReceipt
 
 
 def test_result_evidence_commits_to_every_nested_field() -> None:
@@ -25,6 +28,42 @@ def test_result_evidence_commits_to_every_nested_field() -> None:
 
     sealed["execution"]["generation_attempts"][0]["attempt"] = 2
     assert verify_result_row_evidence(sealed) is False
+
+
+def test_seal_result_row_normalizes_nested_billing_receipt_for_json() -> None:
+    receipt = ProviderBillingReceipt(
+        currency="USD",
+        status="confirmed",
+        amount_nanos=12_000_000,
+        usd_equivalent_nanos=12_000_000,
+        fx_native_per_usd_nanos=1_000_000_000,
+    )
+    row = {
+        "group": "B2",
+        "task_id": "task-1",
+        "generation_usage": {
+            "model_usage_breakdown": [
+                {"provider": "openrouter", "billing_receipt": receipt}
+            ]
+        },
+    }
+
+    sealed = seal_result_row(row)
+
+    assert sealed["generation_usage"]["model_usage_breakdown"][0]["billing_receipt"] == {
+        "currency": "USD",
+        "status": "confirmed",
+        "amount_nanos": 12_000_000,
+        "usd_equivalent_nanos": 12_000_000,
+        "fx_native_per_usd_nanos": 1_000_000_000,
+        "schema_version": 1,
+    }
+    assert row["generation_usage"]["model_usage_breakdown"][0]["billing_receipt"] is receipt
+    round_tripped = json.loads(
+        json.dumps(sealed, ensure_ascii=False, allow_nan=False)
+    )
+    assert verify_result_row_evidence(sealed) is True
+    assert verify_result_row_evidence(round_tripped) is True
 
 
 def test_trace_is_an_exact_projection_bound_to_the_sealed_result() -> None:

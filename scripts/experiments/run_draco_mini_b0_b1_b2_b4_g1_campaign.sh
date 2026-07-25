@@ -21,6 +21,7 @@ Usage:
   run_draco_mini_b0_b1_b2_b4_g1_campaign.sh
     [--snapshot-repo CLEAN_GIT_SNAPSHOT]
     [--output-name NEW_DIRECTORY_NAME]
+    [--prior-account-window-dir ABORTED_CAMPAIGN_ACCOUNT_DIR]
 
 The output is always a new direct child of:
   /home/codex/code/opensquilla-agentic-routing/reports/draco
@@ -30,6 +31,10 @@ EOF
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SNAPSHOT_REPO="${DRACO_CAMPAIGN_SNAPSHOT_REPO:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 OUTPUT_NAME="${DRACO_CAMPAIGN_OUTPUT_NAME:-draco-mini-b0-b1-b2-b4-g1-c5-j6-a3-$(date +%Y%m%d-%H%M%S)}"
+PRIOR_ACCOUNT_WINDOW_SOURCES=()
+if [[ -n "${DRACO_CAMPAIGN_PRIOR_ACCOUNT_WINDOW_DIR:-}" ]]; then
+  PRIOR_ACCOUNT_WINDOW_SOURCES+=("$DRACO_CAMPAIGN_PRIOR_ACCOUNT_WINDOW_DIR")
+fi
 
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
@@ -41,6 +46,11 @@ while [[ "$#" -gt 0 ]]; do
     --output-name)
       [[ "$#" -ge 2 ]] || { usage; exit 2; }
       OUTPUT_NAME="$2"
+      shift 2
+      ;;
+    --prior-account-window-dir)
+      [[ "$#" -ge 2 ]] || { usage; exit 2; }
+      PRIOR_ACCOUNT_WINDOW_SOURCES+=("$2")
       shift 2
       ;;
     -h|--help)
@@ -174,7 +184,52 @@ ACCOUNT_BEFORE="$ARCHIVE_DIR/account/openrouter-account-before.json"
 ACCOUNT_AFTER="$ARCHIVE_DIR/account/openrouter-account-after.json"
 ACCOUNT_RECON="$ARCHIVE_DIR/account/openrouter-account-reconciliation.json"
 ACCOUNT_POLL_DIR="$ARCHIVE_DIR/account/stable-polls"
+PRIOR_ACCOUNT_WINDOW_DIRS=()
 mkdir "$ACCOUNT_POLL_DIR"
+
+archive_prior_account_window() {
+  local index=0
+  local requested_source
+  for requested_source in "${PRIOR_ACCOUNT_WINDOW_SOURCES[@]}"; do
+    index=$((index + 1))
+    local source_dir
+    local raw_source_runtime
+    local source_runtime
+    local destination
+    source_dir="$(realpath "$requested_source")"
+    raw_source_runtime="$source_dir/../runtime-environment.json"
+    if [[ -L "$raw_source_runtime" || ! -f "$raw_source_runtime" ]]; then
+      echo "Prior aborted account window runtime source is missing or unsafe" >&2
+      exit 2
+    fi
+    source_runtime="$(realpath "$raw_source_runtime")"
+    destination="$(printf '%s/account/prior-aborted-window-%03d' "$ARCHIVE_DIR" "$index")"
+    if [[
+      -L "$requested_source"
+      || ! -d "$source_dir"
+      || ! -f "$source_runtime"
+    ]]; then
+      echo "Prior aborted account window source is missing or unsafe" >&2
+      exit 2
+    fi
+    mkdir "$destination"
+    local name
+    for name in \
+      openrouter-account-before.json \
+      openrouter-account-after.json \
+      openrouter-account-reconciliation.json; do
+      if [[ ! -f "$source_dir/$name" || -L "$source_dir/$name" ]]; then
+        echo "Prior aborted account window lacks safe $name" >&2
+        exit 2
+      fi
+      install -m 600 "$source_dir/$name" "$destination/$name"
+    done
+    install -m 600 "$source_runtime" "$destination/runtime-environment.json"
+    PRIOR_ACCOUNT_WINDOW_DIRS+=("$destination")
+  done
+}
+
+archive_prior_account_window
 
 COMMON_ARGS=(
   --input "$INPUT"
@@ -509,6 +564,7 @@ import json
 import os
 import stat
 import sys
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -664,6 +720,47 @@ for index, source in enumerate(source_manifests):
         source.get("result_sha256"),
         label=f"source manifest result {index}",
     )
+
+cost_attribution = manifest.get("cost_attribution")
+if not isinstance(cost_attribution, Mapping):
+    raise SystemExit("formal manifest lacks cost attribution")
+account_windows = cost_attribution.get("account_windows")
+if not isinstance(account_windows, list) or not account_windows:
+    raise SystemExit("formal manifest lacks account windows")
+window_kinds = [window.get("kind") for window in account_windows if isinstance(window, Mapping)]
+if window_kinds.count("current") != 1 or any(
+    kind not in {"current", "prior_aborted"} for kind in window_kinds
+):
+    raise SystemExit("formal account window kinds differ")
+try:
+    has_positive_prior = any(
+        window.get("kind") == "prior_aborted"
+        and Decimal(str(window.get("usage_delta_usd"))) > 0
+        for window in account_windows
+        if isinstance(window, Mapping)
+    )
+except (InvalidOperation, TypeError, ValueError) as exc:
+    raise SystemExit("formal account window delta is invalid") from exc
+if has_positive_prior and (
+    cost_attribution.get("attribution_precision")
+    != "multi-window-counter-exact-campaign-attribution-unproven"
+    or cost_attribution.get("campaign_attributable_exact") is not False
+):
+    raise SystemExit("formal positive-prior attribution semantics differ")
+for window_index, window in enumerate(account_windows):
+    if not isinstance(window, Mapping):
+        raise SystemExit("formal account window is not an object")
+    sources = window.get("sources")
+    if not isinstance(sources, list) or len(sources) != 4:
+        raise SystemExit("formal account window source inventory differs")
+    for source_index, source in enumerate(sources):
+        if not isinstance(source, Mapping):
+            raise SystemExit("formal account window source is not an object")
+        require_archived_source(
+            source.get("path"),
+            source.get("sha256"),
+            label=f"account window {window_index} source {source_index}",
+        )
 
 pending_manifest = output_dir / f".manifest.pending-{os.getpid()}"
 if pending_manifest.exists() or pending_manifest.is_symlink():
@@ -1041,6 +1138,9 @@ FINALIZER_ARGS=(
   --groups "$DRACO_GROUPS"
   --max-generation-attempts 3
 )
+for prior_account_window_dir in "${PRIOR_ACCOUNT_WINDOW_DIRS[@]}"; do
+  FINALIZER_ARGS+=(--prior-account-window-dir "$prior_account_window_dir")
+done
 for result_jsonl in "${RESULT_JSONLS[@]}"; do
   FINALIZER_ARGS+=(--result "$result_jsonl")
 done

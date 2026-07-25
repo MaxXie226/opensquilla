@@ -47,7 +47,7 @@ JUDGE_ATTEMPT_EVIDENCE_SCHEMA = "opensquilla.draco-judge-attempt/v1"
 JUDGE_ATTEMPT_BUDGET_SCOPE = "criterion_repeat_campaign"
 JUDGE_ATTEMPT_BUDGET_LIMIT = 3
 JUDGE_ATTEMPT_BUDGET_EXHAUSTED_ERROR = "judge_attempt_budget_exhausted"
-FINALIZER_VERSION = 1
+FINALIZER_VERSION = 2
 FROZEN_DRACO_MINI_TASK_COUNT = 10
 FROZEN_DRACO_MINI_SHA256 = "1eb4e618c8df8e7f68bded3d2b6f77a541744aa1072eb338835b776183188a8d"
 FORMAL_REQUIRED_STABLE_POLL_COUNT = 6
@@ -3968,6 +3968,149 @@ def selected_time_window(
     return min(starts), max(completions)
 
 
+def validate_prior_account_window(
+    *,
+    window_dir: Path,
+    expected_key_fingerprint: str,
+    current_before_time: datetime,
+    current_before_usage: Decimal,
+    current_before_byok: Decimal,
+) -> dict[str, Any]:
+    raw_window_dir = Path(window_dir)
+    if raw_window_dir.is_symlink() or not raw_window_dir.is_dir():
+        raise FinalizationError("prior account window must be a non-symlink directory")
+    if raw_window_dir.stat().st_uid != os.getuid():
+        raise FinalizationError("prior account window must be campaign-owned")
+    window_dir = raw_window_dir.resolve(strict=True)
+    before_path = window_dir / "openrouter-account-before.json"
+    after_path = window_dir / "openrouter-account-after.json"
+    reconciliation_path = window_dir / "openrouter-account-reconciliation.json"
+    runtime_path = window_dir / "runtime-environment.json"
+    before_path = require_regular_file(before_path, owner_only=True)
+    after_path = require_regular_file(after_path, owner_only=True)
+    reconciliation_path = require_regular_file(reconciliation_path, owner_only=True)
+    runtime_path = require_regular_file(runtime_path, owner_only=True)
+    before = load_json(before_path)
+    after = load_json(after_path)
+    reconciliation = load_json(reconciliation_path)
+    _, runtime_fingerprint = validate_runtime_environment(runtime_path)
+    if reconciliation.get("schema") != RECONCILIATION_SCHEMA:
+        raise FinalizationError("prior account reconciliation schema differs")
+    if reconciliation.get("settlement_status") != "stable":
+        raise FinalizationError("prior account reconciliation is not stable")
+    fingerprints = {
+        normalize_key_fingerprint(before.get("api_key_sha256"), label="prior before key"),
+        normalize_key_fingerprint(after.get("api_key_sha256"), label="prior after key"),
+        normalize_key_fingerprint(
+            reconciliation.get("api_key_sha256"),
+            label="prior reconciliation key",
+        ),
+        expected_key_fingerprint,
+    }
+    if len(fingerprints) != 1:
+        raise FinalizationError("prior and current account windows use different API keys")
+    if (
+        before.get("benchmark_environment_key_verified") is not True
+        or after.get("benchmark_environment_key_verified") is not True
+        or before.get("is_free_tier") is not False
+        or after.get("is_free_tier") is not False
+        or reconciliation.get("is_free_tier") is not False
+    ):
+        raise FinalizationError("prior account window is not bound to the verified paid key")
+
+    before_usage = required_decimal(before.get("usage"), label="prior before usage")
+    after_usage = required_decimal(after.get("usage"), label="prior after usage")
+    before_byok = required_decimal(before.get("byok_usage"), label="prior before byok")
+    after_byok = required_decimal(after.get("byok_usage"), label="prior after byok")
+    if after_usage < before_usage or after_byok < before_byok:
+        raise FinalizationError("prior account counters decreased")
+    if after_usage > current_before_usage or after_byok > current_before_byok:
+        raise FinalizationError("account counters decreased between prior and current windows")
+    usage_delta = after_usage - before_usage
+    byok_delta = after_byok - before_byok
+    expected_values = {
+        "usage_before_usd": before_usage,
+        "usage_after_usd": after_usage,
+        "usage_delta_usd": usage_delta,
+        "byok_usage_before_usd": before_byok,
+        "byok_usage_after_usd": after_byok,
+        "byok_usage_delta_usd": byok_delta,
+    }
+    for field_name, expected in expected_values.items():
+        actual = required_decimal(
+            reconciliation.get(field_name),
+            label=f"prior reconciliation {field_name}",
+        )
+        if actual != expected:
+            raise FinalizationError(
+                f"prior reconciliation {field_name} differs from account snapshots"
+            )
+    if byok_delta != Decimal(0):
+        raise FinalizationError("prior account window BYOK delta is not exactly zero")
+    if reconciliation.get("runtime_environment_sha256") != runtime_fingerprint:
+        raise FinalizationError("prior reconciliation runtime fingerprint differs")
+    if reconciliation.get("runtime_environment_file_sha256") != file_sha256(runtime_path):
+        raise FinalizationError("prior reconciliation runtime file hash differs")
+    stability = validate_stable_observations(
+        reconciliation,
+        before_usage=before_usage,
+        before_byok=before_byok,
+        after_usage=after_usage,
+        after_byok=after_byok,
+    )
+    before_time = parse_iso(before.get("captured_at"), label="prior account before captured_at")
+    after_time = parse_iso(after.get("captured_at"), label="prior account after captured_at")
+    last_stable = parse_iso(
+        stability["last_stable_observation_at"],
+        label="prior last stable observation",
+    )
+    first_observation = parse_iso(
+        stability["first_observation_at"],
+        label="prior first stable observation",
+    )
+    if before_time > first_observation:
+        raise FinalizationError(
+            "prior account before snapshot does not precede settlement observations"
+        )
+    if after_time != last_stable:
+        raise FinalizationError("prior account after differs from its stable reconciliation")
+    if before_time >= after_time:
+        raise FinalizationError("prior account window has a non-positive time span")
+    if after_time > current_before_time:
+        raise FinalizationError("prior and current account windows overlap")
+    source_sha256 = {
+        "account_before": file_sha256(before_path),
+        "account_after": file_sha256(after_path),
+        "account_reconciliation": file_sha256(reconciliation_path),
+        "runtime_environment": file_sha256(runtime_path),
+    }
+    return {
+        "kind": "prior_aborted",
+        "admission_basis": "operator_supplied_unallocated_window",
+        "path": str(window_dir),
+        "usage_before_usd": str(before_usage),
+        "usage_after_usd": str(after_usage),
+        "usage_delta_usd": str(usage_delta),
+        "byok_usage_before_usd": str(before_byok),
+        "byok_usage_after_usd": str(after_byok),
+        "byok_usage_delta_usd": str(byok_delta),
+        "account_before_at": before_time.isoformat(),
+        "account_after_at": after_time.isoformat(),
+        "runtime_environment_sha256": runtime_fingerprint,
+        "source_sha256": source_sha256,
+        "sources": [
+            {"path": str(before_path), "sha256": source_sha256["account_before"]},
+            {"path": str(after_path), "sha256": source_sha256["account_after"]},
+            {
+                "path": str(reconciliation_path),
+                "sha256": source_sha256["account_reconciliation"],
+            },
+            {"path": str(runtime_path), "sha256": source_sha256["runtime_environment"]},
+        ],
+        **stability,
+    }
+
+
 def validate_account_proof(
     *,
     before_path: Path,
@@ -3980,6 +4123,7 @@ def validate_account_proof(
     source_records: Sequence[SourceRecord],
     ledger_rows: Sequence[Mapping[str, Any]],
     ledger_summary: Mapping[str, Any],
+    prior_account_window_dirs: Sequence[Path] = (),
 ) -> dict[str, Any]:
     before_path = require_regular_file(before_path, owner_only=True)
     after_path = require_regular_file(after_path, owner_only=True)
@@ -4044,6 +4188,10 @@ def validate_account_proof(
     reconciliation_runtime = str(reconciliation.get("runtime_environment_sha256") or "")
     if reconciliation_runtime != runtime_fingerprint:
         raise FinalizationError("reconciliation runtime fingerprint differs")
+    if reconciliation.get("runtime_environment_file_sha256") != file_sha256(
+        require_regular_file(runtime_environment_path, owner_only=True)
+    ):
+        raise FinalizationError("reconciliation runtime file hash differs")
     lock = validate_lock(
         lock_file=lock_file,
         lock_fd=lock_fd,
@@ -4126,6 +4274,89 @@ def validate_account_proof(
         if campaign_attributable_exact
         else "account_window_only_external-use-not-provable"
     )
+    prior_windows = [
+        validate_prior_account_window(
+            window_dir=Path(window_dir),
+            expected_key_fingerprint=next(iter(fingerprints)),
+            current_before_time=before_time,
+            current_before_usage=before_usage,
+            current_before_byok=before_byok,
+        )
+        for window_dir in prior_account_window_dirs
+    ]
+    ordered_windows = sorted(
+        prior_windows,
+        key=lambda window: parse_iso(
+            window["account_before_at"],
+            label="prior account window account_before_at",
+        ),
+    )
+    for earlier, later in zip(ordered_windows, ordered_windows[1:], strict=False):
+        earlier_after = parse_iso(
+            earlier["account_after_at"], label="prior account window account_after_at"
+        )
+        later_before = parse_iso(
+            later["account_before_at"], label="prior account window account_before_at"
+        )
+        if earlier_after > later_before:
+            raise FinalizationError("prior account windows overlap")
+        if required_decimal(
+            earlier["usage_after_usd"], label="prior account usage after"
+        ) > required_decimal(later["usage_before_usd"], label="prior account usage before"):
+            raise FinalizationError("account usage decreased between prior windows")
+        if required_decimal(
+            earlier["byok_usage_after_usd"], label="prior account BYOK usage after"
+        ) > required_decimal(
+            later["byok_usage_before_usd"], label="prior account BYOK usage before"
+        ):
+            raise FinalizationError("account BYOK usage decreased between prior windows")
+    current_window = {
+        "kind": "current",
+        "path": str(before_path.parent.resolve()),
+        "usage_before_usd": str(before_usage),
+        "usage_after_usd": str(after_usage),
+        "usage_delta_usd": str(usage_delta),
+        "byok_usage_before_usd": str(before_byok),
+        "byok_usage_after_usd": str(after_byok),
+        "byok_usage_delta_usd": str(byok_delta),
+        "account_before_at": before_time.isoformat(),
+        "account_after_at": after_time.isoformat(),
+        "runtime_environment_sha256": runtime_fingerprint,
+        "source_sha256": {
+            "account_before": file_sha256(before_path),
+            "account_after": file_sha256(after_path),
+            "account_reconciliation": file_sha256(reconciliation_path),
+            "runtime_environment": file_sha256(
+                require_regular_file(runtime_environment_path, owner_only=True)
+            ),
+        },
+        **stability,
+    }
+    current_window["sources"] = [
+        {"path": str(before_path), "sha256": current_window["source_sha256"]["account_before"]},
+        {"path": str(after_path), "sha256": current_window["source_sha256"]["account_after"]},
+        {
+            "path": str(reconciliation_path),
+            "sha256": current_window["source_sha256"]["account_reconciliation"],
+        },
+        {
+            "path": str(Path(runtime_environment_path).resolve()),
+            "sha256": current_window["source_sha256"]["runtime_environment"],
+        },
+    ]
+    account_windows = [*ordered_windows, current_window]
+    aborted_total = sum(
+        (
+            required_decimal(window["usage_delta_usd"], label="prior account usage delta")
+            for window in ordered_windows
+        ),
+        Decimal(0),
+    )
+    account_window_total = aborted_total + usage_delta
+    current_window_campaign_attributable_exact = campaign_attributable_exact
+    if aborted_total > 0:
+        campaign_attributable_exact = False
+        attribution_precision = "multi-window-counter-exact-campaign-attribution-unproven"
     source_hashes = {
         "account_before": file_sha256(before_path),
         "account_after": file_sha256(after_path),
@@ -4146,6 +4377,10 @@ def validate_account_proof(
         ),
         "api_key_sha256": next(iter(fingerprints)),
         "runtime_environment_sha256": runtime_fingerprint,
+        "account_windows": account_windows,
+        "account_window_total_usd": str(account_window_total),
+        "unallocated_aborted_window_usd": str(aborted_total),
+        "result_row_account_window_scope": "current_window_only",
         "account": {
             "usage_before_usd": str(before_usage),
             "usage_after_usd": str(after_usage),
@@ -4177,6 +4412,9 @@ def validate_account_proof(
             "ledger_exact_cost_usd": ledger_summary.get("exact_cost_usd"),
             "account_usage_delta_usd": str(usage_delta),
             "account_window_delta_usd": str(usage_delta),
+            "account_windows": account_windows,
+            "account_window_total_usd": str(account_window_total),
+            "unallocated_aborted_window_usd": str(aborted_total),
             "reconciliation_gap_usd": str(gap),
             "reconciliation_tolerance_usd": str(tolerance),
             "reconciliation_status": cost_reconciliation_status,
@@ -4184,13 +4422,20 @@ def validate_account_proof(
             "non_exact_cost_request_count": non_exact_cost_count,
             "attribution_precision": attribution_precision,
             "campaign_attributable_exact": campaign_attributable_exact,
+            "current_window_campaign_attributable_exact": (
+                current_window_campaign_attributable_exact
+            ),
             "campaign_attributable_cost_usd": (
                 str(usage_delta) if campaign_attributable_exact else None
             ),
             "account_total_precision": (
-                "campaign-attributable-exact"
-                if campaign_attributable_exact
-                else "window-counter-exact-campaign-attribution-unproven"
+                attribution_precision
+                if aborted_total > 0
+                else (
+                    "campaign-attributable-exact"
+                    if campaign_attributable_exact
+                    else "window-counter-exact-campaign-attribution-unproven"
+                )
             ),
             "per_request_precision": (
                 "exact" if cost_reconciliation_status == "exact" else "mixed_or_incomplete"
@@ -5146,13 +5391,25 @@ def experiment_results_markdown(
             f"- OpenRouter account window delta："
             f"${cost_scope['account_window_delta_usd']}；"
             f"归因精度：`{cost_scope['attribution_precision']}`。",
+            f"- 纳入审计的账户窗口：{len(cost_scope['account_windows'])}；"
+            f"各窗口 counter 精确增量合计：${cost_scope['account_window_total_usd']}；"
+            f"其中中止窗口未分配成本：${cost_scope['unallocated_aborted_window_usd']}。",
+            "- `results.jsonl` 的任务行只绑定当前正式窗口；中止窗口成本仅在 "
+            "campaign 级 proof/audit/manifest/report 中归档，窗口间 gap 不计费。",
             (
                 "- 每个物理请求均有 exact receipt 且账本与账户窗口增量一致，"
                 "因此该窗口增量可作为 campaign attributable exact cost。"
                 if cost_scope["campaign_attributable_exact"]
-                else "- 存在 non-exact/unknown 物理请求；该数值仅是共享 key 的"
-                "账户窗口增量，跨主机外部使用无法证明不存在，不能称为 campaign "
-                "total，也不会分摊到任务或实验组。"
+                else (
+                    "- 当前正式窗口的物理回执与账户 counter 已精确对账；但 prior "
+                    "aborted window 成本未分配到请求或任务，因此多窗口合计不能称为 "
+                    "campaign attributable exact cost。"
+                    if cost_scope["current_window_campaign_attributable_exact"]
+                    and Decimal(cost_scope["unallocated_aborted_window_usd"]) > 0
+                    else "- 当前正式窗口存在 non-exact/unknown 物理请求；该数值仅是"
+                    "共享 key 的账户窗口增量，跨主机外部使用无法证明不存在，不能称为 "
+                    "campaign total，也不会分摊到任务或实验组。"
+                )
             ),
             "",
             "## Non-BYOK 与 Web 成本说明",
@@ -5348,6 +5605,9 @@ def final_audit(
         "selected_generation_attempt_bindings": dict(sorted(selected_attempt_bindings.items())),
         "selected_generation_cost_reconciliation": dict(selected_cost_reconciliation),
         "openrouter_non_byok_campaign_proof_sha256": proof.get("proof_sha256"),
+        "account_windows": proof.get("account_windows"),
+        "account_window_total_usd": proof.get("account_window_total_usd"),
+        "unallocated_aborted_window_usd": proof.get("unallocated_aborted_window_usd"),
         "physical_request_count": ledger_summary.get("physical_request_count"),
         "external_tool_cost": dict(external_tool_cost),
         "selected_generation_cost": {
@@ -5358,6 +5618,13 @@ def final_audit(
             "unknown_costs_are_zero": False,
             "account_delta_allocated_to_tasks": False,
             "account_window_delta_usd": proof.get("cost_scope", {}).get("account_window_delta_usd"),
+            "account_windows": proof.get("cost_scope", {}).get("account_windows"),
+            "account_window_total_usd": proof.get("cost_scope", {}).get(
+                "account_window_total_usd"
+            ),
+            "unallocated_aborted_window_usd": proof.get("cost_scope", {}).get(
+                "unallocated_aborted_window_usd"
+            ),
             "attribution_precision": proof.get("cost_scope", {}).get("attribution_precision"),
             "campaign_attributable_exact": proof.get("cost_scope", {}).get(
                 "campaign_attributable_exact"
@@ -5394,6 +5661,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--account-before", type=Path, required=True)
     parser.add_argument("--account-after", type=Path, required=True)
     parser.add_argument("--account-reconciliation", type=Path, required=True)
+    parser.add_argument(
+        "--prior-account-window-dir",
+        type=Path,
+        action="append",
+        default=[],
+        help=(
+            "Archived prior aborted account window directory containing before, "
+            "stable-after, reconciliation, and runtime-environment evidence."
+        ),
+    )
     parser.add_argument("--runtime-environment", type=Path, required=True)
     parser.add_argument("--lock-file", type=Path, required=True)
     parser.add_argument("--lock-fd", type=int, default=9)
@@ -5423,6 +5700,16 @@ def run_finalization(args: argparse.Namespace) -> dict[str, Any]:
     ):
         source_path = require_regular_file(Path(raw_path), owner_only=False)
         critical_source_snapshots[str(source_path)] = file_sha256(source_path)
+    prior_account_window_dirs = list(getattr(args, "prior_account_window_dir", ()) or ())
+    for prior_dir in prior_account_window_dirs:
+        for name in (
+            "openrouter-account-before.json",
+            "openrouter-account-after.json",
+            "openrouter-account-reconciliation.json",
+            "runtime-environment.json",
+        ):
+            source_path = require_regular_file(Path(prior_dir) / name, owner_only=True)
+            critical_source_snapshots[str(source_path)] = file_sha256(source_path)
     attempt_evidence_audit = validate_generation_attempt_evidence(
         source_records,
         max_attempts=args.max_generation_attempts,
@@ -5470,6 +5757,7 @@ def run_finalization(args: argparse.Namespace) -> dict[str, Any]:
         source_records=source_records,
         ledger_rows=ledger_rows,
         ledger_summary=ledger_summary,
+        prior_account_window_dirs=prior_account_window_dirs,
     )
     final_rows = finalize_rows(
         selected,
@@ -5564,8 +5852,16 @@ def run_finalization(args: argparse.Namespace) -> dict[str, Any]:
         "model_provider_metrics": model_metrics,
         "external_tool_cost": external_tool_cost,
         "openrouter_non_byok_campaign_proof_sha256": proof["proof_sha256"],
+        "account_windows": proof["account_windows"],
+        "account_window_total_usd": proof["account_window_total_usd"],
+        "unallocated_aborted_window_usd": proof["unallocated_aborted_window_usd"],
         "cost_attribution": {
             "account_window_delta_usd": proof["cost_scope"]["account_window_delta_usd"],
+            "account_windows": proof["cost_scope"]["account_windows"],
+            "account_window_total_usd": proof["cost_scope"]["account_window_total_usd"],
+            "unallocated_aborted_window_usd": proof["cost_scope"][
+                "unallocated_aborted_window_usd"
+            ],
             "attribution_precision": proof["cost_scope"]["attribution_precision"],
             "campaign_attributable_exact": proof["cost_scope"]["campaign_attributable_exact"],
             "campaign_attributable_cost_usd": proof["cost_scope"]["campaign_attributable_cost_usd"],

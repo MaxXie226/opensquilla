@@ -866,6 +866,7 @@ def _campaign(
             "stable_tail_span_seconds": 210.0,
             "stable_observations": stable,
             "runtime_environment_sha256": runtime_sha,
+            "runtime_environment_file_sha256": module.file_sha256(runtime_path),
             "lock_file": str(lock_path.resolve()),
             "lock_inode": lock_path.stat().st_ino,
         },
@@ -885,6 +886,92 @@ def _campaign(
         max_generation_attempts=3,
     )
     return args, rows, lock_fd
+
+
+def _prior_account_window(
+    module,
+    args: argparse.Namespace,
+    tmp_path: Path,
+    *,
+    before_usage: str = "5.401561244",
+    suffix: str = "prior-aborted",
+) -> Path:
+    window = tmp_path / "archive" / "account" / suffix
+    window.mkdir(parents=True)
+    runtime = window / "runtime-environment.json"
+    runtime.write_bytes(args.runtime_environment.read_bytes())
+    runtime.chmod(0o600)
+    key_hash = json.loads(args.account_before.read_text())["api_key_sha256"]
+    before = window / "openrouter-account-before.json"
+    after = window / "openrouter-account-after.json"
+    _owner_json(
+        before,
+        {
+            "captured_at": "1970-01-01T00:10:00+00:00",
+            "api_key_sha256": key_hash,
+            "benchmark_environment_key_verified": True,
+            "usage": before_usage,
+            "byok_usage": "0",
+            "is_free_tier": False,
+        },
+    )
+    _owner_json(
+        after,
+        {
+            "captured_at": "1970-01-01T00:15:00+00:00",
+            "api_key_sha256": key_hash,
+            "benchmark_environment_key_verified": True,
+            "usage": "10",
+            "byok_usage": "0",
+            "is_free_tier": False,
+        },
+    )
+    runtime_payload = json.loads(runtime.read_text())
+    usage_delta = str(module.Decimal("10") - module.Decimal(before_usage))
+    observations = [
+        {
+            "captured_at": value,
+            "usage": "10",
+            "byok_usage": "0",
+        }
+        for value in (
+            "1970-01-01T00:11:00+00:00",
+            "1970-01-01T00:12:00+00:00",
+            "1970-01-01T00:13:00+00:00",
+            "1970-01-01T00:14:00+00:00",
+            "1970-01-01T00:14:45+00:00",
+            "1970-01-01T00:15:00+00:00",
+        )
+    ]
+    _owner_json(
+        window / "openrouter-account-reconciliation.json",
+        {
+            "schema": module.RECONCILIATION_SCHEMA,
+            "created_at": "1970-01-01T00:15:00+00:00",
+            "settlement_status": "stable",
+            "api_key_sha256": key_hash,
+            "usage_before_usd": before_usage,
+            "usage_after_usd": "10",
+            "usage_delta_usd": usage_delta,
+            "byok_usage_before_usd": "0",
+            "byok_usage_after_usd": "0",
+            "byok_usage_delta_usd": "0",
+            "is_free_tier": False,
+            "stable_poll_count": 6,
+            "required_stable_poll_count": 6,
+            "poll_observation_count": 6,
+            "stable_tail_start_index": 0,
+            "poll_interval_seconds": 15,
+            "minimum_settlement_seconds": 180,
+            "minimum_stable_tail_seconds": 75,
+            "observation_span_seconds": 240.0,
+            "stable_tail_span_seconds": 240.0,
+            "stable_observations": observations,
+            "runtime_environment_sha256": runtime_payload["environment_sha256"],
+            "runtime_environment_file_sha256": module.file_sha256(runtime),
+        },
+    )
+    return window
 
 
 def test_full_offline_finalization_is_atomic_and_preserves_contracts(
@@ -950,6 +1037,282 @@ def test_full_offline_finalization_is_atomic_and_preserves_contracts(
     assert proof["cost_scope"]["campaign_attributable_exact"] is True
     assert proof["cost_scope"]["campaign_attributable_cost_usd"] == "3.6"
     assert proof["cost_scope"]["attribution_precision"] == "campaign-attributable-exact"
+    assert [window["kind"] for window in proof["account_windows"]] == ["current"]
+    assert proof["account_window_total_usd"] == "3.6"
+    assert proof["unallocated_aborted_window_usd"] == "0"
+
+
+def test_prior_aborted_account_window_is_preserved_without_fake_ledger_rows(
+    module, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from opensquilla.provider import ranking_router
+
+    monkeypatch.setattr(
+        ranking_router,
+        "ranking_trace_replay_reasons",
+        lambda _plan: [],
+        raising=False,
+    )
+    args, _, lock_fd = _campaign(module, tmp_path)
+    prior = _prior_account_window(module, args, tmp_path)
+    args.prior_account_window_dir = [prior]
+    try:
+        manifest = module.run_finalization(args)
+    finally:
+        os.close(lock_fd)
+    proof = json.loads(
+        (args.output_dir / "openrouter-non-byok-campaign-proof.json").read_text()
+    )
+    scope = proof["cost_scope"]
+    assert [window["kind"] for window in scope["account_windows"]] == [
+        "prior_aborted",
+        "current",
+    ]
+    assert scope["account_window_total_usd"] == "8.198438756"
+    assert scope["unallocated_aborted_window_usd"] == "4.598438756"
+    assert (
+        scope["attribution_precision"]
+        == "multi-window-counter-exact-campaign-attribution-unproven"
+    )
+    assert scope["campaign_attributable_exact"] is False
+    assert scope["campaign_attributable_cost_usd"] is None
+    assert proof["result_row_account_window_scope"] == "current_window_only"
+    ledger = [
+        json.loads(line)
+        for line in (args.output_dir / "actual-spend-ledger.jsonl").read_text().splitlines()
+    ]
+    assert len(ledger) == 36
+    assert manifest["cost_attribution"]["account_windows"] == scope["account_windows"]
+    assert manifest["cost_attribution"]["account_window_total_usd"] == "8.198438756"
+    audit = json.loads((args.output_dir / "audit.json").read_text())
+    assert audit["selected_generation_cost"]["unallocated_aborted_window_usd"] == (
+        "4.598438756"
+    )
+    report = (args.output_dir / "EXPERIMENT_RESULTS.md").read_text()
+    assert "multi-window-counter-exact-campaign-attribution-unproven" in report
+    assert "4.598438756" in report
+    assert "当前正式窗口的物理回执与账户 counter 已精确对账" in report
+    assert "当前正式窗口存在 non-exact/unknown 物理请求" not in report
+    assert proof["account_windows"][0]["admission_basis"] == (
+        "operator_supplied_unallocated_window"
+    )
+
+
+def test_current_reconciliation_runtime_file_hash_mismatch_is_rejected(
+    module, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from opensquilla.provider import ranking_router
+
+    monkeypatch.setattr(
+        ranking_router,
+        "ranking_trace_replay_reasons",
+        lambda _plan: [],
+        raising=False,
+    )
+    args, _, lock_fd = _campaign(module, tmp_path)
+    reconciliation = json.loads(args.account_reconciliation.read_text())
+    reconciliation["runtime_environment_file_sha256"] = "b" * 64
+    _owner_json(args.account_reconciliation, reconciliation)
+    try:
+        with pytest.raises(module.FinalizationError, match="runtime file hash differs"):
+            module.run_finalization(args)
+    finally:
+        os.close(lock_fd)
+
+
+def test_prior_account_window_overlap_is_rejected(
+    module, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from opensquilla.provider import ranking_router
+
+    monkeypatch.setattr(
+        ranking_router,
+        "ranking_trace_replay_reasons",
+        lambda _plan: [],
+        raising=False,
+    )
+    args, _, lock_fd = _campaign(module, tmp_path)
+    prior = _prior_account_window(module, args, tmp_path)
+    after = json.loads((prior / "openrouter-account-after.json").read_text())
+    after["captured_at"] = "1970-01-01T00:17:00+00:00"
+    _owner_json(prior / "openrouter-account-after.json", after)
+    reconciliation = json.loads(
+        (prior / "openrouter-account-reconciliation.json").read_text()
+    )
+    reconciliation["stable_observations"][-1]["captured_at"] = (
+        "1970-01-01T00:17:00+00:00"
+    )
+    reconciliation["observation_span_seconds"] = 360.0
+    reconciliation["stable_tail_span_seconds"] = 360.0
+    _owner_json(prior / "openrouter-account-reconciliation.json", reconciliation)
+    args.prior_account_window_dir = [prior]
+    try:
+        with pytest.raises(module.FinalizationError, match="overlap"):
+            module.run_finalization(args)
+    finally:
+        os.close(lock_fd)
+
+
+def test_prior_account_before_must_precede_first_stable_observation(
+    module, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from opensquilla.provider import ranking_router
+
+    monkeypatch.setattr(
+        ranking_router,
+        "ranking_trace_replay_reasons",
+        lambda _plan: [],
+        raising=False,
+    )
+    args, _, lock_fd = _campaign(module, tmp_path)
+    prior = _prior_account_window(module, args, tmp_path)
+    before = json.loads((prior / "openrouter-account-before.json").read_text())
+    before["captured_at"] = "1970-01-01T00:11:30+00:00"
+    _owner_json(prior / "openrouter-account-before.json", before)
+    args.prior_account_window_dir = [prior]
+    try:
+        with pytest.raises(module.FinalizationError, match="precede settlement observations"):
+            module.run_finalization(args)
+    finally:
+        os.close(lock_fd)
+
+
+def test_prior_windows_require_monotonic_cumulative_byok_counter(
+    module, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from opensquilla.provider import ranking_router
+
+    monkeypatch.setattr(
+        ranking_router,
+        "ranking_trace_replay_reasons",
+        lambda _plan: [],
+        raising=False,
+    )
+    args, _, lock_fd = _campaign(module, tmp_path)
+    for path in (args.account_before, args.account_after):
+        payload = json.loads(path.read_text())
+        payload["byok_usage"] = "2"
+        _owner_json(path, payload)
+    current_reconciliation = json.loads(args.account_reconciliation.read_text())
+    for field in (
+        "byok_usage_before_usd",
+        "byok_usage_after_usd",
+    ):
+        current_reconciliation[field] = "2"
+    for observation in current_reconciliation["stable_observations"]:
+        observation["byok_usage"] = "2"
+    _owner_json(args.account_reconciliation, current_reconciliation)
+
+    earlier = _prior_account_window(
+        module,
+        args,
+        tmp_path,
+        before_usage="1",
+        suffix="prior-earlier",
+    )
+    earlier_before = json.loads(
+        (earlier / "openrouter-account-before.json").read_text()
+    )
+    earlier_before.update(
+        captured_at="1970-01-01T00:03:00+00:00",
+        byok_usage="2",
+    )
+    _owner_json(earlier / "openrouter-account-before.json", earlier_before)
+    earlier_after = json.loads((earlier / "openrouter-account-after.json").read_text())
+    earlier_after.update(
+        captured_at="1970-01-01T00:09:00+00:00",
+        usage="5",
+        byok_usage="2",
+    )
+    _owner_json(earlier / "openrouter-account-after.json", earlier_after)
+    earlier_reconciliation = json.loads(
+        (earlier / "openrouter-account-reconciliation.json").read_text()
+    )
+    earlier_reconciliation.update(
+        usage_before_usd="1",
+        usage_after_usd="5",
+        usage_delta_usd="4",
+        byok_usage_before_usd="2",
+        byok_usage_after_usd="2",
+        byok_usage_delta_usd="0",
+    )
+    earlier_times = (
+        "1970-01-01T00:05:00+00:00",
+        "1970-01-01T00:06:00+00:00",
+        "1970-01-01T00:07:00+00:00",
+        "1970-01-01T00:08:00+00:00",
+        "1970-01-01T00:08:45+00:00",
+        "1970-01-01T00:09:00+00:00",
+    )
+    for observation, captured_at in zip(
+        earlier_reconciliation["stable_observations"],
+        earlier_times,
+        strict=True,
+    ):
+        observation.update(captured_at=captured_at, usage="5", byok_usage="2")
+    _owner_json(
+        earlier / "openrouter-account-reconciliation.json",
+        earlier_reconciliation,
+    )
+
+    later = _prior_account_window(
+        module,
+        args,
+        tmp_path,
+        before_usage="6",
+        suffix="prior-later",
+    )
+    for name in (
+        "openrouter-account-before.json",
+        "openrouter-account-after.json",
+    ):
+        payload = json.loads((later / name).read_text())
+        payload["byok_usage"] = "1"
+        _owner_json(later / name, payload)
+    later_reconciliation = json.loads(
+        (later / "openrouter-account-reconciliation.json").read_text()
+    )
+    later_reconciliation.update(
+        byok_usage_before_usd="1",
+        byok_usage_after_usd="1",
+        byok_usage_delta_usd="0",
+    )
+    for observation in later_reconciliation["stable_observations"]:
+        observation["byok_usage"] = "1"
+    _owner_json(later / "openrouter-account-reconciliation.json", later_reconciliation)
+    args.prior_account_window_dir = [earlier, later]
+    try:
+        with pytest.raises(module.FinalizationError, match="BYOK usage decreased"):
+            module.run_finalization(args)
+    finally:
+        os.close(lock_fd)
+
+
+def test_prior_account_window_delta_is_not_hard_coded(
+    module, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from opensquilla.provider import ranking_router
+
+    monkeypatch.setattr(
+        ranking_router,
+        "ranking_trace_replay_reasons",
+        lambda _plan: [],
+        raising=False,
+    )
+    args, _, lock_fd = _campaign(module, tmp_path)
+    args.prior_account_window_dir = [
+        _prior_account_window(module, args, tmp_path, before_usage="6")
+    ]
+    try:
+        module.run_finalization(args)
+    finally:
+        os.close(lock_fd)
+    proof = json.loads(
+        (args.output_dir / "openrouter-non-byok-campaign-proof.json").read_text()
+    )
+    assert proof["unallocated_aborted_window_usd"] == "4"
+    assert proof["account_window_total_usd"] == "7.6"
+    assert proof["cost_scope"]["campaign_attributable_exact"] is False
 
 
 def test_unverified_receipt_is_resolved_only_by_campaign_proof(module, tmp_path: Path) -> None:

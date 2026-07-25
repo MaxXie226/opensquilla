@@ -5,15 +5,29 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+from collections.abc import Mapping
+from dataclasses import asdict, is_dataclass
 from typing import Any
 
 RESULT_EVIDENCE_SCHEMA = "opensquilla.draco.result-evidence/v1"
 RESULT_EVIDENCE_SHA256_FIELD = "result_evidence_sha256"
 
 
+def _json_artifact_value(value: Any) -> Any:
+    """Return the JSON-compatible representation committed to an artifact."""
+
+    if is_dataclass(value) and not isinstance(value, type):
+        return _json_artifact_value(asdict(value))
+    if isinstance(value, Mapping):
+        return {key: _json_artifact_value(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_json_artifact_value(item) for item in value]
+    return value
+
+
 def canonical_json_sha256(value: Any) -> str:
     payload = json.dumps(
-        value,
+        _json_artifact_value(value),
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
@@ -36,7 +50,9 @@ def result_evidence_payload(row: dict[str, Any]) -> dict[str, Any]:
 def seal_result_row(row: dict[str, Any]) -> dict[str, Any]:
     """Return a copy whose hash commits to the complete final result row."""
 
-    sealed = dict(row)
+    sealed = _json_artifact_value(row)
+    if not isinstance(sealed, dict):
+        raise TypeError("DRACO result row must normalize to a JSON object")
     sealed["result_evidence_schema"] = RESULT_EVIDENCE_SCHEMA
     sealed.pop(RESULT_EVIDENCE_SHA256_FIELD, None)
     sealed[RESULT_EVIDENCE_SHA256_FIELD] = canonical_json_sha256(

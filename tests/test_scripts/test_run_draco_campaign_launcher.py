@@ -490,6 +490,7 @@ def _write_formal_publication_fixture(
     tmp_path: Path,
     *,
     source_outside_archive: bool = False,
+    include_prior: bool = True,
 ) -> tuple[Path, Path, Path]:
     output_dir = tmp_path / "campaign"
     archive_dir = output_dir / "archive"
@@ -545,6 +546,40 @@ def _write_formal_publication_fixture(
         ],
         "artifacts": artifact_records,
     }
+    account_windows = []
+    kinds = ("prior_aborted", "current") if include_prior else ("current",)
+    for kind in kinds:
+        window_dir = archive_dir / "account" / kind
+        window_dir.mkdir(parents=True)
+        sources = []
+        for name in (
+            "openrouter-account-before.json",
+            "openrouter-account-after.json",
+            "openrouter-account-reconciliation.json",
+            "runtime-environment.json",
+        ):
+            path = window_dir / name
+            path.write_text(f"{kind}:{name}\n", encoding="utf-8")
+            path.chmod(0o600)
+            sources.append({"path": str(path.resolve()), "sha256": _file_sha256(path)})
+        account_windows.append(
+            {
+                "kind": kind,
+                "usage_delta_usd": "4.598438756" if kind == "prior_aborted" else "0.4",
+                "sources": sources,
+            }
+        )
+    manifest["cost_attribution"] = {
+        "account_windows": account_windows,
+        "account_window_total_usd": "5" if include_prior else "0.4",
+        "unallocated_aborted_window_usd": "4.598438756" if include_prior else "0",
+        "attribution_precision": (
+            "multi-window-counter-exact-campaign-attribution-unproven"
+            if include_prior
+            else "campaign-attributable-exact"
+        ),
+        "campaign_attributable_exact": not include_prior,
+    }
     manifest["manifest_sha256"] = _canonical_sha256(manifest)
     manifest_path = formal_dir / "manifest.json"
     manifest_path.write_text(
@@ -562,6 +597,7 @@ def test_output_layout_archives_process_material_and_has_no_final_directory() ->
     for fragment in (
         'RUNTIME_ENV="$ARCHIVE_DIR/runtime-environment.json"',
         'ACCOUNT_BEFORE="$ARCHIVE_DIR/account/openrouter-account-before.json"',
+        'PRIOR_ACCOUNT_WINDOW_DIRS=()',
         'ROUTE_EVIDENCE="$ARCHIVE_DIR/preflight/openrouter-route-preflight.json"',
         'STATIC_DIR="$ARCHIVE_DIR/preflight/static"',
         'WAVE1_DIR="$ARCHIVE_DIR/waves/wave-1"',
@@ -571,6 +607,12 @@ def test_output_layout_archives_process_material_and_has_no_final_directory() ->
     ):
         assert fragment in script
     assert '"$OUTPUT_DIR/final"' not in script
+    assert 'FINALIZER_ARGS+=(--prior-account-window-dir "$prior_account_window_dir")' in script
+    assert "archive_prior_account_window" in script
+    assert "DEFAULT_PRIOR_ACCOUNT_WINDOW_DIR" not in script
+    assert "prior-aborted-window-20260726-000227" not in script
+    assert "prior-aborted-window-%03d" in script
+    assert 'PRIOR_ACCOUNT_WINDOW_SOURCES=()' in script
     finalizer = script.index('"$PYTHON" "$FINALIZER" "${FINALIZER_ARGS[@]}"')
     publisher = script.index("publish_final_artifacts", finalizer)
     unlock = script.index("flock -u 9", publisher)
@@ -616,6 +658,34 @@ def test_final_artifacts_are_promoted_with_manifest_as_commit_marker(
         assert Path(source["result_path"]).is_file()
 
 
+def test_final_publication_accepts_current_only_account_window(
+    tmp_path: Path,
+) -> None:
+    publisher_block = _embedded_python_blocks()[2]
+    output_dir, archive_dir, formal_dir = _write_formal_publication_fixture(
+        tmp_path,
+        include_prior=False,
+    )
+    lock_path = tmp_path / "publisher.lock"
+    lock_path.touch(mode=0o600)
+    lock_fd = os.open(lock_path, os.O_RDWR)
+    try:
+        completed = _run_embedded_python(
+            publisher_block,
+            str(formal_dir),
+            str(output_dir),
+            str(archive_dir),
+            lock_fd=lock_fd,
+        )
+    finally:
+        os.close(lock_fd)
+    assert completed.returncode == 0, completed.stderr
+    manifest = json.loads((output_dir / "manifest.json").read_text())
+    assert [window["kind"] for window in manifest["cost_attribution"]["account_windows"]] == [
+        "current"
+    ]
+
+
 def test_final_publication_rejects_source_evidence_outside_archive(
     tmp_path: Path,
 ) -> None:
@@ -646,3 +716,38 @@ def test_final_publication_rejects_source_evidence_outside_archive(
         "archive",
         ".formal-results",
     }
+
+
+def test_final_publication_rejects_prior_account_source_outside_archive(
+    tmp_path: Path,
+) -> None:
+    publisher_block = _embedded_python_blocks()[2]
+    output_dir, archive_dir, formal_dir = _write_formal_publication_fixture(tmp_path)
+    manifest_path = formal_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    outside = tmp_path / "outside-prior.json"
+    outside.write_text("prior\n", encoding="utf-8")
+    outside.chmod(0o600)
+    manifest["cost_attribution"]["account_windows"][0]["sources"][0] = {
+        "path": str(outside.resolve()),
+        "sha256": _file_sha256(outside),
+    }
+    manifest.pop("manifest_sha256")
+    manifest["manifest_sha256"] = _canonical_sha256(manifest)
+    manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+    manifest_path.chmod(0o600)
+    lock_path = tmp_path / "publisher.lock"
+    lock_path.touch(mode=0o600)
+    lock_fd = os.open(lock_path, os.O_RDWR)
+    try:
+        completed = _run_embedded_python(
+            publisher_block,
+            str(formal_dir),
+            str(output_dir),
+            str(archive_dir),
+            lock_fd=lock_fd,
+        )
+    finally:
+        os.close(lock_fd)
+    assert completed.returncode != 0
+    assert "outside archive/" in completed.stderr
