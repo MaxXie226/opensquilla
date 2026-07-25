@@ -280,7 +280,10 @@ interface ConfigData {
     }
   }
   image_generation?: {
-    providers?: Record<string, { api_key_env?: string; base_url?: string }>
+    size?: string
+    output_format?: string
+    fallbacks?: string[]
+    providers?: Record<string, { api_key?: string; api_key_env?: string; base_url?: string }>
   }
   audio?: {
     enabled?: boolean
@@ -2355,8 +2358,10 @@ function onMemoryProviderChange() {
   capabilitiesForm.onMemoryProviderChange(memorySpec.value, memoryApiKeyEnabled.value)
 }
 
-function onImageProviderChange() {
-  capabilitiesForm.onImageProviderChange(imageSpec.value)
+function onImageProviderChange(providerId: string) {
+  capabilitiesForm.onImageProviderChange(
+    imageProviders.value.find(provider => provider.providerId === providerId),
+  )
 }
 
 function updateCapabilityField(
@@ -2417,6 +2422,11 @@ function searchStatusText(): string {
 function _imageGenerationStatusText(): string {
   if (status.value.imageGenerationEnabled === false) {
     return t('setup.image.statusDisabled')
+  }
+  const detail = (status.value.sectionDetails || {}).image_generation || {}
+  const actionableDetail = String(detail.detail || '').trim()
+  if ((detail.blocking || detail.actionRequired || detail.status === 'unknown') && actionableDetail) {
+    return actionableDetail
   }
   if (status.value.imageGenerationConfigured === true) {
     if (status.value.imageGenerationSource === 'llm_fallback') {

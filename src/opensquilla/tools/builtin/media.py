@@ -55,6 +55,10 @@ from opensquilla.provider.image_generation import (
     parse_image_generation_model_ref,
     reset_image_generation_providers,
 )
+from opensquilla.provider.image_generation_policy import (
+    conflicting_image_generation_endpoint_provider,
+    is_valid_image_generation_base_url,
+)
 from opensquilla.provider.protocol import provider_metadata
 from opensquilla.provider.types import ChatConfig, derive_provider_request_correlation
 from opensquilla.sandbox.operation_runtime import SandboxToolDescriptor
@@ -496,7 +500,7 @@ async def _call_vision_provider(b64_data: str, media_type: str, prompt: str) -> 
 )
 async def image_generate(
     prompt: str,
-    size: str = "1024x1024",
+    size: str | None = None,
     model: str | None = None,
     filename: str | None = None,
 ) -> str:
@@ -506,18 +510,21 @@ async def image_generate(
 async def _image_generate_impl(
     *,
     prompt: str,
-    size: str,
+    size: str | None,
     model: str | None,
     filename: str | None,
 ) -> str:
     if not prompt or not prompt.strip():
         raise ToolError("Prompt must not be empty")
 
-    valid_sizes = {"1024x1024", "1536x1024", "1024x1536"}
-    if size not in valid_sizes:
-        raise ToolError(f"Invalid size: {size}. Must be {' | '.join(sorted(valid_sizes))}")
-
     config = _resolve_image_generation_config()
+    effective_size = size if size is not None else getattr(config, "size", "1024x1024")
+    valid_sizes = {"1024x1024", "1536x1024", "1024x1536"}
+    if effective_size not in valid_sizes:
+        raise ToolError(
+            f"Invalid size: {effective_size}. Must be {' | '.join(sorted(valid_sizes))}"
+        )
+
     if not getattr(config, "enabled", False):
         raise ToolError("Image generation is disabled")
 
@@ -532,7 +539,7 @@ async def _image_generate_impl(
             request=ImageGenerationRequest(
                 prompt=prompt,
                 model=candidates[0],
-                size=size or getattr(config, "size", "1024x1024"),
+                size=effective_size,
                 output_format=output_format,
                 timeout_seconds=float(getattr(config, "timeout_seconds", 180.0)),
             ),
@@ -652,6 +659,19 @@ def image_generation_available(config: Any | None = None) -> bool:
 
 
 def _image_generation_provider_has_auth(provider: Any) -> bool:
+    provider_id = str(getattr(provider, "provider_id", "") or "")
+    missing_base_url = object()
+    configured_base_url = getattr(provider, "_base_url", missing_base_url)
+    # Third-party image providers are not required to expose an HTTP endpoint
+    # by the public protocol. Built-in HTTP adapters do, and retain endpoint
+    # validation before they are surfaced as available.
+    if configured_base_url is not missing_base_url:
+        base_url = str(configured_base_url or "")
+        if not is_valid_image_generation_base_url(base_url):
+            return False
+        if conflicting_image_generation_endpoint_provider(provider_id, base_url) is not None:
+            return False
+
     resolve_api_key = getattr(provider, "_resolve_api_key", None)
     if callable(resolve_api_key):
         try:
@@ -676,7 +696,7 @@ def _resolve_generated_image_path(filename: str | None, output_format: str) -> P
         else Path.cwd()
     )
     candidate = Path(raw).expanduser()
-    if not candidate.suffix:
+    if candidate.suffix.lower() != f".{ext}":
         candidate = candidate.with_suffix(f".{ext}")
 
     target = candidate if candidate.is_absolute() else root / candidate
