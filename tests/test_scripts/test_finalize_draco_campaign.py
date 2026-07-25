@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import importlib.util
 import json
 import os
@@ -32,6 +33,126 @@ def _load():
 @pytest.fixture
 def module():
     return _load()
+
+
+def test_text_sha256_matches_runner_wire_format(module) -> None:
+    assert module.text_sha256("value") == hashlib.sha256(b"value").hexdigest()
+
+
+@pytest.mark.parametrize("separator", ["\u0085", "\u2028", "\u2029"])
+def test_load_jsonl_rows_preserves_unicode_line_separators(
+    module,
+    tmp_path: Path,
+    separator: str,
+) -> None:
+    path = tmp_path / "rows.jsonl"
+    value = {"content": f"before{separator}after"}
+    path.write_text(
+        json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o600)
+
+    assert module.load_jsonl_rows(
+        path,
+        owner_only=True,
+        source_label="test JSONL",
+    ) == [(1, value)]
+
+
+def test_run_expected_request_count_does_not_double_count_placeholder(module) -> None:
+    run = {
+        "llm_request_count": 2,
+        "usage": {
+            "usage_missing_count": 1,
+            "model_usage_breakdown": [
+                {"role": "proposer"},
+                {"role": "agent_llm_request_unknown"},
+            ],
+        },
+    }
+
+    assert module.run_expected_request_count(run) == 2
+
+
+def test_selected_endpoint_receipt_binds_serving_alias_and_provider(module) -> None:
+    unit = {
+        "role": "agent_llm_call",
+        "provider": "openrouter",
+        "model": module.B0_MODEL,
+        "requested_provider": "openrouter",
+        "requested_model": module.B0_MODEL,
+        "billed_cost": 0.1,
+        "provider_usage": {
+            "is_byok": False,
+            "provider_reported_cost": 0.1,
+            "response_ids": ["response-1"],
+            "router_metadata": {
+                "requested": module.B0_MODEL,
+                "is_byok": False,
+                "endpoints": {
+                    "available": [
+                        {
+                            "provider": "Anthropic",
+                            "model": "anthropic/claude-4.8-opus-20260528",
+                            "selected": True,
+                        }
+                    ]
+                },
+            },
+        },
+    }
+
+    assert module.usage_route_reasons(
+        {
+            "model_usage_breakdown": [
+                unit,
+                {"role": "agent_llm_request_unknown"},
+            ]
+        },
+        allowed_models={module.B0_MODEL},
+        provider_pins={module.B0_MODEL: "anthropic"},
+    ) == []
+    assert module.unit_exact_non_byok(unit) is True
+    assert module._formal_openrouter_models_equivalent(
+        module.B0_MODEL,
+        "anthropic/claude-4.8-opus-20260528",
+    )
+    assert not module._formal_openrouter_models_equivalent(
+        "anthropic/claude-sonnet-5",
+        "anthropic/claude-sonnet-5-20260630",
+    )
+
+    bad_placeholder = {
+        "role": "agent_llm_request_unknown",
+        "provider_usage": {
+            "requested_provider": "direct",
+            "requested_model": module.B4_MODEL,
+            "router_metadata": {"requested": module.B4_MODEL},
+        },
+    }
+    reasons = module.usage_route_reasons(
+        {"model_usage_breakdown": [unit, bad_placeholder]},
+        allowed_models={module.B0_MODEL},
+        provider_pins={module.B0_MODEL: "anthropic"},
+    )
+    assert "wrong_generation_provider_route" in reasons
+    assert "wrong_generation_model_route" in reasons
+
+    unit["provider_usage"]["router_metadata"]["endpoints"]["available"].append(
+        {
+            "provider": "OpenAI",
+            "model": module.B4_MODEL,
+            "selected": True,
+        }
+    )
+    reasons = module.usage_route_reasons(
+        {"model_usage_breakdown": [unit]},
+        allowed_models={module.B0_MODEL},
+        provider_pins={module.B0_MODEL: "anthropic"},
+    )
+    assert "conflicting_successful_router_receipt" in reasons
+    assert module.unit_exact_non_byok(unit) is False
 
 
 def _owner_json(path: Path, value: object) -> None:
@@ -68,6 +189,7 @@ def _receipt(
         "response_ids": [response_id],
         "provider_reported_cost": cost,
         "router_metadata": {
+            "requested": model,
             "attempts": [
                 {
                     "provider": upstream_provider,
@@ -207,6 +329,10 @@ def _contract(module, group: str, key_hash: str) -> dict[str, object]:
                     "c3": {
                         "provider": "openrouter",
                         "model": "anthropic/claude-opus-4.8",
+                    },
+                    "image_model": {
+                        "provider": "openrouter",
+                        "model": "moonshotai/kimi-k2.6",
                     },
                 }
             }
@@ -1040,6 +1166,30 @@ def test_full_offline_finalization_is_atomic_and_preserves_contracts(
     assert [window["kind"] for window in proof["account_windows"]] == ["current"]
     assert proof["account_window_total_usd"] == "3.6"
     assert proof["unallocated_aborted_window_usd"] == "0"
+
+
+def test_metadata_only_wave_may_replay_identical_judge_snapshot_declarations(
+    module,
+    tmp_path: Path,
+) -> None:
+    args, _, lock_fd = _campaign(module, tmp_path)
+    rows = [json.loads(line) for line in args.result[1].read_text().splitlines()]
+    judge = rows[0]["judge"]
+    declared_new = 0
+    for judgment in judge["criterion_judgments"]:
+        attempts = judgment["judge_attempts"]
+        judgment["prior_judge_attempts_used"] = 0
+        judgment["judge_new_attempt_count"] = len(attempts)
+        declared_new += len(attempts)
+    judge["judge_new_attempt_count"] = declared_new
+    rows[0] = module.seal_result_row(rows[0])
+    args.result[1].write_text("".join(json.dumps(row) + "\n" for row in rows))
+    try:
+        manifest = module.run_finalization(args)
+    finally:
+        os.close(lock_fd)
+
+    assert manifest["status"] == "complete"
 
 
 def test_prior_aborted_account_window_is_preserved_without_fake_ledger_rows(
@@ -2381,8 +2531,6 @@ def test_b2_rejects_analyzer_and_g1_requires_it(module, tmp_path: Path) -> None:
         1:
     ]
     attempt_run2["llm_request_count"] = 1
-    g1["usage"]["model_usage_breakdown"] = g1["usage"]["model_usage_breakdown"][1:]
-    g1["llm_request_count"] = 1
     g1_index = rows2.index(g1)
     rows2[g1_index] = module.seal_result_row(g1)
     args2.result[0].write_text("".join(json.dumps(row) + "\n" for row in rows2))

@@ -28,6 +28,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
+from functools import cache
 from pathlib import Path
 from typing import Any
 
@@ -74,11 +75,15 @@ B2_PROPOSERS = (
 B2_AGGREGATOR = "z-ai/glm-5.2"
 B0_MODEL = "anthropic/claude-opus-4.8"
 B4_MODEL = "openai/gpt-5.5"
-B1_TIER_MODELS = {
+B1_TEXT_TIER_MODELS = {
     "c0": "deepseek/deepseek-v4-flash",
     "c1": "deepseek/deepseek-v4-pro",
     "c2": "z-ai/glm-5.2",
     "c3": "anthropic/claude-opus-4.8",
+}
+B1_TIER_MODELS = {
+    **B1_TEXT_TIER_MODELS,
+    "image_model": "moonshotai/kimi-k2.6",
 }
 FORMAL_UPSTREAM_PINS = {
     B0_MODEL: "anthropic",
@@ -86,6 +91,7 @@ FORMAL_UPSTREAM_PINS = {
     "deepseek/deepseek-v4-flash": "deepseek",
     "deepseek/deepseek-v4-pro": "deepseek",
     "z-ai/glm-5.2": "z-ai",
+    "moonshotai/kimi-k2.6": "moonshotai",
     "moonshotai/kimi-k2.7-code": "moonshotai",
     "qwen/qwen3.7-max": "alibaba",
     "google/gemini-3.1-pro-preview": "google-ai-studio",
@@ -99,6 +105,18 @@ ALLOWED_NON_GENERATION_ERRORS = frozenset(
         "judge_incomplete",
         "openrouter_non_byok_metadata_incomplete",
         "openrouter_non_byok_verification_failed",
+    }
+)
+MISSING_USAGE_PLACEHOLDER_ROLES = frozenset(
+    {
+        "abandoned_stream",
+        "usage_missing",
+        "unknown_call",
+        "abandoned_stream_request",
+        "agent_llm_request_unknown",
+        "abandoned_provider_request",
+        "unknown_request",
+        "incomplete_stream",
     }
 )
 POLICY_VIOLATION_ERRORS = frozenset(
@@ -219,7 +237,7 @@ def file_sha256(path: Path) -> str:
 
 
 def text_sha256(value: str) -> str:
-    return f"sha256:{hashlib.sha256(value.encode('utf-8')).hexdigest()}"
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 def utc_now() -> str:
@@ -323,17 +341,41 @@ def load_json(path: Path, *, owner_only: bool = True) -> dict[str, Any]:
     return value
 
 
+def load_jsonl_rows(
+    path: Path,
+    *,
+    owner_only: bool,
+    source_label: str,
+) -> list[tuple[int, Any]]:
+    """Load JSONL records without treating Unicode line separators as row boundaries."""
+    resolved = require_regular_file(path, owner_only=owner_only)
+    rows: list[tuple[int, Any]] = []
+    try:
+        with resolved.open("r", encoding="utf-8", newline="\n") as handle:
+            for line_number, raw in enumerate(handle, start=1):
+                if not raw.strip():
+                    continue
+                try:
+                    value = json.loads(raw)
+                except json.JSONDecodeError as exc:
+                    raise FinalizationError(
+                        f"invalid {source_label} at {resolved}:{line_number}"
+                    ) from exc
+                rows.append((line_number, value))
+    except (OSError, UnicodeError) as exc:
+        raise FinalizationError(f"unable to read {source_label} {resolved}: {exc}") from exc
+    return rows
+
+
 def read_tasks(path: Path) -> list[dict[str, Any]]:
     resolved = require_regular_file(path, owner_only=False)
     tasks: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for line_number, raw in enumerate(resolved.read_text(encoding="utf-8").splitlines(), start=1):
-        if not raw.strip():
-            continue
-        try:
-            value = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise FinalizationError(f"invalid benchmark JSONL at {resolved}:{line_number}") from exc
+    for line_number, value in load_jsonl_rows(
+        resolved,
+        owner_only=False,
+        source_label="benchmark JSONL",
+    ):
         if not isinstance(value, dict):
             raise FinalizationError(f"benchmark row is not an object at {resolved}:{line_number}")
         task_id = str(value.get("id") or value.get("task_id") or "").strip()
@@ -552,9 +594,12 @@ def load_manifest_contracts(
                 f"manifest results_jsonl is not bound to its result shard: {path}"
             )
         result_rows = [
-            json.loads(raw)
-            for raw in result_path.read_text(encoding="utf-8").splitlines()
-            if raw.strip()
+            value
+            for _, value in load_jsonl_rows(
+                result_path,
+                owner_only=True,
+                source_label="result JSONL",
+            )
         ]
         shard_attempt_ids = {
             str(attempt.get("attempt_id") or "")
@@ -709,7 +754,9 @@ def validate_formal_campaign_contracts(
     if not isinstance(b1_spec, Mapping) or b1_spec.get("kind") != "router_single":
         raise FinalizationError("B1 formal contract must be router_single")
     if not isinstance(tiers, Mapping) or set(tiers) != set(B1_TIER_MODELS):
-        raise FinalizationError("B1 formal tier set differs from c0/c1/c2/c3")
+        raise FinalizationError(
+            "B1 formal tier set differs from c0/c1/c2/c3/image_model"
+        )
     for tier, expected_model in B1_TIER_MODELS.items():
         value = tiers.get(tier)
         if (
@@ -1086,6 +1133,33 @@ def contract_provider_pins(contract: Mapping[str, Any]) -> dict[str, str]:
     )
 
 
+def _is_unknown_task_analyzer_placeholder(unit: Mapping[str, Any]) -> bool:
+    provider_usage = unit.get("provider_usage")
+    return (
+        str(unit.get("role") or "").strip().casefold() == "unknown_request"
+        and str(unit.get("label") or "").strip().casefold() == "task_analyzer"
+        and str(unit.get("provider") or "").strip() == ""
+        and str(unit.get("model") or "").strip() == ""
+        and str(unit.get("requested_provider") or "").strip().casefold() == "openrouter"
+        and str(unit.get("requested_model") or "").strip() == B0_MODEL
+        and isinstance(unit.get("attempt"), int)
+        and not isinstance(unit.get("attempt"), bool)
+        and int(unit["attempt"]) >= 1
+        and HEX32.fullmatch(str(unit.get("physical_attempt_id") or "")) is not None
+        and nonnegative_int(unit.get("input_tokens")) == 0
+        and nonnegative_int(unit.get("output_tokens")) == 0
+        and nonnegative_int(unit.get("reasoning_tokens")) == 0
+        and nonnegative_int(unit.get("cached_tokens")) == 0
+        and nonnegative_int(unit.get("cache_write_tokens")) == 0
+        and finite_number(unit.get("billed_cost"))
+        and float(unit["billed_cost"]) == 0.0
+        and str(unit.get("cost_source") or "none").casefold() in {"none", "unavailable"}
+        and isinstance(provider_usage, Mapping)
+        and provider_usage.get("usage_unknown") is True
+        and provider_usage.get("physical_attempt_id") == unit.get("physical_attempt_id")
+    )
+
+
 def usage_route_reasons(
     usage: Any,
     *,
@@ -1101,47 +1175,142 @@ def usage_route_reasons(
     represented = 0
     for unit in units:
         role = str(unit.get("role") or "").strip().casefold()
-        if role in {"missing_usage", "incomplete_stream", "unknown_request"}:
-            provider_usage = unit.get("provider_usage")
+        label = str(unit.get("label") or "").strip().casefold()
+        route_role = (
+            label
+            if role in MISSING_USAGE_PLACEHOLDER_ROLES
+            and role_model_pins is not None
+            and label in role_model_pins
+            else role
+        )
+        effective_allowed_models = (
+            {str(role_model_pins[route_role])}
+            if role_model_pins is not None and route_role in role_model_pins
+            else allowed_models
+        )
+        if role in MISSING_USAGE_PLACEHOLDER_ROLES:
             unknown_analyzer_allowed = (
                 allow_unknown_task_analyzer_attempts
-                and role == "unknown_request"
-                and str(unit.get("label") or "").strip().casefold() == "task_analyzer"
-                and str(unit.get("provider") or "").strip() == ""
-                and str(unit.get("model") or "").strip() == ""
-                and str(unit.get("requested_provider") or "").strip().casefold() == "openrouter"
-                and str(unit.get("requested_model") or "").strip() == B0_MODEL
-                and isinstance(unit.get("attempt"), int)
-                and not isinstance(unit.get("attempt"), bool)
-                and int(unit["attempt"]) >= 1
-                and HEX32.fullmatch(str(unit.get("physical_attempt_id") or "")) is not None
-                and nonnegative_int(unit.get("input_tokens")) == 0
-                and nonnegative_int(unit.get("output_tokens")) == 0
-                and nonnegative_int(unit.get("reasoning_tokens")) == 0
-                and nonnegative_int(unit.get("cached_tokens")) == 0
-                and nonnegative_int(unit.get("cache_write_tokens")) == 0
-                and finite_number(unit.get("billed_cost"))
-                and float(unit["billed_cost"]) == 0.0
-                and str(unit.get("cost_source") or "none").casefold() in {"none", "unavailable"}
-                and isinstance(provider_usage, Mapping)
-                and provider_usage.get("usage_unknown") is True
-                and provider_usage.get("physical_attempt_id") == unit.get("physical_attempt_id")
+                and _is_unknown_task_analyzer_placeholder(unit)
             )
+            provider = str(unit.get("provider") or "").strip().casefold()
+            requested_provider = str(
+                unit.get("requested_provider") or ""
+            ).strip().casefold()
+            model = str(unit.get("model") or "").strip()
+            requested_model = str(unit.get("requested_model") or "").strip()
+            provider_usage = unit.get("provider_usage")
+            nested_requested_provider = (
+                str(provider_usage.get("requested_provider") or "").strip().casefold()
+                if isinstance(provider_usage, Mapping)
+                else ""
+            )
+            nested_requested_model = (
+                str(provider_usage.get("requested_model") or "").strip()
+                if isinstance(provider_usage, Mapping)
+                else ""
+            )
+            router_metadata = (
+                provider_usage.get("router_metadata")
+                if isinstance(provider_usage, Mapping)
+                else None
+            )
+            router_requested_provider = (
+                str(router_metadata.get("requested_provider") or "").strip().casefold()
+                if isinstance(router_metadata, Mapping)
+                else ""
+            )
+            router_requested_model = (
+                str(router_metadata.get("requested") or "").strip()
+                if isinstance(router_metadata, Mapping)
+                else ""
+            )
+            known_providers = {
+                value
+                for value in (
+                    provider,
+                    requested_provider,
+                    nested_requested_provider,
+                    router_requested_provider,
+                )
+                if value
+            }
+            known_models = [
+                value
+                for value in (
+                    model,
+                    requested_model,
+                    nested_requested_model,
+                    router_requested_model,
+                )
+                if value
+            ]
+            if any(value != "openrouter" for value in known_providers):
+                reasons.append("wrong_generation_provider_route")
+            model_outside_contract = any(
+                not any(
+                    _formal_openrouter_models_equivalent(value, allowed_model)
+                    for allowed_model in effective_allowed_models
+                )
+                for value in known_models
+            )
+            conflicting_known_models = bool(known_models) and any(
+                not _formal_openrouter_models_equivalent(known_models[0], value)
+                for value in known_models[1:]
+            )
+            if model_outside_contract or conflicting_known_models:
+                reasons.append("wrong_generation_model_route")
+            successful = _successful_router_bindings(unit)
+            known_model = known_models[0] if known_models else ""
+            if successful and (
+                not known_model
+                or any(
+                    any(
+                        not _formal_openrouter_models_equivalent(
+                            upstream_model,
+                            known_value,
+                        )
+                        for known_value in known_models
+                    )
+                    for _, upstream_model in successful
+                )
+            ):
+                reasons.append("conflicting_successful_router_receipt")
+            if provider_pins is not None and known_model:
+                pin_model = next(
+                    (
+                        allowed_model
+                        for allowed_model in effective_allowed_models
+                        if _formal_openrouter_models_equivalent(
+                            known_model,
+                            allowed_model,
+                        )
+                    ),
+                    "",
+                )
+                expected_pin = str(
+                    provider_pins.get(pin_model) or ""
+                ).strip().casefold()
+                if not expected_pin:
+                    reasons.append("missing_formal_upstream_provider_pin")
+                elif successful and any(
+                    upstream_provider
+                    != _normalize_openrouter_provider_identity(expected_pin)
+                    for upstream_provider, _ in successful
+                ):
+                    reasons.append("router_receipt_provider_not_bound_to_formal_route")
             if unknown_analyzer_allowed:
                 represented += 1
-                continue
-            reasons.append("unverified_generation_usage_route")
+            # The runner emits an explicit placeholder for a physical request whose
+            # response usage could not be recovered.  Preserve it for account-level
+            # reconciliation.  Missing fields remain unknown, while every field and
+            # router binding that is present must still satisfy the frozen route.
             continue
         represented += 1
         provider = str(unit.get("provider") or "").strip().casefold()
         requested_provider = str(unit.get("requested_provider") or "").strip().casefold()
         model = str(unit.get("model") or "").strip()
         requested_model = str(unit.get("requested_model") or "").strip()
-        effective_allowed_models = (
-            {str(role_model_pins[role])}
-            if role_model_pins is not None and role in role_model_pins
-            else allowed_models
-        )
         if provider != "openrouter" or requested_provider != "openrouter":
             reasons.append("wrong_generation_provider_route")
         if (
@@ -1149,36 +1318,58 @@ def usage_route_reasons(
             or model not in effective_allowed_models
             or not requested_model
             or requested_model not in effective_allowed_models
+            or not _formal_openrouter_models_equivalent(model, requested_model)
         ):
             reasons.append("wrong_generation_model_route")
         provider_usage = unit.get("provider_usage")
+        nested_requested_provider = (
+            str(provider_usage.get("requested_provider") or "").strip().casefold()
+            if isinstance(provider_usage, Mapping)
+            else ""
+        )
+        nested_requested_model = (
+            str(provider_usage.get("requested_model") or "").strip()
+            if isinstance(provider_usage, Mapping)
+            else ""
+        )
         router_metadata = (
             provider_usage.get("router_metadata") if isinstance(provider_usage, Mapping) else None
         )
-        attempts = router_metadata.get("attempts") if isinstance(router_metadata, Mapping) else None
-        successful = [
-            attempt
-            for attempt in attempts or []
-            if isinstance(attempt, Mapping)
-            and isinstance(attempt.get("status"), int)
-            and not isinstance(attempt.get("status"), bool)
-            and 200 <= int(attempt["status"]) < 300
-        ]
-        model_bound = [
-            attempt
-            for attempt in successful
-            if (
-                str(attempt.get("model") or "").strip() in {model, requested_model}
-                or (
-                    requested_model
-                    and str(attempt.get("model") or "").strip().startswith(f"{requested_model}-")
-                )
-            )
-        ]
+        successful = _successful_router_bindings(unit)
+        model_bound = {
+            (upstream_provider, upstream_model)
+            for upstream_provider, upstream_model in successful
+            if _formal_openrouter_models_equivalent(upstream_model, model)
+            and _formal_openrouter_models_equivalent(upstream_model, requested_model)
+        }
+        router_requested = (
+            str(router_metadata.get("requested") or "").strip()
+            if isinstance(router_metadata, Mapping)
+            else ""
+        )
+        router_requested_provider = (
+            str(router_metadata.get("requested_provider") or "").strip().casefold()
+            if isinstance(router_metadata, Mapping)
+            else ""
+        )
+        if any(
+            value and value != "openrouter"
+            for value in (nested_requested_provider, router_requested_provider)
+        ):
+            reasons.append("wrong_generation_provider_route")
+        if nested_requested_model and not _formal_openrouter_models_equivalent(
+            nested_requested_model,
+            requested_model,
+        ):
+            reasons.append("wrong_generation_model_route")
         if not isinstance(router_metadata, Mapping) or not successful:
             reasons.append("missing_successful_router_receipt")
         elif not model_bound:
             reasons.append("router_receipt_model_not_bound_to_formal_route")
+        elif model_bound != successful:
+            reasons.append("conflicting_successful_router_receipt")
+        if not _formal_openrouter_models_equivalent(router_requested, requested_model):
+            reasons.append("router_receipt_request_not_bound_to_formal_route")
         expected_pin = (
             str(provider_pins.get(requested_model) or "").strip().casefold()
             if provider_pins is not None
@@ -1186,9 +1377,9 @@ def usage_route_reasons(
         )
         if provider_pins is not None and not expected_pin:
             reasons.append("missing_formal_upstream_provider_pin")
-        elif expected_pin and not any(
-            str(attempt.get("provider") or "").strip().casefold() == expected_pin
-            for attempt in model_bound
+        elif expected_pin and any(
+            upstream_provider != _normalize_openrouter_provider_identity(expected_pin)
+            for upstream_provider, _ in successful
         ):
             reasons.append("router_receipt_provider_not_bound_to_formal_route")
     if represented <= 0:
@@ -1207,15 +1398,64 @@ def _unit_present_value(unit: Mapping[str, Any], field: str) -> Any | None:
     return value
 
 
+def _normalize_openrouter_provider_identity(value: Any) -> str:
+    """Normalize OpenRouter provider slugs and display names for comparison."""
+    return "".join(character for character in str(value or "").casefold() if character.isalnum())
+
+
+@cache
+def _formal_openrouter_model_aliases() -> dict[str, frozenset[str]]:
+    """Bind requested model ids to the frozen registry's serving-model aliases."""
+    from opensquilla.provider.ranking_router import load_model_registry_snapshot
+
+    aliases: dict[str, set[str]] = {
+        str(model).strip().casefold(): {str(model).strip().casefold()}
+        for model in FORMAL_UPSTREAM_PINS
+        if str(model).strip()
+    }
+    snapshot = load_model_registry_snapshot()
+    if canonical_sha256(snapshot) != FORMAL_G1_SOURCE_REGISTRY_SNAPSHOT_SHA256:
+        raise FinalizationError("formal OpenRouter model registry snapshot changed")
+    rows = snapshot.get("models")
+    if not isinstance(rows, list):
+        raise FinalizationError("formal OpenRouter model registry snapshot is malformed")
+    for row in rows:
+        facts = row.get("registry_facts") if isinstance(row, Mapping) else None
+        if not isinstance(facts, Mapping):
+            continue
+        model = str(facts.get("model_id") or "").strip().casefold()
+        version = str(facts.get("version") or "").strip().casefold()
+        if model not in aliases:
+            continue
+        if version:
+            aliases[model].add(version)
+    return {model: frozenset(values) for model, values in aliases.items()}
+
+
+def _formal_openrouter_models_equivalent(left: Any, right: Any) -> bool:
+    """Treat a frozen requested model and its serving version as one identity."""
+    left_model = str(left or "").strip().casefold()
+    right_model = str(right or "").strip().casefold()
+    if not left_model or not right_model:
+        return False
+    if left_model == right_model:
+        return True
+    for requested_model, aliases in _formal_openrouter_model_aliases().items():
+        equivalence_class = {requested_model, *aliases}
+        if left_model in equivalence_class and right_model in equivalence_class:
+            return True
+    return False
+
+
 def _successful_router_bindings(unit: Mapping[str, Any]) -> set[tuple[str, str]]:
     provider_usage = unit.get("provider_usage")
     router_metadata = (
         provider_usage.get("router_metadata") if isinstance(provider_usage, Mapping) else None
     )
     attempts = router_metadata.get("attempts") if isinstance(router_metadata, Mapping) else None
-    return {
+    bindings = {
         (
-            str(attempt.get("provider") or "").strip().casefold(),
+            _normalize_openrouter_provider_identity(attempt.get("provider")),
             str(attempt.get("model") or "").strip(),
         )
         for attempt in attempts or []
@@ -1226,6 +1466,20 @@ def _successful_router_bindings(unit: Mapping[str, Any]) -> set[tuple[str, str]]
         and str(attempt.get("provider") or "").strip()
         and str(attempt.get("model") or "").strip()
     }
+    endpoints = router_metadata.get("endpoints") if isinstance(router_metadata, Mapping) else None
+    available = endpoints.get("available") if isinstance(endpoints, Mapping) else None
+    bindings.update(
+        (
+            _normalize_openrouter_provider_identity(endpoint.get("provider")),
+            str(endpoint.get("model") or "").strip(),
+        )
+        for endpoint in available or []
+        if isinstance(endpoint, Mapping)
+        and endpoint.get("selected") is True
+        and str(endpoint.get("provider") or "").strip()
+        and str(endpoint.get("model") or "").strip()
+    )
+    return bindings
 
 
 def run_receipt_enrichment(
@@ -1393,6 +1647,8 @@ def validate_judge_attempt_evidence(
             "successful": False,
             "exhausted": False,
             "source_row_count": 0,
+            "declaration_prior": None,
+            "declaration_new": None,
         }
     )
     scope_count = 0
@@ -1489,14 +1745,24 @@ def validate_judge_attempt_evidence(
                         "Judge attempts are not cumulative"
                     )
                 new_count = len(current_ids) - len(previous_ids)
+                declared_prior = judgment.get("prior_judge_attempts_used")
+                declared_new = judgment.get("judge_new_attempt_count")
+                canonical_delta_declaration = (
+                    declared_prior == len(previous_ids) and declared_new == new_count
+                )
+                replayed_snapshot_declaration = (
+                    new_count == 0
+                    and current_ids == previous_ids
+                    and declared_prior == unit_state["declaration_prior"]
+                    and declared_new == unit_state["declaration_new"]
+                )
                 if (
-                    judgment.get("prior_judge_attempts_used") != len(previous_ids)
+                    not (canonical_delta_declaration or replayed_snapshot_declaration)
                     or judgment.get("judge_attempt_count") != len(current_ids)
                     or judgment.get("judge_attempt_budget_used") != len(current_ids)
                     or judgment.get("judge_attempt_budget_remaining")
                     != JUDGE_ATTEMPT_BUDGET_LIMIT - len(current_ids)
                     or judgment.get("judge_attempt_budget_limit") != JUDGE_ATTEMPT_BUDGET_LIMIT
-                    or judgment.get("judge_new_attempt_count") != new_count
                     or judgment.get("judge_attempt_evidence_schema")
                     != JUDGE_ATTEMPT_EVIDENCE_SCHEMA
                     or judgment.get("judge_attempt_budget_scope") != JUDGE_ATTEMPT_BUDGET_SCOPE
@@ -1549,8 +1815,10 @@ def validate_judge_attempt_evidence(
                 unit_state["successful"] = successful
                 unit_state["exhausted"] = exhausted
                 unit_state["source_row_count"] += 1
+                unit_state["declaration_prior"] = declared_prior
+                unit_state["declaration_new"] = declared_new
                 top_attempt_count += len(current_ids)
-                top_new_count += new_count
+                top_new_count += int(declared_new)
                 top_exhausted_count += int(exhausted)
             if (
                 judge.get("judge_attempt_count") != top_attempt_count
@@ -2130,7 +2398,7 @@ def route_reasons(
             )
     elif group == "B1":
         applied = str(routing.get("applied_model") or routing.get("routed_model") or "")
-        allowed = set(B1_TIER_MODELS.values())
+        allowed = set(B1_TEXT_TIER_MODELS.values())
         if (
             routing.get("routing_applied") is not True
             or not applied
@@ -2266,7 +2534,7 @@ def validate_physical_generation_routes(
             allowed = {str(spec.get("model") or "")} if isinstance(spec, Mapping) else set()
         elif group == "B1":
             applied = str(routing.get("applied_model") or routing.get("routed_model") or "")
-            allowed = {applied} if applied in set(B1_TIER_MODELS.values()) else set()
+            allowed = {applied} if applied in set(B1_TEXT_TIER_MODELS.values()) else set()
         elif group == "B2":
             allowed = {*B2_PROPOSERS, B2_AGGREGATOR}
         else:
@@ -2327,12 +2595,13 @@ def validate_physical_generation_routes(
         }
         if record.key[0] == "B2" and "task_analyzer" in roles:
             reasons.append("unexpected_b2_task_analyzer_request")
-        unknown_analyzer_attempt = any(
-            str(unit.get("role") or "").strip().casefold() == "unknown_request"
-            and str(unit.get("label") or "").strip().casefold() == "task_analyzer"
-            for unit in usage_units(run.get("usage"))
-        )
-        if record.key[0] == "G1" and "task_analyzer" not in roles and not unknown_analyzer_attempt:
+        if record.key[0] == "G1" and not (
+            "task_analyzer" in roles
+            or any(
+                _is_unknown_task_analyzer_placeholder(unit)
+                for unit in usage_units(run.get("usage"))
+            )
+        ):
             reasons.append("missing_g1_task_analyzer_request")
         if reasons:
             violations.append(
@@ -2753,7 +3022,7 @@ def run_expected_request_count(run: Mapping[str, Any]) -> int:
         1
         for unit in units
         if str(unit.get("role") or "").strip().casefold()
-        in {"missing_usage", "incomplete_stream", "unknown_request"}
+        in MISSING_USAGE_PLACEHOLDER_ROLES
     )
     represented = len(units) + max(0, usage_missing - represented_missing)
     trace_events = run.get("trace_events")
@@ -3537,14 +3806,9 @@ def unit_exact_non_byok(unit: Mapping[str, Any]) -> bool:
     router_metadata = provider_usage.get("router_metadata")
     ids = response_ids(unit)
     routed_model = str(unit.get("requested_model") or unit.get("model") or "").strip()
-    attempts = router_metadata.get("attempts") if isinstance(router_metadata, Mapping) else None
     successful_models = {
-        str(attempt.get("model") or "").strip()
-        for attempt in attempts or []
-        if isinstance(attempt, Mapping)
-        and isinstance(attempt.get("status"), int)
-        and not isinstance(attempt.get("status"), bool)
-        and 200 <= int(attempt["status"]) < 300
+        upstream_model
+        for _, upstream_model in _successful_router_bindings(unit)
     }
     if (
         provider_usage.get("is_byok") is not False
@@ -3552,7 +3816,11 @@ def unit_exact_non_byok(unit: Mapping[str, Any]) -> bool:
         or router_metadata.get("is_byok") is not False
         or not router_provider_metadata_complete(router_metadata)
         or not routed_model
-        or routed_model not in successful_models
+        or not successful_models
+        or not all(
+            _formal_openrouter_models_equivalent(routed_model, upstream_model)
+            for upstream_model in successful_models
+        )
         or not ids
     ):
         return False
@@ -3610,16 +3878,7 @@ def ledger_entry_payload(entry: LedgerEntry) -> dict[str, Any]:
         cost_source = str(unit.get("cost_source") or "").strip()
         if cost_source:
             cost_sources.add(cost_source)
-        provider_usage = unit.get("provider_usage")
-        router_metadata = (
-            provider_usage.get("router_metadata") if isinstance(provider_usage, Mapping) else None
-        )
-        attempts = router_metadata.get("attempts") if isinstance(router_metadata, Mapping) else None
-        for attempt in attempts or []:
-            if not isinstance(attempt, Mapping):
-                continue
-            upstream_provider = str(attempt.get("provider") or "").strip()
-            upstream_model = str(attempt.get("model") or "").strip()
+        for upstream_provider, upstream_model in _successful_router_bindings(unit):
             if upstream_provider:
                 upstream_providers.add(upstream_provider)
             if upstream_model:
@@ -3642,11 +3901,10 @@ def ledger_entry_payload(entry: LedgerEntry) -> dict[str, Any]:
     costs: list[tuple[Decimal, str]] = []
     for unit in entry.units:
         provider_usage = unit.get("provider_usage")
-        declared_unknown = str(unit.get("role") or "").strip().casefold() in {
-            "missing_usage",
-            "incomplete_stream",
-            "unknown_request",
-        } or (isinstance(provider_usage, Mapping) and provider_usage.get("usage_unknown") is True)
+        declared_unknown = (
+            str(unit.get("role") or "").strip().casefold()
+            in MISSING_USAGE_PLACEHOLDER_ROLES
+        ) or (isinstance(provider_usage, Mapping) and provider_usage.get("usage_unknown") is True)
         reported = (
             provider_usage.get("provider_reported_cost")
             if isinstance(provider_usage, Mapping)
