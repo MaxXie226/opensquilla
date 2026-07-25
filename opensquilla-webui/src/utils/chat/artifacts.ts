@@ -15,7 +15,9 @@ const ARTIFACT_EXTENSION_CATEGORIES: Record<string, string> = {
 }
 
 export function artifactMime(artifact: ArtifactPayload): string {
-  return artifact?.mime ? String(artifact.mime).toLowerCase() : ''
+  return artifact?.mime
+    ? String(artifact.mime).split(';', 1)[0].trim().toLowerCase()
+    : ''
 }
 
 export function artifactName(artifact: ArtifactPayload): string {
