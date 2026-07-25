@@ -142,13 +142,26 @@ def _quick_check(connection: sqlite3.Connection, *, label: str) -> None:
         raise sqlite3.DatabaseError(f"{label} quick_check failed: {result!r}")
 
 
-def _read_only_connection(path: Path) -> sqlite3.Connection:
+@contextlib.contextmanager
+def _read_only_connection(path: Path) -> Iterator[sqlite3.Connection]:
+    """Open ``path`` read-only and always close the handle on exit.
+
+    ``sqlite3.Connection`` is itself a context manager, but its ``__exit__``
+    only commits or rolls back the active transaction — it leaves the handle
+    open.  Windows applies mandatory file locking, so a leaked read handle makes
+    the private-snapshot ``TemporaryDirectory`` teardown fail with
+    ``PermissionError`` and turns consolidation into ``blocked``.
+    """
+
     connection = sqlite3.connect(
         f"{path.expanduser().absolute().as_uri()}?mode=ro",
         uri=True,
     )
-    connection.row_factory = sqlite3.Row
-    return connection
+    try:
+        connection.row_factory = sqlite3.Row
+        yield connection
+    finally:
+        connection.close()
 
 
 @contextlib.contextmanager

@@ -1499,3 +1499,37 @@ def test_wheelhouse_release_hydrates_current_router_bundle() -> None:
     assert 'root / "router.runtime.yaml"' in text
     assert "intent_head.joblib" not in text
     assert "router_model.onnx" not in text
+
+
+def test_linux_desktop_recovery_e2e_scripts_preserve_x11_authority() -> None:
+    """The xvfb display needs ``DISPLAY`` and ``XAUTHORITY`` to survive scrubbing.
+
+    These harnesses strip credential-shaped variables from the Electron child
+    environment, and ``XAUTHORITY`` matches that pattern.  Dropping it makes the
+    ubuntu Desktop recovery E2E job fail with ``Missing X server or $DISPLAY``,
+    so every harness that scrubs must exempt the X11 variables.
+    """
+
+    data = _workflow("ci.yml")
+    steps = data["jobs"]["desktop-recovery-e2e"]["steps"]
+    step = next(
+        item for item in steps if item.get("name") == "Run compiled Desktop recovery flows"
+    )
+    run = step["run"]
+    assert "xvfb-run" in run, "the Linux branch must provide a virtual display"
+
+    scripts = re.findall(r"'[a-z0-9-]+:(scripts/[A-Za-z0-9_./-]+\.mjs)'", run)
+    assert scripts, "no Desktop recovery E2E scripts were found in ci.yml"
+
+    exemption = "name === 'DISPLAY' || name === 'XAUTHORITY'"
+    for relative in scripts:
+        path = Path("desktop/electron") / relative
+        assert path.is_file(), f"missing Desktop recovery E2E script: {path}"
+        source = path.read_text(encoding="utf-8")
+        if "CREDENTIAL|AUTH" not in source:
+            continue
+        assert exemption in source, (
+            f"{path} scrubs credential-shaped environment variables without exempting "
+            "DISPLAY/XAUTHORITY, so the ubuntu Desktop recovery E2E job will fail with "
+            "'Missing X server or $DISPLAY'"
+        )

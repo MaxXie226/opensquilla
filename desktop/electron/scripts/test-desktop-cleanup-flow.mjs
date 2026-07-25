@@ -47,6 +47,9 @@ async function waitFor(check, label, timeoutMs = 90_000) {
 function launchEnvironment(isolatedHome) {
   const inherited = { ...process.env }
   for (const name of Object.keys(inherited)) {
+    // XAUTHORITY matches the credential pattern below, but stripping it leaves
+    // Electron unable to authenticate against the xvfb display on Linux CI.
+    if (name === 'DISPLAY' || name === 'XAUTHORITY') continue
     const upperName = name.toUpperCase()
     if (
       upperName.startsWith('OPENSQUILLA_')

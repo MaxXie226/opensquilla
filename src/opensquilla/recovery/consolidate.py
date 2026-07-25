@@ -49,7 +49,6 @@ _RECOVERY_ID_RE = re.compile(
 _CONFIG_NAMES = ("config.toml", ".env")
 _CONTEXT_NAME = "desktop-profile-context.json"
 _CREDENTIAL_NAME = "desktop-credential.json"
-_FINDER_METADATA_NAME = ".DS_Store"
 _JOURNAL_NAME = ".opensquilla-profile-consolidation.json"
 _BACKUPS_RELATIVE = Path("backups") / "profile-consolidation"
 _STAGING_PREFIX = ".opensquilla.profile-consolidation."
@@ -317,16 +316,23 @@ def _plain_optional_file(path: Path, *, label: str) -> bool:
 
 
 def _validate_recovery_container_metadata(path: Path) -> None:
+    """Admit an unrecognized container entry only when it is an inert file.
+
+    The entry is named in the diagnostic so an operator can clear it without
+    guessing which file blocked startup.
+    """
+
     try:
         value = path.lstat()
     except OSError as exc:
         raise _ConsolidationBlockedError(
-            f"recovery container metadata is unavailable: {path}",
+            f"recovery container entry is unavailable: {path}",
             stable_code="profile_consolidation_unsafe_recovery_root",
         ) from exc
     if _is_link_or_reparse(value) or not stat.S_ISREG(value.st_mode):
         raise _ConsolidationBlockedError(
-            f"recovery container metadata must be a regular file: {path}",
+            "unexpected entry in the recovery profile container must be a "
+            f"regular file, remove it to continue: {path}",
             stable_code="profile_consolidation_unsafe_recovery_root",
         )
 
@@ -359,20 +365,18 @@ def _enumerate_recoveries(user_data: Path) -> tuple[_RecoveryProfile, ...]:
     profiles: list[_RecoveryProfile] = []
     with os.scandir(container) as entries:
         for entry in sorted(entries, key=lambda item: item.name):
-            if entry.name == _FINDER_METADATA_NAME:
+            # Match Desktop's exact v4 UUID contract, not merely UUID-shaped names.
+            if not _RECOVERY_ID_RE.fullmatch(entry.name) or uuid.UUID(entry.name).version != 4:
+                # This container is a directory the app itself created, so shell
+                # and antivirus metadata land in it whenever the user browses
+                # there (``desktop.ini``, ``Thumbs.db``, ``.DS_Store``). An inert
+                # regular file cannot redirect the archival rename, so skip it
+                # and let it ride into the backup with the container. Anything
+                # that could be profile-shaped or could redirect the move stays
+                # fail-closed, because permitting it would defer the failure to
+                # the post-publish archival phase instead.
                 _validate_recovery_container_metadata(Path(entry.path))
                 continue
-            if not _RECOVERY_ID_RE.fullmatch(entry.name):
-                raise _ConsolidationBlockedError(
-                    f"unexpected entry in recovery profile container: {entry.name}",
-                    stable_code="profile_consolidation_unsafe_recovery_root",
-                )
-            # Match Desktop's exact v4 UUID contract, not merely UUID-shaped names.
-            if uuid.UUID(entry.name).version != 4:
-                raise _ConsolidationBlockedError(
-                    f"unsupported recovery profile id: {entry.name}",
-                    stable_code="profile_consolidation_unsafe_recovery_root",
-                )
             root = Path(entry.path)
             root_stat = _plain_directory(root, label="recovery profile")
             home = root / "opensquilla"
@@ -543,7 +547,11 @@ def _metadata_identity(path: Path) -> tuple[int, int, int, int, int] | None:
 
 def _source_snapshot(
     profile: _RecoveryProfile,
-) -> tuple[object | None, tuple[int, int, int, int, int], object | None]:
+) -> tuple[
+    object | None,
+    tuple[int, int, int, int, int],
+    tuple[int, int, int, int, int] | None,
+]:
     home_manifest = profile_no_follow_manifest(profile.home) if profile.home.is_dir() else None
     root_identity = _metadata_identity(profile.root)
     if root_identity is None:
@@ -807,6 +815,19 @@ def _safe_derived_data_overlap(
     return False
 
 
+def _authority_size(authority: dict[str, object]) -> int:
+    """Read the byte size recorded by :func:`_file_authority`.
+
+    ``_file_authority`` returns a heterogeneous mapping, so narrow the value
+    explicitly rather than trusting the annotation at each call site.
+    """
+
+    value = authority["size"]
+    if not isinstance(value, int):
+        raise UnsafePathError(f"file authority size must be an integer: {value!r}")
+    return value
+
+
 def _file_authority(path: Path, *, label: str) -> dict[str, object]:
     from opensquilla.recovery.config_patch import ConfigSnapshot
 
@@ -1043,15 +1064,17 @@ def _build_primary_data_routes(
             if normalized_agent_id == "main"
             else workspace_path / "agents" / normalized_agent_id
         )
+        configured_path: Path
         if entry.get("workspace") is None:
             configured_path = derived_path
             origin: Literal["derived", "explicit"] = "derived"
         else:
-            configured_path = _configured_absolute_path(
+            explicit_path = _configured_absolute_path(
                 entry.get("workspace"),
                 name=f"agents.{normalized_agent_id}.workspace",
             )
-            assert configured_path is not None
+            assert explicit_path is not None
+            configured_path = explicit_path
             origin = (
                 "derived"
                 if _normalized_path(configured_path) == _normalized_path(derived_path)
@@ -3251,7 +3274,7 @@ def consolidate_recovery_profiles(
                         else None
                     ),
                     configuration_source_credential_size=(
-                        int(credential_authority["size"])
+                        _authority_size(credential_authority)
                         if credential_authority is not None
                         else None
                     ),

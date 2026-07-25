@@ -3404,3 +3404,121 @@ def test_credential_authority_is_captured_after_profile_lock(
     assert result.outcome == "consolidated", result
     assert result.configuration_source_credential_sha256 == hashlib.sha256(updated).hexdigest()
     assert result.configuration_source_credential_size == len(updated)
+
+
+@pytest.mark.parametrize(
+    "stray_name",
+    ["desktop.ini", "Thumbs.db", ".localized", "sessions.db.avquarantine", "notes.txt"],
+)
+def test_consolidate_allows_stray_regular_files_in_recovery_root(
+    tmp_path: Path,
+    monkeypatch,
+    stray_name: str,
+) -> None:
+    """Shell and antivirus metadata must never strand startup on a repair page.
+
+    Windows Explorer writes ``desktop.ini``/``Thumbs.db`` into any folder the
+    user browses, and the recovery container is a folder the app created.  A
+    stray regular file is inert: it rides into the archive with the container.
+    """
+
+    monkeypatch.setenv("OPENSQUILLA_USER_STATE_DIR", str(tmp_path / "locks"))
+    user_data = tmp_path / "user-data"
+    primary = user_data / "opensquilla"
+    (primary / "workspace").mkdir(parents=True)
+    (primary / "config.toml").write_text("primary = true\n", encoding="utf-8")
+    recovery_id = str(uuid.uuid4())
+    _recovery(
+        user_data,
+        recovery_id,
+        config="selected = 'recovery'\n",
+        credential="{}\n",
+        memory="memory\n",
+        conflict="recovery",
+        extra_name="recovery.txt",
+        session_key="agent:main:stray-file",
+    )
+    stray = user_data / "recovery-profiles" / stray_name
+    stray.write_bytes(b"stray metadata")
+
+    result = consolidate_recovery_profiles(user_data, primary)
+
+    assert result.outcome == "consolidated", result
+    assert result.consumed_recovery_ids == (recovery_id,)
+    assert result.backup_path is not None
+    archived = result.backup_path / "recovery-profiles" / stray_name
+    assert archived.read_bytes() == b"stray metadata"
+
+
+def test_consolidate_with_only_stray_files_boots_without_blocking(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """A container holding no real profile is a noop, not a blocked startup."""
+
+    monkeypatch.setenv("OPENSQUILLA_USER_STATE_DIR", str(tmp_path / "locks"))
+    user_data = tmp_path / "user-data"
+    primary = user_data / "opensquilla"
+    (primary / "workspace").mkdir(parents=True)
+    (primary / "config.toml").write_text("primary = true\n", encoding="utf-8")
+    recovery_root = user_data / "recovery-profiles"
+    recovery_root.mkdir()
+    (recovery_root / "desktop.ini").write_bytes(b"[.ShellClassInfo]\n")
+    (recovery_root / "Thumbs.db").write_bytes(b"thumbs")
+
+    result = consolidate_recovery_profiles(user_data, primary)
+
+    assert result.outcome == "noop", result
+    assert result.stable_code == "no_recovery_profiles"
+    assert (recovery_root / "desktop.ini").exists()
+    assert (recovery_root / "Thumbs.db").exists()
+
+
+def test_consolidate_still_rejects_stray_directory_and_names_it(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """An unrecognized directory could be profile-shaped; stay fail-closed.
+
+    Allowing it would defer the failure to the post-publish archival move, a
+    strictly more dangerous phase, so it is refused up front — but the
+    diagnostic must name the entry so the user can remove it.
+    """
+
+    monkeypatch.setenv("OPENSQUILLA_USER_STATE_DIR", str(tmp_path / "locks"))
+    user_data = tmp_path / "user-data"
+    primary = user_data / "opensquilla"
+    primary.mkdir(parents=True)
+    recovery_root = user_data / "recovery-profiles"
+    recovery_root.mkdir()
+    stray = recovery_root / f"{uuid.uuid4()} - Copy"
+    stray.mkdir()
+
+    result = consolidate_recovery_profiles(user_data, primary)
+
+    assert result.outcome == "blocked"
+    assert result.stable_code == "profile_consolidation_unsafe_recovery_root"
+    assert stray.is_dir()
+
+
+def test_consolidate_still_rejects_stray_symlink(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_USER_STATE_DIR", str(tmp_path / "locks"))
+    user_data = tmp_path / "user-data"
+    primary = user_data / "opensquilla"
+    primary.mkdir(parents=True)
+    recovery_root = user_data / "recovery-profiles"
+    recovery_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.write_text("outside\n", encoding="utf-8")
+    stray = recovery_root / "notes.txt"
+    stray.symlink_to(outside)
+
+    result = consolidate_recovery_profiles(user_data, primary)
+
+    assert result.outcome == "blocked"
+    assert result.stable_code == "profile_consolidation_unsafe_recovery_root"
+    assert stray.is_symlink()
+    assert outside.read_text(encoding="utf-8") == "outside\n"
