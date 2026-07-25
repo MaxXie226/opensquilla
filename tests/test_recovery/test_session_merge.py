@@ -6,6 +6,7 @@ import os
 import shutil
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from typer.testing import CliRunner
@@ -633,6 +634,65 @@ def test_unsafe_target_media_does_not_block_transcript_import(tmp_path: Path) ->
         "agent:main:webchat:unsafe-target-media"
     ][1]] == [envelope]
     assert list(outside.iterdir()) == []
+
+
+def test_windows_prepare_target_media_root_accepts_existing_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target_media = tmp_path / "primary-media"
+    target_media.mkdir()
+    monkeypatch.setattr(session_merge_module, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(session_merge_module, "_absolute", lambda _path: target_media)
+    monkeypatch.setattr(session_merge_module, "_parent_chain_identities", lambda _path: {})
+    monkeypatch.setattr(session_merge_module, "no_follow_manifest", lambda _path: {})
+
+    assert session_merge_module._prepare_target_media_root(target_media) == target_media
+
+
+def test_normalize_snapshot_closes_connections_before_return(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    copied = tmp_path / "copied.db"
+    normalized = tmp_path / "normalized.db"
+    original_connect = sqlite3.connect
+    seed = original_connect(copied)
+    try:
+        seed.execute("CREATE TABLE messages (content TEXT NOT NULL)")
+        seed.execute("INSERT INTO messages VALUES ('preserved')")
+        seed.commit()
+    finally:
+        seed.close()
+
+    connections: list[sqlite3.Connection] = []
+
+    class TrackedConnection(sqlite3.Connection):
+        closed = False
+
+        def close(self) -> None:
+            self.closed = True
+            super().close()
+
+    def tracked_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+        connection = original_connect(*args, factory=TrackedConnection, **kwargs)
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(session_merge_module.sqlite3, "connect", tracked_connect)
+    try:
+        session_merge_module._normalize_snapshot(copied, normalized)
+        assert len(connections) == 2
+        assert all(getattr(connection, "closed", False) for connection in connections)
+    finally:
+        for connection in connections:
+            connection.close()
+
+    verify = original_connect(normalized)
+    try:
+        assert verify.execute("SELECT content FROM messages").fetchone() == ("preserved",)
+    finally:
+        verify.close()
 
 
 def test_merge_snapshots_committed_wal_without_mutating_source(

@@ -2733,6 +2733,7 @@ def test_compiled_electron_flows_preserve_xvfb_display_authority() -> None:
     for script in (
         "desktop/electron/scripts/test-profile-recovery-flow.mjs",
         "desktop/electron/scripts/test-profile-import-flow.mjs",
+        "desktop/electron/scripts/test-unsafe-profile-no-write.mjs",
     ):
         source = _read(script)
         assert "name === 'DISPLAY' || name === 'XAUTHORITY'" in source

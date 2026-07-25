@@ -295,21 +295,23 @@ def _bundle_paths(database: Path) -> tuple[Path, ...]:
 
 def _normalize_snapshot(copied_database: Path, normalized_database: Path) -> None:
     try:
-        with sqlite3.connect(copied_database) as source:
-            result = source.execute("PRAGMA integrity_check").fetchone()
-            if result is None or result[0] != "ok":
-                raise SessionMergeError(
-                    "source session database failed integrity validation",
-                    stable_code="session_merge_source_invalid",
-                )
-            with sqlite3.connect(normalized_database) as target:
-                source.backup(target)
-                target_result = target.execute("PRAGMA integrity_check").fetchone()
-                if target_result is None or target_result[0] != "ok":
+        with contextlib.closing(sqlite3.connect(copied_database)) as source:
+            with source:
+                result = source.execute("PRAGMA integrity_check").fetchone()
+                if result is None or result[0] != "ok":
                     raise SessionMergeError(
-                        "session database snapshot failed integrity validation",
-                        stable_code="session_merge_snapshot_failed",
+                        "source session database failed integrity validation",
+                        stable_code="session_merge_source_invalid",
                     )
+                with contextlib.closing(sqlite3.connect(normalized_database)) as target:
+                    with target:
+                        source.backup(target)
+                        target_result = target.execute("PRAGMA integrity_check").fetchone()
+                        if target_result is None or target_result[0] != "ok":
+                            raise SessionMergeError(
+                                "session database snapshot failed integrity validation",
+                                stable_code="session_merge_snapshot_failed",
+                            )
     except SessionMergeError:
         raise
     except sqlite3.Error as exc:
@@ -750,7 +752,7 @@ def _prepare_target_media_root(target_media_root: Path) -> Path:
     try:
         target_guard = _parent_chain_identities(target_root)
         if os.name == "nt":
-            target_root.mkdir(parents=True, mode=0o700)
+            target_root.mkdir(parents=True, mode=0o700, exist_ok=True)
         else:
             descriptor = _open_posix_target_directory(target_root, target_guard)
             os.close(descriptor)

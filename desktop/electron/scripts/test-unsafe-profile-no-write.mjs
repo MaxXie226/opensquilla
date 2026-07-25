@@ -113,6 +113,7 @@ async function waitForNormalDesktop(app) {
 function isolatedLaunchEnvironment(isolatedHome, gatewayPort) {
   const inherited = { ...process.env }
   for (const name of Object.keys(inherited)) {
+    if (name === 'DISPLAY' || name === 'XAUTHORITY') continue
     const upperName = name.toUpperCase()
     if (
       name.startsWith('OPENSQUILLA_')
