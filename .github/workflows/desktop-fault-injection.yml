@@ -1,0 +1,265 @@
+name: Desktop Fault Injection
+
+# Exercises a real packaged Desktop build against hostile profile layouts before
+# a release tag exists. The tag-time gate only proved the packaged process
+# survived eight seconds and that `recovery inspect` reported `ready`, which is
+# why the 0.5.0 profile-consolidation regression shipped: nothing asserted the
+# user could actually reach the control surface.
+#
+# Signed installers are reused from a completed Release Assets run rather than
+# rebuilt here, so this workflow never needs the Apple signing credentials.
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: Completed Release Assets run holding opensquilla-electron-macos
+        required: true
+      scenarios:
+        description: Space-separated scenario names (empty runs the whole catalogue)
+        required: false
+        default: ""
+      run_wedge_probe:
+        description: Also probe interrupted consolidations (reported, never gating)
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: desktop-fault-injection-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  macos-fault-injection:
+    name: macOS packaged fault injection
+    if: github.repository == 'opensquilla/opensquilla' && github.actor == 'Open-Squilla'
+    runs-on: macos-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download signed macOS installer
+        uses: actions/download-artifact@v4
+        with:
+          name: opensquilla-electron-macos
+          path: packaged-macos
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_run_id }}
+
+      - name: Mount the installer and stage the application
+        id: stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          dmgs=(packaged-macos/*.dmg)
+          if [[ "${#dmgs[@]}" -ne 1 ]]; then
+            printf 'expected exactly one DMG, found %d\n' "${#dmgs[@]}" >&2
+            ls -la packaged-macos >&2 || true
+            exit 1
+          fi
+          # RUNNER_TEMP is a real path; consolidation refuses profile roots that
+          # resolve through a link, and /tmp on macOS is such a link.
+          stage="$(cd "${RUNNER_TEMP}" && pwd -P)/fault-injection"
+          mount="${stage}/mount"
+          apps="${stage}/Applications"
+          mkdir -p "${mount}" "${apps}"
+          hdiutil attach -nobrowse -readonly -mountpoint "${mount}" "${dmgs[0]}"
+          ditto "${mount}/OpenSquilla.app" "${apps}/OpenSquilla.app"
+          hdiutil detach "${mount}" -quiet
+          printf 'stage=%s\n' "${stage}" >> "${GITHUB_OUTPUT}"
+          printf 'app=%s\n' "${apps}/OpenSquilla.app" >> "${GITHUB_OUTPUT}"
+
+      - name: Record the signature the scenarios actually run against
+        shell: bash
+        run: |
+          set -euo pipefail
+          app='${{ steps.stage.outputs.app }}'
+          codesign --verify --deep --strict --verbose=2 "${app}"
+          codesign --display --verbose=4 "${app}" 2>&1 | tee signature.txt
+          # An ad-hoc signature cannot exercise the real safeStorage keychain
+          # policy, so say so loudly instead of reporting a false pass.
+          if grep -qi 'Signature=adhoc' signature.txt; then
+            printf '::warning::Artifact is ad-hoc signed; the safeStorage credential path is NOT covered.\n'
+          fi
+          spctl --assess --type execute --verbose "${app}" || \
+            printf '::warning::Gatekeeper assessment failed for the staged app.\n'
+
+      - name: Run fault-injection scenarios
+        shell: bash
+        run: |
+          set -euo pipefail
+          selected='${{ inputs.scenarios }}'
+          args=()
+          for name in ${selected}; do
+            args+=(--scenario "${name}")
+          done
+          python .github/scripts/desktop_fault_injection.py run \
+            --app '${{ steps.stage.outputs.app }}' \
+            --workdir '${{ steps.stage.outputs.stage }}/scenarios' \
+            --report '${{ steps.stage.outputs.stage }}/scenario-report.json' \
+            "${args[@]}"
+
+      - name: Summarize scenarios
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          report='${{ steps.stage.outputs.stage }}/scenario-report.json'
+          test -f "${report}" || exit 0
+          python - "${report}" >> "${GITHUB_STEP_SUMMARY}" <<'PY'
+          import json, sys
+          from pathlib import Path
+
+          results = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          print("## macOS packaged fault injection\n")
+          print("| scenario | expected | observed | result |")
+          print("| --- | --- | --- | --- |")
+          for item in results:
+              mark = "pass" if item["ok"] else "**FAIL**"
+              print(
+                  f"| `{item['scenario']}` | {item['expected']} "
+                  f"| {item['verdict']} | {mark} |"
+              )
+          print("")
+          for item in results:
+              if item["ok"]:
+                  continue
+              print(f"### `{item['scenario']}`\n")
+              print(f"{item['why']}\n")
+              for failure in item.get("failures", []):
+                  print(f"- {failure}")
+              print("")
+          PY
+
+      - name: Upload scenario evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-fault-injection-macos-attempt-${{ github.run_attempt }}
+          path: |
+            ${{ steps.stage.outputs.stage }}/scenario-report.json
+            ${{ steps.stage.outputs.stage }}/scenarios/*/user-data/logs/desktop.log
+            ${{ steps.stage.outputs.stage }}/scenarios/*/launch-stdio.log
+            signature.txt
+          if-no-files-found: warn
+          retention-days: 14
+
+  macos-wedge-probe:
+    name: macOS interrupted-consolidation probe (reported, not gating)
+    if: >-
+      github.repository == 'opensquilla/opensquilla'
+      && github.actor == 'Open-Squilla'
+      && inputs.run_wedge_probe
+    runs-on: macos-latest
+    timeout-minutes: 60
+    # Two resume paths are known to refuse continuation once a recorded source
+    # snapshot stops reproducing. Failing the workflow on them would keep it red
+    # indefinitely and mask new regressions, so the probe reports instead.
+    continue-on-error: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download signed macOS installer
+        uses: actions/download-artifact@v4
+        with:
+          name: opensquilla-electron-macos
+          path: packaged-macos
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_run_id }}
+
+      - name: Mount the installer and stage the application
+        id: stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          dmgs=(packaged-macos/*.dmg)
+          if [[ "${#dmgs[@]}" -ne 1 ]]; then
+            printf 'expected exactly one DMG, found %d\n' "${#dmgs[@]}" >&2
+            exit 1
+          fi
+          stage="$(cd "${RUNNER_TEMP}" && pwd -P)/wedge-probe"
+          mount="${stage}/mount"
+          apps="${stage}/Applications"
+          mkdir -p "${mount}" "${apps}"
+          hdiutil attach -nobrowse -readonly -mountpoint "${mount}" "${dmgs[0]}"
+          ditto "${mount}/OpenSquilla.app" "${apps}/OpenSquilla.app"
+          hdiutil detach "${mount}" -quiet
+          printf 'stage=%s\n' "${stage}" >> "${GITHUB_OUTPUT}"
+          printf 'app=%s\n' "${apps}/OpenSquilla.app" >> "${GITHUB_OUTPUT}"
+
+      - name: Probe interrupted consolidations
+        shell: bash
+        run: |
+          set -euo pipefail
+          python .github/scripts/desktop_fault_injection.py wedge \
+            --app '${{ steps.stage.outputs.app }}' \
+            --workdir '${{ steps.stage.outputs.stage }}/probes' \
+            --report '${{ steps.stage.outputs.stage }}/wedge-report.json'
+
+      - name: Summarize probes
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          report='${{ steps.stage.outputs.stage }}/wedge-report.json'
+          test -f "${report}" || exit 0
+          python - "${report}" >> "${GITHUB_STEP_SUMMARY}" <<'PY'
+          import json, sys
+          from pathlib import Path
+
+          probes = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          wedged = [probe for probe in probes if probe["wedged"]]
+          print("## Interrupted-consolidation probe\n")
+          print(
+              f"{len(wedged)} of {len(probes)} interruptions left startup blocked "
+              "after an ordinary metadata change.\n"
+          )
+          print("| killed after | journal phase | relaunch | startup |")
+          print("| --- | --- | --- | --- |")
+          for probe in probes:
+              state = "**blocked**" if probe["wedged"] else "recovered"
+              print(
+                  f"| {probe['kill_after_seconds']:g}s "
+                  f"| `{probe['journal_phase_after_kill']}` "
+                  f"| {probe['relaunch_verdict']} | {state} |"
+              )
+          PY
+
+      - name: Upload probe evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-wedge-probe-macos-attempt-${{ github.run_attempt }}
+          path: |
+            ${{ steps.stage.outputs.stage }}/wedge-report.json
+            ${{ steps.stage.outputs.stage }}/probes/*/user-data/logs/desktop.log
+            ${{ steps.stage.outputs.stage }}/probes/*/user-data/.opensquilla-profile-consolidation.json
+            ${{ steps.stage.outputs.stage }}/probes/*/launch-stdio.log
+          if-no-files-found: warn
+          retention-days: 14
