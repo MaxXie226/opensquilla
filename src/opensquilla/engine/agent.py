@@ -99,11 +99,13 @@ from opensquilla.engine.usage_accounting import (
     UsageCallStart,
     UsageEventSink,
     UsageExecutionContext,
+    _coerce_billing_receipt,
     bind_usage_accounting_scope,
     current_usage_accounting_scope,
     has_known_provider_usage_receipt,
     normalize_provider_usage,
     provider_accounts_physical_usage,
+    provider_usage_receipt_rows,
     start_usage_call,
 )
 from opensquilla.execution_status import (
@@ -256,6 +258,7 @@ def _resolve_turn_objective_reminder() -> tuple[bool, int]:
         + ", ".join(sorted(_TURN_OBJECTIVE_REMINDER_ON | _TURN_OBJECTIVE_REMINDER_OFF))
         + ", or trim:<positive integer>"
     )
+
 
 _PROVIDER_OUTPUT_TRUNCATED_REPLY = build_terminal_reply(
     {
@@ -467,9 +470,7 @@ def _progress_watchdog_guidance_message(reason: str, details: Mapping[str, Any])
 
     count = details.get("count")
     count_text = f" Count: {count}." if isinstance(count, int) and count > 0 else ""
-    workspace_change_likely_required = bool(
-        details.get("workspace_change_likely_required")
-    )
+    workspace_change_likely_required = bool(details.get("workspace_change_likely_required"))
     failure_summary = str(details.get("failure_anchor_summary") or "").strip()
     if len(failure_summary) > 700:
         failure_summary = failure_summary[:697].rstrip() + "..."
@@ -583,6 +584,84 @@ def _usage_float(value: Any) -> float:
         return 0.0
 
 
+def _usage_field(value: object, *names: str, default: Any = None) -> Any:
+    if isinstance(value, Mapping):
+        for name in names:
+            if name in value:
+                return value[name]
+        return default
+    for name in names:
+        if hasattr(value, name):
+            return getattr(value, name)
+    return default
+
+
+def _canonical_provider_billed_cost(value: object) -> tuple[float, bool]:
+    """Return canonical USD and whether one exact provider receipt proves it."""
+
+    source = str(
+        _usage_field(value, "cost_source", "costSource", default="none")
+        or "none"
+    ).strip().casefold()
+    reported = _usage_float(
+        _usage_field(
+            value,
+            "billed_cost",
+            "billedCost",
+            "billed_cost_usd",
+            "billedCostUsd",
+            default=0.0,
+        )
+    )
+    receipt = _usage_field(
+        value,
+        "billing_receipt",
+        "billingReceipt",
+        default=None,
+    )
+    if receipt is not None:
+        validated_receipt = _coerce_billing_receipt(receipt)
+        if (
+            validated_receipt is not None
+            and validated_receipt.status == "confirmed"
+        ):
+            return (
+                int(validated_receipt.usd_equivalent_nanos or 0)
+                / 1_000_000_000,
+                True,
+            )
+        # Pending or malformed native receipts override any optimistic legacy
+        # source marker until an exact confirmed amount exists.
+        return 0.0, False
+    legacy_implicit_bill = (
+        source in {"", "none", "unavailable"} and reported > 0.0
+    )
+    trusted = (
+        source in {"provider_billed", "openrouter_usage"}
+        or legacy_implicit_bill
+    )
+    return (reported if trusted else 0.0), trusted
+
+
+_MISSING_USAGE_PLACEHOLDER_ROLES = frozenset(
+    {
+        "abandoned_stream",
+        "usage_missing",
+        "unknown_call",
+        "abandoned_stream_request",
+        "agent_llm_request_unknown",
+        "abandoned_provider_request",
+    }
+)
+
+
+def _is_missing_usage_placeholder(row: Mapping[str, Any]) -> bool:
+    return (
+        str(row.get("role") or "").strip().casefold()
+        in _MISSING_USAGE_PLACEHOLDER_ROLES
+    )
+
+
 def _model_usage_row_cost_source(sources: list[str], *, cost_usd: float) -> str:
     meaningful = [source for source in sources if source not in {"", "none"}]
     if not meaningful:
@@ -599,40 +678,21 @@ def _with_model_usage_cost_fields(rows: list[dict[str, Any]]) -> list[dict[str, 
     enriched: list[dict[str, Any]] = []
     for row in rows:
         item = dict(row)
-        model_id = str(item.get("model") or "")
-        if model_id:
-            provider_cost_source = str(
-                item.get("cost_source") or item.get("costSource") or "none"
-            ).strip().lower()
+        actual_model_id = str(item.get("model") or "")
+        requested_model_id = str(item.get("requested_model") or "")
+        pricing_model_id = actual_model_id or requested_model_id
+        if pricing_model_id:
+            provider_cost_source = (
+                str(item.get("cost_source") or item.get("costSource") or "none").strip().lower()
+            )
             reported_billed_cost = _usage_float(
                 item.get("billed_cost")
                 or item.get("billedCost")
                 or item.get("billed_cost_usd")
                 or item.get("billedCostUsd")
             )
-            usage_receipt = item.get(
-                "billing_receipt",
-                item.get("billingReceipt"),
-            )
-            if isinstance(usage_receipt, dict):
-                receipt_status = str(
-                    usage_receipt.get("status") or ""
-                ).strip().lower()
-            else:
-                receipt_status = str(
-                    getattr(usage_receipt, "status", "") or ""
-                ).strip().lower()
-            legacy_implicit_bill = (
-                provider_cost_source in {"", "none", "unavailable"}
-                and reported_billed_cost > 0.0
-            )
-            has_billed_receipt = (
-                receipt_status == "confirmed"
-                or provider_cost_source in {"provider_billed", "openrouter_usage"}
-                or legacy_implicit_bill
-            )
-            trusted_billed_cost = (
-                reported_billed_cost if has_billed_receipt else 0.0
+            trusted_billed_cost, has_billed_receipt = (
+                _canonical_provider_billed_cost(item)
             )
             cache_read = (
                 item.get("cache_read_tokens")
@@ -640,12 +700,14 @@ def _with_model_usage_cost_fields(rows: list[dict[str, Any]]) -> list[dict[str, 
                 else item.get("cached_tokens")
             )
             cost_fields = model_usage_cost_fields(
-                model_id=model_id,
-                provider=str(item.get("provider") or ""),
-                input_tokens=_usage_int(item.get("input_tokens") or item.get("inputTokens")),
-                output_tokens=_usage_int(
-                    item.get("output_tokens") or item.get("outputTokens")
+                model_id=pricing_model_id,
+                provider=str(
+                    item.get("provider")
+                    or item.get("requested_provider")
+                    or ""
                 ),
+                input_tokens=_usage_int(item.get("input_tokens") or item.get("inputTokens")),
+                output_tokens=_usage_int(item.get("output_tokens") or item.get("outputTokens")),
                 billed_cost=trusted_billed_cost,
                 # Unbilled rows must be priced with their own cache counts,
                 # not cache-blind — otherwise the legacy-inference path in
@@ -655,7 +717,7 @@ def _with_model_usage_cost_fields(rows: list[dict[str, Any]]) -> list[dict[str, 
                 cache_write_tokens=_usage_int(item.get("cache_write_tokens") or 0),
                 has_billed_receipt=True if has_billed_receipt else None,
             )
-            if has_billed_receipt and reported_billed_cost <= 0.0:
+            if has_billed_receipt and trusted_billed_cost <= 0.0:
                 # An explicit zero-cost provider receipt is exact; list pricing
                 # must not turn it into an estimate.
                 cost_fields.update(
@@ -681,21 +743,45 @@ def _with_model_usage_cost_fields(rows: list[dict[str, Any]]) -> list[dict[str, 
             item["provider_reported_billed_cost"] = reported_billed_cost
             item["billed_cost"] = trusted_billed_cost
             item["provider_cost_source"] = provider_cost_source
+            if has_billed_receipt:
+                item["cost_source"] = "provider_billed"
+                item["costSource"] = "provider_billed"
+            elif _usage_field(
+                item,
+                "billing_receipt",
+                "billingReceipt",
+                default=None,
+            ) is not None:
+                item["cost_source"] = (
+                    str(item.get("cost_source") or "").strip().casefold()
+                    if str(item.get("cost_source") or "").startswith("opensquilla_")
+                    else "unavailable"
+                )
+                item["costSource"] = item["cost_source"]
         enriched.append(item)
     return enriched
 
 
 def _summarize_model_usage_breakdown(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    aggregated: dict[tuple[str, str, str, str], dict[str, Any]] = {}
-    sources_by_key: dict[tuple[str, str, str, str], list[str]] = {}
+    aggregated: dict[tuple[str, str, str, str, str, str], dict[str, Any]] = {}
+    sources_by_key: dict[tuple[str, str, str, str, str, str], list[str]] = {}
     for row in _with_model_usage_cost_fields(rows):
         model_id = str(row.get("model") or "").strip()
-        if not model_id:
+        requested_model = str(row.get("requested_model") or "").strip()
+        if not model_id and not requested_model:
             continue
         role = str(row.get("role") or "").strip() or "member"
         label = str(row.get("label") or role).strip() or role
         provider = str(row.get("provider") or "").strip()
-        key = (role, label, provider, model_id)
+        requested_provider = str(row.get("requested_provider") or "").strip()
+        key = (
+            role,
+            label,
+            provider,
+            model_id,
+            requested_provider,
+            requested_model,
+        )
         if key not in aggregated:
             aggregated[key] = {
                 "role": role,
@@ -703,6 +789,8 @@ def _summarize_model_usage_breakdown(rows: list[dict[str, Any]]) -> list[dict[st
                 "label": label,
                 "provider": provider,
                 "model": model_id,
+                "requested_provider": requested_provider,
+                "requested_model": requested_model,
                 "sample_index": row.get("sample_index", 0),
                 "input_tokens": 0,
                 "output_tokens": 0,
@@ -860,6 +948,15 @@ _DEADLINE_WRAPUP_DIRECTIVE_TEMPLATE = (
     "final answer. Finishing your best-supported work now is better than "
     "further investigation that the clock will cut off."
 )
+_DEADLINE_NO_TOOL_FINALIZATION_SUFFIX = (
+    " Do not call tools. Use the evidence already present in the conversation "
+    "and provide the best complete final answer now."
+)
+_RETRIEVAL_LOOP_TOOL_NAMES = frozenset({"web_search", "web_fetch"})
+_LEGACY_DEADLINE_PREEMPT_PROGRESS_TYPES = frozenset({"proposer_start", "proposer_finish"})
+_PROVIDER_STREAM_CLEANUP_TIMEOUT_SECONDS = 5.0
+_TOOL_TASK_CLEANUP_TIMEOUT_SECONDS = 1.0
+_USAGE_ACCOUNTING_COMPLETION_TIMEOUT_SECONDS = 5.0
 _MID_BUDGET_NO_DIFF_NUDGE_FRACTIONS: tuple[float, ...] = (0.5, 0.75)
 _MID_BUDGET_NO_DIFF_NUDGE_TEMPLATE = (
     "Progress check: about {percent}% of the wall-clock budget for this task "
@@ -869,9 +966,22 @@ _MID_BUDGET_NO_DIFF_NUDGE_TEMPLATE = (
     "file and make the smallest reasonable edit now, then refine it with the "
     "remaining time instead of leaving the whole budget to analysis."
 )
-_MID_BUDGET_NO_DIFF_NUDGE_PREFIX = _MID_BUDGET_NO_DIFF_NUDGE_TEMPLATE.split(
-    "{percent}", 1
-)[0]
+
+
+def _is_legacy_deadline_preempt_signal(event: object) -> bool:
+    """Return whether an uncooperative ensemble is still in proposer work."""
+
+    if isinstance(event, ProviderHeartbeatEvent):
+        return event.phase in {
+            "ensemble_proposers_wait",
+            "agent_deadline_wrapup_boundary",
+        }
+    if isinstance(event, ProviderEnsembleProgressEvent):
+        return event.event_type in _LEGACY_DEADLINE_PREEMPT_PROGRESS_TYPES
+    return False
+
+
+_MID_BUDGET_NO_DIFF_NUDGE_PREFIX = _MID_BUDGET_NO_DIFF_NUDGE_TEMPLATE.split("{percent}", 1)[0]
 _LARGE_CONTEXT_INVALID_RESPONSE_INPUT_TOKENS = 30_000
 _COMPACTED_TOOL_ARGUMENT_MARKERS = frozenset(
     {
@@ -1103,6 +1213,7 @@ async def _review_pending_elevation_if_configured(
         return None
 
     from opensquilla.gateway.approval_queue import get_approval_queue
+
     queue = get_approval_queue()
     try:
         entry = queue.get(approval_id)
@@ -1138,9 +1249,7 @@ async def _review_pending_elevation_if_configured(
             "fingerprint": fingerprint,
             "humanActionable": False,
             "reviewer": "deterministic_rules",
-            "action": (
-                suspended_action.audit_payload() if suspended_action is not None else None
-            ),
+            "action": (suspended_action.audit_payload() if suspended_action is not None else None),
         },
     )
 
@@ -1231,9 +1340,7 @@ async def _review_pending_elevation_if_configured(
         outcome=assessment.outcome,
         source=review_source,
         status=(
-            "human_confirmation_required"
-            if requires_human_confirmation
-            else assessment.status
+            "human_confirmation_required" if requires_human_confirmation else assessment.status
         ),
     )
     return None if requires_human_confirmation else assessment
@@ -1286,9 +1393,7 @@ def _artifact_event_kwargs(payload: dict[str, Any]) -> dict[str, Any]:
     kwargs = {key: value for key, value in normalized.items() if key in allowed}
     # artifact_payload exposes the public thumbnail_url; carry the boolean signal onto
     # the event dataclass so downstream serializers can rebuild the variant URL.
-    kwargs["has_thumbnail"] = bool(
-        payload.get("has_thumbnail") or normalized.get("thumbnail_url")
-    )
+    kwargs["has_thumbnail"] = bool(payload.get("has_thumbnail") or normalized.get("thumbnail_url"))
     return kwargs
 
 
@@ -1444,6 +1549,20 @@ class _IterationStreamTimeoutError(TimeoutError):
     """Raised when provider streaming exceeds the active Agent iteration budget."""
 
 
+@dataclass
+class _ProviderStreamCloseStatus:
+    """Close result shared by the provider relay and its outer retry loop."""
+
+    closed: bool | None = None
+
+
+def _consume_background_future(future: asyncio.Future[Any]) -> None:
+    """Consume a detached cleanup result without surfacing loop warnings."""
+
+    with contextlib.suppress(BaseException):
+        future.result()
+
+
 def _is_large_context_invalid_response(
     kind: _ProviderAttemptKind,
     *,
@@ -1571,9 +1690,7 @@ class _MessageCountRequestView:
         materialized = self.materialize(canonical_before)
         if removed_count > len(materialized):
             raise ValueError("canonical cleanup exceeds the request view")
-        rebased_messages = (
-            materialized[:-removed_count] if removed_count else materialized
-        )
+        rebased_messages = materialized[:-removed_count] if removed_count else materialized
         return _MessageCountRequestView(
             messages=rebased_messages,
             canonical_tail_start=len(canonical_after),
@@ -1663,6 +1780,11 @@ def _chat_config_with_thinking_disabled(chat_cfg: ChatConfig) -> ChatConfig:
         thinking_level=None,
         provider_request_max_chars=chat_cfg.provider_request_max_chars,
         tool_choice=chat_cfg.tool_choice,
+        candidate_output_mode=chat_cfg.candidate_output_mode,
+        ensemble_execution_mode=chat_cfg.ensemble_execution_mode,
+        ensemble_soft_deadline_seconds=chat_cfg.ensemble_soft_deadline_seconds,
+        ensemble_soft_deadline_disable_tools=(chat_cfg.ensemble_soft_deadline_disable_tools),
+        ensemble_soft_deadline_disable_thinking=(chat_cfg.ensemble_soft_deadline_disable_thinking),
     )
 
 
@@ -1780,10 +1902,8 @@ class Agent:
                 ),
             )
         if tool_context is not None and (
-            tool_context.source_diff_preservation_mode
-            != self.config.source_diff_preservation_mode
-            or tool_context.source_diff_candidate_mode
-            != self.config.source_diff_candidate_mode
+            tool_context.source_diff_preservation_mode != self.config.source_diff_preservation_mode
+            or tool_context.source_diff_candidate_mode != self.config.source_diff_candidate_mode
         ):
             tool_context = replace(
                 tool_context,
@@ -1817,6 +1937,9 @@ class Agent:
         ) = _resolve_turn_objective_reminder()
 
         self._state: AgentState = AgentState.IDLE
+        self._active_turn = False
+        self._pending_cleanup_tasks: set[asyncio.Future[Any]] = set()
+        self._cleanup_poisoned_reason = ""
         self._history: list[Message] = []
         self._context: ContextAssembly | None = None
         # Typed dependency surface. Either constructor injection or legacy
@@ -1952,9 +2075,7 @@ class Agent:
         return parsed if parsed > 0 else None
 
     def _configured_tool_result_budget_policy(self) -> ToolResultBudgetPolicy | None:
-        single_limit = self._positive_int(
-            getattr(self.config, "tool_result_dispatch_max_chars", 0)
-        )
+        single_limit = self._positive_int(getattr(self.config, "tool_result_dispatch_max_chars", 0))
         turn_limit = self._positive_int(
             getattr(self.config, "tool_result_dispatch_turn_max_chars", 0)
         )
@@ -2493,9 +2614,7 @@ class Agent:
             if tool.name in target_names:
                 input_schema = payload.get("input_schema") or {}
                 properties = (
-                    input_schema.get("properties")
-                    if isinstance(input_schema, dict)
-                    else {}
+                    input_schema.get("properties") if isinstance(input_schema, dict) else {}
                 )
                 target_schemas[tool.name] = {
                     "schema_hash": schema_hashes[tool.name],
@@ -2523,9 +2642,7 @@ class Agent:
                 "sent_to_provider": bool(tools),
                 "tool_count": len(tool_names),
                 "tool_names": tool_names,
-                "target_tool_visible": {
-                    name: name in set(tool_names) for name in target_names
-                },
+                "target_tool_visible": {name: name in set(tool_names) for name in target_names},
                 "target_schemas": target_schemas,
                 "schema_hashes": schema_hashes,
             },
@@ -2632,9 +2749,7 @@ class Agent:
             ):
                 continue
             digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
-            by_digest.setdefault(digest, []).append(
-                (message_index, block_index, block, content)
-            )
+            by_digest.setdefault(digest, []).append((message_index, block_index, block, content))
 
         replacements: dict[tuple[int, int], ContentBlockToolResult] = {}
         survivor_ids: set[str] = set()
@@ -2700,13 +2815,11 @@ class Agent:
             )
 
         self.config.metadata["provider_history_dedup_applied"] = True
-        self.config.metadata["provider_history_dedup_elided"] = (
-            self.config.metadata.get("provider_history_dedup_elided", 0)
-            + len(replacements)
-        )
+        self.config.metadata["provider_history_dedup_elided"] = self.config.metadata.get(
+            "provider_history_dedup_elided", 0
+        ) + len(replacements)
         self.config.metadata["provider_history_dedup_chars_saved"] = (
-            self.config.metadata.get("provider_history_dedup_chars_saved", 0)
-            + chars_saved
+            self.config.metadata.get("provider_history_dedup_chars_saved", 0) + chars_saved
         )
         self._write_turn_call_log(
             "provider_history_dedup",
@@ -3276,9 +3389,9 @@ class Agent:
         if record:
             self.config.metadata["tool_argument_provider_view_summaries_applied"] = True
             metadata_key = "tool_argument_provider_view_summaries"
-            self.config.metadata[metadata_key] = self.config.metadata.get(
-                metadata_key, 0
-            ) + len(replacements)
+            self.config.metadata[metadata_key] = self.config.metadata.get(metadata_key, 0) + len(
+                replacements
+            )
             self._write_turn_call_log(
                 "tool_argument_provider_view_summary",
                 sanitized_tool_uses=len(replacements),
@@ -3314,8 +3427,7 @@ class Agent:
         if cached is not None:
             try:
                 meta_path = (
-                    store._record_dir(cached.handle, session_id=session_id)
-                    / TOOL_RESULT_META_NAME
+                    store._record_dir(cached.handle, session_id=session_id) / TOOL_RESULT_META_NAME
                 )
             except ValueError:
                 meta_path = None
@@ -4054,9 +4166,7 @@ class Agent:
         return await start_usage_call(
             scope,
             provider=str(
-                self.config.provider_id
-                or getattr(self.provider, "provider_name", "")
-                or ""
+                self.config.provider_id or getattr(self.provider, "provider_name", "") or ""
             ),
             model=str(self.config.model_id or ""),
         )
@@ -4078,13 +4188,25 @@ class Agent:
         )
         finalize_task = asyncio.create_task(sink.finalize(call, result))
         try:
-            await asyncio.shield(finalize_task)
+            done, _ = await asyncio.wait(
+                {finalize_task},
+                timeout=max(
+                    0.0,
+                    float(_USAGE_ACCOUNTING_COMPLETION_TIMEOUT_SECONDS),
+                ),
+            )
         except asyncio.CancelledError:
-            # A provider usage receipt already exists.  Finish its durable
-            # write before allowing turn cancellation to unwind.
-            with contextlib.suppress(Exception):
-                await finalize_task
+            finalize_task.add_done_callback(_consume_background_future)
             raise
+        if not done:
+            finalize_task.add_done_callback(_consume_background_future)
+            logger.warning(
+                "usage_accounting.finalize_timeout",
+                event_id=call.event_id,
+            )
+            return
+        try:
+            finalize_task.result()
         except Exception as exc:  # noqa: BLE001 - sink owns persistence/retry policy
             # The durable started row remains available to gateway recovery.
             # Never discard an already-generated provider response because a
@@ -4103,11 +4225,26 @@ class Agent:
         stable_reason = normalize_usage_unknown_reason(reason)
         unknown_task = asyncio.create_task(sink.mark_unknown(call, stable_reason))
         try:
-            await asyncio.shield(unknown_task)
+            done, _ = await asyncio.wait(
+                {unknown_task},
+                timeout=max(
+                    0.0,
+                    float(_USAGE_ACCOUNTING_COMPLETION_TIMEOUT_SECONDS),
+                ),
+            )
         except asyncio.CancelledError:
-            with contextlib.suppress(Exception):
-                await unknown_task
+            unknown_task.add_done_callback(_consume_background_future)
             raise
+        if not done:
+            unknown_task.add_done_callback(_consume_background_future)
+            logger.warning(
+                "usage_accounting.mark_unknown_timeout",
+                event_id=call.event_id,
+                reason=stable_reason,
+            )
+            return
+        try:
+            unknown_task.result()
         except Exception as exc:  # noqa: BLE001 - preserve the original turn outcome
             logger.warning(
                 "usage_accounting.mark_unknown_failed",
@@ -4116,7 +4253,126 @@ class Agent:
                 error=str(exc),
             )
 
+    def _track_pending_cleanup(
+        self,
+        future: asyncio.Future[Any],
+        *,
+        reason: str,
+        poison_if_unsuccessful: bool = False,
+    ) -> None:
+        """Prevent a later turn from overlapping detached owned work."""
+
+        pending_cleanup_tasks = getattr(self, "_pending_cleanup_tasks", None)
+        if pending_cleanup_tasks is None:
+            pending_cleanup_tasks = set()
+            self._pending_cleanup_tasks = pending_cleanup_tasks
+        if future.done():
+            if poison_if_unsuccessful:
+                try:
+                    if future.result() is False:
+                        self._cleanup_poisoned_reason = reason
+                except BaseException:
+                    self._cleanup_poisoned_reason = reason
+            _consume_background_future(future)
+            return
+        pending_cleanup_tasks.add(future)
+        logger.warning(
+            "agent.cleanup_pending",
+            reason=reason,
+            pending_count=len(pending_cleanup_tasks),
+        )
+
+        def _finish_cleanup_observation(done: asyncio.Future[Any]) -> None:
+            pending_cleanup_tasks.discard(done)
+            if poison_if_unsuccessful:
+                try:
+                    if done.result() is False:
+                        self._cleanup_poisoned_reason = reason
+                except BaseException:
+                    self._cleanup_poisoned_reason = reason
+            _consume_background_future(done)
+
+        def _cleanup_finished(done: asyncio.Future[Any]) -> None:
+            # Keep the gate closed through the callback turn in which a raw
+            # stream operation transfers ownership to its deferred close task.
+            try:
+                asyncio.get_running_loop().call_soon(
+                    _finish_cleanup_observation,
+                    done,
+                )
+            except RuntimeError:
+                _finish_cleanup_observation(done)
+
+        future.add_done_callback(_cleanup_finished)
+
+    def _cleanup_gate_reason(self) -> str:
+        pending_cleanup_tasks = getattr(self, "_pending_cleanup_tasks", set())
+        # Completion callbacks own result observation and removal.  Dropping a
+        # done future here can race a callback that must poison on failed close
+        # or schedule the next deferred cleanup step.
+        poisoned_reason = str(getattr(self, "_cleanup_poisoned_reason", "") or "")
+        if poisoned_reason:
+            return poisoned_reason
+        provider_gate = getattr(
+            getattr(self, "provider", None),
+            "_cleanup_is_pending",
+            None,
+        )
+        if callable(provider_gate):
+            try:
+                if bool(provider_gate()):
+                    return "provider_cleanup_in_progress"
+            except Exception:  # noqa: BLE001 - provider diagnostic boundary
+                return "provider_cleanup_state_unavailable"
+        if pending_cleanup_tasks:
+            return "owned_cleanup_in_progress"
+        return ""
+
     async def run_turn(
+        self,
+        message: str,
+        extra_messages: list[Message] | None = None,
+        semantic_message: str | None = None,
+        *,
+        pending_input_provider: PendingInputProvider | None = None,
+    ) -> AsyncIterator[AgentEvent]:
+        if self._active_turn:
+            yield ErrorEvent(
+                message="another turn is still active on this Agent instance",
+                code="agent_turn_in_progress",
+            )
+            return
+        cleanup_reason = self._cleanup_gate_reason()
+        if cleanup_reason:
+            yield ErrorEvent(
+                message=(
+                    "a previous provider or tool operation is still closing; "
+                    "no new physical request was started"
+                ),
+                code="agent_cleanup_in_progress",
+            )
+            return
+        self._active_turn = True
+        try:
+            async with contextlib.aclosing(
+                self._run_turn_owned(
+                    message,
+                    extra_messages,
+                    semantic_message,
+                    pending_input_provider=pending_input_provider,
+                )
+            ) as owned_turn:
+                async for event in owned_turn:
+                    yield event
+        finally:
+            # Early terminal paths (notably meta resume/launch) bypass the
+            # ordinary bottom-of-turn reset.  The ownership gate above still
+            # blocks unresolved cleanup, while the public state accurately
+            # returns to idle once this owned generator has closed.
+            self._state = AgentState.IDLE
+            self._active_turn = False
+
+    async def _run_turn_owned(
         self,
         message: str,
         extra_messages: list[Message] | None = None,
@@ -4153,13 +4409,16 @@ class Agent:
                     context=context,
                 )
         with bind_usage_accounting_scope(scope):
-            async for event in self._turn_generator(
-                message,
-                extra_messages,
-                semantic_message,
-                pending_input_provider=pending_input_provider,
-            ):
-                yield event
+            async with contextlib.aclosing(
+                self._turn_generator(
+                    message,
+                    extra_messages,
+                    semantic_message,
+                    pending_input_provider=pending_input_provider,
+                )
+            ) as turn_events:
+                async for event in turn_events:
+                    yield event
 
     async def _turn_generator(
         self,
@@ -4180,6 +4439,12 @@ class Agent:
         # ------ IDLE → THINKING ------
         yield self._transition(AgentState.THINKING)
 
+        # The total turn budget starts before metadata dispatch. Meta
+        # resume/launch can perform blocking setup and nested orchestration, so
+        # starting this clock later would let those paths run without a bound.
+        _loop = asyncio.get_running_loop()
+        _total_deadline = _loop.time() + self.config.timeout if self.config.timeout > 0 else None
+
         # PR7/9 E2E fix — consume meta_resolution's awaiting-branch
         # outcomes. meta_resolution stages six distinct outcomes on
         # ctx.metadata (resume / errors / cancelled / expired /
@@ -4191,17 +4456,31 @@ class Agent:
         metadata = self.config.metadata or {}
         meta_resume = metadata.get("meta_resume")
         if meta_resume is not None:
-            async for ev in self._run_meta_resume(meta_resume):
-                yield ev
+            async with contextlib.aclosing(
+                self._stream_meta_events_with_deadline(
+                    self._run_meta_resume(meta_resume),
+                    loop=_loop,
+                    total_deadline=_total_deadline,
+                    phase="meta_resume",
+                )
+            ) as resume_events:
+                async for ev in resume_events:
+                    yield ev
             return
         meta_launch = metadata.get("meta_launch")
         if meta_launch is not None:
-            launch_name = (
-                meta_launch.get("name") if isinstance(meta_launch, dict) else None
-            )
+            launch_name = meta_launch.get("name") if isinstance(meta_launch, dict) else None
             if launch_name:
-                async for ev in self._run_meta_launch(launch_name):
-                    yield ev
+                async with contextlib.aclosing(
+                    self._stream_meta_events_with_deadline(
+                        self._run_meta_launch(launch_name),
+                        loop=_loop,
+                        total_deadline=_total_deadline,
+                        phase="meta_launch",
+                    )
+                ) as launch_events:
+                    async for ev in launch_events:
+                        yield ev
                 return
         clarify_outcome = self._read_clarify_outcome(metadata)
         if clarify_outcome is not None:
@@ -4430,6 +4709,7 @@ class Agent:
         )
         turn_llm_calls = 0
         turn_tool_errors = 0
+
         async def _review_inflight_sandbox_request(
             payload: dict[str, object],
         ) -> RuleAssessment | None:
@@ -4443,9 +4723,18 @@ class Agent:
             self._tool_context.on_sandbox_auto_review = _review_inflight_sandbox_request
         last_actual_model = ""
         last_actual_provider = ""
+        last_requested_model = str(self.config.model_id or "")
+        last_requested_provider = str(
+            self.config.provider_id
+            or getattr(self.provider, "provider_id", "")
+            or getattr(self.provider, "provider_name", "")
+            or ""
+        )
         turn_model_usage_breakdown: list[dict[str, Any]] = []
         last_ensemble_trace: dict[str, Any] | None = None
         turn_ensemble_request_count = 0
+        turn_ensemble_physical_request_count = 0
+        turn_ensemble_usage_missing_count = 0
         terminal_error: ErrorEvent | None = None
         final_text_parts: list[str] = []
         final_reasoning_parts: list[str] = []
@@ -4455,11 +4744,14 @@ class Agent:
         max_iterations_finalization_attempted = False
         max_iterations_finalization_pending = False
         max_iterations_finalization_message: Message | None = None
+        forced_finalization_reason = ""
+        consecutive_retrieval_only_iterations = 0
         post_write_convergence_finalization_pending = False
         post_write_convergence_finalization_message: Message | None = None
         placeholder_offense_iterations = 0
         deadline_wrapup_armed = False
         deadline_wrapup_message: Message | None = None
+        iteration_deadline: float | None = None
         deadline_thinking_off_armed = False
         endgame_git_freeze_armed = False
         mid_budget_nudge_fired_fractions: set[float] = set()
@@ -4567,8 +4859,7 @@ class Agent:
             RuntimeDiagnosticsObserver(
                 session_key=self._session_key,
                 agent_id=(
-                    self.config.tool_result_store_agent_id
-                    or self.config.metadata.get("agent_id")
+                    self.config.tool_result_store_agent_id or self.config.metadata.get("agent_id")
                 ),
             )
             if self.config.runtime_events_path or runtime_recovery_mode == "warn_model"
@@ -4580,10 +4871,8 @@ class Agent:
             max_backoff_ms=self.config.retry_max_backoff_ms,
         )
 
-        # Timeout budgets: optional total turn budget, idle LLM stream budget,
-        # and per-tool execution budget.
-        _loop = asyncio.get_running_loop()
-        _total_deadline = _loop.time() + self.config.timeout if self.config.timeout > 0 else None
+        # The optional total turn budget was established before metadata
+        # dispatch; all ordinary LLM/tool work shares that same deadline.
 
         # Endgame git freeze: once remaining wall clock drops below the margin,
         # the shell tools block workspace-reverting git commands outright so
@@ -4709,6 +4998,13 @@ class Agent:
         ) -> WarningEvent:
             nonlocal artifact_delivery_degraded_final_response
             nonlocal artifact_delivery_final_response_pending
+            nonlocal last_actual_model, last_actual_provider
+            # The explanatory text below is engine-authored, not emitted by
+            # the preceding provider call.  Preserve requested identity for
+            # accounting, but never attribute synthetic text to that physical
+            # model/provider.
+            last_actual_model = ""
+            last_actual_provider = ""
             if not "".join(final_text_parts).strip():
                 final_text_parts.append(
                     self._artifact_delivery_final_response_text(
@@ -4733,6 +5029,9 @@ class Agent:
             )
 
         def _finish_artifact_delivery_without_provider() -> None:
+            nonlocal last_actual_model, last_actual_provider
+            last_actual_model = ""
+            last_actual_provider = ""
             final_response_text = self._artifact_delivery_final_response_text(
                 artifact_delivery_final_response_artifacts
             )
@@ -4746,9 +5045,99 @@ class Agent:
                 artifact_count=len(artifact_delivery_final_response_artifacts),
             )
 
+        wrapup_margin_seconds = max(
+            0,
+            int(getattr(self.config, "deadline_wrapup_margin_seconds", 0) or 0),
+        )
+
+        def _arm_deadline_wrapup_if_due(
+            *,
+            reason: str,
+            attempt: int | None = None,
+            lookahead_seconds: float = 0.0,
+        ) -> bool:
+            nonlocal deadline_wrapup_armed, deadline_wrapup_message
+            if (
+                wrapup_margin_seconds <= 0
+                or _total_deadline is None
+                or (
+                    not deadline_wrapup_armed
+                    and _loop.time() + max(0.0, lookahead_seconds)
+                    <= _total_deadline - wrapup_margin_seconds
+                )
+            ):
+                return False
+            remaining_seconds = max(0.0, _total_deadline - _loop.time())
+            deadline_wrapup_content = _DEADLINE_WRAPUP_DIRECTIVE_TEMPLATE.format(
+                minutes=max(1, int(remaining_seconds // 60)),
+            )
+            if bool(getattr(self.config, "deadline_wrapup_disable_tools", False)):
+                deadline_wrapup_content += _DEADLINE_NO_TOOL_FINALIZATION_SUFFIX
+            deadline_wrapup_message = Message(
+                role="user",
+                content=deadline_wrapup_content,
+            )
+            if not deadline_wrapup_armed:
+                deadline_wrapup_armed = True
+                log_payload: dict[str, Any] = {
+                    "action": "deadline_wrapup",
+                    "reason": reason,
+                    "code": "deadline_wrapup",
+                    "iteration": iterations,
+                    "remaining_seconds": int(remaining_seconds),
+                    "margin_seconds": wrapup_margin_seconds,
+                }
+                if attempt is not None:
+                    log_payload["attempt"] = attempt
+                if lookahead_seconds > 0:
+                    log_payload["skipped_retry_backoff_seconds"] = lookahead_seconds
+                self._write_turn_call_log(
+                    "turn_policy_decision",
+                    **log_payload,
+                )
+            return True
+
+        def _provider_retry_deadline_error(
+            delay_seconds: float = 0.0,
+        ) -> ErrorEvent | None:
+            deadlines: list[tuple[float, str]] = []
+            if _total_deadline is not None:
+                deadlines.append((_total_deadline, "total"))
+            if iteration_deadline is not None:
+                deadlines.append((iteration_deadline, "iteration"))
+            if not deadlines:
+                return None
+            deadline, deadline_kind = min(deadlines, key=lambda item: item[0])
+            if _loop.time() + max(0.0, delay_seconds) + 0.001 < deadline:
+                return None
+            if deadline_kind == "iteration":
+                return ErrorEvent(
+                    message=(
+                        f"Iteration {iterations} exceeded iteration_timeout "
+                        f"({self.config.iteration_timeout}s) before a provider retry"
+                    ),
+                    code="iteration_timeout",
+                )
+            return ErrorEvent(
+                message=f"Agent turn timed out after {self.config.timeout}s",
+                code="agent_runtime_timeout",
+            )
+
         try:
             while True:
-                if self.config.max_iterations > 0 and iterations >= self.config.max_iterations:
+                max_iterations_finalization_at = self.config.max_iterations
+                if self.config.max_iterations > 0 and bool(
+                    getattr(
+                        self.config,
+                        "max_iterations_includes_finalization",
+                        False,
+                    )
+                ):
+                    max_iterations_finalization_at = max(
+                        0,
+                        self.config.max_iterations - 1,
+                    )
+                if self.config.max_iterations > 0 and iterations >= max_iterations_finalization_at:
                     max_iterations_source = str(
                         self.config.metadata.get("agent_max_iterations_source", "agent_config")
                     )
@@ -4775,6 +5164,7 @@ class Agent:
                     if not max_iterations_finalization_attempted:
                         max_iterations_finalization_attempted = True
                         max_iterations_finalization_pending = True
+                        forced_finalization_reason = "max_iterations"
                         max_iterations_finalization_message = Message(
                             role="user",
                             content=(
@@ -4790,6 +5180,13 @@ class Agent:
                             code="max_iterations",
                             iteration=iterations,
                             max_iterations=self.config.max_iterations,
+                            includes_finalization=bool(
+                                getattr(
+                                    self.config,
+                                    "max_iterations_includes_finalization",
+                                    False,
+                                )
+                            ),
                             max_iterations_source=max_iterations_source,
                         )
                     else:
@@ -4820,38 +5217,10 @@ class Agent:
                 # Pre-deadline wrap-up: arm once when remaining wall clock drops
                 # below the configured margin. The directive is spliced into
                 # every subsequent provider request and rebuilt each iteration
-                # so the remaining-time figure stays current; tools stay
-                # available so the model can still apply and verify a final fix.
-                wrapup_margin_seconds = max(
-                    0,
-                    int(getattr(self.config, "deadline_wrapup_margin_seconds", 0) or 0),
-                )
-                if (
-                    wrapup_margin_seconds > 0
-                    and _total_deadline is not None
-                    and (
-                        deadline_wrapup_armed
-                        or _loop.time() > _total_deadline - wrapup_margin_seconds
-                    )
-                ):
-                    remaining_seconds = max(0.0, _total_deadline - _loop.time())
-                    deadline_wrapup_message = Message(
-                        role="user",
-                        content=_DEADLINE_WRAPUP_DIRECTIVE_TEMPLATE.format(
-                            minutes=max(1, int(remaining_seconds // 60)),
-                        ),
-                    )
-                    if not deadline_wrapup_armed:
-                        deadline_wrapup_armed = True
-                        self._write_turn_call_log(
-                            "turn_policy_decision",
-                            action="deadline_wrapup",
-                            reason="deadline_margin",
-                            code="deadline_wrapup",
-                            iteration=iterations,
-                            remaining_seconds=int(remaining_seconds),
-                            margin_seconds=wrapup_margin_seconds,
-                        )
+                # so the remaining-time figure stays current. Tools remain
+                # available by default; deadline_wrapup_disable_tools turns the
+                # armed request into a final no-tool answer call.
+                _arm_deadline_wrapup_if_due(reason="deadline_margin")
 
                 # Pre-deadline thinking cutoff: once remaining wall clock drops
                 # below the configured margin, thinking stays off for every
@@ -4859,10 +5228,7 @@ class Agent:
                 # calls rather than a single long reasoning stream.
                 thinking_off_margin_seconds = max(
                     0,
-                    int(
-                        getattr(self.config, "deadline_thinking_off_margin_seconds", 0)
-                        or 0
-                    ),
+                    int(getattr(self.config, "deadline_thinking_off_margin_seconds", 0) or 0),
                 )
                 if (
                     thinking_off_margin_seconds > 0
@@ -4877,9 +5243,7 @@ class Agent:
                         reason="deadline_margin",
                         code="deadline_thinking_off",
                         iteration=iterations,
-                        remaining_seconds=int(
-                            max(0.0, _total_deadline - _loop.time())
-                        ),
+                        remaining_seconds=int(max(0.0, _total_deadline - _loop.time())),
                         margin_seconds=thinking_off_margin_seconds,
                     )
 
@@ -4889,6 +5253,11 @@ class Agent:
                 _arm_endgame_git_freeze_if_due()
 
                 iterations += 1
+                iteration_deadline = (
+                    _loop.time() + self.config.iteration_timeout
+                    if self.config.iteration_timeout > 0
+                    else None
+                )
 
                 # ------ THINKING → STREAMING ------
                 yield self._transition(AgentState.STREAMING)
@@ -4917,6 +5286,27 @@ class Agent:
                 _invalid_response_fallback_done = False
                 _message_limit_recovery_done = False
                 while _retry_attempt <= _fallback.max_retries:
+                    # A retry stays inside this loop, so it does not revisit the
+                    # outer iteration's deadline policy. Re-arm the wrap-up and
+                    # reject an already-expired attempt before provider.chat()
+                    # can open another billable stream.
+                    _arm_deadline_wrapup_if_due(
+                        reason="deadline_margin_retry",
+                        attempt=_call_attempt,
+                    )
+                    retry_deadline_error = _provider_retry_deadline_error()
+                    if retry_deadline_error is not None:
+                        terminal_error = retry_deadline_error
+                        if artifact_delivery_final_response_pending:
+                            yield _finish_artifact_delivery_degraded(
+                                reason=terminal_error.message,
+                                code=terminal_error.code,
+                            )
+                            terminal_error = None
+                        else:
+                            yield self._transition(AgentState.ERROR)
+                            yield terminal_error
+                        break
                     provider_error = None
                     assistant_text_parts = []
                     tool_calls = []
@@ -4935,18 +5325,31 @@ class Agent:
                     iter_thinking_signature = None
                     _got_error = False
                     _stream_policy_preempt = False
+                    graceful_ensemble_finalization_for_call = False
                     attempt_reasoning_stream_chars = 0
                     provider_done_for_log: ProviderDoneEvent | None = None
                     provider_error_for_log: ProviderErrorEvent | None = None
                     provider_error_usage_for_log: dict[str, Any] | None = None
+                    provider_error_normalized_missing_for_log = 0
                     cost_receipt_counted = False
                     call_id = f"{iterations}.{_call_attempt}"
                     call_started_at = time.monotonic()
+                    deadline_finalization_pending = bool(
+                        deadline_wrapup_armed
+                        and getattr(
+                            self.config,
+                            "deadline_wrapup_disable_tools",
+                            False,
+                        )
+                    )
+                    forced_finalization_for_call = bool(
+                        max_iterations_finalization_pending or deadline_finalization_pending
+                    )
                     provider_tools_for_call = (
                         None
                         if (
                             artifact_delivery_final_response_pending
-                            or max_iterations_finalization_pending
+                            or forced_finalization_for_call
                             or post_write_convergence_finalization_pending
                         )
                         else provider_tool_definitions
@@ -4955,14 +5358,12 @@ class Agent:
                         provider_tools_for_call,
                         workspace_edit_gate_details,
                         recovery_read_paths=workspace_edit_gate_recovery_read_paths,
-                        recovery_reads_remaining=(
-                            workspace_edit_gate_recovery_reads_remaining
-                        ),
+                        recovery_reads_remaining=(workspace_edit_gate_recovery_reads_remaining),
                     )
                     tools_supported_for_call = (
                         tools_supported
                         and not artifact_delivery_final_response_pending
-                        and not max_iterations_finalization_pending
+                        and not forced_finalization_for_call
                         and not post_write_convergence_finalization_pending
                     )
                     ignored_post_delivery_tool_use = False
@@ -5084,9 +5485,7 @@ class Agent:
                         )
                         if _call_attempt == 0:
                             self.config.metadata["identical_request_loop_perturbations"] = (
-                                self.config.metadata.get(
-                                    "identical_request_loop_perturbations", 0
-                                )
+                                self.config.metadata.get("identical_request_loop_perturbations", 0)
                                 + 1
                             )
                             self._write_turn_call_log(
@@ -5135,10 +5534,23 @@ class Agent:
                         workspace_edit_gate_details,
                         provider_tools_for_call,
                         recovery_read_paths=workspace_edit_gate_recovery_read_paths,
-                        recovery_reads_remaining=(
-                            workspace_edit_gate_recovery_reads_remaining
-                        ),
+                        recovery_reads_remaining=(workspace_edit_gate_recovery_reads_remaining),
                     )
+                    if deadline_finalization_pending and _total_deadline is not None:
+                        # The wrap-up margin is reserved for this final request.
+                        # Do not leave it constrained by the ordinary HTTP
+                        # request timeout (typically 120s); still cap it by both
+                        # the iteration budget and the actual remaining turn.
+                        finalization_timeout = max(0.0, _total_deadline - _loop.time())
+                        if self.config.iteration_timeout > 0:
+                            finalization_timeout = min(
+                                finalization_timeout,
+                                self.config.iteration_timeout,
+                            )
+                        finalization_timeout = max(0.001, finalization_timeout)
+                        call_chat_cfg = call_chat_cfg.model_copy(
+                            update={"timeout": finalization_timeout}
+                        )
                     forced_tool_choice = self.config.metadata.get("meta_match_tool_choice")
                     if (
                         forced_tool_choice is not None
@@ -5158,7 +5570,95 @@ class Agent:
                     if deadline_thinking_off_armed:
                         call_chat_cfg = _chat_config_with_thinking_disabled(call_chat_cfg)
                         _attempt_thinking_disabled = True
+                    if forced_finalization_for_call and bool(
+                        getattr(self.config, "finalization_disable_thinking", False)
+                    ):
+                        call_chat_cfg = _chat_config_with_thinking_disabled(call_chat_cfg)
+                        _attempt_thinking_disabled = True
+                    graceful_ensemble_provider = bool(
+                        getattr(
+                            self.provider,
+                            "supports_graceful_ensemble_finalization",
+                            False,
+                        )
+                    )
+                    if (
+                        forced_finalization_for_call
+                        and not graceful_ensemble_provider
+                        and bool(
+                            getattr(
+                                self.config,
+                                "finalization_aggregator_only",
+                                False,
+                            )
+                        )
+                    ):
+                        call_chat_cfg = call_chat_cfg.model_copy(
+                            update={"ensemble_execution_mode": "aggregator_only"}
+                        )
+                    if (
+                        graceful_ensemble_provider
+                        and wrapup_margin_seconds > 0
+                        and _total_deadline is not None
+                        and bool(
+                            getattr(
+                                self.config,
+                                "deadline_wrapup_disable_tools",
+                                False,
+                            )
+                        )
+                        and call_chat_cfg.ensemble_execution_mode == "full"
+                    ):
+                        # A cooperative ensemble owns its in-flight proposer
+                        # tasks and known usage receipts. Give it the relative
+                        # soft deadline so it can stop exploration, preserve
+                        # receipts, and finalize without the Agent cancelling
+                        # the physical request.
+                        graceful_ensemble_finalization_for_call = True
+                        proposer_soft_deadline_seconds = (
+                            _total_deadline - wrapup_margin_seconds - _loop.time()
+                        )
+                        if forced_finalization_for_call and proposer_soft_deadline_seconds <= 0:
+                            # The no-tool finalizer may start after the wrap-up
+                            # margin has armed. Still run the proposers, but
+                            # reserve most of the remaining wall clock for the
+                            # aggregator instead of falling back to an
+                            # aggregator-only answer with no fresh candidates.
+                            proposer_soft_deadline_seconds = max(
+                                0.001,
+                                (_total_deadline - _loop.time()) * 0.4,
+                            )
+                        call_chat_cfg = call_chat_cfg.model_copy(
+                            update={
+                                "ensemble_soft_deadline_seconds": max(
+                                    0.001,
+                                    proposer_soft_deadline_seconds,
+                                ),
+                                "ensemble_soft_deadline_disable_tools": True,
+                                "ensemble_soft_deadline_disable_thinking": bool(
+                                    getattr(
+                                        self.config,
+                                        "finalization_disable_thinking",
+                                        False,
+                                    )
+                                ),
+                            }
+                        )
 
+                    # The final engine Done identity describes this physical
+                    # attempt, not any earlier Agent-loop request.  Reset at the
+                    # exact point where a new provider request is committed so a
+                    # missing/failed terminal receipt cannot inherit the prior
+                    # call's model or provider.
+                    last_actual_model = ""
+                    last_actual_provider = ""
+                    last_requested_model = str(self.config.model_id or "")
+                    last_requested_provider = str(
+                        self.config.provider_id
+                        or getattr(self.provider, "provider_id", "")
+                        or getattr(self.provider, "provider_name", "")
+                        or ""
+                    )
                     self._write_turn_call_log(
                         "llm_request",
                         call_id=call_id,
@@ -5206,9 +5706,21 @@ class Agent:
                     usage_call: UsageCallStart | None = None
                     usage_call_terminal = False
                     usage_unknown_reason = "provider_stream_ended_without_usage"
-                    if usage_scope is not None and not provider_accounts_physical_usage(
-                        self.provider
-                    ):
+                    provider_event_stream: AsyncIterator[Any] | None = None
+                    provider_stream_close_status: _ProviderStreamCloseStatus | None = None
+                    provider_stream_closed = True
+                    usage_call_enabled = bool(
+                        usage_scope is not None
+                        and not provider_accounts_physical_usage(self.provider)
+                    )
+                    if usage_call_enabled and usage_scope is not None:
+                        # This is the fail-closed durable barrier.  Calling
+                        # ``provider.chat`` (and especially awaiting the first
+                        # streamed item) is not allowed until the start record
+                        # commits.  A provider-side preflight rejection later
+                        # finalizes this envelope with physical_request_count=0
+                        # instead of deferring the start until after a request
+                        # may already have become billable.
                         usage_call = await self._usage_call_start(usage_scope)
 
                     try:
@@ -5228,13 +5740,111 @@ class Agent:
                                 tools=provider_tools_for_call,
                                 config=call_chat_cfg,
                             )
-                        async for raw_ev in self._stream_provider_events_with_deadline(
+                        provider_stream_close_status = _ProviderStreamCloseStatus()
+                        policy_wakeup_deadline = (
+                            _total_deadline - wrapup_margin_seconds
+                            if (
+                                wrapup_margin_seconds > 0
+                                and _total_deadline is not None
+                                and not graceful_ensemble_finalization_for_call
+                                and bool(
+                                    getattr(
+                                        self.config,
+                                        "deadline_wrapup_disable_tools",
+                                        False,
+                                    )
+                                )
+                            )
+                            else None
+                        )
+                        provider_event_stream = self._stream_provider_events_with_deadline(
                             raw_stream,
                             loop=_loop,
                             total_deadline=_total_deadline,
-                        ):
+                            iteration_deadline=iteration_deadline,
+                            policy_wakeup_deadline=policy_wakeup_deadline,
+                            close_status=provider_stream_close_status,
+                        )
+                        legacy_deadline_preempt_active = False
+                        async for raw_ev in provider_event_stream:
                             if first_event_at is None:
                                 first_event_at = time.monotonic()
+                            synthetic_wrapup_boundary = bool(
+                                isinstance(raw_ev, ProviderHeartbeatEvent)
+                                and raw_ev.phase == "agent_deadline_wrapup_boundary"
+                            )
+                            if isinstance(raw_ev, ProviderHeartbeatEvent) and (
+                                raw_ev.phase == "ensemble_proposers_wait"
+                            ):
+                                legacy_deadline_preempt_active = True
+                            elif isinstance(
+                                raw_ev,
+                                ProviderEnsembleProgressEvent,
+                            ):
+                                if raw_ev.event_type in (_LEGACY_DEADLINE_PREEMPT_PROGRESS_TYPES):
+                                    legacy_deadline_preempt_active = True
+                                elif raw_ev.event_type.startswith("aggregator_"):
+                                    legacy_deadline_preempt_active = False
+                            deadline_preempt_signal = _is_legacy_deadline_preempt_signal(
+                                raw_ev
+                            ) and (not synthetic_wrapup_boundary or legacy_deadline_preempt_active)
+                            if (
+                                deadline_preempt_signal
+                                and wrapup_margin_seconds > 0
+                                and _total_deadline is not None
+                                and not deadline_wrapup_armed
+                                and not forced_finalization_for_call
+                                and not graceful_ensemble_finalization_for_call
+                                and bool(
+                                    getattr(
+                                        self.config,
+                                        "deadline_wrapup_disable_tools",
+                                        False,
+                                    )
+                                )
+                                and not attempt_user_visible_emitted
+                                and not pending_tools
+                                and not tool_calls
+                                and _loop.time() > _total_deadline - wrapup_margin_seconds
+                            ):
+                                # Ensemble providers can keep a single physical
+                                # call alive with heartbeat/progress events until
+                                # the hard deadline. Preempt that in-flight
+                                # exploration at the soft margin and retry this
+                                # same logical iteration as aggregator-only
+                                # finalization over the accumulated conversation.
+                                remaining_seconds = max(
+                                    0.0,
+                                    _total_deadline - _loop.time(),
+                                )
+                                deadline_wrapup_content = (
+                                    _DEADLINE_WRAPUP_DIRECTIVE_TEMPLATE.format(
+                                        minutes=max(
+                                            1,
+                                            int(remaining_seconds // 60),
+                                        ),
+                                    )
+                                    + _DEADLINE_NO_TOOL_FINALIZATION_SUFFIX
+                                )
+                                deadline_wrapup_message = Message(
+                                    role="user",
+                                    content=deadline_wrapup_content,
+                                )
+                                deadline_wrapup_armed = True
+                                self._write_turn_call_log(
+                                    "turn_policy_decision",
+                                    action="deadline_wrapup",
+                                    reason="provider_progress_preempt",
+                                    code="deadline_wrapup_preempt",
+                                    iteration=iterations,
+                                    attempt=_call_attempt,
+                                    remaining_seconds=int(remaining_seconds),
+                                    margin_seconds=wrapup_margin_seconds,
+                                )
+                                _got_error = True
+                                _stream_policy_preempt = True
+                                usage_unknown_reason = "policy_preempt"
+                                break
                             if isinstance(raw_ev, ProviderTextDelta):
                                 assistant_text_parts.append(raw_ev.text)
                                 if raw_ev.text:
@@ -5256,9 +5866,7 @@ class Agent:
                                     # to "intermediate" above; the few pre-tool tokens
                                     # already shown as answer are a deliberate,
                                     # harmless trade for live output.
-                                    yield TextDeltaEvent(
-                                        text=raw_ev.text, presentation="answer"
-                                    )
+                                    yield TextDeltaEvent(text=raw_ev.text, presentation="answer")
 
                             elif isinstance(raw_ev, ProviderReasoningDelta):
                                 # Reasoning is the model's thinking, not the
@@ -5281,14 +5889,11 @@ class Agent:
                                     # discards reasoning for a directive-free,
                                     # otherwise identical request.
                                     and not artifact_delivery_final_response_pending
-                                    and not max_iterations_finalization_pending
+                                    and not forced_finalization_for_call
+                                    and not graceful_ensemble_finalization_for_call
                                     and not post_write_convergence_finalization_pending
-                                    and (
-                                        not turn_messages
-                                        or turn_messages[-1].role != "assistant"
-                                    )
-                                    and _loop.time()
-                                    > _total_deadline - wrapup_margin_seconds
+                                    and (not turn_messages or turn_messages[-1].role != "assistant")
+                                    and _loop.time() > _total_deadline - wrapup_margin_seconds
                                 ):
                                     # The wrap-up directive arms only at
                                     # iteration boundaries, so a reasoning-only
@@ -5300,16 +5905,25 @@ class Agent:
                                     # reasoning prefix was running into the hard
                                     # kill anyway. One-shot: arming makes this
                                     # branch unreachable afterwards.
-                                    remaining_seconds = max(
-                                        0.0, _total_deadline - _loop.time()
+                                    remaining_seconds = max(0.0, _total_deadline - _loop.time())
+                                    deadline_wrapup_content = (
+                                        _DEADLINE_WRAPUP_DIRECTIVE_TEMPLATE.format(
+                                            minutes=max(1, int(remaining_seconds // 60)),
+                                        )
                                     )
+                                    if bool(
+                                        getattr(
+                                            self.config,
+                                            "deadline_wrapup_disable_tools",
+                                            False,
+                                        )
+                                    ):
+                                        deadline_wrapup_content += (
+                                            _DEADLINE_NO_TOOL_FINALIZATION_SUFFIX
+                                        )
                                     deadline_wrapup_message = Message(
                                         role="user",
-                                        content=_DEADLINE_WRAPUP_DIRECTIVE_TEMPLATE.format(
-                                            minutes=max(
-                                                1, int(remaining_seconds // 60)
-                                            ),
-                                        ),
+                                        content=deadline_wrapup_content,
                                     )
                                     deadline_wrapup_armed = True
                                     self._write_turn_call_log(
@@ -5324,17 +5938,15 @@ class Agent:
                                     )
                                     _got_error = True
                                     _stream_policy_preempt = True
+                                    usage_unknown_reason = "policy_preempt"
                                     break  # break stream, retry with directive
                                 if (
                                     _reasoning_stream_char_cap > 0
                                     and not _reasoning_cap_preempt_done
                                 ):
-                                    attempt_reasoning_stream_chars += len(
-                                        raw_ev.text or ""
-                                    )
+                                    attempt_reasoning_stream_chars += len(raw_ev.text or "")
                                     if (
-                                        attempt_reasoning_stream_chars
-                                        > _reasoning_stream_char_cap
+                                        attempt_reasoning_stream_chars > _reasoning_stream_char_cap
                                         and not attempt_user_visible_emitted
                                         and not pending_tools
                                         and not tool_calls
@@ -5361,9 +5973,7 @@ class Agent:
                                             code="reasoning_cap_preempt",
                                             iteration=iterations,
                                             attempt=_call_attempt,
-                                            reasoning_chars=(
-                                                attempt_reasoning_stream_chars
-                                            ),
+                                            reasoning_chars=(attempt_reasoning_stream_chars),
                                             cap_chars=_reasoning_stream_char_cap,
                                         )
                                         # The turn-call log is a raw debug
@@ -5379,35 +5989,28 @@ class Agent:
                                                 "feature": "reasoning_cap",
                                                 "name": "reasoning_cap.preempt",
                                                 "action": "retry_without_thinking",
-                                                "reason": (
-                                                    "reasoning_stream_char_cap"
-                                                ),
+                                                "reason": ("reasoning_stream_char_cap"),
                                                 "iteration": iterations,
                                                 "attempt": _call_attempt,
-                                                "reasoning_chars": (
-                                                    attempt_reasoning_stream_chars
-                                                ),
-                                                "cap_chars": (
-                                                    _reasoning_stream_char_cap
-                                                ),
+                                                "reasoning_chars": (attempt_reasoning_stream_chars),
+                                                "cap_chars": (_reasoning_stream_char_cap),
                                                 "session_key": self._session_key,
                                                 "agent_id": (
                                                     self.config.tool_result_store_agent_id
-                                                    or self.config.metadata.get(
-                                                        "agent_id"
-                                                    )
+                                                    or self.config.metadata.get("agent_id")
                                                 ),
                                             },
                                         )
                                         _got_error = True
                                         _stream_policy_preempt = True
+                                        usage_unknown_reason = "policy_preempt"
                                         break  # break stream, retry sans thinking
 
                             elif isinstance(raw_ev, ProviderToolUseStart):
                                 if not tools_supported_for_call:
                                     if (
                                         artifact_delivery_final_response_pending
-                                        or max_iterations_finalization_pending
+                                        or forced_finalization_for_call
                                         or post_write_convergence_finalization_pending
                                     ):
                                         ignored_post_delivery_tool_use = True
@@ -5494,9 +6097,7 @@ class Agent:
                                     )
                                     yield RunHeartbeatEvent(
                                         phase="llm_tool_arguments",
-                                        elapsed_ms=int(
-                                            (time.monotonic() - call_started_at) * 1000
-                                        ),
+                                        elapsed_ms=int((time.monotonic() - call_started_at) * 1000),
                                         idle_ms=0,
                                         message=(f"Receiving {acc.tool_name} arguments"),
                                     )
@@ -5505,16 +6106,13 @@ class Agent:
                                 if not tools_supported_for_call:
                                     if (
                                         artifact_delivery_final_response_pending
-                                        or max_iterations_finalization_pending
+                                        or forced_finalization_for_call
                                         or post_write_convergence_finalization_pending
                                     ):
                                         ignored_post_delivery_tool_use = True
                                     continue
                                 end_tool_use_id = raw_ev.tool_use_id
-                                if (
-                                    isinstance(end_tool_use_id, str)
-                                    and end_tool_use_id.strip()
-                                ):
+                                if isinstance(end_tool_use_id, str) and end_tool_use_id.strip():
                                     acc = pending_tools.pop(end_tool_use_id, None)
                                     tool_argument_heartbeat_chars.pop(end_tool_use_id, None)
                                 else:
@@ -5589,29 +6187,34 @@ class Agent:
                                     continue
                                 provider_done_for_log = raw_ev
                                 _got_done_event = True
-                                physical_usage_provider = str(
-                                    getattr(
+                                # Actual deployment identity must come from a
+                                # physical provider receipt.  The accounting
+                                # call-start identity is requested/configured
+                                # context and must never be promoted to actual.
+                                physical_usage_model = str(raw_ev.model or "")
+                                executed_provider_id = str(
+                                    getattr(raw_ev, "provider", "")
+                                    or getattr(
                                         raw_ev,
                                         "_opensquilla_usage_provider",
                                         "",
                                     )
                                     or ""
                                 )
-                                physical_usage_model = str(
-                                    getattr(raw_ev, "_opensquilla_usage_model", "")
-                                    or raw_ev.model
+                                requested_model_id = str(
+                                    getattr(raw_ev, "requested_model", "")
                                     or self.config.model_id
                                     or ""
                                 )
-                                executed_provider_id = str(
-                                    physical_usage_provider
-                                    or getattr(raw_ev, "provider", "")
-                                    or getattr(self.provider, "active_provider_id", "")
+                                requested_provider_id = str(
+                                    getattr(raw_ev, "requested_provider", "")
                                     or self.config.provider_id
                                     or getattr(self.provider, "provider_id", "")
                                     or getattr(self.provider, "provider_name", "")
                                     or ""
                                 )
+                                last_requested_model = requested_model_id
+                                last_requested_provider = requested_provider_id
                                 if usage_call is not None and not usage_call_terminal:
                                     # A malformed provider that emits duplicate Done
                                     # events still finalizes this call envelope once.
@@ -5622,9 +6225,11 @@ class Agent:
                                 iter_reasoning_tokens = raw_ev.reasoning_tokens
                                 iter_reasoning_content = raw_ev.reasoning_content
                                 iter_thinking_signature = raw_ev.thinking_signature
-                                raw_cost_source = str(
-                                    getattr(raw_ev, "cost_source", "none") or "none"
-                                ).strip().lower()
+                                raw_cost_source = (
+                                    str(getattr(raw_ev, "cost_source", "none") or "none")
+                                    .strip()
+                                    .lower()
+                                )
                                 trusted_billed_cost = (
                                     raw_ev.billed_cost
                                     if raw_cost_source == "provider_billed"
@@ -5649,6 +6254,39 @@ class Agent:
                                     if isinstance(usage_breakdown, list)
                                     else []
                                 )
+                                for usage_row in valid_usage_breakdown:
+                                    if not str(
+                                        usage_row.get("requested_model") or ""
+                                    ).strip():
+                                        usage_row["requested_model"] = requested_model_id
+                                    if not str(
+                                        usage_row.get("requested_provider") or ""
+                                    ).strip():
+                                        usage_row["requested_provider"] = (
+                                            requested_provider_id
+                                        )
+                                if not physical_usage_model:
+                                    receipt_models = {
+                                        str(row.get("model") or "").strip()
+                                        for row in valid_usage_breakdown
+                                        if not _is_missing_usage_placeholder(row)
+                                        if str(row.get("model") or "").strip()
+                                    }
+                                    if len(receipt_models) == 1:
+                                        physical_usage_model = next(
+                                            iter(receipt_models)
+                                        )
+                                if not executed_provider_id:
+                                    receipt_providers = {
+                                        str(row.get("provider") or "").strip()
+                                        for row in valid_usage_breakdown
+                                        if not _is_missing_usage_placeholder(row)
+                                        if str(row.get("provider") or "").strip()
+                                    }
+                                    if len(receipt_providers) == 1:
+                                        executed_provider_id = next(
+                                            iter(receipt_providers)
+                                        )
                                 usage_source_rows = (
                                     valid_usage_breakdown
                                     if valid_usage_breakdown
@@ -5670,61 +6308,52 @@ class Agent:
                                 )
                                 trusted_billed_cost = 0.0
                                 for usage_source_row in usage_source_rows:
-                                    usage_source = str(
-                                        usage_source_row.get("cost_source")
-                                        or usage_source_row.get("costSource")
-                                        or "none"
-                                    ).strip().lower()
-                                    usage_receipt = usage_source_row.get(
-                                        "billing_receipt",
-                                        usage_source_row.get("billingReceipt"),
-                                    )
-                                    if isinstance(usage_receipt, dict):
-                                        receipt_status = str(
-                                            usage_receipt.get("status") or ""
-                                        ).strip().lower()
-                                    else:
-                                        receipt_status = str(
-                                            getattr(usage_receipt, "status", "") or ""
-                                        ).strip().lower()
-                                    reported_row_cost = _usage_float(
-                                        usage_source_row.get(
-                                            "billed_cost",
-                                            usage_source_row.get("billedCost", 0.0),
+                                    usage_source = (
+                                        str(
+                                            usage_source_row.get("cost_source")
+                                            or usage_source_row.get("costSource")
+                                            or "none"
                                         )
+                                        .strip()
+                                        .lower()
                                     )
-                                    if usage_source == "mixed":
-                                        total_provider_billed_entries += 1
-                                        total_unbilled_entries += 1
-                                        continue
-                                    trusted_row = (
-                                        usage_source in {
-                                            "provider_billed",
-                                            "openrouter_usage",
-                                        }
-                                        or receipt_status == "confirmed"
-                                        # Compatibility bridge for adapters and
-                                        # test doubles predating native receipts.
-                                        or (
-                                            usage_source
-                                            in {"", "none", "unavailable"}
-                                            and reported_row_cost > 0.0
+                                    canonical_row_cost, trusted_row = (
+                                        _canonical_provider_billed_cost(
+                                            usage_source_row
                                         )
                                     )
                                     if trusted_row:
                                         total_provider_billed_entries += 1
-                                        trusted_billed_cost += reported_row_cost
-                                    else:
+                                        trusted_billed_cost += canonical_row_cost
+                                        continue
+                                    receipt_present = (
+                                        _usage_field(
+                                            usage_source_row,
+                                            "billing_receipt",
+                                            "billingReceipt",
+                                            default=None,
+                                        )
+                                        is not None
+                                    )
+                                    if usage_source == "mixed" and not receipt_present:
+                                        total_provider_billed_entries += 1
                                         total_unbilled_entries += 1
+                                        continue
+                                    total_unbilled_entries += 1
                                 total_billed_cost += trusted_billed_cost
                                 _accumulate_turn_cost(
                                     raw_ev,
-                                    default_provider=executed_provider_id,
-                                    default_model=physical_usage_model,
+                                    default_provider=(
+                                        executed_provider_id
+                                        or requested_provider_id
+                                    ),
+                                    default_model=(
+                                        physical_usage_model
+                                        or requested_model_id
+                                    ),
                                 )
                                 cost_receipt_counted = True
-                                if physical_usage_model:
-                                    last_actual_model = physical_usage_model
+                                last_actual_model = physical_usage_model
                                 last_actual_provider = executed_provider_id
                                 # Usage/cost accounting is billed-attempt based: discarded
                                 # invalid responses still consumed provider tokens, but
@@ -5764,25 +6393,31 @@ class Agent:
                                                 cache_write_tokens=_usage_int(
                                                     usage_row.get("cache_write_tokens") or 0
                                                 ),
-                                                billed_cost=(
-                                                    _usage_float(
-                                                        usage_row.get("billed_cost") or 0.0
-                                                    )
-                                                    if str(
-                                                        usage_row.get("cost_source") or "none"
-                                                    ).strip().lower()
-                                                    == "provider_billed"
-                                                    else 0.0
-                                                ),
+                                                billed_cost=_canonical_provider_billed_cost(
+                                                    usage_row
+                                                )[0],
                                                 provider=str(
                                                     usage_row.get("provider")
-                                                    or physical_usage_provider
                                                     or executed_provider_id
                                                 ),
-                                                cost_source=str(
-                                                    usage_row.get("cost_source")
-                                                    or usage_row.get("costSource")
-                                                    or "none"
+                                                cost_source=(
+                                                    "provider_billed"
+                                                    if _canonical_provider_billed_cost(
+                                                        usage_row
+                                                    )[1]
+                                                    else "unavailable"
+                                                    if _usage_field(
+                                                        usage_row,
+                                                        "billing_receipt",
+                                                        "billingReceipt",
+                                                        default=None,
+                                                    )
+                                                    is not None
+                                                    else str(
+                                                        usage_row.get("cost_source")
+                                                        or usage_row.get("costSource")
+                                                        or "none"
+                                                    )
                                                 ),
                                             )
                                     else:
@@ -5795,7 +6430,24 @@ class Agent:
                                             cache_write_tokens=raw_ev.cache_write_tokens,
                                             billed_cost=trusted_billed_cost,
                                             provider=executed_provider_id,
-                                            cost_source=getattr(raw_ev, "cost_source", "none"),
+                                            cost_source=(
+                                                "provider_billed"
+                                                if _canonical_provider_billed_cost(
+                                                    raw_ev
+                                                )[1]
+                                                else "unavailable"
+                                                if getattr(
+                                                    raw_ev,
+                                                    "billing_receipt",
+                                                    None,
+                                                )
+                                                is not None
+                                                else getattr(
+                                                    raw_ev,
+                                                    "cost_source",
+                                                    "none",
+                                                )
+                                            ),
                                         )
                                 ensemble_trace = getattr(raw_ev, "ensemble_trace", None)
                                 if isinstance(ensemble_trace, dict):
@@ -5803,17 +6455,75 @@ class Agent:
                                     turn_ensemble_request_count += _usage_int(
                                         ensemble_trace.get("llm_request_count") or 0
                                     )
+                                    turn_ensemble_physical_request_count += _usage_int(
+                                        ensemble_trace.get("physical_request_count")
+                                        or ensemble_trace.get("llm_request_count")
+                                        or 0
+                                    )
+                                    turn_ensemble_usage_missing_count += _usage_int(
+                                        ensemble_trace.get("usage_missing_count") or 0
+                                    )
 
                             elif isinstance(raw_ev, ProviderErrorEvent):
                                 provider_error_for_log = raw_ev
-                                usage_unknown_reason = provider_error_usage_reason(
-                                    raw_ev.code
+                                if str(raw_ev.code or "").endswith("_close_timeout"):
+                                    provider_gate = getattr(
+                                        self.provider,
+                                        "_cleanup_is_pending",
+                                        None,
+                                    )
+                                    if not callable(provider_gate):
+                                        self._cleanup_poisoned_reason = str(
+                                            raw_ev.code or "provider_stream_close_timeout"
+                                        )
+                                ensemble_trace = getattr(raw_ev, "ensemble_trace", None)
+                                if isinstance(ensemble_trace, dict):
+                                    last_ensemble_trace = dict(ensemble_trace)
+                                    turn_ensemble_request_count += _usage_int(
+                                        ensemble_trace.get("llm_request_count") or 0
+                                    )
+                                    turn_ensemble_physical_request_count += _usage_int(
+                                        ensemble_trace.get("physical_request_count")
+                                        or ensemble_trace.get("llm_request_count")
+                                        or 0
+                                    )
+                                    turn_ensemble_usage_missing_count += _usage_int(
+                                        ensemble_trace.get("usage_missing_count") or 0
+                                    )
+                                usage_unknown_reason = provider_error_usage_reason(raw_ev.code)
+                                explicit_physical_request_count = (
+                                    max(0, int(raw_ev.physical_request_count))
+                                    if raw_ev.physical_request_count is not None
+                                    else None
+                                )
+                                explicit_no_request = bool(
+                                    raw_ev.request_started is False
+                                    or explicit_physical_request_count == 0
                                 )
                                 known_usage_receipt = has_known_provider_usage_receipt(raw_ev)
                                 if (
+                                    usage_call_enabled
+                                    and usage_scope is not None
+                                    and not known_usage_receipt
+                                    and explicit_physical_request_count is not None
+                                    and explicit_physical_request_count > 1
+                                ):
+                                    # One call envelope is represented by
+                                    # ``usage_call``; fallback wrappers can
+                                    # prove additional failed physical calls.
+                                    for _ in range(explicit_physical_request_count - 1):
+                                        extra_usage_call = await self._usage_call_start(
+                                            usage_scope
+                                        )
+                                        if extra_usage_call is not None:
+                                            await self._usage_call_unknown(
+                                                extra_usage_call,
+                                                usage_unknown_reason,
+                                            )
+                                if (
                                     usage_call is not None
                                     and not usage_call_terminal
-                                    and known_usage_receipt
+                                    and (known_usage_receipt or explicit_no_request)
                                 ):
                                     usage_call_terminal = True
                                     await self._usage_call_finalize(usage_call, raw_ev)
@@ -5832,11 +6542,197 @@ class Agent:
                                         if usage_call is not None
                                         else str(self.config.model_id or "")
                                     )
-                                    error_rows = [
-                                        dict(usage_row)
-                                        for usage_row in raw_ev.model_usage_breakdown
-                                        if isinstance(usage_row, dict)
-                                    ]
+                                    diagnostic_done = getattr(
+                                        raw_ev,
+                                        "diagnostic_done",
+                                        None,
+                                    )
+                                    diagnostic_rows = (
+                                        [
+                                            dict(usage_row)
+                                            for usage_row in getattr(
+                                                diagnostic_done,
+                                                "model_usage_breakdown",
+                                                [],
+                                            )
+                                            if isinstance(usage_row, dict)
+                                        ]
+                                        if diagnostic_done is not None
+                                        else []
+                                    )
+                                    error_rows = provider_usage_receipt_rows(
+                                        raw_ev,
+                                        default_provider=error_default_provider,
+                                        default_model=error_default_model,
+                                    )
+                                    row_requested_models = {
+                                        str(
+                                            usage_row.get("requested_model") or ""
+                                        ).strip()
+                                        for usage_row in error_rows
+                                        if str(
+                                            usage_row.get("requested_model") or ""
+                                        ).strip()
+                                    }
+                                    row_requested_providers = {
+                                        str(
+                                            usage_row.get("requested_provider") or ""
+                                        ).strip()
+                                        for usage_row in error_rows
+                                        if str(
+                                            usage_row.get("requested_provider") or ""
+                                        ).strip()
+                                    }
+                                    diagnostic_row_requested_models = {
+                                        str(
+                                            usage_row.get("requested_model") or ""
+                                        ).strip()
+                                        for usage_row in diagnostic_rows
+                                        if str(
+                                            usage_row.get("requested_model") or ""
+                                        ).strip()
+                                    }
+                                    diagnostic_row_requested_providers = {
+                                        str(
+                                            usage_row.get("requested_provider") or ""
+                                        ).strip()
+                                        for usage_row in diagnostic_rows
+                                        if str(
+                                            usage_row.get("requested_provider") or ""
+                                        ).strip()
+                                    }
+                                    diagnostic_requested_model = str(
+                                        getattr(
+                                            diagnostic_done,
+                                            "requested_model",
+                                            "",
+                                        )
+                                        or ""
+                                    ).strip()
+                                    diagnostic_requested_provider = str(
+                                        getattr(
+                                            diagnostic_done,
+                                            "requested_provider",
+                                            "",
+                                        )
+                                        or ""
+                                    ).strip()
+                                    error_requested_model = (
+                                        diagnostic_requested_model
+                                        or (
+                                            next(iter(diagnostic_row_requested_models))
+                                            if len(diagnostic_row_requested_models) == 1
+                                            else ""
+                                        )
+                                        or (
+                                            next(iter(row_requested_models))
+                                            if len(row_requested_models) == 1
+                                            else ""
+                                        )
+                                        or error_default_model
+                                    )
+                                    error_requested_provider = (
+                                        diagnostic_requested_provider
+                                        or (
+                                            next(iter(diagnostic_row_requested_providers))
+                                            if len(diagnostic_row_requested_providers) == 1
+                                            else ""
+                                        )
+                                        or (
+                                            next(iter(row_requested_providers))
+                                            if len(row_requested_providers) == 1
+                                            else ""
+                                        )
+                                        or error_default_provider
+                                    )
+                                    last_requested_model = error_requested_model
+                                    last_requested_provider = error_requested_provider
+                                    for usage_row in error_rows:
+                                        if not str(
+                                            usage_row.get("requested_provider") or ""
+                                        ).strip():
+                                            usage_row["requested_provider"] = (
+                                                error_requested_provider
+                                            )
+                                        if not str(
+                                            usage_row.get("requested_model") or ""
+                                        ).strip():
+                                            usage_row["requested_model"] = (
+                                                error_requested_model
+                                            )
+                                    row_actual_models = {
+                                        str(usage_row.get("model") or "").strip()
+                                        for usage_row in error_rows
+                                        if not _is_missing_usage_placeholder(usage_row)
+                                        if str(usage_row.get("model") or "").strip()
+                                    }
+                                    row_actual_providers = {
+                                        str(usage_row.get("provider") or "").strip()
+                                        for usage_row in error_rows
+                                        if not _is_missing_usage_placeholder(usage_row)
+                                        if str(usage_row.get("provider") or "").strip()
+                                    }
+                                    diagnostic_row_actual_models = {
+                                        str(usage_row.get("model") or "").strip()
+                                        for usage_row in diagnostic_rows
+                                        if not _is_missing_usage_placeholder(usage_row)
+                                        if str(usage_row.get("model") or "").strip()
+                                    }
+                                    diagnostic_row_actual_providers = {
+                                        str(usage_row.get("provider") or "").strip()
+                                        for usage_row in diagnostic_rows
+                                        if not _is_missing_usage_placeholder(usage_row)
+                                        if str(usage_row.get("provider") or "").strip()
+                                    }
+                                    diagnostic_identity_allowed = (
+                                        not diagnostic_rows
+                                        or any(
+                                            not _is_missing_usage_placeholder(row)
+                                            for row in diagnostic_rows
+                                        )
+                                    )
+                                    diagnostic_model = (
+                                        str(
+                                            getattr(diagnostic_done, "model", "")
+                                            or ""
+                                        ).strip()
+                                        if diagnostic_identity_allowed
+                                        else ""
+                                    )
+                                    diagnostic_provider = (
+                                        str(
+                                            getattr(diagnostic_done, "provider", "")
+                                            or ""
+                                        ).strip()
+                                        if diagnostic_identity_allowed
+                                        else ""
+                                    )
+                                    error_actual_model = (
+                                        diagnostic_model
+                                        or (
+                                            next(iter(diagnostic_row_actual_models))
+                                            if len(diagnostic_row_actual_models) == 1
+                                            else ""
+                                        )
+                                        or (
+                                            next(iter(row_actual_models))
+                                            if len(row_actual_models) == 1
+                                            else ""
+                                        )
+                                    )
+                                    error_actual_provider = (
+                                        diagnostic_provider
+                                        or (
+                                            next(iter(diagnostic_row_actual_providers))
+                                            if len(diagnostic_row_actual_providers) == 1
+                                            else ""
+                                        )
+                                        or (
+                                            next(iter(row_actual_providers))
+                                            if len(row_actual_providers) == 1
+                                            else ""
+                                        )
+                                    )
                                     normalized_error_usage = normalize_provider_usage(
                                         raw_ev,
                                         default_provider=error_default_provider,
@@ -5848,27 +6744,25 @@ class Agent:
                                     total_reasoning_tokens += (
                                         normalized_error_usage.reasoning_tokens
                                     )
-                                    total_cached_tokens += (
-                                        normalized_error_usage.cache_read_tokens
-                                    )
+                                    total_cached_tokens += normalized_error_usage.cache_read_tokens
                                     total_cache_write_tokens += (
                                         normalized_error_usage.cache_write_tokens
                                     )
                                     total_billed_cost += (
-                                        normalized_error_usage.billed_cost_nanos
-                                        / 1_000_000_000
+                                        normalized_error_usage.billed_cost_nanos / 1_000_000_000
                                     )
+                                    provider_error_normalized_missing_for_log = max(
+                                        0,
+                                        normalized_error_usage.missing_usage_entries,
+                                    )
+                                    for normalized_item in normalized_error_usage.items:
+                                        if normalized_item.cost_source == "provider_billed":
+                                            total_provider_billed_entries += 1
+                                        else:
+                                            total_unbilled_entries += 1
                                     turn_model_usage_breakdown.extend(error_rows)
-                                    if error_rows:
-                                        last_error_row = error_rows[-1]
-                                        last_actual_model = str(
-                                            last_error_row.get("model")
-                                            or error_default_model
-                                        )
-                                        last_actual_provider = str(
-                                            last_error_row.get("provider")
-                                            or error_default_provider
-                                        )
+                                    last_actual_model = error_actual_model
+                                    last_actual_provider = error_actual_provider
                                     if self._usage_tracker and self._session_key:
                                         for usage_row in error_rows:
                                             cache_read = (
@@ -5885,45 +6779,55 @@ class Agent:
                                                     usage_row.get("output_tokens") or 0
                                                 ),
                                                 model_id=str(
-                                                    usage_row.get("model")
-                                                    or error_default_model
+                                                    usage_row.get("model") or error_default_model
                                                 ),
                                                 cache_read_tokens=_usage_int(cache_read or 0),
                                                 cache_write_tokens=_usage_int(
                                                     usage_row.get("cache_write_tokens") or 0
                                                 ),
-                                                billed_cost=(
-                                                    _usage_float(
-                                                        usage_row.get("billed_cost") or 0.0
-                                                    )
-                                                    if str(
-                                                        usage_row.get("cost_source") or "none"
-                                                    ).strip().lower()
-                                                    == "provider_billed"
-                                                    else 0.0
-                                                ),
+                                                billed_cost=_canonical_provider_billed_cost(
+                                                    usage_row
+                                                )[0],
                                                 provider=str(
                                                     usage_row.get("provider")
                                                     or error_default_provider
                                                 ),
+                                                cost_source=(
+                                                    "provider_billed"
+                                                    if _canonical_provider_billed_cost(
+                                                        usage_row
+                                                    )[1]
+                                                    else "unavailable"
+                                                    if _usage_field(
+                                                        usage_row,
+                                                        "billing_receipt",
+                                                        "billingReceipt",
+                                                        default=None,
+                                                    )
+                                                    is not None
+                                                    else str(
+                                                        usage_row.get("cost_source")
+                                                        or usage_row.get("costSource")
+                                                        or "none"
+                                                    )
+                                                ),
                                             )
                                     provider_error_usage_for_log = {
-                                        "provider": error_default_provider,
-                                        "model": last_actual_model or error_default_model,
+                                        "provider": error_actual_provider,
+                                        "model": error_actual_model,
+                                        "requested_provider": error_requested_provider,
+                                        "requested_model": error_requested_model,
                                         "input_tokens": normalized_error_usage.input_tokens,
                                         "output_tokens": normalized_error_usage.output_tokens,
                                         "reasoning_tokens": (
                                             normalized_error_usage.reasoning_tokens
                                         ),
-                                        "cached_tokens": (
-                                            normalized_error_usage.cache_read_tokens
-                                        ),
+                                        "cached_tokens": (normalized_error_usage.cache_read_tokens),
                                         "cache_write_tokens": (
                                             normalized_error_usage.cache_write_tokens
                                         ),
                                         "billed_cost": (
-                                            normalized_error_usage.billed_cost_nanos
-                                            / 1_000_000_000
+                                            normalized_error_usage.billed_cost_nanos / 1_000_000_000
                                         ),
                                         "estimated_cost_usd": (
                                             normalized_error_usage.estimated_cost_nanos
@@ -5935,7 +6839,9 @@ class Agent:
                                         )
                                         / 1_000_000_000,
                                         "cost_source": normalized_error_usage.cost_source,
-                                        "model_usage_breakdown": error_rows,
+                                        "model_usage_breakdown": (
+                                            _with_model_usage_cost_fields(error_rows)
+                                        ),
                                     }
                                     _accumulate_turn_cost(
                                         raw_ev,
@@ -6019,6 +6925,18 @@ class Agent:
                         _notify_call_outcome(ok=False, failure_kind="raised")
                         raise
                     finally:
+                        if provider_event_stream is not None:
+                            # `async for ...: break` does not guarantee that an
+                            # async iterator is synchronously closed. Await the
+                            # relay close here before a policy retry can launch
+                            # another billable provider request.
+                            relay_closed = await self._close_provider_stream(provider_event_stream)
+                            provider_stream_closed = relay_closed and (
+                                provider_stream_close_status is None
+                                or provider_stream_close_status.closed is not False
+                            )
+                            if not provider_stream_closed:
+                                usage_unknown_reason = "provider_stream_close_timeout"
                         if usage_call is not None and not usage_call_terminal:
                             await self._usage_call_unknown(
                                 usage_call,
@@ -6026,12 +6944,17 @@ class Agent:
                             )
 
                     call_duration_ms = int((time.monotonic() - call_started_at) * 1000)
+                    call_abandoned = bool(_stream_policy_preempt and not _got_done_event)
                     _notify_call_outcome(
-                        ok=provider_error_for_log is None,
+                        ok=(provider_error_for_log is None and not call_abandoned),
                         failure_kind=(
-                            str(provider_error_for_log.code or "provider_error")
-                            if provider_error_for_log is not None
-                            else ""
+                            "policy_preempt"
+                            if call_abandoned
+                            else (
+                                str(provider_error_for_log.code or "provider_error")
+                                if provider_error_for_log is not None
+                                else ""
+                            )
                         ),
                     )
                     response_payload = {
@@ -6053,9 +6976,15 @@ class Agent:
                     if provider_done_for_log is not None:
                         response_payload["usage_missing_count"] = max(
                             0,
-                            _usage_int(
-                                getattr(provider_done_for_log, "usage_missing_count", 0)
-                            ),
+                            _usage_int(getattr(provider_done_for_log, "usage_missing_count", 0)),
+                        )
+                        logged_billed_cost, logged_exact_receipt = (
+                            _canonical_provider_billed_cost(provider_done_for_log)
+                        )
+                        logged_receipt = getattr(
+                            provider_done_for_log,
+                            "billing_receipt",
+                            None,
                         )
                         usage_payload: dict[str, Any] = {
                             "stop_reason": provider_done_for_log.stop_reason,
@@ -6064,12 +6993,38 @@ class Agent:
                             "reasoning_tokens": provider_done_for_log.reasoning_tokens,
                             "cached_tokens": provider_done_for_log.cached_tokens,
                             "cache_write_tokens": provider_done_for_log.cache_write_tokens,
-                            "billed_cost": provider_done_for_log.billed_cost,
-                            "cost_source": getattr(provider_done_for_log, "cost_source", "none"),
+                            "billed_cost": logged_billed_cost,
+                            "cost_source": (
+                                "provider_billed"
+                                if logged_exact_receipt
+                                else "unavailable"
+                                if logged_receipt is not None
+                                else getattr(
+                                    provider_done_for_log,
+                                    "cost_source",
+                                    "none",
+                                )
+                            ),
                             "model": provider_done_for_log.model,
                             "provider": str(
                                 getattr(provider_done_for_log, "provider", "")
-                                or getattr(self.provider, "active_provider_id", "")
+                                or ""
+                            ),
+                            "requested_model": str(
+                                getattr(
+                                    provider_done_for_log,
+                                    "requested_model",
+                                    "",
+                                )
+                                or self.config.model_id
+                                or ""
+                            ),
+                            "requested_provider": str(
+                                getattr(
+                                    provider_done_for_log,
+                                    "requested_provider",
+                                    "",
+                                )
                                 or self.config.provider_id
                                 or getattr(self.provider, "provider_id", "")
                                 or getattr(self.provider, "provider_name", "")
@@ -6083,6 +7038,13 @@ class Agent:
                         )
                         if isinstance(provider_usage, dict):
                             usage_payload["provider_usage"] = dict(provider_usage)
+                        billing_receipt = getattr(
+                            provider_done_for_log,
+                            "billing_receipt",
+                            None,
+                        )
+                        if billing_receipt is not None:
+                            usage_payload["billing_receipt"] = billing_receipt
                         response_payload["usage"] = usage_payload
                         model_usage_breakdown = getattr(
                             provider_done_for_log,
@@ -6090,16 +7052,42 @@ class Agent:
                             None,
                         )
                         if model_usage_breakdown:
-                            usage_payload["model_usage_breakdown"] = model_usage_breakdown
+                            usage_payload["model_usage_breakdown"] = (
+                                _with_model_usage_cost_fields(
+                                    [
+                                        dict(row)
+                                        for row in model_usage_breakdown
+                                        if isinstance(row, dict)
+                                    ]
+                                )
+                            )
                         ensemble_trace = getattr(provider_done_for_log, "ensemble_trace", None)
                         if ensemble_trace:
                             response_payload["ensemble_trace"] = ensemble_trace
-                    if provider_error_for_log is not None:
+                    if call_abandoned:
+                        # This physical request was sent and may have incurred
+                        # unknown upstream cost, but the engine intentionally
+                        # stopped it before a terminal usage receipt arrived.
+                        response_payload["usage_missing_count"] = max(
+                            1,
+                            int(response_payload.get("usage_missing_count", 0) or 0),
+                        )
+                        response_payload["failure_kind"] = "policy_preempt"
+                        self._write_turn_call_log(
+                            "llm_abandoned",
+                            **response_payload,
+                        )
+                    elif provider_error_for_log is not None:
                         response_payload["usage_missing_count"] = max(
                             0,
-                            _usage_int(
-                                getattr(provider_error_for_log, "usage_missing_count", 0)
-                            ),
+                            _usage_int(getattr(provider_error_for_log, "usage_missing_count", 0)),
+                            provider_error_normalized_missing_for_log,
+                        )
+                        response_payload["request_started"] = (
+                            provider_error_for_log.request_started
+                        )
+                        response_payload["physical_request_count"] = (
+                            provider_error_for_log.physical_request_count
                         )
                         if provider_error_usage_for_log is not None:
                             response_payload["usage"] = provider_error_usage_for_log
@@ -6107,6 +7095,13 @@ class Agent:
                             "message": provider_error_for_log.message,
                             "code": provider_error_for_log.code,
                         }
+                        ensemble_trace = getattr(
+                            provider_error_for_log,
+                            "ensemble_trace",
+                            None,
+                        )
+                        if isinstance(ensemble_trace, dict):
+                            response_payload["ensemble_trace"] = dict(ensemble_trace)
                         self._write_turn_call_log("llm_error", **response_payload)
                     else:
                         self._write_turn_call_log("llm_response", **response_payload)
@@ -6137,17 +7132,32 @@ class Agent:
                             response_text = self._artifact_delivery_final_response_text(
                                 artifact_delivery_final_response_artifacts
                             )
-                        elif max_iterations_finalization_pending:
-                            response_text = (
-                                "I reached the configured iteration limit after completing "
-                                "the available tool step. Here is the best partial result so far."
-                            )
+                        elif forced_finalization_for_call:
+                            if forced_finalization_reason == "retrieval_loop":
+                                response_text = (
+                                    "The retrieval loop was stopped after the configured "
+                                    "limit. Here is the best-supported result from the "
+                                    "evidence collected so far."
+                                )
+                            elif deadline_finalization_pending:
+                                response_text = (
+                                    "The deadline wrap-up produced no additional text. "
+                                    "Here is the best partial result from completed work."
+                                )
+                            else:
+                                response_text = (
+                                    "I reached the configured iteration limit after "
+                                    "completing the available tool step. Here is the best "
+                                    "partial result so far."
+                                )
                         elif post_write_convergence_finalization_pending:
                             response_text = (
                                 "The workspace diff stayed stable after clean validation. "
                                 "Here is the current validated patch state."
                             )
                         if response_text:
+                            last_actual_model = ""
+                            last_actual_provider = ""
                             assistant_text_parts.append(response_text)
                             attempt_user_visible_emitted = True
                             yield TextDeltaEvent(text=response_text)
@@ -6196,6 +7206,38 @@ class Agent:
                         reasoning_tokens=iter_reasoning_tokens,
                         user_visible_emitted=attempt_user_visible_emitted,
                     )
+                    if not provider_stream_closed:
+                        would_reopen_provider = bool(
+                            _got_error
+                            or attempt_classification.kind != _ProviderAttemptKind.OK
+                            or tool_calls
+                            or pending_tools
+                        )
+                        if would_reopen_provider:
+                            terminal_error = ErrorEvent(
+                                message=(
+                                    "The previous provider stream did not close within "
+                                    "the cleanup window; retry was stopped to prevent "
+                                    "overlapping billable requests."
+                                ),
+                                code="provider_stream_close_timeout",
+                            )
+                            self._write_turn_call_log(
+                                "turn_policy_decision",
+                                action="stop",
+                                reason="provider_stream_close_timeout",
+                                code=terminal_error.code,
+                                iteration=iterations,
+                                attempt=_call_attempt,
+                            )
+                            yield self._transition(AgentState.ERROR)
+                            yield terminal_error
+                            break
+                        # A complete text-only terminal answer is safe to return:
+                        # no subsequent physical request is necessary. Treat it
+                        # as forced finalization so recovery/watchdog gates cannot
+                        # silently reopen the provider after close timed out.
+                        forced_finalization_for_call = True
                     if (
                         attempt_classification.kind != _ProviderAttemptKind.OK
                         # An engine-chosen preempt truncated the stream; the
@@ -6224,7 +7266,8 @@ class Agent:
                         logger.warning(
                             "provider.invalid_response",
                             session_key=self._session_key,
-                            model=last_actual_model or self.config.model_id or "",
+                            model=last_actual_model,
+                            requested_model=self.config.model_id or "",
                             provider=type(self.provider).__name__,
                             classification=attempt_classification.kind.value,
                             iteration=iterations,
@@ -6477,7 +7520,8 @@ class Agent:
                                 logger.warning(
                                     "provider.large_context_visible_retry",
                                     session_key=self._session_key,
-                                    model=last_actual_model or self.config.model_id or "",
+                                    model=last_actual_model,
+                                    requested_model=self.config.model_id or "",
                                     provider=type(self.provider).__name__,
                                     classification=attempt_classification.kind.value,
                                     iteration=iterations,
@@ -6525,9 +7569,7 @@ class Agent:
                             )
                         ):
                             _attempt_retries_used[_ProviderAttemptKind.REASONING_ONLY] += 1
-                            if getattr(
-                                self.config, "reasoning_only_thinking_fallback", False
-                            ):
+                            if getattr(self.config, "reasoning_only_thinking_fallback", False):
                                 _thinking_fallback_done = True
                                 _disable_thinking_for_next_provider_call = True
                                 yield WarningEvent(
@@ -6566,6 +7608,19 @@ class Agent:
                                 code="provider_empty_retry",
                                 message="The provider returned an empty response; retrying once.",
                             )
+                            if _arm_deadline_wrapup_if_due(
+                                reason="deadline_margin_retry_backoff",
+                                attempt=_call_attempt,
+                                lookahead_seconds=delay,
+                            ):
+                                _call_attempt += 1
+                                continue
+                            retry_deadline_error = _provider_retry_deadline_error(delay)
+                            if retry_deadline_error is not None:
+                                terminal_error = retry_deadline_error
+                                yield self._transition(AgentState.ERROR)
+                                yield terminal_error
+                                break
                             await asyncio.sleep(delay)
                             _call_attempt += 1
                             continue
@@ -6591,6 +7646,19 @@ class Agent:
                                     "The provider stream ended before completion; retrying once."
                                 ),
                             )
+                            if _arm_deadline_wrapup_if_due(
+                                reason="deadline_margin_retry_backoff",
+                                attempt=_call_attempt,
+                                lookahead_seconds=delay,
+                            ):
+                                _call_attempt += 1
+                                continue
+                            retry_deadline_error = _provider_retry_deadline_error(delay)
+                            if retry_deadline_error is not None:
+                                terminal_error = retry_deadline_error
+                                yield self._transition(AgentState.ERROR)
+                                yield terminal_error
+                                break
                             await asyncio.sleep(delay)
                             _call_attempt += 1
                             continue
@@ -6613,7 +7681,8 @@ class Agent:
                             logger.warning(
                                 "provider.output_truncated_continue",
                                 session_key=self._session_key,
-                                model=last_actual_model or self.config.model_id or "",
+                                model=last_actual_model,
+                                requested_model=self.config.model_id or "",
                                 provider=type(self.provider).__name__,
                                 iteration=iterations,
                                 call_attempt=_call_attempt,
@@ -6681,7 +7750,8 @@ class Agent:
                             logger.warning(
                                 "provider.output_truncated_exhausted",
                                 session_key=self._session_key,
-                                model=last_actual_model or self.config.model_id or "",
+                                model=last_actual_model,
+                                requested_model=self.config.model_id or "",
                                 provider=type(self.provider).__name__,
                                 iteration=iterations,
                                 call_attempt=_call_attempt,
@@ -6710,7 +7780,8 @@ class Agent:
                         logger.warning(
                             "provider.empty_response",
                             session_key=self._session_key,
-                            model=last_actual_model or self.config.model_id or "",
+                            model=last_actual_model,
+                            requested_model=self.config.model_id or "",
                             provider=type(self.provider).__name__,
                             iteration=iterations,
                             retry_attempt=_call_attempt,
@@ -6797,15 +7868,11 @@ class Agent:
                         message_limit_proof = provider_error.message_limit_proof
                         if message_limit_proof is not None:
                             proof_log = {
-                                "actual_wire_messages": (
-                                    message_limit_proof.actual_wire_messages
-                                ),
+                                "actual_wire_messages": (message_limit_proof.actual_wire_messages),
                                 "limit": message_limit_proof.limit,
                                 "logical_messages": message_limit_proof.logical_messages,
                                 "system_messages": message_limit_proof.system_messages,
-                                "tool_result_messages": (
-                                    message_limit_proof.tool_result_messages
-                                ),
+                                "tool_result_messages": (message_limit_proof.tool_result_messages),
                                 "provider_kind": message_limit_proof.provider_kind,
                                 "model": message_limit_proof.model,
                                 "base_host": message_limit_proof.base_host,
@@ -6841,28 +7908,21 @@ class Agent:
                                 break
 
                             _message_limit_recovery_done = True
-                            recovery_outcome, recovery_reason = (
-                                await self._recover_provider_message_count_limit(
-                                    base_request_turn_messages,
-                                    request_suffix_messages=request_suffix_messages,
-                                    proof=message_limit_proof,
-                                    config=call_chat_cfg,
-                                    identical_request_perturbed=(
-                                        identical_request_action == "perturb"
-                                    ),
-                                    request_context_message=request_context_message,
-                                    request_context_insert_index=(
-                                        active_request_context_insert_index
-                                    ),
-                                    runtime_context_message=runtime_context_message,
-                                    runtime_context_insert_index=(
-                                        active_runtime_context_insert_index
-                                    ),
-                                    turn_objective_message=turn_objective_message,
-                                    protected_turn_start_index=(
-                                        active_protected_turn_start_index
-                                    ),
-                                )
+                            (
+                                recovery_outcome,
+                                recovery_reason,
+                            ) = await self._recover_provider_message_count_limit(
+                                base_request_turn_messages,
+                                request_suffix_messages=request_suffix_messages,
+                                proof=message_limit_proof,
+                                config=call_chat_cfg,
+                                identical_request_perturbed=(identical_request_action == "perturb"),
+                                request_context_message=request_context_message,
+                                request_context_insert_index=(active_request_context_insert_index),
+                                runtime_context_message=runtime_context_message,
+                                runtime_context_insert_index=(active_runtime_context_insert_index),
+                                turn_objective_message=turn_objective_message,
+                                protected_turn_start_index=(active_protected_turn_start_index),
                             )
                             if recovery_outcome is None:
                                 _log.warning(
@@ -6904,16 +7964,12 @@ class Agent:
                                 **proof_log,
                                 "target_wire_messages": (
                                     message_limit_proof.limit
-                                    - self._message_count_headroom(
-                                        message_limit_proof.limit
-                                    )
+                                    - self._message_count_headroom(message_limit_proof.limit)
                                 ),
                                 "projected_wire_messages": (
                                     recovery_outcome.projected_wire_messages
                                 ),
-                                "removed_logical_messages": (
-                                    recovery_outcome.removed_count
-                                ),
+                                "removed_logical_messages": (recovery_outcome.removed_count),
                             }
                             _log.info(
                                 "provider_request_message_limit_recovery_success",
@@ -6938,12 +7994,78 @@ class Agent:
                                 code=provider_error.code,
                             )
                             break
-                        if max_iterations_finalization_pending:
+                        if forced_finalization_for_call:
+                            finalization_reason = forced_finalization_reason or "deadline_wrapup"
+                            if finalization_reason != "max_iterations":
+                                should_retry_finalization = _fallback.should_retry(
+                                    kind,
+                                    _retry_attempt,
+                                )
+                                retry_delay = 0.0
+                                if should_retry_finalization:
+                                    retry_delay = backoff_sleep(
+                                        _retry_attempt,
+                                        _fallback.base_backoff_ms,
+                                        _fallback.max_backoff_ms,
+                                        _fake=True,
+                                    )
+                                remaining_total = (
+                                    None
+                                    if _total_deadline is None
+                                    else max(0.0, _total_deadline - _loop.time())
+                                )
+                                retry_deadline_error = _provider_retry_deadline_error(retry_delay)
+                                retry_has_deadline_headroom = retry_deadline_error is None
+                                if should_retry_finalization and retry_has_deadline_headroom:
+                                    self._write_turn_call_log(
+                                        "turn_policy_decision",
+                                        action="finalization_provider_retry",
+                                        reason=finalization_reason,
+                                        code=provider_error.code,
+                                        attempt=_retry_attempt + 1,
+                                        remaining_seconds=(
+                                            None
+                                            if remaining_total is None
+                                            else int(remaining_total)
+                                        ),
+                                    )
+                                    yield WarningEvent(
+                                        code="provider_finalization_retry",
+                                        message=(
+                                            "The finalization provider failed "
+                                            "transiently; retrying within the "
+                                            "remaining turn deadline."
+                                        ),
+                                    )
+                                    await asyncio.sleep(retry_delay)
+                                    _retry_attempt += 1
+                                    _call_attempt += 1
+                                    continue
+                                terminal_error = ErrorEvent(
+                                    message=(
+                                        f"The {finalization_reason.replace('_', ' ')} "
+                                        "finalization provider failed: "
+                                        f"{provider_error.message}"
+                                    ),
+                                    code=f"{finalization_reason}_finalization_failed",
+                                )
+                                self._write_turn_call_log(
+                                    "turn_policy_decision",
+                                    action="finalization_provider_error",
+                                    reason=finalization_reason,
+                                    code=terminal_error.code,
+                                    provider_error_code=provider_error.code,
+                                )
+                                yield self._transition(AgentState.ERROR)
+                                yield terminal_error
+                                break
                             response_text = (
-                                "I reached the configured iteration limit, and the "
-                                "provider could not generate an additional wrap-up. "
+                                f"The {finalization_reason.replace('_', ' ')} "
+                                "finalization could not generate an additional wrap-up. "
                                 "Returning the best partial result from completed work."
                             )
+                            last_actual_model = ""
+                            last_actual_provider = ""
                             assistant_text_parts.append(response_text)
                             provider_done_for_log = ProviderDoneEvent(stop_reason="stop")
                             _got_done_event = True
@@ -6952,8 +8074,8 @@ class Agent:
                             self._write_turn_call_log(
                                 "turn_policy_decision",
                                 action="partial_after_finalization_provider_error",
-                                reason="max_iterations",
-                                code="max_iterations",
+                                reason=finalization_reason,
+                                code=finalization_reason,
                                 provider_error_code=provider_error.code,
                             )
                             yield TextDeltaEvent(text=response_text)
@@ -6964,6 +8086,8 @@ class Agent:
                                 "and the provider could not generate an additional wrap-up. "
                                 "Returning the current validated patch state."
                             )
+                            last_actual_model = ""
+                            last_actual_provider = ""
                             assistant_text_parts.append(response_text)
                             provider_done_for_log = ProviderDoneEvent(stop_reason="stop")
                             _got_done_event = True
@@ -7015,6 +8139,20 @@ class Agent:
                                     "execution; retrying once."
                                 ),
                             )
+                            if _arm_deadline_wrapup_if_due(
+                                reason="deadline_margin_retry_backoff",
+                                attempt=_call_attempt,
+                                lookahead_seconds=delay,
+                            ):
+                                _retry_attempt += 1
+                                _call_attempt += 1
+                                continue
+                            retry_deadline_error = _provider_retry_deadline_error(delay)
+                            if retry_deadline_error is not None:
+                                terminal_error = retry_deadline_error
+                                yield self._transition(AgentState.ERROR)
+                                yield terminal_error
+                                break
                             await asyncio.sleep(delay)
                             _retry_attempt += 1
                             _call_attempt += 1
@@ -7143,6 +8281,10 @@ class Agent:
                             terminal_error = ErrorEvent(
                                 message=provider_error.message,
                                 code=provider_error.code,
+                                request_started=provider_error.request_started,
+                                physical_request_count=(
+                                    provider_error.physical_request_count
+                                ),
                             )
                             yield terminal_error
                             break
@@ -7158,6 +8300,20 @@ class Agent:
                             kind=kind.value,
                             delay_s=round(delay, 2),
                         )
+                        if _arm_deadline_wrapup_if_due(
+                            reason="deadline_margin_retry_backoff",
+                            attempt=_call_attempt,
+                            lookahead_seconds=delay,
+                        ):
+                            _retry_attempt += 1
+                            _call_attempt += 1
+                            continue
+                        retry_deadline_error = _provider_retry_deadline_error(delay)
+                        if retry_deadline_error is not None:
+                            terminal_error = retry_deadline_error
+                            yield self._transition(AgentState.ERROR)
+                            yield terminal_error
+                            break
                         await asyncio.sleep(delay)
                         _retry_attempt += 1
                         _call_attempt += 1
@@ -7190,9 +8346,7 @@ class Agent:
                             "text_only_tool_recovery_mode",
                             "off",
                         )
-                        self.config.metadata[
-                            "text_only_tool_recovery_next_action_errors"
-                        ] = (
+                        self.config.metadata["text_only_tool_recovery_next_action_errors"] = (
                             self.config.metadata.get(
                                 "text_only_tool_recovery_next_action_errors",
                                 0,
@@ -7226,7 +8380,8 @@ class Agent:
                     logger.warning(
                         "provider.invalid_response_unhandled",
                         session_key=self._session_key,
-                        model=last_actual_model or self.config.model_id or "",
+                        model=last_actual_model,
+                        requested_model=self.config.model_id or "",
                         provider=type(self.provider).__name__,
                         classification=final_classification.kind.value,
                         iteration=iterations,
@@ -7277,12 +8432,16 @@ class Agent:
                     tools=provider_tools_for_call,
                     config=call_chat_cfg,
                 )
-                overflow_outcome = await self._check_context_overflow(
-                    turn_messages,
-                    estimated_context_tokens,
-                    request_context_insert_index=request_context_insert_index,
-                    runtime_context_insert_index=runtime_context_insert_index,
-                    protected_turn_start_index=current_turn_start_index,
+                overflow_outcome = (
+                    CompactionOutcome(messages=turn_messages)
+                    if not provider_stream_closed
+                    else await self._check_context_overflow(
+                        turn_messages,
+                        estimated_context_tokens,
+                        request_context_insert_index=request_context_insert_index,
+                        runtime_context_insert_index=runtime_context_insert_index,
+                        protected_turn_start_index=current_turn_start_index,
+                    )
                 )
                 if overflow_outcome is None:
                     if overflow_retries >= self.config.max_overflow_retries:
@@ -7358,11 +8517,7 @@ class Agent:
                         "off",
                     )
                     next_action = (
-                        "tool_call"
-                        if tool_calls
-                        else "text"
-                        if visible_text.strip()
-                        else "empty"
+                        "tool_call" if tool_calls else "text" if visible_text.strip() else "empty"
                     )
                     metadata_key: str | None
                     metadata_key = f"text_only_tool_recovery_next_action_{next_action}s"
@@ -7439,8 +8594,7 @@ class Agent:
                 if (
                     len(tool_calls) == 1
                     and repeat_threshold > 0
-                    and tool_calls[0].tool_name
-                    in self._repeated_tool_call_recovery_tool_names()
+                    and tool_calls[0].tool_name in self._repeated_tool_call_recovery_tool_names()
                 ):
                     current_repeat_key = self._tool_call_repeat_key(tool_calls[0])
                     current_workspace_write_count = len(self._effective_workspace_write_records())
@@ -7607,7 +8761,7 @@ class Agent:
                         and bool(provider_tools_for_call)
                         and not tool_choice_none
                         and not last_executed_results
-                        and not max_iterations_finalization_pending
+                        and not forced_finalization_for_call
                         and not artifact_delivery_final_response_pending
                         and not post_write_convergence_finalization_pending
                     )
@@ -7621,8 +8775,7 @@ class Agent:
                         )
                         should_inject_text_only = (
                             text_only_mode == "warn_model"
-                            and text_only_tool_recovery_injections
-                            < _TEXT_ONLY_TOOL_RECOVERY_LIMIT
+                            and text_only_tool_recovery_injections < _TEXT_ONLY_TOOL_RECOVERY_LIMIT
                         )
                         decision = RuntimeRecoveryDecision(
                             action="nudge" if should_inject_text_only else "observe",
@@ -7680,7 +8833,7 @@ class Agent:
                             continue
                     if (
                         progress_watchdog_mode == "warn_model"
-                        and not max_iterations_finalization_pending
+                        and not forced_finalization_for_call
                         and not artifact_delivery_final_response_pending
                     ):
                         failed_tool_finalization = (
@@ -7710,10 +8863,8 @@ class Agent:
                                 failed_tool_finalization["recovery_key"] = recovery_key
                         if failed_tool_finalization is not None:
                             recovery_message: str | None
-                            recovery_message = (
-                                self._failed_tool_finalization_recovery_message(
-                                    failed_tool_finalization
-                                )
+                            recovery_message = self._failed_tool_finalization_recovery_message(
+                                failed_tool_finalization
                             )
                             self._record_tool_loop_runtime_event(
                                 reason=str(failed_tool_finalization["reason"]),
@@ -7756,7 +8907,7 @@ class Agent:
                             continue
                     if (
                         finalize_evidence_tracker is not None
-                        and not max_iterations_finalization_pending
+                        and not forced_finalization_for_call
                         and not artifact_delivery_final_response_pending
                         and not post_write_convergence_finalization_pending
                     ):
@@ -7808,12 +8959,8 @@ class Agent:
                                 finalize_evidence_gate_keys.add(gate_key)
                                 if visible_text and final_text_parts:
                                     final_text_parts.pop()
-                                turn_messages.append(
-                                    Message(role="user", content=gate_message)
-                                )
-                                self.config.metadata[
-                                    "finalize_evidence_gate_recoveries"
-                                ] = (
+                                turn_messages.append(Message(role="user", content=gate_message))
+                                self.config.metadata["finalize_evidence_gate_recoveries"] = (
                                     self.config.metadata.get(
                                         "finalize_evidence_gate_recoveries",
                                         0,
@@ -7839,7 +8986,7 @@ class Agent:
                     if (
                         progress_watchdog_mode == "warn_model"
                         and not workspace_diff_recovery_attempted
-                        and not max_iterations_finalization_pending
+                        and not forced_finalization_for_call
                         and not artifact_delivery_final_response_pending
                     ):
                         empty_diff_reason = await self._empty_diff_finalization_reason(visible_text)
@@ -7897,7 +9044,7 @@ class Agent:
                     )
                     if (
                         final_diff_contract_mode != "off"
-                        and not max_iterations_finalization_pending
+                        and not forced_finalization_for_call
                         and not artifact_delivery_final_response_pending
                     ):
                         final_diff_observation = self._final_diff_contract_observation()
@@ -7954,8 +9101,13 @@ class Agent:
                     break
                 tool_calls = [self._coerce_meta_tool_call(tc) for tc in tool_calls]
                 tool_calls = self._force_matched_meta_invoke_tool_calls(tool_calls)
+                _arm_deadline_wrapup_if_due(
+                    reason="deadline_margin_before_tools",
+                )
 
-                tool_deadline = _loop.time() + self.config.iteration_timeout
+                tool_deadline = (
+                    iteration_deadline if iteration_deadline is not None else float("inf")
+                )
                 _arm_endgame_git_freeze_if_due()
 
                 # ------ STREAMING → TOOL_CALLING ------
@@ -7972,6 +9124,7 @@ class Agent:
                 tool_result_blocks: list[ContentBlockToolResult] = []
                 executed_results: list[ToolResult] = []
                 turn_yielded = False
+                unclosed_tool_use_ids: set[str] = set()
 
                 # Map tool_use_id -> ToolResult built up below.
                 results_by_id: dict[str, ToolResult] = {}
@@ -7980,7 +9133,105 @@ class Agent:
                     remaining = min(timeout, max(0.0, tool_deadline - _loop.time()))
                     if _total_deadline is not None:
                         remaining = min(remaining, max(0.0, _total_deadline - _loop.time()))
-                    return max(0.001, remaining)
+                        if wrapup_margin_seconds > 0 and bool(
+                            getattr(
+                                self.config,
+                                "deadline_wrapup_disable_tools",
+                                False,
+                            )
+                        ):
+                            remaining = min(
+                                remaining,
+                                max(
+                                    0.0,
+                                    _total_deadline - wrapup_margin_seconds - _loop.time(),
+                                ),
+                            )
+                    # Zero means the execution boundary has already passed.
+                    # Callers must synthesize a timeout/skip result without
+                    # physically starting the tool.
+                    return max(0.0, remaining)
+
+                def _deadline_wrapup_blocks_tools() -> bool:
+                    return bool(
+                        deadline_wrapup_armed
+                        and getattr(
+                            self.config,
+                            "deadline_wrapup_disable_tools",
+                            False,
+                        )
+                    )
+
+                def _deadline_wrapup_tool_result(tc: ToolCall) -> ToolResult:
+                    return ToolResult(
+                        tool_use_id=tc.tool_use_id,
+                        tool_name=tc.tool_name,
+                        content=(
+                            "Tool execution was skipped because the reserved "
+                            "deadline wrap-up window has started. Return the "
+                            "best final answer from completed work."
+                        ),
+                        is_error=True,
+                        execution_status=runtime_execution_status(
+                            "error",
+                            reason="deadline_wrapup",
+                        ),
+                    )
+
+                def _tool_timeout_result(
+                    tc: ToolCall,
+                    *,
+                    timeout: float,
+                    reason: str = "runtime_timeout",
+                    cleanup_failed: bool = False,
+                ) -> ToolResult:
+                    suffix = (
+                        " and did not stop within the cleanup window"
+                        if cleanup_failed
+                        else ""
+                    )
+                    return ToolResult(
+                        tool_use_id=tc.tool_use_id,
+                        tool_name=tc.tool_name,
+                        content=(
+                            f"Tool '{tc.tool_name}' timed out after {timeout:g}s{suffix}"
+                        ),
+                        is_error=True,
+                        execution_status=runtime_execution_status(
+                            "timeout",
+                            reason=reason,
+                            timed_out=True,
+                        ),
+                    )
+
+                async def _cancel_owned_tool_task(
+                    task: asyncio.Task[Any],
+                    tc: ToolCall,
+                ) -> bool:
+                    if task.done():
+                        _consume_background_future(task)
+                        return True
+                    # Register ownership before the first cancellable cleanup
+                    # await. A repeated cancellation of the outer turn must
+                    # not detach a still-running physical tool task and reopen
+                    # the next-turn/provider gate.
+                    self._track_pending_cleanup(
+                        task,
+                        reason=f"tool_cleanup:{tc.tool_use_id}",
+                    )
+                    task.cancel()
+                    done, _ = await asyncio.wait(
+                        {task},
+                        timeout=max(
+                            0.0,
+                            float(_TOOL_TASK_CLEANUP_TIMEOUT_SECONDS),
+                        ),
+                    )
+                    if done:
+                        _consume_background_future(task)
+                        return True
+                    unclosed_tool_use_ids.add(tc.tool_use_id)
+                    return False
 
                 async def _run_one(tc: ToolCall) -> ToolResult:
                     nonlocal workspace_edit_gate_details
@@ -7994,6 +9245,12 @@ class Agent:
                         name=tc.tool_name,
                         arguments=tc.arguments,
                     )
+                    # A queued/keyed tool may acquire its semaphore or lock
+                    # after the soft boundary even though dispatch began
+                    # before it. Re-arm at the physical execution boundary.
+                    _arm_deadline_wrapup_if_due(
+                        reason="deadline_margin_queued_tool",
+                    )
                     tool_timeout = _cap_timeout_by_deadlines(self._tool_execution_timeout(tc))
                     preflight_result = preflight_tool_results.get(tc.tool_use_id)
                     gate_recovery_read = self._workspace_edit_gate_allows_recovery_read(
@@ -8004,23 +9261,21 @@ class Agent:
                         tc,
                         workspace_edit_gate_details,
                         recovery_read_paths=workspace_edit_gate_recovery_read_paths,
-                        recovery_reads_remaining=(
-                            workspace_edit_gate_recovery_reads_remaining
-                        ),
+                        recovery_reads_remaining=(workspace_edit_gate_recovery_reads_remaining),
                     )
                     diagnostic_retrieval_gate_result = (
                         self._projected_diagnostic_retrieval_gate_tool_result(tc)
                     )
-                    if gate_result is not None:
+                    if _deadline_wrapup_blocks_tools():
+                        res = _deadline_wrapup_tool_result(tc)
+                    elif gate_result is not None:
                         self._record_tool_loop_runtime_event(
                             reason="workspace_edit_gate_blocked_tool_call",
                             iteration=iterations,
                             provider_call_count=turn_llm_calls,
                             tool_name=tc.tool_name,
                             gate_details=dict(workspace_edit_gate_details or {}),
-                            workspace_write_count=len(
-                                self._effective_workspace_write_records()
-                            ),
+                            workspace_write_count=len(self._effective_workspace_write_records()),
                             injected_to_model=True,
                         )
                         res = gate_result
@@ -8030,31 +9285,50 @@ class Agent:
                             iteration=iterations,
                             provider_call_count=turn_llm_calls,
                             tool_name=tc.tool_name,
-                            workspace_write_count=len(
-                                self._effective_workspace_write_records()
-                            ),
+                            workspace_write_count=len(self._effective_workspace_write_records()),
                             injected_to_model=True,
                         )
                         res = diagnostic_retrieval_gate_result
                     elif preflight_result is not None:
                         res = preflight_result
                     else:
-                        try:
-                            res = await asyncio.wait_for(
-                                self._execute_tool(tc), timeout=tool_timeout
+                        if tool_timeout <= 0:
+                            _arm_deadline_wrapup_if_due(
+                                reason="deadline_before_tool_start",
                             )
-                        except TimeoutError:
-                            res = ToolResult(
-                                tool_use_id=tc.tool_use_id,
-                                tool_name=tc.tool_name,
-                                content=(f"Tool '{tc.tool_name}' timed out after {tool_timeout}s"),
-                                is_error=True,
-                                execution_status=runtime_execution_status(
-                                    "timeout",
-                                    reason="runtime_timeout",
-                                    timed_out=True,
-                                ),
+                            res = (
+                                _deadline_wrapup_tool_result(tc)
+                                if _deadline_wrapup_blocks_tools()
+                                else _tool_timeout_result(
+                                    tc,
+                                    timeout=0.0,
+                                    reason="deadline_expired",
+                                )
                             )
+                        else:
+                            tool_task = asyncio.create_task(self._execute_tool(tc))
+                            try:
+                                done, _ = await asyncio.wait(
+                                    {tool_task},
+                                    timeout=tool_timeout,
+                                )
+                                if done:
+                                    res = tool_task.result()
+                                else:
+                                    closed = await _cancel_owned_tool_task(tool_task, tc)
+                                    res = _tool_timeout_result(
+                                        tc,
+                                        timeout=tool_timeout,
+                                        reason=(
+                                            "runtime_timeout"
+                                            if closed
+                                            else "tool_cleanup_timeout"
+                                        ),
+                                        cleanup_failed=not closed,
+                                    )
+                            except asyncio.CancelledError:
+                                await _cancel_owned_tool_task(tool_task, tc)
+                                raise
                     duration_ms = int((time.monotonic() - started) * 1000)
                     self._record_focused_diagnostic_retrieval(tc, res)
                     if len(self._effective_workspace_write_records()) > 0:
@@ -8088,9 +9362,7 @@ class Agent:
                                 iteration=iterations,
                                 provider_call_count=turn_llm_calls,
                                 tool_name=tc.tool_name,
-                                target_paths=sorted(
-                                    workspace_edit_gate_recovery_read_paths
-                                ),
+                                target_paths=sorted(workspace_edit_gate_recovery_read_paths),
                                 injected_to_model=False,
                             )
                     elif gate_recovery_read:
@@ -8130,29 +9402,40 @@ class Agent:
                     last_event_at = started
                     try:
                         while pending:
-                            remaining = max(0.0, tool_deadline - _loop.time())
+                            active_tool_deadline = tool_deadline
                             if _total_deadline is not None:
-                                remaining = min(
-                                    remaining,
-                                    max(0.0, _total_deadline - _loop.time()),
+                                active_tool_deadline = min(
+                                    active_tool_deadline,
+                                    _total_deadline,
                                 )
+                                if wrapup_margin_seconds > 0 and bool(
+                                    getattr(
+                                        self.config,
+                                        "deadline_wrapup_disable_tools",
+                                        False,
+                                    )
+                                ):
+                                    active_tool_deadline = min(
+                                        active_tool_deadline,
+                                        _total_deadline - wrapup_margin_seconds,
+                                    )
+                            remaining = max(0.0, active_tool_deadline - _loop.time())
                             if remaining <= 0:
+                                _arm_deadline_wrapup_if_due(
+                                    reason="deadline_during_tool_execution",
+                                )
                                 for task, tc in list(task_to_tool_call.items()):
                                     if task in pending:
                                         task.cancel()
-                                        results_by_id[tc.tool_use_id] = ToolResult(
-                                            tool_use_id=tc.tool_use_id,
-                                            tool_name=tc.tool_name,
-                                            content=(
-                                                f"Tool '{tc.tool_name}' timed out after "
-                                                f"{self.config.iteration_timeout}s"
-                                            ),
-                                            is_error=True,
-                                            execution_status=runtime_execution_status(
-                                                "timeout",
-                                                reason="runtime_timeout",
-                                                timed_out=True,
-                                            ),
+                                        results_by_id[tc.tool_use_id] = (
+                                            _deadline_wrapup_tool_result(tc)
+                                            if _deadline_wrapup_blocks_tools()
+                                            else _tool_timeout_result(
+                                                tc,
+                                                timeout=float(
+                                                    self.config.iteration_timeout
+                                                ),
+                                            )
                                         )
                                 return
                             wait_timeout = remaining if interval <= 0 else min(interval, remaining)
@@ -8162,25 +9445,22 @@ class Agent:
                                 return_when=asyncio.FIRST_COMPLETED,
                             )
                             if not done:
-                                if _loop.time() >= tool_deadline or (
-                                    _total_deadline is not None and _loop.time() >= _total_deadline
-                                ):
+                                if _loop.time() >= active_tool_deadline:
+                                    _arm_deadline_wrapup_if_due(
+                                        reason="deadline_during_tool_execution",
+                                    )
                                     for task, tc in list(task_to_tool_call.items()):
                                         if task in pending:
                                             task.cancel()
-                                            results_by_id[tc.tool_use_id] = ToolResult(
-                                                tool_use_id=tc.tool_use_id,
-                                                tool_name=tc.tool_name,
-                                                content=(
-                                                    f"Tool '{tc.tool_name}' timed out after "
-                                                    f"{self.config.iteration_timeout}s"
-                                                ),
-                                                is_error=True,
-                                                execution_status=runtime_execution_status(
-                                                    "timeout",
-                                                    reason="runtime_timeout",
-                                                    timed_out=True,
-                                                ),
+                                            results_by_id[tc.tool_use_id] = (
+                                                _deadline_wrapup_tool_result(tc)
+                                                if _deadline_wrapup_blocks_tools()
+                                                else _tool_timeout_result(
+                                                    tc,
+                                                    timeout=float(
+                                                        self.config.iteration_timeout
+                                                    ),
+                                                )
                                             )
                                     return
                                 now = time.monotonic()
@@ -8220,13 +9500,43 @@ class Agent:
                                         ),
                                     )
                                 results_by_id[tc.tool_use_id] = outcome
+                            # A physical tool task may have ignored cancellation
+                            # and outlived its owned cleanup window.  Stop the
+                            # whole batch immediately: wrappers still waiting
+                            # on semaphores/locks must never begin another tool
+                            # while that task is still running.
+                            if unclosed_tool_use_ids:
+                                for task in pending:
+                                    task.cancel()
+                                return
                     finally:
-                        for task in pending:
+                        active_pending = {
+                            task for task in pending if not task.done()
+                        }
+                        for task in active_pending:
+                            tc = task_to_tool_call[task]
+                            # Keep every wrapper owned across the cancellable
+                            # batch-cleanup wait. Its inner task may itself be
+                            # unwinding a provider-backed/meta operation.
+                            self._track_pending_cleanup(
+                                task,
+                                reason=f"tool_batch_cleanup:{tc.tool_use_id}",
+                            )
                             if not task.done():
                                 task.cancel()
-                        for task in pending:
-                            with contextlib.suppress(asyncio.CancelledError):
-                                await task
+                        if active_pending:
+                            done, lingering = await asyncio.wait(
+                                active_pending,
+                                timeout=max(
+                                    0.0,
+                                    float(_TOOL_TASK_CLEANUP_TIMEOUT_SECONDS),
+                                ),
+                            )
+                            for task in done:
+                                _consume_background_future(task)
+                            for task in lingering:
+                                tc = task_to_tool_call[task]
+                                unclosed_tool_use_ids.add(tc.tool_use_id)
 
                 # Dispatch preserving original order: accumulate consecutive
                 # concurrent/keyed tools into a batch and flush before each
@@ -8265,6 +9575,17 @@ class Agent:
 
                         async def _run_after_policy_locks() -> ToolResult:
                             async with semaphore:
+                                # Re-check after every scheduling boundary.
+                                # Another wrapper may have timed out while this
+                                # one was queued and left a cancellation-
+                                # resistant physical task behind.
+                                if unclosed_tool_use_ids:
+                                    return _tool_timeout_result(
+                                        tc,
+                                        timeout=0.0,
+                                        reason="prior_tool_cleanup_timeout",
+                                        cleanup_failed=True,
+                                    )
                                 return await _run_one(tc)
 
                         async def _run_after_key_lock() -> ToolResult:
@@ -8279,22 +9600,233 @@ class Agent:
                             return await _run_after_key_lock()
 
                     task_to_tool_call = {asyncio.create_task(_run_limited(tc)): tc for tc in batch}
-                    async for event in _collect_tool_tasks(task_to_tool_call):
-                        yield event
+                    async with contextlib.aclosing(
+                        _collect_tool_tasks(task_to_tool_call)
+                    ) as batch_events:
+                        async for event in batch_events:
+                            yield event
 
                 for tc in tool_calls:
+                    if unclosed_tool_use_ids:
+                        break
                     if tc.tool_name == "meta_invoke":
-                        async for event in _flush_parallel_batch(parallel_batch):
-                            yield event
+                        async with contextlib.aclosing(
+                            _flush_parallel_batch(parallel_batch)
+                        ) as batch_events:
+                            async for event in batch_events:
+                                yield event
                         parallel_batch = []
+                        if unclosed_tool_use_ids:
+                            break
+                        _arm_deadline_wrapup_if_due(
+                            reason="deadline_margin_meta_tool",
+                        )
+                        if _deadline_wrapup_blocks_tools():
+                            results_by_id[tc.tool_use_id] = (
+                                _deadline_wrapup_tool_result(tc)
+                            )
+                            continue
                         active_ctx = (
                             current_tool_context.get() or self._tool_context or ToolContext()
                         )
-                        async for ev in self._run_one_streaming(tc, active_ctx):
-                            if isinstance(ev, ToolResult):
-                                results_by_id[tc.tool_use_id] = ev
+                        streaming_timeout = _cap_timeout_by_deadlines(
+                            self._tool_execution_timeout(tc)
+                        )
+                        if streaming_timeout <= 0:
+                            _arm_deadline_wrapup_if_due(
+                                reason="deadline_before_meta_tool_start",
+                            )
+                            results_by_id[tc.tool_use_id] = (
+                                _deadline_wrapup_tool_result(tc)
+                                if _deadline_wrapup_blocks_tools()
+                                else _tool_timeout_result(
+                                    tc,
+                                    timeout=0.0,
+                                    reason="deadline_expired",
+                                )
+                            )
+                            continue
+
+                        # Consume the streaming meta tool in an owned producer.
+                        # The absolute timeout never spans an outward ``yield``:
+                        # a slow event consumer therefore cannot receive a raw
+                        # CancelledError from ``asyncio.timeout``.
+                        meta_queue: asyncio.Queue[
+                            tuple[float, bool, AgentEvent | ToolResult]
+                        ] = asyncio.Queue(maxsize=32)
+
+                        async def _produce_meta_events() -> None:
+                            terminal_result: ToolResult | None = None
+                            try:
+                                async with contextlib.aclosing(
+                                    self._run_one_streaming(tc, active_ctx)
+                                ) as streaming_events:
+                                    async for ev in streaming_events:
+                                        completed_at = _loop.time()
+                                        if isinstance(ev, ToolResult):
+                                            terminal_result = ev
+                                            break
+                                        await meta_queue.put(
+                                            (completed_at, False, ev)
+                                        )
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception as exc:  # noqa: BLE001
+                                terminal_result = ToolResult(
+                                    tool_use_id=tc.tool_use_id,
+                                    tool_name=tc.tool_name,
+                                    content=f"Tool '{tc.tool_name}' raised: {exc}",
+                                    is_error=True,
+                                    execution_status=runtime_execution_status(
+                                        "error",
+                                        reason="runtime_error",
+                                    ),
+                                )
+                            if terminal_result is None:
+                                terminal_result = ToolResult(
+                                    tool_use_id=tc.tool_use_id,
+                                    tool_name=tc.tool_name,
+                                    content=(
+                                        f"Tool '{tc.tool_name}' ended before returning "
+                                        "a terminal result"
+                                    ),
+                                    is_error=True,
+                                    execution_status=runtime_execution_status(
+                                        "error",
+                                        reason="stream_incomplete",
+                                    ),
+                                )
+                            await meta_queue.put(
+                                (_loop.time(), True, terminal_result)
+                            )
+
+                        meta_deadline = _loop.time() + streaming_timeout
+                        meta_producer = asyncio.create_task(_produce_meta_events())
+                        meta_deadline_reached = asyncio.Event()
+
+                        async def _cancel_meta_at_deadline() -> None:
+                            await asyncio.sleep(
+                                max(0.0, meta_deadline - _loop.time())
+                            )
+                            if not meta_producer.done():
+                                meta_deadline_reached.set()
+                                meta_producer.cancel()
+
+                        meta_watchdog = asyncio.create_task(
+                            _cancel_meta_at_deadline()
+                        )
+                        meta_timed_out = False
+                        queued_event: asyncio.Task[
+                            tuple[float, bool, AgentEvent | ToolResult]
+                        ] | None = None
+                        try:
+                            while True:
+                                if meta_deadline_reached.is_set():
+                                    meta_timed_out = True
+                                    break
+                                remaining = max(0.0, meta_deadline - _loop.time())
+                                if not meta_queue.empty():
+                                    completed_at, is_terminal, payload = (
+                                        meta_queue.get_nowait()
+                                    )
+                                else:
+                                    if remaining <= 0:
+                                        meta_timed_out = True
+                                        break
+                                    queued_event = asyncio.create_task(meta_queue.get())
+                                    done, _ = await asyncio.wait(
+                                        {queued_event},
+                                        timeout=remaining,
+                                    )
+                                    if not done:
+                                        queued_event.cancel()
+                                        queued_event.add_done_callback(
+                                            _consume_background_future
+                                        )
+                                        queued_event = None
+                                        meta_timed_out = True
+                                        break
+                                    completed_at, is_terminal, payload = (
+                                        queued_event.result()
+                                    )
+                                    queued_event = None
+                                if completed_at > meta_deadline:
+                                    meta_timed_out = True
+                                    break
+                                if is_terminal:
+                                    results_by_id[tc.tool_use_id] = payload  # type: ignore[assignment]
+                                    break
+                                if isinstance(payload, TextDeltaEvent):
+                                    # Inline meta output is already relayed to
+                                    # the caller, so it must also be part of
+                                    # the terminal snapshot.  Otherwise a
+                                    # snapshot-aware consumer replaces the
+                                    # visible stream with an empty Done text.
+                                    final_text_parts.append(payload.text)
+                                yield payload  # type: ignore[misc]
+                        finally:
+                            if not meta_producer.done():
+                                # The inline meta producer can own child Agents
+                                # using this same provider. Register and cancel
+                                # it before *any* cleanup await (including the
+                                # watchdog join), so repeated outer cancellation
+                                # cannot make that work invisible to the
+                                # next-turn gate.
+                                self._track_pending_cleanup(
+                                    meta_producer,
+                                    reason=f"meta_tool_cleanup:{tc.tool_use_id}",
+                                )
+                                meta_producer.cancel()
+                            if not meta_watchdog.done():
+                                meta_watchdog.cancel()
+                            try:
+                                await meta_watchdog
+                            except asyncio.CancelledError:
+                                # Suppress only the watchdog's own cancelled
+                                # terminal state.  If the owning turn is being
+                                # cancelled, propagate immediately: the
+                                # cancellation-resistant producer is already
+                                # registered above and the next-turn gate owns
+                                # the remainder of its cleanup.
+                                current_task = asyncio.current_task()
+                                if (
+                                    current_task is not None
+                                    and current_task.cancelling()
+                                ):
+                                    raise
+                            if queued_event is not None and not queued_event.done():
+                                queued_event.cancel()
+                                queued_event.add_done_callback(
+                                    _consume_background_future
+                                )
+                            if not meta_producer.done():
+                                producer_done, _ = await asyncio.wait(
+                                    {meta_producer},
+                                    timeout=max(
+                                        0.0,
+                                        float(_TOOL_TASK_CLEANUP_TIMEOUT_SECONDS),
+                                    ),
+                                )
+                                if not producer_done:
+                                    unclosed_tool_use_ids.add(tc.tool_use_id)
+                                else:
+                                    _consume_background_future(meta_producer)
                             else:
-                                yield ev
+                                _consume_background_future(meta_producer)
+                        if meta_timed_out:
+                            cleanup_failed = tc.tool_use_id in unclosed_tool_use_ids
+                            results_by_id[tc.tool_use_id] = _tool_timeout_result(
+                                tc,
+                                timeout=streaming_timeout,
+                                reason=(
+                                    "tool_cleanup_timeout"
+                                    if cleanup_failed
+                                    else "runtime_timeout"
+                                ),
+                                cleanup_failed=cleanup_failed,
+                            )
+                        if unclosed_tool_use_ids:
+                            break
                         continue
                     policy = _get_tool_concurrency_policy(
                         tc.tool_name,
@@ -8304,16 +9836,51 @@ class Agent:
                     if policy.mode != "mutex":
                         parallel_batch.append(tc)
                     else:
-                        async for event in _flush_parallel_batch(parallel_batch):
-                            yield event
+                        async with contextlib.aclosing(
+                            _flush_parallel_batch(parallel_batch)
+                        ) as batch_events:
+                            async for event in batch_events:
+                                yield event
                         parallel_batch = []
-                        async for event in _collect_tool_tasks(
-                            {asyncio.create_task(_run_one(tc)): tc}
-                        ):
+                        if unclosed_tool_use_ids:
+                            break
+                        async with contextlib.aclosing(
+                            _collect_tool_tasks(
+                                {asyncio.create_task(_run_one(tc)): tc}
+                            )
+                        ) as mutex_events:
+                            async for event in mutex_events:
+                                yield event
+                        if unclosed_tool_use_ids:
+                            break
+
+                if not unclosed_tool_use_ids:
+                    async with contextlib.aclosing(
+                        _flush_parallel_batch(parallel_batch)
+                    ) as batch_events:
+                        async for event in batch_events:
                             yield event
 
-                async for event in _flush_parallel_batch(parallel_batch):
-                    yield event
+                if unclosed_tool_use_ids:
+                    terminal_error = ErrorEvent(
+                        message=(
+                            "One or more tool executions did not stop within the "
+                            "cleanup window; finalization was stopped to prevent "
+                            "overlapping tool side effects."
+                        ),
+                        code="tool_stream_close_timeout",
+                    )
+                    self._write_turn_call_log(
+                        "turn_policy_decision",
+                        action="stop",
+                        reason="tool_stream_close_timeout",
+                        code=terminal_error.code,
+                        iteration=iterations,
+                        tool_use_ids=sorted(unclosed_tool_use_ids),
+                    )
+                    yield self._transition(AgentState.ERROR)
+                    yield terminal_error
+                    break
 
                 # Emit results in original tool_calls order.
                 for tc in tool_calls:
@@ -8394,10 +9961,14 @@ class Agent:
                             if approval_entry.resolution == "expired":
                                 turn_yielded = True
                         else:
-                            resumed_call = suspended.approve(
-                                str(pending_approval["approval_id"])
-                            )
+                            resumed_call = suspended.approve(str(pending_approval["approval_id"]))
                             result = await _run_one(suspended.begin_execution())
+                            # The approved physical action may itself ignore
+                            # timeout cancellation.  Do not mark the suspended
+                            # request complete or project more results while it
+                            # is still capable of side effects.
+                            if unclosed_tool_use_ids:
+                                break
                             suspended.complete()
                             result_tool_call = resumed_call
                             for artifact in result.artifacts:
@@ -8414,9 +9985,7 @@ class Agent:
                                 arguments=tc.arguments,
                                 execution_status=projected_result.execution_status,
                             )
-                            replay_event = router_control_replay_event_from_payload(
-                                result.content
-                            )
+                            replay_event = router_control_replay_event_from_payload(result.content)
                             if replay_event is not None:
                                 yield replay_event
                             if _pending_approval_payload(result.content) is not None:
@@ -8430,9 +9999,7 @@ class Agent:
                             arguments=tc.arguments,
                             execution_status=projected_result.execution_status,
                         )
-                        replay_event = router_control_replay_event_from_payload(
-                            result.content
-                        )
+                        replay_event = router_control_replay_event_from_payload(result.content)
                         if replay_event is not None:
                             yield replay_event
                     executed_results.append(result)
@@ -8448,6 +10015,27 @@ class Agent:
                             execution_status=projected_result.execution_status,
                         )
                     )
+
+                if unclosed_tool_use_ids:
+                    terminal_error = ErrorEvent(
+                        message=(
+                            "One or more approved tool executions did not stop "
+                            "within the cleanup window; finalization was stopped "
+                            "to prevent overlapping tool side effects."
+                        ),
+                        code="tool_stream_close_timeout",
+                    )
+                    self._write_turn_call_log(
+                        "turn_policy_decision",
+                        action="stop",
+                        reason="tool_stream_close_timeout",
+                        code=terminal_error.code,
+                        iteration=iterations,
+                        tool_use_ids=sorted(unclosed_tool_use_ids),
+                    )
+                    yield self._transition(AgentState.ERROR)
+                    yield terminal_error
+                    break
 
                 terminal_artifacts = self._terminal_artifact_delivery_artifacts(executed_results)
                 if terminal_artifacts:
@@ -8507,9 +10095,7 @@ class Agent:
                             timed_out=gate_timed_out,
                             status_reason=gate_status_reason,
                             failure_anchors=(
-                                self._failure_anchor_lines(gate_result_text)
-                                if gate_red
-                                else []
+                                self._failure_anchor_lines(gate_result_text) if gate_red else []
                             ),
                             iteration=iterations,
                         )
@@ -8535,9 +10121,7 @@ class Agent:
                             current_focused_verification_observed = True
                             post_write_focused_verification_observed = True
                             result_text = self._tool_result_text_for_anchor(result.content)
-                            verification_state = (
-                                self._classify_focused_verification_result(result)
-                            )
+                            verification_state = self._classify_focused_verification_result(result)
                             self._record_runtime_event(
                                 "focused_verification.classified",
                                 feature="verification",
@@ -8556,17 +10140,14 @@ class Agent:
                             elif result.is_error or self._tool_result_has_failure_signal(
                                 result_text
                             ):
-                                execution_status: Mapping[str, Any] = (
-                                    result.execution_status or {}
-                                )
+                                execution_status: Mapping[str, Any] = result.execution_status or {}
                                 status_reason = ""
                                 if isinstance(execution_status, Mapping):
                                     status_reason = str(execution_status.get("reason") or "")
                                 post_write_focused_verification_success_observed = False
                                 last_post_write_failed_verification = {
                                     "reason": (
-                                        "final_response_after_failed_focused_"
-                                        "verification_with_diff"
+                                        "final_response_after_failed_focused_verification_with_diff"
                                     ),
                                     "tool_name": result.tool_name,
                                     "command": command[:500],
@@ -8591,9 +10172,7 @@ class Agent:
                     recent_failure_anchor_summaries.append(failure_anchor_summary)
                     recent_failure_anchor_summaries[:] = recent_failure_anchor_summaries[-3:]
                 runtime_diff_paths = self._workspace_diff_paths_for_runtime_event()
-                runtime_diff_fingerprint = (
-                    self._workspace_diff_fingerprint_for_runtime_event()
-                )
+                runtime_diff_fingerprint = self._workspace_diff_fingerprint_for_runtime_event()
                 runtime_diagnostic_events: list[dict[str, Any]] = []
                 if runtime_diagnostics is not None:
                     for runtime_event in runtime_diagnostics.observe_tool_results(
@@ -8625,24 +10204,20 @@ class Agent:
                             or successful_source_context_tool_result
                         )
                     )
-                    post_write_convergence_decision = (
-                        post_write_convergence_tracker.observe(
-                            PostWriteConvergenceObservation(
-                                iteration=iterations,
-                                provider_call_count=turn_llm_calls,
-                                workspace_write_count=workspace_write_count,
-                                changed_receipt_count=mutation_receipt_counts[
-                                    "changed_receipt_count"
-                                ],
-                                diff_fingerprint=runtime_diff_fingerprint,
-                                diff_paths=runtime_diff_paths,
-                                focused_verification_success_observed=(
-                                    post_write_focused_verification_success_observed
-                                ),
-                                continued_activity_after_verification=(
-                                    continued_activity_after_verification
-                                ),
-                            )
+                    post_write_convergence_decision = post_write_convergence_tracker.observe(
+                        PostWriteConvergenceObservation(
+                            iteration=iterations,
+                            provider_call_count=turn_llm_calls,
+                            workspace_write_count=workspace_write_count,
+                            changed_receipt_count=mutation_receipt_counts["changed_receipt_count"],
+                            diff_fingerprint=runtime_diff_fingerprint,
+                            diff_paths=runtime_diff_paths,
+                            focused_verification_success_observed=(
+                                post_write_focused_verification_success_observed
+                            ),
+                            continued_activity_after_verification=(
+                                continued_activity_after_verification
+                            ),
                         )
                     )
                     if (
@@ -8724,15 +10299,9 @@ class Agent:
                             user_visible_output=bool("".join(final_text_parts).strip()),
                             artifact_completed=bool(terminal_artifacts),
                             workspace_write_count=workspace_write_count,
-                            changed_receipt_count=mutation_receipt_counts[
-                                "changed_receipt_count"
-                            ],
-                            noop_receipt_count=mutation_receipt_counts[
-                                "noop_receipt_count"
-                            ],
-                            partial_receipt_count=mutation_receipt_counts[
-                                "partial_receipt_count"
-                            ],
+                            changed_receipt_count=mutation_receipt_counts["changed_receipt_count"],
+                            noop_receipt_count=mutation_receipt_counts["noop_receipt_count"],
+                            partial_receipt_count=mutation_receipt_counts["partial_receipt_count"],
                             workspace_change_likely_required=(
                                 self._turn_likely_requires_workspace_change("")
                             ),
@@ -8826,9 +10395,7 @@ class Agent:
                             workspace_write_count=workspace_write_count,
                             source_context_signature=source_context_signature,
                         )
-                        recovery_event_key = source_loop_recovery.details.get(
-                            "recovery_event_key"
-                        )
+                        recovery_event_key = source_loop_recovery.details.get("recovery_event_key")
                         if isinstance(recovery_event_key, str) and recovery_event_key:
                             source_loop_recovery_attempted_keys.add(recovery_event_key)
                         else:
@@ -8842,10 +10409,7 @@ class Agent:
                             reason=source_loop_recovery.reason,
                             details=source_loop_recovery.details,
                         )
-                        if (
-                            source_loop_recovery.action == "nudge"
-                            and source_loop_recovery.message
-                        ):
+                        if source_loop_recovery.action == "nudge" and source_loop_recovery.message:
                             source_loop_recovery_guidance = source_loop_recovery.message
                             runtime_recovery_scaffolding_pending = True
                             self.config.metadata["source_loop_recoveries"] = (
@@ -8902,6 +10466,52 @@ class Agent:
                 turn_messages.append(
                     Message(role="user", content=tool_result_blocks)  # type: ignore[arg-type]
                 )
+                retrieval_loop_threshold = max(
+                    0,
+                    int(
+                        getattr(
+                            self.config,
+                            "retrieval_loop_finalization_threshold",
+                            0,
+                        )
+                        or 0
+                    ),
+                )
+                retrieval_only_iteration = bool(tool_calls) and all(
+                    tc.tool_name in _RETRIEVAL_LOOP_TOOL_NAMES for tc in tool_calls
+                )
+                if retrieval_only_iteration:
+                    consecutive_retrieval_only_iterations += 1
+                else:
+                    consecutive_retrieval_only_iterations = 0
+                if (
+                    retrieval_loop_threshold > 0
+                    and consecutive_retrieval_only_iterations >= retrieval_loop_threshold
+                    and not max_iterations_finalization_pending
+                    and not post_write_convergence_finalization_pending
+                ):
+                    max_iterations_finalization_pending = True
+                    forced_finalization_reason = "retrieval_loop"
+                    max_iterations_finalization_message = Message(
+                        role="user",
+                        content=(
+                            "The consecutive retrieval-only iteration limit has "
+                            "been reached. Do not call tools or continue searching. "
+                            "Use the evidence already collected and provide the best "
+                            "complete final answer now."
+                        ),
+                    )
+                    self._write_turn_call_log(
+                        "turn_policy_decision",
+                        action="finalize_partial",
+                        reason="retrieval_loop",
+                        code="retrieval_loop",
+                        iteration=iterations,
+                        consecutive_retrieval_only_iterations=(
+                            consecutive_retrieval_only_iterations
+                        ),
+                        threshold=retrieval_loop_threshold,
+                    )
                 if pending_input_provider is not None:
                     pending_inputs = pending_input_provider.drain_pending()
                     if pending_inputs:
@@ -8994,15 +10604,11 @@ class Agent:
                     placeholder_offense_iterations += 1
                     placeholder_escalation_threshold = max(
                         0,
-                        int(
-                            getattr(self.config, "placeholder_escalation_threshold", 0)
-                            or 0
-                        ),
+                        int(getattr(self.config, "placeholder_escalation_threshold", 0) or 0),
                     )
                     if (
                         placeholder_escalation_threshold > 0
-                        and placeholder_offense_iterations
-                        >= placeholder_escalation_threshold
+                        and placeholder_offense_iterations >= placeholder_escalation_threshold
                     ):
                         turn_messages.append(
                             Message(
@@ -9052,29 +10658,27 @@ class Agent:
         # ------ → DONE ------
         # Compute per-turn cost from pricing table
         done_model = last_actual_model
-        if not done_model and self._usage_tracker and self._session_key:
-            su = self._usage_tracker.get(self._session_key)
-            if su and su.model_id:
-                done_model = su.model_id
-        if not done_model:
-            done_model = self.config.model_id or ""
-        done_provider = (
-            last_actual_provider
-            or self.config.provider_id
-            or getattr(self.provider, "provider_id", "")
-            or getattr(self.provider, "provider_name", "")
-            or ""
-        )
+        done_provider = last_actual_provider
+        requested_done_model = last_requested_model
+        requested_done_provider = last_requested_provider
+        pricing_model = done_model or requested_done_model
+        pricing_provider = done_provider or requested_done_provider
         from opensquilla.engine.pricing import estimate_cost, resolve_model_price
 
-        turn_estimate = estimate_cost(
-            input_tokens=total_input_tokens,
-            output_tokens=total_output_tokens,
-            cache_read_tokens=total_cached_tokens,
-            cache_write_tokens=total_cache_write_tokens,
-            price=resolve_model_price(done_model, done_provider).entry,
-        )
-        estimated_cost = turn_estimate.cost_usd
+        resolved_turn_price = resolve_model_price(pricing_model, pricing_provider)
+        if resolved_turn_price.entry is None:
+            estimated_cost = 0.0
+            turn_estimate_basis: str | None = None
+        else:
+            turn_estimate = estimate_cost(
+                input_tokens=total_input_tokens,
+                output_tokens=total_output_tokens,
+                cache_read_tokens=total_cached_tokens,
+                cache_write_tokens=total_cache_write_tokens,
+                price=resolved_turn_price.entry,
+            )
+            estimated_cost = turn_estimate.cost_usd
+            turn_estimate_basis = turn_estimate.basis
         estimate_basis: str | None
         if total_provider_billed_entries and not total_unbilled_entries:
             done_cost = total_billed_cost
@@ -9086,11 +10690,11 @@ class Agent:
             # even when its confirmed amount is zero.
             done_cost = total_billed_cost
             cost_source = "mixed"
-            estimate_basis = turn_estimate.basis
+            estimate_basis = turn_estimate_basis
         elif estimated_cost > 0.0:
             done_cost = estimated_cost
             cost_source = "opensquilla_static_estimate"
-            estimate_basis = turn_estimate.basis
+            estimate_basis = turn_estimate_basis
         else:
             done_cost = 0.0
             cost_source = "unavailable"
@@ -9100,7 +10704,11 @@ class Agent:
                 or total_cached_tokens
                 or total_cache_write_tokens
             )
-            estimate_basis = "free" if turn_estimate.basis == "free" and has_turn_tokens else None
+            estimate_basis = (
+                "free"
+                if turn_estimate_basis == "free" and has_turn_tokens
+                else None
+            )
 
         session_totals = (
             self._usage_tracker.session_snapshot(self._session_key)
@@ -9141,7 +10749,7 @@ class Agent:
             elif cost_source in {"mixed", "opensquilla_estimate"}:
                 # The delta includes an estimated component; disclose the
                 # turn-level estimator basis for it.
-                estimate_basis = turn_estimate.basis
+                estimate_basis = turn_estimate_basis
             elif estimate_basis != "free":
                 # "unavailable": no estimated dollars in the reported cost.
                 estimate_basis = None
@@ -9163,11 +10771,11 @@ class Agent:
         )
         if final_ensemble_trace is not None and turn_ensemble_request_count > 0:
             final_ensemble_trace["llm_request_count"] = turn_ensemble_request_count
+            final_ensemble_trace["physical_request_count"] = turn_ensemble_physical_request_count
+            final_ensemble_trace["usage_missing_count"] = turn_ensemble_usage_missing_count
         await self._write_patch_evidence_ledger(
             final_status=(
-                "ok"
-                if terminal_error is None
-                else (terminal_error.code or "agent_error")
+                "ok" if terminal_error is None else (terminal_error.code or "agent_error")
             ),
             iterations=iterations,
             provider_call_count=turn_llm_calls,
@@ -9228,6 +10836,8 @@ class Agent:
                 cost_source=cost_source,
                 model=done_model,
                 provider=done_provider,
+                requested_model=requested_done_model,
+                requested_provider=requested_done_provider,
                 runtime_context_hash=runtime_context_hash,
                 runtime_context_chars=len(runtime_context),
                 reasoning_content=(
@@ -9331,9 +10941,7 @@ class Agent:
             return False
         name = Path(normalized).name.lower()
         return any(
-            name == prefix
-            or name.startswith(f"{prefix}.")
-            or name.startswith(f"{prefix}_")
+            name == prefix or name.startswith(f"{prefix}.") or name.startswith(f"{prefix}_")
             for prefix in _SUSPICIOUS_NEW_WORKSPACE_WRITE_PREFIXES
         )
 
@@ -9376,9 +10984,7 @@ class Agent:
         receipts = self._workspace_mutation_receipts()
         return {
             "changed_receipt_count": len(self._changed_workspace_mutation_receipts()),
-            "noop_receipt_count": sum(
-                1 for receipt in receipts if receipt.get("changed") is False
-            ),
+            "noop_receipt_count": sum(1 for receipt in receipts if receipt.get("changed") is False),
             "partial_receipt_count": sum(
                 1 for receipt in receipts if receipt.get("partial") is True
             ),
@@ -9468,9 +11074,7 @@ class Agent:
             "changed_files": self._relative_paths_from_records(self._workspace_write_records()),
             "mutation_records": self._workspace_mutation_records(),
             "hint_text_sha256": (
-                hashlib.sha256(hint_text.encode("utf-8")).hexdigest()
-                if hint_text
-                else None
+                hashlib.sha256(hint_text.encode("utf-8")).hexdigest() if hint_text else None
             ),
             "trigger_confidence": "final_diff_contract_gate",
         }
@@ -9526,9 +11130,7 @@ class Agent:
         applied: list[dict[str, Any]] = []
         handled_paths: set[str] = set()
         for candidate in reversed(candidates):
-            paths = [
-                path for path in candidate.get("paths", []) if isinstance(path, str) and path
-            ]
+            paths = [path for path in candidate.get("paths", []) if isinstance(path, str) and path]
             if not paths or paths[0] in handled_paths:
                 continue
             path = paths[0]
@@ -9734,11 +11336,7 @@ class Agent:
         raw_status_line = line.rstrip()
         if not raw_status_line.strip():
             return None
-        text = (
-            raw_status_line[3:].strip()
-            if len(raw_status_line) > 3
-            else raw_status_line.strip()
-        )
+        text = raw_status_line[3:].strip() if len(raw_status_line) > 3 else raw_status_line.strip()
         if " -> " in text:
             text = text.split(" -> ", 1)[1].strip()
         return text.replace("\\", "/").lstrip("./") or None
@@ -9953,11 +11551,7 @@ class Agent:
             )
         tool_name = str(details.get("tool_name") or "a tool")
         status_reason = str(details.get("execution_status_reason") or "").strip()
-        reason_text = (
-            f" Reason: {status_reason}."
-            if status_reason
-            else ""
-        )
+        reason_text = f" Reason: {status_reason}." if status_reason else ""
         anchors = details.get("failure_anchors")
         anchor_text = ""
         if isinstance(anchors, list) and anchors:
@@ -10131,15 +11725,12 @@ class Agent:
             return False
         name = resolved_path.name.lower()
         suspicious_name = any(
-            name == prefix
-            or name.startswith(f"{prefix}.")
-            or name.startswith(f"{prefix}_")
+            name == prefix or name.startswith(f"{prefix}.") or name.startswith(f"{prefix}_")
             for prefix in _SUSPICIOUS_NEW_WORKSPACE_WRITE_PREFIXES
         )
         content = (self._tool_call_string_arg(tc, "content") or "").lower()
         suspicious_content = any(
-            marker in content
-            for marker in _SUSPICIOUS_NEW_WORKSPACE_WRITE_CONTENT_MARKERS
+            marker in content for marker in _SUSPICIOUS_NEW_WORKSPACE_WRITE_CONTENT_MARKERS
         )
         return suspicious_name or suspicious_content
 
@@ -10184,9 +11775,8 @@ class Agent:
     ) -> ToolResult | None:
         if gate_details is None:
             return None
-        if (
-            recovery_reads_remaining > 0
-            and self._workspace_edit_gate_allows_recovery_read(tc, recovery_read_paths)
+        if recovery_reads_remaining > 0 and self._workspace_edit_gate_allows_recovery_read(
+            tc, recovery_read_paths
         ):
             return None
         edit_block_detail = (
@@ -10349,14 +11939,10 @@ class Agent:
         return (tc.tool_name, hashlib.sha256(payload.encode("utf-8")).hexdigest())
 
     def _repeated_tool_call_recovery_tool_names(self) -> frozenset[str]:
-        extra_tools = (
-            getattr(self.config, "repeated_tool_call_recovery_extra_tools", None) or ()
-        )
+        extra_tools = getattr(self.config, "repeated_tool_call_recovery_extra_tools", None) or ()
         if not extra_tools:
             return _REPEATED_TOOL_CALL_RECOVERY_TOOL_NAMES
-        return _REPEATED_TOOL_CALL_RECOVERY_TOOL_NAMES | {
-            str(name) for name in extra_tools
-        }
+        return _REPEATED_TOOL_CALL_RECOVERY_TOOL_NAMES | {str(name) for name in extra_tools}
 
     @staticmethod
     def _tool_call_arguments_preview(tc: ToolCall, *, max_chars: int = 400) -> str:
@@ -10397,8 +11983,7 @@ class Agent:
             payload["session_key"] = self._session_key
         if payload.get("agent_id") is None:
             payload["agent_id"] = (
-                self.config.tool_result_store_agent_id
-                or self.config.metadata.get("agent_id")
+                self.config.tool_result_store_agent_id or self.config.metadata.get("agent_id")
             )
         append_runtime_event(self.config.runtime_events_path, payload)
 
@@ -10518,9 +12103,7 @@ class Agent:
             "diff_paths": self._workspace_diff_paths_for_runtime_event(),
             "verification_commands": self._verification_commands_for_runtime_event(),
             "hint_text_sha256": (
-                hashlib.sha256(hint_text.encode("utf-8")).hexdigest()
-                if hint_text
-                else None
+                hashlib.sha256(hint_text.encode("utf-8")).hexdigest() if hint_text else None
             ),
             "trigger_confidence": "post_write_convergence_gate",
             "details": evidence,
@@ -10626,8 +12209,8 @@ class Agent:
             if not raw_path:
                 continue
             try:
-                relative = Path(raw_path).expanduser().resolve(strict=False).relative_to(
-                    workspace_dir
+                relative = (
+                    Path(raw_path).expanduser().resolve(strict=False).relative_to(workspace_dir)
                 )
             except ValueError:
                 continue
@@ -10743,10 +12326,9 @@ class Agent:
         text = Agent._tool_result_text_for_anchor(result.content)
         if result.is_error or Agent._tool_result_has_failure_signal(text):
             return "failure"
-        if (
-            Agent._tool_result_has_validation_success_signal(text)
-            or _PLAIN_PASSED_SUMMARY_RE.search(text)
-        ):
+        if Agent._tool_result_has_validation_success_signal(
+            text
+        ) or _PLAIN_PASSED_SUMMARY_RE.search(text):
             return "success"
         return "unknown"
 
@@ -10815,51 +12397,282 @@ class Agent:
         *,
         loop: asyncio.AbstractEventLoop,
         total_deadline: float | None,
+        iteration_deadline: float | None = None,
+        policy_wakeup_deadline: float | None = None,
+        close_status: _ProviderStreamCloseStatus | None = None,
     ) -> AsyncIterator[Any]:
-        stream_iter = stream.__aiter__()
-        while True:
-            wait_budget = max(0.001, self.config.iteration_timeout)
-            total_deadline_limits_wait = False
-            if total_deadline is not None:
-                remaining_total = total_deadline - loop.time()
-                if remaining_total <= 0:
-                    await self._close_provider_stream(stream_iter)
-                    raise TimeoutError(f"Agent total timeout after {self.config.timeout}s")
-                if remaining_total <= wait_budget:
-                    wait_budget = remaining_total
-                    total_deadline_limits_wait = True
-
-            next_event: asyncio.Future[Any] = asyncio.ensure_future(stream_iter.__anext__())
-            try:
-                done, _ = await asyncio.wait({next_event}, timeout=wait_budget)
-            except (asyncio.CancelledError, GeneratorExit):
-                next_event.cancel()
-                with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration):
-                    await next_event
-                raise
-            if not done:
-                next_event.cancel()
-                with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration):
-                    await next_event
-                if total_deadline_limits_wait or (
-                    total_deadline is not None and loop.time() >= total_deadline
-                ):
-                    raise TimeoutError(f"Agent total timeout after {self.config.timeout}s")
-                raise _IterationStreamTimeoutError
-            try:
-                yield next_event.result()
-            except StopAsyncIteration:
-                return
-
-    @staticmethod
-    async def _close_provider_stream(stream_iter: AsyncIterator[Any]) -> None:
-        aclose = getattr(stream_iter, "aclose", None)
-        if not callable(aclose):
-            return
         try:
-            await aclose()
-        except Exception as exc:  # noqa: BLE001 - cleanup must not mask timeout
+            stream_iter = stream.__aiter__()
+        except BaseException:
+            closed = await self._close_provider_stream(
+                stream,
+                require_aclose=True,
+            )
+            if close_status is not None:
+                close_status.closed = closed
+            raise
+        stream_close_started = False
+        stream_terminal_observed = False
+        stream_exhausted = False
+        if iteration_deadline is None and self.config.iteration_timeout > 0:
+            iteration_deadline = loop.time() + self.config.iteration_timeout
+
+        async def _close_stream_once() -> bool:
+            nonlocal stream_close_started
+            if stream_close_started:
+                return close_status is None or close_status.closed is not False
+            stream_close_started = True
+            closed = await self._close_provider_stream(
+                stream_iter,
+                require_aclose=not (stream_terminal_observed or stream_exhausted),
+            )
+            if close_status is not None:
+                close_status.closed = closed
+            return closed
+
+        async def _cancel_pending(next_event: asyncio.Future[Any]) -> bool:
+            nonlocal stream_close_started
+            deferred_close_needed = False
+            deferred_close_scheduled = False
+            pending_callback_ran = False
+
+            def _schedule_deferred_close() -> None:
+                nonlocal deferred_close_scheduled
+                if deferred_close_scheduled:
+                    return
+                deferred_close_scheduled = True
+                try:
+                    close_task = asyncio.get_running_loop().create_task(
+                        self._close_provider_stream(
+                            stream_iter,
+                            require_aclose=True,
+                        )
+                    )
+                except RuntimeError:
+                    return
+
+                def _record_close_result(future: asyncio.Future[Any]) -> None:
+                    if close_status is not None:
+                        with contextlib.suppress(BaseException):
+                            close_status.closed = bool(future.result())
+                    _consume_background_future(future)
+
+                close_task.add_done_callback(_record_close_result)
+                self._track_pending_cleanup(
+                    close_task,
+                    reason="provider_deferred_stream_close",
+                    poison_if_unsuccessful=not callable(
+                        getattr(
+                            getattr(self, "provider", None),
+                            "_cleanup_is_pending",
+                            None,
+                        )
+                    ),
+                )
+
+            def _close_after_pending(done: asyncio.Future[Any]) -> None:
+                nonlocal pending_callback_ran
+                pending_callback_ran = True
+                _consume_background_future(done)
+                if deferred_close_needed:
+                    _schedule_deferred_close()
+
+            # Register ownership and the close continuation before the first
+            # cancellable cleanup wait. This function itself may be cancelled.
+            self._track_pending_cleanup(
+                next_event,
+                reason="provider_pending_event_cleanup",
+            )
+            next_event.add_done_callback(_close_after_pending)
+            next_event.cancel()
+            stream_close_started = True
+            try:
+                done, _ = await asyncio.wait(
+                    {next_event},
+                    timeout=max(
+                        0.0,
+                        float(_PROVIDER_STREAM_CLEANUP_TIMEOUT_SECONDS),
+                    ),
+                )
+            except BaseException:
+                deferred_close_needed = True
+                next_event.cancel()
+                if next_event.done() and pending_callback_ran:
+                    _schedule_deferred_close()
+                raise
+            if done:
+                _consume_background_future(next_event)
+                stream_close_started = False
+                return True
+            deferred_close_needed = True
+            next_event.cancel()
+            if next_event.done() and pending_callback_ran:
+                _schedule_deferred_close()
+            if close_status is not None:
+                close_status.closed = False
+            return False
+
+        next_event: asyncio.Future[Any] | None = None
+        completion_times: dict[asyncio.Future[Any], float] = {}
+        try:
+            while True:
+                if next_event is None:
+                    next_event = asyncio.ensure_future(stream_iter.__anext__())
+                    next_event.add_done_callback(
+                        lambda done: completion_times.setdefault(done, loop.time())
+                    )
+                now = loop.time()
+                deadline_candidates: list[tuple[str, float]] = []
+                if iteration_deadline is not None:
+                    deadline_candidates.append(("iteration", iteration_deadline))
+                if total_deadline is not None:
+                    deadline_candidates.append(("total", total_deadline))
+                if policy_wakeup_deadline is not None:
+                    deadline_candidates.append(("policy", policy_wakeup_deadline))
+                if deadline_candidates:
+                    limiting_kind, limiting_deadline = min(
+                        deadline_candidates,
+                        key=lambda item: item[1],
+                    )
+                    wait_budget = max(0.0, limiting_deadline - now)
+                else:
+                    limiting_kind = "none"
+                    wait_budget = None
+                if wait_budget is not None and wait_budget <= 0:
+                    if limiting_kind == "total":
+                        raise TimeoutError(f"Agent total timeout after {self.config.timeout}s")
+                    if limiting_kind == "iteration":
+                        raise _IterationStreamTimeoutError
+                    policy_wakeup_deadline = None
+                    yield ProviderHeartbeatEvent(
+                        phase="agent_deadline_wrapup_boundary",
+                        message="Agent wrap-up margin reached",
+                    )
+                    continue
+                try:
+                    done, _ = await asyncio.wait({next_event}, timeout=wait_budget)
+                except (asyncio.CancelledError, GeneratorExit):
+                    await _cancel_pending(next_event)
+                    raise
+                if not done:
+                    if limiting_kind == "total":
+                        await _cancel_pending(next_event)
+                        raise TimeoutError(f"Agent total timeout after {self.config.timeout}s")
+                    if limiting_kind == "iteration":
+                        await _cancel_pending(next_event)
+                        raise _IterationStreamTimeoutError
+                    policy_wakeup_deadline = None
+                    yield ProviderHeartbeatEvent(
+                        phase="agent_deadline_wrapup_boundary",
+                        message="Agent wrap-up margin reached",
+                    )
+                    continue
+                event_completed_at = completion_times.get(next_event, loop.time())
+                try:
+                    event = next_event.result()
+                except StopAsyncIteration:
+                    stream_exhausted = True
+                    return
+                if total_deadline is not None and event_completed_at > total_deadline:
+                    raise TimeoutError(f"Agent total timeout after {self.config.timeout}s")
+                if iteration_deadline is not None and event_completed_at > iteration_deadline:
+                    raise _IterationStreamTimeoutError
+                if (
+                    policy_wakeup_deadline is not None
+                    and event_completed_at > policy_wakeup_deadline
+                    and not isinstance(event, ProviderDoneEvent)
+                ):
+                    policy_wakeup_deadline = None
+                    yield ProviderHeartbeatEvent(
+                        phase="agent_deadline_wrapup_boundary",
+                        message="Agent wrap-up margin reached",
+                    )
+                    # The already-completed provider event remains valid and
+                    # will be delivered only if the consumer elects not to
+                    # preempt after the synthetic boundary event.
+                yield event
+                completion_times.pop(next_event, None)
+                next_event = None
+                if isinstance(event, ProviderDoneEvent | ProviderErrorEvent):
+                    stream_terminal_observed = True
+                    return
+        finally:
+            # Cancellation of a pending __anext__ does not guarantee cleanup
+            # for arbitrary AsyncIterator implementations. Explicitly close
+            # the owned physical stream exactly once before this relay exits.
+            if not stream_close_started and next_event is not None and not next_event.done():
+                await _cancel_pending(next_event)
+            if not stream_close_started:
+                await _close_stream_once()
+
+    async def _close_provider_stream(
+        self,
+        stream_iter: AsyncIterator[Any],
+        *,
+        require_aclose: bool = False,
+    ) -> bool:
+        try:
+            aclose = getattr(stream_iter, "aclose", None)
+        except BaseException as exc:
+            self._cleanup_poisoned_reason = "provider_stream_close_unavailable"
+            logger.warning("provider_stream.close_unavailable", error=str(exc))
+            return False
+        if not callable(aclose):
+            if require_aclose:
+                self._cleanup_poisoned_reason = "provider_stream_close_unavailable"
+                logger.warning("provider_stream.close_unavailable")
+                return False
+            return True
+        try:
+            close_task = asyncio.ensure_future(aclose())
+        except BaseException as exc:  # noqa: BLE001 - provider boundary
             logger.debug("provider_stream.close_failed", error=str(exc))
+            if not callable(
+                getattr(
+                    getattr(self, "provider", None),
+                    "_cleanup_is_pending",
+                    None,
+                )
+            ):
+                self._cleanup_poisoned_reason = "provider_stream_close_failed"
+            return False
+        provider_gate = getattr(
+            getattr(self, "provider", None),
+            "_cleanup_is_pending",
+            None,
+        )
+        self._track_pending_cleanup(
+            close_task,
+            reason="provider_stream_close",
+            poison_if_unsuccessful=not callable(provider_gate),
+        )
+        done, _ = await asyncio.wait(
+            {close_task},
+            timeout=max(
+                0.0,
+                float(_PROVIDER_STREAM_CLEANUP_TIMEOUT_SECONDS),
+            ),
+        )
+        if not done:
+            logger.warning("provider_stream.close_timeout")
+            return False
+        try:
+            close_task.result()
+        except BaseException as exc:  # noqa: BLE001 - cleanup must not mask timeout
+            logger.debug("provider_stream.close_failed", error=str(exc))
+            provider_gate = getattr(
+                getattr(self, "provider", None),
+                "_cleanup_is_pending",
+                None,
+            )
+            provider_pending = False
+            if callable(provider_gate):
+                with contextlib.suppress(Exception):
+                    provider_pending = bool(provider_gate())
+            if not callable(provider_gate) or not provider_pending:
+                self._cleanup_poisoned_reason = "provider_stream_close_failed"
+            return False
+        return True
 
     def _provider_request_messages(
         self,
@@ -11057,9 +12870,7 @@ class Agent:
             turn_objective_message=turn_objective_message,
         )
         if identical_request_perturbed:
-            request_messages = self._append_identical_request_loop_nudge(
-                request_messages
-            )
+            request_messages = self._append_identical_request_loop_nudge(request_messages)
         return project_provider_message_count(
             self.provider,
             request_messages,
@@ -11239,8 +13050,7 @@ class Agent:
         except Exception:  # noqa: BLE001 - refusal is surfaced as a stable terminal state
             return None, "summary_failed"
         kept_start_index = int(
-            getattr(result, "kept_start_index", result.removed_count)
-            or result.removed_count
+            getattr(result, "kept_start_index", result.removed_count) or result.removed_count
         )
         if (
             result.removed_count != selected_cut
@@ -11426,10 +13236,9 @@ class Agent:
             if not isinstance(message.content, list):
                 continue
             for block in message.content:
-                if (
-                    isinstance(block, ContentBlockToolUse)
-                    and Agent._has_provider_context_replay_marker(block.input)
-                ):
+                if isinstance(
+                    block, ContentBlockToolUse
+                ) and Agent._has_provider_context_replay_marker(block.input):
                     return True
         return False
 
@@ -11777,9 +13586,7 @@ class Agent:
                 real_tokens = get_approx_tokens(m.content)
             else:
                 flat = _flatten_content_blocks(m.content)
-                real_tokens = get_approx_tokens(
-                    json.dumps(Agent._live_request_jsonable(m.content))
-                )
+                real_tokens = get_approx_tokens(json.dumps(Agent._live_request_jsonable(m.content)))
             entries.append(
                 {
                     "role": m.role,
@@ -11950,8 +13757,7 @@ class Agent:
         # prefix-only compaction already guarantees that removed_count is the
         # same boundary when the additive field is absent.
         kept_start_index = int(
-            getattr(result, "kept_start_index", result.removed_count)
-            or result.removed_count
+            getattr(result, "kept_start_index", result.removed_count) or result.removed_count
         )
         adjusted_request_idx = self._adjust_index_after_prefix_compaction(
             request_context_insert_index,
@@ -12268,9 +14074,7 @@ class Agent:
             and last_blocked_result_index == len(projected_messages) - 1
         )
         if repair_prompt_appended:
-            projected_messages.append(
-                Message(role="user", content=_PROVIDER_CONTEXT_REPAIR_PROMPT)
-            )
+            projected_messages.append(Message(role="user", content=_PROVIDER_CONTEXT_REPAIR_PROMPT))
 
         if record:
             self.config.metadata["tool_argument_projection_replay_feedback"] = (
@@ -12781,20 +14585,17 @@ class Agent:
             usage_event_sink=self._usage_event_sink,
             usage_execution_context=self._usage_execution_context,
         )
-        llm_chat = (
-            getattr(self, "_test_llm_chat_override", None)
-            or (
-                make_llm_chat_from_provider(
-                    provider=self.provider,
-                    base_config=self.config,
-                    usage_tracker=self._usage_tracker,
-                    session_key=self._session_key,
-                    usage_event_sink=self._usage_event_sink,
-                    usage_execution_context=self._usage_execution_context,
-                )
-                if self.provider is not None
-                else None
+        llm_chat = getattr(self, "_test_llm_chat_override", None) or (
+            make_llm_chat_from_provider(
+                provider=self.provider,
+                base_config=self.config,
+                usage_tracker=self._usage_tracker,
+                session_key=self._session_key,
+                usage_event_sink=self._usage_event_sink,
+                usage_execution_context=self._usage_execution_context,
             )
+            if self.provider is not None
+            else None
         )
         tool_invoker = (
             make_tool_invoker_from_handler(tool_handler=self.tool_handler)
@@ -13106,13 +14907,16 @@ class Agent:
             runtime_e2e_token = set_runtime_e2e_context(runtime_e2e_ctx)
             smoke_fixture_token = set_smoke_fixture_context({"llm_chat": llm_chat})
             try:
-                async for ev in orch.iter_events(match):
-                    if isinstance(ev, MetaResult):
-                        result = ev
-                    elif isinstance(ev, TextDeltaEvent):
-                        continue
-                    else:
-                        yield ev
+                async with contextlib.aclosing(
+                    orch.iter_events(match)
+                ) as orchestrator_events:
+                    async for ev in orchestrator_events:
+                        if isinstance(ev, MetaResult):
+                            result = ev
+                        elif isinstance(ev, TextDeltaEvent):
+                            continue
+                        else:
+                            yield ev
             except Exception as exc:  # noqa: BLE001
                 yield ToolResult(
                     tool_use_id=tc.tool_use_id,
@@ -13186,6 +14990,65 @@ class Agent:
                 _meta_invoke_depth.reset(depth_token)
             except ValueError:
                 _meta_invoke_depth.set(current_depth)
+
+    async def _stream_meta_events_with_deadline(
+        self,
+        stream: AsyncIterator[Any],
+        *,
+        loop: asyncio.AbstractEventLoop,
+        total_deadline: float | None,
+        phase: str,
+    ) -> AsyncIterator[Any]:
+        """Own, bound, and close a top-level meta orchestration stream."""
+
+        close_status = _ProviderStreamCloseStatus()
+        relay: AsyncIterator[Any] | None = None
+        terminal_event: DoneEvent | ErrorEvent | None = None
+        timed_out = False
+        try:
+            relay = self._stream_provider_events_with_deadline(
+                stream,
+                loop=loop,
+                total_deadline=total_deadline,
+                close_status=close_status,
+            )
+            async for event in relay:
+                # Do not publish a terminal snapshot until the orchestrator
+                # stream has exhausted and strict close has been proved.
+                if isinstance(event, DoneEvent | ErrorEvent):
+                    terminal_event = event
+                    continue
+                yield event
+        except TimeoutError:
+            timed_out = True
+        finally:
+            relay_closed = True
+            if relay is not None:
+                relay_closed = await self._close_provider_stream(relay)
+            physically_closed = relay_closed and close_status.closed is not False
+            if not physically_closed:
+                self._cleanup_poisoned_reason = f"agent_{phase}_stream_close_timeout"
+
+        if not physically_closed:
+            yield ErrorEvent(
+                message=(
+                    f"{phase.replace('_', ' ')} stopped because its owned stream "
+                    "did not close within the cleanup window"
+                ),
+                code=f"agent_{phase}_stream_close_timeout",
+            )
+            return
+        if timed_out:
+            yield ErrorEvent(
+                message=(
+                    f"{phase.replace('_', ' ')} exceeded the Agent total timeout "
+                    f"of {self.config.timeout:g}s"
+                ),
+                code=f"agent_{phase}_timeout",
+            )
+            return
+        if terminal_event is not None:
+            yield terminal_event
 
     async def _run_meta_resume(self, meta_resume: Any) -> AsyncIterator[Any]:
         """Stream a meta-skill resume's events as a single turn.
@@ -13283,24 +15146,40 @@ class Agent:
         result: Any = None
         final_text_parts: list[str] = []
         try:
-            async for ev in orch.iter_resume_events(
-                payload=claim,
-                filled_fields=parsed,
-            ):
-                if isinstance(ev, MetaResult):
-                    result = ev
-                    continue
-                # Stream nested AgentEvents through (TextDelta, ToolUseStart,
-                # ToolResult). Capture text deltas so we can render the
-                # final assistant text for the transcript / Done event.
-                from opensquilla.engine.types import TextDeltaEvent
+            async with contextlib.aclosing(
+                orch.iter_resume_events(
+                    payload=claim,
+                    filled_fields=parsed,
+                )
+            ) as orchestrator_events:
+                async for ev in orchestrator_events:
+                    if isinstance(ev, MetaResult):
+                        result = ev
+                        continue
+                    # Stream nested AgentEvents through (TextDelta,
+                    # ToolUseStart, ToolResult). Capture text deltas so we can
+                    # render the final assistant text for the transcript /
+                    # Done event.
+                    from opensquilla.engine.types import TextDeltaEvent
 
-                if isinstance(ev, TextDeltaEvent) and ev.text:
-                    final_text_parts.append(ev.text)
-                yield ev
+                    if isinstance(ev, TextDeltaEvent) and ev.text:
+                        final_text_parts.append(ev.text)
+                    yield ev
         except Exception as exc:  # noqa: BLE001
             logger.warning("agent.meta_resume_failed", extra={"error": str(exc)})
-            yield DoneEvent(text="", input_tokens=0, output_tokens=0, iterations=0)
+            yield DoneEvent(
+                text="",
+                input_tokens=0,
+                output_tokens=0,
+                iterations=0,
+                requested_model=self.config.model_id or "",
+                requested_provider=str(
+                    self.config.provider_id
+                    or getattr(self.provider, "provider_id", "")
+                    or getattr(self.provider, "provider_name", "")
+                    or ""
+                ),
+            )
             return
 
         # Build the final assistant text. If the DAG re-paused, use the
@@ -13337,7 +15216,13 @@ class Agent:
             iterations=1,
             cost_usd=0.0,
             cost_source="none",
-            model=self.config.model_id or "",
+            requested_model=self.config.model_id or "",
+            requested_provider=str(
+                self.config.provider_id
+                or getattr(self.provider, "provider_id", "")
+                or getattr(self.provider, "provider_name", "")
+                or ""
+            ),
             text_snapshot=final_text,
         )
 
@@ -13411,8 +15296,7 @@ class Agent:
         skill_spec = skill_loader.get_by_name(name)
         if skill_spec is None or getattr(skill_spec, "kind", "skill") != "meta":
             async for ev in self._emit_terminal_text(
-                f"{name!r} is not a meta-skill. Type /meta to list available "
-                "meta-skills.",
+                f"{name!r} is not a meta-skill. Type /meta to list available meta-skills.",
                 iterations=0,
             ):
                 yield ev
@@ -13462,8 +15346,7 @@ class Agent:
             plan=plan,
             inputs=make_meta_inputs(
                 user_message=(
-                    getattr(self, "_current_turn_message", "")
-                    or metadata.get("user_message", "")
+                    getattr(self, "_current_turn_message", "") or metadata.get("user_message", "")
                 ),
                 system_prompt=system_prompt,
                 **meta_input_overrides_from_metadata(metadata),
@@ -13496,18 +15379,31 @@ class Agent:
         result: Any = None
         final_text_parts: list[str] = []
         try:
-            async for ev in orch.iter_events(match):
-                if isinstance(ev, MetaResult):
-                    result = ev
-                    continue
-                if isinstance(ev, TextDeltaEvent) and ev.text:
-                    final_text_parts.append(ev.text)
-                yield ev
+            async with contextlib.aclosing(
+                orch.iter_events(match)
+            ) as orchestrator_events:
+                async for ev in orchestrator_events:
+                    if isinstance(ev, MetaResult):
+                        result = ev
+                        continue
+                    if isinstance(ev, TextDeltaEvent) and ev.text:
+                        final_text_parts.append(ev.text)
+                    yield ev
         except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "agent.meta_launch_failed", extra={"error": str(exc), "name": name}
+            logger.warning("agent.meta_launch_failed", extra={"error": str(exc), "name": name})
+            yield DoneEvent(
+                text="",
+                input_tokens=0,
+                output_tokens=0,
+                iterations=0,
+                requested_model=self.config.model_id or "",
+                requested_provider=str(
+                    self.config.provider_id
+                    or getattr(self.provider, "provider_id", "")
+                    or getattr(self.provider, "provider_name", "")
+                    or ""
+                ),
             )
-            yield DoneEvent(text="", input_tokens=0, output_tokens=0, iterations=0)
             return
         finally:
             reset_smoke_fixture_context(smoke_fixture_token)
@@ -13539,7 +15435,13 @@ class Agent:
             iterations=1,
             cost_usd=0.0,
             cost_source="none",
-            model=self.config.model_id or "",
+            requested_model=self.config.model_id or "",
+            requested_provider=str(
+                self.config.provider_id
+                or getattr(self.provider, "provider_id", "")
+                or getattr(self.provider, "provider_name", "")
+                or ""
+            ),
             text_snapshot=final_text,
         )
 
@@ -13580,17 +15482,22 @@ class Agent:
         soft_progress = metadata.pop("meta_clarify_soft_progress", None)
         if proceed_blocked is not None:
             return self._render_clarify_progress(
-                proceed_blocked, proceed_blocked=True,
+                proceed_blocked,
+                proceed_blocked=True,
             ), True
         if soft_progress is not None:
             return self._render_clarify_progress(
-                soft_progress, proceed_blocked=False,
+                soft_progress,
+                proceed_blocked=False,
             ), True
 
         return None
 
     def _render_clarify_progress(
-        self, payload: Any, *, proceed_blocked: bool,
+        self,
+        payload: Any,
+        *,
+        proceed_blocked: bool,
     ) -> str:
         """Render soft-clarify progress without exposing internal state."""
         data = payload if isinstance(payload, dict) else {}
@@ -13604,11 +15511,7 @@ class Agent:
         lines: list[str] = []
         if proceed_blocked:
             if missing:
-                lines.append(
-                    "现在还不能开始，还需要补充："
-                    + "、".join(missing)
-                    + "。"
-                )
+                lines.append("现在还不能开始，还需要补充：" + "、".join(missing) + "。")
             else:
                 lines.append("现在还不能开始，还需要补充必填信息。")
             if filled_summary:
@@ -13761,7 +15664,13 @@ class Agent:
             iterations=iterations,
             cost_usd=0.0,
             cost_source="none",
-            model=self.config.model_id or "",
+            requested_model=self.config.model_id or "",
+            requested_provider=str(
+                self.config.provider_id
+                or getattr(self.provider, "provider_id", "")
+                or getattr(self.provider, "provider_name", "")
+                or ""
+            ),
             text_snapshot=text,
         )
 
@@ -13821,8 +15730,7 @@ class Agent:
         parent_sandbox_mounts = [
             dict(item)
             for item in (getattr(parent_ctx, "sandbox_mounts", None) or [])
-            if isinstance(item, dict)
-            and normalize_scope(item.get("scope"), "chat") != "once"
+            if isinstance(item, dict) and normalize_scope(item.get("scope"), "chat") != "once"
         ]
         parent_run_mode = getattr(parent_ctx, "run_mode", None)
         if parent_run_mode is None:
@@ -13851,14 +15759,10 @@ class Agent:
                     else None
                 ),
                 session_id=(
-                    parent_usage_context.session_id
-                    if parent_usage_context is not None
-                    else None
+                    parent_usage_context.session_id if parent_usage_context is not None else None
                 ),
                 session_epoch=(
-                    parent_usage_context.session_epoch
-                    if parent_usage_context is not None
-                    else 0
+                    parent_usage_context.session_epoch if parent_usage_context is not None else 0
                 ),
                 agent_id=(
                     parent_usage_context.agent_id
@@ -13920,6 +15824,7 @@ class Agent:
 
         child_cfg = AgentConfig(
             max_iterations=spec.max_iterations,
+            max_iterations_includes_finalization=(self.config.max_iterations_includes_finalization),
             timeout=spec.timeout,
             provider_id=self.config.provider_id,
             max_tokens=self.config.max_tokens,
@@ -13961,9 +15866,7 @@ class Agent:
                 self.config.tool_result_fresh_diagnostic_inline_max_chars
             ),
             tool_result_dispatch_max_chars=self.config.tool_result_dispatch_max_chars,
-            tool_result_dispatch_turn_max_chars=(
-                self.config.tool_result_dispatch_turn_max_chars
-            ),
+            tool_result_dispatch_turn_max_chars=(self.config.tool_result_dispatch_turn_max_chars),
             tool_result_provider_request_max_chars=(
                 self.config.tool_result_provider_request_max_chars
             ),
@@ -13979,15 +15882,17 @@ class Agent:
             ),
             placeholder_escalation_threshold=self.config.placeholder_escalation_threshold,
             deadline_wrapup_margin_seconds=self.config.deadline_wrapup_margin_seconds,
-            reasoning_only_thinking_fallback=self.config.reasoning_only_thinking_fallback,
-            deadline_thinking_off_margin_seconds=(
-                self.config.deadline_thinking_off_margin_seconds
+            deadline_wrapup_disable_tools=self.config.deadline_wrapup_disable_tools,
+            retrieval_loop_finalization_threshold=(
+                self.config.retrieval_loop_finalization_threshold
             ),
+            finalization_aggregator_only=self.config.finalization_aggregator_only,
+            finalization_disable_thinking=self.config.finalization_disable_thinking,
+            reasoning_only_thinking_fallback=self.config.reasoning_only_thinking_fallback,
+            deadline_thinking_off_margin_seconds=(self.config.deadline_thinking_off_margin_seconds),
             reasoning_stream_char_cap=self.config.reasoning_stream_char_cap,
             final_diff_salvage=self.config.final_diff_salvage,
-            endgame_git_freeze_margin_seconds=(
-                self.config.endgame_git_freeze_margin_seconds
-            ),
+            endgame_git_freeze_margin_seconds=(self.config.endgame_git_freeze_margin_seconds),
             mid_budget_no_diff_nudge=self.config.mid_budget_no_diff_nudge,
             repeated_tool_call_recovery_threshold=(
                 self.config.repeated_tool_call_recovery_threshold
@@ -13996,9 +15901,7 @@ class Agent:
                 self.config.repeated_tool_call_recovery_extra_tools
             ),
             provider_history_dedup_enabled=self.config.provider_history_dedup_enabled,
-            provider_history_dedup_min_repeats=(
-                self.config.provider_history_dedup_min_repeats
-            ),
+            provider_history_dedup_min_repeats=(self.config.provider_history_dedup_min_repeats),
             progress_watchdog_mode=self.config.progress_watchdog_mode,
             progress_watchdog_repeated_tool_error_threshold=(
                 self.config.progress_watchdog_repeated_tool_error_threshold

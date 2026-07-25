@@ -31,7 +31,6 @@ from opensquilla.session.usage_ledger import (
     UsageEventCompletion,
     UsageEventItem,
     UsageEventStart,
-    UsageItemBillingReceipt,
 )
 from opensquilla.usage_reasons import normalize_usage_unknown_reason
 
@@ -88,6 +87,15 @@ def _completion(call: UsageCallStart, result: UsageCallResult) -> UsageEventComp
     if not result.items and result.cost_source == "unavailable":
         missing = 1
     missing_usage = max(0, int(result.missing_usage_entries))
+    # A missing physical request can be represented both by an explicit
+    # unavailable placeholder item and by the envelope's missing-usage count.
+    # Subtract only the overlap proven by normalization; unrepresented missing
+    # requests and independently unpriced items must remain additive.
+    represented_missing_usage = min(
+        missing,
+        missing_usage,
+        max(0, int(result.represented_missing_usage_entries)),
+    )
     item_providers = {item.provider for item in result.items if item.provider}
     item_models = {item.model for item in result.items if item.model}
     return UsageEventCompletion(
@@ -114,7 +122,7 @@ def _completion(call: UsageCallStart, result: UsageCallResult) -> UsageEventComp
             if missing
             else "complete"
         ),
-        missing_cost_entries=missing + missing_usage,
+        missing_cost_entries=missing + missing_usage - represented_missing_usage,
     )
 
 
@@ -143,22 +151,6 @@ def _item(event_id: str, value: UsageCallItem) -> UsageEventItem:
     )
 
 
-def _receipt(event_id: str, value: UsageCallItem) -> UsageItemBillingReceipt | None:
-    receipt = value.billing_receipt
-    if receipt is None:
-        return None
-    return UsageItemBillingReceipt(
-        event_id=event_id,
-        ordinal=max(0, int(value.ordinal)),
-        currency=receipt.currency,
-        status=receipt.status,
-        amount_nanos=receipt.amount_nanos,
-        usd_equivalent_nanos=receipt.usd_equivalent_nanos,
-        fx_native_per_usd_nanos=receipt.fx_native_per_usd_nanos,
-        schema_version=receipt.schema_version,
-    )
-
-
 def _reconciled_items(
     call: UsageCallStart,
     result: UsageCallResult,
@@ -184,20 +176,6 @@ def _reconciled_items(
     )
     if items and sums == envelope:
         return items
-    billing_receipt = items[0].billing_receipt if len(items) == 1 else None
-    if billing_receipt is not None:
-        receipt_reconciles = (
-            billing_receipt.status == "confirmed"
-            and billing_receipt.usd_equivalent_nanos == result.billed_cost_nanos
-            and result.estimated_cost_nanos == 0
-            and result.cost_source == "provider_billed"
-        ) or (
-            billing_receipt.status == "pending"
-            and result.billed_cost_nanos == 0
-            and result.cost_source != "provider_billed"
-        )
-        if not receipt_reconciles:
-            billing_receipt = None
     # Persistence is the last defensive boundary: never store dimensions
     # whose model rows add up to less or more than the billed envelope.
     return (
@@ -215,7 +193,6 @@ def _reconciled_items(
             cost_source=result.cost_source or "unavailable",
             estimate_basis=result.estimate_basis,
             price_source=result.price_source,
-            billing_receipt=billing_receipt,
         ),
     )
 
@@ -269,21 +246,18 @@ class SessionUsageEventSink:
 
     async def finalize(self, call: UsageCallStart, result: UsageCallResult) -> None:
         completion = _completion(call, result)
-        reconciled = _reconciled_items(call, result)
-        items = tuple(_item(call.event_id, value) for value in reconciled)
-        receipts = tuple(
-            receipt
-            for value in reconciled
-            if (receipt := _receipt(call.event_id, value)) is not None
+        items = tuple(
+            _item(call.event_id, value) for value in _reconciled_items(call, result)
         )
         try:
-            kwargs: dict[str, Any] = {"items": items}
-            if receipts:
-                kwargs["receipts"] = receipts
-            await self._storage.finalize_usage_event(call.event_id, completion, **kwargs)
+            await self._storage.finalize_usage_event(
+                call.event_id,
+                completion,
+                items=items,
+            )
         except Exception:
             self._schedule_retry(
-                self._retry_finalize(call.event_id, completion, items, receipts),
+                self._retry_finalize(call.event_id, completion, items),
                 event_id=call.event_id,
                 operation="finalize",
             )
@@ -337,15 +311,15 @@ class SessionUsageEventSink:
         event_id: str,
         completion: UsageEventCompletion,
         items: tuple[UsageEventItem, ...],
-        receipts: tuple[UsageItemBillingReceipt, ...],
     ) -> None:
         for delay in self._retry_delays:
             await asyncio.sleep(delay)
             try:
-                kwargs: dict[str, Any] = {"items": items}
-                if receipts:
-                    kwargs["receipts"] = receipts
-                await self._storage.finalize_usage_event(event_id, completion, **kwargs)
+                await self._storage.finalize_usage_event(
+                    event_id,
+                    completion,
+                    items=items,
+                )
                 return
             except Exception:  # noqa: BLE001 - bounded retry; recovery handles residue.
                 continue

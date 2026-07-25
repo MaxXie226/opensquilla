@@ -158,6 +158,10 @@ class ErrorEvent:
     # Appended last with a default: positional construction elsewhere must not
     # shift (same hazard the DoneEvent comment in this file documents).
     error_id: str = ""
+    # Provider-originated physical-request evidence. ``None`` means unknown;
+    # explicit 0/False proves a local preflight rejection.
+    request_started: bool | None = None
+    physical_request_count: int | None = None
 
 
 @dataclass
@@ -218,9 +222,14 @@ class DoneEvent:
     # legacy/partial producers whose empty ``text`` means "fall back to the
     # streamed deltas".  Appended last for positional-construction compatibility.
     text_snapshot: str | None = None
-    # Configured registry identity that served the terminal model response.
-    # Appended for compatibility with existing positional construction.
+    # Physical identity reported by the terminal provider response.  This stays
+    # empty when the adapter has no authoritative receipt; configured/requested
+    # identity belongs in the separate fields below.
     provider: str = ""
+    # Configured request identity, kept distinct from the physical response
+    # identity in ``model``/``provider``.
+    requested_model: str = ""
+    requested_provider: str = ""
 
     @property
     def upstream_cost_usd(self) -> float:
@@ -609,8 +618,7 @@ class AgentConfig:
     # wall-clock time drops below this many seconds, then is rebuilt each
     # iteration (so the remaining-minutes figure stays current) and spliced
     # into every subsequent provider request; only the arming log event is
-    # one-shot. Unlike the max_iterations finalization, tools stay available
-    # so the model can still apply and verify its final changes. Set via
+    # one-shot. Set via
     # OPENSQUILLA_DEADLINE_WRAPUP_MARGIN_SECONDS.
     deadline_wrapup_margin_seconds: int = 0
     # Retry the reasoning-only provider failure with thinking disabled instead
@@ -691,6 +699,26 @@ class AgentConfig:
     # stays gateway-agnostic and a broken observer can never affect a turn.
     provider_call_observer: Callable[..., None] | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Treat max_iterations as the total number of outer model/tool-loop
+    # iterations, including the final no-tool wrap-up iteration. Provider-level
+    # retries inside one loop iteration remain governed by max_provider_retries
+    # and max_turn_llm_calls. Off preserves the historical behavior where the
+    # wrap-up is an extra iteration after max_iterations tool-capable iterations.
+    max_iterations_includes_finalization: bool = False
+    # Once deadline wrap-up is armed, turn the next provider call into a
+    # no-tool finalization call. Off preserves the interactive coding behavior
+    # where the model may still apply and verify last-minute changes.
+    deadline_wrapup_disable_tools: bool = False
+    # Consecutive iterations containing only these runtime-recognized retrieval
+    # calls (web_search/web_fetch) before a no-tool finalization is forced.
+    # 0 disables the guard.
+    retrieval_loop_finalization_threshold: int = 0
+    # Ask ensemble providers to skip proposers during a forced finalization and
+    # invoke only their aggregator over the accumulated conversation.
+    finalization_aggregator_only: bool = False
+    # Disable extended thinking on max-iteration, retrieval-loop, or deadline
+    # forced finalization calls so the remaining budget goes to the answer.
+    finalization_disable_thinking: bool = False
 
     def __post_init__(self) -> None:
         self.flush_triggers = list(normalize_flush_triggers_strict(self.flush_triggers))

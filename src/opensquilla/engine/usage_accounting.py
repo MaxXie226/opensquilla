@@ -36,6 +36,17 @@ from opensquilla.usage_reasons import (
 )
 
 _NANOS_PER_USD = Decimal("1000000000")
+_MAX_MONEY_NANOS = (1 << 63) - 1
+_MISSING_REQUEST_PLACEHOLDER_ROLES = frozenset(
+    {
+        "abandoned_stream",
+        "usage_missing",
+        "unknown_call",
+        "abandoned_stream_request",
+        "agent_llm_request_unknown",
+        "abandoned_provider_request",
+    }
+)
 log = structlog.get_logger(__name__)
 
 
@@ -140,6 +151,11 @@ class UsageCallResult:
     price_source: str | None
     items: tuple[UsageCallItem, ...]
     missing_usage_entries: int = 0
+    # Number of ``missing_usage_entries`` that already have a concrete
+    # placeholder item in ``items``.  The durable ledger uses this provenance
+    # to avoid counting the same missing physical request once as an
+    # unavailable item and again as an unrepresented missing-usage entry.
+    represented_missing_usage_entries: int = 0
 
 
 @runtime_checkable
@@ -336,11 +352,13 @@ async def account_provider_stream(
         async for event in stream_factory():
             kind = str(getattr(event, "kind", "") or "")
             if kind == "done" and not terminal:
-                # Preserve the physical deployment for compatibility rollups
-                # that consume this same Done event after the ledger boundary.
+                # ``provider`` is the selector's physically chosen adapter
+                # leg, captured immediately before invoking it.  Preserve
+                # that authoritative leg identity for downstream compatibility
+                # rollups without promoting the configured/requested model to
+                # an actual deployment model.
                 with contextlib.suppress(Exception):
                     setattr(event, "_opensquilla_usage_provider", call.provider)
-                    setattr(event, "_opensquilla_usage_model", call.model)
                 terminal = True
                 await finalize_usage_call(scope, call, event)
             elif kind == "error":
@@ -426,40 +444,367 @@ def _breakdown_reconciles(event: object, rows: list[dict[str, Any]]) -> bool:
 def _row_has_explicit_usage_receipt(row: dict[str, Any]) -> bool:
     """Distinguish a real zero-valued receipt from an arbitrary empty row."""
 
-    if not str(row.get("model") or row.get("provider") or "").strip():
+    if (
+        str(row.get("role") or "").strip().casefold()
+        in _MISSING_REQUEST_PLACEHOLDER_ROLES
+    ):
         return False
-    return all(
+    if not all(
         key in row and _raw_nonnegative_number(row[key])
         for key in ("input_tokens", "output_tokens")
+    ):
+        return False
+    if str(row.get("model") or row.get("provider") or "").strip():
+        return True
+    quantitative_evidence = any(
+        _usage_float(row.get(key)) > 0
+        for key in (
+            "input_tokens",
+            "output_tokens",
+            "reasoning_tokens",
+            "cache_read_tokens",
+            "cached_tokens",
+            "cache_write_tokens",
+            "billed_cost",
+        )
     )
+    source = str(row.get("cost_source") or "none").strip().casefold()
+    metadata_evidence = bool(
+        row.get("billing_receipt")
+        or (isinstance(row.get("provider_usage"), Mapping) and row["provider_usage"])
+        or source
+        not in {
+            "",
+            "none",
+            "unavailable",
+        }
+    )
+    return quantitative_evidence or metadata_evidence
+
+
+def _usage_row_fingerprint(row: Mapping[str, Any]) -> tuple[Any, ...]:
+    """Stable overlap key for a receipt copied across ErrorEvent fields."""
+
+    return (
+        str(row.get("provider") or "").strip(),
+        str(row.get("model") or "").strip(),
+        _usage_int(row.get("input_tokens")),
+        _usage_int(row.get("output_tokens")),
+        _usage_int(row.get("reasoning_tokens")),
+        _usage_int(
+            row.get("cache_read_tokens")
+            if "cache_read_tokens" in row
+            else row.get("cached_tokens")
+        ),
+        _usage_int(row.get("cache_write_tokens")),
+        usd_to_nanos(row.get("billed_cost")),
+        str(row.get("cost_source") or "none").strip().casefold(),
+    )
+
+
+def _usage_row_response_ids(row: Mapping[str, Any]) -> frozenset[str]:
+    values: list[Any] = []
+    direct = row.get("response_id")
+    if direct is not None:
+        values.append(direct)
+    provider_usage = row.get("provider_usage")
+    if isinstance(provider_usage, Mapping):
+        nested = provider_usage.get("response_ids")
+        if isinstance(nested, list | tuple | set | frozenset):
+            values.extend(nested)
+        elif nested is not None:
+            values.append(nested)
+        nested_single = provider_usage.get("response_id")
+        if nested_single is not None:
+            values.append(nested_single)
+    return frozenset(
+        str(value).strip()
+        for value in values
+        if str(value).strip()
+    )
+
+
+def _usage_row_match_priority(
+    left: Mapping[str, Any],
+    right: Mapping[str, Any],
+) -> int | None:
+    left_placeholder = (
+        str(left.get("role") or "").strip().casefold()
+        in _MISSING_REQUEST_PLACEHOLDER_ROLES
+    )
+    right_placeholder = (
+        str(right.get("role") or "").strip().casefold()
+        in _MISSING_REQUEST_PLACEHOLDER_ROLES
+    )
+    if left_placeholder != right_placeholder:
+        return None
+    left_ids = _usage_row_response_ids(left)
+    right_ids = _usage_row_response_ids(right)
+    # A stable upstream response id is the strongest receipt identity.  Copies
+    # of the same receipt can legitimately differ in richness (for example the
+    # outer Error row may omit actual deployment and exact billed cost while
+    # diagnostic_done retains them), so do not require their metric
+    # fingerprints to match when both sides carry ids.
+    if left_ids and right_ids:
+        return 0 if left_ids & right_ids else None
+    if _usage_row_fingerprint(left) != _usage_row_fingerprint(right):
+        return None
+    return 1 if not left_ids and not right_ids else 2
+
+
+def _usage_rows_represent_same_receipt(
+    left: Mapping[str, Any],
+    right: Mapping[str, Any],
+) -> bool:
+    return _usage_row_match_priority(left, right) is not None
+
+
+def _merge_usage_row_provenance(
+    target: dict[str, Any],
+    source: Mapping[str, Any],
+) -> None:
+    target_ids = _usage_row_response_ids(target)
+    source_ids = _usage_row_response_ids(source)
+    stable_id_match = bool(target_ids and source_ids and target_ids & source_ids)
+    if stable_id_match:
+        # diagnostic_done is the receipt-native copy.  Once a stable response
+        # id proves identity, its quantitative and billing fields are
+        # authoritative even when the outer wrapper carried a partial/zero
+        # projection.  Wrapper role/label/profile and requested identity stay
+        # on ``target``.
+        for key in (
+            "provider",
+            "model",
+            "input_tokens",
+            "output_tokens",
+            "reasoning_tokens",
+            "cache_read_tokens",
+            "cached_tokens",
+            "cache_write_tokens",
+            "billed_cost",
+            "cost_source",
+            "billing_receipt",
+        ):
+            if key in source:
+                target[key] = source[key]
+    for key in (
+        "provider",
+        "model",
+        "requested_provider",
+        "requested_model",
+        "response_id",
+        "billing_receipt",
+    ):
+        if not target.get(key) and source.get(key):
+            target[key] = source[key]
+    source_usage = source.get("provider_usage")
+    if not isinstance(source_usage, Mapping) or not source_usage:
+        return
+    target_usage = (
+        dict(target.get("provider_usage"))
+        if isinstance(target.get("provider_usage"), Mapping)
+        else {}
+    )
+    for key, value in source_usage.items():
+        if key == "response_ids":
+            existing_ids = target_usage.get(key)
+            merged_ids = {
+                str(item).strip()
+                for item in (
+                    list(existing_ids)
+                    if isinstance(existing_ids, list | tuple | set | frozenset)
+                    else [existing_ids]
+                    if existing_ids is not None
+                    else []
+                )
+                if str(item).strip()
+            }
+            source_ids = (
+                list(value)
+                if isinstance(value, list | tuple | set | frozenset)
+                else [value]
+            )
+            merged_ids.update(
+                str(item).strip()
+                for item in source_ids
+                if str(item).strip()
+            )
+            target_usage[key] = sorted(merged_ids)
+        elif stable_id_match or (
+            key not in target_usage
+            or target_usage[key] is None
+            or target_usage[key] == ""
+            or target_usage[key] == []
+            or target_usage[key] == {}
+        ):
+            target_usage[key] = value
+    target["provider_usage"] = target_usage
+
+
+def _usage_envelope_row(
+    event: object,
+    *,
+    default_provider: str = "",
+    default_model: str = "",
+) -> dict[str, Any]:
+    return {
+        # Defaults are requested/pricing context, never physical response
+        # identity. Preserve a blank actual identity when the provider did not
+        # report one.
+        "provider": str(
+            getattr(event, "provider", "")
+            or getattr(event, "_opensquilla_usage_provider", "")
+            or ""
+        ),
+        "model": str(getattr(event, "model", "") or ""),
+        "requested_provider": str(
+            getattr(event, "requested_provider", "") or default_provider or ""
+        ),
+        "requested_model": str(
+            getattr(event, "requested_model", "") or default_model or ""
+        ),
+        "input_tokens": getattr(event, "input_tokens", 0),
+        "output_tokens": getattr(event, "output_tokens", 0),
+        "reasoning_tokens": getattr(event, "reasoning_tokens", 0),
+        "cached_tokens": getattr(event, "cached_tokens", 0),
+        "cache_write_tokens": getattr(event, "cache_write_tokens", 0),
+        "billed_cost": getattr(event, "billed_cost", 0.0),
+        "cost_source": getattr(event, "cost_source", "none"),
+        "billing_receipt": getattr(event, "billing_receipt", None),
+        "provider_usage": dict(getattr(event, "provider_usage", {}) or {}),
+    }
+
+
+def _normalized_breakdown_rows(
+    event: object,
+    *,
+    synthesize_envelope: bool,
+    default_provider: str = "",
+    default_model: str = "",
+) -> list[dict[str, Any]]:
+    raw_breakdown = getattr(event, "model_usage_breakdown", None)
+    rows = (
+        [dict(row) for row in raw_breakdown]
+        if isinstance(raw_breakdown, list)
+        and raw_breakdown
+        and all(isinstance(row, dict) for row in raw_breakdown)
+        else []
+    )
+    if rows and _breakdown_reconciles(event, rows):
+        return rows
+    return (
+        [
+            _usage_envelope_row(
+                event,
+                default_provider=default_provider,
+                default_model=default_model,
+            )
+        ]
+        if synthesize_envelope
+        else []
+    )
+
+
+def _merged_event_usage_rows(
+    event: object,
+    *,
+    default_provider: str = "",
+    default_model: str = "",
+) -> list[dict[str, Any]]:
+    """Merge ErrorEvent outer and diagnostic receipts without double billing."""
+
+    is_error = str(getattr(event, "kind", "") or "") == "error"
+    rows = _normalized_breakdown_rows(
+        event,
+        synthesize_envelope=not is_error,
+        default_provider=default_provider,
+        default_model=default_model,
+    )
+    diagnostic_done = getattr(event, "diagnostic_done", None) if is_error else None
+    if diagnostic_done is None:
+        return rows
+    diagnostic_rows = _normalized_breakdown_rows(
+        diagnostic_done,
+        synthesize_envelope=True,
+        default_provider=default_provider,
+        default_model=default_model,
+    )
+    outer_count = len(rows)
+    consumed_outer_rows: set[int] = set()
+    matched_outer_by_diagnostic: dict[int, int] = {}
+    diagnostic_match_order = sorted(
+        range(len(diagnostic_rows)),
+        key=lambda index: (
+            0 if _usage_row_response_ids(diagnostic_rows[index]) else 1,
+            index,
+        ),
+    )
+    for diagnostic_index in diagnostic_match_order:
+        diagnostic_row = diagnostic_rows[diagnostic_index]
+        candidates = [
+            (priority, index)
+            for index in range(outer_count)
+            if index not in consumed_outer_rows
+            if (
+                priority := _usage_row_match_priority(
+                    rows[index],
+                    diagnostic_row,
+                )
+            )
+            is not None
+        ]
+        matched_index = min(candidates)[1] if candidates else None
+        if matched_index is not None:
+            consumed_outer_rows.add(matched_index)
+            matched_outer_by_diagnostic[diagnostic_index] = matched_index
+    for diagnostic_index, diagnostic_row in enumerate(diagnostic_rows):
+        matched_index = matched_outer_by_diagnostic.get(diagnostic_index)
+        if matched_index is None:
+            rows.append(diagnostic_row)
+        else:
+            _merge_usage_row_provenance(rows[matched_index], diagnostic_row)
+    return rows
 
 
 def has_known_provider_usage_receipt(event: object) -> bool:
     """Whether an Error event carries at least one trustworthy usage row."""
 
-    raw_breakdown = getattr(event, "model_usage_breakdown", None)
-    if (
-        not isinstance(raw_breakdown, list)
-        or not raw_breakdown
-        or not all(isinstance(row, dict) for row in raw_breakdown)
-    ):
-        return False
-    rows = [dict(row) for row in raw_breakdown]
-    return _breakdown_reconciles(event, rows) and any(
-        _row_has_explicit_usage_receipt(row) for row in rows
+    return any(
+        _row_has_explicit_usage_receipt(row)
+        for row in _merged_event_usage_rows(event)
+    )
+
+
+def provider_usage_receipt_rows(
+    event: object,
+    *,
+    default_provider: str = "",
+    default_model: str = "",
+) -> list[dict[str, Any]]:
+    """Return deduplicated physical receipt rows carried by one terminal event."""
+
+    return _merged_event_usage_rows(
+        event,
+        default_provider=default_provider,
+        default_model=default_model,
     )
 
 
 def _receipt_int(value: Any, *, nullable: bool = False) -> int | None:
     if value is None and nullable:
         return None
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise ValueError("billing receipt nanos must be non-negative integers")
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 0
+        or value > _MAX_MONEY_NANOS
+    ):
+        raise ValueError("billing receipt nanos must be ledger-safe integers")
     return int(value)
 
 
 def _coerce_billing_receipt(value: Any) -> ProviderBillingReceipt | None:
-    """Defensively normalize additive receipt rows from wrappers/test doubles."""
+    """Return a schema-valid native receipt, or ``None`` without partial trust."""
 
     if value is None:
         return None
@@ -469,22 +814,15 @@ def _coerce_billing_receipt(value: Any) -> ProviderBillingReceipt | None:
         try:
             raw_fx = value.get("fx_native_per_usd_nanos")
             raw_schema = value.get("schema_version", 1)
-            if (
-                isinstance(raw_fx, bool)
-                or not isinstance(raw_fx, int)
-                or isinstance(raw_schema, bool)
-                or not isinstance(raw_schema, int)
-            ):
-                return None
             candidate = ProviderBillingReceipt(
-                currency=str(value.get("currency") or "").upper(),
-                status=str(value.get("status") or ""),  # type: ignore[arg-type]
-                amount_nanos=_receipt_int(value.get("amount_nanos"), nullable=True),
-                usd_equivalent_nanos=_receipt_int(
-                    value.get("usd_equivalent_nanos"), nullable=True
+                currency=value.get("currency"),  # type: ignore[arg-type]
+                status=value.get("status"),  # type: ignore[arg-type]
+                amount_nanos=value.get("amount_nanos"),  # type: ignore[arg-type]
+                usd_equivalent_nanos=value.get(  # type: ignore[arg-type]
+                    "usd_equivalent_nanos"
                 ),
-                fx_native_per_usd_nanos=raw_fx,
-                schema_version=raw_schema,
+                fx_native_per_usd_nanos=raw_fx,  # type: ignore[arg-type]
+                schema_version=raw_schema,  # type: ignore[arg-type]
             )
         except (TypeError, ValueError, OverflowError):
             return None
@@ -498,20 +836,28 @@ def _coerce_billing_receipt(value: Any) -> ProviderBillingReceipt | None:
     if (
         not isinstance(candidate.currency, str)
         or len(candidate.currency) != 3
-        or candidate.currency != candidate.currency.upper()
+        or any(character < "A" or character > "Z" for character in candidate.currency)
         or candidate.status not in {"confirmed", "pending"}
         or isinstance(candidate.fx_native_per_usd_nanos, bool)
         or not isinstance(candidate.fx_native_per_usd_nanos, int)
         or candidate.fx_native_per_usd_nanos <= 0
+        or candidate.fx_native_per_usd_nanos > _MAX_MONEY_NANOS
         or isinstance(candidate.schema_version, bool)
         or not isinstance(candidate.schema_version, int)
-        or candidate.schema_version <= 0
+        or candidate.schema_version != 1
     ):
         return None
     if candidate.status == "confirmed" and (amount_nanos is None or usd_nanos is None):
         return None
     if candidate.status == "pending" and usd_nanos is not None:
         return None
+    if candidate.status == "confirmed":
+        expected_usd_nanos = (
+            amount_nanos * int(_NANOS_PER_USD)
+            + candidate.fx_native_per_usd_nanos // 2
+        ) // candidate.fx_native_per_usd_nanos
+        if expected_usd_nanos != usd_nanos:
+            return None
     return candidate
 
 
@@ -522,8 +868,29 @@ def _item_from_row(
     default_provider: str,
     default_model: str,
 ) -> UsageCallItem:
-    provider = str(row.get("provider") or default_provider or "")
-    model = str(row.get("model") or default_model or "")
+    # Persist only physical response identity.  Requested/configured defaults
+    # are valid pricing context, but are not proof of the deployment that
+    # actually executed the request.
+    placeholder = (
+        str(row.get("role") or "").strip().casefold()
+        in _MISSING_REQUEST_PLACEHOLDER_ROLES
+    )
+    provider = "" if placeholder else str(row.get("provider") or "")
+    model = "" if placeholder else str(row.get("model") or "")
+    pricing_provider = str(
+        provider
+        or row.get("provider")
+        or row.get("requested_provider")
+        or default_provider
+        or ""
+    )
+    pricing_model = str(
+        model
+        or row.get("model")
+        or row.get("requested_model")
+        or default_model
+        or ""
+    )
     input_tokens = _usage_int(row.get("input_tokens"))
     output_tokens = _usage_int(row.get("output_tokens"))
     reasoning_tokens = _usage_int(row.get("reasoning_tokens"))
@@ -535,8 +902,13 @@ def _item_from_row(
     cache_write_tokens = _usage_int(row.get("cache_write_tokens"))
     reported_source = str(row.get("cost_source") or "none").strip().lower()
     reported_billed = _usage_float(row.get("billed_cost"))
-    receipt = _coerce_billing_receipt(row.get("billing_receipt"))
-    receipt_pending = receipt is not None and receipt.status == "pending"
+    raw_receipt = (
+        row.get("billing_receipt")
+        if "billing_receipt" in row
+        else row.get("billingReceipt")
+    )
+    receipt_present = raw_receipt is not None
+    receipt = _coerce_billing_receipt(raw_receipt)
     confirmed_receipt = receipt is not None and receipt.status == "confirmed"
     # Explicitly unverified/BYOK sources must never enter the exact billed
     # bucket merely because they contain a positive provider-reported number.
@@ -545,11 +917,10 @@ def _item_from_row(
         reported_source in {"", "none", "unavailable"}
         and reported_billed > 0.0
     )
-    trusted_provider_bill = (
-        not receipt_pending
+    trusted_provider_bill = confirmed_receipt or (
+        not receipt_present
         and (
-            confirmed_receipt
-            or reported_source in {"provider_billed", "openrouter_usage"}
+            reported_source in {"provider_billed", "openrouter_usage"}
             or legacy_implicit_bill
         )
     )
@@ -559,17 +930,18 @@ def _item_from_row(
     estimate_basis: str | None = None
     price_source: str | None = None
     if not trusted_provider_bill and reported_source != "free":
-        resolved = resolve_model_price(model, provider)
-        estimate = estimate_cost(
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            cache_read_tokens=cache_read_tokens,
-            cache_write_tokens=cache_write_tokens,
-            price=resolved.entry,
-        )
-        estimate_usd = max(0.0, float(estimate.cost_usd or 0.0))
-        estimate_basis = estimate.basis
+        resolved = resolve_model_price(pricing_model, pricing_provider)
         price_source = resolved.source
+        if resolved.entry is not None:
+            estimate = estimate_cost(
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cache_read_tokens=cache_read_tokens,
+                cache_write_tokens=cache_write_tokens,
+                price=resolved.entry,
+            )
+            estimate_usd = max(0.0, float(estimate.cost_usd or 0.0))
+            estimate_basis = estimate.basis
 
     billed_nanos = (
         max(0, int(receipt.usd_equivalent_nanos or 0))
@@ -583,6 +955,10 @@ def _item_from_row(
         # Explicit zero-dollar receipts are still exact.  Do not replace them
         # with a list-price estimate merely because ``billed_cost`` is zero.
         source = "provider_billed"
+    elif receipt_present and estimated_nanos:
+        source = "opensquilla_estimate"
+    elif receipt_present:
+        source = "unavailable"
     elif estimated_nanos:
         source = "opensquilla_estimate"
     elif estimate_basis == "free":
@@ -626,31 +1002,30 @@ def normalize_provider_usage(
     exactly without a second rounding path.
     """
 
-    raw_breakdown = getattr(event, "model_usage_breakdown", None)
-    candidate_rows = (
-        [dict(row) for row in raw_breakdown]
-        if isinstance(raw_breakdown, list)
-        and raw_breakdown
-        and all(isinstance(row, dict) for row in raw_breakdown)
-        else []
+    diagnostic_done = getattr(event, "diagnostic_done", None)
+    provider = (
+        default_provider
+        or str(getattr(event, "provider", "") or "")
+        or str(getattr(diagnostic_done, "provider", "") or "")
     )
-    provider = default_provider or str(getattr(event, "provider", "") or "")
-    model = str(getattr(event, "model", "") or default_model or "")
-    rows = candidate_rows if _breakdown_reconciles(event, candidate_rows) else []
+    model = (
+        str(getattr(event, "model", "") or "")
+        or str(getattr(diagnostic_done, "model", "") or "")
+        or default_model
+        or ""
+    )
+    rows = _merged_event_usage_rows(
+        event,
+        default_provider=provider,
+        default_model=model,
+    )
     if not rows:
         rows = [
-            {
-                "provider": provider,
-                "model": model,
-                "input_tokens": getattr(event, "input_tokens", 0),
-                "output_tokens": getattr(event, "output_tokens", 0),
-                "reasoning_tokens": getattr(event, "reasoning_tokens", 0),
-                "cached_tokens": getattr(event, "cached_tokens", 0),
-                "cache_write_tokens": getattr(event, "cache_write_tokens", 0),
-                "billed_cost": getattr(event, "billed_cost", 0.0),
-                "cost_source": getattr(event, "cost_source", "none"),
-                "billing_receipt": getattr(event, "billing_receipt", None),
-            }
+            _usage_envelope_row(
+                event,
+                default_provider=provider,
+                default_model=model,
+            )
         ]
 
     items = tuple(
@@ -705,6 +1080,32 @@ def normalize_provider_usage(
         else None
     )
 
+    represented_missing_entries = sum(
+        1
+        for row in rows
+        if str(row.get("role") or "").strip().casefold()
+        in _MISSING_REQUEST_PLACEHOLDER_ROLES
+    )
+    real_receipt_count = sum(
+        1
+        for row in rows
+        if str(row.get("role") or "").strip().casefold()
+        not in _MISSING_REQUEST_PLACEHOLDER_ROLES
+    )
+    raw_physical_request_count = getattr(event, "physical_request_count", None)
+    explicit_physical_request_count = (
+        max(0, int(raw_physical_request_count))
+        if isinstance(raw_physical_request_count, int)
+        and not isinstance(raw_physical_request_count, bool)
+        else 0
+    )
+    missing_usage_entries = max(
+        _usage_int(getattr(event, "usage_missing_count", 0)),
+        _usage_int(getattr(diagnostic_done, "usage_missing_count", 0)),
+        represented_missing_entries,
+        max(0, explicit_physical_request_count - real_receipt_count),
+    )
+
     return UsageCallResult(
         completed_at_ms=max(0, int(completed_at_ms)),
         input_tokens=sum(item.input_tokens for item in items),
@@ -718,9 +1119,8 @@ def normalize_provider_usage(
         estimate_basis=estimate_basis,
         price_source=price_source,
         items=items,
-        missing_usage_entries=_usage_int(
-            getattr(event, "usage_missing_count", 0)
-        ),
+        missing_usage_entries=missing_usage_entries,
+        represented_missing_usage_entries=represented_missing_entries,
     )
 
 
@@ -740,6 +1140,7 @@ __all__ = [
     "mark_usage_call_unknown",
     "normalize_provider_usage",
     "provider_accounts_physical_usage",
+    "provider_usage_receipt_rows",
     "start_usage_call",
     "usd_to_nanos",
 ]

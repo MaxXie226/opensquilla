@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
+import contextlib
 import hashlib
 import json
 import math
@@ -29,6 +31,7 @@ if str(ROOT) not in sys.path:
 
 from opensquilla.engine.agent import Agent
 from opensquilla.engine.pipeline import TurnContext, run_pipeline
+from opensquilla.engine.pricing import estimate_cost, resolve_model_price
 from opensquilla.engine.selector_override import apply_model_override
 from opensquilla.engine.steps.squilla_router import apply_squilla_router
 from opensquilla.engine.types import (
@@ -63,6 +66,7 @@ from opensquilla.engine.types import (
 from opensquilla.engine.types import (
     ToolUseStartEvent as AgentToolUseStartEvent,
 )
+from opensquilla.engine.types import done_text_snapshot
 from opensquilla.engine.types import (
     WarningEvent as AgentWarningEvent,
 )
@@ -99,6 +103,7 @@ from opensquilla.provider.types import (
     DoneEvent,
     ErrorEvent,
     Message,
+    ProviderBillingReceipt,
     ProviderHeartbeatEvent,
     ReasoningDeltaEvent,
     TextDeltaEvent,
@@ -115,6 +120,16 @@ from opensquilla.tools.registry import ToolRegistry
 from opensquilla.tools.types import CallerKind, InteractionMode, ToolContext, ToolSpec
 
 DEFAULT_B2_EXPERIMENT_CONFIG_PATH = ROOT / "configs/benchmarks/draco_b2_g12.json"
+MISSING_USAGE_PLACEHOLDER_ROLES = frozenset(
+    {
+        "abandoned_stream",
+        "usage_missing",
+        "unknown_call",
+        "abandoned_stream_request",
+        "agent_llm_request_unknown",
+        "abandoned_provider_request",
+    }
+)
 
 
 GROUP_SPECS: dict[str, dict[str, Any]] = {
@@ -158,6 +173,43 @@ RUNNER_MODE_PROVIDER = "provider"
 RUNNER_MODE_AGENT_LOOP = "agent_loop"
 DEFAULT_DRACO_RUNNER_MODE = RUNNER_MODE_AGENT_LOOP
 DEFAULT_AGENT_MAX_ITERATIONS = 12
+DEFAULT_DEADLINE_WRAPUP_MARGIN_SECONDS = 0
+DEFAULT_DEADLINE_WRAPUP_DISABLE_TOOLS = False
+DEFAULT_DEADLINE_THINKING_OFF_MARGIN_SECONDS = 0
+DEFAULT_MAX_ITERATIONS_INCLUDES_FINALIZATION = False
+DEFAULT_RETRIEVAL_LOOP_FINALIZATION_THRESHOLD = 0
+DEFAULT_FINALIZATION_AGGREGATOR_ONLY = False
+DEFAULT_FINALIZATION_DISABLE_THINKING = False
+AGENT_FINALIZATION_POLICY_FIELDS = (
+    "deadline_wrapup_margin_seconds",
+    "deadline_wrapup_disable_tools",
+    "deadline_thinking_off_margin_seconds",
+    "max_iterations_includes_finalization",
+    "retrieval_loop_finalization_threshold",
+    "finalization_aggregator_only",
+    "finalization_disable_thinking",
+)
+AGENT_FINALIZATION_BOOLEAN_FIELDS = frozenset(
+    {
+        "deadline_wrapup_disable_tools",
+        "max_iterations_includes_finalization",
+        "finalization_aggregator_only",
+        "finalization_disable_thinking",
+    }
+)
+DEFAULT_AGENT_FINALIZATION_POLICY: dict[str, int | bool] = {
+    "deadline_wrapup_margin_seconds": DEFAULT_DEADLINE_WRAPUP_MARGIN_SECONDS,
+    "deadline_wrapup_disable_tools": DEFAULT_DEADLINE_WRAPUP_DISABLE_TOOLS,
+    "deadline_thinking_off_margin_seconds": DEFAULT_DEADLINE_THINKING_OFF_MARGIN_SECONDS,
+    "max_iterations_includes_finalization": DEFAULT_MAX_ITERATIONS_INCLUDES_FINALIZATION,
+    "retrieval_loop_finalization_threshold": (DEFAULT_RETRIEVAL_LOOP_FINALIZATION_THRESHOLD),
+    "finalization_aggregator_only": DEFAULT_FINALIZATION_AGGREGATOR_ONLY,
+    "finalization_disable_thinking": DEFAULT_FINALIZATION_DISABLE_THINKING,
+}
+# B2 and G1 are compared in the same DRACO campaign.  Their task envelope
+# (Agent policy, tools, Judge, generation, and timeouts) must therefore come
+# from the same profile even when either group is launched by itself.
+GLOBAL_EXPERIMENT_PROFILE_GROUPS = frozenset({"B2", "G1"})
 SUPPORTED_RUNNER_MODES = (RUNNER_MODE_PROVIDER, RUNNER_MODE_AGENT_LOOP)
 SUPPORTED_TOOL_MODES = (
     TOOL_MODE_PROVIDER_ONLY,
@@ -222,7 +274,75 @@ GENERATION_MAX_ATTEMPTS = 3
 DEFAULT_GENERATION_RETRY_BACKOFF_SECONDS = 2.0
 GENERATION_EMPTY_OUTPUT_ERROR = "empty_generation_output"
 GENERATION_MISSING_DONE_ERROR = "generation_missing_done"
+RUNNER_STREAM_CLEANUP_TIMEOUT_SECONDS = 1.0
 RUN_COMPATIBILITY_SCHEMA = "opensquilla.draco.run-compatibility/v1"
+
+
+def normalized_agent_finalization_policy(
+    value: Mapping[str, Any] | None = None,
+) -> dict[str, int | bool]:
+    raw = dict(value or {})
+    policy: dict[str, int | bool] = {}
+    for field_name in AGENT_FINALIZATION_POLICY_FIELDS:
+        default = DEFAULT_AGENT_FINALIZATION_POLICY[field_name]
+        candidate = raw.get(field_name, default)
+        if field_name in AGENT_FINALIZATION_BOOLEAN_FIELDS:
+            if not isinstance(candidate, bool):
+                raise ValueError(f"{field_name} must be a boolean")
+            policy[field_name] = candidate
+            continue
+        if isinstance(candidate, bool) or not isinstance(candidate, int):
+            raise ValueError(f"{field_name} must be an integer >= 0")
+        if candidate < 0:
+            raise ValueError(f"{field_name} must be an integer >= 0")
+        policy[field_name] = candidate
+    return policy
+
+
+def legal_proposer_quorum(proposer_count: int) -> int:
+    """Return the DRACO two-thirds quorum (4 -> 3, 3 -> 2)."""
+
+    if isinstance(proposer_count, bool) or not isinstance(proposer_count, int):
+        raise ValueError("proposer_count must be a non-negative integer")
+    if proposer_count < 0:
+        raise ValueError("proposer_count must be a non-negative integer")
+    return (2 * proposer_count + 2) // 3 if proposer_count else 0
+
+
+def agent_finalization_policy_from_args(
+    args: argparse.Namespace,
+) -> dict[str, int | bool]:
+    return normalized_agent_finalization_policy(
+        {
+            field_name: getattr(
+                args,
+                field_name,
+                DEFAULT_AGENT_FINALIZATION_POLICY[field_name],
+            )
+            for field_name in AGENT_FINALIZATION_POLICY_FIELDS
+        }
+    )
+
+
+def normalize_agent_runner_args(
+    args: argparse.Namespace,
+) -> dict[str, int | bool]:
+    raw_max_iterations = getattr(
+        args,
+        "agent_max_iterations",
+        DEFAULT_AGENT_MAX_ITERATIONS,
+    )
+    if raw_max_iterations is None:
+        raw_max_iterations = DEFAULT_AGENT_MAX_ITERATIONS
+    if isinstance(raw_max_iterations, bool) or not isinstance(raw_max_iterations, int):
+        raise ValueError("agent_max_iterations must be an integer >= 0")
+    if raw_max_iterations < 0:
+        raise ValueError("agent_max_iterations must be an integer >= 0")
+    args.agent_max_iterations = raw_max_iterations
+    policy = agent_finalization_policy_from_args(args)
+    for field_name, value in policy.items():
+        setattr(args, field_name, value)
+    return policy
 
 
 def apply_b2_g12_argument_alignment(
@@ -231,15 +351,13 @@ def apply_b2_g12_argument_alignment(
 ) -> dict[str, Any] | None:
     """Load the composable JSON profile and apply its run-wide settings."""
 
-    uses_b2_config = any(GROUP_SPECS[group].get("experiment_config") for group in groups)
     config_requested = bool(
         getattr(args, "experiment_config", None)
         or getattr(args, "experiment_config_override", None)
         or getattr(args, "experiment_config_set", None)
     )
-    if not uses_b2_config:
-        if config_requested:
-            raise ValueError("DRACO experiment config overrides currently require group B2")
+    uses_global_profile = bool(GLOBAL_EXPERIMENT_PROFILE_GROUPS.intersection(groups))
+    if not uses_global_profile and not config_requested:
         return None
 
     base_path = Path(getattr(args, "experiment_config", None) or DEFAULT_B2_EXPERIMENT_CONFIG_PATH)
@@ -259,6 +377,14 @@ def apply_b2_g12_argument_alignment(
         "expand_ensemble_timeouts_to_task_timeout": False,
         "runner_mode": config.runner.mode,
         "agent_max_iterations": config.runner.agent_max_iterations,
+        **{
+            field_name: getattr(
+                config.runner,
+                field_name,
+                DEFAULT_AGENT_FINALIZATION_POLICY[field_name],
+            )
+            for field_name in AGENT_FINALIZATION_POLICY_FIELDS
+        },
         "judge_model": config.judge.model,
         "judge_repeats": config.judge.repeats,
         "judge_concurrency": config.judge.concurrency,
@@ -275,21 +401,33 @@ def apply_b2_g12_argument_alignment(
         "openrouter_web_fetch_max_content_tokens": (config.tools.web_fetch.max_content_tokens),
     }
     requested = {key: getattr(args, key, None) for key in overrides}
+    overridden = {
+        key: {"requested": requested[key], "effective": value}
+        for key, value in overrides.items()
+        if requested[key] != value
+    }
     for key, value in overrides.items():
         setattr(args, key, value)
+    effective_sources = dict(getattr(args, "_effective_argument_sources", {}) or {})
+    effective_sources.update({key: "experiment_config" for key in overrides})
+    args._effective_argument_sources = effective_sources
     args.experiment_config = bundle.base_path
     args._draco_experiment_config_bundle = bundle
     record = {
         "id": config.profile_id,
         "reference": config.reference.model_dump(mode="json"),
-        "scope": "G12 execution configuration on the current runtime implementation",
+        "scope": "Shared DRACO execution profile; B2 ensemble mapping remains B2-only",
         "config_provenance": bundle.provenance(),
         "effective_config": config.model_dump(mode="json"),
         "requested_args": requested,
         "effective_args": dict(overrides),
+        "effective_arg_sources": {key: "experiment_config" for key in overrides},
+        "overridden_args": overridden,
     }
     alignments = dict(getattr(args, "_benchmark_alignments", {}) or {})
-    alignments["B2"] = record
+    alignments["global_experiment_profile"] = record
+    if "B2" in groups:
+        alignments["B2"] = record
     args._benchmark_alignments = alignments
     return record
 
@@ -401,6 +539,7 @@ class DryProvider:
             input_tokens=max(1, len(prompt) // 4),
             output_tokens=max(1, len(text) // 4),
             model=self.model,
+            provider="dry",
             cost_source="none",
         )
 
@@ -418,34 +557,65 @@ class DryEnsembleProvider:
         profile: str,
         proposer_models: list[str] | None = None,
         model: str = "dry-aggregator",
+        selection_mode: str = "",
     ) -> None:
         self.group = group
         self.profile = profile
         self.model = model
         self.proposer_models = proposer_models or ["dry-proposer-a", "dry-proposer-b"]
+        self.selection_mode = selection_mode or profile
+        self.selection_plan: dict[str, Any] = {}
 
     async def chat(self, messages: list[Message], tools=None, config=None):  # noqa: ANN001
         prompt = str(messages[-1].content if messages else "")
-        candidates: list[dict[str, Any]] = [
-            {
-                "index": index,
-                "sample_index": 0,
-                "label": f"proposer_{index + 1}",
-                "provider": "dry",
-                "model": model,
-                "ok": True,
-                "text": f"Candidate {index + 1} for {prompt[:80]}",
-                "input_tokens": 10 + index,
-                "output_tokens": 8,
-                "billed_cost": 0.0,
-                "cost_source": "none",
-            }
-            for index, model in enumerate(self.proposer_models)
-        ]
+        sample_indexes: dict[str, int] = {}
+        candidates: list[dict[str, Any]] = []
+        selected_p = self.selection_plan.get("selected_P")
+        selected_identities = selected_p if isinstance(selected_p, list) else []
+        for index, model in enumerate(self.proposer_models):
+            sample_index = sample_indexes.get(model, 0)
+            sample_indexes[model] = sample_index + 1
+            identity = (
+                selected_identities[index]
+                if index < len(selected_identities)
+                and isinstance(selected_identities[index], str)
+                else f"dry:{model}"
+            )
+            provider, separator, selected_model = identity.partition(":")
+            provider = provider.strip() if separator else "dry"
+            selected_model = selected_model.strip() if separator else model
+            candidate_text = f"Candidate {index + 1} for {prompt[:80]}"
+            candidates.append(
+                {
+                    "index": index,
+                    "sample_index": sample_index,
+                    "label": f"proposer_{index + 1}",
+                    "provider": provider,
+                    "requested_provider": provider,
+                    "model": selected_model,
+                    "requested_model": selected_model,
+                    "ok": True,
+                    "request_started": True,
+                    "physical_request_count": 1,
+                    "usage_reported": True,
+                    "stop_reason": "stop",
+                    "content": {
+                        "text": candidate_text,
+                        "chars": len(candidate_text),
+                        "truncated": False,
+                    },
+                    "text": candidate_text,
+                    "input_tokens": 10 + index,
+                    "output_tokens": 8,
+                    "billed_cost": 0.0,
+                    "cost_source": "none",
+                }
+            )
         text = f"[dry:{self.group}:{self.profile}] fused answer for {prompt[:120]}"
         proposer_usage = [
             {
                 "role": "proposer",
+                "provider": candidate["provider"],
                 "model": candidate["model"],
                 "input_tokens": candidate["input_tokens"],
                 "output_tokens": candidate["output_tokens"],
@@ -457,14 +627,19 @@ class DryEnsembleProvider:
             for candidate in candidates
         ]
         yield TextDeltaEvent(text=text)
+        aggregator_provider = str(
+            self.selection_plan.get("selected_A") or "dry:"
+        ).partition(":")[0].strip() or "dry"
         yield DoneEvent(
             input_tokens=sum(int(candidate["input_tokens"]) for candidate in candidates) + 21,
             output_tokens=max(1, len(text) // 4),
             model=self.model,
+            provider=aggregator_provider,
             model_usage_breakdown=[
                 *proposer_usage,
                 {
                     "role": "aggregator",
+                    "provider": aggregator_provider,
                     "model": self.model,
                     "input_tokens": 21,
                     "output_tokens": max(1, len(text) // 4),
@@ -477,6 +652,8 @@ class DryEnsembleProvider:
             ensemble_trace={
                 "mode": "b5_fusion",
                 "profile": self.profile,
+                "selection_strategy": self.selection_mode,
+                "selection_plan": dict(self.selection_plan),
                 "successful_proposers": len(candidates),
                 "total_candidates": len(candidates),
                 "fallback_used": False,
@@ -485,6 +662,24 @@ class DryEnsembleProvider:
                 "proposer_tools": getattr(self, "proposer_tools", False),
                 "aggregator_tools": getattr(self, "aggregator_tools", True),
                 "final_request_role": "aggregator",
+                "final_request": {
+                    "role": "aggregator",
+                    "request_started": True,
+                    "execution": {
+                        "provider": aggregator_provider,
+                        "model": self.model,
+                    },
+                    "usage": {
+                        "provider": aggregator_provider,
+                        "model": self.model,
+                        "stop_reason": "stop",
+                    },
+                    "output": {
+                        "text": text,
+                        "chars": len(text),
+                        "truncated": False,
+                    },
+                },
                 "llm_request_count": len(candidates) + 1,
             },
         )
@@ -495,6 +690,7 @@ class DryEnsembleProvider:
 
 def load_tasks(path: Path, *, max_tasks: int = 0) -> list[dict[str, Any]]:
     tasks: list[dict[str, Any]] = []
+    task_id_lines: dict[str, int] = {}
     for lineno, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
         line = raw.strip()
         if not line:
@@ -504,6 +700,13 @@ def load_tasks(path: Path, *, max_tasks: int = 0) -> list[dict[str, Any]]:
         prompt = str(payload.get("prompt") or payload.get("problem") or "").strip()
         if not task_id or not prompt:
             raise ValueError(f"{path}:{lineno} requires non-empty id/task_id and prompt/problem")
+        prior_lineno = task_id_lines.get(task_id)
+        if prior_lineno is not None:
+            raise ValueError(
+                f"{path}:{lineno} duplicate task id {task_id!r}; "
+                f"first declared on line {prior_lineno}"
+            )
+        task_id_lines[task_id] = lineno
         payload["id"] = task_id
         payload["prompt"] = prompt
         if "rubric" in payload:
@@ -518,10 +721,47 @@ def load_tasks(path: Path, *, max_tasks: int = 0) -> list[dict[str, Any]]:
 
 def parse_groups(raw: str) -> list[str]:
     groups = [item.strip().upper() for item in raw.split(",") if item.strip()]
+    if not groups:
+        raise ValueError("--groups must contain at least one experiment group")
     unknown = [group for group in groups if group not in GROUP_SPECS]
     if unknown:
         raise ValueError(f"unknown group(s): {', '.join(unknown)}")
+    duplicates = sorted(group for group in set(groups) if groups.count(group) > 1)
+    if duplicates:
+        raise ValueError(f"duplicate group(s): {', '.join(duplicates)}")
     return groups
+
+
+def result_key_coverage(
+    rows: list[dict[str, Any]],
+    *,
+    expected_keys: set[tuple[str, str]],
+) -> dict[str, Any]:
+    """Audit exact one-row coverage for every normalized group/task key."""
+
+    counts: dict[tuple[str, str], int] = {}
+    for row in rows:
+        key = (
+            str(row.get("group") or "").strip().upper(),
+            str(row.get("task_id") or "").strip(),
+        )
+        counts[key] = counts.get(key, 0) + 1
+    actual_keys = set(counts)
+    missing = sorted(expected_keys - actual_keys)
+    unexpected = sorted(actual_keys - expected_keys)
+    duplicates = sorted(key for key, count in counts.items() if count > 1)
+    row = {
+        "pass": not missing and not unexpected and not duplicates,
+        "expected_row_count": len(expected_keys),
+        "actual_row_count": len(rows),
+        "actual_unique_key_count": len(actual_keys),
+        "missing_keys": [list(key) for key in missing],
+        "unexpected_keys": [list(key) for key in unexpected],
+        "duplicate_keys": [
+            {"key": list(key), "count": counts[key]} for key in duplicates
+        ],
+    }
+    return row
 
 
 def normalize_domain(value: Any) -> str:
@@ -798,9 +1038,7 @@ def benchmark_tool_policy(args: argparse.Namespace | None = None) -> dict[str, A
                     "max_content_chars": approx_chars_for_content_tokens(
                         local_fetch_max_content_tokens
                     ),
-                    "allow_firecrawl": bool(
-                        getattr(args, "allow_firecrawl_web_fetch", False)
-                    ),
+                    "allow_firecrawl": bool(getattr(args, "allow_firecrawl_web_fetch", False)),
                 },
             },
             "contamination_blocked_domains": blocked_domains,
@@ -876,9 +1114,7 @@ def validate_tool_mode_for_runner(
             "tool calls are executed rather than only forwarded to the provider."
         )
     if tool_mode == TOOL_MODE_OPENROUTER_SERVER_TOOLS and runner_mode != RUNNER_MODE_PROVIDER:
-        raise ValueError(
-            "--tool-mode=openrouter_server_tools requires --runner-mode=provider."
-        )
+        raise ValueError("--tool-mode=openrouter_server_tools requires --runner-mode=provider.")
 
 
 def benchmark_tool_policy_for_group(
@@ -1480,9 +1716,7 @@ async def run_local_web_tools_preflight(
                 ) from exc
             detail = str(result.content or "")[:500]
             if result.is_error:
-                raise RuntimeError(
-                    f"DRACO local web tool {tool_name} preflight failed: {detail}"
-                )
+                raise RuntimeError(f"DRACO local web tool {tool_name} preflight failed: {detail}")
             try:
                 payload = json.loads(result.content)
             except (TypeError, json.JSONDecodeError) as exc:
@@ -1502,9 +1736,7 @@ async def run_local_web_tools_preflight(
                 or "denied" in reason
                 or "policy" in reason
             ):
-                raise RuntimeError(
-                    f"DRACO local web tool {tool_name} preflight failed: {detail}"
-                )
+                raise RuntimeError(f"DRACO local web tool {tool_name} preflight failed: {detail}")
             return payload
 
         search_payload = await _call(
@@ -1517,9 +1749,7 @@ async def run_local_web_tools_preflight(
             or not isinstance(search_results, list)
             or not search_results
         ):
-            raise RuntimeError(
-                "DRACO local web tool web_search preflight returned invalid results"
-            )
+            raise RuntimeError("DRACO local web tool web_search preflight returned invalid results")
         if not any(
             isinstance(item, dict)
             and urlparse(str(item.get("url") or "")).scheme in {"http", "https"}
@@ -1795,10 +2025,15 @@ def align_b2_provider_to_g12(
             "k": provider.aggregator.k,
         }
     )
-    proposer_models = [member.provider_config.model for member in provider.proposers]
+    proposer_models = [
+        member.provider_config.model
+        for member in provider.proposers
+        for _ in range(max(1, int(member.k or 1)))
+    ]
     selected_proposers = [
         f"{member.provider_config.provider}:{member.provider_config.model}"
         for member in provider.proposers
+        for _ in range(max(1, int(member.k or 1)))
     ]
     aggregator_model = provider.aggregator.provider_config.model
     selected_aggregator = f"{provider.aggregator.provider_config.provider}:{aggregator_model}"
@@ -1837,6 +2072,25 @@ def align_b2_provider_to_g12(
         "require_highest_thinking": experiment.generation.require_highest_thinking,
         "member_generation": member_generation,
     }
+    return provider
+
+
+def enforce_draco_legal_proposer_quorum(provider: Any) -> Any:
+    """Apply the experiment's two-thirds proposer quorum to a live ensemble."""
+
+    proposers = list(getattr(provider, "proposers", []) or [])
+    proposer_count = sum(max(1, int(getattr(member, "k", 1) or 1)) for member in proposers)
+    if proposer_count <= 0:
+        return provider
+    required = legal_proposer_quorum(proposer_count)
+    configured = int(getattr(provider, "min_successful_proposers", 1) or 1)
+    provider.min_successful_proposers = required
+    selection_plan = dict(getattr(provider, "selection_plan", {}) or {})
+    selection_plan.setdefault("configured_min_successful_proposers", configured)
+    selection_plan["effective_min_successful_proposers"] = required
+    selection_plan["legal_min_successful_proposers"] = required
+    selection_plan["legal_quorum_policy"] = "ceil(2*n/3)"
+    provider.selection_plan = selection_plan
     return provider
 
 
@@ -1933,9 +2187,9 @@ def validate_strict_openrouter_ensemble_members(
     strict_routing = os.environ.get("OPENSQUILLA_PROVIDER_ROUTING_STRICT", "").strip().lower()
     truthy = {"1", "true", "yes", "on", "enabled"}
     strict_routing_enabled = strict_routing in truthy
-    require_parameters = os.environ.get(
-        "OPENSQUILLA_OPENROUTER_REQUIRE_PARAMETERS", ""
-    ).strip().lower()
+    require_parameters = (
+        os.environ.get("OPENSQUILLA_OPENROUTER_REQUIRE_PARAMETERS", "").strip().lower()
+    )
     require_parameters_enabled = require_parameters in truthy
     requests: list[tuple[ProviderConfig, str]] = [
         (member.provider_config, str(member.thinking or ""))
@@ -1961,9 +2215,7 @@ def validate_strict_openrouter_ensemble_members(
                     f"frozen thinking={thinking!r}"
                 )
         if strict_routing_enabled and model not in cfg.provider_routing:
-            raise ValueError(
-                f"OpenRouter model {model!r} has no strict upstream provider pin"
-            )
+            raise ValueError(f"OpenRouter model {model!r} has no strict upstream provider pin")
         if strict_routing_enabled and not require_parameters_enabled:
             raise ValueError(
                 "strict OpenRouter routing requires parameter compatibility enforcement"
@@ -2143,32 +2395,90 @@ def clamp_percent(value: float) -> float:
     return max(0.0, min(100.0, float(value)))
 
 
+LEGACY_JUDGE_SCORE_KEYS = (
+    "accuracy",
+    "completeness",
+    "objectivity",
+    "citation",
+)
+
+
+def valid_legacy_judge_scores(result: Mapping[str, Any]) -> dict[str, float] | None:
+    scores = result.get("scores")
+    if not isinstance(scores, Mapping) or set(scores) != set(LEGACY_JUDGE_SCORE_KEYS):
+        return None
+    validated: dict[str, float] = {}
+    for key in LEGACY_JUDGE_SCORE_KEYS:
+        value = scores.get(key)
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            return None
+        score = float(value)
+        if not math.isfinite(score) or score < 1.0 or score > 5.0:
+            return None
+        validated[key] = score
+    return validated
+
+
 def normalize_legacy_judge_result(result: dict[str, Any]) -> dict[str, Any]:
     normalized = dict(result)
     normalized.setdefault("mode", "legacy_dimension_score")
     normalized["score_scale"] = "0-100"
 
-    scores = normalized.get("scores")
-    score_values: list[float] = []
-    if isinstance(scores, dict):
-        score_values = [float(value) for value in scores.values() if isinstance(value, int | float)]
-
+    scores = valid_legacy_judge_scores(normalized)
     raw_total = normalized.get("total")
-    if isinstance(raw_total, int | float):
+    if isinstance(raw_total, int | float) and not isinstance(raw_total, bool):
         normalized["raw_total"] = float(raw_total)
 
-    normalized_score: float | None = None
-    if score_values:
-        max_score = len(score_values) * 5.0
-        normalized_score = sum(score_values) / max_score * 100.0 if max_score else None
-    elif isinstance(raw_total, int | float):
-        raw_float = float(raw_total)
-        normalized_score = raw_float if raw_float > 20.0 else raw_float / 20.0 * 100.0
-
-    if normalized_score is not None:
+    if scores is not None:
+        normalized["scores"] = scores
+        normalized_score = sum(scores.values()) / 20.0 * 100.0
         normalized["normalized_score"] = clamp_percent(normalized_score)
         normalized["total"] = normalized["normalized_score"]
+        normalized["score_status"] = "complete"
+        normalized["judge_error_count"] = 0
+        normalized.pop("error", None)
+    else:
+        normalized["normalized_score"] = None
+        normalized["total"] = None
+        normalized["score_status"] = "incomplete"
+        normalized["judge_error_count"] = max(
+            1,
+            coerce_metric_int(normalized.get("judge_error_count")),
+        )
+        normalized["error"] = "judge_json_schema_invalid"
     return normalized
+
+
+def judge_completion_reasons(
+    row: Mapping[str, Any],
+    *,
+    judge_required: bool,
+) -> list[str]:
+    """Return Judge-only incompleteness reasons for a stored result row."""
+
+    if not judge_required:
+        return []
+    judge = row.get("judge")
+    reasons: list[str] = []
+    if not isinstance(judge, Mapping):
+        return ["judge_incomplete", "judge_errors", "missing_quality_total"]
+
+    if judge.get("score_status") != "complete" or quality_total(dict(judge)) is None:
+        reasons.append("judge_incomplete")
+    if judge.get("error") or coerce_metric_int(judge.get("judge_error_count")) != 0:
+        reasons.append("judge_errors")
+    expected_quality = quality_total(dict(judge))
+    stored_quality = row.get("quality_total")
+    if isinstance(stored_quality, bool) or not isinstance(stored_quality, int | float):
+        reasons.append("missing_quality_total")
+    elif expected_quality is None or not math.isclose(
+        float(stored_quality),
+        float(expected_quality),
+        rel_tol=0.0,
+        abs_tol=1e-9,
+    ):
+        reasons.append("quality_total_mismatch")
+    return reasons
 
 
 def inherited_provider_config(config: GatewayConfig) -> ProviderConfig:
@@ -2248,11 +2558,17 @@ def task_analyzer_usage_row(
             "usage_unknown": not bool(usage),
         }
     )
-    return {
+    row = {
         "role": "task_analyzer",
         "label": "task_analyzer",
-        "provider": provider_id,
-        "model": model_id,
+        "provider": str(usage.get("provider") or ""),
+        "model": str(usage.get("model") or ""),
+        "requested_provider": str(
+            usage.get("requested_provider") or provider_id or ""
+        ),
+        "requested_model": str(
+            usage.get("requested_model") or model_id or ""
+        ),
         "input_tokens": int(usage.get("input_tokens") or 0),
         "output_tokens": int(usage.get("output_tokens") or 0),
         "reasoning_tokens": int(usage.get("reasoning_tokens") or 0),
@@ -2262,6 +2578,16 @@ def task_analyzer_usage_row(
         "cost_source": str(usage.get("cost_source") or "none"),
         "provider_usage": provider_usage,
     }
+    billing_receipt = usage.get("billing_receipt", usage.get("billingReceipt"))
+    if billing_receipt is not None:
+        row["billing_receipt"] = billing_receipt
+    row["billed_cost"] = trusted_provider_billed_cost(row)
+    exact_cost = exact_provider_usage_cost(row)
+    if exact_cost is not None:
+        row["cost_source"] = "provider_billed"
+    elif billing_receipt is not None:
+        row["cost_source"] = "unavailable"
+    return row
 
 
 async def build_experiment_provider(
@@ -2296,7 +2622,11 @@ async def build_experiment_provider(
                     else spec["selection_mode"]
                 ),
                 proposer_models=(
-                    [member.model for member in b2_experiment.ensemble.proposers]
+                    [
+                        member.model
+                        for member in b2_experiment.ensemble.proposers
+                        for _ in range(max(1, int(member.k or 1)))
+                    ]
                     if b2_experiment is not None
                     else None
                 ),
@@ -2305,10 +2635,11 @@ async def build_experiment_provider(
                     if b2_experiment is not None
                     else "dry-aggregator"
                 ),
+                selection_mode=str(spec.get("selection_mode") or ""),
             )
             if b2_experiment is not None:
-                dry_provider.min_successful_proposers = (
-                    b2_experiment.ensemble.min_successful_proposers
+                dry_provider.min_successful_proposers = legal_proposer_quorum(
+                    len(dry_provider.proposer_models)
                 )
                 dry_provider.proposer_timeout_seconds = b2_experiment.timeouts.proposer_seconds
                 dry_provider.aggregator_timeout_seconds = b2_experiment.timeouts.aggregator_seconds
@@ -2322,10 +2653,15 @@ async def build_experiment_provider(
             **dict(spec),
         }
         if b2_experiment is not None:
-            proposer_models = [member.model for member in b2_experiment.ensemble.proposers]
+            proposer_models = [
+                member.model
+                for member in b2_experiment.ensemble.proposers
+                for _ in range(max(1, int(member.k or 1)))
+            ]
             selected_proposers = [
                 f"{member.provider.strip().lower()}:{member.model}"
                 for member in b2_experiment.ensemble.proposers
+                for _ in range(max(1, int(member.k or 1)))
             ]
             aggregator = b2_experiment.ensemble.aggregator
             member_generation = [
@@ -2353,7 +2689,7 @@ async def build_experiment_provider(
                             b2_experiment.ensemble.min_successful_proposers
                         ),
                         "effective_min_successful_proposers": (
-                            b2_experiment.ensemble.min_successful_proposers
+                            legal_proposer_quorum(len(proposer_models))
                         ),
                         "effective_proposer_timeout_seconds": (
                             b2_experiment.timeouts.proposer_seconds
@@ -2369,6 +2705,7 @@ async def build_experiment_provider(
                     },
                 }
             )
+            dry_provider.selection_plan = dict(dry_routing_trace["selection_plan"])
         result = ProviderBuildResult(
             provider=dry_provider,
             prompt=prompt,
@@ -2594,6 +2931,7 @@ async def build_experiment_provider(
         )
         if b2_experiment is not None:
             provider = align_b2_provider_to_g12(provider, b2_experiment)
+        provider = enforce_draco_legal_proposer_quorum(provider)
         if generation_policy is not None:
             provider = apply_generation_policy_to_ensemble_provider(
                 provider,
@@ -2697,6 +3035,223 @@ def build_profile_provider(
     )
 
 
+def _consume_background_task(task: asyncio.Future[Any]) -> None:
+    with contextlib.suppress(BaseException):
+        task.result()
+
+
+_BENCHMARK_OWNER_CLEANUP_STATE: dict[int, dict[str, Any]] = {}
+
+
+def _benchmark_owner_state(owner: Any) -> dict[str, Any]:
+    key = id(owner)
+    state = _BENCHMARK_OWNER_CLEANUP_STATE.get(key)
+    if state is None or state.get("owner") is not owner:
+        state = {"owner": owner, "pending": set(), "poisoned_reason": ""}
+        _BENCHMARK_OWNER_CLEANUP_STATE[key] = state
+    return state
+
+
+def _benchmark_owner_cleanup_reason(owner: Any) -> str:
+    state = _benchmark_owner_state(owner)
+    poisoned = str(state.get("poisoned_reason") or "")
+    if poisoned:
+        return poisoned
+    pending = state.get("pending")
+    if pending:
+        return "owned_cleanup_in_progress"
+    _BENCHMARK_OWNER_CLEANUP_STATE.pop(id(owner), None)
+    return ""
+
+
+def _poison_benchmark_owner(owner: Any, reason: str) -> None:
+    _benchmark_owner_state(owner)["poisoned_reason"] = reason
+
+
+def _track_benchmark_owner_cleanup(
+    owner: Any,
+    task: asyncio.Future[Any],
+    *,
+    reason: str,
+) -> None:
+    pending = _benchmark_owner_state(owner)["pending"]
+    pending.add(task)
+
+    def _finished(done: asyncio.Future[Any]) -> None:
+        pending.discard(done)
+        _observe_benchmark_cleanup_result(owner, done, reason=reason)
+        state = _BENCHMARK_OWNER_CLEANUP_STATE.get(id(owner))
+        if (
+            state is not None
+            and not state.get("pending")
+            and not state.get("poisoned_reason")
+        ):
+            _BENCHMARK_OWNER_CLEANUP_STATE.pop(id(owner), None)
+
+    task.add_done_callback(_finished)
+
+
+class _RunnerStreamCloseError(RuntimeError):
+    pass
+
+
+def _observe_benchmark_cleanup_result(
+    owner: Any,
+    task: asyncio.Future[Any],
+    *,
+    reason: str,
+) -> None:
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        # Expected after timeout: cancellation is safe only because the
+        # consumer's owned close path has now completed.
+        return
+    except _RunnerStreamCloseError:
+        _poison_benchmark_owner(owner, reason)
+    except BaseException:
+        # The owned stream wrapper already ran its close path before exposing
+        # any unrelated consumer exception.
+        return
+
+
+async def _close_runner_stream(stream_iter: Any, stream: Any) -> None:
+    lookup_errors: list[BaseException] = []
+    candidates = [stream_iter]
+    if stream is not stream_iter:
+        candidates.append(stream)
+    for candidate in candidates:
+        try:
+            aclose = getattr(candidate, "aclose", None)
+        except BaseException as exc:
+            lookup_errors.append(exc)
+            continue
+        if not callable(aclose):
+            continue
+        try:
+            await aclose()
+        except BaseException as exc:
+            raise _RunnerStreamCloseError(
+                "provider_stream_close_failed: iterator aclose failed"
+            ) from exc
+        return
+    cause = lookup_errors[-1] if lookup_errors else None
+    error = _RunnerStreamCloseError(
+        "provider_stream_close_unavailable: iterator has no usable aclose"
+    )
+    if cause is not None:
+        raise error from cause
+    raise error
+
+
+async def _aclosing_events(stream: Any) -> Any:
+    try:
+        stream_iter = stream.__aiter__()
+    except BaseException as exc:
+        try:
+            await _close_runner_stream(stream, stream)
+        except _RunnerStreamCloseError:
+            raise
+        raise exc
+    exhausted = False
+    try:
+        while True:
+            try:
+                yield await stream_iter.__anext__()
+            except StopAsyncIteration:
+                exhausted = True
+                return
+    finally:
+        if exhausted:
+            return
+        await _close_runner_stream(stream_iter, stream)
+
+
+async def _await_benchmark_consumer(
+    consumer: Any,
+    *,
+    timeout: float,
+    owner: Any,
+) -> str:
+    """Own one stream consumer and bound cancellation cleanup.
+
+    Returns ``"timeout"`` when cancellation closed the stream, or
+    ``"cleanup_timeout"`` when the consumer remained alive after the bounded
+    close window.  The latter must suppress generation retries.
+    """
+
+    task = asyncio.create_task(consumer)
+    try:
+        if not timeout or timeout <= 0:
+            await task
+            return ""
+        done, _ = await asyncio.wait({task}, timeout=timeout)
+    except BaseException:
+        if not task.done():
+            task.cancel()
+            try:
+                cleaned, _ = await asyncio.wait(
+                    {task},
+                    timeout=max(0.0, RUNNER_STREAM_CLEANUP_TIMEOUT_SECONDS),
+                )
+            except BaseException:
+                _track_benchmark_owner_cleanup(
+                    owner,
+                    task,
+                    reason="external_cancel_cleanup_failed",
+                )
+                task.add_done_callback(_consume_background_task)
+                raise
+            if not cleaned:
+                _track_benchmark_owner_cleanup(
+                    owner,
+                    task,
+                    reason="external_cancel_cleanup_timeout",
+                )
+                task.add_done_callback(_consume_background_task)
+            else:
+                _observe_benchmark_cleanup_result(
+                    owner,
+                    task,
+                    reason="external_cancel_cleanup_failed",
+                )
+        else:
+            _observe_benchmark_cleanup_result(
+                owner,
+                task,
+                reason="external_cancel_cleanup_failed",
+            )
+        raise
+    if done:
+        try:
+            await task
+        except _RunnerStreamCloseError:
+            _poison_benchmark_owner(owner, "stream_close_failed")
+            raise
+        return ""
+    task.cancel()
+    cleaned, _ = await asyncio.wait(
+        {task},
+        timeout=max(0.0, RUNNER_STREAM_CLEANUP_TIMEOUT_SECONDS),
+    )
+    if not cleaned:
+        _track_benchmark_owner_cleanup(
+            owner,
+            task,
+            reason="stream_close_timeout",
+        )
+        task.add_done_callback(_consume_background_task)
+        return "cleanup_timeout"
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    except _RunnerStreamCloseError:
+        _poison_benchmark_owner(owner, "stream_close_failed")
+        raise
+    return "timeout"
+
+
 async def collect_run(
     provider: Any,
     prompt: str,
@@ -2724,90 +3279,127 @@ async def collect_run(
             }
         )
 
+    owner_cleanup_reason = _benchmark_owner_cleanup_reason(provider)
+    if owner_cleanup_reason:
+        error = (
+            "benchmark_owner_cleanup_in_progress: a prior stream owned by this "
+            "provider has not proved closure"
+        )
+        _trace(
+            "cleanup_in_progress",
+            code="benchmark_owner_cleanup_in_progress",
+            reason=owner_cleanup_reason,
+        )
+        return RunResult(
+            final_text="",
+            done=None,
+            error=error,
+            latency_ms=int((time.monotonic() - started) * 1000),
+            trace_events=trace_events,
+        )
+
     try:
         chat_config = (
             config.model_copy(update={"timeout": timeout})
             if config is not None
             else ChatConfig(timeout=timeout)
         )
-        stream = provider.chat(
-            messages,
-            tools=tools,
-            config=chat_config,
-        )
-
         async def _consume() -> None:
             nonlocal done, error, ttft_ms, tool_call_count
-            async for event in stream:
-                if isinstance(event, TextDeltaEvent):
-                    if ttft_ms is None and event.text:
-                        ttft_ms = int((time.monotonic() - started) * 1000)
-                        _trace("first_text_delta", text_chars=len(event.text))
-                    else:
-                        _trace("text_delta", text_chars=len(event.text))
-                    text_parts.append(event.text)
-                elif isinstance(event, ReasoningDeltaEvent):
-                    _trace("reasoning_delta", text_chars=len(event.text))
-                elif isinstance(event, ToolUseStartEvent):
-                    tool_call_count += 1
-                    _trace(
-                        "tool_use_start",
-                        tool_use_id=event.tool_use_id,
-                        tool_name=event.tool_name,
-                        synthetic_from_text=event.synthetic_from_text,
-                    )
-                elif isinstance(event, ToolUseDeltaEvent):
-                    _trace(
-                        "tool_use_delta",
-                        tool_use_id=event.tool_use_id,
-                        json_fragment_chars=len(event.json_fragment),
-                    )
-                elif isinstance(event, ToolUseEndEvent):
-                    _trace(
-                        "tool_use_end",
-                        tool_use_id=event.tool_use_id,
-                        tool_name=event.tool_name,
-                        argument_keys=sorted(event.arguments.keys()),
-                        synthetic_from_text=event.synthetic_from_text,
-                    )
-                elif isinstance(event, ProviderHeartbeatEvent):
-                    _trace(
-                        "provider_heartbeat",
-                        phase=event.phase,
-                        message=event.message,
-                    )
-                elif isinstance(event, DoneEvent):
-                    done = event
-                    _trace(
-                        "done",
-                        stop_reason=event.stop_reason,
-                        usage=done_payload(event),
-                        has_ensemble_trace=bool(event.ensemble_trace),
-                    )
-                elif isinstance(event, ErrorEvent):
-                    if done is None and isinstance(event.diagnostic_done, DoneEvent):
-                        done = event.diagnostic_done
+            stream = provider.chat(
+                messages,
+                tools=tools,
+                config=chat_config,
+            )
+            async with contextlib.aclosing(
+                _aclosing_events(stream)
+            ) as owned_stream:
+                async for event in owned_stream:
+                    if isinstance(event, TextDeltaEvent):
+                        if ttft_ms is None and event.text:
+                            ttft_ms = int((time.monotonic() - started) * 1000)
+                            _trace("first_text_delta", text_chars=len(event.text))
+                        else:
+                            _trace("text_delta", text_chars=len(event.text))
+                        text_parts.append(event.text)
+                    elif isinstance(event, ReasoningDeltaEvent):
+                        _trace("reasoning_delta", text_chars=len(event.text))
+                    elif isinstance(event, ToolUseStartEvent):
+                        tool_call_count += 1
                         _trace(
-                            "diagnostic_done",
-                            stop_reason=done.stop_reason,
-                            usage=done_payload(done),
-                            has_ensemble_trace=bool(done.ensemble_trace),
+                            "tool_use_start",
+                            tool_use_id=event.tool_use_id,
+                            tool_name=event.tool_name,
+                            synthetic_from_text=event.synthetic_from_text,
                         )
-                    error = event.message
-                    _trace("error", message=event.message, code=event.code)
-                    break
-                else:
-                    _trace("stream_event", event_type=type(event).__name__)
+                    elif isinstance(event, ToolUseDeltaEvent):
+                        _trace(
+                            "tool_use_delta",
+                            tool_use_id=event.tool_use_id,
+                            json_fragment_chars=len(event.json_fragment),
+                        )
+                    elif isinstance(event, ToolUseEndEvent):
+                        _trace(
+                            "tool_use_end",
+                            tool_use_id=event.tool_use_id,
+                            tool_name=event.tool_name,
+                            argument_keys=sorted(event.arguments.keys()),
+                            synthetic_from_text=event.synthetic_from_text,
+                        )
+                    elif isinstance(event, ProviderHeartbeatEvent):
+                        _trace(
+                            "provider_heartbeat",
+                            phase=event.phase,
+                            message=event.message,
+                        )
+                    elif isinstance(event, DoneEvent):
+                        done = event
+                        _trace(
+                            "done",
+                            stop_reason=event.stop_reason,
+                            usage=done_payload(event),
+                            has_ensemble_trace=bool(event.ensemble_trace),
+                        )
+                    elif isinstance(event, ErrorEvent):
+                        diagnostic_done = diagnostic_done_from_error_event(event)
+                        if done is None and diagnostic_done is not None:
+                            done = diagnostic_done
+                            _trace(
+                                "diagnostic_done",
+                                stop_reason=done.stop_reason,
+                                usage=done_payload(done),
+                                has_ensemble_trace=bool(done.ensemble_trace),
+                            )
+                        error = event.message
+                        _trace(
+                            "error",
+                            message=event.message,
+                            code=event.code,
+                            request_started=event.request_started,
+                            physical_request_count=event.physical_request_count,
+                        )
+                        break
+                    else:
+                        _trace("stream_event", event_type=type(event).__name__)
 
-        if timeout and timeout > 0:
-            try:
-                async with asyncio.timeout(timeout):
-                    await _consume()
-            except TimeoutError:
-                error = f"TimeoutError: run timed out after {timeout:g}s"
-                _trace("timeout", timeout_s=timeout)
-        else:
-            await _consume()
+        consume_outcome = await _await_benchmark_consumer(
+            _consume(),
+            timeout=timeout,
+            owner=provider,
+        )
+        if consume_outcome == "cleanup_timeout":
+            error = (
+                "provider_stream_close_timeout: provider stream did not close "
+                "within the bounded cleanup window"
+            )
+            _trace(
+                "cleanup_timeout",
+                code="provider_stream_close_timeout",
+                timeout_s=RUNNER_STREAM_CLEANUP_TIMEOUT_SECONDS,
+            )
+        elif consume_outcome == "timeout":
+            error = f"TimeoutError: run timed out after {timeout:g}s"
+            _trace("timeout", timeout_s=timeout)
     except Exception as exc:  # noqa: BLE001 - benchmark rows should keep going
         error = f"{type(exc).__name__}: {exc}"
         _trace("exception", error=error)
@@ -2833,7 +3425,7 @@ async def collect_run(
         latency_ms=int((time.monotonic() - started) * 1000) + setup_latency_ms,
         ttft_ms=(ttft_ms + setup_latency_ms if ttft_ms is not None else None),
         tool_call_count=tool_call_count,
-        trace_events=trace_events,
+        trace_events=copy.deepcopy(trace_events),
         setup_latency_ms=setup_latency_ms,
         setup_usage=setup_usage,
         routing_trace=routing_trace,
@@ -2890,9 +3482,11 @@ def agent_config_from_chat_config(
     timeout: float,
     model_id: str,
     max_iterations: int,
+    finalization_policy: Mapping[str, Any] | None = None,
 ) -> AgentConfig:
+    policy = normalized_agent_finalization_policy(finalization_policy)
     return AgentConfig(
-        max_iterations=max(0, int(max_iterations or 0)),
+        max_iterations=max(0, int(max_iterations)),
         timeout=timeout,
         iteration_timeout=timeout,
         request_timeout=(
@@ -2917,10 +3511,18 @@ def agent_config_from_chat_config(
         model_id=model_id,
         workspace_dir=str(ROOT),
         tool_result_external_keep_recent=3,
+        deadline_wrapup_margin_seconds=int(policy["deadline_wrapup_margin_seconds"]),
+        deadline_wrapup_disable_tools=bool(policy["deadline_wrapup_disable_tools"]),
+        deadline_thinking_off_margin_seconds=int(policy["deadline_thinking_off_margin_seconds"]),
+        max_iterations_includes_finalization=bool(policy["max_iterations_includes_finalization"]),
+        retrieval_loop_finalization_threshold=int(policy["retrieval_loop_finalization_threshold"]),
+        finalization_aggregator_only=bool(policy["finalization_aggregator_only"]),
+        finalization_disable_thinking=bool(policy["finalization_disable_thinking"]),
         metadata={
             "benchmark": "DRACO",
             "runner_mode": RUNNER_MODE_AGENT_LOOP,
             "tool_activity_heartbeat_interval": 30.0,
+            "agent_finalization_policy": dict(policy),
         },
     )
 
@@ -2929,9 +3531,18 @@ def llm_response_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [
         record
         for record in records
-        if record.get("kind") in {"llm_response", "llm_error"}
+        if record.get("kind") in {"llm_response", "llm_error", "llm_abandoned"}
         and isinstance(record.get("payload"), dict)
     ]
+
+
+def payload_physical_request_count(payload: Mapping[str, Any]) -> int | None:
+    value = payload.get("physical_request_count")
+    if isinstance(value, int) and not isinstance(value, bool):
+        return max(0, value)
+    if payload.get("request_started") is False:
+        return 0
+    return None
 
 
 def aggregate_agent_model_usage(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -2968,7 +3579,17 @@ def aggregate_agent_model_usage(records: list[dict[str, Any]]) -> list[dict[str,
 
         usage = payload.get("usage") if isinstance(payload, dict) else None
         if not isinstance(usage, dict):
-            append_unknown_usage(max(1, missing_usage_count))
+            explicit_request_count = payload_physical_request_count(payload)
+            append_unknown_usage(
+                max(
+                    (
+                        explicit_request_count
+                        if explicit_request_count is not None
+                        else 1
+                    ),
+                    missing_usage_count,
+                )
+            )
             continue
         breakdown = usage.get("model_usage_breakdown")
         if isinstance(breakdown, list) and breakdown:
@@ -2977,7 +3598,7 @@ def aggregate_agent_model_usage(records: list[dict[str, Any]]) -> list[dict[str,
                 for row in breakdown
                 if isinstance(row, dict)
                 and str(row.get("role") or "").strip().casefold()
-                == "abandoned_stream_request"
+                in MISSING_USAGE_PLACEHOLDER_ROLES
             )
             for row in breakdown:
                 if not isinstance(row, dict):
@@ -2991,43 +3612,129 @@ def aggregate_agent_model_usage(records: list[dict[str, Any]]) -> list[dict[str,
                 rows.append(enriched)
             append_unknown_usage(max(0, missing_usage_count - represented_missing_count))
             continue
-        rows.append(
-            {
-                "role": "agent_llm_call",
-                "agent_call_index": call_index,
-                "agent_iteration": coerce_metric_int(payload.get("iteration")),
-                "agent_call_attempt": coerce_metric_int(
-                    payload.get("attempt") or payload.get("call_attempt")
-                ),
-                "provider": str(usage.get("provider") or ""),
-                "model": str(usage.get("model") or ""),
-                "input_tokens": coerce_metric_int(usage.get("input_tokens")),
-                "output_tokens": coerce_metric_int(usage.get("output_tokens")),
-                "reasoning_tokens": coerce_metric_int(usage.get("reasoning_tokens")),
-                "cached_tokens": coerce_metric_int(usage.get("cached_tokens")),
-                "cache_write_tokens": coerce_metric_int(usage.get("cache_write_tokens")),
-                "billed_cost": float(usage.get("billed_cost") or 0.0),
-                "cost_source": str(usage.get("cost_source") or "none"),
-                "provider_usage": (
-                    dict(usage.get("provider_usage"))
-                    if isinstance(usage.get("provider_usage"), Mapping)
-                    else {}
-                ),
-            }
-        )
+        synthesized = {
+            "role": "agent_llm_call",
+            "agent_call_index": call_index,
+            "agent_iteration": coerce_metric_int(payload.get("iteration")),
+            "agent_call_attempt": coerce_metric_int(
+                payload.get("attempt") or payload.get("call_attempt")
+            ),
+            "provider": str(usage.get("provider") or ""),
+            "model": str(usage.get("model") or ""),
+            "requested_provider": str(
+                usage.get("requested_provider") or ""
+            ),
+            "requested_model": str(usage.get("requested_model") or ""),
+            "input_tokens": coerce_metric_int(usage.get("input_tokens")),
+            "output_tokens": coerce_metric_int(usage.get("output_tokens")),
+            "reasoning_tokens": coerce_metric_int(usage.get("reasoning_tokens")),
+            "cached_tokens": coerce_metric_int(usage.get("cached_tokens")),
+            "cache_write_tokens": coerce_metric_int(usage.get("cache_write_tokens")),
+            "billed_cost": float(usage.get("billed_cost") or 0.0),
+            "cost_source": str(usage.get("cost_source") or "none"),
+            "provider_usage": (
+                dict(usage.get("provider_usage"))
+                if isinstance(usage.get("provider_usage"), Mapping)
+                else {}
+            ),
+        }
+        billing_receipt = usage.get("billing_receipt", usage.get("billingReceipt"))
+        if billing_receipt is not None:
+            synthesized["billing_receipt"] = billing_receipt
+        rows.append(synthesized)
         append_unknown_usage(missing_usage_count)
     return rows
 
 
 def aggregate_agent_ensemble_trace(records: list[dict[str, Any]]) -> dict[str, Any]:
+    call_records = llm_response_records(records)
     traces: list[dict[str, Any]] = []
+    first_real_trace: dict[str, Any] | None = None
     total_llm_requests = 0
-    for call_index, record in enumerate(llm_response_records(records), start=1):
+    untraced_llm_requests = 0
+    for call_index, record in enumerate(call_records, start=1):
         payload = record["payload"]
         trace = payload.get("ensemble_trace") if isinstance(payload, dict) else None
+        if record.get("kind") == "llm_abandoned":
+            trace_requests = (
+                coerce_metric_int(trace.get("llm_request_count")) if isinstance(trace, dict) else 0
+            )
+            request_count = max(
+                1,
+                trace_requests,
+                coerce_metric_int(payload.get("usage_missing_count")),
+            )
+            untraced_llm_requests += request_count
+            traces.append(
+                {
+                    "request_outcome": "llm_abandoned",
+                    "agent_call_index": call_index,
+                    "agent_call_id": str(payload.get("call_id") or ""),
+                    "agent_iteration": coerce_metric_int(payload.get("iteration")),
+                    "agent_call_attempt": coerce_metric_int(payload.get("attempt")),
+                    "agent_call_duration_ms": coerce_metric_int(payload.get("duration_ms")),
+                    "trace_missing": True,
+                    "llm_request_count": request_count,
+                    "physical_request_count": request_count,
+                    "usage_missing_count": max(
+                        request_count,
+                        coerce_metric_int(payload.get("usage_missing_count")),
+                    ),
+                }
+            )
+            continue
         if not isinstance(trace, dict) or not trace:
+            usage = payload.get("usage") if isinstance(payload, dict) else None
+            breakdown = usage.get("model_usage_breakdown") if isinstance(usage, dict) else None
+            represented_missing = (
+                sum(
+                    1
+                    for item in breakdown
+                    if isinstance(item, dict)
+                    and str(item.get("role") or "").strip().casefold()
+                    in MISSING_USAGE_PLACEHOLDER_ROLES
+                )
+                if isinstance(breakdown, list)
+                else 0
+            )
+            observed = (
+                sum(1 for item in breakdown if isinstance(item, dict))
+                if isinstance(breakdown, list) and breakdown
+                else (1 if isinstance(usage, dict) and usage else 0)
+            )
+            missing = coerce_metric_int(
+                payload.get("usage_missing_count") if isinstance(payload, dict) else 0
+            )
+            inferred_count = observed + max(0, missing - represented_missing)
+            explicit_request_count = payload_physical_request_count(payload)
+            if explicit_request_count is not None:
+                request_count = max(explicit_request_count, inferred_count)
+            else:
+                # Older logs have no explicit start evidence. A response/error
+                # record conservatively represents at least one request.
+                request_count = max(1, inferred_count)
+            receipt_count = max(0, observed - represented_missing)
+            effective_missing = max(missing, request_count - receipt_count)
+            untraced_llm_requests += request_count
+            traces.append(
+                {
+                    "request_outcome": str(record.get("kind") or "unknown"),
+                    "agent_call_index": call_index,
+                    "agent_call_id": str(payload.get("call_id") or ""),
+                    "agent_iteration": coerce_metric_int(payload.get("iteration")),
+                    "agent_call_attempt": coerce_metric_int(payload.get("attempt")),
+                    "agent_call_duration_ms": coerce_metric_int(payload.get("duration_ms")),
+                    "trace_missing": True,
+                    "llm_request_count": request_count,
+                    "physical_request_count": request_count,
+                    "usage_missing_count": effective_missing,
+                }
+            )
             continue
         enriched = dict(trace)
+        if first_real_trace is None:
+            first_real_trace = enriched
+        enriched["request_outcome"] = str(record.get("kind") or "unknown")
         enriched["agent_call_index"] = call_index
         if payload.get("call_id") is not None:
             enriched["agent_call_id"] = str(payload.get("call_id"))
@@ -3035,14 +3742,33 @@ def aggregate_agent_ensemble_trace(records: list[dict[str, Any]]) -> dict[str, A
         enriched["agent_call_attempt"] = coerce_metric_int(payload.get("attempt"))
         enriched["agent_call_duration_ms"] = coerce_metric_int(payload.get("duration_ms"))
         traces.append(enriched)
-        total_llm_requests += coerce_metric_int(trace.get("llm_request_count"))
-    if not traces:
+        total_llm_requests += max(
+            0,
+            coerce_metric_int(
+                trace.get("physical_request_count")
+                if trace.get("physical_request_count") is not None
+                else trace.get("llm_request_count")
+            ),
+        )
+    if not call_records:
         return {}
-    first_trace = traces[0]
+    first_trace = first_real_trace or {}
     payload: dict[str, Any] = {
         "mode": "agent_loop",
-        "agent_llm_call_count": len(llm_response_records(records)),
-        "llm_request_count": total_llm_requests or len(llm_response_records(records)),
+        "agent_llm_call_count": len(call_records),
+        "untraced_agent_llm_call_count": sum(
+            1
+            for record in call_records
+            if record.get("kind") == "llm_abandoned"
+            or not isinstance(record.get("payload", {}).get("ensemble_trace"), dict)
+            or not record.get("payload", {}).get("ensemble_trace")
+        ),
+        "llm_request_count": total_llm_requests + untraced_llm_requests,
+        "physical_request_count": total_llm_requests + untraced_llm_requests,
+        "usage_missing_count": sum(
+            max(0, coerce_metric_int(call.get("usage_missing_count")))
+            for call in traces
+        ),
         "calls": traces,
     }
     for key in (
@@ -3074,29 +3800,149 @@ def provider_done_from_agent_done(
 ) -> DoneEvent | None:
     breakdown = aggregate_agent_model_usage(recorder.records)
     trace = aggregate_agent_ensemble_trace(recorder.records)
-    if done is None:
-        observed_rows = [
-            row
-            for row in breakdown
-            if row.get("role") != "agent_llm_request_unknown"
+    if done is not None:
+        done_rows = [
+            dict(row)
+            for row in getattr(done, "model_usage_breakdown", [])
+            if isinstance(row, Mapping)
         ]
-        if not observed_rows:
-            return None
-        sources = {
-            str(row.get("cost_source") or "none").strip().casefold()
+        if not done_rows and (
+            getattr(done, "billing_receipt", None) is not None
+            or getattr(done, "provider_usage", None)
+            or done.input_tokens
+            or done.output_tokens
+            or done.reasoning_tokens
+            or done.cached_tokens
+            or done.cache_write_tokens
+            or done.billed_cost
+        ):
+            done_rows = [
+                {
+                    "role": "agent_done",
+                    "provider": str(getattr(done, "provider", "") or ""),
+                    "model": str(getattr(done, "model", "") or ""),
+                    "requested_provider": str(
+                        getattr(done, "requested_provider", "") or ""
+                    ),
+                    "requested_model": str(
+                        getattr(done, "requested_model", "") or fallback_model
+                    ),
+                    "input_tokens": done.input_tokens,
+                    "output_tokens": done.output_tokens,
+                    "reasoning_tokens": done.reasoning_tokens,
+                    "cached_tokens": done.cached_tokens,
+                    "cache_write_tokens": done.cache_write_tokens,
+                    "billed_cost": done.billed_cost,
+                    "cost_source": done.cost_source,
+                    "provider_usage": dict(
+                        getattr(done, "provider_usage", {})
+                        if isinstance(getattr(done, "provider_usage", {}), Mapping)
+                        else {}
+                    ),
+                    **(
+                        {"billing_receipt": getattr(done, "billing_receipt")}
+                        if getattr(done, "billing_receipt", None) is not None
+                        else {}
+                    ),
+                }
+            ]
+        for done_row in done_rows:
+            candidates = [
+                (priority, index)
+                for index, row in enumerate(breakdown)
+                if (
+                    priority := usage_row_match_priority(row, done_row)
+                )
+                is not None
+            ]
+            if candidates:
+                merge_usage_receipt_provenance(
+                    breakdown[min(candidates)[1]],
+                    done_row,
+                )
+            else:
+                breakdown.append(done_row)
+        done_trace = (
+            dict(done.ensemble_trace)
+            if isinstance(done.ensemble_trace, Mapping)
+            else {}
+        )
+        if done_trace:
+            if not trace:
+                trace = done_trace
+            else:
+                for key, value in done_trace.items():
+                    trace.setdefault(key, value)
+                for key in (
+                    "llm_request_count",
+                    "physical_request_count",
+                    "usage_missing_count",
+                ):
+                    trace[key] = max(
+                        coerce_metric_int(trace.get(key)),
+                        coerce_metric_int(done_trace.get(key)),
+                    )
+    observed_rows = [
+        row
+        for row in breakdown
+        if str(row.get("role") or "").strip().casefold()
+        not in MISSING_USAGE_PLACEHOLDER_ROLES
+    ]
+    observed_providers = {
+        str(row.get("provider") or "").strip()
+        for row in observed_rows
+        if str(row.get("provider") or "").strip()
+    }
+    observed_models = {
+        str(row.get("model") or "").strip()
+        for row in observed_rows
+        if str(row.get("model") or "").strip()
+    }
+    observed_requested_providers = {
+        str(row.get("requested_provider") or "").strip()
+        for row in observed_rows
+        if str(row.get("requested_provider") or "").strip()
+    }
+    usage_missing_count = max(
+        sum(
+            1
             for row in breakdown
-        }
+            if str(row.get("role") or "").strip().casefold()
+            in MISSING_USAGE_PLACEHOLDER_ROLES
+        ),
+        coerce_metric_int(trace.get("usage_missing_count")) if trace else 0,
+        coerce_metric_int(
+            getattr(done, "usage_missing_count", 0) if done is not None else 0
+        ),
+    )
+    if done is not None and (breakdown or usage_missing_count):
+        represented_missing = sum(
+            1 for row in breakdown if usage_row_is_missing_placeholder(row)
+        )
+        physical_request_count = len(breakdown) + max(
+            0,
+            usage_missing_count - represented_missing,
+        )
+        trace = dict(trace or {})
+        trace["llm_request_count"] = max(
+            coerce_metric_int(trace.get("llm_request_count")),
+            physical_request_count,
+        )
+        trace["physical_request_count"] = max(
+            coerce_metric_int(trace.get("physical_request_count")),
+            physical_request_count,
+        )
+        trace["usage_missing_count"] = usage_missing_count
+    if done is None:
+        if not breakdown:
+            return None
+        sources = {str(row.get("cost_source") or "none").strip().casefold() for row in breakdown}
         if sources == {"provider_billed"}:
             envelope_source = "provider_billed"
         elif len(sources) == 1:
             envelope_source = next(iter(sources))
         else:
             envelope_source = "mixed"
-        providers = {
-            str(row.get("provider") or "").strip()
-            for row in observed_rows
-            if str(row.get("provider") or "").strip()
-        }
         return DoneEvent(
             stop_reason="error",
             input_tokens=sum(coerce_metric_int(row.get("input_tokens")) for row in breakdown),
@@ -3109,27 +3955,84 @@ def provider_done_from_agent_done(
                 coerce_metric_int(row.get("cache_write_tokens")) for row in breakdown
             ),
             billed_cost=sum(
-                float(row.get("billed_cost") or 0.0)
+                trusted_provider_billed_cost(row)
                 for row in breakdown
-                if str(row.get("cost_source") or "none").strip().casefold()
-                == "provider_billed"
             ),
-            model=str(observed_rows[-1].get("model") or fallback_model),
-            provider=next(iter(providers)) if len(providers) == 1 else "",
+            model=(
+                next(iter(observed_models))
+                if len(observed_models) == 1
+                else ""
+            ),
+            provider=(
+                next(iter(observed_providers))
+                if len(observed_providers) == 1
+                else ""
+            ),
             cost_source=envelope_source,
+            requested_model=fallback_model,
+            requested_provider=(
+                next(iter(observed_requested_providers))
+                if len(observed_requested_providers) == 1
+                else ""
+            ),
             model_usage_breakdown=breakdown,
             ensemble_trace=trace,
+            usage_missing_count=usage_missing_count,
             provider_usage={
                 "diagnostic_usage_only": True,
                 "agent_llm_call_count": len(llm_response_records(recorder.records)),
+                "requested_model": fallback_model,
+                "requested_provider": (
+                    next(iter(observed_requested_providers))
+                    if len(observed_requested_providers) == 1
+                    else ""
+                ),
             },
         )
     if trace:
         trace["agent_iterations"] = done.iterations
-    provider_usage: dict[str, Any] = {
+    provider_usage: dict[str, Any] = dict(
+        getattr(done, "provider_usage", {})
+        if isinstance(getattr(done, "provider_usage", {}), Mapping)
+        else {}
+    )
+    provider_usage.update({
         "agent_iterations": done.iterations,
         "agent_llm_call_count": len(llm_response_records(recorder.records)),
-    }
+        "provider_identity_source": (
+            "unique_model_usage_breakdown"
+            if len(observed_providers) == 1
+            else "unresolved"
+        ),
+        "requested_model": str(
+            getattr(done, "requested_model", "") or fallback_model
+        ),
+        "requested_provider": str(
+            getattr(done, "requested_provider", "") or ""
+        ),
+    })
+    done_provider = str(getattr(done, "provider", "") or "").strip()
+    done_model = str(getattr(done, "model", "") or "").strip()
+    provider = done_provider or (
+        next(iter(observed_providers))
+        if len(observed_providers) == 1
+        else ""
+    )
+    model = done_model or (
+        next(iter(observed_models))
+        if len(observed_models) == 1
+        else ""
+    )
+    requested_provider = str(
+        getattr(done, "requested_provider", "")
+        or (
+            next(iter(observed_requested_providers))
+            if len(observed_requested_providers) == 1
+            else ""
+        )
+        or ""
+    )
+    provider_usage["requested_provider"] = requested_provider
     provider_done = DoneEvent(
         stop_reason="stop",
         input_tokens=done.input_tokens,
@@ -3138,15 +4041,20 @@ def provider_done_from_agent_done(
         reasoning_tokens=done.reasoning_tokens,
         cached_tokens=done.cached_tokens,
         billed_cost=done.billed_cost,
-        model=done.model or fallback_model,
+        model=model,
+        provider=provider,
+        requested_model=str(
+            getattr(done, "requested_model", "") or fallback_model
+        ),
+        requested_provider=requested_provider,
         cache_write_tokens=done.cache_write_tokens,
         cost_source=done.cost_source,
         model_usage_breakdown=breakdown,
         ensemble_trace=trace,
+        usage_missing_count=usage_missing_count,
+        billing_receipt=getattr(done, "billing_receipt", None),
+        provider_usage=provider_usage,
     )
-    # provider_usage is a first-class field on the reference branch and an
-    # open compatibility attribute on the current dataclass.
-    setattr(provider_done, "provider_usage", provider_usage)
     return provider_done
 
 
@@ -3162,6 +4070,7 @@ async def collect_agent_run(
     group: str,
     output_dir: Path | None = None,
     max_iterations: int = DEFAULT_AGENT_MAX_ITERATIONS,
+    finalization_policy: Mapping[str, Any] | None = None,
 ) -> RunResult:
     text_parts: list[str] = []
     done: AgentDoneEvent | None = None
@@ -3180,6 +4089,25 @@ async def collect_agent_run(
                 "kind": kind,
                 **payload,
             }
+        )
+
+    owner_cleanup_reason = _benchmark_owner_cleanup_reason(provider)
+    if owner_cleanup_reason:
+        error = (
+            "benchmark_owner_cleanup_in_progress: a prior stream owned by this "
+            "provider has not proved closure"
+        )
+        _trace(
+            "cleanup_in_progress",
+            code="benchmark_owner_cleanup_in_progress",
+            reason=owner_cleanup_reason,
+        )
+        return RunResult(
+            final_text="",
+            done=None,
+            error=error,
+            latency_ms=int((time.monotonic() - started) * 1000),
+            trace_events=trace_events,
         )
 
     tool_registry: ToolRegistry | None = None
@@ -3203,6 +4131,7 @@ async def collect_agent_run(
             timeout=timeout,
             model_id=str(model_id or ""),
             max_iterations=max_iterations,
+            finalization_policy=finalization_policy,
         ),
         tool_definitions=tools,
         tool_handler=tool_handler,
@@ -3215,7 +4144,7 @@ async def collect_agent_run(
 
         async def _consume() -> None:
             nonlocal done, error, ttft_ms, tool_call_count
-            async for event in agent.run_turn(prompt):
+            async for event in _aclosing_events(agent.run_turn(prompt)):
                 if isinstance(event, AgentTextDeltaEvent):
                     if event.presentation == "answer":
                         if ttft_ms is None and event.text:
@@ -3261,9 +4190,7 @@ async def collect_agent_run(
                         tool_name=event.tool_name,
                         is_error=event.is_error,
                         result_chars=len(event.result or ""),
-                        execution_status=compact_provider_status(
-                            event.execution_status
-                        ),
+                        execution_status=compact_provider_status(event.execution_status),
                         diagnostic=compact_tool_result_diagnostic(event.result),
                     )
                 elif isinstance(event, AgentRunHeartbeatEvent):
@@ -3283,8 +4210,9 @@ async def collect_agent_run(
                     _trace("warning", code=event.code, message=event.message)
                 elif isinstance(event, AgentDoneEvent):
                     done = event
-                    if event.text and not "".join(text_parts).strip():
-                        text_parts.append(event.text)
+                    has_snapshot, authoritative_text = done_text_snapshot(event)
+                    if has_snapshot:
+                        text_parts[:] = [authoritative_text]
                     _trace(
                         "done",
                         usage={
@@ -3302,19 +4230,34 @@ async def collect_agent_run(
                     )
                 elif isinstance(event, AgentErrorEvent):
                     error = event.message
-                    _trace("error", message=event.message, code=event.code)
+                    _trace(
+                        "error",
+                        message=event.message,
+                        code=event.code,
+                        request_started=event.request_started,
+                        physical_request_count=event.physical_request_count,
+                    )
                 else:
                     _trace("agent_event", event_type=type(event).__name__)
 
-        if timeout and timeout > 0:
-            try:
-                async with asyncio.timeout(timeout):
-                    await _consume()
-            except TimeoutError:
-                error = f"TimeoutError: agent run timed out after {timeout:g}s"
-                _trace("timeout", timeout_s=timeout)
-        else:
-            await _consume()
+        consume_outcome = await _await_benchmark_consumer(
+            _consume(),
+            timeout=timeout,
+            owner=provider,
+        )
+        if consume_outcome == "cleanup_timeout":
+            error = (
+                "agent_stream_close_timeout: agent turn did not close "
+                "within the bounded cleanup window"
+            )
+            _trace(
+                "cleanup_timeout",
+                code="agent_stream_close_timeout",
+                timeout_s=RUNNER_STREAM_CLEANUP_TIMEOUT_SECONDS,
+            )
+        elif consume_outcome == "timeout":
+            error = f"TimeoutError: agent run timed out after {timeout:g}s"
+            _trace("timeout", timeout_s=timeout)
     except Exception as exc:  # noqa: BLE001 - benchmark rows should keep going
         error = f"{type(exc).__name__}: {exc}"
         _trace("exception", error=error)
@@ -3330,7 +4273,7 @@ async def collect_agent_run(
             "elapsed_ms": int((time.monotonic() - started) * 1000),
             "kind": "turn_call_log_summary",
             "llm_response_records": len(llm_response_records(recorder.records)),
-            "records": recorder.records,
+            "records": copy.deepcopy(recorder.records),
         }
     )
     setup = consume_provider_setup(provider)
@@ -3355,7 +4298,7 @@ async def collect_agent_run(
         latency_ms=int((time.monotonic() - started) * 1000) + setup_latency_ms,
         ttft_ms=(ttft_ms + setup_latency_ms if ttft_ms is not None else None),
         tool_call_count=tool_call_count,
-        trace_events=trace_events,
+        trace_events=copy.deepcopy(trace_events),
         setup_latency_ms=setup_latency_ms,
         setup_usage=setup_usage,
         routing_trace=routing_trace,
@@ -3415,12 +4358,33 @@ def llm_request_count_for_run(
 ) -> int:
     if not provider_attempted:
         return 0
+    traced = 0
     if done is not None and isinstance(done.ensemble_trace, dict):
-        traced = coerce_metric_int(done.ensemble_trace.get("llm_request_count"))
-        if traced:
-            return traced
+        traced = max(
+            coerce_metric_int(done.ensemble_trace.get("llm_request_count")),
+            coerce_metric_int(done.ensemble_trace.get("physical_request_count")),
+        )
     if done is not None and done.model_usage_breakdown:
-        return len(done.model_usage_breakdown)
+        represented_missing = sum(
+            1
+            for row in done.model_usage_breakdown
+            if isinstance(row, Mapping)
+            and str(row.get("role") or "").strip().casefold()
+            in MISSING_USAGE_PLACEHOLDER_ROLES
+        )
+        return max(
+            traced,
+            len(done.model_usage_breakdown)
+            + max(
+                0,
+                coerce_metric_int(done.usage_missing_count) - represented_missing,
+            ),
+        )
+    if done is not None:
+        return max(
+            traced,
+            1 + max(0, coerce_metric_int(done.usage_missing_count)),
+        )
     if spec.get("kind") == "single":
         return 1
     return 1
@@ -3432,6 +4396,10 @@ def done_payload(done: DoneEvent | None) -> dict[str, Any]:
     payload = {
         "provider": str(getattr(done, "provider", "") or ""),
         "model": done.model,
+        "requested_provider": str(
+            getattr(done, "requested_provider", "") or ""
+        ),
+        "requested_model": str(getattr(done, "requested_model", "") or ""),
         "stop_reason": done.stop_reason,
         "input_tokens": done.input_tokens,
         "output_tokens": done.output_tokens,
@@ -3440,15 +4408,406 @@ def done_payload(done: DoneEvent | None) -> dict[str, Any]:
         "cache_write_tokens": done.cache_write_tokens,
         "billed_cost": done.billed_cost,
         "cost_source": done.cost_source,
+        "usage_missing_count": max(
+            0,
+            coerce_metric_int(getattr(done, "usage_missing_count", 0)),
+        ),
         "provider_usage": getattr(done, "provider_usage", {}),
         "model_usage_breakdown": done.model_usage_breakdown,
         "reasoning_content_chars": len(done.reasoning_content or ""),
         "thinking_signature_present": bool(done.thinking_signature),
     }
+    billing_receipt = getattr(done, "billing_receipt", None)
+    if billing_receipt is not None:
+        payload["billing_receipt"] = billing_receipt
+    payload["billed_cost"] = trusted_provider_billed_cost(payload)
+    exact_cost = exact_provider_usage_cost(payload)
+    if exact_cost is not None:
+        payload["cost_source"] = "provider_billed"
+    elif billing_receipt is not None:
+        payload["cost_source"] = "unavailable"
     server_tool_use = server_tool_counts_from_usage_payload(payload)
     payload["server_tool_use"] = server_tool_use
     payload["server_tool_call_count"] = sum(server_tool_use.values())
     return payload
+
+
+def usage_row_is_missing_placeholder(row: Mapping[str, Any]) -> bool:
+    return (
+        str(row.get("role") or "").strip().casefold()
+        in MISSING_USAGE_PLACEHOLDER_ROLES
+    )
+
+
+def usage_row_response_ids(row: Mapping[str, Any]) -> frozenset[str]:
+    values: list[Any] = []
+    direct = row.get("response_id")
+    if direct is not None:
+        values.append(direct)
+    provider_usage = row.get("provider_usage")
+    if isinstance(provider_usage, Mapping):
+        response_ids = provider_usage.get("response_ids")
+        if isinstance(response_ids, (list, tuple, set, frozenset)):
+            values.extend(response_ids)
+        elif response_ids is not None:
+            values.append(response_ids)
+        response_id = provider_usage.get("response_id")
+        if response_id is not None:
+            values.append(response_id)
+    return frozenset(
+        str(value).strip()
+        for value in values
+        if str(value).strip()
+    )
+
+
+def usage_receipt_fingerprint(row: Mapping[str, Any]) -> tuple[Any, ...]:
+    return (
+        str(row.get("provider") or "").strip(),
+        str(row.get("model") or "").strip(),
+        coerce_metric_int(row.get("input_tokens")),
+        coerce_metric_int(row.get("output_tokens")),
+        coerce_metric_int(row.get("reasoning_tokens")),
+        coerce_metric_int(row.get("cached_tokens")),
+        coerce_metric_int(row.get("cache_write_tokens")),
+        float(row.get("billed_cost") or 0.0),
+        str(row.get("cost_source") or "none").strip().casefold(),
+    )
+
+
+def usage_row_match_priority(
+    left: Mapping[str, Any],
+    right: Mapping[str, Any],
+) -> int | None:
+    if usage_row_is_missing_placeholder(left) != usage_row_is_missing_placeholder(right):
+        return None
+    left_ids = usage_row_response_ids(left)
+    right_ids = usage_row_response_ids(right)
+    if left_ids and right_ids:
+        return 0 if left_ids & right_ids else None
+    if usage_receipt_fingerprint(left) != usage_receipt_fingerprint(right):
+        return None
+    return 1 if not left_ids and not right_ids else 2
+
+
+def merge_usage_receipt_provenance(
+    target: dict[str, Any],
+    source: Mapping[str, Any],
+) -> None:
+    target_ids = usage_row_response_ids(target)
+    source_ids = usage_row_response_ids(source)
+    stable_id_match = bool(target_ids and source_ids and target_ids & source_ids)
+    if stable_id_match:
+        for key in (
+            "provider",
+            "model",
+            "input_tokens",
+            "output_tokens",
+            "reasoning_tokens",
+            "cache_read_tokens",
+            "cached_tokens",
+            "cache_write_tokens",
+            "billed_cost",
+            "cost_source",
+            "billing_receipt",
+        ):
+            if key in source:
+                target[key] = source[key]
+    for key in (
+        "provider",
+        "model",
+        "requested_provider",
+        "requested_model",
+        "response_id",
+        "billing_receipt",
+    ):
+        if not target.get(key) and source.get(key):
+            target[key] = source[key]
+    source_usage = source.get("provider_usage")
+    if not isinstance(source_usage, Mapping) or not source_usage:
+        return
+    target_usage = (
+        dict(target.get("provider_usage"))
+        if isinstance(target.get("provider_usage"), Mapping)
+        else {}
+    )
+    for key, value in source_usage.items():
+        if key == "response_ids":
+            existing = target_usage.get(key)
+            existing_values = (
+                list(existing)
+                if isinstance(existing, (list, tuple, set, frozenset))
+                else [existing]
+                if existing is not None
+                else []
+            )
+            source_values = (
+                list(value)
+                if isinstance(value, (list, tuple, set, frozenset))
+                else [value]
+            )
+            target_usage[key] = sorted(
+                {
+                    str(item).strip()
+                    for item in [*existing_values, *source_values]
+                    if str(item).strip()
+                }
+            )
+        elif stable_id_match or not target_usage.get(key):
+            target_usage[key] = value
+    target["provider_usage"] = target_usage
+
+
+def deduplicate_stable_usage_receipts(
+    units: list[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Collapse repeated physical receipts only when a stable response ID proves it."""
+
+    deduplicated: list[dict[str, Any]] = []
+    for unit in units:
+        row = dict(unit)
+        response_ids = usage_row_response_ids(row)
+        if not response_ids:
+            # Similar token/cost values are not proof of the same physical call.
+            deduplicated.append(row)
+            continue
+        matching_indexes = [
+            index
+            for index, existing in enumerate(deduplicated)
+            if response_ids & usage_row_response_ids(existing)
+        ]
+        if not matching_indexes:
+            deduplicated.append(row)
+            continue
+        target = deduplicated[matching_indexes[0]]
+        merge_usage_receipt_provenance(target, row)
+        # A later receipt can bridge two previously separate response-id sets.
+        for index in reversed(matching_indexes[1:]):
+            merge_usage_receipt_provenance(target, deduplicated.pop(index))
+    return deduplicated
+
+
+def diagnostic_done_from_error_event(event: ErrorEvent) -> DoneEvent | None:
+    """Preserve receipts from a failed composite request for spend accounting."""
+
+    nested_done = event.diagnostic_done if isinstance(event.diagnostic_done, DoneEvent) else None
+    rows = [
+        dict(row)
+        for row in event.model_usage_breakdown
+        if isinstance(row, Mapping)
+    ]
+    trace = (
+        dict(event.ensemble_trace)
+        if isinstance(event.ensemble_trace, dict)
+        else None
+    )
+    missing_count = max(
+        coerce_metric_int(event.usage_missing_count),
+        coerce_metric_int(trace.get("usage_missing_count")) if trace else 0,
+    )
+    explicit_count = (
+        max(0, event.physical_request_count)
+        if isinstance(event.physical_request_count, int)
+        and not isinstance(event.physical_request_count, bool)
+        else None
+    )
+    explicit_zero = explicit_count == 0 or event.request_started is False
+    if (
+        nested_done is not None
+        and not rows
+        and trace is None
+        and explicit_count in {None, 1}
+        and missing_count <= 0
+    ):
+        return nested_done
+    if nested_done is not None:
+        nested_rows = [
+            dict(row)
+            for row in nested_done.model_usage_breakdown
+            if isinstance(row, Mapping)
+        ]
+        if not nested_rows:
+            nested_rows = [
+                {
+                    "role": "diagnostic_request",
+                    "provider": str(nested_done.provider or ""),
+                    "model": str(nested_done.model or ""),
+                    "requested_provider": str(nested_done.requested_provider or ""),
+                    "requested_model": str(nested_done.requested_model or ""),
+                    "input_tokens": nested_done.input_tokens,
+                    "output_tokens": nested_done.output_tokens,
+                    "reasoning_tokens": nested_done.reasoning_tokens,
+                    "cached_tokens": nested_done.cached_tokens,
+                    "cache_write_tokens": nested_done.cache_write_tokens,
+                    "billed_cost": nested_done.billed_cost,
+                    "cost_source": nested_done.cost_source,
+                    "provider_usage": dict(nested_done.provider_usage),
+                    **(
+                        {"billing_receipt": nested_done.billing_receipt}
+                        if nested_done.billing_receipt is not None
+                        else {}
+                    ),
+                }
+            ]
+        nested_trace = (
+            nested_done.ensemble_trace
+            if isinstance(nested_done.ensemble_trace, dict)
+            else {}
+        )
+        nested_placeholder_count = sum(
+            1 for row in nested_rows if usage_row_is_missing_placeholder(row)
+        )
+        nested_real_receipt_count = len(nested_rows) - nested_placeholder_count
+        nested_physical_count = max(
+            coerce_metric_int(nested_trace.get("physical_request_count")),
+            coerce_metric_int(nested_trace.get("llm_request_count")),
+            nested_real_receipt_count
+            + max(
+                nested_placeholder_count,
+                coerce_metric_int(nested_done.usage_missing_count),
+                coerce_metric_int(nested_trace.get("usage_missing_count")),
+            ),
+        )
+        missing_count = max(
+            missing_count,
+            nested_placeholder_count,
+            coerce_metric_int(nested_done.usage_missing_count),
+            coerce_metric_int(nested_trace.get("usage_missing_count")),
+            nested_physical_count - nested_real_receipt_count,
+        )
+
+        outer_row_count = len(rows)
+        consumed_rows: set[int] = set()
+        matched_outer_by_nested: dict[int, int] = {}
+        nested_match_order = sorted(
+            range(len(nested_rows)),
+            key=lambda index: (
+                0 if usage_row_response_ids(nested_rows[index]) else 1,
+                index,
+            ),
+        )
+        for nested_index in nested_match_order:
+            nested_row = nested_rows[nested_index]
+            candidates = [
+                (priority, index)
+                for index, row in enumerate(rows[:outer_row_count])
+                if index not in consumed_rows
+                if (
+                    priority := usage_row_match_priority(row, nested_row)
+                )
+                is not None
+            ]
+            matched_index = min(candidates)[1] if candidates else None
+            if matched_index is not None:
+                consumed_rows.add(matched_index)
+                matched_outer_by_nested[nested_index] = matched_index
+        for nested_index, nested_row in enumerate(nested_rows):
+            matched_index = matched_outer_by_nested.get(nested_index)
+            if matched_index is None:
+                rows.append(nested_row)
+            else:
+                merge_usage_receipt_provenance(rows[matched_index], nested_row)
+
+    placeholder_count = sum(
+        1
+        for row in rows
+        if str(row.get("role") or "").strip().casefold()
+        in MISSING_USAGE_PLACEHOLDER_ROLES
+    )
+    real_receipt_count = max(0, len(rows) - placeholder_count)
+    trace_count = max(
+        coerce_metric_int(trace.get("physical_request_count")) if trace else 0,
+        coerce_metric_int(trace.get("llm_request_count")) if trace else 0,
+    )
+    if explicit_zero and real_receipt_count == 0:
+        physical_count = 0
+        missing_count = 0
+        rows = []
+    else:
+        physical_count = max(
+            trace_count,
+            explicit_count or 0,
+            real_receipt_count + max(missing_count, placeholder_count),
+        )
+        missing_count = max(missing_count, physical_count - real_receipt_count)
+    if not rows and physical_count <= 0 and missing_count <= 0:
+        return None
+    if physical_count > 0:
+        trace = dict(trace or {})
+        trace.setdefault("mode", "diagnostic_error")
+        trace["llm_request_count"] = physical_count
+        trace["physical_request_count"] = physical_count
+        trace["usage_missing_count"] = missing_count
+    models = {
+        str(row.get("model") or "").strip()
+        for row in rows
+        if not usage_row_is_missing_placeholder(row)
+        if str(row.get("model") or "").strip()
+    }
+    providers = {
+        str(row.get("provider") or "").strip()
+        for row in rows
+        if not usage_row_is_missing_placeholder(row)
+        if str(row.get("provider") or "").strip()
+    }
+    requested_models = {
+        str(row.get("requested_model") or "").strip()
+        for row in rows
+        if str(row.get("requested_model") or "").strip()
+    }
+    requested_providers = {
+        str(row.get("requested_provider") or "").strip()
+        for row in rows
+        if str(row.get("requested_provider") or "").strip()
+    }
+    sources = {
+        str(row.get("cost_source") or "none").strip().casefold()
+        for row in rows
+    }
+    cost_source = (
+        next(iter(sources))
+        if len(sources) == 1
+        else "mixed"
+        if sources
+        else "none"
+    )
+    return DoneEvent(
+        stop_reason="error",
+        input_tokens=sum(coerce_metric_int(row.get("input_tokens")) for row in rows),
+        output_tokens=sum(coerce_metric_int(row.get("output_tokens")) for row in rows),
+        reasoning_tokens=sum(
+            coerce_metric_int(row.get("reasoning_tokens")) for row in rows
+        ),
+        cached_tokens=sum(coerce_metric_int(row.get("cached_tokens")) for row in rows),
+        cache_write_tokens=sum(
+            coerce_metric_int(row.get("cache_write_tokens")) for row in rows
+        ),
+        billed_cost=sum(
+            trusted_provider_billed_cost(row)
+            for row in rows
+        ),
+        model=next(iter(models)) if len(models) == 1 else "",
+        provider=next(iter(providers)) if len(providers) == 1 else "",
+        requested_model=(
+            next(iter(requested_models)) if len(requested_models) == 1 else ""
+        ),
+        requested_provider=(
+            next(iter(requested_providers)) if len(requested_providers) == 1 else ""
+        ),
+        cost_source=cost_source,
+        model_usage_breakdown=rows,
+        ensemble_trace=trace,
+        usage_missing_count=missing_count,
+        billing_receipt=(
+            rows[0].get("billing_receipt")
+            if len(rows) == 1
+            else None
+        ),
+        provider_usage={
+            "diagnostic_usage_only": True,
+            "terminal_error_code": str(event.code or ""),
+        },
+    )
 
 
 def run_result_usage_payload(result: RunResult) -> dict[str, Any]:
@@ -3457,6 +4816,14 @@ def run_result_usage_payload(result: RunResult) -> dict[str, Any]:
         return payload
     merged = dict(payload)
     merged.setdefault("model", getattr(result.done, "model", "") if result.done else "")
+    merged.setdefault(
+        "requested_provider",
+        getattr(result.done, "requested_provider", "") if result.done else "",
+    )
+    merged.setdefault(
+        "requested_model",
+        getattr(result.done, "requested_model", "") if result.done else "",
+    )
     merged.setdefault("stop_reason", getattr(result.done, "stop_reason", "") if result.done else "")
     merged.setdefault("provider_usage", {})
     merged.setdefault("reasoning_content_chars", 0)
@@ -3472,7 +4839,7 @@ def run_result_usage_payload(result: RunResult) -> dict[str, Any]:
             coerce_metric_int(row.get(key)) for row in result.setup_usage
         )
     merged["billed_cost"] = float(merged.get("billed_cost") or 0.0) + sum(
-        float(row.get("billed_cost") or 0.0) for row in result.setup_usage
+        trusted_provider_billed_cost(row) for row in result.setup_usage
     )
     existing_breakdown = merged.get("model_usage_breakdown")
     merged["model_usage_breakdown"] = [
@@ -3527,6 +4894,41 @@ def text_sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+_NO_PHYSICAL_REQUEST_GATE_CODES = frozenset(
+    {
+        "agent_cleanup_in_progress",
+        "agent_turn_in_progress",
+        "benchmark_owner_cleanup_in_progress",
+        "ensemble_cleanup_in_progress",
+        "ensemble_call_in_progress",
+    }
+)
+
+
+def run_result_was_blocked_before_request(result: RunResult) -> bool:
+    """Return true only for ownership gates that start no LLM request."""
+
+    return any(
+        str(event.get("code") or "").strip() in _NO_PHYSICAL_REQUEST_GATE_CODES
+        for event in result.trace_events
+        if isinstance(event, dict)
+    )
+
+
+def run_result_error_physical_request_count(result: RunResult) -> int | None:
+    """Return explicit adapter/Agent failure evidence, including zero."""
+
+    for event in reversed(result.trace_events):
+        if not isinstance(event, dict) or str(event.get("kind") or "") != "error":
+            continue
+        value = event.get("physical_request_count")
+        if isinstance(value, int) and not isinstance(value, bool):
+            return max(0, value)
+        if event.get("request_started") is False:
+            return 0
+    return None
+
+
 def run_result_summary(result: RunResult) -> dict[str, Any]:
     usage = run_result_usage_payload(result)
     server_tool_call_count = coerce_metric_int(usage.get("server_tool_call_count"))
@@ -3535,20 +4937,59 @@ def run_result_summary(result: RunResult) -> dict[str, Any]:
     usage_unknown_count = 0
     if result.done is not None:
         if isinstance(result.done.ensemble_trace, dict):
-            llm_request_count = coerce_metric_int(
-                result.done.ensemble_trace.get("llm_request_count")
+            llm_request_count = max(
+                coerce_metric_int(
+                    result.done.ensemble_trace.get("llm_request_count")
+                ),
+                coerce_metric_int(
+                    result.done.ensemble_trace.get("physical_request_count")
+                ),
             )
             usage_unknown_count = ensemble_usage_unknown_count(result.done.ensemble_trace)
-        if not llm_request_count and result.done.model_usage_breakdown:
-            llm_request_count = len(result.done.model_usage_breakdown)
-        if not llm_request_count:
-            llm_request_count = 1
+        usage_unknown_count = max(
+            usage_unknown_count,
+            coerce_metric_int(result.done.usage_missing_count),
+        )
+        if result.done.model_usage_breakdown:
+            represented_missing = sum(
+                1
+                for row in result.done.model_usage_breakdown
+                if isinstance(row, Mapping)
+                and str(row.get("role") or "").strip().casefold()
+                in MISSING_USAGE_PLACEHOLDER_ROLES
+            )
+            llm_request_count = max(
+                llm_request_count,
+                len(result.done.model_usage_breakdown)
+                + max(
+                    0,
+                    coerce_metric_int(result.done.usage_missing_count)
+                    - represented_missing,
+                ),
+            )
+        else:
+            llm_request_count = max(
+                llm_request_count,
+                1 + max(
+                    0,
+                    coerce_metric_int(result.done.usage_missing_count),
+                ),
+            )
         usage_unknown_count = max(
             usage_unknown_count,
             usage_unknown_count_from_usage_payload(usage),
         )
     elif result.error or result.final_text:
-        llm_request_count = 1
+        explicit_request_count = run_result_error_physical_request_count(result)
+        if explicit_request_count is not None:
+            llm_request_count = explicit_request_count
+            usage_unknown_count = max(
+                usage_unknown_count,
+                explicit_request_count,
+            )
+        elif not run_result_was_blocked_before_request(result):
+            llm_request_count = 1
+            usage_unknown_count = max(usage_unknown_count, 1)
     llm_request_count += len(result.setup_usage)
     return {
         "latency_ms": result.latency_ms,
@@ -3587,13 +5028,648 @@ def bounded_generation_retry_backoff(value: Any) -> float:
     return max(0.0, backoff)
 
 
-def generation_retry_reason(result: RunResult) -> str:
+def ensemble_call_core_reasons(
+    trace: Mapping[str, Any],
+    *,
+    expected_selection_mode: str = "",
+    expected_selection_plan: Mapping[str, Any] | None = None,
+    final_text: str = "",
+    require_output_binding: bool = False,
+) -> list[str]:
+    """Validate one physical ensemble call without trusting declared counts."""
+
+    reasons: list[str] = []
+    if str(trace.get("request_outcome") or "llm_response") != "llm_response":
+        reasons.append("aggregator_call_error")
+    if trace.get("fallback_used") is not False:
+        reasons.append("aggregator_fallback_used_or_unknown")
+    if str(trace.get("final_request_role") or "") != "aggregator":
+        reasons.append("final_request_not_aggregator")
+
+    total = trace.get("total_candidates")
+    successful = trace.get("successful_proposers")
+    declared_counts_valid = bool(
+        isinstance(total, int)
+        and not isinstance(total, bool)
+        and total > 0
+        and isinstance(successful, int)
+        and not isinstance(successful, bool)
+        and 0 <= successful <= total
+        and successful >= legal_proposer_quorum(total)
+    )
+    if not declared_counts_valid:
+        reasons.append("insufficient_proposer_quorum")
+
+    expected_plan = (
+        dict(expected_selection_plan)
+        if isinstance(expected_selection_plan, Mapping)
+        else {}
+    )
+    expected_total = coerce_metric_int(expected_plan.get("proposer_sample_count"))
+    if expected_total <= 0:
+        expected_models = expected_plan.get("proposer_models")
+        if isinstance(expected_models, list):
+            expected_total = len(expected_models)
+    if expected_total and total != expected_total:
+        reasons.append("wrong_executed_proposer_count")
+    if expected_total and (
+        not isinstance(successful, int)
+        or isinstance(successful, bool)
+        or successful < legal_proposer_quorum(expected_total)
+    ):
+        reasons.append("insufficient_configured_proposer_quorum")
+
+    if expected_selection_mode:
+        executed_mode = str(
+            trace.get("selection_strategy")
+            or (
+                trace.get("selection_plan", {}).get("strategy")
+                if isinstance(trace.get("selection_plan"), dict)
+                else ""
+            )
+            or ""
+        )
+        if executed_mode != expected_selection_mode:
+            reasons.append("wrong_executed_selection_mode")
+    executed_plan = trace.get("selection_plan")
+    if expected_plan:
+        if not isinstance(executed_plan, Mapping):
+            reasons.append("missing_executed_selection_plan")
+        else:
+            for field in (
+                "strategy",
+                "selection_mode",
+                "profile",
+                "proposer_models",
+                "selected_P",
+                "proposer_sample_count",
+                "aggregator_model",
+                "selected_A",
+            ):
+                expected_value = expected_plan.get(field)
+                if (
+                    expected_value not in (None, [], "")
+                    and executed_plan.get(field) != expected_value
+                ):
+                    reasons.append(f"wrong_executed_{field}")
+
+    candidate_rows = trace.get("candidates")
+    if not isinstance(candidate_rows, list):
+        reasons.append("missing_actual_proposer_candidates")
+    else:
+        if isinstance(total, int) and not isinstance(total, bool) and len(candidate_rows) != total:
+            reasons.append("wrong_actual_proposer_count")
+        proven_successes: list[bool] = []
+        for candidate in candidate_rows:
+            content = (
+                candidate.get("content")
+                if isinstance(candidate, Mapping)
+                else None
+            )
+            proven = bool(
+                isinstance(candidate, Mapping)
+                and candidate.get("ok") is True
+                and candidate.get("request_started") is True
+                and isinstance(candidate.get("physical_request_count"), int)
+                and not isinstance(candidate.get("physical_request_count"), bool)
+                and candidate.get("physical_request_count") > 0
+                and not candidate.get("error")
+                and candidate.get("usage_reported") is True
+                and bool(str(candidate.get("stop_reason") or "").strip())
+                and isinstance(content, Mapping)
+                and coerce_metric_int(content.get("chars")) > 0
+                and bool(str(content.get("text") or "").strip())
+            )
+            proven_successes.append(proven)
+            if (
+                isinstance(candidate, Mapping)
+                and candidate.get("ok") is True
+                and not proven
+            ):
+                reasons.append("invalid_successful_proposer_evidence")
+        actual_successful = sum(proven_successes)
+        if (
+            not isinstance(successful, int)
+            or isinstance(successful, bool)
+            or actual_successful != successful
+        ):
+            reasons.append("successful_proposer_count_mismatch")
+        if expected_total and actual_successful < legal_proposer_quorum(expected_total):
+            reasons.append("insufficient_actual_proposer_quorum")
+        expected_selected_p = expected_plan.get("selected_P")
+        if isinstance(expected_selected_p, list):
+            if len(candidate_rows) != len(expected_selected_p):
+                reasons.append("wrong_actual_proposer_count")
+            else:
+                requested_identity_missing = False
+                requested_identity_wrong = False
+                actual_identity_missing = False
+                actual_identity_wrong = False
+                for candidate_index, (candidate, identity) in enumerate(zip(
+                    candidate_rows,
+                    expected_selected_p,
+                    strict=True,
+                )):
+                    expected_provider, separator, expected_model = (
+                        identity.partition(":")
+                        if isinstance(identity, str)
+                        else ("", "", "")
+                    )
+                    execution = (
+                        candidate.get("execution")
+                        if isinstance(candidate, Mapping)
+                        else None
+                    )
+                    requested_provider = (
+                        candidate.get("requested_provider")
+                        if isinstance(candidate, Mapping)
+                        else None
+                    ) or (
+                        execution.get("requested_provider")
+                        or execution.get("provider")
+                        if isinstance(execution, Mapping)
+                        else None
+                    )
+                    requested_model = (
+                        candidate.get("requested_model")
+                        if isinstance(candidate, Mapping)
+                        else None
+                    ) or (
+                        execution.get("model")
+                        if isinstance(execution, Mapping)
+                        else None
+                    )
+                    candidate_provider = (
+                        candidate.get("provider")
+                        if isinstance(candidate, Mapping)
+                        else None
+                    )
+                    candidate_model = (
+                        candidate.get("model")
+                        if isinstance(candidate, Mapping)
+                        else None
+                    )
+                    if (
+                        separator != ":"
+                        or not expected_provider.strip()
+                        or not expected_model.strip()
+                    ):
+                        requested_identity_wrong = True
+                    elif (
+                        not isinstance(requested_provider, str)
+                        or not requested_provider.strip()
+                        or not isinstance(requested_model, str)
+                        or not requested_model.strip()
+                    ):
+                        requested_identity_missing = True
+                    elif (
+                        requested_provider.strip() != expected_provider.strip()
+                        or requested_model.strip() != expected_model.strip()
+                    ):
+                        requested_identity_wrong = True
+                    if proven_successes[candidate_index] and (
+                        not isinstance(candidate_provider, str)
+                        or not candidate_provider.strip()
+                        or not isinstance(candidate_model, str)
+                        or not candidate_model.strip()
+                    ):
+                        actual_identity_missing = True
+                    elif (
+                        isinstance(candidate_provider, str)
+                        and candidate_provider.strip()
+                        and candidate_provider.strip() != expected_provider.strip()
+                    ) or (
+                        isinstance(candidate_model, str)
+                        and candidate_model.strip()
+                        and candidate_model.strip() != expected_model.strip()
+                    ):
+                        actual_identity_wrong = True
+                if requested_identity_missing:
+                    reasons.append("missing_requested_proposer_identity")
+                if requested_identity_wrong:
+                    reasons.append("wrong_requested_proposer_identity")
+                if actual_identity_missing:
+                    reasons.append("missing_actual_proposer_identity")
+                if actual_identity_wrong:
+                    reasons.append("wrong_actual_proposer_identity")
+
+    final_request = trace.get("final_request")
+    if (
+        not isinstance(final_request, Mapping)
+        or final_request.get("request_started") is not True
+        or str(final_request.get("role") or "") != "aggregator"
+        or final_request.get("error")
+        or trace.get("aggregator_error")
+    ):
+        reasons.append("aggregator_request_incomplete")
+        return list(dict.fromkeys(reasons))
+
+    if expected_plan:
+        expected_aggregator_model = expected_plan.get("aggregator_model")
+        expected_selected_a = expected_plan.get("selected_A")
+        expected_provider, separator, selected_model = (
+            expected_selected_a.partition(":")
+            if isinstance(expected_selected_a, str)
+            else ("", "", "")
+        )
+        usage = final_request.get("usage")
+        actual_model = usage.get("model") if isinstance(usage, Mapping) else None
+        actual_provider = (
+            usage.get("provider") if isinstance(usage, Mapping) else None
+        )
+        requested_model = (
+            usage.get("requested_model") if isinstance(usage, Mapping) else None
+        )
+        requested_provider = (
+            usage.get("requested_provider") if isinstance(usage, Mapping) else None
+        )
+        if not isinstance(expected_aggregator_model, str) or not (
+            expected_aggregator_model.strip()
+        ):
+            reasons.append("wrong_actual_aggregator_model")
+        elif not isinstance(actual_model, str) or not actual_model.strip():
+            reasons.append("missing_actual_aggregator_model")
+        elif actual_model.strip() != expected_aggregator_model.strip():
+            reasons.append("wrong_actual_aggregator_model")
+        if (
+            separator != ":"
+            or not expected_provider.strip()
+            or selected_model.strip()
+            != (
+                expected_aggregator_model.strip()
+                if isinstance(expected_aggregator_model, str)
+                else ""
+            )
+        ):
+            reasons.append("wrong_actual_aggregator_provider")
+        elif not isinstance(actual_provider, str) or not actual_provider.strip():
+            reasons.append("missing_actual_aggregator_provider")
+        elif actual_provider.strip() != expected_provider.strip():
+            reasons.append("wrong_actual_aggregator_provider")
+        if (
+            not isinstance(requested_provider, str)
+            or not requested_provider.strip()
+            or not isinstance(requested_model, str)
+            or not requested_model.strip()
+        ):
+            reasons.append("missing_requested_aggregator_identity")
+        elif (
+            requested_provider.strip() != expected_provider.strip()
+            or requested_model.strip()
+            != (
+                expected_aggregator_model.strip()
+                if isinstance(expected_aggregator_model, str)
+                else ""
+            )
+        ):
+            reasons.append("wrong_requested_aggregator_identity")
+
+    if require_output_binding:
+        output = final_request.get("output")
+        if not isinstance(output, Mapping):
+            reasons.append("missing_aggregator_output_binding")
+        else:
+            output_text = output.get("text")
+            output_chars = coerce_metric_int(output.get("chars"))
+            output_truncated = output.get("truncated") is True
+            if (
+                not isinstance(output_text, str)
+                or not output_text.strip()
+                or output_chars <= 0
+            ):
+                reasons.append("missing_aggregator_output_binding")
+            elif output_chars > len(final_text):
+                reasons.append("wrong_aggregator_output_length")
+            else:
+                final_output_tail = final_text[-output_chars:]
+                if (
+                    output_truncated
+                    and not final_output_tail.startswith(output_text)
+                ) or (
+                    not output_truncated
+                    and output_text != final_output_tail
+                ):
+                    reasons.append("wrong_aggregator_output_binding")
+    return list(dict.fromkeys(reasons))
+
+
+def ensemble_call_trace_sequence(
+    trace: Mapping[str, Any],
+) -> tuple[list[Mapping[str, Any]], list[str]]:
+    """Return a complete, ordered Agent-loop call sequence or strict reasons."""
+
+    calls = trace.get("calls")
+    if calls is None and str(trace.get("mode") or "") != "agent_loop":
+        return [trace], []
+    reasons: list[str] = []
+    if not isinstance(calls, list) or not calls:
+        return [], ["missing_ensemble_call_trace"]
+    if any(not isinstance(item, Mapping) for item in calls):
+        return [], ["invalid_ensemble_call_trace"]
+    call_traces = [item for item in calls if isinstance(item, Mapping)]
+    raw_count = trace.get("agent_llm_call_count")
+    if (
+        not isinstance(raw_count, int)
+        or isinstance(raw_count, bool)
+        or raw_count <= 0
+        or raw_count != len(call_traces)
+    ):
+        reasons.append("wrong_agent_llm_call_count")
+    if coerce_metric_int(trace.get("untraced_agent_llm_call_count")) != 0:
+        reasons.append("untraced_agent_llm_calls")
+    indices = [item.get("agent_call_index") for item in call_traces]
+    if indices != list(range(1, len(call_traces) + 1)):
+        reasons.append("invalid_agent_call_index_sequence")
+    return call_traces, reasons
+
+
+def ensemble_generation_retry_reason(
+    result: RunResult,
+    *,
+    expected_selection_mode: str = "",
+    expected_selection_plan: Mapping[str, Any] | None = None,
+) -> str:
+    """Reject a fallback or sub-quorum ensemble result before Judge is called."""
+
+    done = result.done
+    if done is None or not isinstance(done.ensemble_trace, dict):
+        return "missing_ensemble_trace"
+    trace = done.ensemble_trace
+    call_traces, sequence_reasons = ensemble_call_trace_sequence(trace)
+    if sequence_reasons:
+        return sequence_reasons[0]
+    if not call_traces:
+        return "missing_ensemble_call_trace"
+    for index, call_trace in enumerate(call_traces):
+        reasons = ensemble_call_core_reasons(
+            call_trace,
+            expected_selection_mode=expected_selection_mode,
+            expected_selection_plan=expected_selection_plan,
+            final_text=result.final_text,
+            require_output_binding=index == len(call_traces) - 1,
+        )
+        generation_reasons = [
+            reason
+            for reason in reasons
+            if not reason.startswith(("missing_actual_", "missing_requested_"))
+        ]
+        if generation_reasons:
+            return generation_reasons[0]
+    return ""
+
+
+def backfill_result_requested_identity(
+    result: RunResult,
+    *,
+    expected_model: str = "",
+    expected_provider: str = "",
+    expected_selection_plan: Mapping[str, Any] | None = None,
+) -> bool:
+    """Backfill only absent requested identity from the frozen request plan."""
+
+    done = result.done
+    if done is None:
+        return False
+    changed_fields: list[str] = []
+    plan = (
+        dict(expected_selection_plan)
+        if isinstance(expected_selection_plan, Mapping)
+        else {}
+    )
+    selected_a = plan.get("selected_A")
+    plan_provider, separator, plan_model = (
+        selected_a.partition(":")
+        if isinstance(selected_a, str)
+        else ("", "", "")
+    )
+    if separator == ":" and plan_provider.strip() and plan_model.strip():
+        expected_provider = plan_provider.strip()
+        expected_model = plan_model.strip()
+    if expected_model and not str(done.requested_model or "").strip():
+        done.requested_model = expected_model
+        changed_fields.append("requested_model")
+    if expected_provider and not str(done.requested_provider or "").strip():
+        done.requested_provider = expected_provider
+        changed_fields.append("requested_provider")
+
+    root_trace = done.ensemble_trace
+    if isinstance(root_trace, dict):
+        calls = root_trace.get("calls")
+        call_traces = (
+            [item for item in calls if isinstance(item, dict)]
+            if isinstance(calls, list)
+            else [root_trace]
+        )
+        for call_trace in call_traces:
+            call_plan = (
+                call_trace.get("selection_plan")
+                if isinstance(call_trace.get("selection_plan"), Mapping)
+                else plan
+            )
+            selected_p = call_plan.get("selected_P") if isinstance(call_plan, Mapping) else None
+            candidates = call_trace.get("candidates")
+            if (
+                isinstance(selected_p, list)
+                and isinstance(candidates, list)
+                and len(selected_p) == len(candidates)
+            ):
+                for candidate, identity in zip(candidates, selected_p, strict=True):
+                    if not isinstance(candidate, dict) or not isinstance(identity, str):
+                        continue
+                    provider, identity_separator, model = identity.partition(":")
+                    if (
+                        identity_separator != ":"
+                        or not provider.strip()
+                        or not model.strip()
+                    ):
+                        continue
+                    if not str(candidate.get("requested_provider") or "").strip():
+                        candidate["requested_provider"] = provider.strip()
+                        changed_fields.append("candidate.requested_provider")
+                    if not str(candidate.get("requested_model") or "").strip():
+                        candidate["requested_model"] = model.strip()
+                        changed_fields.append("candidate.requested_model")
+            call_selected_a = (
+                call_plan.get("selected_A") if isinstance(call_plan, Mapping) else None
+            )
+            final_provider, final_separator, final_model = (
+                call_selected_a.partition(":")
+                if isinstance(call_selected_a, str)
+                else ("", "", "")
+            )
+            if (
+                final_separator != ":"
+                or not final_provider.strip()
+                or not final_model.strip()
+            ):
+                continue
+            final_request = call_trace.get("final_request")
+            if not isinstance(final_request, dict):
+                continue
+            usage = final_request.get("usage")
+            if isinstance(usage, dict):
+                if not str(usage.get("requested_provider") or "").strip():
+                    usage["requested_provider"] = final_provider.strip()
+                    changed_fields.append("aggregator.requested_provider")
+                if not str(usage.get("requested_model") or "").strip():
+                    usage["requested_model"] = final_model.strip()
+                    changed_fields.append("aggregator.requested_model")
+            execution = final_request.get("execution")
+            if isinstance(execution, dict):
+                if not str(execution.get("requested_provider") or "").strip():
+                    execution["requested_provider"] = final_provider.strip()
+                if not str(execution.get("requested_model") or "").strip():
+                    execution["requested_model"] = final_model.strip()
+
+    if changed_fields:
+        provider_usage = (
+            dict(done.provider_usage)
+            if isinstance(done.provider_usage, Mapping)
+            else {}
+        )
+        provider_usage["requested_identity_backfill"] = {
+            "source": "frozen_request_configuration",
+            "fields": sorted(set(changed_fields)),
+        }
+        done.provider_usage = provider_usage
+    return bool(changed_fields)
+
+
+def single_generation_identity_reason(
+    result: RunResult,
+    *,
+    expected_model: str = "",
+    expected_provider: str = "",
+) -> str:
+    """Validate one fixed/router-single generation from physical receipts."""
+
+    done = result.done
+    if done is None:
+        return GENERATION_MISSING_DONE_ERROR
+    breakdown = [
+        row
+        for row in done.model_usage_breakdown
+        if isinstance(row, Mapping)
+        and str(row.get("role") or "").strip().casefold()
+        not in MISSING_USAGE_PLACEHOLDER_ROLES
+    ]
+    models = {
+        str(row.get("model") or "").strip()
+        for row in breakdown
+        if str(row.get("model") or "").strip()
+    }
+    providers = {
+        str(row.get("provider") or "").strip()
+        for row in breakdown
+        if str(row.get("provider") or "").strip()
+    }
+    direct_model = str(done.model or "").strip()
+    direct_provider = str(done.provider or "").strip()
+    requested_model = str(done.requested_model or "").strip()
+    requested_provider = str(done.requested_provider or "").strip()
+    actual_model = direct_model or (next(iter(models)) if len(models) == 1 else "")
+    actual_provider = direct_provider or (
+        next(iter(providers)) if len(providers) == 1 else ""
+    )
+    if direct_model and models and any(model != direct_model for model in models):
+        return "actual_model_receipt_mismatch"
+    if direct_provider and providers and any(
+        provider != direct_provider for provider in providers
+    ):
+        return "actual_provider_receipt_mismatch"
+    if not actual_model:
+        return "actual_model_evidence_missing"
+    if expected_model and actual_model != expected_model:
+        return "wrong_actual_model"
+    if not actual_provider:
+        return "actual_provider_evidence_missing"
+    if expected_provider and actual_provider != expected_provider:
+        return "wrong_actual_provider"
+    if not requested_model:
+        return "missing_requested_model_identity"
+    if expected_model and requested_model != expected_model:
+        return "wrong_requested_model"
+    if not requested_provider:
+        return "missing_requested_provider_identity"
+    if expected_provider and requested_provider != expected_provider:
+        return "wrong_requested_provider"
+    return ""
+
+
+def generation_retry_reason(
+    result: RunResult,
+    *,
+    expected_selection_mode: str = "",
+    expected_selection_plan: Mapping[str, Any] | None = None,
+    expected_model: str = "",
+    expected_provider: str = "",
+) -> str:
     if result.error:
         return result.error
     if result.done is None:
         return GENERATION_MISSING_DONE_ERROR
     if not result.final_text.strip():
         return GENERATION_EMPTY_OUTPUT_ERROR
+    if expected_selection_mode:
+        return ensemble_generation_retry_reason(
+            result,
+            expected_selection_mode=expected_selection_mode,
+            expected_selection_plan=expected_selection_plan,
+        )
+    if expected_model or expected_provider:
+        return single_generation_identity_reason(
+            result,
+            expected_model=expected_model,
+            expected_provider=expected_provider,
+        )
+    return ""
+
+
+def is_agent_hard_timeout(result: RunResult) -> bool:
+    if any(str(event.get("kind") or "") == "timeout" for event in result.trace_events):
+        return True
+    normalized_error = str(result.error or "").strip().casefold()
+    return (
+        ("agent run timed out" in normalized_error)
+        or ("agent turn timed out" in normalized_error)
+        or ("agent_runtime_timeout" in normalized_error)
+    )
+
+
+def generation_cleanup_failure_reason(result: RunResult) -> str:
+    """Return a non-retryable cleanup/ownership failure code, if present."""
+
+    for event in result.trace_events:
+        code = str(event.get("code") or "").strip()
+        if (
+            code.endswith("_close_timeout")
+            or code.endswith("_cleanup_timeout")
+            or code
+            in {
+                "agent_cleanup_in_progress",
+                "agent_turn_in_progress",
+                "benchmark_owner_cleanup_in_progress",
+                "ensemble_cleanup_in_progress",
+                "ensemble_call_in_progress",
+                "provider_stream_close_failed",
+                "provider_stream_close_unavailable",
+            }
+        ):
+            return code
+    normalized_error = str(result.error or "").strip().casefold()
+    for marker in (
+        "close_timeout",
+        "close_failed",
+        "close_unavailable",
+        "cleanup_timeout",
+        "cleanup in progress",
+        "cleanup_in_progress",
+        "still closing",
+        "turn_in_progress",
+        "call_in_progress",
+    ):
+        if marker in normalized_error:
+            return marker
     return ""
 
 
@@ -3612,8 +5688,6 @@ def mark_empty_generation_output(result: RunResult) -> None:
 
 def mark_retryable_generation_error(result: RunResult, reason: str) -> None:
     if result.error or not reason:
-        return
-    if reason not in {GENERATION_EMPTY_OUTPUT_ERROR, GENERATION_MISSING_DONE_ERROR}:
         return
     result.error = reason
     result.trace_events.append(
@@ -3653,13 +5727,21 @@ async def collect_generation_with_retries(
     group: str = "",
     output_dir: Path | None = None,
     agent_max_iterations: int = DEFAULT_AGENT_MAX_ITERATIONS,
+    finalization_policy: Mapping[str, Any] | None = None,
     max_attempts: int = GENERATION_MAX_ATTEMPTS,
     retry_backoff_seconds: float = 0.0,
+    expected_model: str = "",
+    expected_provider: str = "",
 ) -> tuple[RunResult, list[dict[str, Any]], int]:
     attempts: list[dict[str, Any]] = []
     best_non_empty: RunResult | None = None
     last_result: RunResult | None = None
     attempt_limit = bounded_generation_attempts(max_attempts)
+    expected_selection_plan = (
+        dict(getattr(provider, "selection_plan", {}) or {})
+        if str((GROUP_SPECS.get(group) or {}).get("kind") or "") == "selection_mode"
+        else {}
+    )
     for attempt_index in range(1, attempt_limit + 1):
         if runner_mode == RUNNER_MODE_AGENT_LOOP:
             result = await collect_agent_run(
@@ -3673,6 +5755,7 @@ async def collect_generation_with_retries(
                 group=group,
                 output_dir=output_dir,
                 max_iterations=agent_max_iterations,
+                finalization_policy=finalization_policy,
             )
         else:
             result = await collect_run(
@@ -3683,11 +5766,36 @@ async def collect_generation_with_retries(
                 tools=tools,
             )
         last_result = result
-        reason = generation_retry_reason(result)
+        group_spec = GROUP_SPECS.get(group) or {}
+        expected_selection_mode = (
+            str(group_spec.get("selection_mode") or "")
+            if group_spec.get("kind") == "selection_mode"
+            else ""
+        )
+        backfill_result_requested_identity(
+            result,
+            expected_model=expected_model,
+            expected_provider=expected_provider,
+            expected_selection_plan=expected_selection_plan,
+        )
+        reason = generation_retry_reason(
+            result,
+            expected_selection_mode=expected_selection_mode,
+            expected_selection_plan=expected_selection_plan,
+            expected_model=expected_model,
+            expected_provider=expected_provider,
+        )
         mark_retryable_generation_error(result, reason)
+        retry_suppressed_reason = generation_cleanup_failure_reason(result)
+        if (
+            not retry_suppressed_reason
+            and runner_mode == RUNNER_MODE_AGENT_LOOP
+            and is_agent_hard_timeout(result)
+        ):
+            retry_suppressed_reason = "agent_hard_timeout"
         if result.final_text.strip() and best_non_empty is None:
             best_non_empty = result
-        will_retry = bool(reason) and attempt_index < attempt_limit
+        will_retry = bool(reason) and not retry_suppressed_reason and attempt_index < attempt_limit
         retry_backoff_s = (
             bounded_generation_retry_backoff(retry_backoff_seconds) * (2 ** (attempt_index - 1))
             if will_retry
@@ -3698,6 +5806,7 @@ async def collect_generation_with_retries(
                 "attempt": attempt_index,
                 "retryable": bool(reason),
                 "retry_reason": reason,
+                "retry_suppressed_reason": retry_suppressed_reason,
                 "will_retry": will_retry,
                 "retry_backoff_s": retry_backoff_s,
                 "run": run_result_summary(result),
@@ -3705,6 +5814,8 @@ async def collect_generation_with_retries(
         )
         if not reason:
             return result, attempts, attempt_index
+        if retry_suppressed_reason:
+            return result, attempts, 0
         if retry_backoff_s > 0:
             await asyncio.sleep(retry_backoff_s)
     selected = (
@@ -3717,9 +5828,7 @@ async def collect_generation_with_retries(
         )
     )
     mark_empty_generation_output(selected)
-    if best_non_empty is None and attempts:
-        return selected, attempts, coerce_metric_int(attempts[-1].get("attempt"))
-    return selected, attempts, selected_generation_attempt(attempts, selected)
+    return selected, attempts, 0
 
 
 def sum_generation_attempt_metric(attempts: list[dict[str, Any]], key: str) -> int:
@@ -3801,7 +5910,7 @@ async def judge_text(
                 judge_repeats=repeats,
             )
         score = min(20, max(4, len(answer) // 40))
-        return normalize_legacy_judge_result(
+        dry_judge = normalize_legacy_judge_result(
             {
                 "mode": "legacy_dimension_score",
                 "scores": {
@@ -3814,15 +5923,16 @@ async def judge_text(
                 "rationale": "dry-run heuristic",
             }
         )
+        dry_judge["judge_model"] = "dry-run"
+        dry_judge["judge_cost_exempt"] = True
+        return dry_judge
     if judge_provider is None:
         return None
     max_attempts = bounded_judge_attempts(judge_max_attempts)
     # One experiment-wide semaphore covers both structured rubric judging and
     # the legacy single-call Judge path.  Otherwise task concurrency can
     # silently multiply the configured Judge concurrency.
-    semaphore = judge_semaphore or asyncio.Semaphore(
-        max(1, int(judge_concurrency or 1))
-    )
+    semaphore = judge_semaphore or asyncio.Semaphore(max(1, int(judge_concurrency or 1)))
     if criteria:
         repeats = max(1, int(judge_repeats or 1))
 
@@ -3865,6 +5975,7 @@ async def judge_text(
     )
     attempts: list[dict[str, Any]] = []
     last_result: RunResult | None = None
+    last_cleanup_failure = ""
     for attempt_index in range(1, max_attempts + 1):
         async with semaphore:
             result = await collect_run(
@@ -3874,23 +5985,41 @@ async def judge_text(
                 config=ChatConfig(temperature=0.0, thinking=False),
             )
         last_result = result
+        cleanup_failure = generation_cleanup_failure_reason(result)
+        if cleanup_failure:
+            last_cleanup_failure = cleanup_failure
         parsed = extract_json_object(result.final_text)
         attempts.append(
             {
                 "attempt": attempt_index,
                 "parsed": parsed is not None,
+                "schema_valid": False,
+                "retry_suppressed_reason": cleanup_failure,
                 "run": run_result_summary(result),
             }
         )
+        if cleanup_failure:
+            break
         if parsed is not None:
             normalized = normalize_legacy_judge_result(parsed)
-            normalized["judge_run"] = run_result_summary(result)
-            normalized["judge_attempt_count"] = attempt_index
-            normalized["judge_attempts"] = attempts
-            return normalized
+            attempts[-1]["schema_valid"] = normalized.get("score_status") == "complete"
+            if normalized.get("score_status") == "complete":
+                normalized["judge_run"] = run_result_summary(result)
+                normalized["judge_attempt_count"] = attempt_index
+                normalized["judge_attempts"] = attempts
+                return normalized
     last_text = last_result.final_text if last_result is not None else ""
+    parsed_any = any(bool(attempt.get("parsed")) for attempt in attempts)
     return {
-        "error": "judge_json_parse_failed",
+        "mode": "legacy_dimension_score",
+        "score_status": "incomplete",
+        "judge_error_count": 1,
+        "normalized_score": None,
+        "total": None,
+        "error": (
+            last_cleanup_failure
+            or ("judge_json_schema_invalid" if parsed_any else "judge_json_parse_failed")
+        ),
         "raw": last_text[:2000],
         "judge_run": run_result_summary(last_result) if last_result is not None else {},
         "judge_attempt_count": len(attempts),
@@ -3941,12 +6070,14 @@ async def judge_criterion(
         )
         parsed = extract_json_object(result.final_text) or {}
         met = parse_verdict(parsed.get("verdict"))
+        cleanup_failure = generation_cleanup_failure_reason(result)
         run_summary = run_result_summary(result)
         attempts.append(
             {
                 "attempt": attempt_index,
                 "verdict": parsed.get("verdict") if parsed else "",
                 "met": met,
+                "retry_suppressed_reason": cleanup_failure,
                 "run": run_summary,
             }
         )
@@ -3961,11 +6092,15 @@ async def judge_criterion(
             "judge_attempt_count": attempt_index,
             "judge_attempts": list(attempts),
         }
-        if met is not None:
+        if met is not None and not cleanup_failure:
             return row
         row["error"] = result.error or "judge_verdict_parse_failed"
         row["raw"] = result.final_text[:1000]
         last_row = row
+        if cleanup_failure:
+            row["retry_suppressed_reason"] = cleanup_failure
+            row["error"] = cleanup_failure
+            break
     return (
         last_row
         if last_row is not None
@@ -4104,6 +6239,13 @@ def score_criterion_judgments(
 def quality_total(judge: dict[str, Any] | None) -> float | None:
     if not isinstance(judge, dict):
         return None
+    if judge.get("mode") == "legacy_dimension_score":
+        if judge.get("score_status") != "complete":
+            return None
+        scores = valid_legacy_judge_scores(judge)
+        if scores is None:
+            return None
+        return clamp_percent(sum(scores.values()) / 20.0 * 100.0)
     if judge.get("mode") == "draco_criterion_judgments" and judge.get("score_status") != "complete":
         return None
     normalized = judge.get("normalized_score")
@@ -4116,11 +6258,6 @@ def quality_total(judge: dict[str, Any] | None) -> float | None:
             normalized_total = total_float if total_float > 20.0 else total_float / 20.0 * 100.0
             return clamp_percent(normalized_total)
         return float(total)
-    scores = judge.get("scores")
-    if isinstance(scores, dict):
-        values = [value for value in scores.values() if isinstance(value, int | float)]
-        if values:
-            return clamp_percent(float(sum(values)) / (len(values) * 5.0) * 100.0)
     return None
 
 
@@ -4149,6 +6286,7 @@ async def run_one(
     runner_mode: str = RUNNER_MODE_PROVIDER,
     output_dir: Path | None = None,
     agent_max_iterations: int = DEFAULT_AGENT_MAX_ITERATIONS,
+    agent_finalization_policy: Mapping[str, Any] | None = None,
     generation_max_attempts: int = GENERATION_MAX_ATTEMPTS,
     generation_retry_backoff: float = DEFAULT_GENERATION_RETRY_BACKOFF_SECONDS,
     tools: list[ToolDefinition] | None = None,
@@ -4163,8 +6301,10 @@ async def run_one(
     failed_build_setup_latency_ms = 0
     failed_build_setup_usage: list[dict[str, Any]] = []
     failed_build_routing_trace: dict[str, Any] = {}
+    frozen_build_routing_trace: dict[str, Any] = {}
     generation_attempt_limit = bounded_generation_attempts(generation_max_attempts)
     generation_retry_backoff_s = bounded_generation_retry_backoff(generation_retry_backoff)
+    finalization_policy = normalized_agent_finalization_policy(agent_finalization_policy)
     effective_timeout = group_timeout_seconds(
         requested_timeout=timeout,
         config=config,
@@ -4195,6 +6335,7 @@ async def run_one(
         )
         provider = build.provider
         effective_prompt = build.prompt
+        frozen_build_routing_trace = json.loads(json.dumps(build.routing_trace, ensure_ascii=False))
         generation_config = with_openrouter_model_capabilities(
             generation_config,
             str(
@@ -4213,6 +6354,20 @@ async def run_one(
             failed_build_routing_trace = dict(exc.routing_trace)
         else:
             provider_error = f"{type(exc).__name__}: {exc}"
+    expected_generation_model = ""
+    if spec.get("kind") == "single":
+        expected_generation_model = str(spec.get("model") or "").strip()
+    elif spec.get("kind") == "router_single":
+        expected_generation_model = str(
+            frozen_build_routing_trace.get("applied_model")
+            or frozen_build_routing_trace.get("fallback_model")
+            or ""
+        ).strip()
+    expected_generation_provider = (
+        "dry"
+        if dry_run and spec.get("kind") in {"single", "router_single"}
+        else str(inherited.provider or "").strip()
+    )
     if provider is not None:
         (
             run,
@@ -4230,8 +6385,11 @@ async def run_one(
             group=group,
             output_dir=output_dir,
             agent_max_iterations=agent_max_iterations,
+            finalization_policy=finalization_policy,
             max_attempts=generation_attempt_limit,
             retry_backoff_seconds=generation_retry_backoff_s,
+            expected_model=expected_generation_model,
+            expected_provider=expected_generation_provider,
         )
     else:
         run = RunResult(
@@ -4244,11 +6402,25 @@ async def run_one(
         )
         generation_attempts = []
         selected_generation_attempt_index = 0
-    terminal_generation_reason = generation_retry_reason(run)
+    terminal_generation_reason = generation_retry_reason(
+        run,
+        expected_selection_mode=(
+            str(spec.get("selection_mode") or "") if spec.get("kind") == "selection_mode" else ""
+        ),
+        expected_selection_plan=(
+            dict(getattr(provider, "selection_plan", {}) or {})
+            if provider is not None and spec.get("kind") == "selection_mode"
+            else {}
+        ),
+        expected_model=expected_generation_model,
+        expected_provider=expected_generation_provider,
+    )
     mark_retryable_generation_error(run, terminal_generation_reason)
+    generation_accepted = not bool(terminal_generation_reason)
     usage_payload = run_result_usage_payload(run)
     generation_non_byok_audit: dict[str, Any] | None = None
-    if require_openrouter_non_byok and not terminal_generation_reason:
+    generation_cost_audit_failed = False
+    if require_openrouter_non_byok and generation_accepted:
         generation_non_byok_audit = openrouter_non_byok_audit(
             {
                 "llm_request_count": (
@@ -4267,8 +6439,7 @@ async def run_one(
             }
         )
         if not generation_non_byok_audit["pass"]:
-            run.error = "openrouter_non_byok_verification_failed"
-            terminal_generation_reason = run.error
+            generation_cost_audit_failed = True
     profile_proposer_timeout_s = getattr(provider, "proposer_timeout_seconds", None)
     profile_aggregator_timeout_s = getattr(provider, "aggregator_timeout_seconds", None)
     profile_min_successful_proposers = getattr(
@@ -4293,7 +6464,7 @@ async def run_one(
         "proposer_early_stop_after_seconds",
         None,
     )
-    should_judge = not terminal_generation_reason and run.done is not None
+    should_judge = generation_accepted and not generation_cost_audit_failed and run.done is not None
     judge = (
         await judge_text(
             judge_provider=judge_provider,
@@ -4341,6 +6512,13 @@ async def run_one(
         done=run.done,
         provider_attempted=provider is not None,
     ) + len(run.setup_usage)
+    ensemble_trace = run.done.ensemble_trace if run.done is not None else {}
+    selected_usage_unknown_count = max(
+        ensemble_usage_unknown_count(ensemble_trace),
+        usage_unknown_count_from_usage_payload(usage_payload),
+    )
+    selected_trajectory_steps = selected_total_tool_call_count + selected_llm_request_count
+    selected_billed_cost = float(usage_payload.get("billed_cost") or 0.0)
     attempt_stream_tool_call_count = sum_generation_attempt_metric(
         generation_attempts, "stream_tool_call_count"
     )
@@ -4362,28 +6540,69 @@ async def run_one(
     attempt_latency_ms = sum_generation_attempt_metric(generation_attempts, "latency_ms")
     attempt_server_tool_use = sum_generation_attempt_server_tools(generation_attempts)
     generation_attempt_total_billed_cost = sum_generation_attempt_billed_cost(generation_attempts)
+    if not generation_attempts:
+        generation_attempt_total_billed_cost = float(usage_payload.get("billed_cost") or 0.0)
     generation_retry_reasons = [
         str(attempt.get("retry_reason") or "")
         for attempt in generation_attempts
         if attempt.get("retry_reason")
     ]
-    latency_ms = attempt_latency_ms or run.latency_ms
-    stream_tool_call_count = attempt_stream_tool_call_count or run.tool_call_count
-    server_tool_call_count = attempt_server_tool_call_count or selected_server_tool_call_count
-    if attempt_server_tool_use:
-        server_tool_use = attempt_server_tool_use
-    total_tool_call_count = attempt_total_tool_call_count or selected_total_tool_call_count
-    llm_request_count = attempt_llm_request_count or selected_llm_request_count
-    trajectory_steps = total_tool_call_count + llm_request_count
-    if attempt_trajectory_steps:
-        trajectory_steps = attempt_trajectory_steps
-    ensemble_trace = run.done.ensemble_trace if run.done is not None else {}
-    usage_unknown_count = max(
-        ensemble_usage_unknown_count(ensemble_trace),
-        usage_unknown_count_from_usage_payload(usage_payload),
+    actual_latency_ms = attempt_latency_ms if generation_attempts else run.latency_ms
+    actual_stream_tool_call_count = (
+        attempt_stream_tool_call_count if generation_attempts else run.tool_call_count
     )
-    if attempt_usage_unknown_count:
-        usage_unknown_count = attempt_usage_unknown_count
+    actual_server_tool_call_count = (
+        attempt_server_tool_call_count if generation_attempts else selected_server_tool_call_count
+    )
+    actual_server_tool_use = attempt_server_tool_use if generation_attempts else server_tool_use
+    actual_total_tool_call_count = (
+        attempt_total_tool_call_count if generation_attempts else selected_total_tool_call_count
+    )
+    actual_llm_request_count = (
+        attempt_llm_request_count if generation_attempts else selected_llm_request_count
+    )
+    actual_trajectory_steps = (
+        attempt_trajectory_steps
+        if generation_attempts
+        else actual_total_tool_call_count + actual_llm_request_count
+    )
+    actual_usage_unknown_count = (
+        attempt_usage_unknown_count if generation_attempts else selected_usage_unknown_count
+    )
+    selected_generation_succeeded = generation_accepted
+    if not selected_generation_succeeded:
+        selected_generation_attempt_index = 0
+        selected_server_tool_call_count = 0
+        server_tool_use = {}
+        selected_total_tool_call_count = 0
+        selected_llm_request_count = 0
+        selected_usage_unknown_count = 0
+        selected_trajectory_steps = 0
+        selected_billed_cost = 0.0
+    selected_attempt_metrics = {
+        "latency_ms": run.latency_ms if selected_generation_succeeded else 0,
+        "stream_tool_call_count": (run.tool_call_count if selected_generation_succeeded else 0),
+        "server_tool_call_count": selected_server_tool_call_count,
+        "server_tool_use": server_tool_use,
+        "total_tool_call_count": selected_total_tool_call_count,
+        "trajectory_steps": selected_trajectory_steps,
+        "llm_request_count": selected_llm_request_count,
+        "usage_unknown_count": selected_usage_unknown_count,
+        "billed_cost_usd": selected_billed_cost,
+        "generation_attempt": selected_generation_attempt_index,
+    }
+    actual_spend_metrics = {
+        "latency_ms": actual_latency_ms,
+        "stream_tool_call_count": actual_stream_tool_call_count,
+        "server_tool_call_count": actual_server_tool_call_count,
+        "server_tool_use": actual_server_tool_use,
+        "total_tool_call_count": actual_total_tool_call_count,
+        "trajectory_steps": actual_trajectory_steps,
+        "llm_request_count": actual_llm_request_count,
+        "usage_unknown_count": actual_usage_unknown_count,
+        "billed_cost_usd": generation_attempt_total_billed_cost,
+        "generation_attempt_count": len(generation_attempts),
+    }
     row = {
         "task_id": task["id"],
         "group": group,
@@ -4394,8 +6613,9 @@ async def run_one(
         "run_compatibility_fingerprint": run_compatibility_fingerprint,
         "metadata": task.get("metadata", {}),
         "provider_spec": dict(spec),
-        "routing_trace": run.routing_trace,
+        "routing_trace": run.routing_trace or frozen_build_routing_trace,
         "runner_mode": runner_mode,
+        "agent_finalization_policy": dict(finalization_policy),
         "tools_enabled": bool(tool_policy.get("tools_enabled")),
         "tool_policy": tool_policy,
         "generation_policy": generation_policy,
@@ -4404,22 +6624,30 @@ async def run_one(
         "started_at": started,
         "completed_at": completed_at,
         "total_elapsed_ms": int((completed_at - started) * 1000),
-        "latency_ms": latency_ms,
+        "latency_ms": run.latency_ms,
         "ttft_ms": run.ttft_ms,
-        "tool_call_count": stream_tool_call_count,
-        "stream_tool_call_count": stream_tool_call_count,
-        "server_tool_call_count": server_tool_call_count,
+        "tool_call_count": run.tool_call_count,
+        "stream_tool_call_count": run.tool_call_count,
+        "server_tool_call_count": selected_server_tool_call_count,
         "server_tool_use": server_tool_use,
-        "total_tool_call_count": total_tool_call_count,
-        "trajectory_steps": trajectory_steps,
-        "llm_request_count": llm_request_count,
-        "usage_unknown_count": usage_unknown_count,
+        "total_tool_call_count": selected_total_tool_call_count,
+        "trajectory_steps": selected_trajectory_steps,
+        "llm_request_count": selected_llm_request_count,
+        "usage_unknown_count": selected_usage_unknown_count,
+        "selected_attempt_metrics": selected_attempt_metrics,
+        "selected_generation_succeeded": selected_generation_succeeded,
+        "actual_spend_metrics": actual_spend_metrics,
+        "selected_attempt_billed_cost_usd": selected_billed_cost,
+        "actual_spend_billed_cost_usd": generation_attempt_total_billed_cost,
         "generation_attempt_count": len(generation_attempts),
         "generation_max_attempts": generation_attempt_limit,
         "generation_retry_backoff_s": generation_retry_backoff_s,
         "generation_attempt_total_billed_cost": generation_attempt_total_billed_cost,
         "generation_retry_reasons": generation_retry_reasons,
-        "error": run.error,
+        "error": (
+            run.error
+            or ("openrouter_non_byok_verification_failed" if generation_cost_audit_failed else None)
+        ),
         "final_text": run.final_text,
         "final_text_chars": len(run.final_text),
         "final_text_sha256": final_text_sha,
@@ -4428,8 +6656,7 @@ async def run_one(
             "run_error": run.error,
             "judge_skipped_reason": (
                 "generation_cost_audit_failed"
-                if generation_non_byok_audit
-                and not bool(generation_non_byok_audit.get("pass"))
+                if generation_cost_audit_failed
                 else ("run_not_done" if not should_judge else "")
             ),
             "requested_timeout_s": timeout,
@@ -4448,20 +6675,23 @@ async def run_one(
             "profile_proposer_early_stop_after_s": profile_proposer_early_stop_after_s,
             "runner_mode": runner_mode,
             "agent_max_iterations": agent_max_iterations,
-            "latency_ms": latency_ms,
+            "agent_finalization_policy": dict(finalization_policy),
+            "latency_ms": run.latency_ms,
             "selected_generation_latency_ms": run.latency_ms,
+            "selected_attempt_metrics": selected_attempt_metrics,
+            "actual_spend_metrics": actual_spend_metrics,
             "routing_setup_latency_ms": run.setup_latency_ms,
-            "routing_trace": run.routing_trace,
+            "routing_trace": run.routing_trace or frozen_build_routing_trace,
             "ttft_ms": run.ttft_ms,
             "total_elapsed_ms": int((completed_at - started) * 1000),
-            "tool_call_count": stream_tool_call_count,
-            "stream_tool_call_count": stream_tool_call_count,
-            "server_tool_call_count": server_tool_call_count,
+            "tool_call_count": run.tool_call_count,
+            "stream_tool_call_count": run.tool_call_count,
+            "server_tool_call_count": selected_server_tool_call_count,
             "server_tool_use": server_tool_use,
-            "total_tool_call_count": total_tool_call_count,
-            "trajectory_steps": trajectory_steps,
-            "llm_request_count": llm_request_count,
-            "usage_unknown_count": usage_unknown_count,
+            "total_tool_call_count": selected_total_tool_call_count,
+            "trajectory_steps": selected_trajectory_steps,
+            "llm_request_count": selected_llm_request_count,
+            "usage_unknown_count": selected_usage_unknown_count,
             "generation_attempt_count": len(generation_attempts),
             "generation_max_attempts": generation_attempt_limit,
             "generation_retry_backoff_s": generation_retry_backoff_s,
@@ -4487,7 +6717,52 @@ async def run_one(
     }
     if generation_non_byok_audit is not None:
         row["openrouter_non_byok_audit"] = generation_non_byok_audit
-    row["cost_accounting"] = row_cost_accounting(row)
+    repair_row_cost_metadata_with_estimates(row)
+    row["cost_accounting"] = public_cost_accounting(row_cost_accounting(row))
+    final_non_byok_audit: dict[str, Any] | None = None
+    if require_openrouter_non_byok:
+        final_non_byok_audit = openrouter_non_byok_audit(row)
+        row["openrouter_non_byok_audit"] = final_non_byok_audit
+    judge_reasons = judge_completion_reasons(
+        row,
+        judge_required=judge_provider is not None,
+    )
+    cost_metadata_complete = bool(row["cost_accounting"].get("actual_spend_cost_complete"))
+    if require_openrouter_non_byok:
+        cost_metadata_complete = bool(
+            cost_metadata_complete
+            and isinstance(final_non_byok_audit, Mapping)
+            and final_non_byok_audit.get("pass") is True
+        )
+    if generation_accepted and not row.get("error"):
+        if not cost_metadata_complete:
+            row["error"] = (
+                "openrouter_non_byok_verification_failed"
+                if require_openrouter_non_byok
+                and (
+                    generation_cost_audit_failed
+                    or not isinstance(final_non_byok_audit, Mapping)
+                    or final_non_byok_audit.get("pass") is not True
+                )
+                else "cost_metadata_incomplete"
+            )
+        elif judge_reasons:
+            row["error"] = "judge_incomplete"
+    row["completion_status"] = {
+        "generation_accepted": generation_accepted,
+        "cost_metadata_complete": cost_metadata_complete,
+        "judge_complete": not judge_reasons,
+        "status": (
+            "complete"
+            if generation_accepted and cost_metadata_complete and not judge_reasons
+            else "incomplete"
+        ),
+        "incomplete_reasons": [
+            *([] if generation_accepted else [terminal_generation_reason]),
+            *([] if cost_metadata_complete else ["cost_metadata_incomplete"]),
+            *judge_reasons,
+        ],
+    }
     return row
 
 
@@ -4571,6 +6846,21 @@ def row_generation_attempt_usage_total(row: dict[str, Any], key: str) -> float |
 
 
 def row_usage_number(row: dict[str, Any], key: str) -> float:
+    """Return usage for the selected successful generation attempt only."""
+
+    if row.get("selected_generation_succeeded") is False:
+        return 0.0
+    usage = row.get("usage") or {}
+    if isinstance(usage, dict):
+        value = usage.get(key)
+        if isinstance(value, int | float):
+            return float(value)
+    return 0.0
+
+
+def row_actual_spend_usage_number(row: dict[str, Any], key: str) -> float:
+    """Return usage charged across every generation attempt."""
+
     attempt_total = row_generation_attempt_usage_total(row, key)
     if attempt_total is not None:
         return attempt_total
@@ -4583,6 +6873,12 @@ def row_usage_number(row: dict[str, Any], key: str) -> float:
 
 
 def row_billed_cost(row: dict[str, Any]) -> float:
+    """Compatibility cost: selected successful generation attempt."""
+
+    return row_usage_number(row, "billed_cost")
+
+
+def row_actual_spend_billed_cost(row: dict[str, Any]) -> float:
     attempt_cost = row_generation_attempt_usage_total(row, "billed_cost")
     if attempt_cost is not None:
         return attempt_cost
@@ -4593,17 +6889,14 @@ def row_billed_cost(row: dict[str, Any]) -> float:
     value = execution.get("generation_attempt_total_billed_cost")
     if isinstance(value, int | float):
         return float(value)
-    return row_usage_number(row, "billed_cost")
+    return row_billed_cost(row)
 
 
 def _usage_token_count(usage: dict[str, Any]) -> int:
     # OpenRouter reports reasoning_tokens as a completion/output-token detail,
     # not an additional billed token bucket.  Keep it separately observable
     # without adding it to input + output a second time.
-    return sum(
-        coerce_metric_int(usage.get(key))
-        for key in ("input_tokens", "output_tokens")
-    )
+    return sum(coerce_metric_int(usage.get(key)) for key in ("input_tokens", "output_tokens"))
 
 
 def _finite_nonnegative_number(value: Any) -> bool:
@@ -4612,6 +6905,71 @@ def _finite_nonnegative_number(value: Any) -> bool:
         and isinstance(value, int | float)
         and math.isfinite(float(value))
         and float(value) >= 0.0
+    )
+
+
+def _openrouter_router_provider_metadata_is_complete(
+    router_metadata: Mapping[str, Any],
+) -> bool:
+    """Require attested metadata for the upstream that served the response."""
+
+    attempts = router_metadata.get("attempts")
+    if isinstance(attempts, list):
+        for attempt in attempts:
+            if not isinstance(attempt, Mapping):
+                continue
+            status = attempt.get("status")
+            if (
+                isinstance(attempt.get("provider"), str)
+                and bool(str(attempt.get("provider")).strip())
+                and isinstance(attempt.get("model"), str)
+                and bool(str(attempt.get("model")).strip())
+                and isinstance(status, int)
+                and not isinstance(status, bool)
+                and 200 <= status < 300
+            ):
+                return True
+    endpoints = router_metadata.get("endpoints")
+    available = endpoints.get("available") if isinstance(endpoints, Mapping) else None
+    if isinstance(available, list):
+        return any(
+            isinstance(endpoint, Mapping)
+            and endpoint.get("selected") is True
+            and isinstance(endpoint.get("provider"), str)
+            and bool(str(endpoint.get("provider")).strip())
+            and isinstance(endpoint.get("model"), str)
+            and bool(str(endpoint.get("model")).strip())
+            for endpoint in available
+        )
+    return False
+
+
+def _openrouter_provider_billed_cost_is_exact(unit: Mapping[str, Any]) -> bool:
+    """Preserve the non-audit OpenRouter provider-billed cost contract."""
+
+    if str(unit.get("provider") or "").strip().casefold() != "openrouter":
+        return False
+    provider_usage = unit.get("provider_usage")
+    if not isinstance(provider_usage, Mapping):
+        return False
+    router_metadata = provider_usage.get("router_metadata")
+    response_ids = provider_usage.get("response_ids")
+    billed_cost = unit.get("billed_cost")
+    reported_cost = provider_usage.get("provider_reported_cost")
+    return (
+        provider_usage.get("is_byok") is False
+        and isinstance(router_metadata, Mapping)
+        and router_metadata.get("is_byok") is False
+        and _finite_nonnegative_number(billed_cost)
+        and _finite_nonnegative_number(reported_cost)
+        and round(float(billed_cost) * 1_000_000_000)
+        == round(float(reported_cost) * 1_000_000_000)
+        and isinstance(response_ids, list)
+        and bool(response_ids)
+        and all(
+            isinstance(response_id, str) and bool(response_id.strip())
+            for response_id in response_ids
+        )
     )
 
 
@@ -4632,16 +6990,22 @@ def _openrouter_non_byok_receipt_is_exact(unit: Mapping[str, Any]) -> bool:
         or not isinstance(billed_cost, int | float)
         or isinstance(reported_cost, bool)
         or not isinstance(reported_cost, int | float)
+        or not _finite_nonnegative_number(billed_cost)
+        or not _finite_nonnegative_number(reported_cost)
     ):
         return False
+    receipt_present, receipt_status, receipt_cost = _billing_receipt_state(unit)
+    if receipt_present and (receipt_status != "confirmed" or receipt_cost is None):
+        return False
+    exact_costs = [float(billed_cost), float(reported_cost)]
+    if receipt_cost is not None:
+        exact_costs.append(receipt_cost)
     return (
         provider_usage.get("is_byok") is False
         and isinstance(router_metadata, Mapping)
         and router_metadata.get("is_byok") is False
-        and _finite_nonnegative_number(billed_cost)
-        and _finite_nonnegative_number(reported_cost)
-        and round(float(billed_cost) * 1_000_000_000)
-        == round(float(reported_cost) * 1_000_000_000)
+        and _openrouter_router_provider_metadata_is_complete(router_metadata)
+        and len({round(cost * 1_000_000_000) for cost in exact_costs}) == 1
         and isinstance(response_ids, list)
         and bool(response_ids)
         and all(
@@ -4656,6 +7020,137 @@ def _first_usage_cost(unit: Mapping[str, Any], *keys: str) -> float | None:
         if key in unit and _finite_nonnegative_number(unit.get(key)):
             return float(unit[key])
     return None
+
+
+def _coerce_provider_billing_receipt(value: Any) -> ProviderBillingReceipt | None:
+    """Validate the complete provider-native billing receipt schema."""
+
+    if value is None:
+        return None
+
+    def receipt_int(raw: Any, *, nullable: bool = False) -> int | None:
+        if raw is None and nullable:
+            return None
+        if (
+            isinstance(raw, bool)
+            or not isinstance(raw, int)
+            or raw < 0
+            or raw > (1 << 63) - 1
+        ):
+            raise ValueError("billing receipt nanos must be ledger-safe integers")
+        return int(raw)
+
+    if isinstance(value, ProviderBillingReceipt):
+        candidate = value
+    elif isinstance(value, Mapping):
+        try:
+            raw_fx = value.get("fx_native_per_usd_nanos")
+            raw_schema = value.get("schema_version", 1)
+            if (
+                isinstance(raw_fx, bool)
+                or not isinstance(raw_fx, int)
+                or isinstance(raw_schema, bool)
+                or not isinstance(raw_schema, int)
+            ):
+                return None
+            candidate = ProviderBillingReceipt(
+                currency=str(value.get("currency") or ""),
+                status=str(value.get("status") or ""),  # type: ignore[arg-type]
+                amount_nanos=receipt_int(value.get("amount_nanos"), nullable=True),
+                usd_equivalent_nanos=receipt_int(
+                    value.get("usd_equivalent_nanos"),
+                    nullable=True,
+                ),
+                fx_native_per_usd_nanos=raw_fx,
+                schema_version=raw_schema,
+            )
+        except (TypeError, ValueError, OverflowError):
+            return None
+    else:
+        return None
+    try:
+        amount_nanos = receipt_int(candidate.amount_nanos, nullable=True)
+        usd_nanos = receipt_int(candidate.usd_equivalent_nanos, nullable=True)
+    except ValueError:
+        return None
+    if (
+        not isinstance(candidate.currency, str)
+        or len(candidate.currency) != 3
+        or any(character < "A" or character > "Z" for character in candidate.currency)
+        or candidate.status not in {"confirmed", "pending"}
+        or isinstance(candidate.fx_native_per_usd_nanos, bool)
+        or not isinstance(candidate.fx_native_per_usd_nanos, int)
+        or candidate.fx_native_per_usd_nanos <= 0
+        or candidate.fx_native_per_usd_nanos > (1 << 63) - 1
+        or isinstance(candidate.schema_version, bool)
+        or not isinstance(candidate.schema_version, int)
+        or candidate.schema_version != 1
+    ):
+        return None
+    if candidate.status == "confirmed" and (
+        amount_nanos is None or usd_nanos is None
+    ):
+        return None
+    if candidate.status == "pending" and usd_nanos is not None:
+        return None
+    if candidate.status == "confirmed":
+        expected_usd_nanos = (
+            amount_nanos * 1_000_000_000
+            + candidate.fx_native_per_usd_nanos // 2
+        ) // candidate.fx_native_per_usd_nanos
+        if expected_usd_nanos != usd_nanos:
+            return None
+    return candidate
+
+
+def _billing_receipt_state(
+    unit: Mapping[str, Any],
+) -> tuple[bool, str, float | None]:
+    receipt = unit.get("billing_receipt", unit.get("billingReceipt"))
+    if receipt is None:
+        return False, "", None
+    normalized = _coerce_provider_billing_receipt(receipt)
+    if normalized is None:
+        return True, "invalid", None
+    if normalized.status == "confirmed":
+        return (
+            True,
+            normalized.status,
+            int(normalized.usd_equivalent_nanos or 0) / 1_000_000_000,
+        )
+    return True, normalized.status, None
+
+
+def exact_provider_usage_cost(unit: Mapping[str, Any]) -> float | None:
+    receipt_present, receipt_status, receipt_cost = _billing_receipt_state(unit)
+    if receipt_present:
+        return receipt_cost if receipt_status == "confirmed" else None
+    source = str(unit.get("cost_source") or "none").strip().casefold()
+    billed_cost = _first_usage_cost(unit, "billed_cost")
+    if source == "openrouter_usage":
+        return billed_cost
+    if (
+        source == "provider_billed"
+        and _openrouter_provider_billed_cost_is_exact(unit)
+    ):
+        return billed_cost
+    return None
+
+
+def trusted_provider_billed_cost(unit: Mapping[str, Any]) -> float:
+    exact_cost = exact_provider_usage_cost(unit)
+    if exact_cost is not None:
+        return exact_cost
+    receipt_present, _, _ = _billing_receipt_state(unit)
+    if receipt_present:
+        return 0.0
+    source = str(unit.get("cost_source") or "none").strip().casefold()
+    reported = _first_usage_cost(unit, "billed_cost")
+    if source in {"provider_billed", "openrouter_usage"}:
+        return float(reported or 0.0)
+    if source in {"", "none", "unavailable"} and reported and reported > 0.0:
+        return reported
+    return 0.0
 
 
 def _mixed_usage_cost(unit: Mapping[str, Any]) -> float | None:
@@ -4678,6 +7173,141 @@ def _mixed_usage_cost(unit: Mapping[str, Any]) -> float | None:
     return (billed or 0.0) + (estimated or 0.0)
 
 
+def estimate_missing_usage_costs(
+    usage: Any,
+    *,
+    default_provider: str = "",
+    default_model: str = "",
+) -> bool:
+    """Fill missing dollars from the frozen pricing resolver, never as exact."""
+
+    if not isinstance(usage, dict):
+        return False
+    breakdown = usage.get("model_usage_breakdown")
+    units = (
+        [item for item in breakdown if isinstance(item, dict)]
+        if isinstance(breakdown, list) and breakdown
+        else [usage]
+    )
+    changed = False
+    estimated_total = 0.0
+    all_units_priced = True
+    for unit in units:
+        source = str(unit.get("cost_source") or "none").strip().casefold()
+        exact_cost = exact_provider_usage_cost(unit)
+        already_known = (
+            exact_cost is not None
+            or (
+                source.startswith("opensquilla_")
+                and _first_usage_cost(
+                    unit,
+                    "estimated_cost_usd",
+                    "estimatedCostUsd",
+                    "cost_usd",
+                    "costUsd",
+                )
+                is not None
+            )
+            or (source == "mixed" and _mixed_usage_cost(unit) is not None)
+        )
+        if already_known:
+            known_cost = (
+                exact_cost
+                if exact_cost is not None
+                else _mixed_usage_cost(unit)
+                if source == "mixed"
+                else _first_usage_cost(
+                    unit,
+                    "estimated_cost_usd",
+                    "estimatedCostUsd",
+                    "cost_usd",
+                    "costUsd",
+                )
+            )
+            estimated_total += float(known_cost or 0.0)
+            continue
+        model = str(unit.get("model") or default_model or "")
+        provider = str(unit.get("provider") or default_provider or "")
+        input_tokens = coerce_metric_int(unit.get("input_tokens"))
+        output_tokens = coerce_metric_int(unit.get("output_tokens"))
+        cached_tokens = coerce_metric_int(
+            unit.get("cache_read_tokens")
+            if "cache_read_tokens" in unit
+            else unit.get("cached_tokens")
+        )
+        cache_write_tokens = coerce_metric_int(unit.get("cache_write_tokens"))
+        if not model or not any((input_tokens, output_tokens, cached_tokens, cache_write_tokens)):
+            all_units_priced = False
+            continue
+        resolved = resolve_model_price(model, provider)
+        estimate = estimate_cost(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_read_tokens=cached_tokens,
+            cache_write_tokens=cache_write_tokens,
+            price=resolved.entry,
+        )
+        unit["estimated_cost_usd"] = float(estimate.cost_usd)
+        unit["cost_usd"] = float(estimate.cost_usd)
+        unit["cost_source"] = "opensquilla_static_estimate"
+        provider_usage = (
+            dict(unit.get("provider_usage"))
+            if isinstance(unit.get("provider_usage"), Mapping)
+            else {}
+        )
+        provider_usage.update(
+            {
+                "cost_repair": "token_price_estimate",
+                "estimate_basis": estimate.basis,
+                "price_source": resolved.source,
+            }
+        )
+        unit["provider_usage"] = provider_usage
+        estimated_total += float(estimate.cost_usd)
+        changed = True
+    if isinstance(breakdown, list) and breakdown and all_units_priced:
+        usage["estimated_cost_usd"] = estimated_total
+        usage["cost_usd"] = estimated_total
+        if str(usage.get("cost_source") or "none").casefold() not in {
+            "provider_billed",
+            "mixed",
+        }:
+            usage["cost_source"] = "opensquilla_static_estimate"
+    return changed
+
+
+def repair_row_cost_metadata_with_estimates(row: dict[str, Any]) -> bool:
+    """Estimate every retained generation/Judge receipt without rerunning models."""
+
+    provider_spec = row.get("provider_spec")
+    default_provider = (
+        str(provider_spec.get("provider") or "") if isinstance(provider_spec, Mapping) else ""
+    )
+    default_model = (
+        str(provider_spec.get("model") or "") if isinstance(provider_spec, Mapping) else ""
+    )
+    changed = estimate_missing_usage_costs(
+        row.get("usage"),
+        default_provider=default_provider,
+        default_model=default_model,
+    )
+    execution = row.get("execution")
+    attempts = execution.get("generation_attempts") if isinstance(execution, Mapping) else None
+    if isinstance(attempts, list):
+        for attempt in attempts:
+            run = attempt.get("run") if isinstance(attempt, Mapping) else None
+            if isinstance(run, dict):
+                changed |= estimate_missing_usage_costs(
+                    run.get("usage"),
+                    default_provider=default_provider,
+                    default_model=default_model,
+                )
+    for judge in [row.get("judge"), *(row.get("candidate_judges") or [])]:
+        for run in iter_judge_attempt_runs(judge):
+            changed |= estimate_missing_usage_costs(run.get("usage"))
+    return changed
+
+
 def usage_cost_accounting(
     usage: Any,
     *,
@@ -4691,6 +7321,8 @@ def usage_cost_accounting(
         if isinstance(breakdown, list) and breakdown
         else ([usage_dict] if usage_dict else [])
     )
+    raw_observed = len(units)
+    units = deduplicate_stable_usage_receipts(units)
     observed = len(units)
     request_count = max(max(0, int(expected_requests)), observed)
     counts = {"exact": 0, "estimated": 0, "mixed": 0, "unknown": 0}
@@ -4699,11 +7331,9 @@ def usage_cost_accounting(
     for unit in units:
         source = str(unit.get("cost_source") or "none").strip().casefold()
         cost: float | None = None
-        if (
-            source == "provider_billed"
-            and _openrouter_non_byok_receipt_is_exact(unit)
-        ):
-            cost = _first_usage_cost(unit, "billed_cost")
+        exact_cost = exact_provider_usage_cost(unit)
+        if exact_cost is not None:
+            cost = exact_cost
             category = "exact" if cost is not None else "unknown"
         elif source.startswith("opensquilla_"):
             cost = _first_usage_cost(
@@ -4731,6 +7361,7 @@ def usage_cost_accounting(
         "scope": scope,
         "request_count": request_count,
         "usage_observed_request_count": observed,
+        "duplicate_stable_receipt_count": raw_observed - observed,
         "exact_request_count": counts["exact"],
         "estimated_request_count": counts["estimated"],
         "mixed_request_count": counts["mixed"],
@@ -4754,17 +7385,46 @@ def usage_cost_accounting(
         ),
         "cost_complete": counts["unknown"] == 0,
         "cost_exact": (
-            counts["unknown"] == 0
-            and counts["estimated"] == 0
-            and counts["mixed"] == 0
+            counts["unknown"] == 0 and counts["estimated"] == 0 and counts["mixed"] == 0
         ),
+        # Internal-only provenance lets nested account merges deduplicate a
+        # physical response across attempts and scopes. It is stripped before
+        # result rows are serialized.
+        "_stable_usage_receipts": units,
+        "_receipt_provenance_complete": True,
     }
 
 
 def merge_cost_accounting(scope: str, accounts: list[dict[str, Any]]) -> dict[str, Any]:
+    if all(
+        account.get("_receipt_provenance_complete") is True
+        and isinstance(account.get("_stable_usage_receipts"), list)
+        for account in accounts
+    ):
+        combined_units = [
+            unit
+            for account in accounts
+            for unit in account["_stable_usage_receipts"]
+            if isinstance(unit, Mapping)
+        ]
+        merged = usage_cost_accounting(
+            {"model_usage_breakdown": combined_units} if combined_units else None,
+            expected_requests=sum(
+                max(0, coerce_metric_int(account.get("request_count")))
+                for account in accounts
+            ),
+            scope=scope,
+        )
+        merged["duplicate_stable_receipt_count"] += sum(
+            max(0, coerce_metric_int(account.get("duplicate_stable_receipt_count")))
+            for account in accounts
+        )
+        return merged
+
     merged_numeric: dict[str, int | float] = {
         "request_count": 0,
         "usage_observed_request_count": 0,
+        "duplicate_stable_receipt_count": 0,
         "exact_request_count": 0,
         "estimated_request_count": 0,
         "mixed_request_count": 0,
@@ -4791,14 +7451,10 @@ def merge_cost_accounting(scope: str, accounts: list[dict[str, Any]]) -> dict[st
                 known_requests / requests * 100.0 if requests else 100.0
             ),
             "exact_request_coverage_pct": (
-                int(merged_numeric["exact_request_count"]) / requests * 100.0
-                if requests
-                else 100.0
+                int(merged_numeric["exact_request_count"]) / requests * 100.0 if requests else 100.0
             ),
             "known_token_coverage_pct": (
-                (total_tokens - int(merged_numeric["unknown_tokens"]))
-                / total_tokens
-                * 100.0
+                (total_tokens - int(merged_numeric["unknown_tokens"])) / total_tokens * 100.0
                 if total_tokens
                 else (100.0 if not merged_numeric["unknown_request_count"] else 0.0)
             ),
@@ -4813,36 +7469,114 @@ def merge_cost_accounting(scope: str, accounts: list[dict[str, Any]]) -> dict[st
     return merged
 
 
-def generation_cost_accounting(row: dict[str, Any]) -> dict[str, Any]:
+def public_cost_accounting(value: Any) -> Any:
+    """Remove internal receipt provenance before serializing result rows."""
+
+    if isinstance(value, Mapping):
+        return {
+            key: public_cost_accounting(item)
+            for key, item in value.items()
+            if not str(key).startswith("_")
+        }
+    if isinstance(value, list):
+        return [public_cost_accounting(item) for item in value]
+    return value
+
+
+def summarized_run_expected_request_count(run: Mapping[str, Any]) -> int:
+    """Preserve explicit zero-request evidence while supporting legacy rows."""
+
+    declared = coerce_metric_int(run.get("llm_request_count"))
+    trace_events = run.get("trace_events")
+    if isinstance(trace_events, list):
+        for event in reversed(trace_events):
+            if not isinstance(event, Mapping):
+                continue
+            physical = event.get("physical_request_count")
+            if isinstance(physical, int) and not isinstance(physical, bool):
+                return max(declared, max(0, physical)) if physical else 0
+            if event.get("request_started") is False:
+                return 0
+            if str(event.get("code") or "").strip() in _NO_PHYSICAL_REQUEST_GATE_CODES:
+                return 0
+    # Legacy summaries do not prove whether the request started.
+    return max(1, declared)
+
+
+def actual_generation_spend_accounting(row: dict[str, Any]) -> dict[str, Any]:
     accounts: list[dict[str, Any]] = []
     execution = row.get("execution") or {}
     attempts = execution.get("generation_attempts") if isinstance(execution, dict) else None
+    observed_attempts = 0
     if isinstance(attempts, list):
         for attempt in attempts:
             run = attempt.get("run") if isinstance(attempt, dict) else None
             if not isinstance(run, dict):
                 continue
+            observed_attempts += 1
             accounts.append(
                 usage_cost_accounting(
                     run.get("usage"),
-                    expected_requests=coerce_metric_int(run.get("llm_request_count")),
+                    expected_requests=summarized_run_expected_request_count(run),
                     scope="generation_attempt",
                 )
             )
+    actual_metrics = row.get("actual_spend_metrics")
+    declared_attempts = max(
+        coerce_metric_int(row.get("generation_attempt_count")),
+        coerce_metric_int(
+            actual_metrics.get("generation_attempt_count")
+            if isinstance(actual_metrics, dict)
+            else 0
+        ),
+    )
+    if declared_attempts > observed_attempts:
+        accounts.append(
+            usage_cost_accounting(
+                None,
+                expected_requests=declared_attempts - observed_attempts,
+                scope="missing_generation_attempt",
+            )
+        )
     if not accounts:
+        expected_requests = row_llm_request_count(row)
+        if str(row.get("final_text") or "").strip():
+            expected_requests = max(1, expected_requests)
         accounts.append(
             usage_cost_accounting(
                 row.get("usage"),
-                expected_requests=row_llm_request_count(row),
+                expected_requests=expected_requests,
                 scope="generation_attempt",
             )
         )
-    return merge_cost_accounting("generation", accounts)
+    return merge_cost_accounting("actual_generation_spend", accounts)
+
+
+def generation_cost_accounting(row: dict[str, Any]) -> dict[str, Any]:
+    """Account for only the selected generation attempt."""
+
+    if row.get("selected_generation_succeeded") is False:
+        return usage_cost_accounting(
+            None,
+            expected_requests=0,
+            scope="selected_generation_attempt",
+        )
+    return usage_cost_accounting(
+        row.get("usage"),
+        expected_requests=row_llm_request_count(row),
+        scope="selected_generation_attempt",
+    )
 
 
 def iter_judge_attempt_runs(judge: Any):
     if not isinstance(judge, dict):
         return
+    prior_attempts = judge.get("prior_judge_attempts")
+    if isinstance(prior_attempts, list):
+        for attempt in prior_attempts:
+            run = attempt.get("run") if isinstance(attempt, dict) else None
+            if isinstance(run, dict):
+                yield run
     criteria = judge.get("criterion_judgments")
     if isinstance(criteria, list):
         for criterion in criteria:
@@ -4863,21 +7597,63 @@ def iter_judge_attempt_runs(judge: Any):
 
 
 def judge_cost_accounting(judge: Any, *, scope: str) -> dict[str, Any]:
+    if not isinstance(judge, dict):
+        return merge_cost_accounting(scope, [])
+    if (
+        judge.get("judge_cost_exempt") is True
+        or str(judge.get("judge_model") or "").casefold() == "dry-run"
+    ):
+        return merge_cost_accounting(scope, [])
+    runs = list(iter_judge_attempt_runs(judge))
     accounts = [
         usage_cost_accounting(
             run.get("usage"),
-            expected_requests=coerce_metric_int(run.get("llm_request_count")),
+            expected_requests=summarized_run_expected_request_count(run),
             scope=f"{scope}_attempt",
         )
-        for run in iter_judge_attempt_runs(judge)
+        for run in runs
     ]
+    declared_attempts = coerce_metric_int(judge.get("judge_attempt_count"))
+    criteria = judge.get("criterion_judgments")
+    if isinstance(criteria, list):
+        declared_attempts = max(
+            declared_attempts,
+            sum(
+                max(
+                    1,
+                    coerce_metric_int(item.get("judge_attempt_count")),
+                )
+                for item in criteria
+                if isinstance(item, dict)
+            ),
+            coerce_metric_int(judge.get("criteria_count")),
+        )
+    elif judge.get("score_status") or judge.get("error") or judge.get("judge_run"):
+        declared_attempts = max(1, declared_attempts)
+    if declared_attempts > len(runs):
+        accounts.append(
+            usage_cost_accounting(
+                None,
+                expected_requests=declared_attempts - len(runs),
+                scope=f"{scope}_missing_attempt",
+            )
+        )
     return merge_cost_accounting(scope, accounts)
 
 
-def external_tool_cost_accounting(row: dict[str, Any]) -> dict[str, Any]:
+def external_tool_cost_accounting(
+    row: dict[str, Any],
+    *,
+    actual_spend: bool = False,
+) -> dict[str, Any]:
     tool_policy = row.get("tool_policy") or {}
     mode = str(tool_policy.get("tool_mode") or TOOL_MODE_PROVIDER_ONLY)
-    tool_calls = row_total_tool_call_count(row)
+    actual_metrics = row.get("actual_spend_metrics") or {}
+    tool_calls = (
+        coerce_metric_int(actual_metrics.get("total_tool_call_count"))
+        if actual_spend and isinstance(actual_metrics, dict)
+        else row_total_tool_call_count(row)
+    )
     local = tool_policy.get("local_web_tools") or {}
     search = local.get("web_search") or {}
     fetch = local.get("web_fetch") or {}
@@ -4888,7 +7664,7 @@ def external_tool_cost_accounting(row: dict[str, Any]) -> dict[str, Any]:
     )
     untracked_cost_possible = untracked_paid_path_configured and tool_calls > 0
     return {
-        "scope": "external_tools",
+        "scope": "actual_external_tools" if actual_spend else "external_tools",
         "tool_call_count": tool_calls,
         "recorded_cost_usd": 0.0,
         "potentially_unpriced_tool_call_count_upper_bound": (
@@ -4906,6 +7682,7 @@ def external_tool_cost_accounting(row: dict[str, Any]) -> dict[str, Any]:
 
 def row_cost_accounting(row: dict[str, Any]) -> dict[str, Any]:
     generation = generation_cost_accounting(row)
+    actual_generation = actual_generation_spend_accounting(row)
     judge = judge_cost_accounting(row.get("judge"), scope="judge")
     candidate_accounts = [
         judge_cost_accounting(item, scope="candidate_judge")
@@ -4913,53 +7690,121 @@ def row_cost_accounting(row: dict[str, Any]) -> dict[str, Any]:
     ]
     candidate_judge = merge_cost_accounting("candidate_judge", candidate_accounts)
     llm_total = merge_cost_accounting("llm_total", [generation, judge, candidate_judge])
+    actual_llm_total = merge_cost_accounting(
+        "actual_llm_total",
+        [actual_generation, judge, candidate_judge],
+    )
     external = external_tool_cost_accounting(row)
+    actual_external = external_tool_cost_accounting(row, actual_spend=True)
     return {
         "generation": generation,
+        "selected_generation_attempt": generation,
+        "actual_generation_spend": actual_generation,
         "judge": judge,
         "candidate_judge": candidate_judge,
         "llm_total": llm_total,
+        "actual_llm_total": actual_llm_total,
         "external_tools": external,
+        "actual_external_tools": actual_external,
         "recorded_total_cost_usd": float(llm_total["recorded_cost_usd"])
         + float(external["recorded_cost_usd"]),
+        "actual_spend_recorded_total_cost_usd": (
+            float(actual_llm_total["recorded_cost_usd"])
+            + float(actual_external["recorded_cost_usd"])
+        ),
         "result_cost_complete": bool(llm_total["cost_complete"])
         and bool(external["cost_complete"]),
-        "result_cost_exact": bool(llm_total["cost_exact"])
-        and bool(external["cost_exact"]),
+        "result_cost_exact": bool(llm_total["cost_exact"]) and bool(external["cost_exact"]),
+        "actual_spend_cost_complete": bool(actual_llm_total["cost_complete"])
+        and bool(actual_external["cost_complete"]),
+        "actual_spend_cost_exact": bool(actual_llm_total["cost_exact"])
+        and bool(actual_external["cost_exact"]),
         "scope_note": (
-            "Per-result cost includes all generation retries and recorded Judge attempts. "
+            "Compatibility cost fields use the selected generation attempt plus recorded "
+            "Judge attempts. actual_spend_* includes every generation attempt. "
             "Whole-experiment spend must also retain failed/replaced shards and preflight calls."
         ),
     }
 
 
+def _usage_units_for_openrouter_non_byok_audit(
+    usage: Any,
+) -> list[Mapping[str, Any]]:
+    if not isinstance(usage, Mapping):
+        return []
+    breakdown = usage.get("model_usage_breakdown")
+    if isinstance(breakdown, list) and breakdown:
+        return [item for item in breakdown if isinstance(item, Mapping)]
+    return [usage]
+
+
+def _actual_llm_usage_units_for_openrouter_non_byok_audit(
+    row: dict[str, Any],
+) -> list[Mapping[str, Any]]:
+    units: list[Mapping[str, Any]] = []
+    execution = row.get("execution")
+    attempts = execution.get("generation_attempts") if isinstance(execution, Mapping) else None
+    observed_generation_run = False
+    if isinstance(attempts, list):
+        for attempt in attempts:
+            run = attempt.get("run") if isinstance(attempt, Mapping) else None
+            if not isinstance(run, Mapping):
+                continue
+            observed_generation_run = True
+            units.extend(
+                _usage_units_for_openrouter_non_byok_audit(run.get("usage"))
+            )
+    if not observed_generation_run:
+        units.extend(_usage_units_for_openrouter_non_byok_audit(row.get("usage")))
+    for judge in [row.get("judge"), *(row.get("candidate_judges") or [])]:
+        if not isinstance(judge, dict):
+            continue
+        if (
+            judge.get("judge_cost_exempt") is True
+            or str(judge.get("judge_model") or "").casefold() == "dry-run"
+        ):
+            continue
+        for run in iter_judge_attempt_runs(judge):
+            units.extend(
+                _usage_units_for_openrouter_non_byok_audit(run.get("usage"))
+            )
+    return deduplicate_stable_usage_receipts(units)
+
+
 def openrouter_non_byok_audit(row: dict[str, Any]) -> dict[str, Any]:
-    # Never trust a persisted/derived summary here: recompute from every
-    # physical usage row so stale or forged ``cost_exact`` cannot bypass the
-    # non-BYOK receipt checks above.
+    # Keep this stricter audit separate from ordinary cost accounting. Native
+    # receipts and legacy openrouter_usage remain valid cost evidence, but do
+    # not prove the OpenRouter non-BYOK execution policy by themselves.
     accounting = row_cost_accounting(row)
-    llm_total = accounting.get("llm_total") or {}
-    passed = bool(llm_total.get("cost_exact"))
+    llm_total = accounting.get("actual_llm_total") or {}
+    request_count = coerce_metric_int(llm_total.get("request_count"))
+    verified_count = sum(
+        1
+        for unit in _actual_llm_usage_units_for_openrouter_non_byok_audit(row)
+        if _openrouter_non_byok_receipt_is_exact(unit)
+    )
+    verified_count = min(request_count, verified_count)
+    passed = request_count == verified_count
     return {
         "pass": passed,
         "policy": "every recorded or expected LLM request must prove is_byok=false",
-        "request_count": coerce_metric_int(llm_total.get("request_count")),
-        "exact_request_count": coerce_metric_int(llm_total.get("exact_request_count")),
-        "unverified_or_byok_request_count": (
-            coerce_metric_int(llm_total.get("request_count"))
-            - coerce_metric_int(llm_total.get("exact_request_count"))
-        ),
+        "request_count": request_count,
+        "exact_request_count": verified_count,
+        "unverified_or_byok_request_count": request_count - verified_count,
         "note": (
-            "pass means every OpenRouter usage record was classified provider_billed "
-            "from explicit is_byok=false evidence; true or missing evidence fails closed"
+            "pass requires every request to carry OpenRouter provider identity, "
+            "is_byok=false at usage and router levels, serving-provider metadata, "
+            "a response id, and matching provider-reported cost; generic billing "
+            "receipts and legacy openrouter_usage do not satisfy this policy"
         ),
     }
 
 
 def row_server_tool_call_count(row: dict[str, Any]) -> int:
-    direct = row_metric_int(row, "server_tool_call_count")
-    if direct:
-        return direct
+    if row.get("selected_generation_succeeded") is False:
+        return 0
+    if row.get("server_tool_call_count") is not None:
+        return row_metric_int(row, "server_tool_call_count")
     usage = row.get("usage") or {}
     if isinstance(usage, dict):
         return sum(server_tool_counts_from_usage_payload(usage).values())
@@ -4967,21 +7812,51 @@ def row_server_tool_call_count(row: dict[str, Any]) -> int:
 
 
 def row_total_tool_call_count(row: dict[str, Any]) -> int:
-    direct = row_metric_int(row, "total_tool_call_count")
-    if direct:
-        return direct
+    if row.get("selected_generation_succeeded") is False:
+        return 0
+    if row.get("total_tool_call_count") is not None:
+        return row_metric_int(row, "total_tool_call_count")
     stream_count = row_metric_int(row, "stream_tool_call_count", "tool_call_count")
     return stream_count + row_server_tool_call_count(row)
 
 
 def row_llm_request_count(row: dict[str, Any]) -> int:
-    direct = row_metric_int(row, "llm_request_count")
-    if direct:
-        return direct
+    if row.get("selected_generation_succeeded") is False:
+        return 0
+    declared = (
+        row_metric_int(row, "llm_request_count")
+        if row.get("llm_request_count") is not None
+        else 0
+    )
     usage = row.get("usage") or {}
     breakdown = usage.get("model_usage_breakdown") if isinstance(usage, dict) else None
     if isinstance(breakdown, list) and breakdown:
-        return len(breakdown)
+        represented_missing = sum(
+            1
+            for item in breakdown
+            if isinstance(item, Mapping)
+            and str(item.get("role") or "").strip().casefold()
+            in MISSING_USAGE_PLACEHOLDER_ROLES
+        )
+        return max(
+            declared,
+            len(breakdown)
+            + max(
+                0,
+                coerce_metric_int(usage.get("usage_missing_count"))
+                - represented_missing,
+            ),
+        )
+    if isinstance(usage, dict) and usage:
+        return max(
+            declared,
+            1 + max(
+                0,
+                coerce_metric_int(usage.get("usage_missing_count")),
+            ),
+        )
+    if declared:
+        return declared
     provider_spec = row.get("provider_spec") or {}
     execution = row.get("execution") or {}
     if provider_spec.get("kind") == "single" and not execution.get("provider_error"):
@@ -4992,22 +7867,32 @@ def row_llm_request_count(row: dict[str, Any]) -> int:
 def ensemble_usage_unknown_count(trace: Any) -> int:
     if not isinstance(trace, dict):
         return 0
+    direct_missing = max(
+        0,
+        coerce_metric_int(trace.get("usage_missing_count")),
+    )
+    detected_missing = 0
     calls = trace.get("calls")
     if isinstance(calls, list):
-        return sum(ensemble_usage_unknown_count(call) for call in calls)
+        detected_missing = sum(ensemble_usage_unknown_count(call) for call in calls)
     early_stop = trace.get("proposer_early_stop")
     if isinstance(early_stop, dict):
-        value = coerce_metric_int(early_stop.get("usage_unknown_count"))
-        if value:
-            return value
+        detected_missing = max(
+            detected_missing,
+            coerce_metric_int(early_stop.get("usage_unknown_count")),
+        )
     candidates = trace.get("candidates")
     if isinstance(candidates, list):
-        return sum(
-            1
-            for candidate in candidates
-            if isinstance(candidate, dict) and candidate.get("error_code") == "early_stopped"
+        detected_missing = max(
+            detected_missing,
+            sum(
+                1
+                for candidate in candidates
+                if isinstance(candidate, dict)
+                and candidate.get("error_code") == "early_stopped"
+            ),
         )
-    return 0
+    return max(direct_missing, detected_missing)
 
 
 def usage_unknown_count_from_usage_payload(usage: Any) -> int:
@@ -5019,20 +7904,37 @@ def usage_unknown_count_from_usage_payload(usage: Any) -> int:
         if isinstance(breakdown, list) and breakdown
         else [usage]
     )
-    known_sources = {"provider_billed", "mixed"}
-    return sum(
+    represented_missing = sum(
         1
         for item in units
         if (
-            item.get("error_code") == "early_stopped"
+            str(item.get("role") or "").strip().casefold()
+            in MISSING_USAGE_PLACEHOLDER_ROLES
+            or item.get("error_code") == "early_stopped"
             or str(item.get("cost_source") or "none") == "unknown_canceled"
-            or (
+        )
+    )
+    unknown_receipt_cost = sum(
+        1
+        for item in units
+        if (
+            str(item.get("role") or "").strip().casefold()
+            not in MISSING_USAGE_PLACEHOLDER_ROLES
+            and item.get("error_code") != "early_stopped"
+            and str(item.get("cost_source") or "none") != "unknown_canceled"
+            and (
                 _usage_token_count(item) > 0
-                and str(item.get("cost_source") or "none") not in known_sources
+                and exact_provider_usage_cost(item) is None
+                and str(item.get("cost_source") or "none") != "mixed"
                 and not str(item.get("cost_source") or "none").startswith("opensquilla_")
             )
         )
     )
+    explicit_missing = max(
+        0,
+        coerce_metric_int(usage.get("usage_missing_count")),
+    )
+    return unknown_receipt_cost + max(explicit_missing, represented_missing)
 
 
 def row_generation_attempt_usage_unknown_count(row: dict[str, Any]) -> int:
@@ -5100,38 +8002,41 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
         quality_values = (
             [completed_quality_value(row) for row in group_rows] if judging_enabled else []
         )
-        completed_quality_values = (
-            [completed_quality_value(row) for row in completed_rows] if judging_enabled else []
-        )
         pass_rates = [
             float((row.get("judge") or {}).get("pass_rate"))
             for row in completed_rows
             if isinstance((row.get("judge") or {}).get("pass_rate"), int | float)
         ]
-        cost_accounts = [
-            row.get("cost_accounting") or row_cost_accounting(row) for row in group_rows
-        ]
-        completed_cost_accounts = [
-            row.get("cost_accounting") or row_cost_accounting(row)
-            for row in completed_rows
-        ]
+        # Recompute with the current accounting contract. Persisted rows may
+        # carry an older/stale cost_accounting object and must not bypass new
+        # completeness gates.
+        cost_accounts = [row_cost_accounting(row) for row in group_rows]
+        completed_cost_accounts = [row_cost_accounting(row) for row in completed_rows]
         generation_costs = [
             float(account["generation"]["recorded_cost_usd"]) for account in cost_accounts
         ]
-        judge_costs = [
-            float(account["judge"]["recorded_cost_usd"]) for account in cost_accounts
-        ]
-        candidate_judge_costs = [
-            float(account["candidate_judge"]["recorded_cost_usd"])
+        actual_generation_costs = [
+            float(account["actual_generation_spend"]["recorded_cost_usd"])
             for account in cost_accounts
         ]
+        judge_costs = [float(account["judge"]["recorded_cost_usd"]) for account in cost_accounts]
+        candidate_judge_costs = [
+            float(account["candidate_judge"]["recorded_cost_usd"]) for account in cost_accounts
+        ]
         costs = [float(account["recorded_total_cost_usd"]) for account in cost_accounts]
+        actual_spend_costs = [
+            float(account["actual_spend_recorded_total_cost_usd"]) for account in cost_accounts
+        ]
         completed_costs = [
             float(account["recorded_total_cost_usd"]) for account in completed_cost_accounts
         ]
         group_llm_cost = merge_cost_accounting(
             "group_llm_total",
             [account["llm_total"] for account in cost_accounts],
+        )
+        actual_group_llm_cost = merge_cost_accounting(
+            "actual_group_llm_total",
+            [account["actual_llm_total"] for account in cost_accounts],
         )
         visible_tokens = [
             int(row_usage_number(row, "input_tokens")) + int(row_usage_number(row, "output_tokens"))
@@ -5147,20 +8052,18 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
         trajectory_steps = [row_trajectory_steps(row) for row in group_rows]
         llm_requests = [row_llm_request_count(row) for row in group_rows]
         usage_unknown = [
-            int(account["llm_total"]["unknown_request_count"])
-            for account in cost_accounts
+            int(account["llm_total"]["unknown_request_count"]) for account in cost_accounts
         ]
         summary["groups"][group] = {
             "rows": len(group_rows),
+            "task_ids": sorted(str(row.get("task_id") or "") for row in group_rows),
             "completed": len(completed_rows),
             "scored_rows": len(scored_totals),
             "score_coverage_pct": (
                 len(scored_totals) / len(group_rows) * 100.0 if group_rows else 0.0
             ),
             "avg_quality": statistics.mean(quality_values) if quality_values else None,
-            "avg_quality_scored": (
-                statistics.mean(completed_quality_values) if completed_quality_values else None
-            ),
+            "avg_quality_scored": (statistics.mean(scored_totals) if scored_totals else None),
             "avg_pass_rate": statistics.mean(pass_rates) if pass_rates else None,
             "judge_errors": sum(
                 int((row.get("judge") or {}).get("judge_error_count") or 0)
@@ -5171,24 +8074,26 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
                 statistics.mean(completed_costs) if completed_costs else None
             ),
             "recorded_total_cost_usd": sum(costs),
+            "avg_actual_spend_cost_usd": (
+                statistics.mean(actual_spend_costs) if actual_spend_costs else 0.0
+            ),
+            "actual_spend_recorded_total_cost_usd": sum(actual_spend_costs),
             "recorded_generation_cost_usd": sum(generation_costs),
+            "actual_spend_generation_cost_usd": sum(actual_generation_costs),
             "recorded_judge_cost_usd": sum(judge_costs),
             "recorded_candidate_judge_cost_usd": sum(candidate_judge_costs),
             "avg_recorded_generation_cost_usd": (
                 statistics.mean(generation_costs) if generation_costs else 0.0
             ),
-            "avg_recorded_judge_cost_usd": (
-                statistics.mean(judge_costs) if judge_costs else 0.0
+            "avg_actual_spend_generation_cost_usd": (
+                statistics.mean(actual_generation_costs) if actual_generation_costs else 0.0
             ),
+            "avg_recorded_judge_cost_usd": (statistics.mean(judge_costs) if judge_costs else 0.0),
             "avg_recorded_candidate_judge_cost_usd": (
                 statistics.mean(candidate_judge_costs) if candidate_judge_costs else 0.0
             ),
-            "known_cost_request_coverage_pct": group_llm_cost[
-                "known_request_coverage_pct"
-            ],
-            "exact_cost_request_coverage_pct": group_llm_cost[
-                "exact_request_coverage_pct"
-            ],
+            "known_cost_request_coverage_pct": group_llm_cost["known_request_coverage_pct"],
+            "exact_cost_request_coverage_pct": group_llm_cost["exact_request_coverage_pct"],
             "unknown_cost_request_count": group_llm_cost["unknown_request_count"],
             "unknown_cost_tokens": group_llm_cost["unknown_tokens"],
             "llm_cost_complete_rows": sum(
@@ -5196,6 +8101,15 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
             ),
             "result_cost_complete_rows": sum(
                 1 for account in cost_accounts if account["result_cost_complete"]
+            ),
+            "actual_spend_known_cost_request_coverage_pct": actual_group_llm_cost[
+                "known_request_coverage_pct"
+            ],
+            "actual_spend_unknown_cost_request_count": actual_group_llm_cost[
+                "unknown_request_count"
+            ],
+            "actual_spend_cost_complete_rows": sum(
+                1 for account in cost_accounts if account["actual_spend_cost_complete"]
             ),
             "avg_visible_tokens": (statistics.mean(visible_tokens) if visible_tokens else 0.0),
             "avg_reasoning_tokens": (
@@ -5235,8 +8149,10 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
             )
             comparable_costs = (
                 item.get("result_cost_complete_rows") == item.get("rows")
-                and baseline_item.get("result_cost_complete_rows")
-                == baseline_item.get("rows")
+                and baseline_item.get("result_cost_complete_rows") == baseline_item.get("rows")
+                and item.get("completed") == item.get("rows")
+                and baseline_item.get("completed") == baseline_item.get("rows")
+                and item.get("task_ids") == baseline_item.get("task_ids")
             )
             item[f"avg_cost_pct_delta_vs_{suffix}"] = (
                 numeric_pct_delta(
@@ -5256,11 +8172,13 @@ def render_markdown(
     generation_policy: dict[str, Any] | None = None,
     runner_mode: str = DEFAULT_DRACO_RUNNER_MODE,
     agent_max_iterations: int = DEFAULT_AGENT_MAX_ITERATIONS,
+    agent_finalization_policy: Mapping[str, Any] | None = None,
 ) -> str:
     stamp = jsonl_path.stem.removeprefix("draco_ensemble_")
     trace_path = jsonl_path.parent / f"draco_run_{stamp}.trace.jsonl"
     policy = tool_policy or benchmark_tool_policy()
     generation = generation_policy or generation_thinking_policy()
+    finalization = normalized_agent_finalization_policy(agent_finalization_policy)
     blocked_domains = policy.get("contamination_blocked_domains") or []
     tool_line = (
         f"Runner mode: `{runner_mode}`; tool mode: `{policy.get('tool_mode') or RUNNER_MODE}`; "
@@ -5322,31 +8240,36 @@ def render_markdown(
         f"{generation_budget_note}, "
         f"temperature: `{generation.get('temperature')}`).",
         f"Agent max iterations: `{agent_max_iterations}`.",
+        "Agent finalization policy: "
+        f"`{json.dumps(finalization, ensure_ascii=False, sort_keys=True)}`.",
         tool_line,
         *([fusion_line] if fusion_line else []),
         "Contamination blocked domains: "
         f"`{', '.join(blocked_domains) if blocked_domains else '(none)'}`.",
-        "Cost accounting: recorded LLM cost includes all generation retries, rubric Judge "
-        "attempts, and candidate Judge attempts. Unpriced requests remain unknown rather "
-        "than being treated as $0; cost deltas are blank unless both groups are complete. "
-        "Preflight and replaced/failed shard spend must be audited at the whole-experiment "
-        "level.",
+        "Cost accounting: selected columns contain only the accepted generation attempt "
+        "plus rubric/candidate Judge attempts; actual-spend columns contain every "
+        "generation attempt plus those Judge attempts. Unpriced requests remain unknown "
+        "rather than being treated as $0; selected cost deltas are blank unless both "
+        "groups are complete. Preflight and replaced/failed shard spend must still be "
+        "audited at the whole-experiment level.",
         "",
         "| Group | Rows | Done | Avg Quality | AvgQ Scored | Avg Pass | "
-        "Judge Err | Avg Recorded LLM $ | Avg Gen $ | Avg Judge $ | Known Cost % | "
-        "Cost Complete | Avg Visible | Avg Reason | Avg Tokens | Avg Tools | Tool % | "
+        "Judge Err | Avg Selected LLM $ | Avg Selected Gen $ | Avg Actual LLM $ | "
+        "Avg Actual Gen $ | Avg Judge $ | Selected Known Cost % | Actual Known Cost % | "
+        "Selected Complete | Actual Complete | Avg Visible | Avg Reason | Avg Tokens | "
+        "Avg Tools | Tool % | "
         "Avg Steps | Avg LLM Req | Unknown Cost Req | p50 ms | p95 ms | "
         "AvgQ % vs B0 | Avg$ % vs B0 | "
         "AvgQ % vs B1 | Avg$ % vs B1 |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | "
-        "---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | "
-        "---: | ---: | ---: | ---: | ---: | ---: |",
+        "| --- |" + " ---: |" * 29,
     ]
     for group, item in sorted(summary["groups"].items()):
         lines.append(
             "| {group} | {rows} | {done} | {quality} | {quality_scored} | "
             "{pass_rate} | {judge_errors} | {cost:.6f} | {generation_cost:.6f} | "
-            "{judge_cost:.6f} | {known_cost:.1f}% | {cost_complete}/{rows} | "
+            "{actual_cost:.6f} | {actual_generation_cost:.6f} | {judge_cost:.6f} | "
+            "{known_cost:.1f}% | {actual_known_cost:.1f}% | "
+            "{cost_complete}/{rows} | {actual_cost_complete}/{rows} | "
             "{visible_tokens:.1f} | {reasoning_tokens:.1f} | "
             "{tokens:.1f} | {tool_calls:.1f} | {tool_rate:.1f}% | "
             "{steps:.1f} | {llm_requests:.1f} | {usage_unknown:.1f} | "
@@ -5367,12 +8290,16 @@ def render_markdown(
                 judge_errors=item["judge_errors"],
                 cost=item["avg_cost_usd"],
                 generation_cost=item["avg_recorded_generation_cost_usd"],
+                actual_cost=item["avg_actual_spend_cost_usd"],
+                actual_generation_cost=item["avg_actual_spend_generation_cost_usd"],
                 judge_cost=(
                     item["avg_recorded_judge_cost_usd"]
                     + item["avg_recorded_candidate_judge_cost_usd"]
                 ),
                 known_cost=item["known_cost_request_coverage_pct"],
+                actual_known_cost=item["actual_spend_known_cost_request_coverage_pct"],
                 cost_complete=item["result_cost_complete_rows"],
+                actual_cost_complete=item["actual_spend_cost_complete_rows"],
                 visible_tokens=item["avg_visible_tokens"],
                 reasoning_tokens=item["avg_reasoning_tokens"],
                 tokens=item["avg_total_tokens"],
@@ -5414,6 +8341,7 @@ def manifest_args(args: argparse.Namespace) -> dict[str, Any]:
         "expand_ensemble_timeouts_to_task_timeout",
         "runner_mode",
         "agent_max_iterations",
+        *AGENT_FINALIZATION_POLICY_FIELDS,
         "require_clean_source",
         "dry_run",
         "judge_model",
@@ -5430,6 +8358,7 @@ def manifest_args(args: argparse.Namespace) -> dict[str, Any]:
         "local_web_search_api_key_env",
         "allow_firecrawl_web_fetch",
         "require_openrouter_non_byok",
+        "continue_after_cost_audit_failure",
         "openrouter_web_search_engine",
         "openrouter_web_search_max_results",
         "openrouter_web_search_max_total_results",
@@ -5588,9 +8517,7 @@ def resolved_llm_runtime_contract(config: GatewayConfig) -> dict[str, Any]:
             for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")
             if os.environ.get(name)
         }
-    cache_namespace = os.environ.get(
-        "OPENSQUILLA_BENCHMARK_CACHE_NAMESPACE", ""
-    ).strip()
+    cache_namespace = os.environ.get("OPENSQUILLA_BENCHMARK_CACHE_NAMESPACE", "").strip()
     return {
         "provider": runtime.provider,
         "model": runtime.model,
@@ -5605,34 +8532,24 @@ def resolved_llm_runtime_contract(config: GatewayConfig) -> dict[str, Any]:
             in {"1", "true", "yes", "on", "enabled"}
         ),
         "stream_error_frames": (
-            os.environ.get("OPENSQUILLA_PROVIDER_STREAM_ERROR_FRAMES", "")
-            .strip()
-            .lower()
+            os.environ.get("OPENSQUILLA_PROVIDER_STREAM_ERROR_FRAMES", "").strip().lower()
             in {"1", "true", "yes", "on", "enabled"}
         ),
         "router_metadata_required": (
-            os.environ.get("OPENSQUILLA_OPENROUTER_METADATA_REQUIRED", "")
-            .strip()
-            .lower()
+            os.environ.get("OPENSQUILLA_OPENROUTER_METADATA_REQUIRED", "").strip().lower()
             in {"1", "true", "yes", "on", "enabled"}
         ),
         "require_parameters": (
-            os.environ.get("OPENSQUILLA_OPENROUTER_REQUIRE_PARAMETERS", "")
-            .strip()
-            .lower()
+            os.environ.get("OPENSQUILLA_OPENROUTER_REQUIRE_PARAMETERS", "").strip().lower()
             in {"1", "true", "yes", "on", "enabled"}
         ),
         "response_cache_disabled": (
-            os.environ.get("OPENSQUILLA_OPENROUTER_DISABLE_RESPONSE_CACHE", "")
-            .strip()
-            .lower()
+            os.environ.get("OPENSQUILLA_OPENROUTER_DISABLE_RESPONSE_CACHE", "").strip().lower()
             in {"1", "true", "yes", "on", "enabled"}
         ),
         "cache_namespace_enabled": bool(cache_namespace),
         "cache_namespace_required": (
-            os.environ.get("OPENSQUILLA_BENCHMARK_CACHE_NAMESPACE_REQUIRED", "")
-            .strip()
-            .lower()
+            os.environ.get("OPENSQUILLA_BENCHMARK_CACHE_NAMESPACE_REQUIRED", "").strip().lower()
             in {"1", "true", "yes", "on", "enabled"}
         ),
         "cache_namespace_sha256": (
@@ -5756,6 +8673,22 @@ def build_run_compatibility(
         judge_config = effective_experiment_config.get("judge")
         if isinstance(judge_config, dict):
             judge_config.pop("concurrency", None)
+    global_experiment_profile = None
+    if isinstance(effective_experiment_config, dict):
+        global_experiment_profile = {
+            key: effective_experiment_config[key]
+            for key in (
+                "schema_version",
+                "profile_id",
+                "benchmark_input",
+                "timeouts",
+                "runner",
+                "generation",
+                "tools",
+                "judge",
+            )
+            if key in effective_experiment_config
+        }
     source = dict(getattr(args, "_source_provenance", {}) or {})
     source_identity = {
         "git_head": source.get("git_head"),
@@ -5766,9 +8699,7 @@ def build_run_compatibility(
     contracts: dict[str, dict[str, Any]] = {}
     fingerprints: dict[str, str] = {}
     for group in groups:
-        tool_contract = json.loads(
-            json.dumps(group_tool_policies[group], ensure_ascii=False)
-        )
+        tool_contract = json.loads(json.dumps(group_tool_policies[group], ensure_ascii=False))
         local_tool_contract = tool_contract.get("local_web_tools")
         if isinstance(local_tool_contract, dict):
             local_tool_contract.pop("preflight", None)
@@ -5781,6 +8712,7 @@ def build_run_compatibility(
             "runner": {
                 "mode": args.runner_mode,
                 "agent_max_iterations": args.agent_max_iterations,
+                "finalization_policy": agent_finalization_policy_from_args(args),
             },
             "tools": tool_contract,
             "generation": {
@@ -5811,10 +8743,9 @@ def build_run_compatibility(
                     getattr(args, "require_openrouter_non_byok", False)
                 )
             },
+            "global_experiment_profile": global_experiment_profile,
             "experiment_config": (
-                effective_experiment_config
-                if GROUP_SPECS[group].get("experiment_config")
-                else None
+                effective_experiment_config if GROUP_SPECS[group].get("experiment_config") else None
             ),
             "dry_run": bool(args.dry_run),
         }
@@ -5837,9 +8768,7 @@ def validate_expected_run_compatibility(
         raise ValueError(f"expected compatibility manifest does not exist: {path}")
     manifest = json.loads(path.read_text(encoding="utf-8"))
     expected = manifest.get("run_compatibility") if isinstance(manifest, dict) else None
-    expected_fingerprints = (
-        expected.get("fingerprints") if isinstance(expected, dict) else None
-    )
+    expected_fingerprints = expected.get("fingerprints") if isinstance(expected, dict) else None
     actual_fingerprints = actual.get("fingerprints")
     if not isinstance(expected_fingerprints, dict):
         raise ValueError(f"manifest lacks run_compatibility fingerprints: {path}")
@@ -5848,8 +8777,7 @@ def validate_expected_run_compatibility(
     mismatches = [
         group
         for group in groups
-        if str(expected_fingerprints.get(group) or "")
-        != str(actual_fingerprints.get(group) or "")
+        if str(expected_fingerprints.get(group) or "") != str(actual_fingerprints.get(group) or "")
     ]
     if mismatches:
         raise ValueError(
@@ -5956,6 +8884,7 @@ def write_manifest(
             "agent_max_iterations",
             DEFAULT_AGENT_MAX_ITERATIONS,
         ),
+        "agent_finalization_policy": agent_finalization_policy_from_args(args),
         "tool_policy": policy,
         "generation_policy": generation_policy,
         "stamp": stamp,
@@ -5970,9 +8899,8 @@ def write_manifest(
         "task_ids": [str(task["id"]) for task in tasks],
         "rows_written": rows_written,
         "artifacts": artifacts,
-        "source_provenance": dict(
-            getattr(args, "_source_provenance", None) or source_provenance()
-        ),
+        "effective_argument_sources": dict(getattr(args, "_effective_argument_sources", {}) or {}),
+        "source_provenance": dict(getattr(args, "_source_provenance", None) or source_provenance()),
     }
     run_compatibility = getattr(args, "_run_compatibility", None)
     if isinstance(run_compatibility, dict):
@@ -6029,17 +8957,814 @@ def load_selected_group_task_keys(
             )
             if not all(key):
                 raise ValueError(
-                    f"missing group or task_id in group/task key JSONL at "
-                    f"{path}:{line_number}"
+                    f"missing group or task_id in group/task key JSONL at {path}:{line_number}"
                 )
             requested_keys.add(key)
     unknown_keys = requested_keys - selected_keys
     if unknown_keys:
-        preview = ", ".join(
-            f"{group}/{task_id}" for group, task_id in sorted(unknown_keys)[:5]
-        )
+        preview = ", ".join(f"{group}/{task_id}" for group, task_id in sorted(unknown_keys)[:5])
         raise ValueError(f"group/task key JSONL contains unknown keys: {preview}")
     return selected_keys & requested_keys
+
+
+_COST_METADATA_ONLY_ERRORS = frozenset(
+    {
+        "openrouter_non_byok_verification_failed",
+        "cost_metadata_incomplete",
+        "judge_incomplete",
+    }
+)
+
+
+def ensemble_generation_completion_reasons(
+    row: dict[str, Any],
+    *,
+    expected_run_compatibility_contract: Mapping[str, Any] | None = None,
+) -> list[str]:
+    """Require a quorum-backed, completed aggregator for ensemble generations."""
+
+    group = str(row.get("group") or "")
+    spec = GROUP_SPECS.get(group) or {}
+    trace = row.get("ensemble_trace")
+    requires_ensemble_proof = spec.get("kind") == "selection_mode" or (
+        isinstance(trace, dict)
+        and any(key in trace for key in ("calls", "final_request", "total_candidates"))
+    )
+    if not requires_ensemble_proof:
+        return []
+    if not isinstance(trace, dict) or not trace:
+        return ["missing_ensemble_trace"]
+
+    traces, sequence_reasons = ensemble_call_trace_sequence(trace)
+    if not traces:
+        return sequence_reasons or ["missing_ensemble_call_trace"]
+    final_trace = traces[-1]
+    reasons: list[str] = list(sequence_reasons)
+    expected_spec = GROUP_SPECS.get(group) or {}
+    routing_trace = row.get("routing_trace")
+    expected_plan = (
+        routing_trace.get("selection_plan")
+        if isinstance(routing_trace, dict)
+        else None
+    )
+    expected_selection_mode = str(expected_spec.get("selection_mode") or "")
+
+    # Every Agent-loop provider call affects the tool trajectory, not only the
+    # final answer-producing call.  Reject an earlier fallback, sub-quorum
+    # fusion, or wrong physical lineup before treating the generation as
+    # reusable.  Only the last call must bind its aggregator output to the
+    # stored final answer.
+    for index, call_trace in enumerate(traces):
+        reasons.extend(
+            ensemble_call_core_reasons(
+                call_trace,
+                expected_selection_mode=expected_selection_mode,
+                expected_selection_plan=(
+                    expected_plan if isinstance(expected_plan, Mapping) else None
+                ),
+                final_text=str(row.get("final_text") or ""),
+                require_output_binding=index == len(traces) - 1,
+            )
+        )
+
+    agent_call_count = coerce_metric_int(trace.get("agent_llm_call_count"))
+    final_call_index = coerce_metric_int(final_trace.get("agent_call_index"))
+    if agent_call_count and final_call_index and final_call_index != agent_call_count:
+        reasons.append("final_agent_call_ensemble_trace_missing")
+    if str(final_trace.get("request_outcome") or "llm_response") != "llm_response":
+        reasons.append("aggregator_call_error")
+    if final_trace.get("fallback_used") is not False:
+        reasons.append("aggregator_fallback_used_or_unknown")
+    if str(final_trace.get("final_request_role") or "") != "aggregator":
+        reasons.append("final_request_not_aggregator")
+
+    total = final_trace.get("total_candidates")
+    successful = final_trace.get("successful_proposers")
+    if (
+        isinstance(total, bool)
+        or not isinstance(total, int)
+        or total <= 0
+        or isinstance(successful, bool)
+        or not isinstance(successful, int)
+        or successful > total
+        or successful < legal_proposer_quorum(total)
+    ):
+        reasons.append("insufficient_proposer_quorum")
+
+    final_request = final_trace.get("final_request")
+    if not isinstance(final_request, dict):
+        reasons.append("missing_final_aggregator_request")
+        return list(dict.fromkeys(reasons))
+    if str(final_request.get("role") or "") != "aggregator":
+        reasons.append("final_request_trace_not_aggregator")
+    if final_request.get("request_started") is not True:
+        reasons.append("aggregator_request_not_started")
+    if final_request.get("error") or final_trace.get("aggregator_error"):
+        reasons.append("aggregator_request_error")
+
+    usage = final_request.get("usage")
+    if (
+        not isinstance(usage, dict)
+        or "stop_reason" not in usage
+    ):
+        reasons.append("aggregator_done_usage_missing")
+    output = final_request.get("output")
+    if (
+        not isinstance(output, dict)
+        or coerce_metric_int(output.get("chars")) <= 0
+        or not str(output.get("text") or "").strip()
+    ):
+        reasons.append("aggregator_done_output_missing")
+    elif str(row.get("final_text") or "").strip():
+        output_text = str(output.get("text") or "")
+        final_text = str(row.get("final_text") or "")
+        output_chars = coerce_metric_int(output.get("chars"))
+        final_segment = (
+            final_text[-output_chars:]
+            if output_chars > 0 and len(final_text) >= output_chars
+            else ""
+        )
+        output_matches = (
+            final_segment.startswith(output_text)
+            if output.get("truncated") is True
+            else final_segment == output_text
+        )
+        if not output_matches:
+            reasons.append("aggregator_output_mismatch")
+
+    provider_spec = row.get("provider_spec")
+    if not isinstance(provider_spec, dict):
+        reasons.append("missing_provider_spec")
+    else:
+        for key in ("kind", "selection_mode", "model"):
+            if key in expected_spec and provider_spec.get(key) != expected_spec.get(key):
+                reasons.append(f"wrong_provider_spec_{key}")
+
+    final_selection_mode = str(
+        final_trace.get("selection_strategy")
+        or (
+            final_trace.get("selection_plan", {}).get("strategy")
+            if isinstance(final_trace.get("selection_plan"), dict)
+            else ""
+        )
+        or ""
+    )
+    if expected_selection_mode and final_selection_mode != expected_selection_mode:
+        reasons.append("wrong_executed_selection_mode")
+
+    executed_plan = final_trace.get("selection_plan")
+    if spec.get("kind") == "selection_mode" and not isinstance(expected_plan, dict):
+        reasons.append("missing_expected_selection_plan")
+    if spec.get("kind") == "selection_mode" and not isinstance(executed_plan, dict):
+        reasons.append("missing_executed_selection_plan")
+    if isinstance(expected_plan, dict) and isinstance(executed_plan, dict):
+        expected_models_value = expected_plan.get("proposer_models")
+        normalized_expected_models = (
+            [
+                model.strip() if isinstance(model, str) else ""
+                for model in expected_models_value
+            ]
+            if isinstance(expected_models_value, list)
+            else []
+        )
+        expected_selected_p_value = expected_plan.get("selected_P")
+        normalized_expected_selected_p = (
+            [
+                identity.strip() if isinstance(identity, str) else ""
+                for identity in expected_selected_p_value
+            ]
+            if isinstance(expected_selected_p_value, list)
+            else []
+        )
+        raw_aggregator_model = expected_plan.get("aggregator_model")
+        expected_aggregator_model_value = (
+            raw_aggregator_model.strip()
+            if isinstance(raw_aggregator_model, str)
+            else ""
+        )
+        raw_selected_a = expected_plan.get("selected_A")
+        expected_selected_a_value = (
+            raw_selected_a.strip() if isinstance(raw_selected_a, str) else ""
+        )
+        raw_sample_count = expected_plan.get("proposer_sample_count")
+        expected_sample_count_value = (
+            raw_sample_count
+            if isinstance(raw_sample_count, int) and not isinstance(raw_sample_count, bool)
+            else 0
+        )
+        normalized_selected_p_parts = [
+            tuple(part.strip() for part in identity.partition(":"))
+            for identity in normalized_expected_selected_p
+        ]
+        selected_a_provider, selected_a_separator, selected_a_model = tuple(
+            part.strip() for part in expected_selected_a_value.partition(":")
+        )
+        expected_plan_valid = bool(
+            isinstance(expected_models_value, list)
+            and normalized_expected_models
+            and all(isinstance(model, str) for model in expected_models_value)
+            and all(normalized_expected_models)
+            and isinstance(expected_selected_p_value, list)
+            and all(
+                isinstance(identity, str)
+                for identity in expected_selected_p_value
+            )
+            and len(normalized_expected_selected_p) == len(normalized_expected_models)
+            and expected_sample_count_value > 0
+            and expected_sample_count_value == len(normalized_expected_models)
+            and isinstance(raw_aggregator_model, str)
+            and expected_aggregator_model_value
+            and isinstance(raw_selected_a, str)
+            and expected_selected_a_value
+            and all(
+                isinstance(identity, str)
+                and separator == ":"
+                and bool(provider)
+                and bool(model_identity)
+                and model_identity == model
+                for identity, (provider, separator, model_identity), model in zip(
+                    expected_selected_p_value,
+                    normalized_selected_p_parts,
+                    normalized_expected_models,
+                    strict=True,
+                )
+            )
+            and selected_a_separator == ":"
+            and bool(selected_a_provider)
+            and bool(selected_a_model)
+            and selected_a_model == expected_aggregator_model_value
+        )
+        if not expected_plan_valid:
+            reasons.append("invalid_expected_selection_plan")
+        for key in (
+            "strategy",
+            "selection_mode",
+            "profile",
+            "proposer_models",
+            "selected_P",
+            "aggregator_model",
+            "selected_A",
+        ):
+            if key in expected_plan and executed_plan.get(key) != expected_plan.get(key):
+                reasons.append(f"executed_selection_plan_mismatch_{key}")
+        expected_total = expected_sample_count_value
+        if expected_total <= 0:
+            expected_models = expected_plan.get("proposer_models")
+            if isinstance(expected_models, list):
+                expected_total = len(expected_models)
+        if expected_total and total != expected_total:
+            reasons.append("wrong_executed_proposer_count")
+        if expected_total and (
+            not isinstance(successful, int) or successful < legal_proposer_quorum(expected_total)
+        ):
+            reasons.append("insufficient_configured_proposer_quorum")
+
+        expected_aggregator_model = expected_aggregator_model_value
+        expected_selected_a = expected_selected_a_value
+        expected_aggregator_provider = (
+            expected_selected_a.partition(":")[0].strip() if ":" in expected_selected_a else ""
+        )
+        raw_actual_aggregator_model = (
+            usage.get("model") if isinstance(usage, Mapping) else None
+        )
+        actual_aggregator_model = (
+            raw_actual_aggregator_model.strip()
+            if isinstance(raw_actual_aggregator_model, str)
+            else ""
+        )
+        raw_actual_aggregator_provider = (
+            usage.get("provider") if isinstance(usage, Mapping) else None
+        )
+        actual_aggregator_provider = (
+            raw_actual_aggregator_provider.strip()
+            if isinstance(raw_actual_aggregator_provider, str)
+            else ""
+        )
+        if expected_aggregator_model and not actual_aggregator_model:
+            reasons.append("missing_actual_aggregator_model")
+        elif (
+            expected_aggregator_model
+            and actual_aggregator_model != expected_aggregator_model
+        ):
+            reasons.append("wrong_actual_aggregator_model")
+        if (
+            expected_aggregator_provider
+            and not actual_aggregator_provider
+        ):
+            reasons.append("missing_actual_aggregator_provider")
+        elif (
+            expected_aggregator_provider
+            and actual_aggregator_provider != expected_aggregator_provider
+        ):
+            reasons.append("wrong_actual_aggregator_provider")
+    if group == "B2" and isinstance(expected_run_compatibility_contract, Mapping):
+        experiment = expected_run_compatibility_contract.get("experiment_config")
+        ensemble = experiment.get("ensemble") if isinstance(experiment, Mapping) else None
+        routing = experiment.get("routing") if isinstance(experiment, Mapping) else None
+        if not isinstance(ensemble, Mapping):
+            reasons.append("missing_expected_b2_ensemble_contract")
+        else:
+            if not isinstance(executed_plan, dict):
+                reasons.append("missing_executed_selection_plan")
+            expected_members = ensemble.get("proposers")
+            members = (
+                [member for member in expected_members if isinstance(member, Mapping)]
+                if isinstance(expected_members, list)
+                else []
+            )
+            expected_models = [
+                str(member.get("model") or "")
+                for member in members
+                for _ in range(max(1, coerce_metric_int(member.get("k"))))
+            ]
+            expected_selected_p = [
+                f"{str(member.get('provider') or '')}:{str(member.get('model') or '')}"
+                for member in members
+                for _ in range(max(1, coerce_metric_int(member.get("k"))))
+            ]
+            expected_total = len(expected_models)
+            expected_minimum = legal_proposer_quorum(expected_total)
+            if expected_total and total != expected_total:
+                reasons.append("wrong_b2_proposer_count")
+            if expected_minimum and (
+                not isinstance(successful, int) or successful < expected_minimum
+            ):
+                reasons.append("insufficient_b2_configured_quorum")
+            if isinstance(executed_plan, dict):
+                if expected_models and executed_plan.get("proposer_models") != expected_models:
+                    reasons.append("wrong_b2_proposer_lineup")
+                if expected_selected_p and executed_plan.get("selected_P") != expected_selected_p:
+                    reasons.append("wrong_b2_proposer_provider_lineup")
+                expected_aggregator = ensemble.get("aggregator")
+                expected_aggregator_provider = (
+                    str(expected_aggregator.get("provider") or "")
+                    if isinstance(expected_aggregator, Mapping)
+                    else ""
+                )
+                expected_aggregator_model = (
+                    str(expected_aggregator.get("model") or "")
+                    if isinstance(expected_aggregator, Mapping)
+                    else ""
+                )
+                if (
+                    expected_aggregator_model
+                    and executed_plan.get("aggregator_model") != expected_aggregator_model
+                ):
+                    reasons.append("wrong_b2_aggregator_model")
+                expected_selected_a = (
+                    f"{expected_aggregator_provider}:{expected_aggregator_model}"
+                    if expected_aggregator_provider and expected_aggregator_model
+                    else ""
+                )
+                if expected_selected_a and executed_plan.get("selected_A") != expected_selected_a:
+                    reasons.append("wrong_b2_aggregator_provider_identity")
+                actual_aggregator_model = (
+                    str(usage.get("model") or "") if isinstance(usage, Mapping) else ""
+                )
+                if (
+                    expected_aggregator_model
+                    and not actual_aggregator_model
+                ):
+                    reasons.append("missing_actual_aggregator_model")
+                elif (
+                    expected_aggregator_model
+                    and actual_aggregator_model != expected_aggregator_model
+                ):
+                    reasons.append("wrong_b2_actual_aggregator_model")
+                actual_aggregator_provider = (
+                    str(usage.get("provider") or "") if isinstance(usage, Mapping) else ""
+                )
+                if (
+                    expected_aggregator_provider
+                    and not actual_aggregator_provider
+                ):
+                    reasons.append("missing_actual_aggregator_provider")
+                elif (
+                    expected_aggregator_provider
+                    and actual_aggregator_provider != expected_aggregator_provider
+                ):
+                    reasons.append("wrong_b2_actual_aggregator_provider")
+                expected_profile = str(ensemble.get("profile_name") or "")
+                if expected_profile and executed_plan.get("profile") != expected_profile:
+                    reasons.append("wrong_b2_profile")
+                expected_mode = (
+                    str(routing.get("selection_mode") or "") if isinstance(routing, Mapping) else ""
+                )
+                executed_mode = str(
+                    executed_plan.get("selection_mode") or executed_plan.get("strategy") or ""
+                )
+                if expected_mode and executed_mode != expected_mode:
+                    reasons.append("wrong_b2_selection_mode")
+    return list(dict.fromkeys(reasons))
+
+
+def usage_actual_identity_evidence(usage: Any) -> dict[str, Any]:
+    """Extract auditable physical model/provider evidence from saved receipts."""
+
+    usage_dict = usage if isinstance(usage, Mapping) else {}
+    breakdown = usage_dict.get("model_usage_breakdown")
+    rows = (
+        [
+            item
+            for item in breakdown
+            if isinstance(item, Mapping)
+            and str(item.get("role") or "").strip().casefold()
+            not in MISSING_USAGE_PLACEHOLDER_ROLES
+        ]
+        if isinstance(breakdown, list)
+        else []
+    )
+    models = sorted(
+        {
+            str(item.get("model") or "").strip()
+            for item in rows
+            if str(item.get("model") or "").strip()
+        }
+    )
+    providers = sorted(
+        {
+            str(item.get("provider") or "").strip()
+            for item in rows
+            if str(item.get("provider") or "").strip()
+        }
+    )
+    return {
+        "model": models[0] if len(models) == 1 else "",
+        "provider": providers[0] if len(providers) == 1 else "",
+        "models": models,
+        "providers": providers,
+        "receipt_count": len(rows),
+    }
+
+
+def backfill_usage_actual_identity(usage: Any) -> bool:
+    """Fill only uniquely evidenced envelope identity; never copy declarations."""
+
+    if not isinstance(usage, dict):
+        return False
+    evidence = usage_actual_identity_evidence(usage)
+    changed_fields: list[str] = []
+    for field in ("model", "provider"):
+        current = usage.get(field)
+        current_text = current.strip() if isinstance(current, str) else ""
+        inferred = str(evidence.get(field) or "")
+        if not current_text and inferred:
+            usage[field] = inferred
+            changed_fields.append(field)
+    if not changed_fields:
+        return False
+    provider_usage = (
+        dict(usage.get("provider_usage"))
+        if isinstance(usage.get("provider_usage"), Mapping)
+        else {}
+    )
+    provider_usage["actual_identity_backfill"] = {
+        "source": "unique_model_usage_breakdown",
+        "fields": changed_fields,
+        "receipt_count": coerce_metric_int(evidence.get("receipt_count")),
+    }
+    usage["provider_usage"] = provider_usage
+    return True
+
+
+def backfill_saved_row_requested_identity(
+    row: dict[str, Any],
+    *,
+    expected_run_compatibility_contract: Mapping[str, Any] | None = None,
+) -> bool:
+    """Repair absent requested identity from the row's frozen compatible plan."""
+
+    usage = row.get("usage")
+    if not isinstance(usage, dict):
+        return False
+    spec = GROUP_SPECS.get(str(row.get("group") or "")) or {}
+    routing_trace = row.get("routing_trace")
+    expected_model = ""
+    if spec.get("kind") == "single":
+        expected_model = str(spec.get("model") or "").strip()
+    elif spec.get("kind") == "router_single" and isinstance(routing_trace, Mapping):
+        expected_model = str(
+            routing_trace.get("applied_model")
+            or routing_trace.get("fallback_model")
+            or ""
+        ).strip()
+    expected_provider = ""
+    if isinstance(expected_run_compatibility_contract, Mapping):
+        runtime_contract = expected_run_compatibility_contract.get(
+            "resolved_llm_runtime"
+        )
+        if isinstance(runtime_contract, Mapping):
+            expected_provider = str(runtime_contract.get("provider") or "").strip()
+    expected_plan = (
+        routing_trace.get("selection_plan")
+        if isinstance(routing_trace, Mapping)
+        and isinstance(routing_trace.get("selection_plan"), Mapping)
+        else None
+    )
+    synthetic_done = DoneEvent(
+        requested_model=str(usage.get("requested_model") or ""),
+        requested_provider=str(usage.get("requested_provider") or ""),
+        provider_usage=(
+            dict(usage.get("provider_usage"))
+            if isinstance(usage.get("provider_usage"), Mapping)
+            else {}
+        ),
+        ensemble_trace=(
+            row.get("ensemble_trace")
+            if isinstance(row.get("ensemble_trace"), dict)
+            else None
+        ),
+    )
+    synthetic_result = RunResult(
+        final_text=str(row.get("final_text") or ""),
+        done=synthetic_done,
+    )
+    changed = backfill_result_requested_identity(
+        synthetic_result,
+        expected_model=expected_model,
+        expected_provider=expected_provider,
+        expected_selection_plan=expected_plan,
+    )
+    if not changed:
+        return False
+    usage["requested_model"] = synthetic_done.requested_model
+    usage["requested_provider"] = synthetic_done.requested_provider
+    usage["provider_usage"] = dict(synthetic_done.provider_usage)
+    if spec.get("kind") in {"single", "router_single"}:
+        breakdown = usage.get("model_usage_breakdown")
+        if isinstance(breakdown, list):
+            for item in breakdown:
+                if not isinstance(item, dict):
+                    continue
+                if expected_model and not str(item.get("requested_model") or "").strip():
+                    item["requested_model"] = expected_model
+                if (
+                    expected_provider
+                    and not str(item.get("requested_provider") or "").strip()
+                ):
+                    item["requested_provider"] = expected_provider
+    return True
+
+
+def resume_row_completion_state(
+    row: dict[str, Any],
+    *,
+    expected_prompt_sha256: str,
+    expected_task_input_sha256: str,
+    expected_run_compatibility_fingerprint: str,
+    expected_run_compatibility_contract: Mapping[str, Any] | None = None,
+    require_openrouter_non_byok: bool = False,
+    judge_required: bool = True,
+) -> dict[str, Any]:
+    """Classify a prior row without conflating generation, Judge, and metadata."""
+
+    generation_reasons: list[str] = []
+    identity_metadata_reasons: list[str] = []
+    if not verify_result_row_evidence(row):
+        generation_reasons.append("invalid_result_evidence")
+    row_error = str(row.get("error") or "")
+    if row_error and row_error not in _COST_METADATA_ONLY_ERRORS:
+        generation_reasons.append("generation_error")
+    if not str(row.get("final_text") or "").strip():
+        generation_reasons.append("empty_final_text")
+    if str(row.get("prompt_sha256") or "") != expected_prompt_sha256:
+        generation_reasons.append("prompt_hash_mismatch")
+    task_input_sha256 = str(row.get("task_input_sha256") or "")
+    if not task_input_sha256:
+        generation_reasons.append("missing_task_input_sha256")
+    elif task_input_sha256 != expected_task_input_sha256:
+        generation_reasons.append("task_input_hash_mismatch")
+    run_fingerprint = str(row.get("run_compatibility_fingerprint") or "")
+    if not run_fingerprint:
+        generation_reasons.append("missing_run_compatibility_fingerprint")
+    elif run_fingerprint != expected_run_compatibility_fingerprint:
+        generation_reasons.append("run_compatibility_fingerprint_mismatch")
+
+    ensemble_reasons = ensemble_generation_completion_reasons(
+        row,
+        expected_run_compatibility_contract=(expected_run_compatibility_contract),
+    )
+    for reason in ensemble_reasons:
+        if reason.startswith(("missing_actual_", "missing_requested_")):
+            identity_metadata_reasons.append(f"{reason}_backfill_required")
+        else:
+            generation_reasons.append(reason)
+    generation_valid = not generation_reasons
+
+    judge_reasons = judge_completion_reasons(
+        row,
+        judge_required=judge_required,
+    )
+    judge_complete = generation_valid and not judge_reasons
+
+    spec = GROUP_SPECS.get(str(row.get("group") or "")) or {}
+    provider_spec = row.get("provider_spec")
+    if not isinstance(provider_spec, Mapping):
+        generation_reasons.append("missing_provider_spec")
+    elif provider_spec.get("kind") != spec.get("kind"):
+        generation_reasons.append("wrong_provider_spec_kind")
+
+    expected_model = ""
+    if spec.get("kind") == "single":
+        raw_expected_model = spec.get("model")
+        expected_model = (
+            raw_expected_model.strip()
+            if isinstance(raw_expected_model, str)
+            else ""
+        )
+        configured_model = (
+            provider_spec.get("model")
+            if isinstance(provider_spec, Mapping)
+            else None
+        )
+        if configured_model != expected_model:
+            generation_reasons.append("wrong_fixed_model")
+    elif spec.get("kind") == "router_single":
+        routing_trace = row.get("routing_trace")
+        if not isinstance(routing_trace, Mapping):
+            generation_reasons.append("missing_single_router_trace")
+        else:
+            raw_applied_model = routing_trace.get("applied_model")
+            raw_fallback_model = routing_trace.get("fallback_model")
+            applied_model = (
+                raw_applied_model.strip()
+                if isinstance(raw_applied_model, str)
+                else ""
+            )
+            fallback_model = (
+                raw_fallback_model.strip()
+                if isinstance(raw_fallback_model, str)
+                else ""
+            )
+            expected_model = applied_model or fallback_model
+            if not expected_model:
+                generation_reasons.append("missing_single_router_model")
+
+    if spec.get("kind") in {"single", "router_single"}:
+        usage = row.get("usage")
+        identity_evidence = usage_actual_identity_evidence(usage)
+        raw_actual_model = usage.get("model") if isinstance(usage, Mapping) else None
+        actual_model = (
+            raw_actual_model.strip()
+            if isinstance(raw_actual_model, str)
+            else ""
+        )
+        raw_actual_provider = (
+            usage.get("provider") if isinstance(usage, Mapping) else None
+        )
+        actual_provider = (
+            raw_actual_provider.strip()
+            if isinstance(raw_actual_provider, str)
+            else ""
+        )
+        evidenced_model = str(identity_evidence.get("model") or "")
+        evidenced_models = list(identity_evidence.get("models") or [])
+        if actual_model and evidenced_models and any(
+            model != actual_model for model in evidenced_models
+        ):
+            generation_reasons.append("actual_model_receipt_mismatch")
+        if not actual_model:
+            if evidenced_model:
+                if expected_model and evidenced_model != expected_model:
+                    generation_reasons.append("wrong_actual_model")
+                else:
+                    identity_metadata_reasons.append(
+                        "actual_model_metadata_backfill_required"
+                    )
+            else:
+                identity_metadata_reasons.append(
+                    "actual_model_evidence_missing"
+                )
+        elif expected_model and actual_model != expected_model:
+            generation_reasons.append("wrong_actual_model")
+
+        expected_provider = ""
+        if isinstance(expected_run_compatibility_contract, Mapping):
+            runtime_contract = expected_run_compatibility_contract.get(
+                "resolved_llm_runtime"
+            )
+            raw_expected_provider = (
+                runtime_contract.get("provider")
+                if isinstance(runtime_contract, Mapping)
+                else None
+            )
+            expected_provider = (
+                raw_expected_provider.strip()
+                if isinstance(raw_expected_provider, str)
+                else ""
+            )
+        evidenced_provider = str(identity_evidence.get("provider") or "")
+        evidenced_providers = list(identity_evidence.get("providers") or [])
+        if actual_provider and evidenced_providers and any(
+            provider != actual_provider for provider in evidenced_providers
+        ):
+            generation_reasons.append("actual_provider_receipt_mismatch")
+        if not actual_provider:
+            if evidenced_provider:
+                if expected_provider and evidenced_provider != expected_provider:
+                    generation_reasons.append("wrong_actual_provider")
+                else:
+                    identity_metadata_reasons.append(
+                        "actual_provider_metadata_backfill_required"
+                    )
+            else:
+                identity_metadata_reasons.append(
+                    "actual_provider_evidence_missing"
+                )
+        elif expected_provider and actual_provider != expected_provider:
+            generation_reasons.append("wrong_actual_provider")
+
+        raw_requested_model = (
+            usage.get("requested_model") if isinstance(usage, Mapping) else None
+        )
+        requested_model = (
+            raw_requested_model.strip()
+            if isinstance(raw_requested_model, str)
+            else ""
+        )
+        if not requested_model:
+            identity_metadata_reasons.append(
+                "requested_model_metadata_backfill_required"
+            )
+        elif expected_model and requested_model != expected_model:
+            generation_reasons.append("wrong_requested_model")
+
+        raw_requested_provider = (
+            usage.get("requested_provider") if isinstance(usage, Mapping) else None
+        )
+        requested_provider = (
+            raw_requested_provider.strip()
+            if isinstance(raw_requested_provider, str)
+            else ""
+        )
+        if not requested_provider:
+            identity_metadata_reasons.append(
+                "requested_provider_metadata_backfill_required"
+            )
+        elif expected_provider and requested_provider != expected_provider:
+            generation_reasons.append("wrong_requested_provider")
+
+    generation_valid = not generation_reasons
+    if not generation_valid:
+        judge_complete = False
+
+    cost_reasons: list[str] = []
+    cost_reasons.extend(identity_metadata_reasons)
+    accounting = row_cost_accounting(row)
+    if not bool(accounting.get("actual_spend_cost_complete")):
+        cost_reasons.append("cost_metadata_incomplete")
+    recomputed_non_byok: dict[str, Any] | None = None
+    if require_openrouter_non_byok:
+        recomputed_non_byok = openrouter_non_byok_audit(row)
+        stored_non_byok = row.get("openrouter_non_byok_audit")
+        if (
+            recomputed_non_byok.get("pass") is not True
+            or coerce_metric_int(recomputed_non_byok.get("request_count")) <= 0
+            or coerce_metric_int(recomputed_non_byok.get("unverified_or_byok_request_count")) != 0
+            or not isinstance(stored_non_byok, dict)
+            or stored_non_byok != recomputed_non_byok
+        ):
+            cost_reasons.append("openrouter_non_byok_unverified")
+    stale_error = bool(
+        (row_error == "judge_incomplete" and not judge_reasons)
+        or (
+            row_error == "cost_metadata_incomplete"
+            and bool(accounting.get("actual_spend_cost_complete"))
+        )
+        or (
+            row_error == "openrouter_non_byok_verification_failed"
+            and (
+                not require_openrouter_non_byok
+                or (
+                    isinstance(recomputed_non_byok, Mapping)
+                    and recomputed_non_byok.get("pass") is True
+                )
+            )
+        )
+    )
+    if stale_error:
+        # Clear only a marker whose underlying condition has already become
+        # complete.  A real Judge-only gap must remain judge_only rather than
+        # being misclassified as metadata repair.
+        cost_reasons.append("stale_completion_error")
+    cost_metadata_complete = generation_valid and not cost_reasons
+    if not generation_valid:
+        action = "regenerate"
+    elif not cost_metadata_complete:
+        action = "metadata_only"
+    elif not judge_complete:
+        action = "judge_only"
+    else:
+        action = "complete"
+    return {
+        "generation_valid": generation_valid,
+        "judge_complete": judge_complete,
+        "cost_metadata_complete": cost_metadata_complete,
+        "generation_reasons": generation_reasons,
+        "judge_reasons": judge_reasons,
+        "cost_metadata_reasons": cost_reasons,
+        "action": action,
+    }
 
 
 def strict_resume_row_invalid_reasons(
@@ -6048,84 +9773,56 @@ def strict_resume_row_invalid_reasons(
     expected_prompt_sha256: str,
     expected_task_input_sha256: str,
     expected_run_compatibility_fingerprint: str,
+    expected_run_compatibility_contract: Mapping[str, Any] | None = None,
     require_openrouter_non_byok: bool = False,
+    judge_required: bool = True,
 ) -> list[str]:
-    """Match the strict result audit and reject incompatible historical rows."""
+    """Compatibility wrapper returning all incomplete-state reasons."""
 
-    reasons: list[str] = []
-    if not verify_result_row_evidence(row):
-        reasons.append("invalid_result_evidence")
-    if row.get("error"):
-        reasons.append("error")
-    if not str(row.get("final_text") or "").strip():
-        reasons.append("empty_final_text")
-    if row.get("quality_total") is None:
-        reasons.append("missing_quality_total")
-    if str(row.get("prompt_sha256") or "") != expected_prompt_sha256:
-        reasons.append("prompt_hash_mismatch")
-    task_input_sha256 = str(row.get("task_input_sha256") or "")
-    if not task_input_sha256:
-        reasons.append("missing_task_input_sha256")
-    elif task_input_sha256 != expected_task_input_sha256:
-        reasons.append("task_input_hash_mismatch")
-    run_fingerprint = str(row.get("run_compatibility_fingerprint") or "")
-    if not run_fingerprint:
-        reasons.append("missing_run_compatibility_fingerprint")
-    elif run_fingerprint != expected_run_compatibility_fingerprint:
-        reasons.append("run_compatibility_fingerprint_mismatch")
-
-    if require_openrouter_non_byok:
-        recomputed_non_byok = openrouter_non_byok_audit(row)
-        stored_non_byok = row.get("openrouter_non_byok_audit")
-        if (
-            recomputed_non_byok.get("pass") is not True
-            or coerce_metric_int(recomputed_non_byok.get("request_count")) <= 0
-            or coerce_metric_int(
-                recomputed_non_byok.get("unverified_or_byok_request_count")
-            )
-            != 0
-            or not isinstance(stored_non_byok, dict)
-            or stored_non_byok != recomputed_non_byok
-        ):
-            reasons.append("openrouter_non_byok_unverified")
-
-    judge = row.get("judge") or {}
-    if not isinstance(judge, dict) or judge.get("score_status") != "complete":
-        reasons.append("judge_incomplete")
-    if not isinstance(judge, dict) or judge.get("judge_error_count") != 0:
-        reasons.append("judge_errors")
-
-    trace = row.get("ensemble_trace") or {}
-    if isinstance(trace, dict):
-        total = trace.get("total_candidates")
-        successful = trace.get("successful_proposers")
-        if total is not None and (successful is None or successful < total):
-            reasons.append("incomplete_ensemble")
-
-    group = str(row.get("group") or "")
-    spec = GROUP_SPECS.get(group) or {}
-    expected_model = spec.get("model") if spec.get("kind") == "single" else None
-    if expected_model is not None:
-        provider_spec = row.get("provider_spec") or {}
-        actual_model = provider_spec.get("model") if isinstance(provider_spec, dict) else None
-        if actual_model != expected_model:
-            reasons.append("wrong_fixed_model")
-    return reasons
+    state = resume_row_completion_state(
+        row,
+        expected_prompt_sha256=expected_prompt_sha256,
+        expected_task_input_sha256=expected_task_input_sha256,
+        expected_run_compatibility_fingerprint=(expected_run_compatibility_fingerprint),
+        expected_run_compatibility_contract=expected_run_compatibility_contract,
+        require_openrouter_non_byok=require_openrouter_non_byok,
+        judge_required=judge_required,
+    )
+    return [
+        *state["generation_reasons"],
+        *state["judge_reasons"],
+        *state["cost_metadata_reasons"],
+    ]
 
 
-def load_strict_completed_group_task_keys(
+def load_resume_group_task_states(
     *,
     resume_paths: list[Path],
     selected_keys: set[tuple[str, str]],
     prompt_hashes: dict[str, str],
     task_input_hashes: dict[str, str],
     run_compatibility_fingerprints: dict[str, str],
+    run_compatibility_contracts: Mapping[str, Mapping[str, Any]] | None = None,
     require_openrouter_non_byok: bool = False,
-) -> tuple[set[tuple[str, str]], dict[str, Any]]:
-    completed_keys: set[tuple[str, str]] = set()
-    invalid_attempts = 0
+    judge_required: bool = True,
+) -> tuple[dict[tuple[str, str], dict[str, Any]], dict[str, Any]]:
+    best: dict[tuple[str, str], dict[str, Any]] = {}
     matching_attempts = 0
+    invalid_attempts = 0
     invalid_reason_counts: dict[str, int] = {}
+    actions = ("regenerate", "judge_only", "metadata_only", "complete")
+
+    def _repairability_rank(state: Mapping[str, Any]) -> tuple[int, int, int]:
+        # Exact generation cost metadata is not reconstructible by merely
+        # replaying Judge. Prefer a cost-complete generation whose missing
+        # Judge can converge, then one with a completed Judge, and only then a
+        # metadata-incomplete row requiring external backfill/audit.
+        return (
+            int(bool(state.get("generation_valid"))),
+            int(bool(state.get("cost_metadata_complete"))),
+            int(bool(state.get("judge_complete"))),
+        )
+
     for resume_path in resume_paths:
         path = Path(resume_path)
         if not path.is_file():
@@ -6149,29 +9846,74 @@ def load_strict_completed_group_task_keys(
                 if key not in selected_keys:
                     continue
                 matching_attempts += 1
-                expected_hash = prompt_hashes.get(key[1])
-                reasons = strict_resume_row_invalid_reasons(
+                state = resume_row_completion_state(
                     prior_row,
-                    expected_prompt_sha256=expected_hash or "",
+                    expected_prompt_sha256=prompt_hashes.get(key[1], ""),
                     expected_task_input_sha256=task_input_hashes.get(key[1], ""),
                     expected_run_compatibility_fingerprint=(
                         run_compatibility_fingerprints.get(key[0], "")
                     ),
+                    expected_run_compatibility_contract=(
+                        run_compatibility_contracts.get(key[0])
+                        if run_compatibility_contracts is not None
+                        else None
+                    ),
                     require_openrouter_non_byok=require_openrouter_non_byok,
+                    judge_required=judge_required,
                 )
-                if expected_hash is None or reasons:
+                if state["action"] != "complete":
                     invalid_attempts += 1
-                    for reason in reasons:
-                        invalid_reason_counts[reason] = invalid_reason_counts.get(reason, 0) + 1
-                    continue
-                completed_keys.add(key)
-    return completed_keys, {
+                for reason in (
+                    *state["generation_reasons"],
+                    *state["judge_reasons"],
+                    *state["cost_metadata_reasons"],
+                ):
+                    invalid_reason_counts[reason] = invalid_reason_counts.get(reason, 0) + 1
+                candidate = {
+                    **state,
+                    "row": prior_row,
+                    "source_path": str(path),
+                    "source_line": line_number,
+                }
+                current = best.get(key)
+                if current is None or _repairability_rank(state) > _repairability_rank(current):
+                    best[key] = candidate
+    action_counts = {
+        action: sum(1 for state in best.values() if state["action"] == action) for action in actions
+    }
+    return best, {
         "resume_source_count": len(resume_paths),
         "matching_attempt_count": matching_attempts,
-        "strict_valid_pair_count": len(completed_keys),
+        "best_pair_count": len(best),
+        "resume_action_counts": action_counts,
+        "strict_valid_pair_count": action_counts["complete"],
         "strict_invalid_attempt_count": invalid_attempts,
         "strict_invalid_reason_counts": dict(sorted(invalid_reason_counts.items())),
     }
+
+
+def load_strict_completed_group_task_keys(
+    *,
+    resume_paths: list[Path],
+    selected_keys: set[tuple[str, str]],
+    prompt_hashes: dict[str, str],
+    task_input_hashes: dict[str, str],
+    run_compatibility_fingerprints: dict[str, str],
+    run_compatibility_contracts: Mapping[str, Mapping[str, Any]] | None = None,
+    require_openrouter_non_byok: bool = False,
+    judge_required: bool = True,
+) -> tuple[set[tuple[str, str]], dict[str, Any]]:
+    states, audit = load_resume_group_task_states(
+        resume_paths=resume_paths,
+        selected_keys=selected_keys,
+        prompt_hashes=prompt_hashes,
+        task_input_hashes=task_input_hashes,
+        run_compatibility_fingerprints=run_compatibility_fingerprints,
+        run_compatibility_contracts=run_compatibility_contracts,
+        require_openrouter_non_byok=require_openrouter_non_byok,
+        judge_required=judge_required,
+    )
+    return {key for key, state in states.items() if state["action"] == "complete"}, audit
 
 
 async def amain(args: argparse.Namespace) -> int:
@@ -6202,7 +9944,7 @@ async def amain(args: argparse.Namespace) -> int:
     if alignment is not None:
         effective = alignment["effective_args"]
         print(
-            "B2 G12 alignment applied: "
+            "DRACO shared experiment profile applied: "
             f"concurrency={effective['concurrency']}, timeout={effective['timeout']}, "
             f"web={effective['local_web_search_provider']}, "
             f"judge={effective['judge_model']}",
@@ -6215,14 +9957,7 @@ async def amain(args: argparse.Namespace) -> int:
     if args.runner_mode not in SUPPORTED_RUNNER_MODES:
         raise ValueError(f"unknown runner mode: {args.runner_mode}")
     validate_runner_mode_for_groups(args.runner_mode, groups)
-    try:
-        args.agent_max_iterations = int(
-            getattr(args, "agent_max_iterations", DEFAULT_AGENT_MAX_ITERATIONS)
-            or DEFAULT_AGENT_MAX_ITERATIONS
-        )
-    except (TypeError, ValueError) as exc:
-        raise ValueError("agent_max_iterations must be an integer") from exc
-    args.agent_max_iterations = max(0, args.agent_max_iterations)
+    agent_finalization_policy = normalize_agent_runner_args(args)
     args.generation_max_attempts = bounded_generation_attempts(
         getattr(args, "generation_max_attempts", GENERATION_MAX_ATTEMPTS)
     )
@@ -6263,12 +9998,8 @@ async def amain(args: argparse.Namespace) -> int:
         groups=groups,
         only_keys_path=getattr(args, "only_group_task_keys", None),
     )
-    prompt_hashes = {
-        str(task["id"]): text_sha256(str(task.get("prompt") or "")) for task in tasks
-    }
-    task_input_hashes = {
-        str(task["id"]): canonical_json_sha256(task) for task in tasks
-    }
+    prompt_hashes = {str(task["id"]): text_sha256(str(task.get("prompt") or "")) for task in tasks}
+    task_input_hashes = {str(task["id"]): canonical_json_sha256(task) for task in tasks}
     if getattr(args, "only_group_task_keys", None) is not None:
         print(
             f"selection: restricted run to {len(selected_keys)} group/task pairs",
@@ -6309,22 +10040,50 @@ async def amain(args: argparse.Namespace) -> int:
             actual=args._run_compatibility,
             groups=groups,
         )
-    completed_keys, resume_audit = load_strict_completed_group_task_keys(
+    judge_required = bool(str(getattr(args, "judge_model", "") or "").strip())
+    resume_states, resume_audit = load_resume_group_task_states(
         resume_paths=list(getattr(args, "resume_from_jsonl", []) or []),
         selected_keys=selected_keys,
         prompt_hashes=prompt_hashes,
         task_input_hashes=task_input_hashes,
         run_compatibility_fingerprints=args._run_compatibility["fingerprints"],
-        require_openrouter_non_byok=bool(
-            getattr(args, "require_openrouter_non_byok", False)
-        ),
+        run_compatibility_contracts=args._run_compatibility["contracts"],
+        require_openrouter_non_byok=bool(getattr(args, "require_openrouter_non_byok", False)),
+        judge_required=judge_required,
     )
+    completed_keys = {key for key, state in resume_states.items() if state["action"] == "complete"}
     scheduled_keys = selected_keys - completed_keys
+    regenerate_keys = {
+        key
+        for key in scheduled_keys
+        if key not in resume_states or resume_states[key]["action"] == "regenerate"
+    }
+    judge_only_keys = {
+        key
+        for key in scheduled_keys
+        if key in resume_states and resume_states[key]["action"] == "judge_only"
+    }
+    metadata_only_keys = {
+        key
+        for key in scheduled_keys
+        if key in resume_states and resume_states[key]["action"] == "metadata_only"
+    }
     args._resume_selection = {
         "selected_pair_count": len(selected_keys),
         "scheduled_pair_count": len(scheduled_keys),
+        "regenerate_pair_count": len(regenerate_keys),
+        "judge_only_pair_count": len(judge_only_keys),
+        "metadata_only_pair_count": len(metadata_only_keys),
         "scheduled_pairs": [
-            {"group": group, "task_id": str(task["id"])}
+            {
+                "group": group,
+                "task_id": str(task["id"]),
+                "action": (
+                    resume_states[(group, str(task["id"]))]["action"]
+                    if (group, str(task["id"])) in resume_states
+                    else "regenerate"
+                ),
+            }
             for task in tasks
             for group in groups
             if (group, str(task["id"])) in scheduled_keys
@@ -6347,39 +10106,41 @@ async def amain(args: argparse.Namespace) -> int:
         )
         return 0
     preflight_started_at = time.time()
-    try:
-        web_preflight = await run_local_web_tools_preflight(
-            tool_policy,
-            dry_run=bool(getattr(args, "dry_run", False)),
-        )
-    except Exception as exc:
-        if not smoke_only:
-            output_dir = args.output_dir
-            output_dir.mkdir(parents=True, exist_ok=True)
-            failure_stamp = time.strftime("%Y%m%d-%H%M%S")
-            failure_manifest = output_dir / (
-                f"draco_run_{failure_stamp}.preflight-failed.manifest.json"
+    web_preflight: dict[str, Any] = {}
+    if regenerate_keys or smoke_only:
+        try:
+            web_preflight = await run_local_web_tools_preflight(
+                tool_policy,
+                dry_run=bool(getattr(args, "dry_run", False)),
             )
-            write_manifest(
-                failure_manifest,
-                args=args,
-                stamp=failure_stamp,
-                status="preflight_failed",
-                started_at=preflight_started_at,
-                finished_at=time.time(),
-                tasks=tasks,
-                groups=groups,
-                artifacts={"manifest_json": str(failure_manifest)},
-                tool_policy=tool_policy,
-                command=command_payload(args),
-                failure={
-                    "stage": "local_web_tools_preflight",
-                    "error_class": type(exc).__name__,
-                    "error": str(exc)[:1000],
-                    "model_or_judge_started": False,
-                },
-            )
-        raise
+        except Exception as exc:
+            if not smoke_only:
+                output_dir = args.output_dir
+                output_dir.mkdir(parents=True, exist_ok=True)
+                failure_stamp = time.strftime("%Y%m%d-%H%M%S")
+                failure_manifest = output_dir / (
+                    f"draco_run_{failure_stamp}.preflight-failed.manifest.json"
+                )
+                write_manifest(
+                    failure_manifest,
+                    args=args,
+                    stamp=failure_stamp,
+                    status="preflight_failed",
+                    started_at=preflight_started_at,
+                    finished_at=time.time(),
+                    tasks=tasks,
+                    groups=groups,
+                    artifacts={"manifest_json": str(failure_manifest)},
+                    tool_policy=tool_policy,
+                    command=command_payload(args),
+                    failure={
+                        "stage": "local_web_tools_preflight",
+                        "error_class": type(exc).__name__,
+                        "error": str(exc)[:1000],
+                        "model_or_judge_started": False,
+                    },
+                )
+            raise
     if web_preflight:
         local_web_tools = dict(tool_policy.get("local_web_tools") or {})
         local_web_tools["preflight"] = web_preflight
@@ -6435,9 +10196,7 @@ async def amain(args: argparse.Namespace) -> int:
     command_path = output_dir / f"draco_run_{stamp}.command.txt"
     summary_json_path = jsonl_path.with_suffix(".summary.json")
     semaphore = asyncio.Semaphore(max(1, args.concurrency))
-    judge_semaphore = asyncio.Semaphore(
-        max(1, int(getattr(args, "judge_concurrency", 1) or 1))
-    )
+    judge_semaphore = asyncio.Semaphore(max(1, int(getattr(args, "judge_concurrency", 1) or 1)))
     rows: list[dict[str, Any]] = []
     artifacts = {
         "results_jsonl": str(jsonl_path),
@@ -6502,6 +10261,7 @@ async def amain(args: argparse.Namespace) -> int:
                 runner_mode=args.runner_mode,
                 output_dir=output_dir,
                 agent_max_iterations=args.agent_max_iterations,
+                agent_finalization_policy=agent_finalization_policy,
                 generation_max_attempts=getattr(
                     args, "generation_max_attempts", GENERATION_MAX_ATTEMPTS
                 ),
@@ -6511,21 +10271,257 @@ async def amain(args: argparse.Namespace) -> int:
                     DEFAULT_GENERATION_RETRY_BACKOFF_SECONDS,
                 ),
                 tools=group_tools,
-                run_compatibility_fingerprint=args._run_compatibility["fingerprints"][
-                    group
-                ],
+                run_compatibility_fingerprint=args._run_compatibility["fingerprints"][group],
                 require_openrouter_non_byok=bool(
                     getattr(args, "require_openrouter_non_byok", False)
                 ),
             )
 
+    async def _repair_prior_row(
+        task: dict[str, Any],
+        group: str,
+        state: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Repair Judge/metadata while preserving the accepted generation verbatim."""
+
+        def _usage_generation_contract(value: Any) -> Any:
+            """Project immutable generation identity while allowing cost repair."""
+
+            if not isinstance(value, Mapping):
+                return None
+            contract_keys = (
+                "provider",
+                "model",
+                "requested_provider",
+                "requested_model",
+                "input_tokens",
+                "output_tokens",
+                "reasoning_tokens",
+                "cached_tokens",
+                "cache_read_tokens",
+                "cache_write_tokens",
+            )
+            contract = {key: value.get(key) for key in contract_keys if key in value}
+            breakdown = value.get("model_usage_breakdown")
+            if isinstance(breakdown, list):
+                contract["model_usage_breakdown"] = [
+                    _usage_generation_contract(item)
+                    for item in breakdown
+                    if isinstance(item, Mapping)
+                ]
+            return contract
+
+        async with semaphore:
+            row = json.loads(json.dumps(state["row"], ensure_ascii=False))
+            action = str(state["action"])
+            actual_identity_repaired = backfill_usage_actual_identity(row.get("usage"))
+            requested_identity_repaired = backfill_saved_row_requested_identity(
+                row,
+                expected_run_compatibility_contract=(
+                    args._run_compatibility["contracts"].get(group)
+                ),
+            )
+            identity_repaired = bool(
+                actual_identity_repaired or requested_identity_repaired
+            )
+            prior_final_text = row.get("final_text")
+            prior_usage_contract = _usage_generation_contract(row.get("usage"))
+            cost_metadata_repaired = repair_row_cost_metadata_with_estimates(row)
+            metadata_repaired = bool(identity_repaired or cost_metadata_repaired)
+            preexisting_non_byok_ready = True
+            if getattr(args, "require_openrouter_non_byok", False):
+                # A new Judge call cannot repair historical BYOK/unverified
+                # spend because prior attempts remain part of actual spend.
+                # Refuse to add more cost unless every existing generation and
+                # Judge receipt already satisfies the strict policy.
+                preexisting_non_byok_ready = (
+                    openrouter_non_byok_audit(row).get("pass") is True
+                )
+            needs_judge = bool(
+                judge_completion_reasons(
+                    row,
+                    judge_required=judge_required,
+                )
+            )
+            judge_reran = bool(
+                needs_judge
+                and preexisting_non_byok_ready
+                and action in {"judge_only", "metadata_only"}
+            )
+            if judge_reran:
+                prior_judge_attempts = [
+                    {
+                        "source": "resume_prior_judge",
+                        "run": json.loads(json.dumps(run, ensure_ascii=False)),
+                    }
+                    for run in iter_judge_attempt_runs(row.get("judge"))
+                ]
+                judge = await judge_text(
+                    judge_provider=judge_provider,
+                    task=task,
+                    answer=str(prior_final_text or ""),
+                    dry_run=bool(args.dry_run and judge_provider is not None),
+                    judge_repeats=args.judge_repeats,
+                    judge_concurrency=getattr(args, "judge_concurrency", 1),
+                    judge_max_attempts=getattr(
+                        args,
+                        "judge_max_attempts",
+                        JUDGE_MAX_ATTEMPTS,
+                    ),
+                    judge_semaphore=judge_semaphore,
+                )
+                if isinstance(judge, dict) and prior_judge_attempts:
+                    judge = {
+                        **judge,
+                        "prior_judge_attempts": prior_judge_attempts,
+                    }
+                elif judge is None and prior_judge_attempts:
+                    judge = {
+                        "score_status": "incomplete",
+                        "judge_error_count": 1,
+                        "error": "judge_unavailable",
+                        "prior_judge_attempts": prior_judge_attempts,
+                    }
+                row["judge"] = judge
+                row["quality_total"] = quality_total(judge)
+                candidate_totals = [
+                    total
+                    for candidate_judge in (
+                        row.get("candidate_judges")
+                        if isinstance(row.get("candidate_judges"), list)
+                        else []
+                    )
+                    if (total := quality_total(candidate_judge)) is not None
+                ]
+                row["fusion_delta"] = (
+                    row["quality_total"] - max(candidate_totals)
+                    if row["quality_total"] is not None and candidate_totals
+                    else None
+                )
+                metadata_repaired |= repair_row_cost_metadata_with_estimates(row)
+            non_byok_audit: dict[str, Any] | None = None
+            if getattr(args, "require_openrouter_non_byok", False):
+                prior_audit = row.get("openrouter_non_byok_audit")
+                non_byok_audit = openrouter_non_byok_audit(row)
+                row["openrouter_non_byok_audit"] = non_byok_audit
+                metadata_repaired |= prior_audit != non_byok_audit
+            non_byok_ready = (
+                non_byok_audit is None or non_byok_audit.get("pass") is True
+            )
+            execution = dict(row.get("execution") or {})
+            execution.update(
+                {
+                    "resume_action": action,
+                    "generation_reused": True,
+                    "metadata_repaired": metadata_repaired,
+                    "judge_reran": judge_reran,
+                    "resume_source_path": state.get("source_path"),
+                    "resume_source_line": state.get("source_line"),
+                }
+            )
+            row["execution"] = execution
+            row["completed_at"] = time.time()
+            row["cost_accounting"] = public_cost_accounting(
+                row_cost_accounting(row)
+            )
+            judge_complete = not judge_completion_reasons(
+                row,
+                judge_required=judge_required,
+            )
+            cost_metadata_complete = (
+                bool(row["cost_accounting"].get("actual_spend_cost_complete")) and non_byok_ready
+            )
+            if not cost_metadata_complete:
+                row["error"] = (
+                    "openrouter_non_byok_verification_failed"
+                    if not non_byok_ready
+                    else "cost_metadata_incomplete"
+                )
+            elif not judge_complete:
+                row["error"] = "judge_incomplete"
+            elif str(row.get("error") or "") in _COST_METADATA_ONLY_ERRORS:
+                row["error"] = None
+            # Re-seal and re-run the same strict classifier used when loading a
+            # resume source.  This prevents a metadata-only repair from
+            # claiming completion while still carrying an unrepairable
+            # identity or stale state that would fail again on the next run.
+            row = seal_result_row(row)
+            task_id = str(task["id"])
+            post_state = resume_row_completion_state(
+                row,
+                expected_prompt_sha256=prompt_hashes.get(task_id, ""),
+                expected_task_input_sha256=task_input_hashes.get(task_id, ""),
+                expected_run_compatibility_fingerprint=(
+                    args._run_compatibility["fingerprints"].get(group, "")
+                ),
+                expected_run_compatibility_contract=(
+                    args._run_compatibility["contracts"].get(group)
+                ),
+                require_openrouter_non_byok=bool(
+                    getattr(args, "require_openrouter_non_byok", False)
+                ),
+                judge_required=judge_required,
+            )
+            judge_complete = bool(post_state["judge_complete"])
+            cost_metadata_complete = bool(post_state["cost_metadata_complete"])
+            generation_accepted = bool(post_state["generation_valid"])
+            incomplete_reasons = list(
+                dict.fromkeys(
+                    [
+                        *post_state["generation_reasons"],
+                        *post_state["judge_reasons"],
+                        *post_state["cost_metadata_reasons"],
+                    ]
+                )
+            )
+            completion_complete = post_state["action"] == "complete"
+            row["resume_completion"] = {
+                "action": action,
+                "generation_reused": True,
+                "identity_repaired": identity_repaired,
+                "metadata_repaired": metadata_repaired,
+                "judge_reran": judge_reran,
+                "judge_complete": judge_complete,
+                "cost_metadata_complete": cost_metadata_complete,
+                "post_repair_action": post_state["action"],
+                "status": "complete" if completion_complete else "incomplete",
+                "incomplete_reasons": incomplete_reasons,
+            }
+            row["completion_status"] = {
+                "generation_accepted": generation_accepted,
+                "cost_metadata_complete": cost_metadata_complete,
+                "judge_complete": judge_complete,
+                "status": "complete" if completion_complete else "incomplete",
+                "incomplete_reasons": list(incomplete_reasons),
+            }
+            if (
+                row.get("final_text") != prior_final_text
+                or _usage_generation_contract(row.get("usage")) != prior_usage_contract
+            ):
+                raise RuntimeError("Judge/metadata repair mutated accepted generation data")
+            return row
+
+    expected_result_keys = set(scheduled_keys)
     pending = [
-        asyncio.create_task(_guarded(task, group))
+        asyncio.create_task(
+            _guarded(task, group)
+            if (group, str(task["id"])) in regenerate_keys
+            else _repair_prior_row(
+                task,
+                group,
+                resume_states[(group, str(task["id"]))],
+            )
+        )
         for task in tasks
         for group in groups
         if (group, str(task["id"])) in scheduled_keys
     ]
     cost_audit_failure: dict[str, Any] | None = None
+    cost_audit_failures: list[dict[str, Any]] = []
+    repair_failures: list[dict[str, Any]] = []
+    continue_after_cost_audit_failure = bool(
+        getattr(args, "continue_after_cost_audit_failure", False)
+    )
     with (
         jsonl_path.open("w", encoding="utf-8") as fh,
         trace_path.open("w", encoding="utf-8") as trace_fh,
@@ -6533,19 +10529,37 @@ async def amain(args: argparse.Namespace) -> int:
         for row_index, coro in enumerate(asyncio.as_completed(pending), start=1):
             row = await coro
             row["row_index"] = row_index
+            resume_completion = row.get("resume_completion")
+            if (
+                isinstance(resume_completion, dict)
+                and resume_completion.get("status") == "incomplete"
+            ):
+                repair_failures.append(
+                    {
+                        "stage": "resume_repair",
+                        "group": row.get("group"),
+                        "task_id": row.get("task_id"),
+                        "action": resume_completion.get("action"),
+                        "reasons": list(resume_completion.get("incomplete_reasons") or []),
+                        "model_or_judge_started": bool(resume_completion.get("judge_reran")),
+                    }
+                )
             if getattr(args, "require_openrouter_non_byok", False):
                 audit = openrouter_non_byok_audit(row)
                 row["openrouter_non_byok_audit"] = audit
                 if not audit["pass"]:
                     if not row.get("error"):
                         row["error"] = "openrouter_non_byok_verification_failed"
-                    cost_audit_failure = {
+                    failure = {
                         "stage": "openrouter_non_byok_audit",
                         "group": row.get("group"),
                         "task_id": row.get("task_id"),
                         "audit": audit,
                         "model_or_judge_started": True,
                     }
+                    cost_audit_failures.append(failure)
+                    if cost_audit_failure is None:
+                        cost_audit_failure = failure
             row = seal_result_row(row)
             trace_value = trace_row(row)
             result_line = json.dumps(row, ensure_ascii=False, allow_nan=False)
@@ -6556,13 +10570,124 @@ async def amain(args: argparse.Namespace) -> int:
             trace_fh.write(trace_line + "\n")
             trace_fh.flush()
             print(f"{row['group']} {row['task_id']} error={bool(row['error'])}", flush=True)
-            if cost_audit_failure is not None:
+            if cost_audit_failure is not None and not continue_after_cost_audit_failure:
                 break
-    if cost_audit_failure is not None:
+    if cost_audit_failure is not None and not continue_after_cost_audit_failure:
         for task in pending:
             if not task.done():
                 task.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
+    result_failures: list[dict[str, Any]] = []
+    for row in rows:
+        if (
+            cost_audit_failure is not None
+            and str(row.get("error") or "")
+            == "openrouter_non_byok_verification_failed"
+        ):
+            continue
+        completion = row.get("completion_status")
+        completion_complete = bool(
+            isinstance(completion, Mapping) and completion.get("status") == "complete"
+        )
+        if not row.get("error") and completion_complete:
+            continue
+        reasons = (
+            list(completion.get("incomplete_reasons") or [])
+            if isinstance(completion, Mapping)
+            else ["missing_completion_status"]
+        )
+        if row.get("error"):
+            reasons.append(str(row["error"]))
+        result_failures.append(
+            {
+                "stage": "result_completion",
+                "group": row.get("group"),
+                "task_id": row.get("task_id"),
+                "reasons": list(dict.fromkeys(reason for reason in reasons if reason)),
+                "model_or_judge_started": True,
+            }
+        )
+    if cost_audit_failure is None:
+        coverage = result_key_coverage(rows, expected_keys=expected_result_keys)
+        if not coverage["pass"]:
+            coverage_reasons: list[str] = []
+            if coverage["missing_keys"]:
+                coverage_reasons.append("missing_result_rows")
+            if coverage["unexpected_keys"]:
+                coverage_reasons.append("unexpected_result_rows")
+            if coverage["duplicate_keys"]:
+                coverage_reasons.append("duplicate_result_rows")
+            result_failures.append(
+                {
+                    "stage": "result_coverage",
+                    **coverage,
+                    "reasons": coverage_reasons,
+                    "model_or_judge_started": bool(rows),
+                }
+            )
+    manifest_failure = cost_audit_failure
+    if len(cost_audit_failures) > 1:
+        manifest_failure = {
+            "stage": "openrouter_non_byok_audit",
+            "failure_count": len(cost_audit_failures),
+            "failures": cost_audit_failures,
+            "model_or_judge_started": True,
+        }
+    if repair_failures:
+        repair_failure: dict[str, Any] = {
+            "stage": "resume_repair",
+            "failure_count": len(repair_failures),
+            "failures": repair_failures,
+            "model_or_judge_started": any(
+                bool(item.get("model_or_judge_started")) for item in repair_failures
+            ),
+        }
+        if manifest_failure is None:
+            manifest_failure = repair_failure
+        else:
+            manifest_failure = {
+                "stage": "multiple_failures",
+                "failures": [manifest_failure, repair_failure],
+                "model_or_judge_started": True,
+            }
+    if result_failures:
+        result_failure: dict[str, Any] = {
+            "stage": "result_completion",
+            "failure_count": len(result_failures),
+            "failures": result_failures,
+            "model_or_judge_started": any(
+                bool(item.get("model_or_judge_started")) for item in result_failures
+            ),
+        }
+        if manifest_failure is None:
+            manifest_failure = result_failure
+        else:
+            manifest_failure = {
+                "stage": "multiple_failures",
+                "failures": [manifest_failure, result_failure],
+                "model_or_judge_started": True,
+            }
+    run_status = "complete"
+    if cost_audit_failure is not None:
+        run_status = "cost_audit_failed"
+    elif result_failures or repair_failures:
+        flattened_reasons = {
+            str(reason)
+            for failure in [*result_failures, *repair_failures]
+            for reason in failure.get("reasons", [])
+        }
+        run_status = (
+            "metadata_incomplete"
+            if flattened_reasons
+            and flattened_reasons
+            <= {
+                "cost_metadata_incomplete",
+                "openrouter_non_byok_verification_failed",
+            }
+            else "judge_incomplete"
+            if flattened_reasons and flattened_reasons <= {"judge_incomplete"}
+            else "resume_repair_incomplete"
+        )
     summary = summarize(rows)
     summary_path = jsonl_path.with_suffix(".md")
     summary_path.write_text(
@@ -6573,6 +10698,7 @@ async def amain(args: argparse.Namespace) -> int:
             generation_policy=generation_policy,
             runner_mode=args.runner_mode,
             agent_max_iterations=args.agent_max_iterations,
+            agent_finalization_policy=agent_finalization_policy,
         ),
         encoding="utf-8",
     )
@@ -6584,7 +10710,7 @@ async def amain(args: argparse.Namespace) -> int:
         manifest_path,
         args=args,
         stamp=stamp,
-        status=("cost_audit_failed" if cost_audit_failure is not None else "complete"),
+        status=run_status,
         started_at=run_started_at,
         finished_at=time.time(),
         tasks=tasks,
@@ -6594,7 +10720,7 @@ async def amain(args: argparse.Namespace) -> int:
         summary=summary,
         tool_policy=manifest_tool_policy,
         command=command,
-        failure=cost_audit_failure,
+        failure=manifest_failure,
     )
     print(f"wrote {jsonl_path}")
     print(f"wrote {trace_path}")
@@ -6605,7 +10731,7 @@ async def amain(args: argparse.Namespace) -> int:
     for key, path in artifacts.items():
         if key.startswith("experiment_config_"):
             print(f"wrote {path}")
-    return 2 if cost_audit_failure is not None else 0
+    return 2 if manifest_failure is not None else 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -6746,6 +10872,57 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--deadline-wrapup-margin-seconds",
+        type=int,
+        default=DEFAULT_DEADLINE_WRAPUP_MARGIN_SECONDS,
+        help=(
+            "Reserve this many seconds before the Agent deadline for a finalization "
+            "pass; 0 preserves the legacy hard-deadline behavior."
+        ),
+    )
+    parser.add_argument(
+        "--deadline-wrapup-disable-tools",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_DEADLINE_WRAPUP_DISABLE_TOOLS,
+        help="Disable tools during the deadline-triggered finalization pass.",
+    )
+    parser.add_argument(
+        "--deadline-thinking-off-margin-seconds",
+        type=int,
+        default=DEFAULT_DEADLINE_THINKING_OFF_MARGIN_SECONDS,
+        help=(
+            "Disable model thinking this many seconds before the Agent deadline; "
+            "0 disables the transition."
+        ),
+    )
+    parser.add_argument(
+        "--max-iterations-includes-finalization",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_MAX_ITERATIONS_INCLUDES_FINALIZATION,
+        help="Count the finalization pass against --agent-max-iterations.",
+    )
+    parser.add_argument(
+        "--retrieval-loop-finalization-threshold",
+        type=int,
+        default=DEFAULT_RETRIEVAL_LOOP_FINALIZATION_THRESHOLD,
+        help=(
+            "Trigger finalization after this many consecutive retrieval-only Agent "
+            "iterations; 0 disables retrieval-loop finalization."
+        ),
+    )
+    parser.add_argument(
+        "--finalization-aggregator-only",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_FINALIZATION_AGGREGATOR_ONLY,
+        help="Use only the ensemble aggregator during Agent finalization.",
+    )
+    parser.add_argument(
+        "--finalization-disable-thinking",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_FINALIZATION_DISABLE_THINKING,
+        help="Disable model thinking during Agent finalization.",
+    )
+    parser.add_argument(
         "--require-clean-source",
         action="store_true",
         help="Refuse to start unless the benchmark source worktree is clean and identifiable.",
@@ -6833,6 +11010,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Fail the experiment unless every OpenRouter LLM usage record proves "
             "is_byok=false. Missing evidence fails closed."
+        ),
+    )
+    parser.add_argument(
+        "--continue-after-cost-audit-failure",
+        action="store_true",
+        help=(
+            "Keep running independent rows after a strict OpenRouter cost-audit failure. "
+            "Failed rows remain metadata-incomplete and the process exits with status 2."
         ),
     )
     parser.add_argument(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from dataclasses import fields
 from typing import Any
 
 import pytest
@@ -38,6 +39,7 @@ class _LoopingToolProvider:
     def __init__(self, *, final_on_call: int | None = None) -> None:
         self.final_on_call = final_on_call
         self.calls: list[list[Message]] = []
+        self.tools_by_call: list[list[Any] | None] = []
 
     def chat(
         self,
@@ -46,6 +48,7 @@ class _LoopingToolProvider:
         config: ChatConfig | None = None,
     ) -> AsyncIterator[Any]:
         self.calls.append(messages)
+        self.tools_by_call.append(tools)
         call_number = len(self.calls)
         return self._stream(call_number)
 
@@ -325,6 +328,7 @@ async def _artifact_tool(call: Any) -> ToolResult:
 
 def test_agent_iteration_defaults_are_unbounded() -> None:
     assert AgentConfig().max_iterations == 0
+    assert AgentConfig().max_iterations_includes_finalization is False
     assert SubagentSpec(task="check").max_iterations == 0
     assert AgentConfig().max_turn_llm_calls == 0
     assert AgentConfig().max_turn_input_tokens == 0
@@ -332,6 +336,53 @@ def test_agent_iteration_defaults_are_unbounded() -> None:
     assert AgentConfig().max_turn_billed_cost_usd == 0.0
     assert AgentConfig().max_turn_tool_errors == 0
     assert AgentConfig().length_capped_continuations == 3
+
+
+def test_agent_config_finalization_fields_preserve_positional_abi() -> None:
+    config = AgentConfig(
+        7,
+        601.0,
+        602.0,
+        603.0,
+        604.0,
+        5,
+        606,
+        8,
+        9,
+        10,
+        11.5,
+        12.5,
+        13,
+        0.4,
+        0.8,
+    )
+
+    assert config.max_iterations == 7
+    assert config.timeout == 601.0
+    assert config.iteration_timeout == 602.0
+    assert config.request_timeout == 603.0
+    assert config.tool_timeout == 604.0
+    assert config.max_safe_tool_concurrency == 5
+    assert config.max_tokens == 606
+    assert config.max_turn_llm_calls == 8
+    assert config.max_turn_input_tokens == 9
+    assert config.max_turn_output_tokens == 10
+    assert config.max_turn_billed_cost_usd == 11.5
+    assert config.max_turn_cost_usd == 12.5
+    assert config.max_turn_tool_errors == 13
+    assert config.temperature == 0.4
+    assert config.top_p == 0.8
+
+    field_names = [item.name for item in fields(AgentConfig)]
+    metadata_index = field_names.index("metadata")
+    for finalization_field in (
+        "max_iterations_includes_finalization",
+        "deadline_wrapup_disable_tools",
+        "retrieval_loop_finalization_threshold",
+        "finalization_aggregator_only",
+        "finalization_disable_thinking",
+    ):
+        assert field_names.index(finalization_field) > metadata_index
 
 
 @pytest.mark.asyncio
@@ -371,6 +422,28 @@ async def test_agent_finalizes_when_tool_loop_reaches_max_iterations() -> None:
     )
     assert not any(event.kind == "state" and event.state.value == "error" for event in events)
     assert not any(event.kind == "error" and event.code == "max_iterations" for event in events)
+    assert any(event.kind == "done" and event.text == "done" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_agent_can_count_finalization_inside_max_iterations() -> None:
+    provider = _LoopingToolProvider(final_on_call=3)
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            max_iterations=3,
+            max_iterations_includes_finalization=True,
+        ),
+        tool_definitions=[_echo_definition()],
+        tool_handler=_echo_tool,
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    assert len(provider.calls) == 3
+    assert all(tools is not None for tools in provider.tools_by_call[:2])
+    assert provider.tools_by_call[2] is None
+    assert "Do not call tools" in str(provider.calls[2][-1].content)
     assert any(event.kind == "done" and event.text == "done" for event in events)
 
 

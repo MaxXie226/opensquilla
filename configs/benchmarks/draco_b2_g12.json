@@ -90,7 +90,7 @@
       "thinking": "xhigh",
       "k": 1
     },
-    "min_successful_proposers": 1,
+    "min_successful_proposers": 3,
     "all_failed_policy": "fallback_single",
     "candidate_max_chars": 24000,
     "shuffle_candidates": false,
@@ -109,7 +109,14 @@
   "runner": {
     "mode": "agent_loop",
     "agent_max_iterations": 12,
-    "concurrency": 2
+    "concurrency": 2,
+    "deadline_wrapup_margin_seconds": 600,
+    "deadline_wrapup_disable_tools": true,
+    "deadline_thinking_off_margin_seconds": 600,
+    "max_iterations_includes_finalization": true,
+    "retrieval_loop_finalization_threshold": 3,
+    "finalization_aggregator_only": true,
+    "finalization_disable_thinking": true
   },
   "generation": {
     "thinking_enabled": true,

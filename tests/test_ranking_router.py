@@ -102,6 +102,8 @@ def _model(
     credential_available: bool = True,
     context_window: int = 128_000,
     modalities: list[str] | None = None,
+    is_open_source: bool = False,
+    is_chinese_model: bool = False,
     capability: float = 0.8,
     aggregator_fit: float = 0.8,
     price: float = 1.0,
@@ -116,6 +118,8 @@ def _model(
             "provider": provider,
             "vendor": vendor or provider,
             "family": family or model_id,
+            "is_open_source": is_open_source,
+            "is_chinese_model": is_chinese_model,
             "status": status,
             "roles": roles or ["proposer", "aggregator"],
             "context_window": context_window,
@@ -264,12 +268,12 @@ def test_ranking_config_rejects_unknown_or_missing_nested_parameters() -> None:
             )
 
 
-def test_packaged_mock_registry_has_versioned_step2_profiles() -> None:
+def test_packaged_curated_registry_has_versioned_step2_profiles() -> None:
     snapshot = load_model_registry_snapshot()
     model_ids = [model["registry_facts"]["model_id"] for model in snapshot["models"]]
 
-    assert snapshot["snapshot_version"].startswith("mock-step2-")
-    assert len(snapshot["models"]) == 20
+    assert snapshot["snapshot_version"].startswith("curated-openrouter-step2-")
+    assert len(snapshot["models"]) == 80
     assert len(set(model_ids)) == len(model_ids)
     assert {
         "poolside/laguna-xs-2.1",
@@ -283,35 +287,47 @@ def test_packaged_mock_registry_has_versioned_step2_profiles() -> None:
         "anthropic/claude-sonnet-5",
         "x-ai/grok-4.5",
         "google/gemini-3.1-pro-preview",
+        "anthropic/claude-fable-5",
+        "moonshotai/kimi-k3",
+        "thinkingmachines/inkling",
+        "nvidia/nemotron-3-ultra-550b-a55b",
+        "openai/gpt-oss-120b",
+        "qwen/qwen3.6-27b",
+        "inclusionai/ling-2.6-1t",
+        "mistralai/devstral-2512",
+        "openai/gpt-oss-20b",
     }.issubset(model_ids)
     for model in snapshot["models"]:
-        assert model["registry_facts"]["model_id"]
-        assert model["registry_facts"]["provider"] == "openrouter"
-        assert model["registry_facts"]["roles"]
-        assert model["registry_facts"]["context_window"] > 0
+        facts = model["registry_facts"]
+        assert facts["model_id"]
+        assert facts["provider"] == "openrouter"
+        assert facts["roles"]
+        assert facts["context_window"] > 0
+        assert type(facts["is_open_source"]) is bool
+        assert type(facts["is_chinese_model"]) is bool
+        assert type(facts["supports_reasoning"]) is bool
+        assert type(facts["supports_tools"]) is bool
+        assert facts["catalog_verified_at"] == "2026-07-24"
+        assert facts["latency_source"] == "curated_estimate"
         assert set(model["static_profile"]["capability_dist_prior"]) == set(CAPABILITIES)
         assert set(model["static_profile"]["domain_dist_prior"]) == set(DOMAINS)
         assert model["static_profile"]["tier_dist_prior"]
         assert model["static_profile"]["role_fit_prior"]["aggregator"] >= 0
+        assert model["online_profile"]["source"] == "curated_estimate"
 
-    catalog_models = [
+    curated_models = [
         model
         for model in snapshot["models"]
-        if model["source"] == "openrouter_catalog_mock_profile"
+        if model["source"] == "curated_openrouter_profile"
     ]
-    assert len(catalog_models) == 11
-    assert all(
-        model["registry_facts"]["catalog_verified_at"] == "2026-07-14"
-        and model["registry_facts"]["latency_source"] == "mock"
-        for model in catalog_models
-    )
+    assert len(curated_models) == 80
     assert min(
         model["registry_facts"]["price"]["input_per_million"]
-        for model in catalog_models
-    ) <= 0.10
+        for model in curated_models
+    ) <= 0.05
     assert max(
         model["static_profile"]["role_fit_prior"]["proposer"]
-        for model in catalog_models
+        for model in curated_models
     ) >= 0.94
 
 
@@ -794,6 +810,23 @@ def test_ranking_rejects_malformed_numeric_model_profiles(
         model["static_profile"]["capability_dist_prior"]["reasoning"] = value
 
     with pytest.raises(DynamicRankingError, match=message):
+        _decision(model, analysis=_analysis(tier=1))
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "is_open_source",
+        "is_chinese_model",
+        "supports_reasoning",
+        "supports_tools",
+    ],
+)
+def test_ranking_rejects_non_boolean_model_boolean_fact(field: str) -> None:
+    model = _model("malformed")
+    model["registry_facts"][field] = "false"
+
+    with pytest.raises(DynamicRankingError, match=f"invalid {field}"):
         _decision(model, analysis=_analysis(tier=1))
 
 
@@ -1884,6 +1917,11 @@ def test_ranking_is_deterministic_for_the_same_snapshot() -> None:
     assert first.trace["registry_snapshot_hash"] == second.trace["registry_snapshot_hash"]
     assert len(first.trace["registry_snapshot_hash"]) == 64
     assert all(len(row["profile_hash"]) == 64 for row in first.trace["candidate_pool"])
+    assert all(
+        type(row["is_open_source"]) is bool
+        and type(row["is_chinese_model"]) is bool
+        for row in first.trace["candidate_pool"]
+    )
 
 
 def test_ranking_emits_the_required_debug_lifecycle_events() -> None:

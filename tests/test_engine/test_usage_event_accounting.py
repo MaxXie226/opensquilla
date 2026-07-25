@@ -21,7 +21,9 @@ from opensquilla.engine.usage_accounting import (
     UsageExecutionContext,
     account_provider_stream,
     bind_usage_accounting_scope,
+    has_known_provider_usage_receipt,
     normalize_provider_usage,
+    provider_usage_receipt_rows,
     usd_to_nanos,
 )
 from opensquilla.provider import ChatConfig, Message, ModelCapabilities
@@ -665,6 +667,380 @@ async def test_agent_known_error_receipt_is_retained_in_totals_and_llm_error_log
     assert error_log["usage_missing_count"] == 1
 
 
+@pytest.mark.asyncio
+async def test_agent_diagnostic_only_error_receipt_is_retained_exactly() -> None:
+    diagnostic_row = {
+        "provider": "",
+        "model": "",
+        "requested_provider": "openrouter",
+        "requested_model": "model-a",
+        "input_tokens": 12,
+        "output_tokens": 3,
+        "billed_cost": 0.25,
+        "cost_source": "provider_billed",
+    }
+    error = ProviderError(
+        message="response rejected after billing",
+        code="response_invalid",
+        diagnostic_done=ProviderDone(
+            provider="",
+            model="",
+            requested_provider="openrouter",
+            requested_model="model-a",
+            input_tokens=12,
+            output_tokens=3,
+            billed_cost=0.25,
+            cost_source="provider_billed",
+            model_usage_breakdown=[diagnostic_row],
+        ),
+        request_started=True,
+        physical_request_count=1,
+    )
+    provider = _SequenceProvider([[error]])
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            max_iterations=1,
+            max_provider_retries=0,
+            provider_id="openrouter",
+            model_id="model-a",
+        ),
+    )
+
+    assert has_known_provider_usage_receipt(error) is True
+    events = [event async for event in agent.run_turn("hello")]
+    done = next(event for event in events if isinstance(event, AgentDone))
+
+    assert done.input_tokens == 12
+    assert done.output_tokens == 3
+    assert done.billed_cost == pytest.approx(0.25)
+    assert len(done.model_usage_breakdown) == 1
+    assert done.model_usage_breakdown[0]["model"] == ""
+    assert done.model_usage_breakdown[0]["provider"] == ""
+    assert done.model_usage_breakdown[0]["requested_model"] == "model-a"
+    assert done.model_usage_breakdown[0]["requested_provider"] == "openrouter"
+    assert done.model_usage_breakdown[0]["billed_cost"] == pytest.approx(0.25)
+
+
+@pytest.mark.asyncio
+async def test_agent_uses_confirmed_receipt_nanos_as_authoritative_cost() -> None:
+    receipt = ProviderBillingReceipt(
+        currency="USD",
+        status="confirmed",
+        amount_nanos=200_000_000,
+        usd_equivalent_nanos=200_000_000,
+        fx_native_per_usd_nanos=1_000_000_000,
+    )
+    provider = _SequenceProvider(
+        [
+            [
+                ProviderText(text="ok"),
+                ProviderDone(
+                    provider="openrouter",
+                    model="actual-model",
+                    requested_provider="openrouter",
+                    requested_model="requested-model",
+                    input_tokens=5,
+                    output_tokens=1,
+                    billed_cost=0.1,
+                    cost_source="provider_billed",
+                    billing_receipt=receipt,
+                )
+            ]
+        ]
+    )
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            max_iterations=1,
+            provider_id="openrouter",
+            model_id="requested-model",
+        ),
+    )
+    call_logs: list[tuple[str, dict[str, Any]]] = []
+    agent._write_turn_call_log = (  # type: ignore[method-assign]
+        lambda kind, **payload: call_logs.append((kind, payload))
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+    done = next(event for event in events if isinstance(event, AgentDone))
+    response_log = next(
+        payload for kind, payload in call_logs if kind == "llm_response"
+    )
+
+    assert done.billed_cost == pytest.approx(0.2)
+    assert done.cost_source == "provider_billed"
+    assert response_log["usage"]["billed_cost"] == pytest.approx(0.2)
+    assert response_log["usage"]["billing_receipt"] == receipt
+
+
+@pytest.mark.asyncio
+async def test_agent_pending_receipt_never_reenters_exact_billed_totals() -> None:
+    receipt = ProviderBillingReceipt(
+        currency="USD",
+        status="pending",
+        amount_nanos=None,
+        usd_equivalent_nanos=None,
+        fx_native_per_usd_nanos=1_000_000_000,
+    )
+    provider = _SequenceProvider(
+        [
+            [
+                ProviderText(text="ok"),
+                ProviderDone(
+                    provider="openrouter",
+                    model="unknown-model",
+                    input_tokens=5,
+                    output_tokens=1,
+                    billed_cost=0.1,
+                    cost_source="provider_billed",
+                    billing_receipt=receipt,
+                )
+            ]
+        ]
+    )
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            max_iterations=1,
+            provider_id="openrouter",
+            model_id="unknown-model",
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+    done = next(event for event in events if isinstance(event, AgentDone))
+
+    assert done.billed_cost == 0.0
+    assert done.cost_source != "provider_billed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("legacy_source", ["provider_billed", "openrouter_usage"])
+async def test_agent_malformed_receipt_blocks_legacy_exact_cost_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    legacy_source: str,
+) -> None:
+    monkeypatch.setattr(
+        "opensquilla.engine.pricing.resolve_model_price",
+        lambda model, provider: ResolvedModelPrice(
+            entry=PriceEntry(input_per_m=1.0, output_per_m=2.0),
+            source="test",
+        ),
+    )
+    provider = _SequenceProvider(
+        [
+            [
+                ProviderText(text="ok"),
+                ProviderDone(
+                    provider="openrouter",
+                    model="priced-model",
+                    input_tokens=1_000_000,
+                    output_tokens=0,
+                    billed_cost=99.0,
+                    cost_source=legacy_source,
+                    billing_receipt={
+                        "currency": "USD",
+                        "status": "confirmed",
+                        "amount_nanos": 1_000_000_000,
+                        "usd_equivalent_nanos": 1_000_000_000,
+                        # A USD receipt cannot reconcile at this FX rate.
+                        "fx_native_per_usd_nanos": 2_000_000_000,
+                        "schema_version": 1,
+                    },
+                )
+            ]
+        ]
+    )
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            max_iterations=1,
+            provider_id="openrouter",
+            model_id="priced-model",
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+    done = next(event for event in events if isinstance(event, AgentDone))
+
+    assert done.billed_cost == 0.0
+    assert done.cost_usd == pytest.approx(1.0)
+    assert done.cost_source == "opensquilla_static_estimate"
+    assert done.estimate_basis == "cache_aware"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "receipt",
+    [
+        ProviderBillingReceipt(
+            currency="USD",
+            status="pending",
+            amount_nanos=None,
+            usd_equivalent_nanos=None,
+            fx_native_per_usd_nanos=1_000_000_000,
+        ),
+        {
+            "currency": "usd",
+            "status": "confirmed",
+            "amount_nanos": 1_000_000_000,
+            "usd_equivalent_nanos": 1_000_000_000,
+            "fx_native_per_usd_nanos": 1_000_000_000,
+            "schema_version": 1,
+        },
+    ],
+    ids=["pending", "malformed"],
+)
+async def test_agent_unresolved_mixed_receipt_keeps_non_exact_static_estimate(
+    monkeypatch: pytest.MonkeyPatch,
+    receipt: object,
+) -> None:
+    monkeypatch.setattr(
+        "opensquilla.engine.pricing.resolve_model_price",
+        lambda model, provider: ResolvedModelPrice(
+            entry=PriceEntry(input_per_m=1.0, output_per_m=2.0),
+            source="test",
+        ),
+    )
+    provider = _SequenceProvider(
+        [
+            [
+                ProviderText(text="ok"),
+                ProviderDone(
+                    provider="openrouter",
+                    model="priced-model",
+                    input_tokens=1_000_000,
+                    output_tokens=0,
+                    billed_cost=0.25,
+                    cost_source="mixed",
+                    billing_receipt=receipt,  # type: ignore[arg-type]
+                )
+            ]
+        ]
+    )
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            max_iterations=1,
+            provider_id="openrouter",
+            model_id="priced-model",
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+    done = next(event for event in events if isinstance(event, AgentDone))
+
+    assert done.billed_cost == 0.0
+    assert done.cost_usd == pytest.approx(1.0)
+    assert done.cost_source == "opensquilla_static_estimate"
+    assert done.cost_source not in {"provider_billed", "mixed"}
+    assert done.estimate_basis == "cache_aware"
+
+
+@pytest.mark.asyncio
+async def test_accounting_scope_does_not_promote_requested_identity_to_actual() -> None:
+    sink = _RecordingSink()
+    provider = _SequenceProvider(
+        [
+            [
+                ProviderText(text="ok"),
+                ProviderDone(
+                    provider="",
+                    model="",
+                    requested_provider="openrouter",
+                    requested_model="requested-model",
+                    input_tokens=1,
+                    output_tokens=1,
+                    billed_cost=0.0,
+                    cost_source="provider_billed",
+                )
+            ]
+        ]
+    )
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            max_iterations=1,
+            provider_id="openrouter",
+            model_id="requested-model",
+        ),
+        usage_event_sink=sink,
+        usage_execution_context=_context(),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+    done = next(event for event in events if isinstance(event, AgentDone))
+
+    assert done.provider == ""
+    assert done.model == ""
+    assert done.requested_provider == "openrouter"
+    assert done.requested_model == "requested-model"
+    assert sink.finalized[0][1].items[0].provider == ""
+    assert sink.finalized[0][1].items[0].model == ""
+
+
+@pytest.mark.asyncio
+async def test_agent_merges_disjoint_outer_and_diagnostic_error_receipts() -> None:
+    outer_row = {
+        "provider": "openrouter",
+        "model": "model-a",
+        "input_tokens": 8,
+        "output_tokens": 2,
+        "billed_cost": 0.1,
+        "cost_source": "provider_billed",
+    }
+    diagnostic_row = {
+        "provider": "openrouter",
+        "model": "model-b",
+        "input_tokens": 10,
+        "output_tokens": 3,
+        "billed_cost": 0.2,
+        "cost_source": "provider_billed",
+    }
+    error = ProviderError(
+        message="composite response rejected",
+        code="response_invalid",
+        model_usage_breakdown=[outer_row],
+        diagnostic_done=ProviderDone(
+            provider="openrouter",
+            model="model-b",
+            input_tokens=10,
+            output_tokens=3,
+            billed_cost=0.2,
+            cost_source="provider_billed",
+            model_usage_breakdown=[diagnostic_row],
+        ),
+        request_started=True,
+        physical_request_count=2,
+    )
+    provider = _SequenceProvider([[error]])
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            max_iterations=1,
+            max_provider_retries=0,
+            provider_id="openrouter",
+            model_id="router",
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+    done = next(event for event in events if isinstance(event, AgentDone))
+
+    assert done.input_tokens == 18
+    assert done.output_tokens == 5
+    assert done.billed_cost == pytest.approx(0.3)
+    assert [row["model"] for row in done.model_usage_breakdown] == [
+        "model-a",
+        "model-b",
+    ]
+    assert sum(
+        float(row.get("billed_cost") or 0.0)
+        for row in done.model_usage_breakdown
+    ) == pytest.approx(0.3)
+
+
 def test_ensemble_breakdown_is_one_envelope_with_items(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "opensquilla.engine.usage_accounting.resolve_model_price",
@@ -1045,6 +1421,459 @@ def test_partial_ensemble_error_preserves_known_items_and_missing_coverage() -> 
     assert result.items[0].model == "m1"
     assert result.billed_cost_nanos == usd_to_nanos("0.25")
     assert result.missing_usage_entries == 1
+
+
+def test_explicit_physical_count_fills_unreported_missing_usage() -> None:
+    event = ProviderError(
+        message="second physical request has no receipt",
+        code="response_invalid",
+        model_usage_breakdown=[
+            {
+                "provider": "openrouter",
+                "model": "model-a",
+                "input_tokens": 5,
+                "output_tokens": 1,
+                "billed_cost": 0.01,
+                "cost_source": "provider_billed",
+            }
+        ],
+        usage_missing_count=0,
+        request_started=True,
+        physical_request_count=2,
+    )
+
+    result = normalize_provider_usage(
+        event,
+        default_provider="openrouter",
+        default_model="model-a",
+        completed_at_ms=1234,
+    )
+
+    assert len(result.items) == 1
+    assert result.missing_usage_entries == 1
+
+
+def test_diagnostic_receipts_with_distinct_response_ids_are_not_collapsed() -> None:
+    def receipt_row(response_id: str) -> dict[str, Any]:
+        return {
+            "provider": "openrouter",
+            "model": "model-a",
+            "input_tokens": 5,
+            "output_tokens": 1,
+            "billed_cost": 0.01,
+            "cost_source": "provider_billed",
+            "provider_usage": {"response_ids": [response_id]},
+        }
+
+    event = ProviderError(
+        message="two identical-metric physical responses",
+        code="response_invalid",
+        model_usage_breakdown=[receipt_row("response-a")],
+        diagnostic_done=ProviderDone(
+            provider="openrouter",
+            model="model-a",
+            input_tokens=5,
+            output_tokens=1,
+            billed_cost=0.01,
+            cost_source="provider_billed",
+            model_usage_breakdown=[receipt_row("response-b")],
+        ),
+        request_started=True,
+        physical_request_count=2,
+    )
+
+    result = normalize_provider_usage(
+        event,
+        default_provider="openrouter",
+        default_model="model-a",
+        completed_at_ms=1234,
+    )
+
+    assert len(result.items) == 2
+    assert result.billed_cost_nanos == usd_to_nanos("0.02")
+    assert result.missing_usage_entries == 0
+
+
+def test_diagnostic_overlap_enriches_poorer_outer_receipt_provenance() -> None:
+    outer = {
+        "provider": "openrouter",
+        "model": "model-a",
+        "input_tokens": 5,
+        "output_tokens": 1,
+        "billed_cost": 0.01,
+        "cost_source": "provider_billed",
+    }
+    richer = {
+        **outer,
+        "provider_usage": {"response_ids": ["response-a"], "is_byok": False},
+    }
+    event = ProviderError(
+        message="same receipt repeated with richer metadata",
+        code="response_invalid",
+        model_usage_breakdown=[outer],
+        diagnostic_done=ProviderDone(
+            provider="openrouter",
+            model="model-a",
+            input_tokens=5,
+            output_tokens=1,
+            billed_cost=0.01,
+            cost_source="provider_billed",
+            model_usage_breakdown=[richer],
+        ),
+        request_started=True,
+        physical_request_count=1,
+    )
+
+    rows = provider_usage_receipt_rows(event)
+    result = normalize_provider_usage(
+        event,
+        default_provider="openrouter",
+        default_model="model-a",
+        completed_at_ms=1234,
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["provider_usage"]["response_ids"] == ["response-a"]
+    assert rows[0]["provider_usage"]["is_byok"] is False
+    assert len(result.items) == 1
+    assert result.missing_usage_entries == 0
+
+
+def test_same_response_id_uses_authoritative_diagnostic_receipt_fields() -> None:
+    outer = {
+        "provider": "",
+        "model": "",
+        "requested_provider": "openrouter",
+        "requested_model": "requested-model",
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "billed_cost": 0.0,
+        "cost_source": "none",
+        "provider_usage": {"response_ids": ["response-a"]},
+    }
+    diagnostic = {
+        **outer,
+        "provider": "actual-provider",
+        "model": "actual-model",
+        "input_tokens": 7,
+        "output_tokens": 3,
+        "billed_cost": 0.25,
+        "cost_source": "provider_billed",
+        "provider_usage": {
+            "response_ids": ["response-a"],
+            "is_byok": False,
+        },
+    }
+    event = ProviderError(
+        message="outer wrapper retained only a partial receipt",
+        code="response_invalid",
+        model_usage_breakdown=[outer],
+        diagnostic_done=ProviderDone(
+            model_usage_breakdown=[diagnostic],
+            input_tokens=7,
+            output_tokens=3,
+            billed_cost=0.25,
+            cost_source="provider_billed",
+        ),
+        physical_request_count=1,
+        request_started=True,
+    )
+
+    rows = provider_usage_receipt_rows(event)
+    result = normalize_provider_usage(
+        event,
+        default_provider="openrouter",
+        default_model="requested-model",
+        completed_at_ms=1234,
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["provider"] == "actual-provider"
+    assert rows[0]["model"] == "actual-model"
+    assert rows[0]["input_tokens"] == 7
+    assert rows[0]["output_tokens"] == 3
+    assert rows[0]["billed_cost"] == pytest.approx(0.25)
+    assert rows[0]["cost_source"] == "provider_billed"
+    assert rows[0]["requested_model"] == "requested-model"
+    assert rows[0]["provider_usage"]["is_byok"] is False
+    assert len(result.items) == 1
+    assert result.items[0].provider == "actual-provider"
+    assert result.items[0].model == "actual-model"
+    assert result.billed_cost_nanos == usd_to_nanos("0.25")
+
+
+@pytest.mark.parametrize("diagnostic_id_first", [False, True])
+def test_receipt_matching_prioritizes_stable_ids_before_idless_fallback(
+    diagnostic_id_first: bool,
+) -> None:
+    def row(response_id: str | None) -> dict[str, Any]:
+        return {
+            "provider": "openrouter",
+            "model": "same-model",
+            "input_tokens": 5,
+            "output_tokens": 1,
+            "billed_cost": 0.01,
+            "cost_source": "provider_billed",
+            "provider_usage": (
+                {"response_ids": [response_id]} if response_id is not None else {}
+            ),
+        }
+
+    id_row = row("response-a")
+    idless_row = row(None)
+    diagnostic_rows = [id_row, idless_row]
+    if not diagnostic_id_first:
+        diagnostic_rows.reverse()
+    event = ProviderError(
+        message="diagnostic copies arrive in an adversarial order",
+        code="response_invalid",
+        model_usage_breakdown=[row("response-a"), row("response-b")],
+        diagnostic_done=ProviderDone(
+            input_tokens=10,
+            output_tokens=2,
+            billed_cost=0.02,
+            cost_source="provider_billed",
+            model_usage_breakdown=diagnostic_rows,
+        ),
+        physical_request_count=2,
+        request_started=True,
+    )
+
+    rows = provider_usage_receipt_rows(event)
+    result = normalize_provider_usage(
+        event,
+        default_provider="openrouter",
+        default_model="same-model",
+        completed_at_ms=1234,
+    )
+
+    assert len(rows) == 2
+    assert len(result.items) == 2
+    assert result.billed_cost_nanos == usd_to_nanos("0.02")
+    assert result.missing_usage_entries == 0
+
+
+def test_requested_defaults_price_but_do_not_forge_durable_actual_identity() -> None:
+    event = ProviderDone(
+        provider="",
+        model="",
+        requested_provider="openrouter",
+        requested_model="requested-model",
+        input_tokens=5,
+        output_tokens=1,
+        cost_source="none",
+        model_usage_breakdown=[
+            {
+                "provider": "",
+                "model": "",
+                "requested_provider": "openrouter",
+                "requested_model": "requested-model",
+                "input_tokens": 5,
+                "output_tokens": 1,
+                "cost_source": "none",
+            }
+        ],
+    )
+
+    result = normalize_provider_usage(
+        event,
+        default_provider="openrouter",
+        default_model="requested-model",
+        completed_at_ms=1234,
+    )
+
+    assert len(result.items) == 1
+    assert result.items[0].provider == ""
+    assert result.items[0].model == ""
+
+
+def test_missing_placeholder_does_not_persist_configured_actual_identity() -> None:
+    event = ProviderDone(
+        input_tokens=0,
+        output_tokens=0,
+        model_usage_breakdown=[
+            {
+                "role": "abandoned_stream_request",
+                "provider": "openrouter",
+                "model": "requested-model",
+                "requested_provider": "openrouter",
+                "requested_model": "requested-model",
+                "cost_source": "none",
+            }
+        ],
+        usage_missing_count=1,
+    )
+
+    result = normalize_provider_usage(
+        event,
+        default_provider="openrouter",
+        default_model="requested-model",
+        completed_at_ms=1234,
+    )
+
+    assert len(result.items) == 1
+    assert result.items[0].provider == ""
+    assert result.items[0].model == ""
+    assert result.missing_usage_entries == 1
+
+
+def test_pending_receipt_never_remains_exact_when_price_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "opensquilla.engine.usage_accounting.resolve_model_price",
+        lambda *_args, **_kwargs: ResolvedModelPrice(
+            entry=None,
+            source="test_missing",
+        ),
+    )
+    receipt = ProviderBillingReceipt(
+        currency="USD",
+        status="pending",
+        amount_nanos=None,
+        usd_equivalent_nanos=None,
+        fx_native_per_usd_nanos=1_000_000_000,
+    )
+    event = ProviderDone(
+        provider="openrouter",
+        model="unknown-model",
+        input_tokens=5,
+        output_tokens=1,
+        billed_cost=0.25,
+        cost_source="provider_billed",
+        billing_receipt=receipt,
+    )
+
+    result = normalize_provider_usage(
+        event,
+        default_provider="openrouter",
+        default_model="unknown-model",
+        completed_at_ms=1234,
+    )
+
+    assert result.billed_cost_nanos == 0
+    assert result.estimated_cost_nanos == 0
+    assert result.cost_source == "unavailable"
+    assert result.items[0].cost_source == "unavailable"
+
+
+@pytest.mark.parametrize("legacy_source", ["provider_billed", "openrouter_usage"])
+@pytest.mark.parametrize(
+    "receipt_override",
+    [
+        {"currency": "usd"},
+        {"status": "settled"},
+        {"amount_nanos": True},
+        {"usd_equivalent_nanos": -1},
+        {"fx_native_per_usd_nanos": 0},
+        {"amount_nanos": 1 << 63},
+        {"usd_equivalent_nanos": 1 << 63},
+        {"fx_native_per_usd_nanos": 1 << 63},
+        {"schema_version": 2},
+        {
+            "amount_nanos": 1_000_000_000,
+            "usd_equivalent_nanos": 1_000_000_000,
+            "fx_native_per_usd_nanos": 2_000_000_000,
+        },
+    ],
+    ids=[
+        "currency",
+        "status",
+        "amount",
+        "usd-nanos",
+        "fx",
+        "amount-overflow",
+        "usd-nanos-overflow",
+        "fx-overflow",
+        "schema-version",
+        "inconsistent-nanos",
+    ],
+)
+def test_malformed_receipt_never_falls_back_to_legacy_exact_cost(
+    monkeypatch: pytest.MonkeyPatch,
+    legacy_source: str,
+    receipt_override: dict[str, object],
+) -> None:
+    monkeypatch.setattr(
+        "opensquilla.engine.usage_accounting.resolve_model_price",
+        lambda model, provider: ResolvedModelPrice(
+            entry=PriceEntry(input_per_m=1.0, output_per_m=2.0),
+            source="test",
+        ),
+    )
+    receipt = {
+        "currency": "USD",
+        "status": "confirmed",
+        "amount_nanos": 1_000_000_000,
+        "usd_equivalent_nanos": 1_000_000_000,
+        "fx_native_per_usd_nanos": 1_000_000_000,
+        "schema_version": 1,
+        **receipt_override,
+    }
+    result = normalize_provider_usage(
+        ProviderDone(
+            provider="openrouter",
+            model="priced-model",
+            input_tokens=1_000_000,
+            output_tokens=0,
+            billed_cost=99.0,
+            cost_source=legacy_source,
+            billing_receipt=receipt,  # type: ignore[arg-type]
+        ),
+        default_provider="openrouter",
+        default_model="priced-model",
+        completed_at_ms=1234,
+    )
+
+    assert result.billed_cost_nanos == 0
+    assert result.estimated_cost_nanos == usd_to_nanos("1.0")
+    assert result.cost_source == "opensquilla_estimate"
+    assert result.items[0].billing_receipt is None
+    assert result.items[0].cost_source == "opensquilla_estimate"
+
+
+def test_missing_placeholder_is_not_counted_twice_in_usage_ledger() -> None:
+    event = ProviderDone(
+        input_tokens=10,
+        output_tokens=2,
+        billed_cost=0.01,
+        cost_source="mixed",
+        model="fallback-model",
+        model_usage_breakdown=[
+            {
+                "role": "abandoned_stream_request",
+                "provider": "openrouter",
+                "model": "fallback-model",
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "billed_cost": 0.0,
+                "cost_source": "none",
+            },
+            {
+                "role": "fallback_non_stream",
+                "provider": "openrouter",
+                "model": "fallback-model",
+                "input_tokens": 10,
+                "output_tokens": 2,
+                "billed_cost": 0.01,
+                "cost_source": "provider_billed",
+            },
+        ],
+        usage_missing_count=1,
+    )
+
+    result = normalize_provider_usage(
+        event,
+        default_provider="openrouter",
+        default_model="fallback-model",
+        completed_at_ms=1234,
+    )
+
+    assert len(result.items) == 2
+    assert result.items[0].cost_source == "unavailable"
+    assert result.items[1].cost_source == "provider_billed"
+    assert result.missing_usage_entries == 1
+    assert result.represented_missing_usage_entries == 1
 
 
 def test_complete_ensemble_error_preserves_known_items_without_missing_coverage() -> None:

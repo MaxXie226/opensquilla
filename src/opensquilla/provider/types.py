@@ -111,9 +111,9 @@ class DoneEvent:
     # Number of physical ensemble legs that ended without a usage receipt.
     # Appended for source compatibility with positional constructors.
     usage_missing_count: int = 0
-    # Configured registry identity serving this response.  Appended for
-    # positional-construction compatibility; generic adapters default it to
-    # their family identity when constructed outside a selector.
+    # Physical provider identity reported for this response.  Keep it empty
+    # when the adapter has no authoritative evidence; configured/requested
+    # identity belongs in ``requested_provider`` below.
     provider: str = ""
     # Provider-native receipt for this physical request. Ensemble envelopes do
     # not carry a synthetic receipt; their physical breakdown rows do.
@@ -122,6 +122,11 @@ class DoneEvent:
     # OpenRouter benchmark runs use this for explicit BYOK and router-metadata
     # attestation; callers must still treat unknown additive keys permissively.
     provider_usage: dict[str, Any] = field(default_factory=dict)
+    # Requested/configured identity is not physical response evidence. Keep it
+    # separate so callers never need to fill an absent actual model/provider
+    # with configuration values.
+    requested_model: str = ""
+    requested_provider: str = ""
 
     @property
     def upstream_cost_usd(self) -> float:
@@ -190,13 +195,24 @@ class ErrorEvent:
     # metadata).  Runners can account for that request without treating it as
     # a successful completion.
     diagnostic_done: DoneEvent | None = None
+    # Optional ensemble execution trace for terminal composite failures.  Kept
+    # at the end for positional-construction compatibility.
+    ensemble_trace: dict[str, Any] | None = None
+    # Physical-request evidence for failures that happen before a DoneEvent.
+    # ``None`` means the adapter cannot distinguish local preflight failure
+    # from an upstream request. Explicit ``False``/``0`` proves that no
+    # billable request started; fallback wrappers may report counts > 1.
+    request_started: bool | None = None
+    physical_request_count: int | None = None
 
 
 @dataclass
 class ProviderHeartbeatEvent:
     """Provider-side liveness signal while no user-visible tokens are ready."""
 
-    kind: Literal["provider_heartbeat"] = field(default="provider_heartbeat", init=False)
+    kind: Literal["provider_heartbeat"] = field(
+        default="provider_heartbeat", init=False
+    )
     phase: str = "provider"
     message: str = ""
 
@@ -349,6 +365,29 @@ class ChatConfig(BaseModel):
     tool_choice: Any | None = None
     candidate_output_mode: Literal["normal", "inert_artifact"] = Field(
         default="normal",
+        exclude=True,
+        repr=False,
+    )
+    ensemble_execution_mode: Literal["full", "aggregator_only"] = Field(
+        default="full",
+        exclude=True,
+        repr=False,
+    )
+    # Ensemble-internal graceful-finalization controls.  These are deliberately
+    # excluded from adapter payloads and are consumed only by a full
+    # EnsembleProvider call; downstream member requests receive the defaults.
+    ensemble_soft_deadline_seconds: float = Field(
+        default=0.0,
+        exclude=True,
+        repr=False,
+    )
+    ensemble_soft_deadline_disable_tools: bool = Field(
+        default=False,
+        exclude=True,
+        repr=False,
+    )
+    ensemble_soft_deadline_disable_thinking: bool = Field(
+        default=False,
         exclude=True,
         repr=False,
     )

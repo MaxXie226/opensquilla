@@ -321,16 +321,42 @@ async def test_placeholder_escalation_and_wrapup_env_thread_to_agent_config(
     stage = _make_stage()
     monkeypatch.delenv("OPENSQUILLA_PLACEHOLDER_ESCALATION_THRESHOLD", raising=False)
     monkeypatch.delenv("OPENSQUILLA_DEADLINE_WRAPUP_MARGIN_SECONDS", raising=False)
+    monkeypatch.delenv("OPENSQUILLA_DEADLINE_WRAPUP_DISABLE_TOOLS", raising=False)
+    monkeypatch.delenv(
+        "OPENSQUILLA_MAX_ITERATIONS_INCLUDES_FINALIZATION",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "OPENSQUILLA_RETRIEVAL_LOOP_FINALIZATION_THRESHOLD",
+        raising=False,
+    )
+    monkeypatch.delenv("OPENSQUILLA_FINALIZATION_AGGREGATOR_ONLY", raising=False)
+    monkeypatch.delenv("OPENSQUILLA_FINALIZATION_DISABLE_THINKING", raising=False)
     default_out = await stage.run(_make_input())
     assert default_out.output.agent_config.placeholder_escalation_threshold == 0
     assert default_out.output.agent_config.deadline_wrapup_margin_seconds == 0
+    assert default_out.output.agent_config.deadline_wrapup_disable_tools is False
+    assert default_out.output.agent_config.max_iterations_includes_finalization is False
+    assert default_out.output.agent_config.retrieval_loop_finalization_threshold == 0
+    assert default_out.output.agent_config.finalization_aggregator_only is False
+    assert default_out.output.agent_config.finalization_disable_thinking is False
 
     monkeypatch.setenv("OPENSQUILLA_PLACEHOLDER_ESCALATION_THRESHOLD", "2")
     monkeypatch.setenv("OPENSQUILLA_DEADLINE_WRAPUP_MARGIN_SECONDS", "360")
+    monkeypatch.setenv("OPENSQUILLA_DEADLINE_WRAPUP_DISABLE_TOOLS", "1")
+    monkeypatch.setenv("OPENSQUILLA_MAX_ITERATIONS_INCLUDES_FINALIZATION", "1")
+    monkeypatch.setenv("OPENSQUILLA_RETRIEVAL_LOOP_FINALIZATION_THRESHOLD", "3")
+    monkeypatch.setenv("OPENSQUILLA_FINALIZATION_AGGREGATOR_ONLY", "1")
+    monkeypatch.setenv("OPENSQUILLA_FINALIZATION_DISABLE_THINKING", "1")
     enabled_out = await stage.run(_make_input())
 
     assert enabled_out.output.agent_config.placeholder_escalation_threshold == 2
     assert enabled_out.output.agent_config.deadline_wrapup_margin_seconds == 360
+    assert enabled_out.output.agent_config.deadline_wrapup_disable_tools is True
+    assert enabled_out.output.agent_config.max_iterations_includes_finalization is True
+    assert enabled_out.output.agent_config.retrieval_loop_finalization_threshold == 3
+    assert enabled_out.output.agent_config.finalization_aggregator_only is True
+    assert enabled_out.output.agent_config.finalization_disable_thinking is True
 
 
 @pytest.mark.asyncio

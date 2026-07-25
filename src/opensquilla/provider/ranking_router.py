@@ -174,6 +174,10 @@ class RankedModel:
             "source": self.source,
             "vendor": self.vendor,
             "family": self.family,
+            "is_open_source": facts.get("is_open_source"),
+            "is_chinese_model": facts.get("is_chinese_model"),
+            "supports_reasoning": facts.get("supports_reasoning"),
+            "supports_tools": facts.get("supports_tools"),
             "status": str(facts.get("status") or ""),
             "roles": list(facts.get("roles") or []),
             "context_window": _as_int(facts.get("context_window"), 0),
@@ -2606,7 +2610,7 @@ def _packaged_registry_snapshot() -> dict[str, Any]:
 
 
 def load_model_registry_snapshot() -> dict[str, Any]:
-    """Return an isolated copy of the packaged mock chapter-5 snapshot."""
+    """Return an isolated copy of the packaged versioned registry snapshot."""
 
     return copy.deepcopy(_packaged_registry_snapshot())
 
@@ -2964,6 +2968,18 @@ def _validate_registry_model(
         raise DynamicRankingError(
             f"router_dynamic model registry {identity} has invalid credential_available"
         )
+    for boolean_fact in (
+        "is_open_source",
+        "is_chinese_model",
+        "supports_reasoning",
+        "supports_tools",
+    ):
+        value = facts.get(boolean_fact)
+        if value is not None and not isinstance(value, bool):
+            raise DynamicRankingError(
+                "router_dynamic model registry "
+                f"{identity} has invalid {boolean_fact}"
+            )
 
     price = facts.get("price")
     if isinstance(price, Mapping):

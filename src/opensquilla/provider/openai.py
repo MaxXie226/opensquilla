@@ -193,6 +193,16 @@ _OPENAI_STREAM_NOOP_CHOICE_KEYS = frozenset(
     {"index", "delta", "finish_reason", "native_finish_reason"}
 )
 _OPENAI_STREAM_NOOP_DELTA_KEYS = frozenset({"content", "role"})
+_MISSING_USAGE_PLACEHOLDER_ROLES = frozenset(
+    {
+        "abandoned_stream",
+        "usage_missing",
+        "unknown_call",
+        "abandoned_stream_request",
+        "agent_llm_request_unknown",
+        "abandoned_provider_request",
+    }
+)
 # Some OpenAI-compatible API roots carry a non-integer version segment before
 # an adapter namespace.  Gemini's documented compatibility root is
 # ``/v1beta/openai``: appending our canonical ``/v1`` again produces the
@@ -1305,6 +1315,108 @@ _TOKENRHYTHM_CNY_PER_USD = TOKENRHYTHM_CNY_PER_USD
 _TOKENRHYTHM_FX_NANOS = TOKENRHYTHM_CNY_PER_USD_NANOS
 _USD_FX_NANOS = _MONEY_NANO_SCALE
 
+
+def _receipt_int(value: Any, *, nullable: bool = False) -> int | None:
+    if value is None and nullable:
+        return None
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 0
+        or value > _MAX_MONEY_NANOS
+    ):
+        raise ValueError("billing receipt nanos must be ledger-safe integers")
+    return int(value)
+
+
+def _coerce_billing_receipt(value: Any) -> ProviderBillingReceipt | None:
+    """Return a fully schema-valid native receipt without partial trust."""
+
+    if value is None:
+        return None
+    if isinstance(value, ProviderBillingReceipt):
+        candidate = value
+    elif isinstance(value, Mapping):
+        try:
+            candidate = ProviderBillingReceipt(
+                currency=value.get("currency"),  # type: ignore[arg-type]
+                status=value.get("status"),  # type: ignore[arg-type]
+                amount_nanos=value.get("amount_nanos"),  # type: ignore[arg-type]
+                usd_equivalent_nanos=value.get(  # type: ignore[arg-type]
+                    "usd_equivalent_nanos"
+                ),
+                fx_native_per_usd_nanos=value.get(  # type: ignore[arg-type]
+                    "fx_native_per_usd_nanos"
+                ),
+                schema_version=value.get("schema_version", 1),  # type: ignore[arg-type]
+            )
+        except (TypeError, ValueError, OverflowError):
+            return None
+    else:
+        return None
+    try:
+        amount_nanos = _receipt_int(candidate.amount_nanos, nullable=True)
+        usd_nanos = _receipt_int(candidate.usd_equivalent_nanos, nullable=True)
+    except ValueError:
+        return None
+    if (
+        not isinstance(candidate.currency, str)
+        or len(candidate.currency) != 3
+        or any(character < "A" or character > "Z" for character in candidate.currency)
+        or candidate.status not in {"confirmed", "pending"}
+        or isinstance(candidate.fx_native_per_usd_nanos, bool)
+        or not isinstance(candidate.fx_native_per_usd_nanos, int)
+        or candidate.fx_native_per_usd_nanos <= 0
+        or candidate.fx_native_per_usd_nanos > _MAX_MONEY_NANOS
+        or isinstance(candidate.schema_version, bool)
+        or not isinstance(candidate.schema_version, int)
+        or candidate.schema_version != 1
+    ):
+        return None
+    if candidate.status == "confirmed" and (amount_nanos is None or usd_nanos is None):
+        return None
+    if candidate.status == "pending" and usd_nanos is not None:
+        return None
+    if candidate.status == "confirmed":
+        expected_usd_nanos = (
+            amount_nanos * _MONEY_NANO_SCALE
+            + candidate.fx_native_per_usd_nanos // 2
+        ) // candidate.fx_native_per_usd_nanos
+        if expected_usd_nanos != usd_nanos:
+            return None
+    return candidate
+
+
+def _validated_billing_result(
+    billed_cost: float,
+    cost_source: str,
+    billing_receipt: ProviderBillingReceipt | Mapping[str, Any] | None,
+) -> tuple[float, str, ProviderBillingReceipt | None]:
+    """Fail closed when native billing evidence is absent or malformed.
+
+    A confirmed receipt is the sole authority for exact adapter-native cost.
+    Pending receipts remain useful provenance but can never make their amount
+    trusted, and an invalid receipt must not fall back to the enclosing float.
+    """
+
+    source = str(cost_source or "none").strip().casefold() or "none"
+    if billing_receipt is None:
+        if source == "provider_billed" or billed_cost > 0.0:
+            return 0.0, "billing_receipt_missing", None
+        return 0.0, source, None
+    receipt = _coerce_billing_receipt(billing_receipt)
+    if receipt is None:
+        return 0.0, "billing_receipt_invalid", None
+    if receipt.status != "confirmed":
+        return 0.0, "billing_pending", receipt
+    assert receipt.usd_equivalent_nanos is not None
+    return (
+        receipt.usd_equivalent_nanos / _MONEY_NANO_SCALE,
+        "provider_billed",
+        receipt,
+    )
+
+
 @dataclass
 class _ProviderBillingAccumulator:
     """Accumulate provider billing metadata separately from token usage."""
@@ -1837,6 +1949,269 @@ def _provider_cost_with_byok_evidence(
     return 0.0, "openrouter_billing_unverified"
 
 
+def _usage_diagnostic_done(
+    *,
+    provider_kind: str,
+    provider_id: str,
+    requested_model: str,
+    base_url: str,
+    actual_model: str,
+    usage: _UsageSnapshotAccumulator,
+    billing: _ProviderBillingAccumulator,
+    usage_evidence_seen: bool,
+    provider_usage: Mapping[str, Any] | None,
+    router_metadata: Mapping[str, Any] | None,
+    response_ids: list[str],
+    cache_namespace_sha256: str,
+) -> DoneEvent | None:
+    """Preserve usage settled before a later response-validation failure."""
+
+    billing_evidence_seen = bool(
+        billing.tokenrhythm_cost_present or billing.tokenrhythm_pending_present
+    )
+    if not usage_evidence_seen and not billing_evidence_seen:
+        return None
+    (
+        input_tokens,
+        output_tokens,
+        reasoning_tokens,
+        cached_tokens,
+        cache_write_tokens,
+        _,
+    ) = usage.fields()
+    billed_cost, cost_source, billing_receipt = _billing_result(
+        provider_kind=provider_kind,
+        base_url=base_url,
+        usage=usage,
+        billing=billing,
+        model=requested_model,
+    )
+    if provider_kind == "openrouter":
+        billed_cost, cost_source = _provider_cost_with_byok_evidence(
+            provider_kind,
+            billed_cost,
+            provider_usage,
+        )
+        if cost_source != "provider_billed":
+            billing_receipt = None
+    billed_cost, cost_source, billing_receipt = _validated_billing_result(
+        billed_cost,
+        cost_source,
+        billing_receipt,
+    )
+    return DoneEvent(
+        stop_reason="error",
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        reasoning_tokens=reasoning_tokens,
+        cached_tokens=cached_tokens,
+        cache_write_tokens=cache_write_tokens,
+        billed_cost=billed_cost,
+        model=actual_model,
+        cost_source=cost_source,
+        provider=provider_id,
+        requested_model=requested_model,
+        requested_provider=provider_id,
+        billing_receipt=billing_receipt,
+        provider_usage=_provider_usage_evidence(
+            provider_kind=provider_kind,
+            usage=provider_usage,
+            router_metadata=router_metadata,
+            response_ids=response_ids,
+            cache_namespace_sha256=cache_namespace_sha256,
+        ),
+    )
+
+
+def _fallback_usage_receipt_fingerprint(row: Mapping[str, Any]) -> tuple[Any, ...]:
+    return (
+        str(row.get("provider") or "").strip(),
+        str(row.get("model") or "").strip(),
+        _coerce_int(row.get("input_tokens")),
+        _coerce_int(row.get("output_tokens")),
+        _coerce_int(row.get("reasoning_tokens")),
+        _coerce_int(row.get("cached_tokens")),
+        _coerce_int(row.get("cache_write_tokens")),
+        _coerce_float(row.get("billed_cost")),
+        str(row.get("cost_source") or "none").strip().casefold(),
+    )
+
+
+def _fallback_usage_response_ids(row: Mapping[str, Any]) -> frozenset[str]:
+    values: list[Any] = []
+    direct = row.get("response_id")
+    if direct is not None:
+        values.append(direct)
+    provider_usage = row.get("provider_usage")
+    if isinstance(provider_usage, Mapping):
+        response_ids = provider_usage.get("response_ids")
+        if isinstance(response_ids, (list, tuple, set, frozenset)):
+            values.extend(response_ids)
+        elif response_ids is not None:
+            values.append(response_ids)
+        response_id = provider_usage.get("response_id")
+        if response_id is not None:
+            values.append(response_id)
+    return frozenset(
+        str(value).strip()
+        for value in values
+        if str(value).strip()
+    )
+
+
+def _fallback_usage_row_match_priority(
+    left: Mapping[str, Any],
+    right: Mapping[str, Any],
+) -> int | None:
+    left_placeholder = (
+        str(left.get("role") or "").strip().casefold()
+        in _MISSING_USAGE_PLACEHOLDER_ROLES
+    )
+    right_placeholder = (
+        str(right.get("role") or "").strip().casefold()
+        in _MISSING_USAGE_PLACEHOLDER_ROLES
+    )
+    if left_placeholder != right_placeholder:
+        return None
+    left_ids = _fallback_usage_response_ids(left)
+    right_ids = _fallback_usage_response_ids(right)
+    if left_ids and right_ids:
+        return 0 if left_ids & right_ids else None
+    if _fallback_usage_receipt_fingerprint(left) != (
+        _fallback_usage_receipt_fingerprint(right)
+    ):
+        return None
+    return 1 if not left_ids and not right_ids else 2
+
+
+def _fallback_diagnostic_receipt_rows(event: ErrorEvent) -> list[dict[str, Any]]:
+    done = event.diagnostic_done
+    if done is None:
+        return []
+    rows = [
+        dict(row)
+        for row in done.model_usage_breakdown
+        if isinstance(row, Mapping)
+    ]
+    if rows:
+        return rows
+    return [
+        {
+            "provider": str(done.provider or ""),
+            "model": str(done.model or ""),
+            "requested_provider": str(done.requested_provider or ""),
+            "requested_model": str(done.requested_model or ""),
+            "input_tokens": done.input_tokens,
+            "output_tokens": done.output_tokens,
+            "reasoning_tokens": done.reasoning_tokens,
+            "cached_tokens": done.cached_tokens,
+            "cache_write_tokens": done.cache_write_tokens,
+            "billed_cost": done.billed_cost,
+            "cost_source": done.cost_source,
+            "provider_usage": dict(done.provider_usage),
+            **(
+                {"billing_receipt": done.billing_receipt}
+                if done.billing_receipt is not None
+                else {}
+            ),
+        }
+    ]
+
+
+def _fallback_error_receipt_count(event: ErrorEvent) -> int:
+    """Count the union of outer and diagnostic receipts with multiplicity."""
+
+    union_rows = [
+        dict(row)
+        for row in event.model_usage_breakdown
+        if isinstance(row, Mapping)
+    ]
+    outer_count = len(union_rows)
+    consumed: set[int] = set()
+    diagnostic_rows = _fallback_diagnostic_receipt_rows(event)
+    diagnostic_order = sorted(
+        range(len(diagnostic_rows)),
+        key=lambda index: (
+            0 if _fallback_usage_response_ids(diagnostic_rows[index]) else 1,
+            index,
+        ),
+    )
+    matched_diagnostic: set[int] = set()
+    for diagnostic_index in diagnostic_order:
+        diagnostic_row = diagnostic_rows[diagnostic_index]
+        candidates = [
+            (priority, index)
+            for index, outer_row in enumerate(union_rows[:outer_count])
+            if index not in consumed
+            if (
+                priority := _fallback_usage_row_match_priority(
+                    outer_row,
+                    diagnostic_row,
+                )
+            )
+            is not None
+        ]
+        matched_index = min(candidates)[1] if candidates else None
+        if matched_index is not None:
+            consumed.add(matched_index)
+            matched_diagnostic.add(diagnostic_index)
+    union_rows.extend(
+        row
+        for index, row in enumerate(diagnostic_rows)
+        if index not in matched_diagnostic
+    )
+    return sum(
+        1
+        for row in union_rows
+        if str(row.get("role") or "").strip().casefold()
+        not in _MISSING_USAGE_PLACEHOLDER_ROLES
+    )
+
+
+def _fallback_error_placeholder_count(event: ErrorEvent) -> int:
+    outer_rows = [
+        dict(row)
+        for row in event.model_usage_breakdown
+        if isinstance(row, Mapping)
+        and str(row.get("role") or "").strip().casefold()
+        in _MISSING_USAGE_PLACEHOLDER_ROLES
+    ]
+    diagnostic_rows = [
+        row
+        for row in _fallback_diagnostic_receipt_rows(event)
+        if str(row.get("role") or "").strip().casefold()
+        in _MISSING_USAGE_PLACEHOLDER_ROLES
+    ]
+    consumed: set[int] = set()
+    count = len(outer_rows)
+    diagnostic_order = sorted(
+        range(len(diagnostic_rows)),
+        key=lambda index: (
+            0 if _fallback_usage_response_ids(diagnostic_rows[index]) else 1,
+            index,
+        ),
+    )
+    for diagnostic_index in diagnostic_order:
+        diagnostic_row = diagnostic_rows[diagnostic_index]
+        candidates = [
+            (priority, index)
+            for index, outer_row in enumerate(outer_rows)
+            if index not in consumed
+            if (
+                priority := _fallback_usage_row_match_priority(
+                    outer_row,
+                    diagnostic_row,
+                )
+            )
+            is not None
+        ]
+        if candidates:
+            consumed.add(min(candidates)[1])
+        else:
+            count += 1
+    return count
+
+
 def _mark_stream_fallback_cost_unknown(
     event: StreamEvent,
     *,
@@ -1846,23 +2221,124 @@ def _mark_stream_fallback_cost_unknown(
     """Retain evidence that a stream request preceded a fallback request.
 
     The abandoned stream may still be billed even when it returned no usable
-    usage payload. Marking the successful fallback as mixed prevents strict
+    usage payload. Marking the terminal fallback result prevents strict
     benchmark accounting from treating two physical requests as one exact
-    request. An exact provider billing receipt is the exception: it is
-    authoritative evidence for the completed fallback and must remain usable
-    as an exact billed result.
+    request. An exact receipt for the fallback does not cover the abandoned
+    stream request.
     """
+    if isinstance(event, ErrorEvent):
+        declared_fallback_request_count = (
+            max(0, int(event.physical_request_count))
+            if event.physical_request_count is not None
+            else (0 if event.request_started is False else 1)
+        )
+        fallback_receipt_count = _fallback_error_receipt_count(event)
+        outer_placeholder_count = sum(
+            1
+            for row in event.model_usage_breakdown
+            if isinstance(row, Mapping)
+            and str(row.get("role") or "").strip().casefold()
+            in _MISSING_USAGE_PLACEHOLDER_ROLES
+        )
+        diagnostic_done = event.diagnostic_done
+        diagnostic_rows = (
+            _fallback_diagnostic_receipt_rows(event)
+            if diagnostic_done is not None
+            else []
+        )
+        diagnostic_placeholder_count = sum(
+            1
+            for row in diagnostic_rows
+            if str(row.get("role") or "").strip().casefold()
+            in _MISSING_USAGE_PLACEHOLDER_ROLES
+        )
+        placeholder_union_count = _fallback_error_placeholder_count(event)
+        outer_missing_remainder = max(
+            0,
+            max(0, int(event.usage_missing_count or 0))
+            - outer_placeholder_count,
+        )
+        diagnostic_missing_remainder = (
+            max(
+                0,
+                max(0, int(diagnostic_done.usage_missing_count or 0))
+                - diagnostic_placeholder_count,
+            )
+            if diagnostic_done is not None
+            else 0
+        )
+        # Outer and diagnostic scalar counts describe the same nested attempts.
+        # Without stable IDs only the conservative minimum can be overlapped,
+        # leaving the maximum unrepresented remainder in the physical union.
+        declared_missing_count = (
+            placeholder_union_count
+            + max(outer_missing_remainder, diagnostic_missing_remainder)
+        )
+        outer_trace = (
+            dict(event.ensemble_trace)
+            if isinstance(event.ensemble_trace, Mapping)
+            else {}
+        )
+        diagnostic_trace = (
+            dict(diagnostic_done.ensemble_trace)
+            if diagnostic_done is not None
+            and isinstance(diagnostic_done.ensemble_trace, Mapping)
+            else {}
+        )
+        traced_fallback_request_count = max(
+            max(
+                0,
+                int(outer_trace.get("physical_request_count") or 0),
+                int(outer_trace.get("llm_request_count") or 0),
+            ),
+            max(
+                0,
+                int(diagnostic_trace.get("physical_request_count") or 0),
+                int(diagnostic_trace.get("llm_request_count") or 0),
+            ),
+        )
+        fallback_request_count = max(
+            declared_fallback_request_count,
+            traced_fallback_request_count,
+            fallback_receipt_count + declared_missing_count,
+        )
+        fallback_missing_count = max(
+            declared_missing_count,
+            fallback_request_count - fallback_receipt_count,
+        )
+        merged_trace: dict[str, Any] | None = None
+        if diagnostic_trace or outer_trace:
+            merged_trace = {**diagnostic_trace, **outer_trace}
+            total_physical_request_count = 1 + fallback_request_count
+            total_missing_count = 1 + fallback_missing_count
+            merged_trace["physical_request_count"] = total_physical_request_count
+            merged_trace["usage_missing_count"] = total_missing_count
+            if (
+                "llm_request_count" in diagnostic_trace
+                or "llm_request_count" in outer_trace
+            ):
+                merged_trace["llm_request_count"] = max(
+                    int(merged_trace.get("llm_request_count") or 0),
+                    total_physical_request_count,
+                )
+        return replace(
+            event,
+            request_started=True,
+            physical_request_count=1 + fallback_request_count,
+            usage_missing_count=1 + fallback_missing_count,
+            ensemble_trace=merged_trace,
+        )
     if not isinstance(event, DoneEvent):
-        return event
-    if event.billing_receipt is not None:
         return event
     known_rows = list(event.model_usage_breakdown or [])
     if not known_rows:
         known_rows = [
             {
                 "role": "fallback_non_stream",
-                "provider": provider_kind,
-                "model": event.model or requested_model,
+                "provider": event.provider or "",
+                "requested_provider": provider_kind,
+                "model": event.model,
+                "requested_model": requested_model,
                 "input_tokens": event.input_tokens,
                 "output_tokens": event.output_tokens,
                 "reasoning_tokens": event.reasoning_tokens,
@@ -1870,12 +2346,20 @@ def _mark_stream_fallback_cost_unknown(
                 "cache_write_tokens": event.cache_write_tokens,
                 "billed_cost": event.billed_cost,
                 "cost_source": event.cost_source,
+                "provider_usage": dict(event.provider_usage),
+                **(
+                    {"billing_receipt": event.billing_receipt}
+                    if event.billing_receipt is not None
+                    else {}
+                ),
             }
         ]
     unknown_stream = {
         "role": "abandoned_stream_request",
-        "provider": provider_kind,
-        "model": requested_model,
+        "provider": "",
+        "requested_provider": provider_kind,
+        "model": "",
+        "requested_model": requested_model,
         "input_tokens": 0,
         "output_tokens": 0,
         "reasoning_tokens": 0,
@@ -3332,6 +3816,8 @@ class OpenAIProvider:
             yield ErrorEvent(
                 message=json.dumps(proof, ensure_ascii=False, sort_keys=True),
                 code="provider_request_budget_exhausted",
+                request_started=False,
+                physical_request_count=0,
             )
             return
         payload = budget_decision.payload or payload
@@ -3349,6 +3835,8 @@ class OpenAIProvider:
             yield ErrorEvent(
                 message=json.dumps(exc.proof, ensure_ascii=False, sort_keys=True),
                 code="provider_request_budget_exhausted",
+                request_started=False,
+                physical_request_count=0,
             )
             return
 
@@ -3404,7 +3892,9 @@ class OpenAIProvider:
         billing_receipt: ProviderBillingReceipt | None = None
         usage_accumulator = _UsageSnapshotAccumulator()
         billing_accumulator = _ProviderBillingAccumulator()
-        actual_model = self._model
+        # Requested configuration is not physical response evidence. Keep
+        # actual identity empty until an upstream chunk names the model.
+        actual_model = ""
         stop_reason = "stop"
         emitted_stream_event = False
         saw_done_sentinel = False
@@ -3424,6 +3914,11 @@ class OpenAIProvider:
         terminal_native_finish_reason_present = False
         terminal_native_finish_reason: Any = None
         active_choice_seen = False
+        response_ids: set[str] = set()
+        raw_provider_usage: dict[str, Any] = {}
+        router_metadata: dict[str, Any] = {}
+        trace_tool_calls: list[dict[str, Any]] = []
+        usage_evidence_seen = False
 
         if os.environ.get("OPENSQUILLA_TRACE_ROUTING"):
             print(
@@ -3506,6 +4001,135 @@ class OpenAIProvider:
             released.extend(deferred_native_events.drain())
             released.extend(deferred_post_native_events.drain())
             return released
+
+        def response_validation_error(
+            *,
+            message: str,
+            code: str,
+            **kwargs: Any,
+        ) -> ErrorEvent:
+            diagnostic_done = _usage_diagnostic_done(
+                provider_kind=self._provider_kind,
+                provider_id=self.provider_id,
+                requested_model=self._model,
+                base_url=self._base_url,
+                actual_model=actual_model,
+                usage=usage_accumulator,
+                billing=billing_accumulator,
+                usage_evidence_seen=usage_evidence_seen,
+                provider_usage=raw_provider_usage,
+                router_metadata=router_metadata,
+                response_ids=sorted(response_ids),
+                cache_namespace_sha256=cache_namespace_sha256,
+            )
+            if diagnostic_done is None:
+                return ErrorEvent(message=message, code=code, **kwargs)
+            return ErrorEvent(
+                message=message,
+                code=code,
+                diagnostic_done=diagnostic_done,
+                request_started=True,
+                physical_request_count=1,
+                **kwargs,
+            )
+
+        async def accounted_non_stream_fallback(
+            timeout_exc: httpx.TimeoutException,
+        ) -> AsyncIterator[StreamEvent]:
+            """Own fallback failures while preserving both physical attempts."""
+
+            try:
+                async for fallback_event in self._complete_non_stream(
+                    payload=payload,
+                    headers=headers,
+                    cfg=cfg,
+                    tools=tools,
+                    timeout_exc=timeout_exc,
+                    cache_namespace_sha256=cache_namespace_sha256,
+                ):
+                    yield _mark_stream_fallback_cost_unknown(
+                        fallback_event,
+                        provider_kind=self._provider_kind,
+                        requested_model=self._model,
+                    )
+            except CandidateArtifactLimitError as fallback_exc:
+                log.warning(
+                    "provider.candidate_artifact_limit",
+                    provider=self._provider_kind,
+                    model=self._model,
+                    phase="non_stream_fallback",
+                    operation=fallback_exc.operation,
+                    reason=fallback_exc.reason,
+                    limit=fallback_exc.limit,
+                    observed=fallback_exc.observed,
+                )
+                message = "Candidate artifact exceeded bounded assembly limits"
+                trace.record_error(
+                    code="candidate_artifact_limit_exceeded",
+                    message=message,
+                    metadata={
+                        "phase": "non_stream_fallback",
+                        "cache_shape": cache_shape,
+                    },
+                )
+                yield _mark_stream_fallback_cost_unknown(
+                    ErrorEvent(
+                        message=message,
+                        code="candidate_artifact_limit_exceeded",
+                    ),
+                    provider_kind=self._provider_kind,
+                    requested_model=self._model,
+                )
+            except ToolStreamProtocolError as fallback_exc:
+                log.warning(
+                    "provider.tool_stream_protocol_error",
+                    provider=self._provider_kind,
+                    model=self._model,
+                    phase="non_stream_fallback",
+                    operation=fallback_exc.operation,
+                    reason=fallback_exc.reason,
+                )
+                message = "Provider returned an invalid tool lifecycle"
+                trace.record_error(
+                    code="provider_protocol_error",
+                    message=message,
+                    metadata={
+                        "phase": "non_stream_fallback",
+                        "cache_shape": cache_shape,
+                    },
+                )
+                yield _mark_stream_fallback_cost_unknown(
+                    ErrorEvent(message=message, code="provider_protocol_error"),
+                    provider_kind=self._provider_kind,
+                    requested_model=self._model,
+                )
+            except Exception as fallback_exc:  # noqa: BLE001 - provider contract
+                fallback_error = redact_upstream_error_text(
+                    f"Provider response handling failed: "
+                    f"{str(fallback_exc) or repr(fallback_exc)}",
+                    api_key=self._api_key,
+                    max_len=2000,
+                )
+                log.error(
+                    "provider.stream_internal_error",
+                    provider=self._provider_kind,
+                    model=self._model,
+                    error=fallback_error,
+                    exception_type=type(fallback_exc).__name__,
+                )
+                trace.record_error(
+                    code="provider_internal",
+                    message=fallback_error,
+                    metadata={
+                        "phase": "non_stream_fallback",
+                        "cache_shape": cache_shape,
+                    },
+                )
+                yield _mark_stream_fallback_cost_unknown(
+                    ErrorEvent(message=fallback_error, code="provider_internal"),
+                    provider_kind=self._provider_kind,
+                    requested_model=self._model,
+                )
 
         try:
             async with httpx.AsyncClient(
@@ -3643,10 +4267,6 @@ class OpenAIProvider:
                         )
                         return
 
-                    response_ids: set[str] = set()
-                    raw_provider_usage: dict[str, Any] = {}
-                    router_metadata: dict[str, Any] = {}
-                    trace_tool_calls: list[dict[str, Any]] = []
                     async for line in response.aiter_lines():
                         if not line.startswith("data:"):
                             continue
@@ -3729,7 +4349,7 @@ class OpenAIProvider:
                             # including malformed empty error envelopes.
                             # Provisional text/tool events already delivered stay
                             # diagnostic only; no deferred End or Done is released.
-                            yield ErrorEvent(
+                            yield response_validation_error(
                                 message=(
                                     f"{self._compat.display_name} stream error: "
                                     f"{err_message}"
@@ -3758,7 +4378,7 @@ class OpenAIProvider:
                                 message="Provider stream returned an invalid choice batch",
                                 metadata={"phase": "stream", "cache_shape": cache_shape},
                             )
-                            yield ErrorEvent(
+                            yield response_validation_error(
                                 message=(
                                     f"{self._compat.display_name} stream returned "
                                     "multiple or malformed choices"
@@ -3788,7 +4408,7 @@ class OpenAIProvider:
                                         "cache_shape": cache_shape,
                                     },
                                 )
-                                yield ErrorEvent(
+                                yield response_validation_error(
                                     message=(
                                         f"{self._compat.display_name} stream mutated "
                                         "state after finish_reason"
@@ -3802,6 +4422,7 @@ class OpenAIProvider:
                                 billing_chunk,
                             )
                             if isinstance(usage_payload, Mapping):
+                                usage_evidence_seen = True
                                 raw_provider_usage = dict(usage_payload)
                                 usage_accumulator.update(usage_payload)
                                 (
@@ -3840,7 +4461,7 @@ class OpenAIProvider:
                                 message="Provider stream returned malformed usage",
                                 metadata={"phase": "stream", "cache_shape": cache_shape},
                             )
-                            yield ErrorEvent(
+                            yield response_validation_error(
                                 message=(
                                     f"{self._compat.display_name} stream returned "
                                     "malformed usage"
@@ -3858,6 +4479,7 @@ class OpenAIProvider:
                             billing_chunk,
                         )
                         if isinstance(usage_payload, Mapping):
+                            usage_evidence_seen = True
                             raw_provider_usage = dict(usage_payload)
                             usage_accumulator.update(usage_payload)
                             (
@@ -3880,7 +4502,7 @@ class OpenAIProvider:
 
                         for choice in raw_choices:
                             if not isinstance(choice, Mapping):
-                                yield ErrorEvent(
+                                yield response_validation_error(
                                     message=(
                                         f"{self._compat.display_name} stream returned "
                                         "a malformed choice"
@@ -3894,7 +4516,7 @@ class OpenAIProvider:
                                 or isinstance(choice_index, bool)
                                 or choice_index != 0
                             ):
-                                yield ErrorEvent(
+                                yield response_validation_error(
                                     message=(
                                         f"{self._compat.display_name} stream returned "
                                         "an unsupported choice index"
@@ -3907,7 +4529,7 @@ class OpenAIProvider:
                             if finish is not None and (
                                 not isinstance(finish, str) or not finish.strip()
                             ):
-                                yield ErrorEvent(
+                                yield response_validation_error(
                                     message=(
                                         f"{self._compat.display_name} stream returned "
                                         "an invalid finish reason"
@@ -3921,7 +4543,7 @@ class OpenAIProvider:
 
                             delta = choice.get("delta", {})
                             if not isinstance(delta, Mapping):
-                                yield ErrorEvent(
+                                yield response_validation_error(
                                     message=(
                                         f"{self._compat.display_name} stream returned "
                                         "a malformed choice delta"
@@ -4337,7 +4959,7 @@ class OpenAIProvider:
                                                 "cache_shape": cache_shape,
                                             },
                                         )
-                                        yield ErrorEvent(
+                                        yield response_validation_error(
                                             message=(
                                                 f"{self._compat.display_name} returned "
                                                 "an incomplete native tool identity"
@@ -4413,7 +5035,7 @@ class OpenAIProvider:
                                 "malformed_frame_count": malformed_stream_frames,
                             },
                         )
-                        yield ErrorEvent(
+                        yield response_validation_error(
                             message=(
                                 f"{self._compat.display_name} stream contained "
                                 "a malformed data frame"
@@ -4450,19 +5072,10 @@ class OpenAIProvider:
                                 ),
                             )
                             empty_stream_exc = httpx.ReadTimeout("empty stream")
-                            async for fallback_event in self._complete_non_stream(
-                                payload=payload,
-                                headers=headers,
-                                cfg=cfg,
-                                tools=tools,
-                                timeout_exc=empty_stream_exc,
-                                cache_namespace_sha256=cache_namespace_sha256,
+                            async for fallback_event in accounted_non_stream_fallback(
+                                empty_stream_exc
                             ):
-                                yield _mark_stream_fallback_cost_unknown(
-                                    fallback_event,
-                                    provider_kind=self._provider_kind,
-                                    requested_model=self._model,
-                                )
+                                yield fallback_event
                             return
                         for pending_event in _segment_text_tool_events(
                             text_tool_normalizer.finish(
@@ -4487,7 +5100,7 @@ class OpenAIProvider:
                             message="Provider stream ended without terminal evidence",
                             metadata={"phase": "stream", "cache_shape": cache_shape},
                         )
-                        yield ErrorEvent(
+                        yield response_validation_error(
                             message=(
                                 f"{self._compat.display_name} stream ended before a "
                                 "finish reason"
@@ -4536,7 +5149,7 @@ class OpenAIProvider:
                             ),
                             metadata={"phase": "stream", "cache_shape": cache_shape},
                         )
-                        yield ErrorEvent(
+                        yield response_validation_error(
                             message=(
                                 f"{self._compat.display_name} ended a native tool call "
                                 f"with finish reason {stop_reason!r}"
@@ -4616,7 +5229,7 @@ class OpenAIProvider:
                                 "invalid_call_count": invalid_native_arguments,
                             },
                         )
-                        yield ErrorEvent(
+                        yield response_validation_error(
                             message=(
                                 f"{self._compat.display_name} returned invalid "
                                 "native tool arguments"
@@ -4733,19 +5346,10 @@ class OpenAIProvider:
                             ),
                         )
                         empty_stream_exc = httpx.ReadTimeout("empty stream")
-                        async for fallback_event in self._complete_non_stream(
-                            payload=payload,
-                            headers=headers,
-                            cfg=cfg,
-                            tools=tools,
-                            timeout_exc=empty_stream_exc,
-                            cache_namespace_sha256=cache_namespace_sha256,
+                        async for fallback_event in accounted_non_stream_fallback(
+                            empty_stream_exc
                         ):
-                            yield _mark_stream_fallback_cost_unknown(
-                                fallback_event,
-                                provider_kind=self._provider_kind,
-                                requested_model=self._model,
-                            )
+                            yield fallback_event
                         return
 
                     billed_cost, cost_source, billing_receipt = _billing_result(
@@ -4763,6 +5367,13 @@ class OpenAIProvider:
                         )
                         if cost_source != "provider_billed":
                             billing_receipt = None
+                    billed_cost, cost_source, billing_receipt = (
+                        _validated_billing_result(
+                            billed_cost,
+                            cost_source,
+                            billing_receipt,
+                        )
+                    )
 
                     trace.record_response(
                         usage={
@@ -4797,6 +5408,8 @@ class OpenAIProvider:
                         model=actual_model,
                         cost_source=cost_source,
                         provider=self.provider_id,
+                        requested_model=self._model,
+                        requested_provider=self.provider_id,
                         billing_receipt=billing_receipt,
                         provider_usage=_provider_usage_evidence(
                             provider_kind=self._provider_kind,
@@ -4838,67 +5451,8 @@ class OpenAIProvider:
                         "retrying without streaming."
                     ),
                 )
-                try:
-                    async for fallback_event in self._complete_non_stream(
-                        payload=payload,
-                        headers=headers,
-                        cfg=cfg,
-                        tools=tools,
-                        timeout_exc=exc,
-                        cache_namespace_sha256=cache_namespace_sha256,
-                    ):
-                        yield _mark_stream_fallback_cost_unknown(
-                            fallback_event,
-                            provider_kind=self._provider_kind,
-                            requested_model=self._model,
-                        )
-                except CandidateArtifactLimitError as fallback_exc:
-                    log.warning(
-                        "provider.candidate_artifact_limit",
-                        provider=self._provider_kind,
-                        model=self._model,
-                        phase="non_stream_fallback",
-                        operation=fallback_exc.operation,
-                        reason=fallback_exc.reason,
-                        limit=fallback_exc.limit,
-                        observed=fallback_exc.observed,
-                    )
-                    yield ErrorEvent(
-                        message="Candidate artifact exceeded bounded assembly limits",
-                        code="candidate_artifact_limit_exceeded",
-                    )
-                except ToolStreamProtocolError as fallback_exc:
-                    log.warning(
-                        "provider.tool_stream_protocol_error",
-                        provider=self._provider_kind,
-                        model=self._model,
-                        phase="non_stream_fallback",
-                        operation=fallback_exc.operation,
-                        reason=fallback_exc.reason,
-                    )
-                    yield ErrorEvent(
-                        message="Provider returned an invalid tool lifecycle",
-                        code="provider_protocol_error",
-                    )
-                except Exception as fallback_exc:  # noqa: BLE001 - see contract note below
-                    fallback_error = redact_upstream_error_text(
-                        f"Provider response handling failed: "
-                        f"{str(fallback_exc) or repr(fallback_exc)}",
-                        api_key=self._api_key,
-                        max_len=2000,
-                    )
-                    log.error(
-                        "provider.stream_internal_error",
-                        provider=self._provider_kind,
-                        model=self._model,
-                        error=fallback_error,
-                        exception_type=type(fallback_exc).__name__,
-                    )
-                    trace.record_error(code="provider_internal", message=fallback_error)
-                    yield ErrorEvent(
-                        message=fallback_error,
-                        code="provider_internal",
-                    )
+                async for fallback_event in accounted_non_stream_fallback(exc):
+                    yield fallback_event
                 return
             for pending_event in _segment_text_tool_events(
                 text_tool_normalizer.finish(successful_text_tool_terminal=False),
@@ -4915,7 +5469,7 @@ class OpenAIProvider:
                     visible_assistant_text_parts.append(deferred_event.text)
                 yield deferred_event
             deferred_post_native_events.clear()
-            yield ErrorEvent(message=safe_error, code="timeout")
+            yield response_validation_error(message=safe_error, code="timeout")
         except httpx.RequestError as exc:
             safe_error = redact_upstream_error_text(
                 f"Request error: {str(exc) or repr(exc)}",
@@ -4942,7 +5496,7 @@ class OpenAIProvider:
                     visible_assistant_text_parts.append(deferred_event.text)
                 yield deferred_event
             deferred_post_native_events.clear()
-            yield ErrorEvent(message=safe_error, code="request_error")
+            yield response_validation_error(message=safe_error, code="request_error")
         except CandidateArtifactLimitError as exc:
             message = "Candidate artifact exceeded bounded assembly limits"
             log.warning(
@@ -4968,7 +5522,7 @@ class OpenAIProvider:
             )
             deferred_native_events.clear()
             deferred_post_native_events.clear()
-            yield ErrorEvent(
+            yield response_validation_error(
                 message=message,
                 code="candidate_artifact_limit_exceeded",
             )
@@ -5000,7 +5554,10 @@ class OpenAIProvider:
                     yield pending_event
             deferred_native_events.clear()
             deferred_post_native_events.clear()
-            yield ErrorEvent(message=message, code="provider_protocol_error")
+            yield response_validation_error(
+                message=message,
+                code="provider_protocol_error",
+            )
         except Exception as exc:  # noqa: BLE001 - chat() contract: ErrorEvent instead of raising
             safe_error = redact_upstream_error_text(
                 f"Provider response handling failed: {str(exc) or repr(exc)}",
@@ -5034,7 +5591,7 @@ class OpenAIProvider:
                     visible_assistant_text_parts.append(deferred_event.text)
                 yield deferred_event
             deferred_post_native_events.clear()
-            yield ErrorEvent(
+            yield response_validation_error(
                 message=safe_error,
                 code="provider_internal",
             )
@@ -5247,7 +5804,12 @@ class OpenAIProvider:
             )
             return
 
-        actual_model = data.get("model") or self._model
+        raw_actual_model = data.get("model")
+        actual_model = (
+            raw_actual_model.strip()
+            if isinstance(raw_actual_model, str)
+            else ""
+        )
         usage_accumulator = _UsageSnapshotAccumulator()
         usage_payload = data.get("usage")
         if isinstance(usage_payload, Mapping):
@@ -5285,6 +5847,47 @@ class OpenAIProvider:
             )
             if cost_source != "provider_billed":
                 billing_receipt = None
+        billed_cost, cost_source, billing_receipt = _validated_billing_result(
+            billed_cost,
+            cost_source,
+            billing_receipt,
+        )
+        response_id = _safe_evidence_string(data.get("id"))
+        nonstream_response_ids = [response_id] if response_id is not None else []
+        diagnostic_done = _usage_diagnostic_done(
+            provider_kind=self._provider_kind,
+            provider_id=self.provider_id,
+            requested_model=self._model,
+            base_url=self._base_url,
+            actual_model=actual_model,
+            usage=usage_accumulator,
+            billing=billing_accumulator,
+            usage_evidence_seen=isinstance(usage_payload, Mapping),
+            provider_usage=(
+                usage_payload if isinstance(usage_payload, Mapping) else None
+            ),
+            router_metadata=(
+                router_metadata if isinstance(router_metadata, Mapping) else None
+            ),
+            response_ids=nonstream_response_ids,
+            cache_namespace_sha256=cache_namespace_sha256,
+        )
+
+        def non_stream_validation_error(
+            *,
+            message: str,
+            code: str,
+        ) -> ErrorEvent:
+            if diagnostic_done is None:
+                return ErrorEvent(message=message, code=code)
+            return ErrorEvent(
+                message=message,
+                code=code,
+                diagnostic_done=diagnostic_done,
+                request_started=True,
+                physical_request_count=1,
+            )
+
         _log_provider_cache_usage(
             provider_kind=self._provider_kind,
             model=self._model,
@@ -5526,7 +6129,7 @@ class OpenAIProvider:
                 if isinstance(event, TextDeltaEvent):
                     visible_assistant_text_parts.append(event.text)
                 yield event
-            yield ErrorEvent(
+            yield non_stream_validation_error(
                 message=(
                     f"{self._compat.display_name} response ended without a finish reason"
                 ),
@@ -5571,7 +6174,7 @@ class OpenAIProvider:
                 ),
                 metadata={"phase": "non_stream", "cache_shape": cache_shape},
             )
-            yield ErrorEvent(
+            yield non_stream_validation_error(
                 message=(
                     f"{self._compat.display_name} ended a native tool call with "
                     f"finish reason {stop_reason!r}"
@@ -5601,7 +6204,7 @@ class OpenAIProvider:
                     "invalid_call_count": invalid_native_arguments,
                 },
             )
-            yield ErrorEvent(
+            yield non_stream_validation_error(
                 message=(
                     f"{self._compat.display_name} returned invalid native tool arguments"
                 ),
@@ -5662,8 +6265,6 @@ class OpenAIProvider:
         ):
             reasoning_text = _extract_think_tags("".join(assistant_text_parts)) or None
 
-        response_id = _safe_evidence_string(data.get("id"))
-        nonstream_response_ids = [response_id] if response_id is not None else []
         trace.record_response(
             response=data,
             usage={
@@ -5701,6 +6302,8 @@ class OpenAIProvider:
             model=actual_model,
             cost_source=cost_source,
             provider=self.provider_id,
+            requested_model=self._model,
+            requested_provider=self.provider_id,
             billing_receipt=billing_receipt,
             provider_usage=_provider_usage_evidence(
                 provider_kind=self._provider_kind,

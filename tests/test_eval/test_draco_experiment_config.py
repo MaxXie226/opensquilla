@@ -8,6 +8,7 @@ import pytest
 from pydantic import ValidationError
 
 from opensquilla.eval.draco_experiment_config import (
+    DracoRunnerConfig,
     load_draco_experiment_config,
     validate_reference_input,
 )
@@ -61,7 +62,7 @@ def test_default_b2_config_pins_g12_highest_thinking_and_tool_permissions() -> N
     assert all(member.temperature == 0.0 for member in config.ensemble.proposers)
     assert config.ensemble.aggregator.max_tokens == 16_384
     assert config.ensemble.aggregator.temperature == 0.0
-    assert config.ensemble.min_successful_proposers == 1
+    assert config.ensemble.min_successful_proposers == 3
     assert config.ensemble.all_failed_policy == "fallback_single"
     assert config.ensemble.candidate_max_chars == 24_000
     assert config.ensemble.shuffle_candidates is False
@@ -80,12 +81,35 @@ def test_default_b2_config_pins_g12_highest_thinking_and_tool_permissions() -> N
     assert config.runner.mode == "agent_loop"
     assert config.runner.agent_max_iterations == 12
     assert config.runner.concurrency == 2
+    assert config.runner.deadline_wrapup_margin_seconds == 600
+    assert config.runner.deadline_wrapup_disable_tools is True
+    assert config.runner.deadline_thinking_off_margin_seconds == 600
+    assert config.runner.max_iterations_includes_finalization is True
+    assert config.runner.retrieval_loop_finalization_threshold == 3
+    assert config.runner.finalization_aggregator_only is True
+    assert config.runner.finalization_disable_thinking is True
     assert config.generation.max_attempts == 3
     assert config.generation.retry_backoff_seconds == 2.0
     assert config.judge.model == "google/gemini-3.1-pro-preview"
     assert config.judge.repeats == 3
     assert config.judge.concurrency == 6
     assert config.judge.max_attempts == 3
+
+
+def test_runner_finalization_fields_default_off_for_legacy_configs() -> None:
+    config = DracoRunnerConfig(
+        mode="agent_loop",
+        agent_max_iterations=12,
+        concurrency=2,
+    )
+
+    assert config.deadline_wrapup_margin_seconds == 0
+    assert config.deadline_wrapup_disable_tools is False
+    assert config.deadline_thinking_off_margin_seconds == 0
+    assert config.max_iterations_includes_finalization is False
+    assert config.retrieval_loop_finalization_threshold == 0
+    assert config.finalization_aggregator_only is False
+    assert config.finalization_disable_thinking is False
 
 
 def test_override_files_and_inline_paths_apply_in_documented_order(tmp_path: Path) -> None:

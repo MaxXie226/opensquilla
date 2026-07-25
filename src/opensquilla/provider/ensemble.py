@@ -9,6 +9,7 @@ import random
 import time
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from functools import cache
 from typing import Any, Literal
 
 import structlog
@@ -76,7 +77,25 @@ ENSEMBLE_MULTIMODAL_UNSUPPORTED_MESSAGE = (
 )
 _GENERATION_POLICY_FILTER_REASON = "generation_policy_reasoning_unsupported"
 _RUNTIME_HARD_FILTER_REASONS_FIELD = "runtime_hard_filter_reasons"
+_ENSEMBLE_PROPOSER_CLOSE_TIMEOUT_CODE = "ensemble_proposer_close_timeout"
 log = structlog.get_logger(__name__)
+
+
+@dataclass
+class _StreamCloseStatus:
+    """Mutable close result shared across an async-generator relay boundary."""
+
+    closed: bool | None = None
+    absolute_deadline_triggered: bool = False
+    deadline_event: StreamEvent | None = None
+
+
+class _EnsembleStreamCloseError(RuntimeError):
+    """A nested physical stream could not be proven closed."""
+
+    def __init__(self, phase: str) -> None:
+        self.phase = phase
+        super().__init__(f"{phase} stream did not close within the cleanup window")
 
 
 def _ensemble_heartbeat_interval() -> float:
@@ -137,21 +156,42 @@ async def _close_async_iterator(
     *,
     phase: str,
     cleanup_deadline: float | None = None,
-) -> None:
+    require_aclose: bool = False,
+    pending_cleanup_tracker: Callable[[asyncio.Future[Any], str], None] | None = None,
+) -> bool:
     """Close a provider iterator without letting cleanup mask the terminal event."""
 
-    aclose = getattr(stream_iter, "aclose", None)
+    try:
+        aclose = getattr(stream_iter, "aclose", None)
+    except BaseException as exc:  # descriptor access is part of the close boundary
+        log.warning(
+            "ensemble.stream_close_unavailable",
+            phase=phase,
+            error=str(exc),
+        )
+        return False
     if not callable(aclose):
-        return
+        if require_aclose:
+            log.warning(
+                "ensemble.stream_close_unavailable",
+                phase=phase,
+            )
+            return False
+        return True
     try:
         close_future = asyncio.ensure_future(aclose())
-    except Exception as exc:  # noqa: BLE001 - cleanup must not mask the root cause
+    except BaseException as exc:  # noqa: BLE001 - cleanup is a provider boundary
         log.warning(
             "ensemble.stream_close_failed",
             phase=phase,
             error=str(exc),
         )
-        return
+        return False
+    # Register the physical close before the first cancellable await.  A caller
+    # may cancel this cleanup operation itself; the cross-call latch must still
+    # observe the child ``aclose`` until it really terminates.
+    if pending_cleanup_tracker is not None:
+        pending_cleanup_tracker(close_future, f"{phase}_close")
     lingering = await _bounded_task_cleanup(
         [close_future],
         phase=f"{phase}_close",
@@ -159,8 +199,57 @@ async def _close_async_iterator(
     )
     if lingering:
         close_future.cancel()
-    if close_future.done():
-        _consume_task_result(close_future)
+        return False
+    try:
+        close_future.result()
+    except BaseException as exc:  # noqa: BLE001 - cleanup is a provider boundary
+        log.warning(
+            "ensemble.stream_close_failed",
+            phase=phase,
+            error=str(exc),
+        )
+        return False
+    return True
+
+
+@contextlib.asynccontextmanager
+async def _closing_async_iterator(
+    stream: AsyncIterator[StreamEvent],
+    *,
+    phase: str,
+    pending_cleanup_tracker: Callable[[asyncio.Future[Any], str], None] | None = None,
+) -> AsyncIterator[AsyncIterator[StreamEvent]]:
+    """Relay an async stream and synchronously close the lower iterator.
+
+    An ``async for`` does not guarantee prompt closure when its consumer
+    returns, breaks, is cancelled, or starts a retry.  Every ensemble relay
+    uses this context manager so the lower generator's ``finally`` runs before
+    control leaves that relay.
+    """
+
+    try:
+        stream_iter = stream.__aiter__()
+    except BaseException as exc:
+        closed = await _close_async_iterator(
+            stream,
+            phase=phase,
+            require_aclose=True,
+            pending_cleanup_tracker=pending_cleanup_tracker,
+        )
+        if not closed:
+            raise _EnsembleStreamCloseError(phase) from exc
+        raise
+    try:
+        yield stream_iter
+    finally:
+        closed = await _close_async_iterator(
+            stream_iter,
+            phase=phase,
+            require_aclose=True,
+            pending_cleanup_tracker=pending_cleanup_tracker,
+        )
+        if not closed:
+            raise _EnsembleStreamCloseError(phase)
 
 
 async def _stream_with_heartbeats(
@@ -170,34 +259,87 @@ async def _stream_with_heartbeats(
     message: str,
     timeout_seconds: float | None,
     reset_deadline_on_event: bool = False,
+    close_status: _StreamCloseStatus | None = None,
+    absolute_deadline: float | None = None,
+    pending_cleanup_tracker: Callable[[asyncio.Future[Any], str], None] | None = None,
 ) -> AsyncIterator[StreamEvent]:
-    stream_iter = stream.__aiter__()
-    pending: asyncio.Future[StreamEvent] = asyncio.ensure_future(stream_iter.__anext__())
-    timeout_budget = (
-        timeout_seconds
-        if timeout_seconds is not None and timeout_seconds > 0
-        else None
-    )
-    deadline = time.monotonic() + timeout_budget if timeout_budget is not None else None
     try:
+        stream_iter = stream.__aiter__()
+    except BaseException as exc:
+        closed = await _close_async_iterator(
+            stream,
+            phase=phase,
+            require_aclose=True,
+            pending_cleanup_tracker=pending_cleanup_tracker,
+        )
+        if close_status is not None:
+            close_status.closed = closed
+        if not closed:
+            raise _EnsembleStreamCloseError(phase) from exc
+        raise
+    completion_times: dict[asyncio.Future[StreamEvent], float] = {}
+
+    def _start_next_event() -> asyncio.Future[StreamEvent]:
+        future: asyncio.Future[StreamEvent] = asyncio.ensure_future(stream_iter.__anext__())
+        future.add_done_callback(lambda done: completion_times.setdefault(done, time.monotonic()))
+        return future
+
+    pending: asyncio.Future[StreamEvent] | None = None
+    timeout_budget = (
+        timeout_seconds if timeout_seconds is not None and timeout_seconds > 0 else None
+    )
+    timeout_deadline = time.monotonic() + timeout_budget if timeout_budget is not None else None
+
+    def _effective_deadline() -> float | None:
+        deadlines = [value for value in (timeout_deadline, absolute_deadline) if value is not None]
+        return min(deadlines) if deadlines else None
+
+    def _record_deadline_event() -> None:
+        if close_status is None or pending is None or not pending.done():
+            return
+        try:
+            close_status.deadline_event = pending.result()
+        except BaseException:
+            return
+
+    try:
+        pending = _start_next_event()
         while True:
             wait_seconds = _ensemble_heartbeat_interval()
+            deadline = _effective_deadline()
             if deadline is not None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     if not pending.done():
+                        if (
+                            close_status is not None
+                            and absolute_deadline is not None
+                            and absolute_deadline <= deadline
+                        ):
+                            close_status.absolute_deadline_triggered = True
                         raise TimeoutError
                     # The stream completed this event before the deadline was
                     # enforced (typically while suspended at a heartbeat
                     # yield). Deliver the finished work — a completed, billed
                     # response must not be reported as a timeout.
+                    completed_at = completion_times.get(pending, time.monotonic())
+                    if completed_at > deadline:
+                        if (
+                            close_status is not None
+                            and absolute_deadline is not None
+                            and absolute_deadline <= deadline
+                        ):
+                            close_status.absolute_deadline_triggered = True
+                            _record_deadline_event()
+                        raise TimeoutError
                     try:
                         event = pending.result()
                     except StopAsyncIteration:
                         return
-                    pending = asyncio.ensure_future(stream_iter.__anext__())
+                    completion_times.pop(pending, None)
+                    pending = _start_next_event()
                     if reset_deadline_on_event and timeout_budget is not None:
-                        deadline = time.monotonic() + timeout_budget
+                        timeout_deadline = time.monotonic() + timeout_budget
                     yield event
                     continue
                 wait_seconds = min(wait_seconds, remaining)
@@ -205,55 +347,127 @@ async def _stream_with_heartbeats(
             if not done:
                 yield ProviderHeartbeatEvent(phase=phase, message=message)
                 continue
+            if deadline is not None and completion_times.get(pending, time.monotonic()) > deadline:
+                if (
+                    close_status is not None
+                    and absolute_deadline is not None
+                    and absolute_deadline <= deadline
+                ):
+                    close_status.absolute_deadline_triggered = True
+                    _record_deadline_event()
+                raise TimeoutError
             try:
                 event = pending.result()
             except StopAsyncIteration:
                 return
+            completion_times.pop(pending, None)
             if reset_deadline_on_event and timeout_budget is not None:
                 # Idle budget: a healthy stream that keeps producing events may
                 # run arbitrarily long; only a silent stall expires the wait.
-                deadline = time.monotonic() + timeout_budget
+                timeout_deadline = time.monotonic() + timeout_budget
             yield event
-            pending = asyncio.ensure_future(stream_iter.__anext__())
+            pending = _start_next_event()
     finally:
         cleanup_deadline = time.monotonic() + max(
             0.0,
             float(_ENSEMBLE_CANCEL_CLEANUP_TIMEOUT_SECONDS),
         )
-        if not pending.done():
-            pending.cancel()
-            lingering = await _bounded_task_cleanup(
-                [pending],
-                phase=f"{phase}_stream",
-                cleanup_deadline=cleanup_deadline,
-            )
-            if lingering:
-                # A second cancellation interrupts providers that suppress the
-                # first CancelledError while unwinding their stream.
-                pending.cancel()
-        if pending.done():
-            _consume_task_result(pending)
-            await _close_async_iterator(
+        closed = False
+        if pending is None:
+            closed = await _close_async_iterator(
                 stream_iter,
                 phase=phase,
                 cleanup_deadline=cleanup_deadline,
+                require_aclose=True,
+                pending_cleanup_tracker=pending_cleanup_tracker,
             )
+            if close_status is not None:
+                close_status.closed = closed
+            if not closed:
+                raise _EnsembleStreamCloseError(phase)
         else:
-            # If __anext__ ignored cancellation, close the iterator as soon as
-            # that in-flight call eventually yields or exits. This callback is
-            # detached so the user-facing timeout remains bounded.
-            def _close_after_pending(done: asyncio.Future[Any]) -> None:
-                _consume_task_result(done)
+            deferred_close_needed = False
+            deferred_close_scheduled = False
+            pending_callback_ran = False
+
+            def _schedule_deferred_close() -> None:
+                nonlocal deferred_close_scheduled
+                if deferred_close_scheduled:
+                    return
+                deferred_close_scheduled = True
                 try:
                     loop = asyncio.get_running_loop()
                 except RuntimeError:
                     return
                 close_task = loop.create_task(
-                    _close_async_iterator(stream_iter, phase=phase)
+                    _close_async_iterator(
+                        stream_iter,
+                        phase=phase,
+                        require_aclose=True,
+                        pending_cleanup_tracker=pending_cleanup_tracker,
+                    )
                 )
+                if pending_cleanup_tracker is not None:
+                    pending_cleanup_tracker(close_task, f"{phase}_deferred_close")
                 close_task.add_done_callback(_consume_task_result)
 
-            pending.add_done_callback(_close_after_pending)
+            def _close_after_pending(done: asyncio.Future[Any]) -> None:
+                nonlocal pending_callback_ran
+                pending_callback_ran = True
+                _consume_task_result(done)
+                if deferred_close_needed:
+                    _schedule_deferred_close()
+
+            if not pending.done():
+                # Install the close continuation before the first cancellable
+                # cleanup wait. If this ``finally`` is itself cancelled, the
+                # owned raw stream will still be closed when ``__anext__``
+                # eventually exits.
+                if pending_cleanup_tracker is not None:
+                    pending_cleanup_tracker(pending, f"{phase}_stream")
+                pending.add_done_callback(_close_after_pending)
+                pending.cancel()
+                try:
+                    lingering = await _bounded_task_cleanup(
+                        [pending],
+                        phase=f"{phase}_stream",
+                        cleanup_deadline=cleanup_deadline,
+                    )
+                except BaseException:
+                    deferred_close_needed = True
+                    pending.cancel()
+                    if pending.done() and pending_callback_ran:
+                        _schedule_deferred_close()
+                    raise
+                if lingering:
+                    deferred_close_needed = True
+                    # A second cancellation interrupts providers that suppress
+                    # the first CancelledError while unwinding their stream.
+                    pending.cancel()
+
+            if deferred_close_needed:
+                if pending.done():
+                    _schedule_deferred_close()
+                closed = False
+            elif pending.done():
+                _consume_task_result(pending)
+                closed = await _close_async_iterator(
+                    stream_iter,
+                    phase=phase,
+                    cleanup_deadline=cleanup_deadline,
+                    require_aclose=True,
+                    pending_cleanup_tracker=pending_cleanup_tracker,
+                )
+            else:
+                # The future was already owned by ``_start_next_event`` and
+                # the callback above will schedule strict physical close.
+                deferred_close_needed = True
+                closed = False
+
+            if close_status is not None:
+                close_status.closed = closed
+        if not closed:
+            raise _EnsembleStreamCloseError(phase)
 
 
 @dataclass(frozen=True)
@@ -298,6 +512,7 @@ class _CandidateResult:
     label: str
     provider: str
     model: str
+    requested_provider: str = ""
     requested_model: str = ""
     text: str = ""
     input_tokens: int = 0
@@ -317,7 +532,15 @@ class _CandidateResult:
     execution: dict[str, Any] = field(default_factory=dict)
     usage_reported: bool = False
     request_started: bool = False
+    physical_request_count: int = 0
+    usage_missing_count: int = 0
     provider_usage: dict[str, Any] = field(default_factory=dict)
+    # Nested rows carried by ErrorEvent.diagnostic_done are provenance for the
+    # aggregate candidate receipt.  Retain them for audit, but do not add them
+    # to the outer totals again (that would double-count the same request).
+    diagnostic_model_usage_breakdown: list[dict[str, Any]] = field(default_factory=list)
+    model_usage_breakdown: list[dict[str, Any]] = field(default_factory=list)
+    diagnostic_receipt_present: bool = False
 
     @property
     def ok(self) -> bool:
@@ -329,8 +552,9 @@ class _CandidateResult:
             "profile": profile,
             "label": self.label,
             "provider": self.provider,
+            "requested_provider": self.requested_provider,
             "model": self.model,
-            "requested_model": self.requested_model or self.model,
+            "requested_model": self.requested_model,
             "sample_index": self.sample_index,
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
@@ -346,7 +570,11 @@ class _CandidateResult:
         }
         if self.billing_receipt is not None:
             row["billing_receipt"] = self.billing_receipt
-        return row
+        if self.diagnostic_model_usage_breakdown:
+            row["diagnostic_model_usage_breakdown"] = [
+                dict(item) for item in self.diagnostic_model_usage_breakdown
+            ]
+        return _canonicalize_usage_row(row)
 
     def trace_row(self, *, include_text: bool, content_max_chars: int) -> dict[str, Any]:
         row: dict[str, Any] = {
@@ -354,9 +582,14 @@ class _CandidateResult:
             "sample_index": self.sample_index,
             "label": self.label,
             "provider": self.provider,
+            "requested_provider": self.requested_provider,
             "model": self.model,
+            "requested_model": self.requested_model,
             "ok": self.ok,
             "request_started": self.request_started,
+            "usage_reported": self.usage_reported,
+            "physical_request_count": self.physical_request_count,
+            "usage_missing_count": self.usage_missing_count,
             "stop_reason": self.stop_reason,
             "elapsed_ms": self.elapsed_ms,
             "ttft_ms": self.ttft_ms,
@@ -371,6 +604,12 @@ class _CandidateResult:
         if self.error:
             row["error"] = self.error
             row["error_code"] = self.error_code
+        if self.diagnostic_model_usage_breakdown:
+            row["diagnostic_model_usage_breakdown"] = [
+                dict(item) for item in self.diagnostic_model_usage_breakdown
+            ]
+        if self.model_usage_breakdown:
+            row["model_usage_breakdown"] = [dict(item) for item in self.model_usage_breakdown]
         if include_text:
             row["text"] = self.text
         return row
@@ -386,6 +625,7 @@ class _AggregatorAccumulator:
     billed_cost: float = 0.0
     cost_source: str = "none"
     billing_receipt: ProviderBillingReceipt | None = None
+    provider: str = ""
     model: str = ""
     provider_usage: dict[str, Any] = field(default_factory=dict)
 
@@ -403,8 +643,9 @@ class _AggregatorAccumulator:
             "role": role,
             "profile": profile,
             "label": label or member.label or role,
-            "provider": cfg.provider,
-            "model": self.model or cfg.model,
+            "provider": self.provider,
+            "requested_provider": cfg.provider,
+            "model": self.model,
             "requested_model": cfg.model,
             "sample_index": 0,
             "input_tokens": self.input_tokens,
@@ -419,7 +660,7 @@ class _AggregatorAccumulator:
         }
         if self.billing_receipt is not None:
             row["billing_receipt"] = self.billing_receipt
-        return row
+        return _canonicalize_usage_row(row)
 
 
 def _normalize_thinking(value: str | None) -> tuple[bool | None, Any | None]:
@@ -433,8 +674,63 @@ def _normalize_thinking(value: str | None) -> tuple[bool | None, Any | None]:
     return True, normalized
 
 
+@cache
+def _profiled_openrouter_capabilities() -> dict[str, ModelCapabilities]:
+    """Load exact capabilities recorded in the versioned router registry.
+
+    The registry is the routing policy's source of truth.  Static prefixes
+    remain only as a compatibility fallback for models not present in that
+    versioned snapshot.
+    """
+
+    try:
+        from .ranking_router import load_model_registry_snapshot
+
+        snapshot = load_model_registry_snapshot()
+    except Exception:  # noqa: BLE001 - retain the static fallback below
+        return {}
+    rows = snapshot.get("models")
+    if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes)):
+        return {}
+
+    capabilities: dict[str, ModelCapabilities] = {}
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        facts = row.get("registry_facts")
+        if not isinstance(facts, Mapping):
+            continue
+        if str(facts.get("provider") or "").strip().lower() != "openrouter":
+            continue
+        model = str(facts.get("model_id") or "").strip().lower()
+        supports_reasoning = facts.get("supports_reasoning")
+        supports_tools = facts.get("supports_tools")
+        modalities = facts.get("modalities")
+        if (
+            not model
+            or not isinstance(supports_reasoning, bool)
+            or not isinstance(supports_tools, bool)
+            or not isinstance(modalities, Sequence)
+            or isinstance(modalities, (str, bytes))
+        ):
+            continue
+        normalized_modalities = {
+            str(modality).strip().lower() for modality in modalities
+        }
+        capabilities[model] = ModelCapabilities(
+            supports_reasoning=supports_reasoning,
+            supports_tools=supports_tools,
+            supports_vision=bool({"image", "video"} & normalized_modalities),
+            reasoning_format="openrouter" if supports_reasoning else "none",
+        )
+    return capabilities
+
+
 def openrouter_static_capabilities(model: str) -> ModelCapabilities | None:
     model_l = model.strip().lower()
+    profiled = _profiled_openrouter_capabilities().get(model_l)
+    if profiled is not None:
+        return profiled
     reasoning_prefixes = (
         "anthropic/claude-opus-4.8",
         "anthropic/claude-sonnet-5",
@@ -493,16 +789,11 @@ def _apply_strict_generation_policy_candidate_filter(
     raw_mapping = policy.get("model_thinking_levels")
     mapping = raw_mapping if isinstance(raw_mapping, Mapping) else {}
     normalized_mapping = {
-        str(model).strip().lower(): str(level).strip().lower()
-        for model, level in mapping.items()
+        str(model).strip().lower(): str(level).strip().lower() for model, level in mapping.items()
     }
     default_level = str(policy.get("default_thinking_level") or "xhigh").strip().lower()
     rows = snapshot.get("models")
-    candidates = (
-        rows
-        if isinstance(rows, Sequence) and not isinstance(rows, (str, bytes))
-        else []
-    )
+    candidates = rows if isinstance(rows, Sequence) and not isinstance(rows, (str, bytes)) else []
     excluded: list[dict[str, Any]] = []
     for row in candidates:
         if not isinstance(row, Mapping):
@@ -524,8 +815,7 @@ def _apply_strict_generation_policy_candidate_filter(
         raw_reasons = facts.get(_RUNTIME_HARD_FILTER_REASONS_FIELD)
         reasons = (
             [str(reason) for reason in raw_reasons]
-            if isinstance(raw_reasons, Sequence)
-            and not isinstance(raw_reasons, (str, bytes))
+            if isinstance(raw_reasons, Sequence) and not isinstance(raw_reasons, (str, bytes))
             else []
         )
         if _GENERATION_POLICY_FILTER_REASON not in reasons:
@@ -617,6 +907,12 @@ def _member_chat_config(
     updates: dict[str, Any] = {
         "max_tokens": _member_max_tokens(member),
         "model_capabilities": _member_model_capabilities(member),
+        # These controls belong to the outer ensemble coordinator.  Do not
+        # leak them into a concrete member (or accidentally recurse when a
+        # member itself is another ensemble).
+        "ensemble_soft_deadline_seconds": 0.0,
+        "ensemble_soft_deadline_disable_tools": False,
+        "ensemble_soft_deadline_disable_thinking": False,
     }
     if member.temperature is not None:
         updates["temperature"] = member.temperature
@@ -636,21 +932,19 @@ def _member_chat_config(
         and request_budget_binding.context_window_tokens > 0
     ):
         thinking_budget_tokens = (
-            max(0, int(effective.thinking_budget_tokens or 0))
-            if effective.thinking
-            else 0
+            max(0, int(effective.thinking_budget_tokens or 0)) if effective.thinking else 0
         )
-        rebound_cap = ContextBudgetGovernor.from_values(
-            context_window_tokens=request_budget_binding.context_window_tokens,
-            max_output_tokens=effective.max_tokens,
-            thinking_budget_tokens=thinking_budget_tokens,
-            context_overflow_threshold=(
-                request_budget_binding.context_overflow_threshold
-            ),
-        ).snapshot().provider_request_max_chars
-        effective = effective.model_copy(
-            update={"provider_request_max_chars": rebound_cap}
+        rebound_cap = (
+            ContextBudgetGovernor.from_values(
+                context_window_tokens=request_budget_binding.context_window_tokens,
+                max_output_tokens=effective.max_tokens,
+                thinking_budget_tokens=thinking_budget_tokens,
+                context_overflow_threshold=(request_budget_binding.context_overflow_threshold),
+            )
+            .snapshot()
+            .provider_request_max_chars
         )
+        effective = effective.model_copy(update={"provider_request_max_chars": rebound_cap})
         member_cfg = member.provider_config
         if record_budget_rebound:
             log.info(
@@ -661,12 +955,8 @@ def _member_chat_config(
                 model=member_cfg.model,
                 inherited_request_max_chars=inherited_cap,
                 effective_request_max_chars=rebound_cap,
-                effective_context_window_tokens=(
-                    request_budget_binding.context_window_tokens
-                ),
-                effective_context_window_source=(
-                    request_budget_binding.context_window_source
-                ),
+                effective_context_window_tokens=(request_budget_binding.context_window_tokens),
+                effective_context_window_source=(request_budget_binding.context_window_source),
             )
     return effective
 
@@ -683,13 +973,93 @@ def _truncate_text(text: str, max_chars: int) -> str:
     return text[: max(0, max_chars - len(marker))] + marker
 
 
+def _usage_value(value: object, *names: str, default: Any = None) -> Any:
+    if isinstance(value, Mapping):
+        for name in names:
+            if name in value:
+                return value[name]
+        return default
+    for name in names:
+        if hasattr(value, name):
+            return getattr(value, name)
+    return default
+
+
+def _canonical_usage_billed_cost(value: object) -> tuple[float, bool, bool]:
+    source = str(
+        _usage_value(value, "cost_source", "costSource", default="none")
+        or "none"
+    ).strip().casefold()
+    try:
+        reported = max(
+            0.0,
+            float(
+                _usage_value(
+                    value,
+                    "billed_cost",
+                    "billedCost",
+                    default=0.0,
+                )
+                or 0.0
+            ),
+        )
+    except (TypeError, ValueError, OverflowError):
+        reported = 0.0
+    receipt = _usage_value(
+        value,
+        "billing_receipt",
+        "billingReceipt",
+        default=None,
+    )
+    if receipt is not None:
+        status = str(_usage_value(receipt, "status", default="") or "").strip().casefold()
+        usd_nanos = _usage_value(
+            receipt,
+            "usd_equivalent_nanos",
+            default=None,
+        )
+        if (
+            status == "confirmed"
+            and isinstance(usd_nanos, int)
+            and not isinstance(usd_nanos, bool)
+            and usd_nanos >= 0
+        ):
+            return usd_nanos / 1_000_000_000, True, True
+        return 0.0, False, True
+    trusted = (
+        source in {"provider_billed", "openrouter_usage"}
+        or (source in {"", "none", "unavailable"} and reported > 0.0)
+    )
+    return (reported if trusted else 0.0), trusted, False
+
+
+def _canonical_usage_cost_source(value: object) -> str:
+    _, exact, receipt_present = _canonical_usage_billed_cost(value)
+    if exact:
+        return "provider_billed"
+    source = str(
+        _usage_value(value, "cost_source", "costSource", default="none")
+        or "none"
+    ).strip().casefold()
+    if receipt_present:
+        return source if source.startswith("opensquilla_") else "unavailable"
+    return source
+
+
+def _canonicalize_usage_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    item = dict(row)
+    billed_cost, _, _ = _canonical_usage_billed_cost(item)
+    item["billed_cost"] = billed_cost
+    item["cost_source"] = _canonical_usage_cost_source(item)
+    return item
+
+
 def _rollup_cost_source(rows: Sequence[dict[str, Any]]) -> str:
-    sources = {str(row.get("cost_source") or "none") for row in rows}
+    sources = {_canonical_usage_cost_source(row) for row in rows}
     billed = sum(
         1
         for row in rows
-        if str(row.get("cost_source") or "none")
-        in {"provider_billed", "openrouter_usage"}
+        if _canonical_usage_cost_source(row) == "provider_billed"
     )
     if "mixed" in sources:
         return "mixed"
@@ -710,6 +1080,8 @@ def _summed_int(rows: Sequence[dict[str, Any]], key: str) -> int:
 
 
 def _summed_float(rows: Sequence[dict[str, Any]], key: str) -> float:
+    if key == "billed_cost":
+        return sum(_canonical_usage_billed_cost(row)[0] for row in rows)
     return sum(float(row.get(key) or 0.0) for row in rows)
 
 
@@ -732,21 +1104,472 @@ def _candidate_usage_rows(
     *,
     profile: str,
 ) -> list[dict[str, Any]]:
-    return [
-        candidate.usage_row(role="proposer", profile=profile)
-        for candidate in candidates
-        if _candidate_has_usage(candidate)
-    ]
+    rows: list[dict[str, Any]] = []
+    for candidate in candidates:
+        for inner_index, inner in enumerate(
+            candidate.model_usage_breakdown,
+            start=1,
+        ):
+            row = dict(inner)
+            row.setdefault("role", "proposer")
+            row.setdefault("profile", profile)
+            row.setdefault("label", f"{candidate.label}_partial_{inner_index}")
+            row.setdefault("provider", candidate.provider)
+            if not str(row.get("requested_provider") or "").strip():
+                row["requested_provider"] = candidate.requested_provider
+            row.setdefault("model", candidate.model)
+            if not str(row.get("requested_model") or "").strip():
+                row["requested_model"] = candidate.requested_model
+            rows.append(_canonicalize_usage_row(row))
+        if _candidate_has_usage(candidate) and not candidate.model_usage_breakdown:
+            rows.append(candidate.usage_row(role="proposer", profile=profile))
+    return rows
 
 
 def _candidate_missing_usage_count(candidates: Sequence[_CandidateResult]) -> int:
     """Count only requests that started but never produced a usage receipt."""
 
     return sum(
-        1
+        (candidate.usage_missing_count if candidate.usage_missing_count > 0 else 1)
         for candidate in candidates
         if candidate.request_started and not candidate.usage_reported
+    ) + sum(
+        candidate.usage_missing_count
+        for candidate in candidates
+        if candidate.request_started and candidate.usage_reported
     )
+
+
+_MISSING_REQUEST_PLACEHOLDER_ROLES = frozenset(
+    {
+        "abandoned_stream",
+        "usage_missing",
+        "unknown_call",
+        "abandoned_stream_request",
+        "agent_llm_request_unknown",
+        "abandoned_provider_request",
+    }
+)
+
+
+def _is_missing_request_placeholder(row: Mapping[str, Any]) -> bool:
+    return (
+        str(row.get("role") or "").strip().casefold()
+        in _MISSING_REQUEST_PLACEHOLDER_ROLES
+    )
+
+
+def _usage_rows_physical_request_count(
+    rows: Sequence[Mapping[str, Any]],
+    missing_count: int,
+) -> int:
+    """Count receipt/placeholder rows without double-counting missing units."""
+
+    represented_missing = sum(
+        1
+        for row in rows
+        if _is_missing_request_placeholder(row)
+    )
+    return len(rows) + max(0, int(missing_count or 0) - represented_missing)
+
+
+def _unrepresented_missing_request_count(
+    rows: Sequence[Mapping[str, Any]],
+    missing_count: int,
+) -> int:
+    """Return scalar missing units not already materialized as placeholders."""
+
+    represented_missing = sum(
+        1 for row in rows if _is_missing_request_placeholder(row)
+    )
+    return max(0, int(missing_count or 0) - represented_missing)
+
+
+def _usage_receipt_fingerprint(row: Mapping[str, Any]) -> tuple[Any, ...]:
+    return (
+        str(row.get("provider") or "").strip(),
+        str(row.get("model") or "").strip(),
+        int(row.get("input_tokens") or 0),
+        int(row.get("output_tokens") or 0),
+        int(row.get("reasoning_tokens") or 0),
+        int(row.get("cached_tokens") or 0),
+        int(row.get("cache_write_tokens") or 0),
+        float(row.get("billed_cost") or 0.0),
+        str(row.get("cost_source") or "none").strip().casefold(),
+    )
+
+
+def _usage_row_response_ids(row: Mapping[str, Any]) -> frozenset[str]:
+    values: list[Any] = []
+    direct = row.get("response_id")
+    if direct is not None:
+        values.append(direct)
+    provider_usage = row.get("provider_usage")
+    if isinstance(provider_usage, Mapping):
+        nested = provider_usage.get("response_ids")
+        if isinstance(nested, (list, tuple, set, frozenset)):
+            values.extend(nested)
+        elif nested is not None:
+            values.append(nested)
+        nested_single = provider_usage.get("response_id")
+        if nested_single is not None:
+            values.append(nested_single)
+    return frozenset(
+        str(value).strip()
+        for value in values
+        if str(value).strip()
+    )
+
+
+def _usage_row_match_priority(
+    left: Mapping[str, Any],
+    right: Mapping[str, Any],
+) -> int | None:
+    if _is_missing_request_placeholder(left) != _is_missing_request_placeholder(right):
+        return None
+    left_ids = _usage_row_response_ids(left)
+    right_ids = _usage_row_response_ids(right)
+    if left_ids and right_ids:
+        return 0 if left_ids & right_ids else None
+    if _usage_receipt_fingerprint(left) != _usage_receipt_fingerprint(right):
+        return None
+    return 1 if not left_ids and not right_ids else 2
+
+
+def _usage_rows_represent_same_receipt(
+    left: Mapping[str, Any],
+    right: Mapping[str, Any],
+) -> bool:
+    return _usage_row_match_priority(left, right) is not None
+
+
+def _merge_usage_row_provenance(
+    target: dict[str, Any],
+    source: Mapping[str, Any],
+) -> None:
+    target_ids = _usage_row_response_ids(target)
+    source_ids = _usage_row_response_ids(source)
+    stable_id_match = bool(target_ids and source_ids and target_ids & source_ids)
+    if stable_id_match:
+        for key in (
+            "provider",
+            "model",
+            "input_tokens",
+            "output_tokens",
+            "reasoning_tokens",
+            "cache_read_tokens",
+            "cached_tokens",
+            "cache_write_tokens",
+            "billed_cost",
+            "cost_source",
+            "billing_receipt",
+        ):
+            if key in source:
+                target[key] = source[key]
+    for key in (
+        "provider",
+        "model",
+        "requested_provider",
+        "requested_model",
+        "response_id",
+        "billing_receipt",
+    ):
+        if not target.get(key) and source.get(key):
+            target[key] = source[key]
+    source_usage = source.get("provider_usage")
+    if not isinstance(source_usage, Mapping) or not source_usage:
+        return
+    target_usage = (
+        dict(target.get("provider_usage"))
+        if isinstance(target.get("provider_usage"), Mapping)
+        else {}
+    )
+    for key, value in source_usage.items():
+        if key == "response_ids":
+            existing = target_usage.get(key)
+            existing_values = (
+                list(existing)
+                if isinstance(existing, (list, tuple, set, frozenset))
+                else [existing]
+                if existing is not None
+                else []
+            )
+            source_values = (
+                list(value)
+                if isinstance(value, (list, tuple, set, frozenset))
+                else [value]
+            )
+            target_usage[key] = sorted(
+                {
+                    str(item).strip()
+                    for item in [*existing_values, *source_values]
+                    if str(item).strip()
+                }
+            )
+        elif stable_id_match or not target_usage.get(key):
+            target_usage[key] = value
+    target["provider_usage"] = target_usage
+
+
+def _matching_usage_row_index(
+    rows: Sequence[Mapping[str, Any]],
+    expected: Mapping[str, Any],
+    consumed: set[int],
+) -> int | None:
+    candidates = [
+        (priority, index)
+        for index, row in enumerate(rows)
+        if index not in consumed
+        if (priority := _usage_row_match_priority(row, expected)) is not None
+    ]
+    return min(candidates)[1] if candidates else None
+
+
+def _diagnostic_done_receipt_rows(done: DoneEvent) -> list[dict[str, Any]]:
+    rows = [
+        _canonicalize_usage_row(row)
+        for row in done.model_usage_breakdown
+        if isinstance(row, Mapping)
+    ]
+    if rows:
+        return rows
+    return [
+        _canonicalize_usage_row(
+            {
+            "provider": str(done.provider or ""),
+            "model": str(done.model or ""),
+            "requested_provider": str(done.requested_provider or ""),
+            "requested_model": str(done.requested_model or ""),
+            "input_tokens": done.input_tokens,
+            "output_tokens": done.output_tokens,
+            "reasoning_tokens": done.reasoning_tokens,
+            "cached_tokens": done.cached_tokens,
+            "cache_write_tokens": done.cache_write_tokens,
+            "billed_cost": done.billed_cost,
+            "cost_source": done.cost_source,
+            "provider_usage": dict(done.provider_usage),
+            **(
+                {"billing_receipt": done.billing_receipt}
+                if done.billing_receipt is not None
+                else {}
+            ),
+            }
+        )
+    ]
+
+
+def _diagnostic_done_is_represented(
+    rows: Sequence[Mapping[str, Any]],
+    done: DoneEvent,
+) -> bool:
+    represented_count = _diagnostic_done_represented_receipt_count(rows, done)
+    return represented_count == len(_diagnostic_done_receipt_rows(done))
+
+
+def _diagnostic_done_represented_receipt_count(
+    rows: Sequence[Mapping[str, Any]],
+    done: DoneEvent,
+) -> int:
+    """Match receipt multiplicity rather than collapsing identical requests."""
+
+    return _represented_usage_row_count(rows, _diagnostic_done_receipt_rows(done))
+
+
+def _represented_usage_row_count(
+    rows: Sequence[Mapping[str, Any]],
+    expected_rows: Sequence[Mapping[str, Any]],
+) -> int:
+    consumed: set[int] = set()
+    matched = 0
+    expected_order = sorted(
+        range(len(expected_rows)),
+        key=lambda index: (
+            0 if _usage_row_response_ids(expected_rows[index]) else 1,
+            index,
+        ),
+    )
+    for expected_index in expected_order:
+        diagnostic_row = expected_rows[expected_index]
+        matched_index = _matching_usage_row_index(
+            rows,
+            diagnostic_row,
+            consumed,
+        )
+        if matched_index is None:
+            continue
+        consumed.add(matched_index)
+        matched += 1
+    return matched
+
+
+def _error_event_physical_request_count(
+    event: ErrorEvent,
+    *,
+    request_started: bool,
+) -> int:
+    """Best evidence for requests consumed inside one terminal error wrapper."""
+
+    nested_trace = event.ensemble_trace if isinstance(event.ensemble_trace, dict) else {}
+    traced = max(
+        int(nested_trace.get("physical_request_count") or 0),
+        int(nested_trace.get("llm_request_count") or 0),
+    )
+    event_rows = [
+        row for row in event.model_usage_breakdown if isinstance(row, Mapping)
+    ]
+    evidenced = _usage_rows_physical_request_count(
+        event_rows,
+        max(0, int(event.usage_missing_count or 0)),
+    )
+    if event.diagnostic_done is not None:
+        diagnostic_rows = _diagnostic_done_receipt_rows(
+            event.diagnostic_done
+        )
+        represented_diagnostic_rows = _represented_usage_row_count(
+            event_rows,
+            diagnostic_rows,
+        )
+        # Outer Error fields and diagnostic_done describe the same nested
+        # physical attempts.  Placeholder rows can be matched directly; scalar
+        # missing counts have no stable ID, so overlap only the conservative
+        # minimum of the two unrepresented remainders.
+        represented_missing_remainder = min(
+            _unrepresented_missing_request_count(
+                event_rows,
+                max(0, int(event.usage_missing_count or 0)),
+            ),
+            _unrepresented_missing_request_count(
+                diagnostic_rows,
+                max(
+                    0,
+                    int(event.diagnostic_done.usage_missing_count or 0),
+                ),
+            ),
+        )
+        evidenced += max(
+            0,
+            _done_event_physical_request_count(event.diagnostic_done)
+            - represented_diagnostic_rows
+            - represented_missing_remainder,
+        )
+    explicit = (
+        max(0, int(event.physical_request_count))
+        if event.physical_request_count is not None
+        else 0
+    )
+    default_started = bool(request_started and event.request_started is not False)
+    return max(traced, evidenced, explicit, 1 if default_started else 0)
+
+
+def _done_event_physical_request_count(event: DoneEvent) -> int:
+    """Best evidence for requests represented by one successful wrapper."""
+
+    nested_trace = event.ensemble_trace if isinstance(event.ensemble_trace, dict) else {}
+    traced = max(
+        int(nested_trace.get("physical_request_count") or 0),
+        int(nested_trace.get("llm_request_count") or 0),
+    )
+    event_rows = [
+        row for row in event.model_usage_breakdown if isinstance(row, Mapping)
+    ]
+    evidenced = _usage_rows_physical_request_count(
+        event_rows,
+        max(0, int(event.usage_missing_count or 0)),
+    )
+    return max(traced, evidenced, 1)
+
+
+def _error_event_missing_usage_count(
+    event: ErrorEvent,
+    *,
+    request_started: bool,
+) -> int:
+    """Count physical failures not backed by an actual usage receipt."""
+
+    physical_count = _error_event_physical_request_count(
+        event,
+        request_started=request_started,
+    )
+    receipt_rows = sum(
+        1
+        for row in event.model_usage_breakdown
+        if isinstance(row, Mapping)
+        and not _is_missing_request_placeholder(row)
+    )
+    if event.diagnostic_done is not None:
+        event_rows = [
+            row
+            for row in event.model_usage_breakdown
+            if isinstance(row, Mapping)
+            and not _is_missing_request_placeholder(row)
+        ]
+        diagnostic_receipt_rows = [
+            row
+            for row in _diagnostic_done_receipt_rows(event.diagnostic_done)
+            if not _is_missing_request_placeholder(row)
+        ]
+        receipt_rows += max(
+            0,
+            len(diagnostic_receipt_rows)
+            - _represented_usage_row_count(
+                event_rows,
+                diagnostic_receipt_rows,
+            ),
+        )
+    return max(
+        max(0, int(event.usage_missing_count or 0)),
+        physical_count - receipt_rows,
+    )
+
+
+def _done_event_actual_provider(event: DoneEvent) -> str:
+    """Resolve only provider identity carried by the physical Done receipt."""
+
+    direct = str(event.provider or "").strip()
+    if direct:
+        return direct
+    providers = {
+        str(row.get("provider") or "").strip()
+        for row in event.model_usage_breakdown
+        if isinstance(row, Mapping)
+        and not _is_missing_request_placeholder(row)
+        and str(row.get("provider") or "").strip()
+    }
+    return next(iter(providers)) if len(providers) == 1 else ""
+
+
+def _reconcile_nested_error_request_count(
+    trace: dict[str, Any],
+    event: ErrorEvent,
+    *,
+    outer_request_started: bool,
+) -> None:
+    """Replace one outer-wrapper request with its known nested physical count."""
+
+    nested_count = _error_event_physical_request_count(
+        event,
+        request_started=outer_request_started,
+    )
+    already_counted = 1 if outer_request_started else 0
+    delta = nested_count - already_counted
+    if delta:
+        trace["llm_request_count"] = max(
+            0,
+            int(trace.get("llm_request_count") or 0) + delta,
+        )
+    trace["physical_request_count"] = int(trace.get("llm_request_count") or 0)
+
+
+def _reconcile_nested_done_request_count(
+    trace: dict[str, Any],
+    event: DoneEvent,
+) -> None:
+    """Replace one successful outer-wrapper request with its physical children."""
+
+    extra = max(0, _done_event_physical_request_count(event) - 1)
+    if extra:
+        trace["llm_request_count"] = int(trace.get("llm_request_count") or 0) + extra
+    trace["physical_request_count"] = int(trace.get("llm_request_count") or 0)
 
 
 def _uniform_message_limit_proof(
@@ -763,9 +1586,7 @@ def _uniform_message_limit_proof(
         if candidate.message_limit_proof is None:
             return None
         proofs.append(candidate.message_limit_proof)
-    provider_identities = {
-        (proof.provider_kind, proof.base_host) for proof in proofs
-    }
+    provider_identities = {(proof.provider_kind, proof.base_host) for proof in proofs}
     if len(provider_identities) != 1:
         return None
     # Limits can differ across mirrored endpoints/models.  The strictest exact
@@ -786,8 +1607,9 @@ def _done_usage_row(
         "role": role,
         "profile": profile,
         "label": label,
-        "provider": provider,
-        "model": event.model or model,
+        "provider": _done_event_actual_provider(event),
+        "requested_provider": provider,
+        "model": event.model,
         "requested_model": model,
         "sample_index": 0,
         "input_tokens": event.input_tokens,
@@ -801,7 +1623,77 @@ def _done_usage_row(
     }
     if event.billing_receipt is not None:
         row["billing_receipt"] = event.billing_receipt
-    return row
+    return _canonicalize_usage_row(row)
+
+
+def _unrepresented_diagnostic_usage_rows(
+    existing_rows: Sequence[Mapping[str, Any]],
+    event: DoneEvent,
+    *,
+    role: str,
+    profile: str,
+    label: str,
+    provider: str,
+    model: str,
+) -> list[dict[str, Any]]:
+    """Return only diagnostic receipts not already carried by the ErrorEvent.
+
+    Some adapters attach the same physical receipt both to
+    ``ErrorEvent.model_usage_breakdown`` and ``ErrorEvent.diagnostic_done``.
+    Others split disjoint receipts between the two.  Merge by receipt
+    fingerprint so the former is counted once and the latter is retained.
+    """
+
+    consumed: set[int] = set()
+    if event.model_usage_breakdown:
+        diagnostic_rows = _diagnostic_done_receipt_rows(event)
+    else:
+        diagnostic_rows = [
+            _done_usage_row(
+                event,
+                role=role,
+                profile=profile,
+                label=label,
+                provider=provider,
+                model=model,
+            )
+        ]
+    missing: list[dict[str, Any]] = []
+    matched_existing_by_diagnostic: dict[int, int] = {}
+    diagnostic_order = sorted(
+        range(len(diagnostic_rows)),
+        key=lambda index: (
+            0 if _usage_row_response_ids(diagnostic_rows[index]) else 1,
+            index,
+        ),
+    )
+    for diagnostic_index in diagnostic_order:
+        raw_row = diagnostic_rows[diagnostic_index]
+        matched_index = _matching_usage_row_index(
+            existing_rows,
+            raw_row,
+            consumed,
+        )
+        if matched_index is not None:
+            consumed.add(matched_index)
+            matched_existing_by_diagnostic[diagnostic_index] = matched_index
+    for diagnostic_index, raw_row in enumerate(diagnostic_rows):
+        matched_index = matched_existing_by_diagnostic.get(diagnostic_index)
+        if matched_index is not None:
+            existing_row = existing_rows[matched_index]
+            if isinstance(existing_row, dict):
+                _merge_usage_row_provenance(existing_row, raw_row)
+            continue
+        row = dict(raw_row)
+        row.setdefault("role", role)
+        row.setdefault("profile", profile)
+        row.setdefault("label", label)
+        if not str(row.get("requested_provider") or "").strip():
+            row["requested_provider"] = provider
+        if not str(row.get("requested_model") or "").strip():
+            row["requested_model"] = model
+        missing.append(row)
+    return missing
 
 
 class EnsembleProvider:
@@ -812,6 +1704,7 @@ class EnsembleProvider:
     # Selector fallback may still hop to a single provider, whose default is
     # retry-safe, before the Agent considers a same-provider retry.
     retry_failed_call_safe = False
+    supports_graceful_ensemble_finalization = True
 
     def __init__(
         self,
@@ -834,9 +1727,7 @@ class EnsembleProvider:
         aggregator_tools: bool = True,
         quorum_grace_seconds: float = 0.0,
         selection_plan: Mapping[str, Any] | None = None,
-        _member_request_budget_bindings: Mapping[
-            tuple[str, str, str], _MemberRequestBudgetBinding
-        ]
+        _member_request_budget_bindings: Mapping[tuple[str, str, str], _MemberRequestBudgetBinding]
         | None = None,
         _credential_pool_failure_reporter: CredentialPoolFailureReporter | None = None,
     ) -> None:
@@ -858,10 +1749,150 @@ class EnsembleProvider:
         self.aggregator_tools = bool(aggregator_tools)
         self.quorum_grace_seconds = max(0.0, float(quorum_grace_seconds or 0.0))
         self.selection_plan = dict(selection_plan or {})
-        self._member_request_budget_bindings = dict(
-            _member_request_budget_bindings or {}
-        )
+        self._member_request_budget_bindings = dict(_member_request_budget_bindings or {})
         self._credential_pool_failure_reporter = _credential_pool_failure_reporter
+        self._active_chat = False
+        self._pending_cleanup_tasks: set[asyncio.Future[Any]] = set()
+        self._pending_cleanup_phases: dict[asyncio.Future[Any], str] = {}
+        self._cleanup_poisoned_reason = ""
+
+    def _observe_cleanup_result(
+        self,
+        future: asyncio.Future[Any],
+        phase: str,
+    ) -> None:
+        """Apply close-result semantics exactly once a tracked task is done."""
+
+        close_failed = False
+        if "close" in phase:
+            try:
+                if future.result() is False:
+                    close_failed = True
+            except BaseException:
+                close_failed = True
+        if close_failed:
+            failed_scope = self._cleanup_phase_scope(phase)
+            related_pending = any(
+                other is not future
+                and self._cleanup_phase_scope(pending_phase) == failed_scope
+                and not other.done()
+                for other, pending_phase in self._pending_cleanup_phases.items()
+            )
+            if related_pending:
+                # A relay-level close can time out while its already-registered
+                # lower physical close is still observable.  Keep the gate
+                # closed, but do not permanently poison the provider unless
+                # the last proof task also fails.
+                log.warning(
+                    "ensemble.cleanup_failure_deferred",
+                    phase=phase,
+                    pending_count=len(self._pending_cleanup_tasks),
+                )
+            else:
+                self._cleanup_poisoned_reason = phase
+        _consume_task_result(future)
+
+    def _track_pending_cleanup(
+        self,
+        future: asyncio.Future[Any],
+        phase: str,
+    ) -> None:
+        """Block later composite calls until detached owned work really exits."""
+
+        if future.done():
+            self._observe_cleanup_result(future, phase)
+            return
+        self._pending_cleanup_tasks.add(future)
+        self._pending_cleanup_phases[future] = phase
+        log.warning(
+            "ensemble.cleanup_pending",
+            phase=phase,
+            pending_count=len(self._pending_cleanup_tasks),
+        )
+
+        def _finish_cleanup_observation(done: asyncio.Future[Any]) -> None:
+            self._pending_cleanup_tasks.discard(done)
+            observed_phase = self._pending_cleanup_phases.pop(done, phase)
+            self._observe_cleanup_result(done, observed_phase)
+
+        def _cleanup_finished(done: asyncio.Future[Any]) -> None:
+            # Run one event-loop turn after the future's other callbacks. Raw
+            # ``__anext__`` cleanup installs its deferred ``aclose`` callback
+            # after registration; deferring removal keeps the gate continuously
+            # closed while that callback transfers ownership to the close task.
+            try:
+                asyncio.get_running_loop().call_soon(
+                    _finish_cleanup_observation,
+                    done,
+                )
+            except RuntimeError:
+                _finish_cleanup_observation(done)
+
+        future.add_done_callback(_cleanup_finished)
+
+    def _cleanup_is_pending(self) -> bool:
+        # Leave completed futures in the set until their registered callback
+        # observes the result and applies close-failure poisoning.  Removing a
+        # done future here can race the callback that schedules a deferred
+        # ``aclose`` and briefly open the next-call gate.
+        return bool(self._cleanup_poisoned_reason or self._pending_cleanup_tasks)
+
+    @staticmethod
+    def _cleanup_phase_scope(phase: str) -> str:
+        """Return the physical leg whose close proof a phase describes."""
+
+        value = str(phase or "")
+        if value.startswith("ensemble_proposer_"):
+            parts = value.split("_", 3)
+            # The outer relay uses ``ensemble_proposer_<index>_*`` while the
+            # owned collection task uses ``proposer_<index>_*``.  They are one
+            # physical leg and must share a cleanup scope; otherwise an
+            # observable, still-running close is mistaken for an unobservable
+            # failure and permanently poisons the provider after it later
+            # closes successfully.
+            return f"proposer_{parts[2]}" if len(parts) >= 3 else value
+        if value.startswith("proposer_"):
+            parts = value.split("_", 2)
+            return "_".join(parts[:2]) if len(parts) >= 2 else value
+        if value.startswith("ensemble_aggregator"):
+            return "ensemble_aggregator"
+        if value.startswith("ensemble_fallback"):
+            return "ensemble_fallback"
+        if value.startswith("ensemble_owned_chat"):
+            return "ensemble_owned_chat"
+        return value
+
+    def _mark_cleanup_unproven(self, phase: str) -> None:
+        """Permanently poison this instance for an unobservable close failure.
+
+        Pending cleanup belonging to a different proposer/phase cannot prove
+        that this failed stream was closed.  Record the poison immediately;
+        tracked tasks still remain useful for diagnostics and cleanup, but
+        their eventual completion must not clear an unrelated close failure.
+        """
+
+        failed_scope = self._cleanup_phase_scope(phase)
+        related_pending = any(
+            self._cleanup_phase_scope(pending_phase) == failed_scope
+            and (not future.done() or "close" in pending_phase)
+            for future, pending_phase in self._pending_cleanup_phases.items()
+        )
+        if related_pending:
+            # This exact stream still has observable owned cleanup.  Keep the
+            # instance gated until its callback proves success or poisons on a
+            # failed close.  Unrelated proposer cleanup never masks this phase.
+            log.warning(
+                "ensemble.cleanup_unproven_pending",
+                phase=phase,
+                pending_count=len(self._pending_cleanup_tasks),
+            )
+            return
+        self._cleanup_poisoned_reason = phase
+        log.warning(
+            "ensemble.cleanup_unproven",
+            phase=phase,
+            pending_count=len(self._pending_cleanup_tasks),
+        )
 
     def _report_member_credential_failure(
         self,
@@ -871,10 +1902,7 @@ class EnsembleProvider:
         code: str,
     ) -> None:
         """Classify and report one pool-backed member failure; never raises."""
-        if (
-            not member.credential_pool_provider
-            or self._credential_pool_failure_reporter is None
-        ):
+        if not member.credential_pool_provider or self._credential_pool_failure_reporter is None:
             return
         try:
             kind = classify_provider_error(
@@ -931,6 +1959,8 @@ class EnsembleProvider:
                     return ErrorEvent(
                         message=ENSEMBLE_MULTIMODAL_UNSUPPORTED_MESSAGE,
                         code=ENSEMBLE_MULTIMODAL_UNSUPPORTED_CODE,
+                        request_started=False,
+                        physical_request_count=0,
                     )
                 if not isinstance(block, ContentBlockToolResult):
                     continue
@@ -940,6 +1970,8 @@ class EnsembleProvider:
                     return ErrorEvent(
                         message=ENSEMBLE_MULTIMODAL_UNSUPPORTED_MESSAGE,
                         code=ENSEMBLE_MULTIMODAL_UNSUPPORTED_CODE,
+                        request_started=False,
+                        physical_request_count=0,
                     )
         return None
 
@@ -994,6 +2026,35 @@ class EnsembleProvider:
                 raise RuntimeError("ensemble member message-count projection unavailable")
             projections.append(projection)
 
+        if config is not None and config.ensemble_execution_mode == "aggregator_only":
+            downstream_config = config.model_copy(
+                update={
+                    "ensemble_execution_mode": "full",
+                    "ensemble_soft_deadline_seconds": 0.0,
+                    "ensemble_soft_deadline_disable_tools": False,
+                    "ensemble_soft_deadline_disable_thinking": False,
+                }
+            )
+            if self.aggregator.ready:
+                aggregator_config, _ = self._aggregator_only_chat_config(config)
+                _require_projection(
+                    _build_provider(self.aggregator.provider_config),
+                    aggregator_config,
+                    synthetic_messages=additional_messages,
+                )
+            elif self.all_failed_policy == "fallback_single" and self.fallback_provider is not None:
+                _require_projection(
+                    self.fallback_provider,
+                    downstream_config.model_copy(update={"candidate_output_mode": "normal"}),
+                    synthetic_messages=additional_messages,
+                )
+            if not projections:
+                raise RuntimeError("ensemble message-count projection unavailable")
+            return max(
+                projections,
+                key=lambda projection: projection.actual_wire_messages,
+            )
+
         for member in self.proposers:
             if not member.ready:
                 continue
@@ -1026,8 +2087,7 @@ class EnsembleProvider:
         if self.all_failed_policy == "fallback_single" and self.fallback_provider is not None:
             fallback_config = (
                 config.model_copy(update={"candidate_output_mode": "normal"})
-                if config is not None
-                and config.candidate_output_mode != "normal"
+                if config is not None and config.candidate_output_mode != "normal"
                 else config
             )
             _require_projection(
@@ -1054,21 +2114,125 @@ class EnsembleProvider:
         tools: list[ToolDefinition] | None = None,
         config: ChatConfig | None = None,
     ) -> AsyncIterator[StreamEvent]:
+        if self._active_chat:
+            yield ErrorEvent(
+                message="another ensemble call is still active",
+                code="ensemble_call_in_progress",
+                request_started=False,
+                physical_request_count=0,
+            )
+            return
+        if self._cleanup_is_pending():
+            yield ErrorEvent(
+                message=(
+                    "a previous ensemble provider stream is still closing; "
+                    "no new physical request was started"
+                ),
+                code="ensemble_cleanup_in_progress",
+                request_started=False,
+                physical_request_count=0,
+            )
+            return
+        self._active_chat = True
+        try:
+            async with _closing_async_iterator(
+                self._chat_owned(messages, tools=tools, config=config),
+                phase="ensemble_owned_chat",
+                pending_cleanup_tracker=self._track_pending_cleanup,
+            ) as owned_stream:
+                async for event in owned_stream:
+                    yield event
+        except _EnsembleStreamCloseError as exc:
+            self._mark_cleanup_unproven(exc.phase)
+            raise
+        finally:
+            self._active_chat = False
+
+    async def _chat_owned(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition] | None = None,
+        config: ChatConfig | None = None,
+    ) -> AsyncIterator[StreamEvent]:
+        chat_started = time.monotonic()
         validation_error = self.validate_chat_request(messages)
         if validation_error is not None:
             yield validation_error
             return
 
+        if config is not None and config.ensemble_execution_mode == "aggregator_only":
+            async with _closing_async_iterator(
+                self._chat_aggregator_only(
+                    messages,
+                    tools=tools,
+                    config=config,
+                ),
+                phase="ensemble_aggregator_only_relay",
+            ) as child_stream:
+                async for event in child_stream:
+                    yield event
+            return
+
+        soft_deadline_seconds = max(
+            0.0,
+            float(
+                getattr(config, "ensemble_soft_deadline_seconds", 0.0)
+                if config is not None
+                else 0.0
+            ),
+        )
+        soft_deadline = chat_started + soft_deadline_seconds if soft_deadline_seconds > 0 else None
+        soft_deadline_triggered = asyncio.Event()
+
+        def _soft_deadline_reached() -> bool:
+            return soft_deadline is not None and (
+                soft_deadline_triggered.is_set() or time.monotonic() >= soft_deadline
+            )
+
+        def _soft_finalization_trace(
+            *,
+            quorum_met: bool | None = None,
+        ) -> dict[str, Any]:
+            trace_overrides: dict[str, Any] = {
+                "execution_mode": "deadline_preserving_fusion",
+                "soft_deadline_triggered": True,
+                "soft_deadline_seconds": soft_deadline_seconds,
+                "soft_deadline_disable_tools": bool(
+                    getattr(
+                        config,
+                        "ensemble_soft_deadline_disable_tools",
+                        False,
+                    )
+                ),
+                "soft_deadline_disable_thinking": bool(
+                    getattr(
+                        config,
+                        "ensemble_soft_deadline_disable_thinking",
+                        False,
+                    )
+                ),
+            }
+            if quorum_met is not None:
+                trace_overrides["soft_deadline_quorum_met"] = quorum_met
+            return trace_overrides
+
         if not self.proposers:
-            async for event in self._fallback_or_error(
-                messages,
-                tools=tools,
-                config=config,
-                reason="llm ensemble profile has no proposers",
-                code="ensemble_no_proposers",
-                candidates=[],
-            ):
-                yield event
+            async with _closing_async_iterator(
+                self._fallback_or_error(
+                    messages,
+                    tools=tools,
+                    config=config,
+                    reason="llm ensemble profile has no proposers",
+                    code="ensemble_no_proposers",
+                    candidates=[],
+                    soft_deadline=soft_deadline,
+                    soft_deadline_seconds=soft_deadline_seconds,
+                    soft_deadline_triggered=soft_deadline_triggered,
+                ),
+                phase="ensemble_no_proposers_relay",
+            ) as child_stream:
+                async for event in child_stream:
+                    yield event
             return
 
         if not self.aggregator.ready:
@@ -1077,15 +2241,22 @@ class EnsembleProvider:
             # zero output. Route to the single-provider fallback (or a terminal
             # error) before any proposer request starts.
             reason = self.aggregator.unavailable_reason or "deployment_unavailable"
-            async for event in self._fallback_or_error(
-                messages,
-                tools=tools,
-                config=config,
-                reason=f"ensemble aggregator deployment is not ready: {reason}",
-                code="ensemble_aggregator_error",
-                candidates=[],
-            ):
-                yield event
+            async with _closing_async_iterator(
+                self._fallback_or_error(
+                    messages,
+                    tools=tools,
+                    config=config,
+                    reason=f"ensemble aggregator deployment is not ready: {reason}",
+                    code="ensemble_aggregator_error",
+                    candidates=[],
+                    soft_deadline=soft_deadline,
+                    soft_deadline_seconds=soft_deadline_seconds,
+                    soft_deadline_triggered=soft_deadline_triggered,
+                ),
+                phase="ensemble_unready_aggregator_relay",
+            ) as child_stream:
+                async for event in child_stream:
+                    yield event
             return
 
         yield ProviderHeartbeatEvent(
@@ -1102,7 +2273,12 @@ class EnsembleProvider:
         async def _drain_proposers() -> list[_CandidateResult]:
             try:
                 return await self._run_proposers(
-                    messages, tools=tools, config=config, progress=progress_queue.put_nowait
+                    messages,
+                    tools=tools,
+                    config=config,
+                    progress=progress_queue.put_nowait,
+                    soft_deadline=soft_deadline,
+                    soft_deadline_triggered=soft_deadline_triggered,
                 )
             finally:
                 progress_queue.put_nowait(None)  # sentinel: proposers finished
@@ -1118,10 +2294,7 @@ class EnsembleProvider:
                 except TimeoutError:
                     yield ProviderHeartbeatEvent(
                         phase="ensemble_proposers_wait",
-                        message=(
-                            "Still waiting for "
-                            f"{len(self.proposers)} proposer model(s)"
-                        ),
+                        message=(f"Still waiting for {len(self.proposers)} proposer model(s)"),
                     )
                     continue
                 if progress_event is None:
@@ -1133,33 +2306,87 @@ class EnsembleProvider:
                 proposer_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await proposer_task
+        proposer_close_failures = [
+            candidate
+            for candidate in candidates
+            if candidate.error_code == _ENSEMBLE_PROPOSER_CLOSE_TIMEOUT_CODE
+        ]
+        if proposer_close_failures:
+            # A cancelled/timed-out proposer can still own a live billable
+            # request when its adapter suppresses cancellation. Starting an
+            # aggregator or fallback here would overlap physical requests, so
+            # the entire composite call fails closed even if quorum was met.
+            close_reason = (
+                "ensemble proposer cleanup did not finish; aggregation and "
+                "fallback were not started"
+            )
+            close_rows = _candidate_usage_rows(
+                candidates,
+                profile=self.profile_name,
+            )
+            close_missing_count = _candidate_missing_usage_count(candidates)
+            close_trace = self._trace_payload(
+                candidates,
+                successful_count=sum(1 for candidate in candidates if candidate.ok),
+                fallback_used=False,
+                fallback_reason=close_reason,
+                final_request_role="none",
+                selected_candidates=[candidate for candidate in candidates if candidate.ok],
+            )
+            close_trace["usage_missing_count"] = close_missing_count
+            yield _attach_error_request_evidence(
+                ErrorEvent(
+                    message=close_reason,
+                    code=_ENSEMBLE_PROPOSER_CLOSE_TIMEOUT_CODE,
+                    model_usage_breakdown=close_rows,
+                    usage_missing_count=close_missing_count,
+                    ensemble_trace=close_trace,
+                ),
+                close_trace,
+            )
+            return
+        # Reaching the boundary is sufficient even when every proposer already
+        # completed. The outer consumer may spend time rendering progress
+        # events before aggregation resumes; in that case no pending task was
+        # available to set the cancellation Event, but starting a tool/thinking
+        # loop after the promised cutoff would still violate finalization.
+        soft_finalize = _soft_deadline_reached()
+        soft_trace_overrides: dict[str, Any] = {}
+        if soft_finalize:
+            soft_deadline_triggered.set()
+            soft_trace_overrides = _soft_finalization_trace()
         successful = [candidate for candidate in candidates if candidate.ok]
         if len(successful) < self.min_successful_proposers:
-            async for event in self._fallback_or_error(
-                messages,
-                tools=tools,
-                config=config,
-                reason=(
-                    "llm ensemble had "
-                    f"{len(successful)} successful proposer(s), "
-                    f"requires {self.min_successful_proposers}"
+            if not soft_finalize and _soft_deadline_reached():
+                soft_finalize = True
+                soft_deadline_triggered.set()
+                soft_trace_overrides = _soft_finalization_trace()
+            insufficient_soft_trace = dict(soft_trace_overrides)
+            if insufficient_soft_trace:
+                insufficient_soft_trace["soft_deadline_quorum_met"] = False
+            async with _closing_async_iterator(
+                self._fallback_or_error(
+                    messages,
+                    tools=tools,
+                    config=config,
+                    reason=(
+                        "llm ensemble had "
+                        f"{len(successful)} successful proposer(s), "
+                        f"requires {self.min_successful_proposers}"
+                    ),
+                    code="ensemble_insufficient_proposers",
+                    candidates=candidates,
+                    trace_overrides=insufficient_soft_trace,
+                    soft_deadline=soft_deadline,
+                    soft_deadline_seconds=soft_deadline_seconds,
+                    soft_deadline_triggered=soft_deadline_triggered,
                 ),
-                code="ensemble_insufficient_proposers",
-                candidates=candidates,
-            ):
-                yield event
+                phase="ensemble_insufficient_proposers_relay",
+            ) as child_stream:
+                async for event in child_stream:
+                    yield event
             return
 
-        aggregator_cfg = _member_chat_config(
-            config,
-            self.aggregator,
-            request_budget_binding=self._member_request_budget_binding(self.aggregator),
-            role="aggregator",
-        ).model_copy(update={"candidate_output_mode": "normal"})
-        if self.aggregator_timeout_seconds > 0:
-            aggregator_cfg = aggregator_cfg.model_copy(
-                update={"timeout": self.aggregator_timeout_seconds}
-            )
         proposer_rows = _candidate_usage_rows(candidates, profile=self.profile_name)
         candidate_order_seed = (
             random.SystemRandom().getrandbits(64) if self.shuffle_candidates else None
@@ -1168,56 +2395,483 @@ class EnsembleProvider:
             successful,
             candidate_order_seed=candidate_order_seed,
         )
-        aggregator_messages = self._build_aggregator_messages(
-            messages,
-            successful,
-            candidate_order_seed=candidate_order_seed,
-        )
-        aggregator_request_tools = tools if self.aggregator_tools else None
-        trace = self._trace_payload(
-            candidates,
-            successful_count=len(successful),
-            fallback_used=False,
-            fallback_reason="",
-            final_request_role="aggregator",
-            selected_candidates=successful,
-            final_request_member=self.aggregator,
-            final_request_config=aggregator_cfg,
-            final_request_tools=aggregator_request_tools,
-            final_request_messages=aggregator_messages,
-            final_request_timeout_seconds=self.aggregator_timeout_seconds,
-            candidate_order_seed=candidate_order_seed,
-            candidate_display_order=[candidate.index for candidate in ordered_candidates],
-        )
+
+        def _build_aggregator_request(
+            *,
+            finalize_directly: bool,
+        ) -> tuple[ChatConfig, list[Message], list[ToolDefinition] | None, dict[str, Any]]:
+            request_config = _member_chat_config(
+                config,
+                self.aggregator,
+                request_budget_binding=self._member_request_budget_binding(self.aggregator),
+                role="aggregator",
+            ).model_copy(update={"candidate_output_mode": "normal"})
+            if finalize_directly and bool(
+                getattr(
+                    config,
+                    "ensemble_soft_deadline_disable_thinking",
+                    False,
+                )
+            ):
+                request_config = request_config.model_copy(
+                    update={
+                        "thinking": False,
+                        "thinking_level": None,
+                        "thinking_budget_tokens": 0,
+                        "thinking_budget_explicit": False,
+                    }
+                )
+            if finalize_directly and bool(
+                getattr(
+                    config,
+                    "ensemble_soft_deadline_disable_tools",
+                    False,
+                )
+            ):
+                request_config = request_config.model_copy(update={"tool_choice": None})
+            if self.aggregator_timeout_seconds > 0:
+                request_config = request_config.model_copy(
+                    update={"timeout": self.aggregator_timeout_seconds}
+                )
+            request_messages = self._build_aggregator_messages(
+                messages,
+                successful,
+                candidate_order_seed=candidate_order_seed,
+                finalize_directly=finalize_directly,
+            )
+            request_tools = (
+                None
+                if finalize_directly
+                and bool(
+                    getattr(
+                        config,
+                        "ensemble_soft_deadline_disable_tools",
+                        False,
+                    )
+                )
+                else tools
+                if self.aggregator_tools
+                else None
+            )
+            request_trace = self._trace_payload(
+                candidates,
+                successful_count=len(successful),
+                fallback_used=False,
+                fallback_reason="",
+                final_request_role="aggregator",
+                selected_candidates=successful,
+                final_request_member=self.aggregator,
+                final_request_config=request_config,
+                final_request_tools=request_tools,
+                final_request_messages=request_messages,
+                final_request_timeout_seconds=self.aggregator_timeout_seconds,
+                candidate_order_seed=candidate_order_seed,
+                candidate_display_order=[candidate.index for candidate in ordered_candidates],
+            )
+            if finalize_directly:
+                request_trace.update(_soft_finalization_trace(quorum_met=True))
+                request_trace["physical_request_count"] = int(
+                    request_trace.get("llm_request_count") or 0
+                )
+                request_trace["usage_missing_count"] = _candidate_missing_usage_count(candidates)
+            return request_config, request_messages, request_tools, request_trace
+
+        def _refresh_soft_finalization_request() -> bool:
+            nonlocal soft_finalize, soft_trace_overrides
+            if soft_finalize or not _soft_deadline_reached():
+                return False
+            soft_finalize = True
+            soft_deadline_triggered.set()
+            soft_trace_overrides = _soft_finalization_trace(quorum_met=True)
+            return True
+
+        (
+            aggregator_cfg,
+            aggregator_messages,
+            aggregator_request_tools,
+            trace,
+        ) = _build_aggregator_request(finalize_directly=soft_finalize)
+        if _refresh_soft_finalization_request():
+            (
+                aggregator_cfg,
+                aggregator_messages,
+                aggregator_request_tools,
+                trace,
+            ) = _build_aggregator_request(finalize_directly=True)
         try:
             provider = _build_provider(self.aggregator.provider_config)
         except Exception as exc:  # noqa: BLE001 - provider boundary returns ErrorEvent
+            if _refresh_soft_finalization_request():
+                (
+                    aggregator_cfg,
+                    aggregator_messages,
+                    aggregator_request_tools,
+                    trace,
+                ) = _build_aggregator_request(finalize_directly=True)
             # The completed drafts are reusable, so aggregator construction
             # failure follows the same fallback path as an unreachable quorum
             # instead of discarding the whole (already billed) proposer round.
-            async for event in self._fallback_or_error(
-                messages,
-                tools=tools,
-                config=config,
-                reason=(
-                    "ensemble aggregator could not be initialized: "
-                    f"{type(exc).__name__}"
+            async with _closing_async_iterator(
+                self._fallback_or_error(
+                    messages,
+                    tools=tools,
+                    config=config,
+                    reason=(f"ensemble aggregator could not be initialized: {type(exc).__name__}"),
+                    code="ensemble_aggregator_error",
+                    candidates=candidates,
+                    trace_overrides=soft_trace_overrides,
+                    soft_deadline=soft_deadline,
+                    soft_deadline_seconds=soft_deadline_seconds,
+                    soft_deadline_triggered=soft_deadline_triggered,
                 ),
-                code="ensemble_aggregator_error",
-                candidates=candidates,
-            ):
+                phase="ensemble_aggregator_build_fallback_relay",
+            ) as child_stream:
+                async for event in child_stream:
+                    yield event
+            return
+        # Provider construction can perform synchronous credential/deployment
+        # resolution. Re-check at the last point before opening a billable
+        # stream so crossing the cutoff during setup cannot start a normal
+        # tool/thinking aggregator.
+        if _refresh_soft_finalization_request():
+            (
+                aggregator_cfg,
+                aggregator_messages,
+                aggregator_request_tools,
+                trace,
+            ) = _build_aggregator_request(finalize_directly=True)
+        if soft_deadline is None or soft_finalize:
+            async with _closing_async_iterator(
+                self._stream_final_aggregator(
+                    provider=provider,
+                    messages=aggregator_messages,
+                    tools=aggregator_request_tools,
+                    config=aggregator_cfg,
+                    prior_rows=proposer_rows,
+                    prior_missing_count=_candidate_missing_usage_count(candidates),
+                    trace=trace,
+                ),
+                phase="ensemble_final_aggregator_relay",
+            ) as child_stream:
+                async for event in child_stream:
+                    yield event
+            return
+
+        # A normal fusion attempt may begin before the soft cutoff but still
+        # run across it. Buffer user-visible output until that attempt either
+        # finishes or reaches the cutoff. On cutoff, close it first and replace
+        # it with a direct no-tool/no-thinking finalizer; this preserves normal
+        # aggregation quality when it finishes in time without allowing two
+        # billable aggregator streams to overlap.
+        remaining_soft_seconds = max(0.001, soft_deadline - time.monotonic())
+        configured_aggregator_timeout = float(self.aggregator_timeout_seconds)
+        soft_budget_is_limiter = (
+            configured_aggregator_timeout <= 0
+            or remaining_soft_seconds <= configured_aggregator_timeout
+        )
+        first_attempt_timeout = (
+            remaining_soft_seconds
+            if configured_aggregator_timeout <= 0
+            else min(remaining_soft_seconds, configured_aggregator_timeout)
+        )
+        final_request = trace.get("final_request")
+        if isinstance(final_request, dict):
+            execution = final_request.get("execution")
+            if isinstance(execution, dict):
+                execution["timeout_seconds"] = first_attempt_timeout
+        buffered_events: list[StreamEvent] = []
+        terminal_event: ErrorEvent | None = None
+        completed_event: DoneEvent | None = None
+        async with _closing_async_iterator(
+            self._stream_final_aggregator(
+                provider=provider,
+                messages=aggregator_messages,
+                tools=aggregator_request_tools,
+                config=aggregator_cfg,
+                prior_rows=proposer_rows,
+                prior_missing_count=_candidate_missing_usage_count(candidates),
+                trace=trace,
+                timeout_seconds=first_attempt_timeout,
+                absolute_deadline=soft_deadline,
+            ),
+            phase="ensemble_soft_deadline_aggregator_relay",
+        ) as child_stream:
+            async for event in child_stream:
+                if isinstance(event, ProviderHeartbeatEvent):
+                    yield event
+                    continue
+                buffered_events.append(event)
+                if isinstance(event, DoneEvent):
+                    completed_event = event
+                elif isinstance(event, ErrorEvent):
+                    terminal_event = event
+
+        completed_with_tool_after_cutoff = bool(
+            completed_event is not None
+            and soft_deadline is not None
+            and time.monotonic() >= soft_deadline
+            and bool(
+                getattr(
+                    config,
+                    "ensemble_soft_deadline_disable_tools",
+                    False,
+                )
+            )
+            and any(
+                isinstance(
+                    event,
+                    (ToolUseStartEvent, ToolUseDeltaEvent, ToolUseEndEvent),
+                )
+                for event in buffered_events
+            )
+        )
+        if completed_event is not None and not completed_with_tool_after_cutoff:
+            for event in buffered_events:
                 yield event
             return
-        async for event in self._stream_final_aggregator(
-            provider=provider,
-            messages=aggregator_messages,
-            tools=aggregator_request_tools,
-            config=aggregator_cfg,
-            prior_rows=proposer_rows,
-            prior_missing_count=_candidate_missing_usage_count(candidates),
-            trace=trace,
+        if not completed_with_tool_after_cutoff and (
+            terminal_event is None
+            or terminal_event.code != "ensemble_aggregator_timeout"
+            or not soft_budget_is_limiter
         ):
-            yield event
+            for event in buffered_events:
+                yield event
+            return
+
+        soft_deadline_triggered.set()
+        soft_trace_overrides = _soft_finalization_trace(quorum_met=True)
+        trace.update(soft_trace_overrides)
+        previous_final_request = trace.get("final_request")
+        trace["soft_deadline_abandoned_final_request"] = _json_safe(previous_final_request)
+        trace["soft_deadline_replacement_reason"] = (
+            "completed_tool_output_delivered_after_cutoff"
+            if completed_with_tool_after_cutoff
+            else "aggregator_timeout"
+        )
+        direct_cfg = aggregator_cfg
+        if soft_trace_overrides["soft_deadline_disable_thinking"]:
+            direct_cfg = direct_cfg.model_copy(
+                update={
+                    "thinking": False,
+                    "thinking_level": None,
+                    "thinking_budget_tokens": 0,
+                    "thinking_budget_explicit": False,
+                }
+            )
+        direct_tools = aggregator_request_tools
+        if soft_trace_overrides["soft_deadline_disable_tools"]:
+            direct_cfg = direct_cfg.model_copy(update={"tool_choice": None})
+            direct_tools = None
+        direct_messages = self._build_aggregator_messages(
+            messages,
+            successful,
+            candidate_order_seed=candidate_order_seed,
+            finalize_directly=True,
+        )
+        trace["final_request"] = {
+            "role": "aggregator",
+            "request_started": False,
+            "retry_count": 1,
+            "soft_deadline_replacement": True,
+            "execution": {
+                **_request_execution_trace(
+                    role="aggregator",
+                    chat_config=direct_cfg,
+                    tools=direct_tools,
+                    timeout_seconds=self.aggregator_timeout_seconds,
+                ),
+                "provider": self.aggregator.provider_config.provider,
+                "model": self.aggregator.provider_config.model,
+                "label": self.aggregator.label,
+            },
+            "input": _messages_trace(
+                direct_messages,
+                max_chars=TRACE_CONTENT_MAX_CHARS,
+            ),
+        }
+        yield ProviderHeartbeatEvent(
+            phase="ensemble_soft_deadline_finalizer",
+            message=(
+                "Ensemble soft deadline reached; the prior aggregator was closed "
+                "and a direct finalizer is starting"
+            ),
+        )
+        async with _closing_async_iterator(
+            self._stream_final_aggregator(
+                provider=provider,
+                messages=direct_messages,
+                tools=direct_tools,
+                config=direct_cfg,
+                prior_rows=[
+                    dict(item)
+                    for item in (
+                        completed_event.model_usage_breakdown
+                        if completed_with_tool_after_cutoff and completed_event is not None
+                        else terminal_event.model_usage_breakdown
+                        if terminal_event is not None
+                        else []
+                    )
+                    if isinstance(item, Mapping)
+                ],
+                prior_missing_count=max(
+                    0,
+                    int(
+                        (
+                            completed_event.usage_missing_count
+                            if completed_with_tool_after_cutoff and completed_event is not None
+                            else terminal_event.usage_missing_count
+                            if terminal_event is not None
+                            else 0
+                        )
+                        or 0
+                    ),
+                ),
+                trace=trace,
+            ),
+            phase="ensemble_soft_deadline_finalizer_relay",
+        ) as child_stream:
+            async for event in child_stream:
+                yield event
+
+    def _aggregator_only_timeout_seconds(
+        self,
+        config: ChatConfig | None,
+    ) -> float | None:
+        outer_timeout_seconds = float(
+            getattr(config, "timeout", ChatConfig().timeout)
+            if config is not None
+            else ChatConfig().timeout
+        )
+        candidates = [
+            timeout_seconds
+            for timeout_seconds in (
+                outer_timeout_seconds,
+                self.aggregator_timeout_seconds,
+            )
+            if timeout_seconds > 0
+        ]
+        return min(candidates) if candidates else None
+
+    def _aggregator_only_chat_config(
+        self,
+        config: ChatConfig,
+    ) -> tuple[ChatConfig, float | None]:
+        """Build a finalizer config without re-enabling member-level thinking."""
+
+        downstream_config = config.model_copy(
+            update={
+                "ensemble_execution_mode": "full",
+                "ensemble_soft_deadline_seconds": 0.0,
+                "ensemble_soft_deadline_disable_tools": False,
+                "ensemble_soft_deadline_disable_thinking": False,
+            }
+        )
+        aggregator_timeout_seconds = self._aggregator_only_timeout_seconds(config)
+        aggregator_updates: dict[str, Any] = {
+            "candidate_output_mode": "normal",
+            "ensemble_execution_mode": "full",
+            # A forced finalization deliberately sets these on the outer
+            # config. _member_chat_config normally lets the profile override
+            # them, which would silently turn expensive thinking back on.
+            "thinking": config.thinking,
+            "thinking_level": config.thinking_level,
+            "thinking_budget_tokens": config.thinking_budget_tokens,
+            "thinking_budget_explicit": config.thinking_budget_explicit,
+        }
+        if aggregator_timeout_seconds is not None:
+            aggregator_updates["timeout"] = aggregator_timeout_seconds
+        return (
+            _member_chat_config(
+                downstream_config,
+                self.aggregator,
+                request_budget_binding=self._member_request_budget_binding(self.aggregator),
+                role="aggregator",
+            ).model_copy(update=aggregator_updates),
+            aggregator_timeout_seconds,
+        )
+
+    async def _chat_aggregator_only(
+        self,
+        messages: list[Message],
+        *,
+        tools: list[ToolDefinition] | None,
+        config: ChatConfig,
+    ) -> AsyncIterator[StreamEvent]:
+        """Finalize the supplied conversation with only the aggregator member."""
+
+        downstream_config = config.model_copy(
+            update={
+                "ensemble_execution_mode": "full",
+                "ensemble_soft_deadline_seconds": 0.0,
+                "ensemble_soft_deadline_disable_tools": False,
+                "ensemble_soft_deadline_disable_thinking": False,
+            }
+        )
+        if not self.aggregator.ready:
+            reason = self.aggregator.unavailable_reason or "deployment_unavailable"
+            async with _closing_async_iterator(
+                self._fallback_or_error(
+                    messages,
+                    tools=tools,
+                    config=downstream_config,
+                    reason=f"ensemble aggregator deployment is not ready: {reason}",
+                    code="ensemble_aggregator_error",
+                    candidates=[],
+                ),
+                phase="ensemble_aggregator_only_unready_relay",
+            ) as child_stream:
+                async for event in child_stream:
+                    yield event
+            return
+
+        aggregator_cfg, aggregator_timeout_seconds = self._aggregator_only_chat_config(config)
+        aggregator_request_tools = tools if self.aggregator_tools else None
+        trace = self._trace_payload(
+            [],
+            successful_count=0,
+            fallback_used=False,
+            fallback_reason="",
+            final_request_role="aggregator",
+            selected_candidates=[],
+            final_request_member=self.aggregator,
+            final_request_config=aggregator_cfg,
+            final_request_tools=aggregator_request_tools,
+            final_request_messages=messages,
+            final_request_timeout_seconds=aggregator_timeout_seconds,
+        )
+        trace["execution_mode"] = "aggregator_only"
+        try:
+            provider = _build_provider(self.aggregator.provider_config)
+        except Exception as exc:  # noqa: BLE001 - provider boundary returns ErrorEvent
+            async with _closing_async_iterator(
+                self._fallback_or_error(
+                    messages,
+                    tools=tools,
+                    config=downstream_config,
+                    reason=(f"ensemble aggregator could not be initialized: {type(exc).__name__}"),
+                    code="ensemble_aggregator_error",
+                    candidates=[],
+                ),
+                phase="ensemble_aggregator_only_build_fallback_relay",
+            ) as child_stream:
+                async for event in child_stream:
+                    yield event
+            return
+        async with _closing_async_iterator(
+            self._stream_final_aggregator(
+                provider=provider,
+                messages=messages,
+                tools=aggregator_request_tools,
+                config=aggregator_cfg,
+                prior_rows=[],
+                prior_missing_count=0,
+                trace=trace,
+                timeout_seconds=aggregator_timeout_seconds,
+            ),
+            phase="ensemble_aggregator_only_final_relay",
+        ) as child_stream:
+            async for event in child_stream:
+                yield event
 
     async def _run_proposers(
         self,
@@ -1226,6 +2880,8 @@ class EnsembleProvider:
         tools: list[ToolDefinition] | None,
         config: ChatConfig | None,
         progress: Callable[[EnsembleProgressEvent], None] | None = None,
+        soft_deadline: float | None = None,
+        soft_deadline_triggered: asyncio.Event | None = None,
     ) -> list[_CandidateResult]:
         tasks: list[asyncio.Task[_CandidateResult]] = []
         task_meta: dict[
@@ -1268,14 +2924,45 @@ class EnsembleProvider:
             while pending:
                 if cancel_code:
                     break
+                wait_timeout = (
+                    max(0.0, soft_deadline - time.monotonic())
+                    if soft_deadline is not None
+                    else None
+                )
                 done, pending = await asyncio.wait(
                     pending,
+                    timeout=wait_timeout,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 for task in done:
                     results.append(await task)
 
+                if any(
+                    result.error_code == _ENSEMBLE_PROPOSER_CLOSE_TIMEOUT_CODE
+                    for result in results
+                ):
+                    cancel_code = _ENSEMBLE_PROPOSER_CLOSE_TIMEOUT_CODE
+                    cancel_message = (
+                        "proposer batch stopped because a physical provider stream "
+                        "did not close within the cleanup window"
+                    )
+                    break
+
                 successful_count = sum(1 for result in results if result.ok)
+                if (
+                    pending
+                    and not cancel_code
+                    and soft_deadline is not None
+                    and time.monotonic() >= soft_deadline
+                ):
+                    cancel_code = "soft_deadline"
+                    cancel_message = (
+                        "proposer cancelled at ensemble soft deadline; "
+                        "preserving completed candidates for final fusion"
+                    )
+                    if soft_deadline_triggered is not None:
+                        soft_deadline_triggered.set()
+                    break
                 if successful_count + len(pending) < self.min_successful_proposers:
                     cancel_code = "quorum_unreachable"
                     cancel_message = (
@@ -1291,18 +2978,42 @@ class EnsembleProvider:
                     break
 
             if pending and not cancel_code:
-                done, pending = await asyncio.wait(
-                    pending,
-                    timeout=self.quorum_grace_seconds,
-                )
+                grace_timeout = self.quorum_grace_seconds
+                if soft_deadline is not None:
+                    grace_timeout = min(
+                        grace_timeout,
+                        max(0.0, soft_deadline - time.monotonic()),
+                    )
+                done, pending = await asyncio.wait(pending, timeout=grace_timeout)
                 for task in done:
                     results.append(await task)
+                if any(
+                    result.error_code == _ENSEMBLE_PROPOSER_CLOSE_TIMEOUT_CODE
+                    for result in results
+                ):
+                    cancel_code = _ENSEMBLE_PROPOSER_CLOSE_TIMEOUT_CODE
+                    cancel_message = (
+                        "proposer batch stopped because a physical provider stream "
+                        "did not close within the cleanup window"
+                    )
+                if (
+                    pending
+                    and not cancel_code
+                    and soft_deadline is not None
+                    and time.monotonic() >= soft_deadline
+                ):
+                    cancel_code = "soft_deadline"
+                    cancel_message = (
+                        "proposer cancelled at ensemble soft deadline; "
+                        "preserving completed candidates for final fusion"
+                    )
+                    if soft_deadline_triggered is not None:
+                        soft_deadline_triggered.set()
 
             if pending:
                 controlled_code = cancel_code or "quorum_cancelled"
                 controlled_message = cancel_message or (
-                    "proposer cancelled after "
-                    f"{self.quorum_grace_seconds:g}s ensemble quorum grace"
+                    f"proposer cancelled after {self.quorum_grace_seconds:g}s ensemble quorum grace"
                 )
                 for task in pending:
                     setattr(task, "_opensquilla_ensemble_cancel_code", controlled_code)
@@ -1313,33 +3024,61 @@ class EnsembleProvider:
                     )
                     task.cancel()
                 remaining = list(pending)
+                for task in remaining:
+                    self._track_pending_cleanup(task, "proposers")
                 lingering = await _bounded_task_cleanup(remaining, phase="proposers")
                 for task in remaining:
                     if task.done():
-                        with contextlib.suppress(BaseException):
+                        try:
                             item = task.result()
-                            if isinstance(item, _CandidateResult):
-                                results.append(item)
-                                continue
+                        except _EnsembleStreamCloseError:
+                            item = None
+                            controlled_code = _ENSEMBLE_PROPOSER_CLOSE_TIMEOUT_CODE
+                            controlled_message = (
+                                "proposer batch stopped because a physical provider "
+                                "stream did not close within the cleanup window"
+                            )
+                        except BaseException:
+                            item = None
+                        if isinstance(item, _CandidateResult):
+                            results.append(item)
+                            continue
                     if task in lingering or task.done():
                         index, sample_index, member = task_meta[task]
                         cfg = member.provider_config
+                        request_started = bool(
+                            getattr(
+                                task,
+                                "_opensquilla_ensemble_request_started",
+                                False,
+                            )
+                        )
                         results.append(
                             _CandidateResult(
                                 index=index,
                                 sample_index=sample_index,
                                 label=member.label or f"proposer_{index + 1}",
-                                provider=cfg.provider,
-                                model=cfg.model,
-                                error=controlled_message,
-                                error_code=controlled_code,
-                                # A task only reaches the quorum-cancel path
-                                # after issuing its upstream request — fast
-                                # exits (not-ready members, immediate errors)
-                                # complete with a real result instead. The
-                                # request may bill without a usage receipt, so
-                                # it must count in usage_missing_count.
-                                request_started=True,
+                                provider="",
+                                model="",
+                                requested_provider=cfg.provider,
+                                requested_model=cfg.model,
+                                error=(
+                                    "proposer physical provider stream did not close "
+                                    "within the cleanup window"
+                                    if task in lingering
+                                    else controlled_message
+                                ),
+                                error_code=(
+                                    _ENSEMBLE_PROPOSER_CLOSE_TIMEOUT_CODE
+                                    if task in lingering
+                                    else controlled_code
+                                ),
+                                # A soft deadline can fire before a scheduled
+                                # coroutine reaches its provider.  Preserve the
+                                # exact physical-request fact recorded at the
+                                # point where the lower stream is entered.
+                                request_started=request_started,
+                                physical_request_count=1 if request_started else 0,
                             )
                         )
             return sorted(results, key=lambda result: (result.index, result.sample_index))
@@ -1347,11 +3086,34 @@ class EnsembleProvider:
             for task in pending:
                 if not task.done():
                     task.cancel()
+            lingering: set[asyncio.Future[Any]] = set()
+            close_failed = False
             if pending:
-                await _bounded_task_cleanup(list(pending), phase="proposers_external_cancel")
+                for task in pending:
+                    self._track_pending_cleanup(
+                        task,
+                        "proposers_external_cancel",
+                    )
+                lingering = await _bounded_task_cleanup(
+                    list(pending),
+                    phase="proposers_external_cancel",
+                )
                 for task in pending:
                     if task.done():
-                        _consume_task_result(task)
+                        try:
+                            item = task.result()
+                        except _EnsembleStreamCloseError:
+                            close_failed = True
+                        except BaseException:
+                            pass
+                        else:
+                            close_failed = close_failed or (
+                                isinstance(item, _CandidateResult)
+                                and item.error_code
+                                == _ENSEMBLE_PROPOSER_CLOSE_TIMEOUT_CODE
+                            )
+            if lingering or close_failed:
+                raise _EnsembleStreamCloseError("ensemble_proposers_external_cancel")
             raise
 
     async def _collect_candidate(
@@ -1371,8 +3133,9 @@ class EnsembleProvider:
             index=index,
             sample_index=sample_index,
             label=member.label or f"proposer_{index + 1}",
-            provider=cfg.provider,
-            model=cfg.model,
+            provider="",
+            model="",
+            requested_provider=cfg.provider,
             requested_model=cfg.model,
         )
         if progress is not None:
@@ -1381,13 +3144,14 @@ class EnsembleProvider:
                     event_type="proposer_start",
                     proposer_index=index,
                     proposer_label=result.label,
-                    proposer_model=result.model,
-                    proposer_provider=result.provider,
+                    proposer_model=result.model or result.requested_model,
+                    proposer_provider=result.provider or result.requested_provider,
                     sample_index=sample_index,
                 )
             )
         try:
-            return await asyncio.wait_for(
+            request_task = asyncio.current_task()
+            inner_task = asyncio.create_task(
                 self._collect_candidate_inner(
                     result=result,
                     member=member,
@@ -1395,13 +3159,70 @@ class EnsembleProvider:
                     tools=tools,
                     config=config,
                     started=started,
-                ),
-                timeout=(
-                    self.proposer_timeout_seconds
-                    if self.proposer_timeout_seconds > 0
-                    else None
-                ),
+                    request_task=request_task,
+                )
             )
+            try:
+                if self.proposer_timeout_seconds > 0:
+                    done, _ = await asyncio.wait(
+                        {inner_task},
+                        timeout=self.proposer_timeout_seconds,
+                    )
+                    if not done:
+                        self._track_pending_cleanup(
+                            inner_task,
+                            f"proposer_{index}_timeout",
+                        )
+                        inner_task.cancel()
+                        lingering = await _bounded_task_cleanup(
+                            [inner_task],
+                            phase=f"proposer_{index}_timeout",
+                        )
+                        if inner_task.done():
+                            try:
+                                inner_task.result()
+                            except _EnsembleStreamCloseError:
+                                raise
+                            except BaseException:
+                                pass
+                        if lingering:
+                            raise _EnsembleStreamCloseError(
+                                f"ensemble_proposer_{index}_timeout"
+                            )
+                        # The provider may ignore cancellation while unwinding.
+                        # Return an immutable snapshot so that a detached child
+                        # cannot mutate the candidate later.
+                        result = replace(result)
+                        result.error = (
+                            f"proposer timed out after {self.proposer_timeout_seconds:g}s"
+                        )
+                        result.error_code = "timeout"
+                        return result
+                    return inner_task.result()
+                return await asyncio.shield(inner_task)
+            except BaseException as exc:
+                if not inner_task.done():
+                    self._track_pending_cleanup(
+                        inner_task,
+                        f"proposer_{index}_external_cancel",
+                    )
+                    inner_task.cancel()
+                    lingering = await _bounded_task_cleanup(
+                        [inner_task],
+                        phase=f"proposer_{index}_external_cancel",
+                    )
+                    if lingering:
+                        raise _EnsembleStreamCloseError(
+                            f"ensemble_proposer_{index}_external_cancel"
+                        ) from exc
+                if inner_task.done():
+                    try:
+                        inner_task.result()
+                    except _EnsembleStreamCloseError:
+                        raise
+                    except BaseException:
+                        pass
+                raise
         except asyncio.CancelledError:
             current_task = asyncio.current_task()
             code = str(getattr(current_task, "_opensquilla_ensemble_cancel_code", "") or "")
@@ -1416,9 +3237,15 @@ class EnsembleProvider:
                 )
                 or "proposer cancelled after ensemble quorum was reached"
             )
-        except TimeoutError:
-            result.error = f"proposer timed out after {self.proposer_timeout_seconds:g}s"
-            result.error_code = "timeout"
+        except _EnsembleStreamCloseError:
+            self._mark_cleanup_unproven(
+                f"ensemble_proposer_{index}_close_unproven"
+            )
+            result.error_code = _ENSEMBLE_PROPOSER_CLOSE_TIMEOUT_CODE
+            result.error = (
+                "proposer physical provider stream did not close within the "
+                "cleanup window"
+            )
         except Exception as exc:  # noqa: BLE001 - candidate failures are diagnostic data
             result.error = redact_upstream_error_text(
                 str(exc),
@@ -1437,8 +3264,8 @@ class EnsembleProvider:
                         event_type="proposer_finish",
                         proposer_index=index,
                         proposer_label=result.label,
-                        proposer_model=result.model,
-                        proposer_provider=result.provider,
+                        proposer_model=result.model or result.requested_model,
+                        proposer_provider=result.provider or result.requested_provider,
                         sample_index=sample_index,
                         elapsed_ms=result.elapsed_ms,
                         input_tokens=result.input_tokens,
@@ -1458,6 +3285,7 @@ class EnsembleProvider:
         tools: list[ToolDefinition] | None,
         config: ChatConfig | None,
         started: float,
+        request_task: asyncio.Task[Any] | None,
     ) -> _CandidateResult:
         chat_cfg = _member_chat_config(
             config,
@@ -1489,54 +3317,147 @@ class EnsembleProvider:
         provider = _build_provider(member.provider_config)
         text_parts: list[str] = []
         got_done = False
+        raw_stream = provider.chat(messages, tools=tools, config=chat_cfg)
         result.request_started = True
-        async for event in provider.chat(messages, tools=tools, config=chat_cfg):
-            if isinstance(event, TextDeltaEvent):
-                if result.ttft_ms is None and event.text:
-                    result.ttft_ms = int((time.monotonic() - started) * 1000)
-                text_parts.append(event.text)
-            elif isinstance(event, ReasoningDeltaEvent):
-                continue
-            elif isinstance(
-                event,
-                (ToolUseStartEvent, ToolUseDeltaEvent, ToolUseEndEvent),
-            ):
-                result.error = (
-                    "proposer provider violated the inert candidate-output contract"
-                )
-                result.error_code = "candidate_mode_contract_violation"
-                break
-            elif isinstance(event, DoneEvent):
-                got_done = True
-                result.usage_reported = True
-                result.input_tokens = event.input_tokens
-                result.output_tokens = event.output_tokens
-                result.reasoning_tokens = event.reasoning_tokens
-                result.cached_tokens = event.cached_tokens
-                result.cache_write_tokens = event.cache_write_tokens
-                result.billed_cost = event.billed_cost
-                result.cost_source = event.cost_source
-                result.billing_receipt = event.billing_receipt
-                result.stop_reason = event.stop_reason
-                result.model = event.model or result.model
-                result.provider_usage = dict(event.provider_usage)
-            elif isinstance(event, ErrorEvent):
-                result.error = redact_upstream_error_text(
-                    event.message,
-                    api_key=member.provider_config.api_key,
-                    max_len=2000,
-                )
-                result.error_code = redact_upstream_error_code(
-                    event.code,
-                    api_key=member.provider_config.api_key,
-                )
-                result.message_limit_proof = event.message_limit_proof
-                self._report_member_credential_failure(
-                    member,
-                    message=result.error,
-                    code=result.error_code,
-                )
-                break
+        result.physical_request_count = 1
+        if request_task is not None:
+            setattr(request_task, "_opensquilla_ensemble_request_started", True)
+        async with _closing_async_iterator(
+            raw_stream,
+            phase=f"ensemble_proposer_{result.index}",
+            pending_cleanup_tracker=self._track_pending_cleanup,
+        ) as provider_stream:
+            async for event in provider_stream:
+                if isinstance(event, TextDeltaEvent):
+                    if result.ttft_ms is None and event.text:
+                        result.ttft_ms = int((time.monotonic() - started) * 1000)
+                    text_parts.append(event.text)
+                elif isinstance(event, ReasoningDeltaEvent):
+                    continue
+                elif isinstance(
+                    event,
+                    (ToolUseStartEvent, ToolUseDeltaEvent, ToolUseEndEvent),
+                ):
+                    result.error = "proposer provider violated the inert candidate-output contract"
+                    result.error_code = "candidate_mode_contract_violation"
+                    break
+                elif isinstance(event, DoneEvent):
+                    got_done = True
+                    result.usage_reported = True
+                    result.usage_missing_count = max(
+                        0,
+                        int(event.usage_missing_count or 0),
+                    )
+                    result.physical_request_count = _done_event_physical_request_count(event)
+                    result.model_usage_breakdown = [
+                        _canonicalize_usage_row(item)
+                        for item in event.model_usage_breakdown
+                        if isinstance(item, Mapping)
+                    ]
+                    result.input_tokens = event.input_tokens
+                    result.output_tokens = event.output_tokens
+                    result.reasoning_tokens = event.reasoning_tokens
+                    result.cached_tokens = event.cached_tokens
+                    result.cache_write_tokens = event.cache_write_tokens
+                    (
+                        result.billed_cost,
+                        _,
+                        _,
+                    ) = _canonical_usage_billed_cost(event)
+                    result.cost_source = _canonical_usage_cost_source(event)
+                    result.billing_receipt = event.billing_receipt
+                    result.stop_reason = event.stop_reason
+                    result.provider = _done_event_actual_provider(event)
+                    result.model = str(event.model or "").strip()
+                    result.provider_usage = dict(event.provider_usage)
+                    break
+                elif isinstance(event, ErrorEvent):
+                    explicitly_not_started = bool(
+                        event.request_started is False
+                        or event.physical_request_count == 0
+                    )
+                    if explicitly_not_started:
+                        result.request_started = False
+                        result.physical_request_count = 0
+                        if request_task is not None:
+                            setattr(
+                                request_task,
+                                "_opensquilla_ensemble_request_started",
+                                False,
+                            )
+                    result.error = redact_upstream_error_text(
+                        event.message,
+                        api_key=member.provider_config.api_key,
+                        max_len=2000,
+                    )
+                    result.error_code = redact_upstream_error_code(
+                        event.code,
+                        api_key=member.provider_config.api_key,
+                    )
+                    result.message_limit_proof = event.message_limit_proof
+                    result.model_usage_breakdown = [
+                        _canonicalize_usage_row(item)
+                        for item in event.model_usage_breakdown
+                        if isinstance(item, Mapping)
+                    ]
+                    result.usage_missing_count = _error_event_missing_usage_count(
+                        event,
+                        request_started=result.request_started,
+                    )
+                    result.physical_request_count = _error_event_physical_request_count(
+                        event,
+                        request_started=result.request_started,
+                    )
+                    if result.model_usage_breakdown:
+                        result.usage_reported = True
+                    diagnostic_done = event.diagnostic_done
+                    if diagnostic_done is not None:
+                        # Some adapters reject a response only after receiving
+                        # an exact billable usage receipt. Preserve that receipt
+                        # even though the proposer itself remains failed.
+                        diagnostic_rows = _unrepresented_diagnostic_usage_rows(
+                            result.model_usage_breakdown,
+                            diagnostic_done,
+                            role="proposer",
+                            profile=self.profile_name,
+                            label=result.label,
+                            provider=member.provider_config.provider,
+                            model=member.provider_config.model,
+                        )
+                        result.model_usage_breakdown.extend(diagnostic_rows)
+                        result.usage_reported = True
+                        result.diagnostic_receipt_present = bool(diagnostic_rows)
+                        result.input_tokens = diagnostic_done.input_tokens
+                        result.output_tokens = diagnostic_done.output_tokens
+                        result.reasoning_tokens = diagnostic_done.reasoning_tokens
+                        result.cached_tokens = diagnostic_done.cached_tokens
+                        result.cache_write_tokens = diagnostic_done.cache_write_tokens
+                        (
+                            result.billed_cost,
+                            _,
+                            _,
+                        ) = _canonical_usage_billed_cost(diagnostic_done)
+                        result.cost_source = _canonical_usage_cost_source(
+                            diagnostic_done
+                        )
+                        result.billing_receipt = diagnostic_done.billing_receipt
+                        result.stop_reason = diagnostic_done.stop_reason
+                        result.provider = _done_event_actual_provider(
+                            diagnostic_done
+                        )
+                        result.model = str(diagnostic_done.model or "").strip()
+                        result.provider_usage = dict(diagnostic_done.provider_usage)
+                        result.diagnostic_model_usage_breakdown = [
+                            _canonicalize_usage_row(item)
+                            for item in diagnostic_done.model_usage_breakdown
+                            if isinstance(item, Mapping)
+                        ]
+                    self._report_member_credential_failure(
+                        member,
+                        message=result.error,
+                        code=result.error_code,
+                    )
+                    break
         result.text = _truncate_text("".join(text_parts), self.candidate_max_chars)
         if not got_done and not result.error:
             result.error = "proposer stream ended before DoneEvent"
@@ -1565,6 +3486,7 @@ class EnsembleProvider:
         candidates: Sequence[_CandidateResult],
         *,
         candidate_order_seed: int | None = None,
+        finalize_directly: bool = False,
     ) -> list[Message]:
         ordered = self._ordered_candidates(
             candidates,
@@ -1583,9 +3505,17 @@ class EnsembleProvider:
             "conversation and the tools available to you before making a new "
             "tool call.",
             "Otherwise, answer the user directly with the strongest fused result.",
-            "",
-            "Candidate drafts:",
         ]
+        if finalize_directly:
+            lines.extend(
+                [
+                    "The ensemble soft deadline has been reached. Return a direct "
+                    "final answer now from the completed drafts and available "
+                    "conversation context; do not request more evidence, defer the "
+                    "answer, or emit a tool call.",
+                ]
+            )
+        lines.extend(["", "Candidate drafts:"])
         for display_index, candidate in enumerate(ordered, start=1):
             lines.append(f"\n<CANDIDATE {display_index}>")
             lines.append(
@@ -1634,8 +3564,16 @@ class EnsembleProvider:
             "content_max_chars": TRACE_CONTENT_MAX_CHARS,
             "final_request_role": final_request_role,
             "llm_request_count": sum(
-                1 for candidate in candidates if candidate.request_started
+                candidate.physical_request_count
+                for candidate in candidates
+                if candidate.request_started
             ),
+            "physical_request_count": sum(
+                candidate.physical_request_count
+                for candidate in candidates
+                if candidate.request_started
+            ),
+            "usage_missing_count": _candidate_missing_usage_count(candidates),
             "selected_candidate_count": len(selected),
             "selected_candidate_indexes": [candidate.index for candidate in selected],
             "candidate_order_seed": candidate_order_seed,
@@ -1661,9 +3599,7 @@ class EnsembleProvider:
                 chat_config=final_request_config,
                 tools=final_request_tools,
                 timeout_seconds=final_request_timeout_seconds,
-                request_budget_binding=self._member_request_budget_binding(
-                    final_request_member
-                ),
+                request_budget_binding=self._member_request_budget_binding(final_request_member),
             )
         elif (
             final_request_config is not None
@@ -1700,9 +3636,19 @@ class EnsembleProvider:
         prior_rows: list[dict[str, Any]],
         prior_missing_count: int,
         trace: dict[str, Any],
+        timeout_seconds: float | None = None,
+        absolute_deadline: float | None = None,
     ) -> AsyncIterator[StreamEvent]:
         final_text_parts: list[str] = []
         aggregator_started = time.monotonic()
+        abandoned_rows: list[dict[str, Any]] = []
+        abandoned_missing_count = 0
+        attempt_request_started = False
+        effective_timeout_seconds = (
+            float(timeout_seconds)
+            if timeout_seconds is not None
+            else float(self.aggregator_timeout_seconds)
+        )
 
         def aggregator_progress(
             event_type: str,
@@ -1732,29 +3678,69 @@ class EnsembleProvider:
 
         def ensemble_done(event: DoneEvent, *, aggregator_elapsed_ms: int) -> DoneEvent:
             output_text = "".join(final_text_parts)
-            _attach_final_request_output(trace, event=event, output_text=output_text)
+            _attach_final_request_output(
+                trace,
+                event=event,
+                output_text=output_text,
+                requested_provider=self.aggregator.provider_config.provider,
+                requested_model=self.aggregator.provider_config.model,
+            )
             acc = _AggregatorAccumulator(
                 input_tokens=event.input_tokens,
                 output_tokens=event.output_tokens,
                 reasoning_tokens=event.reasoning_tokens,
                 cached_tokens=event.cached_tokens,
                 cache_write_tokens=event.cache_write_tokens,
-                billed_cost=event.billed_cost,
-                cost_source=event.cost_source,
+                billed_cost=_canonical_usage_billed_cost(event)[0],
+                cost_source=_canonical_usage_cost_source(event),
                 billing_receipt=event.billing_receipt,
-                model=event.model or self.aggregator.provider_config.model,
+                provider=_done_event_actual_provider(event),
+                model=str(event.model or "").strip(),
                 provider_usage=dict(event.provider_usage),
             )
+            aggregator_rows: list[dict[str, Any]] = []
+            for inner_index, inner in enumerate(
+                event.model_usage_breakdown,
+                start=1,
+            ):
+                if not isinstance(inner, Mapping):
+                    continue
+                row = dict(inner)
+                row.setdefault("role", "aggregator")
+                row.setdefault("profile", self.profile_name)
+                row.setdefault("label", f"aggregator_inner_{inner_index}")
+                row.setdefault("provider", acc.provider)
+                if not str(row.get("requested_provider") or "").strip():
+                    row["requested_provider"] = (
+                        self.aggregator.provider_config.provider
+                    )
+                row.setdefault("model", acc.model)
+                if not str(row.get("requested_model") or "").strip():
+                    row["requested_model"] = self.aggregator.provider_config.model
+                aggregator_rows.append(_canonicalize_usage_row(row))
+            if not aggregator_rows:
+                aggregator_rows.append(
+                    acc.usage_row(
+                        profile=self.profile_name,
+                        member=self.aggregator,
+                        role="aggregator",
+                        label="aggregator",
+                        elapsed_ms=aggregator_elapsed_ms,
+                    )
+                )
             rows = [
                 *prior_rows,
-                acc.usage_row(
-                    profile=self.profile_name,
-                    member=self.aggregator,
-                    role="aggregator",
-                    label="aggregator",
-                    elapsed_ms=aggregator_elapsed_ms,
-                ),
+                *abandoned_rows,
+                *aggregator_rows,
             ]
+            usage_missing_count = (
+                prior_missing_count
+                + abandoned_missing_count
+                + max(0, int(event.usage_missing_count or 0))
+            )
+            _reconcile_nested_done_request_count(trace, event)
+            if "usage_missing_count" in trace:
+                trace["usage_missing_count"] = usage_missing_count
             return replace(
                 event,
                 input_tokens=_summed_int(rows, "input_tokens"),
@@ -1764,68 +3750,182 @@ class EnsembleProvider:
                 cache_write_tokens=_summed_int(rows, "cache_write_tokens"),
                 billed_cost=_summed_float(rows, "billed_cost"),
                 model=acc.model,
-                provider=self.aggregator.provider_config.provider,
+                provider=acc.provider,
+                requested_model=str(
+                    event.requested_model
+                    or self.aggregator.provider_config.model
+                    or ""
+                ),
+                requested_provider=str(
+                    event.requested_provider
+                    or self.aggregator.provider_config.provider
+                    or ""
+                ),
                 cost_source=_rollup_cost_source(rows),
                 model_usage_breakdown=rows,
                 ensemble_trace=trace,
                 # Each retried aggregator attempt started a request that never
                 # produced a usage receipt.
-                usage_missing_count=prior_missing_count + attempt,
+                usage_missing_count=usage_missing_count,
                 billing_receipt=None,
             )
 
         def partial_error(event: ErrorEvent) -> ErrorEvent:
-            return replace(
+            terminal_rows = list(abandoned_rows)
+            event_rows = [
+                _canonicalize_usage_row(item)
+                for item in event.model_usage_breakdown
+                if isinstance(item, Mapping)
+            ]
+            terminal_rows.extend(event_rows)
+            event_missing_count = _error_event_missing_usage_count(
                 event,
-                model_usage_breakdown=list(prior_rows),
-                usage_missing_count=prior_missing_count + attempt + 1,
+                request_started=attempt_request_started,
             )
+            usage_missing_count = (
+                prior_missing_count + abandoned_missing_count + event_missing_count
+            )
+            if event.diagnostic_done is not None:
+                terminal_rows.extend(
+                    _unrepresented_diagnostic_usage_rows(
+                        event_rows,
+                        event.diagnostic_done,
+                        role="aggregator",
+                        profile=self.profile_name,
+                        label=f"aggregator_attempt_{attempt + 1}",
+                        provider=self.aggregator.provider_config.provider,
+                        model=self.aggregator.provider_config.model,
+                    )
+                )
+            _reconcile_nested_error_request_count(
+                trace,
+                event,
+                outer_request_started=attempt_request_started,
+            )
+            trace["usage_missing_count"] = usage_missing_count
+            trace["physical_request_count"] = int(trace.get("llm_request_count") or 0)
+            return _attach_error_request_evidence(
+                replace(
+                    event,
+                    model_usage_breakdown=[*prior_rows, *terminal_rows],
+                    usage_missing_count=usage_missing_count,
+                    ensemble_trace=trace,
+                ),
+                trace,
+            )
+
+        def record_abandoned_attempt(event: ErrorEvent) -> None:
+            nonlocal abandoned_missing_count
+            event_rows = [
+                _canonicalize_usage_row(item)
+                for item in event.model_usage_breakdown
+                if isinstance(item, Mapping)
+            ]
+            abandoned_rows.extend(event_rows)
+            event_missing_count = _error_event_missing_usage_count(
+                event,
+                request_started=attempt_request_started,
+            )
+            recorded_missing_count = event_missing_count
+            abandoned_missing_count += event_missing_count
+            if event.diagnostic_done is not None:
+                abandoned_rows.extend(
+                    _unrepresented_diagnostic_usage_rows(
+                        event_rows,
+                        event.diagnostic_done,
+                        role="aggregator",
+                        profile=self.profile_name,
+                        label=f"aggregator_retry_{attempt + 1}",
+                        provider=self.aggregator.provider_config.provider,
+                        model=self.aggregator.provider_config.model,
+                    )
+                )
+            _reconcile_nested_error_request_count(
+                trace,
+                event,
+                outer_request_started=attempt_request_started,
+            )
+            final_request = trace.get("final_request")
+            if isinstance(final_request, dict):
+                attempts = final_request.setdefault("abandoned_attempts", [])
+                if isinstance(attempts, list):
+                    attempts.append(
+                        {
+                            "attempt": attempt + 1,
+                            "request_started": attempt_request_started,
+                            "usage_reported": bool(event_rows or event.diagnostic_done is not None),
+                            "usage_missing_count": recorded_missing_count,
+                            "code": event.code,
+                        }
+                    )
+            if "usage_missing_count" in trace:
+                trace["usage_missing_count"] = prior_missing_count + abandoned_missing_count
 
         yield aggregator_progress("aggregator_start")
         attempt = 0
+        physical_attempts_started = 0
         while True:
+            attempt_request_started = False
+            attempt_timeout_seconds = effective_timeout_seconds
+            if absolute_deadline is not None:
+                remaining_to_deadline = absolute_deadline - time.monotonic()
+                if remaining_to_deadline <= 0:
+                    deadline_error = ErrorEvent(
+                        message="ensemble aggregator reached its absolute deadline",
+                        code="ensemble_aggregator_timeout",
+                    )
+                    yield aggregator_progress(
+                        "aggregator_finish",
+                        error=deadline_error.message,
+                    )
+                    yield partial_error(deadline_error)
+                    return
+                attempt_timeout_seconds = (
+                    remaining_to_deadline
+                    if attempt_timeout_seconds <= 0
+                    else min(attempt_timeout_seconds, remaining_to_deadline)
+                )
             content_streamed = False
             retry_error: ErrorEvent | None = None
+            terminal_stream_error: ErrorEvent | None = None
+            completed_provider_event: DoneEvent | None = None
             heartbeat_stream: AsyncIterator[StreamEvent] | None = None
+            heartbeat_close_status: _StreamCloseStatus | None = None
+            stream_closed = True
+            external_close_requested = False
+            attempt_request_started = False
             try:
-                _mark_final_request_started(trace)
                 stream = provider.chat(messages, tools=tools, config=config)
-                timeout_seconds = (
-                    self.aggregator_timeout_seconds
-                    if self.aggregator_timeout_seconds > 0
-                    else None
-                )
+                if attempt == 0:
+                    _mark_final_request_started(trace)
+                else:
+                    trace["llm_request_count"] = int(trace.get("llm_request_count") or 0) + 1
+                    if "physical_request_count" in trace:
+                        trace["physical_request_count"] = (
+                            int(trace.get("physical_request_count") or 0) + 1
+                        )
+                    final_request = trace.setdefault("final_request", {})
+                    final_request["request_started"] = True
+                physical_attempts_started += 1
+                attempt_request_started = True
+                heartbeat_close_status = _StreamCloseStatus()
                 heartbeat_stream = _stream_with_heartbeats(
                     stream,
                     phase="ensemble_aggregator_wait",
                     message="Still waiting for ensemble aggregator response",
-                    timeout_seconds=timeout_seconds,
+                    timeout_seconds=attempt_timeout_seconds,
+                    close_status=heartbeat_close_status,
+                    pending_cleanup_tracker=self._track_pending_cleanup,
                 )
                 async for event in heartbeat_stream:
                     if isinstance(event, DoneEvent):
-                        aggregator_elapsed_ms = int(
-                            (time.monotonic() - aggregator_started) * 1000
-                        )
-                        done_event = ensemble_done(
-                            event,
-                            aggregator_elapsed_ms=aggregator_elapsed_ms,
-                        )
-                        usage_rows = done_event.model_usage_breakdown or []
-                        aggregator_usage = next(
-                            (
-                                row
-                                for row in reversed(usage_rows)
-                                if isinstance(row, Mapping)
-                                and row.get("role") == "aggregator"
-                            ),
-                            {},
-                        )
-                        yield aggregator_progress(
-                            "aggregator_finish",
-                            usage=aggregator_usage,
-                        )
-                        yield done_event
-                        return
+                        # A terminal event is not safe to hand to Agent until
+                        # the underlying provider iterator has really closed.
+                        # Otherwise a tool-bearing completion can trigger the
+                        # next ensemble call while the old billable stream is
+                        # still alive.
+                        completed_provider_event = event
+                        break
                     elif isinstance(event, ErrorEvent):
                         safe_event = replace(
                             event,
@@ -1839,6 +3939,19 @@ class EnsembleProvider:
                                 api_key=self.aggregator.provider_config.api_key,
                             ),
                         )
+                        if (
+                            safe_event.request_started is False
+                            or safe_event.physical_request_count == 0
+                        ):
+                            physical_attempts_started = max(
+                                0,
+                                physical_attempts_started - 1,
+                            )
+                            _unmark_final_request_attempt(
+                                trace,
+                                clear_request_started=physical_attempts_started == 0,
+                            )
+                            attempt_request_started = False
                         self._report_member_credential_failure(
                             self.aggregator,
                             message=safe_event.message,
@@ -1854,12 +3967,8 @@ class EnsembleProvider:
                         ):
                             retry_error = safe_event
                             break
-                        yield aggregator_progress(
-                            "aggregator_finish",
-                            error=safe_event.message,
-                        )
-                        yield partial_error(safe_event)
-                        return
+                        terminal_stream_error = safe_event
+                        break
                     elif isinstance(event, TextDeltaEvent):
                         content_streamed = True
                         final_text_parts.append(event.text)
@@ -1872,17 +3981,14 @@ class EnsembleProvider:
                         # output downstream, so they pin this attempt.
                         content_streamed = True
                         yield event
+            except (GeneratorExit, asyncio.CancelledError):
+                external_close_requested = True
+                raise
             except TimeoutError:
-                error = ErrorEvent(
-                    message=(
-                        "ensemble aggregator timed out after "
-                        f"{self.aggregator_timeout_seconds:g}s"
-                    ),
+                terminal_stream_error = ErrorEvent(
+                    message=(f"ensemble aggregator timed out after {attempt_timeout_seconds:g}s"),
                     code="ensemble_aggregator_timeout",
                 )
-                yield aggregator_progress("aggregator_finish", error=error.message)
-                yield partial_error(error)
-                return
             except Exception as exc:  # noqa: BLE001 - provider boundary returns ErrorEvent
                 safe_message = redact_upstream_error_text(
                     f"ensemble aggregator failed: {exc}",
@@ -1902,13 +4008,103 @@ class EnsembleProvider:
                         code="ensemble_aggregator_error",
                     )
                 else:
-                    error = ErrorEvent(
+                    terminal_stream_error = ErrorEvent(
                         message=safe_message,
                         code="ensemble_aggregator_error",
                     )
-                    yield aggregator_progress("aggregator_finish", error=error.message)
-                    yield partial_error(error)
+            finally:
+                if heartbeat_stream is not None:
+                    relay_closed = await _close_async_iterator(
+                        heartbeat_stream,
+                        phase="ensemble_aggregator_heartbeat_relay",
+                        pending_cleanup_tracker=self._track_pending_cleanup,
+                    )
+                    stream_closed = relay_closed and (
+                        heartbeat_close_status is None or heartbeat_close_status.closed is not False
+                    )
+                if not stream_closed:
+                    self._mark_cleanup_unproven(
+                        "ensemble_aggregator_close_unproven"
+                    )
+                if external_close_requested and not stream_closed:
+                    raise _EnsembleStreamCloseError(
+                        "ensemble_aggregator_external_close"
+                    )
+            if completed_provider_event is not None:
+                aggregator_elapsed_ms = int((time.monotonic() - aggregator_started) * 1000)
+                done_event = ensemble_done(
+                    completed_provider_event,
+                    aggregator_elapsed_ms=aggregator_elapsed_ms,
+                )
+                usage_rows = done_event.model_usage_breakdown or []
+                aggregator_usage = next(
+                    (
+                        row
+                        for row in reversed(usage_rows)
+                        if isinstance(row, Mapping) and row.get("role") == "aggregator"
+                    ),
+                    {},
+                )
+                if not stream_closed:
+                    close_error = ErrorEvent(
+                        message=(
+                            "ensemble aggregator completed but its provider stream "
+                            "did not close within the cleanup window"
+                        ),
+                        code="ensemble_aggregator_close_timeout",
+                        model_usage_breakdown=[
+                            dict(row) for row in done_event.model_usage_breakdown
+                        ],
+                        usage_missing_count=max(
+                            0,
+                            int(done_event.usage_missing_count or 0),
+                        ),
+                        ensemble_trace=trace,
+                    )
+                    yield aggregator_progress(
+                        "aggregator_finish",
+                        usage=aggregator_usage,
+                        error=close_error.message,
+                    )
+                    yield _attach_error_request_evidence(close_error, trace)
                     return
+                yield aggregator_progress(
+                    "aggregator_finish",
+                    usage=aggregator_usage,
+                )
+                yield done_event
+                return
+            if terminal_stream_error is not None:
+                if not stream_closed:
+                    terminal_stream_error = replace(
+                        terminal_stream_error,
+                        message=(
+                            "ensemble aggregator timed out and its provider stream "
+                            "did not close within the cleanup window"
+                        ),
+                        code="ensemble_aggregator_close_timeout",
+                    )
+                yield aggregator_progress(
+                    "aggregator_finish",
+                    error=terminal_stream_error.message,
+                )
+                yield partial_error(terminal_stream_error)
+                return
+            if retry_error is not None and not stream_closed:
+                close_error = replace(
+                    retry_error,
+                    message=(
+                        "ensemble aggregator retry aborted because the previous "
+                        "provider stream did not close within the cleanup window"
+                    ),
+                    code="ensemble_aggregator_close_timeout",
+                )
+                yield aggregator_progress(
+                    "aggregator_finish",
+                    error=close_error.message,
+                )
+                yield partial_error(close_error)
+                return
             if retry_error is None:
                 error = ErrorEvent(
                     message="ensemble aggregator stream ended before DoneEvent",
@@ -1917,16 +4113,11 @@ class EnsembleProvider:
                 yield aggregator_progress("aggregator_finish", error=error.message)
                 yield partial_error(error)
                 return
-            close_stream = getattr(heartbeat_stream, "aclose", None)
-            if callable(close_stream):
-                with contextlib.suppress(Exception):
-                    await close_stream()
+            record_abandoned_attempt(retry_error)
             attempt += 1
             final_request = trace.get("final_request")
             if isinstance(final_request, dict):
                 final_request["retry_count"] = attempt
-            # The retried attempt is one more real upstream request.
-            trace["llm_request_count"] = int(trace.get("llm_request_count") or 0) + 1
             log.warning(
                 "ensemble.aggregator_retry",
                 attempt=attempt,
@@ -1942,6 +4133,17 @@ class EnsembleProvider:
                 ),
             )
             delay = _aggregator_retry_backoff_seconds(attempt)
+            if absolute_deadline is not None and time.monotonic() + delay >= absolute_deadline:
+                deadline_error = ErrorEvent(
+                    message=("ensemble aggregator retry budget reached the absolute deadline"),
+                    code="ensemble_aggregator_timeout",
+                )
+                yield aggregator_progress(
+                    "aggregator_finish",
+                    error=deadline_error.message,
+                )
+                yield partial_error(deadline_error)
+                return
             if delay > 0:
                 await asyncio.sleep(delay)
 
@@ -1954,15 +4156,330 @@ class EnsembleProvider:
         reason: str,
         code: str,
         candidates: Sequence[_CandidateResult],
+        trace_overrides: Mapping[str, Any] | None = None,
+        soft_deadline: float | None = None,
+        soft_deadline_seconds: float = 0.0,
+        soft_deadline_triggered: asyncio.Event | None = None,
+        prior_final_rows: Sequence[Mapping[str, Any]] = (),
+        prior_final_missing_count: int = 0,
+        prior_final_request_count: int = 0,
+        fallback_close_status: _StreamCloseStatus | None = None,
     ) -> AsyncIterator[StreamEvent]:
-        proposer_rows = _candidate_usage_rows(candidates, profile=self.profile_name)
-        proposer_missing_count = _candidate_missing_usage_count(candidates)
+        proposer_rows = [
+            *_candidate_usage_rows(candidates, profile=self.profile_name),
+            *(dict(row) for row in prior_final_rows),
+        ]
+        candidate_missing_count = _candidate_missing_usage_count(candidates)
+        proposer_missing_count = candidate_missing_count + max(
+            0,
+            int(prior_final_missing_count),
+        )
+        effective_trace_overrides = dict(trace_overrides or {})
+        soft_finalize = bool(effective_trace_overrides.get("soft_deadline_triggered") is True)
+        if not soft_finalize and soft_deadline is not None and time.monotonic() >= soft_deadline:
+            soft_finalize = True
+            if soft_deadline_triggered is not None:
+                soft_deadline_triggered.set()
+            effective_trace_overrides.update(
+                {
+                    "execution_mode": "deadline_preserving_fusion",
+                    "soft_deadline_triggered": True,
+                    "soft_deadline_seconds": soft_deadline_seconds,
+                    "soft_deadline_disable_tools": bool(
+                        getattr(
+                            config,
+                            "ensemble_soft_deadline_disable_tools",
+                            False,
+                        )
+                    ),
+                    "soft_deadline_disable_thinking": bool(
+                        getattr(
+                            config,
+                            "ensemble_soft_deadline_disable_thinking",
+                            False,
+                        )
+                    ),
+                    "soft_deadline_quorum_met": (
+                        sum(1 for candidate in candidates if candidate.ok)
+                        >= self.min_successful_proposers
+                    ),
+                }
+            )
+
+        if (
+            soft_deadline is not None
+            and not soft_finalize
+            and self.all_failed_policy == "fallback_single"
+            and self.fallback_provider is not None
+        ):
+            # Preserve normal fallback quality before the cutoff. Buffer its
+            # user-visible output and enforce a separate absolute deadline
+            # alongside the fallback provider's normal idle timeout. If the
+            # cutoff wins, the relay closes the first stream before starting a
+            # direct no-tool/no-thinking replacement, preventing concurrent
+            # billable requests or duplicate streamed output.
+            buffered_events: list[StreamEvent] = []
+            first_close_status = _StreamCloseStatus()
+            first_physical_close_status = _StreamCloseStatus()
+            first_relay: AsyncIterator[StreamEvent] | None = None
+            absolute_timeout = False
+            external_close_requested = False
+            try:
+                first_relay = _stream_with_heartbeats(
+                    self._fallback_or_error(
+                        messages,
+                        tools=tools,
+                        config=config,
+                        reason=reason,
+                        code=code,
+                        candidates=candidates,
+                        trace_overrides=effective_trace_overrides,
+                        prior_final_rows=prior_final_rows,
+                        prior_final_missing_count=prior_final_missing_count,
+                        prior_final_request_count=prior_final_request_count,
+                        fallback_close_status=first_physical_close_status,
+                    ),
+                    phase="ensemble_fallback_soft_deadline_wait",
+                    message="Waiting for ensemble fallback before the soft deadline",
+                    timeout_seconds=None,
+                    close_status=first_close_status,
+                    absolute_deadline=soft_deadline,
+                    pending_cleanup_tracker=self._track_pending_cleanup,
+                )
+                async for event in first_relay:
+                    if isinstance(event, ProviderHeartbeatEvent):
+                        yield event
+                    else:
+                        buffered_events.append(event)
+                        if isinstance(event, (DoneEvent, ErrorEvent)):
+                            break
+            except TimeoutError:
+                absolute_timeout = first_close_status.absolute_deadline_triggered
+            except _EnsembleStreamCloseError:
+                # The absolute soft deadline can win and the cancelled lower
+                # provider can then refuse to close inside the bounded cleanup
+                # window.  `_stream_with_heartbeats` correctly upgrades that
+                # cleanup failure, but this policy layer must still translate
+                # it into the typed terminal close-timeout event below rather
+                # than leaking an internal exception to Agent.
+                if first_close_status.absolute_deadline_triggered:
+                    absolute_timeout = True
+                else:
+                    raise
+            except (GeneratorExit, asyncio.CancelledError):
+                external_close_requested = True
+                raise
+            finally:
+                if first_relay is not None:
+                    relay_closed = await _close_async_iterator(
+                        first_relay,
+                        phase="ensemble_fallback_soft_deadline_relay",
+                        pending_cleanup_tracker=self._track_pending_cleanup,
+                    )
+                    if first_close_status.closed is None:
+                        first_close_status.closed = relay_closed
+                    elif not relay_closed:
+                        first_close_status.closed = False
+                if external_close_requested and (
+                    first_close_status.closed is not True
+                    or first_physical_close_status.closed is not True
+                ):
+                    raise _EnsembleStreamCloseError(
+                        "ensemble_fallback_external_close"
+                    )
+
+            if not absolute_timeout:
+                for event in buffered_events:
+                    yield event
+                return
+
+            if (
+                first_close_status.closed is not True
+                or first_physical_close_status.closed is not True
+            ):
+                self._mark_cleanup_unproven(
+                    "ensemble_fallback_soft_deadline_close_unproven"
+                )
+                close_trace = self._trace_payload(
+                    candidates,
+                    successful_count=sum(1 for candidate in candidates if candidate.ok),
+                    fallback_used=True,
+                    fallback_reason=reason,
+                    final_request_role="fallback_single",
+                    selected_candidates=[candidate for candidate in candidates if candidate.ok],
+                    final_request_model=(
+                        self.fallback_model or _provider_model_id(self.fallback_provider)
+                    ),
+                )
+                close_trace.update(effective_trace_overrides)
+                close_trace.update(
+                    {
+                        "execution_mode": "deadline_preserving_fusion",
+                        "soft_deadline_triggered": True,
+                        "soft_deadline_seconds": soft_deadline_seconds,
+                        "soft_deadline_replacement_blocked": "provider_stream_not_closed",
+                    }
+                )
+                _mark_final_request_started(close_trace)
+                close_trace["llm_request_count"] = int(
+                    close_trace.get("llm_request_count") or 0
+                ) + max(0, int(prior_final_request_count))
+                close_trace["physical_request_count"] = int(
+                    close_trace.get("llm_request_count") or 0
+                )
+                close_trace["usage_missing_count"] = proposer_missing_count + 1
+                yield _attach_error_request_evidence(
+                    ErrorEvent(
+                        message=(
+                            "ensemble fallback reached the soft deadline and its "
+                            "provider stream did not close within the cleanup window"
+                        ),
+                        code="ensemble_fallback_close_timeout",
+                        model_usage_breakdown=list(proposer_rows),
+                        usage_missing_count=proposer_missing_count + 1,
+                        ensemble_trace=close_trace,
+                    ),
+                    close_trace,
+                )
+                return
+
+            abandoned_event = first_close_status.deadline_event
+            abandoned_rows: list[dict[str, Any]] = []
+            abandoned_missing_count = 1
+            abandoned_request_count = 1
+            if isinstance(abandoned_event, (DoneEvent, ErrorEvent)):
+                event_rows = [
+                    _canonicalize_usage_row(row)
+                    for row in abandoned_event.model_usage_breakdown
+                    if isinstance(row, Mapping)
+                ]
+                # The outer fallback wrapper prepends the already-accounted
+                # proposer/prior rows before any rows returned by a nested
+                # selector or ensemble. Slice that structural prefix rather
+                # than filtering by role, because nested proposer/aggregator
+                # rows are valid receipts for the fallback request.
+                abandoned_rows = event_rows[len(proposer_rows) :]
+                abandoned_missing_count = max(
+                    0,
+                    int(abandoned_event.usage_missing_count or 0)
+                    - candidate_missing_count
+                    - max(0, int(prior_final_missing_count)),
+                )
+                if not abandoned_rows and abandoned_missing_count == 0:
+                    abandoned_missing_count = 1
+                nested_total = (
+                    _done_event_physical_request_count(abandoned_event)
+                    if isinstance(abandoned_event, DoneEvent)
+                    else _error_event_physical_request_count(
+                        abandoned_event,
+                        request_started=True,
+                    )
+                )
+                candidate_request_count = sum(
+                    candidate.physical_request_count
+                    for candidate in candidates
+                    if candidate.request_started
+                )
+                abandoned_request_count = max(
+                    1,
+                    nested_total
+                    - candidate_request_count
+                    - max(0, int(prior_final_request_count)),
+                )
+
+            if soft_deadline_triggered is not None:
+                soft_deadline_triggered.set()
+            deadline_overrides = {
+                **effective_trace_overrides,
+                "execution_mode": "deadline_preserving_fusion",
+                "soft_deadline_triggered": True,
+                "soft_deadline_seconds": soft_deadline_seconds,
+                "soft_deadline_disable_tools": bool(
+                    getattr(
+                        config,
+                        "ensemble_soft_deadline_disable_tools",
+                        False,
+                    )
+                ),
+                "soft_deadline_disable_thinking": bool(
+                    getattr(
+                        config,
+                        "ensemble_soft_deadline_disable_thinking",
+                        False,
+                    )
+                ),
+                "soft_deadline_quorum_met": (
+                    sum(1 for candidate in candidates if candidate.ok)
+                    >= self.min_successful_proposers
+                ),
+                "soft_deadline_replacement_reason": "fallback_timeout",
+                "soft_deadline_abandoned_final_request": {
+                    "role": "fallback_single",
+                    "request_started": True,
+                    "usage_reported": bool(abandoned_rows),
+                    "usage_missing_count": abandoned_missing_count,
+                    "physical_request_count": abandoned_request_count,
+                },
+            }
+            yield ProviderHeartbeatEvent(
+                phase="ensemble_soft_deadline_finalizer",
+                message=(
+                    "Ensemble soft deadline reached; the prior fallback was "
+                    "closed and a direct finalizer is starting"
+                ),
+            )
+            async with _closing_async_iterator(
+                self._fallback_or_error(
+                    messages,
+                    tools=tools,
+                    config=config,
+                    reason=reason,
+                    code=code,
+                    candidates=candidates,
+                    trace_overrides=deadline_overrides,
+                    prior_final_rows=[
+                        *prior_final_rows,
+                        *abandoned_rows,
+                    ],
+                    prior_final_missing_count=(
+                        max(0, int(prior_final_missing_count)) + abandoned_missing_count
+                    ),
+                    prior_final_request_count=(
+                        max(0, int(prior_final_request_count))
+                        + abandoned_request_count
+                    ),
+                ),
+                phase="ensemble_soft_deadline_fallback_finalizer_relay",
+            ) as child_stream:
+                async for event in child_stream:
+                    yield event
+            return
+
+        error_trace = self._trace_payload(
+            candidates,
+            successful_count=sum(1 for candidate in candidates if candidate.ok),
+            fallback_used=False,
+            fallback_reason=reason,
+            final_request_role="none",
+            selected_candidates=[candidate for candidate in candidates if candidate.ok],
+        )
+        if effective_trace_overrides:
+            error_trace.update(_json_safe(effective_trace_overrides))
+        error_trace["llm_request_count"] = int(error_trace.get("llm_request_count") or 0) + max(
+            0, int(prior_final_request_count)
+        )
+        error_trace["physical_request_count"] = int(error_trace.get("llm_request_count") or 0)
+        error_trace["usage_missing_count"] = proposer_missing_count
 
         def proposer_error(event: ErrorEvent) -> ErrorEvent:
-            return replace(
-                event,
-                model_usage_breakdown=list(proposer_rows),
-                usage_missing_count=proposer_missing_count,
+            return _attach_error_request_evidence(
+                replace(
+                    event,
+                    model_usage_breakdown=list(proposer_rows),
+                    usage_missing_count=proposer_missing_count,
+                    ensemble_trace=error_trace,
+                ),
+                error_trace,
             )
 
         if self.all_failed_policy != "fallback_single" or self.fallback_provider is None:
@@ -1982,12 +4499,51 @@ class EnsembleProvider:
             else:
                 yield proposer_error(ErrorEvent(message=reason, code=code))
             return
-        fallback_config = (
-            config.model_copy(update={"candidate_output_mode": "normal"})
-            if config is not None
-            and config.candidate_output_mode != "normal"
-            else config
-        )
+        fallback_config = config
+        if config is not None and (
+            config.candidate_output_mode != "normal"
+            or config.ensemble_soft_deadline_seconds > 0
+            or config.ensemble_soft_deadline_disable_tools
+            or config.ensemble_soft_deadline_disable_thinking
+        ):
+            fallback_config = config.model_copy(
+                update={
+                    "candidate_output_mode": "normal",
+                    "ensemble_soft_deadline_seconds": 0.0,
+                    "ensemble_soft_deadline_disable_tools": False,
+                    "ensemble_soft_deadline_disable_thinking": False,
+                }
+            )
+        fallback_messages = messages
+        fallback_tools = tools
+        if soft_finalize:
+            fallback_messages = [
+                *messages,
+                Message(
+                    role="user",
+                    content=(
+                        "The ensemble soft deadline has been reached. Return a "
+                        "direct final answer now from the conversation and any "
+                        "completed work already available. Do not request more "
+                        "evidence, defer the answer, or emit a tool call."
+                    ),
+                ),
+            ]
+            if bool(effective_trace_overrides.get("soft_deadline_disable_tools")):
+                fallback_tools = None
+                if fallback_config is not None:
+                    fallback_config = fallback_config.model_copy(update={"tool_choice": None})
+            if fallback_config is not None and bool(
+                effective_trace_overrides.get("soft_deadline_disable_thinking")
+            ):
+                fallback_config = fallback_config.model_copy(
+                    update={
+                        "thinking": False,
+                        "thinking_level": None,
+                        "thinking_budget_tokens": 0,
+                        "thinking_budget_explicit": False,
+                    }
+                )
         fallback_timeout_seconds = float(
             getattr(fallback_config, "timeout", ChatConfig().timeout)
             if fallback_config is not None
@@ -2000,34 +4556,212 @@ class EnsembleProvider:
             fallback_reason=reason,
             final_request_role="fallback_single",
             selected_candidates=[candidate for candidate in candidates if candidate.ok],
-            final_request_model=(
-                self.fallback_model or _provider_model_id(self.fallback_provider)
-            ),
+            final_request_model=(self.fallback_model or _provider_model_id(self.fallback_provider)),
             final_request_config=fallback_config,
-            final_request_tools=tools,
-            final_request_messages=messages,
+            final_request_tools=fallback_tools,
+            final_request_messages=fallback_messages,
             final_request_timeout_seconds=fallback_timeout_seconds,
         )
         trace["fallback_code"] = code
+        final_request = trace.get("final_request")
+        if isinstance(final_request, dict):
+            execution = final_request.get("execution")
+            if isinstance(execution, dict):
+                requested_fallback_provider = str(
+                    self.fallback_provider_name
+                    or getattr(self.fallback_provider, "provider_name", "")
+                    or ""
+                )
+                requested_fallback_model = str(
+                    self.fallback_model
+                    or _provider_model_id(self.fallback_provider)
+                    or ""
+                )
+                execution.setdefault(
+                    "requested_provider",
+                    requested_fallback_provider,
+                )
+                execution.setdefault("provider", requested_fallback_provider)
+                execution.setdefault("requested_model", requested_fallback_model)
+        if effective_trace_overrides:
+            trace.update(_json_safe(effective_trace_overrides))
+        trace["llm_request_count"] = int(trace.get("llm_request_count") or 0) + max(
+            0, int(prior_final_request_count)
+        )
+        trace["physical_request_count"] = int(trace.get("llm_request_count") or 0)
+        trace["usage_missing_count"] = proposer_missing_count
+
+        fallback_request_started = False
+
         def partial_error(event: ErrorEvent) -> ErrorEvent:
+            rows = list(proposer_rows)
+            fallback_rows = [
+                _canonicalize_usage_row(item)
+                for item in event.model_usage_breakdown
+                if isinstance(item, Mapping)
+            ]
+            event_missing_count = _error_event_missing_usage_count(
+                event,
+                request_started=fallback_request_started,
+            )
+            usage_missing_count = proposer_missing_count + event_missing_count
+            if fallback_rows:
+                # A nested selector/ensemble has already normalized its
+                # partial receipts. Preserve those rows directly instead of
+                # replacing them with one unknown outer fallback request.
+                rows.extend(fallback_rows)
+            if event.diagnostic_done is not None:
+                rows.extend(
+                    _unrepresented_diagnostic_usage_rows(
+                        fallback_rows,
+                        event.diagnostic_done,
+                        role="fallback_single",
+                        profile=self.profile_name,
+                        label="fallback",
+                        provider=(
+                            self.fallback_provider_name
+                            or getattr(
+                                self.fallback_provider,
+                                "provider_name",
+                                "fallback",
+                            )
+                        ),
+                        model=(
+                            self.fallback_model
+                            or _provider_model_id(self.fallback_provider)
+                            or event.diagnostic_done.model
+                        ),
+                    )
+                )
+            _reconcile_nested_error_request_count(
+                trace,
+                event,
+                outer_request_started=fallback_request_started,
+            )
+            trace["usage_missing_count"] = usage_missing_count
+            trace["physical_request_count"] = int(trace.get("llm_request_count") or 0)
+            return _attach_error_request_evidence(
+                replace(
+                    event,
+                    model_usage_breakdown=rows,
+                    usage_missing_count=usage_missing_count,
+                    ensemble_trace=trace,
+                ),
+                trace,
+            )
+
+        final_text_parts: list[str] = []
+
+        def complete_fallback(event: DoneEvent) -> DoneEvent:
+            output_text = "".join(final_text_parts)
+            _attach_final_request_output(
+                trace,
+                event=event,
+                output_text=output_text,
+                requested_provider=str(
+                    event.requested_provider
+                    or self.fallback_provider_name
+                    or getattr(self.fallback_provider, "provider_name", "")
+                    or ""
+                ),
+                requested_model=str(
+                    event.requested_model
+                    or self.fallback_model
+                    or _provider_model_id(self.fallback_provider)
+                    or ""
+                ),
+            )
+            executed_provider = _done_event_actual_provider(event)
+            requested_fallback_provider = str(
+                event.requested_provider
+                or self.fallback_provider_name
+                or getattr(self.fallback_provider, "provider_name", "")
+                or ""
+            )
+            configured_fallback_model = (
+                event.requested_model
+                or self.fallback_model
+                or _provider_model_id(self.fallback_provider)
+                or ""
+            )
+            # ``final_request.execution.model`` is the configured model
+            # identity used for feedback attribution. Do not replace it with a
+            # provider-reported alias/snapshot; the latter already lives in
+            # ``final_request.usage.model`` and the DoneEvent.
+            fallback_row = _done_usage_row(
+                event,
+                role="fallback_single",
+                profile=self.profile_name,
+                label="fallback",
+                provider=requested_fallback_provider,
+                model=configured_fallback_model,
+            )
+            fallback_rows: list[dict[str, Any]] = []
+            for inner_index, inner in enumerate(
+                event.model_usage_breakdown,
+                start=1,
+            ):
+                if not isinstance(inner, Mapping):
+                    continue
+                row = dict(inner)
+                row.setdefault("role", "fallback_single")
+                row.setdefault("profile", self.profile_name)
+                row.setdefault("label", f"fallback_inner_{inner_index}")
+                row.setdefault("provider", executed_provider)
+                if not str(row.get("requested_provider") or "").strip():
+                    row["requested_provider"] = requested_fallback_provider
+                row.setdefault("model", str(event.model or "").strip())
+                if not str(row.get("requested_model") or "").strip():
+                    row["requested_model"] = configured_fallback_model
+                fallback_rows.append(_canonicalize_usage_row(row))
+            if not fallback_rows:
+                fallback_rows.append(fallback_row)
+            rows = [*proposer_rows, *fallback_rows]
+            usage_missing_count = proposer_missing_count + max(
+                0,
+                int(event.usage_missing_count or 0),
+            )
+            _reconcile_nested_done_request_count(trace, event)
+            if "usage_missing_count" in trace:
+                trace["usage_missing_count"] = usage_missing_count
             return replace(
                 event,
-                model_usage_breakdown=list(proposer_rows),
-                usage_missing_count=proposer_missing_count + 1,
+                input_tokens=_summed_int(rows, "input_tokens"),
+                output_tokens=_summed_int(rows, "output_tokens"),
+                reasoning_tokens=_summed_int(rows, "reasoning_tokens"),
+                cached_tokens=_summed_int(rows, "cached_tokens"),
+                cache_write_tokens=_summed_int(
+                    rows,
+                    "cache_write_tokens",
+                ),
+                billed_cost=_summed_float(rows, "billed_cost"),
+                provider=executed_provider,
+                requested_model=configured_fallback_model,
+                requested_provider=requested_fallback_provider,
+                cost_source=_rollup_cost_source(rows),
+                model_usage_breakdown=rows,
+                ensemble_trace=trace,
+                usage_missing_count=usage_missing_count,
+                billing_receipt=None,
             )
-        final_text_parts: list[str] = []
-        _mark_final_request_started(trace)
+
         yield ProviderHeartbeatEvent(
             phase="ensemble_fallback",
             message="Ensemble quorum unavailable; waiting for fallback model",
         )
+        physical_close_status = fallback_close_status or _StreamCloseStatus()
+        completed_fallback_event: DoneEvent | None = None
+        terminal_fallback_error: ErrorEvent | None = None
         try:
-            async for event in _stream_with_heartbeats(
-                self.fallback_provider.chat(
-                    messages,
-                    tools=tools,
-                    config=fallback_config,
-                ),
+            fallback_stream = self.fallback_provider.chat(
+                fallback_messages,
+                tools=fallback_tools,
+                config=fallback_config,
+            )
+            _mark_final_request_started(trace)
+            fallback_request_started = True
+            heartbeat_stream = _stream_with_heartbeats(
+                fallback_stream,
                 phase="ensemble_fallback_wait",
                 message="Waiting for ensemble fallback model",
                 timeout_seconds=fallback_timeout_seconds,
@@ -2038,102 +4772,199 @@ class EnsembleProvider:
                 # stall — the condition the HTTP layer itself would flag —
                 # expires the fallback.
                 reset_deadline_on_event=True,
-            ):
-                if isinstance(event, DoneEvent):
-                    output_text = "".join(final_text_parts)
-                    _attach_final_request_output(trace, event=event, output_text=output_text)
-                    executed_provider = str(
-                        getattr(self.fallback_provider, "active_provider_id", "")
-                        or self.fallback_provider_name
-                        or getattr(self.fallback_provider, "provider_name", "fallback")
-                    )
-                    executed_model = event.model or self.fallback_model
-                    configured_fallback_model = (
-                        self.fallback_model
-                        or _provider_model_id(self.fallback_provider)
-                        or executed_model
-                    )
-                    # ``final_request.execution.model`` is the configured model
-                    # identity used for feedback attribution.  Do not replace it
-                    # with a provider-reported alias/snapshot; the latter already
-                    # lives in ``final_request.usage.model`` and the DoneEvent.
-                    final_request = trace.get("final_request")
-                    if isinstance(final_request, dict):
-                        execution = final_request.get("execution")
-                        if isinstance(execution, dict):
-                            execution["provider"] = executed_provider
-                    fallback_row = _done_usage_row(
-                        event,
-                        role="fallback_single",
-                        profile=self.profile_name,
-                        label="fallback",
-                        provider=executed_provider,
-                        model=configured_fallback_model,
-                    )
-                    rows = [*proposer_rows, fallback_row]
-                    yield replace(
-                        event,
-                        input_tokens=_summed_int(rows, "input_tokens"),
-                        output_tokens=_summed_int(rows, "output_tokens"),
-                        reasoning_tokens=_summed_int(rows, "reasoning_tokens"),
-                        cached_tokens=_summed_int(rows, "cached_tokens"),
-                        cache_write_tokens=_summed_int(rows, "cache_write_tokens"),
-                        billed_cost=_summed_float(rows, "billed_cost"),
-                        provider=executed_provider,
-                        cost_source=_rollup_cost_source(rows),
-                        model_usage_breakdown=rows,
-                        ensemble_trace=trace,
-                        usage_missing_count=proposer_missing_count,
-                        billing_receipt=None,
-                    )
-                    return
-                if isinstance(event, ErrorEvent):
-                    safe_event = replace(
-                        event,
-                        message=redact_upstream_error_text(
-                            event.message,
-                            api_key=self._fallback_api_key,
-                            max_len=2000,
-                        ),
-                        code=redact_upstream_error_code(
-                            event.code,
-                            api_key=self._fallback_api_key,
-                        ),
-                    )
-                    yield partial_error(safe_event)
-                    return
-                if isinstance(event, TextDeltaEvent):
-                    final_text_parts.append(event.text)
-                yield event
-        except TimeoutError:
-            yield partial_error(
-                ErrorEvent(
-                    message=(
-                        "ensemble fallback stalled: no stream events for "
-                        f"{fallback_timeout_seconds:g}s"
-                    ),
-                    code="ensemble_fallback_timeout",
-                )
+                close_status=physical_close_status,
+                pending_cleanup_tracker=self._track_pending_cleanup,
             )
+            async with _closing_async_iterator(
+                heartbeat_stream,
+                phase="ensemble_fallback_heartbeat_relay",
+                pending_cleanup_tracker=self._track_pending_cleanup,
+            ) as child_stream:
+                async for event in child_stream:
+                    if isinstance(event, DoneEvent):
+                        completed_fallback_event = event
+                        break
+                    if isinstance(event, ErrorEvent):
+                        terminal_fallback_error = replace(
+                            event,
+                            message=redact_upstream_error_text(
+                                event.message,
+                                api_key=self._fallback_api_key,
+                                max_len=2000,
+                            ),
+                            code=redact_upstream_error_code(
+                                event.code,
+                                api_key=self._fallback_api_key,
+                            ),
+                        )
+                        if (
+                            terminal_fallback_error.request_started is False
+                            or terminal_fallback_error.physical_request_count == 0
+                        ):
+                            _unmark_final_request_attempt(
+                                trace,
+                                clear_request_started=True,
+                            )
+                            fallback_request_started = False
+                        break
+                    if isinstance(event, TextDeltaEvent):
+                        final_text_parts.append(event.text)
+                    yield event
+            if completed_fallback_event is not None:
+                done_event = complete_fallback(completed_fallback_event)
+                if physical_close_status.closed is not True:
+                    self._mark_cleanup_unproven(
+                        "ensemble_fallback_close_unproven"
+                    )
+                    yield _attach_error_request_evidence(
+                        ErrorEvent(
+                            message=(
+                                "ensemble fallback completed but its provider stream "
+                                "did not close within the cleanup window"
+                            ),
+                            code="ensemble_fallback_close_timeout",
+                            model_usage_breakdown=[
+                                dict(row) for row in done_event.model_usage_breakdown
+                            ],
+                            usage_missing_count=max(
+                                0,
+                                int(done_event.usage_missing_count or 0),
+                            ),
+                            ensemble_trace=trace,
+                        ),
+                        trace,
+                    )
+                    return
+                yield done_event
+                return
+            if terminal_fallback_error is not None:
+                if physical_close_status.closed is not True:
+                    self._mark_cleanup_unproven(
+                        "ensemble_fallback_close_unproven"
+                    )
+                    terminal_fallback_error = replace(
+                        terminal_fallback_error,
+                        message=(
+                            "ensemble fallback failed and its provider stream "
+                            "did not close within the cleanup window"
+                        ),
+                        code="ensemble_fallback_close_timeout",
+                    )
+                yield partial_error(terminal_fallback_error)
+                return
+        except _EnsembleStreamCloseError:
+            # `_closing_async_iterator` deliberately withholds a terminal Done
+            # until the physical stream closes.  If that close proof times out,
+            # retain the already-received usage receipt in a typed terminal
+            # error instead of falling through the generic exception path and
+            # turning a known billed request into unknown usage.
+            self._mark_cleanup_unproven(
+                "ensemble_fallback_close_unproven"
+            )
+            if completed_fallback_event is not None:
+                done_event = complete_fallback(completed_fallback_event)
+                yield _attach_error_request_evidence(
+                    ErrorEvent(
+                        message=(
+                            "ensemble fallback completed but its provider stream "
+                            "did not close within the cleanup window"
+                        ),
+                        code="ensemble_fallback_close_timeout",
+                        model_usage_breakdown=[
+                            dict(row) for row in done_event.model_usage_breakdown
+                        ],
+                        usage_missing_count=max(
+                            0,
+                            int(done_event.usage_missing_count or 0),
+                        ),
+                        ensemble_trace=trace,
+                    ),
+                    trace,
+                )
+                return
+            if terminal_fallback_error is not None:
+                yield partial_error(
+                    replace(
+                        terminal_fallback_error,
+                        message=(
+                            "ensemble fallback failed and its provider stream "
+                            "did not close within the cleanup window"
+                        ),
+                        code="ensemble_fallback_close_timeout",
+                    )
+                )
+                return
+            fallback_error = ErrorEvent(
+                message=(
+                    "ensemble fallback provider stream did not close within "
+                    "the cleanup window"
+                ),
+                code="ensemble_fallback_close_timeout",
+            )
+            yield partial_error(fallback_error)
+            return
+        except TimeoutError:
+            timeout_error = ErrorEvent(
+                message=(
+                    "ensemble fallback stalled: no stream events for "
+                    f"{fallback_timeout_seconds:g}s"
+                ),
+                code="ensemble_fallback_timeout",
+            )
+            if physical_close_status.closed is not True:
+                self._mark_cleanup_unproven(
+                    "ensemble_fallback_close_unproven"
+                )
+                timeout_error = replace(
+                    timeout_error,
+                    message=(
+                        "ensemble fallback timed out and its provider stream "
+                        "did not close within the cleanup window"
+                    ),
+                    code="ensemble_fallback_close_timeout",
+                )
+            yield partial_error(timeout_error)
             return
         except Exception as exc:  # noqa: BLE001 - provider boundary returns ErrorEvent
-            yield partial_error(
-                ErrorEvent(
-                    message=redact_upstream_error_text(
-                        f"ensemble fallback failed: {exc}",
-                        api_key=self._fallback_api_key,
-                        max_len=2000,
-                    ),
-                    code="ensemble_fallback_error",
+            fallback_error = ErrorEvent(
+                message=redact_upstream_error_text(
+                    f"ensemble fallback failed: {exc}",
+                    api_key=self._fallback_api_key,
+                    max_len=2000,
+                ),
+                code="ensemble_fallback_error",
+            )
+            if fallback_request_started and physical_close_status.closed is not True:
+                self._mark_cleanup_unproven(
+                    "ensemble_fallback_close_unproven"
                 )
-            )
+                fallback_error = replace(
+                    fallback_error,
+                    message=(
+                        "ensemble fallback failed and its provider stream "
+                        "did not close within the cleanup window"
+                    ),
+                    code="ensemble_fallback_close_timeout",
+                )
+            yield partial_error(fallback_error)
             return
-        yield partial_error(
-            ErrorEvent(
-                message="ensemble fallback stream ended before DoneEvent",
-                code="ensemble_fallback_incomplete",
-            )
+        incomplete_error = ErrorEvent(
+            message="ensemble fallback stream ended before DoneEvent",
+            code="ensemble_fallback_incomplete",
         )
+        if fallback_request_started and physical_close_status.closed is not True:
+            self._mark_cleanup_unproven(
+                "ensemble_fallback_close_unproven"
+            )
+            incomplete_error = replace(
+                incomplete_error,
+                message=(
+                    "ensemble fallback ended without a terminal event and its "
+                    "provider stream did not close within the cleanup window"
+                ),
+                code="ensemble_fallback_close_timeout",
+            )
+        yield partial_error(incomplete_error)
 
 
 def _trace_content(text: str, *, max_chars: int = TRACE_CONTENT_MAX_CHARS) -> dict[str, Any]:
@@ -2162,10 +4993,7 @@ def _message_content_text(content: Any) -> str:
                 if item_type == "text":
                     parts.append(str(item.get("text") or ""))
                 elif item_type == "tool_use":
-                    parts.append(
-                        f"[tool_use:{item.get('name') or ''} "
-                        f"{item.get('input') or {}}]"
-                    )
+                    parts.append(f"[tool_use:{item.get('name') or ''} {item.get('input') or {}}]")
                 elif item_type == "tool_result":
                     parts.append(f"[tool_result:{item.get('content') or ''}]")
                 elif item_type == "image":
@@ -2224,7 +5052,9 @@ def _member_execution_trace(
     payload.update(
         {
             "label": member.label or role,
+            "requested_provider": cfg.provider,
             "provider": cfg.provider,
+            "requested_model": cfg.model,
             "model": cfg.model,
             "temperature_override": member.temperature,
             "max_tokens_override": member.max_tokens,
@@ -2304,6 +5134,52 @@ def _mark_final_request_started(trace: dict[str, Any]) -> None:
         return
     final_request["request_started"] = True
     trace["llm_request_count"] = int(trace.get("llm_request_count") or 0) + 1
+    if "physical_request_count" in trace:
+        trace["physical_request_count"] = int(trace.get("physical_request_count") or 0) + 1
+
+
+def _attach_error_request_evidence(
+    event: ErrorEvent,
+    trace: Mapping[str, Any],
+) -> ErrorEvent:
+    """Expose composite physical-request evidence directly on terminal errors."""
+
+    trace_count = max(
+        int(trace.get("physical_request_count") or 0),
+        int(trace.get("llm_request_count") or 0),
+    )
+    event_count = (
+        max(0, int(event.physical_request_count))
+        if event.physical_request_count is not None
+        else 0
+    )
+    physical_count = max(trace_count, event_count)
+    return replace(
+        event,
+        request_started=physical_count > 0,
+        physical_request_count=physical_count,
+    )
+
+
+def _unmark_final_request_attempt(
+    trace: dict[str, Any],
+    *,
+    clear_request_started: bool,
+) -> None:
+    """Remove a pre-counted lazy adapter call proven to have stayed local."""
+
+    trace["llm_request_count"] = max(
+        0,
+        int(trace.get("llm_request_count") or 0) - 1,
+    )
+    if "physical_request_count" in trace:
+        trace["physical_request_count"] = max(
+            0,
+            int(trace.get("physical_request_count") or 0) - 1,
+        )
+    if clear_request_started:
+        final_request = trace.setdefault("final_request", {})
+        final_request["request_started"] = False
 
 
 def _attach_final_request_output(
@@ -2311,11 +5187,22 @@ def _attach_final_request_output(
     *,
     event: DoneEvent,
     output_text: str,
+    requested_provider: str = "",
+    requested_model: str = "",
 ) -> None:
     final_request = trace.setdefault("final_request", {})
+    execution = final_request.get("execution")
+    if isinstance(execution, dict):
+        execution["actual_provider"] = _done_event_actual_provider(event)
+        execution["actual_model"] = str(event.model or "").strip()
     final_request["output"] = _trace_content(output_text, max_chars=TRACE_CONTENT_MAX_CHARS)
     final_request["usage"] = {
+        "provider": _done_event_actual_provider(event),
         "model": event.model,
+        "requested_provider": str(
+            event.requested_provider or requested_provider or ""
+        ),
+        "requested_model": str(event.requested_model or requested_model or ""),
         "stop_reason": event.stop_reason,
         "input_tokens": event.input_tokens,
         "output_tokens": event.output_tokens,
@@ -2894,9 +5781,7 @@ def _candidate_pool(
                 continue
             add(
                 _dynamic_candidate(
-                    provider=str(
-                        tier_cfg.get("provider") or inherited_provider_config.provider
-                    ),
+                    provider=str(tier_cfg.get("provider") or inherited_provider_config.provider),
                     model=model,
                     tier_hint=str(tier_name),
                     thinking=_coerce_thinking_level(tier_cfg.get("thinking_level")),
@@ -3086,12 +5971,10 @@ def _score_trace(row: Mapping[str, Any]) -> dict[str, Any]:
         "duplicate_count": int(row.get("duplicate_count") or 0),
         "duplicate_penalty": round(float(row.get("duplicate_penalty") or 0.0), 5),
         "components": {
-            key: round(float(value), 5)
-            for key, value in dict(row.get("components") or {}).items()
+            key: round(float(value), 5) for key, value in dict(row.get("components") or {}).items()
         },
         "weights": {
-            key: round(float(value), 5)
-            for key, value in dict(row.get("weights") or {}).items()
+            key: round(float(value), 5) for key, value in dict(row.get("weights") or {}).items()
         },
     }
 
@@ -3314,9 +6197,7 @@ def _build_router_dynamic_members(
     ensemble_cfg = getattr(config, "llm_ensemble", None)
     llm_cfg = getattr(config, "llm", None)
     configured_output_tokens = int(getattr(llm_cfg, "max_tokens", 0) or 0)
-    candidate_max_chars = int(
-        getattr(ensemble_cfg, "candidate_max_chars", 24_000) or 0
-    )
+    candidate_max_chars = int(getattr(ensemble_cfg, "candidate_max_chars", 24_000) or 0)
     candidate_output_tokens, aggregator_output_tokens = dynamic_output_token_budgets(
         configured_output_tokens=configured_output_tokens,
         candidate_max_chars=candidate_max_chars,
@@ -3332,9 +6213,7 @@ def _build_router_dynamic_members(
             aggregator_output_tokens=aggregator_output_tokens,
             ranking_config=ranking_config,
         )
-    user_profile_enabled = bool(
-        getattr(ensemble_cfg, "ranking_user_profile_enabled", False)
-    )
+    user_profile_enabled = bool(getattr(ensemble_cfg, "ranking_user_profile_enabled", False))
     supplied_user_profile = inputs.get("user_profile")
     user_profile: Mapping[str, Any] | None = None
     if user_profile_enabled:
@@ -3487,9 +6366,7 @@ def _build_router_tree_baseline_members(
     extra = metadata.get("routing_extra")
     extra_map = extra if isinstance(extra, Mapping) else {}
     routed_tier = (
-        metadata.get("routed_tier")
-        or extra_map.get("final_tier")
-        or extra_map.get("base_tier")
+        metadata.get("routed_tier") or extra_map.get("final_tier") or extra_map.get("base_tier")
     )
     ensemble_cfg = getattr(config, "llm_ensemble", None)
     structured_candidates = [
@@ -3503,12 +6380,8 @@ def _build_router_tree_baseline_members(
     ]
     router_cfg = getattr(config, "squilla_router", None)
     router_tiers = getattr(router_cfg, "tiers", {}) or {}
-    configured_model_options = list(
-        getattr(ensemble_cfg, "model_options", []) or []
-    )
-    ensemble_fields_set = set(
-        getattr(ensemble_cfg, "model_fields_set", set()) or set()
-    )
+    configured_model_options = list(getattr(ensemble_cfg, "model_options", []) or [])
+    ensemble_fields_set = set(getattr(ensemble_cfg, "model_fields_set", set()) or set())
     explicit_model_options = (
         configured_model_options
         if "model_options" in ensemble_fields_set and configured_model_options
@@ -3523,11 +6396,7 @@ def _build_router_tree_baseline_members(
             structured_candidates=structured_candidates,
             model_options=explicit_model_options,
             router_tiers=router_tiers if isinstance(router_tiers, Mapping) else {},
-            router_source=(
-                "squilla_router_local_tree"
-                if routed_tier
-                else "compatibility_default"
-            ),
+            router_source=("squilla_router_local_tree" if routed_tier else "compatibility_default"),
         )
     except TreeBaselineError as exc:
         raise TreeBaselineSelectionError(str(exc)) from exc
@@ -3829,9 +6698,7 @@ def static_b5_credential_available(
             base_url=str(getattr(inherited_provider_config, "base_url", "") or ""),
             org_id=str(getattr(inherited_provider_config, "org_id", "") or ""),
             proxy=str(getattr(inherited_provider_config, "proxy", "") or ""),
-            provider_routing=dict(
-                getattr(inherited_provider_config, "provider_routing", {}) or {}
-            ),
+            provider_routing=dict(getattr(inherited_provider_config, "provider_routing", {}) or {}),
         )
     member_models = (*profile.proposer_models, profile.aggregator_model)
     return all(
@@ -3908,15 +6775,11 @@ def _runtime_member_request_budget_bindings(
 
     llm_cfg = getattr(config, "llm", None)
     try:
-        explicit_cap = int(
-            getattr(llm_cfg, "provider_request_proof_max_chars", 0) or 0
-        )
+        explicit_cap = int(getattr(llm_cfg, "provider_request_proof_max_chars", 0) or 0)
     except (TypeError, ValueError):
         explicit_cap = 0
     try:
-        global_context_override = int(
-            getattr(llm_cfg, "context_window_tokens", 0) or 0
-        )
+        global_context_override = int(getattr(llm_cfg, "context_window_tokens", 0) or 0)
     except (TypeError, ValueError):
         global_context_override = 0
 
@@ -3998,14 +6861,12 @@ def build_ensemble_provider_from_config(
             session_key=_session_key,
         )
     elif selection_mode == TREE_BASELINE_SELECTION_MODE:
-        profile_name, proposers, aggregator, selection_plan = (
-            _build_router_tree_baseline_members(
-                config=config,
-                inherited_provider_config=inherited_provider_config,
-                turn_metadata=turn_metadata,
-                credential_pool_acquirer=_credential_pool_acquirer,
-                session_key=_session_key,
-            )
+        profile_name, proposers, aggregator, selection_plan = _build_router_tree_baseline_members(
+            config=config,
+            inherited_provider_config=inherited_provider_config,
+            turn_metadata=turn_metadata,
+            credential_pool_acquirer=_credential_pool_acquirer,
+            session_key=_session_key,
         )
     elif selection_mode == "router_dynamic":
         profile_name, proposers, aggregator, selection_plan = _build_router_dynamic_members(
@@ -4025,10 +6886,7 @@ def build_ensemble_provider_from_config(
     is_static_b5 = static_profile is not None or is_custom_b5
     configured_min_success = int(getattr(ensemble_cfg, "min_successful_proposers", 1) or 1)
     requested_min_success = configured_min_success
-    if (
-        is_static_b5
-        and configured_min_success == _LEGACY_ENSEMBLE_MIN_SUCCESSFUL_PROPOSERS
-    ):
+    if is_static_b5 and configured_min_success == _LEGACY_ENSEMBLE_MIN_SUCCESSFUL_PROPOSERS:
         requested_min_success = (
             # Custom lineups size freely (2–6): quorum defaults to N-1, the
             # same "all but one" shape the 3-of-4 static default encodes.
@@ -4064,10 +6922,7 @@ def build_ensemble_provider_from_config(
         getattr(ensemble_cfg, "shuffle_candidates", _LEGACY_ENSEMBLE_SHUFFLE_CANDIDATES)
     )
     shuffle_candidates = configured_shuffle_candidates
-    if (
-        is_static_b5
-        and configured_shuffle_candidates == _LEGACY_ENSEMBLE_SHUFFLE_CANDIDATES
-    ):
+    if is_static_b5 and configured_shuffle_candidates == _LEGACY_ENSEMBLE_SHUFFLE_CANDIDATES:
         shuffle_candidates = _STATIC_B5_DEFAULT_SHUFFLE_CANDIDATES
     if selection_mode == "router_dynamic" and bool(
         (selection_plan.get("aggregator") or {}).get("requires_order_randomization")
@@ -4105,7 +6960,9 @@ def build_ensemble_provider_from_config(
         # Once any member crosses providers, no member or single-provider
         # fallback may replay provider-private history.  This covers both
         # A -> B and a later B -> configured-primary-A transition.
-        def without_private_replay(member: EnsembleMemberConfig) -> EnsembleMemberConfig:
+        def without_private_replay(
+            member: EnsembleMemberConfig,
+        ) -> EnsembleMemberConfig:
             return replace(
                 member,
                 provider_config=replace(

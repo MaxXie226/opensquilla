@@ -747,7 +747,12 @@ def test_tokenrhythm_nonstream_fallback_preserves_confirmed_receipt(
     assert done.reasoning_tokens == 6
     assert done.cached_tokens == 4
     assert done.billed_cost == 0.000003011
-    assert done.cost_source == "provider_billed"
+    # The successful non-stream fallback has a confirmed receipt, but the
+    # preceding timed-out streaming request was also a physical, potentially
+    # billable request with no receipt.  The composite can therefore preserve
+    # the confirmed amount without claiming that the whole attempt is exact.
+    assert done.cost_source == "mixed"
+    assert done.usage_missing_count == 1
     assert done.billing_receipt is not None
     assert done.billing_receipt.amount_nanos == 21_000
     assert done.billing_receipt.usd_equivalent_nanos == 3_011

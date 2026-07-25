@@ -453,7 +453,7 @@ every turn. The implementation is split across:
 - `src/opensquilla/provider/ranking_router.py` — context adapters, task-profile
   validation, hard filters, scoring, greedy selection, and trace generation;
 - `src/opensquilla/provider/router_dynamic_model_profiles.json` — versioned
-  mock model registry and static/online profiles;
+  80-model curated OpenRouter registry and static/online profile estimates;
 - `src/opensquilla/provider/router_dynamic_ranking_config.json` — the complete
   dynamic-routing parameter set, including limits, fallback/mock defaults,
   hard-filter states, ranking, reranking, proposer count, and session behavior;
@@ -505,7 +505,7 @@ Before ranking, runtime builds four replaceable inputs:
    The profile is never sent to the task analyzer; only ranking reads it.
 4. **Model registry snapshot** — composed from the routed model, enabled
    `llm_ensemble.candidates`, non-default legacy `model_options`, configured
-   SquillaRouter tiers, and the packaged twenty-model mock registry. Unknown
+   SquillaRouter tiers, and the packaged eighty-model curated registry. Unknown
    deployments receive deterministic synthesized priors. Credential presence
    is added as an availability fact before ranking. Malformed profile rows and
    duplicate case-normalized deployment identities are rejected before pool
@@ -765,9 +765,17 @@ Unknown, misspelled, missing, or currently inactive settings therefore fail
 explicitly instead of appearing to take effect. A malformed config raises
 `DynamicRankingError`, so runtime follows the existing single-model fail-open
 path. The packaged config is cached; editing it requires a process restart.
-The twenty catalog mock profiles remain separately versioned in
-`router_dynamic_model_profiles.json`; defaults used to synthesize an unknown
-deployment are in the ranking JSON. Protocol enums, probability bounds, and
+The eighty curated OpenRouter profiles remain separately versioned in
+`router_dynamic_model_profiles.json`. Catalog facts (model ID/version, context,
+modalities, token prices, and advertised reasoning/tool support) carry their
+verification date. The
+`is_open_source` flag means that the exact model has publicly downloadable
+weights under a published license (including open-weight licenses, not only
+OSI-approved licenses); `is_chinese_model` follows the original model
+developer, independently of the serving provider. Capability priors, latency,
+and error rates are curated routing estimates rather than OpenRouter
+measurements. Defaults used to synthesize an unknown deployment are in the
+ranking JSON. Protocol enums, probability bounds, and
 deterministic tie-break order remain code contracts rather than tuning knobs.
 `router_dynamic` retains its 3,600-second proposer/aggregator timeouts and zero
 quorum-grace default.

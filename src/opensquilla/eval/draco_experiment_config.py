@@ -120,6 +120,13 @@ class DracoRunnerConfig(_StrictConfig):
     mode: Literal["agent_loop", "provider"]
     agent_max_iterations: int = Field(ge=0)
     concurrency: int = Field(ge=1)
+    deadline_wrapup_margin_seconds: int = Field(default=0, ge=0)
+    deadline_wrapup_disable_tools: bool = False
+    deadline_thinking_off_margin_seconds: int = Field(default=0, ge=0)
+    max_iterations_includes_finalization: bool = False
+    retrieval_loop_finalization_threshold: int = Field(default=0, ge=0)
+    finalization_aggregator_only: bool = False
+    finalization_disable_thinking: bool = False
 
 
 class DracoGenerationConfig(_StrictConfig):

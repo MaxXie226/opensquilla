@@ -13,8 +13,10 @@ from opensquilla.engine.types import ThinkingLevel
 from opensquilla.provider.openai import (
     OpenAIProvider,
     _build_openai_tool,
+    _mark_stream_fallback_cost_unknown,
     _stream_timeout,
     _tool_schema_accepts_arguments,
+    _validated_billing_result,
 )
 from opensquilla.provider.selector import build_provider
 from opensquilla.provider.types import (
@@ -25,6 +27,7 @@ from opensquilla.provider.types import (
     ErrorEvent,
     Message,
     ModelCapabilities,
+    ProviderBillingReceipt,
     ProviderHeartbeatEvent,
     ToolDefinition,
     ToolInputSchema,
@@ -647,6 +650,580 @@ def _collect_events(
         ]
 
     return asyncio.run(_run())
+
+
+def test_provider_request_budget_preflight_reports_zero_physical_requests(
+    monkeypatch: Any,
+) -> None:
+    class BudgetLimited:
+        action = "budget_limited"
+        proof = {"actual_chars": 101, "limit": 100}
+        payload = None
+
+    def fail_if_http_client_is_created(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("preflight rejection must not create an HTTP client")
+
+    monkeypatch.setattr(
+        "opensquilla.engine.context_budget.coordinate_provider_context_budget",
+        lambda *args, **kwargs: BudgetLimited(),
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.openai.httpx.AsyncClient",
+        fail_if_http_client_is_created,
+    )
+    provider = OpenAIProvider(
+        api_key="test",
+        model="deepseek/deepseek-v4-flash",
+        base_url="https://openrouter.ai/api/v1",
+        provider_kind="openrouter",
+    )
+
+    events = _collect_events(provider, ChatConfig())
+
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert error.code == "provider_request_budget_exhausted"
+    assert error.request_started is False
+    assert error.physical_request_count == 0
+    assert error.usage_missing_count == 0
+
+
+def test_stream_to_non_stream_fallback_error_accounts_for_both_requests(
+    monkeypatch: Any,
+) -> None:
+    class TimeoutStream:
+        async def __aenter__(self) -> Any:
+            raise httpx.ReadTimeout("stream idle")
+
+        async def __aexit__(self, *_exc: Any) -> None:
+            return None
+
+    class TimeoutClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> TimeoutClient:
+            return self
+
+        async def __aexit__(self, *_exc: Any) -> None:
+            return None
+
+        def stream(self, *args: Any, **kwargs: Any) -> TimeoutStream:
+            return TimeoutStream()
+
+    class FailingFallbackProvider(OpenAIProvider):
+        async def _complete_non_stream(self, **kwargs: Any):
+            yield ErrorEvent(message="fallback failed", code="timeout")
+
+    monkeypatch.setattr("opensquilla.provider.openai.httpx.AsyncClient", TimeoutClient)
+    provider = FailingFallbackProvider(
+        api_key="test",
+        model="deepseek/deepseek-v4-flash",
+        base_url="https://openrouter.ai/api/v1",
+        provider_kind="openrouter",
+    )
+
+    events = _collect_events(provider, ChatConfig(timeout=1.0))
+
+    assert any(isinstance(event, ProviderHeartbeatEvent) for event in events)
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert error.request_started is True
+    assert error.physical_request_count == 2
+    assert error.usage_missing_count == 2
+
+
+def test_empty_stream_fallback_generator_exception_preserves_both_requests(
+    monkeypatch: Any,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=b"data: [DONE]\n\n",
+        )
+
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+
+    def patched_async_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        kwargs["transport"] = transport
+        return real_async_client(*args, **kwargs)
+
+    class RaisingFallbackProvider(OpenAIProvider):
+        async def _complete_non_stream(self, **kwargs: Any):
+            if False:  # pragma: no cover - make this an async generator
+                yield None
+            raise RuntimeError("fallback generator exploded")
+
+    monkeypatch.setattr(
+        "opensquilla.provider.openai.httpx.AsyncClient",
+        patched_async_client,
+    )
+    provider = RaisingFallbackProvider(
+        api_key="test",
+        model="kimi-k2.5",
+        base_url="https://api.moonshot.cn/v1",
+        provider_kind="moonshot",
+    )
+
+    events = _collect_events(provider, ChatConfig(timeout=1.0))
+
+    assert any(isinstance(event, ProviderHeartbeatEvent) for event in events)
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert error.code == "provider_internal"
+    assert error.request_started is True
+    assert error.physical_request_count == 2
+    assert error.usage_missing_count == 2
+
+
+def test_stream_fallback_error_does_not_double_count_missing_placeholder() -> None:
+    fallback_error = ErrorEvent(
+        message="fallback failed after two internal attempts",
+        code="timeout",
+        model_usage_breakdown=[
+            {
+                "role": "abandoned_stream_request",
+                "provider": "openrouter",
+                "model": "requested-model",
+                "cost_source": "none",
+            },
+            {
+                "role": "fallback_non_stream",
+                "provider": "openrouter",
+                "model": "actual-model",
+                "cost_source": "provider_billed",
+            },
+        ],
+        usage_missing_count=1,
+        request_started=True,
+        physical_request_count=2,
+    )
+
+    wrapped = _mark_stream_fallback_cost_unknown(
+        fallback_error,
+        provider_kind="openrouter",
+        requested_model="requested-model",
+    )
+
+    assert isinstance(wrapped, ErrorEvent)
+    assert wrapped.physical_request_count == 3
+    assert wrapped.usage_missing_count == 2
+
+
+def test_stream_fallback_done_preserves_receipt_and_requested_identity() -> None:
+    receipt = ProviderBillingReceipt(
+        currency="USD",
+        status="confirmed",
+        amount_nanos=10_000_000,
+        usd_equivalent_nanos=10_000_000,
+        fx_native_per_usd_nanos=1_000_000_000,
+    )
+    fallback_done = DoneEvent(
+        provider="openrouter",
+        model="",
+        requested_provider="openrouter",
+        requested_model="requested-model",
+        input_tokens=4,
+        output_tokens=1,
+        billed_cost=0.01,
+        cost_source="provider_billed",
+        billing_receipt=receipt,
+        provider_usage={"is_byok": False, "response_ids": ["response-1"]},
+    )
+
+    wrapped = _mark_stream_fallback_cost_unknown(
+        fallback_done,
+        provider_kind="openrouter",
+        requested_model="requested-model",
+    )
+
+    assert isinstance(wrapped, DoneEvent)
+    assert wrapped.usage_missing_count == 1
+    assert len(wrapped.model_usage_breakdown) == 2
+    fallback_row = wrapped.model_usage_breakdown[1]
+    assert fallback_row["model"] == ""
+    assert fallback_row["requested_model"] == "requested-model"
+    assert fallback_row["provider"] == "openrouter"
+    assert fallback_row["requested_provider"] == "openrouter"
+    assert fallback_row["billing_receipt"] == receipt
+    assert fallback_row["provider_usage"]["response_ids"] == ["response-1"]
+
+
+def test_stream_fallback_done_does_not_forge_blank_actual_provider() -> None:
+    wrapped = _mark_stream_fallback_cost_unknown(
+        DoneEvent(
+            provider="",
+            model="",
+            requested_provider="openrouter",
+            requested_model="requested-model",
+            input_tokens=1,
+            output_tokens=1,
+            cost_source="provider_billed",
+        ),
+        provider_kind="openrouter",
+        requested_model="requested-model",
+    )
+
+    assert isinstance(wrapped, DoneEvent)
+    abandoned_row, fallback_row = wrapped.model_usage_breakdown
+    assert abandoned_row["provider"] == ""
+    assert abandoned_row["requested_provider"] == "openrouter"
+    assert fallback_row["provider"] == ""
+    assert fallback_row["requested_provider"] == "openrouter"
+    assert fallback_row["model"] == ""
+    assert fallback_row["requested_model"] == "requested-model"
+
+
+def test_stream_fallback_error_preserves_diagnostic_receipt_multiplicity() -> None:
+    receipt = {
+        "provider": "openrouter",
+        "model": "actual-model",
+        "input_tokens": 4,
+        "output_tokens": 1,
+        "billed_cost": 0.01,
+        "cost_source": "provider_billed",
+    }
+    fallback_error = ErrorEvent(
+        message="two billed fallback requests",
+        code="timeout",
+        model_usage_breakdown=[receipt],
+        diagnostic_done=DoneEvent(
+            provider="openrouter",
+            model="actual-model",
+            input_tokens=8,
+            output_tokens=2,
+            billed_cost=0.02,
+            cost_source="provider_billed",
+            model_usage_breakdown=[receipt, receipt],
+        ),
+        request_started=True,
+        physical_request_count=2,
+    )
+
+    wrapped = _mark_stream_fallback_cost_unknown(
+        fallback_error,
+        provider_kind="openrouter",
+        requested_model="requested-model",
+    )
+
+    assert isinstance(wrapped, ErrorEvent)
+    assert wrapped.physical_request_count == 3
+    # Both fallback requests have receipts; only the abandoned stream is
+    # missing usage.
+    assert wrapped.usage_missing_count == 1
+
+
+@pytest.mark.parametrize("diagnostic_id_first", [False, True])
+def test_stream_fallback_error_receipt_matching_prioritizes_response_ids(
+    diagnostic_id_first: bool,
+) -> None:
+    def receipt(response_id: str | None) -> dict[str, Any]:
+        return {
+            "provider": "openrouter",
+            "model": "actual-model",
+            "input_tokens": 4,
+            "output_tokens": 1,
+            "billed_cost": 0.01,
+            "cost_source": "provider_billed",
+            "provider_usage": (
+                {"response_ids": [response_id]} if response_id is not None else {}
+            ),
+        }
+
+    diagnostic_rows = [receipt("response-a"), receipt(None)]
+    if not diagnostic_id_first:
+        diagnostic_rows.reverse()
+    fallback_error = ErrorEvent(
+        message="diagnostic copies arrive in an adversarial order",
+        code="timeout",
+        model_usage_breakdown=[receipt("response-a"), receipt("response-b")],
+        diagnostic_done=DoneEvent(
+            input_tokens=8,
+            output_tokens=2,
+            billed_cost=0.02,
+            cost_source="provider_billed",
+            model_usage_breakdown=diagnostic_rows,
+        ),
+        request_started=True,
+        physical_request_count=2,
+    )
+
+    wrapped = _mark_stream_fallback_cost_unknown(
+        fallback_error,
+        provider_kind="openrouter",
+        requested_model="requested-model",
+    )
+
+    assert isinstance(wrapped, ErrorEvent)
+    assert wrapped.physical_request_count == 3
+    assert wrapped.usage_missing_count == 1
+
+
+def test_stream_fallback_error_counts_distinct_response_ids_as_distinct_receipts() -> None:
+    def receipt(response_id: str) -> dict[str, Any]:
+        return {
+            "provider": "openrouter",
+            "model": "actual-model",
+            "input_tokens": 4,
+            "output_tokens": 1,
+            "billed_cost": 0.01,
+            "cost_source": "provider_billed",
+            "provider_usage": {"response_ids": [response_id]},
+        }
+
+    fallback_error = ErrorEvent(
+        message="two physical responses share token metrics",
+        code="timeout",
+        model_usage_breakdown=[receipt("response-a")],
+        diagnostic_done=DoneEvent(
+            input_tokens=4,
+            output_tokens=1,
+            billed_cost=0.01,
+            cost_source="provider_billed",
+            model_usage_breakdown=[receipt("response-b")],
+        ),
+        request_started=True,
+        physical_request_count=1,
+    )
+
+    wrapped = _mark_stream_fallback_cost_unknown(
+        fallback_error,
+        provider_kind="openrouter",
+        requested_model="requested-model",
+    )
+
+    assert isinstance(wrapped, ErrorEvent)
+    assert wrapped.physical_request_count == 3
+    assert wrapped.usage_missing_count == 1
+
+
+def test_stream_fallback_error_merges_nested_missing_and_trace_evidence() -> None:
+    receipt = {
+        "provider": "openrouter",
+        "model": "actual-model",
+        "input_tokens": 4,
+        "output_tokens": 1,
+        "billed_cost": 0.01,
+        "cost_source": "provider_billed",
+        "provider_usage": {"response_ids": ["response-a"]},
+    }
+    fallback_error = ErrorEvent(
+        message="nested fallback failed",
+        code="timeout",
+        model_usage_breakdown=[receipt],
+        usage_missing_count=1,
+        diagnostic_done=DoneEvent(
+            provider="openrouter",
+            model="actual-model",
+            model_usage_breakdown=[receipt],
+            usage_missing_count=2,
+            ensemble_trace={
+                "llm_request_count": 3,
+                "physical_request_count": 3,
+                "usage_missing_count": 2,
+            },
+        ),
+        request_started=True,
+        physical_request_count=1,
+    )
+
+    wrapped = _mark_stream_fallback_cost_unknown(
+        fallback_error,
+        provider_kind="openrouter",
+        requested_model="requested-model",
+    )
+
+    assert isinstance(wrapped, ErrorEvent)
+    assert wrapped.physical_request_count == 4
+    assert wrapped.usage_missing_count == 3
+    assert wrapped.ensemble_trace is not None
+    assert wrapped.ensemble_trace["physical_request_count"] == 4
+    assert wrapped.ensemble_trace["llm_request_count"] == 4
+    assert wrapped.ensemble_trace["usage_missing_count"] == 3
+
+
+def test_invalid_billing_receipt_cannot_fall_back_to_enclosing_cost() -> None:
+    malformed = ProviderBillingReceipt(
+        currency="usd",
+        status="confirmed",
+        amount_nanos=10_000_000,
+        usd_equivalent_nanos=10_000_000,
+        fx_native_per_usd_nanos=1_000_000_000,
+    )
+
+    billed_cost, source, receipt = _validated_billing_result(
+        0.01,
+        "provider_billed",
+        malformed,
+    )
+
+    assert billed_cost == 0.0
+    assert source == "billing_receipt_invalid"
+    assert receipt is None
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "amount_nanos",
+        "usd_equivalent_nanos",
+        "fx_native_per_usd_nanos",
+    ],
+)
+def test_oversized_billing_receipt_cannot_be_trusted(field: str) -> None:
+    values = {
+        "currency": "USD",
+        "status": "confirmed",
+        "amount_nanos": 10_000_000,
+        "usd_equivalent_nanos": 10_000_000,
+        "fx_native_per_usd_nanos": 1_000_000_000,
+    }
+    values[field] = 1 << 63
+    oversized = ProviderBillingReceipt(**values)
+
+    billed_cost, source, receipt = _validated_billing_result(
+        0.01,
+        "provider_billed",
+        oversized,
+    )
+
+    assert billed_cost == 0.0
+    assert source == "billing_receipt_invalid"
+    assert receipt is None
+
+
+def test_pending_billing_receipt_is_provenance_not_trusted_cost() -> None:
+    pending = ProviderBillingReceipt(
+        currency="CNY",
+        status="pending",
+        amount_nanos=70_000_000,
+        usd_equivalent_nanos=None,
+        fx_native_per_usd_nanos=7_000_000_000,
+    )
+
+    billed_cost, source, receipt = _validated_billing_result(
+        99.0,
+        "provider_billed",
+        pending,
+    )
+
+    assert billed_cost == 0.0
+    assert source == "billing_pending"
+    assert receipt == pending
+
+
+def test_stream_validation_error_preserves_prior_usage_and_receipt(
+    monkeypatch: Any,
+) -> None:
+    first_chunk = {
+        "id": "response-stream-1",
+        "model": "actual-model",
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"content": "partial"},
+                "finish_reason": None,
+            }
+        ],
+        "usage": {
+            "prompt_tokens": 7,
+            "completion_tokens": 3,
+            "cost": 0.0125,
+            "is_byok": False,
+        },
+    }
+    malformed_chunk = {"choices": {"not": "an array"}}
+    body = (
+        f"data: {json.dumps(first_chunk)}\n\n"
+        f"data: {json.dumps(malformed_chunk)}\n\n"
+        "data: [DONE]\n\n"
+    ).encode()
+    _patch_transport_body(monkeypatch, {}, body)
+    provider = OpenAIProvider(
+        api_key="test",
+        model="requested-model",
+        base_url="https://openrouter.ai/api/v1",
+        provider_kind="openrouter",
+    )
+
+    events = _collect_events(provider, ChatConfig())
+
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert error.code == "invalid_stream_frame"
+    assert error.request_started is True
+    assert error.physical_request_count == 1
+    assert error.diagnostic_done is not None
+    assert error.diagnostic_done.input_tokens == 7
+    assert error.diagnostic_done.output_tokens == 3
+    assert error.diagnostic_done.billed_cost == pytest.approx(0.0125)
+    assert error.diagnostic_done.cost_source == "provider_billed"
+    assert error.diagnostic_done.billing_receipt is not None
+    assert error.diagnostic_done.model == "actual-model"
+    assert error.diagnostic_done.requested_model == "requested-model"
+    assert error.diagnostic_done.provider_usage["response_ids"] == [
+        "response-stream-1"
+    ]
+
+
+def test_non_stream_validation_error_preserves_usage_and_receipt(
+    monkeypatch: Any,
+) -> None:
+    response = httpx.Response(
+        200,
+        json={
+            "id": "response-nonstream-1",
+            "model": "actual-model",
+            "choices": [
+                {
+                    "index": 0,
+                    "finish_reason": None,
+                    "message": {"content": "partial"},
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 5,
+                "completion_tokens": 2,
+                "cost": 0.02,
+                "is_byok": False,
+            },
+        },
+    )
+    _patch_transport_response(monkeypatch, {}, response)
+    provider = OpenAIProvider(
+        api_key="test",
+        model="requested-model",
+        base_url="https://openrouter.ai/api/v1",
+        provider_kind="openrouter",
+    )
+
+    async def run() -> list[Any]:
+        return [
+            event
+            async for event in provider._complete_non_stream(
+                payload={"messages": [{"role": "user", "content": "hi"}]},
+                headers={},
+                cfg=ChatConfig(),
+                tools=None,
+                timeout_exc=httpx.ReadTimeout("stream timeout"),
+            )
+        ]
+
+    events = asyncio.run(run())
+
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert error.code == "incomplete_stream"
+    assert error.request_started is True
+    assert error.physical_request_count == 1
+    assert error.diagnostic_done is not None
+    assert error.diagnostic_done.input_tokens == 5
+    assert error.diagnostic_done.output_tokens == 2
+    assert error.diagnostic_done.billed_cost == pytest.approx(0.02)
+    assert error.diagnostic_done.cost_source == "provider_billed"
+    assert error.diagnostic_done.billing_receipt is not None
+    assert error.diagnostic_done.model == "actual-model"
+    assert error.diagnostic_done.requested_model == "requested-model"
+    assert error.diagnostic_done.provider_usage["response_ids"] == [
+        "response-nonstream-1"
+    ]
 
 
 def _assert_invalid_native_arguments_fail_closed(

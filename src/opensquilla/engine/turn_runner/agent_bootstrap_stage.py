@@ -626,6 +626,10 @@ class AgentBootstrapStage:
         # the process default workspace instead of the configured one.
         agent_config = AgentConfig(
             max_iterations=budgets.max_iterations,
+            max_iterations_includes_finalization=_bool_from_env(
+                "OPENSQUILLA_MAX_ITERATIONS_INCLUDES_FINALIZATION",
+                AgentConfig().max_iterations_includes_finalization,
+            ),
             system_prompt=inp.final_prompt,
             cache_breakpoints=inp.cache_breakpoints,
             request_context_prompt=inp.request_context_prompt,
@@ -744,6 +748,22 @@ class AgentBootstrapStage:
             deadline_wrapup_margin_seconds=_nonnegative_int_from_env(
                 "OPENSQUILLA_DEADLINE_WRAPUP_MARGIN_SECONDS",
                 AgentConfig().deadline_wrapup_margin_seconds,
+            ),
+            deadline_wrapup_disable_tools=_bool_from_env(
+                "OPENSQUILLA_DEADLINE_WRAPUP_DISABLE_TOOLS",
+                AgentConfig().deadline_wrapup_disable_tools,
+            ),
+            retrieval_loop_finalization_threshold=_nonnegative_int_from_env(
+                "OPENSQUILLA_RETRIEVAL_LOOP_FINALIZATION_THRESHOLD",
+                AgentConfig().retrieval_loop_finalization_threshold,
+            ),
+            finalization_aggregator_only=_bool_from_env(
+                "OPENSQUILLA_FINALIZATION_AGGREGATOR_ONLY",
+                AgentConfig().finalization_aggregator_only,
+            ),
+            finalization_disable_thinking=_bool_from_env(
+                "OPENSQUILLA_FINALIZATION_DISABLE_THINKING",
+                AgentConfig().finalization_disable_thinking,
             ),
             reasoning_only_thinking_fallback=_bool_from_env(
                 "OPENSQUILLA_REASONING_ONLY_THINKING_FALLBACK",

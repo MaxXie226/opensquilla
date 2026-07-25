@@ -36,14 +36,17 @@ def test_formal_scope_is_default(tmp_path: Path) -> None:
     assert args.scope == "formal"
 
 
-def test_formal_routes_cover_exact_router_dynamic_registry() -> None:
+def test_formal_routes_are_a_valid_subset_of_router_dynamic_registry() -> None:
     payload = json.loads(REGISTRY_PATH.read_text(encoding="utf-8"))
     registry_models = {
         str(row["registry_facts"]["model_id"]) for row in payload["models"]
     }
 
-    assert set(validator.FORMAL_EXPECTED_ROUTES) == registry_models
-    assert set(validator.B2_EXPECTED_ROUTES) <= registry_models
+    assert len(registry_models) == 80
+    assert set(validator.FORMAL_EXPECTED_ROUTES) <= registry_models
+    assert set(validator.B2_EXPECTED_ROUTES) <= set(
+        validator.FORMAL_EXPECTED_ROUTES
+    )
 
 
 def test_formal_routes_match_runtime_pins_and_capability_contract() -> None:

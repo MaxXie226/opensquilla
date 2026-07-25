@@ -8,10 +8,28 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from opensquilla.engine.agent import Agent, _IterationStreamTimeoutError
+from opensquilla.engine.agent import (
+    _PROVIDER_STREAM_CLEANUP_TIMEOUT_SECONDS,
+    Agent,
+    _IterationStreamTimeoutError,
+)
 from opensquilla.engine.runtime import TurnRunner
-from opensquilla.engine.types import AgentConfig, DoneEvent
+from opensquilla.engine.types import (
+    AgentConfig,
+    DoneEvent,
+)
+from opensquilla.engine.types import (
+    ErrorEvent as AgentErrorEvent,
+)
+from opensquilla.engine.types import (
+    TextDeltaEvent as AgentTextDeltaEvent,
+)
 from opensquilla.gateway.config import GatewayConfig
+from opensquilla.provider import TextDeltaEvent as ProviderTextDeltaEvent
+
+
+async def _collect_agent_events(stream: AsyncIterator[Any]) -> list[Any]:
+    return [event async for event in stream]
 
 
 class _SessionConfigManager:
@@ -195,7 +213,7 @@ async def test_run_threads_iteration_timeout_into_agent_config(
 
 
 @pytest.mark.asyncio
-async def test_stream_iteration_timeout_does_not_double_close_provider_stream(
+async def test_stream_iteration_timeout_closes_provider_stream_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     agent = Agent.__new__(Agent)
@@ -209,9 +227,15 @@ async def test_stream_iteration_timeout_does_not_double_close_provider_stream(
         finally:
             await asyncio.sleep(0)
 
-    async def record_close(_stream_iter: AsyncIterator[Any]) -> None:
+    async def record_close(
+        _stream_iter: AsyncIterator[Any],
+        *,
+        require_aclose: bool = False,
+    ) -> bool:
         nonlocal close_calls
+        del require_aclose
         close_calls += 1
+        return True
 
     monkeypatch.setattr(agent, "_close_provider_stream", record_close)
 
@@ -225,7 +249,250 @@ async def test_stream_iteration_timeout_does_not_double_close_provider_stream(
         ):
             pass
 
-    assert close_calls == 0
+    assert close_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("deadline_kind", ["iteration", "total"])
+async def test_cancellation_resistant_provider_cannot_block_deadline_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+    deadline_kind: str,
+) -> None:
+    agent = Agent.__new__(Agent)
+    agent.config = SimpleNamespace(timeout=0.02, iteration_timeout=0.02)
+    release = asyncio.Event()
+    closed = asyncio.Event()
+
+    async def provider_stream() -> AsyncIterator[dict[str, str]]:
+        try:
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    continue
+            yield {"type": "chunk", "data": "late"}
+        finally:
+            closed.set()
+
+    monkeypatch.setattr(
+        "opensquilla.engine.agent._PROVIDER_STREAM_CLEANUP_TIMEOUT_SECONDS",
+        0.01,
+    )
+    loop = asyncio.get_running_loop()
+    total_deadline = loop.time() + 0.02 if deadline_kind == "total" else None
+    iteration_deadline = loop.time() + 0.02 if deadline_kind == "iteration" else loop.time() + 1.0
+
+    async def consume() -> None:
+        async for _event in agent._stream_provider_events_with_deadline(
+            provider_stream(),
+            loop=loop,
+            total_deadline=total_deadline,
+            iteration_deadline=iteration_deadline,
+        ):
+            pass
+
+    expected_error = TimeoutError if deadline_kind == "total" else _IterationStreamTimeoutError
+    try:
+        with pytest.raises(expected_error):
+            await asyncio.wait_for(consume(), timeout=0.2)
+    finally:
+        release.set()
+    await asyncio.wait_for(closed.wait(), timeout=0.2)
+
+
+@pytest.mark.asyncio
+async def test_outer_turn_close_blocks_next_turn_until_provider_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = asyncio.Event()
+    closed = asyncio.Event()
+
+    class _CancellationResistantProvider:
+        provider_name = "fake"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def chat(
+            self,
+            *args: Any,
+            **kwargs: Any,
+        ) -> AsyncIterator[Any]:
+            del args, kwargs
+            self.calls += 1
+
+            async def _stream() -> AsyncIterator[Any]:
+                try:
+                    yield ProviderTextDeltaEvent(text="partial")
+                finally:
+                    while not release.is_set():
+                        try:
+                            await release.wait()
+                        except asyncio.CancelledError:
+                            continue
+                    closed.set()
+
+            return _stream()
+
+        async def list_models(self) -> list[Any]:
+            return []
+
+    monkeypatch.setattr(
+        "opensquilla.engine.agent._PROVIDER_STREAM_CLEANUP_TIMEOUT_SECONDS",
+        0.01,
+    )
+    provider = _CancellationResistantProvider()
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(timeout=1.0, iteration_timeout=1.0),
+    )
+    first_turn = agent.run_turn("first")
+
+    try:
+        while True:
+            event = await asyncio.wait_for(first_turn.__anext__(), timeout=0.2)
+            if isinstance(event, AgentTextDeltaEvent):
+                break
+        await asyncio.wait_for(first_turn.aclose(), timeout=0.2)
+
+        second_events = [event async for event in agent.run_turn("second")]
+        [cleanup_error] = [
+            event for event in second_events if isinstance(event, AgentErrorEvent)
+        ]
+        assert cleanup_error.code == "agent_cleanup_in_progress"
+        assert provider.calls == 1
+    finally:
+        release.set()
+    await asyncio.wait_for(closed.wait(), timeout=0.5)
+
+
+@pytest.mark.asyncio
+async def test_agent_rejects_concurrent_turn_on_same_instance() -> None:
+    class _Provider:
+        provider_name = "fake"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def chat(
+            self,
+            *args: Any,
+            **kwargs: Any,
+        ) -> AsyncIterator[Any]:
+            del args, kwargs
+            self.calls += 1
+
+            async def _stream() -> AsyncIterator[Any]:
+                yield ProviderTextDeltaEvent(text="unused")
+
+            return _stream()
+
+        async def list_models(self) -> list[Any]:
+            return []
+
+    provider = _Provider()
+    agent = Agent(provider=provider, config=AgentConfig())
+    first_turn = agent.run_turn("first")
+    await first_turn.__anext__()
+    try:
+        second_events = [event async for event in agent.run_turn("second")]
+    finally:
+        await first_turn.aclose()
+
+    [active_error] = [
+        event for event in second_events if isinstance(event, AgentErrorEvent)
+    ]
+    assert active_error.code == "agent_turn_in_progress"
+    assert provider.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_top_level_meta_resume_obeys_total_deadline_and_resets_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Provider:
+        provider_name = "fake"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def chat(self, *_args: Any, **_kwargs: Any) -> AsyncIterator[Any]:
+            self.calls += 1
+
+            async def _stream() -> AsyncIterator[Any]:
+                yield ProviderTextDeltaEvent(text="unexpected")
+
+            return _stream()
+
+        async def list_models(self) -> list[Any]:
+            return []
+
+    provider = _Provider()
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            timeout=0.02,
+            metadata={"meta_resume": ("claim", {})},
+        ),
+    )
+
+    async def _slow_meta_resume(_value: Any) -> AsyncIterator[Any]:
+        await asyncio.sleep(30.0)
+        yield DoneEvent(text="late")
+
+    monkeypatch.setattr(agent, "_run_meta_resume", _slow_meta_resume)
+
+    events = await asyncio.wait_for(
+        _collect_agent_events(agent.run_turn("resume")),
+        timeout=0.2,
+    )
+
+    [timeout_error] = [
+        event for event in events if isinstance(event, AgentErrorEvent)
+    ]
+    assert timeout_error.code == "agent_meta_resume_timeout"
+    assert agent.state.value == "idle"
+    assert agent._active_turn is False
+    assert provider.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_top_level_meta_terminal_snapshot_survives_streamed_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Provider:
+        provider_name = "fake"
+
+        async def list_models(self) -> list[Any]:
+            return []
+
+    agent = Agent(
+        provider=_Provider(),
+        config=AgentConfig(
+            timeout=1.0,
+            metadata={"meta_resume": ("claim", {})},
+        ),
+    )
+
+    async def _meta_resume(_value: Any) -> AsyncIterator[Any]:
+        yield AgentTextDeltaEvent(text="streamed prefix")
+        yield DoneEvent(
+            text="authoritative final",
+            text_snapshot="authoritative final",
+            iterations=1,
+        )
+
+    monkeypatch.setattr(agent, "_run_meta_resume", _meta_resume)
+    events = await _collect_agent_events(agent.run_turn("resume"))
+
+    assert any(
+        isinstance(event, AgentTextDeltaEvent)
+        and event.text == "streamed prefix"
+        for event in events
+    )
+    [done] = [event for event in events if isinstance(event, DoneEvent)]
+    assert done.text_snapshot == "authoritative final"
+    assert agent.state.value == "idle"
 
 
 @pytest.mark.asyncio
@@ -260,4 +527,5 @@ async def test_total_deadline_limited_wait_stays_total_timeout_on_early_wake(
             pass
 
     assert type(exc_info.value) is TimeoutError
-    assert observed_timeouts == [pytest.approx(0.05)]
+    assert observed_timeouts[0] == pytest.approx(0.05)
+    assert observed_timeouts[1] == pytest.approx(_PROVIDER_STREAM_CLEANUP_TIMEOUT_SECONDS)
