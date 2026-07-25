@@ -9,12 +9,14 @@ being guessed together across installations.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import sqlite3
+import tempfile
 import threading
 import uuid
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -149,17 +151,59 @@ def _read_only_connection(path: Path) -> sqlite3.Connection:
     return connection
 
 
-def snapshot_session_database(source: str | Path, destination: str | Path) -> None:
-    """Create a WAL-aware SQLite snapshot without copying transient sidecars."""
+@contextlib.contextmanager
+def _private_source_snapshot(source: Path) -> Iterator[Path]:
+    """Copy a stable SQLite bundle before allowing SQLite to inspect it.
 
-    source_path = Path(source).expanduser().absolute()
-    destination_path = Path(destination).expanduser().absolute()
-    destination_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination_path.with_name(f".{destination_path.name}.snapshot.tmp")
+    SQLite can create a ``-shm`` file beside a WAL database even when it is
+    opened with ``mode=ro``.  Recovery profiles are immutable inputs, so copy
+    the database and durable sidecars into a private directory first.  The
+    no-follow copy and post-copy validation also prevent a mixed database/WAL
+    snapshot when the source changes concurrently.
+    """
+
+    # Keep the hardened file-copy implementation shared with profile
+    # inspection without introducing an import-time cycle through
+    # ``opensquilla.recovery.__init__``.
+    from opensquilla.recovery.engine import (
+        _copy_source_file_no_follow,
+        _regular_source_stat,
+        _source_snapshot_is_current,
+    )
+
+    bundle = (
+        source,
+        source.with_name(f"{source.name}-wal"),
+        source.with_name(f"{source.name}-journal"),
+    )
+    present_before = tuple(_regular_source_stat(path) is not None for path in bundle)
+    if not present_before[0]:
+        raise FileNotFoundError(source)
+
+    with tempfile.TemporaryDirectory(prefix="opensquilla-session-snapshot-") as temporary:
+        snapshot_root = Path(temporary)
+        snapshots = [
+            _copy_source_file_no_follow(path, snapshot_root / path.name)
+            for path, exists in zip(bundle, present_before, strict=True)
+            if exists
+        ]
+        present_after = tuple(_regular_source_stat(path) is not None for path in bundle)
+        if present_after != present_before or not all(
+            _source_snapshot_is_current(snapshot) for snapshot in snapshots
+        ):
+            raise sqlite3.OperationalError("source sessions database changed during snapshot")
+        yield snapshot_root / source.name
+
+
+def _snapshot_session_database_from_private(source: Path, destination: Path) -> None:
+    """Create a SQLite backup from an already-private source bundle."""
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.snapshot.tmp")
     if temporary.exists():
         raise FileExistsError(f"SQLite snapshot staging already exists: {temporary}")
     try:
-        with _read_only_connection(source_path) as source_connection:
+        with _read_only_connection(source) as source_connection:
             _quick_check(source_connection, label="source sessions database")
             target_connection = sqlite3.connect(temporary)
             try:
@@ -167,9 +211,18 @@ def snapshot_session_database(source: str | Path, destination: str | Path) -> No
                 _quick_check(target_connection, label="snapshot sessions database")
             finally:
                 target_connection.close()
-        temporary.replace(destination_path)
+        temporary.replace(destination)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def snapshot_session_database(source: str | Path, destination: str | Path) -> None:
+    """Create a WAL-aware SQLite snapshot without modifying the source bundle."""
+
+    source_path = Path(source).expanduser().absolute()
+    destination_path = Path(destination).expanduser().absolute()
+    with _private_source_snapshot(source_path) as private_source:
+        _snapshot_session_database_from_private(private_source, destination_path)
 
 
 def _normalized_row(
@@ -612,27 +665,18 @@ def _upgrade_target_session_schema(path: Path) -> None:
     _run_session_schema_initialization(path)
 
 
-def merge_session_database(
+def _merge_session_database_from_private(
     target: str | Path,
-    source: str | Path,
+    source: Path,
     *,
     source_id: str,
 ) -> SessionMergeResult:
-    """Merge one offline source into a primary ``sessions.db``.
-
-    A missing target is created with SQLite's backup API, preserving every
-    source schema object and committed WAL page.  Existing targets receive the
-    supported session graph row-by-row.  Exact conversation duplicates are
-    ignored; divergent session-key collisions get deterministic key and ID
-    remaps so both conversations remain addressable.
-    """
-
     target_path = Path(target).expanduser().absolute()
-    source_path = Path(source).expanduser().absolute()
+    source_path = source
     if not source_path.is_file():
         raise FileNotFoundError(source_path)
     if not target_path.exists():
-        snapshot_session_database(source_path, target_path)
+        _snapshot_session_database_from_private(source_path, target_path)
         excluded = _clear_excluded_operational_rows(target_path)
         result = _snapshot_result(target_path, source_id)
         return SessionMergeResult(
@@ -853,6 +897,33 @@ def merge_session_database(
             )
     finally:
         target_connection.close()
+
+
+def merge_session_database(
+    target: str | Path,
+    source: str | Path,
+    *,
+    source_id: str,
+) -> SessionMergeResult:
+    """Merge one offline source into a primary ``sessions.db``.
+
+    A missing target is created with SQLite's backup API, preserving every
+    source schema object and committed WAL page.  Existing targets receive the
+    supported session graph row-by-row.  Exact conversation duplicates are
+    ignored; divergent session-key collisions get deterministic key and ID
+    remaps so both conversations remain addressable.
+
+    SQLite only opens a stable private copy.  The recovery source bundle is
+    never opened by SQLite and therefore cannot gain a transient ``-shm`` file.
+    """
+
+    source_path = Path(source).expanduser().absolute()
+    with _private_source_snapshot(source_path) as private_source:
+        return _merge_session_database_from_private(
+            target,
+            private_source,
+            source_id=source_id,
+        )
 
 
 __all__ = [

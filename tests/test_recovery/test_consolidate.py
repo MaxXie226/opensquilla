@@ -4,6 +4,7 @@ import hashlib
 import importlib
 import json
 import os
+import shutil
 import sqlite3
 import tomllib
 import uuid
@@ -940,6 +941,102 @@ def test_consolidate_cli_emits_fixed_json_and_blocks_unsafe_recovery(
     assert (recovery_root / "not-a-recovery-uuid").is_dir()
 
 
+def test_consolidate_allows_regular_finder_metadata_in_recovery_root(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_USER_STATE_DIR", str(tmp_path / "locks"))
+    user_data = tmp_path / "user-data"
+    primary = user_data / "opensquilla"
+    (primary / "workspace").mkdir(parents=True)
+    (primary / "config.toml").write_text("primary = true\n", encoding="utf-8")
+    recovery_id = str(uuid.uuid4())
+    _recovery(
+        user_data,
+        recovery_id,
+        config="selected = 'recovery'\n",
+        credential="{}\n",
+        memory="memory\n",
+        conflict="recovery",
+        extra_name="recovery.txt",
+        session_key="agent:main:finder-metadata",
+    )
+    finder_metadata = user_data / "recovery-profiles" / ".DS_Store"
+    finder_metadata.write_bytes(b"finder metadata")
+
+    result = consolidate_recovery_profiles(user_data, primary)
+
+    assert result.outcome == "consolidated", result
+    assert result.backup_path is not None
+    assert (
+        result.backup_path / "recovery-profiles" / ".DS_Store"
+    ).read_bytes() == b"finder metadata"
+
+
+def test_consolidate_rejects_directory_named_like_finder_metadata(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_USER_STATE_DIR", str(tmp_path / "locks"))
+    user_data = tmp_path / "user-data"
+    primary = user_data / "opensquilla"
+    primary.mkdir(parents=True)
+    recovery_root = user_data / "recovery-profiles"
+    recovery_root.mkdir()
+    (recovery_root / ".DS_Store").mkdir()
+
+    result = consolidate_recovery_profiles(user_data, primary)
+
+    assert result.outcome == "blocked"
+    assert result.stable_code == "profile_consolidation_unsafe_recovery_root"
+    assert (recovery_root / ".DS_Store").is_dir()
+
+
+def test_consolidate_rejects_finder_metadata_symlink(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_USER_STATE_DIR", str(tmp_path / "locks"))
+    user_data = tmp_path / "user-data"
+    primary = user_data / "opensquilla"
+    primary.mkdir(parents=True)
+    recovery_root = user_data / "recovery-profiles"
+    recovery_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    finder_metadata = recovery_root / ".DS_Store"
+    try:
+        finder_metadata.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlink creation is unavailable")
+
+    result = consolidate_recovery_profiles(user_data, primary)
+
+    assert result.outcome == "blocked"
+    assert result.stable_code == "profile_consolidation_unsafe_recovery_root"
+    assert finder_metadata.is_symlink()
+    assert outside.is_dir()
+
+
+def test_consolidate_preserves_finder_metadata_in_empty_recovery_root(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_USER_STATE_DIR", str(tmp_path / "locks"))
+    user_data = tmp_path / "user-data"
+    primary = user_data / "opensquilla"
+    primary.mkdir(parents=True)
+    recovery_root = user_data / "recovery-profiles"
+    recovery_root.mkdir()
+    (recovery_root / ".DS_Store").write_bytes(b"finder metadata")
+
+    result = consolidate_recovery_profiles(user_data, primary)
+
+    assert result.outcome == "noop"
+    assert result.stable_code == "no_recovery_profiles"
+    assert (recovery_root / ".DS_Store").read_bytes() == b"finder metadata"
+
+
 def test_fresh_noop_does_not_create_context_or_follow_backup_symlink(
     tmp_path: Path,
     monkeypatch,
@@ -1425,6 +1522,217 @@ def test_credential_ack_rejects_archived_credential_tampering(
         ]
         == "pending"
     )
+
+
+@pytest.mark.parametrize(
+    ("legacy_journal", "missing_transaction_path"),
+    [
+        (True, None),
+        (True, "staging"),
+        (True, "backup"),
+        (False, None),
+    ],
+)
+def test_only_legacy_prepared_journal_changed_by_sqlite_sidecars_restarts(
+    tmp_path: Path,
+    monkeypatch,
+    legacy_journal: bool,
+    missing_transaction_path: str | None,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_USER_STATE_DIR", str(tmp_path / "locks"))
+    user_data = tmp_path / "user-data"
+    primary = user_data / "opensquilla"
+    (primary / "workspace").mkdir(parents=True)
+    (primary / "config.toml").write_text("primary = true\n", encoding="utf-8")
+    recovery_id = str(uuid.uuid4())
+    recovery = _recovery(
+        user_data,
+        recovery_id,
+        config="recovery = true\n",
+        credential="{}\n",
+        memory="memory\n",
+        conflict="recovery",
+        extra_name="sqlite-sidecar.txt",
+        session_key="agent:main:sqlite-sidecar",
+    )
+    source_database = recovery / "opensquilla" / "state" / "sessions.db"
+    connection = sqlite3.connect(source_database)
+    try:
+        assert connection.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        connection.close()
+    assert not source_database.with_name("sessions.db-wal").exists()
+    assert not source_database.with_name("sessions.db-shm").exists()
+
+    consolidate_module = importlib.import_module("opensquilla.recovery.consolidate")
+    original_merge = consolidate_module._merge_prepared_profiles
+
+    def simulate_old_sqlite_read(**kwargs):
+        for profile in kwargs["profiles"]:
+            database = profile.home / "state" / "sessions.db"
+            with sqlite3.connect(
+                f"{database.absolute().as_uri()}?mode=ro",
+                uri=True,
+            ) as connection:
+                assert connection.execute("PRAGMA quick_check").fetchone() == ("ok",)
+        raise OSError("simulated old build stop after direct SQLite source read")
+
+    monkeypatch.setattr(
+        consolidate_module,
+        "_merge_prepared_profiles",
+        simulate_old_sqlite_read,
+    )
+    interrupted = consolidate_recovery_profiles(user_data, primary)
+    monkeypatch.setattr(
+        consolidate_module,
+        "_merge_prepared_profiles",
+        original_merge,
+    )
+
+    assert interrupted.outcome == "blocked"
+    journal_path = user_data / ".opensquilla-profile-consolidation.json"
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    assert journal["phase"] == "prepared"
+    assert journal["source_read_protocol"] == "private-sqlite-v1"
+    old_staging = Path(journal["staging"])
+    old_backup = Path(journal["backup_path"])
+    assert source_database.with_name("sessions.db-wal").is_file()
+    assert source_database.with_name("sessions.db-shm").is_file()
+    if legacy_journal:
+        journal.pop("source_read_protocol")
+        journal_path.write_text(
+            json.dumps(journal, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        if missing_transaction_path == "staging":
+            shutil.rmtree(old_staging)
+        elif missing_transaction_path == "backup":
+            old_backup.rmdir()
+
+    resumed = consolidate_recovery_profiles(user_data, primary)
+
+    if legacy_journal:
+        assert resumed.outcome == "consolidated", resumed
+        assert not journal_path.exists()
+        assert not old_staging.exists()
+        if missing_transaction_path == "backup":
+            assert not old_backup.exists()
+        else:
+            assert old_backup.is_dir()
+            assert not any(old_backup.iterdir())
+        assert (primary / "workspace" / "sqlite-sidecar.txt").is_file()
+    else:
+        assert resumed.outcome == "blocked"
+        assert resumed.stable_code == "profile_consolidation_source_changed"
+        assert journal_path.is_file()
+        assert old_staging.is_dir()
+        assert old_backup.is_dir()
+
+
+@pytest.mark.parametrize(
+    "unsafe_restart_state",
+    [
+        "later-phase",
+        "external-binding",
+        "external-route",
+        "primary-changed",
+        "backup-not-empty",
+        "recovery-ids-changed",
+    ],
+)
+def test_legacy_prepared_journal_restart_remains_fail_closed(
+    tmp_path: Path,
+    monkeypatch,
+    unsafe_restart_state: str,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_USER_STATE_DIR", str(tmp_path / "locks"))
+    user_data = tmp_path / "user-data"
+    primary = user_data / "opensquilla"
+    (primary / "workspace").mkdir(parents=True)
+    (primary / "config.toml").write_text("primary = true\n", encoding="utf-8")
+    recovery_id = str(uuid.uuid4())
+    recovery = _recovery(
+        user_data,
+        recovery_id,
+        config="recovery = true\n",
+        credential="{}\n",
+        memory="memory\n",
+        conflict="recovery",
+        extra_name="fail-closed.txt",
+        session_key="agent:main:fail-closed",
+    )
+    consolidate_module = importlib.import_module("opensquilla.recovery.consolidate")
+    original_merge = consolidate_module._merge_prepared_profiles
+
+    def stop_after_prepared(**_kwargs):
+        raise OSError("simulated stop after prepared journal")
+
+    monkeypatch.setattr(
+        consolidate_module,
+        "_merge_prepared_profiles",
+        stop_after_prepared,
+    )
+    interrupted = consolidate_recovery_profiles(user_data, primary)
+    monkeypatch.setattr(
+        consolidate_module,
+        "_merge_prepared_profiles",
+        original_merge,
+    )
+    assert interrupted.outcome == "blocked"
+
+    journal_path = user_data / ".opensquilla-profile-consolidation.json"
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    journal.pop("source_read_protocol")
+    old_staging = Path(journal["staging"])
+    old_backup = Path(journal["backup_path"])
+    # Make the legacy source token stale so falling back to normal resume must
+    # block instead of accidentally completing the transaction.
+    (recovery / "opensquilla" / "ordinary.txt").write_text(
+        "changed after prepared",
+        encoding="utf-8",
+    )
+
+    if unsafe_restart_state == "later-phase":
+        journal["phase"] = "external_roots_merged"
+        journal["staging_merged"] = journal["staging_baseline"]
+    elif unsafe_restart_state == "external-binding":
+        journal["routes"]["external_bindings"] = [{"path": str(tmp_path / "external")}]
+    elif unsafe_restart_state == "external-route":
+        journal["routes"]["workspace"]["profile_relative"] = None
+    elif unsafe_restart_state == "primary-changed":
+        (primary / "config.toml").write_text(
+            "primary = true\nchanged = true\n",
+            encoding="utf-8",
+        )
+    elif unsafe_restart_state == "backup-not-empty":
+        (old_backup / "unexpected").write_text("preserve", encoding="utf-8")
+    elif unsafe_restart_state == "recovery-ids-changed":
+        _recovery(
+            user_data,
+            str(uuid.uuid4()),
+            config="second = true\n",
+            credential="{}\n",
+            memory="second",
+            conflict="second",
+            extra_name="second.txt",
+            session_key="agent:main:second-fail-closed",
+        )
+    else:  # pragma: no cover - exhaustive parameter guard
+        raise AssertionError(unsafe_restart_state)
+    journal_path.write_text(
+        json.dumps(journal, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    resumed = consolidate_recovery_profiles(user_data, primary)
+
+    assert resumed.outcome == "blocked"
+    assert journal_path.is_file()
+    assert old_staging.is_dir()
+    assert old_backup.is_dir()
+    if unsafe_restart_state == "backup-not-empty":
+        assert (old_backup / "unexpected").read_text(encoding="utf-8") == "preserve"
 
 
 def test_session_id_remap_moves_transcript_attachment_material(

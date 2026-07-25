@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import shutil
 import sqlite3
 from pathlib import Path
 
 import pytest
 
-from opensquilla.recovery.session_merge import merge_session_database
+from opensquilla.recovery.session_merge import (
+    merge_session_database,
+    snapshot_session_database,
+)
 from opensquilla.session.storage import SessionStorage
 
 _SCHEMA = """
@@ -612,6 +616,74 @@ def test_merge_session_database_snapshots_wal_when_target_is_missing(
         assert merged.execute("PRAGMA quick_check").fetchone() == ("ok",)
         assert merged.execute("SELECT label FROM sessions").fetchone() == ("from wal",)
     source.close()
+
+
+@pytest.mark.parametrize("operation", ["snapshot", "merge-existing"])
+def test_wal_source_without_shm_is_never_opened_by_sqlite(
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    origin_path = tmp_path / "origin.db"
+    source_root = tmp_path / "recovery" / "state"
+    source_root.mkdir(parents=True)
+    source_path = source_root / "sessions.db"
+    source_wal = source_path.with_name(f"{source_path.name}-wal")
+    source_shm = source_path.with_name(f"{source_path.name}-shm")
+    target_path = tmp_path / "primary" / "state" / "sessions.db"
+
+    origin = _database(origin_path)
+    try:
+        assert origin.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)
+        origin.execute("PRAGMA wal_autocheckpoint=0")
+        _add_session(
+            origin,
+            key="agent:main:private-wal",
+            session_id="private-wal-session",
+            content="committed only in wal",
+            suffix="private-wal",
+        )
+        origin_wal = origin_path.with_name(f"{origin_path.name}-wal")
+        assert origin_wal.stat().st_size > 32
+        shutil.copyfile(origin_path, source_path)
+        shutil.copyfile(origin_wal, source_wal)
+
+        if operation == "merge-existing":
+            target_path.parent.mkdir(parents=True)
+            target = _database(target_path)
+            target.close()
+
+        assert not source_shm.exists()
+        source_before = {
+            path.name: (path.read_bytes(), path.stat().st_mode, path.stat().st_mtime_ns)
+            for path in (source_path, source_wal)
+        }
+        source_root_before = source_root.stat().st_mtime_ns
+
+        if operation == "snapshot":
+            snapshot_session_database(source_path, target_path)
+        else:
+            result = merge_session_database(
+                target_path,
+                source_path,
+                source_id="44444444-4444-4444-8444-444444444444",
+            )
+            assert result.imported_sessions == 1
+
+        source_after = {
+            path.name: (path.read_bytes(), path.stat().st_mode, path.stat().st_mtime_ns)
+            for path in (source_path, source_wal)
+        }
+        assert source_after == source_before
+        assert source_root.stat().st_mtime_ns == source_root_before
+        assert not source_shm.exists(), "session merge must not create source SQLite sidecars"
+        with sqlite3.connect(target_path) as merged:
+            assert merged.execute("PRAGMA quick_check").fetchone() == ("ok",)
+            assert merged.execute(
+                "SELECT label FROM sessions WHERE session_key=?",
+                ("agent:main:private-wal",),
+            ).fetchone() == ("committed only in wal",)
+    finally:
+        origin.close()
 
 
 @pytest.mark.asyncio

@@ -49,9 +49,11 @@ _RECOVERY_ID_RE = re.compile(
 _CONFIG_NAMES = ("config.toml", ".env")
 _CONTEXT_NAME = "desktop-profile-context.json"
 _CREDENTIAL_NAME = "desktop-credential.json"
+_FINDER_METADATA_NAME = ".DS_Store"
 _JOURNAL_NAME = ".opensquilla-profile-consolidation.json"
 _BACKUPS_RELATIVE = Path("backups") / "profile-consolidation"
 _STAGING_PREFIX = ".opensquilla.profile-consolidation."
+_SOURCE_READ_PROTOCOL = "private-sqlite-v1"
 _MAX_TIMESTAMP_NS = (1 << 63) - 1
 _EXCLUDED_AUTHORITY_NAMES = frozenset(
     {
@@ -314,6 +316,21 @@ def _plain_optional_file(path: Path, *, label: str) -> bool:
     return True
 
 
+def _validate_recovery_container_metadata(path: Path) -> None:
+    try:
+        value = path.lstat()
+    except OSError as exc:
+        raise _ConsolidationBlockedError(
+            f"recovery container metadata is unavailable: {path}",
+            stable_code="profile_consolidation_unsafe_recovery_root",
+        ) from exc
+    if _is_link_or_reparse(value) or not stat.S_ISREG(value.st_mode):
+        raise _ConsolidationBlockedError(
+            f"recovery container metadata must be a regular file: {path}",
+            stable_code="profile_consolidation_unsafe_recovery_root",
+        )
+
+
 def _validate_base_paths(user_data: Path, primary_home: Path) -> None:
     _plain_directory(user_data, label="Electron userData")
     expected = user_data / "opensquilla"
@@ -342,6 +359,9 @@ def _enumerate_recoveries(user_data: Path) -> tuple[_RecoveryProfile, ...]:
     profiles: list[_RecoveryProfile] = []
     with os.scandir(container) as entries:
         for entry in sorted(entries, key=lambda item: item.name):
+            if entry.name == _FINDER_METADATA_NAME:
+                _validate_recovery_container_metadata(Path(entry.path))
+                continue
             if not _RECOVERY_ID_RE.fullmatch(entry.name):
                 raise _ConsolidationBlockedError(
                     f"unexpected entry in recovery profile container: {entry.name}",
@@ -2492,6 +2512,7 @@ def _journal_payload(
         "primary_config": primary_config,
         "use_primary_configuration": use_primary_configuration,
         "routes": routes.as_dict(),
+        "source_read_protocol": _SOURCE_READ_PROTOCOL,
         "source_snapshots": source_snapshots,
         "staging_baseline": staging_baseline,
         "staging_merged": None,
@@ -2829,6 +2850,10 @@ def _load_journal(path: Path, user_data: Path, primary_home: Path) -> dict[str, 
         or not isinstance(payload.get("primary_config"), dict)
         or not isinstance(payload.get("use_primary_configuration"), bool)
         or not isinstance(payload.get("routes"), dict)
+        or (
+            "source_read_protocol" in payload
+            and payload.get("source_read_protocol") != _SOURCE_READ_PROTOCOL
+        )
         or not isinstance(payload.get("source_snapshots"), dict)
         or not isinstance(payload.get("staging_baseline"), str)
         or (
@@ -2861,6 +2886,117 @@ def _load_journal(path: Path, user_data: Path, primary_home: Path) -> dict[str, 
         transaction_id=transaction_id,
     )
     return payload
+
+
+def _all_routes_are_profile_relative(routes: _PrimaryDataRoutes) -> bool:
+    return not routes.external_bindings and all(
+        route.profile_relative is not None
+        for route in (
+            routes.workspace,
+            routes.state,
+            routes.media,
+            *(route for _agent_id, route in routes.agent_workspaces),
+        )
+    )
+
+
+def _directory_is_empty(path: Path) -> bool:
+    _plain_directory(path, label="profile consolidation transaction backup")
+    with os.scandir(path) as entries:
+        return next(entries, None) is None
+
+
+def _restart_legacy_prepared_journal_if_safe(
+    user_data: Path,
+    primary_home: Path,
+    journal_path: Path,
+    payload: dict[str, Any],
+) -> bool:
+    """Discard only an old, pre-publication transaction with no external writes.
+
+    Builds before ``private-sqlite-v1`` opened a WAL-mode recovery database
+    directly.  SQLite could create ``-wal``/``-shm`` beside that read-only
+    source after the prepared journal captured its manifest, permanently
+    making the journal's source token stale.  A prepared transaction is safe
+    to restart only when every possible merge destination is still inside its
+    disposable staging tree and no authoritative primary path has moved.
+    """
+
+    if "source_read_protocol" in payload or payload.get("phase") != "prepared":
+        return False
+    routes_payload = payload.get("routes")
+    if not isinstance(routes_payload, dict) or routes_payload.get("external_bindings") != []:
+        return False
+    result = _result_from_payload(dict(payload["result"]), outcome="consolidated")
+    profiles = _enumerate_recoveries(user_data)
+    expected_ids = result.consumed_recovery_ids
+    if tuple(profile.recovery_id for profile in profiles) != expected_ids:
+        return False
+    recovery_homes = tuple(profile.home for profile in profiles)
+
+    with acquire_profile_locks(primary_home, *recovery_homes, timeout=0.0):
+        # Re-read the journal after acquiring every participating profile lock.
+        # A different transaction or phase must never inherit this cleanup.
+        current_payload = _load_journal(journal_path, user_data, primary_home)
+        if current_payload != payload:
+            return False
+        locked_profiles = _enumerate_recoveries(user_data)
+        if tuple(profile.recovery_id for profile in locked_profiles) != expected_ids:
+            return False
+        if bool(payload["primary_existed"]) != primary_home.is_dir():
+            return False
+        if _primary_config_authority(primary_home) != payload.get("primary_config"):
+            return False
+        current_routes = _build_primary_data_routes(
+            user_data=user_data,
+            primary_home=primary_home,
+            profiles=locked_profiles,
+            use_primary_configuration=bool(payload["use_primary_configuration"]),
+        )
+        if (
+            not _all_routes_are_profile_relative(current_routes)
+            or current_routes.as_dict() != routes_payload
+        ):
+            return False
+
+        staging = Path(str(payload["staging"]))
+        backup_path = Path(str(payload["backup_path"]))
+        staging_exists = _lexists(staging)
+        if staging_exists:
+            _plain_directory(staging, label="profile consolidation staging directory")
+            profile_no_follow_manifest(staging)
+        backup_exists = _lexists(backup_path)
+        if backup_exists and not _directory_is_empty(backup_path):
+            return False
+        journal_authority = _file_authority(
+            journal_path,
+            label="profile consolidation journal",
+        )
+        if not bool(journal_authority.get("exists")):
+            return False
+
+        # Keep the journal until the disposable staging tree is gone.  If the
+        # process stops between these operations, the same guarded cleanup can
+        # be attempted again instead of mistaking the partial staging tree for
+        # authoritative data.
+        if staging_exists:
+            shutil.rmtree(staging)
+            _fsync_directory(user_data)
+        # Keep the empty legacy backup directory. Its parent chain is not
+        # descriptor-bound here, and deleting through a concurrently replaced
+        # parent could target an unrelated directory. Empty transaction
+        # directories are ignored by receipt discovery and are not profiles.
+        if (
+            _file_authority(
+                journal_path,
+                label="profile consolidation journal",
+            )
+            != journal_authority
+        ):
+            raise UnsafePathError("profile consolidation journal changed before restart")
+        journal_path.unlink()
+        _fsync_directory(user_data)
+        return True
 
 
 def _resume(
@@ -3024,13 +3160,21 @@ def consolidate_recovery_profiles(
         _validate_base_paths(user_data_path, primary_path)
         journal = _load_journal(journal_path, user_data_path, primary_path)
         if journal is not None:
-            return _resume(user_data_path, primary_path, journal_path, journal)
+            if not _restart_legacy_prepared_journal_if_safe(
+                user_data_path,
+                primary_path,
+                journal_path,
+                journal,
+            ):
+                return _resume(user_data_path, primary_path, journal_path, journal)
 
         profiles = _enumerate_recoveries(user_data_path)
         recovery_root = user_data_path / "recovery-profiles"
         if not profiles:
-            if recovery_root.exists():
-                recovery_root.rmdir()
+            # A metadata-only/empty container is harmless and does not create
+            # an active recovery profile. Avoid deleting it after enumeration:
+            # its parent could be replaced concurrently, turning cleanup into
+            # an operation outside userData.
             if _lexists(user_data_path / _CONTEXT_NAME):
                 _write_primary_context(user_data_path)
             previous = _latest_receipt(user_data_path, primary_path)
