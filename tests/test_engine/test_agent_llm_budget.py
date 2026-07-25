@@ -2494,7 +2494,9 @@ def test_workspace_edit_gate_allows_configured_scratch_repro_file(
 
 
 def test_workspace_edit_gate_allows_custom_external_scratch_root(tmp_path) -> None:
-    scratch = Path("/opt/opensquilla-custom-scratch")
+    # Anchored to the temp drive so the path is absolute on Windows too;
+    # a bare "/opt/..." has no drive there and falls back to cwd-relative.
+    scratch = Path(tmp_path.anchor) / "opensquilla-custom-scratch"
     agent = Agent(
         provider=_ContextOverflowProvider(success_after=1),
         tool_context=ToolContext(

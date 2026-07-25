@@ -11,6 +11,7 @@ class), through a symlink, or through `ln` itself.
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -324,6 +325,7 @@ async def test_restoring_a_protected_file_is_not_a_violation(effect_context, mon
     assert (workspace / "replacer_test.go").read_text(encoding="utf-8") == "original\n"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="test command requires POSIX ln -s and &&")
 @pytest.mark.asyncio
 async def test_symlink_creation_at_protected_path_reverted_with_guard(
     effect_context, monkeypatch, tmp_path: Path
