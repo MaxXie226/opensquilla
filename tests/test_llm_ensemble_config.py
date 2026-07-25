@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 import pytest
 
+from opensquilla.eval.draco_experiment_config import load_draco_experiment_config
 from opensquilla.gateway.config import GatewayConfig, LlmProviderProfile
 from opensquilla.provider.compat_policy import compat_policy_for_kind
 from opensquilla.provider.ensemble import build_ensemble_provider_from_config
 from opensquilla.provider.openai import _build_openai_wire_messages
 from opensquilla.provider.selector import ProviderConfig
 from opensquilla.provider.types import ChatConfig, Message, ModelCapabilities
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_llm_ensemble_defaults_to_disabled_for_model_router_first_install() -> None:
@@ -145,9 +149,7 @@ def test_static_tokenrhythm_b5_mirrors_the_openrouter_lineup() -> None:
         "kimi-k2.7-code",
         "qwen3.7-max",
     ]
-    assert all(
-        member.provider_config.provider == "tokenrhythm" for member in provider.proposers
-    )
+    assert all(member.provider_config.provider == "tokenrhythm" for member in provider.proposers)
     assert provider.aggregator.provider_config.provider == "tokenrhythm"
     assert provider.aggregator.provider_config.model == "glm-5.2"
     # Same aggregation defaults as the static OpenRouter profile.
@@ -172,9 +174,7 @@ def test_static_b5_mode_tables_agree_across_gateway_and_provider() -> None:
     assert {
         mode: profile.provider_id for mode, profile in STATIC_B5_PROFILES.items()
     } == STATIC_B5_SELECTION_MODE_PROVIDERS
-    literal_modes = set(
-        get_args(LlmEnsembleConfig.model_fields["selection_mode"].annotation)
-    )
+    literal_modes = set(get_args(LlmEnsembleConfig.model_fields["selection_mode"].annotation))
     assert literal_modes == {
         "router_dynamic",
         "router_tree_baseline",
@@ -344,6 +344,55 @@ def test_router_dynamic_uses_structured_candidates_with_source() -> None:
     assert all(candidate["model"] != "disabled/model" for candidate in pool)
 
 
+def test_router_dynamic_exact_registry_allowlist_filters_fully_composed_pool() -> None:
+    experiment = load_draco_experiment_config(
+        ROOT / "configs" / "benchmarks" / "draco_b2_g12.json"
+    ).config
+    assert experiment.g1_routing is not None
+    cfg = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "deepseek/deepseek-v4-pro",
+            "api_key": "fake",
+            "base_url": "https://openrouter.example/api/v1",
+        },
+        llm_ensemble={"enabled": True, "selection_mode": "router_dynamic"},
+    )
+    inherited = ProviderConfig(
+        provider="openrouter",
+        model="deepseek/deepseek-v4-pro",
+        api_key="fake",
+        base_url="https://openrouter.example/api/v1",
+    )
+
+    provider = build_ensemble_provider_from_config(
+        config=cfg,
+        inherited_provider_config=inherited,
+        fallback_provider=None,
+        turn_metadata={"routed_tier": "c1", "routing_confidence": 0.9},
+        ranking_inputs={"registry_allowlist": experiment.g1_routing.model_dump(mode="json")},
+    )
+
+    plan = provider.selection_plan
+    expected = {f"openrouter:{model}" for model in experiment.g1_routing.expected_routes}
+    assert plan["candidate_pool_size"] == 20
+    assert {row["identity"] for row in plan["candidate_pool"]} == expected
+    assert set(plan["selected_P"]) <= expected
+    assert plan["selected_A"] in expected
+    assert plan["proposer_sample_count"] == len(plan["selected_P"])
+    assert len(plan["proposer_models"]) == len(plan["selected_P"])
+    assert plan["aggregator_model"] == plan["selected_A"].partition(":")[2]
+    allowlist = plan["candidate_allowlist"]
+    assert allowlist["profile_id"] == experiment.g1_routing.profile_id
+    assert allowlist["candidate_count"] == 20
+    assert allowlist["input_candidate_count"] == 80
+    assert allowlist["excluded_candidate_count"] == 60
+    assert allowlist["expected_routes_sha256"] == (experiment.g1_routing.expected_routes_sha256)
+    assert allowlist["expected_source_registry_snapshot_sha256"] == (
+        experiment.g1_routing.expected_source_registry_snapshot_sha256
+    )
+
+
 def test_build_ensemble_provider_inherits_current_openrouter_credentials() -> None:
     cfg = GatewayConfig(llm_ensemble={"enabled": True})
     inherited = ProviderConfig(
@@ -364,8 +413,7 @@ def test_build_ensemble_provider_inherits_current_openrouter_credentials() -> No
     members = [*provider.proposers, provider.aggregator]
     assert all(member.provider_config.api_key == "fake" for member in members)
     assert all(
-        member.provider_config.base_url == "https://openrouter.example/api/v1"
-        for member in members
+        member.provider_config.base_url == "https://openrouter.example/api/v1" for member in members
     )
     assert all(member.provider_config.proxy == "http://proxy.local:7890" for member in members)
     assert provider.aggregator.provider_config.provider_routing == {"z-ai/glm-5.2": "z-ai"}
@@ -601,9 +649,7 @@ def test_static_openrouter_b5_ensemble_locks_members_across_routed_tiers() -> No
             "effective_shuffle_candidates": False,
             "quorum_grace_seconds": 10.0,
             "selection_mode": "static_openrouter_b5",
-            "selected_P": [
-                f"openrouter:{model}" for model in expected_proposers
-            ],
+            "selected_P": [f"openrouter:{model}" for model in expected_proposers],
             "selected_A": "openrouter:z-ai/glm-5.2",
         }
         assert provider.min_successful_proposers == 4
@@ -822,9 +868,7 @@ def test_custom_b5_validation_rejects_undersized_and_oversized_lineups() -> None
             llm_ensemble={
                 "enabled": True,
                 "selection_mode": "custom_b5",
-                "candidates": [
-                    {"provider": "a", "model": f"m{i}"} for i in range(7)
-                ],
+                "candidates": [{"provider": "a", "model": f"m{i}"} for i in range(7)],
             }
         )
 
@@ -1158,14 +1202,10 @@ async def test_cross_provider_ensemble_disables_late_plugin_selector_fallback_re
     )
     wrapper = _SelectorFallbackProvider(ensemble, turn_selector)
 
-    events = [
-        event
-        async for event in wrapper.chat([Message(role="user", content="synthetic")])
-    ]
+    events = [event async for event in wrapper.chat([Message(role="user", content="synthetic")])]
 
     assert any(
-        isinstance(event, TextDeltaEvent) and event.text == "fallback answer"
-        for event in events
+        isinstance(event, TextDeltaEvent) and event.text == "fallback answer" for event in events
     )
     assert selector_builds[-1].model == "plugin-fallback"
     assert selector_builds[-1].replay_provider_state is False
@@ -1326,13 +1366,9 @@ def test_tree_baseline_uses_shared_session_pinned_profile_pool(
         first_members = [*first.proposers, first.aggregator]
         assert first.selection_plan["model_options_source"] == "frozen_default"
         first_openrouter_members = [
-            member
-            for member in first_members
-            if member.provider_config.provider == "openrouter"
+            member for member in first_members if member.provider_config.provider == "openrouter"
         ]
-        first_keys = {
-            member.provider_config.api_key for member in first_openrouter_members
-        }
+        first_keys = {member.provider_config.api_key for member in first_openrouter_members}
         assert len(first_keys) == 1
         first_key = first_keys.pop()
         assert all(

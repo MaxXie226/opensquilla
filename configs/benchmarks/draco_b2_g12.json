@@ -31,6 +31,41 @@
     "selection_mode": "static_openrouter_b5",
     "skip_single_model_router": true
   },
+  "g1_routing": {
+    "profile_id": "draco_g1_formal_openrouter_20_20260725",
+    "selection_mode": "router_dynamic",
+    "user_profile_enabled": false,
+    "source_registry_snapshot_version": "curated-openrouter-step2-2026-07-24.2",
+    "expected_source_registry_snapshot_sha256": "420a338072f865cae99f0bcdf4e34f2345e46884389e5f7241cccdffe913c4b1",
+    "expected_ranking_config_schema_version": "step2-ranking-config-v3",
+    "expected_ranking_config_version": "step2-ranking-2026-07-22.1",
+    "expected_ranking_config_sha256": "a8addcdefa04349209c20e97ca5851ed0f5ca55646c9d0c5badc5d32dd7ef10c",
+    "expected_proposer_count_max": 5,
+    "expected_candidate_count": 20,
+    "expected_routes": {
+      "deepseek/deepseek-v4-pro": "deepseek",
+      "z-ai/glm-5.2": "z-ai",
+      "moonshotai/kimi-k2.7-code": "moonshotai",
+      "qwen/qwen3.7-max": "alibaba",
+      "google/gemini-3.1-pro-preview": "google-ai-studio",
+      "anthropic/claude-opus-4.8": "anthropic",
+      "anthropic/claude-sonnet-5": "anthropic",
+      "deepseek/deepseek-v4-flash": "deepseek",
+      "google/gemini-3-flash-preview": "google-ai-studio",
+      "kwaipilot/kat-coder-air-v2.5": "streamlake",
+      "kwaipilot/kat-coder-pro-v2.5": "streamlake",
+      "meta-llama/llama-4-scout": "groq",
+      "minimax/minimax-m3": "minimax",
+      "mistralai/mistral-medium-3-5": "mistral",
+      "openai/gpt-5.5": "openai",
+      "google/gemini-3.5-flash": "google-ai-studio",
+      "poolside/laguna-xs-2.1": "poolside",
+      "qwen/qwen3.7-plus": "alibaba",
+      "tencent/hy3": "tencent",
+      "x-ai/grok-4.5": "xai"
+    },
+    "expected_routes_sha256": "48df6de139b2df034fd0d94f26eae3df3023dc3b650f6ad06e54ad7410c40335"
+  },
   "ensemble": {
     "profile_name": "g12_k2_replace_gemini",
     "proposers": [
@@ -143,6 +178,7 @@
   },
   "tools": {
     "mode": "local_web_tools",
+    "sandbox_enabled": false,
     "contamination_blocked_domains": [
       "hf.co",
       "huggingface.co",

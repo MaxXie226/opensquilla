@@ -29,6 +29,26 @@ def test_default_b2_config_pins_g12_highest_thinking_and_tool_permissions() -> N
     assert config.benchmark_input.task_count == 10
     assert config.routing.selection_mode == "static_openrouter_b5"
     assert config.routing.skip_single_model_router is True
+    assert config.g1_routing is not None
+    assert config.g1_routing.profile_id == "draco_g1_formal_openrouter_20_20260725"
+    assert config.g1_routing.selection_mode == "router_dynamic"
+    assert config.g1_routing.user_profile_enabled is False
+    assert config.g1_routing.expected_source_registry_snapshot_sha256 == (
+        "420a338072f865cae99f0bcdf4e34f2345e46884389e5f7241cccdffe913c4b1"
+    )
+    assert config.g1_routing.expected_ranking_config_schema_version == "step2-ranking-config-v3"
+    assert config.g1_routing.expected_ranking_config_version == "step2-ranking-2026-07-22.1"
+    assert config.g1_routing.expected_ranking_config_sha256 == (
+        "a8addcdefa04349209c20e97ca5851ed0f5ca55646c9d0c5badc5d32dd7ef10c"
+    )
+    assert config.g1_routing.expected_proposer_count_max == 5
+    assert config.g1_routing.expected_candidate_count == 20
+    assert len(config.g1_routing.expected_routes) == 20
+    assert config.g1_routing.expected_routes_sha256 == (
+        "48df6de139b2df034fd0d94f26eae3df3023dc3b650f6ad06e54ad7410c40335"
+    )
+    assert config.g1_routing.expected_routes["google/gemini-3.5-flash"] == ("google-ai-studio")
+    assert "openai/gpt-5.6-luna" not in config.g1_routing.expected_routes
     assert [member.model for member in config.ensemble.proposers] == [
         "deepseek/deepseek-v4-pro",
         "z-ai/glm-5.2",
@@ -72,6 +92,7 @@ def test_default_b2_config_pins_g12_highest_thinking_and_tool_permissions() -> N
     assert config.ensemble.wait_for_all_proposers is True
     assert config.ensemble.quorum_grace_seconds == 0.0
     assert config.tools.web_search.provider == "brave"
+    assert config.tools.sandbox_enabled is False
     assert config.tools.web_search.max_results == 5
     assert config.tools.web_fetch.max_content_tokens == 50_000
     assert config.timeouts.proposer_seconds == pytest.approx(907.5)
@@ -152,6 +173,39 @@ def test_highest_thinking_invariant_rejects_accidental_downgrade() -> None:
         load_draco_experiment_config(
             DEFAULT_CONFIG,
             inline_sets=["ensemble.proposers.2.thinking=high"],
+        )
+
+
+def test_g1_expected_routes_hash_and_count_are_fail_closed() -> None:
+    with pytest.raises(ValidationError, match="expected_routes_sha256"):
+        load_draco_experiment_config(
+            DEFAULT_CONFIG,
+            inline_sets=[f"g1_routing.expected_routes_sha256={'0' * 64}"],
+        )
+    with pytest.raises(ValidationError, match="expected_candidate_count"):
+        load_draco_experiment_config(
+            DEFAULT_CONFIG,
+            inline_sets=["g1_routing.expected_candidate_count=19"],
+        )
+    with pytest.raises(ValidationError, match="expected_proposer_count_max"):
+        load_draco_experiment_config(
+            DEFAULT_CONFIG,
+            inline_sets=["g1_routing.expected_proposer_count_max=21"],
+        )
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        "g1_routing.user_profile_enabled=true",
+        "tools.sandbox_enabled=true",
+    ],
+)
+def test_formal_runtime_false_flags_cannot_be_overridden(override: str) -> None:
+    with pytest.raises(ValidationError):
+        load_draco_experiment_config(
+            DEFAULT_CONFIG,
+            inline_sets=[override],
         )
 
 

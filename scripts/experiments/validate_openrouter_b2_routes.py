@@ -16,7 +16,11 @@ from urllib.parse import quote
 
 import httpx
 
+from opensquilla.eval.draco_experiment_config import load_draco_experiment_config
+
 API_ORIGIN = "https://openrouter.ai"
+ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_EXPERIMENT_CONFIG_PATH = ROOT / "configs" / "benchmarks" / "draco_b2_g12.json"
 B2_EXPECTED_ROUTES = {
     "deepseek/deepseek-v4-pro": "deepseek",
     "z-ai/glm-5.2": "z-ai",
@@ -24,24 +28,16 @@ B2_EXPECTED_ROUTES = {
     "qwen/qwen3.7-max": "alibaba",
     "google/gemini-3.1-pro-preview": "google-ai-studio",
 }
-FORMAL_EXPECTED_ROUTES = {
-    **B2_EXPECTED_ROUTES,
-    "anthropic/claude-opus-4.8": "anthropic",
-    "anthropic/claude-sonnet-5": "anthropic",
-    "deepseek/deepseek-v4-flash": "deepseek",
-    "google/gemini-3-flash-preview": "google-ai-studio",
-    "kwaipilot/kat-coder-air-v2.5": "streamlake",
-    "kwaipilot/kat-coder-pro-v2.5": "streamlake",
-    "meta-llama/llama-4-scout": "groq",
-    "minimax/minimax-m3": "minimax",
-    "mistralai/mistral-medium-3-5": "mistral",
-    "openai/gpt-5.5": "openai",
-    "openai/gpt-5.6-luna": "openai",
-    "poolside/laguna-xs-2.1": "poolside",
-    "qwen/qwen3.7-plus": "alibaba",
-    "tencent/hy3": "tencent",
-    "x-ai/grok-4.5": "xai",
-}
+
+
+def formal_expected_routes(experiment_config: Path) -> dict[str, str]:
+    config = load_draco_experiment_config(experiment_config).config
+    if config.g1_routing is None:
+        raise ValueError("formal route preflight requires g1_routing.expected_routes")
+    return dict(config.g1_routing.expected_routes)
+
+
+FORMAL_EXPECTED_ROUTES = formal_expected_routes(DEFAULT_EXPERIMENT_CONFIG_PATH)
 EXPECTED_PROVIDER_NAMES = {
     "anthropic": "Anthropic",
     "deepseek": "DeepSeek",
@@ -62,9 +58,7 @@ EXPECTED_PROVIDER_NAMES = {
 # definitions; only the GLM aggregator can call the local tool surface.  The
 # Gemini Judge is also text-only.  Over-requiring tool support on every
 # proposer would reject an otherwise valid formal route before the canary.
-B2_REQUIRED_PARAMETERS = {
-    model: {"max_tokens", "reasoning"} for model in B2_EXPECTED_ROUTES
-}
+B2_REQUIRED_PARAMETERS = {model: {"max_tokens", "reasoning"} for model in B2_EXPECTED_ROUTES}
 B2_REQUIRED_PARAMETERS["deepseek/deepseek-v4-pro"].add("temperature")
 B2_REQUIRED_PARAMETERS["z-ai/glm-5.2"] |= {
     "temperature",
@@ -85,16 +79,20 @@ FORMAL_UNSUPPORTED_TEMPERATURE_MODELS = frozenset(
         "anthropic/claude-sonnet-5",
         "moonshotai/kimi-k2.7-code",
         "openai/gpt-5.5",
-        "openai/gpt-5.6-luna",
     }
 )
-FORMAL_REQUIRED_PARAMETERS = {
-    model: {"max_tokens", "tools"} for model in FORMAL_EXPECTED_ROUTES
-}
-for model in set(FORMAL_EXPECTED_ROUTES) - FORMAL_REASONING_INELIGIBLE_MODELS:
-    FORMAL_REQUIRED_PARAMETERS[model].add("reasoning")
-for model in set(FORMAL_EXPECTED_ROUTES) - FORMAL_UNSUPPORTED_TEMPERATURE_MODELS:
-    FORMAL_REQUIRED_PARAMETERS[model].add("temperature")
+
+
+def formal_required_parameters(expected_routes: dict[str, str]) -> dict[str, set[str]]:
+    required = {model: {"max_tokens", "tools"} for model in expected_routes}
+    for model in set(expected_routes) - FORMAL_REASONING_INELIGIBLE_MODELS:
+        required[model].add("reasoning")
+    for model in set(expected_routes) - FORMAL_UNSUPPORTED_TEMPERATURE_MODELS:
+        required[model].add("temperature")
+    return required
+
+
+FORMAL_REQUIRED_PARAMETERS = formal_required_parameters(FORMAL_EXPECTED_ROUTES)
 
 
 def canonical_sha256(value: Any) -> str:
@@ -130,6 +128,66 @@ def tag_matches(tag: str, expected: str) -> bool:
     return tag == expected or tag.startswith(f"{expected}/")
 
 
+def recompute_model_endpoint_compatibility(
+    *,
+    model: str,
+    expected_provider: str,
+    required_parameters: set[str],
+    evidence: dict[str, Any],
+) -> tuple[int, int]:
+    """Recompute route compatibility from the endpoint rows being persisted."""
+
+    if evidence.get("expected_provider") != expected_provider:
+        raise ValueError(f"endpoint evidence provider differs for {model}")
+    if evidence.get("response_model_id") != model:
+        raise ValueError(f"endpoint response model differs for {model}")
+    endpoints = evidence.get("matching_endpoints")
+    if not isinstance(endpoints, list) or not endpoints:
+        raise ValueError(f"endpoint evidence is missing for {model}")
+    expected_provider_name = EXPECTED_PROVIDER_NAMES.get(expected_provider)
+    if not expected_provider_name:
+        raise ValueError(f"provider display-name contract is missing for {expected_provider}")
+
+    operational_count = 0
+    compatible_count = 0
+    for endpoint in endpoints:
+        if not isinstance(endpoint, dict):
+            raise ValueError(f"endpoint evidence row is invalid for {model}")
+        if not tag_matches(str(endpoint.get("tag") or ""), expected_provider):
+            raise ValueError(f"endpoint tag differs for {model} -> {expected_provider}")
+        status = endpoint.get("status")
+        operational = isinstance(status, int) and not isinstance(status, bool) and status == 0
+        if not operational:
+            continue
+        operational_count += 1
+        supported = endpoint.get("supported_parameters")
+        if not isinstance(supported, list) or any(
+            not isinstance(item, str) or not item for item in supported
+        ):
+            raise ValueError(f"endpoint parameters are invalid for {model}")
+        supported_parameters = (
+            {str(item) for item in supported} if isinstance(supported, list) else set()
+        )
+        if (
+            endpoint.get("provider_name") == expected_provider_name
+            and endpoint.get("model_id") == model
+            and required_parameters <= supported_parameters
+        ):
+            compatible_count += 1
+
+    if operational_count <= 0:
+        raise ValueError(f"no operational endpoint remains for {model}")
+    if compatible_count <= 0:
+        raise ValueError(f"no saved endpoint supports the frozen request surface for {model}")
+    if evidence.get("operational_match_count") != operational_count:
+        raise ValueError(f"saved operational endpoint count differs for {model}")
+    if evidence.get("compatible_operational_match_count") != compatible_count:
+        raise ValueError(f"saved compatible endpoint count differs for {model}")
+    if evidence.get("required_parameters") != sorted(required_parameters):
+        raise ValueError(f"saved required parameters differ for {model}")
+    return operational_count, compatible_count
+
+
 def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
@@ -153,6 +211,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("output", type=Path)
     parser.add_argument("--scope", choices=("b2", "formal"), default="formal")
+    parser.add_argument(
+        "--experiment-config",
+        type=Path,
+        default=DEFAULT_EXPERIMENT_CONFIG_PATH,
+    )
     args = parser.parse_args(argv)
     if args.output.exists():
         parser.error(f"refusing to overwrite route preflight evidence: {args.output}")
@@ -162,11 +225,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
 
+    experiment = load_draco_experiment_config(args.experiment_config).config
     expected_routes = (
-        FORMAL_EXPECTED_ROUTES if args.scope == "formal" else B2_EXPECTED_ROUTES
+        dict(experiment.g1_routing.expected_routes)
+        if args.scope == "formal" and experiment.g1_routing is not None
+        else B2_EXPECTED_ROUTES
     )
+    if args.scope == "formal" and experiment.g1_routing is None:
+        raise SystemExit("formal route preflight requires g1_routing.expected_routes")
     required_parameters = (
-        FORMAL_REQUIRED_PARAMETERS
+        formal_required_parameters(expected_routes)
         if args.scope == "formal"
         else B2_REQUIRED_PARAMETERS
     )
@@ -217,14 +285,11 @@ def main() -> int:
                 for row in operational
                 if required_parameters[model]
                 <= {str(item) for item in (row.get("supported_parameters") or [])}
-                and row.get("provider_name")
-                == EXPECTED_PROVIDER_NAMES[expected_provider]
+                and row.get("provider_name") == EXPECTED_PROVIDER_NAMES[expected_provider]
                 and row.get("model_id") == model
             ]
             if not matches:
-                raise SystemExit(
-                    f"No OpenRouter endpoint matches {model} -> {expected_provider}"
-                )
+                raise SystemExit(f"No OpenRouter endpoint matches {model} -> {expected_provider}")
             if not operational:
                 raise SystemExit(
                     f"No operational OpenRouter endpoint for {model} -> {expected_provider}"
@@ -233,8 +298,9 @@ def main() -> int:
                 raise SystemExit(
                     f"No operational endpoint supports the frozen request surface for {model}"
                 )
-            model_evidence[model] = {
+            saved_evidence = {
                 "expected_provider": expected_provider,
+                "response_model_id": data.get("id"),
                 "response_sha256": response_sha256,
                 "matching_endpoints": [
                     {
@@ -254,6 +320,13 @@ def main() -> int:
                 "compatible_operational_match_count": len(compatible),
                 "required_parameters": sorted(required_parameters[model]),
             }
+            recompute_model_endpoint_compatibility(
+                model=model,
+                expected_provider=expected_provider,
+                required_parameters=required_parameters[model],
+                evidence=saved_evidence,
+            )
+            model_evidence[model] = saved_evidence
 
     evidence = {
         "schema": "opensquilla.openrouter-route-preflight/v2",
@@ -264,6 +337,20 @@ def main() -> int:
         "providers_response_sha256": providers_sha256,
         "expected_routes": expected_routes,
         "expected_routes_sha256": canonical_sha256(expected_routes),
+        "experiment_config": {
+            "path": str(args.experiment_config.expanduser().resolve()),
+            "sha256": hashlib.sha256(
+                args.experiment_config.expanduser().resolve().read_bytes()
+            ).hexdigest(),
+            "g1_routing_profile_id": (
+                experiment.g1_routing.profile_id if experiment.g1_routing is not None else None
+            ),
+            "source_registry_snapshot_version": (
+                experiment.g1_routing.source_registry_snapshot_version
+                if experiment.g1_routing is not None
+                else None
+            ),
+        },
         "required_parameters_sha256": canonical_sha256(
             {model: sorted(parameters) for model, parameters in required_parameters.items()}
         ),
@@ -272,9 +359,7 @@ def main() -> int:
         "non_byok_verified": None,
         "billing_verified": None,
         "reasoning_ineligible_models": (
-            sorted(FORMAL_REASONING_INELIGIBLE_MODELS)
-            if args.scope == "formal"
-            else []
+            sorted(FORMAL_REASONING_INELIGIBLE_MODELS) if args.scope == "formal" else []
         ),
         "scope_note": (
             "Public metadata availability only; per-request router metadata, non-BYOK "

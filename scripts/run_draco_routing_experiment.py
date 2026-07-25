@@ -7,8 +7,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import copy
 import contextlib
+import copy
 import hashlib
 import json
 import math
@@ -21,6 +21,7 @@ import time
 import uuid
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field, is_dataclass, replace
+from functools import cache
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -38,6 +39,7 @@ from opensquilla.engine.types import (
     THINKING_BUDGETS,
     AgentConfig,
     ThinkingLevel,
+    done_text_snapshot,
 )
 from opensquilla.engine.types import (
     DoneEvent as AgentDoneEvent,
@@ -66,7 +68,6 @@ from opensquilla.engine.types import (
 from opensquilla.engine.types import (
     ToolUseStartEvent as AgentToolUseStartEvent,
 )
-from opensquilla.engine.types import done_text_snapshot
 from opensquilla.engine.types import (
     WarningEvent as AgentWarningEvent,
 )
@@ -84,7 +85,10 @@ from opensquilla.eval.draco_experiment_config import (
 )
 from opensquilla.execution_status import compact_provider_status
 from opensquilla.gateway.config import GatewayConfig
-from opensquilla.gateway.llm_runtime import resolve_llm_runtime_config
+from opensquilla.gateway.llm_runtime import (
+    OPENROUTER_DEFAULT_PROVIDER_ROUTING,
+    resolve_llm_runtime_config,
+)
 from opensquilla.provider.ensemble import (
     EnsembleMemberConfig,
     EnsembleProvider,
@@ -127,6 +131,7 @@ MISSING_USAGE_PLACEHOLDER_ROLES = frozenset(
         "abandoned_stream_request",
         "agent_llm_request_unknown",
         "abandoned_provider_request",
+        "unknown_request",
     }
 )
 
@@ -270,6 +275,10 @@ DEFAULT_PROFILE_PROPOSER_TIMEOUT_SECONDS = 120.0
 DEFAULT_PROFILE_AGGREGATOR_TIMEOUT_SECONDS = 300.0
 JUDGE_MAX_ATTEMPTS = 3
 GENERATION_MAX_ATTEMPTS = 3
+GENERATION_ATTEMPT_EVIDENCE_SCHEMA = "opensquilla.draco-generation-attempt/v1"
+JUDGE_ATTEMPT_EVIDENCE_SCHEMA = "opensquilla.draco-judge-attempt/v1"
+JUDGE_ATTEMPT_BUDGET_SCOPE = "criterion_repeat_campaign"
+JUDGE_ATTEMPT_BUDGET_EXHAUSTED_ERROR = "judge_attempt_budget_exhausted"
 DEFAULT_GENERATION_RETRY_BACKOFF_SECONDS = 2.0
 GENERATION_EMPTY_OUTPUT_ERROR = "empty_generation_output"
 GENERATION_MISSING_DONE_ERROR = "generation_missing_done"
@@ -306,6 +315,129 @@ def legal_proposer_quorum(proposer_count: int) -> int:
     if proposer_count < 0:
         raise ValueError("proposer_count must be a non-negative integer")
     return (2 * proposer_count + 2) // 3 if proposer_count else 0
+
+
+def validate_g1_registry_contract(
+    experiment: DracoExperimentConfig,
+    config: GatewayConfig,
+) -> dict[str, Any]:
+    """Validate the formal G1 pool and upstream pins before any model call."""
+
+    contract = experiment.g1_routing
+    if contract is None:
+        raise ValueError("G1 requires a versioned g1_routing experiment contract")
+    from opensquilla.provider.ranking_router import (
+        load_model_registry_snapshot,
+        ranking_config_snapshot,
+    )
+
+    snapshot = load_model_registry_snapshot()
+    actual_version = str(snapshot.get("snapshot_version") or "").strip()
+    if actual_version != contract.source_registry_snapshot_version:
+        raise ValueError("G1 registry snapshot version differs from the experiment contract")
+    actual_registry_hash = canonical_json_sha256(snapshot).removeprefix("sha256:")
+    if actual_registry_hash != contract.expected_source_registry_snapshot_sha256:
+        raise ValueError("G1 registry snapshot content differs from the experiment contract")
+    ranking_config = ranking_config_snapshot()
+    actual_ranking_schema = str(ranking_config.get("schema_version") or "").strip()
+    actual_ranking_version = str(ranking_config.get("config_version") or "").strip()
+    actual_ranking_hash = canonical_json_sha256(ranking_config).removeprefix("sha256:")
+    if (
+        actual_ranking_schema != contract.expected_ranking_config_schema_version
+        or actual_ranking_version != contract.expected_ranking_config_version
+        or actual_ranking_hash != contract.expected_ranking_config_sha256
+    ):
+        raise ValueError("G1 ranking configuration differs from the experiment contract")
+    proposer_count_config = ranking_config.get("proposer_count")
+    by_tier = (
+        proposer_count_config.get("by_tier") if isinstance(proposer_count_config, Mapping) else None
+    )
+    high_risk = (
+        proposer_count_config.get("high_risk")
+        if isinstance(proposer_count_config, Mapping)
+        else None
+    )
+    try:
+        actual_proposer_max = max(
+            *(int(row["max"]) for row in by_tier.values() if isinstance(row, Mapping)),
+            int(high_risk["max"]),
+        )
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        raise ValueError("G1 ranking proposer bounds are malformed") from exc
+    if actual_proposer_max != contract.expected_proposer_count_max:
+        raise ValueError("G1 ranking proposer maximum differs from the experiment contract")
+    rows = snapshot.get("models")
+    if not isinstance(rows, list):
+        raise ValueError("G1 registry snapshot has no model rows")
+    available: set[str] = set()
+    for row in rows:
+        facts = row.get("registry_facts") if isinstance(row, Mapping) else None
+        if not isinstance(facts, Mapping):
+            continue
+        if str(facts.get("provider") or "").strip().lower() != "openrouter":
+            continue
+        model = str(facts.get("model_id") or "").strip().lower()
+        if model:
+            available.add(model)
+    missing_models = sorted(set(contract.expected_routes) - available)
+    if missing_models:
+        raise ValueError(
+            "G1 expected route model(s) missing from registry: " + ", ".join(missing_models)
+        )
+
+    runtime = resolve_llm_runtime_config(config)
+    pin_mismatches = {
+        model: {
+            "expected": expected_provider,
+            "actual": runtime.provider_routing.get(model),
+        }
+        for model, expected_provider in contract.expected_routes.items()
+        if runtime.provider_routing.get(model) != expected_provider
+    }
+    if pin_mismatches:
+        raise ValueError(
+            "G1 expected route provider pin(s) differ: " + ", ".join(sorted(pin_mismatches))
+        )
+    return {
+        **contract.model_dump(mode="json"),
+        "policy": "exact_openrouter_routes",
+        "validated": True,
+        "available_registry_candidate_count": len(available),
+        "runtime_pins_match": True,
+    }
+
+
+def enforce_formal_draco_runtime_config(
+    config: GatewayConfig,
+    experiment: DracoExperimentConfig | None,
+    groups: list[str],
+) -> dict[str, Any]:
+    """Apply formal runtime switches independently of the operator base config."""
+
+    if experiment is None:
+        return {}
+    if experiment.tools.sandbox_enabled is not False:
+        raise ValueError("formal DRACO requires tools.sandbox_enabled=false")
+    config.sandbox.sandbox = False
+    config.sandbox.security_grading = False
+    freeze: dict[str, Any] = {
+        "source": "experiment_config",
+        "sandbox_enabled": False,
+        "sandbox_security_grading_enabled": False,
+    }
+    if "G1" in groups:
+        g1_routing = experiment.g1_routing
+        if g1_routing is None or g1_routing.user_profile_enabled is not False:
+            raise ValueError("formal G1 requires g1_routing.user_profile_enabled=false")
+        config.llm_ensemble.ranking_user_profile_generation_enabled = False
+        config.llm_ensemble.ranking_user_profile_enabled = False
+        freeze.update(
+            {
+                "g1_user_profile_generation_enabled": False,
+                "g1_user_profile_enabled": False,
+            }
+        )
+    return freeze
 
 
 def agent_finalization_policy_from_args(
@@ -576,8 +708,7 @@ class DryEnsembleProvider:
             sample_indexes[model] = sample_index + 1
             identity = (
                 selected_identities[index]
-                if index < len(selected_identities)
-                and isinstance(selected_identities[index], str)
+                if index < len(selected_identities) and isinstance(selected_identities[index], str)
                 else f"dry:{model}"
             )
             provider, separator, selected_model = identity.partition(":")
@@ -626,9 +757,9 @@ class DryEnsembleProvider:
             for candidate in candidates
         ]
         yield TextDeltaEvent(text=text)
-        aggregator_provider = str(
-            self.selection_plan.get("selected_A") or "dry:"
-        ).partition(":")[0].strip() or "dry"
+        aggregator_provider = (
+            str(self.selection_plan.get("selected_A") or "dry:").partition(":")[0].strip() or "dry"
+        )
         yield DoneEvent(
             input_tokens=sum(int(candidate["input_tokens"]) for candidate in candidates) + 21,
             output_tokens=max(1, len(text) // 4),
@@ -789,9 +920,7 @@ def result_key_coverage(
         "actual_unique_key_count": len(actual_keys),
         "missing_keys": [list(key) for key in missing],
         "unexpected_keys": [list(key) for key in unexpected],
-        "duplicate_keys": [
-            {"key": list(key), "count": counts[key]} for key in duplicates
-        ],
+        "duplicate_keys": [{"key": list(key), "count": counts[key]} for key in duplicates],
     }
     return row
 
@@ -2578,6 +2707,7 @@ def task_analyzer_usage_row(
     source: str,
     fallback_reason: str,
 ) -> dict[str, Any]:
+    usage_unknown = bool(usage.get("usage_unknown")) or not bool(usage)
     provider_usage = (
         dict(usage.get("provider_usage"))
         if isinstance(usage.get("provider_usage"), Mapping)
@@ -2587,20 +2717,21 @@ def task_analyzer_usage_row(
         {
             "task_analysis_source": source,
             "fallback_reason": fallback_reason,
-            "usage_unknown": not bool(usage),
+            "usage_unknown": usage_unknown,
         }
     )
+    physical_attempt_id = str(usage.get("physical_attempt_id") or uuid.uuid4().hex)
+    provider_usage["physical_attempt_id"] = physical_attempt_id
     row = {
-        "role": "task_analyzer",
+        "role": "unknown_request" if usage_unknown else "task_analyzer",
         "label": "task_analyzer",
+        "request_count": 1,
+        "attempt": max(1, coerce_metric_int(usage.get("attempt"))),
+        "physical_attempt_id": physical_attempt_id,
         "provider": str(usage.get("provider") or ""),
         "model": str(usage.get("model") or ""),
-        "requested_provider": str(
-            usage.get("requested_provider") or provider_id or ""
-        ),
-        "requested_model": str(
-            usage.get("requested_model") or model_id or ""
-        ),
+        "requested_provider": str(usage.get("requested_provider") or provider_id or ""),
+        "requested_model": str(usage.get("requested_model") or model_id or ""),
         "input_tokens": int(usage.get("input_tokens") or 0),
         "output_tokens": int(usage.get("output_tokens") or 0),
         "reasoning_tokens": int(usage.get("reasoning_tokens") or 0),
@@ -2622,6 +2753,104 @@ def task_analyzer_usage_row(
     return row
 
 
+def task_analyzer_usage_rows(
+    usage: Mapping[str, Any],
+    *,
+    provider_id: str,
+    model_id: str,
+    source: str,
+    fallback_reason: str,
+) -> list[dict[str, Any]]:
+    """Expand analyzer retry accounting into one row per physical request."""
+
+    raw_attempts = usage.get("physical_attempts")
+    attempts = (
+        [dict(item) for item in raw_attempts if isinstance(item, Mapping)]
+        if isinstance(raw_attempts, list)
+        else []
+    )
+    declared_count = max(
+        1,
+        coerce_metric_int(usage.get("attempt_count")),
+        len(attempts),
+    )
+    if not attempts and declared_count == 1:
+        single = dict(usage)
+        single.pop("physical_attempts", None)
+        single.pop("attempt_count", None)
+        single.setdefault("attempt", 1)
+        return [
+            task_analyzer_usage_row(
+                single,
+                provider_id=provider_id,
+                model_id=model_id,
+                source=source,
+                fallback_reason=fallback_reason,
+            )
+        ]
+
+    attempts_by_ordinal: dict[int, dict[str, Any]] = {}
+    for position, attempt_usage in enumerate(attempts, start=1):
+        ordinal = max(
+            1,
+            coerce_metric_int(attempt_usage.get("attempt")) or position,
+        )
+        if ordinal in attempts_by_ordinal:
+            continue
+        attempts_by_ordinal[ordinal] = attempt_usage
+
+    aggregate_provider_usage = (
+        usage.get("provider_usage") if isinstance(usage.get("provider_usage"), Mapping) else {}
+    )
+    aggregate_evidence = {
+        "attempt_count": declared_count,
+        "provider": str(usage.get("provider") or ""),
+        "model": str(usage.get("model") or ""),
+        "requested_provider": str(usage.get("requested_provider") or provider_id),
+        "requested_model": str(usage.get("requested_model") or model_id),
+        "input_tokens": coerce_metric_int(usage.get("input_tokens")),
+        "output_tokens": coerce_metric_int(usage.get("output_tokens")),
+        "reasoning_tokens": coerce_metric_int(usage.get("reasoning_tokens")),
+        "cached_tokens": coerce_metric_int(usage.get("cached_tokens")),
+        "cache_write_tokens": coerce_metric_int(usage.get("cache_write_tokens")),
+        "billed_cost": float(usage.get("billed_cost") or 0.0),
+        "cost_source": str(usage.get("cost_source") or "none"),
+        "response_ids": [
+            str(value)
+            for value in aggregate_provider_usage.get("response_ids", [])
+            if str(value).strip()
+        ],
+    }
+    rows: list[dict[str, Any]] = []
+    for ordinal in range(1, declared_count + 1):
+        attempt_usage = dict(attempts_by_ordinal.get(ordinal) or {})
+        if not attempt_usage:
+            attempt_usage = {
+                "attempt": ordinal,
+                "physical_attempt_id": uuid.uuid4().hex,
+                "requested_provider": provider_id,
+                "requested_model": model_id,
+                "usage_unknown": True,
+                "unknown_reason": "per_attempt_receipt_unavailable",
+                "provider_usage": {
+                    "usage_unknown": True,
+                    "unknown_reason": "per_attempt_receipt_unavailable",
+                },
+            }
+            if ordinal == 1:
+                attempt_usage["provider_usage"]["unallocated_aggregate_usage"] = aggregate_evidence
+        rows.append(
+            task_analyzer_usage_row(
+                attempt_usage,
+                provider_id=provider_id,
+                model_id=model_id,
+                source=source,
+                fallback_reason=fallback_reason,
+            )
+        )
+    return rows
+
+
 async def build_experiment_provider(
     *,
     config: GatewayConfig,
@@ -2641,6 +2870,11 @@ async def build_experiment_provider(
     started = time.monotonic()
     kind = spec["kind"]
     b2_experiment = experiment_config if group == "B2" else None
+    g1_routing = (
+        experiment_config.g1_routing if group == "G1" and experiment_config is not None else None
+    )
+    if group == "G1" and g1_routing is None:
+        raise ValueError("G1 requires a versioned g1_routing experiment contract")
     if dry_run:
         if kind in {"single", "router_single"}:
             model = spec.get("model") or "dry-routed-single"
@@ -2738,6 +2972,80 @@ async def build_experiment_provider(
                 }
             )
             dry_provider.selection_plan = dict(dry_routing_trace["selection_plan"])
+        elif g1_routing is not None:
+            from opensquilla.provider.ranking_router import (
+                TaskAnalysisResult,
+                build_request_context,
+                dynamic_output_token_budgets,
+                fallback_task_profile,
+                ranking_config_snapshot,
+            )
+
+            ranking_config = ranking_config_snapshot()
+            dry_config = config.model_copy(deep=True)
+            dry_ensemble = dry_config.llm_ensemble
+            dry_ensemble.enabled = True
+            dry_ensemble.selection_mode = "router_dynamic"
+            dry_ensemble.ranking_user_profile_generation_enabled = False
+            dry_ensemble.ranking_user_profile_enabled = False
+            configured_output_tokens = int(getattr(dry_config.llm, "max_tokens", 0) or 0)
+            candidate_output_tokens, aggregator_output_tokens = dynamic_output_token_budgets(
+                configured_output_tokens=configured_output_tokens,
+                candidate_max_chars=int(dry_ensemble.candidate_max_chars or 0),
+                ranking_config=ranking_config,
+            )
+            request_context = build_request_context(
+                message=prompt,
+                turn_metadata={},
+                attachments=[],
+                candidate_output_tokens=candidate_output_tokens,
+                aggregator_output_tokens=aggregator_output_tokens,
+                ranking_config=ranking_config,
+            )
+            task_profile = fallback_task_profile(
+                routed_tier="c1",
+                request_context=request_context,
+                ranking_config=ranking_config,
+            )
+            dry_dynamic_provider = build_ensemble_provider_from_config(
+                config=dry_config,
+                inherited_provider_config=inherited,
+                fallback_provider=None,
+                turn_metadata={
+                    "routed_tier": "c1",
+                    "routing_confidence": 0.0,
+                    "router_dynamic_task_text": prompt,
+                },
+                ranking_inputs={
+                    "decision_id": ("dry-" + hashlib.sha256(prompt.encode()).hexdigest()[:24]),
+                    "task_analysis": TaskAnalysisResult(
+                        profile=task_profile,
+                        source="dry_run_fallback",
+                        schema_valid=False,
+                        confidence=0.0,
+                        fallback_reason="dry_run_no_analyzer_call",
+                    ),
+                    "user_profile": None,
+                    "request_context": request_context,
+                    "ranking_config": ranking_config,
+                    "generation_policy": dict(generation_policy or {}),
+                    "registry_allowlist": g1_routing.model_dump(mode="json"),
+                },
+            )
+            plan = copy.deepcopy(dry_dynamic_provider.selection_plan)
+            proposer_models = list(plan.get("proposer_models") or [])
+            aggregator_model = str(plan.get("aggregator_model") or "")
+            dry_provider.proposer_models = proposer_models
+            dry_provider.model = aggregator_model
+            dry_provider.min_successful_proposers = legal_proposer_quorum(len(proposer_models))
+            dry_routing_trace.update(
+                {
+                    "benchmark_alignment": g1_routing.profile_id,
+                    "profile": "router_dynamic",
+                    "selection_plan": plan,
+                }
+            )
+            dry_provider.selection_plan = copy.deepcopy(plan)
         result = ProviderBuildResult(
             provider=dry_provider,
             prompt=prompt,
@@ -2838,6 +3146,9 @@ async def build_experiment_provider(
     ensemble_cfg = group_config.llm_ensemble
     ensemble_cfg.enabled = True
     ensemble_cfg.selection_mode = selection_mode
+    if g1_routing is not None:
+        ensemble_cfg.ranking_user_profile_generation_enabled = False
+        ensemble_cfg.ranking_user_profile_enabled = bool(g1_routing.user_profile_enabled)
     ensemble_cfg.proposer_tools = (
         b2_experiment.ensemble.proposer_tools
         if b2_experiment is not None
@@ -2867,6 +3178,7 @@ async def build_experiment_provider(
         from opensquilla.provider.ranking_router import (
             TASK_ANALYZER_MODEL_ID,
             TASK_ANALYZER_PROVIDER_ID,
+            TaskAnalyzerStreamCleanupError,
             analyze_task_with_provider,
             build_request_context,
             dynamic_output_token_budgets,
@@ -2903,25 +3215,58 @@ async def build_experiment_provider(
             aggregator_output_tokens=aggregator_output_tokens,
             ranking_config=ranking_config,
         )
-        user_profile_enabled = bool(ensemble_cfg.ranking_user_profile_enabled)
+        user_profile_enabled = (
+            bool(g1_routing.user_profile_enabled)
+            if g1_routing is not None
+            else bool(ensemble_cfg.ranking_user_profile_enabled)
+        )
         user_profile = mock_user_profile(ranking_config) if user_profile_enabled else None
         analyzer_provider = build_task_analyzer_provider(
             routed_config,
             provider_id=TASK_ANALYZER_PROVIDER_ID,
             model_id=TASK_ANALYZER_MODEL_ID,
         )
-        task_analysis = await analyze_task_with_provider(
-            provider=analyzer_provider,
-            message=turn.semantic_message,
-            user_profile_enabled=user_profile_enabled,
-            request_context=request_context,
-            routed_tier=routed_tier,
-            routing_confidence=routing_confidence,
-            analyzer_provider_id=TASK_ANALYZER_PROVIDER_ID,
-            analyzer_model_id=TASK_ANALYZER_MODEL_ID,
-            ranking_config=ranking_config,
-            decision_id=decision_id,
-        )
+        try:
+            task_analysis = await analyze_task_with_provider(
+                provider=analyzer_provider,
+                message=turn.semantic_message,
+                user_profile_enabled=user_profile_enabled,
+                request_context=request_context,
+                routed_tier=routed_tier,
+                routing_confidence=routing_confidence,
+                analyzer_provider_id=TASK_ANALYZER_PROVIDER_ID,
+                analyzer_model_id=TASK_ANALYZER_MODEL_ID,
+                ranking_config=ranking_config,
+                decision_id=decision_id,
+            )
+        except TaskAnalyzerStreamCleanupError as exc:
+            # Cleanup failure is raised only after the analyzer's provider
+            # stream was opened.  Preserve a conservative unknown-usage
+            # receipt so the paid generation attempt cannot disappear.
+            setup_usage.extend(
+                task_analyzer_usage_rows(
+                    exc.usage or {"attempt_count": 1},
+                    provider_id=TASK_ANALYZER_PROVIDER_ID,
+                    model_id=TASK_ANALYZER_MODEL_ID,
+                    source="analyzer_stream_cleanup_failed",
+                    fallback_reason=type(exc).__name__,
+                )
+            )
+            routing_trace["task_analyzer"] = {
+                "provider": TASK_ANALYZER_PROVIDER_ID,
+                "model": TASK_ANALYZER_MODEL_ID,
+                "source": "analyzer_stream_cleanup_failed",
+                "schema_valid": False,
+                "fallback_reason": type(exc).__name__,
+                "request_context_hash": request_context.get("snapshot_hash"),
+                "user_profile_enabled": user_profile_enabled,
+            }
+            raise ProviderBuildError(
+                exc,
+                setup_latency_ms=int((time.monotonic() - started) * 1000),
+                setup_usage=setup_usage,
+                routing_trace=routing_trace,
+            ) from exc
         ranking_inputs = {
             "decision_id": decision_id,
             "task_analysis": task_analysis,
@@ -2929,13 +3274,14 @@ async def build_experiment_provider(
             "request_context": request_context,
             "ranking_config": ranking_config,
             "generation_policy": dict(generation_policy or {}),
+            "registry_allowlist": g1_routing.model_dump(mode="json"),
         }
         turn.metadata["router_dynamic_task_profile"] = task_analysis.profile
         turn.metadata["router_dynamic_task_analyzer"] = task_analysis.trace(ranking_config)
         turn.metadata["router_dynamic_request_context_hash"] = request_context.get("snapshot_hash")
         analyzer_usage = dict(task_analysis.usage or {})
-        setup_usage.append(
-            task_analyzer_usage_row(
+        setup_usage.extend(
+            task_analyzer_usage_rows(
                 analyzer_usage,
                 provider_id=TASK_ANALYZER_PROVIDER_ID,
                 model_id=TASK_ANALYZER_MODEL_ID,
@@ -2951,6 +3297,7 @@ async def build_experiment_provider(
             "confidence": task_analysis.confidence,
             "fallback_reason": task_analysis.fallback_reason,
             "request_context_hash": request_context.get("snapshot_hash"),
+            "user_profile_enabled": user_profile_enabled,
         }
 
     try:
@@ -2963,6 +3310,8 @@ async def build_experiment_provider(
         )
         if b2_experiment is not None:
             provider = align_b2_provider_to_g12(provider, b2_experiment)
+        if g1_routing is not None:
+            provider.selection_plan["user_profile_enabled"] = user_profile_enabled
         provider = enforce_draco_legal_proposer_quorum(provider)
         if generation_policy is not None:
             provider = apply_generation_policy_to_ensemble_provider(
@@ -2979,6 +3328,7 @@ async def build_experiment_provider(
                 "selection_mode": selection_mode,
                 "profile": provider.profile_name,
                 "selection_plan": provider.selection_plan,
+                "user_profile_enabled": user_profile_enabled if g1_routing is not None else None,
             }
         )
     except Exception as exc:
@@ -3113,11 +3463,7 @@ def _track_benchmark_owner_cleanup(
         pending.discard(done)
         _observe_benchmark_cleanup_result(owner, done, reason=reason)
         state = _BENCHMARK_OWNER_CLEANUP_STATE.get(id(owner))
-        if (
-            state is not None
-            and not state.get("pending")
-            and not state.get("poisoned_reason")
-        ):
+        if state is not None and not state.get("pending") and not state.get("poisoned_reason"):
             _BENCHMARK_OWNER_CLEANUP_STATE.pop(id(owner), None)
 
     task.add_done_callback(_finished)
@@ -3336,6 +3682,7 @@ async def collect_run(
             if config is not None
             else ChatConfig(timeout=timeout)
         )
+
         async def _consume() -> None:
             nonlocal done, error, ttft_ms, tool_call_count
             stream = provider.chat(
@@ -3343,9 +3690,7 @@ async def collect_run(
                 tools=tools,
                 config=chat_config,
             )
-            async with contextlib.aclosing(
-                _aclosing_events(stream)
-            ) as owned_stream:
+            async with contextlib.aclosing(_aclosing_events(stream)) as owned_stream:
                 async for event in owned_stream:
                     if isinstance(event, TextDeltaEvent):
                         if ttft_ms is None and event.text:
@@ -3614,11 +3959,7 @@ def aggregate_agent_model_usage(records: list[dict[str, Any]]) -> list[dict[str,
             explicit_request_count = payload_physical_request_count(payload)
             append_unknown_usage(
                 max(
-                    (
-                        explicit_request_count
-                        if explicit_request_count is not None
-                        else 1
-                    ),
+                    (explicit_request_count if explicit_request_count is not None else 1),
                     missing_usage_count,
                 )
             )
@@ -3629,8 +3970,7 @@ def aggregate_agent_model_usage(records: list[dict[str, Any]]) -> list[dict[str,
                 1
                 for row in breakdown
                 if isinstance(row, dict)
-                and str(row.get("role") or "").strip().casefold()
-                in MISSING_USAGE_PLACEHOLDER_ROLES
+                and str(row.get("role") or "").strip().casefold() in MISSING_USAGE_PLACEHOLDER_ROLES
             )
             for row in breakdown:
                 if not isinstance(row, dict):
@@ -3653,9 +3993,7 @@ def aggregate_agent_model_usage(records: list[dict[str, Any]]) -> list[dict[str,
             ),
             "provider": str(usage.get("provider") or ""),
             "model": str(usage.get("model") or ""),
-            "requested_provider": str(
-                usage.get("requested_provider") or ""
-            ),
+            "requested_provider": str(usage.get("requested_provider") or ""),
             "requested_model": str(usage.get("requested_model") or ""),
             "input_tokens": coerce_metric_int(usage.get("input_tokens")),
             "output_tokens": coerce_metric_int(usage.get("output_tokens")),
@@ -3798,8 +4136,7 @@ def aggregate_agent_ensemble_trace(records: list[dict[str, Any]]) -> dict[str, A
         "llm_request_count": total_llm_requests + untraced_llm_requests,
         "physical_request_count": total_llm_requests + untraced_llm_requests,
         "usage_missing_count": sum(
-            max(0, coerce_metric_int(call.get("usage_missing_count")))
-            for call in traces
+            max(0, coerce_metric_int(call.get("usage_missing_count"))) for call in traces
         ),
         "calls": traces,
     }
@@ -3830,35 +4167,39 @@ def provider_done_from_agent_done(
     recorder: BenchmarkTurnCallRecorder,
     fallback_model: str,
 ) -> DoneEvent | None:
+    call_records = llm_response_records(recorder.records)
     breakdown = aggregate_agent_model_usage(recorder.records)
     trace = aggregate_agent_ensemble_trace(recorder.records)
+    ignored_agent_done_summary_rows = 0
+    ignored_agent_done_policy_evidence: list[dict[str, Any]] = []
     if done is not None:
         done_rows = [
             dict(row)
             for row in getattr(done, "model_usage_breakdown", [])
             if isinstance(row, Mapping)
         ]
-        if not done_rows and (
-            getattr(done, "billing_receipt", None) is not None
-            or getattr(done, "provider_usage", None)
-            or done.input_tokens
-            or done.output_tokens
-            or done.reasoning_tokens
-            or done.cached_tokens
-            or done.cache_write_tokens
-            or done.billed_cost
+        if (
+            not done_rows
+            and not call_records
+            and not breakdown
+            and (
+                getattr(done, "billing_receipt", None) is not None
+                or getattr(done, "provider_usage", None)
+                or done.input_tokens
+                or done.output_tokens
+                or done.reasoning_tokens
+                or done.cached_tokens
+                or done.cache_write_tokens
+                or done.billed_cost
+            )
         ):
             done_rows = [
                 {
                     "role": "agent_done",
                     "provider": str(getattr(done, "provider", "") or ""),
                     "model": str(getattr(done, "model", "") or ""),
-                    "requested_provider": str(
-                        getattr(done, "requested_provider", "") or ""
-                    ),
-                    "requested_model": str(
-                        getattr(done, "requested_model", "") or fallback_model
-                    ),
+                    "requested_provider": str(getattr(done, "requested_provider", "") or ""),
+                    "requested_model": str(getattr(done, "requested_model", "") or fallback_model),
                     "input_tokens": done.input_tokens,
                     "output_tokens": done.output_tokens,
                     "reasoning_tokens": done.reasoning_tokens,
@@ -3879,26 +4220,46 @@ def provider_done_from_agent_done(
                 }
             ]
         for done_row in done_rows:
-            candidates = [
-                (priority, index)
-                for index, row in enumerate(breakdown)
-                if (
-                    priority := usage_row_match_priority(row, done_row)
+            if not call_records:
+                breakdown.append(done_row)
+                continue
+            request_count = max(
+                0,
+                coerce_metric_int(done_row.get("request_count")),
+            )
+            response_ids = usage_row_response_ids(done_row)
+            if request_count > 1 or len(response_ids) > 1:
+                ignored_agent_done_summary_rows += 1
+                policy_evidence = ignored_agent_done_summary_policy_evidence(
+                    done_row,
+                    physical_rows=breakdown,
                 )
-                is not None
-            ]
+                if policy_evidence is not None:
+                    ignored_agent_done_policy_evidence.append(policy_evidence)
+                continue
+            if response_ids:
+                candidates = [
+                    (0, index)
+                    for index, row in enumerate(breakdown)
+                    if response_ids & usage_row_response_ids(row)
+                ]
+            else:
+                candidates = [
+                    (priority, index)
+                    for index, row in enumerate(breakdown)
+                    if not usage_row_response_ids(row)
+                    if (priority := usage_row_match_priority(row, done_row)) is not None
+                ]
             if candidates:
                 merge_usage_receipt_provenance(
                     breakdown[min(candidates)[1]],
                     done_row,
                 )
-            else:
+            elif len(response_ids) == 1:
                 breakdown.append(done_row)
-        done_trace = (
-            dict(done.ensemble_trace)
-            if isinstance(done.ensemble_trace, Mapping)
-            else {}
-        )
+            else:
+                ignored_agent_done_summary_rows += 1
+        done_trace = dict(done.ensemble_trace) if isinstance(done.ensemble_trace, Mapping) else {}
         if done_trace:
             if not trace:
                 trace = done_trace
@@ -3917,8 +4278,7 @@ def provider_done_from_agent_done(
     observed_rows = [
         row
         for row in breakdown
-        if str(row.get("role") or "").strip().casefold()
-        not in MISSING_USAGE_PLACEHOLDER_ROLES
+        if str(row.get("role") or "").strip().casefold() not in MISSING_USAGE_PLACEHOLDER_ROLES
     ]
     observed_providers = {
         str(row.get("provider") or "").strip()
@@ -3939,18 +4299,13 @@ def provider_done_from_agent_done(
         sum(
             1
             for row in breakdown
-            if str(row.get("role") or "").strip().casefold()
-            in MISSING_USAGE_PLACEHOLDER_ROLES
+            if str(row.get("role") or "").strip().casefold() in MISSING_USAGE_PLACEHOLDER_ROLES
         ),
         coerce_metric_int(trace.get("usage_missing_count")) if trace else 0,
-        coerce_metric_int(
-            getattr(done, "usage_missing_count", 0) if done is not None else 0
-        ),
+        coerce_metric_int(getattr(done, "usage_missing_count", 0) if done is not None else 0),
     )
     if done is not None and (breakdown or usage_missing_count):
-        represented_missing = sum(
-            1 for row in breakdown if usage_row_is_missing_placeholder(row)
-        )
+        represented_missing = sum(1 for row in breakdown if usage_row_is_missing_placeholder(row))
         physical_request_count = len(breakdown) + max(
             0,
             usage_missing_count - represented_missing,
@@ -3986,20 +4341,9 @@ def provider_done_from_agent_done(
             cache_write_tokens=sum(
                 coerce_metric_int(row.get("cache_write_tokens")) for row in breakdown
             ),
-            billed_cost=sum(
-                trusted_provider_billed_cost(row)
-                for row in breakdown
-            ),
-            model=(
-                next(iter(observed_models))
-                if len(observed_models) == 1
-                else ""
-            ),
-            provider=(
-                next(iter(observed_providers))
-                if len(observed_providers) == 1
-                else ""
-            ),
+            billed_cost=sum(trusted_provider_billed_cost(row) for row in breakdown),
+            model=(next(iter(observed_models)) if len(observed_models) == 1 else ""),
+            provider=(next(iter(observed_providers)) if len(observed_providers) == 1 else ""),
             cost_source=envelope_source,
             requested_model=fallback_model,
             requested_provider=(
@@ -4012,7 +4356,7 @@ def provider_done_from_agent_done(
             usage_missing_count=usage_missing_count,
             provider_usage={
                 "diagnostic_usage_only": True,
-                "agent_llm_call_count": len(llm_response_records(recorder.records)),
+                "agent_llm_call_count": len(call_records),
                 "requested_model": fallback_model,
                 "requested_provider": (
                     next(iter(observed_requested_providers))
@@ -4028,33 +4372,26 @@ def provider_done_from_agent_done(
         if isinstance(getattr(done, "provider_usage", {}), Mapping)
         else {}
     )
-    provider_usage.update({
-        "agent_iterations": done.iterations,
-        "agent_llm_call_count": len(llm_response_records(recorder.records)),
-        "provider_identity_source": (
-            "unique_model_usage_breakdown"
-            if len(observed_providers) == 1
-            else "unresolved"
-        ),
-        "requested_model": str(
-            getattr(done, "requested_model", "") or fallback_model
-        ),
-        "requested_provider": str(
-            getattr(done, "requested_provider", "") or ""
-        ),
-    })
+    provider_usage.update(
+        {
+            "agent_iterations": done.iterations,
+            "agent_llm_call_count": len(call_records),
+            "agent_done_summary_rows_ignored": ignored_agent_done_summary_rows,
+            "provider_identity_source": (
+                "unique_model_usage_breakdown" if len(observed_providers) == 1 else "unresolved"
+            ),
+            "requested_model": str(getattr(done, "requested_model", "") or fallback_model),
+            "requested_provider": str(getattr(done, "requested_provider", "") or ""),
+        }
+    )
+    if ignored_agent_done_policy_evidence:
+        provider_usage[IGNORED_AGENT_DONE_POLICY_EVIDENCE_KEY] = ignored_agent_done_policy_evidence
     done_provider = str(getattr(done, "provider", "") or "").strip()
     done_model = str(getattr(done, "model", "") or "").strip()
     provider = done_provider or (
-        next(iter(observed_providers))
-        if len(observed_providers) == 1
-        else ""
+        next(iter(observed_providers)) if len(observed_providers) == 1 else ""
     )
-    model = done_model or (
-        next(iter(observed_models))
-        if len(observed_models) == 1
-        else ""
-    )
+    model = done_model or (next(iter(observed_models)) if len(observed_models) == 1 else "")
     requested_provider = str(
         getattr(done, "requested_provider", "")
         or (
@@ -4075,9 +4412,7 @@ def provider_done_from_agent_done(
         billed_cost=done.billed_cost,
         model=model,
         provider=provider,
-        requested_model=str(
-            getattr(done, "requested_model", "") or fallback_model
-        ),
+        requested_model=str(getattr(done, "requested_model", "") or fallback_model),
         requested_provider=requested_provider,
         cache_write_tokens=done.cache_write_tokens,
         cost_source=done.cost_source,
@@ -4401,8 +4736,7 @@ def llm_request_count_for_run(
             1
             for row in done.model_usage_breakdown
             if isinstance(row, Mapping)
-            and str(row.get("role") or "").strip().casefold()
-            in MISSING_USAGE_PLACEHOLDER_ROLES
+            and str(row.get("role") or "").strip().casefold() in MISSING_USAGE_PLACEHOLDER_ROLES
         )
         return max(
             traced,
@@ -4428,9 +4762,7 @@ def done_payload(done: DoneEvent | None) -> dict[str, Any]:
     payload = {
         "provider": str(getattr(done, "provider", "") or ""),
         "model": done.model,
-        "requested_provider": str(
-            getattr(done, "requested_provider", "") or ""
-        ),
+        "requested_provider": str(getattr(done, "requested_provider", "") or ""),
         "requested_model": str(getattr(done, "requested_model", "") or ""),
         "stop_reason": done.stop_reason,
         "input_tokens": done.input_tokens,
@@ -4465,10 +4797,7 @@ def done_payload(done: DoneEvent | None) -> dict[str, Any]:
 
 
 def usage_row_is_missing_placeholder(row: Mapping[str, Any]) -> bool:
-    return (
-        str(row.get("role") or "").strip().casefold()
-        in MISSING_USAGE_PLACEHOLDER_ROLES
-    )
+    return str(row.get("role") or "").strip().casefold() in MISSING_USAGE_PLACEHOLDER_ROLES
 
 
 def usage_row_response_ids(row: Mapping[str, Any]) -> frozenset[str]:
@@ -4486,11 +4815,7 @@ def usage_row_response_ids(row: Mapping[str, Any]) -> frozenset[str]:
         response_id = provider_usage.get("response_id")
         if response_id is not None:
             values.append(response_id)
-    return frozenset(
-        str(value).strip()
-        for value in values
-        if str(value).strip()
-    )
+    return frozenset(str(value).strip() for value in values if str(value).strip())
 
 
 def usage_receipt_fingerprint(row: Mapping[str, Any]) -> tuple[Any, ...]:
@@ -4522,6 +4847,211 @@ def usage_row_match_priority(
     return 1 if not left_ids and not right_ids else 2
 
 
+STABLE_RECEIPT_EVIDENCE_KEY = "stable_receipt_evidence"
+IGNORED_AGENT_DONE_POLICY_EVIDENCE_KEY = "ignored_agent_done_summary_policy_evidence"
+
+
+def build_stable_receipt_evidence(
+    *rows: Mapping[str, Any],
+) -> dict[str, Any]:
+    providers: set[str] = set()
+    models: set[str] = set()
+    cost_usd_nanos: set[int] = set()
+    usage_is_byok_values: set[bool] = set()
+    router_is_byok_values: set[bool] = set()
+    token_values: dict[str, set[int]] = {
+        key: set()
+        for key in (
+            "input_tokens",
+            "output_tokens",
+            "reasoning_tokens",
+            "cache_read_tokens",
+            "cached_tokens",
+            "cache_write_tokens",
+        )
+    }
+    inherited_conflicts: set[str] = set()
+
+    def _add_bool(value: Any, target: set[bool]) -> None:
+        if value is True or value is False:
+            target.add(value)
+
+    def _add_cost(value: Any) -> None:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int | float)
+            or not math.isfinite(float(value))
+            or float(value) < 0
+        ):
+            return
+        cost_usd_nanos.add(int(round(float(value) * 1_000_000_000)))
+
+    for row in rows:
+        provider = str(row.get("provider") or "").strip().casefold()
+        if provider:
+            providers.add(provider)
+        model = str(row.get("model") or "").strip()
+        if model:
+            models.add(model)
+        _add_cost(row.get("billed_cost"))
+        for key, values in token_values.items():
+            raw_value = row.get(key)
+            if isinstance(raw_value, int) and not isinstance(raw_value, bool) and raw_value >= 0:
+                values.add(raw_value)
+        billing_receipt = row.get("billing_receipt")
+        if isinstance(billing_receipt, Mapping):
+            receipt_nanos = billing_receipt.get("usd_equivalent_nanos")
+            if (
+                isinstance(receipt_nanos, int)
+                and not isinstance(receipt_nanos, bool)
+                and receipt_nanos >= 0
+            ):
+                cost_usd_nanos.add(receipt_nanos)
+
+        provider_usage = row.get("provider_usage")
+        if not isinstance(provider_usage, Mapping):
+            continue
+        _add_bool(provider_usage.get("is_byok"), usage_is_byok_values)
+        _add_cost(provider_usage.get("provider_reported_cost"))
+        router_metadata = provider_usage.get("router_metadata")
+        if isinstance(router_metadata, Mapping):
+            _add_bool(router_metadata.get("is_byok"), router_is_byok_values)
+        inherited = provider_usage.get(STABLE_RECEIPT_EVIDENCE_KEY)
+        if not isinstance(inherited, Mapping):
+            continue
+        providers.update(
+            str(value).strip().casefold()
+            for value in inherited.get("providers") or []
+            if str(value).strip()
+        )
+        models.update(
+            str(value).strip() for value in inherited.get("models") or [] if str(value).strip()
+        )
+        for value in inherited.get("cost_usd_nanos") or []:
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                cost_usd_nanos.add(value)
+        for value in inherited.get("usage_is_byok_values") or []:
+            _add_bool(value, usage_is_byok_values)
+        for value in inherited.get("router_is_byok_values") or []:
+            _add_bool(value, router_is_byok_values)
+        inherited_token_values = inherited.get("token_values")
+        if isinstance(inherited_token_values, Mapping):
+            for key, values in token_values.items():
+                for value in inherited_token_values.get(key) or []:
+                    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                        values.add(value)
+        inherited_conflicts.update(
+            str(value).strip()
+            for value in inherited.get("conflict_fields") or []
+            if str(value).strip()
+        )
+
+    conflict_fields = set(inherited_conflicts)
+    if len(providers) > 1:
+        conflict_fields.add("provider")
+    if len(models) > 1:
+        conflict_fields.add("model")
+    if len(cost_usd_nanos) > 1:
+        conflict_fields.add("cost_usd_nanos")
+    if len(usage_is_byok_values | router_is_byok_values) > 1:
+        conflict_fields.add("is_byok")
+    for key, values in token_values.items():
+        if len(values) > 1:
+            conflict_fields.add(key)
+
+    return {
+        "providers": sorted(providers),
+        "models": sorted(models),
+        "cost_usd_nanos": sorted(cost_usd_nanos),
+        "usage_is_byok_values": sorted(usage_is_byok_values),
+        "router_is_byok_values": sorted(router_is_byok_values),
+        "token_values": {key: sorted(values) for key, values in token_values.items() if values},
+        "conflict_fields": sorted(conflict_fields),
+        "receipt_conflict": bool(conflict_fields),
+    }
+
+
+def ignored_agent_done_summary_policy_evidence(
+    summary: Mapping[str, Any],
+    *,
+    physical_rows: list[Mapping[str, Any]],
+) -> dict[str, Any] | None:
+    """Retain policy contradictions from a non-physical AgentDone roll-up.
+
+    A roll-up with ``request_count > 1`` is never a physical request and must
+    not contribute tokens, cost, or request cardinality.  It can still carry
+    security-relevant receipt evidence, however.  Preserve only a compact
+    contradiction record so a later non-BYOK audit cannot lose an explicit
+    BYOK assertion or a stable-receipt identity conflict.
+    """
+
+    stable = build_stable_receipt_evidence(summary)
+    conflict_fields = {
+        str(value).strip() for value in stable.get("conflict_fields") or [] if str(value).strip()
+    }
+    summary_provider = str(summary.get("provider") or "").strip().casefold()
+    summary_model = str(summary.get("model") or "").strip()
+    physical_providers = {
+        str(row.get("provider") or "").strip().casefold()
+        for row in physical_rows
+        if str(row.get("provider") or "").strip()
+    }
+    physical_models = {
+        str(row.get("model") or "").strip()
+        for row in physical_rows
+        if str(row.get("model") or "").strip()
+    }
+    if summary_provider and physical_providers and summary_provider not in physical_providers:
+        conflict_fields.add("provider")
+    if (
+        summary_model
+        and physical_models
+        and not any(
+            _formal_openrouter_models_equivalent(summary_model, physical_model)
+            for physical_model in physical_models
+        )
+    ):
+        conflict_fields.add("model")
+
+    summary_ids = usage_row_response_ids(summary)
+    matching_rows = [row for row in physical_rows if summary_ids & usage_row_response_ids(row)]
+    if matching_rows:
+        overlap_evidence = build_stable_receipt_evidence(summary, *matching_rows)
+        overlap_conflicts = {
+            str(value).strip()
+            for value in overlap_evidence.get("conflict_fields") or []
+            if str(value).strip()
+        }
+        # Cost/token totals on a multi-response summary are aggregates rather
+        # than per-request receipt fields.  They must not poison accounting.
+        if len(summary_ids) > 1:
+            overlap_conflicts &= {"provider", "model", "is_byok"}
+        conflict_fields.update(overlap_conflicts)
+
+    byok_values = {
+        value
+        for key in ("usage_is_byok_values", "router_is_byok_values")
+        for value in stable.get(key) or []
+        if value is True or value is False
+    }
+    explicit_byok = True in byok_values
+    if not explicit_byok and not conflict_fields:
+        return None
+    classification = "conflict" if conflict_fields else "explicit_byok"
+    response_id_fingerprint = canonical_json_sha256(sorted(summary_ids)) if summary_ids else ""
+    return {
+        "source": "ignored_agent_done_summary",
+        "classification": classification,
+        "request_count": max(
+            0,
+            coerce_metric_int(summary.get("request_count")),
+        ),
+        "response_id_set_sha256": response_id_fingerprint,
+        "explicit_byok": explicit_byok,
+        "conflict_fields": sorted(conflict_fields),
+    }
+
+
 def merge_usage_receipt_provenance(
     target: dict[str, Any],
     source: Mapping[str, Any],
@@ -4529,6 +5059,9 @@ def merge_usage_receipt_provenance(
     target_ids = usage_row_response_ids(target)
     source_ids = usage_row_response_ids(source)
     stable_id_match = bool(target_ids and source_ids and target_ids & source_ids)
+    stable_receipt_evidence = (
+        build_stable_receipt_evidence(target, source) if stable_id_match else None
+    )
     if stable_id_match:
         for key in (
             "provider",
@@ -4556,14 +5089,15 @@ def merge_usage_receipt_provenance(
         if not target.get(key) and source.get(key):
             target[key] = source[key]
     source_usage = source.get("provider_usage")
-    if not isinstance(source_usage, Mapping) or not source_usage:
-        return
+    source_usage = source_usage if isinstance(source_usage, Mapping) else {}
     target_usage = (
         dict(target.get("provider_usage"))
         if isinstance(target.get("provider_usage"), Mapping)
         else {}
     )
     for key, value in source_usage.items():
+        if key == STABLE_RECEIPT_EVIDENCE_KEY:
+            continue
         if key == "response_ids":
             existing = target_usage.get(key)
             existing_values = (
@@ -4574,9 +5108,7 @@ def merge_usage_receipt_provenance(
                 else []
             )
             source_values = (
-                list(value)
-                if isinstance(value, (list, tuple, set, frozenset))
-                else [value]
+                list(value) if isinstance(value, (list, tuple, set, frozenset)) else [value]
             )
             target_usage[key] = sorted(
                 {
@@ -4587,7 +5119,10 @@ def merge_usage_receipt_provenance(
             )
         elif stable_id_match or not target_usage.get(key):
             target_usage[key] = value
-    target["provider_usage"] = target_usage
+    if stable_receipt_evidence is not None:
+        target_usage[STABLE_RECEIPT_EVIDENCE_KEY] = stable_receipt_evidence
+    if target_usage:
+        target["provider_usage"] = target_usage
 
 
 def deduplicate_stable_usage_receipts(
@@ -4623,16 +5158,8 @@ def diagnostic_done_from_error_event(event: ErrorEvent) -> DoneEvent | None:
     """Preserve receipts from a failed composite request for spend accounting."""
 
     nested_done = event.diagnostic_done if isinstance(event.diagnostic_done, DoneEvent) else None
-    rows = [
-        dict(row)
-        for row in event.model_usage_breakdown
-        if isinstance(row, Mapping)
-    ]
-    trace = (
-        dict(event.ensemble_trace)
-        if isinstance(event.ensemble_trace, dict)
-        else None
-    )
+    rows = [dict(row) for row in event.model_usage_breakdown if isinstance(row, Mapping)]
+    trace = dict(event.ensemble_trace) if isinstance(event.ensemble_trace, dict) else None
     missing_count = max(
         coerce_metric_int(event.usage_missing_count),
         coerce_metric_int(trace.get("usage_missing_count")) if trace else 0,
@@ -4654,9 +5181,7 @@ def diagnostic_done_from_error_event(event: ErrorEvent) -> DoneEvent | None:
         return nested_done
     if nested_done is not None:
         nested_rows = [
-            dict(row)
-            for row in nested_done.model_usage_breakdown
-            if isinstance(row, Mapping)
+            dict(row) for row in nested_done.model_usage_breakdown if isinstance(row, Mapping)
         ]
         if not nested_rows:
             nested_rows = [
@@ -4682,9 +5207,7 @@ def diagnostic_done_from_error_event(event: ErrorEvent) -> DoneEvent | None:
                 }
             ]
         nested_trace = (
-            nested_done.ensemble_trace
-            if isinstance(nested_done.ensemble_trace, dict)
-            else {}
+            nested_done.ensemble_trace if isinstance(nested_done.ensemble_trace, dict) else {}
         )
         nested_placeholder_count = sum(
             1 for row in nested_rows if usage_row_is_missing_placeholder(row)
@@ -4724,10 +5247,7 @@ def diagnostic_done_from_error_event(event: ErrorEvent) -> DoneEvent | None:
                 (priority, index)
                 for index, row in enumerate(rows[:outer_row_count])
                 if index not in consumed_rows
-                if (
-                    priority := usage_row_match_priority(row, nested_row)
-                )
-                is not None
+                if (priority := usage_row_match_priority(row, nested_row)) is not None
             ]
             matched_index = min(candidates)[1] if candidates else None
             if matched_index is not None:
@@ -4743,8 +5263,7 @@ def diagnostic_done_from_error_event(event: ErrorEvent) -> DoneEvent | None:
     placeholder_count = sum(
         1
         for row in rows
-        if str(row.get("role") or "").strip().casefold()
-        in MISSING_USAGE_PLACEHOLDER_ROLES
+        if str(row.get("role") or "").strip().casefold() in MISSING_USAGE_PLACEHOLDER_ROLES
     )
     real_receipt_count = max(0, len(rows) - placeholder_count)
     trace_count = max(
@@ -4792,37 +5311,19 @@ def diagnostic_done_from_error_event(event: ErrorEvent) -> DoneEvent | None:
         for row in rows
         if str(row.get("requested_provider") or "").strip()
     }
-    sources = {
-        str(row.get("cost_source") or "none").strip().casefold()
-        for row in rows
-    }
-    cost_source = (
-        next(iter(sources))
-        if len(sources) == 1
-        else "mixed"
-        if sources
-        else "none"
-    )
+    sources = {str(row.get("cost_source") or "none").strip().casefold() for row in rows}
+    cost_source = next(iter(sources)) if len(sources) == 1 else "mixed" if sources else "none"
     return DoneEvent(
         stop_reason="error",
         input_tokens=sum(coerce_metric_int(row.get("input_tokens")) for row in rows),
         output_tokens=sum(coerce_metric_int(row.get("output_tokens")) for row in rows),
-        reasoning_tokens=sum(
-            coerce_metric_int(row.get("reasoning_tokens")) for row in rows
-        ),
+        reasoning_tokens=sum(coerce_metric_int(row.get("reasoning_tokens")) for row in rows),
         cached_tokens=sum(coerce_metric_int(row.get("cached_tokens")) for row in rows),
-        cache_write_tokens=sum(
-            coerce_metric_int(row.get("cache_write_tokens")) for row in rows
-        ),
-        billed_cost=sum(
-            trusted_provider_billed_cost(row)
-            for row in rows
-        ),
+        cache_write_tokens=sum(coerce_metric_int(row.get("cache_write_tokens")) for row in rows),
+        billed_cost=sum(trusted_provider_billed_cost(row) for row in rows),
         model=next(iter(models)) if len(models) == 1 else "",
         provider=next(iter(providers)) if len(providers) == 1 else "",
-        requested_model=(
-            next(iter(requested_models)) if len(requested_models) == 1 else ""
-        ),
+        requested_model=(next(iter(requested_models)) if len(requested_models) == 1 else ""),
         requested_provider=(
             next(iter(requested_providers)) if len(requested_providers) == 1 else ""
         ),
@@ -4830,11 +5331,7 @@ def diagnostic_done_from_error_event(event: ErrorEvent) -> DoneEvent | None:
         model_usage_breakdown=rows,
         ensemble_trace=trace,
         usage_missing_count=missing_count,
-        billing_receipt=(
-            rows[0].get("billing_receipt")
-            if len(rows) == 1
-            else None
-        ),
+        billing_receipt=(rows[0].get("billing_receipt") if len(rows) == 1 else None),
         provider_usage={
             "diagnostic_usage_only": True,
             "terminal_error_code": str(event.code or ""),
@@ -4970,12 +5467,8 @@ def run_result_summary(result: RunResult) -> dict[str, Any]:
     if result.done is not None:
         if isinstance(result.done.ensemble_trace, dict):
             llm_request_count = max(
-                coerce_metric_int(
-                    result.done.ensemble_trace.get("llm_request_count")
-                ),
-                coerce_metric_int(
-                    result.done.ensemble_trace.get("physical_request_count")
-                ),
+                coerce_metric_int(result.done.ensemble_trace.get("llm_request_count")),
+                coerce_metric_int(result.done.ensemble_trace.get("physical_request_count")),
             )
             usage_unknown_count = ensemble_usage_unknown_count(result.done.ensemble_trace)
         usage_unknown_count = max(
@@ -4987,22 +5480,21 @@ def run_result_summary(result: RunResult) -> dict[str, Any]:
                 1
                 for row in result.done.model_usage_breakdown
                 if isinstance(row, Mapping)
-                and str(row.get("role") or "").strip().casefold()
-                in MISSING_USAGE_PLACEHOLDER_ROLES
+                and str(row.get("role") or "").strip().casefold() in MISSING_USAGE_PLACEHOLDER_ROLES
             )
             llm_request_count = max(
                 llm_request_count,
                 len(result.done.model_usage_breakdown)
                 + max(
                     0,
-                    coerce_metric_int(result.done.usage_missing_count)
-                    - represented_missing,
+                    coerce_metric_int(result.done.usage_missing_count) - represented_missing,
                 ),
             )
         else:
             llm_request_count = max(
                 llm_request_count,
-                1 + max(
+                1
+                + max(
                     0,
                     coerce_metric_int(result.done.usage_missing_count),
                 ),
@@ -5022,7 +5514,11 @@ def run_result_summary(result: RunResult) -> dict[str, Any]:
         elif not run_result_was_blocked_before_request(result):
             llm_request_count = 1
             usage_unknown_count = max(usage_unknown_count, 1)
-    llm_request_count += len(result.setup_usage)
+    llm_request_count += usage_rows_request_count(result.setup_usage)
+    if result.done is None and result.setup_usage:
+        usage_unknown_count += usage_unknown_count_from_usage_payload(
+            {"model_usage_breakdown": result.setup_usage}
+        )
     return {
         "latency_ms": result.latency_ms,
         "ttft_ms": result.ttft_ms,
@@ -5044,6 +5540,23 @@ def run_result_summary(result: RunResult) -> dict[str, Any]:
     }
 
 
+def usage_rows_request_count(rows: list[dict[str, Any]]) -> int:
+    """Count physical requests represented by aggregate setup-usage rows."""
+
+    total = 0
+    for row in rows:
+        provider_usage = row.get("provider_usage")
+        response_ids = (
+            provider_usage.get("response_ids") if isinstance(provider_usage, Mapping) else None
+        )
+        total += max(
+            1,
+            coerce_metric_int(row.get("request_count")),
+            len(response_ids) if isinstance(response_ids, list) else 0,
+        )
+    return total
+
+
 def bounded_generation_attempts(value: int | None) -> int:
     try:
         attempts = GENERATION_MAX_ATTEMPTS if value is None else int(value)
@@ -5060,11 +5573,233 @@ def bounded_generation_retry_backoff(value: Any) -> float:
     return max(0.0, backoff)
 
 
+_ENSEMBLE_METADATA_ONLY_REASONS = frozenset(
+    {
+        "missing_proposer_usage_metadata",
+        "missing_proposer_stop_reason",
+        "missing_aggregator_usage_metadata",
+        "missing_aggregator_stop_reason",
+        "missing_actual_proposer_identity",
+        "missing_requested_proposer_identity",
+        "missing_actual_aggregator_model",
+        "missing_actual_aggregator_provider",
+        "missing_requested_aggregator_identity",
+    }
+)
+_ENSEMBLE_METADATA_REPAIR_STATUSES = frozenset({"backfilled", "unavailable"})
+
+
+def ensemble_metadata_only_reason(reason: str) -> bool:
+    """Return true only for explicitly enumerated, non-generation metadata gaps."""
+
+    return reason in _ENSEMBLE_METADATA_ONLY_REASONS
+
+
+def ensemble_metadata_field_resolved(
+    record: Mapping[str, Any],
+    field: str,
+) -> bool:
+    """Accept an absent trace field only after an explicit provenance audit."""
+
+    repair = record.get("metadata_repair")
+    item = repair.get(field) if isinstance(repair, Mapping) else None
+    return bool(
+        isinstance(item, Mapping)
+        and str(item.get("status") or "") in _ENSEMBLE_METADATA_REPAIR_STATUSES
+        and str(item.get("source") or "").strip()
+    )
+
+
+def g1_registry_contract_reasons(
+    trace: Mapping[str, Any],
+    contract: Mapping[str, Any] | None,
+) -> list[str]:
+    """Fail closed when a G1 call drifts from its frozen registry allowlist."""
+
+    if not isinstance(contract, Mapping):
+        return []
+    reasons: list[str] = []
+    profile_id = str(contract.get("profile_id") or "").strip()
+    selection_mode = str(contract.get("selection_mode") or "").strip()
+    source_version = str(contract.get("source_registry_snapshot_version") or "").strip()
+    expected_hash = str(contract.get("expected_routes_sha256") or "").strip()
+    expected_source_registry_hash = str(
+        contract.get("expected_source_registry_snapshot_sha256") or ""
+    ).strip()
+    expected_ranking_schema = str(
+        contract.get("expected_ranking_config_schema_version") or ""
+    ).strip()
+    expected_ranking_version = str(contract.get("expected_ranking_config_version") or "").strip()
+    expected_ranking_hash = str(contract.get("expected_ranking_config_sha256") or "").strip()
+    expected_proposer_max = coerce_metric_int(contract.get("expected_proposer_count_max"))
+    expected_count = coerce_metric_int(contract.get("expected_candidate_count"))
+    expected_routes = contract.get("expected_routes")
+    if (
+        not profile_id
+        or selection_mode != "router_dynamic"
+        or contract.get("user_profile_enabled") is not False
+        or not source_version
+        or len(expected_hash) != 64
+        or len(expected_source_registry_hash) != 64
+        or not expected_ranking_schema
+        or not expected_ranking_version
+        or len(expected_ranking_hash) != 64
+        or expected_proposer_max <= 0
+        or expected_proposer_max > expected_count
+        or expected_count <= 0
+        or not isinstance(expected_routes, Mapping)
+        or len(expected_routes) != expected_count
+    ):
+        return ["invalid_g1_registry_contract"]
+    expected_identities = {f"openrouter:{str(model).strip().lower()}" for model in expected_routes}
+    expected_filtered_version = f"{source_version}+{profile_id}+{expected_hash[:12]}"
+    executed_plan = trace.get("selection_plan")
+    if not isinstance(executed_plan, Mapping):
+        return ["missing_g1_selection_plan"]
+    if executed_plan.get("user_profile_enabled") is not False:
+        reasons.append("wrong_g1_user_profile_enabled")
+    ranking_parameters = executed_plan.get("ranking_parameters")
+    ranking_parameters_valid = isinstance(ranking_parameters, Mapping)
+    if not ranking_parameters_valid:
+        reasons.append("missing_g1_ranking_parameters")
+    else:
+        try:
+            actual_ranking_hash = canonical_json_sha256(ranking_parameters).removeprefix("sha256:")
+        except (TypeError, ValueError):
+            actual_ranking_hash = ""
+        if actual_ranking_hash != expected_ranking_hash:
+            reasons.append("wrong_g1_ranking_config_hash")
+        if (
+            str(ranking_parameters.get("schema_version") or "") != expected_ranking_schema
+            or str(ranking_parameters.get("config_version") or "") != expected_ranking_version
+        ):
+            reasons.append("wrong_g1_ranking_config_identity")
+    if (
+        str(executed_plan.get("ranking_config_schema_version") or "") != expected_ranking_schema
+        or str(executed_plan.get("ranking_config_version") or "") != expected_ranking_version
+        or str(executed_plan.get("ranking_config_hash") or "") != expected_ranking_hash
+    ):
+        reasons.append("wrong_g1_ranking_config_trace")
+    allowlist = executed_plan.get("candidate_allowlist")
+    if not isinstance(allowlist, Mapping):
+        reasons.append("missing_g1_candidate_allowlist")
+    else:
+        expected_fields = {
+            "policy": "exact_openrouter_routes",
+            "profile_id": profile_id,
+            "source_registry_snapshot_version": source_version,
+            "filtered_registry_snapshot_version": expected_filtered_version,
+            "expected_routes_sha256": expected_hash,
+            "expected_source_registry_snapshot_sha256": (expected_source_registry_hash),
+            "expected_candidate_count": expected_count,
+            "candidate_count": expected_count,
+        }
+        for field, expected_value in expected_fields.items():
+            if allowlist.get(field) != expected_value:
+                reasons.append(f"wrong_g1_candidate_allowlist_{field}")
+        traced_identities = allowlist.get("expected_identities")
+        if (
+            not isinstance(traced_identities, list)
+            or set(traced_identities) != expected_identities
+            or len(traced_identities) != expected_count
+        ):
+            reasons.append("wrong_g1_candidate_allowlist_identities")
+    if coerce_metric_int(executed_plan.get("candidate_pool_size")) != expected_count:
+        reasons.append("wrong_g1_candidate_pool_size")
+    if executed_plan.get("registry_snapshot_version") != expected_filtered_version:
+        reasons.append("wrong_g1_registry_snapshot_version")
+    registry_hash = str(executed_plan.get("registry_snapshot_hash") or "")
+    if len(registry_hash) != 64 or any(char not in "0123456789abcdef" for char in registry_hash):
+        reasons.append("invalid_g1_registry_snapshot_hash")
+    candidate_pool = executed_plan.get("candidate_pool")
+    candidate_pool_identities = (
+        [str(item.get("identity") or "") for item in candidate_pool if isinstance(item, Mapping)]
+        if isinstance(candidate_pool, list)
+        else []
+    )
+    if (
+        not isinstance(candidate_pool, list)
+        or len(candidate_pool) != expected_count
+        or len(candidate_pool_identities) != expected_count
+        or len(set(candidate_pool_identities)) != expected_count
+        or set(candidate_pool_identities) != expected_identities
+    ):
+        reasons.append("wrong_g1_candidate_pool")
+    selected_p = executed_plan.get("selected_P")
+    if (
+        not isinstance(selected_p, list)
+        or not selected_p
+        or any(not isinstance(identity, str) for identity in selected_p)
+        or len(set(str(identity) for identity in selected_p)) != len(selected_p)
+        or any(str(identity) not in expected_identities for identity in selected_p)
+    ):
+        reasons.append("wrong_g1_selected_proposers")
+    selected_a = executed_plan.get("selected_A")
+    if not isinstance(selected_a, str) or selected_a not in expected_identities:
+        reasons.append("wrong_g1_selected_aggregator")
+    task_profile = executed_plan.get("task_profile")
+    derived_min = derived_max = 0
+    derived_bound_reasons: list[str] = []
+    if ranking_parameters_valid and isinstance(task_profile, Mapping):
+        try:
+            from opensquilla.provider.ranking_router import _proposer_bounds
+
+            derived_min, derived_max, derived_bound_reasons = _proposer_bounds(
+                task_profile,
+                {},
+                ranking_parameters,
+            )
+        except Exception:  # noqa: BLE001 - malformed trace must fail closed
+            reasons.append("invalid_g1_proposer_bound_evidence")
+    else:
+        reasons.append("missing_g1_task_profile")
+    declared_min = coerce_metric_int(executed_plan.get("N_min"))
+    declared_max = coerce_metric_int(executed_plan.get("N_max"))
+    traced_bound_reasons = executed_plan.get("bound_reasons")
+    if (
+        derived_min <= 0
+        or derived_max < derived_min
+        or derived_max > expected_proposer_max
+        or declared_min != derived_min
+        or declared_max != derived_max
+        or not isinstance(traced_bound_reasons, list)
+        or traced_bound_reasons != derived_bound_reasons
+    ):
+        reasons.append("wrong_g1_proposer_bounds")
+    selected_count = len(selected_p) if isinstance(selected_p, list) else 0
+    selected_models = (
+        [str(identity).partition(":")[2] for identity in selected_p]
+        if isinstance(selected_p, list)
+        else []
+    )
+    selected_aggregator_model = selected_a.partition(":")[2] if isinstance(selected_a, str) else ""
+    if (
+        selected_count < derived_min
+        or selected_count > derived_max
+        or selected_count > expected_proposer_max
+        or coerce_metric_int(executed_plan.get("proposer_count")) != selected_count
+        or coerce_metric_int(executed_plan.get("proposer_sample_count")) != selected_count
+        or executed_plan.get("proposer_models") != selected_models
+        or str(executed_plan.get("aggregator_model") or "") != selected_aggregator_model
+    ):
+        reasons.append("wrong_g1_selected_proposer_count")
+    try:
+        from opensquilla.provider.ranking_router import (
+            ranking_trace_replay_reasons,
+        )
+
+        reasons.extend(ranking_trace_replay_reasons(executed_plan))
+    except Exception:  # noqa: BLE001 - completion evidence must fail closed
+        reasons.append("g1_frozen_ranker_replay_failed")
+    return list(dict.fromkeys(reasons))
+
+
 def ensemble_call_core_reasons(
     trace: Mapping[str, Any],
     *,
     expected_selection_mode: str = "",
     expected_selection_plan: Mapping[str, Any] | None = None,
+    expected_g1_registry_contract: Mapping[str, Any] | None = None,
     final_text: str = "",
     require_output_binding: bool = False,
 ) -> list[str]:
@@ -5093,9 +5828,7 @@ def ensemble_call_core_reasons(
         reasons.append("insufficient_proposer_quorum")
 
     expected_plan = (
-        dict(expected_selection_plan)
-        if isinstance(expected_selection_plan, Mapping)
-        else {}
+        dict(expected_selection_plan) if isinstance(expected_selection_plan, Mapping) else {}
     )
     expected_total = coerce_metric_int(expected_plan.get("proposer_sample_count"))
     if expected_total <= 0:
@@ -5123,6 +5856,12 @@ def ensemble_call_core_reasons(
         )
         if executed_mode != expected_selection_mode:
             reasons.append("wrong_executed_selection_mode")
+    reasons.extend(
+        g1_registry_contract_reasons(
+            trace,
+            expected_g1_registry_contract,
+        )
+    )
     executed_plan = trace.get("selection_plan")
     if expected_plan:
         if not isinstance(executed_plan, Mapping):
@@ -5153,11 +5892,7 @@ def ensemble_call_core_reasons(
             reasons.append("wrong_actual_proposer_count")
         proven_successes: list[bool] = []
         for candidate in candidate_rows:
-            content = (
-                candidate.get("content")
-                if isinstance(candidate, Mapping)
-                else None
-            )
+            content = candidate.get("content") if isinstance(candidate, Mapping) else None
             proven = bool(
                 isinstance(candidate, Mapping)
                 and candidate.get("ok") is True
@@ -5166,19 +5901,22 @@ def ensemble_call_core_reasons(
                 and not isinstance(candidate.get("physical_request_count"), bool)
                 and candidate.get("physical_request_count") > 0
                 and not candidate.get("error")
-                and candidate.get("usage_reported") is True
-                and bool(str(candidate.get("stop_reason") or "").strip())
                 and isinstance(content, Mapping)
                 and coerce_metric_int(content.get("chars")) > 0
                 and bool(str(content.get("text") or "").strip())
             )
             proven_successes.append(proven)
-            if (
-                isinstance(candidate, Mapping)
-                and candidate.get("ok") is True
-                and not proven
-            ):
+            if isinstance(candidate, Mapping) and candidate.get("ok") is True and not proven:
                 reasons.append("invalid_successful_proposer_evidence")
+            if isinstance(candidate, Mapping) and proven:
+                if candidate.get(
+                    "usage_reported"
+                ) is not True and not ensemble_metadata_field_resolved(candidate, "usage"):
+                    reasons.append("missing_proposer_usage_metadata")
+                if not str(
+                    candidate.get("stop_reason") or ""
+                ).strip() and not ensemble_metadata_field_resolved(candidate, "stop_reason"):
+                    reasons.append("missing_proposer_stop_reason")
         actual_successful = sum(proven_successes)
         if (
             not isinstance(successful, int)
@@ -5197,49 +5935,36 @@ def ensemble_call_core_reasons(
                 requested_identity_wrong = False
                 actual_identity_missing = False
                 actual_identity_wrong = False
-                for candidate_index, (candidate, identity) in enumerate(zip(
-                    candidate_rows,
-                    expected_selected_p,
-                    strict=True,
-                )):
+                for candidate_index, (candidate, identity) in enumerate(
+                    zip(
+                        candidate_rows,
+                        expected_selected_p,
+                        strict=True,
+                    )
+                ):
                     expected_provider, separator, expected_model = (
-                        identity.partition(":")
-                        if isinstance(identity, str)
-                        else ("", "", "")
+                        identity.partition(":") if isinstance(identity, str) else ("", "", "")
                     )
                     execution = (
-                        candidate.get("execution")
-                        if isinstance(candidate, Mapping)
-                        else None
+                        candidate.get("execution") if isinstance(candidate, Mapping) else None
                     )
                     requested_provider = (
                         candidate.get("requested_provider")
                         if isinstance(candidate, Mapping)
                         else None
                     ) or (
-                        execution.get("requested_provider")
-                        or execution.get("provider")
+                        execution.get("requested_provider") or execution.get("provider")
                         if isinstance(execution, Mapping)
                         else None
                     )
                     requested_model = (
-                        candidate.get("requested_model")
-                        if isinstance(candidate, Mapping)
-                        else None
-                    ) or (
-                        execution.get("model")
-                        if isinstance(execution, Mapping)
-                        else None
-                    )
+                        candidate.get("requested_model") if isinstance(candidate, Mapping) else None
+                    ) or (execution.get("model") if isinstance(execution, Mapping) else None)
                     candidate_provider = (
-                        candidate.get("provider")
-                        if isinstance(candidate, Mapping)
-                        else None
+                        candidate.get("provider") if isinstance(candidate, Mapping) else None
                     )
                     candidate_model = (
-                        candidate.get("model")
-                        if isinstance(candidate, Mapping)
-                        else None
+                        candidate.get("model") if isinstance(candidate, Mapping) else None
                     )
                     if (
                         separator != ":"
@@ -5259,11 +5984,27 @@ def ensemble_call_core_reasons(
                         or requested_model.strip() != expected_model.strip()
                     ):
                         requested_identity_wrong = True
+                    provider_missing = (
+                        not isinstance(candidate_provider, str) or not candidate_provider.strip()
+                    )
+                    model_missing = (
+                        not isinstance(candidate_model, str) or not candidate_model.strip()
+                    )
                     if proven_successes[candidate_index] and (
-                        not isinstance(candidate_provider, str)
-                        or not candidate_provider.strip()
-                        or not isinstance(candidate_model, str)
-                        or not candidate_model.strip()
+                        (
+                            provider_missing
+                            and not ensemble_metadata_field_resolved(
+                                candidate,
+                                "actual_provider",
+                            )
+                        )
+                        or (
+                            model_missing
+                            and not ensemble_metadata_field_resolved(
+                                candidate,
+                                "actual_model",
+                            )
+                        )
                     ):
                         actual_identity_missing = True
                     elif (
@@ -5296,6 +6037,16 @@ def ensemble_call_core_reasons(
         reasons.append("aggregator_request_incomplete")
         return list(dict.fromkeys(reasons))
 
+    usage = final_request.get("usage")
+    if not isinstance(usage, Mapping) and not ensemble_metadata_field_resolved(
+        final_request, "usage"
+    ):
+        reasons.append("missing_aggregator_usage_metadata")
+    if (
+        not isinstance(usage, Mapping) or not str(usage.get("stop_reason") or "").strip()
+    ) and not ensemble_metadata_field_resolved(final_request, "stop_reason"):
+        reasons.append("missing_aggregator_stop_reason")
+
     if expected_plan:
         expected_aggregator_model = expected_plan.get("aggregator_model")
         expected_selected_a = expected_plan.get("selected_A")
@@ -5304,22 +6055,17 @@ def ensemble_call_core_reasons(
             if isinstance(expected_selected_a, str)
             else ("", "", "")
         )
-        usage = final_request.get("usage")
         actual_model = usage.get("model") if isinstance(usage, Mapping) else None
-        actual_provider = (
-            usage.get("provider") if isinstance(usage, Mapping) else None
-        )
-        requested_model = (
-            usage.get("requested_model") if isinstance(usage, Mapping) else None
-        )
-        requested_provider = (
-            usage.get("requested_provider") if isinstance(usage, Mapping) else None
-        )
+        actual_provider = usage.get("provider") if isinstance(usage, Mapping) else None
+        requested_model = usage.get("requested_model") if isinstance(usage, Mapping) else None
+        requested_provider = usage.get("requested_provider") if isinstance(usage, Mapping) else None
         if not isinstance(expected_aggregator_model, str) or not (
             expected_aggregator_model.strip()
         ):
             reasons.append("wrong_actual_aggregator_model")
-        elif not isinstance(actual_model, str) or not actual_model.strip():
+        elif (
+            not isinstance(actual_model, str) or not actual_model.strip()
+        ) and not ensemble_metadata_field_resolved(final_request, "actual_model"):
             reasons.append("missing_actual_aggregator_model")
         elif actual_model.strip() != expected_aggregator_model.strip():
             reasons.append("wrong_actual_aggregator_model")
@@ -5334,7 +6080,9 @@ def ensemble_call_core_reasons(
             )
         ):
             reasons.append("wrong_actual_aggregator_provider")
-        elif not isinstance(actual_provider, str) or not actual_provider.strip():
+        elif (
+            not isinstance(actual_provider, str) or not actual_provider.strip()
+        ) and not ensemble_metadata_field_resolved(final_request, "actual_provider"):
             reasons.append("missing_actual_aggregator_provider")
         elif actual_provider.strip() != expected_provider.strip():
             reasons.append("wrong_actual_aggregator_provider")
@@ -5345,14 +6093,8 @@ def ensemble_call_core_reasons(
             or not requested_model.strip()
         ):
             reasons.append("missing_requested_aggregator_identity")
-        elif (
-            requested_provider.strip() != expected_provider.strip()
-            or requested_model.strip()
-            != (
-                expected_aggregator_model.strip()
-                if isinstance(expected_aggregator_model, str)
-                else ""
-            )
+        elif requested_provider.strip() != expected_provider.strip() or requested_model.strip() != (
+            expected_aggregator_model.strip() if isinstance(expected_aggregator_model, str) else ""
         ):
             reasons.append("wrong_requested_aggregator_identity")
 
@@ -5364,22 +6106,14 @@ def ensemble_call_core_reasons(
             output_text = output.get("text")
             output_chars = coerce_metric_int(output.get("chars"))
             output_truncated = output.get("truncated") is True
-            if (
-                not isinstance(output_text, str)
-                or not output_text.strip()
-                or output_chars <= 0
-            ):
+            if not isinstance(output_text, str) or not output_text.strip() or output_chars <= 0:
                 reasons.append("missing_aggregator_output_binding")
             elif output_chars > len(final_text):
                 reasons.append("wrong_aggregator_output_length")
             else:
                 final_output_tail = final_text[-output_chars:]
-                if (
-                    output_truncated
-                    and not final_output_tail.startswith(output_text)
-                ) or (
-                    not output_truncated
-                    and output_text != final_output_tail
+                if (output_truncated and not final_output_tail.startswith(output_text)) or (
+                    not output_truncated and output_text != final_output_tail
                 ):
                     reasons.append("wrong_aggregator_output_binding")
     return list(dict.fromkeys(reasons))
@@ -5420,6 +6154,7 @@ def ensemble_generation_retry_reason(
     *,
     expected_selection_mode: str = "",
     expected_selection_plan: Mapping[str, Any] | None = None,
+    expected_g1_registry_contract: Mapping[str, Any] | None = None,
 ) -> str:
     """Reject a fallback or sub-quorum ensemble result before Judge is called."""
 
@@ -5437,13 +6172,12 @@ def ensemble_generation_retry_reason(
             call_trace,
             expected_selection_mode=expected_selection_mode,
             expected_selection_plan=expected_selection_plan,
+            expected_g1_registry_contract=expected_g1_registry_contract,
             final_text=result.final_text,
             require_output_binding=index == len(call_traces) - 1,
         )
         generation_reasons = [
-            reason
-            for reason in reasons
-            if not reason.startswith(("missing_actual_", "missing_requested_"))
+            reason for reason in reasons if not ensemble_metadata_only_reason(reason)
         ]
         if generation_reasons:
             return generation_reasons[0]
@@ -5463,16 +6197,10 @@ def backfill_result_requested_identity(
     if done is None:
         return False
     changed_fields: list[str] = []
-    plan = (
-        dict(expected_selection_plan)
-        if isinstance(expected_selection_plan, Mapping)
-        else {}
-    )
+    plan = dict(expected_selection_plan) if isinstance(expected_selection_plan, Mapping) else {}
     selected_a = plan.get("selected_A")
     plan_provider, separator, plan_model = (
-        selected_a.partition(":")
-        if isinstance(selected_a, str)
-        else ("", "", "")
+        selected_a.partition(":") if isinstance(selected_a, str) else ("", "", "")
     )
     if separator == ":" and plan_provider.strip() and plan_model.strip():
         expected_provider = plan_provider.strip()
@@ -5509,11 +6237,7 @@ def backfill_result_requested_identity(
                     if not isinstance(candidate, dict) or not isinstance(identity, str):
                         continue
                     provider, identity_separator, model = identity.partition(":")
-                    if (
-                        identity_separator != ":"
-                        or not provider.strip()
-                        or not model.strip()
-                    ):
+                    if identity_separator != ":" or not provider.strip() or not model.strip():
                         continue
                     if not str(candidate.get("requested_provider") or "").strip():
                         candidate["requested_provider"] = provider.strip()
@@ -5525,15 +6249,9 @@ def backfill_result_requested_identity(
                 call_plan.get("selected_A") if isinstance(call_plan, Mapping) else None
             )
             final_provider, final_separator, final_model = (
-                call_selected_a.partition(":")
-                if isinstance(call_selected_a, str)
-                else ("", "", "")
+                call_selected_a.partition(":") if isinstance(call_selected_a, str) else ("", "", "")
             )
-            if (
-                final_separator != ":"
-                or not final_provider.strip()
-                or not final_model.strip()
-            ):
+            if final_separator != ":" or not final_provider.strip() or not final_model.strip():
                 continue
             final_request = call_trace.get("final_request")
             if not isinstance(final_request, dict):
@@ -5555,9 +6273,7 @@ def backfill_result_requested_identity(
 
     if changed_fields:
         provider_usage = (
-            dict(done.provider_usage)
-            if isinstance(done.provider_usage, Mapping)
-            else {}
+            dict(done.provider_usage) if isinstance(done.provider_usage, Mapping) else {}
         )
         provider_usage["requested_identity_backfill"] = {
             "source": "frozen_request_configuration",
@@ -5582,8 +6298,7 @@ def single_generation_identity_reason(
         row
         for row in done.model_usage_breakdown
         if isinstance(row, Mapping)
-        and str(row.get("role") or "").strip().casefold()
-        not in MISSING_USAGE_PLACEHOLDER_ROLES
+        and str(row.get("role") or "").strip().casefold() not in MISSING_USAGE_PLACEHOLDER_ROLES
     ]
     models = {
         str(row.get("model") or "").strip()
@@ -5600,14 +6315,10 @@ def single_generation_identity_reason(
     requested_model = str(done.requested_model or "").strip()
     requested_provider = str(done.requested_provider or "").strip()
     actual_model = direct_model or (next(iter(models)) if len(models) == 1 else "")
-    actual_provider = direct_provider or (
-        next(iter(providers)) if len(providers) == 1 else ""
-    )
+    actual_provider = direct_provider or (next(iter(providers)) if len(providers) == 1 else "")
     if direct_model and models and any(model != direct_model for model in models):
         return "actual_model_receipt_mismatch"
-    if direct_provider and providers and any(
-        provider != direct_provider for provider in providers
-    ):
+    if direct_provider and providers and any(provider != direct_provider for provider in providers):
         return "actual_provider_receipt_mismatch"
     if not actual_model:
         return "actual_model_evidence_missing"
@@ -5633,6 +6344,7 @@ def generation_retry_reason(
     *,
     expected_selection_mode: str = "",
     expected_selection_plan: Mapping[str, Any] | None = None,
+    expected_g1_registry_contract: Mapping[str, Any] | None = None,
     expected_model: str = "",
     expected_provider: str = "",
 ) -> str:
@@ -5647,6 +6359,7 @@ def generation_retry_reason(
             result,
             expected_selection_mode=expected_selection_mode,
             expected_selection_plan=expected_selection_plan,
+            expected_g1_registry_contract=expected_g1_registry_contract,
         )
     if expected_model or expected_provider:
         return single_generation_identity_reason(
@@ -5761,20 +6474,34 @@ async def collect_generation_with_retries(
     agent_max_iterations: int = DEFAULT_AGENT_MAX_ITERATIONS,
     finalization_policy: Mapping[str, Any] | None = None,
     max_attempts: int = GENERATION_MAX_ATTEMPTS,
+    attempt_offset: int = 0,
     retry_backoff_seconds: float = 0.0,
     expected_model: str = "",
     expected_provider: str = "",
+    expected_g1_registry_contract: Mapping[str, Any] | None = None,
 ) -> tuple[RunResult, list[dict[str, Any]], int]:
     attempts: list[dict[str, Any]] = []
     best_non_empty: RunResult | None = None
     last_result: RunResult | None = None
-    attempt_limit = bounded_generation_attempts(max_attempts)
+    if (
+        not isinstance(attempt_offset, int)
+        or isinstance(attempt_offset, bool)
+        or not 0 <= attempt_offset < GENERATION_MAX_ATTEMPTS
+    ):
+        raise ValueError("generation attempt offset must be an integer within the formal budget")
+    attempt_limit = min(
+        bounded_generation_attempts(max_attempts),
+        GENERATION_MAX_ATTEMPTS - attempt_offset,
+    )
     expected_selection_plan = (
         dict(getattr(provider, "selection_plan", {}) or {})
         if str((GROUP_SPECS.get(group) or {}).get("kind") or "") == "selection_mode"
         else {}
     )
-    for attempt_index in range(1, attempt_limit + 1):
+    for local_attempt_index in range(1, attempt_limit + 1):
+        attempt_index = attempt_offset + local_attempt_index
+        attempt_id = uuid.uuid4().hex
+        attempt_started_at = time.time()
         if runner_mode == RUNNER_MODE_AGENT_LOOP:
             result = await collect_agent_run(
                 provider,
@@ -5814,6 +6541,7 @@ async def collect_generation_with_retries(
             result,
             expected_selection_mode=expected_selection_mode,
             expected_selection_plan=expected_selection_plan,
+            expected_g1_registry_contract=expected_g1_registry_contract,
             expected_model=expected_model,
             expected_provider=expected_provider,
         )
@@ -5827,7 +6555,9 @@ async def collect_generation_with_retries(
             retry_suppressed_reason = "agent_hard_timeout"
         if result.final_text.strip() and best_non_empty is None:
             best_non_empty = result
-        will_retry = bool(reason) and not retry_suppressed_reason and attempt_index < attempt_limit
+        will_retry = (
+            bool(reason) and not retry_suppressed_reason and local_attempt_index < attempt_limit
+        )
         retry_backoff_s = (
             bounded_generation_retry_backoff(retry_backoff_seconds) * (2 ** (attempt_index - 1))
             if will_retry
@@ -5835,7 +6565,11 @@ async def collect_generation_with_retries(
         )
         attempts.append(
             {
+                "attempt_id": attempt_id,
+                "attempt_kind": "generation",
                 "attempt": attempt_index,
+                "started_at": attempt_started_at,
+                "completed_at": time.time(),
                 "retryable": bool(reason),
                 "retry_reason": reason,
                 "retry_suppressed_reason": retry_suppressed_reason,
@@ -5907,6 +6641,154 @@ def bounded_judge_attempts(value: int | None) -> int:
     return max(1, min(JUDGE_MAX_ATTEMPTS, attempts))
 
 
+def validated_prior_judge_attempts(
+    judgment: Mapping[str, Any],
+    *,
+    max_attempts: int,
+    unit_label: str,
+) -> list[dict[str, Any]]:
+    """Validate cumulative physical Judge evidence before spending more."""
+
+    attempts = judgment.get("judge_attempts")
+    if not isinstance(attempts, list):
+        raise ValueError(f"{unit_label} lacks cumulative Judge attempt evidence")
+    if len(attempts) > max_attempts:
+        raise ValueError(f"{unit_label} exceeds the cumulative Judge attempt budget")
+    declared_count = judgment.get("judge_attempt_count")
+    if (
+        not isinstance(declared_count, int)
+        or isinstance(declared_count, bool)
+        or declared_count != len(attempts)
+    ):
+        raise ValueError(f"{unit_label} has contradictory Judge attempt evidence")
+    copied: list[dict[str, Any]] = []
+    for expected_ordinal, attempt in enumerate(attempts, start=1):
+        if not isinstance(attempt, Mapping):
+            raise ValueError(f"{unit_label} has invalid Judge attempt evidence")
+        ordinal = attempt.get("attempt")
+        if not isinstance(ordinal, int) or isinstance(ordinal, bool) or ordinal != expected_ordinal:
+            raise ValueError(f"{unit_label} has non-cumulative Judge attempt ordinals")
+        attempt_id = attempt.get("attempt_id")
+        if (
+            not isinstance(attempt_id, str)
+            or len(attempt_id) != 32
+            or any(char not in "0123456789abcdef" for char in attempt_id)
+        ):
+            raise ValueError(f"{unit_label} has an invalid Judge attempt identity")
+        if not isinstance(attempt.get("run"), Mapping):
+            raise ValueError(f"{unit_label} lacks a physical Judge run")
+        copied.append(copy.deepcopy(dict(attempt)))
+    return copied
+
+
+def judge_attempt_budget_fields(
+    *,
+    attempts: list[dict[str, Any]],
+    prior_attempts_used: int,
+    max_attempts: int,
+    new_attempt_count: int,
+    exhausted: bool,
+) -> dict[str, Any]:
+    used = len(attempts)
+    return {
+        "judge_attempt_evidence_schema": JUDGE_ATTEMPT_EVIDENCE_SCHEMA,
+        "judge_attempt_budget_scope": JUDGE_ATTEMPT_BUDGET_SCOPE,
+        "judge_attempt_budget_limit": max_attempts,
+        "prior_judge_attempts_used": prior_attempts_used,
+        "judge_attempt_count": used,
+        "judge_attempt_budget_used": used,
+        "judge_attempt_budget_remaining": max(0, max_attempts - used),
+        "judge_new_attempt_count": new_attempt_count,
+        "judge_attempt_budget_exhausted": exhausted,
+    }
+
+
+def indexed_prior_criterion_judgments(
+    prior_judge: Mapping[str, Any] | None,
+    *,
+    rubric: str,
+    criteria: list[dict[str, Any]],
+    repeats: int,
+    max_attempts: int,
+) -> dict[tuple[str, int], dict[str, Any]]:
+    """Bind prior Judge attempts to their immutable criterion/repeat unit."""
+
+    if prior_judge is None:
+        return {}
+    if (
+        prior_judge.get("judge_attempt_evidence_schema") != JUDGE_ATTEMPT_EVIDENCE_SCHEMA
+        or prior_judge.get("judge_attempt_budget_scope") != JUDGE_ATTEMPT_BUDGET_SCOPE
+        or prior_judge.get("judge_attempt_budget_limit_per_unit") != max_attempts
+    ):
+        raise ValueError("prior Judge result lacks the formal cumulative budget contract")
+    if prior_judge.get("prior_judge_attempts"):
+        raise ValueError(
+            "legacy flat prior Judge attempts cannot prove a cumulative per-unit budget"
+        )
+    if (
+        prior_judge.get("mode") != "draco_criterion_judgments"
+        or str(prior_judge.get("rubric_id") or "") != rubric
+        or coerce_metric_int(prior_judge.get("judge_repeats")) != repeats
+    ):
+        raise ValueError("prior Judge result is not bound to the current rubric contract")
+    raw_judgments = prior_judge.get("criterion_judgments")
+    expected_keys = {
+        (str(criterion.get("id") or ""), repeat_index)
+        for repeat_index in range(repeats)
+        for criterion in criteria
+    }
+    if not isinstance(raw_judgments, list) or len(raw_judgments) != len(expected_keys):
+        raise ValueError("prior Judge result does not cover every criterion/repeat unit")
+    indexed: dict[tuple[str, int], dict[str, Any]] = {}
+    for raw in raw_judgments:
+        if not isinstance(raw, Mapping):
+            raise ValueError("prior Judge criterion evidence is invalid")
+        key = (
+            str(raw.get("id") or ""),
+            coerce_metric_int(raw.get("repeat_index")),
+        )
+        if key not in expected_keys or key in indexed:
+            raise ValueError("prior Judge criterion/repeat binding is invalid or duplicated")
+        copied = copy.deepcopy(dict(raw))
+        copied["judge_attempts"] = validated_prior_judge_attempts(
+            raw,
+            max_attempts=max_attempts,
+            unit_label=f"Judge unit {key[0]}/{key[1]}",
+        )
+        indexed[key] = copied
+    return indexed
+
+
+def closed_judge_criterion(
+    *,
+    criterion: dict[str, Any],
+    repeat_index: int,
+    prior_judgment: Mapping[str, Any],
+    attempts: list[dict[str, Any]],
+    max_attempts: int,
+) -> dict[str, Any]:
+    """Return an explicit no-call terminal row for an exhausted Judge unit."""
+
+    prior_used = len(attempts)
+    return {
+        **criterion,
+        "repeat_index": repeat_index,
+        "verdict": str(prior_judgment.get("verdict") or ""),
+        "met": None,
+        "rationale": str(prior_judgment.get("rationale") or "")[:1000],
+        "raw": str(prior_judgment.get("raw") or "")[:1000],
+        "error": JUDGE_ATTEMPT_BUDGET_EXHAUSTED_ERROR,
+        "judge_attempts": attempts,
+        **judge_attempt_budget_fields(
+            attempts=attempts,
+            prior_attempts_used=prior_used,
+            max_attempts=max_attempts,
+            new_attempt_count=0,
+            exhausted=True,
+        ),
+    }
+
+
 async def judge_text(
     *,
     judge_provider: Any | None,
@@ -5917,6 +6799,7 @@ async def judge_text(
     judge_concurrency: int = 1,
     judge_max_attempts: int = JUDGE_MAX_ATTEMPTS,
     judge_semaphore: asyncio.Semaphore | None = None,
+    prior_judge: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     if not answer.strip():
         return None
@@ -5967,11 +6850,53 @@ async def judge_text(
     semaphore = judge_semaphore or asyncio.Semaphore(max(1, int(judge_concurrency or 1)))
     if criteria:
         repeats = max(1, int(judge_repeats or 1))
+        prior_index = indexed_prior_criterion_judgments(
+            prior_judge,
+            rubric=rubric_id(task),
+            criteria=criteria,
+            repeats=repeats,
+            max_attempts=max_attempts,
+        )
 
         async def _guarded_judge(
             criterion: dict[str, Any],
             repeat_index: int,
         ) -> dict[str, Any]:
+            key = (str(criterion.get("id") or ""), repeat_index)
+            prior_judgment = prior_index.get(key)
+            prior_attempts = (
+                validated_prior_judge_attempts(
+                    prior_judgment,
+                    max_attempts=max_attempts,
+                    unit_label=f"Judge unit {key[0]}/{key[1]}",
+                )
+                if prior_judgment is not None
+                else []
+            )
+            if (
+                prior_judgment is not None
+                and isinstance(prior_judgment.get("met"), bool)
+                and not prior_judgment.get("error")
+            ):
+                reused = copy.deepcopy(prior_judgment)
+                reused.update(
+                    judge_attempt_budget_fields(
+                        attempts=prior_attempts,
+                        prior_attempts_used=len(prior_attempts),
+                        max_attempts=max_attempts,
+                        new_attempt_count=0,
+                        exhausted=False,
+                    )
+                )
+                return reused
+            if len(prior_attempts) >= max_attempts:
+                return closed_judge_criterion(
+                    criterion=criterion,
+                    repeat_index=repeat_index,
+                    prior_judgment=prior_judgment or {},
+                    attempts=prior_attempts,
+                    max_attempts=max_attempts,
+                )
             async with semaphore:
                 return await judge_criterion(
                     judge_provider=judge_provider,
@@ -5980,6 +6905,7 @@ async def judge_text(
                     criterion=criterion,
                     repeat_index=repeat_index,
                     max_attempts=max_attempts,
+                    prior_attempts=prior_attempts,
                 )
 
         judgments = await asyncio.gather(
@@ -5989,12 +6915,32 @@ async def judge_text(
                 for criterion in criteria
             ]
         )
-        return score_criterion_judgments(
+        result = score_criterion_judgments(
             rubric_id=rubric_id(task),
             judgments=judgments,
             judge_model=str(getattr(judge_provider, "model", "") or ""),
             judge_repeats=repeats,
         )
+        result.update(
+            {
+                "judge_attempt_evidence_schema": JUDGE_ATTEMPT_EVIDENCE_SCHEMA,
+                "judge_attempt_budget_scope": JUDGE_ATTEMPT_BUDGET_SCOPE,
+                "judge_attempt_budget_limit_per_unit": max_attempts,
+                "judge_attempt_count": sum(
+                    coerce_metric_int(item.get("judge_attempt_count")) for item in judgments
+                ),
+                "judge_new_attempt_count": sum(
+                    coerce_metric_int(item.get("judge_new_attempt_count")) for item in judgments
+                ),
+                "judge_attempt_budget_exhausted_count": sum(
+                    item.get("judge_attempt_budget_exhausted") is True for item in judgments
+                ),
+            }
+        )
+        result["judge_attempt_budget_exhausted"] = bool(
+            result["judge_attempt_budget_exhausted_count"]
+        )
+        return result
     rubric = task.get("rubric") or "accuracy, completeness, objectivity, citation quality"
     reference = task.get("reference") or ""
     prompt = (
@@ -6005,10 +6951,50 @@ async def judge_text(
         f"Reference:\n{reference}\n\n"
         f"Answer:\n{answer}"
     )
-    attempts: list[dict[str, Any]] = []
+    if prior_judge is not None:
+        if (
+            prior_judge.get("judge_attempt_evidence_schema") != JUDGE_ATTEMPT_EVIDENCE_SCHEMA
+            or prior_judge.get("judge_attempt_budget_scope") != JUDGE_ATTEMPT_BUDGET_SCOPE
+            or prior_judge.get("judge_attempt_budget_limit") != max_attempts
+        ):
+            raise ValueError(
+                "prior legacy Judge result lacks the formal cumulative budget contract"
+            )
+        if prior_judge.get("prior_judge_attempts"):
+            raise ValueError(
+                "legacy flat prior Judge attempts cannot prove a cumulative Judge budget"
+            )
+    attempts = (
+        validated_prior_judge_attempts(
+            prior_judge,
+            max_attempts=max_attempts,
+            unit_label="legacy Judge unit",
+        )
+        if prior_judge is not None
+        else []
+    )
+    prior_attempts_used = len(attempts)
+    if prior_attempts_used >= max_attempts:
+        return {
+            **copy.deepcopy(dict(prior_judge or {})),
+            "mode": "legacy_dimension_score",
+            "score_status": "incomplete",
+            "judge_error_count": 1,
+            "normalized_score": None,
+            "total": None,
+            "error": JUDGE_ATTEMPT_BUDGET_EXHAUSTED_ERROR,
+            "judge_attempts": attempts,
+            **judge_attempt_budget_fields(
+                attempts=attempts,
+                prior_attempts_used=prior_attempts_used,
+                max_attempts=max_attempts,
+                new_attempt_count=0,
+                exhausted=True,
+            ),
+        }
     last_result: RunResult | None = None
     last_cleanup_failure = ""
-    for attempt_index in range(1, max_attempts + 1):
+    for attempt_index in range(prior_attempts_used + 1, max_attempts + 1):
         async with semaphore:
             result = await collect_run(
                 judge_provider,
@@ -6023,6 +7009,7 @@ async def judge_text(
         parsed = extract_json_object(result.final_text)
         attempts.append(
             {
+                "attempt_id": uuid.uuid4().hex,
                 "attempt": attempt_index,
                 "parsed": parsed is not None,
                 "schema_valid": False,
@@ -6037,8 +7024,16 @@ async def judge_text(
             attempts[-1]["schema_valid"] = normalized.get("score_status") == "complete"
             if normalized.get("score_status") == "complete":
                 normalized["judge_run"] = run_result_summary(result)
-                normalized["judge_attempt_count"] = attempt_index
                 normalized["judge_attempts"] = attempts
+                normalized.update(
+                    judge_attempt_budget_fields(
+                        attempts=attempts,
+                        prior_attempts_used=prior_attempts_used,
+                        max_attempts=max_attempts,
+                        new_attempt_count=len(attempts) - prior_attempts_used,
+                        exhausted=False,
+                    )
+                )
                 return normalized
     last_text = last_result.final_text if last_result is not None else ""
     parsed_any = any(bool(attempt.get("parsed")) for attempt in attempts)
@@ -6054,8 +7049,14 @@ async def judge_text(
         ),
         "raw": last_text[:2000],
         "judge_run": run_result_summary(last_result) if last_result is not None else {},
-        "judge_attempt_count": len(attempts),
         "judge_attempts": attempts,
+        **judge_attempt_budget_fields(
+            attempts=attempts,
+            prior_attempts_used=prior_attempts_used,
+            max_attempts=max_attempts,
+            new_attempt_count=len(attempts) - prior_attempts_used,
+            exhausted=len(attempts) >= max_attempts,
+        ),
     }
 
 
@@ -6074,6 +7075,7 @@ async def judge_criterion(
     criterion: dict[str, Any],
     repeat_index: int = 0,
     max_attempts: int = JUDGE_MAX_ATTEMPTS,
+    prior_attempts: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     weight = coerce_weight(criterion.get("weight"))
     criterion_type = "negative" if weight < 0 else "positive"
@@ -6091,9 +7093,19 @@ async def judge_criterion(
         f"- weight: {weight}\n"
         f"- requirement: {criterion.get('requirement')}\n"
     )
-    attempts: list[dict[str, Any]] = []
+    attempt_limit = bounded_judge_attempts(max_attempts)
+    attempts = copy.deepcopy(list(prior_attempts or []))
+    prior_attempts_used = len(attempts)
+    if prior_attempts_used >= attempt_limit:
+        return closed_judge_criterion(
+            criterion=criterion,
+            repeat_index=repeat_index,
+            prior_judgment={},
+            attempts=attempts,
+            max_attempts=attempt_limit,
+        )
     last_row: dict[str, Any] | None = None
-    for attempt_index in range(1, bounded_judge_attempts(max_attempts) + 1):
+    for attempt_index in range(prior_attempts_used + 1, attempt_limit + 1):
         result = await collect_run(
             judge_provider,
             prompt,
@@ -6106,6 +7118,7 @@ async def judge_criterion(
         run_summary = run_result_summary(result)
         attempts.append(
             {
+                "attempt_id": uuid.uuid4().hex,
                 "attempt": attempt_index,
                 "verdict": parsed.get("verdict") if parsed else "",
                 "met": met,
@@ -6121,8 +7134,14 @@ async def judge_criterion(
             "met": met,
             "rationale": str(parsed.get("rationale") or parsed.get("reason") or "")[:1000],
             "judge_run": run_summary,
-            "judge_attempt_count": attempt_index,
             "judge_attempts": list(attempts),
+            **judge_attempt_budget_fields(
+                attempts=attempts,
+                prior_attempts_used=prior_attempts_used,
+                max_attempts=attempt_limit,
+                new_attempt_count=len(attempts) - prior_attempts_used,
+                exhausted=False,
+            ),
         }
         if met is not None and not cleanup_failure:
             return row
@@ -6133,6 +7152,10 @@ async def judge_criterion(
             row["retry_suppressed_reason"] = cleanup_failure
             row["error"] = cleanup_failure
             break
+    if last_row is not None and len(attempts) >= attempt_limit:
+        last_row["last_judge_error"] = last_row.get("error")
+        last_row["error"] = JUDGE_ATTEMPT_BUDGET_EXHAUSTED_ERROR
+        last_row["judge_attempt_budget_exhausted"] = True
     return (
         last_row
         if last_row is not None
@@ -6144,8 +7167,14 @@ async def judge_criterion(
             "met": None,
             "rationale": "",
             "error": "judge_verdict_parse_failed",
-            "judge_attempt_count": 0,
             "judge_attempts": [],
+            **judge_attempt_budget_fields(
+                attempts=[],
+                prior_attempts_used=prior_attempts_used,
+                max_attempts=attempt_limit,
+                new_attempt_count=0,
+                exhausted=False,
+            ),
         }
     )
 
@@ -6320,13 +7349,21 @@ async def run_one(
     agent_max_iterations: int = DEFAULT_AGENT_MAX_ITERATIONS,
     agent_finalization_policy: Mapping[str, Any] | None = None,
     generation_max_attempts: int = GENERATION_MAX_ATTEMPTS,
+    generation_attempt_offset: int = 0,
     generation_retry_backoff: float = DEFAULT_GENERATION_RETRY_BACKOFF_SECONDS,
     tools: list[ToolDefinition] | None = None,
     run_compatibility_fingerprint: str = "",
+    g1_registry_contract: Mapping[str, Any] | None = None,
     require_openrouter_non_byok: bool = False,
 ) -> dict[str, Any]:
     spec = GROUP_SPECS[group]
     started = time.time()
+    if (
+        not isinstance(generation_attempt_offset, int)
+        or isinstance(generation_attempt_offset, bool)
+        or not 0 <= generation_attempt_offset < GENERATION_MAX_ATTEMPTS
+    ):
+        raise ValueError("generation attempt offset must be an integer within the formal budget")
     provider = None
     effective_prompt = str(task["prompt"])
     provider_error = ""
@@ -6334,7 +7371,10 @@ async def run_one(
     failed_build_setup_usage: list[dict[str, Any]] = []
     failed_build_routing_trace: dict[str, Any] = {}
     frozen_build_routing_trace: dict[str, Any] = {}
-    generation_attempt_limit = bounded_generation_attempts(generation_max_attempts)
+    generation_attempt_limit = min(
+        bounded_generation_attempts(generation_max_attempts),
+        GENERATION_MAX_ATTEMPTS - generation_attempt_offset,
+    )
     generation_retry_backoff_s = bounded_generation_retry_backoff(generation_retry_backoff)
     finalization_policy = normalized_agent_finalization_policy(agent_finalization_policy)
     effective_timeout = group_timeout_seconds(
@@ -6419,9 +7459,11 @@ async def run_one(
             agent_max_iterations=agent_max_iterations,
             finalization_policy=finalization_policy,
             max_attempts=generation_attempt_limit,
+            attempt_offset=generation_attempt_offset,
             retry_backoff_seconds=generation_retry_backoff_s,
             expected_model=expected_generation_model,
             expected_provider=expected_generation_provider,
+            expected_g1_registry_contract=g1_registry_contract,
         )
     else:
         run = RunResult(
@@ -6431,8 +7473,38 @@ async def run_one(
             setup_latency_ms=failed_build_setup_latency_ms,
             setup_usage=failed_build_setup_usage,
             routing_trace=failed_build_routing_trace,
+            trace_events=[
+                {
+                    "seq": 1,
+                    "elapsed_ms": failed_build_setup_latency_ms,
+                    "kind": "error",
+                    "code": "provider_build_failed_after_setup",
+                    "request_started": False,
+                    "physical_request_count": 0,
+                }
+            ]
+            if failed_build_setup_usage
+            else [],
         )
-        generation_attempts = []
+        generation_attempts = (
+            [
+                {
+                    "attempt_id": uuid.uuid4().hex,
+                    "attempt_kind": "provider_build_after_paid_setup",
+                    "attempt": generation_attempt_offset + 1,
+                    "started_at": started,
+                    "completed_at": time.time(),
+                    "retryable": True,
+                    "retry_reason": provider_error,
+                    "retry_suppressed_reason": "",
+                    "will_retry": False,
+                    "retry_backoff_s": 0.0,
+                    "run": run_result_summary(run),
+                }
+            ]
+            if failed_build_setup_usage
+            else []
+        )
         selected_generation_attempt_index = 0
     terminal_generation_reason = generation_retry_reason(
         run,
@@ -6444,14 +7516,17 @@ async def run_one(
             if provider is not None and spec.get("kind") == "selection_mode"
             else {}
         ),
+        expected_g1_registry_contract=g1_registry_contract,
         expected_model=expected_generation_model,
         expected_provider=expected_generation_provider,
     )
     mark_retryable_generation_error(run, terminal_generation_reason)
     generation_accepted = not bool(terminal_generation_reason)
+    generation_completed_at = time.time()
     usage_payload = run_result_usage_payload(run)
     generation_non_byok_audit: dict[str, Any] | None = None
-    generation_cost_audit_failed = False
+    generation_non_byok_policy_violation = False
+    generation_non_byok_metadata_incomplete = False
     if require_openrouter_non_byok and generation_accepted:
         generation_non_byok_audit = openrouter_non_byok_audit(
             {
@@ -6461,17 +7536,21 @@ async def run_one(
                         done=run.done,
                         provider_attempted=provider is not None,
                     )
-                    + len(run.setup_usage)
+                    + usage_rows_request_count(run.setup_usage)
                 ),
                 "usage": usage_payload,
                 "execution": {"generation_attempts": generation_attempts},
                 "judge": None,
                 "candidate_judges": [],
                 "tool_policy": tool_policy,
-            }
+            },
+            provider_routing=inherited.provider_routing,
         )
         if not generation_non_byok_audit["pass"]:
-            generation_cost_audit_failed = True
+            generation_non_byok_policy_violation = not bool(
+                generation_non_byok_audit.get("policy_safe_to_continue")
+            )
+            generation_non_byok_metadata_incomplete = not (generation_non_byok_policy_violation)
     profile_proposer_timeout_s = getattr(provider, "proposer_timeout_seconds", None)
     profile_aggregator_timeout_s = getattr(provider, "aggregator_timeout_seconds", None)
     profile_min_successful_proposers = getattr(
@@ -6496,7 +7575,9 @@ async def run_one(
         "proposer_early_stop_after_seconds",
         None,
     )
-    should_judge = generation_accepted and not generation_cost_audit_failed and run.done is not None
+    should_judge = (
+        generation_accepted and not generation_non_byok_policy_violation and run.done is not None
+    )
     judge = (
         await judge_text(
             judge_provider=judge_provider,
@@ -6543,7 +7624,7 @@ async def run_one(
         spec=spec,
         done=run.done,
         provider_attempted=provider is not None,
-    ) + len(run.setup_usage)
+    ) + usage_rows_request_count(run.setup_usage)
     ensemble_trace = run.done.ensemble_trace if run.done is not None else {}
     selected_usage_unknown_count = max(
         ensemble_usage_unknown_count(ensemble_trace),
@@ -6654,6 +7735,7 @@ async def run_one(
         "generation_config": compact_chat_config(generation_config, generation_policy),
         "contamination_blocked_domains": (tool_policy.get("contamination_blocked_domains") or []),
         "started_at": started,
+        "generation_completed_at": generation_completed_at,
         "completed_at": completed_at,
         "total_elapsed_ms": int((completed_at - started) * 1000),
         "latency_ms": run.latency_ms,
@@ -6672,13 +7754,22 @@ async def run_one(
         "selected_attempt_billed_cost_usd": selected_billed_cost,
         "actual_spend_billed_cost_usd": generation_attempt_total_billed_cost,
         "generation_attempt_count": len(generation_attempts),
+        "generation_attempt_evidence_schema": GENERATION_ATTEMPT_EVIDENCE_SCHEMA,
+        "generation_attempt_budget_limit": GENERATION_MAX_ATTEMPTS,
+        "generation_attempt_budget_used": (generation_attempt_offset + len(generation_attempts)),
         "generation_max_attempts": generation_attempt_limit,
         "generation_retry_backoff_s": generation_retry_backoff_s,
         "generation_attempt_total_billed_cost": generation_attempt_total_billed_cost,
         "generation_retry_reasons": generation_retry_reasons,
         "error": (
             run.error
-            or ("openrouter_non_byok_verification_failed" if generation_cost_audit_failed else None)
+            or (
+                "openrouter_non_byok_policy_violation"
+                if generation_non_byok_policy_violation
+                else "openrouter_non_byok_metadata_incomplete"
+                if generation_non_byok_metadata_incomplete
+                else None
+            )
         ),
         "final_text": run.final_text,
         "final_text_chars": len(run.final_text),
@@ -6687,8 +7778,8 @@ async def run_one(
             "provider_error": provider_error,
             "run_error": run.error,
             "judge_skipped_reason": (
-                "generation_cost_audit_failed"
-                if generation_cost_audit_failed
+                "openrouter_non_byok_policy_violation"
+                if generation_non_byok_policy_violation
                 else ("run_not_done" if not should_judge else "")
             ),
             "requested_timeout_s": timeout,
@@ -6731,6 +7822,12 @@ async def run_one(
             "generation_retry_reasons": generation_retry_reasons,
             "generation_attempt_total_billed_cost": generation_attempt_total_billed_cost,
             "generation_attempts": generation_attempts,
+            "prior_generation_attempts_used": generation_attempt_offset,
+            "metadata_repair_attempted": False,
+            "generation_attempt_budget_remaining": max(
+                0,
+                GENERATION_MAX_ATTEMPTS - generation_attempt_offset - len(generation_attempts),
+            ),
         },
         "run_trace": {
             "event_count": len(run.trace_events),
@@ -6753,36 +7850,65 @@ async def run_one(
     row["cost_accounting"] = public_cost_accounting(row_cost_accounting(row))
     final_non_byok_audit: dict[str, Any] | None = None
     if require_openrouter_non_byok:
-        final_non_byok_audit = openrouter_non_byok_audit(row)
+        final_non_byok_audit = openrouter_non_byok_audit(
+            row,
+            provider_routing=inherited.provider_routing,
+        )
         row["openrouter_non_byok_audit"] = final_non_byok_audit
     judge_reasons = judge_completion_reasons(
         row,
         judge_required=judge_provider is not None,
     )
-    cost_metadata_complete = bool(row["cost_accounting"].get("actual_spend_cost_complete"))
+    cost_metadata_complete = bool(row["cost_accounting"].get("actual_llm_cost_complete"))
     if require_openrouter_non_byok:
         cost_metadata_complete = bool(
             cost_metadata_complete
             and isinstance(final_non_byok_audit, Mapping)
             and final_non_byok_audit.get("pass") is True
         )
+    final_non_byok_policy_violation = bool(
+        require_openrouter_non_byok
+        and isinstance(final_non_byok_audit, Mapping)
+        and final_non_byok_audit.get("policy_safe_to_continue") is False
+    )
+    if final_non_byok_policy_violation:
+        prior_error = str(row.get("error") or "")
+        if prior_error and prior_error != "openrouter_non_byok_policy_violation":
+            execution = dict(row.get("execution") or {})
+            execution["prior_error_before_non_byok_policy_violation"] = prior_error
+            row["execution"] = execution
+        row["error"] = "openrouter_non_byok_policy_violation"
     if generation_accepted and not row.get("error"):
         if not cost_metadata_complete:
-            row["error"] = (
-                "openrouter_non_byok_verification_failed"
-                if require_openrouter_non_byok
-                and (
-                    generation_cost_audit_failed
-                    or not isinstance(final_non_byok_audit, Mapping)
-                    or final_non_byok_audit.get("pass") is not True
+            if (
+                require_openrouter_non_byok
+                and isinstance(final_non_byok_audit, Mapping)
+                and final_non_byok_audit.get("pass") is not True
+            ):
+                row["error"] = (
+                    "openrouter_non_byok_metadata_incomplete"
+                    if final_non_byok_audit.get("policy_safe_to_continue") is True
+                    else "openrouter_non_byok_policy_violation"
                 )
-                else "cost_metadata_incomplete"
-            )
+            else:
+                row["error"] = "cost_metadata_incomplete"
         elif judge_reasons:
-            row["error"] = "judge_incomplete"
+            row["error"] = (
+                JUDGE_ATTEMPT_BUDGET_EXHAUSTED_ERROR
+                if isinstance(judge, Mapping)
+                and judge.get("judge_attempt_budget_exhausted") is True
+                else "judge_incomplete"
+            )
     row["completion_status"] = {
         "generation_accepted": generation_accepted,
         "cost_metadata_complete": cost_metadata_complete,
+        "cost_metadata_scope": "actual_llm_spend",
+        "all_provider_cost_complete": bool(
+            row["cost_accounting"].get("actual_spend_cost_complete")
+        ),
+        "actual_external_tool_cost_complete": bool(
+            row["cost_accounting"].get("actual_external_cost_complete")
+        ),
         "judge_complete": not judge_reasons,
         "status": (
             "complete"
@@ -6976,6 +8102,133 @@ def _openrouter_router_provider_metadata_is_complete(
     return False
 
 
+def _normalize_openrouter_provider_identity(value: Any) -> str:
+    """Normalize OpenRouter provider slugs and display names for comparison."""
+
+    return "".join(character for character in str(value or "").casefold() if character.isalnum())
+
+
+@cache
+def _formal_openrouter_model_aliases() -> dict[str, frozenset[str]]:
+    """Bind requested model ids to the frozen registry's serving-model aliases."""
+
+    from opensquilla.provider.ranking_router import load_model_registry_snapshot
+
+    aliases: dict[str, set[str]] = {
+        str(model).strip().casefold(): {str(model).strip().casefold()}
+        for model in OPENROUTER_DEFAULT_PROVIDER_ROUTING
+        if str(model).strip()
+    }
+    snapshot = load_model_registry_snapshot()
+    rows = snapshot.get("models")
+    if not isinstance(rows, list):
+        return {model: frozenset(values) for model, values in aliases.items()}
+    for row in rows:
+        facts = row.get("registry_facts") if isinstance(row, Mapping) else None
+        if not isinstance(facts, Mapping):
+            continue
+        model = str(facts.get("model_id") or "").strip().casefold()
+        version = str(facts.get("version") or "").strip().casefold()
+        if model not in aliases:
+            continue
+        if version:
+            aliases[model].add(version)
+    return {model: frozenset(values) for model, values in aliases.items()}
+
+
+def _formal_openrouter_models_equivalent(left: Any, right: Any) -> bool:
+    """Treat a frozen requested model and its serving version as one identity."""
+
+    left_model = str(left or "").strip().casefold()
+    right_model = str(right or "").strip().casefold()
+    if not left_model or not right_model:
+        return False
+    if left_model == right_model:
+        return True
+    for requested_model, aliases in _formal_openrouter_model_aliases().items():
+        equivalence_class = {requested_model, *aliases}
+        if left_model in equivalence_class and right_model in equivalence_class:
+            return True
+    return False
+
+
+def _openrouter_router_provider_metadata_pin_state(
+    unit: Mapping[str, Any],
+    *,
+    provider_routing: Mapping[str, str] | None = None,
+) -> str:
+    """Return ``exact``, ``missing``, or ``conflict`` for serving-route proof."""
+
+    provider_usage = unit.get("provider_usage")
+    if not isinstance(provider_usage, Mapping):
+        return "missing"
+    router_metadata = provider_usage.get("router_metadata")
+    if not isinstance(router_metadata, Mapping):
+        return "missing"
+    routes = {
+        str(model).strip().casefold(): str(provider).strip()
+        for model, provider in (
+            provider_routing
+            if provider_routing is not None
+            else OPENROUTER_DEFAULT_PROVIDER_ROUTING
+        ).items()
+        if str(model).strip() and str(provider).strip()
+    }
+    router_requested = str(router_metadata.get("requested") or "").strip().casefold()
+    if not router_requested or router_requested not in routes:
+        return "missing"
+    request_identities = {
+        str(value).strip().casefold()
+        for value in (
+            unit.get("requested_model"),
+            provider_usage.get("requested_model"),
+        )
+        if str(value or "").strip().casefold() in routes
+    }
+    if request_identities and request_identities != {router_requested}:
+        return "conflict"
+    expected_provider = _normalize_openrouter_provider_identity(routes[router_requested])
+    allowed_models = _formal_openrouter_model_aliases().get(
+        router_requested,
+        frozenset({router_requested}),
+    )
+
+    def endpoint_matches(endpoint: Mapping[str, Any]) -> bool:
+        return (
+            _normalize_openrouter_provider_identity(endpoint.get("provider")) == expected_provider
+            and str(endpoint.get("model") or "").strip().casefold() in allowed_models
+        )
+
+    successful_attempts = [
+        attempt
+        for attempt in (router_metadata.get("attempts") or [])
+        if isinstance(attempt, Mapping)
+        and isinstance(attempt.get("status"), int)
+        and not isinstance(attempt.get("status"), bool)
+        and 200 <= int(attempt["status"]) < 300
+    ]
+    if successful_attempts and any(
+        not endpoint_matches(attempt) for attempt in successful_attempts
+    ):
+        return "conflict"
+    endpoints = router_metadata.get("endpoints")
+    available = endpoints.get("available") if isinstance(endpoints, Mapping) else None
+    selected = (
+        [
+            endpoint
+            for endpoint in available
+            if isinstance(endpoint, Mapping) and endpoint.get("selected") is True
+        ]
+        if isinstance(available, list)
+        else []
+    )
+    if selected and any(not endpoint_matches(endpoint) for endpoint in selected):
+        return "conflict"
+    if not successful_attempts and not selected:
+        return "missing"
+    return "exact"
+
+
 def _openrouter_provider_billed_cost_is_exact(unit: Mapping[str, Any]) -> bool:
     """Preserve the non-audit OpenRouter provider-billed cost contract."""
 
@@ -6994,8 +8247,7 @@ def _openrouter_provider_billed_cost_is_exact(unit: Mapping[str, Any]) -> bool:
         and router_metadata.get("is_byok") is False
         and _finite_nonnegative_number(billed_cost)
         and _finite_nonnegative_number(reported_cost)
-        and round(float(billed_cost) * 1_000_000_000)
-        == round(float(reported_cost) * 1_000_000_000)
+        and round(float(billed_cost) * 1_000_000_000) == round(float(reported_cost) * 1_000_000_000)
         and isinstance(response_ids, list)
         and bool(response_ids)
         and all(
@@ -7005,7 +8257,11 @@ def _openrouter_provider_billed_cost_is_exact(unit: Mapping[str, Any]) -> bool:
     )
 
 
-def _openrouter_non_byok_receipt_is_exact(unit: Mapping[str, Any]) -> bool:
+def _openrouter_non_byok_receipt_is_exact(
+    unit: Mapping[str, Any],
+    *,
+    provider_routing: Mapping[str, str] | None = None,
+) -> bool:
     """Require physical OpenRouter receipt evidence before calling cost exact."""
 
     if str(unit.get("provider") or "").strip().casefold() != "openrouter":
@@ -7037,6 +8293,11 @@ def _openrouter_non_byok_receipt_is_exact(unit: Mapping[str, Any]) -> bool:
         and isinstance(router_metadata, Mapping)
         and router_metadata.get("is_byok") is False
         and _openrouter_router_provider_metadata_is_complete(router_metadata)
+        and _openrouter_router_provider_metadata_pin_state(
+            unit,
+            provider_routing=provider_routing,
+        )
+        == "exact"
         and len({round(cost * 1_000_000_000) for cost in exact_costs}) == 1
         and isinstance(response_ids, list)
         and bool(response_ids)
@@ -7063,12 +8324,7 @@ def _coerce_provider_billing_receipt(value: Any) -> ProviderBillingReceipt | Non
     def receipt_int(raw: Any, *, nullable: bool = False) -> int | None:
         if raw is None and nullable:
             return None
-        if (
-            isinstance(raw, bool)
-            or not isinstance(raw, int)
-            or raw < 0
-            or raw > (1 << 63) - 1
-        ):
+        if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0 or raw > (1 << 63) - 1:
             raise ValueError("billing receipt nanos must be ledger-safe integers")
         return int(raw)
 
@@ -7119,16 +8375,13 @@ def _coerce_provider_billing_receipt(value: Any) -> ProviderBillingReceipt | Non
         or candidate.schema_version != 1
     ):
         return None
-    if candidate.status == "confirmed" and (
-        amount_nanos is None or usd_nanos is None
-    ):
+    if candidate.status == "confirmed" and (amount_nanos is None or usd_nanos is None):
         return None
     if candidate.status == "pending" and usd_nanos is not None:
         return None
     if candidate.status == "confirmed":
         expected_usd_nanos = (
-            amount_nanos * 1_000_000_000
-            + candidate.fx_native_per_usd_nanos // 2
+            amount_nanos * 1_000_000_000 + candidate.fx_native_per_usd_nanos // 2
         ) // candidate.fx_native_per_usd_nanos
         if expected_usd_nanos != usd_nanos:
             return None
@@ -7161,10 +8414,7 @@ def exact_provider_usage_cost(unit: Mapping[str, Any]) -> float | None:
     billed_cost = _first_usage_cost(unit, "billed_cost")
     if source == "openrouter_usage":
         return billed_cost
-    if (
-        source == "provider_billed"
-        and _openrouter_provider_billed_cost_is_exact(unit)
-    ):
+    if source == "provider_billed" and _openrouter_provider_billed_cost_is_exact(unit):
         return billed_cost
     return None
 
@@ -7442,8 +8692,7 @@ def merge_cost_accounting(scope: str, accounts: list[dict[str, Any]]) -> dict[st
         merged = usage_cost_accounting(
             {"model_usage_breakdown": combined_units} if combined_units else None,
             expected_requests=sum(
-                max(0, coerce_metric_int(account.get("request_count")))
-                for account in accounts
+                max(0, coerce_metric_int(account.get("request_count"))) for account in accounts
             ),
             scope=scope,
         )
@@ -7699,11 +8948,17 @@ def external_tool_cost_accounting(
         "scope": "actual_external_tools" if actual_spend else "external_tools",
         "tool_call_count": tool_calls,
         "recorded_cost_usd": 0.0,
+        "estimated_cost_usd": None,
         "potentially_unpriced_tool_call_count_upper_bound": (
             tool_calls if untracked_cost_possible else 0
         ),
         "cost_complete": not untracked_cost_possible,
         "cost_exact": not untracked_cost_possible,
+        "cost_status": "unknown" if untracked_cost_possible else "exact",
+        "cost_precision": "unknown" if untracked_cost_possible else "exact",
+        "recorded_cost_is_lower_bound": untracked_cost_possible,
+        "recorded_cost_usd_is_lower_bound": untracked_cost_possible,
+        "separate_from_task_completion": True,
         "note": (
             "Brave/Firecrawl spend is not returned by the local tool API"
             if untracked_cost_possible
@@ -7744,6 +8999,16 @@ def row_cost_accounting(row: dict[str, Any]) -> dict[str, Any]:
             float(actual_llm_total["recorded_cost_usd"])
             + float(actual_external["recorded_cost_usd"])
         ),
+        "result_llm_cost_complete": bool(llm_total["cost_complete"]),
+        "result_llm_cost_exact": bool(llm_total["cost_exact"]),
+        "actual_llm_cost_complete": bool(actual_llm_total["cost_complete"]),
+        "actual_llm_cost_exact": bool(actual_llm_total["cost_exact"]),
+        "actual_spend_llm_cost_complete": bool(actual_llm_total["cost_complete"]),
+        "actual_spend_llm_cost_exact": bool(actual_llm_total["cost_exact"]),
+        "external_cost_complete": bool(external["cost_complete"]),
+        "external_cost_exact": bool(external["cost_exact"]),
+        "actual_external_cost_complete": bool(actual_external["cost_complete"]),
+        "actual_external_cost_exact": bool(actual_external["cost_exact"]),
         "result_cost_complete": bool(llm_total["cost_complete"])
         and bool(external["cost_complete"]),
         "result_cost_exact": bool(llm_total["cost_exact"]) and bool(external["cost_exact"]),
@@ -7751,10 +9016,18 @@ def row_cost_accounting(row: dict[str, Any]) -> dict[str, Any]:
         and bool(actual_external["cost_complete"]),
         "actual_spend_cost_exact": bool(actual_llm_total["cost_exact"])
         and bool(actual_external["cost_exact"]),
+        "recorded_total_cost_is_lower_bound": not (
+            bool(llm_total["cost_complete"]) and bool(external["cost_complete"])
+        ),
+        "actual_spend_recorded_total_cost_is_lower_bound": not (
+            bool(actual_llm_total["cost_complete"]) and bool(actual_external["cost_complete"])
+        ),
         "scope_note": (
             "Compatibility cost fields use the selected generation attempt plus recorded "
             "Judge attempts. actual_spend_* includes every generation attempt. "
-            "Whole-experiment spend must also retain failed/replaced shards and preflight calls."
+            "Lifecycle completeness is gated on actual LLM spend; unpriced local Web "
+            "tools remain a separate explicit lower-bound gap. Whole-experiment spend "
+            "must also retain failed/replaced shards and preflight calls."
         ),
     }
 
@@ -7763,6 +9036,8 @@ def _usage_units_for_openrouter_non_byok_audit(
     usage: Any,
 ) -> list[Mapping[str, Any]]:
     if not isinstance(usage, Mapping):
+        return []
+    if not usage:
         return []
     breakdown = usage.get("model_usage_breakdown")
     if isinstance(breakdown, list) and breakdown:
@@ -7783,10 +9058,17 @@ def _actual_llm_usage_units_for_openrouter_non_byok_audit(
             if not isinstance(run, Mapping):
                 continue
             observed_generation_run = True
-            units.extend(
-                _usage_units_for_openrouter_non_byok_audit(run.get("usage"))
-            )
-    if not observed_generation_run:
+            units.extend(_usage_units_for_openrouter_non_byok_audit(run.get("usage")))
+    actual_metrics = row.get("actual_spend_metrics")
+    declared_generation_attempts = max(
+        coerce_metric_int(row.get("generation_attempt_count")),
+        coerce_metric_int(
+            actual_metrics.get("generation_attempt_count")
+            if isinstance(actual_metrics, Mapping)
+            else 0
+        ),
+    )
+    if not observed_generation_run and declared_generation_attempts <= 0:
         units.extend(_usage_units_for_openrouter_non_byok_audit(row.get("usage")))
     for judge in [row.get("judge"), *(row.get("candidate_judges") or [])]:
         if not isinstance(judge, dict):
@@ -7797,32 +9079,224 @@ def _actual_llm_usage_units_for_openrouter_non_byok_audit(
         ):
             continue
         for run in iter_judge_attempt_runs(judge):
-            units.extend(
-                _usage_units_for_openrouter_non_byok_audit(run.get("usage"))
-            )
+            units.extend(_usage_units_for_openrouter_non_byok_audit(run.get("usage")))
     return deduplicate_stable_usage_receipts(units)
 
 
-def openrouter_non_byok_audit(row: dict[str, Any]) -> dict[str, Any]:
+def _independent_openrouter_policy_evidence(
+    row: dict[str, Any],
+) -> list[Mapping[str, Any]]:
+    """Return non-physical policy evidence without changing request counts."""
+
+    usage_payloads: list[Mapping[str, Any]] = []
+    execution = row.get("execution")
+    attempts = execution.get("generation_attempts") if isinstance(execution, Mapping) else None
+    observed_generation_run = False
+    if isinstance(attempts, list):
+        for attempt in attempts:
+            run = attempt.get("run") if isinstance(attempt, Mapping) else None
+            usage = run.get("usage") if isinstance(run, Mapping) else None
+            if isinstance(usage, Mapping):
+                observed_generation_run = True
+                usage_payloads.append(usage)
+    actual_metrics = row.get("actual_spend_metrics")
+    declared_generation_attempts = max(
+        coerce_metric_int(row.get("generation_attempt_count")),
+        coerce_metric_int(
+            actual_metrics.get("generation_attempt_count")
+            if isinstance(actual_metrics, Mapping)
+            else 0
+        ),
+    )
+    if not observed_generation_run and declared_generation_attempts <= 0:
+        usage = row.get("usage")
+        if isinstance(usage, Mapping):
+            usage_payloads.append(usage)
+    for judge in [row.get("judge"), *(row.get("candidate_judges") or [])]:
+        if not isinstance(judge, dict):
+            continue
+        if (
+            judge.get("judge_cost_exempt") is True
+            or str(judge.get("judge_model") or "").casefold() == "dry-run"
+        ):
+            continue
+        for run in iter_judge_attempt_runs(judge):
+            usage = run.get("usage")
+            if isinstance(usage, Mapping):
+                usage_payloads.append(usage)
+
+    evidence: list[Mapping[str, Any]] = []
+    seen: set[str] = set()
+    for usage in usage_payloads:
+        units = [usage]
+        breakdown = usage.get("model_usage_breakdown")
+        if isinstance(breakdown, list):
+            units.extend(item for item in breakdown if isinstance(item, Mapping))
+        for unit in units:
+            provider_usage = unit.get("provider_usage")
+            raw_evidence = (
+                provider_usage.get(IGNORED_AGENT_DONE_POLICY_EVIDENCE_KEY)
+                if isinstance(provider_usage, Mapping)
+                else None
+            )
+            if not isinstance(raw_evidence, list):
+                continue
+            for item in raw_evidence:
+                if not isinstance(item, Mapping):
+                    continue
+                fingerprint = canonical_json_sha256(item)
+                if fingerprint in seen:
+                    continue
+                seen.add(fingerprint)
+                evidence.append(item)
+    return evidence
+
+
+def classify_openrouter_non_byok_unit(
+    unit: Mapping[str, Any],
+    *,
+    provider_routing: Mapping[str, str] | None = None,
+) -> str:
+    """Classify policy evidence without mistaking missing metadata for BYOK."""
+
+    provider = str(unit.get("provider") or "").strip().casefold()
+    if provider and provider != "openrouter":
+        return "conflict"
+    provider_usage = unit.get("provider_usage")
+    if not isinstance(provider_usage, Mapping):
+        return "unverified"
+    stable_receipt_evidence = provider_usage.get(STABLE_RECEIPT_EVIDENCE_KEY)
+    if isinstance(stable_receipt_evidence, Mapping):
+        if stable_receipt_evidence.get("receipt_conflict") is True or stable_receipt_evidence.get(
+            "conflict_fields"
+        ):
+            return "conflict"
+        evidence_providers = {
+            str(value).strip().casefold()
+            for value in stable_receipt_evidence.get("providers") or []
+            if str(value).strip()
+        }
+        if any(value != "openrouter" for value in evidence_providers):
+            return "conflict"
+        evidence_byok_values = {
+            value
+            for key in (
+                "usage_is_byok_values",
+                "router_is_byok_values",
+            )
+            for value in stable_receipt_evidence.get(key) or []
+            if value is True or value is False
+        }
+        if len(evidence_byok_values) > 1:
+            return "conflict"
+        if True in evidence_byok_values:
+            return "explicit_byok"
+    router_metadata = provider_usage.get("router_metadata")
+    router_is_byok = (
+        router_metadata.get("is_byok") if isinstance(router_metadata, Mapping) else None
+    )
+    usage_is_byok = provider_usage.get("is_byok")
+    if (usage_is_byok is True and router_is_byok is False) or (
+        usage_is_byok is False and router_is_byok is True
+    ):
+        return "conflict"
+    if usage_is_byok is True or router_is_byok is True:
+        return "explicit_byok"
+    pin_state = _openrouter_router_provider_metadata_pin_state(
+        unit,
+        provider_routing=provider_routing,
+    )
+    if pin_state == "conflict":
+        return "conflict"
+    if _openrouter_non_byok_receipt_is_exact(
+        unit,
+        provider_routing=provider_routing,
+    ):
+        return "exact"
+    return "unverified"
+
+
+def openrouter_non_byok_audit(
+    row: dict[str, Any],
+    *,
+    provider_routing: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
     # Keep this stricter audit separate from ordinary cost accounting. Native
     # receipts and legacy openrouter_usage remain valid cost evidence, but do
     # not prove the OpenRouter non-BYOK execution policy by themselves.
     accounting = row_cost_accounting(row)
     llm_total = accounting.get("actual_llm_total") or {}
     request_count = coerce_metric_int(llm_total.get("request_count"))
-    verified_count = sum(
-        1
-        for unit in _actual_llm_usage_units_for_openrouter_non_byok_audit(row)
-        if _openrouter_non_byok_receipt_is_exact(unit)
+    units = _actual_llm_usage_units_for_openrouter_non_byok_audit(row)
+    categories = {
+        "exact": 0,
+        "unverified": 0,
+        "explicit_byok": 0,
+        "conflict": 0,
+    }
+    for unit in units:
+        category = classify_openrouter_non_byok_unit(
+            unit,
+            provider_routing=provider_routing,
+        )
+        categories[category] += 1
+    independent_evidence = _independent_openrouter_policy_evidence(row)
+    independent_explicit_byok_count = sum(
+        1 for item in independent_evidence if item.get("classification") == "explicit_byok"
     )
-    verified_count = min(request_count, verified_count)
-    passed = request_count == verified_count
+    independent_conflict_count = sum(
+        1 for item in independent_evidence if item.get("classification") == "conflict"
+    )
+    evidence_unit_count = sum(categories.values())
+    missing_evidence_request_count = max(0, request_count - evidence_unit_count)
+    evidence_overflow_count = max(0, evidence_unit_count - request_count)
+    verified_count = min(request_count, categories["exact"])
+    explicit_byok_count = categories["explicit_byok"]
+    conflict_count = categories["conflict"]
+    unverified_count = categories["unverified"] + missing_evidence_request_count
+    policy_safe_to_continue = (
+        explicit_byok_count == 0
+        and conflict_count == 0
+        and independent_explicit_byok_count == 0
+        and independent_conflict_count == 0
+        and evidence_overflow_count == 0
+    )
+    passed = (
+        request_count > 0
+        and evidence_unit_count == request_count
+        and categories["exact"] == request_count
+        and categories["unverified"] == 0
+        and policy_safe_to_continue
+    )
     return {
         "pass": passed,
         "policy": "every recorded or expected LLM request must prove is_byok=false",
+        "status": (
+            "exact"
+            if passed
+            else "metadata_incomplete"
+            if policy_safe_to_continue
+            else "policy_violation"
+        ),
+        "policy_safe_to_continue": policy_safe_to_continue,
         "request_count": request_count,
         "exact_request_count": verified_count,
-        "unverified_or_byok_request_count": request_count - verified_count,
+        "unverified_request_count": unverified_count,
+        "explicit_byok_request_count": explicit_byok_count,
+        "conflict_request_count": conflict_count,
+        "independent_policy_evidence_count": len(independent_evidence),
+        "independent_explicit_byok_evidence_count": (independent_explicit_byok_count),
+        "independent_conflict_evidence_count": independent_conflict_count,
+        "unverified_or_byok_request_count": (
+            max(0, request_count - verified_count) + evidence_overflow_count
+        ),
+        "evidence_unit_count": evidence_unit_count,
+        "missing_evidence_request_count": missing_evidence_request_count,
+        "evidence_overflow_count": evidence_overflow_count,
+        "recorded_request_count": evidence_unit_count,
+        "missing_expected_request_count": missing_evidence_request_count,
+        "unexpected_recorded_request_count": evidence_overflow_count,
+        "request_count_match": evidence_unit_count == request_count,
         "note": (
             "pass requires every request to carry OpenRouter provider identity, "
             "is_byok=false at usage and router levels, serving-provider metadata, "
@@ -7856,9 +9330,7 @@ def row_llm_request_count(row: dict[str, Any]) -> int:
     if row.get("selected_generation_succeeded") is False:
         return 0
     declared = (
-        row_metric_int(row, "llm_request_count")
-        if row.get("llm_request_count") is not None
-        else 0
+        row_metric_int(row, "llm_request_count") if row.get("llm_request_count") is not None else 0
     )
     usage = row.get("usage") or {}
     breakdown = usage.get("model_usage_breakdown") if isinstance(usage, dict) else None
@@ -7867,22 +9339,21 @@ def row_llm_request_count(row: dict[str, Any]) -> int:
             1
             for item in breakdown
             if isinstance(item, Mapping)
-            and str(item.get("role") or "").strip().casefold()
-            in MISSING_USAGE_PLACEHOLDER_ROLES
+            and str(item.get("role") or "").strip().casefold() in MISSING_USAGE_PLACEHOLDER_ROLES
         )
         return max(
             declared,
             len(breakdown)
             + max(
                 0,
-                coerce_metric_int(usage.get("usage_missing_count"))
-                - represented_missing,
+                coerce_metric_int(usage.get("usage_missing_count")) - represented_missing,
             ),
         )
     if isinstance(usage, dict) and usage:
         return max(
             declared,
-            1 + max(
+            1
+            + max(
                 0,
                 coerce_metric_int(usage.get("usage_missing_count")),
             ),
@@ -7920,8 +9391,7 @@ def ensemble_usage_unknown_count(trace: Any) -> int:
             sum(
                 1
                 for candidate in candidates
-                if isinstance(candidate, dict)
-                and candidate.get("error_code") == "early_stopped"
+                if isinstance(candidate, dict) and candidate.get("error_code") == "early_stopped"
             ),
         )
     return max(direct_missing, detected_missing)
@@ -7940,8 +9410,7 @@ def usage_unknown_count_from_usage_payload(usage: Any) -> int:
         1
         for item in units
         if (
-            str(item.get("role") or "").strip().casefold()
-            in MISSING_USAGE_PLACEHOLDER_ROLES
+            str(item.get("role") or "").strip().casefold() in MISSING_USAGE_PLACEHOLDER_ROLES
             or item.get("error_code") == "early_stopped"
             or str(item.get("cost_source") or "none") == "unknown_canceled"
         )
@@ -7950,8 +9419,7 @@ def usage_unknown_count_from_usage_payload(usage: Any) -> int:
         1
         for item in units
         if (
-            str(item.get("role") or "").strip().casefold()
-            not in MISSING_USAGE_PLACEHOLDER_ROLES
+            str(item.get("role") or "").strip().casefold() not in MISSING_USAGE_PLACEHOLDER_ROLES
             and item.get("error_code") != "early_stopped"
             and str(item.get("cost_source") or "none") != "unknown_canceled"
             and (
@@ -8522,9 +9990,80 @@ def gateway_execution_contract(config: GatewayConfig) -> dict[str, Any]:
             "model_catalog",
             "models",
             "squilla_router",
+            "sandbox",
         )
     }
     return _sanitize_fingerprint_config(relevant)
+
+
+def validate_strict_openrouter_non_byok_environment(
+    config: GatewayConfig,
+) -> dict[str, Any]:
+    """Fail closed on every routing/cost isolation prerequisite."""
+
+    truthy = {"1", "true", "yes", "on", "enabled"}
+    falsey = {"0", "false", "no", "off", "disabled"}
+    required_truthy = (
+        "OPENSQUILLA_PROVIDER_ROUTING_STRICT",
+        "OPENSQUILLA_PROVIDER_STREAM_ERROR_FRAMES",
+        "OPENSQUILLA_OPENROUTER_METADATA_REQUIRED",
+        "OPENSQUILLA_OPENROUTER_REQUIRE_PARAMETERS",
+        "OPENSQUILLA_OPENROUTER_DISABLE_RESPONSE_CACHE",
+        "DRACO_OPENROUTER_KEY_EXCLUSIVE",
+    )
+    failures = [
+        f"{name}=1 required"
+        for name in required_truthy
+        if os.environ.get(name, "").strip().casefold() not in truthy
+    ]
+    if os.environ.get("OPENSQUILLA_TRUST_ENV", "").strip().casefold() not in falsey:
+        failures.append("OPENSQUILLA_TRUST_ENV=0 required")
+    forbidden_overrides = (
+        "OPENROUTER_BASE_URL",
+        "OPENSQUILLA_LLM_BASE_URL",
+        "OPENSQUILLA_LLM_PROXY",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    )
+    active_overrides = [name for name in forbidden_overrides if os.environ.get(name, "").strip()]
+    if active_overrides:
+        failures.append(
+            "proxy/base-url override(s) forbidden: " + ", ".join(sorted(active_overrides))
+        )
+
+    runtime = resolve_llm_runtime_config(config)
+    official_base_url = str(get_provider_spec("openrouter").default_base_url or "").rstrip("/")
+    if runtime.provider != "openrouter":
+        failures.append("resolved provider must be openrouter")
+    if not runtime.api_key:
+        failures.append("resolved OpenRouter API key is missing")
+    if str(runtime.base_url or "").rstrip("/") != official_base_url:
+        failures.append("resolved OpenRouter base URL is not the official endpoint")
+    if runtime.base_url_from_env:
+        failures.append("resolved OpenRouter base URL came from an environment override")
+    if str(runtime.proxy or "").strip():
+        failures.append("resolved OpenRouter proxy must be empty")
+    if failures:
+        raise ValueError(
+            "strict OpenRouter non-BYOK environment validation failed: " + "; ".join(failures)
+        )
+    return {
+        "validated": True,
+        "provider": "openrouter",
+        "official_base_url": official_base_url,
+        "provider_routing_strict": True,
+        "stream_error_frames": True,
+        "router_metadata_required": True,
+        "require_parameters": True,
+        "response_cache_disabled": True,
+        "key_exclusive": True,
+        "trust_env": False,
+        "proxy_or_base_url_override": False,
+    }
 
 
 def resolved_llm_runtime_contract(config: GatewayConfig) -> dict[str, Any]:
@@ -8575,6 +10114,10 @@ def resolved_llm_runtime_contract(config: GatewayConfig) -> dict[str, Any]:
         ),
         "response_cache_disabled": (
             os.environ.get("OPENSQUILLA_OPENROUTER_DISABLE_RESPONSE_CACHE", "").strip().lower()
+            in {"1", "true", "yes", "on", "enabled"}
+        ),
+        "key_exclusive": (
+            os.environ.get("DRACO_OPENROUTER_KEY_EXCLUSIVE", "").strip().lower()
             in {"1", "true", "yes", "on", "enabled"}
         ),
         "cache_namespace_enabled": bool(cache_namespace),
@@ -8711,6 +10254,7 @@ def build_run_compatibility(
                 "schema_version",
                 "profile_id",
                 "benchmark_input",
+                "g1_routing",
                 "timeouts",
                 "runner",
                 "generation",
@@ -8777,6 +10321,10 @@ def build_run_compatibility(
             "experiment_config": (
                 effective_experiment_config if GROUP_SPECS[group].get("experiment_config") else None
             ),
+            "g1_registry_contract": (
+                dict(getattr(args, "_g1_registry_contract", {}) or {}) if group == "G1" else None
+            ),
+            "formal_runtime_freeze": dict(getattr(args, "_formal_runtime_freeze", {}) or {}),
             "dry_run": bool(args.dry_run),
         }
         contracts[group] = contract
@@ -8910,6 +10458,12 @@ def write_manifest(
     benchmark_alignments = dict(getattr(args, "_benchmark_alignments", {}) or {})
     if benchmark_alignments:
         payload["benchmark_alignments"] = benchmark_alignments
+    g1_registry_contract = getattr(args, "_g1_registry_contract", None)
+    if isinstance(g1_registry_contract, Mapping):
+        payload["g1_registry_contract"] = dict(g1_registry_contract)
+    formal_runtime_freeze = getattr(args, "_formal_runtime_freeze", None)
+    if isinstance(formal_runtime_freeze, Mapping):
+        payload["formal_runtime_freeze"] = dict(formal_runtime_freeze)
     input_validation = getattr(args, "_draco_input_validation", None)
     if input_validation is not None:
         payload["benchmark_input_validation"] = input_validation
@@ -9003,6 +10557,24 @@ async def amain(args: argparse.Namespace) -> int:
     process_api_key = os.environ.get(api_key_env or "OPENROUTER_API_KEY", "").strip()
     if process_api_key:
         config.llm.api_key = process_api_key
+    args._formal_runtime_freeze = enforce_formal_draco_runtime_config(
+        config,
+        experiment_config,
+        groups,
+    )
+    if getattr(args, "require_openrouter_non_byok", False) and not getattr(args, "dry_run", False):
+        args._strict_openrouter_non_byok_environment = (
+            validate_strict_openrouter_non_byok_environment(config)
+        )
+    if "G1" in groups:
+        if experiment_config is None:
+            raise ValueError("G1 requires an experiment config")
+        args._g1_registry_contract = validate_g1_registry_contract(
+            experiment_config,
+            config,
+        )
+        if alignment is not None:
+            alignment["g1_registry_contract"] = dict(args._g1_registry_contract)
     sandbox_runtime = configure_benchmark_sandbox_runtime(config, tool_policy)
     fetch_runtime = configure_local_web_fetch_runtime(tool_policy)
     search_runtime = configure_local_web_search_runtime(
@@ -9181,7 +10753,7 @@ async def amain(args: argparse.Namespace) -> int:
                 ),
                 tool_policy=group_tool_policy,
                 generation_policy=generation_policy,
-                experiment_config=experiment_config if group == "B2" else None,
+                experiment_config=(experiment_config if group in {"B2", "G1"} else None),
                 runner_mode=args.runner_mode,
                 output_dir=output_dir,
                 agent_max_iterations=args.agent_max_iterations,
@@ -9196,22 +10768,18 @@ async def amain(args: argparse.Namespace) -> int:
                 ),
                 tools=group_tools,
                 run_compatibility_fingerprint=args._run_compatibility["fingerprints"][group],
+                g1_registry_contract=(
+                    getattr(args, "_g1_registry_contract", None) if group == "G1" else None
+                ),
                 require_openrouter_non_byok=bool(
                     getattr(args, "require_openrouter_non_byok", False)
                 ),
             )
 
-    expected_result_keys = {
-        (group, str(task["id"]))
-        for task in tasks
-        for group in groups
-    }
+    expected_result_keys = {(group, str(task["id"])) for task in tasks for group in groups}
     pending = [asyncio.create_task(_guarded(task, group)) for task in tasks for group in groups]
     cost_audit_failure: dict[str, Any] | None = None
     cost_audit_failures: list[dict[str, Any]] = []
-    continue_after_cost_audit_failure = bool(
-        getattr(args, "continue_after_cost_audit_failure", False)
-    )
     with (
         jsonl_path.open("w", encoding="utf-8") as fh,
         trace_path.open("w", encoding="utf-8") as trace_fh,
@@ -9220,21 +10788,32 @@ async def amain(args: argparse.Namespace) -> int:
             row = await coro
             row["row_index"] = row_index
             if getattr(args, "require_openrouter_non_byok", False):
-                audit = openrouter_non_byok_audit(row)
+                audit = openrouter_non_byok_audit(
+                    row,
+                    provider_routing=inherited.provider_routing,
+                )
                 row["openrouter_non_byok_audit"] = audit
                 if not audit["pass"]:
-                    if not row.get("error"):
-                        row["error"] = "openrouter_non_byok_verification_failed"
-                    failure = {
-                        "stage": "openrouter_non_byok_audit",
-                        "group": row.get("group"),
-                        "task_id": row.get("task_id"),
-                        "audit": audit,
-                        "model_or_judge_started": True,
-                    }
-                    cost_audit_failures.append(failure)
-                    if cost_audit_failure is None:
-                        cost_audit_failure = failure
+                    if audit.get("policy_safe_to_continue") is not True:
+                        prior_error = str(row.get("error") or "")
+                        if prior_error and prior_error != "openrouter_non_byok_policy_violation":
+                            execution = dict(row.get("execution") or {})
+                            execution["prior_error_before_non_byok_policy_violation"] = prior_error
+                            row["execution"] = execution
+                        row["error"] = "openrouter_non_byok_policy_violation"
+                    elif not row.get("error"):
+                        row["error"] = "openrouter_non_byok_metadata_incomplete"
+                    if audit.get("policy_safe_to_continue") is not True:
+                        failure = {
+                            "stage": "openrouter_non_byok_policy_violation",
+                            "group": row.get("group"),
+                            "task_id": row.get("task_id"),
+                            "audit": audit,
+                            "model_or_judge_started": True,
+                        }
+                        cost_audit_failures.append(failure)
+                        if cost_audit_failure is None:
+                            cost_audit_failure = failure
             row = seal_result_row(row)
             trace_value = trace_row(row)
             result_line = json.dumps(row, ensure_ascii=False, allow_nan=False)
@@ -9245,9 +10824,9 @@ async def amain(args: argparse.Namespace) -> int:
             trace_fh.write(trace_line + "\n")
             trace_fh.flush()
             print(f"{row['group']} {row['task_id']} error={bool(row['error'])}", flush=True)
-            if cost_audit_failure is not None and not continue_after_cost_audit_failure:
+            if cost_audit_failure is not None:
                 break
-    if cost_audit_failure is not None and not continue_after_cost_audit_failure:
+    if cost_audit_failure is not None:
         for task in pending:
             if not task.done():
                 task.cancel()
@@ -9256,8 +10835,7 @@ async def amain(args: argparse.Namespace) -> int:
     for row in rows:
         if (
             cost_audit_failure is not None
-            and str(row.get("error") or "")
-            == "openrouter_non_byok_verification_failed"
+            and str(row.get("error") or "") == "openrouter_non_byok_policy_violation"
         ):
             continue
         completion = row.get("completion_status")
@@ -9339,6 +10917,7 @@ async def amain(args: argparse.Namespace) -> int:
             <= {
                 "cost_metadata_incomplete",
                 "openrouter_non_byok_verification_failed",
+                "openrouter_non_byok_metadata_incomplete",
             }
             else "judge_incomplete"
             if flattened_reasons and flattened_reasons <= {"judge_incomplete"}
@@ -9577,13 +11156,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--judge-model", default="")
     parser.add_argument("--judge-repeats", type=int, default=3)
     parser.add_argument("--judge-concurrency", type=int, default=1)
-    parser.add_argument("--judge-max-attempts", type=int, default=JUDGE_MAX_ATTEMPTS)
+    parser.add_argument(
+        "--judge-max-attempts",
+        type=int,
+        default=JUDGE_MAX_ATTEMPTS,
+        help=(
+            "Cumulative physical attempts for each Judge criterion/repeat unit "
+            "across campaign resume waves; capped at 3."
+        ),
+    )
     parser.add_argument("--judge-candidates", action="store_true")
     parser.add_argument(
         "--generation-max-attempts",
         type=int,
         default=GENERATION_MAX_ATTEMPTS,
-        help="Maximum answer-generation attempts per row; capped at 3.",
+        help=(
+            "Cumulative answer-generation attempts per group/task across campaign "
+            "resume waves; capped at 3."
+        ),
     )
     parser.add_argument(
         "--generation-max-tokens",
@@ -9654,8 +11244,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--continue-after-cost-audit-failure",
         action="store_true",
         help=(
-            "Keep running independent rows after a strict OpenRouter cost-audit failure. "
-            "Failed rows remain invalid and the process still exits with status 2."
+            "Deprecated compatibility flag. Explicit OpenRouter BYOK/provider "
+            "policy violations always stop the run immediately."
         ),
     )
     parser.add_argument(

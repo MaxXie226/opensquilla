@@ -18,9 +18,7 @@ from opensquilla.eval.draco_artifact_integrity import (
 ROOT = Path(__file__).resolve().parents[2]
 PREPARE_CANARY = ROOT / "scripts" / "experiments" / "prepare_draco_b2_canary.py"
 SEAL_ARTIFACTS = ROOT / "scripts" / "experiments" / "seal_draco_b2_artifacts.py"
-CAPTURE_RUNTIME = (
-    ROOT / "scripts" / "experiments" / "capture_draco_runtime_environment.py"
-)
+CAPTURE_RUNTIME = ROOT / "scripts" / "experiments" / "capture_draco_runtime_environment.py"
 
 
 def _load(path: Path, name: str):
@@ -218,3 +216,295 @@ def test_runtime_environment_capture_is_verifiable(
     evidence.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(ValueError, match="runtime changed"):
         module.main()
+
+
+def _owner_only_json(path: Path, payload: dict[str, object]) -> None:
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    path.chmod(0o600)
+
+
+def _formal_g1_config(module, tmp_path: Path) -> tuple[Path, dict[str, object], str]:
+    source = ROOT / "configs" / "benchmarks" / "draco_b2_g12.json"
+    config = json.loads(source.read_text(encoding="utf-8"))
+    path = tmp_path / "experiment-config.json"
+    _owner_only_json(path, config)
+    return path, config, module.file_sha256(path)
+
+
+def _v2_route_preflight(
+    module,
+    *,
+    config_path: Path,
+    config: dict[str, object],
+    config_sha256: str,
+) -> dict[str, object]:
+    g1 = config["g1_routing"]
+    assert isinstance(g1, dict)
+    routes = g1["expected_routes"]
+    assert isinstance(routes, dict)
+    required_parameters = module._formal_required_parameters(routes)
+    return {
+        "schema": module.ROUTE_PREFLIGHT_V2_SCHEMA,
+        "api_origin": "https://openrouter.ai",
+        "scope": "formal",
+        "trust_env": False,
+        "providers_response_sha256": "1" * 64,
+        "expected_routes": routes,
+        "expected_routes_sha256": module.canonical_sha256(routes),
+        "experiment_config": {
+            "path": str(config_path.resolve()),
+            "sha256": config_sha256,
+            "g1_routing_profile_id": g1["profile_id"],
+            "source_registry_snapshot_version": g1["source_registry_snapshot_version"],
+        },
+        "required_parameters_sha256": module.canonical_sha256(required_parameters),
+        "models": {
+            model: {
+                "expected_provider": provider,
+                "response_model_id": model,
+                "response_sha256": "2" * 64,
+                "matching_endpoints": [
+                    {
+                        "tag": provider,
+                        "provider_name": module.EXPECTED_PROVIDER_NAMES[provider],
+                        "model_id": model,
+                        "status": 0,
+                        "supported_parameters": list(required_parameters[model]),
+                    }
+                ],
+                "operational_match_count": 1,
+                "compatible_operational_match_count": 1,
+                "required_parameters": list(required_parameters[model]),
+            }
+            for model, provider in routes.items()
+        },
+        "route_metadata_pass": True,
+    }
+
+
+def _run_formal_success(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    payloads: list[dict[str, object]],
+    experiment_config_sha256: str,
+) -> dict[str, object]:
+    snapshots: list[Path] = []
+    for index in range(3):
+        artifact = tmp_path / f"artifact-{index}.jsonl"
+        artifact.write_text(f"sealed-{index}\n", encoding="utf-8")
+        artifact.chmod(0o600)
+        snapshot = tmp_path / f"snapshot-{index}.json"
+        module.atomic_write_json(
+            snapshot,
+            {
+                "schema": module.SNAPSHOT_SCHEMA,
+                "created_at": "2026-07-25T00:00:00+00:00",
+                "root": ".",
+                "closed_world": False,
+                "allowed_after_snapshot": [],
+                "artifacts": [module.relative_file_record(tmp_path, artifact)],
+            },
+        )
+        snapshots.append(snapshot)
+    evidence_paths: list[Path] = []
+    for index, payload in enumerate(payloads):
+        path = tmp_path / f"route-preflight-{index}.json"
+        module.atomic_write_json(path, payload)
+        evidence_paths.append(path)
+    output = tmp_path / "FORMAL_RUN_SUCCESS.json"
+    argv = [
+        str(SEAL_ARTIFACTS),
+        "success",
+        str(output),
+        "--source-git-head",
+        "a" * 40,
+        "--input-sha256",
+        "b" * 64,
+        "--gateway-config-sha256",
+        "c" * 64,
+        "--experiment-config-sha256",
+        experiment_config_sha256,
+    ]
+    for snapshot in snapshots:
+        argv.extend(("--snapshot", str(snapshot)))
+    for evidence in evidence_paths:
+        argv.extend(("--evidence", str(evidence)))
+    monkeypatch.setattr(sys, "argv", argv)
+    assert module.main() == 0
+    value = json.loads(output.read_text(encoding="utf-8"))
+    assert isinstance(value, dict)
+    return value
+
+
+def test_formal_success_accepts_recomputed_v2_route_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load(
+        SEAL_ARTIFACTS,
+        "seal_draco_artifacts_v2_success_test",
+    )
+    config_path, config, config_sha256 = _formal_g1_config(module, tmp_path)
+    payload = _v2_route_preflight(
+        module,
+        config_path=config_path,
+        config=config,
+        config_sha256=config_sha256,
+    )
+    success = _run_formal_success(
+        module,
+        monkeypatch,
+        tmp_path,
+        payloads=[payload, json.loads(json.dumps(payload))],
+        experiment_config_sha256=config_sha256,
+    )
+    evidence = success["route_preflight_evidence"]
+    assert isinstance(evidence, list)
+    assert {row["route_preflight_schema"] for row in evidence} == {payload["schema"]}
+    contract = evidence[0]["formal_g1_contract"]
+    assert contract["expected_candidate_count"] == 20
+    assert contract["expected_routes_sha256"] == config["g1_routing"]["expected_routes_sha256"]
+
+
+def test_formal_success_rejects_v1_without_endpoint_details(tmp_path: Path) -> None:
+    module = _load(SEAL_ARTIFACTS, "seal_draco_artifacts_v1_rejected_test")
+
+    with pytest.raises(ValueError, match="lacks endpoint details"):
+        module.validate_route_preflight_payload(
+            {"schema": module.ROUTE_PREFLIGHT_V1_SCHEMA, "pass": True},
+            experiment_config_sha256="a" * 64,
+            label="legacy evidence",
+        )
+
+
+@pytest.mark.parametrize(
+    ("bad_field", "error_match"),
+    [
+        ("route_metadata_pass", "metadata did not pass"),
+        ("scope", "scope must be formal"),
+        ("expected_routes_sha256", "expected-routes hash differs"),
+        ("g1_routing_profile_id", "G1 profile differs"),
+        ("models", "model evidence set differs"),
+        ("required_parameters_sha256", "required-parameters hash differs"),
+        ("experiment_config_sha256", "experiment config hash differs"),
+    ],
+)
+def test_v2_route_preflight_rejects_bad_contract_fields(
+    bad_field: str,
+    error_match: str,
+    tmp_path: Path,
+) -> None:
+    module = _load(
+        SEAL_ARTIFACTS,
+        f"seal_draco_artifacts_v2_bad_{bad_field}_test",
+    )
+    config_path, config, config_sha256 = _formal_g1_config(module, tmp_path)
+    payload = _v2_route_preflight(
+        module,
+        config_path=config_path,
+        config=config,
+        config_sha256=config_sha256,
+    )
+    if bad_field == "route_metadata_pass":
+        payload["route_metadata_pass"] = False
+    elif bad_field == "scope":
+        payload["scope"] = "b2"
+    elif bad_field == "expected_routes_sha256":
+        payload["expected_routes_sha256"] = "0" * 64
+    elif bad_field == "g1_routing_profile_id":
+        payload["experiment_config"]["g1_routing_profile_id"] = "wrong-profile"
+    elif bad_field == "models":
+        payload["models"].pop(next(iter(payload["models"])))
+    elif bad_field == "required_parameters_sha256":
+        payload["required_parameters_sha256"] = "0" * 64
+    else:
+        payload["experiment_config"]["sha256"] = "0" * 64
+
+    with pytest.raises(ValueError, match=error_match):
+        module.validate_route_preflight_payload(
+            payload,
+            experiment_config_sha256=config_sha256,
+            label="test evidence",
+        )
+
+
+def test_route_preflight_set_rejects_mixed_v1_v2_schemas(tmp_path: Path) -> None:
+    module = _load(SEAL_ARTIFACTS, "seal_draco_artifacts_mixed_schema_test")
+    config_path, config, config_sha256 = _formal_g1_config(module, tmp_path)
+    v2_payload = _v2_route_preflight(
+        module,
+        config_path=config_path,
+        config=config,
+        config_sha256=config_sha256,
+    )
+    with pytest.raises(ValueError, match="lacks endpoint details"):
+        module.validate_route_preflight_set(
+            [
+                {"schema": module.ROUTE_PREFLIGHT_V1_SCHEMA, "pass": True},
+                v2_payload,
+            ],
+            experiment_config_sha256=config_sha256,
+            labels=["before canary", "before full"],
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "error_match"),
+    [
+        ("inflated_count", "precomputed endpoint counts differ"),
+        ("wrong_status", "no compatible route"),
+        ("wrong_provider_name", "no compatible route"),
+        ("wrong_model_id", "no compatible route"),
+        ("missing_parameter", "no compatible route"),
+        ("wrong_tag", "endpoint provider tag differs"),
+        ("weakened_required_parameters", "frozen parameters differ"),
+    ],
+)
+def test_v2_route_preflight_recomputes_saved_endpoint_compatibility(
+    mutation: str,
+    error_match: str,
+    tmp_path: Path,
+) -> None:
+    module = _load(
+        SEAL_ARTIFACTS,
+        f"seal_draco_artifacts_v2_endpoint_{mutation}_test",
+    )
+    config_path, config, config_sha256 = _formal_g1_config(module, tmp_path)
+    payload = _v2_route_preflight(
+        module,
+        config_path=config_path,
+        config=config,
+        config_sha256=config_sha256,
+    )
+    model = next(iter(payload["models"]))
+    model_row = payload["models"][model]
+    endpoint = model_row["matching_endpoints"][0]
+    if mutation == "inflated_count":
+        model_row["compatible_operational_match_count"] = 2
+    elif mutation == "wrong_status":
+        endpoint["status"] = 1
+    elif mutation == "wrong_provider_name":
+        endpoint["provider_name"] = "Wrong Provider"
+    elif mutation == "wrong_model_id":
+        endpoint["model_id"] = "wrong/model"
+    elif mutation == "missing_parameter":
+        endpoint["supported_parameters"].pop()
+    elif mutation == "wrong_tag":
+        endpoint["tag"] = "wrong-provider"
+    else:
+        model_row["required_parameters"] = model_row["required_parameters"][:-1]
+        payload["required_parameters_sha256"] = module.canonical_sha256(
+            {
+                route_model: payload["models"][route_model]["required_parameters"]
+                for route_model in payload["expected_routes"]
+            }
+        )
+
+    with pytest.raises(ValueError, match=error_match):
+        module.validate_route_preflight_payload(
+            payload,
+            experiment_config_sha256=config_sha256,
+            label="tampered evidence",
+        )

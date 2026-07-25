@@ -32,6 +32,7 @@ from opensquilla.provider.ranking_router import (
     mock_user_profile,
     normalize_task_profile,
     rank_models,
+    ranking_trace_replay_reasons,
 )
 from opensquilla.provider.types import ChatConfig, DoneEvent, Message, TextDeltaEvent
 
@@ -192,6 +193,80 @@ def _decision(
     )
 
 
+def _replayable_decision():
+    return rank_models(
+        task_analysis=_analysis(tier=3),
+        user_profile=None,
+        request_context=_context(),
+        registry_snapshot=_snapshot(
+            _model("alpha", capability=0.95, aggregator_fit=0.82),
+            _model("beta", capability=0.90, aggregator_fit=0.97),
+            _model("gamma", capability=0.85, aggregator_fit=0.88),
+        ),
+        routed_tier="c2",
+        routing_confidence=0.91,
+        decision_id="replay-decision",
+    )
+
+
+def test_ranking_trace_embeds_public_frozen_replay_evidence() -> None:
+    trace = _replayable_decision().trace
+
+    assert trace["registry_snapshot"]["models"]
+    assert trace["request_context"]["snapshot_hash"] == trace["request_context_hash"]
+    assert trace["task_profile_pre_escalation"]
+    assert ranking_trace_replay_reasons(trace) == []
+
+
+@pytest.mark.parametrize("selection_field", ["selected_P", "selected_A"])
+def test_frozen_replay_rejects_valid_pool_selection_swap(
+    selection_field: str,
+) -> None:
+    trace = _replayable_decision().trace
+    tampered = json.loads(json.dumps(trace))
+    pool = [row["identity"] for row in trace["candidate_pool"]]
+    if selection_field == "selected_P":
+        tampered[selection_field] = list(reversed(trace[selection_field]))
+    else:
+        tampered[selection_field] = next(
+            identity for identity in pool if identity != trace[selection_field]
+        )
+
+    assert f"g1_frozen_ranker_replay_mismatch_{selection_field}" in ranking_trace_replay_reasons(
+        tampered
+    )
+
+
+@pytest.mark.parametrize(
+    ("evidence", "needle"),
+    [
+        ({"api_key": "redacted"}, "secret-like field"),
+        ({"nested": {"Authorization": "redacted"}}, "secret-like field"),
+        ({"public_note": "sk-test-secret"}, "secret-like value"),
+    ],
+)
+def test_ranking_trace_rejects_secret_like_replay_evidence(
+    evidence: dict[str, Any],
+    needle: str,
+) -> None:
+    context = _context()
+    context["replay_evidence"] = evidence
+
+    with pytest.raises(DynamicRankingError, match=needle):
+        rank_models(
+            task_analysis=_analysis(tier=3),
+            user_profile=None,
+            request_context=context,
+            registry_snapshot=_snapshot(
+                _model("alpha"),
+                _model("beta"),
+                _model("gamma"),
+            ),
+            routed_tier="c2",
+            routing_confidence=0.9,
+        )
+
+
 def test_packaged_ranking_config_is_versioned_validated_and_isolated() -> None:
     first = load_ranking_config()
     second = load_ranking_config()
@@ -318,19 +393,17 @@ def test_packaged_curated_registry_has_versioned_step2_profiles() -> None:
         assert model["online_profile"]["source"] == "curated_estimate"
 
     curated_models = [
-        model
-        for model in snapshot["models"]
-        if model["source"] == "curated_openrouter_profile"
+        model for model in snapshot["models"] if model["source"] == "curated_openrouter_profile"
     ]
     assert len(curated_models) == 80
-    assert min(
-        model["registry_facts"]["price"]["input_per_million"]
-        for model in curated_models
-    ) <= 0.05
-    assert max(
-        model["static_profile"]["role_fit_prior"]["proposer"]
-        for model in curated_models
-    ) >= 0.94
+    assert (
+        min(model["registry_facts"]["price"]["input_per_million"] for model in curated_models)
+        <= 0.05
+    )
+    assert (
+        max(model["static_profile"]["role_fit_prior"]["proposer"] for model in curated_models)
+        >= 0.94
+    )
 
 
 def test_normalize_task_profile_falls_back_on_missing_required_distributions() -> None:
@@ -856,14 +929,25 @@ def test_ranking_rejects_non_boolean_model_boolean_fact(field: str) -> None:
 class _AnalyzerProvider:
     provider_name = "analyzer-test"
 
-    def __init__(self, response: str | list[str], *, include_done: bool = True) -> None:
+    def __init__(
+        self,
+        response: str | list[str],
+        *,
+        include_done: bool | list[bool] = True,
+    ) -> None:
         self.responses = response if isinstance(response, list) else [response]
-        self.include_done = include_done
+        self.include_done = include_done if isinstance(include_done, list) else [include_done]
         self.calls: list[tuple[list[Message], ChatConfig | None]] = []
 
-    async def _stream(self, response: str) -> AsyncIterator[Any]:
+    async def _stream(
+        self,
+        response: str,
+        *,
+        response_id: str,
+        include_done: bool,
+    ) -> AsyncIterator[Any]:
         yield TextDeltaEvent(text=response)
-        if self.include_done:
+        if include_done:
             yield DoneEvent(
                 model="analyzer-test",
                 input_tokens=11,
@@ -873,7 +957,7 @@ class _AnalyzerProvider:
                 provider_usage={
                     "is_byok": False,
                     "provider_reported_cost": 0.012,
-                    "response_ids": ["analyzer-1"],
+                    "response_ids": [response_id],
                     "router_metadata": {"is_byok": False},
                 },
             )
@@ -885,8 +969,14 @@ class _AnalyzerProvider:
         config: ChatConfig | None = None,
     ) -> AsyncIterator[Any]:
         self.calls.append((messages, config))
-        response = self.responses[min(len(self.calls) - 1, len(self.responses) - 1)]
-        return self._stream(response)
+        attempt = len(self.calls)
+        response = self.responses[min(attempt - 1, len(self.responses) - 1)]
+        include_done = self.include_done[min(attempt - 1, len(self.include_done) - 1)]
+        return self._stream(
+            response,
+            response_id=f"analyzer-{attempt}",
+            include_done=include_done,
+        )
 
     async def list_models(self) -> list[Any]:
         return []
@@ -1111,10 +1201,7 @@ async def test_task_analyzer_omits_user_profile_and_correlates_logs() -> None:
         "llm_ensemble.router_dynamic.task_analyzer_started",
         "llm_ensemble.router_dynamic.task_analyzer_completed",
     ]
-    assert all(
-        row["decision_id"] == "decision-without-profile"
-        for row in analyzer_events
-    )
+    assert all(row["decision_id"] == "decision-without-profile" for row in analyzer_events)
     assert all(row["user_profile_enabled"] is False for row in analyzer_events)
 
 
@@ -1220,11 +1307,58 @@ async def test_task_analyzer_retries_three_times_before_succeeding() -> None:
     assert result.usage["attempt_count"] == 4
     assert result.usage["input_tokens"] == 44
     assert result.usage["billed_cost"] == pytest.approx(0.048)
-    retry_events = [
-        row for row in captured if row["event"].endswith("task_analyzer_retry")
+    physical_attempts = result.usage["physical_attempts"]
+    assert [row["attempt"] for row in physical_attempts] == [1, 2, 3, 4]
+    assert [row["provider_usage"]["response_ids"][0] for row in physical_attempts] == [
+        "analyzer-1",
+        "analyzer-2",
+        "analyzer-3",
+        "analyzer-4",
     ]
+    assert len({row["physical_attempt_id"] for row in physical_attempts}) == 4
+    retry_events = [row for row in captured if row["event"].endswith("task_analyzer_retry")]
     assert [row["attempt"] for row in retry_events] == [1, 2, 3]
     assert not any(row["event"].endswith("task_analyzer_fallback") for row in captured)
+
+
+@pytest.mark.asyncio
+async def test_task_analyzer_preserves_unknown_then_exact_retry_attempts() -> None:
+    config = load_ranking_config()
+    config["task_analyzer"]["max_retries"] = 1
+    provider = _AnalyzerProvider(
+        [
+            json.dumps(_task_profile(tier=2)),
+            json.dumps(_task_profile(tier=2)),
+        ],
+        include_done=[False, True],
+    )
+
+    result = await analyze_task_with_provider(
+        provider=provider,
+        message="hello",
+        user_profile_enabled=False,
+        request_context=_context(),
+        routed_tier="c2",
+        routing_confidence=0.77,
+        analyzer_provider_id=TASK_ANALYZER_PROVIDER_ID,
+        analyzer_model_id=TASK_ANALYZER_MODEL_ID,
+        ranking_config=config,
+        decision_id="a" * 32,
+    )
+
+    assert result.source == "llm_provider"
+    assert result.usage["attempt_count"] == 2
+    attempts = result.usage["physical_attempts"]
+    assert [row["attempt"] for row in attempts] == [1, 2]
+    assert attempts[0]["usage_unknown"] is True
+    assert attempts[0]["provider"] == ""
+    assert attempts[0]["requested_provider"] == TASK_ANALYZER_PROVIDER_ID
+    assert attempts[0]["requested_model"] == TASK_ANALYZER_MODEL_ID
+    assert attempts[0]["cost_source"] == "none"
+    assert attempts[0]["billed_cost"] == 0.0
+    assert attempts[1]["provider_usage"]["response_ids"] == ["analyzer-2"]
+    assert attempts[1].get("usage_unknown") is not True
+    assert len({row["physical_attempt_id"] for row in attempts}) == 2
 
 
 @pytest.mark.asyncio
@@ -1246,6 +1380,7 @@ async def test_task_analyzer_malformed_output_falls_back_to_tree_router_profile(
     assert len(provider.calls) == 4
     assert result.usage["attempt_count"] == 4
     assert result.usage["billed_cost"] == pytest.approx(0.048)
+    assert len(result.usage["physical_attempts"]) == 4
 
 
 @pytest.mark.asyncio
@@ -1428,9 +1563,7 @@ def test_history_reorders_candidates_that_task_match_alone_would_not() -> None:
         liked,
         disliked,
         analysis=_analysis(tier=2),
-        user_profile=_profile_with_history(
-            positive=["liked"], negative=["disliked"], count=20
-        ),
+        user_profile=_profile_with_history(positive=["liked"], negative=["disliked"], count=20),
     )
     assert [m.model_id for m in opinionated.proposers][0] == "liked"
 
@@ -1449,9 +1582,7 @@ def test_history_confidence_ramps_in_with_feedback_count() -> None:
         liked,
         disliked,
         analysis=_analysis(tier=2),
-        user_profile=_profile_with_history(
-            positive=["liked"], negative=["disliked"], count=1
-        ),
+        user_profile=_profile_with_history(positive=["liked"], negative=["disliked"], count=1),
     )
     assert [m.model_id for m in barely.proposers][0] == "disliked"
 
@@ -2024,8 +2155,7 @@ def test_ranking_is_deterministic_for_the_same_snapshot() -> None:
     assert len(first.trace["registry_snapshot_hash"]) == 64
     assert all(len(row["profile_hash"]) == 64 for row in first.trace["candidate_pool"])
     assert all(
-        type(row["is_open_source"]) is bool
-        and type(row["is_chinese_model"]) is bool
+        type(row["is_open_source"]) is bool and type(row["is_chinese_model"]) is bool
         for row in first.trace["candidate_pool"]
     )
 
@@ -2054,8 +2184,6 @@ def test_ranking_emits_the_required_debug_lifecycle_events() -> None:
         "llm_ensemble.router_dynamic.router_decision_recorded",
     }.issubset(event_names)
     lifecycle = [
-        row
-        for row in captured
-        if str(row["event"]).startswith("llm_ensemble.router_dynamic.")
+        row for row in captured if str(row["event"]).startswith("llm_ensemble.router_dynamic.")
     ]
     assert all(row["decision_id"] == "ranking-log-decision" for row in lifecycle)

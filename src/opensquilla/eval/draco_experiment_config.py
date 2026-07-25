@@ -45,6 +45,56 @@ class DracoRoutingConfig(_StrictConfig):
     skip_single_model_router: bool
 
 
+def _canonical_json_sha256(value: Any) -> str:
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+class DracoG1RoutingConfig(_StrictConfig):
+    """Versioned, fail-closed candidate contract for the formal G1 router."""
+
+    profile_id: str = Field(min_length=1)
+    selection_mode: Literal["router_dynamic"]
+    user_profile_enabled: Literal[False]
+    source_registry_snapshot_version: str = Field(min_length=1)
+    expected_source_registry_snapshot_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    expected_ranking_config_schema_version: str = Field(min_length=1)
+    expected_ranking_config_version: str = Field(min_length=1)
+    expected_ranking_config_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    expected_proposer_count_max: int = Field(gt=0)
+    expected_candidate_count: int = Field(gt=0)
+    expected_routes: dict[str, str] = Field(min_length=1)
+    expected_routes_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def _validate_expected_routes(self) -> DracoG1RoutingConfig:
+        if self.expected_proposer_count_max > self.expected_candidate_count:
+            raise ValueError(
+                "g1_routing.expected_proposer_count_max exceeds expected_candidate_count"
+            )
+        if len(self.expected_routes) != self.expected_candidate_count:
+            raise ValueError("g1_routing.expected_routes must match expected_candidate_count")
+        for model, upstream_provider in self.expected_routes.items():
+            if model != model.strip().lower() or "/" not in model:
+                raise ValueError(
+                    "g1_routing.expected_routes model ids must be lowercase, trimmed OpenRouter ids"
+                )
+            if upstream_provider != upstream_provider.strip().lower():
+                raise ValueError(
+                    "g1_routing.expected_routes provider slugs must be lowercase and trimmed"
+                )
+        actual_hash = _canonical_json_sha256(self.expected_routes)
+        if actual_hash != self.expected_routes_sha256:
+            raise ValueError("g1_routing.expected_routes_sha256 does not match expected_routes")
+        return self
+
+
 ThinkingSetting = Literal[
     "off",
     "minimal",
@@ -153,6 +203,7 @@ class DracoWebFetchConfig(_StrictConfig):
 
 class DracoToolsConfig(_StrictConfig):
     mode: Literal["local_web_tools", "provider_only", "openrouter_server_tools"]
+    sandbox_enabled: Literal[False]
     contamination_blocked_domains: list[str]
     web_search: DracoWebSearchConfig
     web_fetch: DracoWebFetchConfig
@@ -173,6 +224,7 @@ class DracoExperimentConfig(_StrictConfig):
     reference: DracoReferenceConfig
     benchmark_input: DracoBenchmarkInputConfig
     routing: DracoRoutingConfig
+    g1_routing: DracoG1RoutingConfig | None = None
     ensemble: DracoEnsembleConfig
     timeouts: DracoTimeoutConfig
     runner: DracoRunnerConfig
