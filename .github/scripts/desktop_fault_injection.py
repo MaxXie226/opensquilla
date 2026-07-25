@@ -43,6 +43,7 @@ from typing import Any
 # A launch that neither answers nor records a terminal event inside this window
 # is reported as ``timeout`` rather than silently passing.
 DEFAULT_TIMEOUT_SECONDS = 180
+_WINDOWS = sys.platform == "win32"
 POLL_INTERVAL_SECONDS = 1.0
 _FAKE_MODEL = "synthetic-fault-injection-model"
 
@@ -472,6 +473,71 @@ def _only_stray_files(user_data: Path, provider_port: int) -> Fixture:
     )
 
 
+def _deny_read(path: Path) -> str:
+    """Make ``path`` unreadable, and say how it was done.
+
+    ``chmod 000`` does not deny the owner a read on Windows, so fall back to an
+    explicit ACL denial there and report when neither is available.
+    """
+
+    if not _WINDOWS:
+        os.chmod(path, 0o000)
+        return "mode 000"
+    account = os.environ.get("USERNAME") or os.environ.get("USER") or ""
+    if account:
+        completed = subprocess.run(
+            ["icacls", str(path), "/deny", f"{account}:(R)"],
+            capture_output=True,
+            check=False,
+        )
+        if completed.returncode == 0:
+            return f"ACL read denied for {account}"
+    os.chmod(path, 0o444)
+    return "read-only attribute only (read denial unavailable)"
+
+
+def _windows_reparse_point(user_data: Path, provider_port: int) -> Fixture:
+    """A directory junction in the container must not be followed.
+
+    Windows reparse points are the analogue of the POSIX symlink boundary, and
+    ``mklink /J`` needs no elevation, so ordinary users really can create one.
+    """
+
+    _primary(
+        user_data,
+        config=_marker_config(1),
+        session_label="primary chat",
+        provider_port=provider_port,
+    )
+    recovery_id = str(uuid.uuid4())
+    _recovery(
+        user_data,
+        recovery_id,
+        config=_marker_config(2),
+        session_label="recovery A",
+        provider_port=provider_port,
+    )
+    outside = user_data.parent / "outside-the-container"
+    outside.mkdir(parents=True, exist_ok=True)
+    (outside / "canary.txt").write_text("must not be touched\n", encoding="utf-8")
+    junction = user_data / "recovery-profiles" / "junction-probe"
+    completed = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(junction), str(outside)],
+        capture_output=True,
+        check=False,
+    )
+    created = completed.returncode == 0
+    return Fixture(
+        user_data,
+        recovery_ids=[recovery_id],
+        primary_session_label="primary chat",
+        notes=[
+            f"junction created: {created}"
+            + ("" if created else f" ({completed.stderr.decode(errors='replace').strip()})")
+        ],
+    )
+
+
 def _readonly_recovery_source(user_data: Path, provider_port: int) -> Fixture:
     """A recovery profile the process cannot read must not lose primary access."""
 
@@ -489,11 +555,12 @@ def _readonly_recovery_source(user_data: Path, provider_port: int) -> Fixture:
         session_label="recovery A",
         provider_port=provider_port,
     )
-    os.chmod(root / "opensquilla" / "state" / "sessions.db", 0o000)
+    database = root / "opensquilla" / "state" / "sessions.db"
+    note = _deny_read(database)
     return Fixture(
         user_data,
         recovery_ids=[recovery_id],
-        notes=["recovery sessions.db is mode 000; primary itself is healthy"],
+        notes=[f"recovery sessions.db: {note}; primary itself is healthy"],
     )
 
 
@@ -549,6 +616,15 @@ SCENARIOS: dict[str, dict[str, Any]] = {
         "expect": "entered",
         "assert_sessions": True,
         "why": "A container with no real profile must be a noop.",
+    },
+    "windows-reparse-point": {
+        "build": _windows_reparse_point,
+        "expect": "blocked",
+        "why": (
+            "Windows-only: a directory junction in the container is the reparse-point "
+            "analogue of the symlink boundary and must be refused, not followed."
+        ),
+        "platforms": ("win32",),
     },
     "readonly-recovery-source": {
         "build": _readonly_recovery_source,
@@ -658,6 +734,8 @@ def _warmup_primary(
 
 
 def _app_binary(app: Path) -> Path:
+    """Resolve the launchable executable from a macOS bundle or Windows layout."""
+
     if app.suffix == ".app":
         candidate = app / "Contents" / "MacOS" / "OpenSquilla"
         if candidate.is_file():
@@ -665,6 +743,18 @@ def _app_binary(app: Path) -> Path:
         raise SystemExit(f"no launchable binary inside {app}")
     if app.is_file():
         return app
+    if app.is_dir():
+        # An unpacked Windows install directory, or a portable extraction.
+        for name in ("OpenSquilla.exe", "opensquilla.exe"):
+            candidate = app / name
+            if candidate.is_file():
+                return candidate
+        matches = sorted(app.glob("*.exe"))
+        if len(matches) == 1:
+            return matches[0]
+        raise SystemExit(
+            f"could not identify a single executable in {app}; pass --app <path-to-exe>"
+        )
     raise SystemExit(f"unrecognized application path: {app}")
 
 
@@ -720,6 +810,15 @@ def _launch(
         }
     )
     log_handle = (user_data.parent / "launch-stdio.log").open("ab")
+    # Electron spawns the gateway as a child, so the launch needs its own group
+    # to be killable as a tree. Windows has no process groups in the POSIX
+    # sense; CREATE_NEW_PROCESS_GROUP is the closest equivalent and taskkill /T
+    # does the tree walk at termination.
+    grouping: dict[str, Any] = (
+        {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}  # type: ignore[attr-defined]
+        if _WINDOWS
+        else {"start_new_session": True}
+    )
     return subprocess.Popen(
         [
             str(binary),
@@ -729,12 +828,30 @@ def _launch(
         env=environment,
         stdout=log_handle,
         stderr=subprocess.STDOUT,
-        start_new_session=True,
+        **grouping,
     )
 
 
 def _terminate(process: subprocess.Popen[bytes]) -> None:
+    """Stop the launch and every process it spawned.
+
+    Leaving the gateway child alive would let it answer the next scenario's
+    health probe and report a false success.
+    """
+
     if process.poll() is not None:
+        return
+    if _WINDOWS:
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+            capture_output=True,
+            check=False,
+        )
+        try:
+            process.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=30)
         return
     try:
         os.killpg(os.getpgid(process.pid), signal.SIGTERM)
@@ -838,6 +955,16 @@ def _run_scenario(
     dry_run: bool,
 ) -> dict[str, Any]:
     scenario = SCENARIOS[name]
+    platforms = scenario.get("platforms")
+    if platforms and sys.platform not in platforms:
+        return {
+            "scenario": name,
+            "why": scenario["why"],
+            "expected": scenario["expect"],
+            "verdict": "skipped",
+            "skipped_reason": f"requires {'/'.join(platforms)}, running on {sys.platform}",
+            "ok": True,
+        }
     # Consolidation refuses profile roots reached through a link, and on macOS
     # /tmp is a symlink to /private/tmp. Resolve so the fixture exercises the
     # product rather than tripping the path guard.
@@ -1013,6 +1140,10 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("list", help="print the scenario catalogue as JSON")
 
+    summarize = sub.add_parser("summarize", help="render a report as a Markdown summary")
+    summarize.add_argument("--report", type=Path, required=True)
+    summarize.add_argument("--title", default="Packaged fault injection")
+
     run = sub.add_parser("run", help="build a fault environment and launch the packaged app")
     run.add_argument("--scenario", action="append", default=None, help="repeatable; default all")
     run.add_argument("--app", type=Path, default=None, help="path to OpenSquilla.app")
@@ -1075,6 +1206,36 @@ def main(argv: list[str] | None = None) -> int:
         # workflow on them would mask new regressions.
         return 0
 
+    if args.command == "summarize":
+        if not args.report.is_file():
+            print(f"No report at {args.report}.")
+            return 0
+        results = json.loads(args.report.read_text(encoding="utf-8"))
+        print(f"## {args.title}\n")
+        print("| scenario | expected | observed | result |")
+        print("| --- | --- | --- | --- |")
+        for item in results:
+            if item.get("verdict") == "skipped":
+                mark = "skipped"
+            elif item["ok"]:
+                mark = "pass"
+            else:
+                mark = "**FAIL**"
+            print(
+                f"| `{item['scenario']}` | {item.get('expected', '-')} "
+                f"| {item['verdict']} | {mark} |"
+            )
+        print("")
+        for item in results:
+            if item.get("ok") or item.get("verdict") == "skipped":
+                continue
+            print(f"### `{item['scenario']}`\n")
+            print(f"{item['why']}\n")
+            for failure in item.get("failures", []):
+                print(f"- {failure}")
+            print("")
+        return 0
+
     if args.command == "list":
         print(
             json.dumps(
@@ -1111,6 +1272,9 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
         latest = results[-1]
+        if latest["verdict"] == "skipped":
+            print(f"[skip] {name}: {latest['skipped_reason']}", flush=True)
+            continue
         status = "ok" if latest["ok"] else "FAIL"
         print(f"[{status}] {name}: verdict={latest['verdict']}", flush=True)
         for failure in latest.get("failures", []):
