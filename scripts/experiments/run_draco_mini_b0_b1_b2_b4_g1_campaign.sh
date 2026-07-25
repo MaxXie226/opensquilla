@@ -8,7 +8,7 @@ readonly REFERENCE_REPO="/home/codex/code/opensquilla"
 readonly INPUT="$REFERENCE_REPO/data/draco/mini.jsonl"
 readonly EXPECTED_INPUT_SHA256="1eb4e618c8df8e7f68bded3d2b6f77a541744aa1072eb338835b776183188a8d"
 readonly CONFIG="$REFERENCE_REPO/.local-state/config.toml"
-readonly GROUPS="B0,B1,B2,B4,G1"
+readonly DRACO_GROUPS="B0,B1,B2,B4,G1"
 readonly BLOCKED_DOMAINS="hf.co,huggingface.co,datasets-server.huggingface.co,github.com,raw.githubusercontent.com,openrouter.ai,perplexity.ai,research.perplexity.ai"
 readonly ACCOUNT_SETTLEMENT_MIN_SECONDS=180
 readonly ACCOUNT_SETTLEMENT_STABLE_POLLS=6
@@ -180,7 +180,7 @@ COMMON_ARGS=(
   --input "$INPUT"
   --config "$CONFIG"
   --experiment-config "$EXPERIMENT_CONFIG"
-  --groups "$GROUPS"
+  --groups "$DRACO_GROUPS"
   --max-tasks 10
   --concurrency 5
   --timeout 3600
@@ -1038,7 +1038,7 @@ FINALIZER_ARGS=(
   --lock-file "$LOCK_FILE"
   --lock-fd 9
   --output-dir "$FINAL_OUTPUT_DIR"
-  --groups "$GROUPS"
+  --groups "$DRACO_GROUPS"
   --max-generation-attempts 3
 )
 for result_jsonl in "${RESULT_JSONLS[@]}"; do

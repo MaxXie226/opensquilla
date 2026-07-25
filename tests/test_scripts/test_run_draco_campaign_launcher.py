@@ -248,8 +248,8 @@ def test_reconciliation_rejects_short_or_mismatched_settlement(
 def test_campaign_shape_and_runtime_policy_are_frozen() -> None:
     script = _script()
     required_fragments = (
-        'readonly GROUPS="B0,B1,B2,B4,G1"',
-        '--groups "$GROUPS"',
+        'readonly DRACO_GROUPS="B0,B1,B2,B4,G1"',
+        '--groups "$DRACO_GROUPS"',
         "--max-tasks 10",
         "--concurrency 5",
         "--experiment-config-set runner.concurrency=5",
@@ -275,7 +275,15 @@ def test_campaign_shape_and_runtime_policy_are_frozen() -> None:
     # Static compatibility, wave 1, and resume waves must fingerprint the
     # same strict non-BYOK policy.
     assert script.count("--require-openrouter-non-byok") == 3
-    assert "B3" not in re.search(r'readonly GROUPS="([^"]+)"', script).group(1).split(",")
+    frozen_groups = re.search(
+        r'readonly DRACO_GROUPS="([^"]+)"',
+        script,
+    )
+    assert frozen_groups is not None
+    assert "B3" not in frozen_groups.group(1).split(",")
+    # GROUPS is a Bash special readonly array containing the process group IDs.
+    # Reusing it silently turns --groups into values such as "1000".
+    assert "readonly GROUPS=" not in script
 
 
 def test_exact_input_and_new_main_repo_report_child_are_enforced() -> None:
@@ -457,7 +465,7 @@ def test_every_prior_result_is_passed_to_resume_and_finalizer() -> None:
         '--runtime-environment "$RUNTIME_ENV"',
         '--lock-file "$LOCK_FILE"',
         '--output-dir "$FINAL_OUTPUT_DIR"',
-        '--groups "$GROUPS"',
+        '--groups "$DRACO_GROUPS"',
         "--max-generation-attempts 3",
     ):
         assert fragment in script
