@@ -6,6 +6,7 @@ import importlib.util
 import inspect
 import json
 import sys
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -4368,6 +4369,10 @@ def test_main_and_resume_share_identical_critical_runtime_functions() -> None:
         "diagnostic_done_from_error_event",
         "aggregate_agent_model_usage",
         "aggregate_agent_ensemble_trace",
+        "ensemble_call_trace_sequence",
+        "admissible_empty_nonterminal_fallback_reasons",
+        "agent_call_output_sequence_reasons",
+        "ensemble_generation_retry_reason",
         "provider_done_from_agent_done",
         "backfill_result_requested_identity",
         "collect_generation_with_retries",
@@ -4400,6 +4405,10 @@ def test_main_and_resume_share_identical_critical_runtime_functions() -> None:
         assert inspect.getsource(getattr(runner, name)) == inspect.getsource(
             getattr(resume_runner, name)
         )
+    assert (
+        runner._ADMISSIBLE_NONTERMINAL_FALLBACK_CORE_REASONS
+        == resume_runner._ADMISSIBLE_NONTERMINAL_FALLBACK_CORE_REASONS
+    )
 
 
 def test_all_serialized_cost_accounting_assignments_strip_private_provenance() -> None:
@@ -6628,14 +6637,20 @@ def test_resume_verifies_b2_runtime_lineup_against_current_contract() -> None:
     assert "wrong_actual_proposer_identity" in failed_receipt_reasons
 
     two_calls = json.loads(json.dumps(row))
-    first_call = json.loads(json.dumps(two_calls["ensemble_trace"]["calls"][0]))
+    terminal_call = json.loads(json.dumps(two_calls["ensemble_trace"]["calls"][0]))
+    terminal_call["agent_call_index"] = 2
+    first_call = json.loads(json.dumps(terminal_call))
     first_call["agent_call_index"] = 1
+    intermediate_text = "intermediate answer segment\n"
+    first_call["final_request"]["output"] = {
+        "text": intermediate_text,
+        "chars": len(intermediate_text),
+        "truncated": False,
+    }
+    two_calls["final_text"] = intermediate_text + row["final_text"]
     two_calls["ensemble_trace"]["calls"] = [
         first_call,
-        {
-            **json.loads(json.dumps(first_call)),
-            "agent_call_index": 2,
-        },
+        terminal_call,
     ]
     two_calls["ensemble_trace"]["agent_llm_call_count"] = 2
     assert (
@@ -6644,6 +6659,17 @@ def test_resume_verifies_b2_runtime_lineup_against_current_contract() -> None:
             expected_run_compatibility_contract=contract,
         )
         == []
+    )
+
+    tampered_intermediate = json.loads(json.dumps(two_calls))
+    tampered_intermediate["ensemble_trace"]["calls"][0]["final_request"]["output"][
+        "text"
+    ] = "x" * len(intermediate_text)
+    assert "wrong_agent_call_output_binding" in (
+        resume_runner.ensemble_generation_completion_reasons(
+            tampered_intermediate,
+            expected_run_compatibility_contract=contract,
+        )
     )
 
     dropped_early = json.loads(json.dumps(two_calls))
@@ -6662,6 +6688,371 @@ def test_resume_verifies_b2_runtime_lineup_against_current_contract() -> None:
         expected_run_compatibility_contract=contract,
     )
     assert "invalid_ensemble_call_trace" in malformed_reasons
+
+
+def _terminal_policy_call(
+    *,
+    index: int,
+    plan: dict[str, object],
+    successful: int,
+    fallback: bool,
+    output: str,
+) -> dict[str, object]:
+    proposer_models = list(plan["proposer_models"])
+    candidates = []
+    for candidate_index, model in enumerate(proposer_models):
+        ok = candidate_index < successful
+        text = f"candidate-{candidate_index}" if ok else ""
+        candidates.append(
+            {
+                "provider": "openrouter",
+                "requested_provider": "openrouter",
+                "model": model,
+                "requested_model": model,
+                "ok": ok,
+                "request_started": True,
+                "physical_request_count": 1,
+                "usage_reported": ok,
+                "stop_reason": "stop" if ok else "",
+                "error": "" if ok else "test failure",
+                "content": {
+                    "text": text,
+                    "chars": len(text),
+                    "truncated": False,
+                },
+            }
+        )
+    role = "fallback_single" if fallback else "aggregator"
+    model = proposer_models[0] if fallback else str(plan["aggregator_model"])
+    return {
+        "agent_call_index": index,
+        "request_outcome": "llm_response",
+        "selection_strategy": plan["selection_mode"],
+        "selection_plan": deepcopy(plan),
+        "successful_proposers": successful,
+        "total_candidates": len(proposer_models),
+        "fallback_used": fallback,
+        "fallback_reason": "sub-quorum" if fallback else "",
+        "candidates": candidates,
+        "final_request_role": role,
+        "final_request": {
+            "role": role,
+            "request_started": True,
+            "error": "",
+            "execution": {
+                "role": role,
+                "requested_provider": "openrouter",
+                "provider": "openrouter",
+                "actual_provider": "openrouter",
+                "requested_model": model,
+                "model": model,
+                "actual_model": model,
+            },
+            "usage": {
+                "stop_reason": "stop",
+                "provider": "openrouter",
+                "model": model,
+                "requested_provider": "openrouter",
+                "requested_model": model,
+            },
+            "output": {
+                "text": output,
+                "chars": len(output),
+                "truncated": False,
+            },
+        },
+    }
+
+
+@pytest.mark.parametrize("module", [runner, _load_resume_runner()], ids=["main", "resume"])
+def test_terminal_policy_allows_only_empty_nonterminal_fallback(module) -> None:
+    plan = {
+        "strategy": "static_openrouter_b5",
+        "selection_mode": "static_openrouter_b5",
+        "profile": "test",
+        "proposer_models": ["p1", "p2", "p3", "p4"],
+        "proposer_sample_count": 4,
+        "selected_P": [
+            "openrouter:p1",
+            "openrouter:p2",
+            "openrouter:p3",
+            "openrouter:p4",
+        ],
+        "aggregator_model": "agg",
+        "selected_A": "openrouter:agg",
+    }
+    fallback = _terminal_policy_call(
+        index=1,
+        plan=plan,
+        successful=2,
+        fallback=True,
+        output="",
+    )
+    terminal = _terminal_policy_call(
+        index=2,
+        plan=plan,
+        successful=4,
+        fallback=False,
+        output="final answer",
+    )
+
+    def retry_reason(calls: list[dict[str, object]], final_text: str) -> str:
+        return module.ensemble_generation_retry_reason(
+            module.RunResult(
+                final_text=final_text,
+                done=module.DoneEvent(
+                    ensemble_trace={
+                        "mode": "agent_loop",
+                        "agent_llm_call_count": len(calls),
+                        "untraced_agent_llm_call_count": 0,
+                        "calls": calls,
+                    }
+                ),
+            ),
+            expected_selection_mode="static_openrouter_b5",
+            expected_selection_plan=plan,
+        )
+
+    assert retry_reason([deepcopy(fallback), deepcopy(terminal)], "final answer") == ""
+
+    visible = deepcopy(fallback)
+    visible["final_request"]["output"] = {
+        "text": "unsafe text",
+        "chars": len("unsafe text"),
+        "truncated": False,
+    }
+    assert (
+        retry_reason([visible, deepcopy(terminal)], "unsafe textfinal answer")
+        == "intermediate_fallback_visible_output"
+    )
+
+    wrong_model = deepcopy(fallback)
+    wrong_model["final_request"]["usage"]["model"] = "outside/model"
+    wrong_model["final_request"]["usage"]["requested_model"] = "outside/model"
+    assert (
+        retry_reason([wrong_model, deepcopy(terminal)], "final answer")
+        == "wrong_intermediate_fallback_model"
+    )
+
+    conflicting_execution = deepcopy(fallback)
+    conflicting_execution["final_request"]["execution"]["actual_model"] = (
+        "outside/model"
+    )
+    assert (
+        retry_reason([conflicting_execution, deepcopy(terminal)], "final answer")
+        == "wrong_intermediate_fallback_model"
+    )
+
+    boolean_chars = deepcopy(fallback)
+    boolean_chars["final_request"]["output"]["chars"] = False
+    assert module.admissible_empty_nonterminal_fallback_reasons(
+        boolean_chars,
+        expected_selection_plan=plan,
+    ) == ["intermediate_fallback_visible_output"]
+
+    assert retry_reason([deepcopy(fallback)], "") == (
+        "aggregator_fallback_used_or_unknown"
+    )
+
+
+@pytest.mark.parametrize("module", [runner, _load_resume_runner()], ids=["main", "resume"])
+def test_agent_ensemble_root_summary_uses_terminal_call(module) -> None:
+    plan = {
+        "selection_mode": "static_openrouter_b5",
+        "proposer_models": ["p1", "p2", "p3", "p4"],
+        "selected_P": [
+            "openrouter:p1",
+            "openrouter:p2",
+            "openrouter:p3",
+            "openrouter:p4",
+        ],
+        "aggregator_model": "agg",
+        "selected_A": "openrouter:agg",
+    }
+    recorder = module.BenchmarkTurnCallRecorder()
+    for call in (
+        _terminal_policy_call(
+            index=1,
+            plan=plan,
+            successful=2,
+            fallback=True,
+            output="",
+        ),
+        _terminal_policy_call(
+            index=2,
+            plan=plan,
+            successful=4,
+            fallback=False,
+            output="final answer",
+        ),
+    ):
+        recorder.write(
+            "llm_response",
+            {
+                "iteration": call["agent_call_index"],
+                "attempt": 1,
+                "ensemble_trace": call,
+            },
+        )
+
+    trace = module.aggregate_agent_ensemble_trace(recorder.records)
+
+    assert trace["fallback_used"] is False
+    assert trace["final_request_role"] == "aggregator"
+    assert trace["successful_proposers"] == 4
+    assert trace["total_candidates"] == 4
+    assert trace["terminal_call_index"] == 2
+    assert trace["any_intermediate_fallback"] is True
+    assert trace["intermediate_fallback_call_indexes"] == [1]
+
+
+def test_resume_reclassifies_one_legacy_terminal_attempt_without_hiding_spend() -> None:
+    module = _load_resume_runner()
+    plan = {
+        "strategy": "static_openrouter_b5",
+        "selection_mode": "static_openrouter_b5",
+        "profile": "test",
+        "proposer_models": ["p1", "p2", "p3", "p4"],
+        "proposer_sample_count": 4,
+        "selected_P": [
+            "openrouter:p1",
+            "openrouter:p2",
+            "openrouter:p3",
+            "openrouter:p4",
+        ],
+        "aggregator_model": "agg",
+        "selected_A": "openrouter:agg",
+    }
+    calls = [
+        _terminal_policy_call(
+            index=1,
+            plan=plan,
+            successful=2,
+            fallback=True,
+            output="",
+        ),
+        _terminal_policy_call(
+            index=2,
+            plan=plan,
+            successful=4,
+            fallback=False,
+            output="final answer",
+        ),
+    ]
+
+    def usage(response_id: str, cost: float) -> dict[str, object]:
+        return {
+            "provider": "openrouter",
+            "model": "agg",
+            "requested_provider": "openrouter",
+            "requested_model": "agg",
+            "input_tokens": 10,
+            "output_tokens": 5,
+            "billed_cost": cost,
+            "cost_source": "provider_billed",
+            "provider_usage": _openrouter_exact_evidence(cost, response_id),
+        }
+
+    selected_usage = usage("selected-generation", 0.1)
+    attempts = []
+    for index, (answer, attempt_usage, error) in enumerate(
+        (
+            (
+                "final answer",
+                selected_usage,
+                module.LEGACY_TERMINAL_POLICY_ERROR,
+            ),
+            ("later answer 2", usage("extra-generation-2", 0.2), "other failure"),
+            ("later answer 3", usage("extra-generation-3", 0.3), "other failure"),
+        ),
+        start=1,
+    ):
+        attempts.append(
+            {
+                "attempt_id": f"{index:032x}",
+                "attempt_kind": "generation",
+                "attempt": index,
+                "started_at": float(index),
+                "completed_at": float(index + 1),
+                "retry_reason": error,
+                "run": {
+                    "error": error,
+                    "final_text_sha256": module.text_sha256(answer),
+                    "latency_ms": 100 * index,
+                    "stream_tool_call_count": index,
+                    "server_tool_call_count": 0,
+                    "server_tool_use": {},
+                    "total_tool_call_count": index,
+                    "trajectory_steps": index + 1,
+                    "llm_request_count": 1,
+                    "usage_unknown_count": 0,
+                    "usage": attempt_usage,
+                },
+            }
+        )
+    row = {
+        "group": "B2",
+        "provider_spec": dict(module.GROUP_SPECS["B2"]),
+        "routing_trace": {"selection_plan": plan},
+        "final_text": "final answer",
+        "final_text_sha256": module.text_sha256("final answer"),
+        "final_text_chars": len("final answer"),
+        "error": module.LEGACY_TERMINAL_POLICY_ERROR,
+        "selected_generation_succeeded": False,
+        "usage": selected_usage,
+        "ensemble_trace": {
+            "mode": "agent_loop",
+            "agent_llm_call_count": 2,
+            "untraced_agent_llm_call_count": 0,
+            "calls": calls,
+        },
+        "execution": {
+            "run_error": module.LEGACY_TERMINAL_POLICY_ERROR,
+            "selected_generation_attempt": 0,
+            "generation_attempts": attempts,
+        },
+        "completion_status": {
+            "generation_accepted": False,
+            "incomplete_reasons": [module.LEGACY_TERMINAL_POLICY_ERROR],
+        },
+        "generation_attempt_count": 3,
+        "actual_spend_metrics": {"generation_attempt_count": 3},
+    }
+
+    assert module.apply_terminal_generation_reclassification(
+        row,
+        expected_run_compatibility_contract=None,
+    )
+    assert row["selected_generation_succeeded"] is True
+    assert row["execution"]["selected_generation_attempt"] == 1
+    assert row["execution"]["generation_attempts"][0]["run"]["error"] == (
+        module.LEGACY_TERMINAL_POLICY_ERROR
+    )
+    assert row["selected_attempt_billed_cost_usd"] == pytest.approx(0.1)
+    accounting = module.row_cost_accounting(row)
+    assert accounting["selected_generation_attempt"]["recorded_cost_usd"] == (
+        pytest.approx(0.1)
+    )
+    assert accounting["actual_generation_spend"]["recorded_cost_usd"] == (
+        pytest.approx(0.6)
+    )
+    prompt_hash = module.text_sha256("same prompt")
+    row.update(
+        {
+            "task_id": "task-1",
+            "prompt_sha256": prompt_hash,
+            "task_input_sha256": "sha256:task-input",
+            "run_compatibility_fingerprint": "sha256:run-contract",
+        }
+    )
+    state = module.resume_row_completion_state(
+        module.seal_result_row(row),
+        expected_prompt_sha256=prompt_hash,
+        expected_task_input_sha256="sha256:task-input",
+        expected_run_compatibility_fingerprint="sha256:run-contract",
+    )
+    assert state["generation_valid"] is True, state
+    assert state["action"] == "judge_only"
 
 
 @pytest.mark.parametrize("module", [runner, _load_resume_runner()], ids=["main", "resume"])
@@ -7051,6 +7442,177 @@ def test_g1_registry_contract_rejects_allowlist_trace_drift(module) -> None:
     assert "wrong_g1_selected_proposers" in module.g1_registry_contract_reasons(
         duplicate_proposer, contract
     )
+
+
+def test_resume_reuses_g1_plan_and_analyzer_within_one_provider_lifecycle() -> None:
+    module = _load_resume_runner()
+    from opensquilla.provider.ranking_router import (
+        TASK_ANALYZER_MODEL_ID,
+        TASK_ANALYZER_PROVIDER_ID,
+    )
+
+    experiment = _experiment_config()
+    contract = experiment.g1_routing.model_dump(mode="json")
+    config = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "deepseek/deepseek-v4-pro",
+            "api_key": "fake",
+            "provider_routing": experiment.g1_routing.expected_routes,
+        },
+        llm_ensemble={"enabled": True, "selection_mode": "router_dynamic"},
+    )
+    inherited = ProviderConfig(
+        provider="openrouter",
+        model="deepseek/deepseek-v4-pro",
+        api_key="fake",
+        provider_routing=experiment.g1_routing.expected_routes,
+    )
+    provider = build_ensemble_provider_from_config(
+        config=config,
+        inherited_provider_config=inherited,
+        fallback_provider=None,
+        turn_metadata={"routed_tier": "c1", "routing_confidence": 0.9},
+        ranking_inputs={
+            "registry_allowlist": experiment.g1_routing.model_dump(mode="json")
+        },
+    )
+    plan = deepcopy(provider.selection_plan)
+    final_text = "answer"
+    selected_usage = {
+        "provider": "openrouter",
+        "model": plan["aggregator_model"],
+        "requested_provider": "openrouter",
+        "requested_model": plan["aggregator_model"],
+        "input_tokens": 3,
+        "output_tokens": 1,
+    }
+    analyzer = {
+        "role": "task_analyzer",
+        "provider": TASK_ANALYZER_PROVIDER_ID,
+        "model": TASK_ANALYZER_MODEL_ID,
+        "requested_provider": TASK_ANALYZER_PROVIDER_ID,
+        "requested_model": TASK_ANALYZER_MODEL_ID,
+        "input_tokens": 3,
+        "output_tokens": 1,
+    }
+    row = {
+        "group": "G1",
+        "provider_spec": dict(module.GROUP_SPECS["G1"]),
+        "routing_trace": {},
+        "final_text": final_text,
+        "final_text_sha256": module.text_sha256(final_text),
+        "usage": selected_usage,
+        "ensemble_trace": {
+            "mode": "agent_loop",
+            "agent_llm_call_count": 1,
+            "untraced_agent_llm_call_count": 0,
+            "calls": [
+                _terminal_policy_call(
+                    index=1,
+                    plan=plan,
+                    successful=len(plan["proposer_models"]),
+                    fallback=False,
+                    output=final_text,
+                )
+            ],
+        },
+        "execution": {
+            "selected_generation_attempt": 2,
+            "generation_attempts": [
+                {
+                    "attempt_id": "1" * 32,
+                    "attempt": 1,
+                    "run": {
+                        "error": "retry",
+                        "final_text_sha256": module.text_sha256("earlier"),
+                        "llm_request_count": 1,
+                        "routing_trace": {
+                            "kind": "selection_mode",
+                            "selection_mode": "router_dynamic",
+                            "selection_plan": deepcopy(plan),
+                        },
+                        "usage": {"model_usage_breakdown": [analyzer]},
+                    },
+                },
+                {
+                    "attempt_id": "2" * 32,
+                    "attempt": 2,
+                    "run": {
+                        "error": "",
+                        "final_text_sha256": module.text_sha256(final_text),
+                        "llm_request_count": 1,
+                        "routing_trace": {},
+                        "usage": deepcopy(selected_usage),
+                    },
+                },
+            ],
+        },
+    }
+    compatibility = {"g1_registry_contract": contract}
+
+    assert (
+        module.ensemble_generation_completion_reasons(
+            row,
+            expected_run_compatibility_contract=compatibility,
+        )
+        == []
+    )
+
+    conflict = deepcopy(row)
+    conflict["ensemble_trace"]["calls"][0]["selection_plan"]["decision_id"] = (
+        "conflicting-decision"
+    )
+    conflict_reasons = module.ensemble_generation_completion_reasons(
+        conflict,
+        expected_run_compatibility_contract=compatibility,
+    )
+    assert "g1_lifecycle_plan_differs_from_physical_plan" in conflict_reasons
+
+    missing_analyzer = deepcopy(row)
+    missing_analyzer["execution"]["generation_attempts"][0]["run"]["usage"] = {
+        "model_usage_breakdown": []
+    }
+    assert (
+        "missing_g1_task_analyzer_request"
+        in module.ensemble_generation_completion_reasons(
+            missing_analyzer,
+            expected_run_compatibility_contract=compatibility,
+        )
+    )
+
+    repeated_analyzer = deepcopy(row)
+    repeated_analyzer["execution"]["generation_attempts"][1]["run"]["usage"][
+        "model_usage_breakdown"
+    ] = [deepcopy(analyzer)]
+    assert (
+        "repeated_g1_task_analyzer_request"
+        in module.ensemble_generation_completion_reasons(
+            repeated_analyzer,
+            expected_run_compatibility_contract=compatibility,
+        )
+    )
+
+    prompt_hash = module.text_sha256("same prompt")
+    row.update(
+        {
+            "task_id": "task-1",
+            "prompt_sha256": prompt_hash,
+            "task_input_sha256": "sha256:task-input",
+            "run_compatibility_fingerprint": "sha256:run-contract",
+            "quality_total": 80.0,
+            "judge": _complete_legacy_judge("g1-lifecycle-judge"),
+        }
+    )
+    state = module.resume_row_completion_state(
+        module.seal_result_row(row),
+        expected_prompt_sha256=prompt_hash,
+        expected_task_input_sha256="sha256:task-input",
+        expected_run_compatibility_fingerprint="sha256:run-contract",
+        expected_run_compatibility_contract=compatibility,
+    )
+    assert state["generation_valid"] is True, state
+    assert state["action"] == "metadata_only"
 
 
 @pytest.mark.parametrize("module", [runner, _load_resume_runner()], ids=["main", "resume"])
@@ -7792,6 +8354,121 @@ async def test_provider_build_failure_preserves_already_billed_setup_receipt(
     assert row["usage"]["model_usage_breakdown"] == [setup_usage]
     assert runner.openrouter_non_byok_audit(row)["pass"] is True
     assert judge_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("module", [runner, _load_resume_runner()], ids=["main", "resume"])
+async def test_run_one_freezes_dataclass_routing_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+    module,
+) -> None:
+    config, inherited = _openrouter_config()
+    receipt = ProviderBillingReceipt(
+        currency="USD",
+        status="confirmed",
+        amount_nanos=10_000_000,
+        usd_equivalent_nanos=10_000_000,
+        fx_native_per_usd_nanos=1_000_000_000,
+    )
+    model = str(module.GROUP_SPECS["B0"]["model"])
+    usage_row = {
+        "provider": "openrouter",
+        "model": model,
+        "requested_provider": "openrouter",
+        "requested_model": model,
+        "input_tokens": 3,
+        "output_tokens": 1,
+        "billed_cost": 0.01,
+        "cost_source": "provider_billed",
+        "provider_usage": _openrouter_exact_evidence(
+            0.01,
+            f"dataclass-routing-{module.__name__}",
+        ),
+    }
+    done = DoneEvent(
+        input_tokens=3,
+        output_tokens=1,
+        billed_cost=0.01,
+        cost_source="provider_billed",
+        provider="openrouter",
+        model=model,
+        requested_provider="openrouter",
+        requested_model=model,
+        model_usage_breakdown=[usage_row],
+    )
+    result = module.RunResult(final_text="answer", done=done)
+    attempts = [
+        {
+            "attempt_id": "1" * 32,
+            "attempt_kind": "generation",
+            "attempt": 1,
+            "started_at": 1.0,
+            "completed_at": 2.0,
+            "retryable": False,
+            "retry_reason": "",
+            "will_retry": False,
+            "retry_backoff_s": 0.0,
+            "run": module.run_result_summary(result),
+        }
+    ]
+
+    async def fake_build_experiment_provider(**_kwargs):
+        return module.ProviderBuildResult(
+            provider=object(),
+            prompt="prompt",
+            routing_trace={
+                "kind": "single",
+                "model": model,
+                "billing_receipt": receipt,
+            },
+        )
+
+    async def fake_collect_generation_with_retries(*_args, **_kwargs):
+        return result, attempts, 1
+
+    async def fake_judge_text(**_kwargs):
+        return _complete_legacy_judge(
+            f"dataclass-routing-judge-{module.__name__}"
+        )
+
+    monkeypatch.setattr(
+        module,
+        "build_experiment_provider",
+        fake_build_experiment_provider,
+    )
+    monkeypatch.setattr(
+        module,
+        "collect_generation_with_retries",
+        fake_collect_generation_with_retries,
+    )
+    monkeypatch.setattr(module, "judge_text", fake_judge_text)
+
+    row = await module.run_one(
+        task={"id": "task-1", "prompt": "prompt"},
+        group="B0",
+        config=config,
+        inherited=inherited,
+        dry_run=False,
+        judge_provider=object(),
+        judge_candidates=False,
+        judge_repeats=1,
+        judge_concurrency=1,
+        judge_max_attempts=1,
+        judge_semaphore=None,
+        timeout=10.0,
+        ensemble_proposer_timeout=None,
+        ensemble_aggregator_timeout=None,
+        ensemble_proposer_early_stop_success_count=None,
+        ensemble_proposer_early_stop_after=None,
+        expand_ensemble_timeouts_to_task_timeout=False,
+        tool_policy={"tools_enabled": False, "tool_mode": "provider_only"},
+        generation_policy={},
+    )
+
+    assert row["selected_generation_succeeded"] is True
+    assert row["execution"]["provider_error"] == ""
+    assert row["routing_trace"]["billing_receipt"]["status"] == "confirmed"
+    assert isinstance(row["routing_trace"]["billing_receipt"], dict)
 
 
 @pytest.mark.parametrize("module", [runner, _load_resume_runner()], ids=["main", "resume"])

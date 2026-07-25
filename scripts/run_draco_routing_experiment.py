@@ -19,7 +19,7 @@ import subprocess
 import sys
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from functools import cache
 from pathlib import Path
@@ -4020,6 +4020,7 @@ def aggregate_agent_ensemble_trace(records: list[dict[str, Any]]) -> dict[str, A
     call_records = llm_response_records(records)
     traces: list[dict[str, Any]] = []
     first_real_trace: dict[str, Any] | None = None
+    last_real_trace: dict[str, Any] | None = None
     total_llm_requests = 0
     untraced_llm_requests = 0
     for call_index, record in enumerate(call_records, start=1):
@@ -4104,6 +4105,7 @@ def aggregate_agent_ensemble_trace(records: list[dict[str, Any]]) -> dict[str, A
         enriched = dict(trace)
         if first_real_trace is None:
             first_real_trace = enriched
+        last_real_trace = enriched
         enriched["request_outcome"] = str(record.get("kind") or "unknown")
         enriched["agent_call_index"] = call_index
         if payload.get("call_id") is not None:
@@ -4123,6 +4125,7 @@ def aggregate_agent_ensemble_trace(records: list[dict[str, Any]]) -> dict[str, A
     if not call_records:
         return {}
     first_trace = first_real_trace or {}
+    terminal_trace = last_real_trace or {}
     payload: dict[str, Any] = {
         "mode": "agent_loop",
         "agent_llm_call_count": len(call_records),
@@ -4143,10 +4146,6 @@ def aggregate_agent_ensemble_trace(records: list[dict[str, Any]]) -> dict[str, A
     for key in (
         "profile",
         "shuffle_candidates",
-        "successful_proposers",
-        "total_candidates",
-        "fallback_used",
-        "final_request_role",
         "moa_layers",
         "moa_refine_count",
         "moa_intermediate_layers",
@@ -4154,10 +4153,28 @@ def aggregate_agent_ensemble_trace(records: list[dict[str, Any]]) -> dict[str, A
     ):
         if key in first_trace:
             payload[key] = first_trace[key]
-    if first_trace.get("output_strategy") == "select_best_candidate":
+    for key in (
+        "successful_proposers",
+        "total_candidates",
+        "fallback_used",
+        "final_request_role",
+    ):
+        if key in terminal_trace:
+            payload[key] = terminal_trace[key]
+    intermediate_fallback_indexes = [
+        coerce_metric_int(call.get("agent_call_index"))
+        for call in traces[:-1]
+        if call.get("fallback_used") is True
+    ]
+    payload["terminal_call_index"] = coerce_metric_int(
+        terminal_trace.get("agent_call_index")
+    )
+    payload["any_intermediate_fallback"] = bool(intermediate_fallback_indexes)
+    payload["intermediate_fallback_call_indexes"] = intermediate_fallback_indexes
+    if terminal_trace.get("output_strategy") == "select_best_candidate":
         for key in ("selected_candidate_count", "selected_candidate_indexes"):
-            if key in first_trace:
-                payload[key] = first_trace[key]
+            if key in terminal_trace:
+                payload[key] = terminal_trace[key]
     return payload
 
 
@@ -6149,6 +6166,173 @@ def ensemble_call_trace_sequence(
     return call_traces, reasons
 
 
+_ADMISSIBLE_NONTERMINAL_FALLBACK_CORE_REASONS = frozenset(
+    {
+        "aggregator_fallback_used_or_unknown",
+        "final_request_not_aggregator",
+        "insufficient_proposer_quorum",
+        "insufficient_configured_proposer_quorum",
+        "insufficient_actual_proposer_quorum",
+        "aggregator_request_incomplete",
+    }
+)
+
+
+def admissible_empty_nonterminal_fallback_reasons(
+    trace: Mapping[str, Any],
+    *,
+    expected_selection_plan: Mapping[str, Any] | None = None,
+) -> list[str]:
+    """Validate the one nonterminal fallback shape that cannot add answer text."""
+
+    reasons: list[str] = []
+    if str(trace.get("request_outcome") or "llm_response") != "llm_response":
+        reasons.append("invalid_intermediate_fallback_outcome")
+    if trace.get("fallback_used") is not True:
+        reasons.append("invalid_intermediate_fallback_flag")
+    if str(trace.get("final_request_role") or "") != "fallback_single":
+        reasons.append("invalid_intermediate_fallback_role")
+    total = trace.get("total_candidates")
+    successful = trace.get("successful_proposers")
+    if (
+        not isinstance(total, int)
+        or isinstance(total, bool)
+        or total <= 0
+        or not isinstance(successful, int)
+        or isinstance(successful, bool)
+        or not 0 <= successful < legal_proposer_quorum(total)
+    ):
+        reasons.append("invalid_intermediate_fallback_quorum")
+    final_request = trace.get("final_request")
+    if (
+        not isinstance(final_request, Mapping)
+        or final_request.get("request_started") is not True
+        or str(final_request.get("role") or "") != "fallback_single"
+        or final_request.get("error")
+        or trace.get("aggregator_error")
+    ):
+        reasons.append("invalid_intermediate_fallback_request")
+        return list(dict.fromkeys(reasons))
+    output = final_request.get("output")
+    output_chars = output.get("chars") if isinstance(output, Mapping) else None
+    if (
+        not isinstance(output, Mapping)
+        or output.get("text") != ""
+        or not isinstance(output_chars, int)
+        or isinstance(output_chars, bool)
+        or output_chars != 0
+        or output.get("truncated") is not False
+    ):
+        reasons.append("intermediate_fallback_visible_output")
+    usage = final_request.get("usage")
+    if not isinstance(usage, Mapping):
+        reasons.append("missing_intermediate_fallback_usage")
+        return list(dict.fromkeys(reasons))
+    execution = final_request.get("execution")
+    if not isinstance(execution, Mapping):
+        reasons.append("missing_intermediate_fallback_execution")
+        return list(dict.fromkeys(reasons))
+    actual_provider = str(usage.get("provider") or "").strip().casefold()
+    requested_provider = str(usage.get("requested_provider") or "").strip().casefold()
+    actual_model = str(usage.get("model") or "").strip()
+    requested_model = str(usage.get("requested_model") or "").strip()
+    execution_providers = [
+        str(execution.get(field) or "").strip().casefold()
+        for field in ("requested_provider", "provider", "actual_provider")
+    ]
+    execution_models = [
+        str(execution.get(field) or "").strip()
+        for field in ("requested_model", "model", "actual_model")
+    ]
+    if (
+        actual_provider != "openrouter"
+        or requested_provider != "openrouter"
+        or any(provider != "openrouter" for provider in execution_providers)
+    ):
+        reasons.append("wrong_intermediate_fallback_provider")
+    plan = (
+        dict(expected_selection_plan)
+        if isinstance(expected_selection_plan, Mapping)
+        else {}
+    )
+    selected_p = plan.get("selected_P")
+    allowed_models = [
+        str(identity).partition(":")[2].strip()
+        for identity in selected_p
+        if isinstance(identity, str)
+        and identity.partition(":")[1] == ":"
+        and identity.partition(":")[0].strip().casefold() == "openrouter"
+        and identity.partition(":")[2].strip()
+    ] if isinstance(selected_p, list) else []
+    if (
+        not actual_model
+        or not requested_model
+        or not allowed_models
+        or not any(
+            _formal_openrouter_models_equivalent(actual_model, model)
+            and _formal_openrouter_models_equivalent(requested_model, model)
+            and all(
+                _formal_openrouter_models_equivalent(execution_model, model)
+                for execution_model in execution_models
+            )
+            for model in allowed_models
+        )
+    ):
+        reasons.append("wrong_intermediate_fallback_model")
+    if str(execution.get("role") or "") != "fallback_single":
+        reasons.append("wrong_intermediate_fallback_execution_role")
+    if not str(usage.get("stop_reason") or "").strip() and not ensemble_metadata_field_resolved(
+        final_request,
+        "stop_reason",
+    ):
+        reasons.append("missing_intermediate_fallback_stop_reason")
+    return list(dict.fromkeys(reasons))
+
+
+def agent_call_output_sequence_reasons(
+    calls: Sequence[Mapping[str, Any]],
+    *,
+    final_text: str,
+) -> list[str]:
+    """Bind every visible Agent-loop response segment to the stored answer."""
+
+    if len(calls) <= 1:
+        return []
+    reasons: list[str] = []
+    offset = 0
+    for call in calls:
+        final_request = call.get("final_request")
+        output = (
+            final_request.get("output")
+            if isinstance(final_request, Mapping)
+            else None
+        )
+        if not isinstance(output, Mapping):
+            reasons.append("missing_agent_call_output_binding")
+            continue
+        output_text = output.get("text")
+        output_chars = output.get("chars")
+        if (
+            not isinstance(output_text, str)
+            or not isinstance(output_chars, int)
+            or isinstance(output_chars, bool)
+            or output_chars < 0
+            or offset + output_chars > len(final_text)
+        ):
+            reasons.append("invalid_agent_call_output_binding")
+            continue
+        segment = final_text[offset : offset + output_chars]
+        if output.get("truncated") is True:
+            if not segment.startswith(output_text):
+                reasons.append("wrong_agent_call_output_binding")
+        elif len(output_text) != output_chars or output_text != segment:
+            reasons.append("wrong_agent_call_output_binding")
+        offset += output_chars
+    if offset != len(final_text):
+        reasons.append("incomplete_agent_call_output_binding")
+    return list(dict.fromkeys(reasons))
+
+
 def ensemble_generation_retry_reason(
     result: RunResult,
     *,
@@ -6167,6 +6351,12 @@ def ensemble_generation_retry_reason(
         return sequence_reasons[0]
     if not call_traces:
         return "missing_ensemble_call_trace"
+    output_sequence_reasons = agent_call_output_sequence_reasons(
+        call_traces,
+        final_text=result.final_text,
+    )
+    if output_sequence_reasons:
+        return output_sequence_reasons[0]
     for index, call_trace in enumerate(call_traces):
         reasons = ensemble_call_core_reasons(
             call_trace,
@@ -6179,6 +6369,18 @@ def ensemble_generation_retry_reason(
         generation_reasons = [
             reason for reason in reasons if not ensemble_metadata_only_reason(reason)
         ]
+        if index < len(call_traces) - 1 and call_trace.get("fallback_used") is True:
+            fallback_reasons = admissible_empty_nonterminal_fallback_reasons(
+                call_trace,
+                expected_selection_plan=expected_selection_plan,
+            )
+            if fallback_reasons:
+                return fallback_reasons[0]
+            generation_reasons = [
+                reason
+                for reason in generation_reasons
+                if reason not in _ADMISSIBLE_NONTERMINAL_FALLBACK_CORE_REASONS
+            ]
         if generation_reasons:
             return generation_reasons[0]
     return ""
@@ -7405,9 +7607,14 @@ async def run_one(
             experiment_config=experiment_config,
             generation_policy=generation_policy,
         )
-        provider = build.provider
         effective_prompt = build.prompt
-        frozen_build_routing_trace = json.loads(json.dumps(build.routing_trace, ensure_ascii=False))
+        safe_routing_trace = json_safe(build.routing_trace)
+        if not isinstance(safe_routing_trace, Mapping):
+            raise TypeError("provider routing trace must serialize to an object")
+        frozen_build_routing_trace = json.loads(
+            json.dumps(dict(safe_routing_trace), ensure_ascii=False)
+        )
+        provider = build.provider
         generation_config = with_openrouter_model_capabilities(
             generation_config,
             str(

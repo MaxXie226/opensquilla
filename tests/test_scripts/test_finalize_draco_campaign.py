@@ -288,6 +288,64 @@ def _ensemble_trace(
     }
 
 
+def _nonterminal_fallback_call(
+    terminal_call: dict[str, object],
+    *,
+    successful: int,
+    output: str = "",
+) -> dict[str, object]:
+    call = deepcopy(terminal_call)
+    call["agent_call_index"] = 1
+    call["successful_proposers"] = successful
+    call["fallback_used"] = True
+    call["final_request_role"] = "fallback_single"
+    candidates = call["candidates"]
+    assert isinstance(candidates, list)
+    for index, candidate in enumerate(candidates):
+        assert isinstance(candidate, dict)
+        if index < successful:
+            continue
+        candidate.update(
+            {
+                "ok": False,
+                "error": "test proposer failure",
+                "content": {"text": "", "chars": 0, "truncated": False},
+            }
+        )
+    plan = call["selection_plan"]
+    assert isinstance(plan, dict)
+    fallback_model = str(plan["proposer_models"][0])
+    final_request = call["final_request"]
+    assert isinstance(final_request, dict)
+    final_request.update(
+        {
+            "role": "fallback_single",
+            "execution": {
+                "role": "fallback_single",
+                "provider": "openrouter",
+                "actual_provider": "openrouter",
+                "model": fallback_model,
+                "actual_model": fallback_model,
+                "requested_provider": "openrouter",
+                "requested_model": fallback_model,
+            },
+            "usage": {
+                "provider": "openrouter",
+                "model": fallback_model,
+                "requested_provider": "openrouter",
+                "requested_model": fallback_model,
+                "stop_reason": "stop",
+            },
+            "output": {
+                "text": output,
+                "chars": len(output),
+                "truncated": False,
+            },
+        }
+    )
+    return call
+
+
 def _contract(module, group: str, key_hash: str) -> dict[str, object]:
     fixed = {
         "B0": "anthropic/claude-opus-4.8",
@@ -779,6 +837,306 @@ def _row(
         },
     }
     return module.seal_result_row(row)
+
+
+def test_ensemble_gate_allows_only_empty_nonterminal_fallback(module) -> None:
+    final_text = "final answer"
+    trace = _ensemble_trace(
+        list(module.B2_PROPOSERS),
+        module.B2_AGGREGATOR,
+        final_text=final_text,
+        selection_mode="static_openrouter_b5",
+    )
+    terminal = deepcopy(trace["calls"][0])
+    terminal["agent_call_index"] = 2
+    fallback = _nonterminal_fallback_call(terminal, successful=2)
+    row = {
+        "final_text": final_text,
+        "routing_trace": {
+            "selection_plan": deepcopy(terminal["selection_plan"]),
+        },
+        "ensemble_trace": {
+            "mode": "agent_loop",
+            "agent_llm_call_count": 2,
+            "untraced_agent_llm_call_count": 0,
+            "calls": [fallback, terminal],
+        },
+    }
+
+    assert (
+        module.ensemble_gate(
+            row,
+            expected_proposers=module.B2_PROPOSERS,
+            expected_aggregator=module.B2_AGGREGATOR,
+        )
+        == []
+    )
+
+    visible = deepcopy(row)
+    visible["ensemble_trace"]["calls"][0]["final_request"]["output"] = {
+        "text": "unsafe text",
+        "chars": len("unsafe text"),
+        "truncated": False,
+    }
+    assert "intermediate_fallback_visible_output" in module.ensemble_gate(
+        visible,
+        expected_proposers=module.B2_PROPOSERS,
+        expected_aggregator=module.B2_AGGREGATOR,
+    )
+
+    wrong_model = deepcopy(row)
+    fallback_request = wrong_model["ensemble_trace"]["calls"][0]["final_request"]
+    fallback_request["usage"]["model"] = "outside/model"
+    fallback_request["usage"]["requested_model"] = "outside/model"
+    assert "wrong_intermediate_fallback_model" in module.ensemble_gate(
+        wrong_model,
+        expected_proposers=module.B2_PROPOSERS,
+        expected_aggregator=module.B2_AGGREGATOR,
+    )
+
+    conflicting_execution = deepcopy(row)
+    conflicting_execution["ensemble_trace"]["calls"][0]["final_request"]["execution"][
+        "actual_model"
+    ] = "outside/model"
+    assert "wrong_intermediate_fallback_model" in module.ensemble_gate(
+        conflicting_execution,
+        expected_proposers=module.B2_PROPOSERS,
+        expected_aggregator=module.B2_AGGREGATOR,
+    )
+
+    boolean_chars = deepcopy(row)
+    boolean_chars["ensemble_trace"]["calls"][0]["final_request"]["output"]["chars"] = (
+        False
+    )
+    assert "intermediate_fallback_visible_output" in (
+        module.admissible_empty_nonterminal_fallback_reasons(
+            boolean_chars["ensemble_trace"]["calls"][0],
+            expected_proposers=module.B2_PROPOSERS,
+        )
+    )
+
+    terminal_fallback = deepcopy(row)
+    terminal_fallback["ensemble_trace"].update(
+        {
+            "agent_llm_call_count": 1,
+            "calls": [deepcopy(fallback)],
+        }
+    )
+    assert "aggregator_fallback_used_or_unknown" in module.ensemble_gate(
+        terminal_fallback,
+        expected_proposers=module.B2_PROPOSERS,
+        expected_aggregator=module.B2_AGGREGATOR,
+    )
+
+    prefix = "preface "
+    visible_intermediate = deepcopy(row)
+    visible_intermediate["final_text"] = prefix + final_text
+    first = deepcopy(terminal)
+    first["agent_call_index"] = 1
+    first["final_request"]["output"] = {
+        "text": prefix,
+        "chars": len(prefix),
+        "truncated": False,
+    }
+    visible_intermediate["ensemble_trace"]["calls"] = [first, terminal]
+    assert (
+        module.ensemble_gate(
+            visible_intermediate,
+            expected_proposers=module.B2_PROPOSERS,
+            expected_aggregator=module.B2_AGGREGATOR,
+        )
+        == []
+    )
+    visible_intermediate["ensemble_trace"]["calls"][0]["final_request"]["output"][
+        "text"
+    ] = "tampered"
+    assert "wrong_agent_call_output_binding" in module.ensemble_gate(
+        visible_intermediate,
+        expected_proposers=module.B2_PROPOSERS,
+        expected_aggregator=module.B2_AGGREGATOR,
+    )
+
+
+def test_g1_route_gate_reuses_one_provider_lifecycle_plan_and_analyzer(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.provider import ranking_router
+
+    monkeypatch.setattr(
+        module,
+        "FORMAL_G1_RANKING_CONFIG_SHA256",
+        module.canonical_sha256(_test_ranking_config(module)),
+    )
+    monkeypatch.setattr(
+        ranking_router,
+        "ranking_trace_replay_reasons",
+        lambda _plan: [],
+    )
+    task = {
+        "id": "task-1",
+        "prompt": "research this",
+        "rubric": {
+            "id": "rubric-1",
+            "sections": [
+                {
+                    "id": "quality",
+                    "title": "Quality",
+                    "criteria": [{"id": "core", "weight": 100, "requirement": "core"}],
+                }
+            ],
+        },
+    }
+    contract = _contract(module, "G1", "a" * 64)
+    row = _row(
+        module,
+        group="G1",
+        task=task,
+        fingerprint="fingerprint",
+        response_prefix="g1-lifecycle",
+    )
+    routing = deepcopy(row["routing_trace"])
+    plan = deepcopy(routing["selection_plan"])
+    original_attempt = row["execution"]["generation_attempts"][0]
+    original_units = row["usage"]["model_usage_breakdown"]
+    analyzer = deepcopy(original_units[0])
+    generation = deepcopy(original_units[1])
+    selected_attempt_id = "f" * 32
+    row["routing_trace"] = {}
+    row["usage"] = {
+        "model_usage_breakdown": [generation],
+        "billed_cost": generation["billed_cost"],
+    }
+    row["llm_request_count"] = 1
+    row["execution"].update(
+        {
+            "selected_generation_attempt": 2,
+            "generation_attempts": [
+                {
+                    **deepcopy(original_attempt),
+                    "attempt_id": "e" * 32,
+                    "attempt": 1,
+                    "run": {
+                        "error": "retry",
+                        "final_text_sha256": module.text_sha256("earlier answer"),
+                        "llm_request_count": 1,
+                        "routing_trace": routing,
+                        "usage": {"model_usage_breakdown": [analyzer]},
+                    },
+                },
+                {
+                    "attempt_id": selected_attempt_id,
+                    "attempt": 2,
+                    "run": {
+                        "error": "",
+                        "final_text_sha256": row["final_text_sha256"],
+                        "llm_request_count": 1,
+                        "routing_trace": {},
+                        "usage": {"model_usage_breakdown": [generation]},
+                    },
+                },
+            ],
+        }
+    )
+    row["ensemble_trace"]["calls"][0]["selection_plan"] = deepcopy(plan)
+
+    assert module.route_reasons(row, group="G1", contract=contract) == []
+
+    conflicting = deepcopy(row)
+    conflicting["ensemble_trace"]["calls"][0]["selection_plan"]["decision_id"] = (
+        "conflicting-decision"
+    )
+    assert "g1_lifecycle_plan_differs_from_physical_plan" in module.route_reasons(
+        conflicting,
+        group="G1",
+        contract=contract,
+    )
+
+    missing_analyzer = deepcopy(row)
+    missing_analyzer["execution"]["generation_attempts"][0]["run"]["usage"] = {
+        "model_usage_breakdown": []
+    }
+    assert "missing_g1_task_analyzer_request" in module.route_reasons(
+        missing_analyzer,
+        group="G1",
+        contract=contract,
+    )
+
+
+def test_legacy_b2_attempt_error_requires_terminal_reclassification_proof(
+    module,
+    tmp_path: Path,
+) -> None:
+    task = {
+        "id": "task-1",
+        "prompt": "research this",
+        "rubric": {
+            "id": "rubric-1",
+            "sections": [
+                {
+                    "id": "quality",
+                    "title": "Quality",
+                    "criteria": [{"id": "core", "weight": 100, "requirement": "core"}],
+                }
+            ],
+        },
+    }
+    row = _row(
+        module,
+        group="B2",
+        task=task,
+        fingerprint="fingerprint",
+        response_prefix="b2-reclassified",
+    )
+    terminal = deepcopy(row["ensemble_trace"]["calls"][0])
+    terminal["agent_call_index"] = 2
+    fallback = _nonterminal_fallback_call(terminal, successful=2)
+    row["ensemble_trace"].update(
+        {
+            "agent_llm_call_count": 2,
+            "calls": [fallback, terminal],
+        }
+    )
+    attempt = row["execution"]["generation_attempts"][0]
+    attempt["run"]["error"] = module.LEGACY_TERMINAL_POLICY_ERROR
+    attempt["retry_reason"] = module.LEGACY_TERMINAL_POLICY_ERROR
+    row["error"] = None
+    row["selected_generation_succeeded"] = True
+    row["execution"]["run_error"] = ""
+    row["execution"]["selected_generation_attempt"] = 1
+    row["execution"]["generation_terminal_reclassification"] = {
+        "schema": module.GENERATION_TERMINAL_RECLASSIFICATION_SCHEMA,
+        "policy": "terminal_aggregator_with_empty_intermediate_fallback/v1",
+        "original_error": module.LEGACY_TERMINAL_POLICY_ERROR,
+        "selected_attempt_id": attempt["attempt_id"],
+        "selected_attempt": attempt["attempt"],
+        "terminal_call_index": 2,
+        "intermediate_fallback_call_indexes": [1],
+    }
+    record = module.SourceRecord(
+        path=tmp_path / "wave.jsonl",
+        source_index=0,
+        line=1,
+        row=row,
+    )
+
+    assert module.bind_selected_generation_attempts([record], [record]) == {
+        "B2/task-1": attempt["attempt_id"]
+    }
+
+    invalid = deepcopy(row)
+    invalid["execution"]["generation_terminal_reclassification"]["schema"] = "wrong"
+    invalid_record = module.SourceRecord(
+        path=tmp_path / "wave.jsonl",
+        source_index=0,
+        line=1,
+        row=invalid,
+    )
+    with pytest.raises(
+        module.FinalizationError,
+        match="not bound to exactly one successful physical generation attempt",
+    ):
+        module.bind_selected_generation_attempts([invalid_record], [invalid_record])
 
 
 def _campaign(

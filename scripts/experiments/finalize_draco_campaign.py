@@ -2093,6 +2093,165 @@ def ensemble_physical_call_reasons(
     return list(dict.fromkeys(reasons))
 
 
+_ADMISSIBLE_NONTERMINAL_FALLBACK_REASONS = frozenset(
+    {
+        "aggregator_fallback_used_or_unknown",
+        "final_request_not_aggregator",
+        "proposer_quorum_not_met",
+        "insufficient_actual_proposer_quorum",
+        "aggregator_request_incomplete",
+    }
+)
+
+
+def admissible_empty_nonterminal_fallback_reasons(
+    call: Mapping[str, Any],
+    *,
+    expected_proposers: Sequence[str],
+) -> list[str]:
+    """Validate an outputless nonterminal fallback against frozen routes."""
+
+    reasons: list[str] = []
+    if str(call.get("request_outcome") or "llm_response") != "llm_response":
+        reasons.append("invalid_intermediate_fallback_outcome")
+    if call.get("fallback_used") is not True:
+        reasons.append("invalid_intermediate_fallback_flag")
+    if str(call.get("final_request_role") or "") != "fallback_single":
+        reasons.append("invalid_intermediate_fallback_role")
+    total = call.get("total_candidates")
+    successful = call.get("successful_proposers")
+    expected_total = len(expected_proposers)
+    if (
+        not isinstance(total, int)
+        or isinstance(total, bool)
+        or total != expected_total
+        or not isinstance(successful, int)
+        or isinstance(successful, bool)
+        or not 0 <= successful < math.ceil(2 * expected_total / 3)
+    ):
+        reasons.append("invalid_intermediate_fallback_quorum")
+    candidates = call.get("candidates")
+    if not isinstance(candidates, list) or len(candidates) != expected_total:
+        reasons.append("invalid_intermediate_fallback_candidates")
+    elif sum(successful_candidate(candidate) for candidate in candidates) != successful:
+        reasons.append("intermediate_fallback_candidate_count_mismatch")
+    final_request = call.get("final_request")
+    if (
+        not isinstance(final_request, Mapping)
+        or final_request.get("request_started") is not True
+        or str(final_request.get("role") or "") != "fallback_single"
+        or final_request.get("error")
+        or call.get("aggregator_error")
+    ):
+        reasons.append("invalid_intermediate_fallback_request")
+        return list(dict.fromkeys(reasons))
+    output = final_request.get("output")
+    output_chars = output.get("chars") if isinstance(output, Mapping) else None
+    if (
+        not isinstance(output, Mapping)
+        or output.get("text") != ""
+        or not isinstance(output_chars, int)
+        or isinstance(output_chars, bool)
+        or output_chars != 0
+        or output.get("truncated") is not False
+    ):
+        reasons.append("intermediate_fallback_visible_output")
+    usage = final_request.get("usage")
+    execution = final_request.get("execution")
+    if not isinstance(usage, Mapping):
+        reasons.append("missing_intermediate_fallback_usage")
+        return list(dict.fromkeys(reasons))
+    if not isinstance(execution, Mapping):
+        reasons.append("missing_intermediate_fallback_execution")
+        return list(dict.fromkeys(reasons))
+    actual_provider = str(usage.get("provider") or "").strip().casefold()
+    requested_provider = str(usage.get("requested_provider") or "").strip().casefold()
+    actual_model = str(usage.get("model") or "").strip()
+    requested_model = str(usage.get("requested_model") or "").strip()
+    execution_providers = [
+        str(execution.get(field) or "").strip().casefold()
+        for field in ("requested_provider", "provider", "actual_provider")
+    ]
+    execution_models = [
+        str(execution.get(field) or "").strip()
+        for field in ("requested_model", "model", "actual_model")
+    ]
+    if (
+        actual_provider != "openrouter"
+        or requested_provider != "openrouter"
+        or any(provider != "openrouter" for provider in execution_providers)
+    ):
+        reasons.append("wrong_intermediate_fallback_provider")
+    if (
+        not actual_model
+        or not requested_model
+        or not any(
+            _formal_openrouter_models_equivalent(actual_model, expected)
+            and _formal_openrouter_models_equivalent(requested_model, expected)
+            and all(
+                _formal_openrouter_models_equivalent(execution_model, expected)
+                for execution_model in execution_models
+            )
+            for expected in expected_proposers
+        )
+    ):
+        reasons.append("wrong_intermediate_fallback_model")
+    if str(execution.get("role") or "") != "fallback_single":
+        reasons.append("wrong_intermediate_fallback_execution_role")
+    if (
+        not isinstance(usage, Mapping)
+        or not str(usage.get("stop_reason") or "").strip()
+    ):
+        reasons.append("missing_intermediate_fallback_stop_reason")
+    return list(dict.fromkeys(reasons))
+
+
+def agent_call_output_sequence_reasons(
+    calls: Sequence[Mapping[str, Any]],
+    *,
+    final_text: str,
+) -> list[str]:
+    """Bind every Agent-loop response segment to the stored final answer."""
+
+    if len(calls) <= 1:
+        return []
+    reasons: list[str] = []
+    offset = 0
+    for call in calls:
+        final_request = call.get("final_request")
+        output = (
+            final_request.get("output")
+            if isinstance(final_request, Mapping)
+            else None
+        )
+        if not isinstance(output, Mapping):
+            reasons.append("missing_agent_call_output_binding")
+            continue
+        output_text = output.get("text")
+        output_chars = output.get("chars")
+        if (
+            not isinstance(output_text, str)
+            or not isinstance(output_chars, int)
+            or isinstance(output_chars, bool)
+            or output_chars < 0
+            or offset + output_chars > len(final_text)
+        ):
+            reasons.append("invalid_agent_call_output_binding")
+            continue
+        if output.get("sha256") not in {None, "", text_sha256(output_text)}:
+            reasons.append("wrong_agent_call_output_hash")
+        segment = final_text[offset : offset + output_chars]
+        if output.get("truncated") is True:
+            if not segment.startswith(output_text):
+                reasons.append("wrong_agent_call_output_binding")
+        elif len(output_text) != output_chars or output_text != segment:
+            reasons.append("wrong_agent_call_output_binding")
+        offset += output_chars
+    if offset != len(final_text):
+        reasons.append("incomplete_agent_call_output_binding")
+    return list(dict.fromkeys(reasons))
+
+
 def ensemble_gate(
     row: Mapping[str, Any],
     *,
@@ -2132,17 +2291,34 @@ def ensemble_gate(
             reasons.append("aggregator_model_outside_frozen_routes")
     calls, sequence_reasons = ensemble_call_trace_sequence(trace)
     reasons.extend(sequence_reasons)
+    reasons.extend(
+        agent_call_output_sequence_reasons(
+            calls,
+            final_text=str(row.get("final_text") or ""),
+        )
+    )
     if proposers and aggregator:
         for index, call in enumerate(calls):
-            reasons.extend(
-                ensemble_physical_call_reasons(
+            call_reasons = ensemble_physical_call_reasons(
+                call,
+                expected_proposers=proposers,
+                expected_aggregator=aggregator,
+                final_text=str(row.get("final_text") or ""),
+                require_output_binding=index == len(calls) - 1,
+            )
+            if index < len(calls) - 1 and call.get("fallback_used") is True:
+                fallback_reasons = admissible_empty_nonterminal_fallback_reasons(
                     call,
                     expected_proposers=proposers,
-                    expected_aggregator=aggregator,
-                    final_text=str(row.get("final_text") or ""),
-                    require_output_binding=index == len(calls) - 1,
                 )
-            )
+                reasons.extend(fallback_reasons)
+                if not fallback_reasons:
+                    call_reasons = [
+                        reason
+                        for reason in call_reasons
+                        if reason not in _ADMISSIBLE_NONTERMINAL_FALLBACK_REASONS
+                    ]
+            reasons.extend(call_reasons)
     return list(dict.fromkeys(reasons))
 
 
@@ -2371,6 +2547,216 @@ def g1_registry_plan_reasons(
     return list(dict.fromkeys(reasons)), proposer_models, aggregator_model
 
 
+_G1_LIFECYCLE_PLAN_MATCH_FIELDS = (
+    "decision_id",
+    "registry_snapshot_hash",
+    "ranking_config_hash",
+    "selected_P",
+    "selected_A",
+    "proposer_models",
+    "aggregator_model",
+    "task_profile",
+    "N_min",
+    "N_max",
+    "bound_reasons",
+)
+
+
+def matching_saved_generation_attempts(
+    row: Mapping[str, Any],
+) -> list[Mapping[str, Any]]:
+    final_sha = str(row.get("final_text_sha256") or "")
+    selected_usage = usage_generation_identity_contract(row.get("usage"))
+    execution = row.get("execution")
+    attempts = (
+        execution.get("generation_attempts")
+        if isinstance(execution, Mapping)
+        and isinstance(execution.get("generation_attempts"), list)
+        else []
+    )
+    return [
+        attempt
+        for attempt in attempts
+        if isinstance(attempt, Mapping)
+        and isinstance(attempt.get("run"), Mapping)
+        and str(attempt["run"].get("final_text_sha256") or "") == final_sha
+        and usage_generation_identity_contract(attempt["run"].get("usage"))
+        == selected_usage
+    ]
+
+
+def effective_g1_lifecycle_routing(
+    row: Mapping[str, Any],
+    *,
+    contract: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
+    """Resolve one G1 plan from the same row/provider lifecycle."""
+
+    registry = contract.get("g1_registry_contract")
+    if not isinstance(registry, Mapping):
+        return {}, {}, ["invalid_g1_registry_contract"]
+    reasons: list[str] = []
+    trace = row.get("ensemble_trace")
+    calls, sequence_reasons = ensemble_call_trace_sequence(
+        trace if isinstance(trace, Mapping) else {}
+    )
+    reasons.extend(sequence_reasons)
+    physical_plans: list[Mapping[str, Any]] = []
+    for call in calls:
+        plan = call.get("selection_plan")
+        plan_reasons, _, _ = g1_registry_plan_reasons(plan, contract=registry)
+        reasons.extend(plan_reasons)
+        if isinstance(plan, Mapping):
+            physical_plans.append(plan)
+    if not physical_plans:
+        reasons.append("missing_g1_physical_selection_plan")
+        return {}, {}, list(dict.fromkeys(reasons))
+    physical = physical_plans[0]
+    for plan in physical_plans[1:]:
+        if any(
+            plan.get(field) != physical.get(field)
+            for field in _G1_LIFECYCLE_PLAN_MATCH_FIELDS
+        ):
+            reasons.append("conflicting_g1_physical_selection_plans")
+
+    routing = row.get("routing_trace")
+    top_routing = dict(routing) if isinstance(routing, Mapping) else {}
+    top_plan = top_routing.get("selection_plan")
+    if isinstance(top_plan, Mapping):
+        top_reasons, _, _ = g1_registry_plan_reasons(top_plan, contract=registry)
+        reasons.extend(top_reasons)
+        if any(
+            top_plan.get(field) != physical.get(field)
+            for field in _G1_LIFECYCLE_PLAN_MATCH_FIELDS
+        ):
+            reasons.append("g1_routing_plan_differs_from_physical_plan")
+        return top_routing, {}, list(dict.fromkeys(reasons))
+    if top_routing:
+        reasons.append("invalid_g1_top_routing_trace")
+        return {}, {}, list(dict.fromkeys(reasons))
+
+    matching = matching_saved_generation_attempts(row)
+    if len(matching) != 1:
+        reasons.append("ambiguous_g1_selected_generation_attempt")
+        return {}, {}, list(dict.fromkeys(reasons))
+    selected = matching[0]
+    selected_ordinal = nonnegative_int(selected.get("attempt"))
+    execution = row.get("execution")
+    attempts = (
+        execution.get("generation_attempts")
+        if isinstance(execution, Mapping)
+        and isinstance(execution.get("generation_attempts"), list)
+        else []
+    )
+    candidates: list[tuple[Mapping[str, Any], Mapping[str, Any]]] = []
+    for attempt in attempts:
+        if not isinstance(attempt, Mapping):
+            continue
+        run = attempt.get("run")
+        attempt_routing = run.get("routing_trace") if isinstance(run, Mapping) else None
+        plan = (
+            attempt_routing.get("selection_plan")
+            if isinstance(attempt_routing, Mapping)
+            else None
+        )
+        plan_reasons, _, _ = g1_registry_plan_reasons(plan, contract=registry)
+        if plan_reasons:
+            if isinstance(plan, Mapping):
+                reasons.extend(plan_reasons)
+            continue
+        if not isinstance(plan, Mapping) or any(
+            plan.get(field) != physical.get(field)
+            for field in _G1_LIFECYCLE_PLAN_MATCH_FIELDS
+        ):
+            reasons.append("g1_lifecycle_plan_differs_from_physical_plan")
+            continue
+        if nonnegative_int(attempt.get("attempt")) > selected_ordinal:
+            continue
+        candidates.append((attempt, attempt_routing))
+    unique = {
+        canonical_sha256(dict(candidate_routing)): (attempt, candidate_routing)
+        for attempt, candidate_routing in candidates
+    }
+    if len(unique) != 1:
+        reasons.append("ambiguous_g1_lifecycle_routing_plan")
+        return {}, {}, list(dict.fromkeys(reasons))
+    attempt, recovered = next(iter(unique.values()))
+    evidence = {
+        "schema": "opensquilla.draco.g1-provider-lifecycle-routing-recovery/v1",
+        "source_attempt_id": str(attempt.get("attempt_id") or ""),
+        "source_attempt": nonnegative_int(attempt.get("attempt")),
+        "selected_attempt_id": str(selected.get("attempt_id") or ""),
+        "selected_attempt": selected_ordinal,
+        "decision_id": str(physical.get("decision_id") or ""),
+        "registry_snapshot_hash": str(physical.get("registry_snapshot_hash") or ""),
+        "ranking_config_hash": str(physical.get("ranking_config_hash") or ""),
+    }
+    return dict(recovered), evidence, list(dict.fromkeys(reasons))
+
+
+def g1_provider_lifecycle_analyzer_reasons(
+    row: Mapping[str, Any],
+    *,
+    allow_unknown_placeholder: bool = False,
+) -> list[str]:
+    """Require the setup-bearing attempt to contain one frozen task analyzer."""
+
+    execution = row.get("execution")
+    attempts = (
+        execution.get("generation_attempts")
+        if isinstance(execution, Mapping)
+        and isinstance(execution.get("generation_attempts"), list)
+        else []
+    )
+    request_attempts = [
+        attempt
+        for attempt in attempts
+        if isinstance(attempt, Mapping)
+        and isinstance(attempt.get("run"), Mapping)
+        and run_expected_request_count(attempt["run"]) > 0
+    ]
+    if not request_attempts:
+        return ["missing_g1_provider_lifecycle_attempt"]
+    first_units = usage_units(request_attempts[0]["run"].get("usage"))
+    analyzers = [
+        unit
+        for unit in first_units
+        if str(unit.get("role") or "").strip().casefold() == "task_analyzer"
+    ]
+    placeholders = [
+        unit
+        for unit in first_units
+        if allow_unknown_placeholder and _is_unknown_task_analyzer_placeholder(unit)
+    ]
+    if not analyzers and not placeholders:
+        return ["missing_g1_task_analyzer_request"]
+    if analyzers:
+        for analyzer in analyzers:
+            if (
+                str(analyzer.get("provider") or "").strip().casefold() != "openrouter"
+                or str(analyzer.get("requested_provider") or "").strip().casefold()
+                != "openrouter"
+                or not _formal_openrouter_models_equivalent(
+                    analyzer.get("model"),
+                    B0_MODEL,
+                )
+                or not _formal_openrouter_models_equivalent(
+                    analyzer.get("requested_model"),
+                    B0_MODEL,
+                )
+            ):
+                return ["wrong_g1_task_analyzer_route"]
+    for attempt in request_attempts[1:]:
+        later_units = usage_units(attempt["run"].get("usage"))
+        if any(
+            str(unit.get("role") or "").strip().casefold() == "task_analyzer"
+            or _is_unknown_task_analyzer_placeholder(unit)
+            for unit in later_units
+        ):
+            return ["repeated_g1_task_analyzer_request"]
+    return []
+
+
 def route_reasons(
     row: Mapping[str, Any],
     *,
@@ -2448,6 +2834,15 @@ def route_reasons(
         allowed = set(routes) if isinstance(routes, Mapping) else set()
         if registry.get("selection_mode") != "router_dynamic" or not allowed:
             reasons.append("invalid_g1_registry_contract")
+        effective_routing, _, lifecycle_routing_reasons = (
+            effective_g1_lifecycle_routing(
+                row,
+                contract=contract,
+            )
+        )
+        reasons.extend(lifecycle_routing_reasons)
+        routing = effective_routing
+        reasons.extend(g1_provider_lifecycle_analyzer_reasons(row))
         if allowed:
             reasons.extend(
                 usage_route_reasons(
@@ -2458,12 +2853,6 @@ def route_reasons(
                     allow_unknown_task_analyzer_attempts=True,
                 )
             )
-            if not any(
-                str(unit.get("role") or "").strip().casefold() == "task_analyzer"
-                and str(unit.get("model") or "").strip() == B0_MODEL
-                for unit in usage_units(row.get("usage"))
-            ):
-                reasons.append("missing_g1_task_analyzer_request")
         row_plan = routing.get("selection_plan")
         plan_reasons, proposers, aggregator = g1_registry_plan_reasons(
             row_plan,
@@ -2493,9 +2882,11 @@ def route_reasons(
                 )
                 if physical_registry_snapshot_hash != row_registry_snapshot_hash:
                     reasons.append("g1_physical_registry_snapshot_hash_differs_from_routing_trace")
+            gate_row = dict(row)
+            gate_row["routing_trace"] = routing
             reasons.extend(
                 ensemble_gate(
-                    row,
+                    gate_row,
                     expected_proposers=proposers,
                     expected_aggregator=aggregator,
                     allowed_models=allowed,
@@ -2552,6 +2943,26 @@ def validate_physical_generation_routes(
             and isinstance(execution.get("generation_attempts"), list)
             else []
         )
+        if group == "G1" and any(
+            isinstance(attempt, Mapping)
+            and isinstance(attempt.get("run"), Mapping)
+            and run_expected_request_count(attempt["run"]) > 0
+            for attempt in attempts
+        ):
+            lifecycle_reasons = g1_provider_lifecycle_analyzer_reasons(
+                record.row,
+                allow_unknown_placeholder=True,
+            )
+            if lifecycle_reasons:
+                violations.append(
+                    record.reference
+                    | {
+                        "group": group,
+                        "task_id": record.key[1],
+                        "attempt_id": "provider_lifecycle",
+                        "reasons": lifecycle_reasons,
+                    }
+                )
         for attempt in attempts:
             if not isinstance(attempt, Mapping):
                 continue
@@ -2595,14 +3006,6 @@ def validate_physical_generation_routes(
         }
         if record.key[0] == "B2" and "task_analyzer" in roles:
             reasons.append("unexpected_b2_task_analyzer_request")
-        if record.key[0] == "G1" and not (
-            "task_analyzer" in roles
-            or any(
-                _is_unknown_task_analyzer_placeholder(unit)
-                for unit in usage_units(run.get("usage"))
-            )
-        ):
-            reasons.append("missing_g1_task_analyzer_request")
         if reasons:
             violations.append(
                 record.reference
@@ -2942,6 +3345,84 @@ def select_results(
     return selected, pair_audit
 
 
+GENERATION_TERMINAL_RECLASSIFICATION_SCHEMA = (
+    "opensquilla.draco.generation-terminal-reclassification/v1"
+)
+LEGACY_TERMINAL_POLICY_ERROR = "aggregator_fallback_used_or_unknown"
+
+
+def selected_legacy_attempt_error_is_reclassified(
+    selected_row: Mapping[str, Any],
+    attempt: Mapping[str, Any],
+) -> bool:
+    """Allow one immutable legacy policy marker after independent terminal proof."""
+
+    if (
+        str(selected_row.get("group") or "") != "B2"
+        or selected_row.get("selected_generation_succeeded") is not True
+        or str(selected_row.get("error") or "") not in ALLOWED_NON_GENERATION_ERRORS
+    ):
+        return False
+    execution = selected_row.get("execution")
+    provenance = (
+        execution.get("generation_terminal_reclassification")
+        if isinstance(execution, Mapping)
+        else None
+    )
+    run = attempt.get("run")
+    if (
+        not isinstance(provenance, Mapping)
+        or provenance.get("schema") != GENERATION_TERMINAL_RECLASSIFICATION_SCHEMA
+        or provenance.get("policy")
+        != "terminal_aggregator_with_empty_intermediate_fallback/v1"
+        or provenance.get("original_error") != LEGACY_TERMINAL_POLICY_ERROR
+        or not isinstance(run, Mapping)
+        or str(run.get("error") or "") != LEGACY_TERMINAL_POLICY_ERROR
+        or str(attempt.get("retry_reason") or "") != LEGACY_TERMINAL_POLICY_ERROR
+        or str(provenance.get("selected_attempt_id") or "")
+        != str(attempt.get("attempt_id") or "")
+        or nonnegative_int(provenance.get("selected_attempt"))
+        != nonnegative_int(attempt.get("attempt"))
+        or nonnegative_int(execution.get("selected_generation_attempt"))
+        != nonnegative_int(attempt.get("attempt"))
+        or str(execution.get("run_error") or "")
+    ):
+        return False
+    completion = selected_row.get("completion_status")
+    if (
+        not isinstance(completion, Mapping)
+        or completion.get("generation_accepted") is not True
+    ):
+        return False
+    trace = selected_row.get("ensemble_trace")
+    calls, sequence_reasons = ensemble_call_trace_sequence(
+        trace if isinstance(trace, Mapping) else {}
+    )
+    if sequence_reasons or not calls:
+        return False
+    expected_intermediate = [
+        nonnegative_int(call.get("agent_call_index"))
+        for call in calls[:-1]
+        if call.get("fallback_used") is True
+    ]
+    terminal = calls[-1]
+    if (
+        not expected_intermediate
+        or provenance.get("intermediate_fallback_call_indexes")
+        != expected_intermediate
+        or nonnegative_int(provenance.get("terminal_call_index"))
+        != nonnegative_int(terminal.get("agent_call_index"))
+        or terminal.get("fallback_used") is not False
+        or str(terminal.get("final_request_role") or "") != "aggregator"
+    ):
+        return False
+    return not ensemble_gate(
+        selected_row,
+        expected_proposers=B2_PROPOSERS,
+        expected_aggregator=B2_AGGREGATOR,
+    )
+
+
 def bind_selected_generation_attempts(
     records: Sequence[SourceRecord],
     selected: Sequence[SourceRecord],
@@ -2973,11 +3454,16 @@ def bind_selected_generation_attempts(
                 run = attempt.get("run")
                 if (
                     not isinstance(run, Mapping)
-                    or str(run.get("error") or "")
                     or str(run.get("final_text_sha256") or "") != selected_final_sha
                     or usage_generation_identity_contract(run.get("usage")) != selected_usage
                     or run_expected_request_count(run) <= 0
                     or len(usage_units(run.get("usage"))) != run_expected_request_count(run)
+                ):
+                    continue
+                run_error = str(run.get("error") or "")
+                if run_error and not selected_legacy_attempt_error_is_reclassified(
+                    selected_record.row,
+                    attempt,
                 ):
                     continue
                 attempt_id = str(attempt.get("attempt_id") or "")

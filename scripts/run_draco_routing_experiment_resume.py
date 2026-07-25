@@ -19,7 +19,7 @@ import subprocess
 import sys
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from functools import cache
 from pathlib import Path
@@ -3988,6 +3988,7 @@ def aggregate_agent_ensemble_trace(records: list[dict[str, Any]]) -> dict[str, A
     call_records = llm_response_records(records)
     traces: list[dict[str, Any]] = []
     first_real_trace: dict[str, Any] | None = None
+    last_real_trace: dict[str, Any] | None = None
     total_llm_requests = 0
     untraced_llm_requests = 0
     for call_index, record in enumerate(call_records, start=1):
@@ -4072,6 +4073,7 @@ def aggregate_agent_ensemble_trace(records: list[dict[str, Any]]) -> dict[str, A
         enriched = dict(trace)
         if first_real_trace is None:
             first_real_trace = enriched
+        last_real_trace = enriched
         enriched["request_outcome"] = str(record.get("kind") or "unknown")
         enriched["agent_call_index"] = call_index
         if payload.get("call_id") is not None:
@@ -4091,6 +4093,7 @@ def aggregate_agent_ensemble_trace(records: list[dict[str, Any]]) -> dict[str, A
     if not call_records:
         return {}
     first_trace = first_real_trace or {}
+    terminal_trace = last_real_trace or {}
     payload: dict[str, Any] = {
         "mode": "agent_loop",
         "agent_llm_call_count": len(call_records),
@@ -4111,10 +4114,6 @@ def aggregate_agent_ensemble_trace(records: list[dict[str, Any]]) -> dict[str, A
     for key in (
         "profile",
         "shuffle_candidates",
-        "successful_proposers",
-        "total_candidates",
-        "fallback_used",
-        "final_request_role",
         "moa_layers",
         "moa_refine_count",
         "moa_intermediate_layers",
@@ -4122,10 +4121,28 @@ def aggregate_agent_ensemble_trace(records: list[dict[str, Any]]) -> dict[str, A
     ):
         if key in first_trace:
             payload[key] = first_trace[key]
-    if first_trace.get("output_strategy") == "select_best_candidate":
+    for key in (
+        "successful_proposers",
+        "total_candidates",
+        "fallback_used",
+        "final_request_role",
+    ):
+        if key in terminal_trace:
+            payload[key] = terminal_trace[key]
+    intermediate_fallback_indexes = [
+        coerce_metric_int(call.get("agent_call_index"))
+        for call in traces[:-1]
+        if call.get("fallback_used") is True
+    ]
+    payload["terminal_call_index"] = coerce_metric_int(
+        terminal_trace.get("agent_call_index")
+    )
+    payload["any_intermediate_fallback"] = bool(intermediate_fallback_indexes)
+    payload["intermediate_fallback_call_indexes"] = intermediate_fallback_indexes
+    if terminal_trace.get("output_strategy") == "select_best_candidate":
         for key in ("selected_candidate_count", "selected_candidate_indexes"):
-            if key in first_trace:
-                payload[key] = first_trace[key]
+            if key in terminal_trace:
+                payload[key] = terminal_trace[key]
     return payload
 
 
@@ -6132,6 +6149,173 @@ def ensemble_call_trace_sequence(
     return call_traces, reasons
 
 
+_ADMISSIBLE_NONTERMINAL_FALLBACK_CORE_REASONS = frozenset(
+    {
+        "aggregator_fallback_used_or_unknown",
+        "final_request_not_aggregator",
+        "insufficient_proposer_quorum",
+        "insufficient_configured_proposer_quorum",
+        "insufficient_actual_proposer_quorum",
+        "aggregator_request_incomplete",
+    }
+)
+
+
+def admissible_empty_nonterminal_fallback_reasons(
+    trace: Mapping[str, Any],
+    *,
+    expected_selection_plan: Mapping[str, Any] | None = None,
+) -> list[str]:
+    """Validate the one nonterminal fallback shape that cannot add answer text."""
+
+    reasons: list[str] = []
+    if str(trace.get("request_outcome") or "llm_response") != "llm_response":
+        reasons.append("invalid_intermediate_fallback_outcome")
+    if trace.get("fallback_used") is not True:
+        reasons.append("invalid_intermediate_fallback_flag")
+    if str(trace.get("final_request_role") or "") != "fallback_single":
+        reasons.append("invalid_intermediate_fallback_role")
+    total = trace.get("total_candidates")
+    successful = trace.get("successful_proposers")
+    if (
+        not isinstance(total, int)
+        or isinstance(total, bool)
+        or total <= 0
+        or not isinstance(successful, int)
+        or isinstance(successful, bool)
+        or not 0 <= successful < legal_proposer_quorum(total)
+    ):
+        reasons.append("invalid_intermediate_fallback_quorum")
+    final_request = trace.get("final_request")
+    if (
+        not isinstance(final_request, Mapping)
+        or final_request.get("request_started") is not True
+        or str(final_request.get("role") or "") != "fallback_single"
+        or final_request.get("error")
+        or trace.get("aggregator_error")
+    ):
+        reasons.append("invalid_intermediate_fallback_request")
+        return list(dict.fromkeys(reasons))
+    output = final_request.get("output")
+    output_chars = output.get("chars") if isinstance(output, Mapping) else None
+    if (
+        not isinstance(output, Mapping)
+        or output.get("text") != ""
+        or not isinstance(output_chars, int)
+        or isinstance(output_chars, bool)
+        or output_chars != 0
+        or output.get("truncated") is not False
+    ):
+        reasons.append("intermediate_fallback_visible_output")
+    usage = final_request.get("usage")
+    if not isinstance(usage, Mapping):
+        reasons.append("missing_intermediate_fallback_usage")
+        return list(dict.fromkeys(reasons))
+    execution = final_request.get("execution")
+    if not isinstance(execution, Mapping):
+        reasons.append("missing_intermediate_fallback_execution")
+        return list(dict.fromkeys(reasons))
+    actual_provider = str(usage.get("provider") or "").strip().casefold()
+    requested_provider = str(usage.get("requested_provider") or "").strip().casefold()
+    actual_model = str(usage.get("model") or "").strip()
+    requested_model = str(usage.get("requested_model") or "").strip()
+    execution_providers = [
+        str(execution.get(field) or "").strip().casefold()
+        for field in ("requested_provider", "provider", "actual_provider")
+    ]
+    execution_models = [
+        str(execution.get(field) or "").strip()
+        for field in ("requested_model", "model", "actual_model")
+    ]
+    if (
+        actual_provider != "openrouter"
+        or requested_provider != "openrouter"
+        or any(provider != "openrouter" for provider in execution_providers)
+    ):
+        reasons.append("wrong_intermediate_fallback_provider")
+    plan = (
+        dict(expected_selection_plan)
+        if isinstance(expected_selection_plan, Mapping)
+        else {}
+    )
+    selected_p = plan.get("selected_P")
+    allowed_models = [
+        str(identity).partition(":")[2].strip()
+        for identity in selected_p
+        if isinstance(identity, str)
+        and identity.partition(":")[1] == ":"
+        and identity.partition(":")[0].strip().casefold() == "openrouter"
+        and identity.partition(":")[2].strip()
+    ] if isinstance(selected_p, list) else []
+    if (
+        not actual_model
+        or not requested_model
+        or not allowed_models
+        or not any(
+            _formal_openrouter_models_equivalent(actual_model, model)
+            and _formal_openrouter_models_equivalent(requested_model, model)
+            and all(
+                _formal_openrouter_models_equivalent(execution_model, model)
+                for execution_model in execution_models
+            )
+            for model in allowed_models
+        )
+    ):
+        reasons.append("wrong_intermediate_fallback_model")
+    if str(execution.get("role") or "") != "fallback_single":
+        reasons.append("wrong_intermediate_fallback_execution_role")
+    if not str(usage.get("stop_reason") or "").strip() and not ensemble_metadata_field_resolved(
+        final_request,
+        "stop_reason",
+    ):
+        reasons.append("missing_intermediate_fallback_stop_reason")
+    return list(dict.fromkeys(reasons))
+
+
+def agent_call_output_sequence_reasons(
+    calls: Sequence[Mapping[str, Any]],
+    *,
+    final_text: str,
+) -> list[str]:
+    """Bind every visible Agent-loop response segment to the stored answer."""
+
+    if len(calls) <= 1:
+        return []
+    reasons: list[str] = []
+    offset = 0
+    for call in calls:
+        final_request = call.get("final_request")
+        output = (
+            final_request.get("output")
+            if isinstance(final_request, Mapping)
+            else None
+        )
+        if not isinstance(output, Mapping):
+            reasons.append("missing_agent_call_output_binding")
+            continue
+        output_text = output.get("text")
+        output_chars = output.get("chars")
+        if (
+            not isinstance(output_text, str)
+            or not isinstance(output_chars, int)
+            or isinstance(output_chars, bool)
+            or output_chars < 0
+            or offset + output_chars > len(final_text)
+        ):
+            reasons.append("invalid_agent_call_output_binding")
+            continue
+        segment = final_text[offset : offset + output_chars]
+        if output.get("truncated") is True:
+            if not segment.startswith(output_text):
+                reasons.append("wrong_agent_call_output_binding")
+        elif len(output_text) != output_chars or output_text != segment:
+            reasons.append("wrong_agent_call_output_binding")
+        offset += output_chars
+    if offset != len(final_text):
+        reasons.append("incomplete_agent_call_output_binding")
+    return list(dict.fromkeys(reasons))
+
+
 def ensemble_generation_retry_reason(
     result: RunResult,
     *,
@@ -6150,6 +6334,12 @@ def ensemble_generation_retry_reason(
         return sequence_reasons[0]
     if not call_traces:
         return "missing_ensemble_call_trace"
+    output_sequence_reasons = agent_call_output_sequence_reasons(
+        call_traces,
+        final_text=result.final_text,
+    )
+    if output_sequence_reasons:
+        return output_sequence_reasons[0]
     for index, call_trace in enumerate(call_traces):
         reasons = ensemble_call_core_reasons(
             call_trace,
@@ -6162,6 +6352,18 @@ def ensemble_generation_retry_reason(
         generation_reasons = [
             reason for reason in reasons if not ensemble_metadata_only_reason(reason)
         ]
+        if index < len(call_traces) - 1 and call_trace.get("fallback_used") is True:
+            fallback_reasons = admissible_empty_nonterminal_fallback_reasons(
+                call_trace,
+                expected_selection_plan=expected_selection_plan,
+            )
+            if fallback_reasons:
+                return fallback_reasons[0]
+            generation_reasons = [
+                reason
+                for reason in generation_reasons
+                if reason not in _ADMISSIBLE_NONTERMINAL_FALLBACK_CORE_REASONS
+            ]
         if generation_reasons:
             return generation_reasons[0]
     return ""
@@ -7388,9 +7590,14 @@ async def run_one(
             experiment_config=experiment_config,
             generation_policy=generation_policy,
         )
-        provider = build.provider
         effective_prompt = build.prompt
-        frozen_build_routing_trace = json.loads(json.dumps(build.routing_trace, ensure_ascii=False))
+        safe_routing_trace = json_safe(build.routing_trace)
+        if not isinstance(safe_routing_trace, Mapping):
+            raise TypeError("provider routing trace must serialize to an object")
+        frozen_build_routing_trace = json.loads(
+            json.dumps(dict(safe_routing_trace), ensure_ascii=False)
+        )
+        provider = build.provider
         generation_config = with_openrouter_model_capabilities(
             generation_config,
             str(
@@ -10559,6 +10766,276 @@ _FATAL_POLICY_ERRORS = frozenset(
         "openrouter_non_byok_policy_violation",
     }
 )
+GENERATION_TERMINAL_RECLASSIFICATION_SCHEMA = (
+    "opensquilla.draco.generation-terminal-reclassification/v1"
+)
+LEGACY_TERMINAL_POLICY_ERROR = "aggregator_fallback_used_or_unknown"
+_G1_LIFECYCLE_PLAN_MATCH_FIELDS = (
+    "decision_id",
+    "registry_snapshot_hash",
+    "ranking_config_hash",
+    "selected_P",
+    "selected_A",
+    "proposer_models",
+    "aggregator_model",
+    "task_profile",
+    "N_min",
+    "N_max",
+    "bound_reasons",
+)
+
+
+def generation_usage_identity_contract(value: Any) -> Any:
+    """Project immutable generation usage while excluding repairable billing fields."""
+
+    if not isinstance(value, Mapping):
+        return None
+    keys = (
+        "provider",
+        "model",
+        "requested_provider",
+        "requested_model",
+        "input_tokens",
+        "output_tokens",
+        "reasoning_tokens",
+        "cached_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+    )
+    contract = {key: value.get(key) for key in keys if key in value}
+    breakdown = value.get("model_usage_breakdown")
+    if isinstance(breakdown, list):
+        contract["model_usage_breakdown"] = [
+            generation_usage_identity_contract(item)
+            for item in breakdown
+            if isinstance(item, Mapping)
+        ]
+    return contract
+
+
+def matching_saved_generation_attempts(
+    row: Mapping[str, Any],
+) -> list[Mapping[str, Any]]:
+    """Find physical attempts whose immutable answer and usage equal the saved row."""
+
+    final_sha = str(row.get("final_text_sha256") or "")
+    usage_contract = generation_usage_identity_contract(row.get("usage"))
+    execution = row.get("execution")
+    attempts = (
+        execution.get("generation_attempts")
+        if isinstance(execution, Mapping)
+        and isinstance(execution.get("generation_attempts"), list)
+        else []
+    )
+    return [
+        attempt
+        for attempt in attempts
+        if isinstance(attempt, Mapping)
+        and isinstance(attempt.get("run"), Mapping)
+        and str(attempt["run"].get("final_text_sha256") or "") == final_sha
+        and generation_usage_identity_contract(attempt["run"].get("usage"))
+        == usage_contract
+    ]
+
+
+def g1_provider_lifecycle_routing_evidence(
+    row: Mapping[str, Any],
+    *,
+    contract: Mapping[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
+    """Recover one frozen G1 plan from the same provider lifecycle, fail closed."""
+
+    if str(row.get("group") or "") != "G1":
+        routing = row.get("routing_trace")
+        return (
+            dict(routing) if isinstance(routing, Mapping) else {},
+            {},
+            [],
+        )
+    reasons: list[str] = []
+    g1_contract = (
+        contract.get("g1_registry_contract")
+        if isinstance(contract, Mapping)
+        else None
+    )
+    if not isinstance(g1_contract, Mapping):
+        return {}, {}, ["missing_g1_registry_contract"]
+    trace = row.get("ensemble_trace")
+    calls, sequence_reasons = ensemble_call_trace_sequence(
+        trace if isinstance(trace, Mapping) else {}
+    )
+    reasons.extend(sequence_reasons)
+    physical_plans: list[Mapping[str, Any]] = []
+    for call in calls:
+        plan = call.get("selection_plan")
+        if not isinstance(plan, Mapping):
+            reasons.append("missing_g1_physical_selection_plan")
+            continue
+        reasons.extend(g1_registry_contract_reasons(call, g1_contract))
+        physical_plans.append(plan)
+    if not physical_plans:
+        reasons.append("missing_g1_physical_selection_plan")
+        return {}, {}, list(dict.fromkeys(reasons))
+    first_physical = physical_plans[0]
+    for plan in physical_plans[1:]:
+        if any(
+            plan.get(field) != first_physical.get(field)
+            for field in _G1_LIFECYCLE_PLAN_MATCH_FIELDS
+        ):
+            reasons.append("conflicting_g1_physical_selection_plans")
+
+    routing = row.get("routing_trace")
+    top_routing = dict(routing) if isinstance(routing, Mapping) else {}
+    top_plan = top_routing.get("selection_plan")
+    if isinstance(top_plan, Mapping):
+        reasons.extend(
+            g1_registry_contract_reasons(
+                {"selection_plan": top_plan},
+                g1_contract,
+            )
+        )
+        if any(
+            top_plan.get(field) != first_physical.get(field)
+            for field in _G1_LIFECYCLE_PLAN_MATCH_FIELDS
+        ):
+            reasons.append("g1_routing_plan_differs_from_physical_plan")
+        return top_routing, {}, list(dict.fromkeys(reasons))
+    if top_routing:
+        reasons.append("invalid_g1_top_routing_trace")
+        return {}, {}, list(dict.fromkeys(reasons))
+
+    matching_attempts = matching_saved_generation_attempts(row)
+    if len(matching_attempts) != 1:
+        reasons.append("ambiguous_g1_selected_generation_attempt")
+        return {}, {}, list(dict.fromkeys(reasons))
+    selected_attempt = matching_attempts[0]
+    selected_ordinal = coerce_metric_int(selected_attempt.get("attempt"))
+    execution = row.get("execution")
+    attempts = (
+        execution.get("generation_attempts")
+        if isinstance(execution, Mapping)
+        and isinstance(execution.get("generation_attempts"), list)
+        else []
+    )
+    candidates: list[tuple[Mapping[str, Any], Mapping[str, Any]]] = []
+    for attempt in attempts:
+        if not isinstance(attempt, Mapping):
+            continue
+        run = attempt.get("run")
+        attempt_routing = run.get("routing_trace") if isinstance(run, Mapping) else None
+        plan = (
+            attempt_routing.get("selection_plan")
+            if isinstance(attempt_routing, Mapping)
+            else None
+        )
+        if not isinstance(plan, Mapping):
+            continue
+        plan_reasons = g1_registry_contract_reasons(
+            {"selection_plan": plan},
+            g1_contract,
+        )
+        if plan_reasons:
+            reasons.extend(plan_reasons)
+            continue
+        if any(
+            plan.get(field) != first_physical.get(field)
+            for field in _G1_LIFECYCLE_PLAN_MATCH_FIELDS
+        ):
+            reasons.append("g1_lifecycle_plan_differs_from_physical_plan")
+            continue
+        if coerce_metric_int(attempt.get("attempt")) > selected_ordinal:
+            continue
+        candidates.append((attempt, attempt_routing))
+    unique_candidates = {
+        canonical_json_sha256(dict(candidate_routing)): (attempt, candidate_routing)
+        for attempt, candidate_routing in candidates
+    }
+    if len(unique_candidates) != 1:
+        reasons.append("ambiguous_g1_lifecycle_routing_plan")
+        return {}, {}, list(dict.fromkeys(reasons))
+    attempt, recovered = next(iter(unique_candidates.values()))
+    evidence = {
+        "schema": "opensquilla.draco.g1-provider-lifecycle-routing-recovery/v1",
+        "source_attempt_id": str(attempt.get("attempt_id") or ""),
+        "source_attempt": coerce_metric_int(attempt.get("attempt")),
+        "selected_attempt_id": str(selected_attempt.get("attempt_id") or ""),
+        "selected_attempt": selected_ordinal,
+        "decision_id": str(first_physical.get("decision_id") or ""),
+        "registry_snapshot_hash": str(first_physical.get("registry_snapshot_hash") or ""),
+        "ranking_config_hash": str(first_physical.get("ranking_config_hash") or ""),
+    }
+    return dict(recovered), evidence, list(dict.fromkeys(reasons))
+
+
+def g1_provider_lifecycle_analyzer_reasons(row: Mapping[str, Any]) -> list[str]:
+    """Require one valid analyzer in the setup-bearing attempt of each G1 lifecycle."""
+
+    from opensquilla.provider.ranking_router import (
+        TASK_ANALYZER_MODEL_ID,
+        TASK_ANALYZER_PROVIDER_ID,
+    )
+
+    if str(row.get("group") or "") != "G1":
+        return []
+    execution = row.get("execution")
+    attempts = (
+        execution.get("generation_attempts")
+        if isinstance(execution, Mapping)
+        and isinstance(execution.get("generation_attempts"), list)
+        else []
+    )
+    request_attempts = [
+        attempt
+        for attempt in attempts
+        if isinstance(attempt, Mapping)
+        and isinstance(attempt.get("run"), Mapping)
+        and coerce_metric_int(attempt["run"].get("llm_request_count")) > 0
+    ]
+    if not request_attempts:
+        return ["missing_g1_provider_lifecycle_attempt"]
+    first_units = (
+        request_attempts[0]["run"].get("usage", {}).get("model_usage_breakdown")
+        if isinstance(request_attempts[0]["run"].get("usage"), Mapping)
+        else None
+    )
+    analyzers = [
+        unit
+        for unit in first_units
+        if isinstance(unit, Mapping)
+        and str(unit.get("role") or "").strip().casefold() == "task_analyzer"
+    ] if isinstance(first_units, list) else []
+    if not analyzers:
+        return ["missing_g1_task_analyzer_request"]
+    for analyzer in analyzers:
+        if (
+            str(analyzer.get("provider") or "").strip().casefold()
+            != TASK_ANALYZER_PROVIDER_ID.casefold()
+            or str(analyzer.get("requested_provider") or "").strip().casefold()
+            != TASK_ANALYZER_PROVIDER_ID.casefold()
+            or not _formal_openrouter_models_equivalent(
+                analyzer.get("model"),
+                TASK_ANALYZER_MODEL_ID,
+            )
+            or not _formal_openrouter_models_equivalent(
+                analyzer.get("requested_model"),
+                TASK_ANALYZER_MODEL_ID,
+            )
+        ):
+            return ["wrong_g1_task_analyzer_route"]
+    for attempt in request_attempts[1:]:
+        usage = attempt["run"].get("usage")
+        breakdown = (
+            usage.get("model_usage_breakdown")
+            if isinstance(usage, Mapping)
+            else None
+        )
+        if isinstance(breakdown, list) and any(
+            isinstance(unit, Mapping)
+            and str(unit.get("role") or "").strip().casefold() == "task_analyzer"
+            for unit in breakdown
+        ):
+            return ["repeated_g1_task_analyzer_request"]
+    return []
 
 
 def ensemble_generation_completion_reasons(
@@ -10582,9 +11059,34 @@ def ensemble_generation_completion_reasons(
         return sequence_reasons or ["missing_ensemble_call_trace"]
     final_trace = traces[-1]
     reasons: list[str] = list(sequence_reasons)
+    reasons.extend(
+        agent_call_output_sequence_reasons(
+            traces,
+            final_text=str(row.get("final_text") or ""),
+        )
+    )
     expected_spec = GROUP_SPECS.get(group) or {}
     routing_trace = row.get("routing_trace")
-    expected_plan = routing_trace.get("selection_plan") if isinstance(routing_trace, dict) else None
+    if (
+        group == "G1"
+        and isinstance(expected_run_compatibility_contract, Mapping)
+        and isinstance(
+            expected_run_compatibility_contract.get("g1_registry_contract"),
+            Mapping,
+        )
+    ):
+        lifecycle_routing, _, lifecycle_reasons = g1_provider_lifecycle_routing_evidence(
+            row,
+            contract=expected_run_compatibility_contract,
+        )
+        reasons.extend(lifecycle_reasons)
+        routing_trace = lifecycle_routing
+        reasons.extend(g1_provider_lifecycle_analyzer_reasons(row))
+    expected_plan = (
+        routing_trace.get("selection_plan")
+        if isinstance(routing_trace, Mapping)
+        else None
+    )
     expected_selection_mode = str(expected_spec.get("selection_mode") or "")
     expected_g1_registry_contract = (
         expected_run_compatibility_contract.get("g1_registry_contract")
@@ -10592,28 +11094,40 @@ def ensemble_generation_completion_reasons(
         else None
     )
 
-    # Every Agent-loop provider call affects the tool trajectory, not only the
-    # final answer-producing call.  Reject an earlier fallback, sub-quorum
-    # fusion, or wrong physical lineup before treating the generation as
-    # reusable.  Only the last call must bind its aggregator output to the
-    # stored final answer.
+    # A nonterminal zero-text fallback may drive tool calls without becoming
+    # part of the answer.  Its route and physical evidence remain strict; only
+    # the expected fallback/quorum outcome markers are admissible.  The final
+    # call always remains a quorum-backed aggregator bound to final_text.
     for index, call_trace in enumerate(traces):
-        reasons.extend(
-            ensemble_call_core_reasons(
+        call_reasons = ensemble_call_core_reasons(
+            call_trace,
+            expected_selection_mode=expected_selection_mode,
+            expected_selection_plan=(
+                expected_plan if isinstance(expected_plan, Mapping) else None
+            ),
+            expected_g1_registry_contract=(
+                expected_g1_registry_contract
+                if isinstance(expected_g1_registry_contract, Mapping)
+                else None
+            ),
+            final_text=str(row.get("final_text") or ""),
+            require_output_binding=index == len(traces) - 1,
+        )
+        if index < len(traces) - 1 and call_trace.get("fallback_used") is True:
+            fallback_reasons = admissible_empty_nonterminal_fallback_reasons(
                 call_trace,
-                expected_selection_mode=expected_selection_mode,
                 expected_selection_plan=(
                     expected_plan if isinstance(expected_plan, Mapping) else None
                 ),
-                expected_g1_registry_contract=(
-                    expected_g1_registry_contract
-                    if isinstance(expected_g1_registry_contract, Mapping)
-                    else None
-                ),
-                final_text=str(row.get("final_text") or ""),
-                require_output_binding=index == len(traces) - 1,
             )
-        )
+            reasons.extend(fallback_reasons)
+            if not fallback_reasons:
+                call_reasons = [
+                    reason
+                    for reason in call_reasons
+                    if reason not in _ADMISSIBLE_NONTERMINAL_FALLBACK_CORE_REASONS
+                ]
+        reasons.extend(call_reasons)
 
     agent_call_count = coerce_metric_int(trace.get("agent_llm_call_count"))
     final_call_index = coerce_metric_int(final_trace.get("agent_call_index"))
@@ -10917,6 +11431,173 @@ def ensemble_generation_completion_reasons(
                 if expected_mode and executed_mode != expected_mode:
                     reasons.append("wrong_b2_selection_mode")
     return list(dict.fromkeys(reasons))
+
+
+def terminal_generation_reclassification_evidence(
+    row: Mapping[str, Any],
+    *,
+    ensemble_reasons: Sequence[str],
+) -> dict[str, Any] | None:
+    """Prove one legacy B2 policy marker is stale without changing attempt history."""
+
+    if str(row.get("group") or "") != "B2" or ensemble_reasons:
+        return None
+    execution = row.get("execution")
+    if not isinstance(execution, Mapping):
+        return None
+    if (
+        str(row.get("error") or "") != LEGACY_TERMINAL_POLICY_ERROR
+        or str(execution.get("run_error") or "") != LEGACY_TERMINAL_POLICY_ERROR
+        or row.get("selected_generation_succeeded") is not False
+    ):
+        return None
+    matching = matching_saved_generation_attempts(row)
+    if len(matching) != 1:
+        return None
+    attempt = matching[0]
+    run = attempt.get("run")
+    if (
+        not isinstance(run, Mapping)
+        or str(run.get("error") or "") != LEGACY_TERMINAL_POLICY_ERROR
+        or str(attempt.get("retry_reason") or "") != LEGACY_TERMINAL_POLICY_ERROR
+    ):
+        return None
+    selected_marker = coerce_metric_int(execution.get("selected_generation_attempt"))
+    if selected_marker > 0 and selected_marker != coerce_metric_int(
+        attempt.get("attempt")
+    ):
+        return None
+    trace = row.get("ensemble_trace")
+    calls, sequence_reasons = ensemble_call_trace_sequence(
+        trace if isinstance(trace, Mapping) else {}
+    )
+    if sequence_reasons or not calls:
+        return None
+    intermediate_fallbacks = [
+        coerce_metric_int(call.get("agent_call_index"))
+        for call in calls[:-1]
+        if call.get("fallback_used") is True
+    ]
+    if not intermediate_fallbacks:
+        return None
+    terminal = calls[-1]
+    if (
+        terminal.get("fallback_used") is not False
+        or str(terminal.get("final_request_role") or "") != "aggregator"
+    ):
+        return None
+    attempt_id = str(attempt.get("attempt_id") or "")
+    if len(attempt_id) != 32 or any(char not in "0123456789abcdef" for char in attempt_id):
+        return None
+    return {
+        "schema": GENERATION_TERMINAL_RECLASSIFICATION_SCHEMA,
+        "policy": "terminal_aggregator_with_empty_intermediate_fallback/v1",
+        "original_error": LEGACY_TERMINAL_POLICY_ERROR,
+        "selected_attempt_id": attempt_id,
+        "selected_attempt": coerce_metric_int(attempt.get("attempt")),
+        "terminal_call_index": coerce_metric_int(terminal.get("agent_call_index")),
+        "intermediate_fallback_call_indexes": intermediate_fallbacks,
+    }
+
+
+def apply_terminal_generation_reclassification(
+    row: dict[str, Any],
+    *,
+    expected_run_compatibility_contract: Mapping[str, Any] | None,
+) -> bool:
+    """Normalize only top-level policy metadata after strict terminal proof."""
+
+    ensemble_reasons = ensemble_generation_completion_reasons(
+        row,
+        expected_run_compatibility_contract=expected_run_compatibility_contract,
+    )
+    evidence = terminal_generation_reclassification_evidence(
+        row,
+        ensemble_reasons=ensemble_reasons,
+    )
+    if evidence is None:
+        return False
+    attempt = matching_saved_generation_attempts(row)[0]
+    run = attempt["run"]
+    usage = run.get("usage") if isinstance(run, Mapping) else None
+    billed_cost = (
+        float(usage.get("billed_cost") or 0.0)
+        if isinstance(usage, Mapping)
+        else 0.0
+    )
+    selected_metrics = {
+        "latency_ms": coerce_metric_int(run.get("latency_ms")),
+        "stream_tool_call_count": coerce_metric_int(
+            run.get("stream_tool_call_count")
+        ),
+        "server_tool_call_count": coerce_metric_int(
+            run.get("server_tool_call_count")
+        ),
+        "server_tool_use": (
+            dict(run.get("server_tool_use"))
+            if isinstance(run.get("server_tool_use"), Mapping)
+            else {}
+        ),
+        "total_tool_call_count": coerce_metric_int(run.get("total_tool_call_count")),
+        "trajectory_steps": coerce_metric_int(run.get("trajectory_steps")),
+        "llm_request_count": coerce_metric_int(run.get("llm_request_count")),
+        "usage_unknown_count": coerce_metric_int(run.get("usage_unknown_count")),
+        "billed_cost_usd": billed_cost,
+        "generation_attempt": coerce_metric_int(attempt.get("attempt")),
+    }
+    row["error"] = None
+    row["selected_generation_succeeded"] = True
+    row["selected_attempt_metrics"] = selected_metrics
+    row["selected_attempt_billed_cost_usd"] = billed_cost
+    for metric_field in (
+        "latency_ms",
+        "stream_tool_call_count",
+        "server_tool_call_count",
+        "server_tool_use",
+        "total_tool_call_count",
+        "trajectory_steps",
+        "llm_request_count",
+        "usage_unknown_count",
+    ):
+        row[metric_field] = selected_metrics[metric_field]
+    row["tool_call_count"] = selected_metrics["stream_tool_call_count"]
+    execution = dict(row.get("execution") or {})
+    execution.update(
+        {
+            "run_error": "",
+            "judge_skipped_reason": "",
+            "selected_generation_attempt": selected_metrics["generation_attempt"],
+            "selected_generation_latency_ms": selected_metrics["latency_ms"],
+            "selected_attempt_metrics": selected_metrics,
+            "generation_terminal_reclassification": evidence,
+        }
+    )
+    for metric_field in (
+        "latency_ms",
+        "stream_tool_call_count",
+        "server_tool_call_count",
+        "server_tool_use",
+        "total_tool_call_count",
+        "trajectory_steps",
+        "llm_request_count",
+        "usage_unknown_count",
+    ):
+        execution[metric_field] = selected_metrics[metric_field]
+    execution["tool_call_count"] = selected_metrics["stream_tool_call_count"]
+    row["execution"] = execution
+    completion = (
+        dict(row.get("completion_status"))
+        if isinstance(row.get("completion_status"), Mapping)
+        else {}
+    )
+    completion["generation_accepted"] = True
+    completion["incomplete_reasons"] = [
+        reason
+        for reason in completion.get("incomplete_reasons") or []
+        if reason != LEGACY_TERMINAL_POLICY_ERROR
+    ]
+    row["completion_status"] = completion
+    return True
 
 
 def usage_actual_identity_evidence(usage: Any) -> dict[str, Any]:
@@ -11356,6 +12037,18 @@ def resume_row_completion_state(
             identity_metadata_reasons.append(f"{reason}_backfill_required")
         else:
             generation_reasons.append(reason)
+    terminal_reclassification = terminal_generation_reclassification_evidence(
+        row,
+        ensemble_reasons=[
+            reason
+            for reason in ensemble_reasons
+            if not ensemble_metadata_only_reason(reason)
+        ],
+    )
+    if terminal_reclassification is not None:
+        generation_reasons = [
+            reason for reason in generation_reasons if reason != "generation_error"
+        ]
     generation_valid = not generation_reasons
 
     judge_reasons = judge_completion_reasons(
@@ -11562,6 +12255,7 @@ def resume_row_completion_state(
             isinstance(row.get("execution"), Mapping)
             and row["execution"].get("metadata_repair_attempted") is True
         ),
+        "generation_terminal_reclassification": terminal_reclassification,
         "action": action,
     }
 
@@ -12754,31 +13448,7 @@ async def amain(args: argparse.Namespace) -> int:
         """Repair Judge/metadata while preserving the accepted generation verbatim."""
 
         def _usage_generation_contract(value: Any) -> Any:
-            """Project immutable generation identity while allowing cost repair."""
-
-            if not isinstance(value, Mapping):
-                return None
-            contract_keys = (
-                "provider",
-                "model",
-                "requested_provider",
-                "requested_model",
-                "input_tokens",
-                "output_tokens",
-                "reasoning_tokens",
-                "cached_tokens",
-                "cache_read_tokens",
-                "cache_write_tokens",
-            )
-            contract = {key: value.get(key) for key in contract_keys if key in value}
-            breakdown = value.get("model_usage_breakdown")
-            if isinstance(breakdown, list):
-                contract["model_usage_breakdown"] = [
-                    _usage_generation_contract(item)
-                    for item in breakdown
-                    if isinstance(item, Mapping)
-                ]
-            return contract
+            return generation_usage_identity_contract(value)
 
         async with semaphore:
             row = json.loads(json.dumps(state["row"], ensure_ascii=False))
@@ -12786,6 +13456,42 @@ async def amain(args: argparse.Namespace) -> int:
             prior_execution = (
                 row.get("execution") if isinstance(row.get("execution"), Mapping) else {}
             )
+            expected_contract = args._run_compatibility["contracts"].get(group)
+            terminal_reclassified = apply_terminal_generation_reclassification(
+                row,
+                expected_run_compatibility_contract=expected_contract,
+            )
+            g1_lifecycle_routing_repaired = False
+            if group == "G1":
+                recovered_routing, recovery_evidence, recovery_reasons = (
+                    g1_provider_lifecycle_routing_evidence(
+                        row,
+                        contract=expected_contract,
+                    )
+                )
+                if (
+                    not recovery_reasons
+                    and recovery_evidence
+                    and recovered_routing
+                    and not row.get("routing_trace")
+                ):
+                    row["routing_trace"] = recovered_routing
+                    execution = dict(row.get("execution") or {})
+                    execution["routing_trace"] = recovered_routing
+                    execution["g1_provider_lifecycle_routing_recovery"] = (
+                        recovery_evidence
+                    )
+                    provider_error = str(execution.get("provider_error") or "")
+                    if (
+                        provider_error.startswith("TypeError:")
+                        and "ProviderBillingReceipt" in provider_error
+                    ):
+                        execution["provider_error_before_routing_recovery"] = (
+                            provider_error
+                        )
+                        execution["provider_error"] = ""
+                    row["execution"] = execution
+                    g1_lifecycle_routing_repaired = True
             metadata_repair_already_attempted = (
                 prior_execution.get("metadata_repair_attempted") is True
             )
@@ -12823,6 +13529,11 @@ async def amain(args: argparse.Namespace) -> int:
                 should_apply_metadata_repair and repair_row_cost_metadata_with_estimates(row)
             )
             metadata_repaired = bool(identity_repaired or cost_metadata_repaired)
+            metadata_repaired = bool(
+                metadata_repaired
+                or terminal_reclassified
+                or g1_lifecycle_routing_repaired
+            )
             preexisting_non_byok_ready = True
             if getattr(
                 args,
@@ -12913,6 +13624,10 @@ async def amain(args: argparse.Namespace) -> int:
                     "resume_action": action,
                     "generation_reused": True,
                     "metadata_repaired": metadata_repaired,
+                    "generation_terminal_reclassified": terminal_reclassified,
+                    "g1_lifecycle_routing_repaired": (
+                        g1_lifecycle_routing_repaired
+                    ),
                     "judge_repair_requested": judge_repair_requested,
                     "judge_reran": judge_reran,
                     "judge_attempt_budget_exhausted": (judge_attempt_budget_exhausted),
