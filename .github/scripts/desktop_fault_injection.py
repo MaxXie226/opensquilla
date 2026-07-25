@@ -30,11 +30,13 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
 import uuid
 from dataclasses import dataclass, field
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +44,7 @@ from typing import Any
 # is reported as ``timeout`` rather than silently passing.
 DEFAULT_TIMEOUT_SECONDS = 180
 POLL_INTERVAL_SECONDS = 1.0
+_FAKE_MODEL = "synthetic-fault-injection-model"
 
 _MINIMAL_SESSION_SCHEMA = """
 CREATE TABLE sessions (
@@ -98,6 +101,91 @@ def _session_labels(path: Path) -> set[str]:
     return {str(row[0]) for row in rows}
 
 
+class _FakeProviderHandler(BaseHTTPRequestHandler):
+    """Answer the few provider calls the desktop performs while starting up."""
+
+    protocol_version = "HTTP/1.1"
+
+    def _json(self, payload: dict[str, Any]) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        self._json({"object": "list", "data": [{"id": _FAKE_MODEL}]})
+
+    def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        length = int(self.headers.get("content-length") or 0)
+        if length:
+            self.rfile.read(length)
+        self._json(
+            {
+                "id": "fault-injection",
+                "object": "chat.completion",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            }
+        )
+
+    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+        return
+
+
+def _start_fake_provider() -> tuple[ThreadingHTTPServer, int]:
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeProviderHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, server.server_address[1]
+
+
+def _credential(provider_port: int, marker: str) -> str:
+    """A plain-encryption credential so startup skips onboarding.
+
+    Without one the desktop legitimately waits in setup and never binds a
+    gateway, which would look identical to a blocked startup.
+    """
+
+    return (
+        json.dumps(
+            {
+                "provider": "minimax_openai",
+                "model": _FAKE_MODEL,
+                "baseUrl": f"http://127.0.0.1:{provider_port}/v1",
+                "encryptedApiKey": marker,
+                "modelRoutingMode": "direct",
+                "routerMode": "disabled",
+                "searchProvider": "duckduckgo",
+                "encryption": "plain",
+                "createdAt": "2026-07-20T00:00:00.000Z",
+                "updatedAt": "2026-07-20T00:00:00.000Z",
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+
+
+def _marker_config(marker: int) -> str:
+    """A valid, non-empty GatewayConfig body tagged with a distinguishable value.
+
+    Synthetic keys are rejected by the real gateway (``extra_forbidden``), which
+    would look like a consolidation failure rather than a bad fixture.  The
+    value must also keep the file non-empty: an empty or comment-only
+    ``config.toml`` counts as *no* configuration for the adoption predicate.
+    """
+
+    return f"log_file_backup_count = {marker}\n"
+
+
 def _write_primary_context(user_data: Path) -> None:
     (user_data / "desktop-profile-context.json").write_text(
         json.dumps(
@@ -123,32 +211,52 @@ class Fixture:
     recovery_ids: list[str] = field(default_factory=list)
     expected_session_labels: set[str] = field(default_factory=set)
     notes: list[str] = field(default_factory=list)
+    # Seeded by a warmup launch rather than written directly: only the packaged
+    # gateway knows the current session schema.
+    primary_session_label: str | None = None
 
 
-def _primary(user_data: Path, *, config: str | None, session_label: str | None) -> Path:
+def _primary(
+    user_data: Path,
+    *,
+    config: str | None,
+    session_label: str | None,
+    provider_port: int,
+    credential: bool = True,
+) -> Path:
     home = user_data / "opensquilla"
     (home / "workspace").mkdir(parents=True, exist_ok=True)
     (home / "state").mkdir(parents=True, exist_ok=True)
     if config is not None:
         (home / "config.toml").write_text(config, encoding="utf-8")
-    if session_label is not None:
-        _seed_sessions_db(
-            home / "state" / "sessions.db",
-            session_key="agent:main:main",
-            session_id="primary-session",
-            label=session_label,
+    # A primary sessions.db is created by the warmup launch, not fabricated
+    # here: a hand-written schema makes the live gateway exit with
+    # "no such column".
+    del session_label
+    if credential:
+        (user_data / "desktop-credential.json").write_text(
+            _credential(provider_port, "primary-credential"), encoding="utf-8"
         )
     _write_primary_context(user_data)
     return home
 
 
-def _recovery(user_data: Path, recovery_id: str, *, config: str, session_label: str) -> Path:
+def _recovery(
+    user_data: Path,
+    recovery_id: str,
+    *,
+    config: str,
+    session_label: str,
+    provider_port: int,
+) -> Path:
     root = user_data / "recovery-profiles" / recovery_id
     home = root / "opensquilla"
     (home / "workspace").mkdir(parents=True, exist_ok=True)
     (home / "config.toml").write_text(config, encoding="utf-8")
     (home / ".env").write_text(f"OPENSQUILLA_SOURCE_MARKER={recovery_id}\n", encoding="utf-8")
-    (root / "desktop-credential.json").write_text("{}\n", encoding="utf-8")
+    (root / "desktop-credential.json").write_text(
+        _credential(provider_port, f"recovery-credential-{recovery_id}"), encoding="utf-8"
+    )
     (home / "workspace" / "MEMORY.md").write_text(f"memory {recovery_id}\n", encoding="utf-8")
     _seed_sessions_db(
         home / "state" / "sessions.db",
@@ -164,28 +272,45 @@ def _recovery(user_data: Path, recovery_id: str, *, config: str, session_label: 
 # ── Scenario builders ──────────────────────────────────────────────────────
 
 
-def _fresh_install(user_data: Path) -> Fixture:
+def _fresh_install(user_data: Path, provider_port: int) -> Fixture:
     """The common case: no legacy container at all. Must reach the product."""
 
-    _primary(user_data, config="", session_label=None)
+    _primary(user_data, config="", session_label=None, provider_port=provider_port)
     return Fixture(user_data, notes=["no recovery-profiles container exists"])
 
 
-def _single_recovery(user_data: Path) -> Fixture:
-    _primary(user_data, config="primary = true\n", session_label="primary chat")
+def _single_recovery(user_data: Path, provider_port: int) -> Fixture:
+    _primary(
+        user_data,
+        config=_marker_config(1),
+        session_label="primary chat",
+        provider_port=provider_port,
+    )
     recovery_id = str(uuid.uuid4())
-    _recovery(user_data, recovery_id, config="selected = 'recovery'\n", session_label="recovery A")
+    _recovery(
+        user_data,
+        recovery_id,
+        config=_marker_config(2),
+        session_label="recovery A",
+        provider_port=provider_port,
+    )
     return Fixture(
         user_data,
         recovery_ids=[recovery_id],
         expected_session_labels={"primary chat", "recovery A"},
+        primary_session_label="primary chat",
     )
 
 
-def _multi_recovery(user_data: Path) -> Fixture:
+def _multi_recovery(user_data: Path, provider_port: int) -> Fixture:
     """R1: every recovery profile is consolidated, with no chooser."""
 
-    _primary(user_data, config="primary = true\n", session_label="primary chat")
+    _primary(
+        user_data,
+        config=_marker_config(1),
+        session_label="primary chat",
+        provider_port=provider_port,
+    )
     ids = []
     for index in range(3):
         recovery_id = str(uuid.uuid4())
@@ -193,25 +318,50 @@ def _multi_recovery(user_data: Path) -> Fixture:
         _recovery(
             user_data,
             recovery_id,
-            config=f"selected = 'recovery-{index}'\n",
+            config=_marker_config(10 + index),
             session_label=f"recovery {index}",
+            provider_port=provider_port,
         )
     return Fixture(
         user_data,
         recovery_ids=ids,
         expected_session_labels={"primary chat", "recovery 0", "recovery 1", "recovery 2"},
+        primary_session_label="primary chat",
     )
 
 
-def _empty_primary_config(user_data: Path) -> Fixture:
-    """R2: an empty primary adopts configuration from the newest recovery."""
+def _empty_primary_config(user_data: Path, provider_port: int) -> Fixture:
+    """R2: an empty primary adopts configuration from the newest recovery.
 
-    _primary(user_data, config="", session_label=None)
+    No primary credential either: a credential on its own counts as existing
+    configuration, so seeding one would skip the adoption path under test. The
+    gateway therefore only starts if the adopted recovery credential works.
+    """
+
+    _primary(
+        user_data,
+        config="",
+        session_label=None,
+        provider_port=provider_port,
+        credential=False,
+    )
     older = str(uuid.uuid4())
-    _recovery(user_data, older, config="adopted = 'older'\n", session_label="older recovery")
+    _recovery(
+        user_data,
+        older,
+        config=_marker_config(3),
+        session_label="older recovery",
+        provider_port=provider_port,
+    )
     time.sleep(1.1)
     newer = str(uuid.uuid4())
-    _recovery(user_data, newer, config="adopted = 'newer'\n", session_label="newer recovery")
+    _recovery(
+        user_data,
+        newer,
+        config=_marker_config(7),
+        session_label="newer recovery",
+        provider_port=provider_port,
+    )
     return Fixture(
         user_data,
         recovery_ids=[older, newer],
@@ -220,25 +370,48 @@ def _empty_primary_config(user_data: Path) -> Fixture:
     )
 
 
-def _corrupt_primary_config(user_data: Path) -> Fixture:
+def _corrupt_primary_config(user_data: Path, provider_port: int) -> Fixture:
     """R2: a corrupt-but-present primary configuration stays authoritative."""
 
-    _primary(user_data, config="this is = = not valid toml [\n", session_label="primary chat")
+    _primary(
+        user_data,
+        config="this is = = not valid toml [\n",
+        session_label="primary chat",
+        provider_port=provider_port,
+    )
     recovery_id = str(uuid.uuid4())
-    _recovery(user_data, recovery_id, config="adopted = 'recovery'\n", session_label="recovery A")
+    _recovery(
+        user_data,
+        recovery_id,
+        config=_marker_config(4),
+        session_label="recovery A",
+        provider_port=provider_port,
+    )
     return Fixture(
         user_data,
         recovery_ids=[recovery_id],
         expected_session_labels={"primary chat", "recovery A"},
+        primary_session_label="primary chat",
     )
 
 
-def _stray_shell_metadata(user_data: Path) -> Fixture:
+def _stray_shell_metadata(user_data: Path, provider_port: int) -> Fixture:
     """Inert shell/antivirus files must never strand startup."""
 
-    _primary(user_data, config="primary = true\n", session_label="primary chat")
+    _primary(
+        user_data,
+        config=_marker_config(1),
+        session_label="primary chat",
+        provider_port=provider_port,
+    )
     recovery_id = str(uuid.uuid4())
-    _recovery(user_data, recovery_id, config="selected = 'recovery'\n", session_label="recovery A")
+    _recovery(
+        user_data,
+        recovery_id,
+        config=_marker_config(2),
+        session_label="recovery A",
+        provider_port=provider_port,
+    )
     container = user_data / "recovery-profiles"
     (container / ".DS_Store").write_bytes(b"finder metadata")
     (container / ".localized").write_bytes(b"")
@@ -249,16 +422,28 @@ def _stray_shell_metadata(user_data: Path) -> Fixture:
         user_data,
         recovery_ids=[recovery_id],
         expected_session_labels={"primary chat", "recovery A"},
+        primary_session_label="primary chat",
         notes=["five inert stray files in the container"],
     )
 
 
-def _stray_directory(user_data: Path) -> Fixture:
+def _stray_directory(user_data: Path, provider_port: int) -> Fixture:
     """A profile-shaped directory is a deliberate fail-closed boundary."""
 
-    _primary(user_data, config="primary = true\n", session_label="primary chat")
+    _primary(
+        user_data,
+        config=_marker_config(1),
+        session_label="primary chat",
+        provider_port=provider_port,
+    )
     recovery_id = str(uuid.uuid4())
-    _recovery(user_data, recovery_id, config="selected = 'recovery'\n", session_label="recovery A")
+    _recovery(
+        user_data,
+        recovery_id,
+        config=_marker_config(2),
+        session_label="recovery A",
+        provider_port=provider_port,
+    )
     (user_data / "recovery-profiles" / f"{uuid.uuid4()} - Copy").mkdir()
     return Fixture(
         user_data,
@@ -267,24 +452,42 @@ def _stray_directory(user_data: Path) -> Fixture:
     )
 
 
-def _only_stray_files(user_data: Path) -> Fixture:
+def _only_stray_files(user_data: Path, provider_port: int) -> Fixture:
     """A container holding no real profile is a noop, not a blocked startup."""
 
-    _primary(user_data, config="primary = true\n", session_label="primary chat")
+    _primary(
+        user_data,
+        config=_marker_config(1),
+        session_label="primary chat",
+        provider_port=provider_port,
+    )
     container = user_data / "recovery-profiles"
     container.mkdir(parents=True)
     (container / "desktop.ini").write_bytes(b"[.ShellClassInfo]\n")
     (container / "Thumbs.db").write_bytes(b"thumbs")
-    return Fixture(user_data, expected_session_labels={"primary chat"})
+    return Fixture(
+        user_data,
+        expected_session_labels={"primary chat"},
+        primary_session_label="primary chat",
+    )
 
 
-def _readonly_recovery_source(user_data: Path) -> Fixture:
+def _readonly_recovery_source(user_data: Path, provider_port: int) -> Fixture:
     """A recovery profile the process cannot read must not lose primary access."""
 
-    _primary(user_data, config="primary = true\n", session_label="primary chat")
+    _primary(
+        user_data,
+        config=_marker_config(1),
+        session_label="primary chat",
+        provider_port=provider_port,
+    )
     recovery_id = str(uuid.uuid4())
     root = _recovery(
-        user_data, recovery_id, config="selected = 'recovery'\n", session_label="recovery A"
+        user_data,
+        recovery_id,
+        config=_marker_config(2),
+        session_label="recovery A",
+        provider_port=provider_port,
     )
     os.chmod(root / "opensquilla" / "state" / "sessions.db", 0o000)
     return Fixture(
@@ -356,6 +559,99 @@ SCENARIOS: dict[str, dict[str, Any]] = {
         ),
     },
 }
+
+
+def _insert_session_row(database: Path, *, session_key: str, session_id: str, label: str) -> bool:
+    """Insert one session using the live schema discovered from the database.
+
+    The packaged gateway owns the session schema and it moves between releases,
+    so the row is built from ``PRAGMA table_info`` rather than a pinned DDL.
+    """
+
+    if not database.is_file():
+        return False
+    connection = sqlite3.connect(database)
+    try:
+        columns = connection.execute("PRAGMA table_info(sessions)").fetchall()
+        if not columns:
+            return False
+        names = {str(column[1]) for column in columns}
+        values: dict[str, Any] = {}
+        for column in columns:
+            name, declared, not_null, default = str(column[1]), str(column[2]), column[3], column[4]
+            if name == "session_key":
+                values[name] = session_key
+            elif name == "session_id":
+                values[name] = session_id
+            elif name in {"label", "title", "name"}:
+                values[name] = label
+            elif not_null and default is None:
+                # Satisfy remaining NOT NULL columns with a type-appropriate zero.
+                upper = declared.upper()
+                if "INT" in upper:
+                    values[name] = 0
+                elif "REAL" in upper or "FLOA" in upper or "DOUB" in upper:
+                    values[name] = 0.0
+                else:
+                    values[name] = ""
+        if "session_key" not in names or "session_id" not in names:
+            return False
+        placeholders = ", ".join("?" for _ in values)
+        quoted = ", ".join(f'"{name}"' for name in values)
+        connection.execute(
+            f"INSERT OR REPLACE INTO sessions({quoted}) VALUES ({placeholders})",
+            tuple(values.values()),
+        )
+        connection.commit()
+    except sqlite3.Error:
+        return False
+    finally:
+        connection.close()
+    return True
+
+
+def _warmup_primary(
+    binary: Path,
+    user_data: Path,
+    *,
+    port: int,
+    isolated_home: Path,
+    label: str,
+    timeout: float,
+) -> dict[str, Any]:
+    """Let the packaged gateway create a real primary database, then seed a row.
+
+    Recovery sources are staged out of the way so this launch cannot consolidate
+    before the primary has any content worth preserving.
+    """
+
+    container = user_data / "recovery-profiles"
+    parked = user_data.parent / "staged-recovery-profiles"
+    staged = container.exists()
+    if staged:
+        shutil.move(str(container), str(parked))
+
+    process = _launch(binary, user_data, port=port, isolated_home=isolated_home)
+    try:
+        deadline = time.monotonic() + timeout
+        answered = False
+        while time.monotonic() < deadline:
+            if _gateway_answered(port):
+                answered = True
+                break
+            if process.poll() is not None:
+                break
+            time.sleep(POLL_INTERVAL_SECONDS)
+    finally:
+        _terminate(process)
+
+    database = user_data / "opensquilla" / "state" / "sessions.db"
+    seeded = _insert_session_row(
+        database, session_key="agent:main:main", session_id="primary-session", label=label
+    )
+    if staged:
+        shutil.move(str(parked), str(container))
+    return {"gateway_answered": answered, "database_seeded": seeded}
 
 
 # ── Launch and classification ──────────────────────────────────────────────
@@ -523,7 +819,7 @@ def _assert_side_effects(
     if scenario.get("assert_config_adopted"):
         config = primary_home / "config.toml"
         text = config.read_text(encoding="utf-8") if config.is_file() else ""
-        if "adopted = 'newer'" not in text:
+        if _marker_config(7).strip() not in text:
             failures.append(
                 "primary config.toml did not adopt the newest recovery configuration; "
                 f"contents were {text!r}"
@@ -554,7 +850,12 @@ def _run_scenario(
     user_data.mkdir(parents=True)
     isolated_home.mkdir(parents=True)
 
-    fixture: Fixture = scenario["build"](user_data)
+    provider, provider_port = _start_fake_provider()
+    try:
+        fixture: Fixture = scenario["build"](user_data, provider_port)
+    except BaseException:
+        provider.shutdown()
+        raise
     result: dict[str, Any] = {
         "scenario": name,
         "why": scenario["why"],
@@ -565,18 +866,38 @@ def _run_scenario(
     }
 
     if dry_run:
+        provider.shutdown()
         result["verdict"] = "dry-run"
         result["ok"] = True
         return result
 
     assert app is not None
     binary = _app_binary(app)
+    if fixture.primary_session_label is not None:
+        result["warmup"] = _warmup_primary(
+            binary,
+            user_data,
+            port=port,
+            isolated_home=isolated_home,
+            label=fixture.primary_session_label,
+            timeout=min(timeout, 120.0),
+        )
+        if not result["warmup"]["database_seeded"]:
+            provider.shutdown()
+            result["verdict"] = "warmup-failed"
+            result["failures"] = [
+                "the warmup launch never produced a seedable primary sessions.db, so this "
+                "scenario cannot prove existing chats survive"
+            ]
+            result["ok"] = False
+            return result
     process = _launch(binary, user_data, port=port, isolated_home=isolated_home)
     log_path = user_data / "logs" / "desktop.log"
     try:
         verdict, events = _classify(process, log_path, port=port, timeout=timeout)
     finally:
         _terminate(process)
+        provider.shutdown()
 
     result["verdict"] = verdict
     result["events"] = [event.get("event") for event in events]
@@ -635,7 +956,8 @@ def _run_wedge_probe(
     isolated_home = root / "home"
     user_data.mkdir(parents=True)
     isolated_home.mkdir(parents=True)
-    fixture = _multi_recovery(user_data)
+    provider, provider_port = _start_fake_provider()
+    fixture = _multi_recovery(user_data, provider_port)
 
     binary = _app_binary(app)
     log_path = user_data / "logs" / "desktop.log"
@@ -669,6 +991,7 @@ def _run_wedge_probe(
         verdict, events = _classify(second, log_path, port=port + 1, timeout=timeout)
     finally:
         _terminate(second)
+        provider.shutdown()
 
     return {
         "probe": label,
