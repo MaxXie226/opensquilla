@@ -80,6 +80,16 @@ DOMAINS = (
 )
 TIERS = ("1", "2", "3", "4")
 MODALITIES = ("text", "image", "audio", "video", "file")
+THINKING_LEVELS = (
+    "off",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+    "adaptive",
+)
 FORMATS = (
     "plain_text",
     "structured_text",
@@ -201,6 +211,9 @@ class RankedModel:
             "is_chinese_model": facts.get("is_chinese_model"),
             "supports_reasoning": facts.get("supports_reasoning"),
             "supports_tools": facts.get("supports_tools"),
+            "supported_thinking_levels": list(
+                facts.get("supported_thinking_levels") or []
+            ),
             "status": str(facts.get("status") or ""),
             "roles": list(facts.get("roles") or []),
             "context_window": _as_int(facts.get("context_window"), 0),
@@ -3079,6 +3092,34 @@ def _validate_registry_model(
             raise DynamicRankingError(
                 "router_dynamic model registry "
                 f"{identity} has invalid {boolean_fact}"
+            )
+
+    supported_thinking_levels = facts.get("supported_thinking_levels")
+    if supported_thinking_levels is not None:
+        normalized_thinking_levels = _registry_string_list(
+            supported_thinking_levels,
+            identity=identity,
+            field_name="supported_thinking_levels",
+            allowed=set(THINKING_LEVELS),
+        )
+        if len(normalized_thinking_levels) != len(supported_thinking_levels):
+            raise DynamicRankingError(
+                "router_dynamic model registry "
+                f"{identity} has duplicate supported_thinking_levels"
+            )
+        supports_reasoning = facts.get("supports_reasoning")
+        has_enabled_level = any(
+            level != "off" for level in normalized_thinking_levels
+        )
+        if supports_reasoning is False and has_enabled_level:
+            raise DynamicRankingError(
+                "router_dynamic model registry "
+                f"{identity} advertises thinking levels without reasoning support"
+            )
+        if supports_reasoning is True and not has_enabled_level:
+            raise DynamicRankingError(
+                "router_dynamic model registry "
+                f"{identity} has no enabled supported_thinking_levels"
             )
 
     price = facts.get("price")

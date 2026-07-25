@@ -19,6 +19,7 @@ from opensquilla.provider.ranking_router import (
     DOMAINS,
     TASK_ANALYZER_MODEL_ID,
     TASK_ANALYZER_PROVIDER_ID,
+    THINKING_LEVELS,
     DynamicRankingError,
     TaskAnalysisResult,
     TaskAnalyzerStreamCleanupError,
@@ -309,6 +310,14 @@ def test_packaged_curated_registry_has_versioned_step2_profiles() -> None:
         assert type(facts["is_chinese_model"]) is bool
         assert type(facts["supports_reasoning"]) is bool
         assert type(facts["supports_tools"]) is bool
+        thinking_levels = facts["supported_thinking_levels"]
+        assert thinking_levels
+        assert len(thinking_levels) == len(set(thinking_levels))
+        assert set(thinking_levels) <= set(THINKING_LEVELS)
+        assert model["runtime"]["thinking"] == thinking_levels[0]
+        assert facts["supports_reasoning"] is any(
+            level != "off" for level in thinking_levels
+        )
         assert facts["catalog_verified_at"] == "2026-07-24"
         assert facts["latency_source"] == "curated_estimate"
         assert set(model["static_profile"]["capability_dist_prior"]) == set(CAPABILITIES)
@@ -323,6 +332,16 @@ def test_packaged_curated_registry_has_versioned_step2_profiles() -> None:
         if model["source"] == "curated_openrouter_profile"
     ]
     assert len(curated_models) == 80
+    by_model_id = {
+        model["registry_facts"]["model_id"]: model for model in curated_models
+    }
+    assert by_model_id["deepseek/deepseek-v4-flash"]["registry_facts"][
+        "supported_thinking_levels"
+    ] == ["xhigh", "high", "off"]
+    assert by_model_id["anthropic/claude-opus-4.8"]["runtime"]["thinking"] == "max"
+    assert by_model_id["kwaipilot/kat-coder-pro-v2.5"]["registry_facts"][
+        "supported_thinking_levels"
+    ] == ["off"]
     assert min(
         model["registry_facts"]["price"]["input_per_million"]
         for model in curated_models
@@ -850,6 +869,28 @@ def test_ranking_rejects_non_boolean_model_boolean_fact(field: str) -> None:
     model["registry_facts"][field] = "false"
 
     with pytest.raises(DynamicRankingError, match=f"invalid {field}"):
+        _decision(model, analysis=_analysis(tier=1))
+
+
+@pytest.mark.parametrize(
+    ("supports_reasoning", "levels", "message"),
+    [
+        (True, ["high", "turbo"], "invalid supported_thinking_levels"),
+        (True, ["high", "high"], "duplicate supported_thinking_levels"),
+        (True, ["off"], "no enabled supported_thinking_levels"),
+        (False, ["high", "off"], "without reasoning support"),
+    ],
+)
+def test_ranking_rejects_invalid_supported_thinking_levels(
+    supports_reasoning: bool,
+    levels: list[str],
+    message: str,
+) -> None:
+    model = _model("malformed")
+    model["registry_facts"]["supports_reasoning"] = supports_reasoning
+    model["registry_facts"]["supported_thinking_levels"] = levels
+
+    with pytest.raises(DynamicRankingError, match=message):
         _decision(model, analysis=_analysis(tier=1))
 
 

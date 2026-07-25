@@ -1,11 +1,11 @@
 {
   "schema_version": "step2-model-registry-v1",
-  "snapshot_version": "curated-openrouter-step2-2026-07-24.2",
+  "snapshot_version": "curated-openrouter-step2-2026-07-24.3",
   "models": [
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "off"
+        "thinking": "xhigh"
       },
       "registry_facts": {
         "model_id": "deepseek/deepseek-v4-flash",
@@ -42,7 +42,12 @@
         "catalog_verified_at": "2026-07-24",
         "latency_source": "curated_estimate",
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "xhigh",
+          "high",
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -102,7 +107,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "high"
+        "thinking": "xhigh"
       },
       "registry_facts": {
         "model_id": "deepseek/deepseek-v4-pro",
@@ -139,7 +144,12 @@
         "catalog_verified_at": "2026-07-24",
         "latency_source": "curated_estimate",
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "xhigh",
+          "high",
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -199,7 +209,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "medium"
+        "thinking": "high"
       },
       "registry_facts": {
         "model_id": "google/gemini-3-flash-preview",
@@ -242,7 +252,14 @@
         "catalog_verified_at": "2026-07-24",
         "latency_source": "curated_estimate",
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "high",
+          "medium",
+          "low",
+          "minimal",
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -302,7 +319,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "high"
+        "thinking": "xhigh"
       },
       "registry_facts": {
         "model_id": "z-ai/glm-5.2",
@@ -341,7 +358,12 @@
         "catalog_verified_at": "2026-07-24",
         "latency_source": "curated_estimate",
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "xhigh",
+          "high",
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -401,7 +423,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "medium"
+        "thinking": "high"
       },
       "registry_facts": {
         "model_id": "qwen/qwen3.7-plus",
@@ -440,7 +462,11 @@
         "catalog_verified_at": "2026-07-24",
         "latency_source": "curated_estimate",
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "high",
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -540,7 +566,10 @@
         "catalog_verified_at": "2026-07-24",
         "latency_source": "curated_estimate",
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "high"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -639,7 +668,11 @@
         "catalog_verified_at": "2026-07-24",
         "latency_source": "curated_estimate",
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "high",
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -699,7 +732,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "xhigh"
+        "thinking": "max"
       },
       "registry_facts": {
         "model_id": "anthropic/claude-opus-4.8",
@@ -740,7 +773,15 @@
         "catalog_verified_at": "2026-07-24",
         "latency_source": "curated_estimate",
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "max",
+          "xhigh",
+          "high",
+          "medium",
+          "low",
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -841,7 +882,14 @@
         "catalog_verified_at": "2026-07-24",
         "latency_source": "curated_estimate",
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "xhigh",
+          "high",
+          "medium",
+          "low",
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -901,7 +949,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "off"
+        "thinking": "high"
       },
       "registry_facts": {
         "model_id": "poolside/laguna-xs-2.1",
@@ -938,7 +986,11 @@
         "is_open_source": true,
         "is_chinese_model": false,
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "high",
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -998,7 +1050,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "low"
+        "thinking": "high"
       },
       "registry_facts": {
         "model_id": "tencent/hy3",
@@ -1036,7 +1088,12 @@
         "is_open_source": true,
         "is_chinese_model": true,
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "high",
+          "low",
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -1096,7 +1153,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "medium"
+        "thinking": "off"
       },
       "registry_facts": {
         "model_id": "kwaipilot/kat-coder-air-v2.5",
@@ -1133,7 +1190,10 @@
         "is_open_source": false,
         "is_chinese_model": true,
         "supports_reasoning": false,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -1232,7 +1292,10 @@
         "is_open_source": true,
         "is_chinese_model": false,
         "supports_reasoning": false,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -1292,7 +1355,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "high"
+        "thinking": "off"
       },
       "registry_facts": {
         "model_id": "kwaipilot/kat-coder-pro-v2.5",
@@ -1329,7 +1392,10 @@
         "is_open_source": false,
         "is_chinese_model": true,
         "supports_reasoning": false,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -1389,7 +1455,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "medium"
+        "thinking": "high"
       },
       "registry_facts": {
         "model_id": "minimax/minimax-m3",
@@ -1430,7 +1496,11 @@
         "is_open_source": true,
         "is_chinese_model": true,
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "high",
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -1490,7 +1560,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "medium"
+        "thinking": "high"
       },
       "registry_facts": {
         "model_id": "mistralai/mistral-medium-3-5",
@@ -1531,7 +1601,11 @@
         "is_open_source": false,
         "is_chinese_model": false,
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "high",
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -1591,7 +1665,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "medium"
+        "thinking": "max"
       },
       "registry_facts": {
         "model_id": "openai/gpt-5.6-luna",
@@ -1632,7 +1706,15 @@
         "is_open_source": false,
         "is_chinese_model": false,
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "max",
+          "xhigh",
+          "high",
+          "medium",
+          "low",
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -1692,7 +1774,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "high"
+        "thinking": "max"
       },
       "registry_facts": {
         "model_id": "anthropic/claude-sonnet-5",
@@ -1733,7 +1815,15 @@
         "is_open_source": false,
         "is_chinese_model": false,
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "max",
+          "xhigh",
+          "high",
+          "medium",
+          "low",
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -1834,7 +1924,12 @@
         "is_open_source": false,
         "is_chinese_model": false,
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "high",
+          "medium",
+          "low"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -1937,7 +2032,12 @@
         "is_open_source": false,
         "is_chinese_model": false,
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "high",
+          "medium",
+          "low"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -1997,7 +2097,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "medium"
+        "thinking": "high"
       },
       "registry_facts": {
         "model_id": "google/gemini-3.6-flash",
@@ -2040,7 +2140,13 @@
         "catalog_verified_at": "2026-07-24",
         "latency_source": "curated_estimate",
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "high",
+          "medium",
+          "low",
+          "minimal"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -2100,7 +2206,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "medium"
+        "thinking": "high"
       },
       "registry_facts": {
         "model_id": "google/gemini-3.5-flash",
@@ -2143,7 +2249,13 @@
         "catalog_verified_at": "2026-07-24",
         "latency_source": "curated_estimate",
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "high",
+          "medium",
+          "low",
+          "minimal"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -2203,7 +2315,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "medium"
+        "thinking": "max"
       },
       "registry_facts": {
         "model_id": "openai/gpt-5.6-sol",
@@ -2244,7 +2356,15 @@
         "catalog_verified_at": "2026-07-24",
         "latency_source": "curated_estimate",
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "max",
+          "xhigh",
+          "high",
+          "medium",
+          "low",
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -2304,7 +2424,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "medium"
+        "thinking": "max"
       },
       "registry_facts": {
         "model_id": "openai/gpt-5.6-terra",
@@ -2345,7 +2465,15 @@
         "is_open_source": false,
         "is_chinese_model": false,
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "max",
+          "xhigh",
+          "high",
+          "medium",
+          "low",
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -2405,7 +2533,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "high"
+        "thinking": "max"
       },
       "registry_facts": {
         "model_id": "anthropic/claude-fable-5",
@@ -2446,7 +2574,14 @@
         "is_open_source": false,
         "is_chinese_model": false,
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "max",
+          "xhigh",
+          "high",
+          "medium",
+          "low"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -2506,7 +2641,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "off"
+        "thinking": "high"
       },
       "registry_facts": {
         "model_id": "anthropic/claude-haiku-4.5",
@@ -2547,7 +2682,11 @@
         "catalog_verified_at": "2026-07-24",
         "latency_source": "curated_estimate",
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "high",
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -2607,7 +2746,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "medium"
+        "thinking": "xhigh"
       },
       "registry_facts": {
         "model_id": "meta/muse-spark-1.1",
@@ -2650,7 +2789,14 @@
         "catalog_verified_at": "2026-07-24",
         "latency_source": "curated_estimate",
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "xhigh",
+          "high",
+          "medium",
+          "low",
+          "minimal"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -2710,7 +2856,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "off"
+        "thinking": "high"
       },
       "registry_facts": {
         "model_id": "x-ai/grok-4.20",
@@ -2751,7 +2897,11 @@
         "is_open_source": false,
         "is_chinese_model": false,
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "high",
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -2811,7 +2961,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "off"
+        "thinking": "high"
       },
       "registry_facts": {
         "model_id": "amazon/nova-2-lite-v1",
@@ -2853,7 +3003,11 @@
         "catalog_verified_at": "2026-07-24",
         "latency_source": "curated_estimate",
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "high",
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -2913,7 +3067,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "medium"
+        "thinking": "xhigh"
       },
       "registry_facts": {
         "model_id": "openai/gpt-5.3-codex",
@@ -2952,7 +3106,14 @@
         "catalog_verified_at": "2026-07-24",
         "latency_source": "curated_estimate",
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "xhigh",
+          "high",
+          "medium",
+          "low",
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -3012,7 +3173,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "xhigh"
+        "thinking": "max"
       },
       "registry_facts": {
         "model_id": "moonshotai/kimi-k3",
@@ -3052,7 +3213,13 @@
         "catalog_verified_at": "2026-07-24",
         "latency_source": "curated_estimate",
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "max",
+          "high",
+          "low",
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -3112,7 +3279,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "off"
+        "thinking": "high"
       },
       "registry_facts": {
         "model_id": "xiaomi/mimo-v2.5-pro",
@@ -3151,7 +3318,11 @@
         "catalog_verified_at": "2026-07-24",
         "latency_source": "curated_estimate",
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "high",
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -3211,7 +3382,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "medium"
+        "thinking": "high"
       },
       "registry_facts": {
         "model_id": "stepfun/step-3.7-flash",
@@ -3252,7 +3423,12 @@
         "is_open_source": true,
         "is_chinese_model": true,
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "high",
+          "medium",
+          "low"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -3312,7 +3488,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "medium"
+        "thinking": "high"
       },
       "registry_facts": {
         "model_id": "meituan/longcat-2.0",
@@ -3351,7 +3527,11 @@
         "is_open_source": true,
         "is_chinese_model": true,
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "high",
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -3411,7 +3591,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "medium"
+        "thinking": "high"
       },
       "registry_facts": {
         "model_id": "qwen/qwen3.6-35b-a3b",
@@ -3452,7 +3632,11 @@
         "catalog_verified_at": "2026-07-24",
         "latency_source": "curated_estimate",
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "high",
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -3549,7 +3733,10 @@
         "is_open_source": true,
         "is_chinese_model": true,
         "supports_reasoning": false,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -3609,7 +3796,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "off"
+        "thinking": "high"
       },
       "registry_facts": {
         "model_id": "deepseek/deepseek-v3.2",
@@ -3648,7 +3835,11 @@
         "catalog_verified_at": "2026-07-24",
         "latency_source": "curated_estimate",
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "high",
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -3708,7 +3899,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "high"
+        "thinking": "xhigh"
       },
       "registry_facts": {
         "model_id": "inclusionai/ring-2.6-1t",
@@ -3747,7 +3938,11 @@
         "catalog_verified_at": "2026-07-24",
         "latency_source": "curated_estimate",
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "xhigh",
+          "high"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -3807,7 +4002,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "medium"
+        "thinking": "high"
       },
       "registry_facts": {
         "model_id": "z-ai/glm-5.1",
@@ -3846,7 +4041,11 @@
         "catalog_verified_at": "2026-07-24",
         "latency_source": "curated_estimate",
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "high",
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -3906,7 +4105,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "medium"
+        "thinking": "high"
       },
       "registry_facts": {
         "model_id": "moonshotai/kimi-k2.6",
@@ -3946,7 +4145,11 @@
         "is_open_source": true,
         "is_chinese_model": true,
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "high",
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -4045,7 +4248,12 @@
         "catalog_verified_at": "2026-07-24",
         "latency_source": "curated_estimate",
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "high",
+          "medium",
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -4144,7 +4352,12 @@
         "catalog_verified_at": "2026-07-24",
         "latency_source": "curated_estimate",
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "medium",
+          "low",
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -4243,7 +4456,10 @@
         "is_open_source": true,
         "is_chinese_model": false,
         "supports_reasoning": false,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -4303,7 +4519,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "off"
+        "thinking": "high"
       },
       "registry_facts": {
         "model_id": "google/gemma-4-26b-a4b-it",
@@ -4344,7 +4560,11 @@
         "is_open_source": true,
         "is_chinese_model": false,
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "high",
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -4404,7 +4624,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "off"
+        "thinking": "high"
       },
       "registry_facts": {
         "model_id": "mistralai/mistral-small-2603",
@@ -4444,7 +4664,11 @@
         "is_open_source": true,
         "is_chinese_model": false,
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "high",
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -4545,7 +4769,10 @@
         "is_open_source": true,
         "is_chinese_model": false,
         "supports_reasoning": false,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -4605,7 +4832,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "medium"
+        "thinking": "high"
       },
       "registry_facts": {
         "model_id": "poolside/laguna-s-2.1",
@@ -4642,7 +4869,11 @@
         "is_open_source": true,
         "is_chinese_model": false,
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "high",
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -4702,7 +4933,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "medium"
+        "thinking": "high"
       },
       "registry_facts": {
         "model_id": "openai/gpt-oss-120b",
@@ -4741,7 +4972,12 @@
         "catalog_verified_at": "2026-07-24",
         "latency_source": "curated_estimate",
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "high",
+          "medium",
+          "low"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -4841,7 +5077,10 @@
         "is_open_source": true,
         "is_chinese_model": false,
         "supports_reasoning": false,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -4901,7 +5140,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "high"
+        "thinking": "max"
       },
       "registry_facts": {
         "model_id": "thinkingmachines/inkling",
@@ -4942,7 +5181,15 @@
         "catalog_verified_at": "2026-07-24",
         "latency_source": "curated_estimate",
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "max",
+          "high",
+          "medium",
+          "low",
+          "minimal",
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -5002,7 +5249,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "medium"
+        "thinking": "high"
       },
       "registry_facts": {
         "model_id": "qwen/qwen3.6-27b",
@@ -5043,7 +5290,11 @@
         "catalog_verified_at": "2026-07-24",
         "latency_source": "curated_estimate",
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "high",
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -5103,7 +5354,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "off"
+        "thinking": "high"
       },
       "registry_facts": {
         "model_id": "qwen/qwen3.5-397b-a17b",
@@ -5144,7 +5395,11 @@
         "catalog_verified_at": "2026-07-24",
         "latency_source": "curated_estimate",
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "high",
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -5204,7 +5459,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "off"
+        "thinking": "high"
       },
       "registry_facts": {
         "model_id": "qwen/qwen3.5-122b-a10b",
@@ -5245,7 +5500,11 @@
         "catalog_verified_at": "2026-07-24",
         "latency_source": "curated_estimate",
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "high",
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -5305,7 +5564,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "medium"
+        "thinking": "high"
       },
       "registry_facts": {
         "model_id": "qwen/qwen3-vl-235b-a22b-thinking",
@@ -5345,7 +5604,10 @@
         "catalog_verified_at": "2026-07-24",
         "latency_source": "curated_estimate",
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "high"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -5442,7 +5704,10 @@
         "is_open_source": true,
         "is_chinese_model": true,
         "supports_reasoning": false,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -5502,7 +5767,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "medium"
+        "thinking": "high"
       },
       "registry_facts": {
         "model_id": "qwen/qwen3-next-80b-a3b-thinking",
@@ -5541,7 +5806,10 @@
         "catalog_verified_at": "2026-07-24",
         "latency_source": "curated_estimate",
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "high"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -5601,7 +5869,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "off"
+        "thinking": "high"
       },
       "registry_facts": {
         "model_id": "deepseek/deepseek-v3.1-terminus",
@@ -5640,7 +5908,11 @@
         "catalog_verified_at": "2026-07-24",
         "latency_source": "curated_estimate",
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "high",
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -5700,7 +5972,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "medium"
+        "thinking": "high"
       },
       "registry_facts": {
         "model_id": "deepseek/deepseek-r1-0528",
@@ -5739,7 +6011,10 @@
         "catalog_verified_at": "2026-07-24",
         "latency_source": "curated_estimate",
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "high"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -5799,7 +6074,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "medium"
+        "thinking": "high"
       },
       "registry_facts": {
         "model_id": "z-ai/glm-5",
@@ -5838,7 +6113,11 @@
         "catalog_verified_at": "2026-07-24",
         "latency_source": "curated_estimate",
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "high",
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -5898,7 +6177,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "medium"
+        "thinking": "high"
       },
       "registry_facts": {
         "model_id": "z-ai/glm-4.7-flash",
@@ -5937,7 +6216,11 @@
         "catalog_verified_at": "2026-07-24",
         "latency_source": "curated_estimate",
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "high",
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -5997,7 +6280,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "off"
+        "thinking": "high"
       },
       "registry_facts": {
         "model_id": "z-ai/glm-4.6v",
@@ -6038,7 +6321,11 @@
         "catalog_verified_at": "2026-07-24",
         "latency_source": "curated_estimate",
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "high",
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -6098,7 +6385,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "medium"
+        "thinking": "high"
       },
       "registry_facts": {
         "model_id": "moonshotai/kimi-k2.5",
@@ -6138,7 +6425,11 @@
         "is_open_source": true,
         "is_chinese_model": true,
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "high",
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -6198,7 +6489,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "medium"
+        "thinking": "high"
       },
       "registry_facts": {
         "model_id": "moonshotai/kimi-k2-thinking",
@@ -6237,7 +6528,10 @@
         "is_open_source": true,
         "is_chinese_model": true,
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "high"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -6297,7 +6591,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "medium"
+        "thinking": "high"
       },
       "registry_facts": {
         "model_id": "minimax/minimax-m2.7",
@@ -6336,7 +6630,10 @@
         "is_open_source": true,
         "is_chinese_model": true,
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "high"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -6396,7 +6693,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "off"
+        "thinking": "high"
       },
       "registry_facts": {
         "model_id": "xiaomi/mimo-v2.5",
@@ -6438,7 +6735,11 @@
         "catalog_verified_at": "2026-07-24",
         "latency_source": "curated_estimate",
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "high",
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -6498,7 +6799,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "medium"
+        "thinking": "high"
       },
       "registry_facts": {
         "model_id": "stepfun/step-3.5-flash",
@@ -6537,7 +6838,10 @@
         "is_open_source": true,
         "is_chinese_model": true,
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "high"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -6636,7 +6940,12 @@
         "is_open_source": true,
         "is_chinese_model": true,
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "high",
+          "low",
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -6736,7 +7045,10 @@
         "catalog_verified_at": "2026-07-24",
         "latency_source": "curated_estimate",
         "supports_reasoning": false,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -6796,7 +7108,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "medium"
+        "thinking": "high"
       },
       "registry_facts": {
         "model_id": "bytedance-seed/seed-2.0-lite",
@@ -6837,7 +7149,14 @@
         "catalog_verified_at": "2026-07-24",
         "latency_source": "curated_estimate",
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "high",
+          "medium",
+          "low",
+          "minimal",
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -6936,7 +7255,10 @@
         "catalog_verified_at": "2026-07-24",
         "latency_source": "curated_estimate",
         "supports_reasoning": false,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -6996,7 +7318,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "off"
+        "thinking": "high"
       },
       "registry_facts": {
         "model_id": "nex-agi/nex-n2-pro",
@@ -7036,7 +7358,11 @@
         "catalog_verified_at": "2026-07-24",
         "latency_source": "curated_estimate",
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "high",
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -7096,7 +7422,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "medium"
+        "thinking": "high"
       },
       "registry_facts": {
         "model_id": "arcee-ai/trinity-large-thinking",
@@ -7135,7 +7461,10 @@
         "catalog_verified_at": "2026-07-24",
         "latency_source": "curated_estimate",
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "high"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -7233,7 +7562,10 @@
         "is_open_source": true,
         "is_chinese_model": false,
         "supports_reasoning": false,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -7333,7 +7665,10 @@
         "is_open_source": true,
         "is_chinese_model": false,
         "supports_reasoning": false,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -7393,7 +7728,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "off"
+        "thinking": "high"
       },
       "registry_facts": {
         "model_id": "google/gemma-4-31b-it",
@@ -7434,7 +7769,11 @@
         "is_open_source": true,
         "is_chinese_model": false,
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "high",
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -7494,7 +7833,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "off"
+        "thinking": "high"
       },
       "registry_facts": {
         "model_id": "nvidia/nemotron-3-nano-30b-a3b",
@@ -7533,7 +7872,11 @@
         "catalog_verified_at": "2026-07-24",
         "latency_source": "curated_estimate",
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "high",
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -7593,7 +7936,7 @@
     {
       "source": "curated_openrouter_profile",
       "runtime": {
-        "thinking": "medium"
+        "thinking": "high"
       },
       "registry_facts": {
         "model_id": "openai/gpt-oss-20b",
@@ -7632,7 +7975,12 @@
         "catalog_verified_at": "2026-07-24",
         "latency_source": "curated_estimate",
         "supports_reasoning": true,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "high",
+          "medium",
+          "low"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -7731,7 +8079,10 @@
         "is_open_source": true,
         "is_chinese_model": false,
         "supports_reasoning": false,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -7832,7 +8183,10 @@
         "is_open_source": true,
         "is_chinese_model": false,
         "supports_reasoning": false,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -7932,7 +8286,10 @@
         "is_open_source": true,
         "is_chinese_model": false,
         "supports_reasoning": false,
-        "supports_tools": true
+        "supports_tools": true,
+        "supported_thinking_levels": [
+          "off"
+        ]
       },
       "static_profile": {
         "capability_dist_prior": {
