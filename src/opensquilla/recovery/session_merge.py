@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import os
 import sqlite3
 import tempfile
 import threading
@@ -20,6 +21,9 @@ from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
+
+from opensquilla.recovery.atomic import _native_io_path
 
 _CORE_TABLES = (
     "sessions",
@@ -153,10 +157,13 @@ def _read_only_connection(path: Path) -> Iterator[sqlite3.Connection]:
     ``PermissionError`` and turns consolidation into ``blocked``.
     """
 
-    connection = sqlite3.connect(
-        f"{path.expanduser().absolute().as_uri()}?mode=ro",
-        uri=True,
-    )
+    absolute = path.expanduser().absolute()
+    if os.name == "nt":
+        encoded_path = quote(_native_io_path(absolute), safe="/:")
+        uri = f"file:{encoded_path}?mode=ro"
+    else:
+        uri = f"{absolute.as_uri()}?mode=ro"
+    connection = sqlite3.connect(uri, uri=True)
     try:
         connection.row_factory = sqlite3.Row
         yield connection
@@ -211,22 +218,25 @@ def _private_source_snapshot(source: Path) -> Iterator[Path]:
 def _snapshot_session_database_from_private(source: Path, destination: Path) -> None:
     """Create a SQLite backup from an already-private source bundle."""
 
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    os.makedirs(_native_io_path(destination.parent), exist_ok=True)
     temporary = destination.with_name(f".{destination.name}.snapshot.tmp")
-    if temporary.exists():
+    if os.path.exists(_native_io_path(temporary)):
         raise FileExistsError(f"SQLite snapshot staging already exists: {temporary}")
     try:
         with _read_only_connection(source) as source_connection:
             _quick_check(source_connection, label="source sessions database")
-            target_connection = sqlite3.connect(temporary)
+            target_connection = sqlite3.connect(_native_io_path(temporary))
             try:
                 source_connection.backup(target_connection)
                 _quick_check(target_connection, label="snapshot sessions database")
             finally:
                 target_connection.close()
-        temporary.replace(destination)
+        os.replace(_native_io_path(temporary), _native_io_path(destination))
     finally:
-        temporary.unlink(missing_ok=True)
+        try:
+            os.unlink(_native_io_path(temporary))
+        except FileNotFoundError:
+            pass
 
 
 def snapshot_session_database(source: str | Path, destination: str | Path) -> None:
@@ -589,7 +599,7 @@ def _snapshot_result(path: Path, source_id: str) -> SessionMergeResult:
 
 
 def _clear_excluded_operational_rows(path: Path) -> tuple[str, ...]:
-    connection = sqlite3.connect(path)
+    connection = sqlite3.connect(_native_io_path(path))
     try:
         excluded = _excluded_tables(connection)
         connection.execute("PRAGMA foreign_keys=OFF")
@@ -634,7 +644,7 @@ async def _initialize_current_session_schema(path: Path) -> None:
 
     from opensquilla.session.storage import SessionStorage
 
-    storage = SessionStorage(str(path))
+    storage = SessionStorage(_native_io_path(path))
     try:
         await storage.connect()
     finally:
@@ -673,7 +683,7 @@ def _upgrade_target_session_schema(path: Path) -> None:
 
     from opensquilla.persistence.migrator import apply_pending, resolve_migrations_dir
 
-    apply_pending(str(path), resolve_migrations_dir())
+    apply_pending(_native_io_path(path), resolve_migrations_dir())
     _run_session_schema_initialization(path)
 
 
@@ -685,9 +695,9 @@ def _merge_session_database_from_private(
 ) -> SessionMergeResult:
     target_path = Path(target).expanduser().absolute()
     source_path = source
-    if not source_path.is_file():
+    if not os.path.isfile(_native_io_path(source_path)):
         raise FileNotFoundError(source_path)
-    if not target_path.exists():
+    if not os.path.exists(_native_io_path(target_path)):
         _snapshot_session_database_from_private(source_path, target_path)
         excluded = _clear_excluded_operational_rows(target_path)
         result = _snapshot_result(target_path, source_id)
@@ -741,7 +751,7 @@ def _merge_session_database_from_private(
     imports: list[_SessionImport] = []
     deduplicated = 0
 
-    target_connection = sqlite3.connect(target_path)
+    target_connection = sqlite3.connect(_native_io_path(target_path))
     target_connection.row_factory = sqlite3.Row
     try:
         with _read_only_connection(source_path) as source_connection:

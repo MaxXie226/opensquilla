@@ -16,7 +16,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
 
-from opensquilla.recovery.atomic import _chmod_open_file, _windows_extended_path
+from opensquilla.recovery.atomic import (
+    _chmod_open_file,
+    _native_io_path,
+    _windows_extended_path,
+)
 from opensquilla.recovery.errors import (
     AtomicStateUnknownError,
     LegacyGatewayRunningError,
@@ -155,8 +159,20 @@ class GatewayLegacyLease:
     owner_thread: int
 
 
+def _logical_path_spelling(path: str | Path) -> str:
+    value = os.fspath(path)
+    if os.name != "nt":
+        return value
+    lowered = value.lower()
+    if lowered.startswith("\\\\?\\unc\\"):
+        return "\\\\" + value[8:]
+    if lowered.startswith("\\\\?\\"):
+        return value[4:]
+    return value
+
+
 def _normalized_path(path: str | Path) -> str:
-    candidate = Path(path).expanduser()
+    candidate = Path(_logical_path_spelling(path)).expanduser()
     try:
         normalized = candidate.resolve(strict=False)
     except (OSError, RuntimeError):
@@ -214,7 +230,7 @@ def _refresh_after_fork() -> None:
 
 def _assert_real_lock_directory(path: Path) -> tuple[int, int]:
     try:
-        value = path.lstat()
+        value = os.lstat(_native_io_path(path))
     except OSError as exc:
         raise UnsafePathError(f"profile lock directory is unavailable: {path}") from exc
     attributes = int(getattr(value, "st_file_attributes", 0))
@@ -425,7 +441,7 @@ def _windows_open_profile_lock_file(path: Path, root: Path) -> int:
     import msvcrt
 
     try:
-        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.makedirs(_native_io_path(root), mode=0o700, exist_ok=True)
     except OSError as exc:
         raise UnsafePathError(f"cannot create profile lock root safely: {root}") from exc
     root_identity = _assert_real_lock_directory(root)
@@ -564,7 +580,7 @@ def _windows_open_profile_lock_file(path: Path, root: Path) -> int:
             create_options=file_options,
         )
         try:
-            path_value = path.lstat()
+            path_value = os.lstat(_native_io_path(path))
         except OSError as exc:
             raise UnsafePathError(f"profile lock path disappeared while opening: {path}") from exc
         attributes = int(getattr(path_value, "st_file_attributes", 0))
@@ -635,7 +651,7 @@ def _prepare_lock_file(path: Path) -> int:
 
 def _state_directory_identity(path: Path) -> tuple[int, int, int]:
     try:
-        value = path.lstat()
+        value = os.lstat(_native_io_path(path))
     except OSError as exc:
         raise UnsafePathError(f"cannot inspect legacy state directory safely: {path}") from exc
     attributes = int(getattr(value, "st_file_attributes", 0))
@@ -648,7 +664,7 @@ def _lockable_state_path(path: Path, *, allow_state_symlink: bool) -> Path:
     """Return the real state directory used solely for runtime lock placement."""
 
     try:
-        value = path.lstat()
+        value = os.lstat(_native_io_path(path))
     except OSError as exc:
         raise UnsafePathError(f"cannot inspect legacy state directory safely: {path}") from exc
     attributes = int(getattr(value, "st_file_attributes", 0))
@@ -657,7 +673,9 @@ def _lockable_state_path(path: Path, *, allow_state_symlink: bool) -> Path:
     if not allow_state_symlink:
         raise UnsafePathError(f"legacy state directory must not be a link: {path}")
     try:
-        resolved = path.resolve(strict=True)
+        resolved = Path(
+            _logical_path_spelling(os.path.realpath(_native_io_path(path), strict=True))
+        )
     except (OSError, RuntimeError) as exc:
         raise UnsafePathError(f"configured state link cannot be resolved safely: {path}") from exc
     # The final resolved leaf must itself be a real directory. Intermediate
@@ -753,7 +771,7 @@ def _prepare_legacy_lock_file(state_path: Path, *, create_if_missing: bool) -> i
         attributes = int(getattr(value, "st_file_attributes", 0))
         if attributes & 0x400 or not stat.S_ISREG(value.st_mode) or value.st_nlink != 1:
             raise UnsafePathError(f"legacy gateway lock is not a regular file: {path}")
-        current_path = path.lstat()
+        current_path = os.lstat(_native_io_path(path))
         current_attributes = int(getattr(current_path, "st_file_attributes", 0))
         if (
             stat.S_ISLNK(current_path.st_mode)
@@ -806,12 +824,12 @@ def rebind_legacy_gateway_lock(
     destination_key = _normalized_path(destination_path)
     if source_key == destination_key:
         raise UnsafePathError("legacy gateway lock handoff paths are identical")
-    if os.path.lexists(source_state):
+    if os.path.lexists(_native_io_path(source_state)):
         raise UnsafePathError("legacy gateway lock source still exists after handoff")
 
     destination_state_identity = _state_directory_identity(destination_state)
     try:
-        path_value = destination_path.lstat()
+        path_value = os.lstat(_native_io_path(destination_path))
     except OSError as exc:
         raise UnsafePathError("moved legacy gateway lock is missing at destination") from exc
     path_attributes = int(getattr(path_value, "st_file_attributes", 0))
@@ -915,7 +933,7 @@ def _profile_relative_path(path: Path, root: Path) -> Path | None:
 
 def _legacy_lock_file_identity(path: Path) -> tuple[int, int]:
     try:
-        value = path.lstat()
+        value = os.lstat(_native_io_path(path))
     except OSError as exc:
         raise UnsafePathError(f"legacy gateway lock is unavailable: {path}") from exc
     attributes = int(getattr(value, "st_file_attributes", 0))
@@ -1383,7 +1401,7 @@ class LegacyGatewayLock:
         self._owner_thread = threading.get_ident()
         try:
             for root in self.state_roots:
-                if not os.path.lexists(root):
+                if not os.path.lexists(_native_io_path(root)):
                     continue
                 self._acquire_one(root)
             return self
@@ -1613,7 +1631,7 @@ def _effective_state_root_specs(
     home_path = Path(home).expanduser().absolute()
     candidates: list[tuple[Path, bool]] = [(home_path / "state", False)]
     config_path = home_path / "config.toml"
-    if os.path.lexists(config_path):
+    if os.path.lexists(_native_io_path(config_path)):
         from opensquilla.recovery.config_patch import ConfigSnapshot, state_override
 
         snapshot = ConfigSnapshot.capture(config_path)

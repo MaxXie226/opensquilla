@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from opensquilla.recovery.atomic import (
+    _native_io_path,
     native_move_no_replace,
     profile_no_follow_manifest,
 )
@@ -314,7 +315,7 @@ def _is_link_or_reparse(value: os.stat_result) -> bool:
 
 def _plain_directory(path: Path, *, label: str) -> os.stat_result:
     try:
-        value = path.lstat()
+        value = os.lstat(_native_io_path(path))
     except OSError as exc:
         raise _ConsolidationBlockedError(
             f"{label} is unavailable: {path}",
@@ -330,7 +331,7 @@ def _plain_directory(path: Path, *, label: str) -> os.stat_result:
 
 def _plain_optional_file(path: Path, *, label: str) -> bool:
     try:
-        value = path.lstat()
+        value = os.lstat(_native_io_path(path))
     except FileNotFoundError:
         return False
     except OSError as exc:
@@ -348,7 +349,7 @@ def _validate_recovery_container_metadata(path: Path) -> None:
     """
 
     try:
-        value = path.lstat()
+        value = os.lstat(_native_io_path(path))
     except OSError as exc:
         raise _ConsolidationBlockedError(
             f"recovery container entry is unavailable: {path}",
@@ -370,7 +371,7 @@ def _validate_base_paths(user_data: Path, primary_home: Path) -> None:
     ):
         raise UnsafePathError("primary home must be the canonical userData/opensquilla path")
     try:
-        primary_stat = primary_home.lstat()
+        primary_stat = os.lstat(_native_io_path(primary_home))
     except FileNotFoundError:
         pass
     else:
@@ -383,12 +384,12 @@ def _validate_base_paths(user_data: Path, primary_home: Path) -> None:
 def _enumerate_recoveries(user_data: Path) -> tuple[_RecoveryProfile, ...]:
     container = user_data / "recovery-profiles"
     try:
-        container.lstat()
+        os.lstat(_native_io_path(container))
     except FileNotFoundError:
         return ()
     _plain_directory(container, label="recovery profile container")
     profiles: list[_RecoveryProfile] = []
-    with os.scandir(container) as entries:
+    with os.scandir(_native_io_path(container)) as entries:
         for entry in sorted(entries, key=lambda item: item.name):
             # Match Desktop's exact v4 UUID contract, not merely UUID-shaped names.
             if not _RECOVERY_ID_RE.fullmatch(entry.name) or uuid.UUID(entry.name).version != 4:
@@ -400,22 +401,22 @@ def _enumerate_recoveries(user_data: Path) -> tuple[_RecoveryProfile, ...]:
                 # that could be profile-shaped or could redirect the move stays
                 # fail-closed, because permitting it would defer the failure to
                 # the post-publish archival phase instead.
-                _validate_recovery_container_metadata(Path(entry.path))
+                _validate_recovery_container_metadata(container / entry.name)
                 continue
-            root = Path(entry.path)
+            root = container / entry.name
             root_stat = _plain_directory(root, label="recovery profile")
             home = root / "opensquilla"
             try:
-                home.lstat()
+                os.lstat(_native_io_path(home))
             except FileNotFoundError:
                 pass
             else:
                 _plain_directory(home, label="recovery home")
                 profile_no_follow_manifest(home)
             for name in (*_CONFIG_NAMES,):
-                if home.exists():
+                if _lexists(home):
                     _plain_optional_file(home / name, label=f"recovery {name}")
-            if home.exists():
+            if _lexists(home):
                 _plain_optional_file(
                     home / "state" / ".env",
                     label="recovery legacy .env",
@@ -489,10 +490,10 @@ def _configuration_source(
 
 
 def _credential_updated_ns(path: Path) -> int:
-    if not path.is_file():
+    if not os.path.isfile(_native_io_path(path)):
         return 0
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(_read_text_native(path))
     except (OSError, json.JSONDecodeError, UnicodeDecodeError):
         return 0
     if not isinstance(payload, dict):
@@ -533,7 +534,7 @@ def _configuration_recency(profile: _RecoveryProfile) -> tuple[int, int]:
         profile.home / "state" / "sessions.db",
     ):
         try:
-            modified.append(int(path.lstat().st_mtime_ns))
+            modified.append(int(os.lstat(_native_io_path(path)).st_mtime_ns))
         except OSError:
             continue
     filesystem_recency = max(modified)
@@ -547,7 +548,7 @@ def _configuration_recency(profile: _RecoveryProfile) -> tuple[int, int]:
 def _revision(profiles: tuple[_RecoveryProfile, ...]) -> int:
     digest = hashlib.sha256()
     for profile in profiles:
-        value = profile.root.lstat()
+        value = os.lstat(_native_io_path(profile.root))
         digest.update(profile.recovery_id.encode("ascii"))
         digest.update(
             f":{value.st_dev}:{value.st_ino}:{value.st_size}:{value.st_mtime_ns}".encode()
@@ -558,7 +559,7 @@ def _revision(profiles: tuple[_RecoveryProfile, ...]) -> int:
 
 def _metadata_identity(path: Path) -> tuple[int, int, int, int, int] | None:
     try:
-        value = path.lstat()
+        value = os.lstat(_native_io_path(path))
     except FileNotFoundError:
         return None
     return (
@@ -577,7 +578,7 @@ def _source_snapshot(
     tuple[int, int, int, int, int],
     tuple[int, int, int, int, int] | None,
 ]:
-    home_manifest = profile_no_follow_manifest(profile.home) if profile.home.is_dir() else None
+    home_manifest = profile_no_follow_manifest(profile.home) if _lexists(profile.home) else None
     root_identity = _metadata_identity(profile.root)
     if root_identity is None:
         raise UnsafePathError("recovery profile disappeared during consolidation")
@@ -586,18 +587,66 @@ def _source_snapshot(
 
 def _file_digest(path: Path) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as handle:
+    with open(_native_io_path(path), "rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
 
 
 def _lexists(path: Path) -> bool:
-    return os.path.lexists(path)
+    return os.path.lexists(_native_io_path(path))
+
+
+def _unlink_native(path: Path, *, missing_ok: bool = False) -> None:
+    try:
+        os.unlink(_native_io_path(path))
+    except FileNotFoundError:
+        if not missing_ok:
+            raise
+
+
+def _rmtree_native(path: Path) -> None:
+    shutil.rmtree(_native_io_path(path))
+
+
+def _makedirs_native(path: Path, *, mode: int = 0o777) -> None:
+    os.makedirs(_native_io_path(path), mode=mode, exist_ok=True)
+
+
+def _read_bytes_native(path: Path) -> bytes:
+    with open(_native_io_path(path), "rb") as handle:
+        return handle.read()
+
+
+def _read_text_native(path: Path) -> str:
+    with open(_native_io_path(path), encoding="utf-8") as handle:
+        return handle.read()
+
+
+def _write_bytes_native(path: Path, data: bytes) -> None:
+    with open(_native_io_path(path), "wb") as handle:
+        handle.write(data)
+
+
+def _write_text_native(path: Path, data: str) -> None:
+    with open(_native_io_path(path), "w", encoding="utf-8") as handle:
+        handle.write(data)
 
 
 def _normalized_path(path: Path) -> str:
     return os.path.normcase(os.path.normpath(str(path.expanduser().absolute())))
+
+def _resolved_native_path(path: Path) -> str:
+    """Resolve through the OS namespace but keep journals namespace-neutral."""
+
+    resolved = os.path.realpath(_native_io_path(path), strict=True)
+    if os.name == "nt":
+        if resolved.startswith("\\\\?\\UNC\\"):
+            resolved = "\\\\" + resolved[8:]
+        elif resolved.startswith("\\\\?\\"):
+            resolved = resolved[4:]
+    return os.path.normcase(os.path.normpath(resolved))
+
 
 
 def _profile_relative_path(path: Path, primary_home: Path) -> Path | None:
@@ -665,7 +714,7 @@ def _directory_chain_binding(path: Path, *, label: str) -> dict[str, object]:
     missing_suffix: list[str] = []
     if candidate.anchor:
         try:
-            anchor_stat = current.lstat()
+            anchor_stat = os.lstat(_native_io_path(current))
         except OSError as exc:
             raise UnsafePathError(f"{label} anchor is unavailable: {current}") from exc
         if _is_link_or_reparse(anchor_stat) or not stat.S_ISDIR(anchor_stat.st_mode):
@@ -682,7 +731,7 @@ def _directory_chain_binding(path: Path, *, label: str) -> dict[str, object]:
     for index, part in enumerate(parts):
         current /= part
         try:
-            value = current.lstat()
+            value = os.lstat(_native_io_path(current))
         except FileNotFoundError:
             missing_suffix = list(parts[index:])
             break
@@ -701,14 +750,14 @@ def _directory_chain_binding(path: Path, *, label: str) -> dict[str, object]:
         )
     existing_path = Path(str(components[-1]["path"])) if components else Path(candidate.anchor)
     try:
-        resolved = existing_path.resolve(strict=True)
+        resolved = _resolved_native_path(existing_path)
     except (OSError, RuntimeError) as exc:
         raise UnsafePathError(f"{label} cannot be resolved safely: {candidate}") from exc
     return {
         "path": str(candidate),
         "normalized_path": _normalized_path(candidate),
         "existing_path": str(existing_path),
-        "resolved_existing_path": os.path.normcase(os.path.normpath(str(resolved))),
+        "resolved_existing_path": resolved,
         "components": components,
         "missing_suffix": missing_suffix,
     }
@@ -735,7 +784,7 @@ def _validate_directory_chain_binding(binding: object) -> None:
             raise UnsafePathError("external directory binding is invalid")
         current = Path(str(expected["path"]))
         try:
-            value = current.lstat()
+            value = os.lstat(_native_io_path(current))
         except OSError as exc:
             raise UnsafePathError(f"external directory ancestor changed: {current}") from exc
         observed = {
@@ -749,7 +798,7 @@ def _validate_directory_chain_binding(binding: object) -> None:
             raise UnsafePathError(f"external directory ancestor identity changed: {current}")
     existing_path = Path(str(binding.get("existing_path")))
     try:
-        resolved = os.path.normcase(os.path.normpath(str(existing_path.resolve(strict=True))))
+        resolved = _resolved_native_path(existing_path)
     except (OSError, RuntimeError) as exc:
         raise UnsafePathError(
             f"external directory ancestor cannot be resolved: {existing_path}"
@@ -760,7 +809,7 @@ def _validate_directory_chain_binding(binding: object) -> None:
     for part in missing_suffix:
         current /= str(part)
         try:
-            value = current.lstat()
+            value = os.lstat(_native_io_path(current))
         except FileNotFoundError:
             continue
         if _is_link_or_reparse(value) or not stat.S_ISDIR(value.st_mode):
@@ -781,8 +830,8 @@ def _paths_alias_or_nest(first: Path, second: Path) -> bool:
     except ValueError:
         return False
     try:
-        resolved_first = os.path.normcase(os.path.normpath(str(first.resolve(strict=True))))
-        resolved_second = os.path.normcase(os.path.normpath(str(second.resolve(strict=True))))
+        resolved_first = _resolved_native_path(first)
+        resolved_second = _resolved_native_path(second)
         return os.path.commonpath((resolved_first, resolved_second)) in {
             resolved_first,
             resolved_second,
@@ -956,7 +1005,7 @@ def _read_primary_config_payload(configuration_home: Path) -> dict[str, Any]:
     if not _lexists(path):
         return {}
     try:
-        payload = tomllib.loads(path.read_text(encoding="utf-8"))
+        payload = tomllib.loads(_read_text_native(path))
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
         # Malformed primary bytes remain authoritative, but they cannot safely
         # nominate external roots. Preserve the prior canonical behavior.
@@ -1124,10 +1173,10 @@ def _build_primary_data_routes(
         source_agents = profile.home / "workspace" / "agents"
         if not _lexists(source_agents):
             continue
-        source_agents_stat = source_agents.lstat()
+        source_agents_stat = os.lstat(_native_io_path(source_agents))
         if _is_link_or_reparse(source_agents_stat) or not stat.S_ISDIR(source_agents_stat.st_mode):
             continue
-        with os.scandir(source_agents) as source_entries:
+        with os.scandir(_native_io_path(source_agents)) as source_entries:
             for source_entry in source_entries:
                 normalized_agent_id = normalize_agent_id(source_entry.name)
                 if normalized_agent_id == "main" or normalized_agent_id in agent_routes:
@@ -1210,12 +1259,14 @@ def _build_primary_data_routes(
 
 
 def _same_leaf(source: Path, destination: Path) -> bool:
-    source_stat = source.lstat()
-    destination_stat = destination.lstat()
+    source_stat = os.lstat(_native_io_path(source))
+    destination_stat = os.lstat(_native_io_path(destination))
     if _is_link_or_reparse(source_stat) or _is_link_or_reparse(destination_stat):
         if not (_is_link_or_reparse(source_stat) and _is_link_or_reparse(destination_stat)):
             return False
-        return os.readlink(source) == os.readlink(destination)
+        return os.readlink(_native_io_path(source)) == os.readlink(
+            _native_io_path(destination)
+        )
     if stat.S_ISREG(source_stat.st_mode) and stat.S_ISREG(destination_stat.st_mode):
         return source_stat.st_size == destination_stat.st_size and (
             _file_digest(source) == _file_digest(destination)
@@ -1243,13 +1294,13 @@ def _ensure_plain_directory(path: Path) -> None:
     for part in parts:
         current /= part
         try:
-            value = current.lstat()
+            value = os.lstat(_native_io_path(current))
         except FileNotFoundError:
             try:
-                current.mkdir(mode=0o700)
+                os.mkdir(_native_io_path(current), mode=0o700)
             except FileExistsError:
                 pass
-            value = current.lstat()
+            value = os.lstat(_native_io_path(current))
             _fsync_directory(current.parent)
         if _is_link_or_reparse(value) or not stat.S_ISDIR(value.st_mode):
             raise UnsafePathError(f"external merge directory must be real: {current}")
@@ -1271,18 +1322,18 @@ def _atomic_copy_regular(
     _ensure_plain_directory(destination.parent)
     temporary = _transaction_temporary(destination, transaction_id)
     if _lexists(temporary):
-        temporary_value = temporary.lstat()
+        temporary_value = os.lstat(_native_io_path(temporary))
         if _is_link_or_reparse(temporary_value) or not stat.S_ISREG(temporary_value.st_mode):
             raise UnsafePathError(f"external merge temporary is unsafe: {temporary}")
-        temporary.unlink()
+        _unlink_native(temporary)
     descriptor = os.open(
-        temporary,
+        _native_io_path(temporary),
         os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-        stat.S_IMODE(source.lstat().st_mode) or 0o600,
+        stat.S_IMODE(os.lstat(_native_io_path(source)).st_mode) or 0o600,
     )
     try:
         with (
-            source.open("rb") as source_handle,
+            open(_native_io_path(source), "rb") as source_handle,
             os.fdopen(
                 descriptor,
                 "wb",
@@ -1301,7 +1352,7 @@ def _atomic_copy_regular(
         if not _same_leaf(source, destination):
             raise
     finally:
-        temporary.unlink(missing_ok=True)
+        _unlink_native(temporary, missing_ok=True)
 
 
 def _copy_leaf(
@@ -1311,17 +1362,17 @@ def _copy_leaf(
     durable: bool = False,
     transaction_id: str = "",
 ) -> None:
-    value = source.lstat()
+    value = os.lstat(_native_io_path(source))
     if durable:
         _ensure_plain_directory(destination.parent)
     else:
-        destination.parent.mkdir(parents=True, exist_ok=True)
+        _makedirs_native(destination.parent)
     if _is_link_or_reparse(value):
         target_is_directory = bool(int(getattr(value, "st_file_attributes", 0)) & 0x10)
         try:
             os.symlink(
-                os.readlink(source),
-                destination,
+                os.readlink(_native_io_path(source)),
+                _native_io_path(destination),
                 target_is_directory=target_is_directory,
             )
         except FileExistsError:
@@ -1333,7 +1384,11 @@ def _copy_leaf(
         if durable:
             _ensure_plain_directory(destination)
         else:
-            shutil.copytree(source, destination, symlinks=True)
+            shutil.copytree(
+                _native_io_path(source),
+                _native_io_path(destination),
+                symlinks=True,
+            )
     elif stat.S_ISREG(value.st_mode):
         if durable:
             _atomic_copy_regular(
@@ -1342,7 +1397,11 @@ def _copy_leaf(
                 transaction_id=transaction_id,
             )
         else:
-            shutil.copy2(source, destination, follow_symlinks=False)
+            shutil.copy2(
+                _native_io_path(source),
+                _native_io_path(destination),
+                follow_symlinks=False,
+            )
     else:
         raise UnsafePathError(f"unsupported recovery workspace entry: {source}")
 
@@ -1359,8 +1418,10 @@ def _merge_memory(
     transaction_id: str = "",
 ) -> None:
     before = _metadata_identity(destination)
-    current = destination.read_text(encoding="utf-8")
-    incoming = source.read_text(encoding="utf-8")
+    with open(_native_io_path(destination), encoding="utf-8") as handle:
+        current = handle.read()
+    with open(_native_io_path(source), encoding="utf-8") as handle:
+        incoming = handle.read()
     blocks = _memory_blocks(current)
     known = {block.replace("\r\n", "\n") for block in blocks}
     for block in _memory_blocks(incoming):
@@ -1372,7 +1433,8 @@ def _merge_memory(
     if merged == current:
         return
     if not durable:
-        destination.write_text(merged, encoding="utf-8")
+        with open(_native_io_path(destination), "w", encoding="utf-8") as handle:
+            handle.write(merged)
         return
     if before is None or _metadata_identity(destination) != before:
         raise UnsafePathError(
@@ -1380,12 +1442,12 @@ def _merge_memory(
         )
     temporary = _transaction_temporary(destination, transaction_id)
     if _lexists(temporary):
-        value = temporary.lstat()
+        value = os.lstat(_native_io_path(temporary))
         if _is_link_or_reparse(value) or not stat.S_ISREG(value.st_mode):
             raise UnsafePathError(f"external merge temporary is unsafe: {temporary}")
-        temporary.unlink()
+        _unlink_native(temporary)
     descriptor = os.open(
-        temporary,
+        _native_io_path(temporary),
         os.O_WRONLY | os.O_CREAT | os.O_EXCL,
         0o600,
     )
@@ -1404,10 +1466,10 @@ def _merge_memory(
     try:
         if _metadata_identity(destination) != before:
             raise UnsafePathError(f"external MEMORY.md changed before publish: {destination}")
-        os.replace(temporary, destination)
+        os.replace(_native_io_path(temporary), _native_io_path(destination))
         _fsync_directory(destination.parent)
     finally:
-        temporary.unlink(missing_ok=True)
+        _unlink_native(temporary, missing_ok=True)
 
 
 def _preserve_conflict(
@@ -1424,20 +1486,21 @@ def _preserve_conflict(
         if not _lexists(destination_path):
             _copy_leaf(source_path, destination_path)
             return
-        source_stat = source_path.lstat()
-        destination_stat = destination_path.lstat()
+        source_stat = os.lstat(_native_io_path(source_path))
+        destination_stat = os.lstat(_native_io_path(destination_path))
         if (
             not _is_link_or_reparse(source_stat)
             and not _is_link_or_reparse(destination_stat)
             and stat.S_ISDIR(source_stat.st_mode)
             and stat.S_ISDIR(destination_stat.st_mode)
         ):
-            with os.scandir(source_path) as entries:
-                for entry in sorted(entries, key=lambda item: item.name):
-                    complete_copy(
-                        Path(entry.path),
-                        destination_path / entry.name,
-                    )
+            with os.scandir(_native_io_path(source_path)) as entries:
+                entry_names = sorted(entry.name for entry in entries)
+            for entry_name in entry_names:
+                complete_copy(
+                    source_path / entry_name,
+                    destination_path / entry_name,
+                )
             return
         if _same_leaf(source_path, destination_path):
             return
@@ -1465,7 +1528,7 @@ def _merge_workspace_tree(
     )
     if workspace_runtime_state:
         return
-    source_stat = source.lstat()
+    source_stat = os.lstat(_native_io_path(source))
     if _is_link_or_reparse(source_stat):
         if not _lexists(destination):
             _copy_leaf(
@@ -1500,9 +1563,13 @@ def _merge_workspace_tree(
         if durable:
             _ensure_plain_directory(destination)
         else:
-            destination.mkdir(parents=True)
-            shutil.copymode(source, destination, follow_symlinks=False)
-    destination_stat = destination.lstat()
+            _makedirs_native(destination)
+            shutil.copymode(
+                _native_io_path(source),
+                _native_io_path(destination),
+                follow_symlinks=False,
+            )
+    destination_stat = os.lstat(_native_io_path(destination))
     if _is_link_or_reparse(destination_stat):
         if not _same_leaf(source, destination):
             _preserve_conflict(
@@ -1514,20 +1581,21 @@ def _merge_workspace_tree(
             )
         return
     if stat.S_ISDIR(source_stat.st_mode) and stat.S_ISDIR(destination_stat.st_mode):
-        with os.scandir(source) as entries:
-            for entry in sorted(entries, key=lambda item: item.name):
-                child_relative = relative / entry.name
-                _merge_workspace_tree(
-                    Path(entry.path),
-                    destination / entry.name,
-                    staging=staging,
-                    recovery_id=recovery_id,
-                    relative=child_relative,
-                    scope=scope,
-                    merge_memory=merge_memory,
-                    durable=durable,
-                    transaction_id=transaction_id,
-                )
+        with os.scandir(_native_io_path(source)) as entries:
+            entry_names = sorted(entry.name for entry in entries)
+        for entry_name in entry_names:
+            child_relative = relative / entry_name
+            _merge_workspace_tree(
+                source / entry_name,
+                destination / entry_name,
+                staging=staging,
+                recovery_id=recovery_id,
+                relative=child_relative,
+                scope=scope,
+                merge_memory=merge_memory,
+                durable=durable,
+                transaction_id=transaction_id,
+            )
         return
     if _same_leaf(source, destination):
         return
@@ -1554,24 +1622,28 @@ def _merge_workspace_tree(
 
 
 def _clone_primary(primary_home: Path, staging: Path) -> None:
-    if primary_home.exists():
+    if _lexists(primary_home):
         before = profile_no_follow_manifest(primary_home)
-        shutil.copytree(primary_home, staging, symlinks=True)
+        shutil.copytree(
+            _native_io_path(primary_home),
+            _native_io_path(staging),
+            symlinks=True,
+        )
         after = profile_no_follow_manifest(primary_home)
         if before != after:
             raise UnsafePathError("primary profile changed while staging consolidation")
         profile_no_follow_manifest(staging)
         source_db = primary_home / "state" / "sessions.db"
-        if source_db.is_file():
+        if os.path.isfile(_native_io_path(source_db)):
             snapshot_session_database(source_db, staging / "state" / "sessions.db")
             for suffix in ("-wal", "-shm", "-journal"):
-                (staging / "state" / f"sessions.db{suffix}").unlink(missing_ok=True)
+                _unlink_native(staging / "state" / f"sessions.db{suffix}", missing_ok=True)
     else:
-        staging.mkdir(mode=0o700)
-    (staging / "state").mkdir(mode=0o700, exist_ok=True)
-    (staging / "workspace").mkdir(mode=0o700, exist_ok=True)
+        os.mkdir(_native_io_path(staging), mode=0o700)
+    _makedirs_native(staging / "state", mode=0o700)
+    _makedirs_native(staging / "workspace", mode=0o700)
     for runtime_lock in ("gateway.pid", "gateway.pid.lock"):
-        (staging / "state" / runtime_lock).unlink(missing_ok=True)
+        _unlink_native(staging / "state" / runtime_lock, missing_ok=True)
 
 
 def _transformed_config(raw: bytes, workspace_root: Path) -> bytes:
@@ -1609,7 +1681,7 @@ def _read_recovery_config(path: Path) -> tuple[bool, bytes | None]:
     if not _lexists(path):
         return True, None
     try:
-        raw = path.read_bytes()
+        raw = _read_bytes_native(path)
         parsed = tomllib.loads(raw.decode("utf-8"))
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
         return False, None
@@ -1618,7 +1690,7 @@ def _read_recovery_config(path: Path) -> tuple[bool, bytes | None]:
 
 def _primary_config_has_user_configuration(path: Path) -> bool:
     try:
-        raw = path.read_bytes()
+        raw = _read_bytes_native(path)
         return bool(tomllib.loads(raw.decode("utf-8")))
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
         # Malformed primary bytes may contain the user's only configuration.
@@ -1647,11 +1719,11 @@ def _dotenv_text_has_user_configuration(raw: str) -> bool:
 
 def _dotenv_has_user_configuration(path: Path) -> bool:
     try:
-        raw = path.read_text(encoding="utf-8")
+        raw = _read_text_native(path)
     except UnicodeDecodeError:
         # A non-empty, unparseable file may still contain credentials. Preserve
         # primary authority instead of silently replacing it.
-        return path.stat().st_size > 0
+        return os.stat(_native_io_path(path)).st_size > 0
     except OSError as exc:
         raise _ConsolidationBlockedError(
             f"primary .env cannot be read: {path}",
@@ -1667,7 +1739,7 @@ def _read_recovery_dotenv(
     if not _lexists(path):
         return True, None
     try:
-        return True, path.read_text(encoding="utf-8")
+        return True, _read_text_native(path)
     except (OSError, UnicodeDecodeError):
         return False, None
 
@@ -1679,7 +1751,7 @@ def _read_recovery_credential(
     if not _lexists(credential):
         return True, False
     try:
-        payload = json.loads(credential.read_text(encoding="utf-8"))
+        payload = json.loads(_read_text_native(credential))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return False, True
     if not isinstance(payload, dict):
@@ -1782,7 +1854,7 @@ def _apply_configuration_source(
     preserved_route_dotenv = ""
     preserved_route_mode_source: Path | None = None
     if _lexists(primary_dotenv):
-        preserved_route_dotenv = _data_route_dotenv(primary_dotenv.read_text(encoding="utf-8"))
+        preserved_route_dotenv = _data_route_dotenv(_read_text_native(primary_dotenv))
         if preserved_route_dotenv:
             preserved_route_mode_source = primary_dotenv
     for destination in (
@@ -1790,7 +1862,7 @@ def _apply_configuration_source(
         staging / ".env",
         staging / "state" / ".env",
     ):
-        destination.unlink(missing_ok=True)
+        _unlink_native(destination, missing_ok=True)
     config = source.home / "config.toml"
     (
         bundle_valid,
@@ -1810,8 +1882,12 @@ def _apply_configuration_source(
         )
     if config_bytes is not None:
         destination = staging / "config.toml"
-        destination.write_bytes(_transformed_config(config_bytes, workspace_root))
-        shutil.copymode(config, destination, follow_symlinks=False)
+        _write_bytes_native(destination, _transformed_config(config_bytes, workspace_root))
+        shutil.copymode(
+            _native_io_path(config),
+            _native_io_path(destination),
+            follow_symlinks=False,
+        )
     recovery_dotenv = (
         _sanitized_dotenv(dotenv_raw)
         if dotenv_raw is not None and _dotenv_text_has_user_configuration(dotenv_raw)
@@ -1821,13 +1897,14 @@ def _apply_configuration_source(
     if merged_dotenv:
         dotenv = source.dotenv
         destination = staging / ".env"
-        destination.write_text(
-            merged_dotenv,
-            encoding="utf-8",
-        )
+        _write_text_native(destination, merged_dotenv)
         mode_source = dotenv if recovery_dotenv else preserved_route_mode_source
         assert mode_source is not None
-        shutil.copymode(mode_source, destination, follow_symlinks=False)
+        shutil.copymode(
+            _native_io_path(mode_source),
+            _native_io_path(destination),
+            follow_symlinks=False,
+        )
 
 
 def _operational_state_path(relative: Path) -> bool:
@@ -1872,31 +1949,32 @@ def _merge_filtered_tree(
 ) -> None:
     if skip_operational_state and _operational_state_path(relative):
         return
-    source_stat = source.lstat()
+    source_stat = os.lstat(_native_io_path(source))
     if not _is_link_or_reparse(source_stat) and stat.S_ISDIR(source_stat.st_mode):
         if _lexists(destination):
-            destination_stat = destination.lstat()
+            destination_stat = os.lstat(_native_io_path(destination))
             if _is_link_or_reparse(destination_stat) or not stat.S_ISDIR(destination_stat.st_mode):
                 destination = staging / "recovered-data" / recovery_id / scope / relative
                 durable = False
         if durable:
             _ensure_plain_directory(destination)
         else:
-            destination.mkdir(parents=True, exist_ok=True)
-        with os.scandir(source) as entries:
-            for entry in sorted(entries, key=lambda item: item.name):
-                child_relative = relative / entry.name
-                _merge_filtered_tree(
-                    Path(entry.path),
-                    destination / entry.name,
-                    staging=staging,
-                    recovery_id=recovery_id,
-                    relative=child_relative,
-                    scope=scope,
-                    skip_operational_state=skip_operational_state,
-                    durable=durable,
-                    transaction_id=transaction_id,
-                )
+            _makedirs_native(destination)
+        with os.scandir(_native_io_path(source)) as entries:
+            entry_names = sorted(entry.name for entry in entries)
+        for entry_name in entry_names:
+            child_relative = relative / entry_name
+            _merge_filtered_tree(
+                source / entry_name,
+                destination / entry_name,
+                staging=staging,
+                recovery_id=recovery_id,
+                relative=child_relative,
+                scope=scope,
+                skip_operational_state=skip_operational_state,
+                durable=durable,
+                transaction_id=transaction_id,
+            )
         return
     _merge_workspace_tree(
         source,
@@ -1933,13 +2011,13 @@ def _merge_profile_files(
         "state",
         "workspace",
     } | _EXCLUDED_AUTHORITY_NAMES
-    with os.scandir(profile.home) as entries:
+    with os.scandir(_native_io_path(profile.home)) as entries:
         for entry in sorted(entries, key=lambda item: item.name):
             if entry.name in excluded:
                 continue
             relative = Path(entry.name)
             _merge_filtered_tree(
-                Path(entry.path),
+                profile.home / entry.name,
                 staging / relative,
                 staging=staging,
                 recovery_id=profile.recovery_id,
@@ -1950,8 +2028,8 @@ def _merge_profile_files(
     state = profile.home / "state"
     if (
         _lexists(state)
-        and not _is_link_or_reparse(state.lstat())
-        and stat.S_ISDIR(state.lstat().st_mode)
+        and not _is_link_or_reparse(os.lstat(_native_io_path(state)))
+        and stat.S_ISDIR(os.lstat(_native_io_path(state)).st_mode)
     ):
         session_archive = state / "session-archive"
         if _lexists(session_archive):
@@ -1969,12 +2047,12 @@ def _merge_profile_files(
         agents = state / "agents"
         if (
             _lexists(agents)
-            and not _is_link_or_reparse(agents.lstat())
-            and stat.S_ISDIR(agents.lstat().st_mode)
+            and not _is_link_or_reparse(os.lstat(_native_io_path(agents)))
+            and stat.S_ISDIR(os.lstat(_native_io_path(agents)).st_mode)
         ):
-            with os.scandir(agents) as entries:
+            with os.scandir(_native_io_path(agents)) as entries:
                 for entry in sorted(entries, key=lambda item: item.name):
-                    memory = Path(entry.path) / "memory"
+                    memory = agents / entry.name / "memory"
                     if not _lexists(memory):
                         continue
                     relative = Path("state") / "agents" / entry.name / "memory"
@@ -2003,13 +2081,13 @@ def _merge_profile_media(
     source_media = profile.home / "media"
     if not _lexists(source_media):
         return
-    source_media_stat = source_media.lstat()
+    source_media_stat = os.lstat(_native_io_path(source_media))
     if _is_link_or_reparse(source_media_stat) or not stat.S_ISDIR(source_media_stat.st_mode):
         return
-    with os.scandir(source_media) as entries:
+    with os.scandir(_native_io_path(source_media)) as entries:
         for entry in sorted(entries, key=lambda item: item.name):
-            source = Path(entry.path)
-            source_stat = source.lstat()
+            source = source_media / entry.name
+            source_stat = os.lstat(_native_io_path(source))
             if (
                 entry.name != "transcripts"
                 or _is_link_or_reparse(source_stat)
@@ -2028,7 +2106,7 @@ def _merge_profile_media(
                     transaction_id=transaction_id,
                 )
                 continue
-            with os.scandir(source) as transcript_entries:
+            with os.scandir(_native_io_path(source)) as transcript_entries:
                 for transcript_entry in sorted(
                     transcript_entries,
                     key=lambda item: item.name,
@@ -2044,7 +2122,7 @@ def _merge_profile_media(
                     )
                     relative = Path("media") / "transcripts" / target_session_id
                     _merge_filtered_tree(
-                        Path(transcript_entry.path),
+                        source / transcript_entry.name,
                         destination_media / "transcripts" / target_session_id,
                         staging=staging,
                         recovery_id=profile.recovery_id,
@@ -2095,7 +2173,7 @@ def _merge_profile_workspace(
     source_workspace = profile.home / "workspace"
     if not _lexists(source_workspace):
         return
-    source_stat = source_workspace.lstat()
+    source_stat = os.lstat(_native_io_path(source_workspace))
     if _is_link_or_reparse(source_stat) or not stat.S_ISDIR(source_stat.st_mode):
         raise UnsafePathError(
             f"recovery workspace root must be a real directory: {source_workspace}"
@@ -2106,9 +2184,9 @@ def _merge_profile_workspace(
         for route in (routes.state, routes.media)
         if _normalized_path(route.path) == _normalized_path(routes.workspace.path / route.path.name)
     }
-    with os.scandir(source_workspace) as entries:
+    with os.scandir(_native_io_path(source_workspace)) as entries:
         for entry in sorted(entries, key=lambda item: item.name):
-            source = Path(entry.path)
+            source = source_workspace / entry.name
             if entry.name in reserved_workspace_children:
                 _preserve_conflict(
                     source,
@@ -2129,7 +2207,7 @@ def _merge_profile_workspace(
                     transaction_id=transaction_id,
                 )
                 continue
-            agents_stat = source.lstat()
+            agents_stat = os.lstat(_native_io_path(source))
             if _is_link_or_reparse(agents_stat) or not stat.S_ISDIR(agents_stat.st_mode):
                 _preserve_conflict(
                     source,
@@ -2139,7 +2217,7 @@ def _merge_profile_workspace(
                     scope="workspace",
                 )
                 continue
-            with os.scandir(source) as agent_entries:
+            with os.scandir(_native_io_path(source)) as agent_entries:
                 for agent_entry in sorted(
                     agent_entries,
                     key=lambda item: item.name,
@@ -2147,7 +2225,7 @@ def _merge_profile_workspace(
                     normalized = normalize_agent_id(agent_entry.name)
                     route = routes.agent_workspace(normalized)
                     _merge_workspace_tree(
-                        Path(agent_entry.path),
+                        source / agent_entry.name,
                         route.destination(staging),
                         staging=staging,
                         recovery_id=profile.recovery_id,
@@ -2167,7 +2245,7 @@ def _merge_session_database_idempotent(
 ) -> SessionMergeResult:
     if not external or _lexists(target):
         if _lexists(target):
-            value = target.lstat()
+            value = os.lstat(_native_io_path(target))
             if _is_link_or_reparse(value) or not stat.S_ISREG(value.st_mode) or value.st_nlink != 1:
                 raise UnsafePathError(f"sessions database target must be a regular file: {target}")
         return merge_session_database(target, source, source_id=source_id)
@@ -2180,12 +2258,15 @@ def _merge_session_database_idempotent(
     ):
         if not _lexists(stale):
             continue
-        value = stale.lstat()
+        value = os.lstat(_native_io_path(stale))
         if _is_link_or_reparse(value) or not stat.S_ISREG(value.st_mode):
             raise UnsafePathError(f"sessions merge temporary is unsafe: {stale}")
-        stale.unlink()
+        _unlink_native(stale)
     result = merge_session_database(temporary, source, source_id=source_id)
-    descriptor = os.open(temporary, os.O_RDONLY)
+    # Windows implements fsync via the CRT ``_commit`` primitive, which rejects
+    # descriptors opened read-only with EBADF.  The file is private to this
+    # transaction until the no-replace publish below, so open it writable.
+    descriptor = os.open(_native_io_path(temporary), os.O_RDWR)
     try:
         os.fsync(descriptor)
     finally:
@@ -2194,7 +2275,7 @@ def _merge_session_database_idempotent(
         native_move_no_replace(temporary, target)
         _fsync_directory(target.parent)
     finally:
-        temporary.unlink(missing_ok=True)
+        _unlink_native(temporary, missing_ok=True)
     return result
 
 
@@ -2226,7 +2307,7 @@ def _merge_recovery_data(
         source_db = profile.home / "state" / "sessions.db"
         session_result: SessionMergeResult | None = None
         if _lexists(source_db):
-            source_db_stat = source_db.lstat()
+            source_db_stat = os.lstat(_native_io_path(source_db))
             if _is_link_or_reparse(source_db_stat) or not stat.S_ISREG(source_db_stat.st_mode):
                 raise UnsafePathError(
                     f"recovery sessions database must be a regular file: {source_db}"
@@ -2251,12 +2332,12 @@ def _merge_recovery_data(
 
 
 def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _makedirs_native(path.parent, mode=0o700)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     data = (json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode(
         "utf-8"
     )
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    descriptor = os.open(_native_io_path(temporary), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         with os.fdopen(descriptor, "wb", closefd=False) as handle:
             handle.write(data)
@@ -2265,10 +2346,10 @@ def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     finally:
         os.close(descriptor)
     try:
-        os.replace(temporary, path)
+        os.replace(_native_io_path(temporary), _native_io_path(path))
         _fsync_directory(path.parent)
     finally:
-        temporary.unlink(missing_ok=True)
+        _unlink_native(temporary, missing_ok=True)
 
 
 def _write_primary_context(user_data: Path) -> None:
@@ -2331,26 +2412,29 @@ def _result_from_payload(
 def _latest_receipt(user_data: Path, primary_home: Path) -> ConsolidationResult | None:
     root = user_data / _BACKUPS_RELATIVE
     try:
-        root_stat = root.lstat()
+        root_stat = os.lstat(_native_io_path(root))
         if _is_link_or_reparse(root_stat) or not stat.S_ISDIR(root_stat.st_mode):
             return None
         receipts: list[Path] = []
-        with os.scandir(root) as entries:
+        with os.scandir(_native_io_path(root)) as entries:
             for entry in entries:
-                transaction_root = Path(entry.path)
-                value = transaction_root.lstat()
+                transaction_root = root / entry.name
+                value = os.lstat(_native_io_path(transaction_root))
                 if _is_link_or_reparse(value) or not stat.S_ISDIR(value.st_mode):
                     continue
                 receipt = transaction_root / "receipt.json"
                 try:
-                    receipt_stat = receipt.lstat()
+                    receipt_stat = os.lstat(_native_io_path(receipt))
                 except OSError:
                     continue
                 if _is_link_or_reparse(receipt_stat) or not stat.S_ISREG(receipt_stat.st_mode):
                     continue
                 receipts.append(receipt)
         receipts.sort(
-            key=lambda receipt: (receipt.lstat().st_mtime_ns, receipt.parent.name),
+            key=lambda receipt: (
+                os.lstat(_native_io_path(receipt)).st_mtime_ns,
+                receipt.parent.name,
+            ),
             reverse=True,
         )
     except OSError:
@@ -2361,7 +2445,7 @@ def _latest_receipt(user_data: Path, primary_home: Path) -> ConsolidationResult 
     try:
         if not _plain_optional_file(path, label="profile consolidation receipt"):
             return None
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(_read_text_native(path))
         if (
             not isinstance(payload, dict)
             or payload.get("schema_version") != 1
@@ -2394,14 +2478,14 @@ def _prepare_backup_path(user_data: Path, transaction_id: str) -> Path:
     for part in _BACKUPS_RELATIVE.parts:
         current = current / part
         try:
-            current.mkdir(mode=0o700)
+            os.mkdir(_native_io_path(current), mode=0o700)
         except FileExistsError:
             pass
-        value = current.lstat()
+        value = os.lstat(_native_io_path(current))
         if _is_link_or_reparse(value) or not stat.S_ISDIR(value.st_mode):
             raise UnsafePathError(f"profile consolidation backup root is unsafe: {current}")
     backup_path = current / transaction_id
-    backup_path.mkdir(mode=0o700)
+    os.mkdir(_native_io_path(backup_path), mode=0o700)
     _plain_directory(backup_path, label="profile consolidation transaction backup")
     return backup_path
 
@@ -2506,7 +2590,7 @@ def _receipt_payload(
             stable_code="profile_consolidation_receipt_missing",
         )
     before = _metadata_identity(receipt_path)
-    payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+    payload = json.loads(_read_text_native(receipt_path))
     after = _metadata_identity(receipt_path)
     if before is None or after != before:
         raise UnsafePathError("profile consolidation receipt changed while reading")
@@ -2665,7 +2749,7 @@ def _validate_journal_authority(
         _validate_directory_chain_binding(binding)
     staging = Path(str(payload["staging"]))
     if require_staging:
-        if not staging.is_dir():
+        if not os.path.isdir(_native_io_path(staging)):
             raise UnsafePathError("profile consolidation staging directory is missing")
         profile_no_follow_manifest(staging)
         if (
@@ -2707,7 +2791,7 @@ def _rebuild_staging_from_authority(
     staging = Path(str(payload["staging"]))
     if _lexists(staging):
         profile_no_follow_manifest(staging)
-        shutil.rmtree(staging)
+        _rmtree_native(staging)
     source_home = _configuration_home_for_journal(payload, primary_home)
     _clone_primary(source_home, staging)
     result = _result_from_payload(dict(payload["result"]), outcome="consolidated")
@@ -2802,17 +2886,35 @@ def _commit_primary(
     parked = backup_path / "primary"
     if phase == "external_roots_merged":
         if bool(payload["primary_existed"]):
-            if primary.exists() and not parked.exists():
+            if _lexists(primary) and not _lexists(parked):
                 move_profile_no_replace(primary, parked)
-            elif primary.exists() or not parked.exists():
+            elif _lexists(primary) or not _lexists(parked):
                 raise UnsafePathError("primary park state is ambiguous")
+            else:
+                # The move may have committed before its journal phase did.
+                # Prove that the destination is the real parked primary, not a
+                # dangling or attacker-supplied reparse point.
+                profile_no_follow_manifest(parked)
+                if _primary_config_authority(parked) != payload.get("primary_config"):
+                    raise _ConsolidationBlockedError(
+                        "primary config.toml changed while the primary was parked",
+                        stable_code="profile_consolidation_source_changed",
+                    )
         payload = _update_journal(journal_path, payload, "primary_parked")
         phase = "primary_parked"
     if phase == "primary_parked":
-        if staging.exists() and not primary.exists():
+        if _lexists(staging) and not _lexists(primary):
             move_profile_no_replace(staging, primary)
-        elif staging.exists() or not primary.exists():
+        elif _lexists(staging) or not _lexists(primary):
             raise UnsafePathError("primary publish state is ambiguous")
+        else:
+            # As above, a destination pathname alone is not proof that the
+            # no-replace move committed. Require the exact merged tree token.
+            expected = payload.get("staging_merged")
+            if not isinstance(expected, str) or _profile_content_token(primary) != expected:
+                raise UnsafePathError(
+                    "published primary no longer matches the consolidation journal"
+                )
         payload = _update_journal(journal_path, payload, "primary_published")
     return payload
 
@@ -2828,7 +2930,7 @@ def _archive_and_finish(
     backup_path = Path(payload["backup_path"])
     archived = backup_path / "recovery-profiles"
     if phase == "primary_published":
-        if recovery_root.exists() and not archived.exists():
+        if _lexists(recovery_root) and not _lexists(archived):
             active_profiles = _enumerate_recoveries(user_data)
             if tuple(
                 profile.recovery_id for profile in active_profiles
@@ -2847,8 +2949,24 @@ def _archive_and_finish(
                 opaque_manifest_directories=opaque,
                 use_profile_manifest_policy=False,
             )
-        elif recovery_root.exists() or not archived.exists():
+        elif _lexists(recovery_root) or not _lexists(archived):
             raise UnsafePathError("recovery archive state is ambiguous")
+        else:
+            # The archive move may likewise have committed before the phase
+            # update. A pathname (especially a dangling reparse point) is not
+            # evidence: validate the exact identities and snapshots consumed.
+            archived_profiles = _enumerate_recoveries(backup_path)
+            if tuple(
+                profile.recovery_id for profile in archived_profiles
+            ) != result.consumed_recovery_ids:
+                raise UnsafePathError(
+                    "archived recovery profiles do not match the consolidation journal"
+                )
+            if _profile_snapshot_tokens(archived_profiles) != payload.get("source_snapshots"):
+                raise _ConsolidationBlockedError(
+                    "archived recovery profile changed after consolidation",
+                    stable_code="profile_consolidation_source_changed",
+                )
         payload = _update_journal(journal_path, payload, "recoveries_archived")
         phase = "recoveries_archived"
     if phase in {"recoveries_archived", "context_written"}:
@@ -2872,18 +2990,18 @@ def _archive_and_finish(
         phase = "context_written"
     if phase != "context_written":
         raise UnsafePathError(f"unsupported consolidation journal phase: {phase}")
-    journal_path.unlink()
+    _unlink_native(journal_path)
     # The transaction finished, so any record of having deferred past it is stale.
     _clear_startup_deferral(user_data)
     return result
 
 
 def _load_journal(path: Path, user_data: Path, primary_home: Path) -> dict[str, Any] | None:
-    if not path.exists():
+    if not _lexists(path):
         return None
     if not _plain_optional_file(path, label="profile consolidation journal"):
         return None
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload = json.loads(_read_text_native(path))
     transaction_id = _validated_transaction_id(
         payload.get("transaction_id") if isinstance(payload, dict) else None
     )
@@ -2963,7 +3081,7 @@ def _primary_profile_is_populated(primary_home: Path) -> bool:
             return True
     sessions = primary_home / "state" / "sessions.db"
     try:
-        value = sessions.lstat()
+        value = os.lstat(_native_io_path(sessions))
     except OSError:
         return False
     return not _is_link_or_reparse(value) and stat.S_ISREG(value.st_mode)
@@ -2993,7 +3111,7 @@ def _primary_home_survives_failure(user_data: Path, primary_home: Path) -> bool:
             payload = _load_journal(journal_path, user_data, primary_home)
             if payload is None or str(payload.get("phase")) == "primary_parked":
                 return False
-        stat_result = primary_home.lstat()
+        stat_result = os.lstat(_native_io_path(primary_home))
         if _is_link_or_reparse(stat_result) or not stat.S_ISDIR(stat_result.st_mode):
             return False
         profile_no_follow_manifest(primary_home)
@@ -3016,7 +3134,7 @@ def _all_routes_are_profile_relative(routes: _PrimaryDataRoutes) -> bool:
 
 def _directory_is_empty(path: Path) -> bool:
     _plain_directory(path, label="profile consolidation transaction backup")
-    with os.scandir(path) as entries:
+    with os.scandir(_native_io_path(path)) as entries:
         return next(entries, None) is None
 
 
@@ -3078,7 +3196,7 @@ def _abort_pre_park_journal(
         # transaction or an advanced phase can never inherit this cleanup.
         if _load_journal(journal_path, user_data, primary_home) != payload:
             return False
-        if bool(payload["primary_existed"]) != primary_home.is_dir():
+        if bool(payload["primary_existed"]) != os.path.isdir(_native_io_path(primary_home)):
             # The primary moved after all; only a resume may touch it.
             return False
 
@@ -3103,7 +3221,7 @@ def _abort_pre_park_journal(
         # here retries this same guarded cleanup instead of mistaking a partial
         # staging tree for authoritative data.
         if staging_exists:
-            shutil.rmtree(staging)
+            _rmtree_native(staging)
             _fsync_directory(user_data)
         # The empty transaction backup directory stays: its parent chain is not
         # descriptor-bound here, and deleting through a concurrently replaced
@@ -3116,7 +3234,7 @@ def _abort_pre_park_journal(
             != journal_authority
         ):
             raise UnsafePathError("profile consolidation journal changed before abort")
-        journal_path.unlink()
+        _unlink_native(journal_path)
         _clear_startup_deferral(user_data)
         _fsync_directory(user_data)
         return True
@@ -3133,7 +3251,7 @@ def _startup_was_deferred_for(user_data: Path, payload: dict[str, Any]) -> bool:
     if not _plain_optional_file(marker, label="profile consolidation deferral marker"):
         return False
     try:
-        recorded = marker.read_text(encoding="utf-8").strip()
+        recorded = _read_text_native(marker).strip()
     except OSError:
         return False
     return bool(recorded) and recorded == str(payload.get("transaction_id"))
@@ -3154,13 +3272,13 @@ def _record_startup_deferral(user_data: Path, payload: dict[str, Any] | None) ->
         return
     with contextlib.suppress(OSError, UnsafePathError):
         marker = _deferral_marker_path(user_data)
-        marker.write_text(f"{transaction_id}\n", encoding="utf-8")
+        _write_text_native(marker, f"{transaction_id}\n")
         _fsync_directory(user_data)
 
 
 def _clear_startup_deferral(user_data: Path) -> None:
     with contextlib.suppress(OSError):
-        _deferral_marker_path(user_data).unlink(missing_ok=True)
+        _unlink_native(_deferral_marker_path(user_data), missing_ok=True)
 
 
 def _is_stale_prepared_plan(error: BaseException) -> bool:
@@ -3239,7 +3357,7 @@ def _restart_legacy_prepared_journal_if_safe(
         locked_profiles = _enumerate_recoveries(user_data)
         if tuple(profile.recovery_id for profile in locked_profiles) != expected_ids:
             return False
-        if bool(payload["primary_existed"]) != primary_home.is_dir():
+        if bool(payload["primary_existed"]) != os.path.isdir(_native_io_path(primary_home)):
             return False
         if _primary_config_authority(primary_home) != payload.get("primary_config"):
             return False
@@ -3276,7 +3394,7 @@ def _restart_legacy_prepared_journal_if_safe(
         # be attempted again instead of mistaking the partial staging tree for
         # authoritative data.
         if staging_exists:
-            shutil.rmtree(staging)
+            _rmtree_native(staging)
             _fsync_directory(user_data)
         # Keep the empty legacy backup directory. Its parent chain is not
         # descriptor-bound here, and deleting through a concurrently replaced
@@ -3290,7 +3408,7 @@ def _restart_legacy_prepared_journal_if_safe(
             != journal_authority
         ):
             raise UnsafePathError("profile consolidation journal changed before restart")
-        journal_path.unlink()
+        _unlink_native(journal_path)
         _fsync_directory(user_data)
         return True
 
@@ -3394,9 +3512,15 @@ def _resume(
                 expected_staging_token=expected_staging_token,
             )
             _prepare_required_state_roots(routes, staging_path)
-        legacy_homes = (primary_home, *recovery_homes) if primary_home.is_dir() else recovery_homes
+        legacy_homes = (
+            (primary_home, *recovery_homes)
+            if os.path.isdir(_native_io_path(primary_home))
+            else recovery_homes
+        )
         if phase in {"recoveries_archived", "context_written"}:
-            legacy_homes = (primary_home,) if primary_home.is_dir() else ()
+            legacy_homes = (
+                (primary_home,) if os.path.isdir(_native_io_path(primary_home)) else ()
+            )
         with acquire_legacy_gateway_locks(
             *legacy_homes,
             read_only_homes=recovery_homes,
@@ -3580,7 +3704,7 @@ def consolidate_recovery_profiles(
                     revision=revision,
                 )
                 canonical_only_homes = _canonical_only_legacy_homes(profiles)
-                primary_existed = primary_path.exists()
+                primary_existed = _lexists(primary_path)
                 source_snapshots = {
                     profile.recovery_id: _source_snapshot_token(profile) for profile in profiles
                 }
@@ -3677,10 +3801,10 @@ def consolidate_recovery_profiles(
         except BaseException:
             # Before a journal exists no authoritative path has moved.  Remove
             # only the UUID staging tree created by this invocation.
-            if not journal_path.exists() and staging.exists():
+            if not _lexists(journal_path) and _lexists(staging):
                 with contextlib.suppress(OSError):
                     profile_no_follow_manifest(staging)
-                    shutil.rmtree(staging)
+                    _rmtree_native(staging)
             raise
     except RecoveryError as exc:
         return _blocked(

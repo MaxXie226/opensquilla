@@ -44,6 +44,7 @@ from opensquilla.recovery.config_patch import ConfigSnapshot
 from opensquilla.recovery.locking import (
     LegacyGatewayLock,
     acquire_legacy_gateway_locks,
+    profile_lock_key,
     user_state_dir,
 )
 
@@ -91,6 +92,18 @@ def test_user_state_override_is_used_with_the_explicit_test_gate(
     monkeypatch.setenv("OPENSQUILLA_TEST_PROFILE_LOCK_ROOT", "1")
 
     assert user_state_dir() == override
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native path alias contract")
+def test_profile_lock_key_collapses_extended_length_alias(tmp_path: Path) -> None:
+    logical = tmp_path / "profile"
+    index = 0
+    while len(str(logical)) < 275:
+        logical /= f"profile-segment-{index:02d}-0123456789"
+        index += 1
+    native = Path(_windows_extended_path(logical))
+
+    assert profile_lock_key(logical) == profile_lock_key(native)
 
 
 def test_profile_lock_does_not_require_descriptor_chmod(
@@ -194,13 +207,13 @@ def test_config_snapshot_rejects_windows_reparse_attribute_before_open(
 ) -> None:
     path = tmp_path / "config.toml"
     path.write_text("synthetic = true\n", encoding="utf-8")
-    original_lstat = Path.lstat
+    original_lstat = os.lstat
     original_open = os.open
     opened = False
 
-    def fake_lstat(candidate: Path):
+    def fake_lstat(candidate: str | bytes | os.PathLike[str] | os.PathLike[bytes]):
         value = original_lstat(candidate)
-        if candidate != path:
+        if not os.path.samefile(candidate, path):
             return value
         return SimpleNamespace(
             st_mode=stat.S_IFREG | 0o600,
@@ -218,7 +231,7 @@ def test_config_snapshot_rejects_windows_reparse_attribute_before_open(
             opened = True
         return original_open(candidate, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "lstat", fake_lstat)
+    monkeypatch.setattr(os, "lstat", fake_lstat)
     monkeypatch.setattr(os, "open", track_open)
 
     with pytest.raises(UnsafePathError):
@@ -628,21 +641,21 @@ def test_windows_native_move_handles_real_path_longer_than_260_characters(
         long_root /= f"segment-{index}-" + ("x" * 42)
     source_parent = long_root / "source-parent"
     destination_parent = long_root / "destination-parent"
-    source_parent.mkdir(parents=True)
-    destination_parent.mkdir(parents=True)
+    os.makedirs(_windows_extended_path(source_parent))
+    os.makedirs(_windows_extended_path(destination_parent))
     source = source_parent / "candidate-profile"
     destination = destination_parent / "published-profile"
-    source.mkdir()
-    (source / "value.txt").write_text("long-path-preserved", encoding="utf-8")
+    os.mkdir(_windows_extended_path(source))
+    with open(_windows_extended_path(source / "value.txt"), "w", encoding="utf-8") as handle:
+        handle.write("long-path-preserved")
     assert len(str(source)) > 260
     assert len(str(destination)) > 260
 
     native_move_no_replace(source, destination)
 
-    assert not source.exists()
-    assert (destination / "value.txt").read_text(encoding="utf-8") == (
-        "long-path-preserved"
-    )
+    assert not os.path.exists(_windows_extended_path(source))
+    with open(_windows_extended_path(destination / "value.txt"), encoding="utf-8") as handle:
+        assert handle.read() == "long-path-preserved"
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="requires a real Windows junction")

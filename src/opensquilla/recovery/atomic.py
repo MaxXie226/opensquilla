@@ -155,7 +155,8 @@ def _is_link_or_reparse(value: os.stat_result) -> bool:
 
 def path_identity(path: str | Path, *, follow_symlinks: bool = False) -> PathIdentity:
     candidate = Path(path)
-    value = candidate.stat() if follow_symlinks else candidate.lstat()
+    native_candidate = _native_io_path(candidate)
+    value = os.stat(native_candidate) if follow_symlinks else os.lstat(native_candidate)
     if follow_symlinks or not _is_link_or_reparse(value):
         return PathIdentity.from_stat(value)
     return _link_leaf_identity(candidate, value)
@@ -168,7 +169,7 @@ def _link_leaf_identity(path: Path, value: os.stat_result) -> PathIdentity:
     if tag is not None and tag not in _ALLOWED_LINK_REPARSE_TAGS:
         raise UnsafePathError(f"unsupported reparse point in recovery source: {path}")
     try:
-        target = os.readlink(path)
+        target = os.readlink(_native_io_path(path))
     except OSError as exc:
         raise UnsafePathError(f"cannot inspect recovery link target: {path}") from exc
     return PathIdentity.from_stat(value, reparse_tag=tag, link_target=target)
@@ -176,7 +177,7 @@ def _link_leaf_identity(path: Path, value: os.stat_result) -> PathIdentity:
 
 def _assert_plain_directory(path: Path, *, label: str) -> os.stat_result:
     try:
-        value = path.lstat()
+        value = os.lstat(_native_io_path(path))
     except OSError as exc:
         raise UnsafePathError(f"{label} is not accessible: {path}") from exc
     if _is_link_or_reparse(value) or not stat.S_ISDIR(value.st_mode):
@@ -218,7 +219,7 @@ def no_follow_manifest(
     """
 
     root_path = Path(root)
-    root_stat = root_path.lstat()
+    root_stat = os.lstat(_native_io_path(root_path))
     if _is_link_or_reparse(root_stat):
         raise UnsafePathError(f"automatic operations refuse links or reparse points: {root_path}")
     if not (stat.S_ISDIR(root_stat.st_mode) or stat.S_ISREG(root_stat.st_mode)):
@@ -230,17 +231,18 @@ def no_follow_manifest(
 
     def visit(directory: Path, relative: Path) -> None:
         try:
-            entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
+            with os.scandir(_native_io_path(directory)) as iterator:
+                entry_names = sorted(entry.name for entry in iterator)
         except OSError as exc:
             raise UnsafePathError(f"cannot enumerate recovery source: {directory}") from exc
-        for entry in entries:
-            child_relative = relative / entry.name
+        for entry_name in entry_names:
+            child_relative = relative / entry_name
             child_key = child_relative.as_posix()
-            child_path = Path(entry.path)
+            child_path = directory / entry_name
             try:
-                value = child_path.lstat()
+                value = os.lstat(_native_io_path(child_path))
             except OSError as exc:
-                raise UnsafePathError(f"cannot inspect recovery source: {entry.path}") from exc
+                raise UnsafePathError(f"cannot inspect recovery source: {child_path}") from exc
             if _is_link_or_reparse(value):
                 if not any(
                     child_relative != Path(link_root)
@@ -248,18 +250,18 @@ def no_follow_manifest(
                     for link_root in link_leaf_directories
                 ):
                     raise UnsafePathError(
-                        f"automatic operations refuse links or reparse points: {entry.path}"
+                        f"automatic operations refuse links or reparse points: {child_path}"
                     )
                 result[child_key] = _link_leaf_identity(child_path, value)
                 continue
             if not (stat.S_ISDIR(value.st_mode) or stat.S_ISREG(value.st_mode)):
-                raise UnsafePathError(f"automatic operations refuse special files: {entry.path}")
+                raise UnsafePathError(f"automatic operations refuse special files: {child_path}")
             result[child_key] = PathIdentity.from_stat(value)
             if (
                 stat.S_ISDIR(value.st_mode)
                 and child_key not in opaque_directories
             ):
-                visit(Path(entry.path), child_relative)
+                visit(child_path, child_relative)
 
     visit(root_path, Path())
     return result
@@ -810,6 +812,14 @@ def _windows_extended_path(path: str | Path) -> str:
     return f"\\\\?\\{value}"
 
 
+def _native_io_path(path: str | Path) -> str:
+    """Return an OS-call spelling without changing persisted logical paths."""
+
+    if os.name == "nt":
+        return _windows_extended_path(path)
+    return os.fspath(path)
+
+
 def native_move_no_replace(
     source: str | Path,
     destination: str | Path,
@@ -841,7 +851,7 @@ def native_move_no_replace(
         raise CrossDeviceMoveError("cross-filesystem recovery moves are not allowed")
 
     try:
-        destination_path.lstat()
+        os.lstat(_native_io_path(destination_path))
     except FileNotFoundError:
         pass
     else:

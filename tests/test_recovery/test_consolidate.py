@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import contextlib
+import errno
 import hashlib
 import importlib
 import json
 import os
 import shutil
 import sqlite3
+import subprocess
 import tomllib
 import uuid
 from pathlib import Path
@@ -14,12 +17,138 @@ import pytest
 from typer.testing import CliRunner
 
 from opensquilla.cli.recovery_cmd import recovery_app
+from opensquilla.recovery.atomic import _native_io_path
 from opensquilla.recovery.consolidate import consolidate_recovery_profiles
+
+
+def _is_file(path: Path) -> bool:
+    return os.path.isfile(_native_io_path(path))
+
+
+def _read_text(path: Path) -> str:
+    with open(_native_io_path(path), encoding="utf-8") as handle:
+        return handle.read()
+
+
+def _read_bytes(path: Path) -> bytes:
+    with open(_native_io_path(path), "rb") as handle:
+        return handle.read()
+
+
+def _write_text(path: Path, value: str) -> None:
+    with open(_native_io_path(path), "w", encoding="utf-8") as handle:
+        handle.write(value)
+
+
+def _make_dangling_directory_link(link: Path) -> None:
+    target = link.with_name(f"{link.name}-target")
+    target.mkdir(parents=True)
+    if os.name == "nt":
+        completed = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if completed.returncode != 0:
+            pytest.skip(f"junction creation is unavailable: {completed.stderr}")
+    else:
+        link.symlink_to(target, target_is_directory=True)
+    target.rmdir()
+    assert os.path.lexists(_native_io_path(link))
+
+
+def _remove_dangling_directory_link(link: Path) -> None:
+    if not os.path.lexists(_native_io_path(link)):
+        return
+    if os.name == "nt":
+        os.rmdir(_native_io_path(link))
+    else:
+        link.unlink()
+
+
+@pytest.mark.parametrize(
+    ("phase", "destination_name"),
+    [
+        ("external_roots_merged", "parked"),
+        ("primary_parked", "primary"),
+    ],
+)
+def test_commit_primary_rejects_dangling_move_destination(
+    tmp_path: Path,
+    phase: str,
+    destination_name: str,
+) -> None:
+    consolidate_module = importlib.import_module("opensquilla.recovery.consolidate")
+    primary = tmp_path / "primary"
+    staging = tmp_path / "staging"
+    backup = tmp_path / "backup"
+    backup.mkdir()
+    destination = backup / "primary" if destination_name == "parked" else primary
+    _make_dangling_directory_link(destination)
+    payload = {
+        "phase": phase,
+        "primary_home": str(primary),
+        "staging": str(staging),
+        "backup_path": str(backup),
+        "primary_existed": True,
+        "primary_config": {
+            "config": {"exists": False},
+            "dotenv_path": None,
+            "dotenv": {"exists": False},
+        },
+        "staging_merged": "synthetic-token",
+    }
+    try:
+        with pytest.raises(consolidate_module.RecoveryError):
+            consolidate_module._commit_primary(tmp_path / "journal.json", payload)
+    finally:
+        _remove_dangling_directory_link(destination)
+
+
+def test_archive_finish_rejects_dangling_archive_destination(tmp_path: Path) -> None:
+    consolidate_module = importlib.import_module("opensquilla.recovery.consolidate")
+    recovery_id = str(uuid.uuid4())
+    primary = tmp_path / "primary"
+    backup = tmp_path / "backup"
+    backup.mkdir()
+    archived = backup / "recovery-profiles"
+    _make_dangling_directory_link(archived)
+    payload = {
+        "phase": "primary_published",
+        "transaction_id": str(uuid.uuid4()),
+        "recovery_root": str(tmp_path / "missing-recovery-profiles"),
+        "backup_path": str(backup),
+        "source_snapshots": {recovery_id: "synthetic-token"},
+        "result": {
+            "stable_code": "profile_consolidation_complete",
+            "primary_home": str(primary),
+            "configuration_source_recovery_id": None,
+            "configuration_source_credential_path": None,
+            "configuration_source_credential_sha256": None,
+            "configuration_source_credential_size": None,
+            "consumed_recovery_ids": [recovery_id],
+            "backup_path": str(backup),
+            "receipt_path": str(backup / "receipt.json"),
+            "credential_adoption_status": "not_required",
+            "revision": 1,
+            "errors": [],
+        },
+    }
+    try:
+        with pytest.raises(consolidate_module.RecoveryError):
+            consolidate_module._archive_and_finish(
+                tmp_path,
+                tmp_path / "journal.json",
+                payload,
+            )
+    finally:
+        _remove_dangling_directory_link(archived)
 
 
 def _session_database(path: Path, key: str, session_id: str, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(path) as connection:
+    with contextlib.closing(sqlite3.connect(path)) as connection, connection:
         connection.executescript(
             """
             CREATE TABLE sessions (
@@ -204,9 +333,9 @@ def test_consolidates_all_recoveries_into_primary_and_archives_sources(
     assert not (user_data / "recovery-profiles").exists()
     assert result.backup_path is not None
     archived = result.backup_path / "recovery-profiles"
-    assert (archived / first_id / "opensquilla" / "config.toml").is_file()
-    assert (archived / second_id / "desktop-credential.json").is_file()
-    assert (
+    assert _is_file(archived / first_id / "opensquilla" / "config.toml")
+    assert _is_file(archived / second_id / "desktop-credential.json")
+    assert _is_file(
         archived
         / first_id
         / "opensquilla"
@@ -215,7 +344,7 @@ def test_consolidates_all_recoveries_into_primary_and_archives_sources(
         / "matrix"
         / "account"
         / "session.json"
-    ).is_file()
+    )
     assert (primary / "config.toml").read_text(encoding="utf-8") == "primary = true\n"
     assert (user_data / "desktop-credential.json").read_text(encoding="utf-8") == (
         '{"source":"primary"}\n'
@@ -223,9 +352,9 @@ def test_consolidates_all_recoveries_into_primary_and_archives_sources(
     assert (workspace / "first-only.txt").read_text(encoding="utf-8") == first_id
     assert (workspace / "second-only.txt").read_text(encoding="utf-8") == second_id
     assert (primary / "media" / f"{first_id}.txt").read_text(encoding="utf-8") == "media"
-    assert (primary / "skills" / "custom" / "SKILL.md").is_file()
-    assert (primary / "state" / "session-archive" / f"{second_id}.json").is_file()
-    assert (primary / "state" / "agents" / "main" / "memory" / f"{first_id}.md").is_file()
+    assert _is_file(primary / "skills" / "custom" / "SKILL.md")
+    assert _is_file(primary / "state" / "session-archive" / f"{second_id}.json")
+    assert _is_file(primary / "state" / "agents" / "main" / "memory" / f"{first_id}.md")
     assert not (primary / "state" / "agents" / "main" / "memory.db").exists()
     assert not (primary / "state" / "approvals.json").exists()
     assert not (primary / "state" / ".env").exists()
@@ -234,10 +363,10 @@ def test_consolidates_all_recoveries_into_primary_and_archives_sources(
     assert not (primary / "state" / "update_check.json").exists()
     assert not (workspace / "state" / "matrix").exists()
     assert not (workspace / "state" / "msteams").exists()
-    assert (
+    assert _is_file(
         primary / "recovered-data" / first_id / "profile" / "state" / "auto_propose_settings.json"
-    ).is_file()
-    assert (
+    )
+    assert _is_file(
         primary
         / "recovered-data"
         / first_id
@@ -246,8 +375,8 @@ def test_consolidates_all_recoveries_into_primary_and_archives_sources(
         / "matrix"
         / "account"
         / "session.json"
-    ).is_file()
-    assert (
+    )
+    assert _is_file(
         primary
         / "recovered-data"
         / first_id
@@ -255,7 +384,7 @@ def test_consolidates_all_recoveries_into_primary_and_archives_sources(
         / "state"
         / "msteams"
         / "conversations.json"
-    ).is_file()
+    )
     assert not (primary / "desktop-recovery-v1.json").exists()
     memory = (workspace / "MEMORY.md").read_text(encoding="utf-8")
     assert memory.count("primary fact") == 1
@@ -274,7 +403,10 @@ def test_consolidates_all_recoveries_into_primary_and_archives_sources(
     assert (primary / "recovered-data" / ordered_ids[1] / "profile" / "ordinary.txt").read_text(
         encoding="utf-8"
     ) == ordered_values[ordered_ids[1]]
-    with sqlite3.connect(primary / "state" / "sessions.db") as connection:
+    with (
+        contextlib.closing(sqlite3.connect(primary / "state" / "sessions.db")) as connection,
+        connection,
+    ):
         assert connection.execute("SELECT COUNT(*) FROM sessions").fetchone() == (3,)
     context = json.loads((user_data / "desktop-profile-context.json").read_text(encoding="utf-8"))
     assert context["active_profile_kind"] == "primary"
@@ -290,8 +422,96 @@ def test_consolidates_all_recoveries_into_primary_and_archives_sources(
     receipt_text = result.receipt_path.read_text(encoding="utf-8")
     assert "agent:main:first" not in receipt_text
     assert f"session-{first_id}" not in receipt_text
-    with sqlite3.connect(primary / "state" / "sessions.db") as connection:
+    with (
+        contextlib.closing(sqlite3.connect(primary / "state" / "sessions.db")) as connection,
+        connection,
+    ):
         assert connection.execute("SELECT COUNT(*) FROM sessions").fetchone() == (3,)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows extended-length path contract")
+def test_consolidates_extended_length_recovery_leaf(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Long-path support must not depend on the machine-wide registry policy."""
+
+    monkeypatch.setenv("OPENSQUILLA_USER_STATE_DIR", str(tmp_path / "locks"))
+    user_data = tmp_path / "user-data"
+    primary = user_data / "opensquilla"
+    (primary / "workspace").mkdir(parents=True)
+    (primary / "config.toml").write_text("primary = true\n", encoding="utf-8")
+    recovery_id = str(uuid.uuid4())
+    recovery = _recovery(
+        user_data,
+        recovery_id,
+        config="recovery = true\n",
+        credential="{}\n",
+        memory="memory\n",
+        conflict="recovery",
+        extra_name="long-path.txt",
+        session_key="agent:main:long-path",
+    )
+    relative = Path("deep") / ("a" * 100) / ("b" * 100) / "preserved-session-metadata.bin"
+    source_leaf = recovery / "opensquilla" / "state" / relative
+    os.makedirs(_native_io_path(source_leaf.parent), exist_ok=True)
+    with open(_native_io_path(source_leaf), "wb") as handle:
+        handle.write(b"long path recovery data")
+    assert len(str(source_leaf)) > 260
+    workspace_relative = (
+        Path("shared-" + ("w" * 90))
+        / ("x" * 100)
+        / "MEMORY.md"
+    )
+    source_workspace_leaf = recovery / "opensquilla" / "workspace" / workspace_relative
+    os.makedirs(_native_io_path(source_workspace_leaf.parent), exist_ok=True)
+    with open(_native_io_path(source_workspace_leaf), "wb") as handle:
+        handle.write(b"long path workspace data")
+    primary_workspace_leaf = primary / "workspace" / workspace_relative
+    os.makedirs(_native_io_path(primary_workspace_leaf.parent), exist_ok=True)
+    with open(_native_io_path(primary_workspace_leaf), "w", encoding="utf-8") as handle:
+        handle.write("primary memory\n")
+    media_relative = (
+        Path("shared-" + ("m" * 90))
+        / ("n" * 100)
+        / "deep-transcript-attachment.bin"
+    )
+    source_media_leaf = recovery / "opensquilla" / "media" / media_relative
+    os.makedirs(_native_io_path(source_media_leaf.parent), exist_ok=True)
+    with open(_native_io_path(source_media_leaf), "wb") as handle:
+        handle.write(b"long path media data")
+    os.makedirs(
+        _native_io_path(primary / "media" / media_relative.parts[0]),
+        exist_ok=True,
+    )
+    assert len(str(source_workspace_leaf)) > 260
+    assert len(str(source_media_leaf)) > 260
+
+    result = consolidate_recovery_profiles(user_data, primary)
+
+    assert result.outcome == "consolidated", result.errors
+    assert result.backup_path is not None
+    assert result.receipt_path is not None
+    assert not str(result.backup_path).startswith("\\\\?\\")
+    assert not str(result.receipt_path).startswith("\\\\?\\")
+    archived_leaf = (
+        result.backup_path / "recovery-profiles" / recovery_id / "opensquilla" / "state" / relative
+    )
+    preserved_leaf = primary / "recovered-data" / recovery_id / "profile" / "state" / relative
+    assert _read_bytes(archived_leaf) == b"long path recovery data"
+    assert _read_bytes(preserved_leaf) == b"long path recovery data"
+    assert _read_text(primary_workspace_leaf) == (
+        "primary memory\n\nlong path workspace data\n"
+    )
+    assert _read_bytes(primary / "media" / media_relative) == b"long path media data"
+    with (
+        contextlib.closing(sqlite3.connect(primary / "state" / "sessions.db")) as connection,
+        connection,
+    ):
+        assert connection.execute(
+            "SELECT session_id FROM sessions WHERE session_key=?",
+            ("agent:main:long-path",),
+        ).fetchone() == (f"session-{recovery_id}",)
 
 
 def test_empty_primary_uses_newest_recovery_configuration_bundle(
@@ -382,7 +602,7 @@ def test_empty_primary_uses_newest_recovery_configuration_bundle(
         result.backup_path / "recovery-profiles" / newer_id / "desktop-credential.json"
     )
     assert result.configuration_source_credential_path == expected_credential
-    assert json.loads(expected_credential.read_text(encoding="utf-8"))["source"] == "newer"
+    assert json.loads(_read_text(expected_credential))["source"] == "newer"
 
     repeated = consolidate_recovery_profiles(user_data, primary)
 
@@ -740,13 +960,13 @@ def test_credential_only_recovery_is_a_configuration_source(
     )
     (recovery / "opensquilla" / "config.toml").unlink()
     (recovery / "opensquilla" / ".env").unlink()
+    credential_bytes = (recovery / "desktop-credential.json").read_bytes()
 
     result = consolidate_recovery_profiles(user_data, primary)
 
     assert result.outcome == "consolidated"
     assert result.configuration_source_recovery_id == recovery_id
     assert result.configuration_source_credential_path is not None
-    credential_bytes = b'{"provider":"openai","updatedAt":"2026-07-25T05:00:00Z"}\n'
     assert (
         result.configuration_source_credential_sha256
         == hashlib.sha256(credential_bytes).hexdigest()
@@ -1375,7 +1595,7 @@ def test_incompatible_sessions_schema_returns_fixed_blocked_json(
     )
     source_db = recovery / "opensquilla" / "state" / "sessions.db"
     source_db.unlink()
-    with sqlite3.connect(source_db) as connection:
+    with contextlib.closing(sqlite3.connect(source_db)) as connection, connection:
         connection.execute("CREATE TABLE sessions (unexpected TEXT)")
         connection.execute("INSERT INTO sessions VALUES ('value')")
 
@@ -1463,7 +1683,7 @@ def test_credential_adoption_ack_is_atomic_and_idempotent(
 
     credential_path = consolidated.configuration_source_credential_path
     assert credential_path is not None
-    credential_path.unlink()
+    os.unlink(_native_io_path(credential_path))
     after_archive_cleanup = consolidate_recovery_profiles(user_data, primary)
     repeated_after_cleanup = CliRunner().invoke(recovery_app, arguments)
 
@@ -1496,10 +1716,7 @@ def test_credential_ack_rejects_archived_credential_tampering(
     assert consolidated.outcome == "consolidated"
     credential_path = consolidated.configuration_source_credential_path
     assert credential_path is not None
-    credential_path.write_text(
-        '{"provider":"openai","apiKey":"replaced"}\n',
-        encoding="utf-8",
-    )
+    _write_text(credential_path, '{"provider":"openai","apiKey":"replaced"}\n')
     assert consolidated.backup_path is not None
 
     acknowledged = CliRunner().invoke(
@@ -1575,10 +1792,15 @@ def test_only_legacy_prepared_journal_changed_by_sqlite_sidecars_restarts(
     def simulate_old_sqlite_read(**kwargs):
         for profile in kwargs["profiles"]:
             database = profile.home / "state" / "sessions.db"
-            with sqlite3.connect(
-                f"{database.absolute().as_uri()}?mode=ro",
-                uri=True,
-            ) as connection:
+            with (
+                contextlib.closing(
+                    sqlite3.connect(
+                        f"{database.absolute().as_uri()}?mode=ro",
+                        uri=True,
+                    )
+                ) as connection,
+                connection,
+            ):
                 assert connection.execute("PRAGMA quick_check").fetchone() == ("ok",)
         raise OSError("simulated old build stop after direct SQLite source read")
 
@@ -1778,7 +2000,7 @@ def test_session_id_remap_moves_transcript_attachment_material(
         session_key="agent:main:attachment-recovery",
     )
     source_db = recovery / "opensquilla" / "state" / "sessions.db"
-    with sqlite3.connect(source_db) as connection:
+    with contextlib.closing(sqlite3.connect(source_db)) as connection, connection:
         connection.execute("UPDATE sessions SET session_id='shared-session-id'")
         connection.execute("UPDATE transcript_entries SET session_id='shared-session-id'")
     recovery_material = recovery / "opensquilla" / "media" / "transcripts" / "shared-session-id"
@@ -1788,7 +2010,7 @@ def test_session_id_remap_moves_transcript_attachment_material(
     result = consolidate_recovery_profiles(user_data, primary)
 
     assert result.outcome == "consolidated"
-    with sqlite3.connect(primary / "state" / "sessions.db") as merged:
+    with contextlib.closing(sqlite3.connect(primary / "state" / "sessions.db")) as merged, merged:
         remapped_session_id = merged.execute(
             "SELECT session_id FROM sessions WHERE session_key=?",
             ("agent:main:attachment-recovery",),
@@ -1906,7 +2128,7 @@ def test_primary_external_roots_receive_active_data_without_canonical_duplicates
         encoding="utf-8",
     )
     source_db = recovery / "opensquilla" / "state" / "sessions.db"
-    with sqlite3.connect(source_db) as connection:
+    with contextlib.closing(sqlite3.connect(source_db)) as connection, connection:
         connection.execute("UPDATE sessions SET session_id='shared-external-id'")
         connection.execute("UPDATE transcript_entries SET session_id='shared-external-id'")
     transcript = recovery / "opensquilla" / "media" / "transcripts" / "shared-external-id"
@@ -1926,7 +2148,7 @@ def test_primary_external_roots_receive_active_data_without_canonical_duplicates
     assert not (primary / "state" / "sessions.db").exists()
     assert not (primary / "media" / f"{recovery_id}.txt").exists()
     assert (media / f"{recovery_id}.txt").read_text(encoding="utf-8") == "media"
-    with sqlite3.connect(state / "sessions.db") as connection:
+    with contextlib.closing(sqlite3.connect(state / "sessions.db")) as connection, connection:
         row = connection.execute(
             "SELECT session_id FROM sessions WHERE session_key=?",
             ("agent:main:external-recovery",),
@@ -2504,7 +2726,7 @@ def test_canonical_sessions_external_media_resume_rebuilds_transcript_remap(
         session_key="agent:main:canonical-recovery",
     )
     source_db = recovery / "opensquilla" / "state" / "sessions.db"
-    with sqlite3.connect(source_db) as connection:
+    with contextlib.closing(sqlite3.connect(source_db)) as connection, connection:
         connection.execute("UPDATE sessions SET session_id='shared-media-id'")
         connection.execute("UPDATE transcript_entries SET session_id='shared-media-id'")
     transcript = recovery / "opensquilla" / "media" / "transcripts" / "shared-media-id"
@@ -2543,7 +2765,10 @@ def test_canonical_sessions_external_media_resume_rebuilds_transcript_remap(
     resumed = consolidate_recovery_profiles(user_data, primary)
 
     assert resumed.outcome == "consolidated", resumed
-    with sqlite3.connect(primary / "state" / "sessions.db") as connection:
+    with (
+        contextlib.closing(sqlite3.connect(primary / "state" / "sessions.db")) as connection,
+        connection,
+    ):
         remapped = connection.execute(
             "SELECT session_id FROM sessions WHERE session_key=?",
             ("agent:main:canonical-recovery",),
@@ -3365,10 +3590,7 @@ def test_archived_credential_mutation_before_context_write_blocks_resume(
     archived_credential = (
         Path(journal["backup_path"]) / "recovery-profiles" / recovery_id / "desktop-credential.json"
     )
-    archived_credential.write_text(
-        '{"provider":"openai","model":"tampered"}\n',
-        encoding="utf-8",
-    )
+    _write_text(archived_credential, '{"provider":"openai","model":"tampered"}\n')
 
     resumed = consolidate_recovery_profiles(user_data, primary)
 
@@ -3526,7 +3748,10 @@ def test_consolidate_still_rejects_stray_symlink(
     outside = tmp_path / "outside"
     outside.write_text("outside\n", encoding="utf-8")
     stray = recovery_root / "notes.txt"
-    stray.symlink_to(outside)
+    try:
+        stray.symlink_to(outside)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink creation is unavailable")
 
     result = consolidate_recovery_profiles(user_data, primary)
 
@@ -3596,7 +3821,7 @@ def test_key_collision_keeps_session_id_so_artifacts_stay_downloadable(
     assert result.outcome == "consolidated", result
     assert result.consumed_recovery_ids == (recovery_id,)
 
-    with sqlite3.connect(primary / "state" / "sessions.db") as merged:
+    with contextlib.closing(sqlite3.connect(primary / "state" / "sessions.db")) as merged, merged:
         rows = dict(merged.execute("SELECT session_key, session_id FROM sessions").fetchall())
     # The colliding key was renamed; the identifier was left alone.
     assert rows["agent:main:main"] == "primary-session"
@@ -3653,24 +3878,31 @@ def test_unreadable_recovery_source_defers_startup_and_still_converges(
         extra_name="recovery.txt",
         session_key="agent:main:recovered",
     )
-    # Fail the merge itself rather than by removing read permission from the
-    # source: a POSIX mode bit does not deny the owner a read on Windows, so a
-    # permission-based fixture would silently succeed there and assert nothing.
-    # This also aims at the behavior under test instead of at the filesystem.
-    consolidate_module = importlib.import_module("opensquilla.recovery.consolidate")
-    original_merge = consolidate_module._merge_recovery_data
+    recovery_engine = importlib.import_module("opensquilla.recovery.engine")
+    copy_source_file = recovery_engine._copy_source_file_no_follow
+    source_db = (
+        user_data / "recovery-profiles" / recovery_id / "opensquilla" / "state" / "sessions.db"
+    )
+    deny_source_read = True
 
-    def fail_once(*args, **kwargs):
-        # The journal is written before the merge runs, so this leaves exactly the
-        # pre-park transaction that a later launch has to recover from.
-        assert (user_data / ".opensquilla-profile-consolidation.json").is_file()
-        raise OSError("simulated unreadable recovery source")
+    def fail_once_for_source_database(source: Path, destination: Path):
+        if deny_source_read and source == source_db:
+            # The journal is written before the real copy boundary, leaving the
+            # exact pre-park transaction that the next launch must recover.
+            assert (user_data / ".opensquilla-profile-consolidation.json").is_file()
+            raise PermissionError(
+                errno.EACCES,
+                "simulated unreadable recovery source",
+                str(source),
+            )
+        return copy_source_file(source, destination)
 
-    monkeypatch.setattr(consolidate_module, "_merge_recovery_data", fail_once)
-    try:
-        blocked = consolidate_recovery_profiles(user_data, primary)
-    finally:
-        monkeypatch.setattr(consolidate_module, "_merge_recovery_data", original_merge)
+    monkeypatch.setattr(
+        recovery_engine,
+        "_copy_source_file_no_follow",
+        fail_once_for_source_database,
+    )
+    blocked = consolidate_recovery_profiles(user_data, primary)
 
     assert blocked.outcome == "blocked", blocked
     # The primary is healthy, so Desktop may start against it and retry later.
@@ -3681,13 +3913,14 @@ def test_unreadable_recovery_source_defers_startup_and_still_converges(
     # Deferred startup means the gateway runs and writes into the primary, which
     # is precisely what invalidates the prepared transaction's baseline.
     (primary / "state" / "gateway.log").write_text("started after deferral\n", encoding="utf-8")
+    deny_source_read = False
 
     resumed = consolidate_recovery_profiles(user_data, primary)
 
     assert resumed.outcome == "consolidated", resumed
     assert resumed.consumed_recovery_ids == (recovery_id,)
     assert not (user_data / "recovery-profiles").exists()
-    with sqlite3.connect(primary / "state" / "sessions.db") as merged:
+    with contextlib.closing(sqlite3.connect(primary / "state" / "sessions.db")) as merged, merged:
         keys = {row[0] for row in merged.execute("SELECT session_key FROM sessions").fetchall()}
     assert "agent:main:primary" in keys
     assert "agent:main:recovered" in keys
@@ -3721,3 +3954,122 @@ def test_parked_primary_keeps_blocking_startup(
     # An empty shell is not a profile worth booting either.
     primary.mkdir(parents=True)
     assert _primary_home_survives_failure(user_data, primary) is False
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows extended-length path contract")
+def test_existing_extended_length_external_state_merges_sessions(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_USER_STATE_DIR", str(tmp_path / "locks"))
+    user_data = tmp_path / "user-data"
+    primary = user_data / "opensquilla"
+    workspace = tmp_path / "workspace"
+    media = tmp_path / "media"
+    workspace.mkdir()
+    media.mkdir()
+    state_prefix = tmp_path / "external-state"
+    state_padding = 280 - len(str(state_prefix)) - (3 * len(os.sep)) - len("state")
+    first_padding = state_padding // 2
+    second_padding = state_padding - first_padding
+    assert 1 <= first_padding <= 200
+    assert 1 <= second_padding <= 200
+    state = state_prefix / ("s" * first_padding) / ("t" * second_padding) / "state"
+    os.makedirs(_native_io_path(state))
+    assert len(str(state)) == 280
+    _external_primary_config(
+        primary,
+        workspace=workspace,
+        state=state,
+        media=media,
+    )
+    target = state / "sessions.db"
+    assert len(str(target)) > 260
+    _session_database(
+        Path(_native_io_path(target)),
+        "agent:main:external-primary-long",
+        "primary-session",
+        "primary",
+    )
+    recovery_id = str(uuid.uuid4())
+    _recovery(
+        user_data,
+        recovery_id,
+        config="recovery = true\n",
+        credential="{}\n",
+        memory="recovery memory\n",
+        conflict="recovery",
+        extra_name="external-long.txt",
+        session_key="agent:main:external-recovery-long",
+    )
+
+    result = consolidate_recovery_profiles(user_data, primary)
+
+    assert result.outcome == "consolidated", result.errors
+    assert result.consumed_recovery_ids == (recovery_id,)
+    assert result.backup_path is not None
+    assert not str(result.backup_path).startswith("\\\\?\\")
+    assert _is_file(state / "gateway.pid.lock")
+    with contextlib.closing(sqlite3.connect(_native_io_path(target))) as connection:
+        keys = {row[0] for row in connection.execute("SELECT session_key FROM sessions")}
+    assert keys == {
+        "agent:main:external-primary-long",
+        "agent:main:external-recovery-long",
+    }
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows extended-length path contract")
+def test_extended_length_user_data_root_consolidates_sessions(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_USER_STATE_DIR", str(tmp_path / "locks"))
+    seed = tmp_path / "seed-user-data"
+    seed_primary = seed / "opensquilla"
+    (seed_primary / "workspace").mkdir(parents=True)
+    (seed_primary / "config.toml").write_text("primary = true\n", encoding="utf-8")
+    _session_database(
+        seed_primary / "state" / "sessions.db",
+        "agent:main:long-root-primary",
+        "primary-session",
+        "primary",
+    )
+    recovery_id = str(uuid.uuid4())
+    _recovery(
+        seed,
+        recovery_id,
+        config="recovery = true\n",
+        credential="{}\n",
+        memory="recovery memory\n",
+        conflict="recovery",
+        extra_name="long-root.txt",
+        session_key="agent:main:long-root-recovery",
+    )
+    prefix = tmp_path / "long-user-data"
+    padding = 270 - len(str(prefix)) - (2 * len(os.sep))
+    first_padding = padding // 2
+    second_padding = padding - first_padding
+    assert 1 <= first_padding <= 200
+    assert 1 <= second_padding <= 200
+    user_data = prefix / ("u" * first_padding) / ("v" * second_padding)
+    shutil.copytree(_native_io_path(seed), _native_io_path(user_data))
+    assert len(str(user_data)) == 270
+    primary = user_data / "opensquilla"
+
+    result = consolidate_recovery_profiles(user_data, primary)
+
+    assert result.outcome == "consolidated", result.errors
+    assert result.consumed_recovery_ids == (recovery_id,)
+    assert result.backup_path is not None
+    assert result.receipt_path is not None
+    assert not str(result.backup_path).startswith("\\\\?\\")
+    assert not str(result.receipt_path).startswith("\\\\?\\")
+    assert not os.path.exists(_native_io_path(user_data / "recovery-profiles"))
+    with contextlib.closing(
+        sqlite3.connect(_native_io_path(primary / "state" / "sessions.db"))
+    ) as connection:
+        keys = {row[0] for row in connection.execute("SELECT session_key FROM sessions")}
+    assert keys == {
+        "agent:main:long-root-primary",
+        "agent:main:long-root-recovery",
+    }

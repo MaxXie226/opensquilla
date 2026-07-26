@@ -929,7 +929,9 @@ def _warn_legacy_home_detected(config: GatewayConfig) -> None:
     operators still learn their old profile exists without any prompt.
     """
     try:
-        if _state_path(config, "sessions.db").exists():
+        from opensquilla.persistence.migrator import _native_sqlite_path
+
+        if os.path.isfile(_native_sqlite_path(_state_path(config, "sessions.db"))):
             return
     except OSError:  # pragma: no cover - unreadable state dir; stay silent.
         return
@@ -2264,17 +2266,19 @@ async def build_services(
     # Migration failures propagate: code ships behind the migration, never
     # ahead of it — silently booting on an out-of-date schema is worse than
     # failing loud.
+    storage_db_path = session_db_path
     if session_db_path != ":memory:":
-        from opensquilla.persistence.migrator import apply_pending
+        from opensquilla.persistence.migrator import _native_sqlite_path, apply_pending
 
         log.info("build_services.migrations_started")
         if "://" not in session_db_path:
             # 0o700: session transcripts are sensitive — keep a freshly created
             # state directory owner-only (umask-masked; no-op on Windows and on
             # pre-existing directories).
-            Path(session_db_path).expanduser().parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            storage_db_path = _native_sqlite_path(session_db_path)
+            os.makedirs(os.path.dirname(storage_db_path) or os.curdir, mode=0o700, exist_ok=True)
         migrations_dir = _resolve_migrations_dir()
-        applied = apply_pending(session_db_path, migrations_dir)
+        applied = apply_pending(storage_db_path, migrations_dir)
         if applied:
             log.info("build_services.migrations_applied", count=len(applied), ids=applied)
         log.info("build_services.migrations_ready", count=len(applied))
@@ -2291,8 +2295,9 @@ async def build_services(
         from opensquilla.session.storage import SessionStorage
 
         log.info("build_services.session_storage_started")
-        Path(session_db_path).parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        storage = SessionStorage(session_db_path)
+        if storage_db_path != ":memory:" and "://" not in storage_db_path:
+            os.makedirs(os.path.dirname(storage_db_path) or os.curdir, mode=0o700, exist_ok=True)
+        storage = SessionStorage(storage_db_path)
         await storage.connect()
         log.info("build_services.session_storage_ready")
         session_manager = SessionManager(
@@ -2580,13 +2585,21 @@ async def build_services(
     # ── Cron scheduler (boot order 20) ──────────────────────────────
     cron_scheduler = None
     try:
+        from opensquilla.persistence.migrator import _native_sqlite_path
         from opensquilla.scheduler import JobStore, SchedulerEngine
 
         scheduler_db = Path(
             os.environ.get("OPENSQUILLA_SCHEDULER_DB", str(_state_path(config, "scheduler.db")))
         )
-        scheduler_db.parent.mkdir(parents=True, exist_ok=True)
-        job_store = JobStore(db_path=str(scheduler_db))
+        if str(scheduler_db) == ":memory:":
+            scheduler_storage = ":memory:"
+        else:
+            scheduler_storage = _native_sqlite_path(scheduler_db)
+            os.makedirs(
+                os.path.dirname(scheduler_storage) or os.curdir,
+                exist_ok=True,
+            )
+        job_store = JobStore(db_path=scheduler_storage)
         await job_store.open()
         cron_scheduler = SchedulerEngine(
             store=job_store,

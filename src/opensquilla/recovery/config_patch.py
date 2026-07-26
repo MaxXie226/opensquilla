@@ -20,6 +20,7 @@ from typing import Any
 from opensquilla.recovery.atomic import (
     PathIdentity,
     _chmod_open_file,
+    _native_io_path,
     _windows_extended_path,
     native_move_no_replace,
 )
@@ -75,7 +76,7 @@ class ConfigSnapshot:
     def capture(cls, path: str | Path) -> ConfigSnapshot:
         config_path = Path(path)
         try:
-            path_stat = config_path.lstat()
+            path_stat = os.lstat(_native_io_path(config_path))
         except FileNotFoundError:
             return cls(
                 path=config_path,
@@ -103,7 +104,7 @@ class ConfigSnapshot:
             | getattr(os, "O_NOFOLLOW", 0)
         )
         try:
-            fd = os.open(config_path, flags)
+            fd = os.open(_native_io_path(config_path), flags)
         except FileNotFoundError as exc:
             raise ConfigChangedError("config disappeared while it was being opened") from exc
         except OSError as exc:
@@ -216,12 +217,12 @@ def _parse_dotenv_value(
 
 def _profile_dotenv_path(home: Path, *, include_legacy: bool) -> Path | None:
     current = home / ".env"
-    if os.path.lexists(current):
+    if os.path.lexists(_native_io_path(current)):
         return current
     if not include_legacy:
         return None
     legacy = home / "state" / ".env"
-    return legacy if os.path.lexists(legacy) else None
+    return legacy if os.path.lexists(_native_io_path(legacy)) else None
 
 
 def _profile_dotenv_override(
@@ -485,7 +486,7 @@ def workspace_patch_journal(home: str | Path) -> Path:
 
 def workspace_patch_exists(home: str | Path) -> bool:
     try:
-        return os.path.lexists(workspace_patch_journal(home))
+        return os.path.lexists(_native_io_path(workspace_patch_journal(home)))
     except OSError:
         return True
 
@@ -581,7 +582,7 @@ def _write_json_no_replace(path: Path, payload: dict[str, Any]) -> ConfigSnapsho
     )
     flags |= getattr(os, "O_NOFOLLOW", 0)
     try:
-        fd = os.open(path, flags, 0o600)
+        fd = os.open(_native_io_path(path), flags, 0o600)
     except FileExistsError as exc:
         raise RecoveryError(
             "an unfinished workspace config transaction already exists",
@@ -663,7 +664,7 @@ def _make_owner_only(path: Path, expected: object) -> None:
         raise AtomicStateUnknownError("workspace config backup identity is ambiguous")
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
-        fd = os.open(path, flags)
+        fd = os.open(_native_io_path(path), flags)
         try:
             opened = PathIdentity.from_stat(os.fstat(fd))
             assert isinstance(expected, dict)
@@ -707,7 +708,7 @@ def _publish_workspace_config(
 ) -> None:
     if not _identity_matches(staged, expected_staged):
         raise AtomicStateUnknownError("workspace config candidate identity is ambiguous")
-    if os.path.lexists(config):
+    if os.path.lexists(_native_io_path(config)):
         raise AtomicStateUnknownError("workspace config destination changed before publication")
     native_move_no_replace(staged, config)
     if not _identity_matches(config, expected_staged):
@@ -719,11 +720,11 @@ def _commit_workspace_patch(home: Path) -> None:
     identities = payload["identities"]
     if not _identity_matches(paths["config"], identities["staged"]):
         raise AtomicStateUnknownError("workspace config is not safely published")
-    if os.path.lexists(paths["staged"]):
+    if os.path.lexists(_native_io_path(paths["staged"])):
         raise AtomicStateUnknownError("workspace config candidate remains after publication")
     old_identity = identities["old_config"]
     if old_identity is None:
-        if os.path.lexists(paths["backup"]):
+        if os.path.lexists(_native_io_path(paths["backup"])):
             raise AtomicStateUnknownError("unexpected workspace config backup exists")
     elif not _parked_config_matches(paths["backup"], old_identity):
         raise AtomicStateUnknownError("workspace config backup identity is ambiguous")
@@ -739,20 +740,22 @@ def _finish_workspace_patch(home: Path) -> Path | None:
     staged_identity = identities["staged"]
 
     if _identity_matches(paths["config"], staged_identity):
-        if os.path.lexists(paths["staged"]):
+        if os.path.lexists(_native_io_path(paths["staged"])):
             raise AtomicStateUnknownError("workspace config publication is duplicated")
     else:
         if old_identity is None:
-            if os.path.lexists(paths["backup"]) or os.path.lexists(paths["config"]):
+            if os.path.lexists(_native_io_path(paths["backup"])) or os.path.lexists(
+                _native_io_path(paths["config"])
+            ):
                 raise AtomicStateUnknownError(
                     "workspace config destination changed during publication"
                 )
         elif _parked_config_matches(paths["backup"], old_identity):
-            if os.path.lexists(paths["config"]):
+            if os.path.lexists(_native_io_path(paths["config"])):
                 raise AtomicStateUnknownError("workspace config destination changed after parking")
             _make_owner_only(paths["backup"], old_identity)
         elif _identity_matches(paths["config"], old_identity) and not os.path.lexists(
-            paths["backup"]
+            _native_io_path(paths["backup"])
         ):
             _park_workspace_config(paths["config"], paths["backup"], old_identity)
         else:
@@ -791,7 +794,7 @@ def _copy_macos_config_metadata(snapshot: ConfigSnapshot, destination_fd: int) -
     fcopyfile.restype = ctypes.c_int
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
-        source_fd = os.open(snapshot.path, flags)
+        source_fd = os.open(_native_io_path(snapshot.path), flags)
     except OSError as exc:
         raise ConfigChangedError("config changed before its ACLs could be preserved") from exc
     try:
@@ -884,7 +887,7 @@ def _patch_workspace_dir_locked(home: str | Path, workspace: str | Path) -> Path
         raise WorkspaceOverrideError(f"remove {name} before changing the persisted workspace path")
     workspace_path = Path(workspace).expanduser().absolute()
     config_path = home_path / "config.toml"
-    home_path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.makedirs(_native_io_path(home_path), mode=0o700, exist_ok=True)
     snapshot = ConfigSnapshot.capture(config_path)
     try:
         raw = snapshot.data.decode("utf-8")
@@ -918,12 +921,16 @@ def _patch_workspace_dir_locked(home: str | Path, workspace: str | Path) -> Path
             | getattr(os, "O_CLOEXEC", 0)
         )
         flags |= getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(staged_path, flags, 0o600)
+        fd = os.open(_native_io_path(staged_path), flags, 0o600)
         staged_created = True
         try:
             if snapshot.identity is not None:
                 try:
-                    shutil.copystat(config_path, staged_path, follow_symlinks=False)
+                    shutil.copystat(
+                        _native_io_path(config_path),
+                        _native_io_path(staged_path),
+                        follow_symlinks=False,
+                    )
                 except OSError as exc:
                     raise RecoveryError(
                         "config permissions, ACLs, or extended metadata could not be preserved",
@@ -958,7 +965,7 @@ def _patch_workspace_dir_locked(home: str | Path, workspace: str | Path) -> Path
         try:
             _write_json_no_replace(paths["journal"], payload)
         finally:
-            journal_created = os.path.lexists(paths["journal"])
+            journal_created = os.path.lexists(_native_io_path(paths["journal"]))
         backup = _finish_workspace_patch(home_path)
         journal_created = False
         staged_created = False
@@ -969,7 +976,7 @@ def _patch_workspace_dir_locked(home: str | Path, workspace: str | Path) -> Path
         # place for deterministic recovery; no failure path guesses or deletes.
         if staged_created and not journal_created:
             with contextlib.suppress(OSError):
-                staged_path.unlink()
+                os.unlink(_native_io_path(staged_path))
 
 
 def patch_workspace_dir(

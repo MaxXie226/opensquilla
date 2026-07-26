@@ -121,6 +121,28 @@ def _ensure_sqlite_datetime_adapter() -> None:
     sqlite3.register_adapter(datetime, _adapt_sqlite_datetime)
 
 
+def _native_sqlite_path(path: str | Path) -> str:
+    """Return a local SQLite spelling that bypasses legacy Windows MAX_PATH."""
+
+    value = os.fspath(Path(path).expanduser())
+    if os.name != "nt":
+        return value
+    absolute = os.path.abspath(value)
+    if absolute.startswith("\\\\?\\"):
+        return absolute
+    if absolute.startswith("\\\\"):
+        return f"\\\\?\\UNC\\{absolute[2:]}"
+    return f"\\\\?\\{absolute}"
+
+
+def _sqlite_path(path: str | Path) -> Path:
+    """Return one absolute local path, native on Windows and logical elsewhere."""
+
+    if os.name == "nt":
+        return Path(_native_sqlite_path(path))
+    return Path(path).expanduser().resolve()
+
+
 def _to_yoyo_url(db_url: str) -> str:
     """Normalise a local SQLite path or URL into a yoyo-compatible URL.
 
@@ -134,12 +156,34 @@ def _to_yoyo_url(db_url: str) -> str:
     drive letters survive.
     """
     if "://" in db_url:
-        return db_url
+        if os.name != "nt":
+            return db_url
+        local_path = _sqlite_path_from_db_url(db_url)
+        if local_path is None:
+            return db_url
+        parsed = urlparse(db_url)
+        normalized = "sqlite:///" + quote(str(local_path), safe="/:")
+        if parsed.query:
+            normalized += f"?{parsed.query}"
+        if parsed.fragment:
+            normalized += f"#{parsed.fragment}"
+        return normalized
     if db_url == ":memory:":
         return "sqlite:///:memory:"
     # bare filesystem path — normalise to absolute so yoyo opens the same db
     # regardless of the worker cwd.
-    return "sqlite:///" + quote(Path(db_url).expanduser().resolve().as_posix(), safe="/:")
+    # On Windows always select the extended namespace. Gateway boot passes a
+    # logical path, while consolidation may already pass ``\\?\``; both must
+    # resolve to the same database without depending on LongPathsEnabled.
+    normalized = _native_sqlite_path(db_url) if os.name == "nt" else _sqlite_path(db_url).as_posix()
+    return "sqlite:///" + quote(normalized, safe="/:")
+
+
+def _sqlite_read_only_uri(db_path: Path) -> str:
+    value = str(db_path)
+    if os.name == "nt" and value.startswith("\\\\?\\"):
+        return f"file:{quote(value, safe='/:')}?mode=ro"
+    return f"{db_path.as_uri()}?mode=ro"
 
 
 def _sqlite_path_from_db_url(db_url: str) -> Path | None:
@@ -148,7 +192,7 @@ def _sqlite_path_from_db_url(db_url: str) -> Path | None:
     if db_url == ":memory:":
         return None
     if "://" not in db_url:
-        return Path(db_url).expanduser().resolve()
+        return _sqlite_path(db_url)
 
     parsed = urlparse(db_url)
     if parsed.scheme != "sqlite" or parsed.netloc:
@@ -157,11 +201,13 @@ def _sqlite_path_from_db_url(db_url: str) -> Path | None:
         return None
 
     path = unquote(parsed.path)
+    if os.name == "nt" and path.startswith("/\\\\?\\"):
+        path = path[1:]
     if os.name == "nt" and len(path) >= 3 and path[0] == "/" and path[2] == ":":
         path = path[1:]
     if os.name != "nt" and path.startswith("//") and not path.startswith("///"):
         path = path[1:]
-    return Path(path).expanduser().resolve()
+    return _sqlite_path(path)
 
 
 @contextlib.contextmanager
@@ -251,7 +297,7 @@ def _is_pid_alive(pid: int) -> bool:
 
 def _read_yoyo_lock_pids(db_path: Path) -> list[int] | None:
     try:
-        connection = sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True)
+        connection = sqlite3.connect(_sqlite_read_only_uri(db_path), uri=True)
     except sqlite3.Error as exc:
         log.warning(
             "migrator.lock_inspect_failed",
@@ -416,7 +462,7 @@ def _read_applied_migration_ids(db_path: Path) -> set[str] | None:
     database), or ``None`` when the database cannot be inspected.
     """
     try:
-        connection = sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True)
+        connection = sqlite3.connect(_sqlite_read_only_uri(db_path), uri=True)
     except sqlite3.Error as exc:
         log.warning(
             "migrator.applied_inspect_failed",
