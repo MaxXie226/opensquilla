@@ -4762,6 +4762,103 @@ def test_resume_expected_manifest_rejects_incompatible_contract(tmp_path: Path) 
         )
 
 
+def _repair_source_drift_compatibility(module):
+    expected = _compatibility_for(module)
+    actual = json.loads(json.dumps(expected))
+    actual_contract = actual["contracts"]["B1"]
+    actual_contract["source_identity"] = {
+        "git_head": "c" * 40,
+        "source_tree_sha256": "d" * 64,
+    }
+    actual["fingerprints"]["B1"] = module.canonical_json_sha256(actual_contract)
+    return expected, actual
+
+
+def test_repair_only_source_drift_inherits_expected_and_allows_repair_actions(
+    tmp_path: Path,
+) -> None:
+    expected, actual = _repair_source_drift_compatibility(resume_runner)
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({"run_compatibility": expected}), encoding="utf-8")
+
+    inherited, audit = resume_runner.validate_repair_only_source_drift_compatibility(
+        path=manifest,
+        actual=actual,
+        groups=["B1"],
+    )
+    action_audit = resume_runner.repair_only_resume_classification_audit(
+        selected_keys={("B1", "judge"), ("B1", "metadata")},
+        resume_states={
+            ("B1", "judge"): {"action": "judge_only"},
+            ("B1", "metadata"): {"action": "metadata_only"},
+        },
+    )
+
+    assert inherited == expected
+    assert audit["groups"]["B1"]["canonical_fingerprints_verified"] is True
+    assert audit["groups"]["B1"]["source_identity_changed"] is True
+    assert action_audit["status"] == "repair_actions_validated"
+    assert action_audit["regenerate_pair_count"] == 0
+
+
+@pytest.mark.parametrize("mutation", ["contract", "fingerprint"])
+def test_repair_only_source_drift_rejects_non_source_or_noncanonical_difference(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    expected, actual = _repair_source_drift_compatibility(resume_runner)
+    if mutation == "contract":
+        actual["contracts"]["B1"]["judge"]["repeats"] = 99
+        actual["fingerprints"]["B1"] = resume_runner.canonical_json_sha256(
+            actual["contracts"]["B1"]
+        )
+    else:
+        actual["fingerprints"]["B1"] = "sha256:not-canonical"
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({"run_compatibility": expected}), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="non-source or non-canonical"):
+        resume_runner.validate_repair_only_source_drift_compatibility(
+            path=manifest,
+            actual=actual,
+            groups=["B1"],
+        )
+
+
+def test_repair_only_source_drift_requires_every_safeguard() -> None:
+    args = resume_runner.build_parser().parse_args(
+        [
+            "--input",
+            "tasks.jsonl",
+            "--groups",
+            "B1",
+            "--repair-only-source-drift",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="all repair-only safeguards"):
+        resume_runner.validate_repair_only_source_drift_prerequisites(args)
+
+
+def test_repair_only_source_drift_rejects_any_regenerate_including_budget_exhausted() -> None:
+    audit = resume_runner.repair_only_resume_classification_audit(
+        selected_keys={("B1", "missing"), ("B1", "exhausted")},
+        resume_states={
+            ("B1", "exhausted"): {
+                "action": "regenerate",
+                "prior_generation_attempts_used": resume_runner.GENERATION_MAX_ATTEMPTS,
+            }
+        },
+    )
+
+    assert audit["status"] == "rejected_regeneration_required"
+    assert audit["regenerate_pair_count"] == 2
+    assert {item["reason"] for item in audit["regenerate_pairs"]} == {
+        "missing_resume_state",
+        "generation_budget_exhausted",
+    }
+
+
 def test_task_input_hash_covers_rubric_not_only_prompt() -> None:
     first = {"id": "task-1", "prompt": "same", "rubric": {"criteria": ["a"]}}
     second = {"id": "task-1", "prompt": "same", "rubric": {"criteria": ["b"]}}
