@@ -640,7 +640,7 @@ def test_cost_audit_accepts_fully_reconciled_strict_artifacts(
             "seq": 0,
             "elapsed_ms": 1,
             "kind": "routing_setup",
-            "routing": {"routing_source": "fixed_g12_alignment"},
+            "routing": {"routing_source": "b2_quality_first_profile"},
             "usage": [],
         }
     ]
@@ -843,7 +843,7 @@ def test_cost_audit_accepts_fully_reconciled_strict_artifacts(
                 "seq": 0,
                 "elapsed_ms": elapsed_ms,
                 "kind": "routing_setup",
-                "routing": {"routing_source": "fixed_g12_alignment"},
+                "routing": {"routing_source": "b2_quality_first_profile"},
                 "usage": [],
             },
             {

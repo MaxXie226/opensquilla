@@ -443,7 +443,7 @@ def _openrouter_config() -> tuple[GatewayConfig, ProviderConfig]:
     return config, inherited
 
 
-def test_b2_argument_alignment_reproduces_g12_run_envelope() -> None:
+def test_b2_argument_alignment_applies_g12_derived_quality_first_envelope() -> None:
     args = runner.build_parser().parse_args(
         [
             "--input",
@@ -469,18 +469,18 @@ def test_b2_argument_alignment_reproduces_g12_run_envelope() -> None:
     assert record["requested_args"]["concurrency"] == 8
     assert record["requested_args"]["timeout"] == 180.0
     assert args.concurrency == 2
-    assert args.timeout == 3600.0
+    assert args.timeout == 10800.0
     assert args.ensemble_proposer_timeout == pytest.approx(907.5)
     assert args.ensemble_aggregator_timeout == pytest.approx(2662.5)
     assert args.runner_mode == "agent_loop"
-    assert args.agent_max_iterations == 12
-    assert args.deadline_wrapup_margin_seconds == 600
+    assert args.agent_max_iterations == 20
+    assert args.deadline_wrapup_margin_seconds == 300
     assert args.deadline_wrapup_disable_tools is True
-    assert args.deadline_thinking_off_margin_seconds == 600
-    assert args.max_iterations_includes_finalization is True
-    assert args.retrieval_loop_finalization_threshold == 3
-    assert args.finalization_aggregator_only is True
-    assert args.finalization_disable_thinking is True
+    assert args.deadline_thinking_off_margin_seconds == 0
+    assert args.max_iterations_includes_finalization is False
+    assert args.retrieval_loop_finalization_threshold == 0
+    assert args.finalization_aggregator_only is False
+    assert args.finalization_disable_thinking is False
     assert args.generation_max_tokens == 16_384
     assert args.generation_max_attempts == 3
     assert args.tool_mode == "local_web_tools"
@@ -4596,7 +4596,7 @@ def test_g1_only_uses_the_same_shared_experiment_profile_as_b2_g1(module) -> Non
     assert g1_record is not None
     assert joint_record is not None
     assert g1_record["effective_args"] == joint_record["effective_args"]
-    assert g1_args.agent_max_iterations == joint_args.agent_max_iterations == 12
+    assert g1_args.agent_max_iterations == joint_args.agent_max_iterations == 20
     assert g1_args.concurrency == joint_args.concurrency == 2
     assert "global_experiment_profile" in g1_args._benchmark_alignments
     assert "B2" not in g1_args._benchmark_alignments
@@ -5217,7 +5217,7 @@ def test_b2_provider_alignment_pins_effective_member_configuration() -> None:
     ]
 
     plan = provider.selection_plan
-    assert plan["benchmark_alignment"]["id"] == "opensquilla_g12_20260630"
+    assert plan["benchmark_alignment"]["id"] == "opensquilla_b2_quality_first_v1"
     assert plan["pre_alignment"]["min_successful_proposers"] == 3
     assert plan["pre_alignment"]["selection_plan"]["profile"] == "static_openrouter_b5"
     assert plan["proposer_models"] == [
@@ -5281,7 +5281,7 @@ def test_b2_provider_alignment_rebuilds_trace_after_lineup_override() -> None:
 
 
 @pytest.mark.asyncio
-async def test_b2_build_skips_single_model_router_and_aligns_provider(monkeypatch) -> None:
+async def test_b2_quality_first_build_skips_single_model_router(monkeypatch) -> None:
     config, inherited = _openrouter_config()
 
     async def _unexpected_router(*_args, **_kwargs):
@@ -5301,7 +5301,7 @@ async def test_b2_build_skips_single_model_router_and_aligns_provider(monkeypatc
     )
 
     assert result.routing_trace["routing_applied"] is False
-    assert result.routing_trace["routing_source"] == "fixed_g12_alignment"
+    assert result.routing_trace["routing_source"] == "b2_quality_first_profile"
     assert result.routing_trace["selection_plan"]["wait_for_all_proposers"] is True
     assert result.provider.proposer_tools is False
     assert result.provider.aggregator_tools is True
@@ -5364,13 +5364,13 @@ def test_manifest_records_effective_and_requested_b2_alignment(tmp_path: Path) -
     assert manifest["runner"] == "scripts/run_draco_routing_experiment.py"
     assert manifest["args"]["concurrency"] == 2
     assert manifest["agent_finalization_policy"] == {
-        "deadline_wrapup_margin_seconds": 600,
+        "deadline_wrapup_margin_seconds": 300,
         "deadline_wrapup_disable_tools": True,
-        "deadline_thinking_off_margin_seconds": 600,
-        "max_iterations_includes_finalization": True,
-        "retrieval_loop_finalization_threshold": 3,
-        "finalization_aggregator_only": True,
-        "finalization_disable_thinking": True,
+        "deadline_thinking_off_margin_seconds": 0,
+        "max_iterations_includes_finalization": False,
+        "retrieval_loop_finalization_threshold": 0,
+        "finalization_aggregator_only": False,
+        "finalization_disable_thinking": False,
     }
     alignment = manifest["benchmark_alignments"]["B2"]
     assert alignment["requested_args"]["concurrency"] == 8

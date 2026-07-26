@@ -146,8 +146,8 @@ GROUP_SPECS: dict[str, dict[str, Any]] = {
     "B2": {
         "kind": "selection_mode",
         "selection_mode": "static_openrouter_b5",
-        "label": "g12_aligned_static_openrouter_b5",
-        "experiment_config": "draco_b2_g12",
+        "label": "b2_quality_first_static_openrouter_b5",
+        "experiment_config": "draco_b2_quality_first_v1",
     },
     "B3": {
         "kind": "selection_mode",
@@ -2758,14 +2758,14 @@ async def build_experiment_provider(
         raw_message=prompt,
     )
     if b2_experiment is not None and b2_experiment.routing.skip_single_model_router:
-        # The reference G12 profile was fixed and did not run a single-model
-        # router first. Keep the inherited provider only as the failure fallback.
+        # This quality-first profile retains G12's fixed B2 model mapping and
+        # skips the single-model router. Keep the inherited provider as fallback.
         routed_provider = fallback_provider
         routed_config = inherited
         routing_trace: dict[str, Any] = {
             "kind": kind,
             "routing_applied": False,
-            "routing_source": "fixed_g12_alignment",
+            "routing_source": "b2_quality_first_profile",
             "routed_model": None,
             "applied_model": None,
             "benchmark_alignment": b2_experiment.profile_id,
@@ -11023,7 +11023,8 @@ def build_parser() -> argparse.ArgumentParser:
             else None
         ),
         help=(
-            "Base B2 experiment JSON. Defaults to the bundled G12-aligned profile; "
+            "Base B2 experiment JSON. Defaults to the bundled G12-derived "
+            "quality-first profile; "
             "OPENSQUILLA_DRACO_EXPERIMENT_CONFIG can inject another base file."
         ),
     )

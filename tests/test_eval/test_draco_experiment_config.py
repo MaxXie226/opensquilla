@@ -17,8 +17,9 @@ ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG = ROOT / "configs/benchmarks/draco_b2_g12.json"
 
 
-def test_default_b2_config_pins_g12_highest_thinking_and_tool_permissions() -> None:
+def test_default_b2_config_is_g12_derived_quality_first_profile() -> None:
     config = load_draco_experiment_config(DEFAULT_CONFIG).config
+    assert config.profile_id == "opensquilla_b2_quality_first_v1"
 
     assert config.reference.source_commit == ("153e5ff267950b0e285efcdb180cea8724c0471d")
     assert config.reference.group == "G12"
@@ -76,18 +77,18 @@ def test_default_b2_config_pins_g12_highest_thinking_and_tool_permissions() -> N
     assert config.tools.web_fetch.max_content_tokens == 50_000
     assert config.timeouts.proposer_seconds == pytest.approx(907.5)
     assert config.timeouts.aggregator_seconds == pytest.approx(2662.5)
-    assert config.timeouts.task_seconds == 3600.0
+    assert config.timeouts.task_seconds == 10800.0
     assert config.timeouts.task_margin_seconds == 30.0
     assert config.runner.mode == "agent_loop"
-    assert config.runner.agent_max_iterations == 12
+    assert config.runner.agent_max_iterations == 20
     assert config.runner.concurrency == 2
-    assert config.runner.deadline_wrapup_margin_seconds == 600
+    assert config.runner.deadline_wrapup_margin_seconds == 300
     assert config.runner.deadline_wrapup_disable_tools is True
-    assert config.runner.deadline_thinking_off_margin_seconds == 600
-    assert config.runner.max_iterations_includes_finalization is True
-    assert config.runner.retrieval_loop_finalization_threshold == 3
-    assert config.runner.finalization_aggregator_only is True
-    assert config.runner.finalization_disable_thinking is True
+    assert config.runner.deadline_thinking_off_margin_seconds == 0
+    assert config.runner.max_iterations_includes_finalization is False
+    assert config.runner.retrieval_loop_finalization_threshold == 0
+    assert config.runner.finalization_aggregator_only is False
+    assert config.runner.finalization_disable_thinking is False
     assert config.generation.max_attempts == 3
     assert config.generation.retry_backoff_seconds == 2.0
     assert config.judge.model == "google/gemini-3.1-pro-preview"

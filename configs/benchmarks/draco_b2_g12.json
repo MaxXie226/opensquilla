@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "profile_id": "opensquilla_g12_20260630",
+  "profile_id": "opensquilla_b2_quality_first_v1",
   "group": "B2",
   "reference": {
     "repository": "opensquilla/opensquilla",
@@ -101,22 +101,22 @@
     "quorum_grace_seconds": 0.0
   },
   "timeouts": {
-    "task_seconds": 3600.0,
+    "task_seconds": 10800.0,
     "proposer_seconds": 907.5,
     "aggregator_seconds": 2662.5,
     "task_margin_seconds": 30.0
   },
   "runner": {
     "mode": "agent_loop",
-    "agent_max_iterations": 12,
+    "agent_max_iterations": 20,
     "concurrency": 2,
-    "deadline_wrapup_margin_seconds": 600,
+    "deadline_wrapup_margin_seconds": 300,
     "deadline_wrapup_disable_tools": true,
-    "deadline_thinking_off_margin_seconds": 600,
-    "max_iterations_includes_finalization": true,
-    "retrieval_loop_finalization_threshold": 3,
-    "finalization_aggregator_only": true,
-    "finalization_disable_thinking": true
+    "deadline_thinking_off_margin_seconds": 0,
+    "max_iterations_includes_finalization": false,
+    "retrieval_loop_finalization_threshold": 0,
+    "finalization_aggregator_only": false,
+    "finalization_disable_thinking": false
   },
   "generation": {
     "thinking_enabled": true,

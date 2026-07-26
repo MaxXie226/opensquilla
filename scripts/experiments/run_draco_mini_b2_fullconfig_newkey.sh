@@ -137,9 +137,9 @@ benchmark_args=(
   --config "$CONFIG"
   --experiment-config "$EXPERIMENT_CONFIG"
   --groups B2
-  --timeout 3600
+  --timeout 10800
   --runner-mode agent_loop
-  --agent-max-iterations 12
+  --agent-max-iterations 20
   --judge-model google/gemini-3.1-pro-preview
   --judge-repeats 3
   --judge-max-attempts 3
@@ -329,7 +329,7 @@ audit_b2_output() {
     --effective-config "${effective_config_files[0]}"
     --reference-effective-config "$reference_effective_config"
     --summary "$summary_file"
-    --expected-agent-max-iterations 12
+    --expected-agent-max-iterations 20
     --expected-generation-max-attempts 3
     --expected-concurrency "$expected_concurrency"
     --expected-judge-repeats 3

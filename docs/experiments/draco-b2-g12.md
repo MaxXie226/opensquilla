@@ -1,31 +1,49 @@
-# DRACO B2 / OpenSquilla G12 Alignment
+# DRACO B2 Quality-First Profile (G12-derived)
 
 `B2` loads [`configs/benchmarks/draco_b2_g12.json`](../../configs/benchmarks/draco_b2_g12.json)
-by default. The file reproduces the scored OpenSquilla `G12` run from source commit
-`153e5ff267950b0e285efcdb180cea8724c0471d`.
+by default. Its model lineup and per-member generation settings are derived from the scored
+OpenSquilla `G12` run at source commit `153e5ff267950b0e285efcdb180cea8724c0471d`,
+but its Agent policy is now intentionally quality-first. It must not be described as an exact
+execution reproduction of historical G12.
 
-## Effective baseline
+The `reference` block is retained as lineage metadata. The effective config artifact and its
+SHA-256 identify this experiment variant. New runs use profile ID
+`opensquilla_b2_quality_first_v1`; G12 remains only the historical reference.
 
-| Setting | B2 / reference G12 |
-| --- | --- |
-| Proposers | DeepSeek V4 Pro, GLM 5.2, Kimi K2.7 Code, Qwen 3.7 Max |
-| Aggregator | GLM 5.2 |
-| Thinking | `xhigh`, `xhigh`, `max`, `xhigh`; aggregator `xhigh` |
-| Completion cap | 16,384 tokens per member |
-| Temperature | 0.0 per member |
-| Tool permissions | proposers disabled; aggregator enabled |
-| Local tools | Brave `web_search` plus `web_fetch` |
-| Proposer completion rule | wait for all four; one success is enough to aggregate |
-| Timeouts | task 3600s; proposer 907.5s; aggregator 2662.5s; margin 30s |
-| Runner | Agent loop, 12 iterations, global concurrency 2 |
-| Judge | Gemini 3.1 Pro Preview, 3 repeats, concurrency 6, 3 attempts |
-| Generation retries | 3 attempts, 2s initial backoff |
+## Effective profile
+
+| Setting | Current B2 quality-first | Historical G12 reference |
+| --- | --- | --- |
+| Proposers | DeepSeek V4 Pro, GLM 5.2, Kimi K2.7 Code, Qwen 3.7 Max | same lineup |
+| Aggregator | GLM 5.2 | GLM 5.2 |
+| Thinking | `xhigh`, `xhigh`, `max`, `xhigh`; aggregator `xhigh` | same requested levels |
+| Completion cap | 16,384 tokens per member | 16,384 tokens per member |
+| Temperature | 0.0 per member | 0.0 per member |
+| Tool permissions | proposers disabled; aggregator enabled | same |
+| Local tools | Brave `web_search` plus `web_fetch` | same tool names/provider |
+| Proposer completion rule | wait for all four; require 3 successes | wait for all four; 1 success was enough |
+| Timeouts | task 10,800s; proposer 907.5s; aggregator 2662.5s; margin 30s | task 3,600s; same member timeouts/margin |
+| Runner | Agent loop, 20 work iterations plus finalization; base concurrency 2, formal launcher 5 | Agent loop, 12 iterations, concurrency 2 |
+| Retrieval-only cutoff | disabled (`0`) | no equivalent cutoff |
+| Endgame policy | retain thinking; no-tool finalization after 20 work rounds or upon entering the last 300s | legacy runtime behavior |
+| Judge | Gemini 3.1 Pro Preview, 3 repeats, concurrency 6, 3 attempts | same requested Judge alias/settings |
+| Generation retries | 3 attempts, 2s initial backoff | same |
 
 The proposers do not execute research tools in the reference experiment. The aggregator
 receives `web_search` and `web_fetch`; a tool request is surfaced to the outer Agent loop,
 which executes it and calls the ensemble again with the result.
 
-## Differences fixed from the earlier B2 run
+The quality-first policy removes the three-consecutive-retrieval forced stop, preserves
+thinking during final synthesis, allows 20 complete work iterations before a separate
+finalization attempt, and extends the task wall-clock budget to three hours. The final
+attempt is no-tool; entering the final five-minute deadline window triggers the same no-tool
+wrap-up early as a last-resort guarantee that a task returns an answer.
+
+The profile is run-wide: every group in a combined campaign inherits its Runner, tool, timeout,
+generation, and Judge envelope. The static four-proposer-plus-aggregator mapping remains B2-only.
+G1-only and joint B2/G1 runs therefore keep the same envelope, preserving comparability.
+
+## Historical alignment lineage
 
 The July 15 B2 result was not execution-equivalent to G12 even though its model names matched:
 
@@ -85,12 +103,13 @@ values, reference source commit, and DRACO mini input hash verification.
 
 ## Reproduction boundary
 
-The runner locks the benchmark input, model lineup, generation settings, tool policy, quorum,
-timeouts, runner, retry, and judge settings that affected G12. Credentials remain external and
+The current profile locks the benchmark input, model lineup, generation settings, tool policy,
+quorum, quality-first Agent policy, retry, and Judge settings. Credentials remain external and
 are never written to the JSON artifacts. Sandbox posture and provider transport come from the
-selected OpenSquilla TOML config; the reference and current comparison both use the same config.
+selected OpenSquilla TOML config.
 
-Exact score equality still cannot be guaranteed. OpenRouter aliases can resolve to a different
-dated backend snapshot, provider-side serving behavior can change, and running a different mix
-of experiment groups changes concurrent provider load. The manifest and request trace preserve
-the resolved model names returned by the provider so that drift is visible after a run.
+This profile is suitable for a new quality-first B2/G1 campaign, not a direct score reproduction
+of historical G12. OpenRouter aliases can resolve to a different dated backend snapshot,
+provider-side serving behavior can change, and running a different mix of experiment groups
+changes concurrent provider load. The manifest and request trace preserve the resolved model
+names returned by the provider so that drift is visible after a run.

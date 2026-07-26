@@ -2316,7 +2316,7 @@ def main() -> int:
             "tool_mode": tools.get("mode"),
         }
         config_pass = bool(
-            effective_config.get("profile_id") == "opensquilla_g12_20260630"
+            effective_config.get("profile_id") == "opensquilla_b2_quality_first_v1"
             and effective_config.get("group") == "B2"
             and proposers == EXPECTED_PROPOSERS
             and aggregator == EXPECTED_AGGREGATOR
