@@ -12,6 +12,7 @@ from opensquilla.eval.draco_experiment_config import (
     load_draco_experiment_config,
     validate_reference_input,
 )
+from opensquilla.provider.ranking_router import load_model_registry_snapshot
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG = ROOT / "configs/benchmarks/draco_b2_g12.json"
@@ -30,6 +31,26 @@ def test_default_b2_config_is_g12_derived_quality_first_profile() -> None:
     assert config.benchmark_input.task_count == 10
     assert config.routing.selection_mode == "static_openrouter_b5"
     assert config.routing.skip_single_model_router is True
+    assert config.g1_routing is not None
+    assert config.g1_routing.profile_id == "draco_g1_formal_openrouter_20_20260725"
+    assert config.g1_routing.selection_mode == "router_dynamic"
+    assert config.g1_routing.user_profile_enabled is False
+    assert config.g1_routing.expected_source_registry_snapshot_sha256 == (
+        "a7cad0eb0b68c97ab82bf21c336107041bc77a14b3e8931b0e672a345610fe9b"
+    )
+    assert config.g1_routing.expected_ranking_config_schema_version == "step2-ranking-config-v3"
+    assert config.g1_routing.expected_ranking_config_version == "step2-ranking-2026-07-22.1"
+    assert config.g1_routing.expected_ranking_config_sha256 == (
+        "a8addcdefa04349209c20e97ca5851ed0f5ca55646c9d0c5badc5d32dd7ef10c"
+    )
+    assert config.g1_routing.expected_proposer_count_max == 5
+    assert config.g1_routing.expected_candidate_count == 20
+    assert len(config.g1_routing.expected_routes) == 20
+    assert config.g1_routing.expected_routes_sha256 == (
+        "48df6de139b2df034fd0d94f26eae3df3023dc3b650f6ad06e54ad7410c40335"
+    )
+    assert config.g1_routing.expected_routes["google/gemini-3.5-flash"] == ("google-ai-studio")
+    assert "openai/gpt-5.6-luna" not in config.g1_routing.expected_routes
     assert [member.model for member in config.ensemble.proposers] == [
         "deepseek/deepseek-v4-pro",
         "z-ai/glm-5.2",
@@ -40,8 +61,8 @@ def test_default_b2_config_is_g12_derived_quality_first_profile() -> None:
     assert [member.thinking for member in config.ensemble.proposers] == [
         "xhigh",
         "xhigh",
-        "max",
-        "xhigh",
+        "high",
+        "high",
     ]
     assert config.ensemble.aggregator.thinking == "xhigh"
     assert config.generation.require_highest_thinking is True
@@ -49,14 +70,27 @@ def test_default_b2_config_is_g12_derived_quality_first_profile() -> None:
     assert config.generation.model_thinking_levels == {
         "anthropic/claude-fable-5": "max",
         "anthropic/claude-opus-4.8": "max",
+        "anthropic/claude-sonnet-5": "max",
+        "deepseek/deepseek-v4-flash": "xhigh",
         "deepseek/deepseek-v4-pro": "xhigh",
         "google/gemini-3.1-pro-preview": "high",
-        "moonshotai/kimi-k2.7-code": "max",
+        "google/gemini-3-flash-preview": "high",
+        "google/gemini-3.5-flash": "high",
+        "kwaipilot/kat-coder-air-v2.5": "off",
+        "kwaipilot/kat-coder-pro-v2.5": "off",
+        "meta-llama/llama-4-scout": "off",
+        "minimax/minimax-m3": "high",
+        "mistralai/mistral-medium-3-5": "high",
+        "moonshotai/kimi-k2.7-code": "high",
         "openai/gpt-5.5": "xhigh",
         "openai/gpt-5.5-pro": "xhigh",
         "openai/gpt-5.6-sol": "max",
-        "qwen/qwen3.7-max": "xhigh",
+        "poolside/laguna-xs-2.1": "high",
+        "qwen/qwen3.7-max": "high",
+        "qwen/qwen3.7-plus": "high",
         "sakana/fugu-ultra": "max",
+        "tencent/hy3": "high",
+        "x-ai/grok-4.5": "high",
         "z-ai/glm-5.2": "xhigh",
     }
     assert all(member.max_tokens == 16_384 for member in config.ensemble.proposers)
@@ -73,6 +107,7 @@ def test_default_b2_config_is_g12_derived_quality_first_profile() -> None:
     assert config.ensemble.wait_for_all_proposers is True
     assert config.ensemble.quorum_grace_seconds == 0.0
     assert config.tools.web_search.provider == "brave"
+    assert config.tools.sandbox_enabled is False
     assert config.tools.web_search.max_results == 5
     assert config.tools.web_fetch.max_content_tokens == 50_000
     assert config.timeouts.proposer_seconds == pytest.approx(907.5)
@@ -152,7 +187,57 @@ def test_highest_thinking_invariant_rejects_accidental_downgrade() -> None:
     with pytest.raises(ValidationError, match="highest configured setting"):
         load_draco_experiment_config(
             DEFAULT_CONFIG,
-            inline_sets=["ensemble.proposers.2.thinking=high"],
+            inline_sets=["ensemble.proposers.2.thinking=medium"],
+        )
+
+
+def test_formal_g1_thinking_map_uses_each_registry_models_highest_level() -> None:
+    config = load_draco_experiment_config(DEFAULT_CONFIG).config
+    assert config.g1_routing is not None
+    registry = load_model_registry_snapshot()
+    highest_by_model = {
+        str(row["registry_facts"]["model_id"]): str(
+            row["registry_facts"]["supported_thinking_levels"][0]
+        )
+        for row in registry["models"]
+    }
+
+    assert {
+        model: config.generation.model_thinking_levels[model]
+        for model in config.g1_routing.expected_routes
+    } == {model: highest_by_model[model] for model in config.g1_routing.expected_routes}
+
+
+def test_g1_expected_routes_hash_and_count_are_fail_closed() -> None:
+    with pytest.raises(ValidationError, match="expected_routes_sha256"):
+        load_draco_experiment_config(
+            DEFAULT_CONFIG,
+            inline_sets=[f"g1_routing.expected_routes_sha256={'0' * 64}"],
+        )
+    with pytest.raises(ValidationError, match="expected_candidate_count"):
+        load_draco_experiment_config(
+            DEFAULT_CONFIG,
+            inline_sets=["g1_routing.expected_candidate_count=19"],
+        )
+    with pytest.raises(ValidationError, match="expected_proposer_count_max"):
+        load_draco_experiment_config(
+            DEFAULT_CONFIG,
+            inline_sets=["g1_routing.expected_proposer_count_max=21"],
+        )
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        "g1_routing.user_profile_enabled=true",
+        "tools.sandbox_enabled=true",
+    ],
+)
+def test_formal_runtime_false_flags_cannot_be_overridden(override: str) -> None:
+    with pytest.raises(ValidationError):
+        load_draco_experiment_config(
+            DEFAULT_CONFIG,
+            inline_sets=[override],
         )
 
 

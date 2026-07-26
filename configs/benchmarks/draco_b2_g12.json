@@ -31,6 +31,41 @@
     "selection_mode": "static_openrouter_b5",
     "skip_single_model_router": true
   },
+  "g1_routing": {
+    "profile_id": "draco_g1_formal_openrouter_20_20260725",
+    "selection_mode": "router_dynamic",
+    "user_profile_enabled": false,
+    "source_registry_snapshot_version": "curated-openrouter-step2-2026-07-24.3",
+    "expected_source_registry_snapshot_sha256": "a7cad0eb0b68c97ab82bf21c336107041bc77a14b3e8931b0e672a345610fe9b",
+    "expected_ranking_config_schema_version": "step2-ranking-config-v3",
+    "expected_ranking_config_version": "step2-ranking-2026-07-22.1",
+    "expected_ranking_config_sha256": "a8addcdefa04349209c20e97ca5851ed0f5ca55646c9d0c5badc5d32dd7ef10c",
+    "expected_proposer_count_max": 5,
+    "expected_candidate_count": 20,
+    "expected_routes": {
+      "deepseek/deepseek-v4-pro": "deepseek",
+      "z-ai/glm-5.2": "z-ai",
+      "moonshotai/kimi-k2.7-code": "moonshotai",
+      "qwen/qwen3.7-max": "alibaba",
+      "google/gemini-3.1-pro-preview": "google-ai-studio",
+      "anthropic/claude-opus-4.8": "anthropic",
+      "anthropic/claude-sonnet-5": "anthropic",
+      "deepseek/deepseek-v4-flash": "deepseek",
+      "google/gemini-3-flash-preview": "google-ai-studio",
+      "kwaipilot/kat-coder-air-v2.5": "streamlake",
+      "kwaipilot/kat-coder-pro-v2.5": "streamlake",
+      "meta-llama/llama-4-scout": "groq",
+      "minimax/minimax-m3": "minimax",
+      "mistralai/mistral-medium-3-5": "mistral",
+      "openai/gpt-5.5": "openai",
+      "google/gemini-3.5-flash": "google-ai-studio",
+      "poolside/laguna-xs-2.1": "poolside",
+      "qwen/qwen3.7-plus": "alibaba",
+      "tencent/hy3": "tencent",
+      "x-ai/grok-4.5": "xai"
+    },
+    "expected_routes_sha256": "48df6de139b2df034fd0d94f26eae3df3023dc3b650f6ad06e54ad7410c40335"
+  },
   "ensemble": {
     "profile_name": "g12_k2_replace_gemini",
     "proposers": [
@@ -64,7 +99,7 @@
         "base_url": "",
         "temperature": 0.0,
         "max_tokens": 16384,
-        "thinking": "max",
+        "thinking": "high",
         "k": 1
       },
       {
@@ -75,7 +110,7 @@
         "base_url": "",
         "temperature": 0.0,
         "max_tokens": 16384,
-        "thinking": "xhigh",
+        "thinking": "high",
         "k": 1
       }
     ],
@@ -125,15 +160,28 @@
     "model_thinking_levels": {
       "anthropic/claude-fable-5": "max",
       "anthropic/claude-opus-4.8": "max",
+      "anthropic/claude-sonnet-5": "max",
       "deepseek/deepseek-v4-pro": "xhigh",
+      "deepseek/deepseek-v4-flash": "xhigh",
       "google/gemini-3.1-pro-preview": "high",
+      "google/gemini-3-flash-preview": "high",
+      "google/gemini-3.5-flash": "high",
+      "kwaipilot/kat-coder-air-v2.5": "off",
+      "kwaipilot/kat-coder-pro-v2.5": "off",
+      "meta-llama/llama-4-scout": "off",
+      "minimax/minimax-m3": "high",
+      "mistralai/mistral-medium-3-5": "high",
       "z-ai/glm-5.2": "xhigh",
-      "moonshotai/kimi-k2.7-code": "max",
+      "moonshotai/kimi-k2.7-code": "high",
       "openai/gpt-5.5": "xhigh",
       "openai/gpt-5.5-pro": "xhigh",
       "openai/gpt-5.6-sol": "max",
-      "qwen/qwen3.7-max": "xhigh",
-      "sakana/fugu-ultra": "max"
+      "poolside/laguna-xs-2.1": "high",
+      "qwen/qwen3.7-max": "high",
+      "qwen/qwen3.7-plus": "high",
+      "sakana/fugu-ultra": "max",
+      "tencent/hy3": "high",
+      "x-ai/grok-4.5": "high"
     },
     "require_highest_thinking": true,
     "temperature": 0.0,
@@ -143,6 +191,7 @@
   },
   "tools": {
     "mode": "local_web_tools",
+    "sandbox_enabled": false,
     "contamination_blocked_domains": [
       "hf.co",
       "huggingface.co",

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
+import json
 import os
 import random
 import time
@@ -251,9 +253,7 @@ async def _closing_async_iterator(
             # request has ended, so a custom iterator without ``aclose`` is
             # still valid on that path.  Early break/cancellation has no such
             # proof and must retain the strict close requirement.
-            require_aclose=not bool(
-                terminal_observed is not None and terminal_observed()
-            ),
+            require_aclose=not bool(terminal_observed is not None and terminal_observed()),
             pending_cleanup_tracker=pending_cleanup_tracker,
         )
         if not closed:
@@ -727,9 +727,7 @@ def _profiled_openrouter_capabilities() -> dict[str, ModelCapabilities]:
             or isinstance(modalities, (str, bytes))
         ):
             continue
-        normalized_modalities = {
-            str(modality).strip().lower() for modality in modalities
-        }
+        normalized_modalities = {str(modality).strip().lower() for modality in modalities}
         capabilities[model] = ModelCapabilities(
             supports_reasoning=supports_reasoning,
             supports_tools=supports_tools,
@@ -999,10 +997,11 @@ def _usage_value(value: object, *names: str, default: Any = None) -> Any:
 
 
 def _canonical_usage_billed_cost(value: object) -> tuple[float, bool, bool]:
-    source = str(
-        _usage_value(value, "cost_source", "costSource", default="none")
-        or "none"
-    ).strip().casefold()
+    source = (
+        str(_usage_value(value, "cost_source", "costSource", default="none") or "none")
+        .strip()
+        .casefold()
+    )
     try:
         reported = max(
             0.0,
@@ -1039,9 +1038,8 @@ def _canonical_usage_billed_cost(value: object) -> tuple[float, bool, bool]:
         ):
             return usd_nanos / 1_000_000_000, True, True
         return 0.0, False, True
-    trusted = (
-        source in {"provider_billed", "openrouter_usage"}
-        or (source in {"", "none", "unavailable"} and reported > 0.0)
+    trusted = source in {"provider_billed", "openrouter_usage"} or (
+        source in {"", "none", "unavailable"} and reported > 0.0
     )
     return (reported if trusted else 0.0), trusted, False
 
@@ -1050,10 +1048,11 @@ def _canonical_usage_cost_source(value: object) -> str:
     _, exact, receipt_present = _canonical_usage_billed_cost(value)
     if exact:
         return "provider_billed"
-    source = str(
-        _usage_value(value, "cost_source", "costSource", default="none")
-        or "none"
-    ).strip().casefold()
+    source = (
+        str(_usage_value(value, "cost_source", "costSource", default="none") or "none")
+        .strip()
+        .casefold()
+    )
     if receipt_present:
         return source if source.startswith("opensquilla_") else "unavailable"
     return source
@@ -1069,11 +1068,7 @@ def _canonicalize_usage_row(row: Mapping[str, Any]) -> dict[str, Any]:
 
 def _rollup_cost_source(rows: Sequence[dict[str, Any]]) -> str:
     sources = {_canonical_usage_cost_source(row) for row in rows}
-    billed = sum(
-        1
-        for row in rows
-        if _canonical_usage_cost_source(row) == "provider_billed"
-    )
+    billed = sum(1 for row in rows if _canonical_usage_cost_source(row) == "provider_billed")
     if "mixed" in sources:
         return "mixed"
     if billed and billed == len(rows):
@@ -1166,10 +1161,7 @@ _MISSING_REQUEST_PLACEHOLDER_ROLES = frozenset(
 
 
 def _is_missing_request_placeholder(row: Mapping[str, Any]) -> bool:
-    return (
-        str(row.get("role") or "").strip().casefold()
-        in _MISSING_REQUEST_PLACEHOLDER_ROLES
-    )
+    return str(row.get("role") or "").strip().casefold() in _MISSING_REQUEST_PLACEHOLDER_ROLES
 
 
 def _usage_rows_physical_request_count(
@@ -1178,11 +1170,7 @@ def _usage_rows_physical_request_count(
 ) -> int:
     """Count receipt/placeholder rows without double-counting missing units."""
 
-    represented_missing = sum(
-        1
-        for row in rows
-        if _is_missing_request_placeholder(row)
-    )
+    represented_missing = sum(1 for row in rows if _is_missing_request_placeholder(row))
     return len(rows) + max(0, int(missing_count or 0) - represented_missing)
 
 
@@ -1192,9 +1180,7 @@ def _unrepresented_missing_request_count(
 ) -> int:
     """Return scalar missing units not already materialized as placeholders."""
 
-    represented_missing = sum(
-        1 for row in rows if _is_missing_request_placeholder(row)
-    )
+    represented_missing = sum(1 for row in rows if _is_missing_request_placeholder(row))
     return max(0, int(missing_count or 0) - represented_missing)
 
 
@@ -1227,11 +1213,7 @@ def _usage_row_response_ids(row: Mapping[str, Any]) -> frozenset[str]:
         nested_single = provider_usage.get("response_id")
         if nested_single is not None:
             values.append(nested_single)
-    return frozenset(
-        str(value).strip()
-        for value in values
-        if str(value).strip()
-    )
+    return frozenset(str(value).strip() for value in values if str(value).strip())
 
 
 def _usage_row_match_priority(
@@ -1308,9 +1290,7 @@ def _merge_usage_row_provenance(
                 else []
             )
             source_values = (
-                list(value)
-                if isinstance(value, (list, tuple, set, frozenset))
-                else [value]
+                list(value) if isinstance(value, (list, tuple, set, frozenset)) else [value]
             )
             target_usage[key] = sorted(
                 {
@@ -1349,23 +1329,23 @@ def _diagnostic_done_receipt_rows(done: DoneEvent) -> list[dict[str, Any]]:
     return [
         _canonicalize_usage_row(
             {
-            "provider": str(done.provider or ""),
-            "model": str(done.model or ""),
-            "requested_provider": str(done.requested_provider or ""),
-            "requested_model": str(done.requested_model or ""),
-            "input_tokens": done.input_tokens,
-            "output_tokens": done.output_tokens,
-            "reasoning_tokens": done.reasoning_tokens,
-            "cached_tokens": done.cached_tokens,
-            "cache_write_tokens": done.cache_write_tokens,
-            "billed_cost": done.billed_cost,
-            "cost_source": done.cost_source,
-            "provider_usage": dict(done.provider_usage),
-            **(
-                {"billing_receipt": done.billing_receipt}
-                if done.billing_receipt is not None
-                else {}
-            ),
+                "provider": str(done.provider or ""),
+                "model": str(done.model or ""),
+                "requested_provider": str(done.requested_provider or ""),
+                "requested_model": str(done.requested_model or ""),
+                "input_tokens": done.input_tokens,
+                "output_tokens": done.output_tokens,
+                "reasoning_tokens": done.reasoning_tokens,
+                "cached_tokens": done.cached_tokens,
+                "cache_write_tokens": done.cache_write_tokens,
+                "billed_cost": done.billed_cost,
+                "cost_source": done.cost_source,
+                "provider_usage": dict(done.provider_usage),
+                **(
+                    {"billing_receipt": done.billing_receipt}
+                    if done.billing_receipt is not None
+                    else {}
+                ),
             }
         )
     ]
@@ -1427,17 +1407,13 @@ def _error_event_physical_request_count(
         int(nested_trace.get("physical_request_count") or 0),
         int(nested_trace.get("llm_request_count") or 0),
     )
-    event_rows = [
-        row for row in event.model_usage_breakdown if isinstance(row, Mapping)
-    ]
+    event_rows = [row for row in event.model_usage_breakdown if isinstance(row, Mapping)]
     evidenced = _usage_rows_physical_request_count(
         event_rows,
         max(0, int(event.usage_missing_count or 0)),
     )
     if event.diagnostic_done is not None:
-        diagnostic_rows = _diagnostic_done_receipt_rows(
-            event.diagnostic_done
-        )
+        diagnostic_rows = _diagnostic_done_receipt_rows(event.diagnostic_done)
         represented_diagnostic_rows = _represented_usage_row_count(
             event_rows,
             diagnostic_rows,
@@ -1466,9 +1442,7 @@ def _error_event_physical_request_count(
             - represented_missing_remainder,
         )
     explicit = (
-        max(0, int(event.physical_request_count))
-        if event.physical_request_count is not None
-        else 0
+        max(0, int(event.physical_request_count)) if event.physical_request_count is not None else 0
     )
     default_started = bool(request_started and event.request_started is not False)
     return max(traced, evidenced, explicit, 1 if default_started else 0)
@@ -1482,9 +1456,7 @@ def _done_event_physical_request_count(event: DoneEvent) -> int:
         int(nested_trace.get("physical_request_count") or 0),
         int(nested_trace.get("llm_request_count") or 0),
     )
-    event_rows = [
-        row for row in event.model_usage_breakdown if isinstance(row, Mapping)
-    ]
+    event_rows = [row for row in event.model_usage_breakdown if isinstance(row, Mapping)]
     evidenced = _usage_rows_physical_request_count(
         event_rows,
         max(0, int(event.usage_missing_count or 0)),
@@ -1506,15 +1478,13 @@ def _error_event_missing_usage_count(
     receipt_rows = sum(
         1
         for row in event.model_usage_breakdown
-        if isinstance(row, Mapping)
-        and not _is_missing_request_placeholder(row)
+        if isinstance(row, Mapping) and not _is_missing_request_placeholder(row)
     )
     if event.diagnostic_done is not None:
         event_rows = [
             row
             for row in event.model_usage_breakdown
-            if isinstance(row, Mapping)
-            and not _is_missing_request_placeholder(row)
+            if isinstance(row, Mapping) and not _is_missing_request_placeholder(row)
         ]
         diagnostic_receipt_rows = [
             row
@@ -2512,9 +2482,7 @@ class EnsembleProvider:
                 else None
             )
             if not request_tools and request_config.tool_choice is not None:
-                request_config = request_config.model_copy(
-                    update={"tool_choice": None}
-                )
+                request_config = request_config.model_copy(update={"tool_choice": None})
             request_trace = self._trace_payload(
                 candidates,
                 successful_count=len(successful),
@@ -2611,11 +2579,7 @@ class EnsembleProvider:
             if isinstance(event, ToolUseDeltaEvent):
                 return bool(event.tool_use_id or event.json_fragment)
             if isinstance(event, ToolUseEndEvent):
-                return bool(
-                    event.tool_use_id
-                    or event.tool_name
-                    or event.arguments
-                )
+                return bool(event.tool_use_id or event.tool_name or event.arguments)
             return False
 
         def _runtime_fallback_accounting(
@@ -2633,8 +2597,7 @@ class EnsembleProvider:
             final_rows = event_rows[len(proposer_rows) :]
             final_missing_count = max(
                 0,
-                int(event.usage_missing_count or 0)
-                - _candidate_missing_usage_count(candidates),
+                int(event.usage_missing_count or 0) - _candidate_missing_usage_count(candidates),
             )
             candidate_request_count = sum(
                 candidate.physical_request_count
@@ -2656,8 +2619,8 @@ class EnsembleProvider:
             *,
             fallback_messages: list[Message],
         ) -> AsyncIterator[StreamEvent]:
-            final_rows, final_missing_count, final_request_count = (
-                _runtime_fallback_accounting(event)
+            final_rows, final_missing_count, final_request_count = _runtime_fallback_accounting(
+                event
             )
             failed_final_request = None
             if isinstance(event.ensemble_trace, Mapping):
@@ -2719,9 +2682,8 @@ class EnsembleProvider:
                     if isinstance(event, ErrorEvent):
                         terminal_error = event
                         continue
-                    visible_output = (
-                        visible_output
-                        or _has_nonempty_visible_aggregator_output(event)
+                    visible_output = visible_output or _has_nonempty_visible_aggregator_output(
+                        event
                     )
                     yield event
 
@@ -2833,8 +2795,7 @@ class EnsembleProvider:
                 yield event
             return
         buffered_visible_output = any(
-            _has_nonempty_visible_aggregator_output(event)
-            for event in buffered_events
+            _has_nonempty_visible_aggregator_output(event) for event in buffered_events
         )
         runtime_fallback_allowed = (
             terminal_event is not None
@@ -2845,8 +2806,7 @@ class EnsembleProvider:
             # A timeout imposed by the soft cutoff already has a dedicated
             # close-then-direct-finalizer path below.
             and not (
-                terminal_event.code == "ensemble_aggregator_timeout"
-                and soft_budget_is_limiter
+                terminal_event.code == "ensemble_aggregator_timeout" and soft_budget_is_limiter
             )
         )
         if runtime_fallback_allowed and terminal_event is not None:
@@ -3061,9 +3021,7 @@ class EnsembleProvider:
         aggregator_cfg, aggregator_timeout_seconds = self._aggregator_only_chat_config(config)
         aggregator_request_tools = tools if self.aggregator_tools else None
         if not aggregator_request_tools and aggregator_cfg.tool_choice is not None:
-            aggregator_cfg = aggregator_cfg.model_copy(
-                update={"tool_choice": None}
-            )
+            aggregator_cfg = aggregator_cfg.model_copy(update={"tool_choice": None})
         trace = self._trace_payload(
             [],
             successful_count=0,
@@ -3176,8 +3134,7 @@ class EnsembleProvider:
                     results.append(await task)
 
                 if any(
-                    result.error_code == _ENSEMBLE_PROPOSER_CLOSE_TIMEOUT_CODE
-                    for result in results
+                    result.error_code == _ENSEMBLE_PROPOSER_CLOSE_TIMEOUT_CODE for result in results
                 ):
                     cancel_code = _ENSEMBLE_PROPOSER_CLOSE_TIMEOUT_CODE
                     cancel_message = (
@@ -3226,8 +3183,7 @@ class EnsembleProvider:
                 for task in done:
                     results.append(await task)
                 if any(
-                    result.error_code == _ENSEMBLE_PROPOSER_CLOSE_TIMEOUT_CODE
-                    for result in results
+                    result.error_code == _ENSEMBLE_PROPOSER_CLOSE_TIMEOUT_CODE for result in results
                 ):
                     cancel_code = _ENSEMBLE_PROPOSER_CLOSE_TIMEOUT_CODE
                     cancel_message = (
@@ -3347,8 +3303,7 @@ class EnsembleProvider:
                         else:
                             close_failed = close_failed or (
                                 isinstance(item, _CandidateResult)
-                                and item.error_code
-                                == _ENSEMBLE_PROPOSER_CLOSE_TIMEOUT_CODE
+                                and item.error_code == _ENSEMBLE_PROPOSER_CLOSE_TIMEOUT_CODE
                             )
             if lingering or close_failed:
                 raise _EnsembleStreamCloseError("ensemble_proposers_external_cancel")
@@ -3424,9 +3379,7 @@ class EnsembleProvider:
                             except BaseException:
                                 pass
                         if lingering:
-                            raise _EnsembleStreamCloseError(
-                                f"ensemble_proposer_{index}_timeout"
-                            )
+                            raise _EnsembleStreamCloseError(f"ensemble_proposer_{index}_timeout")
                         # The provider may ignore cancellation while unwinding.
                         # Return an immutable snapshot so that a detached child
                         # cannot mutate the candidate later.
@@ -3476,13 +3429,10 @@ class EnsembleProvider:
                 or "proposer cancelled after ensemble quorum was reached"
             )
         except _EnsembleStreamCloseError:
-            self._mark_cleanup_unproven(
-                f"ensemble_proposer_{index}_close_unproven"
-            )
+            self._mark_cleanup_unproven(f"ensemble_proposer_{index}_close_unproven")
             result.error_code = _ENSEMBLE_PROPOSER_CLOSE_TIMEOUT_CODE
             result.error = (
-                "proposer physical provider stream did not close within the "
-                "cleanup window"
+                "proposer physical provider stream did not close within the cleanup window"
             )
         except Exception as exc:  # noqa: BLE001 - candidate failures are diagnostic data
             result.error = redact_upstream_error_text(
@@ -3624,8 +3574,7 @@ class EnsembleProvider:
                         response_observed=response_observed,
                     )
                     explicitly_not_started = bool(
-                        event.request_started is False
-                        or event.physical_request_count == 0
+                        event.request_started is False or event.physical_request_count == 0
                     )
                     if explicitly_not_started:
                         result.request_started = False
@@ -3688,14 +3637,10 @@ class EnsembleProvider:
                             _,
                             _,
                         ) = _canonical_usage_billed_cost(diagnostic_done)
-                        result.cost_source = _canonical_usage_cost_source(
-                            diagnostic_done
-                        )
+                        result.cost_source = _canonical_usage_cost_source(diagnostic_done)
                         result.billing_receipt = diagnostic_done.billing_receipt
                         result.stop_reason = diagnostic_done.stop_reason
-                        result.provider = _done_event_actual_provider(
-                            diagnostic_done
-                        )
+                        result.provider = _done_event_actual_provider(diagnostic_done)
                         result.model = str(diagnostic_done.model or "").strip()
                         result.provider_usage = dict(diagnostic_done.provider_usage)
                         result.diagnostic_model_usage_breakdown = [
@@ -3962,9 +3907,7 @@ class EnsembleProvider:
                 row.setdefault("label", f"aggregator_inner_{inner_index}")
                 row.setdefault("provider", acc.provider)
                 if not str(row.get("requested_provider") or "").strip():
-                    row["requested_provider"] = (
-                        self.aggregator.provider_config.provider
-                    )
+                    row["requested_provider"] = self.aggregator.provider_config.provider
                 row.setdefault("model", acc.model)
                 if not str(row.get("requested_model") or "").strip():
                     row["requested_model"] = self.aggregator.provider_config.model
@@ -4003,14 +3946,10 @@ class EnsembleProvider:
                 model=acc.model,
                 provider=acc.provider,
                 requested_model=str(
-                    event.requested_model
-                    or self.aggregator.provider_config.model
-                    or ""
+                    event.requested_model or self.aggregator.provider_config.model or ""
                 ),
                 requested_provider=str(
-                    event.requested_provider
-                    or self.aggregator.provider_config.provider
-                    or ""
+                    event.requested_provider or self.aggregator.provider_config.provider or ""
                 ),
                 cost_source=_rollup_cost_source(rows),
                 model_usage_breakdown=rows,
@@ -4283,13 +4222,9 @@ class EnsembleProvider:
                         heartbeat_close_status is None or heartbeat_close_status.closed is not False
                     )
                 if not stream_closed:
-                    self._mark_cleanup_unproven(
-                        "ensemble_aggregator_close_unproven"
-                    )
+                    self._mark_cleanup_unproven("ensemble_aggregator_close_unproven")
                 if external_close_requested and not stream_closed:
-                    raise _EnsembleStreamCloseError(
-                        "ensemble_aggregator_external_close"
-                    )
+                    raise _EnsembleStreamCloseError("ensemble_aggregator_external_close")
             if completed_provider_event is not None:
                 aggregator_elapsed_ms = int((time.monotonic() - aggregator_started) * 1000)
                 done_event = ensemble_done(
@@ -4370,8 +4305,10 @@ class EnsembleProvider:
                     message="ensemble aggregator stream ended before DoneEvent",
                     code="ensemble_aggregator_incomplete",
                 )
-                if stream_closed and not content_streamed and attempt < (
-                    _ENSEMBLE_AGGREGATOR_MAX_RETRIES
+                if (
+                    stream_closed
+                    and not content_streamed
+                    and attempt < (_ENSEMBLE_AGGREGATOR_MAX_RETRIES)
                 ):
                     retry_error = error
                 else:
@@ -4562,9 +4499,7 @@ class EnsembleProvider:
                     first_close_status.closed is not True
                     or first_physical_close_status.closed is not True
                 ):
-                    raise _EnsembleStreamCloseError(
-                        "ensemble_fallback_external_close"
-                    )
+                    raise _EnsembleStreamCloseError("ensemble_fallback_external_close")
 
             if not absolute_timeout:
                 for event in buffered_events:
@@ -4575,9 +4510,7 @@ class EnsembleProvider:
                 first_close_status.closed is not True
                 or first_physical_close_status.closed is not True
             ):
-                self._mark_cleanup_unproven(
-                    "ensemble_fallback_soft_deadline_close_unproven"
-                )
+                self._mark_cleanup_unproven("ensemble_fallback_soft_deadline_close_unproven")
                 close_trace = self._trace_payload(
                     candidates,
                     successful_count=sum(1 for candidate in candidates if candidate.ok),
@@ -4660,9 +4593,7 @@ class EnsembleProvider:
                 )
                 abandoned_request_count = max(
                     1,
-                    nested_total
-                    - candidate_request_count
-                    - max(0, int(prior_final_request_count)),
+                    nested_total - candidate_request_count - max(0, int(prior_final_request_count)),
                 )
 
             if soft_deadline_triggered is not None:
@@ -4723,8 +4654,7 @@ class EnsembleProvider:
                         max(0, int(prior_final_missing_count)) + abandoned_missing_count
                     ),
                     prior_final_request_count=(
-                        max(0, int(prior_final_request_count))
-                        + abandoned_request_count
+                        max(0, int(prior_final_request_count)) + abandoned_request_count
                     ),
                 ),
                 phase="ensemble_soft_deadline_fallback_finalizer_relay",
@@ -4851,9 +4781,7 @@ class EnsembleProvider:
                     or ""
                 )
                 requested_fallback_model = str(
-                    self.fallback_model
-                    or _provider_model_id(self.fallback_provider)
-                    or ""
+                    self.fallback_model or _provider_model_id(self.fallback_provider) or ""
                 )
                 execution.setdefault(
                     "requested_provider",
@@ -5091,9 +5019,7 @@ class EnsembleProvider:
             if completed_fallback_event is not None:
                 done_event = complete_fallback(completed_fallback_event)
                 if physical_close_status.closed is not True:
-                    self._mark_cleanup_unproven(
-                        "ensemble_fallback_close_unproven"
-                    )
+                    self._mark_cleanup_unproven("ensemble_fallback_close_unproven")
                     yield _attach_error_request_evidence(
                         ErrorEvent(
                             message=(
@@ -5117,9 +5043,7 @@ class EnsembleProvider:
                 return
             if terminal_fallback_error is not None:
                 if physical_close_status.closed is not True:
-                    self._mark_cleanup_unproven(
-                        "ensemble_fallback_close_unproven"
-                    )
+                    self._mark_cleanup_unproven("ensemble_fallback_close_unproven")
                     terminal_fallback_error = replace(
                         terminal_fallback_error,
                         message=(
@@ -5136,9 +5060,7 @@ class EnsembleProvider:
             # retain the already-received usage receipt in a typed terminal
             # error instead of falling through the generic exception path and
             # turning a known billed request into unknown usage.
-            self._mark_cleanup_unproven(
-                "ensemble_fallback_close_unproven"
-            )
+            self._mark_cleanup_unproven("ensemble_fallback_close_unproven")
             if completed_fallback_event is not None:
                 done_event = complete_fallback(completed_fallback_event)
                 yield _attach_error_request_evidence(
@@ -5174,8 +5096,7 @@ class EnsembleProvider:
                 return
             fallback_error = ErrorEvent(
                 message=(
-                    "ensemble fallback provider stream did not close within "
-                    "the cleanup window"
+                    "ensemble fallback provider stream did not close within the cleanup window"
                 ),
                 code="ensemble_fallback_close_timeout",
             )
@@ -5184,15 +5105,12 @@ class EnsembleProvider:
         except TimeoutError:
             timeout_error = ErrorEvent(
                 message=(
-                    "ensemble fallback stalled: no stream events for "
-                    f"{fallback_timeout_seconds:g}s"
+                    f"ensemble fallback stalled: no stream events for {fallback_timeout_seconds:g}s"
                 ),
                 code="ensemble_fallback_timeout",
             )
             if physical_close_status.closed is not True:
-                self._mark_cleanup_unproven(
-                    "ensemble_fallback_close_unproven"
-                )
+                self._mark_cleanup_unproven("ensemble_fallback_close_unproven")
                 timeout_error = replace(
                     timeout_error,
                     message=(
@@ -5225,9 +5143,7 @@ class EnsembleProvider:
                 ),
             )
             if fallback_request_started and physical_close_status.closed is not True:
-                self._mark_cleanup_unproven(
-                    "ensemble_fallback_close_unproven"
-                )
+                self._mark_cleanup_unproven("ensemble_fallback_close_unproven")
                 fallback_error = replace(
                     fallback_error,
                     message=(
@@ -5243,9 +5159,7 @@ class EnsembleProvider:
             code="ensemble_fallback_incomplete",
         )
         if fallback_request_started and physical_close_status.closed is not True:
-            self._mark_cleanup_unproven(
-                "ensemble_fallback_close_unproven"
-            )
+            self._mark_cleanup_unproven("ensemble_fallback_close_unproven")
             incomplete_error = replace(
                 incomplete_error,
                 message=(
@@ -5439,9 +5353,7 @@ def _attach_error_request_evidence(
         int(trace.get("llm_request_count") or 0),
     )
     event_count = (
-        max(0, int(event.physical_request_count))
-        if event.physical_request_count is not None
-        else 0
+        max(0, int(event.physical_request_count)) if event.physical_request_count is not None else 0
     )
     physical_count = max(trace_count, event_count)
     return replace(
@@ -5489,9 +5401,7 @@ def _attach_final_request_output(
     final_request["usage"] = {
         "provider": _done_event_actual_provider(event),
         "model": event.model,
-        "requested_provider": str(
-            event.requested_provider or requested_provider or ""
-        ),
+        "requested_provider": str(event.requested_provider or requested_provider or ""),
         "requested_model": str(event.requested_model or requested_model or ""),
         "stop_reason": event.stop_reason,
         "input_tokens": event.input_tokens,
@@ -6444,6 +6354,108 @@ def _build_router_dynamic_members_legacy(
     return f"router_dynamic/{routed_tier}", proposers, aggregator, plan
 
 
+def _apply_router_dynamic_registry_allowlist(
+    snapshot: dict[str, Any],
+    raw_contract: Any,
+) -> dict[str, Any] | None:
+    """Restrict a fully composed dynamic snapshot to one exact formal route set."""
+
+    if raw_contract is None:
+        return None
+    if not isinstance(raw_contract, Mapping):
+        raise ValueError("router_dynamic registry allowlist contract must be an object")
+    profile_id = str(raw_contract.get("profile_id") or "").strip()
+    source_version = str(raw_contract.get("source_registry_snapshot_version") or "").strip()
+    expected_routes_raw = raw_contract.get("expected_routes")
+    expected_count_raw = raw_contract.get("expected_candidate_count")
+    expected_hash = str(raw_contract.get("expected_routes_sha256") or "").strip()
+    expected_source_snapshot_hash = str(
+        raw_contract.get("expected_source_registry_snapshot_sha256") or ""
+    ).strip()
+    if (
+        not profile_id
+        or not source_version
+        or len(expected_source_snapshot_hash) != 64
+        or any(char not in "0123456789abcdef" for char in expected_source_snapshot_hash)
+        or not isinstance(expected_routes_raw, Mapping)
+    ):
+        raise ValueError("router_dynamic registry allowlist contract is incomplete")
+    if isinstance(expected_count_raw, bool) or not isinstance(expected_count_raw, int):
+        raise ValueError("router_dynamic registry allowlist candidate count is invalid")
+    expected_routes = {
+        str(model).strip().lower(): str(provider).strip().lower()
+        for model, provider in expected_routes_raw.items()
+    }
+    if len(expected_routes) != expected_count_raw or expected_count_raw <= 0:
+        raise ValueError("router_dynamic registry allowlist candidate count differs")
+    actual_hash = hashlib.sha256(
+        json.dumps(
+            expected_routes,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    if actual_hash != expected_hash:
+        raise ValueError("router_dynamic registry allowlist hash differs")
+    actual_source_version = str(snapshot.get("snapshot_version") or "").strip()
+    if actual_source_version != source_version:
+        raise ValueError(
+            "router_dynamic registry snapshot version differs from the formal allowlist contract"
+        )
+
+    rows = snapshot.get("models")
+    if not isinstance(rows, list):
+        raise ValueError("router_dynamic registry snapshot has no model rows")
+    expected_identities = {f"openrouter:{model}" for model in expected_routes}
+    retained: list[dict[str, Any]] = []
+    retained_identities: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError("router_dynamic registry snapshot contains a malformed row")
+        facts = row.get("registry_facts")
+        if not isinstance(facts, Mapping):
+            raise ValueError("router_dynamic registry snapshot row lacks registry facts")
+        identity = (
+            f"{str(facts.get('provider') or '').strip().lower()}:"
+            f"{str(facts.get('model_id') or '').strip().lower()}"
+        )
+        if identity not in expected_identities:
+            continue
+        if identity in retained_identities:
+            raise ValueError(
+                f"router_dynamic registry allowlist contains duplicate deployment {identity}"
+            )
+        retained_identities.add(identity)
+        retained.append(row)
+    missing = sorted(expected_identities - retained_identities)
+    if missing:
+        raise ValueError(
+            "router_dynamic registry allowlist model(s) unavailable: " + ", ".join(missing)
+        )
+    if len(retained) != expected_count_raw:
+        raise ValueError("router_dynamic registry allowlist did not produce the exact pool size")
+
+    input_candidate_count = len(rows)
+    snapshot["models"] = retained
+    snapshot["source_snapshot_version"] = actual_source_version
+    snapshot["snapshot_version"] = f"{actual_source_version}+{profile_id}+{expected_hash[:12]}"
+    return {
+        "policy": "exact_openrouter_routes",
+        "profile_id": profile_id,
+        "source_registry_snapshot_version": actual_source_version,
+        "filtered_registry_snapshot_version": snapshot["snapshot_version"],
+        "expected_routes_sha256": expected_hash,
+        "expected_source_registry_snapshot_sha256": (expected_source_snapshot_hash),
+        "expected_candidate_count": expected_count_raw,
+        "input_candidate_count": input_candidate_count,
+        "excluded_candidate_count": input_candidate_count - len(retained),
+        "candidate_count": len(retained),
+        "expected_identities": sorted(expected_identities),
+    }
+
+
 def _build_router_dynamic_members(
     *,
     config: Any,
@@ -6578,6 +6590,11 @@ def _build_router_dynamic_members(
         ranking_config=ranking_config,
     )
 
+    allowlist_trace = _apply_router_dynamic_registry_allowlist(
+        snapshot,
+        inputs.get("registry_allowlist"),
+    )
+
     # Keep every deployment in the replay snapshot. The ranking hard filter
     # removes deployments that the shared resolver says cannot execute.
     for row in snapshot["models"]:
@@ -6615,6 +6632,8 @@ def _build_router_dynamic_members(
     )
     if generation_filter_trace is not None:
         decision.trace["generation_policy_filter"] = generation_filter_trace
+    if allowlist_trace is not None:
+        decision.trace["candidate_allowlist"] = allowlist_trace
     proposers = [
         _member_from_ref(
             _EnsembleModelRef(
@@ -7247,6 +7266,14 @@ def build_ensemble_provider_from_config(
         "selected_A",
         f"{aggregator.provider_config.provider}:{aggregator.provider_config.model}",
     )
+    if selection_mode == "router_dynamic":
+        selection_plan["proposer_models"] = [
+            member.provider_config.model
+            for member in proposers
+            for _ in range(max(1, int(member.k)))
+        ]
+        selection_plan["proposer_sample_count"] = len(selection_plan["proposer_models"])
+        selection_plan["aggregator_model"] = aggregator.provider_config.model
     inherited_provider = str(inherited_provider_config.provider or "").strip().lower()
     cross_provider_lineup = any(
         member.provider_config.provider.strip().lower() != inherited_provider
