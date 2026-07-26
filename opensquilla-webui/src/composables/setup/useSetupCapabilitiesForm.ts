@@ -40,6 +40,7 @@ interface ConfigData {
 
 interface StatusData {
   imageGenerationEnabled?: boolean
+  imageGenerationConfigured?: boolean
   imageGenerationProvider?: string
   imageGenerationPrimary?: string
 }
@@ -129,7 +130,7 @@ interface ImageProviderDraft {
   primary: string
   apiKeyEnv: string
   baseUrl: string
-  keyConfigured: boolean
+  credentialConfigured: boolean
   touched: Set<ImageTouchedField>
 }
 
@@ -343,6 +344,15 @@ export function useSetupCapabilitiesForm() {
       const providerConfig = (imageConfig.providers || {})[spec.providerId] || {}
       const configuredPrimary = spec.providerId === primaryProvider ? primaryRef : ''
       const keyConfigured = Boolean(providerConfig.api_key)
+      // A stored direct key is not the only working credential: a saved env
+      // reference, or the backend-computed status (ambient env, LLM-provider
+      // fallback), also mean image generation works. Never label those
+      // "not configured" — that wording invites clearing a credential that
+      // is actually in use.
+      const credentialConfigured = keyConfigured
+        || Boolean(providerConfig.api_key_env)
+        || (status.imageGenerationConfigured === true
+          && spec.providerId === status.imageGenerationProvider)
       imageProviderDrafts.set(spec.providerId, {
         primary: imageModelForDisplay(
           spec.providerId,
@@ -352,7 +362,7 @@ export function useSetupCapabilitiesForm() {
           ? ''
           : (providerConfig.api_key_env || (spec.requiresApiKey ? spec.envKey || '' : '')),
         baseUrl: providerConfig.base_url || spec.defaultBaseUrl || '',
-        keyConfigured,
+        credentialConfigured,
         touched: new Set(),
       })
     }
@@ -376,7 +386,7 @@ export function useSetupCapabilitiesForm() {
       primary: imageModelForDisplay(spec?.providerId || '', spec?.defaultModel || ''),
       apiKeyEnv: spec?.requiresApiKey ? spec.envKey || '' : '',
       baseUrl: spec?.defaultBaseUrl || '',
-      keyConfigured: false,
+      credentialConfigured: false,
       touched: new Set(),
     }
   }
@@ -386,7 +396,7 @@ export function useSetupCapabilitiesForm() {
     imageApiKey.value = ''
     imageApiKeyEnv.value = draft.apiKeyEnv
     imageBaseUrl.value = draft.baseUrl
-    imageKeyConfigured.value = draft.keyConfigured
+    imageKeyConfigured.value = draft.credentialConfigured
     imageTouchedFields.value = new Set(draft.touched)
   }
 
@@ -495,14 +505,24 @@ export function useSetupCapabilitiesForm() {
       imageApiKeyEnv.value = ''
       const next = new Set(imageTouchedFields.value)
       next.delete('apiKeyEnv')
-      next.add('apiKey')
+      // Blank must mean "keep". A field emptied after typing has to be
+      // indistinguishable from an untouched one: a touched-but-empty key
+      // would send credentialMode 'direct' with no key, which the backend
+      // reads as an authored switch to direct mode and deletes a stored
+      // env reference.
+      if (String(value).trim()) next.add('apiKey')
+      else next.delete('apiKey')
       imageTouchedFields.value = next
     } else if (key === 'apiKeyEnv') {
       imageApiKeyEnv.value = String(value)
       imageApiKey.value = ''
       const next = new Set(imageTouchedFields.value)
       next.delete('apiKey')
-      next.add('apiKeyEnv')
+      // Same keep-on-blank rule as the direct key: a touched-but-empty env
+      // reference would author credentialMode 'env', which the backend reads
+      // as a source switch and deletes a stored direct key.
+      if (String(value).trim()) next.add('apiKeyEnv')
+      else next.delete('apiKeyEnv')
       imageTouchedFields.value = next
     } else if (key === 'baseUrl') {
       imageBaseUrl.value = String(value)
@@ -584,6 +604,11 @@ export function useSetupCapabilitiesForm() {
         imageProvider: imageProvider.value,
         imagePrimary: imagePrimary.value,
         imageApiKey: imageApiKey.value,
+        // Whether a working credential already exists for the selected
+        // provider — a persisted write-only key, a saved env reference, or
+        // the backend-computed configured status. Drives the key field's
+        // placeholder/state hint; the key itself is never echoed back.
+        imageKeyConfigured: imageKeyConfigured.value,
         imageApiKeyEnv: imageApiKeyEnv.value,
         imageBaseUrl: imageBaseUrl.value,
         imageEnabled: imageEnabled.value,

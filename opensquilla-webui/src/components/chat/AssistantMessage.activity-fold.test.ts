@@ -237,7 +237,7 @@ describe('AssistantMessage activity disclosure', () => {
 
     const summary = el.querySelector('.assistant-activity__summary')
     expect(summary?.getAttribute('aria-expanded')).toBe('false')
-    expect(summary?.textContent).toContain('Completed ·')
+    expect(summary?.textContent).toContain('1 web action')
     expect(summary?.textContent).not.toContain('Activity ·')
     expect(el.querySelector('.assistant-activity')?.getAttribute('data-share-expanded')).toBe('false')
     expect(el.querySelector('.tool-row')).not.toBeNull()
@@ -291,7 +291,7 @@ describe('AssistantMessage activity disclosure', () => {
     expect(activity?.classList.contains('assistant-activity--failed')).toBe(true)
     expect(activity?.querySelector('.assistant-activity__summary')?.getAttribute('aria-expanded')).toBe('true')
     expect(activity?.querySelector('.assistant-activity__summary')?.textContent)
-      .toContain('Activity ·')
+      .toContain('1 web action')
     expect(activity?.querySelector('.assistant-activity__summary')?.textContent)
       .not.toContain('Completed ·')
     expect(activity?.querySelector('.tool-row--error')).not.toBeNull()
@@ -322,15 +322,17 @@ describe('AssistantMessage activity disclosure', () => {
     await nextTick()
 
     const summary = el.querySelector('.assistant-activity__summary')
-    expect(summary?.textContent).toContain('Activity ·')
+    expect(summary?.textContent).toContain('1 web action')
     expect(summary?.textContent).toContain('1 failed')
     expect(summary?.textContent).not.toContain('Completed ·')
     expect(summary?.textContent).not.toContain('recovered')
   })
 
   it('does not claim completion after an approval is denied', async () => {
+    // No tool footprint: the summary falls back to the lifecycle label, which
+    // must not claim completion while the approval outcome is a denial.
     const el = mountMessage(baseMessage({
-      timelineItems: successfulTimeline(),
+      timelineItems: [],
       parts: [approvalPart('denied')],
     }))
     await nextTick()
@@ -342,7 +344,7 @@ describe('AssistantMessage activity disclosure', () => {
 
   it('uses the completed summary after approval and a settled answer', async () => {
     const el = mountMessage(baseMessage({
-      timelineItems: successfulTimeline(),
+      timelineItems: [],
       parts: [approvalPart('approved')],
     }))
     await nextTick()
@@ -386,6 +388,54 @@ describe('AssistantMessage activity disclosure', () => {
     }))
     await nextTick()
     expect(restored.querySelector('.assistant-activity__summary')?.textContent).toContain('Worked for 21s')
+  })
+
+  it('summarizes the collapsed row as footprint parts, overflow, then elapsed time last', async () => {
+    const el = mountMessage(baseMessage({
+      ts: 1_725_000_022,
+      statusHistory: [
+        { action: 'search', label: 'Searching', at: 1_725_000_001_000 },
+      ],
+      timelineItems: [
+        timelineGroup(successfulCall('search-1', 'web_search')),
+        timelineGroup(successfulCall('run-1', 'bash_exec')),
+        timelineGroup(successfulCall('artifact-1', 'publish_artifact')),
+        timelineGroup(successfulCall('recall-1', 'memory_search')),
+      ],
+    }))
+    await nextTick()
+
+    // Footprint first, the projection's own "{count} more" for the overflow,
+    // and the elapsed time strictly last — time must not lead the row.
+    expect(el.querySelector('.assistant-activity__label')?.textContent)
+      .toBe('1 web action · 1 command · 2 more · Worked for 21s')
+  })
+
+  it('persists a measured duration from a watcher even when no disclosure reads it', async () => {
+    // A legacy row (timeline text, no canonical answer) renders no activity
+    // disclosure, so nothing ever evaluates the duration computed. The write
+    // lives in a watcher, not the computed, so the turn duration is still
+    // recorded and survives into the restored separable row.
+    const legacy = mountMessage(baseMessage({
+      text: '',
+      ts: 1_725_000_022,
+      statusHistory: [
+        { action: 'inspect', label: 'Inspecting', at: 1_725_000_001_000 },
+      ],
+    }))
+    await nextTick()
+    expect(legacy.querySelector('.assistant-activity')).toBeNull()
+
+    const restored = mountMessage(baseMessage({
+      id: 'server-assistant',
+      messageId: 'server-assistant',
+      statusHistory: [],
+      timelineItems: successfulTimeline(),
+    }))
+    await nextTick()
+
+    expect(restored.querySelector('.assistant-activity__label')?.textContent)
+      .toContain('Worked for 21s')
   })
 
   it('does not let the tool-detail preference force the outer activity open', async () => {

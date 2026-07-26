@@ -13,6 +13,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   authoritative; when the primary profile has no settings, the newest legacy
   recovery settings are adopted automatically. Desktop no longer creates or
   asks users to confirm isolated recovery profiles.
+- Closing the Desktop main window now preserves the live Control UI on macOS
+  and keeps Windows reachable from a system tray icon. Explicit **Quit
+  OpenSquilla** still drains and stops the local Gateway, and the close behavior
+  can be changed in Runtime settings.
 
 ## [0.5.0] - 2026-07-23
 

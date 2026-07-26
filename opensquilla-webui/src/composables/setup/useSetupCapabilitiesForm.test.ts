@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { computed, ref } from 'vue'
 import {
   buildImagePayload,
   imageModelForDisplay,
@@ -215,6 +216,136 @@ describe('useSetupCapabilitiesForm image hydration', () => {
   })
 })
 
+// A full panel context whose values are irrelevant to the assertion under
+// test: createPanel dereferences every context field eagerly, so exposure
+// tests need the complete shape even when only form state is inspected.
+function stubPanelContext() {
+  const text = computed(() => '')
+  const flag = computed(() => false)
+  const list = computed(() => [] as string[])
+  const providers = computed(() => [] as Array<{ providerId: string; label: string }>)
+  return {
+    searchProviders: providers,
+    memoryProviders: providers,
+    imageProviders: providers,
+    imageSpec: computed(() => null),
+    searchRequiresKey: flag,
+    searchEnvPlaceholder: text,
+    searchAdvancedOpen: flag,
+    searchNeeds: list,
+    searchEnvCommand: text,
+    searchStatusText: () => '',
+    memoryApiKeyEnabled: flag,
+    memoryRemoteOptionsOpen: flag,
+    memoryRemoteOptionsSummary: text,
+    memoryModelPlaceholder: text,
+    memoryBasePlaceholder: text,
+    memoryOnnxPlaceholder: text,
+    memoryApiKeyLabel: text,
+    memoryApiKeyPlaceholder: text,
+    memoryEnvPlaceholder: text,
+    memoryNeeds: list,
+    memoryStatusText: text,
+    memoryEnvCommand: text,
+    imageNeeds: list,
+    imageStatusText: text,
+    imageEnvCommand: text,
+    capabilityBadgeTone: () => '',
+    capabilityBadgeLabel: () => '',
+    capabilitySaveButtonClass: () => '',
+    memoryAutoCapture: ref(false),
+    audioEnabled: ref(false),
+    audioApiKey: ref(''),
+    audioApiKeyEnv: ref(''),
+    audioBaseUrl: ref(''),
+    audioTtsVoice: ref(''),
+    audioTtsModel: ref(''),
+    audioLanguageCode: ref(''),
+    audioStatusText: text,
+    audioBadgeTone: text,
+    audioBadgeLabel: text,
+    audioKeyPlaceholder: text,
+  }
+}
+
+describe('useSetupCapabilitiesForm image key state', () => {
+  it('tracks the stored-key state per provider draft across switches', () => {
+    const form = useSetupCapabilitiesForm()
+
+    form.initImageFromConfig({
+      image_generation: {
+        providers: { openrouter: { api_key: '[redacted]' } },
+      },
+    }, {
+      imageGenerationProvider: 'openrouter',
+      imageGenerationPrimary: 'openrouter/google/gemini-3.1-flash-image-preview',
+    }, imageProviders)
+    expect(form.imageKeyConfiguredValue.value).toBe(true)
+
+    form.onImageProviderChange(imageProviders[0])
+    expect(form.imageKeyConfiguredValue.value).toBe(false)
+
+    form.onImageProviderChange(imageProviders[1])
+    expect(form.imageKeyConfiguredValue.value).toBe(true)
+  })
+
+  it('exposes the stored-key state on the panel without ever exposing the key', () => {
+    const form = useSetupCapabilitiesForm()
+
+    form.initImageFromConfig({
+      image_generation: {
+        providers: { openrouter: { api_key: '[redacted]' } },
+      },
+    }, {
+      imageGenerationProvider: 'openrouter',
+      imageGenerationPrimary: 'openrouter/google/gemini-3.1-flash-image-preview',
+    }, imageProviders)
+    const panel = form.createPanel(stubPanelContext())
+
+    expect(panel.value.form.imageKeyConfigured).toBe(true)
+    expect(panel.value.form.imageApiKey).toBe('')
+
+    form.onImageProviderChange(imageProviders[0])
+    expect(panel.value.form.imageKeyConfigured).toBe(false)
+    expect(panel.value.form.imageApiKey).toBe('')
+  })
+
+  it('renders a provider credentialed by a saved env reference as configured', () => {
+    const form = useSetupCapabilitiesForm()
+
+    form.initImageFromConfig({
+      image_generation: {
+        providers: { openrouter: { api_key_env: 'CUSTOM_OPENROUTER_ENV' } },
+      },
+    }, {
+      imageGenerationProvider: 'openrouter',
+      imageGenerationPrimary: 'openrouter/google/gemini-3.1-flash-image-preview',
+    }, imageProviders)
+
+    expect(form.imageKeyConfiguredValue.value).toBe(true)
+    // The env reference stays editable; only the direct key is write-only.
+    expect(form.imageApiKeyEnvValue.value).toBe('CUSTOM_OPENROUTER_ENV')
+  })
+
+  it('trusts the backend configured status for the matching provider only', () => {
+    const form = useSetupCapabilitiesForm()
+
+    // Ambient-environment credential: nothing stored in config, but the
+    // status RPC already computed that image generation works.
+    form.initImageFromConfig({}, {
+      imageGenerationConfigured: true,
+      imageGenerationProvider: 'openrouter',
+      imageGenerationPrimary: 'openrouter/google/gemini-3.1-flash-image-preview',
+    }, imageProviders)
+    expect(form.imageKeyConfiguredValue.value).toBe(true)
+
+    // The status describes the active provider; another provider without any
+    // stored credential is honestly not configured.
+    form.onImageProviderChange(imageProviders[0])
+    expect(form.imageKeyConfiguredValue.value).toBe(false)
+  })
+})
+
 describe('useSetupCapabilitiesForm provider drafts', () => {
   it('restores each provider model and endpoint across the 0.5.0 event order', () => {
     const form = useSetupCapabilitiesForm()
@@ -292,9 +423,64 @@ describe('useSetupCapabilitiesForm provider drafts', () => {
     })
     expect(form.imagePayload()).not.toHaveProperty('apiKey')
 
+    // Emptying the key field must fall all the way back to "keep": a touched
+    // but empty key would author credentialMode 'direct' and destroy a stored
+    // env reference server-side.
     form.updateField('image', 'apiKey', '')
-    expect(form.imagePayload()).toMatchObject({ credentialMode: 'direct' })
+    expect(form.imagePayload()).not.toHaveProperty('credentialMode')
     expect(form.imagePayload()).not.toHaveProperty('apiKey')
+  })
+
+  it('treats a key field emptied after typing as untouched, keeping the saved credential', () => {
+    const form = useSetupCapabilitiesForm()
+
+    form.initImageFromConfig({
+      image_generation: {
+        providers: { openrouter: { api_key_env: 'CUSTOM_OPENROUTER_ENV' } },
+      },
+    }, {
+      imageGenerationProvider: 'openrouter',
+      imageGenerationPrimary: 'openrouter/google/gemini-3.1-flash-image-preview',
+    }, imageProviders)
+
+    form.updateField('image', 'apiKey', 'sk-typo')
+    expect(form.imagePayload()).toMatchObject({
+      credentialMode: 'direct',
+      apiKey: 'sk-typo',
+    })
+
+    form.updateField('image', 'apiKey', '')
+    const payload = form.imagePayload()
+    expect(payload).not.toHaveProperty('credentialMode')
+    expect(payload).not.toHaveProperty('apiKey')
+    expect(payload).not.toHaveProperty('apiKeyEnv')
+  })
+
+  it('treats an env field emptied after typing as untouched, keeping the saved credential', () => {
+    const form = useSetupCapabilitiesForm()
+
+    form.initImageFromConfig({
+      image_generation: {
+        providers: { openrouter: { api_key: 'sk-saved-direct' } },
+      },
+    }, {
+      imageGenerationProvider: 'openrouter',
+      imageGenerationPrimary: 'openrouter/google/gemini-3.1-flash-image-preview',
+    }, imageProviders)
+
+    form.updateField('image', 'apiKeyEnv', 'TYPO_ENV')
+    expect(form.imagePayload()).toMatchObject({
+      credentialMode: 'env',
+      apiKeyEnv: 'TYPO_ENV',
+    })
+
+    // A touched-but-empty env reference would author credentialMode 'env'
+    // and erase the stored direct key server-side, so blank means "keep".
+    form.updateField('image', 'apiKeyEnv', '')
+    const payload = form.imagePayload()
+    expect(payload).not.toHaveProperty('credentialMode')
+    expect(payload).not.toHaveProperty('apiKey')
+    expect(payload).not.toHaveProperty('apiKeyEnv')
   })
 
   it('distinguishes untouched optional fields from explicit clearing', () => {

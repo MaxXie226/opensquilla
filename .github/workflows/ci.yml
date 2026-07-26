@@ -296,6 +296,7 @@ jobs:
           node scripts/test-desktop-profile-consolidation.mjs
           node scripts/test-desktop-gateway-ownership.mjs
           node scripts/test-desktop-gateway-lifecycle.mjs
+          node scripts/test-desktop-window-lifecycle.mjs
           node scripts/test-desktop-cleanup-contract.mjs
 
   ubuntu-quality:
@@ -916,6 +917,7 @@ jobs:
             'profile-import-flow:scripts/test-profile-import-flow.mjs' \
             'desktop-cleanup-flow:scripts/test-desktop-cleanup-flow.mjs' \
             'gateway-orphan-recovery-flow:scripts/test-desktop-gateway-orphan-recovery-flow.mjs' \
+            'window-background-flow:scripts/test-desktop-window-background-flow.mjs' \
             'unsafe-legacy-recovery-no-write:scripts/test-unsafe-legacy-recovery-no-write.mjs'
           do
             name="${entry%%:*}"

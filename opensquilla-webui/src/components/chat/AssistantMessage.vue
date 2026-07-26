@@ -31,6 +31,7 @@
           :step-count="activityStepCount"
           :failure-count="activityProjection.failureCount"
           :duration-seconds="activityDurationSeconds"
+          :summary-label="activitySummaryLabel"
           :completion-confirmed="activityCompletionConfirmed"
           :default-open="activityDefaultOpen"
           :state-key="activityStateKey"
@@ -582,18 +583,52 @@ const activityContinuityKey = computed(() =>
 )
 const activityDurationSeconds = computed(() => {
   const measured = measuredActivityDurationSeconds.value
-  if (measured > 0) {
-    writeAssistantActivityDuration(
-      activityStateKey.value,
-      measured,
-      activityContinuityKey.value,
-    )
-    return measured
-  }
+  if (measured > 0) return measured
   return readAssistantActivityDuration(
     activityStateKey.value,
     activityContinuityKey.value,
   )
+})
+
+// Persisting a measured duration is a side effect, so it lives in a watcher
+// rather than the computed read path above: renders stay pure, and the value
+// is recorded even on rows that never render a disclosure to read it.
+watch(
+  () => [
+    measuredActivityDurationSeconds.value,
+    activityStateKey.value,
+    activityContinuityKey.value,
+  ] as const,
+  ([measured, stateKey, continuityKey]) => {
+    if (measured > 0) writeAssistantActivityDuration(stateKey, measured, continuityKey)
+  },
+  { immediate: true },
+)
+
+const activityElapsedLabel = computed(() => {
+  const seconds = Math.max(0, Math.floor(activityDurationSeconds.value || 0))
+  if (seconds <= 0) return ''
+  if (seconds < 60) return t('chat.workedForSeconds', { seconds })
+  return t('chat.workedForMinutes', {
+    minutes: Math.floor(seconds / 60),
+    seconds: seconds % 60,
+  })
+})
+
+// The collapsed row leads with what the turn did (the projection's footprint,
+// which already caps itself at two kinds plus a "{count} more" descriptor) and
+// appends the elapsed time last — time is the least important fact, so it must
+// not lead. An empty footprint passes '' so the disclosure keeps its own
+// duration/count fallback chain.
+const activitySummaryLabel = computed(() => {
+  const summary = activityProjection.value.footprintSummary
+  if (!summary.codes.length) return ''
+  const parts = summary.codes.map(part => String(t(part.code, part.params)))
+  if (summary.remaining) {
+    parts.push(String(t(summary.remaining.code, summary.remaining.params)))
+  }
+  if (activityElapsedLabel.value) parts.push(activityElapsedLabel.value)
+  return parts.join(' · ')
 })
 
 function onMessageClick(event: MouseEvent) {

@@ -43,7 +43,10 @@ import type {
   ChatToolCallRenderItem,
   ToolResultContext,
 } from '@/types/chat'
-import type { AssistantActivityTimelineProjection } from '@/utils/chat/assistantActivity'
+import {
+  type AssistantActivityTimelineProjection,
+  isSemanticActivityStatusStep,
+} from '@/utils/chat/assistantActivity'
 import { toolIconName, toolOperationKey } from '@/utils/chat/toolDisplay'
 
 const props = defineProps<{
@@ -73,14 +76,12 @@ const statusSteps = computed(() => {
 
   // The live header owns the current lifecycle phase. Repeating that phase in
   // the body creates pairs such as "Working / Working" and makes transport
-  // phases look like meaningful agent actions. Keep only prior semantic
-  // actions here; completed/history playback can still show the full phase
-  // record when the user expands it.
+  // phases look like meaningful agent actions. The shared predicate keeps this
+  // body filter and the header's step count agreeing by construction;
+  // completed/history playback can still show the full phase record when the
+  // user expands it.
   return props.projection.statusSteps
-    .filter(step =>
-      !step.isCurrent
-      && !step.label.code.startsWith('chat.activity.lifecycle.'),
-    )
+    .filter(isSemanticActivityStatusStep)
     .slice(-3)
 })
 
@@ -158,7 +159,7 @@ const items = computed<ChatStreamTimelineItem[]>(() => {
   display: flex;
   align-items: center;
   min-height: 1.75rem;
-  gap: 0.5rem;
+  gap: 0.625rem;
   padding: 0.25rem 0.125rem;
   color: color-mix(in srgb, var(--text) 62%, transparent);
   font-size: 0.8125rem;
@@ -169,10 +170,13 @@ const items = computed<ChatStreamTimelineItem[]>(() => {
   color: color-mix(in srgb, var(--text) 82%, transparent);
 }
 
+/* The dot centers in the same 0.875rem marker column the tool-row icons use,
+   so phase text and tool-row labels share one left origin (1.625rem). */
 .assistant-activity-status__dot {
   width: 0.375rem;
   height: 0.375rem;
   flex: 0 0 auto;
+  margin: 0 0.25rem;
   border-radius: var(--radius-full);
   background: currentColor;
 }
