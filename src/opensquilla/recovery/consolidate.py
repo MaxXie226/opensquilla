@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from opensquilla.recovery.atomic import (
+    _copy_windows_mount_point_no_follow,
     _native_io_path,
     native_move_no_replace,
     profile_no_follow_manifest,
@@ -58,6 +59,9 @@ _DEFERRAL_MARKER_NAME = ".opensquilla-profile-consolidation-deferred"
 _BACKUPS_RELATIVE = Path("backups") / "profile-consolidation"
 _STAGING_PREFIX = ".opensquilla.profile-consolidation."
 _SOURCE_READ_PROTOCOL = "private-sqlite-v1"
+_WINDOWS_IO_REPARSE_TAG_MOUNT_POINT = 0xA0000003
+_WINDOWS_IO_REPARSE_TAG_SYMLINK = 0xA000000C
+_WINDOWS_FILE_ATTRIBUTE_DIRECTORY = 0x10
 _MAX_TIMESTAMP_NS = (1 << 63) - 1
 _EXCLUDED_AUTHORITY_NAMES = frozenset(
     {
@@ -636,6 +640,7 @@ def _write_text_native(path: Path, data: str) -> None:
 def _normalized_path(path: Path) -> str:
     return os.path.normcase(os.path.normpath(str(path.expanduser().absolute())))
 
+
 def _resolved_native_path(path: Path) -> str:
     """Resolve through the OS namespace but keep journals namespace-neutral."""
 
@@ -646,7 +651,6 @@ def _resolved_native_path(path: Path) -> str:
         elif resolved.startswith("\\\\?\\"):
             resolved = resolved[4:]
     return os.path.normcase(os.path.normpath(resolved))
-
 
 
 def _profile_relative_path(path: Path, primary_home: Path) -> Path | None:
@@ -1264,9 +1268,22 @@ def _same_leaf(source: Path, destination: Path) -> bool:
     if _is_link_or_reparse(source_stat) or _is_link_or_reparse(destination_stat):
         if not (_is_link_or_reparse(source_stat) and _is_link_or_reparse(destination_stat)):
             return False
-        return os.readlink(_native_io_path(source)) == os.readlink(
-            _native_io_path(destination)
-        )
+        source_tag = int(getattr(source_stat, "st_reparse_tag", 0))
+        destination_tag = int(getattr(destination_stat, "st_reparse_tag", 0))
+        if source_tag != destination_tag:
+            return False
+        if os.name == "nt":
+            source_is_directory = bool(
+                int(getattr(source_stat, "st_file_attributes", 0))
+                & _WINDOWS_FILE_ATTRIBUTE_DIRECTORY
+            )
+            destination_is_directory = bool(
+                int(getattr(destination_stat, "st_file_attributes", 0))
+                & _WINDOWS_FILE_ATTRIBUTE_DIRECTORY
+            )
+            if source_is_directory != destination_is_directory:
+                return False
+        return os.readlink(_native_io_path(source)) == os.readlink(_native_io_path(destination))
     if stat.S_ISREG(source_stat.st_mode) and stat.S_ISREG(destination_stat.st_mode):
         return source_stat.st_size == destination_stat.st_size and (
             _file_digest(source) == _file_digest(destination)
@@ -1355,6 +1372,40 @@ def _atomic_copy_regular(
         _unlink_native(temporary, missing_ok=True)
 
 
+def _atomic_copy_windows_mount_point(
+    source: Path,
+    destination: Path,
+    *,
+    transaction_id: str,
+) -> None:
+    """Publish a complete junction without exposing its empty creation leaf."""
+
+    _ensure_plain_directory(destination.parent)
+    for _attempt in range(8):
+        nonce = uuid.uuid4().hex
+        token = hashlib.sha256(
+            f"{transaction_id}\0{destination}\0{nonce}".encode("utf-8", "surrogatepass")
+        ).hexdigest()[:24]
+        temporary = destination.with_name(f".opensquilla-junction-{token}.tmp")
+        try:
+            _copy_windows_mount_point_no_follow(
+                source,
+                temporary,
+                publish_destination=destination,
+            )
+            _fsync_directory(destination.parent)
+            return
+        except FileExistsError:
+            if _lexists(destination):
+                if not _same_leaf(source, destination):
+                    raise
+                return
+            # A same-name temporary can only be an untrusted collision. Never
+            # delete it; retry with a fresh, unpredictable transaction leaf.
+            continue
+    raise UnsafePathError("cannot allocate a private junction publish temporary")
+
+
 def _copy_leaf(
     source: Path,
     destination: Path,
@@ -1368,13 +1419,31 @@ def _copy_leaf(
     else:
         _makedirs_native(destination.parent)
     if _is_link_or_reparse(value):
-        target_is_directory = bool(int(getattr(value, "st_file_attributes", 0)) & 0x10)
+        reparse_tag = int(getattr(value, "st_reparse_tag", 0))
+        target_is_directory = bool(
+            int(getattr(value, "st_file_attributes", 0)) & _WINDOWS_FILE_ATTRIBUTE_DIRECTORY
+        )
+        if os.name == "nt" and reparse_tag not in {
+            _WINDOWS_IO_REPARSE_TAG_MOUNT_POINT,
+            _WINDOWS_IO_REPARSE_TAG_SYMLINK,
+        }:
+            raise UnsafePathError(f"unsupported Windows recovery reparse tag: 0x{reparse_tag:08X}")
         try:
-            os.symlink(
-                os.readlink(_native_io_path(source)),
-                _native_io_path(destination),
-                target_is_directory=target_is_directory,
-            )
+            if os.name == "nt" and reparse_tag == _WINDOWS_IO_REPARSE_TAG_MOUNT_POINT:
+                if durable:
+                    _atomic_copy_windows_mount_point(
+                        source,
+                        destination,
+                        transaction_id=transaction_id,
+                    )
+                else:
+                    _copy_windows_mount_point_no_follow(source, destination)
+            else:
+                os.symlink(
+                    os.readlink(_native_io_path(source)),
+                    _native_io_path(destination),
+                    target_is_directory=target_is_directory,
+                )
         except FileExistsError:
             if not _same_leaf(source, destination):
                 raise
@@ -1384,11 +1453,23 @@ def _copy_leaf(
         if durable:
             _ensure_plain_directory(destination)
         else:
-            shutil.copytree(
-                _native_io_path(source),
-                _native_io_path(destination),
-                symlinks=True,
-            )
+            os.mkdir(_native_io_path(destination), mode=0o700)
+            with os.scandir(_native_io_path(source)) as entries:
+                entry_names = sorted(entry.name for entry in entries)
+            for entry_name in entry_names:
+                _copy_leaf(source / entry_name, destination / entry_name)
+            try:
+                shutil.copystat(
+                    _native_io_path(source),
+                    _native_io_path(destination),
+                    follow_symlinks=False,
+                )
+            except OSError as exc:
+                # Match shutil.copytree's Windows behavior: copying directory
+                # metadata is best-effort when Win32 cannot apply it. Content,
+                # link, and non-Windows failures remain fail-closed.
+                if os.name != "nt" or getattr(exc, "winerror", None) is None:
+                    raise
     elif stat.S_ISREG(value.st_mode):
         if durable:
             _atomic_copy_regular(
@@ -1624,11 +1705,7 @@ def _merge_workspace_tree(
 def _clone_primary(primary_home: Path, staging: Path) -> None:
     if _lexists(primary_home):
         before = profile_no_follow_manifest(primary_home)
-        shutil.copytree(
-            _native_io_path(primary_home),
-            _native_io_path(staging),
-            symlinks=True,
-        )
+        _copy_leaf(primary_home, staging)
         after = profile_no_follow_manifest(primary_home)
         if before != after:
             raise UnsafePathError("primary profile changed while staging consolidation")
@@ -2956,9 +3033,10 @@ def _archive_and_finish(
             # update. A pathname (especially a dangling reparse point) is not
             # evidence: validate the exact identities and snapshots consumed.
             archived_profiles = _enumerate_recoveries(backup_path)
-            if tuple(
-                profile.recovery_id for profile in archived_profiles
-            ) != result.consumed_recovery_ids:
+            if (
+                tuple(profile.recovery_id for profile in archived_profiles)
+                != result.consumed_recovery_ids
+            ):
                 raise UnsafePathError(
                     "archived recovery profiles do not match the consolidation journal"
                 )
@@ -3518,9 +3596,7 @@ def _resume(
             else recovery_homes
         )
         if phase in {"recoveries_archived", "context_written"}:
-            legacy_homes = (
-                (primary_home,) if os.path.isdir(_native_io_path(primary_home)) else ()
-            )
+            legacy_homes = (primary_home,) if os.path.isdir(_native_io_path(primary_home)) else ()
         with acquire_legacy_gateway_locks(
             *legacy_homes,
             read_only_homes=recovery_homes,

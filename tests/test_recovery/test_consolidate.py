@@ -8,10 +8,12 @@ import json
 import os
 import shutil
 import sqlite3
+import stat
 import subprocess
 import tomllib
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from typer.testing import CliRunner
@@ -19,10 +21,29 @@ from typer.testing import CliRunner
 from opensquilla.cli.recovery_cmd import recovery_app
 from opensquilla.recovery.atomic import _native_io_path
 from opensquilla.recovery.consolidate import consolidate_recovery_profiles
+from opensquilla.recovery.errors import UnsafePathError
 
 
 def _is_file(path: Path) -> bool:
     return os.path.isfile(_native_io_path(path))
+
+
+def _link_assertion_target(target: str) -> str:
+    """Normalize only equivalent Win32 spellings used by test assertions."""
+
+    if os.name != "nt":
+        return target
+    lowered = target.lower()
+    if lowered.startswith("\\\\?\\unc\\"):
+        return "\\\\" + target[8:]
+    if (
+        lowered.startswith("\\\\?\\")
+        and len(target) >= 7
+        and target[4].isalpha()
+        and target[5:7] == ":\\"
+    ):
+        return target[4:]
+    return target
 
 
 def _read_text(path: Path) -> str:
@@ -458,11 +479,7 @@ def test_consolidates_extended_length_recovery_leaf(
     with open(_native_io_path(source_leaf), "wb") as handle:
         handle.write(b"long path recovery data")
     assert len(str(source_leaf)) > 260
-    workspace_relative = (
-        Path("shared-" + ("w" * 90))
-        / ("x" * 100)
-        / "MEMORY.md"
-    )
+    workspace_relative = Path("shared-" + ("w" * 90)) / ("x" * 100) / "MEMORY.md"
     source_workspace_leaf = recovery / "opensquilla" / "workspace" / workspace_relative
     os.makedirs(_native_io_path(source_workspace_leaf.parent), exist_ok=True)
     with open(_native_io_path(source_workspace_leaf), "wb") as handle:
@@ -471,11 +488,7 @@ def test_consolidates_extended_length_recovery_leaf(
     os.makedirs(_native_io_path(primary_workspace_leaf.parent), exist_ok=True)
     with open(_native_io_path(primary_workspace_leaf), "w", encoding="utf-8") as handle:
         handle.write("primary memory\n")
-    media_relative = (
-        Path("shared-" + ("m" * 90))
-        / ("n" * 100)
-        / "deep-transcript-attachment.bin"
-    )
+    media_relative = Path("shared-" + ("m" * 90)) / ("n" * 100) / "deep-transcript-attachment.bin"
     source_media_leaf = recovery / "opensquilla" / "media" / media_relative
     os.makedirs(_native_io_path(source_media_leaf.parent), exist_ok=True)
     with open(_native_io_path(source_media_leaf), "wb") as handle:
@@ -500,9 +513,7 @@ def test_consolidates_extended_length_recovery_leaf(
     preserved_leaf = primary / "recovered-data" / recovery_id / "profile" / "state" / relative
     assert _read_bytes(archived_leaf) == b"long path recovery data"
     assert _read_bytes(preserved_leaf) == b"long path recovery data"
-    assert _read_text(primary_workspace_leaf) == (
-        "primary memory\n\nlong path workspace data\n"
-    )
+    assert _read_text(primary_workspace_leaf) == ("primary memory\n\nlong path workspace data\n")
     assert _read_bytes(primary / "media" / media_relative) == b"long path media data"
     with (
         contextlib.closing(sqlite3.connect(primary / "state" / "sessions.db")) as connection,
@@ -2047,7 +2058,7 @@ def test_copying_workspace_symlink_never_follows_it_for_directory_hint(
     consolidate_module._copy_leaf(source, destination)
 
     assert destination.is_symlink()
-    assert os.readlink(destination) == str(outside)
+    assert _link_assertion_target(os.readlink(destination)) == _link_assertion_target(str(outside))
 
 
 def _external_primary_config(
@@ -4073,3 +4084,359 @@ def test_extended_length_user_data_root_consolidates_sessions(
         "agent:main:long-root-primary",
         "agent:main:long-root-recovery",
     }
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows path spelling")
+@pytest.mark.parametrize(
+    ("target", "expected"),
+    [
+        (r"..\relative-target", r"..\relative-target"),
+        (r"\\?\C:\local\target", r"C:\local\target"),
+        (r"\\?\UNC\server\share\target", r"\\server\share\target"),
+        (
+            r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\target",
+            r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\target",
+        ),
+        (
+            r"\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy1\target",
+            r"\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy1\target",
+        ),
+    ],
+)
+def test_link_assertion_target_only_removes_drive_and_unc_prefixes(
+    target: str,
+    expected: str,
+) -> None:
+    assert _link_assertion_target(target) == expected
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows reparse semantics")
+def test_copy_leaf_preserves_verbatim_symlink_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source-link"
+    source.write_bytes(b"synthetic source")
+    destination = tmp_path / "destination" / "copied-link"
+    target = "\\\\?\\C:\\verbatim\\" + ("x" * 270) + "\\tail. "
+    consolidate_module = importlib.import_module("opensquilla.recovery.consolidate")
+    real_lstat = consolidate_module.os.lstat
+    native_source = os.path.normcase(os.path.normpath(str(_native_io_path(source))))
+
+    def link_lstat(path):
+        if os.path.normcase(os.path.normpath(str(path))) == native_source:
+            return SimpleNamespace(
+                st_mode=stat.S_IFLNK,
+                st_file_attributes=0x400,
+                st_reparse_tag=0xA000000C,
+            )
+        return real_lstat(path)
+
+    created: list[tuple[str, object, bool]] = []
+    monkeypatch.setattr(consolidate_module.os, "lstat", link_lstat)
+    monkeypatch.setattr(consolidate_module.os, "readlink", lambda _path: target)
+    monkeypatch.setattr(
+        consolidate_module.os,
+        "symlink",
+        lambda link_target, path, *, target_is_directory: created.append(
+            (link_target, path, target_is_directory)
+        ),
+    )
+
+    consolidate_module._copy_leaf(source, destination)
+
+    assert created == [(target, _native_io_path(destination), False)]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires a real Windows junction")
+def test_durable_junction_resume_ignores_crashed_temporary_and_publishes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "outside"
+    target.mkdir()
+    source = tmp_path / "source-junction"
+    completed = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(source), str(target)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        pytest.skip(f"junction creation is unavailable: {completed.stderr}")
+    destination = tmp_path / "external" / "workspace-link"
+    destination.parent.mkdir()
+    consolidate_module = importlib.import_module("opensquilla.recovery.consolidate")
+    real_copy = consolidate_module._copy_windows_mount_point_no_follow
+    attempted_temporaries: list[Path] = []
+
+    def crash_once(source_path, temporary, *, publish_destination=None):
+        temporary_path = Path(temporary)
+        attempted_temporaries.append(temporary_path)
+        if len(attempted_temporaries) == 1:
+            temporary_path.mkdir()
+            raise RuntimeError("simulated process exit between create and SET")
+        return real_copy(
+            source_path,
+            temporary_path,
+            publish_destination=publish_destination,
+        )
+
+    monkeypatch.setattr(
+        consolidate_module,
+        "_copy_windows_mount_point_no_follow",
+        crash_once,
+    )
+
+    with pytest.raises(RuntimeError, match="simulated process exit"):
+        consolidate_module._atomic_copy_windows_mount_point(
+            source,
+            destination,
+            transaction_id="transaction-a",
+        )
+
+    orphan = attempted_temporaries[0]
+    assert orphan.is_dir()
+    assert not os.path.isjunction(orphan)
+    assert not os.path.lexists(destination)
+
+    consolidate_module._copy_leaf(
+        source,
+        destination,
+        durable=True,
+        transaction_id="transaction-a",
+    )
+
+    assert len(attempted_temporaries) == 2
+    assert attempted_temporaries[1] != orphan
+    assert orphan.is_dir()
+    assert os.path.isjunction(destination)
+    assert os.path.samefile(destination, target)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires a real Windows junction")
+def test_durable_junction_is_idempotent_when_destination_already_matches(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "outside"
+    target.mkdir()
+    source = tmp_path / "source-junction"
+    destination_parent = tmp_path / "external"
+    destination_parent.mkdir()
+    destination = destination_parent / "workspace-link"
+    for link in (source, destination):
+        completed = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if completed.returncode != 0:
+            pytest.skip(f"junction creation is unavailable: {completed.stderr}")
+    consolidate_module = importlib.import_module("opensquilla.recovery.consolidate")
+
+    consolidate_module._copy_leaf(
+        source,
+        destination,
+        durable=True,
+        transaction_id="transaction-b",
+    )
+
+    assert os.path.isjunction(destination)
+    assert os.path.samefile(destination, target)
+    assert not [
+        entry.name
+        for entry in os.scandir(destination_parent)
+        if entry.name.startswith(".opensquilla-junction-")
+    ]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows metadata semantics")
+def test_clone_primary_keeps_windows_directory_metadata_best_effort(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary = tmp_path / "primary"
+    (primary / "workspace").mkdir(parents=True)
+    (primary / "workspace" / "MEMORY.md").write_text("preserved\n", encoding="utf-8")
+    staging = tmp_path / "staging"
+    consolidate_module = importlib.import_module("opensquilla.recovery.consolidate")
+    calls: list[tuple[object, object, bool]] = []
+
+    def fail_windows_directory_metadata(source, destination, *, follow_symlinks):
+        calls.append((source, destination, follow_symlinks))
+        error = OSError(errno.EACCES, "injected Windows directory metadata failure")
+        error.winerror = 5
+        raise error
+
+    monkeypatch.setattr(consolidate_module.shutil, "copystat", fail_windows_directory_metadata)
+
+    consolidate_module._clone_primary(primary, staging)
+
+    assert calls
+    assert (staging / "workspace" / "MEMORY.md").read_text(encoding="utf-8") == "preserved\n"
+
+
+def test_clone_primary_propagates_non_win32_directory_metadata_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary = tmp_path / "primary"
+    primary.mkdir()
+    (primary / "config.toml").write_text("port = 18789\n", encoding="utf-8")
+    staging = tmp_path / "staging"
+    consolidate_module = importlib.import_module("opensquilla.recovery.consolidate")
+
+    def fail_directory_metadata(*_args, **_kwargs):
+        raise OSError(errno.EIO, "injected non-Win32 metadata failure")
+
+    monkeypatch.setattr(consolidate_module.shutil, "copystat", fail_directory_metadata)
+
+    with pytest.raises(OSError, match="non-Win32 metadata failure"):
+        consolidate_module._clone_primary(primary, staging)
+
+    assert primary.is_dir()
+    assert (primary / "config.toml").read_text(encoding="utf-8") == "port = 18789\n"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires a real Windows junction")
+def test_clone_primary_preserves_nested_junction_without_symlink_privilege(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary = tmp_path / "primary"
+    junction_parent = primary / "workspace" / "node_modules"
+    junction_parent.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "sentinel.txt"
+    sentinel.write_text("outside\n", encoding="utf-8")
+    source_junction = junction_parent / "cache"
+    completed = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(source_junction), str(outside)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        pytest.skip(f"junction creation is unavailable: {completed.stderr}")
+    source_target = os.readlink(source_junction)
+    staging = tmp_path / "staging"
+    consolidate_module = importlib.import_module("opensquilla.recovery.consolidate")
+
+    def reject_symlink(*_args, **_kwargs) -> None:
+        raise AssertionError("junction cloning must not call os.symlink")
+
+    monkeypatch.setattr(consolidate_module.os, "symlink", reject_symlink)
+
+    consolidate_module._clone_primary(primary, staging)
+
+    copied = staging / "workspace" / "node_modules" / "cache"
+    assert os.path.isjunction(source_junction)
+    assert os.path.isjunction(copied)
+    assert source_junction.lstat().st_reparse_tag == copied.lstat().st_reparse_tag == 0xA0000003
+    assert os.readlink(copied) == source_target
+    assert os.path.samefile(copied, outside)
+    assert sentinel.read_text(encoding="utf-8") == "outside\n"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows reparse semantics")
+def test_copy_leaf_rejects_unknown_windows_reparse_tag(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    destination = tmp_path / "destination" / "copied"
+    consolidate_module = importlib.import_module("opensquilla.recovery.consolidate")
+    real_lstat = os.lstat
+    native_source = os.path.normcase(os.path.normpath(str(_native_io_path(source))))
+
+    def tagged_lstat(path):
+        if os.path.normcase(os.path.normpath(str(path))) == native_source:
+            current = real_lstat(path)
+            return SimpleNamespace(
+                st_mode=current.st_mode,
+                st_file_attributes=0x410,
+                st_reparse_tag=0xA000001D,
+            )
+        return real_lstat(path)
+
+    monkeypatch.setattr(consolidate_module.os, "lstat", tagged_lstat)
+
+    with pytest.raises(UnsafePathError, match="unsupported Windows recovery reparse tag"):
+        consolidate_module._copy_leaf(source, destination)
+
+    assert not os.path.lexists(_native_io_path(destination))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows reparse semantics")
+def test_same_leaf_distinguishes_windows_junction_from_symlink(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    consolidate_module = importlib.import_module("opensquilla.recovery.consolidate")
+    source = Path("C:/synthetic/source")
+    destination = Path("C:/synthetic/destination")
+    values = {
+        os.path.normcase(str(_native_io_path(source))): SimpleNamespace(
+            st_mode=stat.S_IFDIR,
+            st_file_attributes=0x410,
+            st_reparse_tag=0xA0000003,
+        ),
+        os.path.normcase(str(_native_io_path(destination))): SimpleNamespace(
+            st_mode=stat.S_IFLNK,
+            st_file_attributes=0x410,
+            st_reparse_tag=0xA000000C,
+        ),
+    }
+
+    monkeypatch.setattr(
+        consolidate_module.os,
+        "lstat",
+        lambda path: values[os.path.normcase(str(path))],
+    )
+    monkeypatch.setattr(
+        consolidate_module.os,
+        "readlink",
+        lambda _path: (_ for _ in ()).throw(AssertionError("different tags need no readlink")),
+    )
+
+    assert not consolidate_module._same_leaf(source, destination)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows reparse semantics")
+def test_same_leaf_keeps_verbatim_and_non_verbatim_targets_distinct(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    consolidate_module = importlib.import_module("opensquilla.recovery.consolidate")
+    source = Path("C:/synthetic/source")
+    destination = Path("C:/synthetic/destination")
+    values = {
+        os.path.normcase(str(_native_io_path(source))): SimpleNamespace(
+            st_mode=stat.S_IFLNK,
+            st_file_attributes=0x400,
+            st_reparse_tag=0xA000000C,
+        ),
+        os.path.normcase(str(_native_io_path(destination))): SimpleNamespace(
+            st_mode=stat.S_IFLNK,
+            st_file_attributes=0x400,
+            st_reparse_tag=0xA000000C,
+        ),
+    }
+    targets = {
+        os.path.normcase(str(_native_io_path(source))): r"\\?\C:\root\tail. ",
+        os.path.normcase(str(_native_io_path(destination))): r"C:\root\tail. ",
+    }
+
+    monkeypatch.setattr(
+        consolidate_module.os,
+        "lstat",
+        lambda path: values[os.path.normcase(str(path))],
+    )
+    monkeypatch.setattr(
+        consolidate_module.os,
+        "readlink",
+        lambda path: targets[os.path.normcase(str(path))],
+    )
+
+    assert not consolidate_module._same_leaf(source, destination)
