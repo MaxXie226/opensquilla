@@ -66,7 +66,8 @@
     "discard": "放弃",
     "cancel": "取消",
     "edit": "编辑",
-    "delete": "删除"
+    "delete": "删除",
+    "dismiss": "忽略"
   },
   "nav": {
     "chat": "对话",
@@ -872,6 +873,15 @@
       "fallbacks": "回退模型",
       "fallbacksHint": "以逗号分隔的“服务商/模型”标识；当主模型失败时按顺序尝试。"
     },
+    "capabilities": {
+      "imageStatus": {
+        "missingEnv": "缺少环境变量 {name}。在下方填入密钥，或设置该环境变量后重启网关。"
+      },
+      "imageKeyConfigured": "已配置密钥",
+      "imageKeyMissing": "尚未配置",
+      "imageKeyPlaceholderKeep": "留空则保持已保存的密钥",
+      "imageKeyPlaceholderNew": "粘贴 API 密钥"
+    },
     "audio": {
       "title": "音频",
       "enableLabel": "启用语音和音频工具",
@@ -941,6 +951,8 @@
       "closeBehaviorReadFailed": "无法读取窗口关闭设置：{error}",
       "closeBehaviorSaveFailed": "无法保存窗口关闭设置：{error}",
       "closeBehaviorBackgroundUnavailable": "此平台不支持后台运行。",
+      "closeBehaviorFallbackQuit": "此平台不支持后台运行，关闭窗口时将直接退出应用。",
+      "closeBehaviorRetry": "重试",
       "resetConfirmTitle": "重置已保存的设置？",
       "resetConfirmBody": "这将清除已保存的桌面凭据和生成的配置。下次启动将重新运行首次设置。",
       "resetConfirmPrimary": "重置",
@@ -1117,11 +1129,11 @@
     },
     "privacy": {
       "title": "隐私",
-      "statusEnabled": "提供商请求关联和统一网络可观测性已启用。",
-      "statusDisabled": "提供商请求关联和统一网络可观测性已禁用。",
-      "statusDisabledByEnv": "提供商请求关联和统一网络可观测性已由专用隐私环境变量禁用。",
-      "disableNetworkObservabilityLabel": "禁用网络可观测性和提供商请求关联",
-      "disableNetworkObservabilityDesc": "停止自动安装遥测、被动更新检查，以及发往 TokenRhythm 官方 HTTPS API 的请求所携带的不透明会话、轮次、执行和调用类型关联标头。用户主动发起的模型请求仍会正常执行。",
+      "statusEnabled": "网络上报已开启。",
+      "statusDisabled": "网络上报已关闭。",
+      "statusDisabledByEnv": "网络上报已被环境变量设置关闭。",
+      "disableNetworkObservabilityLabel": "关闭网络上报",
+      "disableNetworkObservabilityDesc": "停止安装遥测、后台更新检查，以及用于串联同一次会话请求的匿名标识——这些标识只会发送给官方 TokenRhythm API。你主动发起的模型请求不受影响。",
       "save": "保存隐私设置"
     },
     "toast": {
@@ -2720,6 +2732,7 @@
     "latest": "最新",
     "thinking": "思考中",
     "thoughtProcess": "思考过程",
+    "thinkingForSeconds": "思考中 · {seconds} 秒",
     "thoughtForSeconds": "思考了 {seconds} 秒",
     "thoughtForMinutes": "思考了 {minutes} 分 {seconds} 秒",
     "toolResult": "工具结果",
@@ -2784,6 +2797,7 @@
       "ensembleDetailUnavailable": "{count} 个候选 · 明细不可用"
     },
     "sources": "来源",
+    "activityLabel": "活动",
     "activitySteps": "活动 · {count} 步",
     "activityItems": "活动 · {count} 项",
     "activityCompletedItems": "已完成 · {count} 项",
@@ -2798,7 +2812,7 @@
         "answering": "正在组织回答",
         "settled": "已完成",
         "interrupted": "已中断",
-        "failed": "未完成"
+        "failed": "已失败"
       },
       "purpose": {
         "discover": "发现链接",
@@ -2811,6 +2825,17 @@
         "recall": "检索记忆",
         "use": "使用工具"
       },
+      "purposeRunning": {
+        "discover": "正在发现链接",
+        "search": "正在搜索网页",
+        "read": "正在读取网页",
+        "inspect": "正在检查文件",
+        "change": "正在编辑文件",
+        "run": "正在运行命令",
+        "create": "正在创建产物",
+        "recall": "正在检索记忆",
+        "use": "正在使用工具"
+      },
       "footprint": {
         "web": "{count} 次网页操作",
         "files": "{count} 个文件",
@@ -2820,7 +2845,9 @@
         "memory": "{count} 次记忆检索",
         "tools": "{count} 次工具调用"
       },
-      "more": "另有 {count} 项"
+      "more": "另有 {count} 项",
+      "stale": "仍在工作 —— 暂无新信号",
+      "liveStep": "第 {n} 步"
     },
     "suggestedTasks": "推荐任务",
     "greetingMorning": "早上好。",
@@ -2985,7 +3012,8 @@
       "downloadFailed": "下载失败",
       "forkFailed": "复刻失败",
       "copyFailed": "复制失败",
-      "shareExportFailed": "分享导出失败",
+      "shareSaveFailed": "无法保存图片，请重试。",
+      "sharePreviewUpdateFailed": "无法更新预览，请重试。",
       "saved": "已保存 {filename}",
       "copiedToClipboard": "已复制到剪贴板",
       "copyNotSupported": "不支持复制 — 请改为下载",
@@ -3000,6 +3028,11 @@
       "voiceUnavailable": "语音输入不可用，请在设置中启用。",
       "voiceTranscribeFailed": "无法转写你的录音，请重试。",
       "voiceSetupNeeded": "语音识别需要配置 ElevenLabs API key —— 正在打开设置……",
+      "voiceCancelledHidden": "窗口隐藏时已停止录音。重新开始即可继续口述。",
+      "voiceMicDenied": "麦克风访问被拒绝，请在浏览器设置中允许。",
+      "voiceMicDeniedDesktop": "麦克风访问被拒绝。请在系统设置中允许后重试。",
+      "voiceMicMissing": "未找到麦克风。",
+      "voiceRecordFailed": "无法开始录音，请重试。",
       "waitAttachments": "请等待文件附件处理完成",
       "waitCompactionBeforeCommand": "请等待上下文压缩完成后再运行 {command}。",
       "waitResponseBeforeCommand": "请等待当前回复结束后再运行 {command}。",
@@ -3015,8 +3048,7 @@
       "preparingOutput": "准备输出",
       "generatingCandidates": "正在生成候选",
       "synthesizingCandidates": "正在聚合候选",
-      "stillWaiting": "仍在等待模型",
-      "stillWorking": "仍在处理 — 上次信号 {seconds} 秒前"
+      "stillWaiting": "仍在等待模型"
     },
     "stall": {
       "title": "回复耗时超出预期",

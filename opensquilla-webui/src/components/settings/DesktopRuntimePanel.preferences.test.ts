@@ -81,6 +81,9 @@ describe('DesktopRuntimePanel close behavior preference', () => {
 
     expect(getDesktopPreferences).toHaveBeenCalledTimes(1)
     expect(select.value).toBe('quit')
+    // The label/select association must hold whenever the select exists.
+    const label = el.querySelector<HTMLLabelElement>('.control-row__label')
+    expect(label?.getAttribute('for')).toBe('desktop-close-behavior-select')
 
     select.value = 'ask'
     select.dispatchEvent(new Event('change', { bubbles: true }))
@@ -116,6 +119,73 @@ describe('DesktopRuntimePanel close behavior preference', () => {
       message: 'Could not save the window close setting: preferences are read-only',
       tone: 'danger',
     })
+    app.unmount()
+  })
+
+  it('keeps the row rendered with an inline error and Retry when reading fails', async () => {
+    const getDesktopPreferences = vi.fn()
+      .mockRejectedValueOnce(new Error('bridge timed out'))
+      .mockResolvedValue({
+        mainWindowCloseBehavior: 'ask' as const,
+        canRunInBackground: true,
+        platform: 'darwin' as const,
+      })
+    const { app, el } = await mountPanel(desktopApi({
+      getDesktopPreferences,
+      saveDesktopPreferences: vi.fn(),
+    }))
+
+    const row = el.querySelector<HTMLElement>('[data-testid="desktop-close-behavior"]')
+    if (!row) throw new Error('Desktop close behavior row was not rendered')
+    expect(row.textContent).toContain('When closing the main window')
+    expect(row.textContent).toContain(
+      'Could not read the window close setting: bridge timed out',
+    )
+    expect(el.querySelector('[data-testid="desktop-close-behavior-select"]')).toBeNull()
+    // With the select absent, the label must not carry a dangling `for` —
+    // assistive tech resolves that to nothing, which is worse than no `for`.
+    const label = el.querySelector<HTMLLabelElement>('.control-row__label')
+    if (!label) throw new Error('Close behavior label was not rendered')
+    expect(label.hasAttribute('for')).toBe(false)
+
+    const retry = el.querySelector<HTMLButtonElement>(
+      '[data-testid="desktop-close-behavior-retry"]',
+    )
+    if (!retry) throw new Error('Retry button was not rendered')
+    expect(retry.textContent).toContain('Retry')
+    retry.click()
+    await settle()
+
+    expect(getDesktopPreferences).toHaveBeenCalledTimes(2)
+    expect(el.textContent).not.toContain('Could not read the window close setting')
+    expect(el.querySelector('[data-testid="desktop-close-behavior-retry"]')).toBeNull()
+    expect(findCloseBehaviorSelect(el).value).toBe('ask')
+    // Once the select is back, so is the association.
+    expect(label.getAttribute('for')).toBe('desktop-close-behavior-select')
+    app.unmount()
+  })
+
+  it('flags a stored selection this platform cannot honor without rewriting it', async () => {
+    const saveDesktopPreferences = vi.fn()
+    const { app, el } = await mountPanel(desktopApi({
+      getDesktopPreferences: async () => ({
+        mainWindowCloseBehavior: 'background' as const,
+        canRunInBackground: false,
+        platform: 'linux' as const,
+      }),
+      saveDesktopPreferences,
+    }))
+    const select = findCloseBehaviorSelect(el)
+
+    expect(select.value).toBe('background')
+    const mismatch = el.querySelector<HTMLElement>(
+      '[data-testid="desktop-close-behavior-mismatch"]',
+    )
+    if (!mismatch) throw new Error('Unavailable-selection notice was not rendered')
+    expect(mismatch.textContent).toContain(
+      'Background mode is unavailable on this platform, so closing the window will quit the app instead.',
+    )
+    expect(saveDesktopPreferences).not.toHaveBeenCalled()
     app.unmount()
   })
 

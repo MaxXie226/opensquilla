@@ -145,8 +145,10 @@ export function useChatStream(options: UseChatStreamOptions) {
     streamActivityTick.value
     const now = Date.now()
     if (lastSignalAt.value > 0 && now - lastSignalAt.value > STALE_SIGNAL_MS) {
-      const silent = Math.floor((now - lastSignalAt.value) / 1000)
-      return i18n.global.t('chat.stream.stillWorking', { seconds: silent })
+      // Static on purpose: this feeds a polite live region, so a ticking
+      // seconds value here would be re-announced every second for the whole
+      // stall. The aria-hidden elapsed chip carries the seconds instead.
+      return i18n.global.t('chat.activity.stale')
     }
     const startedAt = streamActivity.value.startedAt || now
     const seconds = Math.max(0, Math.floor((now - startedAt) / 1000))
@@ -159,7 +161,11 @@ export function useChatStream(options: UseChatStreamOptions) {
   const streamPhaseElapsed = computed(() => {
     streamActivityTick.value
     const now = Date.now()
-    if (lastSignalAt.value > 0 && now - lastSignalAt.value > STALE_SIGNAL_MS) return ''
+    if (lastSignalAt.value > 0 && now - lastSignalAt.value > STALE_SIGNAL_MS) {
+      // During a stall the phase label is static for screen readers, so the
+      // silence duration ticks here, out of the announced sentence.
+      return `${Math.floor((now - lastSignalAt.value) / 1000)}s`
+    }
     const startedAt = streamActivity.value.startedAt || now
     const seconds = Math.max(0, Math.floor((now - startedAt) / 1000))
     return `${seconds}s`

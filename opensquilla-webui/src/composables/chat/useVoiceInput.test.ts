@@ -48,6 +48,35 @@ function stubMedia(recorderClass: typeof FakeMediaRecorder = FakeMediaRecorder) 
   return { getUserMedia, stopTrack }
 }
 
+function stubMediaRejecting(error: unknown) {
+  const getUserMedia = vi.fn(async () => {
+    throw error
+  })
+  ;(globalThis as unknown as { MediaRecorder: unknown }).MediaRecorder = FakeMediaRecorder
+  Object.defineProperty(globalThis.navigator, 'mediaDevices', {
+    configurable: true,
+    value: { getUserMedia },
+  })
+  return { getUserMedia }
+}
+
+// A transcription request that never settles on its own and only rejects when
+// its AbortSignal fires — the shape of a hung endpoint.
+function stubHangingFetch() {
+  let abortSignal: AbortSignal | undefined
+  const fetch = vi.fn(
+    (_input: unknown, init?: { signal?: AbortSignal }) =>
+      new Promise((_resolve, reject) => {
+        abortSignal = init?.signal
+        init?.signal?.addEventListener('abort', () =>
+          reject(new DOMException('Aborted', 'AbortError')),
+        )
+      }),
+  )
+  vi.stubGlobal('fetch', fetch)
+  return { fetch, signal: () => abortSignal }
+}
+
 function stubWindowHiddenBridge() {
   let onHidden: (() => void) | null = null
   const unsubscribe = vi.fn()
@@ -168,6 +197,115 @@ describe('useVoiceInput transcription feedback', () => {
     expect(onText).toHaveBeenCalledWith('hello world')
     expect(toasts.value).toHaveLength(0)
   })
+
+  it('aborts a hung transcription after the timeout and re-enables the mic', async () => {
+    vi.useFakeTimers()
+    try {
+      const { fetch, signal } = stubHangingFetch()
+      const { getUserMedia } = stubMedia()
+      const onText = vi.fn()
+      const { cleanup, toggleVoiceInput, voiceBusy, voiceRecording } = useVoiceInput()
+
+      await toggleVoiceInput(onText)
+      await toggleVoiceInput(onText)
+      expect(fetch).toHaveBeenCalledTimes(1)
+      expect(voiceBusy.value).toBe(true)
+
+      // Just short of the deadline the request is still allowed to finish.
+      await vi.advanceTimersByTimeAsync(59_999)
+      expect(voiceBusy.value).toBe(true)
+      expect(signal()?.aborted).toBe(false)
+      expect(toasts.value).toHaveLength(0)
+
+      await vi.advanceTimersByTimeAsync(1)
+      expect(signal()?.aborted).toBe(true)
+      expect(voiceBusy.value).toBe(false)
+      expect(onText).not.toHaveBeenCalled()
+      expect(toasts.value.map(t => t.message)).toEqual([
+        i18n.global.t('chat.toast.voiceTranscribeFailed'),
+      ])
+
+      // The mic is usable again after the timeout.
+      await toggleVoiceInput(onText)
+      expect(getUserMedia).toHaveBeenCalledTimes(2)
+      expect(voiceRecording.value).toBe(true)
+
+      cleanup()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
+describe('useVoiceInput recording failures', () => {
+  it('toasts the settings hint when microphone permission is denied', async () => {
+    const fetch = vi.fn()
+    vi.stubGlobal('fetch', fetch)
+    stubMediaRejecting(new DOMException('Permission denied', 'NotAllowedError'))
+    const onText = vi.fn()
+    const { cleanup, toggleVoiceInput, voiceBusy, voiceRecording } = useVoiceInput()
+
+    await toggleVoiceInput(onText)
+
+    expect(voiceBusy.value).toBe(false)
+    expect(voiceRecording.value).toBe(false)
+    expect(fetch).not.toHaveBeenCalled()
+    expect(toasts.value.map(t => t.message)).toEqual([
+      i18n.global.t('chat.toast.voiceMicDenied'),
+    ])
+    expect(toasts.value[0].tone).toBe('danger')
+    cleanup()
+  })
+
+  it('points a denied desktop user at system settings, not browser settings', async () => {
+    vi.stubGlobal('fetch', vi.fn())
+    // The desktop shell exposes window.opensquillaDesktop — the same bridge
+    // this composable already uses for hidden-window cancellation.
+    stubWindowHiddenBridge()
+    stubMediaRejecting(new DOMException('Permission denied', 'NotAllowedError'))
+    const onText = vi.fn()
+    const { cleanup, toggleVoiceInput } = useVoiceInput()
+
+    await toggleVoiceInput(onText)
+
+    expect(toasts.value.map(t => t.message)).toEqual([
+      i18n.global.t('chat.toast.voiceMicDeniedDesktop'),
+    ])
+    expect(toasts.value[0].tone).toBe('danger')
+    cleanup()
+  })
+
+  it('toasts the missing-device copy when no microphone device exists', async () => {
+    vi.stubGlobal('fetch', vi.fn())
+    stubMediaRejecting(new DOMException('No capture device found', 'NotFoundError'))
+    const onText = vi.fn()
+    const { cleanup, toggleVoiceInput, voiceBusy } = useVoiceInput()
+
+    await toggleVoiceInput(onText)
+
+    expect(voiceBusy.value).toBe(false)
+    expect(toasts.value.map(t => t.message)).toEqual([
+      i18n.global.t('chat.toast.voiceMicMissing'),
+    ])
+    expect(toasts.value[0].tone).toBe('danger')
+    cleanup()
+  })
+
+  it('toasts on any other recording failure instead of failing silently', async () => {
+    vi.stubGlobal('fetch', vi.fn())
+    stubMediaRejecting(new Error('device is wedged'))
+    const onText = vi.fn()
+    const { cleanup, toggleVoiceInput, voiceBusy } = useVoiceInput()
+
+    await toggleVoiceInput(onText)
+
+    expect(voiceBusy.value).toBe(false)
+    expect(toasts.value.map(t => t.message)).toEqual([
+      i18n.global.t('chat.toast.voiceRecordFailed'),
+    ])
+    expect(toasts.value[0].tone).toBe('danger')
+    cleanup()
+  })
 })
 
 describe('useVoiceInput hidden-window cancellation', () => {
@@ -216,6 +354,11 @@ describe('useVoiceInput hidden-window cancellation', () => {
     expect(voiceRecording.value).toBe(false)
     expect(stopTrack).toHaveBeenCalledTimes(1)
     expect(fetch).not.toHaveBeenCalled()
+    // Discarding the audio is correct, but it must not be silent.
+    expect(toasts.value.map(t => t.message)).toEqual([
+      i18n.global.t('chat.toast.voiceCancelledHidden'),
+    ])
+    expect(toasts.value[0].tone).toBe('danger')
 
     await toggleVoiceInput(onText)
     expect(voiceRecording.value).toBe(true)
@@ -226,9 +369,57 @@ describe('useVoiceInput hidden-window cancellation', () => {
     expect(fetch).not.toHaveBeenCalled()
     expect(onText).not.toHaveBeenCalled()
     expect(bridge.onWindowHidden).toHaveBeenCalledTimes(1)
+    expect(toasts.value.map(t => t.message)).toEqual([
+      i18n.global.t('chat.toast.voiceCancelledHidden'),
+      i18n.global.t('chat.toast.voiceCancelledHidden'),
+    ])
 
     cleanup()
     expect(bridge.unsubscribe).toHaveBeenCalledTimes(1)
+  })
+
+  it('stays silent when the window hides while voice input is idle', async () => {
+    vi.stubGlobal('fetch', vi.fn())
+    const bridge = stubWindowHiddenBridge()
+    let visibilityState: DocumentVisibilityState = 'visible'
+    Object.defineProperty(document, 'visibilityState', {
+      configurable: true,
+      get: () => visibilityState,
+    })
+    const { cleanup } = useVoiceInput()
+
+    bridge.hideWindow()
+    visibilityState = 'hidden'
+    document.dispatchEvent(new Event('visibilitychange'))
+
+    expect(toasts.value).toHaveLength(0)
+    cleanup()
+  })
+
+  it('cancels an in-flight transcription when hidden and reports it exactly once', async () => {
+    const { fetch, signal } = stubHangingFetch()
+    const bridge = stubWindowHiddenBridge()
+    const onText = vi.fn()
+    const { cleanup, toggleVoiceInput, voiceBusy } = useVoiceInput()
+
+    await toggleVoiceInput(onText)
+    await toggleVoiceInput(onText)
+    expect(fetch).toHaveBeenCalledTimes(1)
+    expect(voiceBusy.value).toBe(true)
+
+    bridge.hideWindow()
+
+    expect(signal()?.aborted).toBe(true)
+    expect(voiceBusy.value).toBe(false)
+    // Let the aborted fetch settle: the abort path must not stack a second
+    // transcription-failed toast on top of the cancellation toast.
+    await new Promise(resolve => setTimeout(resolve, 10))
+    expect(toasts.value.map(t => t.message)).toEqual([
+      i18n.global.t('chat.toast.voiceCancelledHidden'),
+    ])
+    expect(onText).not.toHaveBeenCalled()
+
+    cleanup()
   })
 
   it('keeps visibilitychange hidden as a browser fallback', async () => {
@@ -251,8 +442,46 @@ describe('useVoiceInput hidden-window cancellation', () => {
     expect(stopTrack).toHaveBeenCalledTimes(1)
     expect(fetch).not.toHaveBeenCalled()
     expect(onText).not.toHaveBeenCalled()
+    // A toast fired while the tab is hidden auto-dismisses unseen, so the
+    // notice must wait until the user comes back.
+    expect(toasts.value).toHaveLength(0)
+
+    visibilityState = 'visible'
+    document.dispatchEvent(new Event('visibilitychange'))
+
+    expect(toasts.value.map(t => t.message)).toEqual([
+      i18n.global.t('chat.toast.voiceCancelledHidden'),
+    ])
+    expect(toasts.value[0].tone).toBe('danger')
+
+    // The deferred notice fires exactly once, not on every return to the tab.
+    document.dispatchEvent(new Event('visibilitychange'))
+    expect(toasts.value).toHaveLength(1)
 
     cleanup()
+  })
+
+  it('drops a deferred cancellation notice on cleanup instead of firing after unmount', async () => {
+    vi.stubGlobal('fetch', vi.fn())
+    stubMedia()
+    let visibilityState: DocumentVisibilityState = 'visible'
+    Object.defineProperty(document, 'visibilityState', {
+      configurable: true,
+      get: () => visibilityState,
+    })
+    const onText = vi.fn()
+    const { cleanup, toggleVoiceInput } = useVoiceInput()
+
+    await toggleVoiceInput(onText)
+    visibilityState = 'hidden'
+    document.dispatchEvent(new Event('visibilitychange'))
+    expect(toasts.value).toHaveLength(0)
+
+    cleanup()
+    visibilityState = 'visible'
+    document.dispatchEvent(new Event('visibilitychange'))
+
+    expect(toasts.value).toHaveLength(0)
   })
 
   it('cleanup unsubscribes and stops an active stream without transcribing', async () => {
@@ -272,5 +501,7 @@ describe('useVoiceInput hidden-window cancellation', () => {
     expect(bridge.unsubscribe).toHaveBeenCalledTimes(1)
     expect(fetch).not.toHaveBeenCalled()
     expect(onText).not.toHaveBeenCalled()
+    // Teardown is not a hidden window: unmount cancellation stays silent.
+    expect(toasts.value).toHaveLength(0)
   })
 })

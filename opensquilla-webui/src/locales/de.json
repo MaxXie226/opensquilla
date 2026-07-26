@@ -66,7 +66,8 @@
     "discard": "Verwerfen",
     "cancel": "Abbrechen",
     "edit": "Bearbeiten",
-    "delete": "Löschen"
+    "delete": "Löschen",
+    "dismiss": "Ausblenden"
   },
   "nav": {
     "chat": "Chat",
@@ -477,7 +478,7 @@
       "endpointDesc": "Diese Einstellungen gelten nur für Aufrufe an {provider}.",
       "defaultModelTitle": "Standardmodell für {provider}",
       "defaultModelGroupDesc": "Wird bei deaktiviertem Routing oder beim Fallback auf den aktiven Anbieter verwendet.",
-      "defaultModelLabel": "Standardmodell für direkte {provider}-Anfragen",
+      "defaultModelLabel": "Direkt-/Fallback-Modell",
       "configuredModelTitle": "Modell für {provider}",
       "configuredModelCurrentLabel": "Aktuelles Modell",
       "configuredModelFallbackLabel": "Fallback-Modell",
@@ -872,6 +873,15 @@
       "fallbacks": "Fallback-Modelle",
       "fallbacksHint": "Durch Kommas getrennte Anbieter/Modell-IDs, die der Reihe nach versucht werden, wenn das primäre Modell fehlschlägt."
     },
+    "capabilities": {
+      "imageStatus": {
+        "missingEnv": "Umgebungsvariable {name} fehlt. Fügen Sie unten einen Schlüssel ein oder setzen Sie die Variable und starten Sie das Gateway neu."
+      },
+      "imageKeyConfigured": "Schlüssel konfiguriert",
+      "imageKeyMissing": "Noch nicht konfiguriert",
+      "imageKeyPlaceholderKeep": "Leer lassen, um den gespeicherten Schlüssel zu behalten",
+      "imageKeyPlaceholderNew": "API-Schlüssel einfügen"
+    },
     "audio": {
       "title": "Audio",
       "enableLabel": "Sprach- und Audiowerkzeuge aktivieren",
@@ -941,6 +951,8 @@
       "closeBehaviorReadFailed": "Verhalten beim Schließen konnte nicht gelesen werden: {error}",
       "closeBehaviorSaveFailed": "Verhalten beim Schließen konnte nicht gespeichert werden: {error}",
       "closeBehaviorBackgroundUnavailable": "Hintergrundbetrieb ist auf dieser Plattform nicht verfügbar.",
+      "closeBehaviorFallbackQuit": "Hintergrundbetrieb ist auf dieser Plattform nicht verfügbar. Beim Schließen des Fensters wird die App stattdessen beendet.",
+      "closeBehaviorRetry": "Erneut versuchen",
       "resetConfirmTitle": "Gespeicherte Einrichtung zurücksetzen?",
       "resetConfirmBody": "Dies löscht die gespeicherten Desktop-Zugangsdaten und die generierte Konfiguration. Beim nächsten Start wird die Ersteinrichtung erneut ausgeführt.",
       "resetConfirmPrimary": "Zurücksetzen",
@@ -1117,11 +1129,11 @@
     },
     "privacy": {
       "title": "Datenschutz",
-      "statusEnabled": "Anbieteranfrage-Korrelation und einheitliche Netzwerkbeobachtbarkeit sind aktiviert.",
-      "statusDisabled": "Anbieteranfrage-Korrelation und einheitliche Netzwerkbeobachtbarkeit sind deaktiviert.",
-      "statusDisabledByEnv": "Anbieteranfrage-Korrelation und einheitliche Netzwerkbeobachtbarkeit sind durch die spezielle Datenschutz-Umgebungsvariable deaktiviert.",
-      "disableNetworkObservabilityLabel": "Netzwerkbeobachtbarkeit und Anbieteranfrage-Korrelation deaktivieren",
-      "disableNetworkObservabilityDesc": "Stoppt automatische Installationstelemetrie, passive Updateprüfungen und undurchsichtige Korrelationsheader für Sitzung, Turn, Ausführung und Aufrufart bei Anfragen an die offizielle TokenRhythm-HTTPS-API. Vom Benutzer gestartete Provider-Anfragen werden weiterhin ausgeführt.",
+      "statusEnabled": "Netzwerkberichte sind eingeschaltet.",
+      "statusDisabled": "Netzwerkberichte sind ausgeschaltet.",
+      "statusDisabledByEnv": "Netzwerkberichte sind ausgeschaltet, weil eine Umgebungsvariable sie deaktiviert.",
+      "disableNetworkObservabilityLabel": "Netzwerkberichte ausschalten",
+      "disableNetworkObservabilityDesc": "Stoppt Installationstelemetrie, Updateprüfungen im Hintergrund und die anonymen Kennungen, die Anfragen einer Sitzung miteinander verknüpfen — diese Kennungen gehen ausschließlich an die offizielle TokenRhythm-API. Ihre eigenen Modellanfragen funktionieren weiterhin.",
       "save": "Datenschutz speichern"
     },
     "toast": {
@@ -2720,6 +2732,7 @@
     "latest": "Neueste",
     "thinking": "Denkt nach",
     "thoughtProcess": "Denkprozess",
+    "thinkingForSeconds": "Denkt nach · {seconds}s",
     "thoughtForSeconds": "{seconds}s nachgedacht",
     "thoughtForMinutes": "{minutes}min {seconds}s nachgedacht",
     "toolResult": "Werkzeugergebnis",
@@ -2784,11 +2797,12 @@
       "ensembleDetailUnavailable": "{count} Kandidaten · Details nicht verfügbar"
     },
     "sources": "Quellen",
+    "activityLabel": "Aktivität",
     "activitySteps": "Aktivität · {count} Schritt | Aktivität · {count} Schritte",
     "activityItems": "Aktivität · {count} Eintrag | Aktivität · {count} Einträge",
     "activityCompletedItems": "Abgeschlossen · {count} Eintrag | Abgeschlossen · {count} Einträge",
     "activityFailures": "{count} fehlgeschlagen",
-    "activityFailuresRecovered": "{count} Fehler behoben",
+    "activityFailuresRecovered": "{count} Fehler behoben | {count} Fehler behoben",
     "activityWorking": "In Arbeit",
     "workedForSeconds": "{seconds} Sek. gearbeitet",
     "workedForMinutes": "{minutes} Min. {seconds} Sek. gearbeitet",
@@ -2811,6 +2825,17 @@
         "recall": "Speicher durchsucht",
         "use": "Werkzeuge verwendet"
       },
+      "purposeRunning": {
+        "discover": "Links werden entdeckt",
+        "search": "Web wird durchsucht",
+        "read": "Webseiten werden gelesen",
+        "inspect": "Dateien werden geprüft",
+        "change": "Dateien werden bearbeitet",
+        "run": "Befehle werden ausgeführt",
+        "create": "Artefakte werden erstellt",
+        "recall": "Speicher wird durchsucht",
+        "use": "Werkzeuge werden verwendet"
+      },
       "footprint": {
         "web": "{count} Web-Aktion | {count} Web-Aktionen",
         "files": "{count} Datei | {count} Dateien",
@@ -2820,7 +2845,9 @@
         "memory": "{count} Speicherabfrage | {count} Speicherabfragen",
         "tools": "{count} Werkzeugaufruf | {count} Werkzeugaufrufe"
       },
-      "more": "{count} weitere"
+      "more": "{count} weitere",
+      "stale": "Arbeitet weiter — kein aktuelles Signal",
+      "liveStep": "Schritt {n}"
     },
     "suggestedTasks": "Vorgeschlagene Aufgaben",
     "greetingMorning": "Guten Morgen.",
@@ -2985,7 +3012,8 @@
       "downloadFailed": "Download fehlgeschlagen",
       "forkFailed": "Verzweigen fehlgeschlagen",
       "copyFailed": "Kopieren fehlgeschlagen",
-      "shareExportFailed": "Teilen-Export fehlgeschlagen",
+      "shareSaveFailed": "Bild konnte nicht gespeichert werden. Versuchen Sie es erneut.",
+      "sharePreviewUpdateFailed": "Vorschau konnte nicht aktualisiert werden. Versuchen Sie es erneut.",
       "saved": "{filename} gespeichert",
       "copiedToClipboard": "In die Zwischenablage kopiert",
       "copyNotSupported": "Kopieren nicht unterstützt — stattdessen herunterladen",
@@ -3000,6 +3028,11 @@
       "voiceUnavailable": "Spracheingabe ist nicht verfügbar. Aktivieren Sie sie in den Einstellungen.",
       "voiceTranscribeFailed": "Aufnahme konnte nicht transkribiert werden. Bitte erneut versuchen.",
       "voiceSetupNeeded": "Spracheingabe benötigt einen ElevenLabs-API-Schlüssel – Einstellungen werden geöffnet…",
+      "voiceCancelledHidden": "Die Aufnahme wurde beendet, als das Fenster ausgeblendet wurde. Starten Sie erneut, um zu diktieren.",
+      "voiceMicDenied": "Der Mikrofonzugriff wurde verweigert. Erlauben Sie ihn in den Browsereinstellungen.",
+      "voiceMicDeniedDesktop": "Der Mikrofonzugriff ist blockiert. Erlauben Sie ihn in den Systemeinstellungen und versuchen Sie es dann erneut.",
+      "voiceMicMissing": "Es wurde kein Mikrofon gefunden.",
+      "voiceRecordFailed": "Aufnahme konnte nicht gestartet werden. Bitte erneut versuchen.",
       "waitAttachments": "Warten Sie, bis die Verarbeitung der Dateianhänge abgeschlossen ist",
       "waitCompactionBeforeCommand": "Warten Sie auf die Kontextverdichtung, bevor Sie {command} ausführen.",
       "waitResponseBeforeCommand": "Warten Sie auf die aktuelle Antwort, bevor Sie {command} ausführen.",
@@ -3015,8 +3048,7 @@
       "preparingOutput": "Ausgabe wird vorbereitet",
       "generatingCandidates": "Kandidaten werden generiert",
       "synthesizingCandidates": "Kandidaten werden zusammengeführt",
-      "stillWaiting": "Warte weiterhin auf Modell",
-      "stillWorking": "Noch in Arbeit — letztes Signal vor {seconds} s"
+      "stillWaiting": "Warte weiterhin auf Modell"
     },
     "stall": {
       "title": "Die Antwort dauert länger als erwartet",

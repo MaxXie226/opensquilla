@@ -66,7 +66,8 @@
     "discard": "Discard",
     "cancel": "Cancel",
     "edit": "Edit",
-    "delete": "Delete"
+    "delete": "Delete",
+    "dismiss": "Dismiss"
   },
   "nav": {
     "chat": "Chat",
@@ -872,6 +873,15 @@
       "fallbacks": "Fallback models",
       "fallbacksHint": "Comma-separated provider/model ids tried in order if the primary fails."
     },
+    "capabilities": {
+      "imageStatus": {
+        "missingEnv": "Missing environment variable {name}. Paste a key below, or set that variable and restart the gateway."
+      },
+      "imageKeyConfigured": "Key configured",
+      "imageKeyMissing": "Not configured yet",
+      "imageKeyPlaceholderKeep": "Leave blank to keep the saved key",
+      "imageKeyPlaceholderNew": "Paste your API key"
+    },
     "audio": {
       "title": "Audio",
       "enableLabel": "Enable voice & audio tools",
@@ -941,6 +951,8 @@
       "closeBehaviorReadFailed": "Could not read the window close setting: {error}",
       "closeBehaviorSaveFailed": "Could not save the window close setting: {error}",
       "closeBehaviorBackgroundUnavailable": "Background mode is unavailable on this platform.",
+      "closeBehaviorFallbackQuit": "Background mode is unavailable on this platform, so closing the window will quit the app instead.",
+      "closeBehaviorRetry": "Retry",
       "resetConfirmTitle": "Reset saved setup?",
       "resetConfirmBody": "This clears the saved desktop credential and generated config. The next launch re-runs first-time setup.",
       "resetConfirmPrimary": "Reset",
@@ -1117,11 +1129,11 @@
     },
     "privacy": {
       "title": "Privacy",
-      "statusEnabled": "Provider request correlation and unified network observability are enabled.",
-      "statusDisabled": "Provider request correlation and unified network observability are disabled.",
-      "statusDisabledByEnv": "Provider request correlation and unified network observability are disabled by the dedicated privacy environment setting.",
-      "disableNetworkObservabilityLabel": "Disable network observability and provider request correlation",
-      "disableNetworkObservabilityDesc": "Stop automatic install telemetry, passive update checks, and opaque session, turn, execution, and call-kind correlation headers on requests to the official TokenRhythm HTTPS API. User-initiated provider requests still run.",
+      "statusEnabled": "Network reporting is on.",
+      "statusDisabled": "Network reporting is off.",
+      "statusDisabledByEnv": "Network reporting is off because an environment setting disables it.",
+      "disableNetworkObservabilityLabel": "Turn off network reporting",
+      "disableNetworkObservabilityDesc": "Stops install telemetry, background update checks, and the anonymous identifiers that link requests from one session together — those identifiers are only ever sent to the official TokenRhythm API. Your own model requests keep working.",
       "save": "Save privacy"
     },
     "toast": {
@@ -2720,6 +2732,7 @@
     "latest": "Latest",
     "thinking": "Thinking",
     "thoughtProcess": "Thought process",
+    "thinkingForSeconds": "Thinking · {seconds}s",
     "thoughtForSeconds": "Thought for {seconds}s",
     "thoughtForMinutes": "Thought for {minutes}m {seconds}s",
     "toolResult": "Tool Result",
@@ -2784,6 +2797,7 @@
       "ensembleDetailUnavailable": "{count} candidates · detail unavailable"
     },
     "sources": "Sources",
+    "activityLabel": "Activity",
     "activitySteps": "Activity · {count} step | Activity · {count} steps",
     "activityItems": "Activity · {count} item | Activity · {count} items",
     "activityCompletedItems": "Completed · {count} item | Completed · {count} items",
@@ -2811,6 +2825,17 @@
         "recall": "Searched memory",
         "use": "Used tools"
       },
+      "purposeRunning": {
+        "discover": "Discovering links",
+        "search": "Searching the web",
+        "read": "Reading web pages",
+        "inspect": "Inspecting files",
+        "change": "Editing files",
+        "run": "Running commands",
+        "create": "Creating artifacts",
+        "recall": "Searching memory",
+        "use": "Using tools"
+      },
       "footprint": {
         "web": "{count} web action | {count} web actions",
         "files": "{count} file | {count} files",
@@ -2820,7 +2845,9 @@
         "memory": "{count} memory lookup | {count} memory lookups",
         "tools": "{count} tool call | {count} tool calls"
       },
-      "more": "{count} more"
+      "more": "{count} more",
+      "stale": "Still working — no recent signal",
+      "liveStep": "step {n}"
     },
     "suggestedTasks": "Suggested tasks",
     "greetingMorning": "Good morning.",
@@ -2985,7 +3012,8 @@
       "downloadFailed": "Download failed",
       "forkFailed": "Fork failed",
       "copyFailed": "Copy failed",
-      "shareExportFailed": "Share export failed",
+      "shareSaveFailed": "Couldn't save the image. Try again.",
+      "sharePreviewUpdateFailed": "Couldn't update the preview. Try again.",
       "saved": "Saved {filename}",
       "copiedToClipboard": "Copied to clipboard",
       "copyNotSupported": "Copy not supported — download instead",
@@ -3000,6 +3028,11 @@
       "voiceUnavailable": "Voice input isn't available. Enable it in Settings.",
       "voiceTranscribeFailed": "Couldn't transcribe your recording. Please try again.",
       "voiceSetupNeeded": "Voice input needs an ElevenLabs API key — opening Settings…",
+      "voiceCancelledHidden": "Recording stopped when the window was hidden. Start again to dictate.",
+      "voiceMicDenied": "Microphone access was denied — allow it in your browser settings.",
+      "voiceMicDeniedDesktop": "Microphone access is blocked. Allow it in your system settings, then try again.",
+      "voiceMicMissing": "No microphone was found.",
+      "voiceRecordFailed": "Couldn't start recording. Please try again.",
       "waitAttachments": "Wait for file attachment processing to finish",
       "waitCompactionBeforeCommand": "Wait for context compaction before running {command}.",
       "waitResponseBeforeCommand": "Wait for the current response before running {command}.",
@@ -3015,8 +3048,7 @@
       "preparingOutput": "Preparing output",
       "generatingCandidates": "Generating candidates",
       "synthesizingCandidates": "Synthesizing candidates",
-      "stillWaiting": "Still waiting for model",
-      "stillWorking": "Still working — last signal {seconds}s ago"
+      "stillWaiting": "Still waiting for model"
     },
     "stall": {
       "title": "Response is taking longer than expected",

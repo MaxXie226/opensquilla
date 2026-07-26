@@ -2,11 +2,38 @@ import { ref } from 'vue'
 
 import i18n from '@/i18n'
 import { useToasts } from '@/composables/useToasts'
+import { detectPlatformId } from '@/platform/capabilities'
 
 interface TranscriptionResponse {
   text?: string
   error?: string
   code?: string
+}
+
+// Abort a hung transcription request so voiceBusy cannot pin the mic button
+// disabled forever. 60s is deliberately generous: a long dictation against a
+// slow provider can legitimately take tens of seconds, and aborting a working
+// request loses the recording, so we only give up once the request is far
+// beyond any plausible success.
+const TRANSCRIBE_TIMEOUT_MS = 60_000
+
+// getUserMedia failures need different remedies, so map the error to the toast
+// naming its fix: a permission denial is fixable by allowing microphone
+// access, a missing input device is not, and anything else (device busy,
+// hardware fault) at least gets a visible failure instead of silence.
+function recordingFailureKey(err: unknown): string {
+  const name = err instanceof Error ? err.name : ''
+  if (name === 'NotAllowedError' || name === 'SecurityError') {
+    // In the desktop shell there are no "browser settings" — the microphone
+    // permission lives in OS system settings, so point the user there instead.
+    return detectPlatformId() === 'desktop'
+      ? 'chat.toast.voiceMicDeniedDesktop'
+      : 'chat.toast.voiceMicDenied'
+  }
+  if (name === 'NotFoundError' || name === 'OverconstrainedError') {
+    return 'chat.toast.voiceMicMissing'
+  }
+  return 'chat.toast.voiceRecordFailed'
 }
 
 interface DesktopWindowVisibilityBridge {
@@ -32,6 +59,10 @@ export function useVoiceInput() {
   let transcriptionController: AbortController | null = null
   let unsubscribeWindowHidden: (() => void) | null = null
   let cleanedUp = false
+  // A cancellation toast pushed while the document is hidden auto-dismisses
+  // before the user can ever see it — they would just come back to a dead mic.
+  // Remember the pending notice and deliver it once the surface is visible.
+  let pendingCancelNotice = false
 
   async function toggleVoiceInput(onText: (text: string) => void) {
     if (voiceRecording.value) {
@@ -73,6 +104,9 @@ export function useVoiceInput() {
     } catch (err) {
       if (generation !== recordingGeneration || cleanedUp) return
       console.warn('Voice recording failed:', err instanceof Error ? err.message : String(err))
+      // Silent failure here is indistinguishable from a broken mic button, so
+      // tell the user why nothing is recording (denied vs missing vs other).
+      pushToast(i18n.global.t(recordingFailureKey(err)), { tone: 'danger' })
       stopTracks()
     } finally {
       if (generation === recordingGeneration) voiceBusy.value = false
@@ -123,6 +157,15 @@ export function useVoiceInput() {
 
     const controller = new AbortController()
     transcriptionController = controller
+    // A hung endpoint must not wedge the mic: fire the shared controller after
+    // the deadline, and remember that it was us so the abort still surfaces
+    // the failure toast (external aborts — hidden window, cleanup — stay
+    // silent in the catch below).
+    let timedOut = false
+    const timeoutTimer = setTimeout(() => {
+      timedOut = true
+      controller.abort()
+    }, TRANSCRIBE_TIMEOUT_MS)
     voiceBusy.value = true
     try {
       const form = new FormData()
@@ -156,10 +199,12 @@ export function useVoiceInput() {
       const text = String(data.text || '').trim()
       if (text) onText(text)
     } catch (err) {
-      if (controller.signal.aborted || generation !== recordingGeneration || cleanedUp) return
+      if (controller.signal.aborted && !timedOut) return
+      if (generation !== recordingGeneration || cleanedUp) return
       console.warn('Voice transcription failed:', err instanceof Error ? err.message : String(err))
       pushToast(i18n.global.t('chat.toast.voiceTranscribeFailed'), { tone: 'danger' })
     } finally {
+      clearTimeout(timeoutTimer)
       if (transcriptionController === controller) transcriptionController = null
       if (generation === recordingGeneration) voiceBusy.value = false
     }
@@ -171,7 +216,12 @@ export function useVoiceInput() {
     activeStream = null
   }
 
-  function cancelRecording() {
+  function cancelRecording(options?: { notify?: boolean }) {
+    // Notify only when the cancellation actually discarded something: a live
+    // recording, a stop still waiting to hand off its chunks, or an in-flight
+    // transcription (all keep voiceRecording or voiceBusy set). A cancel while
+    // idle stays silent.
+    const wasActive = voiceRecording.value || voiceBusy.value
     recordingGeneration += 1
     chunks = []
     transcriptionController?.abort()
@@ -188,17 +238,31 @@ export function useVoiceInput() {
     voiceBusy.value = false
     voiceRecording.value = false
     stopTracks()
+    if (options?.notify && wasActive) {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+        pendingCancelNotice = true
+      } else {
+        pushToast(i18n.global.t('chat.toast.voiceCancelledHidden'), { tone: 'danger' })
+      }
+    }
   }
 
   function onVisibilityChange() {
-    if (document.visibilityState === 'hidden') cancelRecording()
+    if (document.visibilityState === 'hidden') {
+      cancelRecording({ notify: true })
+      return
+    }
+    if (pendingCancelNotice) {
+      pendingCancelNotice = false
+      pushToast(i18n.global.t('chat.toast.voiceCancelledHidden'), { tone: 'danger' })
+    }
   }
 
   if (typeof window !== 'undefined') {
     const desktop = (window as unknown as {
       opensquillaDesktop?: DesktopWindowVisibilityBridge
     }).opensquillaDesktop
-    const unsubscribe = desktop?.onWindowHidden?.(cancelRecording)
+    const unsubscribe = desktop?.onWindowHidden?.(() => cancelRecording({ notify: true }))
     if (typeof unsubscribe === 'function') unsubscribeWindowHidden = unsubscribe
   }
   if (typeof document !== 'undefined') {
@@ -208,6 +272,8 @@ export function useVoiceInput() {
   function cleanup() {
     if (cleanedUp) return
     cleanedUp = true
+    // A deferred notice must not outlive the surface it belongs to.
+    pendingCancelNotice = false
     try {
       unsubscribeWindowHidden?.()
     } catch {}

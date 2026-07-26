@@ -27,7 +27,7 @@ export type AssistantActivityLifecycleCode =
   | 'chat.activity.lifecycle.interrupted'
   | 'chat.activity.lifecycle.failed'
 
-export type AssistantActivityPurposeCode =
+export type AssistantActivityPurposeBaseCode =
   | 'chat.activity.purpose.discover'
   | 'chat.activity.purpose.search'
   | 'chat.activity.purpose.read'
@@ -37,6 +37,21 @@ export type AssistantActivityPurposeCode =
   | 'chat.activity.purpose.create'
   | 'chat.activity.purpose.recall'
   | 'chat.activity.purpose.use'
+
+export type AssistantActivityPurposeRunningCode =
+  | 'chat.activity.purposeRunning.discover'
+  | 'chat.activity.purposeRunning.search'
+  | 'chat.activity.purposeRunning.read'
+  | 'chat.activity.purposeRunning.inspect'
+  | 'chat.activity.purposeRunning.change'
+  | 'chat.activity.purposeRunning.run'
+  | 'chat.activity.purposeRunning.create'
+  | 'chat.activity.purposeRunning.recall'
+  | 'chat.activity.purposeRunning.use'
+
+export type AssistantActivityPurposeCode =
+  | AssistantActivityPurposeBaseCode
+  | AssistantActivityPurposeRunningCode
 
 export type AssistantActivityFootprintCode =
   | 'chat.activity.footprint.web'
@@ -65,6 +80,10 @@ export interface AssistantActivityCodeSummary<Code extends string> {
    * Number of distinct labels omitted from `codes`, not the number of calls.
    */
   remainingCount: number
+  /**
+   * Overflow segment whose `count` param is the summed call count of the
+   * omitted labels, so it shares a unit with the visible `codes` segments.
+   */
   remaining: AssistantActivityCodeDescriptor<AssistantActivityMoreCode> | null
 }
 
@@ -136,7 +155,7 @@ export interface AssistantActivityProjection extends AssistantActivityTimelinePr
 }
 
 interface ActivitySemantic {
-  purpose: AssistantActivityPurposeCode
+  purpose: AssistantActivityPurposeBaseCode
   footprintKind: 'web' | 'file' | 'command' | 'artifact' | 'memory' | 'tool'
 }
 
@@ -195,6 +214,22 @@ const FILE_TARGET_KEYS = [
   'target_path',
   'targetPath',
 ] as const
+
+// Present-tense counterparts for a cluster that is still in flight. Settled
+// clusters keep the past-tense purpose codes.
+const RUNNING_PURPOSE_CODES: Readonly<
+  Record<AssistantActivityPurposeBaseCode, AssistantActivityPurposeRunningCode>
+> = {
+  'chat.activity.purpose.discover': 'chat.activity.purposeRunning.discover',
+  'chat.activity.purpose.search': 'chat.activity.purposeRunning.search',
+  'chat.activity.purpose.read': 'chat.activity.purposeRunning.read',
+  'chat.activity.purpose.inspect': 'chat.activity.purposeRunning.inspect',
+  'chat.activity.purpose.change': 'chat.activity.purposeRunning.change',
+  'chat.activity.purpose.run': 'chat.activity.purposeRunning.run',
+  'chat.activity.purpose.create': 'chat.activity.purposeRunning.create',
+  'chat.activity.purpose.recall': 'chat.activity.purposeRunning.recall',
+  'chat.activity.purpose.use': 'chat.activity.purposeRunning.use',
+}
 
 const STATUS_PURPOSE_CODES: Readonly<Record<string, AssistantActivityPurposeCode>> = {
   discover: 'chat.activity.purpose.discover',
@@ -392,7 +427,10 @@ function makeCluster(
   const isCurrent = isCurrentLifecycle && (state === 'running' || state === 'pending')
   return {
     key: clusterKey(semantic, call),
-    purpose: codeDescriptor(semantic.purpose, { count: 1 }),
+    purpose: codeDescriptor(
+      isCurrent ? RUNNING_PURPOSE_CODES[semantic.purpose] : semantic.purpose,
+      { count: 1 },
+    ),
     footprint: footprintDescriptor(semantic, [call]),
     state,
     isCurrent,
@@ -425,12 +463,19 @@ function summarizeCodes<Code extends string>(
 
   const descriptors = [...counts].map(([code, count]) => codeDescriptor(code, { count }))
   const codes = descriptors.slice(0, 2)
-  const remainingCount = Math.max(0, descriptors.length - codes.length)
+  const omitted = descriptors.slice(codes.length)
+  // The visible segments render call counts, so the overflow segment must be
+  // denominated in calls too; the count of omitted kinds stays available as
+  // `remainingCount` for callers that need it.
+  const omittedCallCount = omitted.reduce(
+    (total, descriptor) => total + descriptorCount(descriptor),
+    0,
+  )
   return {
     codes,
-    remainingCount,
-    remaining: remainingCount > 0
-      ? codeDescriptor('chat.activity.more', { count: remainingCount })
+    remainingCount: omitted.length,
+    remaining: omitted.length > 0
+      ? codeDescriptor('chat.activity.more', { count: omittedCallCount })
       : null,
   }
 }
@@ -464,6 +509,16 @@ function statusLabelFor(
   const purpose = STATUS_PURPOSE_CODES[normalized]
   if (purpose) return codeDescriptor(purpose)
   return codeDescriptor('chat.activity.lifecycle.working')
+}
+
+/**
+ * A step is "semantic" when it names an activity purpose rather than a
+ * generic lifecycle phase, and is not the still-live current step. Header
+ * counts and the visible step body must share this predicate so they agree
+ * by construction.
+ */
+export function isSemanticActivityStatusStep(step: AssistantActivityStatusStep): boolean {
+  return !step.isCurrent && !step.label.code.startsWith('chat.activity.lifecycle.')
 }
 
 function projectStatusSteps(

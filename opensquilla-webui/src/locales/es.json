@@ -66,7 +66,8 @@
     "discard": "Descartar",
     "cancel": "Cancelar",
     "edit": "Editar",
-    "delete": "Eliminar"
+    "delete": "Eliminar",
+    "dismiss": "Descartar"
   },
   "nav": {
     "chat": "Chat",
@@ -477,7 +478,7 @@
       "endpointDesc": "Estos ajustes solo se aplican cuando OpenSquilla llama a {provider}.",
       "defaultModelTitle": "Modelo predeterminado de {provider}",
       "defaultModelGroupDesc": "Se usa cuando el enrutamiento está desactivado o vuelve al proveedor activo.",
-      "defaultModelLabel": "Modelo directo predeterminado de {provider}",
+      "defaultModelLabel": "Modelo directo / de reserva",
       "configuredModelTitle": "Modelo de {provider}",
       "configuredModelCurrentLabel": "Modelo actual",
       "configuredModelFallbackLabel": "Modelo de reserva",
@@ -872,6 +873,15 @@
       "fallbacks": "Modelos de reserva",
       "fallbacksHint": "Identificadores proveedor/modelo separados por comas, probados en orden si el principal falla."
     },
+    "capabilities": {
+      "imageStatus": {
+        "missingEnv": "Falta la variable de entorno {name}. Pega una clave abajo, o define esa variable y reinicia la puerta de enlace."
+      },
+      "imageKeyConfigured": "Clave configurada",
+      "imageKeyMissing": "Aún sin configurar",
+      "imageKeyPlaceholderKeep": "Déjalo en blanco para conservar la clave guardada",
+      "imageKeyPlaceholderNew": "Pega tu clave de API"
+    },
     "audio": {
       "title": "Audio",
       "enableLabel": "Activar herramientas de voz y audio",
@@ -941,6 +951,8 @@
       "closeBehaviorReadFailed": "No se pudo leer el comportamiento al cerrar: {error}",
       "closeBehaviorSaveFailed": "No se pudo guardar el comportamiento al cerrar: {error}",
       "closeBehaviorBackgroundUnavailable": "La ejecución en segundo plano no está disponible en esta plataforma.",
+      "closeBehaviorFallbackQuit": "La ejecución en segundo plano no está disponible en esta plataforma, así que al cerrar la ventana la aplicación se cerrará.",
+      "closeBehaviorRetry": "Reintentar",
       "resetConfirmTitle": "¿Restablecer la configuración guardada?",
       "resetConfirmBody": "Esto borra la credencial de escritorio guardada y la configuración generada. El próximo inicio vuelve a ejecutar la configuración inicial.",
       "resetConfirmPrimary": "Restablecer",
@@ -1117,11 +1129,11 @@
     },
     "privacy": {
       "title": "Privacidad",
-      "statusEnabled": "La correlación de solicitudes al proveedor y la observabilidad de red unificada están activadas.",
-      "statusDisabled": "La correlación de solicitudes al proveedor y la observabilidad de red unificada están desactivadas.",
-      "statusDisabledByEnv": "La correlación de solicitudes al proveedor y la observabilidad de red unificada están desactivadas por la variable de entorno de privacidad específica.",
-      "disableNetworkObservabilityLabel": "Desactivar observabilidad de red y correlación de solicitudes al proveedor",
-      "disableNetworkObservabilityDesc": "Detiene la telemetría automática de instalación, las comprobaciones pasivas de actualizaciones y las cabeceras opacas de correlación de sesión, turno, ejecución y tipo de llamada en solicitudes a la API HTTPS oficial de TokenRhythm. Las solicitudes al proveedor iniciadas por el usuario siguen funcionando.",
+      "statusEnabled": "Los informes de red están activados.",
+      "statusDisabled": "Los informes de red están desactivados.",
+      "statusDisabledByEnv": "Los informes de red están desactivados por una variable de entorno.",
+      "disableNetworkObservabilityLabel": "Desactivar los informes de red",
+      "disableNetworkObservabilityDesc": "Detiene la telemetría de instalación, las comprobaciones de actualizaciones en segundo plano y los identificadores anónimos que vinculan las solicitudes de una misma sesión — esos identificadores solo se envían a la API oficial de TokenRhythm. Tus propias solicitudes de modelo siguen funcionando.",
       "save": "Guardar privacidad"
     },
     "toast": {
@@ -2720,6 +2732,7 @@
     "latest": "Más reciente",
     "thinking": "Razonando",
     "thoughtProcess": "Proceso de razonamiento",
+    "thinkingForSeconds": "Razonando · {seconds} s",
     "thoughtForSeconds": "Razonó durante {seconds} s",
     "thoughtForMinutes": "Razonó durante {minutes} min {seconds} s",
     "toolResult": "Resultado de la herramienta",
@@ -2784,6 +2797,7 @@
       "ensembleDetailUnavailable": "{count} candidatos · detalle no disponible"
     },
     "sources": "Fuentes",
+    "activityLabel": "Actividad",
     "activitySteps": "Actividad · {count} paso | Actividad · {count} pasos",
     "activityItems": "Actividad · {count} elemento | Actividad · {count} elementos",
     "activityCompletedItems": "Completado · {count} elemento | Completado · {count} elementos",
@@ -2811,6 +2825,17 @@
         "recall": "Memoria consultada",
         "use": "Herramientas usadas"
       },
+      "purposeRunning": {
+        "discover": "Descubriendo enlaces",
+        "search": "Buscando en la web",
+        "read": "Leyendo páginas web",
+        "inspect": "Inspeccionando archivos",
+        "change": "Editando archivos",
+        "run": "Ejecutando comandos",
+        "create": "Creando artefactos",
+        "recall": "Consultando la memoria",
+        "use": "Usando herramientas"
+      },
       "footprint": {
         "web": "{count} acción web | {count} acciones web",
         "files": "{count} archivo | {count} archivos",
@@ -2820,7 +2845,9 @@
         "memory": "{count} consulta de memoria | {count} consultas de memoria",
         "tools": "{count} llamada a herramienta | {count} llamadas a herramientas"
       },
-      "more": "{count} más"
+      "more": "{count} más",
+      "stale": "Sigue trabajando — sin señal reciente",
+      "liveStep": "paso {n}"
     },
     "suggestedTasks": "Tareas sugeridas",
     "greetingMorning": "Buenos días.",
@@ -2985,7 +3012,8 @@
       "downloadFailed": "Error al descargar",
       "forkFailed": "Error al bifurcar",
       "copyFailed": "Error al copiar",
-      "shareExportFailed": "Error al exportar para compartir",
+      "shareSaveFailed": "No se pudo guardar la imagen. Inténtalo de nuevo.",
+      "sharePreviewUpdateFailed": "No se pudo actualizar la vista previa. Inténtalo de nuevo.",
       "saved": "{filename} guardado",
       "copiedToClipboard": "Copiado al portapapeles",
       "copyNotSupported": "Copiar no es compatible — descárgalo en su lugar",
@@ -3000,6 +3028,11 @@
       "voiceUnavailable": "La entrada de voz no está disponible. Actívala en Ajustes.",
       "voiceTranscribeFailed": "No se pudo transcribir tu grabación. Inténtalo de nuevo.",
       "voiceSetupNeeded": "La entrada de voz necesita una clave de API de ElevenLabs: abriendo Ajustes…",
+      "voiceCancelledHidden": "La grabación se detuvo al ocultarse la ventana. Empieza de nuevo para dictar.",
+      "voiceMicDenied": "Se denegó el acceso al micrófono. Permítelo en los ajustes del navegador.",
+      "voiceMicDeniedDesktop": "El acceso al micrófono está bloqueado. Permítelo en los ajustes del sistema e inténtalo de nuevo.",
+      "voiceMicMissing": "No se encontró ningún micrófono.",
+      "voiceRecordFailed": "No se pudo iniciar la grabación. Inténtalo de nuevo.",
       "waitAttachments": "Espera a que termine el procesamiento de los archivos adjuntos",
       "waitCompactionBeforeCommand": "Espera a que termine la compactación del contexto antes de ejecutar {command}.",
       "waitResponseBeforeCommand": "Espera a la respuesta actual antes de ejecutar {command}.",
@@ -3015,8 +3048,7 @@
       "preparingOutput": "Preparando la salida",
       "generatingCandidates": "Generando candidatos",
       "synthesizingCandidates": "Sintetizando candidatos",
-      "stillWaiting": "Aún esperando al modelo",
-      "stillWorking": "Aún trabajando — última señal hace {seconds} s"
+      "stillWaiting": "Aún esperando al modelo"
     },
     "stall": {
       "title": "La respuesta tarda más de lo esperado",

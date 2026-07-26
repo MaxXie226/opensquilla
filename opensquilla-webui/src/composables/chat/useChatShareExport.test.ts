@@ -1,7 +1,11 @@
 // @vitest-environment happy-dom
 
-import { describe, expect, it } from 'vitest'
+import { createApp, h } from 'vue'
+import { afterEach, describe, expect, it } from 'vitest'
 
+import ActivityDisclosure from '@/components/chat/ActivityDisclosure.vue'
+import i18n from '@/i18n'
+import zhHans from '@/locales/zh-Hans.json'
 import { useChatTextRendering } from './useChatTextRendering'
 import { buildShareDom } from './useChatShareExport'
 
@@ -138,6 +142,33 @@ describe('buildShareDom protocol-shaped documentation', () => {
     expect(stage.textContent?.match(/Canonical answer/g)).toHaveLength(1)
   })
 
+  it('uncaps the reasoning scroll container so long reasoning is not clipped', () => {
+    // ReasoningPart caps .thinking-block__body at max-height 16rem with a
+    // scrollbar. The exported PNG has no scrollbar, so without a stage-scoped
+    // reset a long trace inside an expanded activity fold would be silently
+    // cut off with no indication anything is missing.
+    const source = document.createElement('article')
+    source.dataset.shareMessageId = 'assistant-long-reasoning'
+    source.innerHTML = [
+      '<div data-share-activity data-share-expanded="true">',
+      '<div data-share-activity-body>',
+      '<section class="thinking-block">',
+      '<div class="thinking-block__body">A very long reasoning trace.</div>',
+      '</section>',
+      '</div>',
+      '</div>',
+    ].join('')
+
+    const stage = buildShareDom([source])
+    const css = stage.querySelector('style')?.textContent || ''
+    const bodyRule = css.match(/\.thinking-block__body\s*\{[^}]*\}/)?.[0] || ''
+
+    expect(stage.querySelector('.thinking-block__body')?.textContent)
+      .toBe('A very long reasoning trace.')
+    expect(bodyRule).toContain('max-height: none !important;')
+    expect(bodyRule).toContain('overflow-y: visible !important;')
+  })
+
   it('keeps legacy details activity compatible during the data-contract migration', () => {
     const source = document.createElement('article')
     source.dataset.shareMessageId = 'assistant-legacy-activity'
@@ -160,5 +191,129 @@ describe('buildShareDom protocol-shaped documentation', () => {
     expect(stage.textContent).not.toContain('Hidden legacy output')
     expect(stage.textContent).toContain('Visible legacy output')
     expect(stage.textContent?.match(/Canonical answer/g)).toHaveLength(1)
+  })
+})
+
+describe('share export label localization', () => {
+  afterEach(() => {
+    i18n.global.locale.value = 'en'
+  })
+
+  it('localizes the activity and thinking fallback labels baked into the image', () => {
+    // The exported PNG is static: any fallback label the composable writes is
+    // burned in, so it must follow the UI locale rather than hardcode English.
+    i18n.global.setLocaleMessage('zh-Hans', zhHans)
+    i18n.global.locale.value = 'zh-Hans'
+
+    const source = document.createElement('article')
+    source.dataset.shareMessageId = 'assistant-localized'
+    source.innerHTML = [
+      '<div data-share-activity data-share-expanded="true">',
+      '<div data-share-activity-body><div>step output</div></div>',
+      '</div>',
+      '<details class="thinking-fold" open>',
+      '<summary class="thinking-fold__summary"></summary>',
+      '<div class="thinking-fold__body">Weighed the options.</div>',
+      '</details>',
+    ].join('')
+
+    const stage = buildShareDom([source])
+
+    expect(stage.querySelector('.chat-share-export-activity__label')?.textContent).toBe('活动')
+    expect(stage.querySelector('.chat-share-export-thinking__label')?.textContent).toBe('思考中')
+  })
+})
+
+// Pins the renderer/export boundary against the REAL ActivityDisclosure
+// markup: the data-share-* hooks are a contract, and restyling the fold must
+// not silently drop expanded activity from (or leak collapsed activity into)
+// the share image.
+describe('ActivityDisclosure share hook contract', () => {
+  const mountedApps: ReturnType<typeof createApp>[] = []
+
+  function mountDisclosure(props: InstanceType<typeof ActivityDisclosure>['$props']) {
+    const host = document.createElement('article')
+    host.dataset.shareMessageId = 'assistant-disclosure'
+    document.body.appendChild(host)
+    const app = createApp({
+      render: () => h(ActivityDisclosure, props, {
+        default: () => h('div', { class: 'activity-step' }, 'step output'),
+      }),
+    })
+    mountedApps.push(app)
+    app.use(i18n)
+    app.mount(host)
+    return host
+  }
+
+  afterEach(() => {
+    while (mountedApps.length) mountedApps.pop()?.unmount()
+    document.body.innerHTML = ''
+  })
+
+  it('exports the expanded settled fold through the data-share hooks', () => {
+    const host = mountDisclosure({
+      lifecycle: 'settled',
+      stepCount: 2,
+      failureCount: 0,
+      summaryLabel: 'Ran 2 tools',
+      defaultOpen: true,
+    })
+    const activity = host.querySelector<HTMLElement>('[data-share-activity]')
+
+    expect(activity).not.toBeNull()
+    expect(activity?.dataset.shareExpanded).toBe('true')
+    const label = activity?.querySelector<HTMLElement>('[data-share-activity-label]')
+    expect(label?.textContent).toContain('Ran 2 tools')
+    // The interactive summary chrome must keep opting out of the static image.
+    expect(label?.hasAttribute('data-share-control')).toBe(true)
+    expect(activity?.querySelector('[data-share-activity-body]')).not.toBeNull()
+
+    const stage = buildShareDom([host])
+
+    expect(stage.querySelector('[data-share-activity]')).toBeNull()
+    expect(stage.querySelector('.chat-share-export-activity__label')?.textContent)
+      .toContain('Ran 2 tools')
+    expect(stage.querySelector('.chat-share-export-activity__body')?.textContent)
+      .toContain('step output')
+  })
+
+  it('drops the collapsed settled fold from the share image', () => {
+    const host = mountDisclosure({
+      lifecycle: 'settled',
+      stepCount: 2,
+      failureCount: 0,
+      summaryLabel: 'Ran 2 tools',
+    })
+
+    expect(
+      host.querySelector<HTMLElement>('[data-share-activity]')?.dataset.shareExpanded,
+    ).toBe('false')
+
+    const stage = buildShareDom([host])
+
+    expect(stage.querySelector('.chat-share-export-activity')).toBeNull()
+    expect(stage.textContent).not.toContain('step output')
+  })
+
+  it('exports live activity as expanded static content', () => {
+    const host = mountDisclosure({
+      lifecycle: 'working',
+      stepCount: 3,
+      failureCount: 0,
+      phaseLabel: 'Running commands',
+    })
+    const activity = host.querySelector<HTMLElement>('[data-share-activity]')
+
+    expect(activity?.dataset.shareExpanded).toBe('true')
+    expect(activity?.querySelector('[data-share-activity-label]')).not.toBeNull()
+    expect(activity?.querySelector('[data-share-activity-body]')).not.toBeNull()
+
+    const stage = buildShareDom([host])
+
+    expect(stage.querySelector('.chat-share-export-activity__label')?.textContent)
+      .toContain('Running commands')
+    expect(stage.querySelector('.chat-share-export-activity__body')?.textContent)
+      .toContain('step output')
   })
 })

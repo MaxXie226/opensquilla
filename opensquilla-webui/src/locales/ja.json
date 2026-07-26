@@ -66,7 +66,8 @@
     "discard": "破棄",
     "cancel": "キャンセル",
     "edit": "編集",
-    "delete": "削除"
+    "delete": "削除",
+    "dismiss": "閉じる"
   },
   "nav": {
     "chat": "チャット",
@@ -477,7 +478,7 @@
       "endpointDesc": "OpenSquilla が {provider} を呼び出す場合にのみ適用されます。",
       "defaultModelTitle": "{provider} のデフォルトモデル",
       "defaultModelGroupDesc": "ルーティングがオフの場合、または実行が使用中のプロバイダーにフォールバックする場合に使われます。",
-      "defaultModelLabel": "{provider} のデフォルト直接モデル",
+      "defaultModelLabel": "直接/フォールバックモデル",
       "configuredModelTitle": "{provider} のモデル",
       "configuredModelCurrentLabel": "現在のモデル",
       "configuredModelFallbackLabel": "フォールバックモデル",
@@ -872,6 +873,15 @@
       "fallbacks": "フォールバックモデル",
       "fallbacksHint": "主モデルが失敗した場合に順に試す、カンマ区切りの「プロバイダー/モデル」ID。"
     },
+    "capabilities": {
+      "imageStatus": {
+        "missingEnv": "環境変数 {name} がありません。下にキーを貼り付けるか、その変数を設定してゲートウェイを再起動してください。"
+      },
+      "imageKeyConfigured": "キー設定済み",
+      "imageKeyMissing": "未設定",
+      "imageKeyPlaceholderKeep": "空欄のままにすると保存済みのキーを維持します",
+      "imageKeyPlaceholderNew": "API キーを貼り付け"
+    },
     "audio": {
       "title": "オーディオ",
       "enableLabel": "音声・オーディオツールを有効化",
@@ -941,6 +951,8 @@
       "closeBehaviorReadFailed": "ウィンドウを閉じるときの設定を読み込めませんでした: {error}",
       "closeBehaviorSaveFailed": "ウィンドウを閉じるときの設定を保存できませんでした: {error}",
       "closeBehaviorBackgroundUnavailable": "このプラットフォームではバックグラウンド実行を利用できません。",
+      "closeBehaviorFallbackQuit": "このプラットフォームではバックグラウンド実行を利用できないため、ウィンドウを閉じるとアプリは終了します。",
+      "closeBehaviorRetry": "再試行",
       "resetConfirmTitle": "保存済みのセットアップをリセットしますか？",
       "resetConfirmBody": "保存済みのデスクトップ認証情報と生成された設定が消去されます。次回起動時に初回セットアップが再実行されます。",
       "resetConfirmPrimary": "リセット",
@@ -1117,11 +1129,11 @@
     },
     "privacy": {
       "title": "プライバシー",
-      "statusEnabled": "プロバイダーリクエストの相関付けと統合ネットワーク可観測性は有効です。",
-      "statusDisabled": "プロバイダーリクエストの相関付けと統合ネットワーク可観測性は無効です。",
-      "statusDisabledByEnv": "プロバイダーリクエストの相関付けと統合ネットワーク可観測性は専用のプライバシー環境変数によって無効です。",
-      "disableNetworkObservabilityLabel": "ネットワーク可観測性とプロバイダーリクエストの相関付けを無効化",
-      "disableNetworkObservabilityDesc": "自動インストールテレメトリ、受動的な更新確認、および TokenRhythm 公式 HTTPS API へのリクエストに付与される不透明なセッション・ターン・実行・呼び出し種別の相関ヘッダーを停止します。ユーザーが開始したプロバイダーリクエストは引き続き実行されます。",
+      "statusEnabled": "ネットワーク報告はオンです。",
+      "statusDisabled": "ネットワーク報告はオフです。",
+      "statusDisabledByEnv": "環境変数の設定により、ネットワーク報告はオフになっています。",
+      "disableNetworkObservabilityLabel": "ネットワーク報告をオフにする",
+      "disableNetworkObservabilityDesc": "インストールテレメトリ、バックグラウンドの更新確認、同じセッションのリクエストを結び付ける匿名識別子を停止します。この識別子は公式の TokenRhythm API にのみ送信されます。自分で開始したモデルリクエストはそのまま動作します。",
       "save": "プライバシーを保存"
     },
     "toast": {
@@ -2720,6 +2732,7 @@
     "latest": "最新",
     "thinking": "思考中",
     "thoughtProcess": "思考プロセス",
+    "thinkingForSeconds": "思考中 · {seconds} 秒",
     "thoughtForSeconds": "{seconds} 秒間思考",
     "thoughtForMinutes": "{minutes} 分 {seconds} 秒間思考",
     "toolResult": "ツールの結果",
@@ -2784,6 +2797,7 @@
       "ensembleDetailUnavailable": "{count} 個の候補 · 詳細は利用できません"
     },
     "sources": "ソース",
+    "activityLabel": "アクティビティ",
     "activitySteps": "アクティビティ · {count} ステップ | アクティビティ · {count} ステップ",
     "activityItems": "アクティビティ · {count} 件",
     "activityCompletedItems": "完了 · {count} 件",
@@ -2811,6 +2825,17 @@
         "recall": "メモリを検索",
         "use": "ツールを使用"
       },
+      "purposeRunning": {
+        "discover": "リンクを検出中",
+        "search": "ウェブを検索中",
+        "read": "ウェブページを閲覧中",
+        "inspect": "ファイルを確認中",
+        "change": "ファイルを編集中",
+        "run": "コマンドを実行中",
+        "create": "成果物を作成中",
+        "recall": "メモリを検索中",
+        "use": "ツールを使用中"
+      },
       "footprint": {
         "web": "{count} 件のウェブ操作",
         "files": "{count} 件のファイル",
@@ -2820,7 +2845,9 @@
         "memory": "{count} 件のメモリ検索",
         "tools": "{count} 件のツール呼び出し"
       },
-      "more": "ほか {count} 項目"
+      "more": "ほか {count} 項目",
+      "stale": "処理を継続中 — 最近の信号はありません",
+      "liveStep": "ステップ {n}"
     },
     "suggestedTasks": "おすすめのタスク",
     "greetingMorning": "おはようございます。",
@@ -2985,7 +3012,8 @@
       "downloadFailed": "ダウンロードに失敗しました",
       "forkFailed": "フォークに失敗しました",
       "copyFailed": "コピーに失敗しました",
-      "shareExportFailed": "共有のエクスポートに失敗しました",
+      "shareSaveFailed": "画像を保存できませんでした。もう一度お試しください。",
+      "sharePreviewUpdateFailed": "プレビューを更新できませんでした。もう一度お試しください。",
       "saved": "{filename} を保存しました",
       "copiedToClipboard": "クリップボードにコピーしました",
       "copyNotSupported": "コピーはサポートされていません — 代わりにダウンロードしてください",
@@ -3000,6 +3028,11 @@
       "voiceUnavailable": "音声入力は利用できません。設定で有効にしてください。",
       "voiceTranscribeFailed": "録音を文字起こしできませんでした。もう一度お試しください。",
       "voiceSetupNeeded": "音声入力には ElevenLabs API キーが必要です — 設定を開きます…",
+      "voiceCancelledHidden": "ウィンドウが非表示になったため録音を停止しました。もう一度開始すると口述できます。",
+      "voiceMicDenied": "マイクへのアクセスが拒否されました。ブラウザーの設定で許可してください。",
+      "voiceMicDeniedDesktop": "マイクへのアクセスがブロックされています。システム設定で許可してから、もう一度お試しください。",
+      "voiceMicMissing": "マイクが見つかりませんでした。",
+      "voiceRecordFailed": "録音を開始できませんでした。もう一度お試しください。",
       "waitAttachments": "ファイル添付の処理が完了するまでお待ちください",
       "waitCompactionBeforeCommand": "{command} を実行する前にコンテキストの圧縮が完了するまでお待ちください。",
       "waitResponseBeforeCommand": "{command} を実行する前に現在の応答が完了するまでお待ちください。",
@@ -3015,8 +3048,7 @@
       "preparingOutput": "出力を準備中",
       "generatingCandidates": "候補を生成中",
       "synthesizingCandidates": "候補を統合中",
-      "stillWaiting": "まだモデルを待機中",
-      "stillWorking": "まだ処理中 — 最後の信号は {seconds} 秒前"
+      "stillWaiting": "まだモデルを待機中"
     },
     "stall": {
       "title": "応答に予想以上の時間がかかっています",
