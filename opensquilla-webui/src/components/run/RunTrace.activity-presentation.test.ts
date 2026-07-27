@@ -13,6 +13,15 @@ import runTraceSource from './RunTrace.vue?raw'
 
 const mountedApps: App[] = []
 
+function ruleBody(selector: string) {
+  const selectorStart = runTraceSource.indexOf(selector)
+  expect(selectorStart).toBeGreaterThanOrEqual(0)
+
+  const blockStart = runTraceSource.indexOf('{', selectorStart)
+  const blockEnd = runTraceSource.indexOf('}', blockStart)
+  return runTraceSource.slice(blockStart + 1, blockEnd)
+}
+
 function call(
   renderKey: string,
   overrides: Partial<ChatToolCallRenderItem> = {},
@@ -110,20 +119,11 @@ afterEach(() => {
 
 describe('RunTrace activity presentation', () => {
   it('uses AA text roles instead of transparent blends for activity copy', () => {
-    const ruleBody = (selector: string) => {
-      const selectorStart = runTraceSource.indexOf(selector)
-      expect(selectorStart).toBeGreaterThanOrEqual(0)
-
-      const blockStart = runTraceSource.indexOf('{', selectorStart)
-      const blockEnd = runTraceSource.indexOf('}', blockStart)
-      return runTraceSource.slice(blockStart + 1, blockEnd)
-    }
-
     expect(ruleBody('.tool-timeline--activity .tool-row__label')).toContain(
       'color: var(--text-muted);',
     )
 
-    const secondaryTextRule = ruleBody('.tool-timeline--activity .step-count')
+    const secondaryTextRule = ruleBody('.tool-timeline--activity .tool-row__status')
     expect(secondaryTextRule).toContain('color: var(--text-muted);')
     expect(secondaryTextRule).not.toContain('transparent')
     expect(
@@ -139,6 +139,42 @@ describe('RunTrace activity presentation', () => {
     expect(ruleBody('.tool-overflow-note')).toContain(
       'color: var(--text-muted);',
     )
+  })
+
+  it('aligns subordinate activity content to the post-icon text origin', () => {
+    // Row text starts at 0.125rem padding + 0.875rem icon + 0.625rem gap =
+    // 1.625rem; detail bodies and narration share that origin, and nested
+    // member rows indent by one 1.5rem (icon + gap) level.
+    expect(ruleBody('.tool-timeline--activity .tool-row-body')).toContain(
+      'padding: 0 0 0.125rem 1.625rem;',
+    )
+    expect(ruleBody('.tool-timeline--activity .msg-ai-text')).toContain(
+      'margin: 0.125rem 0 0.25rem 1.625rem;',
+    )
+    expect(ruleBody('.tool-timeline--activity .step-group-members')).toContain(
+      'padding-left: 1.5rem;',
+    )
+  })
+
+  it('rests the activity chevron visible on hoverless devices', () => {
+    // Touch has no hover to reveal the chevron; without this media block the
+    // row reads as inert text. Slice to the block's first rule — the arrow
+    // rule sits first inside it.
+    const mediaStart = runTraceSource.indexOf('@media (hover: none)')
+    expect(mediaStart).toBeGreaterThanOrEqual(0)
+    const ruleEnd = runTraceSource.indexOf('}', mediaStart)
+    const mediaRule = runTraceSource.slice(mediaStart, ruleEnd)
+    expect(mediaRule).toContain('.tool-timeline--activity .tool-row__activity-arrow')
+    expect(mediaRule).toContain('opacity: 0.55;')
+    expect(mediaRule).not.toContain('translateX(-')
+  })
+
+  it('keeps the running activity icon static so the header dot is the only loop', () => {
+    const runningIconRule = ruleBody('.tool-timeline--activity .tool-row__activity-icon--running')
+    expect(runningIconRule).toContain('color: var(--accent);')
+    expect(runningIconRule).not.toContain('animation')
+    // No dangling keyframes or reduced-motion overrides for the removed pulse.
+    expect(runTraceSource).not.toContain('activity-tool-icon-pulse')
   })
 
   const completedGroup = group('completed-group', [
@@ -168,6 +204,7 @@ describe('RunTrace activity presentation', () => {
     expect(el.querySelector('.tool-row__state-icon--ok')).not.toBeNull()
     expect(el.querySelector('.step-chevron')).not.toBeNull()
     expect(el.querySelector('.tool-timeline__bulk-icon')).not.toBeNull()
+    expect(el.querySelector('.step-count')?.textContent).toBe('2 calls')
     expect(
       Array.from(el.querySelectorAll('.tool-row--group .tool-row__status'))
         .map(node => node.textContent),
@@ -191,6 +228,9 @@ describe('RunTrace activity presentation', () => {
     ).toBe(true)
     expect(el.querySelector('.tool-timeline__toolbar')).toBeNull()
     expect(el.querySelector('.tool-timeline__bulk-icon')).toBeNull()
+    // The footprint secondary already carries the call count, so the raw
+    // "N calls" pill stays out of activity group rows.
+    expect(el.querySelector('.step-count')).toBeNull()
     expect(
       Array.from(el.querySelectorAll('.tool-row--group .tool-row__status'))
         .map(node => node.textContent),
@@ -229,9 +269,13 @@ describe('RunTrace activity presentation', () => {
       ]),
     ], { presentation: 'activity' })
 
-    const row = el.querySelector('.tool-row--error')
-    const status = row?.querySelector('.tool-row__status[role="status"]')
+    // The failure is plain content of the row button, so it joins the row's
+    // accessible name; a live region mounted already-populated never announces.
+    const row = el.querySelector<HTMLButtonElement>('.tool-row--error')
+    const status = row?.querySelector('.tool-row__status')
     expect(status?.textContent).toBe('Failed')
+    expect(row?.textContent).toContain('Failed')
+    expect(el.querySelector('[role="status"]')).toBeNull()
     expect(el.querySelector('.tool-row__state-icon--err')).not.toBeNull()
     expect(el.querySelector('.tool-row__activity-icon--error')).not.toBeNull()
     expect(el.querySelector('.tool-row__activity-arrow')).not.toBeNull()
@@ -255,9 +299,13 @@ describe('RunTrace activity presentation', () => {
       toolStatusText: () => 'Cancelled',
     })
 
+    const row = el.querySelector<HTMLButtonElement>('.tool-row--error')
     expect(
-      el.querySelector('.tool-row--error .tool-row__status[role="status"]')?.textContent,
+      row?.querySelector('.tool-row__status')?.textContent,
     ).toBe('Cancelled')
+    // Read as part of the row's accessible name, not via a live region.
+    expect(row?.textContent).toContain('Cancelled')
+    expect(el.querySelector('[role="status"]')).toBeNull()
   })
 
   it('keeps a successful activity call collapsed until explicitly opened', async () => {
@@ -274,11 +322,14 @@ describe('RunTrace activity presentation', () => {
   })
 
   it('keeps compact semantic details and explicit raw forwarding available', async () => {
-    const result = 'command output\n'.repeat(30)
+    const result = 'file contents\n'.repeat(30)
     const onShowResult = vi.fn()
+    // A read-shaped call: content-size summaries are reserved for read
+    // operations, so this is the compact-summary path.
     const el = await mountTimeline([
       group('long-result-group', [
         call('long-result', {
+          name: 'read_file',
           result,
           resultPreview: result.slice(0, 200),
         }),
@@ -311,7 +362,7 @@ describe('RunTrace activity presentation', () => {
       `INPUT\n{}\n\nRESULT\n${result.trim()}`,
       'long-result-group · details',
       {
-        toolName: 'shell',
+        toolName: 'read_file',
         inputRaw: '{}',
         section: undefined,
       },

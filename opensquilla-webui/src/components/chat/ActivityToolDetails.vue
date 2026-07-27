@@ -71,7 +71,7 @@ function formatNumber(value: number): string {
 function formatBytes(value: number): string {
   if (!Number.isFinite(value) || value < 0) return '0 B'
   if (value < 1024) return `${formatNumber(value)} B`
-  const units = ['KB', 'MB', 'GB']
+  const units = ['KiB', 'MiB', 'GiB']
   let amount = value / 1024
   let unitIndex = 0
   while (amount >= 1024 && unitIndex < units.length - 1) {
@@ -132,13 +132,13 @@ function showRawDetails() {
 .activity-tool-details__summary {
   position: relative;
   display: flex;
+  flex-wrap: wrap;
   align-items: baseline;
-  gap: 0.35rem;
-  width: max-content;
+  gap: 0 0.35rem;
+  width: fit-content;
   max-width: 100%;
   min-width: 0;
   color: var(--text-muted);
-  white-space: nowrap;
 }
 
 .activity-tool-details__summary--interactive {
@@ -166,7 +166,20 @@ function showRawDetails() {
 }
 
 .activity-tool-details__line--error {
+  flex: 1 1 auto;
+  overflow: visible;
+  overflow-wrap: anywhere;
+  white-space: normal;
   color: var(--danger);
+}
+
+.activity-tool-details__summary--interactive .activity-tool-details__line--target,
+.activity-tool-details__summary--interactive .activity-tool-details__line--code {
+  text-decoration: underline;
+  text-decoration-style: dotted;
+  text-decoration-thickness: 1px;
+  text-decoration-color: color-mix(in srgb, var(--text) 40%, transparent);
+  text-underline-offset: 0.15em;
 }
 
 .activity-tool-details__separator {
@@ -194,6 +207,7 @@ function showRawDetails() {
 .activity-tool-details__summary--interactive:focus-within .activity-tool-details__line--target,
 .activity-tool-details__summary--interactive:focus-within .activity-tool-details__line--code {
   color: var(--text);
+  text-decoration-color: currentColor;
 }
 
 .activity-tool-details__summary--interactive:hover .activity-tool-details__line--error,
@@ -210,22 +224,35 @@ function showRawDetails() {
   margin: 0;
   padding: 0;
   border: 0;
-  border-radius: 0;
+  border-radius: var(--radius-sm);
   background: transparent;
   color: var(--text-muted);
   cursor: pointer;
   font: inherit;
   font-size: 0.71875rem;
   line-height: 1.45;
-  transition: color var(--dur-fast) var(--ease-standard);
+  /* This button is the only path to the raw viewer for tools that expose no
+     safe inline detail, and it sits where the detail text would be. Without a
+     resting underline it renders as muted body copy and reads as the row's
+     content rather than the control that opens it — hover-only affordance also
+     leaves touch users with nothing. */
+  text-decoration: underline;
+  text-decoration-color: color-mix(in srgb, currentColor 40%, transparent);
+  text-underline-offset: 0.15em;
+  transition:
+    color var(--dur-fast) var(--ease-standard),
+    text-decoration-color var(--dur-fast) var(--ease-standard);
+}
+
+.activity-tool-details__fallback:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
 }
 
 .activity-tool-details__fallback:hover,
 .activity-tool-details__fallback:focus-visible {
-  outline: none;
   color: var(--text);
-  text-decoration: underline;
-  text-underline-offset: 0.15em;
+  text-decoration-color: currentColor;
 }
 
 @media (prefers-reduced-motion: reduce) {

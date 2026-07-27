@@ -226,7 +226,9 @@ test.describe('Completed assistant activity disclosure', () => {
     const activity = page.getByTestId('assistant-activity')
     await expect(activity).toBeVisible()
     await expect(activity).toHaveAttribute('data-share-expanded', 'false')
-    await expect(activity).toContainText('Completed · 2 items')
+    // The collapsed row leads with what the turn did (footprint summary)
+    // rather than the generic "Completed · N items" count.
+    await expect(activity).toContainText('1 web action')
 
     const answer = page.getByText('The canonical answer is complete.', { exact: true })
     await expect(answer).toBeVisible()
@@ -258,7 +260,9 @@ test.describe('Completed assistant activity disclosure', () => {
       backgroundColor: 'rgba(0, 0, 0, 0)',
       borderTopWidth: '0px',
       boxShadow: 'none',
-      arrowOpacity: '0',
+      // The chevron rests faintly visible so the disclosure affordance is
+      // discoverable without hover.
+      arrowOpacity: '0.34',
     })
     await summary.hover()
     await expect(summaryArrow).toHaveCSS('opacity', '0.8')
@@ -413,7 +417,14 @@ test.describe('Live assistant activity lifecycle', () => {
     await expect(liveStatus).toHaveAttribute('aria-live', 'polite')
     await expect(liveStatus).toHaveAttribute('aria-atomic', 'true')
     await expect(liveActivity.getByText('Working', { exact: true })).toHaveCount(1)
-    await expect(liveActivity.locator('[role="status"]')).toHaveCount(1)
+    // Exactly two deliberate polite regions with disjoint content: the phase
+    // label, and the always-mounted failure counter (empty until a failure
+    // lands, so it announces only when the count actually changes). Anything
+    // beyond these two would double-announce streaming updates.
+    await expect(liveActivity.locator('[role="status"]')).toHaveCount(2)
+    const liveFailureRegion = liveActivity.locator('.assistant-activity__live-failure')
+    await expect(liveFailureRegion).toHaveAttribute('aria-live', 'polite')
+    await expect(liveFailureRegion).toHaveText('')
     await expect(liveActivity.locator('.assistant-activity-status__row')).toHaveCount(0)
     const liveMotion = await liveActivity.evaluate((element) => ({
       dot: getComputedStyle(
@@ -423,8 +434,10 @@ test.describe('Live assistant activity lifecycle', () => {
         element.querySelector<HTMLElement>('.assistant-activity__live-label')!,
       ).animationName,
     }))
+    // The pulsing dot is the single working signal; the label is deliberately
+    // static (the shimmer gradient was removed as visual noise).
     expect(liveMotion.dot).not.toBe('none')
-    expect(liveMotion.label).not.toBe('none')
+    expect(liveMotion.label).toBe('none')
 
     lifecycle.emit('session.event.tool_use_start', {
       tool_use_id: 'activity-inspect',
@@ -438,7 +451,9 @@ test.describe('Live assistant activity lifecycle', () => {
     await expect(inspectRow.locator('.tool-row__bullet')).toHaveCount(0)
     await expect(liveActivity).not.toContainText('/private/project/chat.ts')
     await expect(liveStatus).toHaveText('Working')
-    await expect(liveActivity.getByText('Inspected files', { exact: true })).toHaveCount(1)
+    // A cluster still in flight reads in the present tense; it settles into
+    // the past tense once its result lands.
+    await expect(liveActivity.getByText('Inspecting files', { exact: true })).toHaveCount(1)
 
     lifecycle.emit('session.event.tool_result', {
       tool_use_id: 'activity-inspect',
@@ -447,6 +462,7 @@ test.describe('Live assistant activity lifecycle', () => {
       result: 'read',
       execution_status: { status: 'success' },
     })
+    await expect(liveActivity.getByText('Inspected files', { exact: true })).toHaveCount(1)
     lifecycle.emit('session.event.text_delta', { text: 'Draft candidate.' })
 
     const answerCandidate = page.locator('.live-answer-candidate')
@@ -467,7 +483,7 @@ test.describe('Live assistant activity lifecycle', () => {
     await expect(liveActivity.getByText('Draft candidate.', { exact: true })).toBeVisible()
     await expect(liveActivity.locator('.tool-row[data-op="command.run"]')).toBeVisible()
     await expect(liveStatus).toHaveText('Working')
-    await expect(liveActivity.getByText('Ran commands', { exact: true })).toHaveCount(1)
+    await expect(liveActivity.getByText('Running commands', { exact: true })).toHaveCount(1)
 
     lifecycle.emit('session.event.tool_result', {
       tool_use_id: 'activity-verify',

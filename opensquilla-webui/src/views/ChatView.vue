@@ -178,7 +178,10 @@
              is live. The trailing text segment is rendered below it as the
              current answer candidate; if a later tool starts, that text moves
              back into the chronological activity transcript. -->
-        <div v-if="isStreaming && streamBubble && answerRevealOpen" class="msg-ai" data-history-role="assistant" aria-live="polite">
+        <!-- No blanket aria-live here: the phase label inside ActivityDisclosure
+             is the single live announcement point, so streaming DOM churn (tool
+             rows, answer tokens) is not read out mutation-by-mutation. -->
+        <div v-if="isStreaming && streamBubble && answerRevealOpen" class="msg-ai" data-history-role="assistant">
           <div class="msg-ai-main">
             <ActivityDisclosure
               :lifecycle="liveAnswerPart ? 'answering' : 'working'"
@@ -188,20 +191,17 @@
               :elapsed-label="streamPhaseElapsed"
               :stale="streamActivityStale"
             >
-              <!-- Reasoning remains available as a flat, secondary disclosure. -->
-              <details v-if="liveThinkingText" class="thinking-fold">
-                <summary class="thinking-fold__summary">
-                  <span>{{ t('chat.thinking') }} · {{ streamThinkingElapsedText }}</span>
-                </summary>
-                <div class="thinking-fold__body">{{ liveThinkingText }}</div>
-              </details>
+              <!-- Reasoning remains available as a flat, secondary disclosure,
+                   rendered by the same part component settled turns use so the
+                   chevron affordance and wording stay consistent; `live`
+                   selects the streaming "Thinking · Ns" label. -->
+              <ReasoningPart v-if="liveReasoningPart" :part="liveReasoningPart" live />
 
               <AssistantActivityTimeline
                 v-if="
                   liveActivityProjection.activityClusters.length
                   || liveActivityProjection.statusSteps.length
                 "
-                class="assistant-activity__timeline"
                 variant="checklist"
                 :projection="liveActivityProjection"
                 :timeline-items="liveActivityTimelineItems"
@@ -211,19 +211,26 @@
                 :tool-group-status-text="toolGroupStatusText"
                 :tool-status-text="toolStatusText"
                 :tool-secondary-text="toolSecondaryText"
-                :tool-elapsed-text="streamToolElapsedText"
+                :tool-elapsed-text="liveToolElapsedText"
                 @toggle-group="toggleToolGroup"
                 @toggle-item="toggleToolItem"
                 @show-result="showToolResultModal"
               />
             </ActivityDisclosure>
 
-            <div v-if="liveAnswerPart" class="live-answer-candidate">
-              <TextPart
-                :part="liveAnswerPart"
-                :sources="[]"
-              />
-            </div>
+            <!-- Provisional answer candidate: the left rule + draft tag mark
+                 it as not-final, because a later tool start moves this text
+                 back into the activity transcript. The tag sits outside the
+                 candidate box so the candidate's own text stays the answer. -->
+            <template v-if="liveAnswerPart">
+              <span class="live-answer-candidate-tag">{{ t('chat.metaRuns.draft') }}</span>
+              <div class="live-answer-candidate">
+                <TextPart
+                  :part="liveAnswerPart"
+                  :sources="[]"
+                />
+              </div>
+            </template>
             <span
               v-if="liveAnswerPart && !streamActivityStale"
               class="stream-caret"
@@ -475,6 +482,13 @@
       @copy="onShareCopy"
       @set-theme="onShareSetTheme"
     />
+
+    <!-- Persistent completion announcer: the live block's role="status" phase
+         label unmounts with the block when streaming ends, so on its own the
+         settle would never reach a screen reader. This region stays mounted
+         across the streaming boundary; it fills when a live turn settles and
+         clears when the next turn starts so repeat turns announce again. -->
+    <span class="chat-turn-settled-announcer" role="status" aria-live="polite">{{ turnSettledAnnouncement }}</span>
   </div>
 </template>
 
@@ -498,6 +512,7 @@ import ClarifyCard from '@/components/chat/ClarifyCard.vue'
 import ConversationMinimap from '@/components/chat/ConversationMinimap.vue'
 import EmptyStateChips from '@/components/chat/EmptyStateChips.vue'
 import InterruptPart from '@/components/chat/parts/InterruptPart.vue'
+import ReasoningPart from '@/components/chat/parts/ReasoningPart.vue'
 import TextPart from '@/components/chat/parts/TextPart.vue'
 import MetaPreflightCard from '@/components/chat/MetaPreflightCard.vue'
 import MetaRibbon from '@/components/chat/MetaRibbon.vue'
@@ -560,6 +575,7 @@ import type {
   ChatRunStatusSource,
   ChatRunStatusState,
   ChatStreamTimelineItem,
+  ChatToolCall,
   DisplayAttachment,
   ToolResultContext,
 } from '@/types/chat'
@@ -597,6 +613,7 @@ import { isShareableChatMessage } from '@/utils/chat/messageIdentity'
 import { agentIdFromSessionKey } from '@/utils/chat/sessionKeys'
 import { clearAssistantActivityExpansionState } from '@/utils/chat/activityDisclosureState'
 import {
+  isSemanticActivityStatusStep,
   projectAssistantActivityTimeline,
   splitLiveAssistantTimeline,
 } from '@/utils/chat/assistantActivity'
@@ -1412,19 +1429,42 @@ const liveActivityPhaseLabel = computed(() => {
   ))
 })
 const liveToolStateScope = computed(() => JSON.stringify([sessionKey.value || '', 'stream']))
+// Elapsed readouts in the live turn round to whole seconds ("4s"), matching
+// streamPhaseElapsed and streamThinkingElapsedText. The shared tool formatter
+// (streamToolElapsedText, useChatStream.ts) emits tenths, so normalise its
+// output here at the call site instead of changing the shared formatter —
+// except sub-second finished tools, which keep their tenths so they never
+// read as a nonsensical "0s".
+function liveToolElapsedText(call: Pick<ChatToolCall, 'toolId'>): string {
+  return streamToolElapsedText(call).replace(/^([1-9]\d*)\.\d+s$/, '$1s')
+}
 const liveArtifacts = computed(() =>
   foldLiveTurnMode.value === true ? foldedTurn.value.artifacts : streamArtifacts.value,
 )
 const liveThinkingText = computed(() =>
   foldLiveTurnMode.value === true ? foldedTurn.value.thinkingText : streamThinkingText.value,
 )
+// Live reasoning rendered through the shared part component, so the live turn
+// and settled turns use one wording and one disclosure affordance. The seconds
+// derive from the ticking elapsed text, which is always `${seconds}s` live.
+const liveReasoningPart = computed<Extract<ChatPart, { type: 'reasoning' }> | null>(() => {
+  if (!liveThinkingText.value) return null
+  const seconds = Number.parseInt(streamThinkingElapsedText.value, 10)
+  return {
+    type: 'reasoning',
+    key: 'live-reasoning',
+    text: liveThinkingText.value,
+    seconds: Number.isFinite(seconds) ? seconds : 0,
+  }
+})
+// No clamp and no raw status count: the header chip must agree with the
+// visible body, which renders clusters plus only the semantic status steps.
+// A text-only turn therefore counts 0 and the disclosure's stepCount > 0
+// gate hides the chip instead of claiming "step 1" over an empty body.
 const liveActivityStepCount = computed(() =>
-  Math.max(
-    1,
-    liveActivityProjection.value.activityClusters.length
-      + liveActivityProjection.value.statusSteps.length
-      + (liveThinkingText.value ? 1 : 0),
-  ),
+  liveActivityProjection.value.activityClusters.length
+    + liveActivityProjection.value.statusSteps.filter(isSemanticActivityStatusStep).length
+    + (liveThinkingText.value ? 1 : 0),
 )
 const liveActivityFailureCount = computed(() =>
   liveActivityProjection.value.activityClusters.filter(cluster => cluster.isFailure).length,
@@ -1442,6 +1482,18 @@ const liveInterruptParts = computed(() =>
         (part): part is Extract<typeof part, { type: 'interrupt' }> => part.type === 'interrupt',
       ),
 )
+
+// Feeds the persistent visually-hidden status region in the template. It only
+// fills on the true→false streaming transition (a live turn actually settled),
+// and empties as soon as the next turn starts so that setting the same
+// "Completed" text again is a fresh mutation screen readers re-announce.
+const turnSettledAnnouncement = ref('')
+watch(isStreaming, (streaming, wasStreaming) => {
+  if (streaming) turnSettledAnnouncement.value = ''
+  else if (wasStreaming) {
+    turnSettledAnnouncement.value = String(t('chat.activity.lifecycle.settled'))
+  }
+})
 
 // Soft content-silence watchdog: after the high negotiated threshold, surface
 // a neutral long-running notice. Backend-deadline-owned Ensemble phases remain
@@ -1924,14 +1976,14 @@ async function saveShareImage() {
       theme: shareTheme.value,
     })
     if (!result) {
-      pushToast(t('chat.toast.shareExportFailed'), { tone: 'danger' })
+      pushToast(t('chat.toast.shareSaveFailed'), { tone: 'danger' })
       return
     }
     const url = URL.createObjectURL(result.blob)
     sharePreview.value = { url, blob: result.blob, filename: result.filename }
   } catch (err) {
     console.warn('Share image export failed:', err)
-    pushToast(t('chat.toast.shareExportFailed'), { tone: 'danger' })
+    pushToast(t('chat.toast.shareSaveFailed'), { tone: 'danger' })
   } finally {
     shareSaving.value = false
   }
@@ -1970,7 +2022,7 @@ async function onShareSetTheme(next: ShareExportTheme) {
   try {
     const result = await chatShareExport.buildShareImage(selectedShareMessageIds.value, { theme: next })
     if (!result) {
-      pushToast(t('chat.toast.shareExportFailed'), { tone: 'danger' })
+      pushToast(t('chat.toast.sharePreviewUpdateFailed'), { tone: 'danger' })
       return
     }
     const previous = sharePreview.value
@@ -1982,7 +2034,9 @@ async function onShareSetTheme(next: ShareExportTheme) {
     if (previous) URL.revokeObjectURL(previous.url)
   } catch (err) {
     console.warn('Share image re-render failed:', err)
-    pushToast(t('chat.toast.shareExportFailed'), { tone: 'danger' })
+    // Not shareSaveFailed: nothing was being saved here — the theme switch
+    // only re-renders the preview, so the copy must name that action.
+    pushToast(t('chat.toast.sharePreviewUpdateFailed'), { tone: 'danger' })
   } finally {
     shareSaving.value = false
   }
@@ -2335,3 +2389,20 @@ watch(() => liveInterruptParts.value.length, (n, prev) => {
 </script>
 
 <style scoped src="../styles/chat-view.css"></style>
+
+<style scoped>
+/* No shared sr-only utility exists in this repo (each component scopes its
+   own), so the completion announcer's clip-out lives here: zero visual
+   footprint, still exposed to assistive tech. */
+.chat-turn-settled-announcer {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+</style>

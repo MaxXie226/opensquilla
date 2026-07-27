@@ -9,8 +9,18 @@ import type {
 } from '@/types/chat'
 import { projectAssistantActivityTimeline } from '@/utils/chat/assistantActivity'
 import AssistantActivityTimeline from './AssistantActivityTimeline.vue'
+import timelineSource from './AssistantActivityTimeline.vue?raw'
 
 const mountedApps: App[] = []
+
+function ruleBody(selector: string) {
+  const selectorStart = timelineSource.indexOf(selector)
+  expect(selectorStart).toBeGreaterThanOrEqual(0)
+
+  const blockStart = timelineSource.indexOf('{', selectorStart)
+  const blockEnd = timelineSource.indexOf('}', blockStart)
+  return timelineSource.slice(blockStart + 1, blockEnd)
+}
 
 function toolCall(id: string, name: string): ChatToolCallRenderItem {
   return {
@@ -108,8 +118,31 @@ describe('AssistantActivityTimeline', () => {
     expect(root.querySelectorAll('.step-card')).toHaveLength(1)
     expect(root.querySelector('.tool-row__label')?.textContent).toBe('Edited files')
     expect(root.querySelector('.tool-row__arg')?.textContent).toBe('2 files')
+    // The footprint carries the count; the raw call-count pill would repeat it.
+    expect(root.querySelector('.step-count')).toBeNull()
+    expect(root.textContent).not.toContain('2 calls')
     expect(root.textContent).not.toContain('/private/')
     expect(root.textContent).not.toContain('Private write-secret')
+  })
+
+  it('renders the present-tense purpose the projection emits for a running cluster', async () => {
+    const running = toolCall('running-search', 'web_search')
+    running.isRunning = true
+    running.status = ''
+    const root = await mountTimeline([group(running)], [], 'working')
+
+    // The projection emits chat.activity.purposeRunning.* while a cluster is
+    // current; the timeline must render that code untouched — no cached or
+    // re-derived past-tense label may shadow it.
+    expect(root.querySelector('.tool-row__label')?.textContent).toBe('Searching the web')
+    expect(root.textContent).not.toContain('Searched the web')
+  })
+
+  it('centers phase dots in the marker column shared with tool-row icons', () => {
+    // 0.125rem row padding + 0.875rem marker column + 0.625rem gap = 1.625rem,
+    // the same left origin the tool-row labels use.
+    expect(ruleBody('.assistant-activity-status__row {')).toContain('gap: 0.625rem;')
+    expect(ruleBody('.assistant-activity-status__dot {')).toContain('margin: 0 0.25rem;')
   })
 
   it('keeps narration as a semantic grouping boundary', async () => {

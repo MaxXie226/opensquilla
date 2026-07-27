@@ -12,10 +12,12 @@ import fr from '@/locales/fr.json'
 import ja from '@/locales/ja.json'
 import zhHans from '@/locales/zh-Hans.json'
 import {
+  isSemanticActivityStatusStep,
   projectAssistantActivity,
   projectAssistantActivityTimeline,
   splitLiveAssistantTimeline,
 } from './assistantActivity'
+import type { AssistantActivityStatusStep } from './assistantActivity'
 
 function message(overrides: Partial<ChatRenderedMessage> = {}): ChatRenderedMessage {
   return {
@@ -258,6 +260,42 @@ describe('projectAssistantActivityTimeline', () => {
     expect(settled.currentClusterKey).toBeNull()
   })
 
+  it('labels in-flight clusters in the present tense and settled clusters in the past tense', () => {
+    const running = toolGroup([
+      call('running', {
+        name: 'bash_exec',
+        isRunning: true,
+        status: '',
+      }),
+    ])
+
+    const live = projectAssistantActivityTimeline([running], { lifecycle: 'working' })
+    expect(live.activityClusters[0]?.purpose).toEqual({
+      code: 'chat.activity.purposeRunning.run',
+      params: { count: 1 },
+    })
+
+    const settled = projectAssistantActivityTimeline([running])
+    expect(settled.activityClusters[0]?.purpose).toEqual({
+      code: 'chat.activity.purpose.run',
+      params: { count: 1 },
+    })
+  })
+
+  it('keeps completed clusters past tense while a later cluster is still current', () => {
+    const projection = projectAssistantActivityTimeline([
+      toolGroup([
+        call('done', { name: 'web_search' }),
+        call('pending', { name: 'web_search', status: '' }),
+      ]),
+    ], { lifecycle: 'working' })
+
+    expect(projection.activityClusters.map(cluster => cluster.purpose.code)).toEqual([
+      'chat.activity.purpose.search',
+      'chat.activity.purposeRunning.search',
+    ])
+  })
+
   it('groups contiguous completed calls with the same semantics and respects text boundaries', () => {
     const projection = projectAssistantActivityTimeline([
       toolGroup([
@@ -387,14 +425,21 @@ describe('projectAssistantActivityTimeline', () => {
     expect(initial.activityClusters[0]?.key).toMatch(/^activity-cluster:[a-z0-9]+$/)
   })
 
-  it('limits semantic summaries to two codes and reports omitted kinds', () => {
+  it('limits semantic summaries to two codes and counts omitted calls in the overflow', () => {
+    // The run kind gets two calls so the number of omitted kinds (2) and the
+    // number of omitted calls (3) genuinely differ: the overflow segment must
+    // count calls, matching the unit of the visible segments, while
+    // `remainingCount` keeps reporting kinds.
     const projection = projectAssistantActivityTimeline([
       toolGroup([call('search', { name: 'web_search' })]),
       toolGroup([call('inspect', {
         name: 'read_file',
         inputRaw: '{"path":"/repo/file.ts"}',
       })]),
-      toolGroup([call('run', { name: 'bash_exec' })]),
+      toolGroup([
+        call('run', { name: 'bash_exec' }),
+        call('run-again', { name: 'python_exec' }),
+      ]),
       toolGroup([call('artifact', { name: 'publish_artifact' })]),
     ])
 
@@ -404,7 +449,7 @@ describe('projectAssistantActivityTimeline', () => {
         { code: 'chat.activity.purpose.inspect', params: { count: 1 } },
       ],
       remainingCount: 2,
-      remaining: { code: 'chat.activity.more', params: { count: 2 } },
+      remaining: { code: 'chat.activity.more', params: { count: 3 } },
     })
     expect(projection.footprintSummary).toEqual({
       codes: [
@@ -412,7 +457,7 @@ describe('projectAssistantActivityTimeline', () => {
         { code: 'chat.activity.footprint.files', params: { count: 1 } },
       ],
       remainingCount: 2,
-      remaining: { code: 'chat.activity.more', params: { count: 2 } },
+      remaining: { code: 'chat.activity.more', params: { count: 3 } },
     })
   })
 
@@ -574,6 +619,40 @@ describe('projectAssistantActivityTimeline', () => {
   })
 })
 
+describe('isSemanticActivityStatusStep', () => {
+  function statusStep(
+    overrides: Partial<AssistantActivityStatusStep> = {},
+  ): AssistantActivityStatusStep {
+    return {
+      key: 'activity-status:test',
+      label: { code: 'chat.activity.purpose.search', params: {} },
+      at: 1_000,
+      isCurrent: false,
+      ...overrides,
+    }
+  }
+
+  it('accepts settled purpose steps', () => {
+    expect(isSemanticActivityStatusStep(statusStep())).toBe(true)
+    expect(isSemanticActivityStatusStep(statusStep({
+      label: { code: 'chat.activity.purposeRunning.run', params: {} },
+    }))).toBe(true)
+  })
+
+  it('rejects lifecycle phases so generic churn never counts as work', () => {
+    expect(isSemanticActivityStatusStep(statusStep({
+      label: { code: 'chat.activity.lifecycle.working', params: {} },
+    }))).toBe(false)
+    expect(isSemanticActivityStatusStep(statusStep({
+      label: { code: 'chat.activity.lifecycle.answering', params: {} },
+    }))).toBe(false)
+  })
+
+  it('rejects the live current step regardless of its code', () => {
+    expect(isSemanticActivityStatusStep(statusStep({ isCurrent: true }))).toBe(false)
+  })
+})
+
 describe('splitLiveAssistantTimeline', () => {
   it('keeps only the trailing text outside as the current answer candidate', () => {
     const timeline: ChatStreamTimelineItem[] = [
@@ -639,12 +718,21 @@ describe('assistant activity locale contract', () => {
     const activities = [en, de, es, fr, ja, zhHans].map(locale => locale.chat.activity)
     const expected = activities[0]
 
+    // Every past-tense purpose leaf needs a present-tense counterpart so a
+    // current cluster can swap purpose -> purposeRunning without a miss.
+    expect(Object.keys(expected.purposeRunning).sort()).toEqual(
+      Object.keys(expected.purpose).sort(),
+    )
+
     for (const activity of activities.slice(1)) {
       expect(Object.keys(activity.lifecycle).sort()).toEqual(
         Object.keys(expected.lifecycle).sort(),
       )
       expect(Object.keys(activity.purpose).sort()).toEqual(
         Object.keys(expected.purpose).sort(),
+      )
+      expect(Object.keys(activity.purposeRunning).sort()).toEqual(
+        Object.keys(expected.purposeRunning).sort(),
       )
       expect(Object.keys(activity.footprint).sort()).toEqual(
         Object.keys(expected.footprint).sort(),

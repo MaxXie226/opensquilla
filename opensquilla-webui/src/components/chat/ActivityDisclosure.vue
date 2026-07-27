@@ -9,17 +9,17 @@
     <header class="assistant-activity__live-head" data-share-activity-label>
       <span
         class="assistant-activity__live-dot"
-        :class="{ 'is-active': !stale }"
+        :class="{ 'is-active': !stale, 'is-stale': stale }"
         aria-hidden="true"
       />
       <span
         class="assistant-activity__live-label"
-        :class="{ 'is-active': !stale }"
+        :class="{ 'is-stale': stale }"
         role="status"
         aria-live="polite"
         aria-atomic="true"
       >
-        {{ phaseLabel || t('chat.activityWorking') }}
+        {{ liveStatusLabel }}
       </span>
       <span
         v-if="elapsedLabel"
@@ -27,6 +27,22 @@
         aria-hidden="true"
       >
         · {{ elapsedLabel }}
+      </span>
+      <span v-if="stepCount > 0" class="assistant-activity__live-step">
+        {{ t('chat.activity.liveStep', { n: stepCount }) }}
+      </span>
+      <span v-if="failureCount > 0" class="assistant-activity__sep" aria-hidden="true">·</span>
+      <!-- Always-mounted polite region so failures announce exactly when the
+           count changes, instead of riding along with phase-label updates. -->
+      <span
+        class="assistant-activity__live-failure"
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+      >
+        <template v-if="failureCount > 0">
+          {{ t('chat.activityFailures', { count: failureCount }) }}
+        </template>
       </span>
     </header>
     <div class="assistant-activity__body" data-share-activity-body>
@@ -51,9 +67,13 @@
       data-share-activity-label
       data-share-control
       :aria-expanded="open"
+      :aria-controls="bodyId"
       @click.stop="open = !open"
     >
       <span class="assistant-activity__label">{{ resolvedSummaryLabel }}</span>
+      <!-- Real DOM separator: the button's textContent doubles as the share
+           label and the accessible name, and ::before content reaches neither. -->
+      <span v-if="failureCount" class="assistant-activity__sep">{{ ' · ' }}</span>
       <span v-if="failureCount" class="assistant-activity__failure">
         {{ resolvedFailureLabel }}
       </span>
@@ -64,14 +84,14 @@
         aria-hidden="true"
       />
     </button>
-    <div v-show="open" class="assistant-activity__body" data-share-activity-body>
+    <div :id="bodyId" v-show="open" class="assistant-activity__body" data-share-activity-body>
       <slot />
     </div>
   </section>
 </template>
 
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, ref, useId, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import {
@@ -106,6 +126,7 @@ const props = withDefaults(defineProps<{
 })
 
 const { t } = useI18n()
+const bodyId = `assistant-activity-body-${useId()}`
 const initialOpen = () =>
   props.defaultOpen
   || props.lifecycle === 'failed'
@@ -143,6 +164,8 @@ watch(
 const isLive = computed(() =>
   props.lifecycle === 'working' || props.lifecycle === 'answering',
 )
+
+const liveStatusLabel = computed(() => props.phaseLabel || t('chat.activityWorking'))
 
 const resolvedSummaryLabel = computed(() => {
   if (props.summaryLabel) return props.summaryLabel
@@ -208,6 +231,10 @@ const resolvedFailureLabel = computed(() =>
   animation: assistant-activity-pulse 2.3s var(--ease-standard) infinite;
 }
 
+.assistant-activity__live-dot.is-stale {
+  background: var(--warn-fill);
+}
+
 .assistant-activity__live-label {
   min-width: 0;
   overflow: hidden;
@@ -215,17 +242,8 @@ const resolvedFailureLabel = computed(() =>
   white-space: nowrap;
 }
 
-.assistant-activity__live-label.is-active {
-  background: linear-gradient(
-    90deg,
-    var(--text-muted) 15%,
-    var(--text) 48%,
-    var(--text-muted) 82%
-  );
-  background-size: 220% 100%;
-  background-clip: text;
-  color: transparent;
-  animation: assistant-activity-shimmer 2.3s linear infinite;
+.assistant-activity__live-label.is-stale {
+  color: var(--warn);
 }
 
 .assistant-activity__live-elapsed {
@@ -233,6 +251,32 @@ const resolvedFailureLabel = computed(() =>
   color: var(--text-muted);
   font-size: 0.75rem;
   font-variant-numeric: tabular-nums;
+}
+
+.assistant-activity__live-step {
+  flex: 0 0 auto;
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.assistant-activity__live-failure {
+  flex: 0 0 auto;
+  color: var(--danger);
+  font-size: 0.75rem;
+  white-space: nowrap;
+}
+
+.assistant-activity__live-step::before {
+  content: "·";
+  margin-right: 0.375rem;
+  color: var(--text-dim);
+}
+
+.assistant-activity__sep {
+  flex: 0 0 auto;
+  color: var(--text-dim);
+  font-size: 0.75rem;
 }
 
 .assistant-activity__summary {
@@ -261,7 +305,7 @@ const resolvedFailureLabel = computed(() =>
 
 .assistant-activity__summary:focus-visible {
   outline: none;
-  box-shadow: none;
+  box-shadow: var(--focus-ring);
   color: var(--text);
 }
 
@@ -277,17 +321,10 @@ const resolvedFailureLabel = computed(() =>
   white-space: nowrap;
 }
 
-.assistant-activity__failure::before {
-  content: "·";
-  margin-right: 0.375rem;
-  color: var(--text-dim);
-}
-
 .assistant-activity__summary-arrow {
   flex: 0 0 auto;
   color: currentColor;
-  opacity: 0;
-  transform: translateX(-0.125rem);
+  opacity: 0.34;
   transform-origin: center;
   transition:
     opacity var(--dur-fast) var(--ease-standard),
@@ -316,20 +353,23 @@ const resolvedFailureLabel = computed(() =>
   min-width: 0;
   gap: 0.25rem;
   margin: 0.125rem 0 0.25rem;
-  padding: 0;
+  padding: 0 0 0 0.75rem;
   border: 0;
+  border-left: 1px solid var(--border);
   background: transparent;
+}
+
+.assistant-activity--settled[data-share-expanded="true"]::after {
+  content: "";
+  display: block;
+  height: 1px;
+  background: var(--border);
 }
 
 @keyframes assistant-activity-pulse {
   0%,
   100% { opacity: 0.45; }
   50% { opacity: 1; }
-}
-
-@keyframes assistant-activity-shimmer {
-  from { background-position: 100% 0; }
-  to { background-position: -120% 0; }
 }
 
 @media (max-width: 480px) {
@@ -342,20 +382,20 @@ const resolvedFailureLabel = computed(() =>
   }
 }
 
+@media (hover: none) {
+  .assistant-activity__summary-arrow {
+    opacity: 0.55;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .assistant-activity__summary,
   .assistant-activity__summary-arrow {
     transition: none;
   }
 
-  .assistant-activity__live-dot.is-active,
-  .assistant-activity__live-label.is-active {
+  .assistant-activity__live-dot.is-active {
     animation: none;
-  }
-
-  .assistant-activity__live-label.is-active {
-    background: none;
-    color: var(--text);
   }
 }
 </style>
