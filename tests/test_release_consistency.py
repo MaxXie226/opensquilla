@@ -281,6 +281,7 @@ def test_release_workflow_gates_built_and_downloaded_installers_on_profile_reten
     ]
     assert "verify-release-macos-upgrade.sh" in mac_build
     assert "verify-release-windows-upgrade.ps1" in windows_build
+    assert "runs-on: windows-2022" in windows_build
     assert "-VerifyLongRunningUpdateBanner" in windows_build
     assert mac_build.index("verify-release-macos-upgrade.sh") < mac_build.index(
         "Upload macOS Electron artifacts"
@@ -346,6 +347,7 @@ def test_release_workflow_gates_built_and_downloaded_installers_on_profile_reten
     assert "verify-release-macos-upgrade.sh" in mac_audit
     assert "Get-FileHash -Algorithm SHA256" in windows_audit
     assert "verify-release-windows-upgrade.ps1" in windows_audit
+    assert "runs-on: windows-2022" in windows_audit
 
 
 def test_manual_release_workflow_without_a_tag_only_uploads_aggregate_artifacts() -> None:
