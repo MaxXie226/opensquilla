@@ -561,6 +561,7 @@ def test_upsert_llm_ensemble_accepts_structured_candidates_partial_merge():
             "selection_mode": "router_dynamic",
             "ranking_user_profile_generation_enabled": True,
             "ranking_user_profile_enabled": False,
+            "ranking_thinking_assignment_enabled": True,
             "model_options": ["legacy/model"],
             "min_successful_proposers": 2,
         }
@@ -583,6 +584,7 @@ def test_upsert_llm_ensemble_accepts_structured_candidates_partial_merge():
     assert res.config.llm_ensemble.selection_mode == "router_dynamic"
     assert res.config.llm_ensemble.ranking_user_profile_generation_enabled is True
     assert res.config.llm_ensemble.ranking_user_profile_enabled is False
+    assert res.config.llm_ensemble.ranking_thinking_assignment_enabled is True
     assert res.config.llm_ensemble.model_options == ["legacy/model"]
     assert res.config.llm_ensemble.min_successful_proposers == 2
     assert [candidate.model_dump() for candidate in res.config.llm_ensemble.candidates] == [
@@ -605,6 +607,7 @@ def test_upsert_llm_ensemble_accepts_structured_candidates_partial_merge():
     ]
     assert res.public_payload["ranking_user_profile_generation_enabled"] is True
     assert res.public_payload["ranking_user_profile_enabled"] is False
+    assert res.public_payload["ranking_thinking_assignment_enabled"] is True
 
 
 def test_upsert_llm_ensemble_can_toggle_profile_switches_independently():
@@ -622,10 +625,32 @@ def test_upsert_llm_ensemble_can_toggle_profile_switches_independently():
     assert res.public_payload["ranking_user_profile_enabled"] is False
 
 
+def test_upsert_llm_ensemble_can_explicitly_disable_thinking_assignment():
+    cfg = GatewayConfig(
+        llm_ensemble={
+            "selection_mode": "router_dynamic",
+            "ranking_thinking_assignment_enabled": True,
+        }
+    )
+
+    res = upsert_llm_ensemble(
+        cfg,
+        ranking_thinking_assignment_enabled=False,
+    )
+
+    assert res.config.llm_ensemble.ranking_thinking_assignment_enabled is False
+    assert res.public_payload["ranking_thinking_assignment_enabled"] is False
+    assert (
+        "llm_ensemble.ranking_thinking_assignment_enabled"
+        in res.config.force_persist_paths()
+    )
+
+
 @pytest.mark.parametrize(
     "field",
     [
         "enabled",
+        "ranking_thinking_assignment_enabled",
     ],
 )
 @pytest.mark.parametrize("value", ["false", "0", 0, 1, [], {}])

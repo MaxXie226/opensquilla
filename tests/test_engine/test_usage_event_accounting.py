@@ -165,6 +165,17 @@ class _CloseTrackingIterator:
         self.closed = True
 
 
+class _CallScopedSnapshotIterator(_CloseTrackingIterator):
+    def __init__(self, events: list[Any], snapshot: ProviderError) -> None:
+        super().__init__(events)
+        self._snapshot = snapshot
+        self.snapshot_calls = 0
+
+    def usage_accounting_snapshot(self) -> ProviderError:
+        self.snapshot_calls += 1
+        return self._snapshot
+
+
 class _NonClosableIterator:
     def __init__(self, events: list[Any]) -> None:
         self._events = iter(events)
@@ -472,6 +483,63 @@ async def test_provider_error_closes_started_call_as_unknown() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        ProviderError(
+            message="call rejected before start",
+            code="call_in_progress",
+            request_started=False,
+        ),
+        ProviderError(
+            message="call rejected before start",
+            code="call_in_progress",
+            physical_request_count=0,
+        ),
+    ],
+)
+async def test_explicit_not_started_error_finalizes_zero_without_foreign_snapshot(
+    error: ProviderError,
+) -> None:
+    sink = _RecordingSink()
+    scope = UsageAccountingScope(sink=sink, context=_context())
+    snapshot_calls = 0
+
+    async def stream() -> AsyncIterator[ProviderError]:
+        yield error
+
+    def foreign_snapshot() -> ProviderError:
+        nonlocal snapshot_calls
+        snapshot_calls += 1
+        return ProviderError(
+            message="snapshot from another call",
+            code="foreign_snapshot",
+            request_started=True,
+            physical_request_count=2,
+            usage_missing_count=2,
+        )
+
+    with bind_usage_accounting_scope(scope):
+        events = [
+            event
+            async for event in account_provider_stream(
+                stream,
+                provider="ensemble",
+                model="aggregator",
+                usage_snapshot=foreign_snapshot,
+            )
+        ]
+
+    assert events == [error]
+    assert snapshot_calls == 0
+    assert len(sink.started) == 1
+    assert len(sink.finalized) == 1
+    assert sink.finalized[0][1].items == ()
+    assert sink.finalized[0][1].missing_usage_entries == 0
+    assert sink.unknown == []
+
+
+@pytest.mark.asyncio
 async def test_agent_does_not_persist_untrusted_provider_error_code() -> None:
     sink = _RecordingSink()
     agent = Agent(
@@ -538,6 +606,158 @@ async def test_cancelled_provider_call_is_marked_unknown() -> None:
 
 
 @pytest.mark.asyncio
+async def test_cancelled_composite_call_finalizes_snapshot_multiplicity() -> None:
+    sink = _RecordingSink()
+    scope = UsageAccountingScope(sink=sink, context=_context())
+    entered = asyncio.Event()
+    never = asyncio.Event()
+
+    async def stream() -> AsyncIterator[ProviderText]:
+        entered.set()
+        await never.wait()
+        yield ProviderText(text="unreachable")
+
+    def usage_snapshot() -> ProviderError:
+        return ProviderError(
+            message="composite cancelled",
+            code="composite_usage_snapshot",
+            request_started=True,
+            physical_request_count=2,
+            usage_missing_count=2,
+        )
+
+    async def consume() -> None:
+        with bind_usage_accounting_scope(scope):
+            async for _ in account_provider_stream(
+                stream,
+                provider="ensemble",
+                model="aggregator",
+                usage_snapshot=usage_snapshot,
+            ):
+                pass
+
+    task = asyncio.create_task(consume())
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert len(sink.started) == 1
+    assert len(sink.finalized) == 1
+    assert sink.finalized[0][1].items == ()
+    assert sink.finalized[0][1].missing_usage_entries == 2
+    assert sink.unknown == []
+
+
+@pytest.mark.asyncio
+async def test_runtime_wrapper_finalizes_cancelled_ensemble_fallback_multiplicity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = _RecordingSink()
+    scope = UsageAccountingScope(sink=sink, context=_context())
+    fallback_entered = asyncio.Event()
+    never = asyncio.Event()
+
+    class _FailedProposer:
+        provider_name = "fake"
+
+        async def chat(
+            self,
+            messages: list[Message],
+            tools: list[Any] | None = None,
+            config: ChatConfig | None = None,
+        ) -> AsyncIterator[Any]:
+            del messages, tools, config
+            yield ProviderError(
+                message="proposer failed",
+                code="503",
+                request_started=True,
+                physical_request_count=1,
+            )
+
+    class _BlockingFallback:
+        provider_name = "fallback"
+
+        async def chat(
+            self,
+            messages: list[Message],
+            tools: list[Any] | None = None,
+            config: ChatConfig | None = None,
+        ) -> AsyncIterator[Any]:
+            del messages, tools, config
+            fallback_entered.set()
+            await never.wait()
+            if False:  # pragma: no cover - keep this an async generator
+                yield ProviderDone(model="fallback")
+
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        lambda _cfg: _FailedProposer(),
+    )
+    member = EnsembleMemberConfig(
+        provider_config=ProviderConfig(provider="fake", model="proposer"),
+    )
+    fallback = _BlockingFallback()
+    ensemble = EnsembleProvider(
+        profile_name="accounting-test",
+        proposers=[member],
+        aggregator=member,
+        fallback_provider=fallback,
+        fallback_provider_name="fallback",
+        fallback_model="fallback",
+        min_successful_proposers=1,
+        all_failed_policy="fallback_single",
+        shuffle_candidates=False,
+    )
+    wrapper = _SelectorFallbackProvider(
+        ensemble,
+        _FallbackSelector(fallback),
+    )
+
+    async def consume() -> None:
+        async for _ in wrapper.chat(
+            [Message(role="user", content="x")],
+            config=ChatConfig(),
+        ):
+            pass
+
+    with bind_usage_accounting_scope(scope):
+        task = asyncio.create_task(consume())
+        await asyncio.wait_for(fallback_entered.wait(), timeout=1)
+        concurrent_events = [
+            event
+            async for event in wrapper.chat(
+                [Message(role="user", content="concurrent")],
+                config=ChatConfig(),
+            )
+        ]
+        concurrent_error = next(
+            event
+            for event in concurrent_events
+            if isinstance(event, ProviderError)
+        )
+        assert concurrent_error.code == "ensemble_call_in_progress"
+        assert concurrent_error.request_started is False
+        assert concurrent_error.physical_request_count == 0
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    snapshot = ensemble.usage_accounting_snapshot()
+    assert snapshot is not None
+    assert snapshot.physical_request_count == 2
+    assert snapshot.usage_missing_count == 2
+    assert len(sink.started) == 2
+    assert len(sink.finalized) == 2
+    assert all(result.items == () for _, result in sink.finalized)
+    assert sorted(result.missing_usage_entries for _, result in sink.finalized) == [
+        0,
+        2,
+    ]
+    assert sink.unknown == []
+
+
+@pytest.mark.asyncio
 async def test_accounted_stream_closes_owned_iterator_without_scope() -> None:
     physical = _CloseTrackingIterator([ProviderText(text="partial")])
     stream = account_provider_stream(
@@ -551,6 +771,50 @@ async def test_accounted_stream_closes_owned_iterator_without_scope() -> None:
 
     assert physical.close_calls == 1
     assert physical.closed is True
+
+
+@pytest.mark.asyncio
+async def test_accounted_stream_prefers_call_scoped_snapshot_over_provider_snapshot() -> None:
+    sink = _RecordingSink()
+    scope = UsageAccountingScope(sink=sink, context=_context())
+    physical = _CallScopedSnapshotIterator(
+        [ProviderText(text="partial")],
+        ProviderError(
+            message="this call's snapshot",
+            code="call_snapshot",
+            request_started=True,
+            physical_request_count=1,
+            usage_missing_count=1,
+        ),
+    )
+    foreign_snapshot_calls = 0
+
+    def foreign_snapshot() -> ProviderError:
+        nonlocal foreign_snapshot_calls
+        foreign_snapshot_calls += 1
+        return ProviderError(
+            message="another call's snapshot",
+            code="foreign_snapshot",
+            request_started=True,
+            physical_request_count=3,
+            usage_missing_count=3,
+        )
+
+    with bind_usage_accounting_scope(scope):
+        stream = account_provider_stream(
+            lambda: physical,
+            provider="ensemble",
+            model="aggregator",
+            usage_snapshot=foreign_snapshot,
+        )
+        assert (await anext(stream)).text == "partial"
+        await stream.aclose()
+
+    assert physical.snapshot_calls == 1
+    assert foreign_snapshot_calls == 0
+    assert len(sink.finalized) == 1
+    assert sink.finalized[0][1].missing_usage_entries == 1
+    assert sink.unknown == []
 
 
 @pytest.mark.asyncio
@@ -648,6 +912,54 @@ async def test_retried_done_calls_get_monotonic_distinct_identities() -> None:
         call.event_id for call in sink.started
     ]
     assert sink.unknown == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("first_stream", "expected_code"),
+    [
+        (
+            [ProviderDone(input_tokens=2, output_tokens=0)],
+            "empty_response",
+        ),
+        ([], "provider_stream_incomplete"),
+    ],
+)
+async def test_agent_does_not_replay_unsafe_composite_invalid_response(
+    first_stream: list[Any],
+    expected_code: str,
+) -> None:
+    provider = _SequenceProvider(
+        [
+            first_stream,
+            [
+                ProviderText(text="must-not-run"),
+                ProviderDone(input_tokens=3, output_tokens=1),
+            ],
+        ]
+    )
+    provider.retry_failed_call_safe = False
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            max_iterations=1,
+            max_provider_retries=1,
+            retry_base_backoff_ms=0,
+            retry_max_backoff_ms=0,
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    assert provider.calls == 1
+    assert not any(
+        getattr(event, "text", "") == "must-not-run"
+        for event in events
+    )
+    assert any(
+        isinstance(event, ErrorEvent) and event.code == expected_code
+        for event in events
+    )
 
 
 @pytest.mark.asyncio
@@ -2142,7 +2454,7 @@ async def test_agent_finalizes_partial_error_with_a_known_receipt() -> None:
 
 
 @pytest.mark.asyncio
-async def test_partial_error_missing_count_without_known_rows_remains_unknown() -> None:
+async def test_partial_error_missing_count_without_known_rows_preserves_multiplicity() -> None:
     sink = _RecordingSink()
     scope = UsageAccountingScope(sink=sink, context=_context())
 
@@ -2165,10 +2477,11 @@ async def test_partial_error_missing_count_without_known_rows_remains_unknown() 
         ]
 
     assert len(events) == 1
-    assert sink.finalized == []
-    assert [reason for _, reason in sink.unknown] == [
-        "provider_error:incomplete_stream"
-    ]
+    assert len(sink.finalized) == 1
+    result = sink.finalized[0][1]
+    assert result.items == ()
+    assert result.missing_usage_entries == 2
+    assert sink.unknown == []
 
 
 def test_runtime_subagent_inherits_sink_with_distinct_execution() -> None:

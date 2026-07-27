@@ -16,7 +16,7 @@ import json
 import math
 from collections import deque
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import cache
 from importlib import resources
 from typing import Any
@@ -28,12 +28,21 @@ from .types import ChatConfig, DoneEvent, ErrorEvent, Message, TextDeltaEvent
 
 log = structlog.get_logger(__name__)
 
-RANKING_VERSION = "step2-ranking-v2"
-RANKING_CONFIG_SCHEMA_VERSION = "step2-ranking-config-v3"
+RANKING_VERSION = "step2-ranking-v3"
+LEGACY_RANKING_VERSION = "step2-ranking-v2"
+RANKING_CONFIG_SCHEMA_VERSION = "step2-ranking-config-v4"
+LEGACY_RANKING_CONFIG_SCHEMA_VERSION = "step2-ranking-config-v3"
+MODEL_REGISTRY_SCHEMA_VERSION = "step2-model-registry-v2"
+LEGACY_MODEL_REGISTRY_SCHEMA_VERSION = "step2-model-registry-v1"
+_PACKAGED_RANKING_CONFIG_VERSION = "step2-ranking-2026-07-27.1"
+_LEGACY_PACKAGED_RANKING_CONFIG_VERSION = "step2-ranking-2026-07-22.1"
+_PACKAGED_REGISTRY_SNAPSHOT_VERSION = "curated-openrouter-step2-2026-07-27.1"
+_LEGACY_PACKAGED_REGISTRY_SNAPSHOT_VERSION = "curated-openrouter-step2-2026-07-24.3"
 TASK_ANALYZER_PROVIDER_ID = "openrouter"
 TASK_ANALYZER_MODEL_ID = "anthropic/claude-opus-4.8"
 TASK_ANALYZER_VERSION = "opus-4.8-json-v3"
 TASK_PROFILE_SCHEMA_VERSION = "step2-task-profile-v1"
+THINKING_POLICY_VERSION = "thinking-policy-v1"
 GENERATION_POLICY_FILTER_REASON_PREFIX = "generation_policy_"
 _TASK_ANALYZER_STREAM_CLOSE_TIMEOUT_SECONDS = 1.0
 _NATIVE_IMAGE_ATTACHMENT_MIMES = frozenset(
@@ -90,6 +99,12 @@ THINKING_LEVELS = (
     "max",
     "adaptive",
 )
+UNIFIED_THINKING_LEVELS = (
+    "low",
+    "medium",
+    "high",
+    "highest",
+)
 FORMATS = (
     "plain_text",
     "structured_text",
@@ -119,6 +134,10 @@ _MODEL_ROLES = {"proposer", "aggregator"}
 
 class DynamicRankingError(ValueError):
     """Raised when no feasible Step2 ``(P, A)`` decision can be built."""
+
+    def __init__(self, message: str, *, reason: str = "") -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 class TaskAnalyzerStreamCleanupError(RuntimeError):
@@ -193,6 +212,11 @@ class RankedModel:
     static_profile: dict[str, Any]
     online_profile: dict[str, Any]
     thinking: str | None = "xhigh"
+    requested_thinking_level: str | None = None
+    effective_thinking_level: str | None = None
+    thinking_fallback_reason: str = ""
+    thinking_policy_version: str = ""
+    thinking_fallbacks: tuple[dict[str, str], ...] = ()
 
     @property
     def identity(self) -> str:
@@ -206,9 +230,16 @@ class RankedModel:
     def vendor(self) -> str:
         return str(self.registry_facts.get("vendor") or self.provider).lower()
 
-    def trace(self) -> dict[str, Any]:
+    def trace(self, *, include_thinking_contract: bool = True) -> dict[str, Any]:
         facts = self.registry_facts
-        return {
+        hash_facts = facts
+        if not include_thinking_contract:
+            hash_facts = {
+                key: value
+                for key, value in facts.items()
+                if key not in {"thinking_levels", "thinking_level_mapping"}
+            }
+        payload = {
             "identity": self.identity,
             "provider": self.provider,
             "model": self.model_id,
@@ -220,9 +251,7 @@ class RankedModel:
             "is_chinese_model": facts.get("is_chinese_model"),
             "supports_reasoning": facts.get("supports_reasoning"),
             "supports_tools": facts.get("supports_tools"),
-            "supported_thinking_levels": list(
-                facts.get("supported_thinking_levels") or []
-            ),
+            "supported_thinking_levels": list(facts.get("supported_thinking_levels") or []),
             "status": str(facts.get("status") or ""),
             "roles": list(facts.get("roles") or []),
             "context_window": _as_int(facts.get("context_window"), 0),
@@ -231,13 +260,34 @@ class RankedModel:
             "credential_available": bool(facts.get("credential_available", True)),
             "profile_hash": _canonical_hash(
                 {
-                    "registry_facts": self.registry_facts,
+                    "registry_facts": hash_facts,
                     "static_profile": self.static_profile,
                     "online_profile": self.online_profile,
                     "thinking": self.thinking,
                 }
             ),
         }
+        if include_thinking_contract and "thinking_levels" in facts:
+            payload["thinking_levels"] = list(facts.get("thinking_levels") or [])
+        if include_thinking_contract and "thinking_level_mapping" in facts:
+            mapping = facts.get("thinking_level_mapping")
+            payload["thinking_level_mapping"] = (
+                copy.deepcopy(dict(mapping)) if isinstance(mapping, Mapping) else {}
+            )
+        if self.requested_thinking_level is not None:
+            payload.update(
+                {
+                    "requested_thinking_level": self.requested_thinking_level,
+                    "effective_thinking_level": self.effective_thinking_level,
+                    "provider_thinking_level": self.thinking,
+                    "thinking_fallback_reason": self.thinking_fallback_reason,
+                    "thinking_policy_version": self.thinking_policy_version,
+                    "thinking_fallbacks": [
+                        copy.deepcopy(dict(fallback)) for fallback in self.thinking_fallbacks
+                    ],
+                }
+            )
+        return payload
 
 
 @dataclass(frozen=True)
@@ -248,6 +298,8 @@ class RankingDecision:
     aggregator: RankedModel
     effective_tier: int
     trace: dict[str, Any]
+    thinking_assignment: dict[str, Any] = field(default_factory=dict)
+    thinking_assignment_details: dict[str, Any] = field(default_factory=dict)
 
 
 def _as_float(value: Any, default: float = 0.0) -> float:
@@ -281,6 +333,40 @@ def _clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
 def _canonical_hash(value: Any) -> str:
     encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode()
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _legacy_ranking_config_projection(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Project the additive v4 policy config onto the exact pre-feature shape."""
+
+    projected = copy.deepcopy(dict(config))
+    if projected.get("schema_version") != RANKING_CONFIG_SCHEMA_VERSION:
+        return projected
+    projected["schema_version"] = LEGACY_RANKING_CONFIG_SCHEMA_VERSION
+    if projected.get("config_version") == _PACKAGED_RANKING_CONFIG_VERSION:
+        projected["config_version"] = _LEGACY_PACKAGED_RANKING_CONFIG_VERSION
+    projected.pop("thinking_assignment", None)
+    return projected
+
+
+def _legacy_registry_snapshot_projection(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    """Project the additive v2 thinking facts onto the exact v1 snapshot."""
+
+    projected = copy.deepcopy(dict(snapshot))
+    if projected.get("schema_version") != MODEL_REGISTRY_SCHEMA_VERSION:
+        return projected
+    projected["schema_version"] = LEGACY_MODEL_REGISTRY_SCHEMA_VERSION
+    if projected.get("snapshot_version") == _PACKAGED_REGISTRY_SNAPSHOT_VERSION:
+        projected["snapshot_version"] = _LEGACY_PACKAGED_REGISTRY_SNAPSHOT_VERSION
+    rows = projected.get("models")
+    if isinstance(rows, list):
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            facts = row.get("registry_facts")
+            if isinstance(facts, dict):
+                facts.pop("thinking_levels", None)
+                facts.pop("thinking_level_mapping", None)
+    return projected
 
 
 _TRACE_SECRET_KEY_FRAGMENTS = (
@@ -466,11 +552,173 @@ def _require_exact_config_keys(
     )
 
 
+def _thinking_assignment_policy(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the strictly validated, versioned unified-thinking policy."""
+
+    _require_exact_config_keys(
+        config,
+        ("thinking_assignment",),
+        {
+            "policy_version",
+            "level_order",
+            "tier_mapping",
+            "aggregator_level_step",
+            "risk_floor",
+            "resource_constraints",
+        },
+    )
+    _require_exact_config_keys(
+        config,
+        ("thinking_assignment", "tier_mapping"),
+        set(TIERS),
+    )
+    _require_exact_config_keys(
+        config,
+        ("thinking_assignment", "risk_floor"),
+        {"high"},
+    )
+    _require_exact_config_keys(
+        config,
+        ("thinking_assignment", "resource_constraints"),
+        {
+            "cost_values",
+            "latency_values",
+            "downshift_levels",
+        },
+    )
+
+    policy_version = _ranking_string(config, "thinking_assignment", "policy_version")
+    if policy_version != THINKING_POLICY_VERSION:
+        raise DynamicRankingError(
+            "router_dynamic ranking config thinking_assignment.policy_version "
+            f"must be {THINKING_POLICY_VERSION}"
+        )
+
+    level_order = _ranking_string_list(
+        config,
+        "thinking_assignment",
+        "level_order",
+    )
+    if tuple(level_order) != UNIFIED_THINKING_LEVELS:
+        raise DynamicRankingError(
+            "router_dynamic ranking config thinking_assignment.level_order "
+            f"must be {list(UNIFIED_THINKING_LEVELS)}"
+        )
+
+    tier_mapping_raw = _ranking_mapping(
+        config,
+        "thinking_assignment",
+        "tier_mapping",
+    )
+    tier_mapping = {
+        tier: _ranking_string(
+            config,
+            "thinking_assignment",
+            "tier_mapping",
+            tier,
+        )
+        for tier in TIERS
+    }
+    expected_tier_mapping = dict(zip(TIERS, UNIFIED_THINKING_LEVELS, strict=True))
+    if tier_mapping != expected_tier_mapping or set(tier_mapping_raw) != set(TIERS):
+        raise DynamicRankingError(
+            "router_dynamic ranking config thinking_assignment.tier_mapping "
+            f"must be {expected_tier_mapping}"
+        )
+
+    aggregator_level_step = _ranking_int(
+        config,
+        "thinking_assignment",
+        "aggregator_level_step",
+    )
+    if aggregator_level_step != 1:
+        raise DynamicRankingError(
+            "router_dynamic ranking config thinking_assignment.aggregator_level_step must be 1"
+        )
+
+    risk_floor = {
+        "high": _ranking_string(
+            config,
+            "thinking_assignment",
+            "risk_floor",
+            "high",
+        )
+    }
+    if risk_floor != {"high": "high"}:
+        raise DynamicRankingError(
+            "router_dynamic ranking config thinking_assignment.risk_floor must be {'high': 'high'}"
+        )
+
+    cost_values = _ranking_string_list(
+        config,
+        "thinking_assignment",
+        "resource_constraints",
+        "cost_values",
+    )
+    latency_values = _ranking_string_list(
+        config,
+        "thinking_assignment",
+        "resource_constraints",
+        "latency_values",
+    )
+    if set(cost_values) != {"low", "hard_limit"}:
+        raise DynamicRankingError(
+            "router_dynamic ranking config thinking_assignment.resource_constraints."
+            "cost_values must contain low and hard_limit"
+        )
+    if set(latency_values) != {"interactive", "hard_timeout"}:
+        raise DynamicRankingError(
+            "router_dynamic ranking config thinking_assignment.resource_constraints."
+            "latency_values must contain interactive and hard_timeout"
+        )
+    downshift_levels = _ranking_int(
+        config,
+        "thinking_assignment",
+        "resource_constraints",
+        "downshift_levels",
+    )
+    if downshift_levels != 1:
+        raise DynamicRankingError(
+            "router_dynamic ranking config thinking_assignment.resource_constraints."
+            "downshift_levels must be 1"
+        )
+
+    return {
+        "policy_version": policy_version,
+        "level_order": tuple(level_order),
+        "tier_mapping": tier_mapping,
+        "aggregator_level_step": aggregator_level_step,
+        "risk_floor": risk_floor,
+        "resource_constraints": {
+            "cost_values": frozenset(cost_values),
+            "latency_values": frozenset(latency_values),
+            "downshift_levels": downshift_levels,
+        },
+    }
+
+
 def _validate_ranking_config(raw: Any) -> _ValidatedRankingConfig:
     if not isinstance(raw, Mapping):
         raise DynamicRankingError("router_dynamic ranking config must be an object")
     config = copy.deepcopy(dict(raw))
-    required_sections = (
+    schema_version = _ranking_string(config, "schema_version")
+    if schema_version not in {
+        RANKING_CONFIG_SCHEMA_VERSION,
+        LEGACY_RANKING_CONFIG_SCHEMA_VERSION,
+    }:
+        raise DynamicRankingError(
+            "router_dynamic ranking config schema_version must be "
+            f"{LEGACY_RANKING_CONFIG_SCHEMA_VERSION} or "
+            f"{RANKING_CONFIG_SCHEMA_VERSION}"
+        )
+    has_thinking_policy = "thinking_assignment" in config
+    if schema_version == RANKING_CONFIG_SCHEMA_VERSION and not has_thinking_policy:
+        raise DynamicRankingError("router_dynamic ranking config v4 requires thinking_assignment")
+    if schema_version == LEGACY_RANKING_CONFIG_SCHEMA_VERSION and has_thinking_policy:
+        raise DynamicRankingError(
+            "router_dynamic legacy ranking config cannot declare thinking_assignment"
+        )
+    base_required_sections = (
         "validation",
         "trace",
         "routing_tiers",
@@ -492,6 +740,11 @@ def _validate_ranking_config(raw: Any) -> _ValidatedRankingConfig:
         "rerank",
         "aggregator",
     )
+    required_sections = (
+        (*base_required_sections, "thinking_assignment")
+        if has_thinking_policy
+        else base_required_sections
+    )
     for key in required_sections:
         _ranking_mapping(config, key)
     if set(config) != {"schema_version", "config_version", *required_sections}:
@@ -509,6 +762,21 @@ def _validate_ranking_config(raw: Any) -> _ValidatedRankingConfig:
             "session_nonzero_epsilon",
         },
         ("routing_tiers",): {"default_router_tier", "mapping"},
+        ("thinking_assignment",): {
+            "policy_version",
+            "level_order",
+            "tier_mapping",
+            "aggregator_level_step",
+            "risk_floor",
+            "resource_constraints",
+        },
+        ("thinking_assignment", "tier_mapping"): set(TIERS),
+        ("thinking_assignment", "risk_floor"): {"high"},
+        ("thinking_assignment", "resource_constraints"): {
+            "cost_values",
+            "latency_values",
+            "downshift_levels",
+        },
         ("context",): {
             "bucket_min_tokens",
             "default_bucket",
@@ -697,14 +965,17 @@ def _validate_ranking_config(raw: Any) -> _ValidatedRankingConfig:
             "same_family_or_vendor_penalty",
         },
     }
+    if not has_thinking_policy:
+        fixed_object_keys = {
+            object_path: expected_keys
+            for object_path, expected_keys in fixed_object_keys.items()
+            if object_path[0] != "thinking_assignment"
+        }
     for object_path, expected_keys in fixed_object_keys.items():
         _require_exact_config_keys(config, object_path, expected_keys)
-    schema_version = _ranking_string(config, "schema_version")
-    if schema_version != RANKING_CONFIG_SCHEMA_VERSION:
-        raise DynamicRankingError(
-            f"router_dynamic ranking config schema_version must be {RANKING_CONFIG_SCHEMA_VERSION}"
-        )
     _ranking_string(config, "config_version")
+    if has_thinking_policy:
+        _thinking_assignment_policy(config)
 
     weight_sum_tolerance = _ranking_number(config, "validation", "weight_sum_tolerance")
     if not 0.0 < weight_sum_tolerance < 1.0:
@@ -1226,10 +1497,24 @@ def load_ranking_config() -> dict[str, Any]:
     return copy.deepcopy(dict(_packaged_ranking_config()))
 
 
-def ranking_config_snapshot() -> Mapping[str, Any]:
-    """Return the process-cached, validated config for internal routing calls."""
+@cache
+def _packaged_legacy_ranking_config() -> _ValidatedRankingConfig:
+    return _validate_ranking_config(
+        _legacy_ranking_config_projection(_packaged_ranking_config())
+    )
 
-    return _packaged_ranking_config()
+
+def ranking_config_snapshot(
+    *,
+    thinking_assignment_enabled: bool = False,
+) -> Mapping[str, Any]:
+    """Return the validated config for the effective default-off policy."""
+
+    return (
+        _packaged_ranking_config()
+        if thinking_assignment_enabled
+        else _packaged_legacy_ranking_config()
+    )
 
 
 def _resolve_ranking_config(
@@ -2729,12 +3014,19 @@ def _validate_registry_snapshot(
     models = snapshot.get("models")
     if not isinstance(models, list):
         raise DynamicRankingError("router_dynamic model registry snapshot is malformed")
-    if (
-        not str(snapshot.get("schema_version") or "").strip()
-        or not str(snapshot.get("snapshot_version") or "").strip()
-    ):
+    schema_version = str(snapshot.get("schema_version") or "").strip()
+    if not schema_version or not str(snapshot.get("snapshot_version") or "").strip():
         raise DynamicRankingError(
             "router_dynamic model registry snapshot requires schema and snapshot versions"
+        )
+    if schema_version.startswith("step2-model-registry-") and schema_version not in {
+        MODEL_REGISTRY_SCHEMA_VERSION,
+        LEGACY_MODEL_REGISTRY_SCHEMA_VERSION,
+    }:
+        raise DynamicRankingError(
+            "router_dynamic model registry schema_version must be "
+            f"{LEGACY_MODEL_REGISTRY_SCHEMA_VERSION} or "
+            f"{MODEL_REGISTRY_SCHEMA_VERSION}"
         )
 
     identities: set[tuple[str, str]] = set()
@@ -2761,6 +3053,14 @@ def _validate_registry_snapshot(
                 "router_dynamic model registry snapshot contains duplicate model identities"
             )
         identities.add(identity)
+        if schema_version == MODEL_REGISTRY_SCHEMA_VERSION and (
+            "thinking_levels" not in facts or "thinking_level_mapping" not in facts
+        ):
+            raise DynamicRankingError(
+                "router_dynamic model registry v2 row "
+                f"{provider}:{model_id} requires thinking_levels and "
+                "thinking_level_mapping"
+            )
         for optional_object in ("runtime", "online_profile"):
             value = row.get(optional_object)
             if value is not None and not isinstance(value, Mapping):
@@ -2769,7 +3069,13 @@ def _validate_registry_snapshot(
                 )
     effective_config = _resolve_ranking_config(ranking_config)
     for row in models:
-        _normalize_model(row, effective_config)
+        normalized = _normalize_model(row, effective_config)
+        if schema_version == MODEL_REGISTRY_SCHEMA_VERSION:
+            _registry_thinking_contract(
+                normalized.registry_facts,
+                identity=normalized.identity,
+                policy={"level_order": UNIFIED_THINKING_LEVELS},
+            )
     return snapshot
 
 
@@ -2862,6 +3168,10 @@ def _synthesized_model(
             "quota": _ranking_string(ranking_config, "synthetic_model", "quota"),
             "rate_limit": _ranking_string(ranking_config, "synthetic_model", "rate_limit"),
             "health": _ranking_string(ranking_config, "synthetic_model", "health"),
+            # Unknown/provider-local deployments must not inherit another
+            # provider's native thinking-level contract.
+            "thinking_levels": [],
+            "thinking_level_mapping": {},
         },
         "static_profile": {
             "capability_dist_prior": {name: base_strength for name in CAPABILITIES},
@@ -2961,6 +3271,13 @@ def build_model_registry_snapshot(
             ranking_config=effective_config,
         )
         facts = row.setdefault("registry_facts", {})
+        template_provider = str(facts.get("provider") or "").strip().lower()
+        if template_provider and template_provider != provider_normalized:
+            # Preserve legacy scoring/profile reuse while refusing to claim
+            # that another provider accepts the same native thinking values.
+            facts["thinking_levels"] = []
+            facts["thinking_level_mapping"] = {}
+            facts.pop("supported_thinking_levels", None)
         facts["provider"] = provider_normalized
         facts["model_id"] = model_normalized
         facts["roles"] = list(dict.fromkeys(roles or facts.get("roles") or []))
@@ -3054,6 +3371,120 @@ def _registry_string_list(
     return list(dict.fromkeys(normalized))
 
 
+def _registry_thinking_contract(
+    facts: Mapping[str, Any],
+    *,
+    identity: str,
+    policy: Mapping[str, Any],
+) -> tuple[tuple[str, ...], dict[str, str]]:
+    """Validate one model's unified levels and provider-native mapping.
+
+    Missing or empty unified levels are a valid registry statement: the
+    feature-gated hard filter will fail that deployment closed with the
+    auditable ``thinking_level_unavailable`` reason. Malformed non-empty
+    contracts are registry errors and never degrade silently.
+    """
+
+    level_order = tuple(str(level) for level in policy["level_order"])
+    allowed_levels = set(level_order)
+    raw_levels = facts.get("thinking_levels")
+    if raw_levels is None:
+        levels: list[str] = []
+    else:
+        if not isinstance(raw_levels, Sequence) or isinstance(
+            raw_levels,
+            (str, bytes, bytearray),
+        ):
+            raise DynamicRankingError(
+                f"router_dynamic model registry {identity} has invalid thinking_levels"
+            )
+        levels = [item.strip().lower() if isinstance(item, str) else "" for item in raw_levels]
+        if any(not level or level not in allowed_levels for level in levels):
+            raise DynamicRankingError(
+                f"router_dynamic model registry {identity} has invalid thinking_levels"
+            )
+        if len(set(levels)) != len(levels):
+            raise DynamicRankingError(
+                f"router_dynamic model registry {identity} has duplicate thinking_levels"
+            )
+    levels = sorted(levels, key=level_order.index)
+
+    raw_mapping = facts.get("thinking_level_mapping")
+    if raw_mapping is None:
+        mapping: dict[str, str] = {}
+    elif not isinstance(raw_mapping, Mapping):
+        raise DynamicRankingError(
+            f"router_dynamic model registry {identity} has invalid thinking_level_mapping"
+        )
+    else:
+        mapping = {}
+        for raw_level, raw_provider_level in raw_mapping.items():
+            level = raw_level.strip().lower() if isinstance(raw_level, str) else ""
+            provider_level = (
+                raw_provider_level.strip().lower() if isinstance(raw_provider_level, str) else ""
+            )
+            if (
+                not level
+                or level not in allowed_levels
+                or level in mapping
+                or not provider_level
+                or provider_level not in THINKING_LEVELS
+            ):
+                raise DynamicRankingError(
+                    f"router_dynamic model registry {identity} has invalid thinking_level_mapping"
+                )
+            mapping[level] = provider_level
+
+    if set(mapping) != set(levels):
+        raise DynamicRankingError(
+            f"router_dynamic model registry {identity} thinking_level_mapping "
+            "must exactly cover thinking_levels"
+        )
+    allowed_native_by_unified = {
+        "low": {"minimal", "low"},
+        "medium": {"medium"},
+        "high": {"high"},
+        "highest": {"xhigh", "max"},
+    }
+    invalid_semantic_mappings = sorted(
+        f"{level}->{provider_level}"
+        for level, provider_level in mapping.items()
+        if provider_level not in allowed_native_by_unified[level]
+    )
+    if invalid_semantic_mappings:
+        raise DynamicRankingError(
+            f"router_dynamic model registry {identity} has semantically invalid "
+            "thinking_level_mapping: " + ", ".join(invalid_semantic_mappings)
+        )
+
+    supported_native = facts.get("supported_thinking_levels")
+    if supported_native is not None:
+        supported = {
+            str(level).strip().lower()
+            for level in supported_native
+            if isinstance(level, str) and str(level).strip()
+        }
+        unsupported_mappings = sorted(
+            {
+                provider_level
+                for provider_level in mapping.values()
+                if provider_level not in supported
+            }
+        )
+        if unsupported_mappings:
+            raise DynamicRankingError(
+                f"router_dynamic model registry {identity} thinking_level_mapping "
+                "uses provider levels outside supported_thinking_levels: "
+                + ", ".join(unsupported_mappings)
+            )
+    if levels and facts.get("supports_reasoning") is False:
+        raise DynamicRankingError(
+            f"router_dynamic model registry {identity} advertises thinking_levels "
+            "without reasoning support"
+        )
+    return tuple(levels), {level: mapping[level] for level in levels}
+
+
 def _validate_registry_profile(
     profile: Mapping[str, Any],
     *,
@@ -3143,13 +3574,10 @@ def _validate_registry_model(
         )
         if len(normalized_thinking_levels) != len(supported_thinking_levels):
             raise DynamicRankingError(
-                "router_dynamic model registry "
-                f"{identity} has duplicate supported_thinking_levels"
+                f"router_dynamic model registry {identity} has duplicate supported_thinking_levels"
             )
         supports_reasoning = facts.get("supports_reasoning")
-        has_enabled_level = any(
-            level != "off" for level in normalized_thinking_levels
-        )
+        has_enabled_level = any(level != "off" for level in normalized_thinking_levels)
         if supports_reasoning is False and has_enabled_level:
             raise DynamicRankingError(
                 "router_dynamic model registry "
@@ -3157,8 +3585,7 @@ def _validate_registry_model(
             )
         if supports_reasoning is True and not has_enabled_level:
             raise DynamicRankingError(
-                "router_dynamic model registry "
-                f"{identity} has no enabled supported_thinking_levels"
+                f"router_dynamic model registry {identity} has no enabled supported_thinking_levels"
             )
 
     price = facts.get("price")
@@ -3225,7 +3652,12 @@ def _validate_registry_model(
             )
 
 
-def _normalize_model(row: Mapping[str, Any], ranking_config: Mapping[str, Any]) -> RankedModel:
+def _normalize_model(
+    row: Mapping[str, Any],
+    ranking_config: Mapping[str, Any],
+    *,
+    thinking_policy: Mapping[str, Any] | None = None,
+) -> RankedModel:
     facts_raw = row.get("registry_facts")
     profile_raw = row.get("static_profile")
     if not isinstance(facts_raw, Mapping) or not isinstance(profile_raw, Mapping):
@@ -3253,6 +3685,14 @@ def _normalize_model(row: Mapping[str, Any], ranking_config: Mapping[str, Any]) 
         online_profile=online_profile,
         ranking_config=ranking_config,
     )
+    if thinking_policy is not None:
+        thinking_levels, thinking_level_mapping = _registry_thinking_contract(
+            facts,
+            identity=f"{provider}:{model_id}",
+            policy=thinking_policy,
+        )
+        facts["thinking_levels"] = list(thinking_levels)
+        facts["thinking_level_mapping"] = thinking_level_mapping
     default_thinking = _ranking_string(ranking_config, "synthetic_model", "thinking")
     thinking_value = runtime.get("thinking") if isinstance(runtime, Mapping) else default_thinking
     return RankedModel(
@@ -3380,6 +3820,7 @@ def _hard_filter_reasons(
     request_context: Mapping[str, Any],
     proposer_count: int,
     ranking_config: Mapping[str, Any],
+    thinking_policy: Mapping[str, Any] | None = None,
 ) -> tuple[list[str], int]:
     reasons = _availability_reasons(model, role, ranking_config)
     permission = user_profile.get("permission")
@@ -3397,6 +3838,24 @@ def _hard_filter_reasons(
 
     constraints = task_profile.get("constraints")
     constraint_map = constraints if isinstance(constraints, Mapping) else {}
+    if thinking_policy is not None:
+        level_order = tuple(str(level) for level in thinking_policy["level_order"])
+        thinking_levels = {
+            str(level).strip().lower()
+            for level in model.registry_facts.get("thinking_levels") or []
+        }
+        task_risk = str(constraint_map.get("risk") or "low").strip().lower()
+        risk_floor = thinking_policy["risk_floor"].get(task_risk)
+        has_eligible_level = bool(thinking_levels)
+        if risk_floor:
+            floor_index = level_order.index(str(risk_floor))
+            has_eligible_level = any(
+                level_order.index(level) >= floor_index
+                for level in thinking_levels
+                if level in level_order
+            )
+        if not has_eligible_level:
+            reasons.append("thinking_level_unavailable")
     risk_allowlist = permission_map.get("risk_allowlist")
     if isinstance(risk_allowlist, Sequence) and not isinstance(risk_allowlist, str):
         allowed_risks = {str(value).strip().lower() for value in risk_allowlist}
@@ -3797,6 +4256,303 @@ def _effective_tier(task_profile: Mapping[str, Any], ranking_config: Mapping[str
     )
 
 
+def _shift_thinking_level(
+    level: str,
+    steps: int,
+    *,
+    level_order: Sequence[str],
+) -> str:
+    index = level_order.index(level)
+    destination = max(0, min(len(level_order) - 1, index + steps))
+    return str(level_order[destination])
+
+
+def _thinking_target_for_role(
+    *,
+    role: str,
+    effective_tier: int,
+    task_profile: Mapping[str, Any],
+    session_trace: Mapping[str, Any],
+    policy: Mapping[str, Any],
+) -> tuple[str, list[str], str | None]:
+    """Apply the section-6.6 corrections in their specified order."""
+
+    level_order = tuple(str(level) for level in policy["level_order"])
+    target = str(policy["tier_mapping"][str(effective_tier)])
+    reasons = [f"tier_{effective_tier}_base_{target}"]
+    if role == "aggregator":
+        before = target
+        target = _shift_thinking_level(
+            target,
+            int(policy["aggregator_level_step"]),
+            level_order=level_order,
+        )
+        reasons.append(
+            "aggregator_level_step" if target != before else "aggregator_level_step_capped"
+        )
+
+    constraints = task_profile.get("constraints")
+    constraint_map = constraints if isinstance(constraints, Mapping) else {}
+    risk = str(constraint_map.get("risk") or "low").strip().lower()
+    risk_floor = policy["risk_floor"].get(risk)
+    floor_index: int | None = None
+    if risk_floor:
+        risk_floor = str(risk_floor)
+        floor_index = level_order.index(risk_floor)
+        if level_order.index(target) < floor_index:
+            target = risk_floor
+            reasons.append(f"risk_{risk}_floor_{risk_floor}")
+        else:
+            reasons.append(f"risk_{risk}_floor_satisfied")
+
+    resource_policy = policy["resource_constraints"]
+    cost = str(constraint_map.get("cost") or "").strip().lower()
+    latency = str(constraint_map.get("latency") or "").strip().lower()
+    cost_constrained = cost in resource_policy["cost_values"]
+    latency_constrained = latency in resource_policy["latency_values"]
+    if cost_constrained or latency_constrained:
+        before = target
+        shifted = _shift_thinking_level(
+            target,
+            -int(resource_policy["downshift_levels"]),
+            level_order=level_order,
+        )
+        if floor_index is not None and level_order.index(shifted) < floor_index:
+            shifted = str(level_order[floor_index])
+        target = shifted
+        constraint_kinds = "_and_".join(
+            kind
+            for kind, constrained in (
+                (f"cost_{cost}", cost_constrained),
+                (f"latency_{latency}", latency_constrained),
+            )
+            if constrained
+        )
+        reasons.append(
+            f"resource_{constraint_kinds}_downshift"
+            if target != before
+            else f"resource_{constraint_kinds}_downshift_blocked"
+        )
+
+    if str(session_trace.get("intent") or "") == "redo":
+        # Redo already changed the tier distribution in section 6.5. Keeping
+        # this no-op reason makes it replay-auditable that no second bump was
+        # applied here.
+        reasons.append("redo_uses_session_adjusted_tier_only")
+    return target, reasons, (str(risk_floor) if risk_floor else None)
+
+
+def _ordered_neighbor_thinking_fallbacks(
+    *,
+    initial_level: str,
+    eligible_levels: Sequence[str],
+    level_order: Sequence[str],
+    high_risk: bool,
+) -> list[str]:
+    """Walk to the nearest remaining level after each rejected attempt."""
+
+    remaining = [level for level in eligible_levels if level != initial_level]
+    ordered: list[str] = []
+    current_level = initial_level
+    while remaining:
+        current_index = level_order.index(current_level)
+        next_level = min(
+            remaining,
+            key=lambda level: (
+                abs(level_order.index(level) - current_index),
+                -level_order.index(level)
+                if high_risk
+                else level_order.index(level),
+            ),
+        )
+        ordered.append(next_level)
+        remaining.remove(next_level)
+        current_level = next_level
+    return ordered
+
+
+def _resolve_model_thinking_level(
+    model: RankedModel,
+    *,
+    role: str,
+    requested_level: str,
+    reasons: Sequence[str],
+    risk_floor: str | None,
+    policy: Mapping[str, Any],
+) -> tuple[RankedModel, dict[str, Any], dict[str, Any] | None]:
+    """Resolve unsupported unified targets deterministically and map native."""
+
+    level_order = tuple(str(level) for level in policy["level_order"])
+    supported = tuple(
+        str(level)
+        for level in model.registry_facts.get("thinking_levels") or []
+        if str(level) in level_order
+    )
+    floor_index = level_order.index(risk_floor) if risk_floor else None
+    eligible = [
+        level
+        for level in supported
+        if floor_index is None or level_order.index(level) >= floor_index
+    ]
+    if not eligible:
+        raise DynamicRankingError(
+            "router_dynamic selected a model without an eligible unified "
+            f"thinking level: {model.identity}"
+        )
+
+    requested_index = level_order.index(requested_level)
+    high_risk = risk_floor is not None
+    eligible.sort(
+        key=lambda level: (
+            abs(level_order.index(level) - requested_index),
+            -level_order.index(level) if high_risk else level_order.index(level),
+        )
+    )
+    effective_level = eligible[0]
+    mapping = model.registry_facts.get("thinking_level_mapping")
+    mapping_map = mapping if isinstance(mapping, Mapping) else {}
+    provider_level = str(mapping_map.get(effective_level) or "").strip().lower()
+    if not provider_level:
+        raise DynamicRankingError(
+            "router_dynamic selected a model with an incomplete "
+            f"thinking_level_mapping: {model.identity}"
+        )
+
+    fallback_reason = ""
+    effective_reasons = list(reasons)
+    unsupported_fallback: dict[str, Any] | None = None
+    if effective_level != requested_level:
+        direction = "higher" if level_order.index(effective_level) > requested_index else "lower"
+        fallback_reason = f"unsupported_requested_level_nearest_{direction}"
+        effective_reasons.append(fallback_reason)
+        unsupported_fallback = {
+            "identity": model.identity,
+            "model_id": model.model_id,
+            "role": role,
+            "requested_level": requested_level,
+            "effective_level": effective_level,
+            "provider_level": provider_level,
+            "reason": fallback_reason,
+        }
+
+    fallback_candidates = _ordered_neighbor_thinking_fallbacks(
+        initial_level=effective_level,
+        eligible_levels=eligible,
+        level_order=level_order,
+        high_risk=high_risk,
+    )
+    provider_fallbacks = tuple(
+        {
+            "unified_level": level,
+            "provider_level": str(mapping_map[level]),
+            "reason": "provider_rejection_fallback",
+        }
+        for level in fallback_candidates
+    )
+    assigned = replace(
+        model,
+        thinking=provider_level,
+        requested_thinking_level=requested_level,
+        effective_thinking_level=effective_level,
+        thinking_fallback_reason=fallback_reason,
+        thinking_policy_version=str(policy["policy_version"]),
+        thinking_fallbacks=provider_fallbacks,
+    )
+    detail = {
+        "identity": model.identity,
+        "model_id": model.model_id,
+        "role": role,
+        "requested_level": requested_level,
+        "effective_level": effective_level,
+        "provider_level": provider_level,
+        "fallback_reason": fallback_reason,
+        "reasons": effective_reasons,
+        "provider_rejection_fallbacks": [
+            copy.deepcopy(dict(fallback)) for fallback in provider_fallbacks
+        ],
+    }
+    return assigned, detail, unsupported_fallback
+
+
+def _assign_thinking_levels(
+    *,
+    proposers: Sequence[RankedModel],
+    aggregator: RankedModel,
+    effective_tier: int,
+    task_profile: Mapping[str, Any],
+    session_trace: Mapping[str, Any],
+    policy: Mapping[str, Any],
+) -> tuple[
+    tuple[RankedModel, ...],
+    RankedModel,
+    dict[str, Any],
+    dict[str, Any],
+    list[dict[str, Any]],
+]:
+    proposer_target, proposer_reasons, risk_floor = _thinking_target_for_role(
+        role="proposer",
+        effective_tier=effective_tier,
+        task_profile=task_profile,
+        session_trace=session_trace,
+        policy=policy,
+    )
+    aggregator_target, aggregator_reasons, aggregator_risk_floor = _thinking_target_for_role(
+        role="aggregator",
+        effective_tier=effective_tier,
+        task_profile=task_profile,
+        session_trace=session_trace,
+        policy=policy,
+    )
+
+    assigned_proposers: list[RankedModel] = []
+    proposer_details: list[dict[str, Any]] = []
+    unsupported_fallbacks: list[dict[str, Any]] = []
+    for proposer in proposers:
+        assigned, detail, unsupported = _resolve_model_thinking_level(
+            proposer,
+            role="proposer",
+            requested_level=proposer_target,
+            reasons=proposer_reasons,
+            risk_floor=risk_floor,
+            policy=policy,
+        )
+        assigned_proposers.append(assigned)
+        proposer_details.append(detail)
+        if unsupported is not None:
+            unsupported_fallbacks.append(unsupported)
+
+    assigned_aggregator, aggregator_detail, unsupported = _resolve_model_thinking_level(
+        aggregator,
+        role="aggregator",
+        requested_level=aggregator_target,
+        reasons=aggregator_reasons,
+        risk_floor=aggregator_risk_floor,
+        policy=policy,
+    )
+    if unsupported is not None:
+        unsupported_fallbacks.append(unsupported)
+
+    assignment = {
+        "proposers": {
+            model.identity: model.effective_thinking_level for model in assigned_proposers
+        },
+        "aggregator": assigned_aggregator.effective_thinking_level,
+        "thinking_policy_version": str(policy["policy_version"]),
+    }
+    details = {
+        "effective_tier": effective_tier,
+        "proposers": proposer_details,
+        "aggregator": aggregator_detail,
+    }
+    return (
+        tuple(assigned_proposers),
+        assigned_aggregator,
+        assignment,
+        details,
+        unsupported_fallbacks,
+    )
+
+
 def _proposer_bounds(
     task_profile: Mapping[str, Any],
     user_profile: Mapping[str, Any],
@@ -3949,6 +4705,7 @@ def _aggregator_filter_rows(
     user_profile: Mapping[str, Any] | None,
     request_context: Mapping[str, Any],
     ranking_config: Mapping[str, Any],
+    thinking_policy: Mapping[str, Any] | None = None,
 ) -> tuple[list[RankedModel], list[dict[str, Any]]]:
     eligible: list[RankedModel] = []
     filters: list[dict[str, Any]] = []
@@ -3962,6 +4719,7 @@ def _aggregator_filter_rows(
             request_context=request_context,
             proposer_count=proposer_count,
             ranking_config=ranking_config,
+            thinking_policy=thinking_policy,
         )
         filters.append(
             {
@@ -3986,6 +4744,7 @@ def _aggregator_rows(
     user_profile: Mapping[str, Any] | None,
     request_context: Mapping[str, Any],
     ranking_config: Mapping[str, Any],
+    thinking_policy: Mapping[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     scored: list[dict[str, Any]] = []
     eligible, filters = _aggregator_filter_rows(
@@ -3995,6 +4754,7 @@ def _aggregator_rows(
         user_profile=user_profile,
         request_context=request_context,
         ranking_config=ranking_config,
+        thinking_policy=thinking_policy,
     )
     cost_weight, latency_weight = _cost_latency_weights(task_profile, user_profile, ranking_config)
     task_weight = _ranking_number(ranking_config, "aggregator", "task_match_weight")
@@ -4091,10 +4851,51 @@ def rank_models(
     routing_confidence: float,
     ranking_config: Mapping[str, Any] | None = None,
     decision_id: str = "",
+    ranking_thinking_assignment_enabled: bool = False,
 ) -> RankingDecision:
     """Select ``(P, A)`` using the Step2 chapter-6 ranking pipeline."""
 
-    effective_ranking_config = _resolve_ranking_config(ranking_config)
+    if not isinstance(ranking_thinking_assignment_enabled, bool):
+        raise DynamicRankingError(
+            "router_dynamic ranking_thinking_assignment_enabled must be a boolean"
+        )
+    if ranking_thinking_assignment_enabled:
+        effective_ranking_config = _resolve_ranking_config(ranking_config)
+    else:
+        source_config = (
+            ranking_config
+            if ranking_config is not None
+            else _packaged_ranking_config()
+        )
+        effective_ranking_config = _validate_ranking_config(
+            _legacy_ranking_config_projection(source_config)
+        )
+        registry_snapshot = _legacy_registry_snapshot_projection(registry_snapshot)
+    if (
+        ranking_thinking_assignment_enabled
+        and effective_ranking_config.get("schema_version") != RANKING_CONFIG_SCHEMA_VERSION
+    ):
+        raise DynamicRankingError(
+            f"router_dynamic thinking_assignment requires {RANKING_CONFIG_SCHEMA_VERSION}"
+        )
+    if (
+        ranking_thinking_assignment_enabled
+        and _ranking_number(
+            effective_ranking_config,
+            "proposer_count",
+            "effective_tier_rounding_offset",
+        )
+        != 0.5
+    ):
+        raise DynamicRankingError(
+            "router_dynamic thinking-policy-v1 requires "
+            "proposer_count.effective_tier_rounding_offset to be 0.5"
+        )
+    thinking_policy = (
+        _thinking_assignment_policy(effective_ranking_config)
+        if ranking_thinking_assignment_enabled
+        else None
+    )
     ranking_config_hash = _canonical_hash(effective_ranking_config)
     profile_decimal_places = _ranking_int(
         effective_ranking_config, "trace", "profile_decimal_places"
@@ -4108,7 +4909,14 @@ def rank_models(
         raise DynamicRankingError("router_dynamic registry snapshot contains no models")
     if any(not isinstance(row, Mapping) for row in rows):
         raise DynamicRankingError("router_dynamic registry snapshot contains a malformed model row")
-    models = [_normalize_model(row, effective_ranking_config) for row in rows]
+    models = [
+        _normalize_model(
+            row,
+            effective_ranking_config,
+            thinking_policy=thinking_policy,
+        )
+        for row in rows
+    ]
     if not models:
         raise DynamicRankingError("router_dynamic registry snapshot is empty")
     model_identities = [model.identity.lower() for model in models]
@@ -4139,6 +4947,7 @@ def rank_models(
             request_context=request_context,
             proposer_count=1,
             ranking_config=effective_ranking_config,
+            thinking_policy=thinking_policy,
         )
         proposer_filters.append(
             {
@@ -4167,12 +4976,26 @@ def rank_models(
             reason.startswith(GENERATION_POLICY_FILTER_REASON_PREFIX) for reason in row["reasons"]
         )
     ]
+    proposer_thinking_unavailable = any(
+        "thinking_level_unavailable" in row["reasons"]
+        for row in proposer_filters
+    )
     if generation_policy_exclusions and len(eligible) < minimum:
         excluded = ", ".join(row["identity"] for row in generation_policy_exclusions)
         raise DynamicRankingError(
             "router_dynamic generation-policy filtering left "
             f"{len(eligible)} eligible proposer(s), fewer than N_min={minimum}; "
             f"excluded: {excluded}"
+            + (
+                "; thinking_level_unavailable"
+                if proposer_thinking_unavailable
+                else ""
+            ),
+            reason=(
+                "thinking_level_unavailable"
+                if proposer_thinking_unavailable
+                else ""
+            ),
         )
     if not eligible:
         no_eligible_reason_counts: dict[str, int] = {}
@@ -4186,7 +5009,22 @@ def rank_models(
             registry_snapshot_version=registry_snapshot.get("snapshot_version"),
             filter_reason_counts=no_eligible_reason_counts,
         )
-        raise DynamicRankingError("router_dynamic has no proposer after hard filtering")
+        thinking_suffix = (
+            ": thinking_level_unavailable"
+            if no_eligible_reason_counts.get("thinking_level_unavailable")
+            else ""
+        )
+        raise DynamicRankingError(
+            "router_dynamic has no proposer after hard filtering"
+            + thinking_suffix,
+            reason=(
+                "thinking_level_unavailable"
+                if no_eligible_reason_counts.get(
+                    "thinking_level_unavailable"
+                )
+                else ""
+            ),
+        )
 
     score_rows = [
         _base_score_row(
@@ -4274,6 +5112,7 @@ def rank_models(
             user_profile=user_profile,
             request_context=request_context,
             ranking_config=effective_ranking_config,
+            thinking_policy=thinking_policy,
         )
         feasibility_reason_counts: dict[str, int] = {}
         for filter_row in feasibility_filters:
@@ -4389,10 +5228,29 @@ def rank_models(
         raise DynamicRankingError(
             "router_dynamic generation-policy filtering allowed only "
             f"{len(selected)} feasible proposer(s), fewer than N_min={minimum}"
+            + (
+                "; thinking_level_unavailable"
+                if proposer_thinking_unavailable
+                else ""
+            ),
+            reason=(
+                "thinking_level_unavailable"
+                if proposer_thinking_unavailable
+                else ""
+            ),
         )
     if not selected:
+        thinking_infeasible = any(
+            row.get("filter_reason_counts", {}).get("thinking_level_unavailable")
+            for row in aggregator_feasibility
+            if isinstance(row.get("filter_reason_counts"), Mapping)
+        )
         raise DynamicRankingError(
             "router_dynamic cannot select a proposer with a feasible aggregator"
+            + (": thinking_level_unavailable" if thinking_infeasible else ""),
+            reason=(
+                "thinking_level_unavailable" if thinking_infeasible else ""
+            ),
         )
     aggregator_rows, aggregator_filters = _aggregator_rows(
         models,
@@ -4401,8 +5259,13 @@ def rank_models(
         user_profile=user_profile,
         request_context=request_context,
         ranking_config=effective_ranking_config,
+        thinking_policy=thinking_policy,
     )
     if not aggregator_rows:
+        thinking_unavailable = any(
+            "thinking_level_unavailable" in row["reasons"]
+            for row in aggregator_filters
+        )
         aggregator_generation_exclusions = [
             row["identity"]
             for row in aggregator_filters
@@ -4415,8 +5278,24 @@ def rank_models(
             raise DynamicRankingError(
                 "router_dynamic generation-policy filtering left no feasible aggregator; "
                 f"excluded: {', '.join(aggregator_generation_exclusions)}"
+                + (
+                    "; thinking_level_unavailable"
+                    if thinking_unavailable
+                    else ""
+                ),
+                reason=(
+                    "thinking_level_unavailable"
+                    if thinking_unavailable
+                    else ""
+                ),
             )
-        raise DynamicRankingError("router_dynamic has no feasible aggregator")
+        raise DynamicRankingError(
+            "router_dynamic has no feasible aggregator"
+            + (": thinking_level_unavailable" if thinking_unavailable else ""),
+            reason=(
+                "thinking_level_unavailable" if thinking_unavailable else ""
+            ),
+        )
     aggregator_row = aggregator_rows[0]
     aggregator = aggregator_row["model"]
     coverage_shortfall = len(selected) < minimum
@@ -4432,6 +5311,35 @@ def rank_models(
     )
     session_trace["adjusted_model_ids"] = session_adjusted_ids
 
+    assigned_proposers = tuple(selected)
+    assigned_aggregator = aggregator
+    thinking_assignment: dict[str, Any] = {}
+    thinking_assignment_details: dict[str, Any] = {}
+    thinking_assignment_reasons: dict[str, Any] = {}
+    thinking_unsupported_fallbacks: list[dict[str, Any]] = []
+    if thinking_policy is not None:
+        (
+            assigned_proposers,
+            assigned_aggregator,
+            thinking_assignment,
+            thinking_assignment_details,
+            thinking_unsupported_fallbacks,
+        ) = _assign_thinking_levels(
+            proposers=selected,
+            aggregator=aggregator,
+            effective_tier=effective_tier,
+            task_profile=task_profile,
+            session_trace=session_trace,
+            policy=thinking_policy,
+        )
+        thinking_assignment_reasons = {
+            "proposers": {
+                row["identity"]: list(row["reasons"])
+                for row in thinking_assignment_details["proposers"]
+            },
+            "aggregator": list(thinking_assignment_details["aggregator"]["reasons"]),
+        }
+
     reason_counts: dict[str, int] = {}
     for filter_row in [*proposer_filters, *aggregator_filters]:
         for reason in filter_row["reasons"]:
@@ -4446,6 +5354,11 @@ def rank_models(
     router_tier_by_effective_tier = {
         tier: router_tier for router_tier, tier in router_tier_mapping.items()
     }
+    effective_ranking_version = (
+        RANKING_VERSION
+        if ranking_thinking_assignment_enabled
+        else LEGACY_RANKING_VERSION
+    )
     trace_registry_snapshot = copy.deepcopy(dict(registry_snapshot))
     trace_request_context = copy.deepcopy(dict(request_context))
     trace_request_context["snapshot_hash"] = _request_context_hash(trace_request_context)
@@ -4460,7 +5373,7 @@ def rank_models(
     trace = {
         "strategy": "router_dynamic",
         "decision_id": decision_id,
-        "ranking_version": RANKING_VERSION,
+        "ranking_version": effective_ranking_version,
         "ranking_config_schema_version": str(effective_ranking_config["schema_version"]),
         "ranking_config_version": str(effective_ranking_config["config_version"]),
         "ranking_config_hash": ranking_config_hash,
@@ -4485,7 +5398,12 @@ def rank_models(
         "request_context_hash": trace_request_context["snapshot_hash"],
         "request_context": trace_request_context,
         "candidate_pool_size": len(models),
-        "candidate_pool": [model.trace() for model in models],
+        "candidate_pool": [
+            model.trace(
+                include_thinking_contract=ranking_thinking_assignment_enabled,
+            )
+            for model in models
+        ],
         "hard_filter": {
             "proposer_results": proposer_filters,
             "aggregator_results": aggregator_filters,
@@ -4524,6 +5442,37 @@ def rank_models(
             "requires_order_randomization": overlap,
         },
     }
+    if thinking_policy is not None:
+        trace.update(
+            {
+                "ranking_thinking_assignment_enabled": True,
+                "thinking_policy_version": str(thinking_policy["policy_version"]),
+                "thinking_assignment": copy.deepcopy(thinking_assignment),
+                "thinking_assignment_details": copy.deepcopy(
+                    thinking_assignment_details
+                ),
+                "assignment_reasons": copy.deepcopy(
+                    thinking_assignment_reasons
+                ),
+                "unsupported_level_fallbacks": copy.deepcopy(
+                    thinking_unsupported_fallbacks
+                ),
+                "policy_versions": {
+                    "ranking": effective_ranking_version,
+                    "thinking": str(thinking_policy["policy_version"]),
+                },
+            }
+        )
+        log.info(
+            "llm_ensemble.router_dynamic.thinking_assignment_recorded",
+            decision_id=decision_id,
+            thinking_assignment=trace["thinking_assignment"],
+            assignment_reasons=trace["assignment_reasons"],
+            unsupported_level_fallbacks=trace[
+                "unsupported_level_fallbacks"
+            ],
+            policy_versions=trace["policy_versions"],
+        )
     log.info(
         "llm_ensemble.router_dynamic.candidate_pool_recorded",
         decision_id=decision_id,
@@ -4538,7 +5487,7 @@ def rank_models(
     log.info(
         "llm_ensemble.router_dynamic.model_scores_recorded",
         decision_id=decision_id,
-        ranking_version=RANKING_VERSION,
+        ranking_version=effective_ranking_version,
         score_count=len(score_rows),
         top_l=top_l,
         quality_floor=round(quality_floor, score_decimal_places),
@@ -4560,22 +5509,40 @@ def rank_models(
         overlap_flag=overlap,
         bias_penalty=round(_as_float(aggregator_row["bias"]), score_decimal_places),
     )
+    router_decision_log_fields: dict[str, Any] = {
+        "decision_id": decision_id,
+        "user_profile_enabled": user_profile_enabled,
+        "ranking_version": effective_ranking_version,
+        "selected_P": selected_ids,
+        "selected_A": aggregator.identity,
+        "session_intent": session_trace["intent"],
+        "escalation_level": session_trace["escalation_level"],
+        "sticky_applied": session_trace["sticky_applied"],
+    }
+    if thinking_policy is not None:
+        router_decision_log_fields.update(
+            {
+                "thinking_assignment_enabled": True,
+                "thinking_policy_version": trace["thinking_policy_version"],
+                "thinking_assignment": trace["thinking_assignment"],
+                "assignment_reasons": trace["assignment_reasons"],
+                "unsupported_level_fallbacks": trace[
+                    "unsupported_level_fallbacks"
+                ],
+                "policy_versions": trace["policy_versions"],
+            }
+        )
     log.info(
         "llm_ensemble.router_dynamic.router_decision_recorded",
-        decision_id=decision_id,
-        user_profile_enabled=user_profile_enabled,
-        ranking_version=RANKING_VERSION,
-        selected_P=selected_ids,
-        selected_A=aggregator.identity,
-        session_intent=session_trace["intent"],
-        escalation_level=session_trace["escalation_level"],
-        sticky_applied=session_trace["sticky_applied"],
+        **router_decision_log_fields,
     )
     return RankingDecision(
-        proposers=tuple(selected),
-        aggregator=aggregator,
+        proposers=assigned_proposers,
+        aggregator=assigned_aggregator,
         effective_tier=effective_tier,
         trace=trace,
+        thinking_assignment=copy.deepcopy(thinking_assignment),
+        thinking_assignment_details=copy.deepcopy(thinking_assignment_details),
     )
 
 
@@ -4591,6 +5558,7 @@ _RANKING_REPLAY_FIELDS = (
     "registry_snapshot_hash",
     "routed_tier",
     "routing_confidence",
+    "ranking_thinking_assignment_enabled",
     "effective_tier",
     "effective_router_tier",
     "task_profile",
@@ -4618,6 +5586,12 @@ _RANKING_REPLAY_FIELDS = (
     "aggregator_feasibility",
     "selected_P",
     "selected_A",
+    "thinking_policy_version",
+    "thinking_assignment",
+    "thinking_assignment_details",
+    "assignment_reasons",
+    "unsupported_level_fallbacks",
+    "policy_versions",
     "exploration",
     "proposer_count",
     "coverage_shortfall",
@@ -4631,6 +5605,23 @@ def ranking_trace_replay_reasons(trace: Mapping[str, Any]) -> list[str]:
     """Replay a frozen G1 ranker trace from embedded public evidence."""
 
     reasons: list[str] = []
+    legacy_trace = (
+        trace.get("ranking_version") == "step2-ranking-v2"
+        and trace.get("ranking_config_schema_version")
+        == LEGACY_RANKING_CONFIG_SCHEMA_VERSION
+    )
+    if (
+        "ranking_thinking_assignment_enabled" not in trace
+        and not legacy_trace
+    ):
+        reasons.append("missing_g1_replay_thinking_assignment_switch")
+    raw_thinking_assignment_enabled = trace.get(
+        "ranking_thinking_assignment_enabled",
+        False,
+    )
+    if not isinstance(raw_thinking_assignment_enabled, bool):
+        reasons.append("invalid_g1_replay_thinking_assignment_switch")
+    thinking_assignment_enabled = raw_thinking_assignment_enabled is True
     if trace.get("user_profile_enabled") is not False:
         reasons.append("g1_ranking_replay_requires_disabled_user_profile")
     registry_snapshot = trace.get("registry_snapshot")
@@ -4708,11 +5699,33 @@ def ranking_trace_replay_reasons(trace: Mapping[str, Any]) -> list[str]:
             ),
             ranking_config=copy.deepcopy(dict(ranking_parameters)),
             decision_id=str(trace.get("decision_id") or ""),
+            ranking_thinking_assignment_enabled=thinking_assignment_enabled,
         ).trace
     except Exception:  # noqa: BLE001 - malformed replay evidence fails closed
         return ["g1_frozen_ranker_replay_failed"]
 
+    additive_thinking_fields = {
+        "ranking_thinking_assignment_enabled",
+        "thinking_policy_version",
+        "thinking_assignment",
+        "thinking_assignment_details",
+        "assignment_reasons",
+        "unsupported_level_fallbacks",
+        "policy_versions",
+    }
+    legacy_disabled_replay = (
+        not thinking_assignment_enabled
+        and legacy_trace
+    )
     for field_name in _RANKING_REPLAY_FIELDS:
+        if field_name == "ranking_version" and legacy_disabled_replay:
+            continue
+        if (
+            field_name in additive_thinking_fields
+            and field_name not in trace
+            and legacy_disabled_replay
+        ):
+            continue
         if trace.get(field_name) != replayed.get(field_name):
             reasons.append(f"g1_frozen_ranker_replay_mismatch_{field_name}")
     return list(dict.fromkeys(reasons))

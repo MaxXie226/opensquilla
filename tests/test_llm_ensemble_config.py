@@ -26,6 +26,7 @@ def test_llm_ensemble_defaults_to_disabled_for_model_router_first_install() -> N
     assert ensemble.selection_mode == "static_openrouter_b5"
     assert ensemble.ranking_user_profile_generation_enabled is False
     assert ensemble.ranking_user_profile_enabled is False
+    assert ensemble.ranking_thinking_assignment_enabled is False
     assert ensemble.proposer_tools is False
     assert ensemble.aggregator_tools is True
     assert ensemble.min_successful_proposers == 1
@@ -91,6 +92,19 @@ def test_llm_ensemble_user_profile_switches_are_independent() -> None:
     serialized_application = application_cfg.to_toml_dict()["llm_ensemble"]
     assert serialized_application["ranking_user_profile_generation_enabled"] is False
     assert serialized_application["ranking_user_profile_enabled"] is True
+
+
+def test_llm_ensemble_thinking_assignment_switch_is_opt_in_and_serialized() -> None:
+    cfg = GatewayConfig(
+        llm_ensemble={
+            "selection_mode": "router_dynamic",
+            "ranking_thinking_assignment_enabled": True,
+        }
+    )
+
+    assert cfg.llm_ensemble.ranking_thinking_assignment_enabled is True
+    serialized = cfg.to_toml_dict()["llm_ensemble"]
+    assert serialized["ranking_thinking_assignment_enabled"] is True
 
 
 def test_static_openrouter_b5_does_not_need_model_options() -> None:
@@ -1213,6 +1227,59 @@ async def test_cross_provider_ensemble_disables_late_plugin_selector_fallback_re
     assert direct_fallback.replay_provider_state is False
     assert plugin_fallback_config.replay_provider_state is True
     assert shared_selector.current_config.replay_provider_state is True
+
+
+@pytest.mark.asyncio
+async def test_selector_fallback_cannot_bypass_routed_thinking_policy() -> None:
+    from opensquilla.engine.runtime import _SelectorFallbackProvider
+    from opensquilla.provider.types import ErrorEvent
+
+    class _ManagedEnsemble:
+        provider_name = "ensemble"
+        enforces_routed_thinking_policy = True
+
+        async def chat(self, messages, tools=None, config=None):
+            del messages, tools, config
+            yield ErrorEvent(message="rate limited", code="429")
+
+    class _UnsafeFallback:
+        provider_name = "fallback"
+
+        async def chat(self, messages, tools=None, config=None):
+            del messages, tools, config
+            yield ErrorEvent(message="must not run", code="unsafe")
+
+    class _Selector:
+        active_provider_id = "openrouter"
+        current_config = ProviderConfig(
+            provider="openrouter",
+            model="unsafe-fallback",
+        )
+
+        def __init__(self) -> None:
+            self.fallback_calls = 0
+
+        def next_fallback_after_failure(self, error):
+            del error
+            self.fallback_calls += 1
+            return _UnsafeFallback()
+
+    selector = _Selector()
+    wrapper = _SelectorFallbackProvider(_ManagedEnsemble(), selector)
+
+    events = [
+        event
+        async for event in wrapper.chat(
+            [Message(role="user", content="synthetic")]
+        )
+    ]
+
+    assert selector.fallback_calls == 0
+    assert len(events) == 1
+    assert isinstance(events[0], ErrorEvent)
+    assert events[0].code == "429"
+    assert wrapper.fallback_after_invalid_response("empty response") is False
+    assert selector.fallback_calls == 0
 
 
 def test_custom_b5_uses_shared_session_pinned_profile_pool(

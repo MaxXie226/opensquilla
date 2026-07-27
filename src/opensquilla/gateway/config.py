@@ -485,6 +485,9 @@ class LlmEnsembleConfig(BaseSettings):
     ranking_user_profile_generation_enabled: bool = False
     # Kept under its existing name for explicit-config compatibility.
     ranking_user_profile_enabled: bool = False
+    # router_dynamic only: assign proposer/aggregator thinking levels after
+    # ranking. Kept opt-in so existing dynamic-routing behavior is unchanged.
+    ranking_thinking_assignment_enabled: bool = False
     proposer_tools: bool = False
     aggregator_tools: bool = True
     min_successful_proposers: int = Field(default=1, ge=1)

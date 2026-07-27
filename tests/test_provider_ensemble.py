@@ -35,11 +35,13 @@ from opensquilla.provider.ensemble import (
     _canonicalize_usage_row,
     _close_async_iterator,
     _error_event_physical_request_count,
+    _is_thinking_parameter_rejection,
     _member_chat_config,
     _member_from_ref,
     _MemberRequestBudgetBinding,
     _rollup_cost_source,
     _stream_with_heartbeats,
+    _StreamCloseStatus,
     _summed_float,
     _unrepresented_diagnostic_usage_rows,
     build_ensemble_provider_from_config,
@@ -253,6 +255,126 @@ def test_ensemble_receipt_matching_prioritizes_stable_ids(
 
     assert missing == []
     assert len(outer_rows) == 2
+
+
+def test_duplicate_diagnostic_response_id_is_counted_once() -> None:
+    row = {
+        "provider": "openrouter",
+        "model": "same-model",
+        "input_tokens": 5,
+        "output_tokens": 1,
+        "billed_cost": 0.1,
+        "cost_source": "provider_billed",
+        "provider_usage": {"response_ids": ["response-a"]},
+    }
+    outer_rows = [dict(row)]
+    diagnostic = DoneEvent(
+        input_tokens=10,
+        output_tokens=2,
+        billed_cost=0.2,
+        cost_source="provider_billed",
+        model_usage_breakdown=[dict(row), dict(row)],
+    )
+
+    missing = _unrepresented_diagnostic_usage_rows(
+        outer_rows,
+        diagnostic,
+        role="aggregator",
+        profile="test",
+        label="aggregator",
+        provider="openrouter",
+        model="same-model",
+    )
+    result = normalize_provider_usage(
+        ErrorEvent(
+            message="duplicate wrapper receipt",
+            code="response_invalid",
+            model_usage_breakdown=[*outer_rows, *missing],
+            diagnostic_done=diagnostic,
+            request_started=True,
+            physical_request_count=1,
+        ),
+        default_provider="openrouter",
+        default_model="same-model",
+        completed_at_ms=1,
+    )
+
+    assert missing == []
+    assert len(result.items) == 1
+    assert result.billed_cost_nanos == 100_000_000
+    assert result.missing_usage_entries == 0
+
+
+def test_malformed_outer_usage_row_defers_to_diagnostic_receipt() -> None:
+    outer_row = {
+        "provider": "fake",
+        "model": "aggregator",
+        "input_tokens": "N/A",
+        "output_tokens": 1,
+        "billed_cost": 0.1,
+        "cost_source": "provider_billed",
+    }
+    diagnostic = DoneEvent(
+        provider="fake",
+        model="aggregator",
+        input_tokens=3,
+        output_tokens=1,
+        billed_cost=0.1,
+        cost_source="provider_billed",
+    )
+    diagnostic_rows = _unrepresented_diagnostic_usage_rows(
+        [outer_row],
+        diagnostic,
+        role="aggregator",
+        profile="test",
+        label="aggregator",
+        provider="fake",
+        model="aggregator",
+    )
+    result = normalize_provider_usage(
+        ErrorEvent(
+            message="malformed wrapper receipt",
+            code="bad_metadata",
+            model_usage_breakdown=[outer_row, *diagnostic_rows],
+            diagnostic_done=diagnostic,
+            request_started=True,
+            physical_request_count=1,
+        ),
+        default_provider="fake",
+        default_model="aggregator",
+        completed_at_ms=1,
+    )
+
+    assert len(diagnostic_rows) == 1
+    assert len(result.items) == 1
+    assert result.items[0].input_tokens == 3
+    assert result.items[0].output_tokens == 1
+    assert result.billed_cost_nanos == 100_000_000
+    assert result.missing_usage_entries == 0
+
+
+@pytest.mark.parametrize(
+    ("message", "code", "expected"),
+    [
+        (
+            "reasoning_effort: value should be one of low, medium, high",
+            "400",
+            True,
+        ),
+        ("unsupported reasoning_effort value", "invalid_reasoning_effort", True),
+        ("Invalid thinking signature", "400", False),
+        ("invalid request body", "400", False),
+    ],
+)
+def test_thinking_rejection_classifier_requires_level_parameter_evidence(
+    message: str,
+    code: str,
+    expected: bool,
+) -> None:
+    assert _is_thinking_parameter_rejection(
+        message=message,
+        code=code,
+    ) is expected
 
 
 @pytest.mark.asyncio
@@ -601,6 +723,118 @@ async def test_heartbeat_wrapper_delivers_final_event_completed_before_deadline(
 
     assert any(isinstance(event, ProviderHeartbeatEvent) for event in events)
     assert any(isinstance(event, DoneEvent) for event in events)
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_wrapper_records_final_event_completed_after_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._ENSEMBLE_HEARTBEAT_INTERVAL_SECONDS",
+        0.01,
+    )
+
+    async def _source() -> AsyncIterator[StreamEvent]:
+        await asyncio.sleep(0.04)
+        yield DoneEvent(
+            input_tokens=9,
+            output_tokens=2,
+            billed_cost=0.1,
+            cost_source="provider_billed",
+            provider="fake",
+            model="m",
+        )
+
+    close_status = _StreamCloseStatus()
+    wrapped = _stream_with_heartbeats(
+        _source(),
+        phase="unit",
+        message="waiting",
+        timeout_seconds=0.03,
+        close_status=close_status,
+    )
+    with pytest.raises(TimeoutError):
+        async for event in wrapped:
+            if isinstance(event, ProviderHeartbeatEvent):
+                await asyncio.sleep(0.06)
+
+    assert close_status.closed is True
+    assert isinstance(close_status.deadline_event, DoneEvent)
+    assert close_status.deadline_event.input_tokens == 9
+    assert close_status.deadline_event.output_tokens == 2
+
+
+@pytest.mark.asyncio
+async def test_aggregator_timeout_preserves_late_done_usage_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._ENSEMBLE_HEARTBEAT_INTERVAL_SECONDS",
+        0.01,
+    )
+
+    class _LateAggregator:
+        provider_name = "fake"
+
+        async def chat(
+            self,
+            messages: list[Message],
+            tools: list[ToolDefinition] | None = None,
+            config: ChatConfig | None = None,
+        ) -> AsyncIterator[StreamEvent]:
+            del messages, tools, config
+            await asyncio.sleep(0.04)
+            yield DoneEvent(
+                input_tokens=9,
+                output_tokens=2,
+                billed_cost=0.1,
+                cost_source="provider_billed",
+                provider="fake",
+                model="agg",
+            )
+
+    provider = EnsembleProvider(
+        profile_name="test",
+        proposers=[_member("agg")],
+        aggregator=_member("agg"),
+        all_failed_policy="error",
+        shuffle_candidates=False,
+    )
+    trace: dict[str, Any] = {
+        "llm_request_count": 0,
+        "physical_request_count": 0,
+        "usage_missing_count": 0,
+        "final_request": {
+            "role": "aggregator",
+            "request_started": False,
+            "execution": {},
+        },
+    }
+    events: list[StreamEvent] = []
+    async for event in provider._stream_final_aggregator(
+        provider=_LateAggregator(),
+        messages=[Message(role="user", content="x")],
+        tools=None,
+        config=ChatConfig(),
+        prior_rows=[],
+        prior_missing_count=0,
+        trace=trace,
+        timeout_seconds=0.03,
+    ):
+        events.append(event)
+        if isinstance(event, ProviderHeartbeatEvent):
+            await asyncio.sleep(0.06)
+
+    terminal = events[-1]
+    assert isinstance(terminal, ErrorEvent)
+    assert terminal.code == "ensemble_aggregator_timeout"
+    assert terminal.physical_request_count == 1
+    assert terminal.usage_missing_count == 0
+    assert isinstance(terminal.diagnostic_done, DoneEvent)
+    assert len(terminal.model_usage_breakdown) == 1
+    assert terminal.model_usage_breakdown[0]["input_tokens"] == 9
+    assert terminal.model_usage_breakdown[0]["output_tokens"] == 2
+    assert terminal.model_usage_breakdown[0]["billed_cost"] == pytest.approx(0.1)
 
 
 @pytest.mark.asyncio
@@ -2794,6 +3028,52 @@ def test_router_dynamic_selection_plan_is_materialized_without_rewriting_members
     assert provider.min_successful_proposers == min(plan["N_min"], len(provider.proposers))
     assert plan["effective_min_successful_proposers"] == (provider.min_successful_proposers)
     assert provider.shuffle_candidates is bool(plan["aggregator"]["requires_order_randomization"])
+    assert plan.get("thinking_assignment") is None
+    assert all(
+        member.thinking_policy_managed is False
+        for member in [*provider.proposers, provider.aggregator]
+    )
+
+
+def test_router_dynamic_thinking_assignment_materializes_provider_native_levels() -> None:
+    config = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "deepseek/deepseek-v4-pro",
+            "api_key": "fake",
+        },
+        llm_ensemble={
+            "enabled": True,
+            "selection_mode": "router_dynamic",
+            "shuffle_candidates": False,
+            "ranking_thinking_assignment_enabled": True,
+        },
+    )
+    provider = build_ensemble_provider_from_config(
+        config=config,
+        inherited_provider_config=ProviderConfig(
+            provider="openrouter",
+            model="deepseek/deepseek-v4-pro",
+            api_key="fake",
+        ),
+        fallback_provider=None,
+        turn_metadata={"routed_tier": "c2"},
+    )
+
+    assignment = provider.selection_plan["thinking_assignment"]
+    assert assignment["thinking_policy_version"] == "thinking-policy-v1"
+    assert set(assignment["proposers"]) == set(provider.selection_plan["selected_P"])
+    for member in provider.proposers:
+        identity = (
+            f"{member.provider_config.provider}:{member.provider_config.model}"
+        )
+        assert member.thinking_policy_managed is True
+        assert member.effective_thinking_level == assignment["proposers"][identity]
+        assert member.thinking in {"minimal", "low", "medium", "high", "xhigh", "max"}
+        assert member.thinking != "highest"
+    assert provider.aggregator.thinking_policy_managed is True
+    assert provider.aggregator.effective_thinking_level == assignment["aggregator"]
+    assert provider.aggregator.thinking != "highest"
 
 
 def test_router_dynamic_rejects_unbounded_candidate_text() -> None:
@@ -2991,6 +3271,611 @@ def test_member_request_cap_does_not_rebind_without_base_chat_config() -> None:
     assert effective.max_tokens == 64_000
     assert effective.thinking is True
     assert effective.provider_request_max_chars == 0
+
+
+@pytest.mark.parametrize(
+    ("provider_level", "expected_budget"),
+    [
+        ("minimal", 1_024),
+        ("low", 4_096),
+        ("medium", 10_000),
+        ("high", 20_000),
+        ("xhigh", 50_000),
+        ("max", 50_000),
+    ],
+)
+def test_policy_managed_member_synchronizes_thinking_budget(
+    provider_level: str,
+    expected_budget: int,
+) -> None:
+    member = EnsembleMemberConfig(
+        provider_config=ProviderConfig(
+            provider="openrouter",
+            model="model-a",
+        ),
+        thinking=provider_level,
+        requested_thinking_level="highest",
+        effective_thinking_level="highest",
+        thinking_policy_version="thinking-policy-v1",
+        thinking_policy_managed=True,
+    )
+
+    effective = _member_chat_config(
+        ChatConfig(
+            thinking=True,
+            thinking_level="xhigh",
+            thinking_budget_tokens=123,
+        ),
+        member,
+    )
+
+    assert effective.thinking is True
+    assert effective.thinking_level == provider_level
+    assert effective.thinking_budget_tokens == expected_budget
+    assert effective.thinking_budget_explicit is True
+
+
+@pytest.mark.asyncio
+async def test_policy_managed_members_retry_neighbor_after_provider_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict[str, list[ChatConfig]] = {"p1": [], "a1": []}
+
+    class _ThinkingFallbackProvider:
+        provider_name = "fake"
+
+        def __init__(self, cfg: ProviderConfig) -> None:
+            self._cfg = cfg
+
+        def chat(
+            self,
+            messages: list[Message],
+            tools: list[ToolDefinition] | None = None,
+            config: ChatConfig | None = None,
+        ) -> AsyncIterator[StreamEvent]:
+            return self._chat(config)
+
+        async def _chat(
+            self,
+            config: ChatConfig | None,
+        ) -> AsyncIterator[StreamEvent]:
+            assert config is not None
+            calls[self._cfg.model].append(config)
+            if len(calls[self._cfg.model]) == 1:
+                yield TextDeltaEvent(text="")
+                yield ErrorEvent(
+                    message="unsupported reasoning_effort value",
+                    code="invalid_reasoning_effort",
+                    request_started=True,
+                    physical_request_count=1,
+                )
+                return
+            if self._cfg.model == "p1":
+                yield TextDeltaEvent(text="draft")
+            else:
+                yield TextDeltaEvent(text="answer")
+            yield DoneEvent(
+                input_tokens=2,
+                output_tokens=1,
+                provider="fake",
+                model=self._cfg.model,
+            )
+
+        async def list_models(self) -> list[Any]:
+            return []
+
+        def project_message_count(
+            self,
+            messages: list[Message],
+            config: ChatConfig | None = None,
+            *,
+            additional_messages: int = 0,
+        ) -> ProviderMessageCountProjection:
+            return ProviderMessageCountProjection(
+                actual_wire_messages=len(messages) + additional_messages,
+                logical_messages=len(messages) + additional_messages,
+                system_messages=0,
+                tool_result_messages=0,
+                additional_messages=additional_messages,
+                provider_kind="fake",
+                model=self._cfg.model,
+            )
+
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        lambda cfg: _ThinkingFallbackProvider(cfg),
+    )
+    proposer = EnsembleMemberConfig(
+        provider_config=ProviderConfig(provider="fake", model="p1"),
+        label="p1",
+        thinking="high",
+        requested_thinking_level="high",
+        effective_thinking_level="high",
+        thinking_policy_version="thinking-policy-v1",
+        thinking_policy_managed=True,
+        thinking_fallbacks=(("medium", "medium"),),
+    )
+    aggregator = EnsembleMemberConfig(
+        provider_config=ProviderConfig(provider="fake", model="a1"),
+        label="a1",
+        thinking="xhigh",
+        requested_thinking_level="highest",
+        effective_thinking_level="highest",
+        thinking_policy_version="thinking-policy-v1",
+        thinking_policy_managed=True,
+        thinking_fallbacks=(("high", "high"),),
+    )
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=[proposer],
+        aggregator=aggregator,
+        min_successful_proposers=1,
+        all_failed_policy="error",
+        shuffle_candidates=False,
+        selection_plan={
+            "strategy": "router_dynamic",
+            "selected_P": ["fake:p1"],
+            "selected_A": "fake:a1",
+            "thinking_assignment": {
+                "proposers": {"fake:p1": "high"},
+                "aggregator": "highest",
+                "thinking_policy_version": "thinking-policy-v1",
+            },
+        },
+    )
+
+    events = await _collect(provider)
+    done = next(event for event in events if isinstance(event, DoneEvent))
+
+    assert [cfg.thinking_level for cfg in calls["p1"]] == ["high", "medium"]
+    assert [cfg.thinking_budget_tokens for cfg in calls["p1"]] == [
+        20_000,
+        10_000,
+    ]
+    assert [cfg.thinking_level for cfg in calls["a1"]] == ["xhigh", "high"]
+    assert [cfg.thinking_budget_tokens for cfg in calls["a1"]] == [
+        50_000,
+        20_000,
+    ]
+    plan = provider.selection_plan
+    assert plan["thinking_assignment"]["proposers"]["fake:p1"] == "high"
+    assert plan["thinking_assignment"]["aggregator"] == "highest"
+    assert plan["executed_thinking_assignment"]["proposers"]["fake:p1"] == (
+        "medium"
+    )
+    assert plan["executed_thinking_assignment"]["aggregator"] == "high"
+    assert {
+        row["fallback_result"]
+        for row in plan["thinking_execution_fallbacks"]
+    } == {"succeeded"}
+    proposer_row = next(
+        row
+        for row in done.model_usage_breakdown
+        if row["role"] == "proposer"
+    )
+    aggregator_row = next(
+        row
+        for row in done.model_usage_breakdown
+        if row["role"] == "aggregator"
+    )
+    assert proposer_row["effective_thinking_level"] == "medium"
+    assert aggregator_row["effective_thinking_level"] == "high"
+    assert (
+        done.ensemble_trace["final_request"]["execution"][
+            "thinking_fallback_attempts"
+        ][0]["fallback_result"]
+        == "succeeded"
+    )
+
+
+@pytest.mark.asyncio
+async def test_cancelled_proposer_neighbor_retry_preserves_physical_multiplicity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    retry_started = asyncio.Event()
+    never = asyncio.Event()
+    calls = {"fast": 0, "retry": 0, "agg": 0}
+
+    class _Provider:
+        provider_name = "fake"
+
+        def __init__(self, cfg: ProviderConfig) -> None:
+            self._cfg = cfg
+
+        async def chat(
+            self,
+            messages: list[Message],
+            tools: list[ToolDefinition] | None = None,
+            config: ChatConfig | None = None,
+        ) -> AsyncIterator[StreamEvent]:
+            del messages, tools, config
+            model = self._cfg.model
+            calls[model] += 1
+            if model == "fast":
+                await retry_started.wait()
+                yield TextDeltaEvent(text="draft")
+                yield DoneEvent(
+                    input_tokens=1,
+                    output_tokens=1,
+                    provider="fake",
+                    model=model,
+                )
+                return
+            if model == "agg":
+                yield TextDeltaEvent(text="final")
+                yield DoneEvent(
+                    input_tokens=1,
+                    output_tokens=1,
+                    provider="fake",
+                    model=model,
+                )
+                return
+            if calls[model] == 1:
+                yield ErrorEvent(
+                    message="unsupported reasoning_effort value",
+                    code="invalid_reasoning_effort",
+                    request_started=True,
+                    physical_request_count=1,
+                )
+                return
+            retry_started.set()
+            await never.wait()
+            if False:  # pragma: no cover - keep this an async generator
+                yield DoneEvent(model=model)
+
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        lambda cfg: _Provider(cfg),
+    )
+    managed = EnsembleMemberConfig(
+        provider_config=ProviderConfig(provider="fake", model="retry"),
+        thinking="high",
+        requested_thinking_level="high",
+        effective_thinking_level="high",
+        thinking_policy_version="thinking-policy-v1",
+        thinking_policy_managed=True,
+        thinking_fallbacks=(("medium", "medium"),),
+    )
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=[_member("fast", thinking=None), managed],
+        aggregator=_member("agg", thinking=None),
+        min_successful_proposers=1,
+        quorum_grace_seconds=0.001,
+        all_failed_policy="error",
+        shuffle_candidates=False,
+        selection_plan={
+            "thinking_assignment": {
+                "proposers": {"fake:retry": "high"},
+                "aggregator": None,
+                "thinking_policy_version": "thinking-policy-v1",
+            }
+        },
+    )
+
+    events = await _collect(provider)
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    retry_candidate = next(
+        row
+        for row in done.ensemble_trace["candidates"]
+        if row["requested_model"] == "retry"
+    )
+    retry_fallback = next(
+        row
+        for row in provider.selection_plan["thinking_execution_fallbacks"]
+        if row["identity"] == "fake:retry"
+    )
+
+    assert calls == {"fast": 1, "retry": 2, "agg": 1}
+    assert retry_candidate["error_code"] == "quorum_cancelled"
+    assert retry_candidate["physical_request_count"] == 2
+    assert retry_candidate["usage_missing_count"] == 2
+    assert retry_candidate["effective_thinking_level"] == "medium"
+    assert retry_candidate["provider_thinking_level"] == "medium"
+    assert retry_fallback["fallback_result"] == "failed"
+    assert done.usage_missing_count == 2
+    assert done.ensemble_trace["physical_request_count"] == 4
+
+
+@pytest.mark.asyncio
+async def test_unclosed_proposer_neighbor_retry_preserves_diagnostic_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = asyncio.Event()
+    closed = asyncio.Event()
+    proposer_calls = 0
+    aggregator_calls = 0
+
+    class _Provider:
+        provider_name = "fake"
+
+        def __init__(self, cfg: ProviderConfig) -> None:
+            self._cfg = cfg
+
+        def chat(
+            self,
+            messages: list[Message],
+            tools: list[ToolDefinition] | None = None,
+            config: ChatConfig | None = None,
+        ) -> AsyncIterator[StreamEvent]:
+            del messages, tools, config
+
+            async def _stream() -> AsyncIterator[StreamEvent]:
+                nonlocal proposer_calls, aggregator_calls
+                if self._cfg.model == "agg":
+                    aggregator_calls += 1
+                    yield DoneEvent(provider="fake", model="agg")
+                    return
+                proposer_calls += 1
+                if proposer_calls == 1:
+                    yield ErrorEvent(
+                        message="unsupported reasoning_effort value",
+                        code="invalid_reasoning_effort",
+                        request_started=True,
+                        physical_request_count=1,
+                    )
+                    return
+                try:
+                    yield ErrorEvent(
+                        message="response rejected after receipt",
+                        code="response_invalid",
+                        request_started=True,
+                        physical_request_count=1,
+                        diagnostic_done=DoneEvent(
+                            input_tokens=7,
+                            output_tokens=2,
+                            billed_cost=0.25,
+                            cost_source="provider_billed",
+                            provider="fake",
+                            model="retry",
+                        ),
+                    )
+                finally:
+                    while not release.is_set():
+                        try:
+                            await release.wait()
+                        except asyncio.CancelledError:
+                            continue
+                    closed.set()
+
+            return _stream()
+
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        lambda cfg: _Provider(cfg),
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._ENSEMBLE_CANCEL_CLEANUP_TIMEOUT_SECONDS",
+        0.01,
+    )
+    managed = EnsembleMemberConfig(
+        provider_config=ProviderConfig(provider="fake", model="retry"),
+        thinking="high",
+        requested_thinking_level="high",
+        effective_thinking_level="high",
+        thinking_policy_version="thinking-policy-v1",
+        thinking_policy_managed=True,
+        thinking_fallbacks=(("medium", "medium"),),
+    )
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=[managed],
+        aggregator=_member("agg", thinking=None),
+        min_successful_proposers=1,
+        all_failed_policy="error",
+        proposer_timeout_seconds=1,
+        shuffle_candidates=False,
+        selection_plan={
+            "ranking_thinking_assignment_enabled": True,
+            "thinking_assignment": {
+                "proposers": {"fake:retry": "high"},
+                "aggregator": None,
+                "thinking_policy_version": "thinking-policy-v1",
+            },
+        },
+    )
+
+    try:
+        events = await asyncio.wait_for(_collect(provider), timeout=0.5)
+    finally:
+        release.set()
+    await asyncio.wait_for(closed.wait(), timeout=1)
+
+    assert proposer_calls == 2
+    assert aggregator_calls == 0
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert error.code == "ensemble_proposer_close_timeout"
+    assert error.physical_request_count == 2
+    assert error.usage_missing_count == 1
+    assert len(error.model_usage_breakdown) == 1
+    assert error.model_usage_breakdown[0]["input_tokens"] == 7
+    assert error.model_usage_breakdown[0]["output_tokens"] == 2
+    assert error.model_usage_breakdown[0]["billed_cost"] == pytest.approx(0.25)
+    assert error.ensemble_trace is not None
+    [candidate] = error.ensemble_trace["candidates"]
+    assert candidate["physical_request_count"] == 2
+    assert candidate["usage_missing_count"] == 1
+    assert candidate["input_tokens"] == 7
+    assert candidate["output_tokens"] == 2
+
+
+@pytest.mark.asyncio
+async def test_policy_managed_proposer_retries_neighbor_after_direct_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict[str, list[str | None]] = {"p1": [], "a1": []}
+
+    class _DirectExceptionProvider:
+        provider_name = "fake"
+
+        def __init__(self, cfg: ProviderConfig) -> None:
+            self._cfg = cfg
+
+        async def chat(
+            self,
+            messages: list[Message],
+            tools: list[ToolDefinition] | None = None,
+            config: ChatConfig | None = None,
+        ) -> AsyncIterator[StreamEvent]:
+            assert config is not None
+            calls[self._cfg.model].append(config.thinking_level)
+            if self._cfg.model == "p1" and len(calls["p1"]) == 1:
+                raise ValueError("unsupported reasoning_effort value")
+            yield TextDeltaEvent(
+                text="draft" if self._cfg.model == "p1" else "answer"
+            )
+            yield DoneEvent(
+                input_tokens=1,
+                output_tokens=1,
+                provider="fake",
+                model=self._cfg.model,
+            )
+
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        lambda cfg: _DirectExceptionProvider(cfg),
+    )
+    proposer = EnsembleMemberConfig(
+        provider_config=ProviderConfig(provider="fake", model="p1"),
+        thinking="high",
+        requested_thinking_level="high",
+        effective_thinking_level="high",
+        thinking_policy_version="thinking-policy-v1",
+        thinking_policy_managed=True,
+        thinking_fallbacks=(("medium", "medium"),),
+    )
+    aggregator = EnsembleMemberConfig(
+        provider_config=ProviderConfig(provider="fake", model="a1"),
+        thinking="xhigh",
+        requested_thinking_level="highest",
+        effective_thinking_level="highest",
+        thinking_policy_version="thinking-policy-v1",
+        thinking_policy_managed=True,
+    )
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=[proposer],
+        aggregator=aggregator,
+        all_failed_policy="error",
+        shuffle_candidates=False,
+        selection_plan={
+            "ranking_thinking_assignment_enabled": True,
+            "thinking_assignment": {
+                "proposers": {"fake:p1": "high"},
+                "aggregator": "highest",
+                "thinking_policy_version": "thinking-policy-v1",
+            },
+        },
+    )
+
+    events = await _collect(provider)
+    done = next(event for event in events if isinstance(event, DoneEvent))
+
+    assert calls["p1"] == ["high", "medium"]
+    assert done.ensemble_trace is not None
+    assert done.ensemble_trace["physical_request_count"] == 3
+    assert done.usage_missing_count == 1
+    assert provider.selection_plan["executed_thinking_assignment"]["proposers"][
+        "fake:p1"
+    ] == "medium"
+
+
+@pytest.mark.asyncio
+async def test_policy_managed_failure_never_uses_unmanaged_single_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fallback_calls = 0
+
+    class _RejectingProvider:
+        provider_name = "fake"
+
+        async def chat(
+            self,
+            messages: list[Message],
+            tools: list[ToolDefinition] | None = None,
+            config: ChatConfig | None = None,
+        ) -> AsyncIterator[StreamEvent]:
+            yield ErrorEvent(
+                message="unsupported reasoning_effort value",
+                code="invalid_reasoning_effort",
+                request_started=True,
+                physical_request_count=1,
+            )
+
+    class _UnmanagedFallback:
+        provider_name = "fallback"
+
+        async def chat(
+            self,
+            messages: list[Message],
+            tools: list[ToolDefinition] | None = None,
+            config: ChatConfig | None = None,
+        ) -> AsyncIterator[StreamEvent]:
+            nonlocal fallback_calls
+            fallback_calls += 1
+            yield TextDeltaEvent(text="unsafe fallback")
+            yield DoneEvent(model="fallback")
+
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        lambda cfg: _RejectingProvider(),
+    )
+    managed = EnsembleMemberConfig(
+        provider_config=ProviderConfig(provider="fake", model="managed"),
+        thinking="high",
+        requested_thinking_level="high",
+        effective_thinking_level="high",
+        thinking_policy_version="thinking-policy-v1",
+        thinking_policy_managed=True,
+    )
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=[managed],
+        aggregator=managed,
+        fallback_provider=_UnmanagedFallback(),
+        all_failed_policy="fallback_single",
+        shuffle_candidates=False,
+        selection_plan={"ranking_thinking_assignment_enabled": True},
+    )
+
+    events = await _collect(provider)
+
+    assert fallback_calls == 0
+    assert any(isinstance(event, ErrorEvent) for event in events)
+    assert not any(
+        isinstance(event, TextDeltaEvent) and event.text == "unsafe fallback"
+        for event in events
+    )
+
+
+def test_policy_managed_aggregator_only_keeps_routed_thinking_assignment() -> None:
+    aggregator = EnsembleMemberConfig(
+        provider_config=ProviderConfig(provider="fake", model="aggregator"),
+        thinking="xhigh",
+        requested_thinking_level="highest",
+        effective_thinking_level="highest",
+        thinking_policy_version="thinking-policy-v1",
+        thinking_policy_managed=True,
+    )
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=[],
+        aggregator=aggregator,
+    )
+
+    effective, _ = provider._aggregator_only_chat_config(
+        ChatConfig(
+            thinking=False,
+            thinking_level=None,
+            thinking_budget_tokens=0,
+            ensemble_soft_deadline_disable_thinking=True,
+        )
+    )
+
+    assert effective.thinking is True
+    assert effective.thinking_level == "xhigh"
+    assert effective.thinking_budget_tokens == 50_000
+    assert effective.thinking_budget_explicit is True
 
 
 @pytest.mark.parametrize(

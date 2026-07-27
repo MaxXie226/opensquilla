@@ -103,6 +103,68 @@ def test_router_dynamic_logs_every_ranking_stage_in_sequence() -> None:
     assert [row["sequence"] for row in captured] == list(range(1, len(captured) + 1))
     assert all(row["decision_id"] == "dynamic-decision" for row in captured)
     assert captured[-1]["user_profile_enabled"] is False
+    assert "llm_ensemble.routing.thinking_assignment_recorded" not in event_names
+    assert not {
+        "thinking_assignment",
+        "assignment_reasons",
+        "unsupported_level_fallbacks",
+        "policy_versions",
+    }.intersection(captured[-1])
+
+
+def test_router_dynamic_logs_thinking_assignment_audit_fields() -> None:
+    assignment = {
+        "proposers": {"provider:model-a": "high"},
+        "aggregator": "highest",
+        "thinking_policy_version": "thinking-policy-v1",
+    }
+    plan: dict[str, Any] = {
+        "strategy": "router_dynamic",
+        "task_analyzer": {},
+        "session": {},
+        "hard_filter": {},
+        "aggregator": {},
+        "selected_P": ["provider:model-a"],
+        "selected_A": "provider:model-b",
+        "thinking_assignment": assignment,
+        "assignment_reasons": {
+            "proposers": {"provider:model-a": ["tier_3_base_high"]},
+            "aggregator": ["aggregator_level_step"],
+        },
+        "unsupported_level_fallbacks": [
+            {
+                "identity": "provider:model-b",
+                "requested_level": "highest",
+                "effective_level": "high",
+            }
+        ],
+        "policy_versions": {
+            "thinking": "thinking-policy-v1",
+        },
+    }
+
+    with structlog.testing.capture_logs() as captured:
+        log_ensemble_decision_steps(
+            decision_id="thinking-decision",
+            selection_mode="router_dynamic",
+            profile_name="router_dynamic/c2",
+            selection_plan=plan,
+        )
+
+    assignment_event = next(
+        row
+        for row in captured
+        if row["event"]
+        == "llm_ensemble.routing.thinking_assignment_recorded"
+    )
+    completed = captured[-1]
+    assert assignment_event["thinking_assignment"] == assignment
+    assert assignment_event["assignment_reasons"] == plan["assignment_reasons"]
+    assert assignment_event["unsupported_level_fallbacks"] == (
+        plan["unsupported_level_fallbacks"]
+    )
+    assert completed["thinking_assignment"] == assignment
+    assert completed["policy_versions"]["thinking"] == "thinking-policy-v1"
 
 
 def test_router_tree_baseline_logs_pool_slots_and_aggregator_scores() -> None:

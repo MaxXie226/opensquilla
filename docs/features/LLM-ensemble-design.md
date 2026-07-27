@@ -448,7 +448,9 @@ selection_mode = "router_tree_baseline"
 > pipeline, not the former fixed slot-template algorithm.
 
 `router_dynamic` chooses proposer set `P` and aggregator `A` independently for
-every turn. The implementation is split across:
+every turn. When `ranking_thinking_assignment_enabled` is on, it then assigns
+the per-role thinking plan `T` without changing the model-ranking search
+space. The implementation is split across:
 
 - `src/opensquilla/provider/ranking_router.py` — context adapters, task-profile
   validation, hard filters, scoring, greedy selection, and trace generation;
@@ -530,6 +532,11 @@ it can be scored. A candidate is rejected for any of these reasons:
   allow/deny policy or a disallowed task-risk level;
 - missing any required input modality;
 - insufficient context window.
+
+When thinking assignment is enabled, a model with no unified thinking level is
+also rejected with `thinking_level_unavailable`. High-risk tasks require at
+least `high`; normal tasks keep partially compatible models and resolve an
+unsupported target to the nearest advertised level after selection.
 
 Context need includes the expected output, not just the prompt:
 
@@ -669,11 +676,50 @@ and a previous dynamic route exists:
   tier, with at most two consecutive escalations;
 - `new_task` clears escalation state.
 
-Runtime keeps only route identities, feedback, and escalation level in a
-bounded in-memory cache of 1,024 sessions. It never stores prompt or candidate
-content there.
+Runtime keeps only route identities, feedback, escalation level, and (when
+enabled) the executed thinking assignment plus its policy version in a bounded
+in-memory cache of 1,024 sessions. It never stores prompt or candidate content
+there.
 
-## 3.8 Output, fallback, and observability
+## 3.8 Thinking-level assignment
+
+`llm_ensemble.ranking_thinking_assignment_enabled` defaults to `false`.
+Disabled mode preserves the existing `P/A` selection, member thinking values,
+provider payloads, and the exact legacy audit contract. The current packaged
+config/registry are projected to ranking `step2-ranking-v2`, config schema
+`step2-ranking-config-v3`, and registry schema `step2-model-registry-v1`;
+thinking-only fields and lifecycle events are omitted from traces, runtime
+metadata, profile hashes, and decision-completed logs.
+
+Enabled mode runs `thinking-policy-v1` only after the final proposer and
+aggregator models are known and after the session adjustment:
+
+1. the session-adjusted effective tier maps to
+   `low`, `medium`, `high`, or `highest` by
+   `floor(expectation + 0.5)`; the policy version fixes the rounding offset at
+   `0.5`;
+2. the aggregator moves up one level, capped at `highest`;
+3. high-risk work has a `high` floor;
+4. low/hard-limit cost or interactive/hard-timeout latency shifts the result
+   down exactly once without crossing the risk floor;
+5. `redo` adds no second shift because its tier distribution was already
+   adjusted by the session policy;
+6. an unsupported target resolves to the nearest unified level, breaking ties
+   downward for normal tasks and upward for high-risk tasks.
+
+The registry stores `thinking_levels` in the unified ordering and an explicit
+`thinking_level_mapping` for each model. The mapped provider-native value
+(such as `xhigh` or `max` for unified `highest`) is what reaches the adapter;
+the member's thinking-token budget is recomputed from that effective value.
+Provider rejection before any visible output triggers an explicit retry at the
+nearest remaining supported level. The nearest order is recomputed from the
+level that was just rejected, rather than sorted once from the initial level.
+High-risk retries never cross below `high`; if no safe level remains, the
+request fails explicitly. Requested,
+assigned, provider-native, fallback-reason, and policy-version fields are
+recorded on execution and usage rows.
+
+## 3.9 Output, fallback, and observability
 
 `_build_router_dynamic_members` returns `router_dynamic/c0` through
 `router_dynamic/c3`, `proposer_1...N`, one `aggregator`, and a replay-oriented
@@ -686,6 +732,11 @@ filtering, ranking raises `DynamicRankingError`; runtime records
 `router_dynamic_ranking_unavailable` and continues with the already selected
 single-model provider. Failure to resolve or construct the fixed analyzer itself
 uses the deterministic task-profile fallback locally and does not abort ranking.
+When thinking assignment is enabled, `thinking_level_unavailable` is a
+fail-closed exception to that general ranking fallback, including when other
+hard-filter reasons are present. Execution-time rejection likewise stays
+inside the managed nearest-level chain and never escapes to an unmanaged
+`fallback_single` provider.
 
 The plan/logs include analyzer provenance and usage, task/profile/request
 hashes, registry version and exact snapshot hash, per-model profile hashes,
@@ -693,13 +744,15 @@ hard-filter reasons, all base scores, `N_min/N_max`, every greedy step, selected
 `P/A`, aggregator overlap/bias, coverage shortfall, stop reason, and session
 escalation. It also stores the ranking-config schema version, config version,
 SHA-256 hash, and complete parameter snapshot. The execution trace additionally
-records `candidate_order_seed` and
-`candidate_display_order`. Structured lifecycle events are:
+records `candidate_order_seed`, `candidate_display_order`, the conditional
+`thinking_assignment`, assignment reasons, unsupported-level fallbacks,
+execution fallbacks, and policy versions. Structured lifecycle events are:
 
 - `task_analyzer_started`, `task_analyzer_completed`, or
   `task_analyzer_fallback`;
 - `candidate_pool_recorded` and `model_scores_recorded`;
 - `proposer_selection_recorded` and `aggregator_selection_recorded`;
+- `thinking_assignment_recorded` when the feature is enabled;
 - `router_decision_recorded`.
 
 All use the `llm_ensemble.router_dynamic.` event prefix and omit raw user or
@@ -715,7 +768,7 @@ credentials end with `decision_skipped`. Every event has a monotonically
 increasing `sequence`, starting with `decision_started = 0`, and contains no
 prompt, candidate answer, or raw user-profile payload.
 
-## 3.9 Configuration surface
+## 3.10 Configuration surface
 
 ```toml
 [llm_ensemble]
@@ -723,6 +776,7 @@ enabled = true
 selection_mode = "router_dynamic"
 ranking_user_profile_generation_enabled = false
 ranking_user_profile_enabled = false
+ranking_thinking_assignment_enabled = false
 ```
 
 Set `ranking_user_profile_generation_enabled = true` to transcribe thumbs from
@@ -730,6 +784,10 @@ dynamic-ranking decisions into preference memory. Set
 `ranking_user_profile_enabled = true` to apply the resolved profile during
 ranking. Both switches affect only `router_dynamic`; the four fixed/custom/tree
 modes neither generate nor consume a user profile.
+
+Set `ranking_thinking_assignment_enabled = true` to enable the independent
+post-ranking thinking policy. It affects only `router_dynamic`; leaving it
+unset or `false` preserves the legacy execution path.
 
 Operators can extend the deployment pool with `llm_ensemble.candidates`,
 non-default `llm_ensemble.model_options`, and `squilla_router.tiers`. All
@@ -740,6 +798,7 @@ tunable Step2 behavior lives in
 |------------|----------|
 | `validation`, `trace` | sum tolerance, trace precision, and nonzero epsilon |
 | `routing_tiers` | `c0`-`c3` mapping and default tier |
+| `thinking_assignment` | versioned unified level order, tier base levels, aggregator step, risk floor, and one-step resource downshift |
 | `context` | context buckets, request truncation, token estimates, output budgets |
 | `task_profile_schema` | accepted task constraints and session intents |
 | `task_analyzer` | timeout, input/response limits, output tokens, temperature, thinking |
@@ -767,8 +826,8 @@ explicitly instead of appearing to take effect. A malformed config raises
 path. The packaged config is cached; editing it requires a process restart.
 The eighty curated OpenRouter profiles remain separately versioned in
 `router_dynamic_model_profiles.json`. Catalog facts (model ID/version, context,
-modalities, token prices, and advertised reasoning/tool support) carry their
-verification date. The
+modalities, token prices, advertised reasoning/tool support, unified thinking
+levels, and provider-native thinking mapping) carry their verification date. The
 `is_open_source` flag means that the exact model has publicly downloadable
 weights under a published license (including open-weight licenses, not only
 OSI-approved licenses); `is_chinese_model` follows the original model

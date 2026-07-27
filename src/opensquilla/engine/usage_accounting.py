@@ -19,7 +19,14 @@ import contextlib
 import math
 import time
 import uuid
-from collections.abc import AsyncGenerator, AsyncIterator, Callable, Iterator, Mapping
+from collections.abc import (
+    AsyncGenerator,
+    AsyncIterator,
+    Callable,
+    Iterator,
+    Mapping,
+    Sequence,
+)
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -369,6 +376,7 @@ async def account_provider_stream(
     *,
     provider: str,
     model: str,
+    usage_snapshot: Callable[[], object | None] | None = None,
 ) -> AsyncGenerator[Any, None]:
     """Account exactly one physical ``provider.chat`` invocation.
 
@@ -387,8 +395,16 @@ async def account_provider_stream(
     physical_stream_exhausted = False
     unknown_reason = "provider_stream_ended_without_usage"
     physical_stream: AsyncIterator[Any] | None = None
+    stream_usage_snapshot: Callable[[], object | None] | None = None
     try:
         physical_stream = stream_factory()
+        candidate_stream_snapshot = getattr(
+            physical_stream,
+            "usage_accounting_snapshot",
+            None,
+        )
+        if callable(candidate_stream_snapshot):
+            stream_usage_snapshot = candidate_stream_snapshot
         async for event in physical_stream:
             kind = str(getattr(event, "kind", "") or "")
             if kind in {"done", "error"}:
@@ -407,10 +423,35 @@ async def account_provider_stream(
                 unknown_reason = provider_error_usage_reason(
                     getattr(event, "code", None)
                 )
+                raw_physical_request_count = getattr(
+                    event,
+                    "physical_request_count",
+                    None,
+                )
+                explicitly_not_started = (
+                    getattr(event, "request_started", None) is False
+                    or (
+                        isinstance(raw_physical_request_count, int)
+                        and not isinstance(raw_physical_request_count, bool)
+                        and raw_physical_request_count == 0
+                    )
+                )
                 if (
                     call is not None
-                    and has_known_provider_usage_receipt(event)
                     and not usage_terminal
+                    and (
+                        explicitly_not_started
+                        or has_known_provider_usage_receipt(event)
+                        or _usage_int(
+                            raw_physical_request_count
+                        )
+                        > 0
+                        or _usage_int(
+                            getattr(event, "usage_missing_count", 0)
+                        )
+                        > 0
+                        or getattr(event, "request_started", None) is True
+                    )
                 ):
                     usage_terminal = True
                     await finalize_usage_call(scope, call, event)
@@ -433,7 +474,22 @@ async def account_provider_stream(
                 )
         finally:
             if call is not None and not usage_terminal:
-                await mark_usage_call_unknown(scope, call, unknown_reason)
+                snapshot = None
+                snapshot_callback = stream_usage_snapshot or usage_snapshot
+                if snapshot_callback is not None:
+                    try:
+                        snapshot = snapshot_callback()
+                    except Exception as exc:  # noqa: BLE001 - accounting fallback only
+                        log.warning(
+                            "usage_accounting.snapshot_failed",
+                            event_id=call.event_id,
+                            error=str(exc),
+                        )
+                if snapshot is not None:
+                    usage_terminal = True
+                    await finalize_usage_call(scope, call, snapshot)
+                else:
+                    await mark_usage_call_unknown(scope, call, unknown_reason)
 
 
 def _usage_int(value: Any) -> int:
@@ -697,6 +753,34 @@ def _merge_usage_row_provenance(
     target["provider_usage"] = target_usage
 
 
+def _deduplicated_stable_usage_rows(
+    rows: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Collapse only receipts sharing a stable upstream response id."""
+
+    deduplicated: list[dict[str, Any]] = []
+    for raw_row in rows:
+        row = dict(raw_row)
+        response_ids = _usage_row_response_ids(row)
+        if not response_ids:
+            deduplicated.append(row)
+            continue
+        matches = [
+            index
+            for index, existing in enumerate(deduplicated)
+            if response_ids & _usage_row_response_ids(existing)
+        ]
+        if not matches:
+            deduplicated.append(row)
+            continue
+        target_index = matches[0]
+        _merge_usage_row_provenance(deduplicated[target_index], row)
+        for duplicate_index in reversed(matches[1:]):
+            duplicate = deduplicated.pop(duplicate_index)
+            _merge_usage_row_provenance(deduplicated[target_index], duplicate)
+    return deduplicated
+
+
 def _usage_envelope_row(
     event: object,
     *,
@@ -770,20 +854,24 @@ def _merged_event_usage_rows(
     """Merge ErrorEvent outer and diagnostic receipts without double billing."""
 
     is_error = str(getattr(event, "kind", "") or "") == "error"
-    rows = _normalized_breakdown_rows(
-        event,
-        synthesize_envelope=not is_error,
-        default_provider=default_provider,
-        default_model=default_model,
+    rows = _deduplicated_stable_usage_rows(
+        _normalized_breakdown_rows(
+            event,
+            synthesize_envelope=not is_error,
+            default_provider=default_provider,
+            default_model=default_model,
+        )
     )
     diagnostic_done = getattr(event, "diagnostic_done", None) if is_error else None
     if diagnostic_done is None:
         return rows
-    diagnostic_rows = _normalized_breakdown_rows(
-        diagnostic_done,
-        synthesize_envelope=True,
-        default_provider=default_provider,
-        default_model=default_model,
+    diagnostic_rows = _deduplicated_stable_usage_rows(
+        _normalized_breakdown_rows(
+            diagnostic_done,
+            synthesize_envelope=True,
+            default_provider=default_provider,
+            default_model=default_model,
+        )
     )
     outer_count = len(rows)
     consumed_outer_rows: set[int] = set()
@@ -1075,7 +1163,7 @@ def normalize_provider_usage(
         default_provider=provider,
         default_model=model,
     )
-    if not rows:
+    if not rows and str(getattr(event, "kind", "") or "") != "error":
         rows = [
             _usage_envelope_row(
                 event,

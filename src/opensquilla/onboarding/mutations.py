@@ -1090,6 +1090,7 @@ def upsert_llm_ensemble(
     selection_mode: str | None = None,
     ranking_user_profile_generation_enabled: bool | None = None,
     ranking_user_profile_enabled: bool | None = None,
+    ranking_thinking_assignment_enabled: bool | None = None,
     model_options: list[str] | None = None,
     candidates: list[dict[str, object]] | None = None,
     min_successful_proposers: int | str | None = None,
@@ -1126,6 +1127,11 @@ def upsert_llm_ensemble(
     if ranking_user_profile_enabled is not None:
         merged["ranking_user_profile_enabled"] = bool(
             ranking_user_profile_enabled
+        )
+    if ranking_thinking_assignment_enabled is not None:
+        merged["ranking_thinking_assignment_enabled"] = _strict_boolean(
+            ranking_thinking_assignment_enabled,
+            label="ranking_thinking_assignment_enabled",
         )
     if model_options is not None:
         if not isinstance(model_options, (list, tuple)):
@@ -1193,6 +1199,10 @@ def upsert_llm_ensemble(
         )
     if ranking_user_profile_enabled is not None:
         new_cfg.mark_force_persist("llm_ensemble.ranking_user_profile_enabled")
+    if ranking_thinking_assignment_enabled is not None:
+        new_cfg.mark_force_persist(
+            "llm_ensemble.ranking_thinking_assignment_enabled"
+        )
 
     payload: dict[str, Any] = {
         "enabled": new_ensemble.enabled,
@@ -1201,6 +1211,9 @@ def upsert_llm_ensemble(
             new_ensemble.ranking_user_profile_generation_enabled
         ),
         "ranking_user_profile_enabled": new_ensemble.ranking_user_profile_enabled,
+        "ranking_thinking_assignment_enabled": (
+            new_ensemble.ranking_thinking_assignment_enabled
+        ),
         "model_options": list(new_ensemble.model_options),
         "min_successful_proposers": new_ensemble.min_successful_proposers,
         "all_failed_policy": new_ensemble.all_failed_policy,

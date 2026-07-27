@@ -6,11 +6,12 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import math
 import os
 import random
 import time
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from functools import cache
 from typing import Any, Literal
 
@@ -80,6 +81,45 @@ ENSEMBLE_MULTIMODAL_UNSUPPORTED_MESSAGE = (
 _GENERATION_POLICY_FILTER_REASON = "generation_policy_reasoning_unsupported"
 _RUNTIME_HARD_FILTER_REASONS_FIELD = "runtime_hard_filter_reasons"
 _ENSEMBLE_PROPOSER_CLOSE_TIMEOUT_CODE = "ensemble_proposer_close_timeout"
+_POLICY_THINKING_BUDGET_TOKENS: dict[str, int] = {
+    "off": 0,
+    "minimal": 1_024,
+    "low": 4_096,
+    "medium": 10_000,
+    "high": 20_000,
+    "xhigh": 50_000,
+    "max": 50_000,
+}
+_THINKING_REJECTION_SUBJECTS = (
+    "thinking",
+    "reasoning",
+    "reasoning_effort",
+    "budget_tokens",
+)
+_THINKING_REJECTION_TERMS = (
+    "invalid",
+    "unsupported",
+    "not support",
+    "not allowed",
+    "unknown",
+    "unrecognized",
+    "reject",
+    "must be",
+    "should be one of",
+    "expected one of",
+    "valid values",
+    "allowed values",
+)
+_THINKING_LEVEL_PARAMETER_MARKERS = (
+    "reasoning_effort",
+    "thinking_level",
+    "thinking level",
+    "reasoning level",
+    "budget_tokens",
+    "budget tokens",
+    "thinking budget",
+    "reasoning budget",
+)
 log = structlog.get_logger(__name__)
 
 
@@ -98,6 +138,60 @@ class _EnsembleStreamCloseError(RuntimeError):
     def __init__(self, phase: str) -> None:
         self.phase = phase
         super().__init__(f"{phase} stream did not close within the cleanup window")
+
+
+@dataclass
+class _UsageAccountingSnapshotState:
+    physical_request_count: int = 0
+    usage_missing_count: int = 0
+    usage_rows: list[dict[str, Any]] = field(default_factory=list)
+
+    def snapshot(self) -> ErrorEvent | None:
+        physical_count = max(0, self.physical_request_count)
+        if physical_count == 0:
+            return None
+        rows = [dict(row) for row in self.usage_rows]
+        receipt_count = sum(
+            1 for row in rows if not _is_missing_request_placeholder(row)
+        )
+        missing_count = max(
+            self.usage_missing_count,
+            physical_count - receipt_count,
+        )
+        return ErrorEvent(
+            message="ensemble call ended before a terminal usage envelope",
+            code="ensemble_usage_snapshot",
+            request_started=True,
+            physical_request_count=physical_count,
+            model_usage_breakdown=rows,
+            usage_missing_count=missing_count,
+        )
+
+
+class _EnsembleChatStream:
+    """Async stream carrying usage evidence for exactly one ensemble call."""
+
+    def __init__(
+        self,
+        stream: AsyncIterator[StreamEvent],
+        accounting_state: _UsageAccountingSnapshotState,
+    ) -> None:
+        self._stream = stream
+        self._accounting_state = accounting_state
+
+    def __aiter__(self) -> _EnsembleChatStream:
+        return self
+
+    async def __anext__(self) -> StreamEvent:
+        return await anext(self._stream)
+
+    async def aclose(self) -> None:
+        close = getattr(self._stream, "aclose", None)
+        if callable(close):
+            await close()
+
+    def usage_accounting_snapshot(self) -> ErrorEvent | None:
+        return self._accounting_state.snapshot()
 
 
 def _ensemble_heartbeat_interval() -> float:
@@ -333,13 +427,13 @@ async def _stream_with_heartbeats(
                     # response must not be reported as a timeout.
                     completed_at = completion_times.get(pending, time.monotonic())
                     if completed_at > deadline:
+                        _record_deadline_event()
                         if (
                             close_status is not None
                             and absolute_deadline is not None
                             and absolute_deadline <= deadline
                         ):
                             close_status.absolute_deadline_triggered = True
-                            _record_deadline_event()
                         raise TimeoutError
                     try:
                         event = pending.result()
@@ -359,13 +453,13 @@ async def _stream_with_heartbeats(
                 yield ProviderHeartbeatEvent(phase=phase, message=message)
                 continue
             if deadline is not None and completion_times.get(pending, time.monotonic()) > deadline:
+                _record_deadline_event()
                 if (
                     close_status is not None
                     and absolute_deadline is not None
                     and absolute_deadline <= deadline
                 ):
                     close_status.absolute_deadline_triggered = True
-                    _record_deadline_event()
                 raise TimeoutError
             try:
                 event = pending.result()
@@ -483,6 +577,51 @@ async def _stream_with_heartbeats(
             raise _EnsembleStreamCloseError(phase)
 
 
+async def _provider_events_with_error_boundary(
+    *,
+    provider_config: ProviderConfig,
+    messages: list[Message],
+    tools: list[ToolDefinition] | None,
+    chat_config: ChatConfig,
+    phase: str,
+    on_request_started: Callable[[], None],
+    pending_cleanup_tracker: Callable[[asyncio.Future[Any], str], None] | None,
+    terminal_observed: Callable[[], bool],
+) -> AsyncIterator[StreamEvent]:
+    """Convert direct provider exceptions into normal terminal error evidence."""
+
+    request_started = False
+    try:
+        provider = _build_provider(provider_config)
+        raw_stream = provider.chat(messages, tools=tools, config=chat_config)
+        on_request_started()
+        request_started = True
+        async with _closing_async_iterator(
+            raw_stream,
+            phase=phase,
+            pending_cleanup_tracker=pending_cleanup_tracker,
+            terminal_observed=terminal_observed,
+        ) as provider_stream:
+            async for event in provider_stream:
+                yield event
+    except (asyncio.CancelledError, _EnsembleStreamCloseError):
+        raise
+    except Exception as exc:  # noqa: BLE001 - normalize provider boundary failures
+        yield ErrorEvent(
+            message=redact_upstream_error_text(
+                str(exc),
+                api_key=provider_config.api_key,
+                max_len=2000,
+            ),
+            code=redact_upstream_error_code(
+                type(exc).__name__,
+                api_key=provider_config.api_key,
+            ),
+            request_started=request_started,
+            physical_request_count=1 if request_started else 0,
+        )
+
+
 @dataclass(frozen=True)
 class EnsembleMemberConfig:
     """A provider plus per-call generation overrides for one ensemble member."""
@@ -492,6 +631,16 @@ class EnsembleMemberConfig:
     temperature: float | None = None
     max_tokens: int = 0
     thinking: str | None = None
+    # The Step2 thinking policy keeps its unified requested/assigned levels
+    # separate from the provider-native value in ``thinking``.  This makes a
+    # registry fallback auditable and prevents the unified ``highest`` label
+    # from leaking onto provider request payloads.
+    requested_thinking_level: str | None = None
+    effective_thinking_level: str | None = None
+    thinking_fallback_reason: str = ""
+    thinking_policy_version: str = ""
+    thinking_policy_managed: bool = False
+    thinking_fallbacks: tuple[tuple[str, str], ...] = ()
     k: int = 1
     # Non-secret pool attribution used to park this member's session-pinned
     # credential after an auth/rate-limit/credits failure.
@@ -527,6 +676,11 @@ class _CandidateResult:
     model: str
     requested_provider: str = ""
     requested_model: str = ""
+    requested_thinking_level: str | None = None
+    effective_thinking_level: str | None = None
+    provider_thinking_level: str | None = None
+    thinking_fallback_reason: str = ""
+    thinking_policy_version: str = ""
     text: str = ""
     input_tokens: int = 0
     output_tokens: int = 0
@@ -559,6 +713,10 @@ class _CandidateResult:
     def ok(self) -> bool:
         return not self.error and bool(self.text.strip())
 
+    @property
+    def thinking_policy_managed(self) -> bool:
+        return bool(self.thinking_policy_version)
+
     def usage_row(self, *, role: str, profile: str) -> dict[str, Any]:
         row = {
             "role": role,
@@ -581,6 +739,16 @@ class _CandidateResult:
             # done payload replaces the live progress rows in WebUI.
             "elapsed_ms": self.elapsed_ms,
         }
+        if self.thinking_policy_managed:
+            row.update(
+                {
+                    "requested_thinking_level": self.requested_thinking_level,
+                    "effective_thinking_level": self.effective_thinking_level,
+                    "provider_thinking_level": self.provider_thinking_level,
+                    "thinking_fallback_reason": self.thinking_fallback_reason,
+                    "thinking_policy_version": self.thinking_policy_version,
+                }
+            )
         if self.billing_receipt is not None:
             row["billing_receipt"] = self.billing_receipt
         if self.diagnostic_model_usage_breakdown:
@@ -611,6 +779,16 @@ class _CandidateResult:
             "billed_cost": self.billed_cost,
             "cost_source": self.cost_source,
         }
+        if self.thinking_policy_managed:
+            row.update(
+                {
+                    "requested_thinking_level": self.requested_thinking_level,
+                    "effective_thinking_level": self.effective_thinking_level,
+                    "provider_thinking_level": self.provider_thinking_level,
+                    "thinking_fallback_reason": self.thinking_fallback_reason,
+                    "thinking_policy_version": self.thinking_policy_version,
+                }
+            )
         if self.execution:
             row["execution"] = dict(self.execution)
         row["content"] = _trace_content(self.text, max_chars=content_max_chars)
@@ -626,6 +804,55 @@ class _CandidateResult:
         if include_text:
             row["text"] = self.text
         return row
+
+
+def _overwrite_candidate_result(
+    target: _CandidateResult,
+    source: _CandidateResult,
+) -> None:
+    """Publish a recursive retry snapshot to the outer cancellation owner."""
+
+    for descriptor in fields(_CandidateResult):
+        setattr(target, descriptor.name, getattr(source, descriptor.name))
+
+
+def _candidate_result_snapshot(candidate: _CandidateResult) -> _CandidateResult:
+    """Copy one terminal attempt before cancellation-resistant cleanup."""
+
+    return replace(
+        candidate,
+        execution=dict(candidate.execution),
+        provider_usage=dict(candidate.provider_usage),
+        diagnostic_model_usage_breakdown=[
+            dict(row) for row in candidate.diagnostic_model_usage_breakdown
+        ],
+        model_usage_breakdown=[
+            dict(row) for row in candidate.model_usage_breakdown
+        ],
+    )
+
+
+def _publish_candidate_attempt_snapshot(
+    request_task: asyncio.Task[Any] | None,
+    candidate: _CandidateResult,
+) -> None:
+    """Publish receipts before stream close can stall task finalization."""
+
+    if request_task is None or not candidate.request_started:
+        return
+    snapshots = getattr(
+        request_task,
+        "_opensquilla_ensemble_candidate_attempt_snapshots",
+        None,
+    )
+    if not isinstance(snapshots, list):
+        snapshots = []
+        setattr(
+            request_task,
+            "_opensquilla_ensemble_candidate_attempt_snapshots",
+            snapshots,
+        )
+    snapshots.append(_candidate_result_snapshot(candidate))
 
 
 @dataclass
@@ -671,6 +898,16 @@ class _AggregatorAccumulator:
             "provider_usage": dict(self.provider_usage),
             "elapsed_ms": max(0, int(elapsed_ms)),
         }
+        if member.thinking_policy_managed:
+            row.update(
+                {
+                    "requested_thinking_level": member.requested_thinking_level,
+                    "effective_thinking_level": member.effective_thinking_level,
+                    "provider_thinking_level": member.thinking,
+                    "thinking_fallback_reason": member.thinking_fallback_reason,
+                    "thinking_policy_version": member.thinking_policy_version,
+                }
+            )
         if self.billing_receipt is not None:
             row["billing_receipt"] = self.billing_receipt
         return _canonicalize_usage_row(row)
@@ -685,6 +922,35 @@ def _normalize_thinking(value: str | None) -> tuple[bool | None, Any | None]:
     if normalized == "off":
         return False, "off"
     return True, normalized
+
+
+def _policy_thinking_budget_tokens(level: str | None) -> int:
+    normalized = str(level or "").strip().lower()
+    if normalized not in _POLICY_THINKING_BUDGET_TOKENS:
+        raise ValueError(
+            f"router_dynamic thinking policy produced unsupported provider level {normalized!r}"
+        )
+    return _POLICY_THINKING_BUDGET_TOKENS[normalized]
+
+
+def _is_thinking_parameter_rejection(*, message: str, code: str) -> bool:
+    evidence = f"{code} {message}".strip().casefold()
+    if "signature" in evidence:
+        return False
+    has_subject = any(
+        subject in evidence for subject in _THINKING_REJECTION_SUBJECTS
+    )
+    has_level_parameter = any(
+        marker in evidence for marker in _THINKING_LEVEL_PARAMETER_MARKERS
+    ) or (
+        ("thinking" in evidence or "reasoning" in evidence)
+        and " value" in evidence
+    )
+    return (
+        has_subject
+        and has_level_parameter
+        and any(term in evidence for term in _THINKING_REJECTION_TERMS)
+    )
 
 
 @cache
@@ -932,6 +1198,13 @@ def _member_chat_config(
         updates["thinking"] = thinking
     if thinking_level is not None:
         updates["thinking_level"] = thinking_level
+    if member.thinking_policy_managed:
+        if thinking_level is None:
+            raise ValueError(
+                "router_dynamic thinking assignment is missing its provider-native level"
+            )
+        updates["thinking_budget_tokens"] = _policy_thinking_budget_tokens(str(thinking_level))
+        updates["thinking_budget_explicit"] = True
     effective = cfg.model_copy(update=updates)
     inherited_cap = int(getattr(cfg, "provider_request_max_chars", 0) or 0)
     if (
@@ -1128,6 +1401,27 @@ def _candidate_usage_rows(
             row.setdefault("model", candidate.model)
             if not str(row.get("requested_model") or "").strip():
                 row["requested_model"] = candidate.requested_model
+            if candidate.thinking_policy_managed:
+                row.setdefault(
+                    "requested_thinking_level",
+                    candidate.requested_thinking_level,
+                )
+                row.setdefault(
+                    "effective_thinking_level",
+                    candidate.effective_thinking_level,
+                )
+                row.setdefault(
+                    "provider_thinking_level",
+                    candidate.provider_thinking_level,
+                )
+                row.setdefault(
+                    "thinking_fallback_reason",
+                    candidate.thinking_fallback_reason,
+                )
+                row.setdefault(
+                    "thinking_policy_version",
+                    candidate.thinking_policy_version,
+                )
             rows.append(_canonicalize_usage_row(row))
         if _candidate_has_usage(candidate) and not candidate.model_usage_breakdown:
             rows.append(candidate.usage_row(role="proposer", profile=profile))
@@ -1138,7 +1432,11 @@ def _candidate_missing_usage_count(candidates: Sequence[_CandidateResult]) -> in
     """Count only requests that started but never produced a usage receipt."""
 
     return sum(
-        (candidate.usage_missing_count if candidate.usage_missing_count > 0 else 1)
+        max(
+            candidate.usage_missing_count,
+            candidate.physical_request_count,
+            1,
+        )
         for candidate in candidates
         if candidate.request_started and not candidate.usage_reported
     ) + sum(
@@ -1185,15 +1483,29 @@ def _unrepresented_missing_request_count(
 
 
 def _usage_receipt_fingerprint(row: Mapping[str, Any]) -> tuple[Any, ...]:
+    def safe_int(value: Any) -> int:
+        try:
+            parsed = int(value or 0)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+        return max(0, parsed)
+
+    def safe_float(value: Any) -> float:
+        try:
+            parsed = float(value or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+        return parsed if math.isfinite(parsed) and parsed >= 0 else 0.0
+
     return (
         str(row.get("provider") or "").strip(),
         str(row.get("model") or "").strip(),
-        int(row.get("input_tokens") or 0),
-        int(row.get("output_tokens") or 0),
-        int(row.get("reasoning_tokens") or 0),
-        int(row.get("cached_tokens") or 0),
-        int(row.get("cache_write_tokens") or 0),
-        float(row.get("billed_cost") or 0.0),
+        safe_int(row.get("input_tokens")),
+        safe_int(row.get("output_tokens")),
+        safe_int(row.get("reasoning_tokens")),
+        safe_int(row.get("cached_tokens")),
+        safe_int(row.get("cache_write_tokens")),
+        safe_float(row.get("billed_cost")),
         str(row.get("cost_source") or "none").strip().casefold(),
     )
 
@@ -1302,6 +1614,36 @@ def _merge_usage_row_provenance(
         elif stable_id_match or not target_usage.get(key):
             target_usage[key] = value
     target["provider_usage"] = target_usage
+
+
+def _deduplicated_stable_usage_rows(
+    rows: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Collapse only rows proven identical by a stable upstream response id."""
+
+    deduplicated: list[dict[str, Any]] = []
+    for raw_row in rows:
+        row = dict(raw_row)
+        response_ids = _usage_row_response_ids(row)
+        if not response_ids:
+            # Equal metrics without a stable id can be distinct physical calls,
+            # so their multiplicity must be preserved.
+            deduplicated.append(row)
+            continue
+        matches = [
+            index
+            for index, existing in enumerate(deduplicated)
+            if response_ids & _usage_row_response_ids(existing)
+        ]
+        if not matches:
+            deduplicated.append(row)
+            continue
+        target_index = matches[0]
+        _merge_usage_row_provenance(deduplicated[target_index], row)
+        for duplicate_index in reversed(matches[1:]):
+            duplicate = deduplicated.pop(duplicate_index)
+            _merge_usage_row_provenance(deduplicated[target_index], duplicate)
+    return deduplicated
 
 
 def _matching_usage_row_index(
@@ -1659,6 +2001,7 @@ def _unrepresented_diagnostic_usage_rows(
                 model=model,
             )
         ]
+    diagnostic_rows = _deduplicated_stable_usage_rows(diagnostic_rows)
     missing: list[dict[str, Any]] = []
     matched_existing_by_diagnostic: dict[int, int] = {}
     diagnostic_order = sorted(
@@ -1695,6 +2038,36 @@ def _unrepresented_diagnostic_usage_rows(
             row["requested_model"] = model
         missing.append(row)
     return missing
+
+
+def _annotate_member_thinking_usage_rows(
+    rows: Sequence[dict[str, Any]],
+    member: EnsembleMemberConfig,
+) -> list[dict[str, Any]]:
+    """Attach the unified/native thinking assignment to physical usage rows."""
+
+    annotated = list(rows)
+    if not member.thinking_policy_managed:
+        return annotated
+    for row in annotated:
+        row.setdefault(
+            "requested_thinking_level",
+            member.requested_thinking_level,
+        )
+        row.setdefault(
+            "effective_thinking_level",
+            member.effective_thinking_level,
+        )
+        row.setdefault("provider_thinking_level", member.thinking)
+        row.setdefault(
+            "thinking_fallback_reason",
+            member.thinking_fallback_reason,
+        )
+        row.setdefault(
+            "thinking_policy_version",
+            member.thinking_policy_version,
+        )
+    return annotated
 
 
 class EnsembleProvider:
@@ -1756,6 +2129,73 @@ class EnsembleProvider:
         self._pending_cleanup_tasks: set[asyncio.Future[Any]] = set()
         self._pending_cleanup_phases: dict[asyncio.Future[Any], str] = {}
         self._cleanup_poisoned_reason = ""
+        self._accounting_state = _UsageAccountingSnapshotState()
+
+    def _thinking_policy_active(self) -> bool:
+        """Return whether every execution path must honor a routed T value."""
+
+        return bool(
+            self.selection_plan.get("ranking_thinking_assignment_enabled") is True
+            or self.aggregator.thinking_policy_managed
+            or any(member.thinking_policy_managed for member in self.proposers)
+        )
+
+    @property
+    def enforces_routed_thinking_policy(self) -> bool:
+        """Whether outer wrappers must not hop to an unmanaged provider."""
+
+        return self._thinking_policy_active()
+
+    def _reset_usage_accounting_snapshot(
+        self,
+        state: _UsageAccountingSnapshotState | None = None,
+    ) -> None:
+        self._accounting_state = state or _UsageAccountingSnapshotState()
+        self._accounting_state.physical_request_count = 0
+        self._accounting_state.usage_missing_count = 0
+        self._accounting_state.usage_rows = []
+
+    def _record_accounting_request_started(self) -> None:
+        self._accounting_state.physical_request_count += 1
+
+    def _record_accounting_request_not_started(self) -> None:
+        self._accounting_state.physical_request_count = max(
+            0,
+            self._accounting_state.physical_request_count - 1,
+        )
+
+    def _record_accounting_candidate(
+        self,
+        candidate: _CandidateResult,
+    ) -> None:
+        self._accounting_state.usage_rows.extend(
+            _candidate_usage_rows(
+                [candidate],
+                profile=self.profile_name,
+            )
+        )
+        self._accounting_state.usage_missing_count += (
+            _candidate_missing_usage_count([candidate])
+        )
+
+    def _record_accounting_rows(
+        self,
+        rows: Sequence[Mapping[str, Any]],
+        *,
+        missing_count: int = 0,
+    ) -> None:
+        self._accounting_state.usage_rows.extend(
+            _canonicalize_usage_row(row) for row in rows
+        )
+        self._accounting_state.usage_missing_count += max(
+            0,
+            int(missing_count or 0),
+        )
+
+    def usage_accounting_snapshot(self) -> ErrorEvent | None:
+        """Return cancellation-safe evidence for the active composite call."""
+
+        return self._accounting_state.snapshot()
 
     def _observe_cleanup_result(
         self,
@@ -1933,6 +2373,67 @@ class EnsembleProvider:
     ) -> _MemberRequestBudgetBinding | None:
         return self._member_request_budget_bindings.get(_member_budget_key(member))
 
+    def _record_thinking_fallback(
+        self,
+        *,
+        member: EnsembleMemberConfig,
+        role: str,
+        rejected_unified_level: str | None,
+        rejected_provider_level: str | None,
+        effective_unified_level: str,
+        effective_provider_level: str,
+        fallback_result: str,
+        trace: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Persist an explicit provider-level thinking fallback for audit/replay."""
+
+        identity = f"{member.provider_config.provider}:{member.provider_config.model}"
+        assignment = self.selection_plan.get("thinking_assignment")
+        executed_assignment = self.selection_plan.get("executed_thinking_assignment")
+        if not isinstance(executed_assignment, dict) and isinstance(
+            assignment,
+            Mapping,
+        ):
+            raw_proposers = assignment.get("proposers")
+            executed_assignment = {
+                "proposers": (dict(raw_proposers) if isinstance(raw_proposers, Mapping) else {}),
+                "aggregator": assignment.get("aggregator"),
+                "thinking_policy_version": assignment.get("thinking_policy_version"),
+            }
+            self.selection_plan["executed_thinking_assignment"] = executed_assignment
+        if isinstance(executed_assignment, dict):
+            if role == "proposer":
+                proposers = executed_assignment.get("proposers")
+                if isinstance(proposers, dict):
+                    proposers[identity] = effective_unified_level
+            elif role == "aggregator":
+                executed_assignment["aggregator"] = effective_unified_level
+        record = {
+            "trigger_stage": f"{role}_execution",
+            "fallback_type": "thinking_level_neighbor",
+            "reason": "provider_rejected_thinking_level",
+            "identity": identity,
+            "requested_thinking_level": member.requested_thinking_level,
+            "rejected_unified_level": rejected_unified_level,
+            "rejected_provider_level": rejected_provider_level,
+            "effective_thinking_level": effective_unified_level,
+            "effective_provider_level": effective_provider_level,
+            "thinking_policy_version": member.thinking_policy_version,
+            "fallback_result": fallback_result,
+        }
+        fallbacks = self.selection_plan.setdefault(
+            "thinking_execution_fallbacks",
+            [],
+        )
+        if isinstance(fallbacks, list):
+            fallbacks.append(record)
+        if trace is not None:
+            trace["selection_plan"] = _json_safe(self.selection_plan)
+            trace_fallbacks = trace.setdefault("thinking_execution_fallbacks", [])
+            if isinstance(trace_fallbacks, list):
+                trace_fallbacks.append(dict(record))
+        return record
+
     def _aggregator_error_is_retryable(self, *, message: str, code: str) -> bool:
         """True when the aggregator failure is a transient upstream condition."""
 
@@ -2047,7 +2548,11 @@ class EnsembleProvider:
                     aggregator_config,
                     synthetic_messages=additional_messages,
                 )
-            elif self.all_failed_policy == "fallback_single" and self.fallback_provider is not None:
+            elif (
+                not self._thinking_policy_active()
+                and self.all_failed_policy == "fallback_single"
+                and self.fallback_provider is not None
+            ):
                 _require_projection(
                     self.fallback_provider,
                     downstream_config.model_copy(update={"candidate_output_mode": "normal"}),
@@ -2089,7 +2594,11 @@ class EnsembleProvider:
                 synthetic_messages=additional_messages + 1,
             )
 
-        if self.all_failed_policy == "fallback_single" and self.fallback_provider is not None:
+        if (
+            not self._thinking_policy_active()
+            and self.all_failed_policy == "fallback_single"
+            and self.fallback_provider is not None
+        ):
             fallback_config = (
                 config.model_copy(update={"candidate_output_mode": "normal"})
                 if config is not None and config.candidate_output_mode != "normal"
@@ -2111,13 +2620,24 @@ class EnsembleProvider:
         tools: list[ToolDefinition] | None = None,
         config: ChatConfig | None = None,
     ) -> AsyncIterator[StreamEvent]:
-        return self._chat(messages, tools=tools, config=config)
+        accounting_state = _UsageAccountingSnapshotState()
+        return _EnsembleChatStream(
+            self._chat(
+                messages,
+                tools=tools,
+                config=config,
+                accounting_state=accounting_state,
+            ),
+            accounting_state,
+        )
 
     async def _chat(
         self,
         messages: list[Message],
         tools: list[ToolDefinition] | None = None,
         config: ChatConfig | None = None,
+        *,
+        accounting_state: _UsageAccountingSnapshotState,
     ) -> AsyncIterator[StreamEvent]:
         if self._active_chat:
             yield ErrorEvent(
@@ -2138,6 +2658,7 @@ class EnsembleProvider:
                 physical_request_count=0,
             )
             return
+        self._reset_usage_accounting_snapshot(accounting_state)
         self._active_chat = True
         try:
             async with _closing_async_iterator(
@@ -2164,6 +2685,7 @@ class EnsembleProvider:
         if validation_error is not None:
             if (
                 validation_error.code == "ensemble_multimodal_unsupported"
+                and not self._thinking_policy_active()
                 and self.all_failed_policy == "fallback_single"
                 and self.fallback_provider is not None
             ):
@@ -2238,7 +2760,8 @@ class EnsembleProvider:
                         "ensemble_soft_deadline_disable_thinking",
                         False,
                     )
-                ),
+                )
+                and not self.aggregator.thinking_policy_managed,
             }
             if quorum_met is not None:
                 trace_overrides["soft_deadline_quorum_met"] = quorum_met
@@ -2434,11 +2957,15 @@ class EnsembleProvider:
                 request_budget_binding=self._member_request_budget_binding(self.aggregator),
                 role="aggregator",
             ).model_copy(update={"candidate_output_mode": "normal"})
-            if finalize_directly and bool(
-                getattr(
-                    config,
-                    "ensemble_soft_deadline_disable_thinking",
-                    False,
+            if (
+                finalize_directly
+                and not self.aggregator.thinking_policy_managed
+                and bool(
+                    getattr(
+                        config,
+                        "ensemble_soft_deadline_disable_thinking",
+                        False,
+                    )
                 )
             ):
                 request_config = request_config.model_copy(
@@ -2692,6 +3219,7 @@ class EnsembleProvider:
             fallback_allowed = (
                 not visible_output
                 and terminal_error.code != "ensemble_aggregator_close_timeout"
+                and not self._thinking_policy_active()
                 and self.all_failed_policy == "fallback_single"
                 and self.fallback_provider is not None
             )
@@ -2801,6 +3329,7 @@ class EnsembleProvider:
             terminal_event is not None
             and not buffered_visible_output
             and terminal_event.code != "ensemble_aggregator_close_timeout"
+            and not self._thinking_policy_active()
             and self.all_failed_policy == "fallback_single"
             and self.fallback_provider is not None
             # A timeout imposed by the soft cutoff already has a dedicated
@@ -2950,7 +3479,7 @@ class EnsembleProvider:
         self,
         config: ChatConfig,
     ) -> tuple[ChatConfig, float | None]:
-        """Build a finalizer config without re-enabling member-level thinking."""
+        """Build a finalizer config while preserving routed thinking policy."""
 
         downstream_config = config.model_copy(
             update={
@@ -2964,14 +3493,18 @@ class EnsembleProvider:
         aggregator_updates: dict[str, Any] = {
             "candidate_output_mode": "normal",
             "ensemble_execution_mode": "full",
-            # A forced finalization deliberately sets these on the outer
-            # config. _member_chat_config normally lets the profile override
-            # them, which would silently turn expensive thinking back on.
-            "thinking": config.thinking,
-            "thinking_level": config.thinking_level,
-            "thinking_budget_tokens": config.thinking_budget_tokens,
-            "thinking_budget_explicit": config.thinking_budget_explicit,
         }
+        if not self.aggregator.thinking_policy_managed:
+            # Legacy forced finalization deliberately preserves the outer
+            # config. A routed T assignment remains authoritative instead.
+            aggregator_updates.update(
+                {
+                    "thinking": config.thinking,
+                    "thinking_level": config.thinking_level,
+                    "thinking_budget_tokens": config.thinking_budget_tokens,
+                    "thinking_budget_explicit": config.thinking_budget_explicit,
+                }
+            )
         if aggregator_timeout_seconds is not None:
             aggregator_updates["timeout"] = aggregator_timeout_seconds
         return (
@@ -3240,22 +3773,140 @@ class EnsembleProvider:
                     if task in lingering or task.done():
                         index, sample_index, member = task_meta[task]
                         cfg = member.provider_config
-                        request_started = bool(
-                            getattr(
-                                task,
-                                "_opensquilla_ensemble_request_started",
-                                False,
+                        physical_request_count = max(
+                            0,
+                            int(
+                                getattr(
+                                    task,
+                                    "_opensquilla_ensemble_request_count",
+                                    0,
+                                )
+                                or 0
+                            ),
+                        )
+                        request_started = physical_request_count > 0
+                        identity = (
+                            f"{member.provider_config.provider}:"
+                            f"{member.provider_config.model}"
+                        )
+                        execution_fallbacks = self.selection_plan.get(
+                            "thinking_execution_fallbacks"
+                        )
+                        if isinstance(execution_fallbacks, list):
+                            for row in execution_fallbacks:
+                                if (
+                                    isinstance(row, dict)
+                                    and row.get("trigger_stage")
+                                    == "proposer_execution"
+                                    and row.get("identity") == identity
+                                    and row.get("fallback_result") == "retrying"
+                                ):
+                                    row["fallback_result"] = "failed"
+                        attempt_snapshots = [
+                            snapshot
+                            for snapshot in (
+                                getattr(
+                                    task,
+                                    "_opensquilla_ensemble_candidate_attempt_snapshots",
+                                    [],
+                                )
+                                or []
                             )
+                            if isinstance(snapshot, _CandidateResult)
+                        ]
+                        published_rows: list[dict[str, Any]] = []
+                        for snapshot in attempt_snapshots:
+                            published_rows.extend(
+                                _candidate_usage_rows(
+                                    [snapshot],
+                                    profile=self.profile_name,
+                                )
+                            )
+                        published_physical_count = sum(
+                            max(0, snapshot.physical_request_count)
+                            for snapshot in attempt_snapshots
+                        )
+                        published_missing_count = sum(
+                            _candidate_missing_usage_count([snapshot])
+                            for snapshot in attempt_snapshots
+                        )
+                        usage_missing_count = published_missing_count + max(
+                            0,
+                            physical_request_count - published_physical_count,
+                        )
+                        latest_snapshot = (
+                            attempt_snapshots[-1]
+                            if attempt_snapshots
+                            else None
                         )
                         results.append(
                             _CandidateResult(
                                 index=index,
                                 sample_index=sample_index,
                                 label=member.label or f"proposer_{index + 1}",
-                                provider="",
-                                model="",
+                                provider=(
+                                    latest_snapshot.provider
+                                    if latest_snapshot is not None
+                                    else ""
+                                ),
+                                model=(
+                                    latest_snapshot.model
+                                    if latest_snapshot is not None
+                                    else ""
+                                ),
                                 requested_provider=cfg.provider,
                                 requested_model=cfg.model,
+                                requested_thinking_level=member.requested_thinking_level,
+                                effective_thinking_level=getattr(
+                                    task,
+                                    "_opensquilla_ensemble_effective_thinking_level",
+                                    member.effective_thinking_level,
+                                ),
+                                provider_thinking_level=getattr(
+                                    task,
+                                    "_opensquilla_ensemble_provider_thinking_level",
+                                    member.thinking,
+                                ),
+                                thinking_fallback_reason=getattr(
+                                    task,
+                                    "_opensquilla_ensemble_thinking_fallback_reason",
+                                    member.thinking_fallback_reason,
+                                ),
+                                thinking_policy_version=member.thinking_policy_version,
+                                input_tokens=_summed_int(
+                                    published_rows,
+                                    "input_tokens",
+                                ),
+                                output_tokens=_summed_int(
+                                    published_rows,
+                                    "output_tokens",
+                                ),
+                                reasoning_tokens=_summed_int(
+                                    published_rows,
+                                    "reasoning_tokens",
+                                ),
+                                cached_tokens=_summed_int(
+                                    published_rows,
+                                    "cached_tokens",
+                                ),
+                                cache_write_tokens=_summed_int(
+                                    published_rows,
+                                    "cache_write_tokens",
+                                ),
+                                billed_cost=_summed_float(
+                                    published_rows,
+                                    "billed_cost",
+                                ),
+                                cost_source=(
+                                    _rollup_cost_source(published_rows)
+                                    if published_rows
+                                    else "none"
+                                ),
+                                stop_reason=(
+                                    latest_snapshot.stop_reason
+                                    if latest_snapshot is not None
+                                    else ""
+                                ),
                                 error=(
                                     "proposer physical provider stream did not close "
                                     "within the cleanup window"
@@ -3272,7 +3923,19 @@ class EnsembleProvider:
                                 # exact physical-request fact recorded at the
                                 # point where the lower stream is entered.
                                 request_started=request_started,
-                                physical_request_count=1 if request_started else 0,
+                                physical_request_count=physical_request_count,
+                                usage_missing_count=usage_missing_count,
+                                usage_reported=bool(published_rows),
+                                provider_usage=(
+                                    dict(latest_snapshot.provider_usage)
+                                    if latest_snapshot is not None
+                                    else {}
+                                ),
+                                model_usage_breakdown=published_rows,
+                                diagnostic_receipt_present=any(
+                                    snapshot.diagnostic_receipt_present
+                                    for snapshot in attempt_snapshots
+                                ),
                             )
                         )
             return sorted(results, key=lambda result: (result.index, result.sample_index))
@@ -3330,6 +3993,11 @@ class EnsembleProvider:
             model="",
             requested_provider=cfg.provider,
             requested_model=cfg.model,
+            requested_thinking_level=member.requested_thinking_level,
+            effective_thinking_level=member.effective_thinking_level,
+            provider_thinking_level=member.thinking,
+            thinking_fallback_reason=member.thinking_fallback_reason,
+            thinking_policy_version=member.thinking_policy_version,
         )
         if progress is not None:
             progress(
@@ -3389,8 +4057,10 @@ class EnsembleProvider:
                         )
                         result.error_code = "timeout"
                         return result
-                    return inner_task.result()
-                return await asyncio.shield(inner_task)
+                    result = inner_task.result()
+                    return result
+                result = await asyncio.shield(inner_task)
+                return result
             except BaseException as exc:
                 if not inner_task.done():
                     self._track_pending_cleanup(
@@ -3462,6 +4132,27 @@ class EnsembleProvider:
                         error=result.error,
                     )
                 )
+            if member.thinking_policy_managed:
+                log.info(
+                    "llm_ensemble.routing.model_execution_recorded",
+                    role="proposer",
+                    model_id=result.model or result.requested_model,
+                    provider=result.provider or result.requested_provider,
+                    requested_thinking_level=(result.requested_thinking_level),
+                    effective_thinking_level=(result.effective_thinking_level),
+                    provider_thinking_level=result.provider_thinking_level,
+                    thinking_fallback_reason=(result.thinking_fallback_reason),
+                    thinking_policy_version=result.thinking_policy_version,
+                    status="succeeded" if result.ok else "failed",
+                    elapsed_ms=result.elapsed_ms,
+                    input_tokens=result.input_tokens,
+                    output_tokens=result.output_tokens,
+                    reasoning_tokens=result.reasoning_tokens,
+                    billed_cost=result.billed_cost,
+                    error_code=result.error_code,
+                )
+            if result.request_started:
+                self._record_accounting_candidate(result)
         return result
 
     async def _collect_candidate_inner(
@@ -3497,21 +4188,74 @@ class EnsembleProvider:
             timeout_seconds=self.proposer_timeout_seconds,
             request_budget_binding=self._member_request_budget_binding(member),
         )
+        if request_task is not None:
+            setattr(
+                request_task,
+                "_opensquilla_ensemble_effective_thinking_level",
+                result.effective_thinking_level,
+            )
+            setattr(
+                request_task,
+                "_opensquilla_ensemble_provider_thinking_level",
+                result.provider_thinking_level,
+            )
+            setattr(
+                request_task,
+                "_opensquilla_ensemble_thinking_fallback_reason",
+                result.thinking_fallback_reason,
+            )
         if not member.ready:
             reason = member.unavailable_reason or "deployment_unavailable"
             result.error = f"proposer deployment is not ready: {reason}"
             result.error_code = reason
             return result
-        provider = _build_provider(member.provider_config)
         text_parts: list[str] = []
         got_done = False
         response_observed = False
         terminal_event_observed = False
-        raw_stream = provider.chat(messages, tools=tools, config=chat_cfg)
-        result.request_started = True
-        result.physical_request_count = 1
-        if request_task is not None:
-            setattr(request_task, "_opensquilla_ensemble_request_started", True)
+
+        def mark_request_started() -> None:
+            result.request_started = True
+            result.physical_request_count = 1
+            self._record_accounting_request_started()
+            if request_task is not None:
+                request_count = (
+                    int(
+                        getattr(
+                            request_task,
+                            "_opensquilla_ensemble_request_count",
+                            0,
+                        )
+                        or 0
+                    )
+                    + 1
+                )
+                setattr(
+                    request_task,
+                    "_opensquilla_ensemble_request_started",
+                    True,
+                )
+                setattr(
+                    request_task,
+                    "_opensquilla_ensemble_request_count",
+                    request_count,
+                )
+
+        if member.thinking_policy_managed:
+            raw_stream = _provider_events_with_error_boundary(
+                provider_config=member.provider_config,
+                messages=messages,
+                tools=tools,
+                chat_config=chat_cfg,
+                phase=f"ensemble_proposer_{result.index}_provider",
+                on_request_started=mark_request_started,
+                pending_cleanup_tracker=self._track_pending_cleanup,
+                terminal_observed=lambda: terminal_event_observed,
+            )
+        else:
+            provider = _build_provider(member.provider_config)
+            raw_stream = provider.chat(messages, tools=tools, config=chat_cfg)
+            mark_request_started()
         async with _closing_async_iterator(
             raw_stream,
             phase=f"ensemble_proposer_{result.index}",
@@ -3520,12 +4264,12 @@ class EnsembleProvider:
         ) as provider_stream:
             async for event in provider_stream:
                 if isinstance(event, TextDeltaEvent):
-                    response_observed = True
+                    response_observed = response_observed or bool(event.text)
                     if result.ttft_ms is None and event.text:
                         result.ttft_ms = int((time.monotonic() - started) * 1000)
                     text_parts.append(event.text)
                 elif isinstance(event, ReasoningDeltaEvent):
-                    response_observed = True
+                    response_observed = response_observed or bool(event.text)
                     continue
                 elif isinstance(
                     event,
@@ -3566,6 +4310,10 @@ class EnsembleProvider:
                     result.provider = _done_event_actual_provider(event)
                     result.model = str(event.model or "").strip()
                     result.provider_usage = dict(event.provider_usage)
+                    _publish_candidate_attempt_snapshot(
+                        request_task,
+                        result,
+                    )
                     break
                 elif isinstance(event, ErrorEvent):
                     terminal_event_observed = True
@@ -3577,13 +4325,31 @@ class EnsembleProvider:
                         event.request_started is False or event.physical_request_count == 0
                     )
                     if explicitly_not_started:
+                        request_was_marked_started = result.request_started
                         result.request_started = False
                         result.physical_request_count = 0
+                        if request_was_marked_started:
+                            self._record_accounting_request_not_started()
                         if request_task is not None:
+                            request_count = int(
+                                getattr(
+                                    request_task,
+                                    "_opensquilla_ensemble_request_count",
+                                    0,
+                                )
+                                or 0
+                            )
+                            if request_was_marked_started:
+                                request_count = max(0, request_count - 1)
                             setattr(
                                 request_task,
                                 "_opensquilla_ensemble_request_started",
-                                False,
+                                request_count > 0,
+                            )
+                            setattr(
+                                request_task,
+                                "_opensquilla_ensemble_request_count",
+                                request_count,
                             )
                     result.error = redact_upstream_error_text(
                         event.message,
@@ -3653,7 +4419,203 @@ class EnsembleProvider:
                         message=result.error,
                         code=result.error_code,
                     )
+                    _publish_candidate_attempt_snapshot(
+                        request_task,
+                        result,
+                    )
                     break
+        if (
+            result.error
+            and not response_observed
+            and member.thinking_policy_managed
+            and member.thinking_fallbacks
+            and _is_thinking_parameter_rejection(
+                message=result.error,
+                code=result.error_code,
+            )
+        ):
+            fallback_unified, fallback_provider = member.thinking_fallbacks[0]
+            prior_rows = [dict(row) for row in result.model_usage_breakdown]
+            for row in prior_rows:
+                row.setdefault(
+                    "requested_thinking_level",
+                    member.requested_thinking_level,
+                )
+                row.setdefault(
+                    "effective_thinking_level",
+                    member.effective_thinking_level,
+                )
+                row.setdefault("provider_thinking_level", member.thinking)
+                row.setdefault(
+                    "thinking_fallback_reason",
+                    "provider_rejected_thinking_level",
+                )
+                row.setdefault(
+                    "thinking_policy_version",
+                    member.thinking_policy_version,
+                )
+            prior_physical_count = result.physical_request_count
+            prior_missing_count = result.usage_missing_count
+            prior_input_tokens = result.input_tokens
+            prior_output_tokens = result.output_tokens
+            prior_reasoning_tokens = result.reasoning_tokens
+            prior_cached_tokens = result.cached_tokens
+            prior_cache_write_tokens = result.cache_write_tokens
+            prior_billed_cost = result.billed_cost
+            prior_usage_reported = result.usage_reported
+            fallback_member = replace(
+                member,
+                thinking=fallback_provider,
+                effective_thinking_level=fallback_unified,
+                thinking_fallback_reason="provider_rejected_thinking_level",
+                thinking_fallbacks=member.thinking_fallbacks[1:],
+            )
+            retry_result = replace(
+                result,
+                effective_thinking_level=fallback_unified,
+                provider_thinking_level=fallback_provider,
+                thinking_fallback_reason="provider_rejected_thinking_level",
+                text="",
+                input_tokens=0,
+                output_tokens=0,
+                reasoning_tokens=0,
+                cached_tokens=0,
+                cache_write_tokens=0,
+                billed_cost=0.0,
+                cost_source="none",
+                billing_receipt=None,
+                stop_reason="",
+                ttft_ms=None,
+                error="",
+                error_code="",
+                message_limit_proof=None,
+                execution={},
+                usage_reported=False,
+                request_started=False,
+                physical_request_count=0,
+                usage_missing_count=0,
+                provider_usage={},
+                diagnostic_model_usage_breakdown=[],
+                model_usage_breakdown=[],
+                diagnostic_receipt_present=False,
+            )
+            fallback_record = self._record_thinking_fallback(
+                member=member,
+                role="proposer",
+                rejected_unified_level=member.effective_thinking_level,
+                rejected_provider_level=member.thinking,
+                effective_unified_level=fallback_unified,
+                effective_provider_level=fallback_provider,
+                fallback_result="retrying",
+            )
+            log.warning(
+                "llm_ensemble.routing.fallback_recorded",
+                trigger_stage="proposer_execution",
+                fallback_type="thinking_level_neighbor",
+                reason="provider_rejected_thinking_level",
+                selected_backup=fallback_provider,
+                fallback_result="retrying",
+                requested_thinking_level=member.requested_thinking_level,
+                rejected_thinking_level=member.thinking,
+                effective_thinking_level=fallback_unified,
+                thinking_policy_version=member.thinking_policy_version,
+                provider=member.provider_config.provider,
+                model=member.provider_config.model,
+            )
+
+            def merge_retry_evidence(*, interrupted: bool) -> None:
+                if (
+                    interrupted
+                    and retry_result.request_started
+                    and not retry_result.usage_reported
+                ):
+                    retry_result.usage_missing_count = max(
+                        retry_result.usage_missing_count,
+                        retry_result.physical_request_count,
+                        1,
+                    )
+                retry_rows = [
+                    dict(row) for row in retry_result.model_usage_breakdown
+                ]
+                if not retry_rows and _candidate_has_usage(retry_result):
+                    retry_rows = [
+                        retry_result.usage_row(
+                            role="proposer",
+                            profile=self.profile_name,
+                        )
+                    ]
+                retry_result.model_usage_breakdown = [
+                    *prior_rows,
+                    *retry_rows,
+                ]
+                retry_result.input_tokens += prior_input_tokens
+                retry_result.output_tokens += prior_output_tokens
+                retry_result.reasoning_tokens += prior_reasoning_tokens
+                retry_result.cached_tokens += prior_cached_tokens
+                retry_result.cache_write_tokens += prior_cache_write_tokens
+                retry_result.billed_cost += prior_billed_cost
+                retry_result.request_started = bool(
+                    retry_result.request_started or prior_physical_count > 0
+                )
+                retry_result.physical_request_count += prior_physical_count
+                retry_result.usage_missing_count += prior_missing_count
+                retry_result.usage_reported = bool(
+                    retry_result.usage_reported or prior_usage_reported
+                )
+
+            def finalize_retry_attempt(attempt_result: str) -> None:
+                fallback_record["fallback_result"] = attempt_result
+                fallback_attempts = list(
+                    retry_result.execution.get(
+                        "thinking_fallback_attempts"
+                    )
+                    or []
+                )
+                retry_result.execution["thinking_fallback_attempts"] = [
+                    {
+                        "trigger_stage": "proposer_execution",
+                        "fallback_type": "thinking_level_neighbor",
+                        "reason": "provider_rejected_thinking_level",
+                        "requested_thinking_level": (
+                            member.requested_thinking_level
+                        ),
+                        "rejected_unified_level": (
+                            member.effective_thinking_level
+                        ),
+                        "rejected_provider_level": member.thinking,
+                        "effective_thinking_level": fallback_unified,
+                        "effective_provider_level": fallback_provider,
+                        "fallback_result": attempt_result,
+                    },
+                    *fallback_attempts,
+                ]
+
+            try:
+                retry_result = await self._collect_candidate_inner(
+                    result=retry_result,
+                    member=fallback_member,
+                    messages=messages,
+                    tools=tools,
+                    config=config,
+                    started=started,
+                    request_task=request_task,
+                )
+            except BaseException:
+                merge_retry_evidence(interrupted=True)
+                finalize_retry_attempt("failed")
+                _overwrite_candidate_result(result, retry_result)
+                raise
+            merge_retry_evidence(interrupted=False)
+            actual_unified = (
+                retry_result.effective_thinking_level or fallback_unified
+            )
+            attempt_result = (
+                "succeeded"
+                if retry_result.ok and actual_unified == fallback_unified
+                else "failed"
+            )
+            finalize_retry_attempt(attempt_result)
+            return retry_result
         result.text = _truncate_text("".join(text_parts), self.candidate_max_chars)
         if not got_done and not result.error:
             result.error = "proposer stream ended before DoneEvent"
@@ -3840,6 +4802,12 @@ class EnsembleProvider:
         abandoned_rows: list[dict[str, Any]] = []
         abandoned_missing_count = 0
         attempt_request_started = False
+        active_member = self.aggregator
+        active_config = config
+        thinking_fallbacks = (
+            list(self.aggregator.thinking_fallbacks) if bool(config.thinking) else []
+        )
+        active_thinking_fallback_record: dict[str, Any] | None = None
         effective_timeout_seconds = (
             float(timeout_seconds)
             if timeout_seconds is not None
@@ -3872,7 +4840,68 @@ class EnsembleProvider:
                 error=error,
             )
 
+        def finalize_thinking_fallback(result: str) -> None:
+            nonlocal active_thinking_fallback_record
+            active_record = active_thinking_fallback_record
+            if active_record is None:
+                return
+            active_record["fallback_result"] = result
+            containers: list[Any] = [
+                self.selection_plan.get("thinking_execution_fallbacks"),
+                trace.get("thinking_execution_fallbacks"),
+            ]
+            traced_plan = trace.get("selection_plan")
+            if isinstance(traced_plan, Mapping):
+                containers.append(traced_plan.get("thinking_execution_fallbacks"))
+            final_request = trace.get("final_request")
+            if isinstance(final_request, Mapping):
+                execution = final_request.get("execution")
+                if isinstance(execution, Mapping):
+                    containers.append(execution.get("thinking_fallback_attempts"))
+            for rows in containers:
+                if not isinstance(rows, list):
+                    continue
+                for row in reversed(rows):
+                    if (
+                        isinstance(row, dict)
+                        and row.get("fallback_result") == "retrying"
+                        and all(
+                            row.get(key) == active_record.get(key)
+                            for key in (
+                                "trigger_stage",
+                                "identity",
+                                "rejected_unified_level",
+                                "rejected_provider_level",
+                                "effective_thinking_level",
+                                "effective_provider_level",
+                            )
+                        )
+                    ):
+                        row["fallback_result"] = result
+                        break
+            active_thinking_fallback_record = None
+
         def ensemble_done(event: DoneEvent, *, aggregator_elapsed_ms: int) -> DoneEvent:
+            finalize_thinking_fallback("succeeded")
+            if active_member.thinking_policy_managed:
+                log.info(
+                    "llm_ensemble.routing.model_execution_recorded",
+                    role="aggregator",
+                    model_id=event.model or active_member.provider_config.model,
+                    provider=event.provider or active_member.provider_config.provider,
+                    requested_thinking_level=(active_member.requested_thinking_level),
+                    effective_thinking_level=(active_member.effective_thinking_level),
+                    provider_thinking_level=active_member.thinking,
+                    thinking_fallback_reason=(active_member.thinking_fallback_reason),
+                    thinking_policy_version=(active_member.thinking_policy_version),
+                    status="succeeded",
+                    elapsed_ms=aggregator_elapsed_ms,
+                    input_tokens=event.input_tokens,
+                    output_tokens=event.output_tokens,
+                    reasoning_tokens=event.reasoning_tokens,
+                    billed_cost=_canonical_usage_billed_cost(event)[0],
+                    error_code="",
+                )
             output_text = "".join(final_text_parts)
             _attach_final_request_output(
                 trace,
@@ -3911,12 +4940,33 @@ class EnsembleProvider:
                 row.setdefault("model", acc.model)
                 if not str(row.get("requested_model") or "").strip():
                     row["requested_model"] = self.aggregator.provider_config.model
+                if active_member.thinking_policy_managed:
+                    row.setdefault(
+                        "requested_thinking_level",
+                        active_member.requested_thinking_level,
+                    )
+                    row.setdefault(
+                        "effective_thinking_level",
+                        active_member.effective_thinking_level,
+                    )
+                    row.setdefault(
+                        "provider_thinking_level",
+                        active_member.thinking,
+                    )
+                    row.setdefault(
+                        "thinking_fallback_reason",
+                        active_member.thinking_fallback_reason,
+                    )
+                    row.setdefault(
+                        "thinking_policy_version",
+                        active_member.thinking_policy_version,
+                    )
                 aggregator_rows.append(_canonicalize_usage_row(row))
             if not aggregator_rows:
                 aggregator_rows.append(
                     acc.usage_row(
                         profile=self.profile_name,
-                        member=self.aggregator,
+                        member=active_member,
                         role="aggregator",
                         label="aggregator",
                         elapsed_ms=aggregator_elapsed_ms,
@@ -3931,6 +4981,10 @@ class EnsembleProvider:
                 prior_missing_count
                 + abandoned_missing_count
                 + max(0, int(event.usage_missing_count or 0))
+            )
+            self._record_accounting_rows(
+                aggregator_rows,
+                missing_count=max(0, int(event.usage_missing_count or 0)),
             )
             _reconcile_nested_done_request_count(trace, event)
             if "usage_missing_count" in trace:
@@ -3961,12 +5015,36 @@ class EnsembleProvider:
             )
 
         def partial_error(event: ErrorEvent) -> ErrorEvent:
+            finalize_thinking_fallback("failed")
+            if active_member.thinking_policy_managed:
+                log.warning(
+                    "llm_ensemble.routing.model_execution_recorded",
+                    role="aggregator",
+                    model_id=active_member.provider_config.model,
+                    provider=active_member.provider_config.provider,
+                    requested_thinking_level=(active_member.requested_thinking_level),
+                    effective_thinking_level=(active_member.effective_thinking_level),
+                    provider_thinking_level=active_member.thinking,
+                    thinking_fallback_reason=(active_member.thinking_fallback_reason),
+                    thinking_policy_version=(active_member.thinking_policy_version),
+                    status="failed",
+                    elapsed_ms=int((time.monotonic() - aggregator_started) * 1000),
+                    input_tokens=0,
+                    output_tokens=0,
+                    reasoning_tokens=0,
+                    billed_cost=0.0,
+                    error_code=event.code,
+                )
             terminal_rows = list(abandoned_rows)
             event_rows = [
                 _canonicalize_usage_row(item)
                 for item in event.model_usage_breakdown
                 if isinstance(item, Mapping)
             ]
+            event_rows = _annotate_member_thinking_usage_rows(
+                event_rows,
+                active_member,
+            )
             terminal_rows.extend(event_rows)
             event_missing_count = _error_event_missing_usage_count(
                 event,
@@ -3975,8 +5053,9 @@ class EnsembleProvider:
             usage_missing_count = (
                 prior_missing_count + abandoned_missing_count + event_missing_count
             )
+            diagnostic_rows: list[dict[str, Any]] = []
             if event.diagnostic_done is not None:
-                terminal_rows.extend(
+                diagnostic_rows = _annotate_member_thinking_usage_rows(
                     _unrepresented_diagnostic_usage_rows(
                         event_rows,
                         event.diagnostic_done,
@@ -3985,8 +5064,14 @@ class EnsembleProvider:
                         label=f"aggregator_attempt_{attempt + 1}",
                         provider=self.aggregator.provider_config.provider,
                         model=self.aggregator.provider_config.model,
-                    )
+                    ),
+                    active_member,
                 )
+                terminal_rows.extend(diagnostic_rows)
+            self._record_accounting_rows(
+                [*event_rows, *diagnostic_rows],
+                missing_count=event_missing_count,
+            )
             _reconcile_nested_error_request_count(
                 trace,
                 event,
@@ -4011,6 +5096,10 @@ class EnsembleProvider:
                 for item in event.model_usage_breakdown
                 if isinstance(item, Mapping)
             ]
+            event_rows = _annotate_member_thinking_usage_rows(
+                event_rows,
+                active_member,
+            )
             abandoned_rows.extend(event_rows)
             event_missing_count = _error_event_missing_usage_count(
                 event,
@@ -4018,8 +5107,9 @@ class EnsembleProvider:
             )
             recorded_missing_count = event_missing_count
             abandoned_missing_count += event_missing_count
+            diagnostic_rows: list[dict[str, Any]] = []
             if event.diagnostic_done is not None:
-                abandoned_rows.extend(
+                diagnostic_rows = _annotate_member_thinking_usage_rows(
                     _unrepresented_diagnostic_usage_rows(
                         event_rows,
                         event.diagnostic_done,
@@ -4028,8 +5118,14 @@ class EnsembleProvider:
                         label=f"aggregator_retry_{attempt + 1}",
                         provider=self.aggregator.provider_config.provider,
                         model=self.aggregator.provider_config.model,
-                    )
+                    ),
+                    active_member,
                 )
+                abandoned_rows.extend(diagnostic_rows)
+            self._record_accounting_rows(
+                [*event_rows, *diagnostic_rows],
+                missing_count=event_missing_count,
+            )
             _reconcile_nested_error_request_count(
                 trace,
                 event,
@@ -4078,6 +5174,7 @@ class EnsembleProvider:
             content_streamed = False
             response_observed = False
             retry_error: ErrorEvent | None = None
+            thinking_retry_target: tuple[str, str] | None = None
             terminal_stream_error: ErrorEvent | None = None
             completed_provider_event: DoneEvent | None = None
             heartbeat_stream: AsyncIterator[StreamEvent] | None = None
@@ -4086,7 +5183,7 @@ class EnsembleProvider:
             external_close_requested = False
             attempt_request_started = False
             try:
-                stream = provider.chat(messages, tools=tools, config=config)
+                stream = provider.chat(messages, tools=tools, config=active_config)
                 if attempt == 0:
                     _mark_final_request_started(trace)
                 else:
@@ -4098,6 +5195,7 @@ class EnsembleProvider:
                     final_request = trace.setdefault("final_request", {})
                     final_request["request_started"] = True
                 physical_attempts_started += 1
+                self._record_accounting_request_started()
                 attempt_request_started = True
                 heartbeat_close_status = _StreamCloseStatus()
                 heartbeat_stream = _stream_with_heartbeats(
@@ -4139,6 +5237,8 @@ class EnsembleProvider:
                             safe_event.request_started is False
                             or safe_event.physical_request_count == 0
                         ):
+                            if attempt_request_started:
+                                self._record_accounting_request_not_started()
                             physical_attempts_started = max(
                                 0,
                                 physical_attempts_started - 1,
@@ -4149,10 +5249,22 @@ class EnsembleProvider:
                             )
                             attempt_request_started = False
                         self._report_member_credential_failure(
-                            self.aggregator,
+                            active_member,
                             message=safe_event.message,
                             code=safe_event.code,
                         )
+                        if (
+                            not content_streamed
+                            and active_member.thinking_policy_managed
+                            and thinking_fallbacks
+                            and _is_thinking_parameter_rejection(
+                                message=safe_event.message,
+                                code=safe_event.code,
+                            )
+                        ):
+                            thinking_retry_target = thinking_fallbacks.pop(0)
+                            retry_error = safe_event
+                            break
                         if (
                             not content_streamed
                             and attempt < _ENSEMBLE_AGGREGATOR_MAX_RETRIES
@@ -4184,9 +5296,19 @@ class EnsembleProvider:
                 external_close_requested = True
                 raise
             except TimeoutError:
+                deadline_event = (
+                    heartbeat_close_status.deadline_event
+                    if heartbeat_close_status is not None
+                    else None
+                )
                 terminal_stream_error = ErrorEvent(
                     message=(f"ensemble aggregator timed out after {attempt_timeout_seconds:g}s"),
                     code="ensemble_aggregator_timeout",
+                    diagnostic_done=(
+                        deadline_event
+                        if isinstance(deadline_event, DoneEvent)
+                        else None
+                    ),
                 )
             except Exception as exc:  # noqa: BLE001 - provider boundary returns ErrorEvent
                 safe_message = redact_upstream_error_text(
@@ -4195,6 +5317,20 @@ class EnsembleProvider:
                     max_len=2000,
                 )
                 if (
+                    not content_streamed
+                    and active_member.thinking_policy_managed
+                    and thinking_fallbacks
+                    and _is_thinking_parameter_rejection(
+                        message=safe_message,
+                        code=type(exc).__name__,
+                    )
+                ):
+                    thinking_retry_target = thinking_fallbacks.pop(0)
+                    retry_error = ErrorEvent(
+                        message=safe_message,
+                        code=type(exc).__name__,
+                    )
+                elif (
                     not content_streamed
                     and attempt < _ENSEMBLE_AGGREGATOR_MAX_RETRIES
                     and self._aggregator_error_is_retryable(
@@ -4329,25 +5465,40 @@ class EnsembleProvider:
                     yield partial_error(error)
                     return
             record_abandoned_attempt(retry_error)
-            attempt += 1
             final_request = trace.get("final_request")
-            if isinstance(final_request, dict):
-                final_request["retry_count"] = attempt
-            log.warning(
-                "ensemble.aggregator_retry",
-                attempt=attempt,
-                max_retries=_ENSEMBLE_AGGREGATOR_MAX_RETRIES,
-                code=retry_error.code,
-                provider=self.aggregator.provider_config.provider,
-            )
-            yield ProviderHeartbeatEvent(
-                phase="ensemble_aggregator_retry",
-                message=(
-                    "Ensemble aggregator hit a transient error; retrying "
-                    f"({attempt}/{_ENSEMBLE_AGGREGATOR_MAX_RETRIES})"
-                ),
-            )
-            delay = _aggregator_retry_backoff_seconds(attempt)
+            if thinking_retry_target is not None:
+                # A second neighbor means the previously attempted neighbor
+                # was itself rejected.
+                finalize_thinking_fallback("failed")
+                fallback_unified, fallback_provider = thinking_retry_target
+                rejected_member = active_member
+                yield ProviderHeartbeatEvent(
+                    phase="ensemble_aggregator_thinking_fallback",
+                    message=(
+                        "Ensemble aggregator thinking level was rejected; "
+                        "retrying with the nearest supported level"
+                    ),
+                )
+                delay = 0.0
+            else:
+                attempt += 1
+                if isinstance(final_request, dict):
+                    final_request["retry_count"] = attempt
+                log.warning(
+                    "ensemble.aggregator_retry",
+                    attempt=attempt,
+                    max_retries=_ENSEMBLE_AGGREGATOR_MAX_RETRIES,
+                    code=retry_error.code,
+                    provider=self.aggregator.provider_config.provider,
+                )
+                yield ProviderHeartbeatEvent(
+                    phase="ensemble_aggregator_retry",
+                    message=(
+                        "Ensemble aggregator hit a transient error; retrying "
+                        f"({attempt}/{_ENSEMBLE_AGGREGATOR_MAX_RETRIES})"
+                    ),
+                )
+                delay = _aggregator_retry_backoff_seconds(attempt)
             if absolute_deadline is not None and time.monotonic() + delay >= absolute_deadline:
                 deadline_error = ErrorEvent(
                     message=("ensemble aggregator retry budget reached the absolute deadline"),
@@ -4359,6 +5510,86 @@ class EnsembleProvider:
                 )
                 yield partial_error(deadline_error)
                 return
+            if thinking_retry_target is not None:
+                attempt += 1
+                if isinstance(final_request, dict):
+                    final_request["retry_count"] = attempt
+                active_member = replace(
+                    active_member,
+                    thinking=fallback_provider,
+                    effective_thinking_level=fallback_unified,
+                    thinking_fallback_reason="provider_rejected_thinking_level",
+                    thinking_fallbacks=tuple(thinking_fallbacks),
+                )
+                active_config = _member_chat_config(
+                    config,
+                    active_member,
+                    request_budget_binding=self._member_request_budget_binding(
+                        active_member
+                    ),
+                    role="aggregator",
+                    record_budget_rebound=False,
+                )
+                if self.aggregator_timeout_seconds > 0:
+                    active_config = active_config.model_copy(
+                        update={"timeout": self.aggregator_timeout_seconds}
+                    )
+                active_thinking_fallback_record = (
+                    self._record_thinking_fallback(
+                        member=rejected_member,
+                        role="aggregator",
+                        rejected_unified_level=(
+                            rejected_member.effective_thinking_level
+                        ),
+                        rejected_provider_level=rejected_member.thinking,
+                        effective_unified_level=fallback_unified,
+                        effective_provider_level=fallback_provider,
+                        fallback_result="retrying",
+                        trace=trace,
+                    )
+                )
+                if isinstance(final_request, dict):
+                    execution = _member_execution_trace(
+                        active_member,
+                        role="aggregator",
+                        chat_config=active_config,
+                        tools=tools,
+                        timeout_seconds=effective_timeout_seconds,
+                        request_budget_binding=(
+                            self._member_request_budget_binding(active_member)
+                        ),
+                    )
+                    prior_execution = final_request.get("execution")
+                    fallback_attempts = list(
+                        prior_execution.get("thinking_fallback_attempts")
+                        or []
+                        if isinstance(prior_execution, Mapping)
+                        else []
+                    )
+                    if active_thinking_fallback_record is not None:
+                        fallback_attempts.append(
+                            dict(active_thinking_fallback_record)
+                        )
+                    execution["thinking_fallback_attempts"] = fallback_attempts
+                    final_request["execution"] = execution
+                log.warning(
+                    "llm_ensemble.routing.fallback_recorded",
+                    trigger_stage="aggregator_execution",
+                    fallback_type="thinking_level_neighbor",
+                    reason="provider_rejected_thinking_level",
+                    selected_backup=fallback_provider,
+                    fallback_result="retrying",
+                    requested_thinking_level=(
+                        rejected_member.requested_thinking_level
+                    ),
+                    rejected_thinking_level=rejected_member.thinking,
+                    effective_thinking_level=fallback_unified,
+                    thinking_policy_version=(
+                        rejected_member.thinking_policy_version
+                    ),
+                    provider=self.aggregator.provider_config.provider,
+                    model=self.aggregator.provider_config.model,
+                )
             if delay > 0:
                 await asyncio.sleep(delay)
 
@@ -4413,7 +5644,8 @@ class EnsembleProvider:
                             "ensemble_soft_deadline_disable_thinking",
                             False,
                         )
-                    ),
+                    )
+                    and not self.aggregator.thinking_policy_managed,
                     "soft_deadline_quorum_met": (
                         sum(1 for candidate in candidates if candidate.ok)
                         >= self.min_successful_proposers
@@ -4424,6 +5656,7 @@ class EnsembleProvider:
         if (
             soft_deadline is not None
             and not soft_finalize
+            and not self._thinking_policy_active()
             and self.all_failed_policy == "fallback_single"
             and self.fallback_provider is not None
         ):
@@ -4690,7 +5923,11 @@ class EnsembleProvider:
                 error_trace,
             )
 
-        if self.all_failed_policy != "fallback_single" or self.fallback_provider is None:
+        if (
+            self._thinking_policy_active()
+            or self.all_failed_policy != "fallback_single"
+            or self.fallback_provider is None
+        ):
             message_limit_proof = _uniform_message_limit_proof(candidates)
             if message_limit_proof is not None:
                 first_error = next(
@@ -4816,29 +6053,33 @@ class EnsembleProvider:
                 # partial receipts. Preserve those rows directly instead of
                 # replacing them with one unknown outer fallback request.
                 rows.extend(fallback_rows)
+            diagnostic_rows: list[dict[str, Any]] = []
             if event.diagnostic_done is not None:
-                rows.extend(
-                    _unrepresented_diagnostic_usage_rows(
-                        fallback_rows,
-                        event.diagnostic_done,
-                        role="fallback_single",
-                        profile=self.profile_name,
-                        label="fallback",
-                        provider=(
-                            self.fallback_provider_name
-                            or getattr(
-                                self.fallback_provider,
-                                "provider_name",
-                                "fallback",
-                            )
-                        ),
-                        model=(
-                            self.fallback_model
-                            or _provider_model_id(self.fallback_provider)
-                            or event.diagnostic_done.model
-                        ),
-                    )
+                diagnostic_rows = _unrepresented_diagnostic_usage_rows(
+                    fallback_rows,
+                    event.diagnostic_done,
+                    role="fallback_single",
+                    profile=self.profile_name,
+                    label="fallback",
+                    provider=(
+                        self.fallback_provider_name
+                        or getattr(
+                            self.fallback_provider,
+                            "provider_name",
+                            "fallback",
+                        )
+                    ),
+                    model=(
+                        self.fallback_model
+                        or _provider_model_id(self.fallback_provider)
+                        or event.diagnostic_done.model
+                    ),
                 )
+                rows.extend(diagnostic_rows)
+            self._record_accounting_rows(
+                [*fallback_rows, *diagnostic_rows],
+                missing_count=event_missing_count,
+            )
             _reconcile_nested_error_request_count(
                 trace,
                 event,
@@ -4922,6 +6163,10 @@ class EnsembleProvider:
                 fallback_rows.append(_canonicalize_usage_row(row))
             if not fallback_rows:
                 fallback_rows.append(fallback_row)
+            self._record_accounting_rows(
+                fallback_rows,
+                missing_count=max(0, int(event.usage_missing_count or 0)),
+            )
             rows = [*proposer_rows, *fallback_rows]
             usage_missing_count = proposer_missing_count + max(
                 0,
@@ -4965,6 +6210,7 @@ class EnsembleProvider:
                 config=fallback_config,
             )
             _mark_final_request_started(trace)
+            self._record_accounting_request_started()
             fallback_request_started = True
             heartbeat_stream = _stream_with_heartbeats(
                 fallback_stream,
@@ -5007,6 +6253,8 @@ class EnsembleProvider:
                             terminal_fallback_error.request_started is False
                             or terminal_fallback_error.physical_request_count == 0
                         ):
+                            if fallback_request_started:
+                                self._record_accounting_request_not_started()
                             _unmark_final_request_attempt(
                                 trace,
                                 clear_request_started=True,
@@ -5103,11 +6351,17 @@ class EnsembleProvider:
             yield partial_error(fallback_error)
             return
         except TimeoutError:
+            deadline_event = physical_close_status.deadline_event
             timeout_error = ErrorEvent(
                 message=(
                     f"ensemble fallback stalled: no stream events for {fallback_timeout_seconds:g}s"
                 ),
                 code="ensemble_fallback_timeout",
+                diagnostic_done=(
+                    deadline_event
+                    if isinstance(deadline_event, DoneEvent)
+                    else None
+                ),
             )
             if physical_close_status.closed is not True:
                 self._mark_cleanup_unproven("ensemble_fallback_close_unproven")
@@ -5290,6 +6544,25 @@ def _member_execution_trace(
             ),
         }
     )
+    if member.thinking_policy_managed:
+        payload.update(
+            {
+                "requested_thinking_level": member.requested_thinking_level,
+                "assigned_thinking_level": member.effective_thinking_level,
+                "effective_thinking_level": member.effective_thinking_level,
+                "provider_thinking_level": member.thinking,
+                "thinking_fallback_reason": member.thinking_fallback_reason,
+                "thinking_policy_version": member.thinking_policy_version,
+                "thinking_policy_managed": True,
+                "thinking_fallbacks": [
+                    {
+                        "unified_level": unified_level,
+                        "provider_level": provider_level,
+                    }
+                    for unified_level, provider_level in member.thinking_fallbacks
+                ],
+            }
+        )
     return payload
 
 
@@ -5325,6 +6598,11 @@ def _request_execution_trace(
         "effective_temperature": getattr(chat_config, "temperature", None),
         "effective_thinking": getattr(chat_config, "thinking", None),
         "effective_thinking_level": _json_safe(getattr(chat_config, "thinking_level", None)),
+        "effective_thinking_budget_tokens": getattr(
+            chat_config,
+            "thinking_budget_tokens",
+            None,
+        ),
         "effective_timeout": getattr(chat_config, "timeout", None),
         "effective_tool_choice": _json_safe(getattr(chat_config, "tool_choice", None)),
     }
@@ -5779,6 +7057,12 @@ class _EnsembleModelRef:
     temperature: float | None = None
     max_tokens: int = 0
     thinking: str | None = "xhigh"
+    requested_thinking_level: str | None = None
+    effective_thinking_level: str | None = None
+    thinking_fallback_reason: str = ""
+    thinking_policy_version: str = ""
+    thinking_policy_managed: bool = False
+    thinking_fallbacks: tuple[tuple[str, str], ...] = ()
     k: int = 1
 
 
@@ -6470,6 +7754,8 @@ def _build_router_dynamic_members(
     from .ranking_router import (
         DynamicRankingError,
         TaskAnalysisResult,
+        _legacy_ranking_config_projection,
+        _legacy_registry_snapshot_projection,
         build_model_registry_snapshot,
         build_request_context,
         dynamic_output_token_budgets,
@@ -6493,11 +7779,18 @@ def _build_router_dynamic_members(
     except (TypeError, ValueError):
         routing_confidence = 0.0
 
+    ensemble_cfg = getattr(config, "llm_ensemble", None)
+    thinking_assignment_enabled = bool(
+        getattr(ensemble_cfg, "ranking_thinking_assignment_enabled", False)
+    )
     inputs = dict(ranking_inputs or {})
     ranking_config = inputs.get("ranking_config")
     if not isinstance(ranking_config, Mapping):
-        ranking_config = ranking_config_snapshot()
-    ensemble_cfg = getattr(config, "llm_ensemble", None)
+        ranking_config = ranking_config_snapshot(
+            thinking_assignment_enabled=thinking_assignment_enabled,
+        )
+    if not thinking_assignment_enabled:
+        ranking_config = _legacy_ranking_config_projection(ranking_config)
     llm_cfg = getattr(config, "llm", None)
     configured_output_tokens = int(getattr(llm_cfg, "max_tokens", 0) or 0)
     candidate_max_chars = int(getattr(ensemble_cfg, "candidate_max_chars", 24_000) or 0)
@@ -6589,6 +7882,8 @@ def _build_router_dynamic_members(
         router_tiers=router_tiers if isinstance(router_tiers, Mapping) else {},
         ranking_config=ranking_config,
     )
+    if not thinking_assignment_enabled:
+        snapshot = _legacy_registry_snapshot_projection(snapshot)
 
     allowlist_trace = _apply_router_dynamic_registry_allowlist(
         snapshot,
@@ -6629,18 +7924,133 @@ def _build_router_dynamic_members(
         routing_confidence=routing_confidence,
         ranking_config=ranking_config,
         decision_id=decision_id,
+        ranking_thinking_assignment_enabled=thinking_assignment_enabled,
     )
     if generation_filter_trace is not None:
         decision.trace["generation_policy_filter"] = generation_filter_trace
     if allowlist_trace is not None:
         decision.trace["candidate_allowlist"] = allowlist_trace
+    assignment = decision.trace.get("thinking_assignment")
+    assignment_map = assignment if isinstance(assignment, Mapping) else {}
+    if thinking_assignment_enabled and assignment_map:
+        raw_executed_proposers = assignment_map.get("proposers")
+        decision.trace["executed_thinking_assignment"] = {
+            "proposers": (
+                dict(raw_executed_proposers) if isinstance(raw_executed_proposers, Mapping) else {}
+            ),
+            "aggregator": assignment_map.get("aggregator"),
+            "thinking_policy_version": assignment_map.get("thinking_policy_version"),
+        }
+    proposer_assignment = assignment_map.get("proposers")
+    proposer_assignment_map = (
+        proposer_assignment if isinstance(proposer_assignment, Mapping) else {}
+    )
+    thinking_policy_version = str(assignment_map.get("thinking_policy_version") or "")
+    task_constraints = task_analysis.profile.get("constraints")
+    task_constraint_map = task_constraints if isinstance(task_constraints, Mapping) else {}
+    high_risk = str(task_constraint_map.get("risk") or "").strip().lower() == "high"
+
+    def ranked_ref(model: Any, *, role: str) -> _EnsembleModelRef:
+        assigned_level = str(
+            getattr(model, "effective_thinking_level", None)
+            or (
+                proposer_assignment_map.get(model.identity)
+                if role == "proposer"
+                else assignment_map.get("aggregator")
+            )
+            or ""
+        ).strip()
+        requested_level = str(
+            getattr(model, "requested_thinking_level", None) or assigned_level or ""
+        ).strip()
+        policy_version = str(
+            getattr(model, "thinking_policy_version", None) or thinking_policy_version or ""
+        ).strip()
+        provider_level = str(getattr(model, "thinking", None) or "").strip()
+        fallback_reason = str(getattr(model, "thinking_fallback_reason", None) or "").strip()
+        fallback_levels: list[tuple[str, str]] = []
+        if thinking_assignment_enabled:
+            if not assigned_level or not policy_version or not provider_level:
+                raise DynamicRankingError(
+                    f"router_dynamic thinking assignment is incomplete for {role} {model.identity}"
+                )
+            level_order = ("low", "medium", "high", "highest")
+            facts = (
+                model.registry_facts
+                if isinstance(getattr(model, "registry_facts", None), Mapping)
+                else {}
+            )
+            supported = {
+                str(level).strip().lower() for level in (facts.get("thinking_levels") or [])
+            }
+            mapping = facts.get("thinking_level_mapping")
+            mapping_map = mapping if isinstance(mapping, Mapping) else {}
+            if assigned_level not in level_order:
+                raise DynamicRankingError(
+                    "router_dynamic thinking assignment produced unknown unified "
+                    f"level {assigned_level!r}"
+                )
+            ranked_fallbacks = getattr(model, "thinking_fallbacks", ()) or ()
+            for item in ranked_fallbacks:
+                if not isinstance(item, Mapping):
+                    continue
+                unified_level = str(item.get("unified_level") or "").strip()
+                native_level = str(item.get("provider_level") or "").strip()
+                if (
+                    unified_level in level_order
+                    and native_level
+                    and (
+                        not high_risk
+                        or level_order.index(unified_level) >= level_order.index("high")
+                    )
+                ):
+                    fallback_levels.append((unified_level, native_level))
+            if not fallback_levels:
+                remaining = [
+                    level
+                    for level in level_order
+                    if level in supported
+                    and level != assigned_level
+                    and (not high_risk or level_order.index(level) >= level_order.index("high"))
+                    and str(mapping_map.get(level) or "").strip()
+                ]
+                ordered_candidates: list[str] = []
+                current_level = assigned_level
+                while remaining:
+                    current_index = level_order.index(current_level)
+                    next_level = min(
+                        remaining,
+                        key=lambda level: (
+                            abs(level_order.index(level) - current_index),
+                            (
+                                -level_order.index(level)
+                                if high_risk
+                                else level_order.index(level)
+                            ),
+                        ),
+                    )
+                    ordered_candidates.append(next_level)
+                    remaining.remove(next_level)
+                    current_level = next_level
+                fallback_levels = [
+                    (level, str(mapping_map[level]).strip())
+                    for level in ordered_candidates
+                ]
+        return _EnsembleModelRef(
+            provider=model.provider,
+            model=model.model_id,
+            thinking=model.thinking,
+            requested_thinking_level=(requested_level or None),
+            effective_thinking_level=(assigned_level or None),
+            thinking_fallback_reason=fallback_reason,
+            thinking_policy_version=policy_version,
+            thinking_policy_managed=thinking_assignment_enabled,
+            thinking_fallbacks=tuple(fallback_levels),
+        )
+
     proposers = [
         _member_from_ref(
-            _EnsembleModelRef(
-                provider=model.provider,
-                model=model.model_id,
-                thinking=model.thinking,
-            ),
+            ranked_ref(model, role="proposer"),
             config=config,
             inherited=inherited_provider_config,
             label=f"proposer_{index + 1}",
@@ -6650,11 +8060,7 @@ def _build_router_dynamic_members(
         for index, model in enumerate(decision.proposers)
     ]
     aggregator = _member_from_ref(
-        _EnsembleModelRef(
-            provider=decision.aggregator.provider,
-            model=decision.aggregator.model_id,
-            thinking=decision.aggregator.thinking,
-        ),
+        ranked_ref(decision.aggregator, role="aggregator"),
         config=config,
         inherited=inherited_provider_config,
         label="aggregator",
@@ -7067,6 +8473,23 @@ def _member_from_ref(
         temperature=getattr(ref, "temperature", None),
         max_tokens=int(getattr(ref, "max_tokens", 0) or 0),
         thinking=getattr(ref, "thinking", None),
+        requested_thinking_level=getattr(ref, "requested_thinking_level", None),
+        effective_thinking_level=getattr(ref, "effective_thinking_level", None),
+        thinking_fallback_reason=str(getattr(ref, "thinking_fallback_reason", "") or ""),
+        thinking_policy_version=str(getattr(ref, "thinking_policy_version", "") or ""),
+        thinking_policy_managed=bool(getattr(ref, "thinking_policy_managed", False)),
+        thinking_fallbacks=tuple(
+            (
+                str(item[0] or ""),
+                str(item[1] or ""),
+            )
+            for item in (getattr(ref, "thinking_fallbacks", ()) or ())
+            if isinstance(item, Sequence)
+            and not isinstance(item, (str, bytes))
+            and len(item) == 2
+            and str(item[0] or "").strip()
+            and str(item[1] or "").strip()
+        ),
         k=int(getattr(ref, "k", 1) or 1),
         credential_pool_provider=(
             resolution.provider if resolution.credential_source == "profile_pool" else ""

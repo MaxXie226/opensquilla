@@ -43,6 +43,7 @@ CUSTOM_LLM_ENSEMBLE: dict[str, object] = {
     "selection_mode": "router_dynamic",
     "ranking_user_profile_generation_enabled": True,
     "ranking_user_profile_enabled": False,
+    "ranking_thinking_assignment_enabled": True,
     "model_options": ["custom/model-a", "custom/model-b"],
 }
 
@@ -61,6 +62,7 @@ def _assert_custom_values(cfg: GatewayConfig) -> None:
     assert cfg.llm_ensemble.selection_mode == "router_dynamic"
     assert cfg.llm_ensemble.ranking_user_profile_generation_enabled is True
     assert cfg.llm_ensemble.ranking_user_profile_enabled is False
+    assert cfg.llm_ensemble.ranking_thinking_assignment_enabled is True
     assert cfg.llm_ensemble.model_options == ["custom/model-a", "custom/model-b"]
 
 
@@ -214,6 +216,7 @@ def test_enabled_only_upsert_keeps_selection_mode_and_model_options() -> None:
     assert ensemble.selection_mode == "router_dynamic"
     assert ensemble.ranking_user_profile_generation_enabled is True
     assert ensemble.ranking_user_profile_enabled is False
+    assert ensemble.ranking_thinking_assignment_enabled is True
     assert ensemble.model_options == ["custom/model-a", "custom/model-b"]
     assert res.changed is True
     assert res.restart_required is False

@@ -235,6 +235,10 @@ ranking_user_profile_generation_enabled = false
 # generation switch, so an existing/manual profile can be applied without
 # collecting new preference memory.
 ranking_user_profile_enabled = false
+# router_dynamic only: assign a deterministic thinking level to each selected
+# proposer and aggregator after model ranking. Disabled by default so existing
+# routing and provider request parameters remain unchanged.
+ranking_thinking_assignment_enabled = false
 # Explicit lineup for custom_b5 (ignored by the static profiles):
 # [[llm_ensemble.candidates]]
 # provider = "volcengine"

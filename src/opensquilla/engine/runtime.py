@@ -1628,7 +1628,18 @@ class _SelectorFallbackProvider:
                 return
             self._note_fallback_hop()
 
+    def _routed_thinking_policy_blocks_fallback(self) -> bool:
+        return bool(
+            getattr(
+                self._provider,
+                "enforces_routed_thinking_policy",
+                False,
+            )
+        )
+
     def fallback_after_invalid_response(self, reason: str) -> bool:
+        if self._routed_thinking_policy_blocks_fallback():
+            return False
         try:
             self._provider = self._selector.next_fallback_after_failure(RuntimeError(reason))
         except Exception:
@@ -1667,10 +1678,20 @@ class _SelectorFallbackProvider:
 
         active_provider = self._provider
         active_provider_id, active_model = self._active_deployment()
+        active_usage_snapshot = getattr(
+            active_provider,
+            "usage_accounting_snapshot",
+            None,
+        )
         primary_stream = account_provider_stream(
             lambda: active_provider.chat(messages, tools=tools, config=config),
             provider=active_provider_id,
             model=active_model,
+            usage_snapshot=(
+                active_usage_snapshot
+                if callable(active_usage_snapshot)
+                else None
+            ),
         )
         try:
             async for event in primary_stream:
@@ -1694,6 +1715,11 @@ class _SelectorFallbackProvider:
                 if isinstance(event, ProviderErrorEvent) and _should_use_selector_fallback(
                     self.provider_name, event
                 ):
+                    if self._routed_thinking_policy_blocks_fallback():
+                        for buffered_event in drain_pre_text_buffer():
+                            yield buffered_event
+                        yield event
+                        return
                     self._record_health_failure(event)
                     try:
                         self._provider = self._selector.next_fallback_after_failure(
@@ -1713,6 +1739,11 @@ class _SelectorFallbackProvider:
                     await primary_stream.aclose()
                     fallback_provider = self._provider
                     fallback_provider_id, fallback_model = self._active_deployment()
+                    fallback_usage_snapshot = getattr(
+                        fallback_provider,
+                        "usage_accounting_snapshot",
+                        None,
+                    )
                     fallback_stream = account_provider_stream(
                         lambda: fallback_provider.chat(
                             messages,
@@ -1721,6 +1752,11 @@ class _SelectorFallbackProvider:
                         ),
                         provider=fallback_provider_id,
                         model=fallback_model,
+                        usage_snapshot=(
+                            fallback_usage_snapshot
+                            if callable(fallback_usage_snapshot)
+                            else None
+                        ),
                     )
                     try:
                         async for fallback_event in fallback_stream:
@@ -2935,13 +2971,23 @@ class TurnRunner:
         session = selection_plan.get("session")
         session_map = session if isinstance(session, Mapping) else {}
         self._router_dynamic_last_routes.pop(session_key, None)
-        self._router_dynamic_last_routes[session_key] = {
+        remembered_route = {
             "selected_P": list(selection_plan.get("selected_P") or []),
             "selected_A": selection_plan.get("selected_A"),
             "strategy_mode": "B5_fuse",
             "quality_feedback": default_session_quality_feedback(),
             "escalation_level": int(session_map.get("escalation_level") or 0),
         }
+        thinking_assignment = selection_plan.get(
+            "executed_thinking_assignment"
+        )
+        if not isinstance(thinking_assignment, Mapping):
+            thinking_assignment = selection_plan.get("thinking_assignment")
+        if isinstance(thinking_assignment, Mapping):
+            remembered_route["thinking_assignment"] = copy.deepcopy(
+                dict(thinking_assignment)
+            )
+        self._router_dynamic_last_routes[session_key] = remembered_route
         while (
             len(self._router_dynamic_last_routes)
             > router_dynamic_route_cache_max_entries()
@@ -6154,7 +6200,18 @@ class TurnRunner:
                             ranking_config_snapshot,
                         )
 
-                        ranking_config = ranking_config_snapshot()
+                        thinking_assignment_enabled = bool(
+                            getattr(
+                                ensemble_cfg,
+                                "ranking_thinking_assignment_enabled",
+                                False,
+                            )
+                        )
+                        ranking_config = ranking_config_snapshot(
+                            thinking_assignment_enabled=(
+                                thinking_assignment_enabled
+                            )
+                        )
                         routing_extra = turn.metadata.get("routing_extra")
                         routing_extra_map = (
                             routing_extra if isinstance(routing_extra, Mapping) else {}
@@ -6287,12 +6344,37 @@ class TurnRunner:
                     )
                     raise
                 except dynamic_selection_errors as exc:
+                    thinking_assignment_enabled = bool(
+                        getattr(
+                            getattr(turn_config, "llm_ensemble", None),
+                            "ranking_thinking_assignment_enabled",
+                            False,
+                        )
+                    )
+                    thinking_fail_closed = (
+                        thinking_assignment_enabled
+                        and (
+                            getattr(exc, "reason", "")
+                            == "thinking_level_unavailable"
+                            or "thinking" in str(exc).casefold()
+                        )
+                    )
                     log_ensemble_decision_failed(
                         decision_id=ensemble_decision_id,
                         selection_mode=selection_mode,
-                        reason="router_dynamic_ranking_unavailable",
+                        reason=(
+                            "router_dynamic_thinking_assignment_unavailable"
+                            if thinking_fail_closed
+                            else "router_dynamic_ranking_unavailable"
+                        ),
                         error=exc,
                     )
+                    if thinking_fail_closed:
+                        turn.metadata["router_dynamic_ranking_error"] = str(exc)
+                        turn.metadata[
+                            "router_dynamic_thinking_assignment_error"
+                        ] = str(exc)
+                        raise
                     log.warning(
                         "llm_ensemble.wrap_skipped",
                         reason="router_dynamic_ranking_unavailable",
@@ -6342,7 +6424,7 @@ class TurnRunner:
                     )
                     if selection_mode == "router_dynamic":
                         turn.metadata["router_dynamic_pending_route_plan"] = plan
-                        turn.metadata["router_dynamic_decision"] = {
+                        router_dynamic_decision = {
                             "decision_id": ensemble_decision_id,
                             "ranking_version": plan.get("ranking_version"),
                             "registry_snapshot_version": plan.get(
@@ -6356,6 +6438,43 @@ class TurnRunner:
                             "effective_tier": plan.get("effective_tier"),
                             "session": dict(plan.get("session") or {}),
                         }
+                        if isinstance(plan.get("thinking_assignment"), Mapping):
+                            router_dynamic_decision.update(
+                                {
+                                    "thinking_assignment": copy.deepcopy(
+                                        dict(plan["thinking_assignment"])
+                                    ),
+                                    "executed_thinking_assignment": (
+                                        copy.deepcopy(
+                                            dict(plan["executed_thinking_assignment"])
+                                        )
+                                        if isinstance(
+                                            plan.get(
+                                                "executed_thinking_assignment"
+                                            ),
+                                            Mapping,
+                                        )
+                                        else None
+                                    ),
+                                    "assignment_reasons": copy.deepcopy(
+                                        plan.get("assignment_reasons")
+                                    ),
+                                    "unsupported_level_fallbacks": copy.deepcopy(
+                                        list(
+                                            plan.get(
+                                                "unsupported_level_fallbacks"
+                                            )
+                                            or []
+                                        )
+                                    ),
+                                    "policy_versions": copy.deepcopy(
+                                        dict(plan.get("policy_versions") or {})
+                                    ),
+                                }
+                            )
+                        turn.metadata["router_dynamic_decision"] = (
+                            router_dynamic_decision
+                        )
                     elif selection_mode == TREE_BASELINE_SELECTION_MODE:
                         turn.metadata["router_tree_baseline_decision"] = {
                             "decision_id": ensemble_decision_id,

@@ -332,18 +332,26 @@ def validate_g1_registry_contract(
     if contract is None:
         raise ValueError("G1 requires a versioned g1_routing experiment contract")
     from opensquilla.provider.ranking_router import (
+        _legacy_registry_snapshot_projection,
         load_model_registry_snapshot,
         ranking_config_snapshot,
     )
 
     snapshot = load_model_registry_snapshot()
+    thinking_assignment_enabled = bool(
+        config.llm_ensemble.ranking_thinking_assignment_enabled
+    )
+    if not thinking_assignment_enabled:
+        snapshot = _legacy_registry_snapshot_projection(snapshot)
     actual_version = str(snapshot.get("snapshot_version") or "").strip()
     if actual_version != contract.source_registry_snapshot_version:
         raise ValueError("G1 registry snapshot version differs from the experiment contract")
     actual_registry_hash = canonical_json_sha256(snapshot).removeprefix("sha256:")
     if actual_registry_hash != contract.expected_source_registry_snapshot_sha256:
         raise ValueError("G1 registry snapshot content differs from the experiment contract")
-    ranking_config = ranking_config_snapshot()
+    ranking_config = ranking_config_snapshot(
+        thinking_assignment_enabled=thinking_assignment_enabled,
+    )
     actual_ranking_schema = str(ranking_config.get("schema_version") or "").strip()
     actual_ranking_version = str(ranking_config.get("config_version") or "").strip()
     actual_ranking_hash = canonical_json_sha256(ranking_config).removeprefix("sha256:")
@@ -3014,7 +3022,11 @@ async def build_experiment_provider(
                 ranking_config_snapshot,
             )
 
-            ranking_config = ranking_config_snapshot()
+            ranking_config = ranking_config_snapshot(
+                thinking_assignment_enabled=bool(
+                    config.llm_ensemble.ranking_thinking_assignment_enabled
+                ),
+            )
             dry_config = config.model_copy(deep=True)
             dry_ensemble = dry_config.llm_ensemble
             dry_ensemble.enabled = True
@@ -3219,7 +3231,11 @@ async def build_experiment_provider(
             ranking_config_snapshot,
         )
 
-        ranking_config = ranking_config_snapshot()
+        ranking_config = ranking_config_snapshot(
+            thinking_assignment_enabled=bool(
+                group_config.llm_ensemble.ranking_thinking_assignment_enabled
+            ),
+        )
         routing_extra = turn.metadata.get("routing_extra")
         routing_extra_map = routing_extra if isinstance(routing_extra, Mapping) else {}
         routed_tier = str(

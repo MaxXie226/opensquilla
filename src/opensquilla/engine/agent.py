@@ -763,8 +763,8 @@ def _with_model_usage_cost_fields(rows: list[dict[str, Any]]) -> list[dict[str, 
 
 
 def _summarize_model_usage_breakdown(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    aggregated: dict[tuple[str, str, str, str, str, str], dict[str, Any]] = {}
-    sources_by_key: dict[tuple[str, str, str, str, str, str], list[str]] = {}
+    aggregated: dict[tuple[str, ...], dict[str, Any]] = {}
+    sources_by_key: dict[tuple[str, ...], list[str]] = {}
     for row in _with_model_usage_cost_fields(rows):
         model_id = str(row.get("model") or "").strip()
         requested_model = str(row.get("requested_model") or "").strip()
@@ -774,6 +774,31 @@ def _summarize_model_usage_breakdown(rows: list[dict[str, Any]]) -> list[dict[st
         label = str(row.get("label") or role).strip() or role
         provider = str(row.get("provider") or "").strip()
         requested_provider = str(row.get("requested_provider") or "").strip()
+        requested_thinking_level = str(
+            row.get("requested_thinking_level") or ""
+        ).strip()
+        effective_thinking_level = str(
+            row.get("effective_thinking_level") or ""
+        ).strip()
+        provider_thinking_level = str(
+            row.get("provider_thinking_level") or ""
+        ).strip()
+        thinking_fallback_reason = str(
+            row.get("thinking_fallback_reason") or ""
+        ).strip()
+        thinking_policy_version = str(
+            row.get("thinking_policy_version") or ""
+        ).strip()
+        thinking_policy_managed = any(
+            field_name in row
+            for field_name in (
+                "requested_thinking_level",
+                "effective_thinking_level",
+                "provider_thinking_level",
+                "thinking_fallback_reason",
+                "thinking_policy_version",
+            )
+        )
         key = (
             role,
             label,
@@ -781,6 +806,12 @@ def _summarize_model_usage_breakdown(rows: list[dict[str, Any]]) -> list[dict[st
             model_id,
             requested_provider,
             requested_model,
+            "managed" if thinking_policy_managed else "legacy",
+            requested_thinking_level,
+            effective_thinking_level,
+            provider_thinking_level,
+            thinking_fallback_reason,
+            thinking_policy_version,
         )
         if key not in aggregated:
             aggregated[key] = {
@@ -803,6 +834,26 @@ def _summarize_model_usage_breakdown(rows: list[dict[str, Any]]) -> list[dict[st
                 "estimated_cost_usd": 0.0,
                 "request_count": 0,
             }
+            if thinking_policy_managed:
+                aggregated[key].update(
+                    {
+                        "requested_thinking_level": (
+                            requested_thinking_level or None
+                        ),
+                        "effective_thinking_level": (
+                            effective_thinking_level or None
+                        ),
+                        "provider_thinking_level": (
+                            provider_thinking_level or None
+                        ),
+                        "thinking_fallback_reason": (
+                            thinking_fallback_reason or None
+                        ),
+                        "thinking_policy_version": (
+                            thinking_policy_version or None
+                        ),
+                    }
+                )
             sources_by_key[key] = []
         target = aggregated[key]
         for usage_field in (
@@ -4630,6 +4681,25 @@ class Agent:
         )
         _thinking_fallback_done = False
         _disable_thinking_for_next_provider_call = False
+
+        def _provider_allows_failed_call_retry() -> bool:
+            return (
+                getattr(self.provider, "retry_failed_call_safe", True)
+                is not False
+            )
+
+        def _provider_allows_thinking_disable_retry() -> bool:
+            return bool(
+                _provider_allows_failed_call_retry()
+                and not bool(
+                    getattr(
+                        self.provider,
+                        "enforces_routed_thinking_policy",
+                        False,
+                    )
+                )
+            )
+
         _reasoning_stream_char_cap = max(
             0, int(getattr(self.config, "reasoning_stream_char_cap", 0) or 0)
         )
@@ -5233,6 +5303,7 @@ class Agent:
                 if (
                     thinking_off_margin_seconds > 0
                     and _total_deadline is not None
+                    and _provider_allows_thinking_disable_retry()
                     and not deadline_thinking_off_armed
                     and _loop.time() > _total_deadline - thinking_off_margin_seconds
                 ):
@@ -5950,6 +6021,7 @@ class Agent:
                                         and not attempt_user_visible_emitted
                                         and not pending_tools
                                         and not tool_calls
+                                        and _provider_allows_thinking_disable_retry()
                                         # Thinking already off for this call:
                                         # a retry sans thinking changes
                                         # nothing, so let the stream run.
@@ -6855,6 +6927,7 @@ class Agent:
                                 if (
                                     thinking_enabled
                                     and not _thinking_fallback_done
+                                    and _provider_allows_thinking_disable_retry()
                                     and ("thinking" in _err_lower or "reasoning" in _err_lower)
                                 ):
                                     _thinking_fallback_done = True
@@ -7318,7 +7391,11 @@ class Agent:
                                 input_tokens=iter_input_tokens,
                                 output_tokens=iter_output_tokens,
                             )
-                            if reasoning_prefill.action == "prefill" and iter_reasoning_content:
+                            if (
+                                reasoning_prefill.action == "prefill"
+                                and iter_reasoning_content
+                                and _provider_allows_failed_call_retry()
+                            ):
                                 turn_messages.append(
                                     _build_reasoning_prefill_message(
                                         reasoning_content=iter_reasoning_content,
@@ -7387,6 +7464,7 @@ class Agent:
                             if (
                                 reasoning_continuation.action == "nudge"
                                 and reasoning_continuation.message
+                                and _provider_allows_failed_call_retry()
                             ):
                                 turn_messages.append(
                                     Message(
@@ -7456,7 +7534,11 @@ class Agent:
                                 input_tokens=iter_input_tokens,
                                 output_tokens=iter_output_tokens,
                             )
-                            if post_tool_empty.action == "nudge" and post_tool_empty.message:
+                            if (
+                                post_tool_empty.action == "nudge"
+                                and post_tool_empty.message
+                                and _provider_allows_failed_call_retry()
+                            ):
                                 turn_messages.append(
                                     Message(
                                         role="assistant",
@@ -7509,6 +7591,7 @@ class Agent:
                             if (
                                 attempt_classification.kind == _ProviderAttemptKind.REASONING_ONLY
                                 and thinking_enabled
+                                and _provider_allows_thinking_disable_retry()
                                 and _retry_policy.can_retry_attempt(
                                     _ProviderAttemptKind.REASONING_ONLY,
                                     _attempt_retries_used,
@@ -7563,6 +7646,7 @@ class Agent:
                         if (
                             attempt_classification.kind == _ProviderAttemptKind.REASONING_ONLY
                             and thinking_enabled
+                            and _provider_allows_thinking_disable_retry()
                             and _retry_policy.can_retry_attempt(
                                 _ProviderAttemptKind.REASONING_ONLY,
                                 _attempt_retries_used,
@@ -7592,6 +7676,7 @@ class Agent:
 
                         if (
                             attempt_classification.kind == _ProviderAttemptKind.MALFORMED_EMPTY
+                            and _provider_allows_failed_call_retry()
                             and _retry_policy.can_retry_attempt(
                                 _ProviderAttemptKind.MALFORMED_EMPTY,
                                 _attempt_retries_used,
@@ -7628,6 +7713,7 @@ class Agent:
                         if (
                             attempt_classification.kind == _ProviderAttemptKind.STREAM_INCOMPLETE
                             and not attempt_classification.user_visible_emitted
+                            and _provider_allows_failed_call_retry()
                             and _retry_policy.can_retry_attempt(
                                 _ProviderAttemptKind.STREAM_INCOMPLETE,
                                 _attempt_retries_used,

@@ -240,6 +240,7 @@ def test_setup_engine_applies_ensemble_with_keep_current_semantics(tmp_path):
             "selectionMode": "router_dynamic",
             "rankingUserProfileGenerationEnabled": True,
             "rankingUserProfileEnabled": False,
+            "rankingThinkingAssignmentEnabled": True,
             "modelOptions": ["prov/model-a", "prov/model-b"],
             "minSuccessfulProposers": 2,
             "allFailedPolicy": "error",
@@ -253,6 +254,7 @@ def test_setup_engine_applies_ensemble_with_keep_current_semantics(tmp_path):
     assert ensemble["selection_mode"] == "router_dynamic"
     assert ensemble["ranking_user_profile_generation_enabled"] is True
     assert ensemble["ranking_user_profile_enabled"] is False
+    assert ensemble["ranking_thinking_assignment_enabled"] is True
     assert ensemble["model_options"] == ["prov/model-a", "prov/model-b"]
     assert ensemble["min_successful_proposers"] == 2
     assert ensemble["all_failed_policy"] == "error"
@@ -268,6 +270,7 @@ def test_setup_engine_applies_ensemble_with_keep_current_semantics(tmp_path):
     assert ensemble["selection_mode"] == "router_dynamic"
     assert ensemble["ranking_user_profile_generation_enabled"] is True
     assert ensemble["ranking_user_profile_enabled"] is False
+    assert ensemble["ranking_thinking_assignment_enabled"] is True
     assert ensemble["model_options"] == ["prov/model-a", "prov/model-b"]
     assert ensemble["min_successful_proposers"] == 2
     assert ensemble["all_failed_policy"] == "error"
@@ -276,6 +279,32 @@ def test_setup_engine_applies_ensemble_with_keep_current_semantics(tmp_path):
         SetupEngine(path=target).apply("ensemble", {"modelOptions": "not-a-list"})
     with pytest.raises(ValueError, match="enabled must be a boolean"):
         SetupEngine(path=target).apply("ensemble", {"enabled": "false"})
+    with pytest.raises(
+        ValueError,
+        match="rankingThinkingAssignmentEnabled must be a boolean",
+    ):
+        SetupEngine(path=target).apply(
+            "ensemble",
+            {"rankingThinkingAssignmentEnabled": "false"},
+        )
+
+
+def test_setup_engine_persists_explicit_false_thinking_assignment(tmp_path):
+    target = tmp_path / "config.toml"
+    engine = SetupEngine(path=target)
+
+    engine.apply(
+        "ensemble",
+        {"rankingThinkingAssignmentEnabled": False},
+    )
+    engine.persist()
+
+    ensemble = tomllib.loads(target.read_text())["llm_ensemble"]
+    assert ensemble["ranking_thinking_assignment_enabled"] is False
+    assert (
+        load_config(target).llm_ensemble.ranking_thinking_assignment_enabled
+        is False
+    )
 
 
 def test_setup_engine_accepts_ensemble_section_aliases(tmp_path):

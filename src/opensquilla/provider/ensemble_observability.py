@@ -48,6 +48,8 @@ def _candidate_fields(candidate: Mapping[str, Any]) -> dict[str, Any]:
             "cost_latency_prior",
             "architecture",
             "profile_hash",
+            "thinking_levels",
+            "thinking_level_mapping",
         )
         if key in candidate
     }
@@ -229,6 +231,22 @@ def log_ensemble_decision_steps(
                 "llm_ensemble.routing.session_adjustment_recorded",
                 session=dict(session),
             )
+            if isinstance(plan.get("thinking_assignment"), Mapping):
+                emit(
+                    "llm_ensemble.routing.thinking_assignment_recorded",
+                    thinking_assignment=dict(
+                        _mapping(plan.get("thinking_assignment"))
+                    ),
+                    assignment_reasons=(
+                        dict(_mapping(plan.get("assignment_reasons")))
+                        if isinstance(plan.get("assignment_reasons"), Mapping)
+                        else list(plan.get("assignment_reasons") or [])
+                    ),
+                    unsupported_level_fallbacks=list(
+                        plan.get("unsupported_level_fallbacks") or []
+                    ),
+                    policy_versions=dict(_mapping(plan.get("policy_versions"))),
+                )
         candidate_pool = _rows(plan.get("candidate_pool"))
         for index, candidate in enumerate(candidate_pool):
             emit(
@@ -305,32 +323,67 @@ def log_ensemble_decision_steps(
             selected_A=selected_a,
             result=aggregator_detail,
         )
-        emit(
-            "llm_ensemble.routing.decision_completed",
-            strategy=strategy,
-            routed_tier=plan.get("routed_tier"),
-            effective_tier=plan.get("effective_tier"),
-            routing_confidence=plan.get("routing_confidence"),
-            user_profile_enabled=plan.get("user_profile_enabled"),
+        completed_fields: dict[str, Any] = {
+            "strategy": strategy,
+            "routed_tier": plan.get("routed_tier"),
+            "effective_tier": plan.get("effective_tier"),
+            "routing_confidence": plan.get("routing_confidence"),
+            "user_profile_enabled": plan.get("user_profile_enabled"),
             # Which profile, not just whether one was on: a learned profile
             # changes with every thumb, so the enabled bit alone cannot
             # explain a decision after the fact. Both are safe to log — a
             # content hash and an enum.
-            user_profile_version=plan.get("user_profile_version"),
-            user_profile_source=plan.get("user_profile_source"),
-            selected_P=selected_p,
-            selected_A=selected_a,
-            proposer_count=len(selected_p),
-            stop_reason=plan.get("stop_reason"),
-            coverage_shortfall=plan.get("coverage_shortfall"),
-            ranking_version=plan.get("ranking_version"),
-            algorithm_version=plan.get("algorithm_version"),
-            config_version=plan.get("ranking_config_version") or plan.get("config_version"),
-            config_hash=plan.get("ranking_config_hash") or plan.get("config_hash"),
-            effective_min_successful_proposers=plan.get("effective_min_successful_proposers"),
-            effective_proposer_timeout_seconds=plan.get("effective_proposer_timeout_seconds"),
-            effective_aggregator_timeout_seconds=plan.get("effective_aggregator_timeout_seconds"),
-            effective_shuffle_candidates=plan.get("effective_shuffle_candidates"),
+            "user_profile_version": plan.get("user_profile_version"),
+            "user_profile_source": plan.get("user_profile_source"),
+            "selected_P": selected_p,
+            "selected_A": selected_a,
+            "proposer_count": len(selected_p),
+            "stop_reason": plan.get("stop_reason"),
+            "coverage_shortfall": plan.get("coverage_shortfall"),
+            "ranking_version": plan.get("ranking_version"),
+            "algorithm_version": plan.get("algorithm_version"),
+            "config_version": (
+                plan.get("ranking_config_version")
+                or plan.get("config_version")
+            ),
+            "config_hash": (
+                plan.get("ranking_config_hash") or plan.get("config_hash")
+            ),
+            "effective_min_successful_proposers": plan.get(
+                "effective_min_successful_proposers"
+            ),
+            "effective_proposer_timeout_seconds": plan.get(
+                "effective_proposer_timeout_seconds"
+            ),
+            "effective_aggregator_timeout_seconds": plan.get(
+                "effective_aggregator_timeout_seconds"
+            ),
+            "effective_shuffle_candidates": plan.get(
+                "effective_shuffle_candidates"
+            ),
+        }
+        if isinstance(plan.get("thinking_assignment"), Mapping):
+            completed_fields.update(
+                {
+                    "thinking_assignment": dict(
+                        _mapping(plan.get("thinking_assignment"))
+                    ),
+                    "assignment_reasons": (
+                        dict(_mapping(plan.get("assignment_reasons")))
+                        if isinstance(plan.get("assignment_reasons"), Mapping)
+                        else list(plan.get("assignment_reasons") or [])
+                    ),
+                    "unsupported_level_fallbacks": list(
+                        plan.get("unsupported_level_fallbacks") or []
+                    ),
+                    "policy_versions": dict(
+                        _mapping(plan.get("policy_versions"))
+                    ),
+                }
+            )
+        emit(
+            "llm_ensemble.routing.decision_completed",
+            **completed_fields,
         )
     except Exception:  # noqa: BLE001 - observability must never break routing
         _log_observability_failure(

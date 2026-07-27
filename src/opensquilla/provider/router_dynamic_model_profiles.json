@@ -1,6 +1,6 @@
 {
-  "schema_version": "step2-model-registry-v1",
-  "snapshot_version": "curated-openrouter-step2-2026-07-24.3",
+  "schema_version": "step2-model-registry-v2",
+  "snapshot_version": "curated-openrouter-step2-2026-07-27.1",
   "models": [
     {
       "source": "curated_openrouter_profile",
@@ -47,7 +47,15 @@
           "xhigh",
           "high",
           "off"
-        ]
+        ],
+        "thinking_levels": [
+          "high",
+          "highest"
+        ],
+        "thinking_level_mapping": {
+          "high": "high",
+          "highest": "xhigh"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -149,7 +157,15 @@
           "xhigh",
           "high",
           "off"
-        ]
+        ],
+        "thinking_levels": [
+          "high",
+          "highest"
+        ],
+        "thinking_level_mapping": {
+          "high": "high",
+          "highest": "xhigh"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -259,7 +275,17 @@
           "low",
           "minimal",
           "off"
-        ]
+        ],
+        "thinking_levels": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "thinking_level_mapping": {
+          "low": "low",
+          "medium": "medium",
+          "high": "high"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -363,7 +389,15 @@
           "xhigh",
           "high",
           "off"
-        ]
+        ],
+        "thinking_levels": [
+          "high",
+          "highest"
+        ],
+        "thinking_level_mapping": {
+          "high": "high",
+          "highest": "xhigh"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -466,7 +500,13 @@
         "supported_thinking_levels": [
           "high",
           "off"
-        ]
+        ],
+        "thinking_levels": [
+          "high"
+        ],
+        "thinking_level_mapping": {
+          "high": "high"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -569,7 +609,13 @@
         "supports_tools": true,
         "supported_thinking_levels": [
           "high"
-        ]
+        ],
+        "thinking_levels": [
+          "high"
+        ],
+        "thinking_level_mapping": {
+          "high": "high"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -672,7 +718,13 @@
         "supported_thinking_levels": [
           "high",
           "off"
-        ]
+        ],
+        "thinking_levels": [
+          "high"
+        ],
+        "thinking_level_mapping": {
+          "high": "high"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -781,7 +833,19 @@
           "medium",
           "low",
           "off"
-        ]
+        ],
+        "thinking_levels": [
+          "low",
+          "medium",
+          "high",
+          "highest"
+        ],
+        "thinking_level_mapping": {
+          "low": "low",
+          "medium": "medium",
+          "high": "high",
+          "highest": "max"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -889,7 +953,19 @@
           "medium",
           "low",
           "off"
-        ]
+        ],
+        "thinking_levels": [
+          "low",
+          "medium",
+          "high",
+          "highest"
+        ],
+        "thinking_level_mapping": {
+          "low": "low",
+          "medium": "medium",
+          "high": "high",
+          "highest": "xhigh"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -990,7 +1066,13 @@
         "supported_thinking_levels": [
           "high",
           "off"
-        ]
+        ],
+        "thinking_levels": [
+          "high"
+        ],
+        "thinking_level_mapping": {
+          "high": "high"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -1093,7 +1175,15 @@
           "high",
           "low",
           "off"
-        ]
+        ],
+        "thinking_levels": [
+          "low",
+          "high"
+        ],
+        "thinking_level_mapping": {
+          "low": "low",
+          "high": "high"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -1193,7 +1283,9 @@
         "supports_tools": true,
         "supported_thinking_levels": [
           "off"
-        ]
+        ],
+        "thinking_levels": [],
+        "thinking_level_mapping": {}
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -1295,7 +1387,9 @@
         "supports_tools": true,
         "supported_thinking_levels": [
           "off"
-        ]
+        ],
+        "thinking_levels": [],
+        "thinking_level_mapping": {}
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -1395,7 +1489,9 @@
         "supports_tools": true,
         "supported_thinking_levels": [
           "off"
-        ]
+        ],
+        "thinking_levels": [],
+        "thinking_level_mapping": {}
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -1500,7 +1596,13 @@
         "supported_thinking_levels": [
           "high",
           "off"
-        ]
+        ],
+        "thinking_levels": [
+          "high"
+        ],
+        "thinking_level_mapping": {
+          "high": "high"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -1605,7 +1707,13 @@
         "supported_thinking_levels": [
           "high",
           "off"
-        ]
+        ],
+        "thinking_levels": [
+          "high"
+        ],
+        "thinking_level_mapping": {
+          "high": "high"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -1714,7 +1822,19 @@
           "medium",
           "low",
           "off"
-        ]
+        ],
+        "thinking_levels": [
+          "low",
+          "medium",
+          "high",
+          "highest"
+        ],
+        "thinking_level_mapping": {
+          "low": "low",
+          "medium": "medium",
+          "high": "high",
+          "highest": "max"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -1823,7 +1943,19 @@
           "medium",
           "low",
           "off"
-        ]
+        ],
+        "thinking_levels": [
+          "low",
+          "medium",
+          "high",
+          "highest"
+        ],
+        "thinking_level_mapping": {
+          "low": "low",
+          "medium": "medium",
+          "high": "high",
+          "highest": "max"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -1929,7 +2061,17 @@
           "high",
           "medium",
           "low"
-        ]
+        ],
+        "thinking_levels": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "thinking_level_mapping": {
+          "low": "low",
+          "medium": "medium",
+          "high": "high"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -2037,7 +2179,17 @@
           "high",
           "medium",
           "low"
-        ]
+        ],
+        "thinking_levels": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "thinking_level_mapping": {
+          "low": "low",
+          "medium": "medium",
+          "high": "high"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -2146,7 +2298,17 @@
           "medium",
           "low",
           "minimal"
-        ]
+        ],
+        "thinking_levels": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "thinking_level_mapping": {
+          "low": "low",
+          "medium": "medium",
+          "high": "high"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -2255,7 +2417,17 @@
           "medium",
           "low",
           "minimal"
-        ]
+        ],
+        "thinking_levels": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "thinking_level_mapping": {
+          "low": "low",
+          "medium": "medium",
+          "high": "high"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -2364,7 +2536,19 @@
           "medium",
           "low",
           "off"
-        ]
+        ],
+        "thinking_levels": [
+          "low",
+          "medium",
+          "high",
+          "highest"
+        ],
+        "thinking_level_mapping": {
+          "low": "low",
+          "medium": "medium",
+          "high": "high",
+          "highest": "max"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -2473,7 +2657,19 @@
           "medium",
           "low",
           "off"
-        ]
+        ],
+        "thinking_levels": [
+          "low",
+          "medium",
+          "high",
+          "highest"
+        ],
+        "thinking_level_mapping": {
+          "low": "low",
+          "medium": "medium",
+          "high": "high",
+          "highest": "max"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -2581,7 +2777,19 @@
           "high",
           "medium",
           "low"
-        ]
+        ],
+        "thinking_levels": [
+          "low",
+          "medium",
+          "high",
+          "highest"
+        ],
+        "thinking_level_mapping": {
+          "low": "low",
+          "medium": "medium",
+          "high": "high",
+          "highest": "max"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -2686,7 +2894,13 @@
         "supported_thinking_levels": [
           "high",
           "off"
-        ]
+        ],
+        "thinking_levels": [
+          "high"
+        ],
+        "thinking_level_mapping": {
+          "high": "high"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -2796,7 +3010,19 @@
           "medium",
           "low",
           "minimal"
-        ]
+        ],
+        "thinking_levels": [
+          "low",
+          "medium",
+          "high",
+          "highest"
+        ],
+        "thinking_level_mapping": {
+          "low": "low",
+          "medium": "medium",
+          "high": "high",
+          "highest": "xhigh"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -2901,7 +3127,13 @@
         "supported_thinking_levels": [
           "high",
           "off"
-        ]
+        ],
+        "thinking_levels": [
+          "high"
+        ],
+        "thinking_level_mapping": {
+          "high": "high"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -3007,7 +3239,13 @@
         "supported_thinking_levels": [
           "high",
           "off"
-        ]
+        ],
+        "thinking_levels": [
+          "high"
+        ],
+        "thinking_level_mapping": {
+          "high": "high"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -3113,7 +3351,19 @@
           "medium",
           "low",
           "off"
-        ]
+        ],
+        "thinking_levels": [
+          "low",
+          "medium",
+          "high",
+          "highest"
+        ],
+        "thinking_level_mapping": {
+          "low": "low",
+          "medium": "medium",
+          "high": "high",
+          "highest": "xhigh"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -3219,7 +3469,17 @@
           "high",
           "low",
           "off"
-        ]
+        ],
+        "thinking_levels": [
+          "low",
+          "high",
+          "highest"
+        ],
+        "thinking_level_mapping": {
+          "low": "low",
+          "high": "high",
+          "highest": "max"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -3322,7 +3582,13 @@
         "supported_thinking_levels": [
           "high",
           "off"
-        ]
+        ],
+        "thinking_levels": [
+          "high"
+        ],
+        "thinking_level_mapping": {
+          "high": "high"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -3428,7 +3694,17 @@
           "high",
           "medium",
           "low"
-        ]
+        ],
+        "thinking_levels": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "thinking_level_mapping": {
+          "low": "low",
+          "medium": "medium",
+          "high": "high"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -3531,7 +3807,13 @@
         "supported_thinking_levels": [
           "high",
           "off"
-        ]
+        ],
+        "thinking_levels": [
+          "high"
+        ],
+        "thinking_level_mapping": {
+          "high": "high"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -3636,7 +3918,13 @@
         "supported_thinking_levels": [
           "high",
           "off"
-        ]
+        ],
+        "thinking_levels": [
+          "high"
+        ],
+        "thinking_level_mapping": {
+          "high": "high"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -3736,7 +4024,9 @@
         "supports_tools": true,
         "supported_thinking_levels": [
           "off"
-        ]
+        ],
+        "thinking_levels": [],
+        "thinking_level_mapping": {}
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -3839,7 +4129,13 @@
         "supported_thinking_levels": [
           "high",
           "off"
-        ]
+        ],
+        "thinking_levels": [
+          "high"
+        ],
+        "thinking_level_mapping": {
+          "high": "high"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -3942,7 +4238,15 @@
         "supported_thinking_levels": [
           "xhigh",
           "high"
-        ]
+        ],
+        "thinking_levels": [
+          "high",
+          "highest"
+        ],
+        "thinking_level_mapping": {
+          "high": "high",
+          "highest": "xhigh"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -4045,7 +4349,13 @@
         "supported_thinking_levels": [
           "high",
           "off"
-        ]
+        ],
+        "thinking_levels": [
+          "high"
+        ],
+        "thinking_level_mapping": {
+          "high": "high"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -4149,7 +4459,13 @@
         "supported_thinking_levels": [
           "high",
           "off"
-        ]
+        ],
+        "thinking_levels": [
+          "high"
+        ],
+        "thinking_level_mapping": {
+          "high": "high"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -4253,7 +4569,15 @@
           "high",
           "medium",
           "off"
-        ]
+        ],
+        "thinking_levels": [
+          "medium",
+          "high"
+        ],
+        "thinking_level_mapping": {
+          "medium": "medium",
+          "high": "high"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -4357,7 +4681,15 @@
           "medium",
           "low",
           "off"
-        ]
+        ],
+        "thinking_levels": [
+          "low",
+          "medium"
+        ],
+        "thinking_level_mapping": {
+          "low": "low",
+          "medium": "medium"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -4459,7 +4791,9 @@
         "supports_tools": true,
         "supported_thinking_levels": [
           "off"
-        ]
+        ],
+        "thinking_levels": [],
+        "thinking_level_mapping": {}
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -4564,7 +4898,13 @@
         "supported_thinking_levels": [
           "high",
           "off"
-        ]
+        ],
+        "thinking_levels": [
+          "high"
+        ],
+        "thinking_level_mapping": {
+          "high": "high"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -4668,7 +5008,13 @@
         "supported_thinking_levels": [
           "high",
           "off"
-        ]
+        ],
+        "thinking_levels": [
+          "high"
+        ],
+        "thinking_level_mapping": {
+          "high": "high"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -4772,7 +5118,9 @@
         "supports_tools": true,
         "supported_thinking_levels": [
           "off"
-        ]
+        ],
+        "thinking_levels": [],
+        "thinking_level_mapping": {}
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -4873,7 +5221,13 @@
         "supported_thinking_levels": [
           "high",
           "off"
-        ]
+        ],
+        "thinking_levels": [
+          "high"
+        ],
+        "thinking_level_mapping": {
+          "high": "high"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -4977,7 +5331,17 @@
           "high",
           "medium",
           "low"
-        ]
+        ],
+        "thinking_levels": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "thinking_level_mapping": {
+          "low": "low",
+          "medium": "medium",
+          "high": "high"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -5080,7 +5444,9 @@
         "supports_tools": true,
         "supported_thinking_levels": [
           "off"
-        ]
+        ],
+        "thinking_levels": [],
+        "thinking_level_mapping": {}
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -5189,7 +5555,19 @@
           "low",
           "minimal",
           "off"
-        ]
+        ],
+        "thinking_levels": [
+          "low",
+          "medium",
+          "high",
+          "highest"
+        ],
+        "thinking_level_mapping": {
+          "low": "low",
+          "medium": "medium",
+          "high": "high",
+          "highest": "max"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -5294,7 +5672,13 @@
         "supported_thinking_levels": [
           "high",
           "off"
-        ]
+        ],
+        "thinking_levels": [
+          "high"
+        ],
+        "thinking_level_mapping": {
+          "high": "high"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -5399,7 +5783,13 @@
         "supported_thinking_levels": [
           "high",
           "off"
-        ]
+        ],
+        "thinking_levels": [
+          "high"
+        ],
+        "thinking_level_mapping": {
+          "high": "high"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -5504,7 +5894,13 @@
         "supported_thinking_levels": [
           "high",
           "off"
-        ]
+        ],
+        "thinking_levels": [
+          "high"
+        ],
+        "thinking_level_mapping": {
+          "high": "high"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -5607,7 +6003,13 @@
         "supports_tools": true,
         "supported_thinking_levels": [
           "high"
-        ]
+        ],
+        "thinking_levels": [
+          "high"
+        ],
+        "thinking_level_mapping": {
+          "high": "high"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -5707,7 +6109,9 @@
         "supports_tools": true,
         "supported_thinking_levels": [
           "off"
-        ]
+        ],
+        "thinking_levels": [],
+        "thinking_level_mapping": {}
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -5809,7 +6213,13 @@
         "supports_tools": true,
         "supported_thinking_levels": [
           "high"
-        ]
+        ],
+        "thinking_levels": [
+          "high"
+        ],
+        "thinking_level_mapping": {
+          "high": "high"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -5912,7 +6322,13 @@
         "supported_thinking_levels": [
           "high",
           "off"
-        ]
+        ],
+        "thinking_levels": [
+          "high"
+        ],
+        "thinking_level_mapping": {
+          "high": "high"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -6014,7 +6430,13 @@
         "supports_tools": true,
         "supported_thinking_levels": [
           "high"
-        ]
+        ],
+        "thinking_levels": [
+          "high"
+        ],
+        "thinking_level_mapping": {
+          "high": "high"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -6117,7 +6539,13 @@
         "supported_thinking_levels": [
           "high",
           "off"
-        ]
+        ],
+        "thinking_levels": [
+          "high"
+        ],
+        "thinking_level_mapping": {
+          "high": "high"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -6220,7 +6648,13 @@
         "supported_thinking_levels": [
           "high",
           "off"
-        ]
+        ],
+        "thinking_levels": [
+          "high"
+        ],
+        "thinking_level_mapping": {
+          "high": "high"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -6325,7 +6759,13 @@
         "supported_thinking_levels": [
           "high",
           "off"
-        ]
+        ],
+        "thinking_levels": [
+          "high"
+        ],
+        "thinking_level_mapping": {
+          "high": "high"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -6429,7 +6869,13 @@
         "supported_thinking_levels": [
           "high",
           "off"
-        ]
+        ],
+        "thinking_levels": [
+          "high"
+        ],
+        "thinking_level_mapping": {
+          "high": "high"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -6531,7 +6977,13 @@
         "supports_tools": true,
         "supported_thinking_levels": [
           "high"
-        ]
+        ],
+        "thinking_levels": [
+          "high"
+        ],
+        "thinking_level_mapping": {
+          "high": "high"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -6633,7 +7085,13 @@
         "supports_tools": true,
         "supported_thinking_levels": [
           "high"
-        ]
+        ],
+        "thinking_levels": [
+          "high"
+        ],
+        "thinking_level_mapping": {
+          "high": "high"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -6739,7 +7197,13 @@
         "supported_thinking_levels": [
           "high",
           "off"
-        ]
+        ],
+        "thinking_levels": [
+          "high"
+        ],
+        "thinking_level_mapping": {
+          "high": "high"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -6841,7 +7305,13 @@
         "supports_tools": true,
         "supported_thinking_levels": [
           "high"
-        ]
+        ],
+        "thinking_levels": [
+          "high"
+        ],
+        "thinking_level_mapping": {
+          "high": "high"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -6945,7 +7415,15 @@
           "high",
           "low",
           "off"
-        ]
+        ],
+        "thinking_levels": [
+          "low",
+          "high"
+        ],
+        "thinking_level_mapping": {
+          "low": "low",
+          "high": "high"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -7048,7 +7526,9 @@
         "supports_tools": true,
         "supported_thinking_levels": [
           "off"
-        ]
+        ],
+        "thinking_levels": [],
+        "thinking_level_mapping": {}
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -7156,7 +7636,17 @@
           "low",
           "minimal",
           "off"
-        ]
+        ],
+        "thinking_levels": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "thinking_level_mapping": {
+          "low": "low",
+          "medium": "medium",
+          "high": "high"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -7258,7 +7748,9 @@
         "supports_tools": true,
         "supported_thinking_levels": [
           "off"
-        ]
+        ],
+        "thinking_levels": [],
+        "thinking_level_mapping": {}
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -7362,7 +7854,13 @@
         "supported_thinking_levels": [
           "high",
           "off"
-        ]
+        ],
+        "thinking_levels": [
+          "high"
+        ],
+        "thinking_level_mapping": {
+          "high": "high"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -7464,7 +7962,13 @@
         "supports_tools": true,
         "supported_thinking_levels": [
           "high"
-        ]
+        ],
+        "thinking_levels": [
+          "high"
+        ],
+        "thinking_level_mapping": {
+          "high": "high"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -7565,7 +8069,9 @@
         "supports_tools": true,
         "supported_thinking_levels": [
           "off"
-        ]
+        ],
+        "thinking_levels": [],
+        "thinking_level_mapping": {}
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -7668,7 +8174,9 @@
         "supports_tools": true,
         "supported_thinking_levels": [
           "off"
-        ]
+        ],
+        "thinking_levels": [],
+        "thinking_level_mapping": {}
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -7773,7 +8281,13 @@
         "supported_thinking_levels": [
           "high",
           "off"
-        ]
+        ],
+        "thinking_levels": [
+          "high"
+        ],
+        "thinking_level_mapping": {
+          "high": "high"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -7876,7 +8390,13 @@
         "supported_thinking_levels": [
           "high",
           "off"
-        ]
+        ],
+        "thinking_levels": [
+          "high"
+        ],
+        "thinking_level_mapping": {
+          "high": "high"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -7980,7 +8500,17 @@
           "high",
           "medium",
           "low"
-        ]
+        ],
+        "thinking_levels": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "thinking_level_mapping": {
+          "low": "low",
+          "medium": "medium",
+          "high": "high"
+        }
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -8082,7 +8612,9 @@
         "supports_tools": true,
         "supported_thinking_levels": [
           "off"
-        ]
+        ],
+        "thinking_levels": [],
+        "thinking_level_mapping": {}
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -8186,7 +8718,9 @@
         "supports_tools": true,
         "supported_thinking_levels": [
           "off"
-        ]
+        ],
+        "thinking_levels": [],
+        "thinking_level_mapping": {}
       },
       "static_profile": {
         "capability_dist_prior": {
@@ -8289,7 +8823,9 @@
         "supports_tools": true,
         "supported_thinking_levels": [
           "off"
-        ]
+        ],
+        "thinking_levels": [],
+        "thinking_level_mapping": {}
       },
       "static_profile": {
         "capability_dist_prior": {

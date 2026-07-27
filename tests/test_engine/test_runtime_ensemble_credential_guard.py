@@ -72,6 +72,45 @@ def _static_b5_config(**ensemble_overrides: Any) -> GatewayConfig:
     )
 
 
+def test_router_dynamic_route_memory_preserves_thinking_assignment() -> None:
+    runner = TurnRunner(
+        provider_selector=None,
+        config=_static_b5_config(selection_mode="router_dynamic"),
+    )
+    assignment = {
+        "proposers": {
+            "openrouter:model-a": "high",
+            "openrouter:model-b": "medium",
+        },
+        "aggregator": "highest",
+        "thinking_policy_version": "thinking-policy-v1",
+    }
+    executed_assignment = {
+        **assignment,
+        "proposers": {
+            **assignment["proposers"],
+            "openrouter:model-b": "low",
+        },
+    }
+
+    runner._remember_router_dynamic_route(
+        "agent:main:thinking-route",
+        {
+            "selected_P": ["openrouter:model-a", "openrouter:model-b"],
+            "selected_A": "openrouter:model-c",
+            "session": {"escalation_level": 1},
+            "thinking_assignment": assignment,
+            "executed_thinking_assignment": executed_assignment,
+        },
+    )
+
+    remembered = runner._previous_router_dynamic_route(
+        "agent:main:thinking-route"
+    )
+    assert remembered is not None
+    assert remembered["thinking_assignment"] == executed_assignment
+
+
 async def test_static_b5_wrap_skipped_without_openrouter_credential(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -252,6 +291,15 @@ async def test_router_dynamic_wrap_is_not_credential_gated(
     assert len(turn.metadata["router_dynamic_decision"]["registry_snapshot_hash"]) == 64
     assert turn.metadata["router_dynamic_decision"]["selected_P"]
     assert turn.metadata["router_dynamic_decision"]["selected_A"]
+    assert not {
+        "ranking_thinking_assignment_enabled",
+        "thinking_policy_version",
+        "thinking_assignment",
+        "thinking_assignment_details",
+        "assignment_reasons",
+        "unsupported_level_fallbacks",
+        "policy_versions",
+    }.intersection(turn.metadata["router_dynamic_decision"])
 
 
 async def test_router_dynamic_uses_fixed_opus_task_analyzer(
@@ -767,6 +815,57 @@ async def test_router_dynamic_selection_failure_fails_open_to_the_single_provide
     assert "no proposer" in turn.metadata["router_dynamic_ranking_error"]
 
 
+async def test_router_dynamic_thinking_unavailable_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def analyzed_task(**kwargs: Any) -> TaskAnalysisResult:
+        return TaskAnalysisResult(
+            profile=fallback_task_profile(
+                routed_tier=str(kwargs["routed_tier"]),
+                request_context=kwargs["request_context"],
+            ),
+            source="test",
+            schema_valid=True,
+            confidence=1.0,
+        )
+
+    monkeypatch.setattr(
+        "opensquilla.provider.ranking_router.analyze_task_with_provider",
+        analyzed_task,
+    )
+
+    def fail_thinking_assignment(**_kwargs: Any) -> None:
+        raise DynamicRankingError(
+            "router_dynamic has no proposer: thinking_level_unavailable"
+        )
+
+    monkeypatch.setattr(
+        "opensquilla.provider.ranking_router.rank_models",
+        fail_thinking_assignment,
+    )
+    runner = TurnRunner(
+        provider_selector=None,
+        config=_static_b5_config(
+            selection_mode="router_dynamic",
+            ranking_thinking_assignment_enabled=True,
+        ),
+    )
+
+    with pytest.raises(
+        DynamicRankingError,
+        match="thinking_level_unavailable",
+    ):
+        await runner._run_pipeline(
+            "high-risk request",
+            "agent:main:router-dynamic-thinking-fail-closed",
+            _Provider(),
+            _FakeSelector(provider="groq", api_key="sk-groq-synthetic"),
+            [],
+            "system prompt",
+            [],
+        )
+
+
 async def test_router_dynamic_analyzer_cleanup_failure_aborts_the_turn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -836,7 +935,11 @@ async def test_router_dynamic_unbounded_candidates_fail_open_before_analysis(
 async def test_router_dynamic_config_load_failure_fails_open_before_analysis(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def fail_config_load() -> dict[str, Any]:
+    def fail_config_load(
+        *,
+        thinking_assignment_enabled: bool = True,
+    ) -> dict[str, Any]:
+        del thinking_assignment_enabled
         raise DynamicRankingError("ranking config is malformed")
 
     monkeypatch.setattr(

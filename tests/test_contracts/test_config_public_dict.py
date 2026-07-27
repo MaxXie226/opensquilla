@@ -81,6 +81,7 @@ LLM_ENSEMBLE_REQUIRED_KEYS = frozenset(
         "selection_mode",
         "ranking_user_profile_generation_enabled",
         "ranking_user_profile_enabled",
+        "ranking_thinking_assignment_enabled",
     }
 )
 SQUILLA_ROUTER_REQUIRED_KEYS = frozenset(

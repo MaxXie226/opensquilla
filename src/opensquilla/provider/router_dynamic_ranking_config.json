@@ -1,6 +1,6 @@
 {
-  "schema_version": "step2-ranking-config-v3",
-  "config_version": "step2-ranking-2026-07-22.1",
+  "schema_version": "step2-ranking-config-v4",
+  "config_version": "step2-ranking-2026-07-27.1",
   "validation": {
     "weight_sum_tolerance": 1e-9,
     "task_profile_sum_tolerance": 0.02
@@ -17,6 +17,30 @@
       "c1": 2,
       "c2": 3,
       "c3": 4
+    }
+  },
+  "thinking_assignment": {
+    "policy_version": "thinking-policy-v1",
+    "level_order": [
+      "low",
+      "medium",
+      "high",
+      "highest"
+    ],
+    "tier_mapping": {
+      "1": "low",
+      "2": "medium",
+      "3": "high",
+      "4": "highest"
+    },
+    "aggregator_level_step": 1,
+    "risk_floor": {
+      "high": "high"
+    },
+    "resource_constraints": {
+      "cost_values": ["low", "hard_limit"],
+      "latency_values": ["interactive", "hard_timeout"],
+      "downshift_levels": 1
     }
   },
   "context": {

@@ -1754,14 +1754,19 @@ def _normalize_openrouter_provider_identity(value: Any) -> str:
 @cache
 def _formal_openrouter_model_aliases() -> dict[str, frozenset[str]]:
     """Bind requested model ids to the frozen registry's serving-model aliases."""
-    from opensquilla.provider.ranking_router import load_model_registry_snapshot
+    from opensquilla.provider.ranking_router import (
+        _legacy_registry_snapshot_projection,
+        load_model_registry_snapshot,
+    )
 
     aliases: dict[str, set[str]] = {
         str(model).strip().casefold(): {str(model).strip().casefold()}
         for model in FORMAL_UPSTREAM_PINS
         if str(model).strip()
     }
-    snapshot = load_model_registry_snapshot()
+    snapshot = _legacy_registry_snapshot_projection(
+        load_model_registry_snapshot()
+    )
     if canonical_sha256(snapshot) != FORMAL_G1_SOURCE_REGISTRY_SNAPSHOT_SHA256:
         raise FinalizationError("formal OpenRouter model registry snapshot changed")
     rows = snapshot.get("models")

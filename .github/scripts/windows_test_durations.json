@@ -205,6 +205,7 @@
     "tests/test_engine/test_agent_reasoning_reemit.py": 0.018,
     "tests/test_engine/test_agent_retry_budget.py": 0.044,
     "tests/test_engine/test_agent_terminal_outcomes.py": 0.012,
+    "tests/test_engine/test_agent_thinking_usage.py": 0.01,
     "tests/test_engine/test_agent_usage_tracker_billed_propagation.py": 0.544,
     "tests/test_engine/test_attachment_messages.py": 0.731,
     "tests/test_engine/test_auxiliary_usage_accounting.py": 0.01,

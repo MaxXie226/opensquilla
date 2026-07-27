@@ -150,6 +150,9 @@ class SetupEngine:
                 "rankingUserProfileGenerationEnabled"
             )
             profile_application_enabled = payload.get("rankingUserProfileEnabled")
+            thinking_assignment_enabled = payload.get(
+                "rankingThinkingAssignmentEnabled"
+            )
             model_options = payload.get("modelOptions")
             if model_options is not None and not isinstance(model_options, (list, tuple)):
                 raise ValueError("modelOptions must be a list of model ids")
@@ -174,6 +177,14 @@ class SetupEngine:
                     None
                     if profile_application_enabled is None
                     else bool(profile_application_enabled)
+                ),
+                ranking_thinking_assignment_enabled=(
+                    None
+                    if thinking_assignment_enabled is None
+                    else _strict_bool(
+                        thinking_assignment_enabled,
+                        field="rankingThinkingAssignmentEnabled",
+                    )
                 ),
                 model_options=(
                     None

@@ -168,6 +168,39 @@ def _model(
     }
 
 
+def _thinking_model(
+    model_id: str,
+    *,
+    thinking_levels: list[str] | None = None,
+    thinking_level_mapping: dict[str, str] | None = None,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    model = _model(model_id, **kwargs)
+    levels = (
+        thinking_levels if thinking_levels is not None else ["low", "medium", "high", "highest"]
+    )
+    mapping = (
+        thinking_level_mapping
+        if thinking_level_mapping is not None
+        else {
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "highest": "xhigh",
+        }
+    )
+    facts = model["registry_facts"]
+    facts.update(
+        {
+            "supports_reasoning": True,
+            "supported_thinking_levels": sorted(set(mapping.values())),
+            "thinking_levels": list(levels),
+            "thinking_level_mapping": dict(mapping),
+        }
+    )
+    return model
+
+
 def _snapshot(*models: dict[str, Any]) -> dict[str, Any]:
     return {
         "schema_version": "test",
@@ -182,6 +215,7 @@ def _decision(
     context: dict[str, Any] | None = None,
     user_profile: dict[str, Any] | None = None,
     ranking_config: dict[str, Any] | None = None,
+    thinking_assignment_enabled: bool = False,
 ):
     return rank_models(
         task_analysis=analysis or _analysis(),
@@ -191,6 +225,7 @@ def _decision(
         routed_tier="c2",
         routing_confidence=0.9,
         ranking_config=ranking_config,
+        ranking_thinking_assignment_enabled=thinking_assignment_enabled,
     )
 
 
@@ -272,7 +307,7 @@ def test_packaged_ranking_config_is_versioned_validated_and_isolated() -> None:
     first = load_ranking_config()
     second = load_ranking_config()
 
-    assert first["schema_version"] == "step2-ranking-config-v3"
+    assert first["schema_version"] == "step2-ranking-config-v4"
     assert first["config_version"].startswith("step2-ranking-")
     assert first["task_analyzer"]["max_output_tokens"] == 1_200
     assert first["routing_tiers"]["mapping"] == {"c0": 1, "c1": 2, "c2": 3, "c3": 4}
@@ -390,9 +425,7 @@ def test_packaged_curated_registry_has_versioned_step2_profiles() -> None:
         assert len(thinking_levels) == len(set(thinking_levels))
         assert set(thinking_levels) <= set(THINKING_LEVELS)
         assert model["runtime"]["thinking"] == thinking_levels[0]
-        assert facts["supports_reasoning"] is any(
-            level != "off" for level in thinking_levels
-        )
+        assert facts["supports_reasoning"] is any(level != "off" for level in thinking_levels)
         assert facts["catalog_verified_at"] == "2026-07-24"
         assert facts["latency_source"] == "curated_estimate"
         assert set(model["static_profile"]["capability_dist_prior"]) == set(CAPABILITIES)
@@ -405,9 +438,7 @@ def test_packaged_curated_registry_has_versioned_step2_profiles() -> None:
         model for model in snapshot["models"] if model["source"] == "curated_openrouter_profile"
     ]
     assert len(curated_models) == 80
-    by_model_id = {
-        model["registry_facts"]["model_id"]: model for model in curated_models
-    }
+    by_model_id = {model["registry_facts"]["model_id"]: model for model in curated_models}
     assert by_model_id["deepseek/deepseek-v4-flash"]["registry_facts"][
         "supported_thinking_levels"
     ] == ["xhigh", "high", "off"]
@@ -415,14 +446,14 @@ def test_packaged_curated_registry_has_versioned_step2_profiles() -> None:
     assert by_model_id["kwaipilot/kat-coder-pro-v2.5"]["registry_facts"][
         "supported_thinking_levels"
     ] == ["off"]
-    assert min(
-        model["registry_facts"]["price"]["input_per_million"]
-        for model in curated_models
-    ) <= 0.05
-    assert max(
-        model["static_profile"]["role_fit_prior"]["proposer"]
-        for model in curated_models
-    ) >= 0.94
+    assert (
+        min(model["registry_facts"]["price"]["input_per_million"] for model in curated_models)
+        <= 0.05
+    )
+    assert (
+        max(model["static_profile"]["role_fit_prior"]["proposer"] for model in curated_models)
+        >= 0.94
+    )
 
 
 def test_normalize_task_profile_falls_back_on_missing_required_distributions() -> None:
@@ -1866,7 +1897,9 @@ def test_rerank_weights_from_json_change_the_selected_proposer_set() -> None:
 
     assert [model.model_id for model in decision.proposers] == ["primary", "duplicate"]
     assert decision.trace["ranking_config_version"] == config["config_version"]
-    assert decision.trace["ranking_parameters"] == config
+    assert decision.trace["ranking_parameters"] == (
+        ranking_router._legacy_ranking_config_projection(config)
+    )
     assert len(decision.trace["ranking_config_hash"]) == 64
 
 
@@ -2228,3 +2261,543 @@ def test_ranking_emits_the_required_debug_lifecycle_events() -> None:
         row for row in captured if str(row["event"]).startswith("llm_ensemble.router_dynamic.")
     ]
     assert all(row["decision_id"] == "ranking-log-decision" for row in lifecycle)
+
+
+def test_enabled_thinking_assignment_emits_dedicated_router_event() -> None:
+    with structlog.testing.capture_logs() as captured:
+        rank_models(
+            task_analysis=_analysis(tier=3),
+            user_profile=mock_user_profile(),
+            request_context=_context(),
+            registry_snapshot=_snapshot(
+                _thinking_model("a", provider="provider-a"),
+                _thinking_model("b", provider="provider-b"),
+            ),
+            routed_tier="c2",
+            routing_confidence=0.9,
+            decision_id="thinking-log-decision",
+            ranking_thinking_assignment_enabled=True,
+        )
+
+    assignment_event = next(
+        row
+        for row in captured
+        if row["event"]
+        == "llm_ensemble.router_dynamic.thinking_assignment_recorded"
+    )
+    assert assignment_event["decision_id"] == "thinking-log-decision"
+    assert assignment_event["thinking_assignment"]["proposers"]
+    assert assignment_event["thinking_assignment"]["aggregator"]
+    assert assignment_event["policy_versions"]["thinking"] == (
+        "thinking-policy-v1"
+    )
+
+
+def test_thinking_assignment_is_default_off_and_selection_is_unchanged() -> None:
+    models = (
+        _thinking_model("alpha", provider="provider-a", capability=0.95),
+        _thinking_model("beta", provider="provider-b", capability=0.90),
+        _thinking_model("gamma", provider="provider-c", capability=0.85),
+    )
+
+    disabled = _decision(*models, analysis=_analysis(tier=3))
+    enabled = _decision(
+        *models,
+        analysis=_analysis(tier=3),
+        thinking_assignment_enabled=True,
+    )
+
+    assert "ranking_thinking_assignment_enabled" not in disabled.trace
+    assert "thinking_assignment" not in disabled.trace
+    assert "assignment_reasons" not in disabled.trace
+    assert all(model.requested_thinking_level is None for model in disabled.proposers)
+    assert disabled.aggregator.requested_thinking_level is None
+    assert [model.identity for model in disabled.proposers] == [
+        model.identity for model in enabled.proposers
+    ]
+    assert disabled.aggregator.identity == enabled.aggregator.identity
+    assert disabled.trace["model_scores"] == enabled.trace["model_scores"]
+    assert disabled.trace["selection_steps"] == enabled.trace["selection_steps"]
+
+
+def test_disabled_thinking_assignment_preserves_exact_legacy_trace_shape() -> None:
+    current_config = load_ranking_config()
+    current_snapshot = {
+        "schema_version": "step2-model-registry-v2",
+        "snapshot_version": "curated-openrouter-step2-2026-07-27.1",
+        "models": [
+            _thinking_model("alpha", provider="provider-a", capability=0.95),
+            _thinking_model("beta", provider="provider-b", capability=0.90),
+            _thinking_model("gamma", provider="provider-c", capability=0.85),
+        ],
+    }
+    legacy_config = ranking_router._legacy_ranking_config_projection(
+        current_config
+    )
+    legacy_snapshot = ranking_router._legacy_registry_snapshot_projection(
+        current_snapshot
+    )
+    common = {
+        "task_analysis": _analysis(tier=3),
+        "user_profile": mock_user_profile(),
+        "request_context": _context(),
+        "routed_tier": "c2",
+        "routing_confidence": 0.9,
+        "decision_id": "legacy-shape",
+    }
+
+    disabled = rank_models(
+        **common,
+        registry_snapshot=current_snapshot,
+        ranking_config=current_config,
+    )
+    legacy = rank_models(
+        **common,
+        registry_snapshot=legacy_snapshot,
+        ranking_config=legacy_config,
+    )
+
+    assert disabled.trace == legacy.trace
+    assert disabled.trace["ranking_version"] == "step2-ranking-v2"
+    assert (
+        disabled.trace["ranking_config_hash"]
+        == "a8addcdefa04349209c20e97ca5851ed0f5ca55646c9d0c5badc5d32dd7ef10c"
+    )
+    for field in (
+        "ranking_thinking_assignment_enabled",
+        "thinking_policy_version",
+        "thinking_assignment",
+        "thinking_assignment_details",
+        "assignment_reasons",
+        "unsupported_level_fallbacks",
+        "policy_versions",
+    ):
+        assert field not in disabled.trace
+    assert all(
+        "thinking_levels" not in row
+        and "thinking_level_mapping" not in row
+        for row in disabled.trace["candidate_pool"]
+    )
+
+
+def test_legacy_v3_ranking_config_remains_usable_only_when_assignment_is_off() -> None:
+    legacy = load_ranking_config()
+    legacy["schema_version"] = "step2-ranking-config-v3"
+    legacy["config_version"] = "step2-ranking-legacy-test"
+    legacy.pop("thinking_assignment")
+    models = (
+        _thinking_model("alpha", provider="provider-a"),
+        _thinking_model("beta", provider="provider-b"),
+    )
+
+    decision = _decision(
+        *models,
+        analysis=_analysis(tier=1),
+        ranking_config=legacy,
+    )
+
+    assert decision.trace["ranking_config_schema_version"] == "step2-ranking-config-v3"
+    with pytest.raises(DynamicRankingError, match="requires step2-ranking-config-v4"):
+        _decision(
+            *models,
+            analysis=_analysis(tier=1),
+            ranking_config=legacy,
+            thinking_assignment_enabled=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("tier", "proposer_level", "aggregator_level"),
+    [
+        (1, "low", "medium"),
+        (2, "medium", "high"),
+        (3, "high", "highest"),
+        (4, "highest", "highest"),
+    ],
+)
+def test_thinking_policy_maps_tiers_and_aggregator_step(
+    tier: int,
+    proposer_level: str,
+    aggregator_level: str,
+) -> None:
+    policy = ranking_router._thinking_assignment_policy(load_ranking_config())
+    profile = _task_profile(tier=tier)
+
+    proposer, _, _ = ranking_router._thinking_target_for_role(
+        role="proposer",
+        effective_tier=tier,
+        task_profile=profile,
+        session_trace={"intent": "new_task"},
+        policy=policy,
+    )
+    aggregator, _, _ = ranking_router._thinking_target_for_role(
+        role="aggregator",
+        effective_tier=tier,
+        task_profile=profile,
+        session_trace={"intent": "new_task"},
+        policy=policy,
+    )
+
+    assert proposer == proposer_level
+    assert aggregator == aggregator_level
+
+
+@pytest.mark.parametrize(
+    ("tier_dist", "expected"),
+    [
+        ({"1": 0.51, "2": 0.49}, 1),
+        ({"1": 0.50, "2": 0.50}, 2),
+    ],
+)
+def test_effective_tier_uses_half_up_rounding(
+    tier_dist: dict[str, float],
+    expected: int,
+) -> None:
+    profile = _task_profile(tier=1)
+    profile["tier_dist"] = tier_dist
+
+    assert ranking_router._effective_tier(profile, load_ranking_config()) == expected
+
+
+def test_enabled_thinking_policy_rejects_non_half_up_tier_rounding() -> None:
+    config = load_ranking_config()
+    config["proposer_count"]["effective_tier_rounding_offset"] = 0.25
+    models = (
+        _thinking_model("alpha", provider="provider-a"),
+        _thinking_model("beta", provider="provider-b"),
+    )
+
+    disabled = _decision(*models, ranking_config=config)
+    assert disabled.trace["ranking_version"] == "step2-ranking-v2"
+    with pytest.raises(
+        DynamicRankingError,
+        match="effective_tier_rounding_offset to be 0.5",
+    ):
+        _decision(
+            *models,
+            ranking_config=config,
+            thinking_assignment_enabled=True,
+        )
+
+
+def test_thinking_policy_applies_risk_floor_before_single_resource_downshift() -> None:
+    policy = ranking_router._thinking_assignment_policy(load_ranking_config())
+    both_constrained = _task_profile(
+        tier=4,
+        cost="hard_limit",
+        latency="interactive",
+    )
+    high_risk = _task_profile(
+        tier=2,
+        risk="high",
+        cost="low",
+        latency="hard_timeout",
+    )
+
+    constrained_level, constrained_reasons, _ = ranking_router._thinking_target_for_role(
+        role="proposer",
+        effective_tier=4,
+        task_profile=both_constrained,
+        session_trace={"intent": "new_task"},
+        policy=policy,
+    )
+    risk_level, risk_reasons, risk_floor = ranking_router._thinking_target_for_role(
+        role="proposer",
+        effective_tier=2,
+        task_profile=high_risk,
+        session_trace={"intent": "new_task"},
+        policy=policy,
+    )
+
+    assert constrained_level == "high"
+    assert sum("resource_" in reason for reason in constrained_reasons) == 1
+    assert risk_floor == "high"
+    assert risk_level == "high"
+    assert any("risk_high_floor_high" in reason for reason in risk_reasons)
+    assert any("downshift_blocked" in reason for reason in risk_reasons)
+
+
+def test_redo_does_not_apply_a_second_thinking_level_shift() -> None:
+    policy = ranking_router._thinking_assignment_policy(load_ranking_config())
+    profile = _task_profile(tier=3, intent="redo")
+
+    new_level, _, _ = ranking_router._thinking_target_for_role(
+        role="proposer",
+        effective_tier=3,
+        task_profile=profile,
+        session_trace={"intent": "new_task"},
+        policy=policy,
+    )
+    redo_level, redo_reasons, _ = ranking_router._thinking_target_for_role(
+        role="proposer",
+        effective_tier=3,
+        task_profile=profile,
+        session_trace={"intent": "redo"},
+        policy=policy,
+    )
+
+    assert redo_level == new_level == "high"
+    assert "redo_uses_session_adjusted_tier_only" in redo_reasons
+
+
+def test_unsupported_thinking_level_uses_deterministic_nearest_tie_breaks() -> None:
+    policy = ranking_router._thinking_assignment_policy(load_ranking_config())
+    model = ranking_router._normalize_model(
+        _thinking_model(
+            "partial",
+            thinking_levels=["low", "high"],
+            thinking_level_mapping={"low": "low", "high": "high"},
+        ),
+        load_ranking_config(),
+        thinking_policy=policy,
+    )
+
+    normal, normal_detail, _ = ranking_router._resolve_model_thinking_level(
+        model,
+        role="proposer",
+        requested_level="medium",
+        reasons=[],
+        risk_floor=None,
+        policy=policy,
+    )
+    high_risk, high_risk_detail, _ = ranking_router._resolve_model_thinking_level(
+        model,
+        role="proposer",
+        requested_level="medium",
+        reasons=[],
+        risk_floor="low",
+        policy=policy,
+    )
+
+    assert normal.effective_thinking_level == "low"
+    assert normal_detail["fallback_reason"].endswith("_lower")
+    assert high_risk.effective_thinking_level == "high"
+    assert high_risk_detail["fallback_reason"].endswith("_higher")
+
+
+def test_provider_rejection_fallbacks_recompute_nearest_remaining_level() -> None:
+    policy = ranking_router._thinking_assignment_policy(load_ranking_config())
+    model = ranking_router._normalize_model(
+        _thinking_model("all-levels"),
+        load_ranking_config(),
+        thinking_policy=policy,
+    )
+
+    assigned, detail, _ = ranking_router._resolve_model_thinking_level(
+        model,
+        role="proposer",
+        requested_level="high",
+        reasons=[],
+        risk_floor=None,
+        policy=policy,
+    )
+
+    assert assigned.effective_thinking_level == "high"
+    assert [
+        row["unified_level"] for row in assigned.thinking_fallbacks
+    ] == ["medium", "low", "highest"]
+    assert [
+        row["unified_level"]
+        for row in detail["provider_rejection_fallbacks"]
+    ] == ["medium", "low", "highest"]
+
+
+def test_normal_risk_partial_thinking_support_falls_back_without_hard_filter() -> None:
+    decision = _decision(
+        _thinking_model(
+            "partial",
+            thinking_levels=["low"],
+            thinking_level_mapping={"low": "low"},
+        ),
+        analysis=_analysis(tier=1, risk="medium"),
+        thinking_assignment_enabled=True,
+    )
+
+    assert decision.proposers[0].effective_thinking_level == "low"
+    assert decision.aggregator.effective_thinking_level == "low"
+    assert decision.trace["unsupported_level_fallbacks"]
+    assert (
+        decision.trace["hard_filter"]["filter_reason_counts"].get("thinking_level_unavailable")
+        is None
+    )
+
+
+def test_high_risk_requires_at_least_high_thinking_support() -> None:
+    with pytest.raises(
+        DynamicRankingError,
+        match="thinking_level_unavailable",
+    ) as caught:
+        _decision(
+            _thinking_model(
+                "partial",
+                thinking_levels=["low", "medium"],
+                thinking_level_mapping={"low": "low", "medium": "medium"},
+            ),
+            analysis=_analysis(tier=3, risk="high"),
+            thinking_assignment_enabled=True,
+        )
+    assert caught.value.reason == "thinking_level_unavailable"
+
+
+@pytest.mark.parametrize(
+    "mapping",
+    [
+        {"low": "off"},
+        {"low": "high"},
+        {"highest": "high"},
+    ],
+)
+def test_registry_v2_rejects_semantically_invalid_thinking_mapping(
+    mapping: dict[str, str],
+) -> None:
+    model = _thinking_model(
+        "invalid",
+        thinking_levels=list(mapping),
+        thinking_level_mapping=mapping,
+    )
+    model["registry_facts"]["supported_thinking_levels"] = sorted(set(mapping.values()))
+
+    with pytest.raises(
+        DynamicRankingError,
+        match="no enabled supported_thinking_levels|semantically invalid",
+    ):
+        ranking_router._validate_registry_snapshot(
+            {
+                "schema_version": "step2-model-registry-v2",
+                "snapshot_version": "invalid-test",
+                "models": [model],
+            }
+        )
+
+
+def test_registry_v2_requires_explicit_thinking_contract_fields() -> None:
+    with pytest.raises(DynamicRankingError, match="requires thinking_levels"):
+        ranking_router._validate_registry_snapshot(
+            {
+                "schema_version": "step2-model-registry-v2",
+                "snapshot_version": "missing-test",
+                "models": [_model("missing")],
+            }
+        )
+
+
+def test_enabled_assignment_is_complete_auditable_and_role_specific() -> None:
+    decision = _decision(
+        _thinking_model("alpha", provider="provider-a", capability=0.95),
+        _thinking_model("beta", provider="provider-b", capability=0.90),
+        _thinking_model("gamma", provider="provider-c", capability=0.85),
+        analysis=_analysis(tier=3),
+        thinking_assignment_enabled=True,
+    )
+    assignment = decision.trace["thinking_assignment"]
+
+    assert assignment == {
+        "proposers": {model.identity: "high" for model in decision.proposers},
+        "aggregator": "highest",
+        "thinking_policy_version": "thinking-policy-v1",
+    }
+    assert decision.aggregator.effective_thinking_level == "highest"
+    assert all(model.effective_thinking_level == "high" for model in decision.proposers)
+    assert decision.trace["assignment_reasons"]["proposers"]
+    assert decision.trace["assignment_reasons"]["aggregator"]
+    assert decision.trace["policy_versions"] == {
+        "ranking": "step2-ranking-v3",
+        "thinking": "thinking-policy-v1",
+    }
+
+
+def test_enabled_thinking_assignment_is_replayable_and_tamper_evident() -> None:
+    decision = rank_models(
+        task_analysis=_analysis(tier=3),
+        user_profile=None,
+        request_context=_context(),
+        registry_snapshot=_snapshot(
+            _thinking_model("alpha", provider="provider-a", capability=0.95),
+            _thinking_model("beta", provider="provider-b", capability=0.90),
+            _thinking_model("gamma", provider="provider-c", capability=0.85),
+        ),
+        routed_tier="c2",
+        routing_confidence=0.91,
+        decision_id="thinking-replay-decision",
+        ranking_thinking_assignment_enabled=True,
+    )
+    trace = decision.trace
+
+    assert ranking_trace_replay_reasons(trace) == []
+    tampered = json.loads(json.dumps(trace))
+    tampered["thinking_assignment"]["aggregator"] = "low"
+    assert "g1_frozen_ranker_replay_mismatch_thinking_assignment" in ranking_trace_replay_reasons(
+        tampered
+    )
+
+
+def test_enabled_thinking_assignment_replay_rejects_switch_downgrade() -> None:
+    decision = rank_models(
+        task_analysis=_analysis(tier=3),
+        user_profile=None,
+        request_context=_context(),
+        registry_snapshot=_snapshot(
+            _thinking_model("alpha", provider="provider-a", capability=0.95),
+            _thinking_model("beta", provider="provider-b", capability=0.90),
+            _thinking_model("gamma", provider="provider-c", capability=0.85),
+        ),
+        routed_tier="c2",
+        routing_confidence=0.91,
+        decision_id="thinking-replay-downgrade",
+        ranking_thinking_assignment_enabled=True,
+    )
+    tampered = json.loads(json.dumps(decision.trace))
+    tampered.pop("ranking_thinking_assignment_enabled")
+    for field_name in (
+        "thinking_policy_version",
+        "thinking_assignment",
+        "thinking_assignment_details",
+        "assignment_reasons",
+        "unsupported_level_fallbacks",
+        "policy_versions",
+    ):
+        tampered.pop(field_name)
+
+    assert (
+        "missing_g1_replay_thinking_assignment_switch"
+        in ranking_trace_replay_reasons(tampered)
+    )
+
+
+def test_registry_builder_never_reuses_native_mapping_across_providers() -> None:
+    openrouter_template = _thinking_model(
+        "vendor/shared-model",
+        provider="openrouter",
+    )
+
+    snapshot = build_model_registry_snapshot(
+        inherited_provider="direct-provider",
+        inherited_model="vendor/shared-model",
+        routed_tier="c2",
+        packaged_snapshot={
+            "schema_version": "step2-model-registry-v2",
+            "snapshot_version": "provider-isolation-test",
+            "models": [openrouter_template],
+        },
+    )
+    anchor = snapshot["models"][0]
+
+    assert anchor["registry_facts"]["provider"] == "direct-provider"
+    assert anchor["registry_facts"]["thinking_levels"] == []
+    assert anchor["registry_facts"]["thinking_level_mapping"] == {}
+    assert "supported_thinking_levels" not in anchor["registry_facts"]
+    assert anchor["static_profile"] == openrouter_template["static_profile"]
+    ranking_router._validate_registry_snapshot(snapshot)
+
+
+def test_packaged_registry_v2_has_valid_unified_thinking_contracts() -> None:
+    snapshot = load_model_registry_snapshot()
+
+    assert snapshot["schema_version"] == "step2-model-registry-v2"
+    for row in snapshot["models"]:
+        facts = row["registry_facts"]
+        levels = facts["thinking_levels"]
+        mapping = facts["thinking_level_mapping"]
+        assert set(mapping) == set(levels)
+        assert all(level in {"low", "medium", "high", "highest"} for level in levels)
+        assert mapping.get("highest") != "high"

@@ -284,6 +284,62 @@ async def test_reasoning_only_prefill_recovery_cleans_synthetic_history(tmp_path
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reasoning_format", "forbidden_warning"),
+    [
+        ("openrouter", "provider_reasoning_prefill_continue"),
+        ("dashscope", "provider_reasoning_continuation"),
+    ],
+)
+async def test_reasoning_recovery_does_not_replay_unsafe_composite_provider(
+    reasoning_format: str,
+    forbidden_warning: str,
+) -> None:
+    provider = _SequenceProvider(
+        [
+            [
+                ProviderDone(
+                    stop_reason="stop",
+                    input_tokens=10,
+                    output_tokens=5,
+                    reasoning_tokens=5,
+                    reasoning_content="internal reasoning",
+                )
+            ],
+            [
+                ProviderText(text="must-not-run"),
+                ProviderDone(stop_reason="stop", input_tokens=11, output_tokens=1),
+            ],
+        ]
+    )
+    provider.retry_failed_call_safe = False
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            thinking=ThinkingLevel.MEDIUM,
+            model_capabilities=ModelCapabilities(
+                supports_reasoning=True,
+                supports_tools=True,
+                reasoning_format=reasoning_format,
+            ),
+            reasoning_prefill_recovery_mode="recover",
+            retry_base_backoff_ms=0,
+            retry_max_backoff_ms=0,
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    assert len(provider.calls) == 1
+    assert not any(
+        event.kind == "warning" and event.code == forbidden_warning
+        for event in events
+    )
+    assert not any(getattr(event, "text", "") == "must-not-run" for event in events)
+    assert any(event.kind == "error" for event in events)
+
+
+@pytest.mark.asyncio
 async def test_tool_loop_observer_logs_reasoning_only_runtime_event(tmp_path) -> None:
     provider = _SequenceProvider(
         [
@@ -912,6 +968,67 @@ async def test_large_reasoning_only_without_fallback_retries_once_with_thinking_
     assert done.input_tokens == 35_004
     assert done.output_tokens == 3
     assert done.reasoning_tokens == 2
+
+
+@pytest.mark.asyncio
+async def test_post_tool_empty_recovery_does_not_replay_unsafe_composite_provider() -> None:
+    provider = _SequenceProvider(
+        [
+            [
+                ProviderToolUseStart(tool_use_id="tool-1", tool_name="echo"),
+                ProviderToolUseEnd(
+                    tool_use_id="tool-1",
+                    tool_name="echo",
+                    arguments={"value": "ok"},
+                ),
+                ProviderDone(stop_reason="tool_use", input_tokens=3, output_tokens=1),
+            ],
+            [ProviderDone(stop_reason="stop", input_tokens=4, output_tokens=0)],
+            [
+                ProviderText(text="must-not-run"),
+                ProviderDone(stop_reason="stop", input_tokens=5, output_tokens=1),
+            ],
+        ]
+    )
+    provider.retry_failed_call_safe = False
+
+    async def tool_handler(call: Any) -> ToolResult:
+        return ToolResult(
+            tool_use_id=call.tool_use_id,
+            tool_name=call.tool_name,
+            content="tool ok",
+        )
+
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            max_iterations=3,
+            post_tool_empty_recovery_mode="warn_model",
+            retry_base_backoff_ms=0,
+            retry_max_backoff_ms=0,
+        ),
+        tool_definitions=[
+            ToolDefinition(
+                name="echo",
+                description="Echo.",
+                input_schema=ToolInputSchema(
+                    properties={"value": {"type": "string"}},
+                    required=["value"],
+                ),
+            )
+        ],
+        tool_handler=tool_handler,
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    assert len(provider.calls) == 2
+    assert not any(
+        event.kind == "warning" and event.code == "post_tool_empty_recovery"
+        for event in events
+    )
+    assert not any(getattr(event, "text", "") == "must-not-run" for event in events)
+    assert any(event.kind == "error" for event in events)
 
 
 @pytest.mark.asyncio
