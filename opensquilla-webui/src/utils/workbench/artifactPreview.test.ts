@@ -8,6 +8,7 @@ import {
   ARTIFACT_HTML_RELATIVE_RESOURCE_LIMIT,
   ARTIFACT_TEXT_PREVIEW_LIMIT,
   artifactPreviewLimit,
+  artifactUsesWorkbenchPreview,
   artifactWorkbenchPreviewKind,
   buildOfflineArtifactHtml,
   ARTIFACT_PREVIEW_ESCAPE_MESSAGE,
@@ -42,6 +43,25 @@ describe('artifactWorkbenchPreviewKind', () => {
     expect(artifactPreviewLimit('html')).toBe(ARTIFACT_TEXT_PREVIEW_LIMIT)
     expect(artifactPreviewLimit('markdown')).toBe(ARTIFACT_TEXT_PREVIEW_LIMIT)
     expect(artifactPreviewLimit('image')).toBeGreaterThan(ARTIFACT_TEXT_PREVIEW_LIMIT)
+  })
+
+  it('reserves Workbench navigation for document previews', () => {
+    expect(artifactUsesWorkbenchPreview(artifact({
+      name: 'page.html',
+      mime: 'text/html',
+    }))).toBe(true)
+    expect(artifactUsesWorkbenchPreview(artifact({
+      name: 'report.pdf',
+      mime: 'application/pdf',
+    }))).toBe(true)
+    expect(artifactUsesWorkbenchPreview(artifact({
+      name: 'poster.png',
+      mime: 'image/png',
+    }))).toBe(false)
+    expect(artifactUsesWorkbenchPreview(artifact({
+      name: 'slides.pptx',
+      mime: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    }))).toBe(false)
   })
 
   it('rejects a response MIME that does not match the selected renderer', () => {

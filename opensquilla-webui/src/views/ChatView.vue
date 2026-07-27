@@ -31,7 +31,7 @@
         :copy-state="sessionCopyState"
         :copy-icon="sessionCopyIcon"
         :copy-live-text="sessionCopyLiveText"
-        :deliverable-count="sessionArtifacts.length"
+        :deliverable-count="headerDeliverableCount"
         :run-history-visible="appStore.features.metaRuns"
         :share-mode="shareMode"
         :shareable-message-count="shareableMessageCount"
@@ -628,7 +628,10 @@ import {
   artifactFromWorkbenchItem,
   createArtifactPreviewWorkbenchItem,
 } from '@/workbench/artifactItems'
-import { artifactWorkbenchPreviewKind } from '@/utils/workbench/artifactPreview'
+import {
+  artifactUsesWorkbenchPreview,
+  artifactWorkbenchPreviewKind,
+} from '@/utils/workbench/artifactPreview'
 import { focusArtifactInTranscript } from '@/utils/chat/artifactFocus'
 import { fetchDisplayAttachmentBlob } from '@/utils/chat/attachmentAccess'
 import { createHistoryNavigationScrollLock } from '@/utils/chat/historyNavigationScrollLock'
@@ -2014,6 +2017,16 @@ const sessionArtifacts = computed<ArtifactPayload[]>(() => {
   return collected
 })
 
+const sessionWorkbenchArtifacts = computed(() =>
+  sessionArtifacts.value.filter(artifactUsesWorkbenchPreview),
+)
+
+const headerDeliverableCount = computed(() =>
+  workbenchEnabled.value
+    ? sessionWorkbenchArtifacts.value.length
+    : sessionArtifacts.value.length,
+)
+
 const deliverablesOpen = ref(false)
 const metaRunsHistoryOpen = ref(false)
 
@@ -2034,8 +2047,7 @@ function openDeliverables() {
       ) return false
       const artifact = artifactFromWorkbenchItem(item)
       if (!artifact) return false
-      const kind = artifactWorkbenchPreviewKind(artifact)
-      return kind !== 'unsupported' && kind !== 'image'
+      return artifactUsesWorkbenchPreview(artifact)
     })
     if (recentPreview) {
       workbenchStore.activateItem(recentPreview.id)
@@ -2043,11 +2055,9 @@ function openDeliverables() {
       return
     }
 
-    for (let index = sessionArtifacts.value.length - 1; index >= 0; index -= 1) {
-      const artifact = sessionArtifacts.value[index]
+    for (let index = sessionWorkbenchArtifacts.value.length - 1; index >= 0; index -= 1) {
+      const artifact = sessionWorkbenchArtifacts.value[index]
       if (!artifact) continue
-      const kind = artifactWorkbenchPreviewKind(artifact)
-      if (kind === 'unsupported' || kind === 'image') continue
       openArtifact(artifact)
       return
     }

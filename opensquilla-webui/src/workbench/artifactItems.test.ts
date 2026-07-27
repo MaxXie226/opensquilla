@@ -7,6 +7,7 @@ import {
   createArtifactCollectionWorkbenchItem,
   createArtifactPreviewWorkbenchItem,
   navigationArtifactsFromWorkbenchItem,
+  previewableNavigationArtifactsFromWorkbenchItem,
 } from './artifactItems'
 
 const artifact: ArtifactPayload = {
@@ -79,5 +80,39 @@ describe('artifact Workbench items', () => {
     expect(collection.id).not.toContain('session-a')
     expect(collection.title).toBe('Deliverables (2)')
     expect(artifactsFromWorkbenchItem(collection)).toEqual([artifact, second])
+  })
+
+  it('keeps every deliverable in the payload but only documents in Workbench navigation', () => {
+    const pdf = {
+      ...artifact,
+      id: 'artifact-pdf',
+      name: 'report.pdf',
+      mime: 'application/pdf',
+    }
+    const image = {
+      ...artifact,
+      id: 'artifact-image',
+      name: 'poster.png',
+      mime: 'image/png',
+    }
+    const slides = {
+      ...artifact,
+      id: 'artifact-slides',
+      name: 'slides.pptx',
+      mime: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    }
+    const navigationArtifacts = [artifact, pdf, image, slides]
+    const item = createArtifactPreviewWorkbenchItem({
+      artifact,
+      navigationArtifacts,
+      nativeHtml: false,
+      sessionKey: 'session-a',
+    })
+
+    expect(navigationArtifactsFromWorkbenchItem(item)).toEqual(navigationArtifacts)
+    expect(previewableNavigationArtifactsFromWorkbenchItem(item)).toEqual([
+      artifact,
+      pdf,
+    ])
   })
 })

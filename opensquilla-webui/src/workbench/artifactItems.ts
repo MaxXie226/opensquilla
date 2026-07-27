@@ -2,7 +2,10 @@ import type { ArtifactPayload } from '@/types/rpc'
 import {
   artifactFileTitle,
 } from '@/utils/chat/artifacts'
-import { artifactWorkbenchPreviewKind } from '@/utils/workbench/artifactPreview'
+import {
+  artifactUsesWorkbenchPreview,
+  artifactWorkbenchPreviewKind,
+} from '@/utils/workbench/artifactPreview'
 import type { WorkbenchItem } from './types'
 
 const BASE64_URL_ALPHABET =
@@ -167,6 +170,13 @@ export function navigationArtifactsFromWorkbenchItem(
         Boolean(artifact) && typeof artifact === 'object',
     )
     : []
+}
+
+export function previewableNavigationArtifactsFromWorkbenchItem(
+  item: WorkbenchItem | null,
+): readonly ArtifactPayload[] {
+  return navigationArtifactsFromWorkbenchItem(item)
+    .filter(artifactUsesWorkbenchPreview)
 }
 
 export function sessionKeyFromWorkbenchItem(item: WorkbenchItem | null): string {

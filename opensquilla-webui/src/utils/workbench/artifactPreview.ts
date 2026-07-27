@@ -57,6 +57,13 @@ export function artifactWorkbenchPreviewKind(
   return 'unsupported'
 }
 
+export function artifactUsesWorkbenchPreview(
+  artifact: ArtifactPayload,
+): boolean {
+  const kind = artifactWorkbenchPreviewKind(artifact)
+  return kind !== 'unsupported' && kind !== 'image'
+}
+
 export function artifactPreviewLimit(kind: ArtifactWorkbenchPreviewKind): number {
   return kind === 'html' || kind === 'markdown' || kind === 'text'
     ? ARTIFACT_TEXT_PREVIEW_LIMIT

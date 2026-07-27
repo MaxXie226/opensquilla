@@ -130,15 +130,13 @@ import {
   artifactWorkbenchItemId,
   createArtifactPreviewWorkbenchItem,
   navigationArtifactsFromWorkbenchItem,
+  previewableNavigationArtifactsFromWorkbenchItem,
   sessionKeyFromWorkbenchItem,
 } from '@/workbench/artifactItems'
 import {
   artifactCategory,
   artifactFileTitle,
-  isInlineMediaArtifact,
 } from '@/utils/chat/artifacts'
-import { focusArtifactInTranscript } from '@/utils/chat/artifactFocus'
-import { artifactWorkbenchPreviewKind } from '@/utils/workbench/artifactPreview'
 import {
   attachWorkbenchRuntime,
   WorkbenchRuntimeManager,
@@ -264,7 +262,7 @@ function panelProps(
 function artifactNavigationItems(
   item: WorkbenchItem | null,
 ): readonly ArtifactPayload[] {
-  return navigationArtifactsFromWorkbenchItem(item)
+  return previewableNavigationArtifactsFromWorkbenchItem(item)
 }
 
 function artifactNavigationId(
@@ -286,28 +284,6 @@ function selectNavigationArtifact(
   if (!artifact || select.value === item.id) return
   const navigationArtifacts = navigationArtifactsFromWorkbenchItem(item)
   const sessionKey = sessionKeyFromWorkbenchItem(item)
-  if (
-    isInlineMediaArtifact(artifact)
-    || artifactWorkbenchPreviewKind(artifact) === 'unsupported'
-  ) {
-    store.setExpanded(false)
-    void nextTick(() => {
-      focusArtifactInTranscript(document, artifact)
-    })
-    return
-  }
-  if (artifactCategory(artifact) === 'visual') {
-    select.focus({ preventScroll: true })
-    artifactImageLightbox.open({
-      artifact,
-      navigationArtifacts,
-      sessionKey,
-    })
-    void nextTick(() => {
-      select.value = item.id
-    })
-    return
-  }
   store.openItem(createArtifactPreviewWorkbenchItem({
     artifact,
     navigationArtifacts,
