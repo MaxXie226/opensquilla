@@ -86,7 +86,7 @@
               :key="landingAgentId"
               :agent-id="landingAgentId"
               :meta-skills="metaSkillChoices"
-              :suppressed="landingPrefilled"
+              :suppressed="landingSuggestionsSuppressed"
               @pick="applyLandingSuggestion"
             />
           </div>
@@ -349,14 +349,6 @@
       </div>
     </div>
 
-    <PendingQueue
-      :items="pendingQueue"
-      :max-pending="maxPending"
-      :mode="isStreaming ? busySendMode : null"
-      @clear="clearPendingQueue"
-      @remove="removePendingChip"
-    />
-
     <!-- Compaction maintenance card -->
     <div v-if="compactStatus.visible" class="chat-compact-status" :class="`chat-compact-status--${compactStatus.tone}`" role="status" aria-live="polite">
       <div class="chat-compact-status__head">
@@ -424,6 +416,16 @@
         <span class="chat-slash-desc" :title="cmd.desc">{{ cmd.desc }}</span>
       </div>
     </div>
+
+    <PendingQueue
+      :items="pendingQueue"
+      :max-pending="maxPending"
+      :image-blocked-message="queuedImageSendBlockedMessage"
+      @clear="clearPendingQueue"
+      @edit="editPendingMessage"
+      @remove="removePendingChip"
+      @steer="steerPendingMessage"
+    />
 
     <ChatComposer
       ref="composerRef"
@@ -574,7 +576,7 @@ import { useChatRouterDecisionRuntime } from '@/composables/chat/useChatRouterDe
 import { useChatAnswerReveal } from '@/composables/chat/useChatAnswerReveal'
 import { useChatRpcEventHandlers } from '@/composables/chat/useChatRpcEventHandlers'
 import { useChatRpcSubscriptions } from '@/composables/chat/useChatRpcSubscriptions'
-import { useChatSend } from '@/composables/chat/useChatSend'
+import { useChatSend, type ChatSendOutcome } from '@/composables/chat/useChatSend'
 import { useSandboxSetupRecovery } from '@/composables/chat/useSandboxSetupRecovery'
 import { useChatStallWatchdog } from '@/composables/chat/useChatStallWatchdog'
 import { useMetaRuns } from '@/composables/chat/useMetaRuns'
@@ -593,6 +595,7 @@ import { hasOpenDialogLayer } from '@/composables/useDialogA11y'
 import { useToasts } from '@/composables/useToasts'
 import type {
   ChatMessage,
+  ChatPendingItem,
   ChatRenderedMessage,
   ChatRunStatus,
   ChatRunStatusSource,
@@ -634,6 +637,7 @@ import {
 } from '@/utils/chat/attachments'
 import { isShareableChatMessage } from '@/utils/chat/messageIdentity'
 import { agentIdFromSessionKey } from '@/utils/chat/sessionKeys'
+import { shouldSuppressLandingSuggestions } from '@/utils/chat/landingSuggestions'
 import { clearAssistantActivityExpansionState } from '@/utils/chat/activityDisclosureState'
 import {
   resolveChatSessionLoadState,
@@ -852,6 +856,7 @@ const {
 const chatAttachments = useChatAttachments()
 const {
   pendingAttachments,
+  attachmentWorkBusy,
   onFileInputChange,
   addAttachments,
   removeAttachment,
@@ -865,7 +870,9 @@ let sendCurrentInput: () => void = () => {}
 // slash handler (useChatSlashCommands, created earlier) needs it at call time.
 let dispatchHiddenForMeta: (providerText: string, displayText: string) => void = () => {}
 let isCompactInFlightForCurrentSession: () => boolean = () => false
+let isQueuedDeliveryBlocked: () => boolean = () => false
 let dispatchHiddenControl: (providerText: string, displayText: string) => void = () => {}
+let dispatchQueuedItem: (item: ChatPendingItem) => Promise<ChatSendOutcome> = async () => 'not_sent'
 const pendingQueueOwnerContext = ref<PendingQueueOwnerContext | null>(null)
 const chatPendingQueue = useChatPendingQueue({
   sessionKey,
@@ -876,6 +883,8 @@ const chatPendingQueue = useChatPendingQueue({
   isStreaming,
   isBlocked: () => (
     isCompactInFlightForCurrentSession()
+    || isQueuedDeliveryBlocked()
+    || hasPendingAttachmentWork()
     || pendingQueueOwnerContext.value?.sessionKey === sessionKey.value
   ),
   autoResizeTextarea,
@@ -883,6 +892,7 @@ const chatPendingQueue = useChatPendingQueue({
   resetInputHistory: () => resetComposerInputHistory(),
   hasComposer: () => Boolean(composerRef.value),
   dispatchHiddenControl: (providerText, displayText) => dispatchHiddenControl(providerText, displayText),
+  dispatchPendingItem: item => dispatchQueuedItem(item),
 })
 const {
   pendingQueue,
@@ -892,6 +902,8 @@ const {
   enqueuePendingInput,
   enqueueHiddenControl,
   removePendingChip,
+  beginPendingDelivery,
+  settlePendingDelivery,
   clearPendingQueue,
   switchPendingQueue,
   adoptPendingQueue,
@@ -901,6 +913,9 @@ const {
   flushDeferredPendingDrain,
   cleanup: cleanupPendingQueue,
 } = chatPendingQueue
+watch(attachmentWorkBusy, (busy) => {
+  if (!busy) flushDeferredPendingDrain()
+})
 
 const chatCompaction = useChatCompaction({
   sessionKey,
@@ -959,6 +974,22 @@ const {
   setRouterVisualEffectsEnabled,
   bindFeatureRefresh,
 } = chatFeatureToggles
+isQueuedDeliveryBlocked = () => (
+  modelRoutingSettingsBusy.value
+  && hasSendableModelInputImageAttachment(pendingQueue.value[0]?.attachments || [])
+)
+watch(
+  [modelRoutingMode, modelRoutingSettingsBusy],
+  ([mode, busy], [previousMode, wasBusy]) => {
+    const routingUnblocked = (
+      (previousMode === 'llm_ensemble' && mode !== 'llm_ensemble')
+      || (wasBusy && !busy)
+    )
+    if (!routingUnblocked || pendingQueue.value.length === 0) return
+    schedulePendingDrainAfterTerminal()
+    flushDeferredPendingDrain()
+  },
+)
 
 const chatRouterDecisionRuntime = useChatRouterDecisionRuntime({
   messages,
@@ -1320,10 +1351,47 @@ const chatSend = useChatSend({
   autoResizeTextarea,
   scrollToBottom,
 })
-const { onSend, onStop, dispatchHiddenSend, sendHiddenMetaPreflightConfirmation } = chatSend
+const {
+  onSend,
+  onStop,
+  sendQueuedSteer,
+  sendQueuedFollowup,
+  dispatchHiddenSend,
+  sendHiddenMetaPreflightConfirmation,
+} = chatSend
 sendCurrentInput = onSend
 dispatchHiddenForMeta = dispatchHiddenSend
 dispatchHiddenControl = dispatchHiddenSend
+dispatchQueuedItem = sendQueuedFollowup
+
+function takeVisiblePendingItem(index: number) {
+  const item = pendingQueue.value[index]
+  if (!item || item.hiddenControl || item.deliveryState) return null
+  pendingQueue.value.splice(index, 1)
+  return item
+}
+
+function editPendingMessage(index: number) {
+  const item = takeVisiblePendingItem(index)
+  if (!item) return
+  inputText.value = [item.text, inputText.value].filter(text => text.trim()).join('\n')
+  pendingAttachments.value = [...(item.attachments || []), ...pendingAttachments.value]
+  pendingSessionIntent.value = item.intent || pendingSessionIntent.value
+  autoResizeTextarea()
+  nextTick(() => composerRef.value?.focusTextarea())
+}
+
+async function steerPendingMessage(index: number) {
+  const item = beginPendingDelivery(index)
+  if (!item) return
+
+  let outcome: ChatSendOutcome = 'retryable_failure'
+  try {
+    outcome = await sendQueuedSteer(item)
+  } finally {
+    settlePendingDelivery(item, outcome)
+  }
+}
 
 // Deny notes ride the normal send path: queued while the turn is streaming,
 // sent immediately otherwise.
@@ -1682,13 +1750,24 @@ const hasSendContent = computed(() => {
   return inputText.value.trim().length > 0 || pendingAttachments.value.some(isSendableAttachment)
 })
 
-const modelImageSendBlockedMessage = computed(() => {
-  if (!hasSendableModelInputImageAttachment(pendingAttachments.value)) return ''
+const landingSuggestionsSuppressed = computed(() => shouldSuppressLandingSuggestions({
+  landingPrefilled: landingPrefilled.value,
+  composerText: inputText.value,
+  attachmentCount: pendingAttachments.value.length,
+}))
+
+const queuedImageSendBlockedMessage = computed(() => {
   if (modelRoutingSettingsBusy.value) {
     return t('chat.composer.routingUpdateImageBlocked')
   }
   return modelRoutingMode.value === 'llm_ensemble'
     ? t('chat.composer.ensembleImageUnsupported')
+    : ''
+})
+
+const modelImageSendBlockedMessage = computed(() => {
+  return hasSendableModelInputImageAttachment(pendingAttachments.value)
+    ? queuedImageSendBlockedMessage.value
     : ''
 })
 
@@ -1751,12 +1830,12 @@ async function setComposerCodingModeEnabled(enabled: boolean) {
   await setCodingModeEnabled(enabled)
 }
 
-// A landing suggestion chip replaces the draft composer text; the user still
-// reviews and sends it themselves.
+// A suggestion chip is an explicit task choice. Route it through the same
+// composer-backed send path as every other message so routing, attachments,
+// optimistic state, and recovery behavior stay identical.
 function applyLandingSuggestion(text: string) {
-  inputText.value = text
-  autoResizeTextarea()
-  composerRef.value?.focusTextarea()
+  if (landingSuggestionsSuppressed.value) return
+  sendComposerText(text)
 }
 
 function appendComposerText(text: string) {
