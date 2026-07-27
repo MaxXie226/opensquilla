@@ -79,4 +79,19 @@ describe('artifact transcript focus', () => {
     expect(focusArtifactInTranscript(document, artifact('data'))).toBe(true)
     expect(document.activeElement).toBe(card.querySelector('.msg-artifact-body'))
   })
+
+  it('focuses the media card when an unsupported format only exposes Download', () => {
+    const card = document.createElement('article')
+    card.className = 'msg-video-card'
+    card.dataset.artifactKey = 'legacy-video'
+    card.innerHTML = `
+      <button class="msg-video-card__download">Download</button>
+    `
+    card.scrollIntoView = vi.fn()
+    document.body.append(card)
+
+    expect(focusArtifactInTranscript(document, artifact('legacy-video'))).toBe(true)
+    expect(document.activeElement).toBe(card)
+    expect(card.tabIndex).toBe(-1)
+  })
 })

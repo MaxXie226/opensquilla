@@ -56,6 +56,13 @@ export function focusArtifactInTranscript(
   const focusable = card.matches(PRIMARY_FOCUS_SELECTOR)
     ? card
     : card.querySelector<HTMLElement>(PRIMARY_FOCUS_SELECTOR)
-  focusable?.focus({ preventScroll: true })
+  if (focusable) {
+    focusable.focus({ preventScroll: true })
+  } else {
+    // An unsupported media card may expose download as its only action. Keep
+    // navigation non-destructive by focusing the card itself instead.
+    card.tabIndex = -1
+    card.focus({ preventScroll: true })
+  }
   return true
 }
