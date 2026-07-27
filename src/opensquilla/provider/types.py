@@ -391,6 +391,15 @@ class ChatConfig(BaseModel):
         exclude=True,
         repr=False,
     )
+    # Ensemble-internal physical-request guard. Some OpenAI-compatible
+    # adapters transparently retry an empty/timed-out stream as a second
+    # non-stream request. Serving recovery disables that adapter-level retry
+    # so its one-extra-request budget remains a real network-request bound.
+    allow_provider_stream_fallback: bool = Field(
+        default=True,
+        exclude=True,
+        repr=False,
+    )
 
     def model_post_init(self, __context: Any) -> None:
         if self.thinking_budget_explicit is None:

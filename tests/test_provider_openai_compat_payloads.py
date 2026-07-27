@@ -364,6 +364,62 @@ def test_openrouter_stream_timeout_emits_heartbeat_before_non_stream_fallback(
     )
 
 
+def test_openrouter_stream_timeout_can_disable_internal_second_request(
+    monkeypatch: Any,
+) -> None:
+    class TimeoutStream:
+        async def __aenter__(self) -> Any:
+            raise httpx.ReadTimeout("stream idle")
+
+        async def __aexit__(self, *_exc: Any) -> None:
+            return None
+
+    class TimeoutClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> TimeoutClient:
+            return self
+
+        async def __aexit__(self, *_exc: Any) -> None:
+            return None
+
+        def stream(self, *args: Any, **kwargs: Any) -> TimeoutStream:
+            return TimeoutStream()
+
+    fallback_calls = 0
+
+    class CountingFallbackProvider(OpenAIProvider):
+        async def _complete_non_stream(self, **kwargs: Any):
+            nonlocal fallback_calls
+            fallback_calls += 1
+            yield ErrorEvent(message="must not run", code="timeout")
+
+    monkeypatch.setattr("opensquilla.provider.openai.httpx.AsyncClient", TimeoutClient)
+    provider = CountingFallbackProvider(
+        api_key="test",
+        model="deepseek/deepseek-v4-flash",
+        base_url="https://openrouter.ai/api/v1",
+        provider_kind="openrouter",
+    )
+
+    events = _collect_events(
+        provider,
+        ChatConfig(
+            timeout=1.0,
+            allow_provider_stream_fallback=False,
+        ),
+    )
+
+    assert fallback_calls == 0
+    assert not any(isinstance(event, ProviderHeartbeatEvent) for event in events)
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert error.code == "timeout"
+    assert error.request_started is True
+    assert error.physical_request_count == 1
+    assert error.usage_missing_count == 1
+
+
 def test_dashscope_stream_timeout_emits_heartbeat_before_non_stream_fallback(
     monkeypatch: Any,
 ) -> None:

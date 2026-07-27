@@ -311,6 +311,14 @@ def _ensemble_trace(
     selection_mode: str,
     successful: int | None = None,
 ) -> dict[str, object]:
+    def output_binding(text: str) -> dict[str, object]:
+        return {
+            "text": text,
+            "chars": len(text),
+            "truncated": False,
+            "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        }
+
     candidates = []
     for model in proposers:
         text = f"candidate from {model}"
@@ -327,20 +335,79 @@ def _ensemble_trace(
                 "content": {"text": text, "chars": len(text), "truncated": False},
             }
         )
+    aggregator_identity = f"openrouter:{aggregator}"
     physical = {
         "agent_call_index": 1,
+        "output_binding_schema": "opensquilla.ensemble-output-binding/v1",
+        "assembled_output": output_binding(final_text),
+        "output_components": [
+            {
+                "attempt": 1,
+                "kind": "primary",
+                "fallback_index": 0,
+                "requested_provider": "openrouter",
+                "requested_model": aggregator,
+                "assembled_start": 0,
+                "assembled_end": len(final_text),
+                "physical_output": output_binding(final_text),
+                "assembled_contribution": output_binding(final_text),
+                "assembled_prefix_sha256": hashlib.sha256(final_text.encode("utf-8")).hexdigest(),
+            }
+        ],
         "request_outcome": "llm_response",
         "total_candidates": len(proposers),
         "successful_proposers": (len(proposers) if successful is None else successful),
         "fallback_used": False,
+        "fallback_reason": "",
+        "executed_A": aggregator_identity,
+        "run_outcome": "success",
+        "delivery_outcome": "complete",
         "final_request_role": "aggregator",
         "selection_plan": {
             "strategy": selection_mode,
             "selection_mode": selection_mode,
             "proposer_models": proposers,
             "aggregator_model": aggregator,
+            "aggregator_candidates": [aggregator_identity],
         },
         "candidates": candidates,
+        "aggregator_recovery": {
+            "schema": "opensquilla.ensemble-aggregator-recovery/v1",
+            "mode": "experiment",
+            "candidate_count": 1,
+            "candidate_ids": [aggregator_identity],
+            "max_tokens_cap": 65_536,
+            "visible_answer_reserve_tokens": 8_192,
+            "attempts": [
+                {
+                    "attempt": 1,
+                    "physical_attempt_index": 1,
+                    "physical_request_count": 1,
+                    "kind": "primary",
+                    "fallback_index": 0,
+                    "trigger": "",
+                    "request_started": True,
+                    "visible_output_emitted": True,
+                    "stream_closed": True,
+                    "outcome": "succeeded",
+                    "stop_reason": "stop",
+                    "requested_provider": "openrouter",
+                    "requested_model": aggregator,
+                    "actual_provider": "openrouter",
+                    "actual_model": aggregator,
+                }
+            ],
+            "proposer_reused": True,
+            "success": True,
+            "degraded": False,
+            "selected_attempt": 1,
+            "selected_kind": "primary",
+            "fallback_index": 0,
+            "fallback_reason": "",
+            "executed_A": aggregator_identity,
+            "continuation_count": 0,
+            "same_model_recovery_count": 0,
+        },
         "final_request": {
             "role": "aggregator",
             "request_started": True,
@@ -361,8 +428,11 @@ def _ensemble_trace(
                 "text": final_text,
                 "chars": len(final_text),
                 "truncated": False,
+                "sha256": hashlib.sha256(final_text.encode("utf-8")).hexdigest(),
             },
         },
+        "llm_request_count": len(proposers) + 1,
+        "physical_request_count": len(proposers) + 1,
     }
     return {
         "mode": "agent_loop",
@@ -383,6 +453,10 @@ def _nonterminal_fallback_call(
     call["successful_proposers"] = successful
     call["fallback_used"] = True
     call["final_request_role"] = "fallback_single"
+    call.pop("aggregator_recovery", None)
+    call.pop("executed_A", None)
+    call.pop("run_outcome", None)
+    call.pop("delivery_outcome", None)
     candidates = call["candidates"]
     assert isinstance(candidates, list)
     for index, candidate in enumerate(candidates):
@@ -424,9 +498,154 @@ def _nonterminal_fallback_call(
                 "text": output,
                 "chars": len(output),
                 "truncated": False,
+                "sha256": hashlib.sha256(output.encode("utf-8")).hexdigest(),
             },
         }
     )
+    call["assembled_output"] = deepcopy(final_request["output"])
+    call["output_components"] = []
+    return call
+
+
+def _ranked_aggregator_fallback_call(
+    plan: dict[str, object],
+    *,
+    final_text: str,
+    fallback_index: int,
+    trigger: str = "reasoning_only_length",
+) -> dict[str, object]:
+    proposers = [str(value) for value in plan["proposer_models"]]
+    primary_model = str(plan["aggregator_model"])
+    call = _ensemble_trace(
+        proposers,
+        primary_model,
+        final_text=final_text,
+        selection_mode="router_dynamic",
+    )["calls"][0]
+    assert isinstance(call, dict)
+    call["selection_plan"] = deepcopy(plan)
+    chain = [str(value) for value in plan["aggregator_candidates"]]
+    selected_identity = chain[fallback_index]
+    selected_provider, _, selected_model = selected_identity.partition(":")
+    primary_provider, _, primary_model = chain[0].partition(":")
+    attempts = [
+        {
+            "attempt": 1,
+            "kind": "primary",
+            "fallback_index": 0,
+            "trigger": trigger,
+            "request_started": True,
+            "physical_attempt_index": 1,
+            "physical_request_count": 1,
+            "visible_output_emitted": False,
+            "stream_closed": True,
+            "outcome": "abandoned",
+            "requested_provider": primary_provider,
+            "requested_model": primary_model,
+        }
+    ]
+    if fallback_index == 2:
+        skipped_provider, _, skipped_model = chain[1].partition(":")
+        attempts.append(
+            {
+                "attempt": 2,
+                "kind": "model_fallback",
+                "fallback_index": 1,
+                "trigger": trigger,
+                "request_started": False,
+                "physical_attempt_index": None,
+                "physical_request_count": 0,
+                "outcome": "member_unavailable",
+                "requested_provider": skipped_provider,
+                "requested_model": skipped_model,
+            }
+        )
+    selected_attempt = len(attempts) + 1
+    attempts.append(
+        {
+            "attempt": selected_attempt,
+            "kind": "model_fallback",
+            "fallback_index": fallback_index,
+            "trigger": trigger,
+            "request_started": True,
+            "physical_attempt_index": 2,
+            "physical_request_count": 1,
+            "visible_output_emitted": True,
+            "stream_closed": True,
+            "outcome": "succeeded",
+            "requested_provider": selected_provider,
+            "requested_model": selected_model,
+            "actual_provider": selected_provider,
+            "actual_model": selected_model,
+        }
+    )
+    call.update(
+        {
+            "fallback_used": True,
+            "fallback_reason": trigger,
+            "executed_A": selected_identity,
+            "run_outcome": "aggregator_recovered",
+            "delivery_outcome": "complete",
+            "aggregator_recovery": {
+                "schema": "opensquilla.ensemble-aggregator-recovery/v1",
+                "mode": "experiment",
+                "candidate_count": len(chain),
+                "candidate_ids": chain,
+                "max_tokens_cap": 65_536,
+                "visible_answer_reserve_tokens": 8_192,
+                "attempts": attempts,
+                "proposer_reused": True,
+                "success": True,
+                "degraded": False,
+                "selected_attempt": selected_attempt,
+                "selected_kind": "model_fallback",
+                "fallback_index": fallback_index,
+                "fallback_reason": trigger,
+                "executed_A": selected_identity,
+                "continuation_count": 0,
+                "same_model_recovery_count": 0,
+            },
+            "llm_request_count": len(proposers) + 2,
+            "physical_request_count": len(proposers) + 2,
+        }
+    )
+    final_request = call["final_request"]
+    assert isinstance(final_request, dict)
+    final_request.update(
+        {
+            "role": "aggregator",
+            "execution": {
+                "provider": selected_provider,
+                "model": selected_model,
+                "actual_provider": selected_provider,
+                "actual_model": selected_model,
+                "requested_provider": selected_provider,
+                "requested_model": selected_model,
+            },
+            "usage": {
+                "provider": selected_provider,
+                "model": selected_model,
+                "requested_provider": selected_provider,
+                "requested_model": selected_model,
+            },
+        }
+    )
+    output = final_request["output"]
+    assert isinstance(output, dict)
+    call["output_components"] = [
+        {
+            "attempt": selected_attempt,
+            "kind": "model_fallback",
+            "fallback_index": fallback_index,
+            "requested_provider": selected_provider,
+            "requested_model": selected_model,
+            "assembled_start": 0,
+            "assembled_end": len(final_text),
+            "physical_output": deepcopy(output),
+            "assembled_contribution": deepcopy(call["assembled_output"]),
+            "assembled_prefix_sha256": hashlib.sha256(final_text.encode("utf-8")).hexdigest(),
+        }
+    ]
     return call
 
 
@@ -454,7 +673,7 @@ def _contract(module, group: str, key_hash: str) -> dict[str, object]:
         ),
         "runner": {
             "mode": "agent_loop",
-            "agent_max_iterations": 12,
+            "agent_max_iterations": 20,
             "finalization_policy": finalization_policy,
         },
         "tools": {
@@ -536,7 +755,7 @@ def _contract(module, group: str, key_hash: str) -> dict[str, object]:
         "cost_policy": {"require_openrouter_non_byok": True},
         "global_experiment_profile": {
             "schema_version": 1,
-            "profile_id": "opensquilla_b2_quality_first_v1",
+            "profile_id": "opensquilla_b2_quality_first_v2",
             "benchmark_input": {
                 "sha256": module.FROZEN_DRACO_MINI_SHA256,
                 "task_count": module.FROZEN_DRACO_MINI_TASK_COUNT,
@@ -550,7 +769,7 @@ def _contract(module, group: str, key_hash: str) -> dict[str, object]:
             },
             "runner": {
                 "mode": "agent_loop",
-                "agent_max_iterations": 12,
+                "agent_max_iterations": 20,
                 **finalization_policy,
             },
             "generation": {
@@ -586,33 +805,35 @@ def _contract(module, group: str, key_hash: str) -> dict[str, object]:
             "source": "experiment_config",
             "sandbox_enabled": False,
             "sandbox_security_grading_enabled": False,
+            **module.FORMAL_AGGREGATOR_RECOVERY_POLICY,
             "g1_user_profile_generation_enabled": False,
             "g1_user_profile_enabled": False,
+        },
+        "gateway_execution": {
+            "llm_ensemble": dict(module.FORMAL_AGGREGATOR_RECOVERY_POLICY),
         },
         "dry_run": False,
     }
     if group == "B1":
-        contract["gateway_execution"] = {
-            "squilla_router": {
-                "tiers": {
-                    "c0": {
-                        "provider": "openrouter",
-                        "model": "deepseek/deepseek-v4-flash",
-                    },
-                    "c1": {
-                        "provider": "openrouter",
-                        "model": "deepseek/deepseek-v4-pro",
-                    },
-                    "c2": {"provider": "openrouter", "model": "z-ai/glm-5.2"},
-                    "c3": {
-                        "provider": "openrouter",
-                        "model": "anthropic/claude-opus-4.8",
-                    },
-                    "image_model": {
-                        "provider": "openrouter",
-                        "model": "moonshotai/kimi-k2.6",
-                    },
-                }
+        contract["gateway_execution"]["squilla_router"] = {
+            "tiers": {
+                "c0": {
+                    "provider": "openrouter",
+                    "model": "deepseek/deepseek-v4-flash",
+                },
+                "c1": {
+                    "provider": "openrouter",
+                    "model": "deepseek/deepseek-v4-pro",
+                },
+                "c2": {"provider": "openrouter", "model": "z-ai/glm-5.2"},
+                "c3": {
+                    "provider": "openrouter",
+                    "model": "anthropic/claude-opus-4.8",
+                },
+                "image_model": {
+                    "provider": "openrouter",
+                    "model": "moonshotai/kimi-k2.6",
+                },
             }
         }
     if group == "G1":
@@ -789,6 +1010,7 @@ def _g1_plan(module, proposers: list[str], aggregator: str) -> dict[str, object]
             "proposer_models": selected_proposers,
             "proposer_sample_count": len(selected_proposers),
             "aggregator_model": selected_aggregator,
+            **module.FORMAL_AGGREGATOR_RECOVERY_POLICY,
             "candidate_allowlist": {
                 "policy": "exact_openrouter_routes",
                 "profile_id": "test-g1",
@@ -864,6 +1086,7 @@ def _row(
             "selection_plan": {
                 "proposer_models": list(module.B2_PROPOSERS),
                 "aggregator_model": module.B2_AGGREGATOR,
+                "aggregator_candidates": [f"openrouter:{module.B2_AGGREGATOR}"],
             },
         }
         ensemble_trace = _ensemble_trace(
@@ -890,7 +1113,11 @@ def _row(
             final_text=final_text,
             selection_mode="router_dynamic",
         )
-        ensemble_trace["calls"][0]["selection_plan"] = deepcopy(plan)
+        call = ensemble_trace["calls"][0]
+        call["selection_plan"] = deepcopy(plan)
+        recovery = call["aggregator_recovery"]
+        recovery["candidate_ids"] = list(plan["aggregator_candidates"])
+        recovery["candidate_count"] = len(plan["aggregator_candidates"])
     rubric = task["rubric"]
     criteria = rubric["sections"][0]["criteria"]
     judgments = []
@@ -1140,7 +1367,7 @@ def test_ensemble_gate_allows_only_empty_nonterminal_fallback(module) -> None:
             "calls": [deepcopy(fallback)],
         }
     )
-    assert "aggregator_fallback_used_or_unknown" in module.ensemble_gate(
+    assert "missing_aggregator_recovery_evidence" in module.ensemble_gate(
         terminal_fallback,
         expected_proposers=module.B2_PROPOSERS,
         expected_aggregator=module.B2_AGGREGATOR,
@@ -1155,7 +1382,17 @@ def test_ensemble_gate_allows_only_empty_nonterminal_fallback(module) -> None:
         "text": prefix,
         "chars": len(prefix),
         "truncated": False,
+        "sha256": module.text_sha256(prefix),
     }
+    first["assembled_output"] = deepcopy(first["final_request"]["output"])
+    first["output_components"][0].update(
+        {
+            "assembled_end": len(prefix),
+            "physical_output": deepcopy(first["final_request"]["output"]),
+            "assembled_contribution": deepcopy(first["final_request"]["output"]),
+            "assembled_prefix_sha256": module.text_sha256(prefix),
+        }
+    )
     visible_intermediate["ensemble_trace"]["calls"] = [first, terminal]
     assert (
         module.ensemble_gate(
@@ -1165,14 +1402,448 @@ def test_ensemble_gate_allows_only_empty_nonterminal_fallback(module) -> None:
         )
         == []
     )
-    visible_intermediate["ensemble_trace"]["calls"][0]["final_request"]["output"]["text"] = (
-        "tampered"
-    )
+    visible_intermediate["ensemble_trace"]["calls"][0]["assembled_output"]["text"] = "tampered"
     assert "wrong_agent_call_output_binding" in module.ensemble_gate(
         visible_intermediate,
         expected_proposers=module.B2_PROPOSERS,
         expected_aggregator=module.B2_AGGREGATOR,
     )
+
+
+@pytest.mark.parametrize("fallback_index", [1, 2])
+def test_g1_ensemble_gate_accepts_only_frozen_ranked_aggregator_fallbacks(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+    fallback_index: int,
+) -> None:
+    monkeypatch.setattr(
+        module,
+        "FORMAL_G1_RANKING_CONFIG_SHA256",
+        module.canonical_sha256(_test_ranking_config(module)),
+    )
+    plan = _g1_plan(
+        module,
+        [
+            "deepseek/deepseek-v4-pro",
+            "qwen/qwen3.7-max",
+            "z-ai/glm-5.2",
+        ],
+        "z-ai/glm-5.2",
+    )
+    final_text = "ranked fallback answer"
+    call = _ranked_aggregator_fallback_call(
+        plan,
+        final_text=final_text,
+        fallback_index=fallback_index,
+    )
+    row = {
+        "final_text": final_text,
+        "routing_trace": {"selection_plan": deepcopy(plan)},
+        "ensemble_trace": {
+            "mode": "agent_loop",
+            "agent_llm_call_count": 1,
+            "untraced_agent_llm_call_count": 0,
+            "calls": [call],
+        },
+    }
+    contract = _contract(module, "G1", "a" * 64)["g1_registry_contract"]
+
+    reasons, _, primary_model = module.g1_registry_plan_reasons(plan, contract=contract)
+    assert reasons == []
+    assert primary_model == str(plan["selected_A"]).partition(":")[2]
+    assert call["selection_plan"]["selected_A"] == plan["selected_A"]
+    assert call["selection_plan"]["aggregator_model"] == plan["aggregator_model"]
+    assert (
+        module.ensemble_gate(
+            row,
+            expected_proposers=plan["proposer_models"],
+            expected_aggregator=primary_model,
+            allowed_models={
+                "deepseek/deepseek-v4-pro",
+                "z-ai/glm-5.2",
+                "qwen/qwen3.7-max",
+            },
+        )
+        == []
+    )
+
+
+@pytest.mark.parametrize(
+    ("continuation_count", "expected_reason"),
+    [(2, None), (0, "aggregator_continuation_fallback_count_mismatch")],
+)
+def test_formal_continuation_fallback_contract(
+    module,
+    continuation_count: int,
+    expected_reason: str | None,
+) -> None:
+    plan = _g1_plan(
+        module,
+        [
+            "deepseek/deepseek-v4-pro",
+            "qwen/qwen3.7-max",
+            "z-ai/glm-5.2",
+        ],
+        "z-ai/glm-5.2",
+    )
+    final_text = "assembled continuation fallback answer"
+    call = _ranked_aggregator_fallback_call(
+        plan,
+        final_text=final_text,
+        fallback_index=1,
+        trigger="visible_length_continuations_exhausted",
+    )
+    recovery = call["aggregator_recovery"]
+    recovery["selected_kind"] = "continuation_fallback"
+    recovery["continuation_count"] = continuation_count
+    recovery["attempts"][0]["visible_output_emitted"] = True
+    recovery["attempts"][-1]["kind"] = "continuation_fallback"
+    prefix = "assembled "
+    remainder = final_text[len(prefix) :]
+
+    def binding(text: str) -> dict[str, object]:
+        return {
+            "text": text,
+            "chars": len(text),
+            "truncated": False,
+            "sha256": module.text_sha256(text),
+        }
+
+    final_request = call["final_request"]
+    final_request["output"] = binding(remainder)
+    selected_attempt = recovery["selected_attempt"]
+    selected_fallback_index = recovery["fallback_index"]
+    selected_identity = recovery["candidate_ids"][selected_fallback_index]
+    selected_provider, _, selected_model = selected_identity.partition(":")
+    call["output_components"] = [
+        {
+            "attempt": 1,
+            "kind": "primary",
+            "fallback_index": 0,
+            "requested_provider": "openrouter",
+            "requested_model": str(plan["aggregator_model"]),
+            "assembled_start": 0,
+            "assembled_end": len(prefix),
+            "physical_output": binding(prefix),
+            "assembled_contribution": binding(prefix),
+            "assembled_prefix_sha256": module.text_sha256(prefix),
+        },
+        {
+            "attempt": selected_attempt,
+            "kind": "continuation_fallback",
+            "fallback_index": selected_fallback_index,
+            "requested_provider": selected_provider,
+            "requested_model": selected_model,
+            "assembled_start": len(prefix),
+            "assembled_end": len(final_text),
+            "physical_output": binding(remainder),
+            "assembled_contribution": binding(remainder),
+            "assembled_prefix_sha256": module.text_sha256(final_text),
+        },
+    ]
+    row = {
+        "final_text": final_text,
+        "routing_trace": {"selection_plan": deepcopy(plan)},
+        "ensemble_trace": {
+            "mode": "agent_loop",
+            "agent_llm_call_count": 1,
+            "untraced_agent_llm_call_count": 0,
+            "calls": [call],
+        },
+    }
+
+    reasons = module.ensemble_gate(
+        row,
+        expected_proposers=plan["proposer_models"],
+        expected_aggregator=str(plan["aggregator_model"]),
+    )
+    if expected_reason is None:
+        assert reasons == []
+    else:
+        assert expected_reason in reasons
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_reason"),
+    [
+        ("missing_schema", "missing_aggregator_output_binding_schema"),
+        ("missing_components", "missing_aggregator_output_components"),
+        ("component_gap", "noncontiguous_aggregator_output_components"),
+        (
+            "wrong_selected_physical",
+            "wrong_selected_aggregator_physical_output_binding",
+        ),
+        (
+            "wrong_prefix_hash",
+            "wrong_aggregator_output_component_prefix_hash",
+        ),
+    ],
+)
+def test_formal_output_binding_fails_closed(
+    module,
+    mutation: str,
+    expected_reason: str,
+) -> None:
+    final_text = "auditable assembled answer"
+    trace = _ensemble_trace(
+        list(module.B2_PROPOSERS),
+        module.B2_AGGREGATOR,
+        final_text=final_text,
+        selection_mode="static_openrouter_b5",
+    )
+    call = trace["calls"][0]
+    if mutation == "missing_schema":
+        call.pop("output_binding_schema")
+    elif mutation == "missing_components":
+        call["output_components"] = []
+    elif mutation == "component_gap":
+        call["output_components"][0]["assembled_start"] = 1
+    elif mutation == "wrong_selected_physical":
+        call["output_components"][0]["physical_output"]["sha256"] = "f" * 64
+    else:
+        call["output_components"][0]["assembled_prefix_sha256"] = "f" * 64
+    row = {
+        "final_text": final_text,
+        "routing_trace": {
+            "selection_plan": deepcopy(call["selection_plan"]),
+        },
+        "ensemble_trace": trace,
+    }
+
+    reasons = module.ensemble_gate(
+        row,
+        expected_proposers=module.B2_PROPOSERS,
+        expected_aggregator=module.B2_AGGREGATOR,
+    )
+    assert expected_reason in reasons
+
+
+def test_formal_recovery_request_conservation_allows_nested_physical_usage(module) -> None:
+    plan = _g1_plan(
+        module,
+        [
+            "deepseek/deepseek-v4-pro",
+            "qwen/qwen3.7-max",
+            "z-ai/glm-5.2",
+        ],
+        "z-ai/glm-5.2",
+    )
+    final_text = "nested provider answer"
+    call = _ranked_aggregator_fallback_call(
+        plan,
+        final_text=final_text,
+        fallback_index=1,
+    )
+    attempts = call["aggregator_recovery"]["attempts"]
+    attempts[0]["physical_request_count"] = 2
+    attempts[1]["physical_attempt_index"] = 3
+    call["llm_request_count"] += 1
+    call["physical_request_count"] += 1
+    row = {
+        "final_text": final_text,
+        "routing_trace": {"selection_plan": deepcopy(plan)},
+        "ensemble_trace": {
+            "mode": "agent_loop",
+            "agent_llm_call_count": 1,
+            "untraced_agent_llm_call_count": 0,
+            "calls": [call],
+        },
+    }
+
+    assert (
+        module.ensemble_gate(
+            row,
+            expected_proposers=plan["proposer_models"],
+            expected_aggregator=str(plan["aggregator_model"]),
+        )
+        == []
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_reason"),
+    [
+        ("unranked_execution", "aggregator_executed_identity_mismatch"),
+        ("final_request_identity", "wrong_final_aggregator_usage_requested_identity"),
+        ("judge_trigger", "nonstructural_aggregator_fallback_trigger"),
+        ("candidate_trace_chain", "aggregator_recovery_candidates_mismatch"),
+        ("skip_top2", "aggregator_fallback_skipped_ranked_candidate"),
+        ("fallback_single", "final_request_not_aggregator"),
+    ],
+)
+def test_g1_ensemble_gate_rejects_forged_or_semantic_aggregator_fallback(
+    module,
+    mutation: str,
+    expected_reason: str,
+) -> None:
+    plan = _g1_plan(
+        module,
+        [
+            "deepseek/deepseek-v4-pro",
+            "qwen/qwen3.7-max",
+            "z-ai/glm-5.2",
+        ],
+        "z-ai/glm-5.2",
+    )
+    final_text = "ranked fallback answer"
+    call = _ranked_aggregator_fallback_call(
+        plan,
+        final_text=final_text,
+        fallback_index=2 if mutation == "skip_top2" else 1,
+    )
+    if mutation == "unranked_execution":
+        call["executed_A"] = "openrouter:outside/unranked"
+    elif mutation == "final_request_identity":
+        call["final_request"]["usage"]["requested_model"] = "outside/unranked"
+    elif mutation == "judge_trigger":
+        call["fallback_reason"] = "judge_low_score"
+        call["aggregator_recovery"]["fallback_reason"] = "judge_low_score"
+        for attempt in call["aggregator_recovery"]["attempts"]:
+            attempt["trigger"] = "judge_low_score"
+    elif mutation == "candidate_trace_chain":
+        call["aggregator_recovery"]["candidate_ids"] = list(
+            reversed(call["aggregator_recovery"]["candidate_ids"])
+        )
+    elif mutation == "skip_top2":
+        call["aggregator_recovery"]["attempts"] = [
+            attempt
+            for attempt in call["aggregator_recovery"]["attempts"]
+            if attempt["fallback_index"] != 1
+        ]
+    else:
+        call["final_request_role"] = "fallback_single"
+        call["final_request"]["role"] = "fallback_single"
+    row = {
+        "final_text": final_text,
+        "routing_trace": {"selection_plan": deepcopy(plan)},
+        "ensemble_trace": {
+            "mode": "agent_loop",
+            "agent_llm_call_count": 1,
+            "untraced_agent_llm_call_count": 0,
+            "calls": [call],
+        },
+    }
+
+    reasons = module.ensemble_gate(
+        row,
+        expected_proposers=plan["proposer_models"],
+        expected_aggregator=str(plan["aggregator_model"]),
+    )
+    assert expected_reason in reasons
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_reason"),
+    [
+        ("missing_candidates", "missing_aggregator_candidate_chain"),
+        ("missing_recovery", "missing_aggregator_recovery_evidence"),
+        ("partial_salvage", "invalid_aggregator_recovery_selected_kind"),
+        ("degraded", "degraded_aggregator_recovery_not_formal"),
+        ("partial_delivery", "aggregator_delivery_not_complete"),
+        ("wrong_run_outcome", "aggregator_run_outcome_selected_kind_mismatch"),
+        ("duplicate_attempt", "invalid_aggregator_recovery_attempt_sequence"),
+        ("selected_unstarted", "ambiguous_aggregator_recovery_selected_attempt"),
+        ("proposer_attempt_kind", "invalid_aggregator_recovery_attempt_kind"),
+        ("missing_physical_index", "invalid_aggregator_physical_attempt_index"),
+        ("request_count_mismatch", "ensemble_request_count_mismatch"),
+        ("hidden_proposer_request", "ensemble_physical_request_count_undercounted"),
+    ],
+)
+def test_formal_ensemble_recovery_evidence_fails_closed(
+    module,
+    mutation: str,
+    expected_reason: str,
+) -> None:
+    final_text = "formal answer"
+    trace = _ensemble_trace(
+        list(module.B2_PROPOSERS),
+        module.B2_AGGREGATOR,
+        final_text=final_text,
+        selection_mode="static_openrouter_b5",
+    )
+    call = trace["calls"][0]
+    recovery = call["aggregator_recovery"]
+    selected_attempt = recovery["attempts"][0]
+    if mutation == "missing_candidates":
+        call["selection_plan"].pop("aggregator_candidates")
+    elif mutation == "missing_recovery":
+        call.pop("aggregator_recovery")
+    elif mutation == "partial_salvage":
+        recovery["selected_kind"] = "partial_salvage"
+        recovery["degraded"] = True
+        call["delivery_outcome"] = "partial_usable"
+        call["run_outcome"] = "length_capped_usable"
+    elif mutation == "degraded":
+        recovery["degraded"] = True
+    elif mutation == "partial_delivery":
+        call["delivery_outcome"] = "partial_usable"
+    elif mutation == "wrong_run_outcome":
+        call["run_outcome"] = "aggregator_recovered"
+    elif mutation == "duplicate_attempt":
+        recovery["attempts"].append(deepcopy(selected_attempt))
+    elif mutation == "selected_unstarted":
+        selected_attempt["request_started"] = False
+        selected_attempt["physical_attempt_index"] = None
+    elif mutation == "proposer_attempt_kind":
+        selected_attempt["kind"] = "proposer"
+    elif mutation == "missing_physical_index":
+        selected_attempt["physical_attempt_index"] = None
+    elif mutation == "request_count_mismatch":
+        call["physical_request_count"] -= 1
+    else:
+        call["candidates"][0]["physical_request_count"] += 1
+    row = {
+        "final_text": final_text,
+        "routing_trace": {"selection_plan": deepcopy(call["selection_plan"])},
+        "ensemble_trace": trace,
+    }
+
+    reasons = module.ensemble_gate(
+        row,
+        expected_proposers=module.B2_PROPOSERS,
+        expected_aggregator=module.B2_AGGREGATOR,
+    )
+
+    assert expected_reason in reasons
+
+
+def test_g1_candidate_chain_must_equal_unique_frozen_aggregator_top3(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        module,
+        "FORMAL_G1_RANKING_CONFIG_SHA256",
+        module.canonical_sha256(_test_ranking_config(module)),
+    )
+    plan = _g1_plan(
+        module,
+        [
+            "deepseek/deepseek-v4-pro",
+            "qwen/qwen3.7-max",
+            "z-ai/glm-5.2",
+        ],
+        "z-ai/glm-5.2",
+    )
+    contract = _contract(module, "G1", "a" * 64)["g1_registry_contract"]
+    assert module.g1_registry_plan_reasons(plan, contract=contract)[0] == []
+
+    reordered = deepcopy(plan)
+    reordered["aggregator_candidates"][1:] = reversed(reordered["aggregator_candidates"][1:])
+    reasons, _, _ = module.g1_registry_plan_reasons(reordered, contract=contract)
+    assert "wrong_g1_aggregator_candidate_chain" in reasons
+
+    duplicated = deepcopy(plan)
+    duplicated["aggregator_candidates"][2] = duplicated["aggregator_candidates"][1]
+    reasons, _, _ = module.g1_registry_plan_reasons(duplicated, contract=contract)
+    assert "wrong_g1_aggregator_candidate_chain" in reasons
+
+    missing = deepcopy(plan)
+    missing.pop("aggregator_candidates")
+    for field in module.FORMAL_AGGREGATOR_RECOVERY_POLICY:
+        missing.pop(field)
+    reasons, _, _ = module.g1_registry_plan_reasons(missing, contract=contract)
+    assert "missing_g1_aggregator_recovery_policy" in reasons
 
 
 def test_g1_route_gate_reuses_one_provider_lifecycle_plan_and_analyzer(
@@ -3235,6 +3906,13 @@ def _set_nested_value(target: dict[str, object], path: tuple[str, ...], value: o
         (("resolved_llm_runtime", "response_cache_disabled"), False),
         (("global_experiment_profile", "generation", "max_tokens"), 4_096),
         (("formal_runtime_freeze", "sandbox_enabled"), True),
+        (("formal_runtime_freeze", "aggregator_recovery_mode"), "serving"),
+        (("formal_runtime_freeze", "aggregator_recovery_top_k"), 2),
+        (("formal_runtime_freeze", "aggregator_max_tokens_cap"), 16_384),
+        (
+            ("formal_runtime_freeze", "aggregator_visible_answer_reserve_tokens"),
+            4_096,
+        ),
     ],
 )
 def test_formal_execution_contract_tampering_fails_closed(
@@ -3252,6 +3930,29 @@ def test_formal_execution_contract_tampering_fails_closed(
         module.validate_formal_campaign_contracts(contracts)
 
     assert f"B2 formal execution contract.{'.'.join(path)}" in str(error.value)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("aggregator_recovery_mode", "serving"),
+        ("aggregator_recovery_top_k", 2),
+        ("aggregator_max_tokens_cap", 16_384),
+        ("aggregator_visible_answer_reserve_tokens", 4_096),
+    ],
+)
+def test_formal_gateway_aggregator_recovery_tampering_fails_closed(
+    module,
+    field: str,
+    value: object,
+) -> None:
+    contracts = {group: _contract(module, group, "a" * 64) for group in module.GROUPS}
+    contracts["G1"]["gateway_execution"]["llm_ensemble"][field] = value
+
+    with pytest.raises(module.FinalizationError) as error:
+        module.validate_formal_campaign_contracts(contracts)
+
+    assert f"G1 gateway llm_ensemble.{field}" in str(error.value)
 
 
 @pytest.mark.parametrize(

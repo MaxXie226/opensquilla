@@ -6790,9 +6790,9 @@ def test_resume_verifies_b2_runtime_lineup_against_current_contract() -> None:
     )
 
     tampered_intermediate = json.loads(json.dumps(two_calls))
-    tampered_intermediate["ensemble_trace"]["calls"][0]["final_request"]["output"][
-        "text"
-    ] = "x" * len(intermediate_text)
+    tampered_intermediate["ensemble_trace"]["calls"][0]["final_request"]["output"]["text"] = (
+        "x" * len(intermediate_text)
+    )
     assert "wrong_agent_call_output_binding" in (
         resume_runner.ensemble_generation_completion_reasons(
             tampered_intermediate,
@@ -6963,9 +6963,7 @@ def test_terminal_policy_allows_only_empty_nonterminal_fallback(module) -> None:
     )
 
     conflicting_execution = deepcopy(fallback)
-    conflicting_execution["final_request"]["execution"]["actual_model"] = (
-        "outside/model"
-    )
+    conflicting_execution["final_request"]["execution"]["actual_model"] = "outside/model"
     assert (
         retry_reason([conflicting_execution, deepcopy(terminal)], "final answer")
         == "wrong_intermediate_fallback_model"
@@ -6978,9 +6976,7 @@ def test_terminal_policy_allows_only_empty_nonterminal_fallback(module) -> None:
         expected_selection_plan=plan,
     ) == ["intermediate_fallback_visible_output"]
 
-    assert retry_reason([deepcopy(fallback)], "") == (
-        "aggregator_fallback_used_or_unknown"
-    )
+    assert retry_reason([deepcopy(fallback)], "") == ("aggregator_fallback_used_or_unknown")
 
 
 @pytest.mark.parametrize("module", [runner, _load_resume_runner()], ids=["main", "resume"])
@@ -7158,12 +7154,8 @@ def test_resume_reclassifies_one_legacy_terminal_attempt_without_hiding_spend() 
     )
     assert row["selected_attempt_billed_cost_usd"] == pytest.approx(0.1)
     accounting = module.row_cost_accounting(row)
-    assert accounting["selected_generation_attempt"]["recorded_cost_usd"] == (
-        pytest.approx(0.1)
-    )
-    assert accounting["actual_generation_spend"]["recorded_cost_usd"] == (
-        pytest.approx(0.6)
-    )
+    assert accounting["selected_generation_attempt"]["recorded_cost_usd"] == (pytest.approx(0.1))
+    assert accounting["actual_generation_spend"]["recorded_cost_usd"] == (pytest.approx(0.6))
     prompt_hash = module.text_sha256("same prompt")
     row.update(
         {
@@ -7244,6 +7236,10 @@ def test_g1_registry_contract_is_manifested_and_fingerprinted(
     )
     assert config.llm_ensemble.ranking_user_profile_generation_enabled is False
     assert config.llm_ensemble.ranking_user_profile_enabled is False
+    assert config.llm_ensemble.aggregator_recovery_mode == "experiment"
+    assert config.llm_ensemble.aggregator_recovery_top_k == 3
+    assert config.llm_ensemble.aggregator_max_tokens_cap == 65_536
+    assert config.llm_ensemble.aggregator_visible_answer_reserve_tokens == 8_192
     assert config.sandbox.sandbox is False
     assert config.sandbox.security_grading is False
     args._g1_registry_contract = module.validate_g1_registry_contract(
@@ -7277,6 +7273,10 @@ def test_g1_registry_contract_is_manifested_and_fingerprinted(
         "source": "experiment_config",
         "sandbox_enabled": False,
         "sandbox_security_grading_enabled": False,
+        "aggregator_recovery_mode": "experiment",
+        "aggregator_recovery_top_k": 3,
+        "aggregator_max_tokens_cap": 65_536,
+        "aggregator_visible_answer_reserve_tokens": 8_192,
         "g1_user_profile_generation_enabled": False,
         "g1_user_profile_enabled": False,
     }
@@ -7354,6 +7354,10 @@ async def test_g1_dry_build_records_exact_candidate_allowlist(module) -> None:
     assert plan["ranking_config_hash"] == (experiment.g1_routing.expected_ranking_config_sha256)
     assert plan["selected_A"] in plan["candidate_allowlist"]["expected_identities"]
     assert set(plan["selected_P"]) <= set(plan["candidate_allowlist"]["expected_identities"])
+    assert plan["aggregator_recovery_mode"] == "experiment"
+    assert plan["aggregator_recovery_top_k"] == 3
+    assert plan["aggregator_max_tokens_cap"] == 65_536
+    assert plan["aggregator_visible_answer_reserve_tokens"] == 8_192
 
 
 def test_g1_dry_cli_main_exits_zero_with_frozen_registry_contract(
@@ -7601,9 +7605,7 @@ def test_resume_reuses_g1_plan_and_analyzer_within_one_provider_lifecycle() -> N
         inherited_provider_config=inherited,
         fallback_provider=None,
         turn_metadata={"routed_tier": "c1", "routing_confidence": 0.9},
-        ranking_inputs={
-            "registry_allowlist": experiment.g1_routing.model_dump(mode="json")
-        },
+        ranking_inputs={"registry_allowlist": experiment.g1_routing.model_dump(mode="json")},
     )
     plan = deepcopy(provider.selection_plan)
     final_text = "answer"
@@ -7688,9 +7690,7 @@ def test_resume_reuses_g1_plan_and_analyzer_within_one_provider_lifecycle() -> N
     )
 
     conflict = deepcopy(row)
-    conflict["ensemble_trace"]["calls"][0]["selection_plan"]["decision_id"] = (
-        "conflicting-decision"
-    )
+    conflict["ensemble_trace"]["calls"][0]["selection_plan"]["decision_id"] = "conflicting-decision"
     conflict_reasons = module.ensemble_generation_completion_reasons(
         conflict,
         expected_run_compatibility_contract=compatibility,
@@ -7701,24 +7701,18 @@ def test_resume_reuses_g1_plan_and_analyzer_within_one_provider_lifecycle() -> N
     missing_analyzer["execution"]["generation_attempts"][0]["run"]["usage"] = {
         "model_usage_breakdown": []
     }
-    assert (
-        "missing_g1_task_analyzer_request"
-        in module.ensemble_generation_completion_reasons(
-            missing_analyzer,
-            expected_run_compatibility_contract=compatibility,
-        )
+    assert "missing_g1_task_analyzer_request" in module.ensemble_generation_completion_reasons(
+        missing_analyzer,
+        expected_run_compatibility_contract=compatibility,
     )
 
     repeated_analyzer = deepcopy(row)
     repeated_analyzer["execution"]["generation_attempts"][1]["run"]["usage"][
         "model_usage_breakdown"
     ] = [deepcopy(analyzer)]
-    assert (
-        "repeated_g1_task_analyzer_request"
-        in module.ensemble_generation_completion_reasons(
-            repeated_analyzer,
-            expected_run_compatibility_contract=compatibility,
-        )
+    assert "repeated_g1_task_analyzer_request" in module.ensemble_generation_completion_reasons(
+        repeated_analyzer,
+        expected_run_compatibility_contract=compatibility,
     )
 
     prompt_hash = module.text_sha256("same prompt")
@@ -7807,6 +7801,7 @@ def test_g1_runtime_dynamic_plan_satisfies_frozen_ranking_contract(
         in module._openrouter_supported_thinking_levels(member.provider_config.model)
         for member in [*provider.proposers, provider.aggregator]
     )
+
 
 def _compatibility_for(
     module,
@@ -8012,12 +8007,10 @@ def test_repair_only_source_drift_inherits_expected_contract_and_actions(
         encoding="utf-8",
     )
 
-    inherited, audit = (
-        module.validate_repair_only_source_drift_compatibility(
-            path=manifest,
-            actual=actual,
-            groups=["B0"],
-        )
+    inherited, audit = module.validate_repair_only_source_drift_compatibility(
+        path=manifest,
+        actual=actual,
+        groups=["B0"],
     )
 
     assert inherited == expected
@@ -8129,9 +8122,10 @@ def test_repair_only_classification_rejects_regenerate_and_budget_exhaustion() -
 
     assert audit["status"] == "rejected_regeneration_required"
     assert audit["regenerate_pair_count"] == 2
-    assert {
-        item["reason"] for item in audit["regenerate_pairs"]
-    } == {"missing_resume_state", "generation_budget_exhausted"}
+    assert {item["reason"] for item in audit["regenerate_pairs"]} == {
+        "missing_resume_state",
+        "generation_budget_exhausted",
+    }
 
 
 @pytest.mark.asyncio
@@ -8244,9 +8238,7 @@ async def test_repair_only_regenerate_fails_before_provider_or_judge(
         "judge": 0,
     }
     assert args._run_compatibility == expected
-    assert args._repair_compatibility_audit["status"] == (
-        "rejected_regeneration_required"
-    )
+    assert args._repair_compatibility_audit["status"] == ("rejected_regeneration_required")
     assert not (tmp_path / "output").exists()
 
 
@@ -8297,9 +8289,7 @@ def test_repair_manifest_keeps_current_source_and_inherited_compatibility(
     payload = json.loads(manifest.read_text(encoding="utf-8"))
     assert payload["source_provenance"]["git_head"] == "c" * 40
     assert payload["run_compatibility"] == inherited
-    assert payload["repair_compatibility_audit"]["status"] == (
-        "repair_actions_validated"
-    )
+    assert payload["repair_compatibility_audit"]["status"] == ("repair_actions_validated")
 
 
 def test_task_input_hash_covers_rubric_not_only_prompt() -> None:
@@ -8918,9 +8908,7 @@ async def test_run_one_freezes_dataclass_routing_receipt(
         return result, attempts, 1
 
     async def fake_judge_text(**_kwargs):
-        return _complete_legacy_judge(
-            f"dataclass-routing-judge-{module.__name__}"
-        )
+        return _complete_legacy_judge(f"dataclass-routing-judge-{module.__name__}")
 
     monkeypatch.setattr(
         module,
@@ -9043,6 +9031,10 @@ def test_b2_provider_alignment_pins_effective_member_configuration() -> None:
     assert provider.record_candidates is True
     assert provider.proposer_tools is False
     assert provider.aggregator_tools is True
+    assert provider.aggregator_recovery_mode == "experiment"
+    assert provider.aggregator_recovery_top_k == 3
+    assert provider.aggregator_max_tokens_cap == 65_536
+    assert provider.aggregator_visible_answer_reserve_tokens == 8_192
 
     members = [*provider.proposers, provider.aggregator]
     assert all(member.max_tokens == 16_384 for member in members)
@@ -9068,7 +9060,7 @@ def test_b2_provider_alignment_pins_effective_member_configuration() -> None:
     ]
 
     plan = provider.selection_plan
-    assert plan["benchmark_alignment"]["id"] == "opensquilla_b2_quality_first_v1"
+    assert plan["benchmark_alignment"]["id"] == "opensquilla_b2_quality_first_v2"
     assert plan["pre_alignment"]["min_successful_proposers"] == 3
     assert plan["pre_alignment"]["selection_plan"]["profile"] == "static_openrouter_b5"
     assert plan["proposer_models"] == [
@@ -9093,6 +9085,10 @@ def test_b2_provider_alignment_pins_effective_member_configuration() -> None:
     assert plan["member_generation"][2]["thinking"] == "high"
     assert plan["proposer_tools"] is False
     assert plan["aggregator_tools"] is True
+    assert plan["aggregator_recovery_mode"] == "experiment"
+    assert plan["aggregator_recovery_top_k"] == 3
+    assert plan["aggregator_max_tokens_cap"] == 65_536
+    assert plan["aggregator_visible_answer_reserve_tokens"] == 8_192
 
     provider = runner.enforce_draco_legal_proposer_quorum(provider)
     assert provider.min_successful_proposers == 3
@@ -9190,6 +9186,50 @@ async def test_b2_dry_build_records_canonical_selection_plan() -> None:
     assert plan["proposer_sample_count"] == 4
     assert plan["member_generation"][-1]["role"] == "aggregator"
     assert plan["member_generation"][-1]["thinking"] == "xhigh"
+    assert plan["aggregator_recovery_mode"] == "experiment"
+    assert plan["aggregator_recovery_top_k"] == 3
+    assert plan["aggregator_max_tokens_cap"] == 65_536
+    assert plan["aggregator_visible_answer_reserve_tokens"] == 8_192
+    assert plan["aggregator_candidates"] == ["openrouter:z-ai/glm-5.2"]
+    assert "aggregator_recovery" not in result.routing_trace
+    assert result.routing_trace["aggregator_recovery_policy"] == {
+        "schema": "opensquilla.ensemble-aggregator-recovery-policy/v1",
+        "evidence_kind": "dry_run_policy_only",
+        "aggregator_recovery_mode": "experiment",
+        "aggregator_recovery_top_k": 3,
+        "aggregator_max_tokens_cap": 65_536,
+        "aggregator_visible_answer_reserve_tokens": 8_192,
+    }
+
+    events = [
+        event
+        async for event in result.provider.chat([runner.Message(role="user", content="dry prompt")])
+    ]
+    trace = events[-1].ensemble_trace
+    recovery = trace["aggregator_recovery"]
+    assert recovery["schema"] == "opensquilla.ensemble-aggregator-recovery/v1"
+    assert recovery["mode"] == "experiment"
+    assert recovery["candidate_ids"] == ["openrouter:z-ai/glm-5.2"]
+    assert recovery["candidate_count"] == 1
+    assert recovery["success"] is True
+    assert recovery["degraded"] is False
+    assert recovery["selected_attempt"] == 1
+    assert recovery["selected_kind"] == "primary"
+    assert recovery["fallback_index"] == 0
+    assert recovery["executed_A"] == "openrouter:z-ai/glm-5.2"
+    assert recovery["attempts"] == [
+        {
+            **recovery["attempts"][0],
+            "attempt": 1,
+            "physical_attempt_index": 1,
+            "request_started": True,
+            "outcome": "succeeded",
+        }
+    ]
+    assert trace["run_outcome"] == "success"
+    assert trace["delivery_outcome"] == "complete"
+    assert trace["llm_request_count"] == 5
+    assert trace["physical_request_count"] == 5
 
 
 def test_manifest_records_effective_and_requested_b2_alignment(tmp_path: Path) -> None:

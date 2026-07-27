@@ -3919,6 +3919,7 @@ class OpenAIProvider:
         router_metadata: dict[str, Any] = {}
         trace_tool_calls: list[dict[str, Any]] = []
         usage_evidence_seen = False
+        physical_request_attempted = False
 
         if os.environ.get("OPENSQUILLA_TRACE_ROUTING"):
             print(
@@ -4022,15 +4023,24 @@ class OpenAIProvider:
                 response_ids=sorted(response_ids),
                 cache_namespace_sha256=cache_namespace_sha256,
             )
+            request_started = physical_request_attempted or diagnostic_done is not None
+            error_kwargs = dict(kwargs)
+            error_kwargs.setdefault("request_started", request_started)
+            error_kwargs.setdefault(
+                "physical_request_count",
+                1 if request_started else 0,
+            )
             if diagnostic_done is None:
-                return ErrorEvent(message=message, code=code, **kwargs)
+                error_kwargs.setdefault(
+                    "usage_missing_count",
+                    1 if request_started else 0,
+                )
+                return ErrorEvent(message=message, code=code, **error_kwargs)
             return ErrorEvent(
                 message=message,
                 code=code,
                 diagnostic_done=diagnostic_done,
-                request_started=True,
-                physical_request_count=1,
-                **kwargs,
+                **error_kwargs,
             )
 
         async def accounted_non_stream_fallback(
@@ -4135,12 +4145,16 @@ class OpenAIProvider:
             async with httpx.AsyncClient(
                 timeout=(
                     _stream_timeout(cfg.timeout)
-                    if self._compat.stream_timeout_fallback
+                    if (
+                        self._compat.stream_timeout_fallback
+                        and cfg.allow_provider_stream_fallback
+                    )
                     else cfg.timeout
                 ),
                 trust_env=_trust_env(),
                 proxy=self._proxy,
             ) as client:
+                physical_request_attempted = True
                 async with client.stream(
                     "POST",
                     endpoint,
@@ -5048,6 +5062,7 @@ class OpenAIProvider:
                     if not has_terminal_evidence:
                         if (
                             self._compat.empty_stream_fallback
+                            and cfg.allow_provider_stream_fallback
                             and not active_choice_seen
                             and not emitted_stream_event
                             and not assistant_text_parts
@@ -5323,6 +5338,7 @@ class OpenAIProvider:
 
                     if (
                         self._compat.empty_stream_fallback
+                        and cfg.allow_provider_stream_fallback
                         and not emitted_stream_event
                         and not assistant_text_parts
                         and not tools_acc.has_calls
@@ -5431,7 +5447,11 @@ class OpenAIProvider:
                 message=safe_error,
                 metadata={"phase": "stream", "cache_shape": cache_shape},
             )
-            if self._compat.stream_timeout_fallback and not emitted_stream_event:
+            if (
+                self._compat.stream_timeout_fallback
+                and cfg.allow_provider_stream_fallback
+                and not emitted_stream_event
+            ):
                 event_name = (
                     "openrouter.stream_timeout_fallback_started"
                     if self._provider_kind == "openrouter"

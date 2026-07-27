@@ -497,6 +497,15 @@ class LlmEnsembleConfig(BaseSettings):
     candidate_max_chars: int = Field(default=24_000, ge=0)
     proposer_timeout_seconds: float = Field(default=3600.0, gt=0.0)
     aggregator_timeout_seconds: float = Field(default=3600.0, gt=0.0)
+    aggregator_serving_chain_timeout_seconds: float = Field(default=120.0, gt=0.0)
+    # Serving stops after the first useful recovery action to protect
+    # interactive latency. Experiment mode exhausts the frozen Top-3
+    # aggregator chain for strict benchmark completeness. Off preserves the
+    # pre-recovery behavior.
+    aggregator_recovery_mode: Literal["off", "serving", "experiment"] = "serving"
+    aggregator_recovery_top_k: int = Field(default=3, ge=1, le=3)
+    aggregator_max_tokens_cap: int = Field(default=65_536, ge=2)
+    aggregator_visible_answer_reserve_tokens: int = Field(default=8_192, ge=1)
     shuffle_candidates: bool = True
     record_candidates: bool = False
 
@@ -511,6 +520,17 @@ class LlmEnsembleConfig(BaseSettings):
             seen_options.add(normalized)
             model_options.append(normalized)
         self.model_options = model_options
+        return self
+
+    @model_validator(mode="after")
+    def _validate_aggregator_output_budget(self) -> LlmEnsembleConfig:
+        """Reject recovery budgets that runtime would otherwise rewrite silently."""
+
+        if self.aggregator_visible_answer_reserve_tokens >= self.aggregator_max_tokens_cap:
+            raise ValueError(
+                "llm_ensemble.aggregator_visible_answer_reserve_tokens must be "
+                "smaller than llm_ensemble.aggregator_max_tokens_cap"
+            )
         return self
 
     @model_validator(mode="after")

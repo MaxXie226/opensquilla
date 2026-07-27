@@ -250,7 +250,7 @@ COMMON_ARGS=(
   --ensemble-proposer-timeout 907.5
   --ensemble-aggregator-timeout 2662.5
   --runner-mode agent_loop
-  --agent-max-iterations 12
+  --agent-max-iterations 20
   --judge-model google/gemini-3.1-pro-preview
   --judge-repeats 3
   --judge-concurrency 6
@@ -263,9 +263,13 @@ COMMON_ARGS=(
   --local-web-search-api-key-env BRAVE_SEARCH_API_KEY
   --contamination-blocked-domains "$BLOCKED_DOMAINS"
   --experiment-config-set timeouts.task_seconds=10800
-  --experiment-config-set runner.agent_max_iterations=12
+  --experiment-config-set runner.agent_max_iterations=20
   --experiment-config-set runner.concurrency=5
   --experiment-config-set judge.concurrency=6
+  --experiment-config-set ensemble.aggregator_recovery_mode=experiment
+  --experiment-config-set ensemble.aggregator_recovery_top_k=3
+  --experiment-config-set ensemble.aggregator_max_tokens_cap=65536
+  --experiment-config-set ensemble.aggregator_visible_answer_reserve_tokens=8192
 )
 
 RESULT_JSONLS=()

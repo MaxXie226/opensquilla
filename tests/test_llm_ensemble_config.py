@@ -35,6 +35,7 @@ def test_llm_ensemble_defaults_to_disabled_for_model_router_first_install() -> N
     assert ensemble.candidate_max_chars == 24_000
     assert ensemble.proposer_timeout_seconds == 3600.0
     assert ensemble.aggregator_timeout_seconds == 3600.0
+    assert ensemble.aggregator_serving_chain_timeout_seconds == 120.0
     assert ensemble.shuffle_candidates is True
     assert ensemble.record_candidates is False
 
@@ -62,6 +63,7 @@ def test_llm_ensemble_defaults_to_disabled_for_model_router_first_install() -> N
     assert provider.min_successful_proposers == 3
     assert provider.proposer_timeout_seconds == 300.0
     assert provider.aggregator_timeout_seconds == 480.0
+    assert provider.aggregator_serving_chain_timeout_seconds == 120.0
     assert provider.shuffle_candidates is False
     assert provider.quorum_grace_seconds == 10.0
 
@@ -105,6 +107,33 @@ def test_llm_ensemble_thinking_assignment_switch_is_opt_in_and_serialized() -> N
     assert cfg.llm_ensemble.ranking_thinking_assignment_enabled is True
     serialized = cfg.to_toml_dict()["llm_ensemble"]
     assert serialized["ranking_thinking_assignment_enabled"] is True
+
+
+def test_llm_ensemble_serving_chain_timeout_serializes_and_reaches_provider() -> None:
+    cfg = GatewayConfig(
+        llm_ensemble={
+            "enabled": True,
+            "selection_mode": "static_openrouter_b5",
+            "aggregator_serving_chain_timeout_seconds": 45.0,
+        }
+    )
+
+    serialized = cfg.to_toml_dict()["llm_ensemble"]
+    assert serialized["aggregator_serving_chain_timeout_seconds"] == 45.0
+
+    provider = build_ensemble_provider_from_config(
+        config=cfg,
+        inherited_provider_config=ProviderConfig(
+            provider="openrouter",
+            model="routed/model",
+            api_key="fake",
+            base_url="https://openrouter.example/api/v1",
+        ),
+        fallback_provider=None,
+    )
+
+    assert provider.aggregator_serving_chain_timeout_seconds == 45.0
+    assert provider.selection_plan["aggregator_serving_chain_timeout_seconds"] == 45.0
 
 
 def test_static_openrouter_b5_does_not_need_model_options() -> None:
@@ -659,10 +688,17 @@ def test_static_openrouter_b5_ensemble_locks_members_across_routed_tiers() -> No
             "effective_proposer_timeout_seconds": 300.0,
             "configured_aggregator_timeout_seconds": 3600.0,
             "effective_aggregator_timeout_seconds": 480.0,
+            "aggregator_serving_chain_timeout_seconds": 120.0,
             "configured_shuffle_candidates": False,
             "effective_shuffle_candidates": False,
             "quorum_grace_seconds": 10.0,
             "selection_mode": "static_openrouter_b5",
+            "aggregator_recovery_mode": "serving",
+            "aggregator_recovery_top_k": 3,
+            "aggregator_max_tokens_cap": 65_536,
+            "aggregator_visible_answer_reserve_tokens": 8_192,
+            "aggregator_candidates": ["openrouter:z-ai/glm-5.2"],
+            "provider_state_replay": "disabled_cross_model",
             "selected_P": [f"openrouter:{model}" for model in expected_proposers],
             "selected_A": "openrouter:z-ai/glm-5.2",
         }
@@ -1267,12 +1303,7 @@ async def test_selector_fallback_cannot_bypass_routed_thinking_policy() -> None:
     selector = _Selector()
     wrapper = _SelectorFallbackProvider(_ManagedEnsemble(), selector)
 
-    events = [
-        event
-        async for event in wrapper.chat(
-            [Message(role="user", content="synthetic")]
-        )
-    ]
+    events = [event async for event in wrapper.chat([Message(role="user", content="synthetic")])]
 
     assert selector.fallback_calls == 0
     assert len(events) == 1

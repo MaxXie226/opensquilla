@@ -130,6 +130,10 @@ class DracoEnsembleConfig(_StrictConfig):
     record_candidates: bool
     proposer_tools: bool
     aggregator_tools: bool
+    aggregator_recovery_mode: Literal["off", "serving", "experiment"] = "experiment"
+    aggregator_recovery_top_k: int = Field(default=3, ge=1, le=3)
+    aggregator_max_tokens_cap: int = Field(default=65_536, ge=2)
+    aggregator_visible_answer_reserve_tokens: int = Field(default=8_192, ge=1)
     wait_for_all_proposers: bool
     quorum_grace_seconds: float = Field(ge=0.0)
 
@@ -146,6 +150,11 @@ class DracoEnsembleConfig(_StrictConfig):
         if not self.wait_for_all_proposers and self.quorum_grace_seconds <= 0:
             raise ValueError(
                 "ensemble.quorum_grace_seconds must be positive when wait_for_all_proposers=false"
+            )
+        if self.aggregator_visible_answer_reserve_tokens >= self.aggregator_max_tokens_cap:
+            raise ValueError(
+                "ensemble.aggregator_visible_answer_reserve_tokens must be smaller than "
+                "ensemble.aggregator_max_tokens_cap"
             )
         return self
 

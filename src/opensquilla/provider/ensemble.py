@@ -147,13 +147,15 @@ class _UsageAccountingSnapshotState:
     usage_rows: list[dict[str, Any]] = field(default_factory=list)
 
     def snapshot(self) -> ErrorEvent | None:
-        physical_count = max(0, self.physical_request_count)
+        physical_count = max(
+            0,
+            self.physical_request_count,
+            _usage_rows_physical_request_count(self.usage_rows, self.usage_missing_count),
+        )
         if physical_count == 0:
             return None
         rows = [dict(row) for row in self.usage_rows]
-        receipt_count = sum(
-            1 for row in rows if not _is_missing_request_placeholder(row)
-        )
+        receipt_count = sum(1 for row in rows if not _is_missing_request_placeholder(row))
         missing_count = max(
             self.usage_missing_count,
             physical_count - receipt_count,
@@ -826,9 +828,7 @@ def _candidate_result_snapshot(candidate: _CandidateResult) -> _CandidateResult:
         diagnostic_model_usage_breakdown=[
             dict(row) for row in candidate.diagnostic_model_usage_breakdown
         ],
-        model_usage_breakdown=[
-            dict(row) for row in candidate.model_usage_breakdown
-        ],
+        model_usage_breakdown=[dict(row) for row in candidate.model_usage_breakdown],
     )
 
 
@@ -937,15 +937,10 @@ def _is_thinking_parameter_rejection(*, message: str, code: str) -> bool:
     evidence = f"{code} {message}".strip().casefold()
     if "signature" in evidence:
         return False
-    has_subject = any(
-        subject in evidence for subject in _THINKING_REJECTION_SUBJECTS
-    )
+    has_subject = any(subject in evidence for subject in _THINKING_REJECTION_SUBJECTS)
     has_level_parameter = any(
         marker in evidence for marker in _THINKING_LEVEL_PARAMETER_MARKERS
-    ) or (
-        ("thinking" in evidence or "reasoning" in evidence)
-        and " value" in evidence
-    )
+    ) or (("thinking" in evidence or "reasoning" in evidence) and " value" in evidence)
     return (
         has_subject
         and has_level_parameter
@@ -1245,6 +1240,143 @@ def _member_chat_config(
     return effective
 
 
+def _aggregator_chat_config(
+    base: ChatConfig | None,
+    member: EnsembleMemberConfig,
+    *,
+    max_tokens_cap: int,
+    visible_answer_reserve_tokens: int,
+    recovery: bool = False,
+    request_budget_binding: _MemberRequestBudgetBinding | None = None,
+    record_budget_rebound: bool = True,
+) -> ChatConfig:
+    """Allocate aggregator reasoning without consuming all visible output.
+
+    The catalog value is treated as a hard capability ceiling only when it
+    came from a provider/catalog/operator source. An unknown/default catalog
+    value must never be used to claim that a model accepts a larger output
+    budget than its configured member limit.
+    """
+
+    member_max = max(0, int(member.max_tokens or 0))
+    default_request_max = max(1, int(ChatConfig().max_tokens))
+    base_max = max(0, int(getattr(base, "max_tokens", 0) or 0))
+    explicit_request_max = base_max if member_max <= 0 and base_max > default_request_max else 0
+    configured_max = max(
+        1,
+        int(_member_max_tokens(member)),
+        explicit_request_max,
+    )
+    capability_max = configured_max
+    capability_source = "configured"
+    try:
+        resolved_max, resolved_source = shared_catalog().resolve_max_tokens_with_source(
+            member.provider_config.model,
+            user_override=0,
+            provider=member.provider_config.provider,
+        )
+        if resolved_source in {"catalog", "override"} and int(resolved_max or 0) > 0:
+            capability_max = int(resolved_max)
+            capability_source = str(resolved_source)
+    except Exception:  # noqa: BLE001 - unknown capability stays conservative
+        pass
+
+    expansion_cap = max(
+        1,
+        min(max(1, int(max_tokens_cap or 1)), capability_max),
+    )
+    reserve = min(
+        max(1, int(visible_answer_reserve_tokens or 1)),
+        max(1, expansion_cap - 1),
+    )
+    normalized_thinking, normalized_level = _normalize_thinking(member.thinking)
+    thinking_enabled = (
+        bool(getattr(base, "thinking", False))
+        if normalized_thinking is None
+        else bool(normalized_thinking)
+    )
+    thinking_budget = (
+        _policy_thinking_budget_tokens(str(normalized_level))
+        if member.thinking_policy_managed and normalized_level is not None
+        else max(0, int(getattr(base, "thinking_budget_tokens", 0) or 0))
+        if thinking_enabled
+        else 0
+    )
+    desired_max = configured_max
+    if not recovery and thinking_budget > 0:
+        desired_max = max(desired_max, thinking_budget + reserve)
+    # The aggregator-specific cap is a real request ceiling. Explicit member
+    # values authorize expansion for an unknown model, but they do not bypass
+    # either this cap or a trusted model/provider capability limit.
+    if capability_source == "configured":
+        effective_max = min(configured_max, max(1, int(max_tokens_cap or 1)))
+    else:
+        effective_max = min(desired_max, expansion_cap)
+    effective_reserve = min(
+        reserve,
+        max(1, effective_max // 2),
+    )
+    effective_member = replace(member, max_tokens=effective_max)
+    effective = _member_chat_config(
+        base,
+        effective_member,
+        request_budget_binding=request_budget_binding,
+        role="aggregator_recovery" if recovery else "aggregator",
+        record_budget_rebound=record_budget_rebound,
+    )
+    if recovery:
+        effective = effective.model_copy(
+            update={
+                "thinking": False,
+                "thinking_level": None,
+                "thinking_budget_tokens": 0,
+                "thinking_budget_explicit": False,
+                "tool_choice": None,
+            }
+        )
+    elif effective.thinking:
+        # Preserve a visible answer partition without claiming more capacity
+        # than the trusted model ceiling permits.
+        # Small ceilings are split conservatively between reasoning and text.
+        bounded_thinking_budget = min(
+            max(0, int(effective.thinking_budget_tokens or 0)),
+            max(0, effective_max - effective_reserve),
+        )
+        effective = effective.model_copy(
+            update=(
+                {
+                    "thinking_budget_tokens": bounded_thinking_budget,
+                    "thinking_budget_explicit": True,
+                }
+                if bounded_thinking_budget > 0
+                else {
+                    "thinking": False,
+                    "thinking_level": None,
+                    "thinking_budget_tokens": 0,
+                    "thinking_budget_explicit": False,
+                }
+            )
+        )
+    log.info(
+        "ensemble_aggregator_output_budget_resolved",
+        label=member.label or "aggregator",
+        provider=member.provider_config.provider,
+        model=member.provider_config.model,
+        recovery=recovery,
+        configured_max_tokens=configured_max,
+        capability_max_tokens=capability_max,
+        capability_source=capability_source,
+        configured_max_tokens_cap=max_tokens_cap,
+        effective_max_tokens=effective.max_tokens,
+        configured_visible_answer_reserve_tokens=reserve,
+        effective_visible_answer_reserve_tokens=effective_reserve,
+        effective_thinking_budget_tokens=(
+            int(effective.thinking_budget_tokens or 0) if effective.thinking else 0
+        ),
+    )
+    return effective
+
+
 def _build_provider(cfg: ProviderConfig) -> LLMProvider:
     selector = ModelSelector(SelectorConfig(primary=cfg))
     return selector.resolve()
@@ -1255,6 +1387,58 @@ def _truncate_text(text: str, max_chars: int) -> str:
         return text
     marker = "\n\n[truncated]"
     return text[: max(0, max_chars - len(marker))] + marker
+
+
+def _deduplicate_continuation(existing: str, continuation: str) -> str:
+    """Remove a repeated prefix from a continuation without rewriting text."""
+
+    if not existing or not continuation:
+        return continuation
+    if continuation.startswith(existing):
+        return continuation[len(existing) :]
+    # Find the longest exact suffix/prefix overlap in linear time. Recovery
+    # outputs can legitimately exceed 4K characters; a fixed short window
+    # would duplicate long code/report fragments when a provider repeats the
+    # tail before continuing.
+    max_overlap = min(len(existing), len(continuation))
+    prefix = continuation[:max_overlap]
+    suffix = existing[-max_overlap:]
+    sentinel = object()
+    sequence: list[object] = [*prefix, sentinel, *suffix]
+    failure = [0] * len(sequence)
+    for index in range(1, len(sequence)):
+        candidate = failure[index - 1]
+        while candidate > 0 and sequence[index] != sequence[candidate]:
+            candidate = failure[candidate - 1]
+        if sequence[index] == sequence[candidate]:
+            candidate += 1
+        failure[index] = candidate
+    overlap = failure[-1]
+    if overlap > 0:
+        return continuation[overlap:]
+    return continuation
+
+
+def _visible_answer_looks_usable(
+    text: str,
+    *,
+    minimum_chars: int = 32,
+) -> bool:
+    """Reject only obviously broken serving fragments without another LLM call."""
+
+    candidate = str(text or "").strip()
+    if not candidate:
+        return False
+    if candidate.count("```") % 2:
+        return False
+    if candidate[:1] in {"{", "["}:
+        try:
+            json.loads(candidate)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
+    if len(candidate) >= max(1, int(minimum_chars)):
+        return True
+    return candidate.endswith((".", "!", "?", "。", "！", "？", "}", "]", "```"))
 
 
 def _usage_value(value: object, *names: str, default: Any = None) -> Any:
@@ -1806,6 +1990,24 @@ def _done_event_physical_request_count(event: DoneEvent) -> int:
     return max(traced, evidenced, 1)
 
 
+def _done_event_missing_usage_count(event: DoneEvent) -> int:
+    """Count successful nested requests that lack one receipt row."""
+
+    physical_count = _done_event_physical_request_count(event)
+    event_rows = [
+        row
+        for row in event.model_usage_breakdown
+        if isinstance(row, Mapping) and not _is_missing_request_placeholder(row)
+    ]
+    # A leaf DoneEvent is itself the receipt. Composite DoneEvents expose one
+    # row per physical child and the outer aggregate is not an extra request.
+    receipt_count = len(event_rows) if event.model_usage_breakdown else 1
+    return max(
+        max(0, int(event.usage_missing_count or 0)),
+        physical_count - receipt_count,
+    )
+
+
 def _error_event_missing_usage_count(
     event: ErrorEvent,
     *,
@@ -1870,14 +2072,24 @@ def _preserve_observed_request_evidence(
 ) -> ErrorEvent:
     """Do not let contradictory local flags erase observed provider work."""
 
-    if not response_observed:
+    evidence_observed = bool(
+        response_observed
+        or event.diagnostic_done is not None
+        or event.model_usage_breakdown
+        or int(event.usage_missing_count or 0) > 0
+        or (event.physical_request_count is not None and int(event.physical_request_count or 0) > 0)
+    )
+    if not evidence_observed:
         return event
     if event.request_started is not False and event.physical_request_count != 0:
         return event
     return replace(
         event,
         request_started=True,
-        physical_request_count=max(1, int(event.physical_request_count or 0)),
+        physical_request_count=max(
+            1,
+            _error_event_physical_request_count(event, request_started=True),
+        ),
     )
 
 
@@ -2043,22 +2255,30 @@ def _unrepresented_diagnostic_usage_rows(
 def _annotate_member_thinking_usage_rows(
     rows: Sequence[dict[str, Any]],
     member: EnsembleMemberConfig,
+    chat_config: ChatConfig | None = None,
 ) -> list[dict[str, Any]]:
     """Attach the unified/native thinking assignment to physical usage rows."""
 
     annotated = list(rows)
     if not member.thinking_policy_managed:
         return annotated
+    actual_thinking_enabled = bool(chat_config.thinking) if chat_config is not None else None
+    actual_effective_level = (
+        "off" if actual_thinking_enabled is False else member.effective_thinking_level
+    )
+    actual_provider_level = "off" if actual_thinking_enabled is False else member.thinking
     for row in annotated:
         row.setdefault(
             "requested_thinking_level",
             member.requested_thinking_level,
         )
-        row.setdefault(
-            "effective_thinking_level",
-            member.effective_thinking_level,
-        )
-        row.setdefault("provider_thinking_level", member.thinking)
+        row["effective_thinking_level"] = actual_effective_level
+        row["provider_thinking_level"] = actual_provider_level
+        if chat_config is not None:
+            row["thinking_budget_tokens"] = max(
+                0,
+                int(chat_config.thinking_budget_tokens or 0),
+            )
         row.setdefault(
             "thinking_fallback_reason",
             member.thinking_fallback_reason,
@@ -2086,6 +2306,7 @@ class EnsembleProvider:
         profile_name: str,
         proposers: Sequence[EnsembleMemberConfig],
         aggregator: EnsembleMemberConfig,
+        aggregator_fallbacks: Sequence[EnsembleMemberConfig] = (),
         fallback_provider: LLMProvider | None = None,
         fallback_provider_name: str = "",
         fallback_model: str = "",
@@ -2094,11 +2315,16 @@ class EnsembleProvider:
         all_failed_policy: Literal["fallback_single", "error"] = "fallback_single",
         proposer_timeout_seconds: float = 3600.0,
         aggregator_timeout_seconds: float = 3600.0,
+        aggregator_serving_chain_timeout_seconds: float = 120.0,
         candidate_max_chars: int = 24_000,
         shuffle_candidates: bool = True,
         record_candidates: bool = False,
         proposer_tools: bool = False,
         aggregator_tools: bool = True,
+        aggregator_recovery_mode: Literal["off", "serving", "experiment"] = "serving",
+        aggregator_recovery_top_k: int = 3,
+        aggregator_max_tokens_cap: int = 65_536,
+        aggregator_visible_answer_reserve_tokens: int = 8_192,
         quorum_grace_seconds: float = 0.0,
         selection_plan: Mapping[str, Any] | None = None,
         _member_request_budget_bindings: Mapping[tuple[str, str, str], _MemberRequestBudgetBinding]
@@ -2108,6 +2334,7 @@ class EnsembleProvider:
         self.profile_name = profile_name
         self.proposers = list(proposers)
         self.aggregator = aggregator
+        self.aggregator_fallbacks = list(aggregator_fallbacks)[:2]
         self.fallback_provider = fallback_provider
         self.fallback_provider_name = str(fallback_provider_name or "")
         self.fallback_model = str(fallback_model or "")
@@ -2116,11 +2343,42 @@ class EnsembleProvider:
         self.all_failed_policy = all_failed_policy
         self.proposer_timeout_seconds = float(proposer_timeout_seconds or 3600.0)
         self.aggregator_timeout_seconds = float(aggregator_timeout_seconds or 3600.0)
+        self.aggregator_serving_chain_timeout_seconds = float(
+            aggregator_serving_chain_timeout_seconds
+        )
+        if self.aggregator_serving_chain_timeout_seconds <= 0:
+            raise ValueError("aggregator_serving_chain_timeout_seconds must be positive")
         self.candidate_max_chars = int(candidate_max_chars or 0)
         self.shuffle_candidates = bool(shuffle_candidates)
         self.record_candidates = bool(record_candidates)
         self.proposer_tools = bool(proposer_tools)
         self.aggregator_tools = bool(aggregator_tools)
+        aggregator_recovery_mode = str(aggregator_recovery_mode or "serving").strip().lower()
+        if aggregator_recovery_mode not in {"off", "serving", "experiment"}:
+            raise ValueError("aggregator_recovery_mode must be one of off, serving, experiment")
+        self.aggregator_recovery_mode = aggregator_recovery_mode
+        self.aggregator_recovery_top_k = max(
+            1,
+            min(3, int(aggregator_recovery_top_k or 1)),
+        )
+        if self.aggregator_recovery_mode == "off":
+            self.aggregator_recovery_top_k = 1
+        self.aggregator_fallbacks = self.aggregator_fallbacks[
+            : max(0, self.aggregator_recovery_top_k - 1)
+        ]
+        self.aggregator_max_tokens_cap = int(aggregator_max_tokens_cap or 0)
+        self.aggregator_visible_answer_reserve_tokens = int(
+            aggregator_visible_answer_reserve_tokens or 0
+        )
+        if self.aggregator_max_tokens_cap < 2:
+            raise ValueError("aggregator_max_tokens_cap must be at least 2")
+        if not (
+            1 <= self.aggregator_visible_answer_reserve_tokens < self.aggregator_max_tokens_cap
+        ):
+            raise ValueError(
+                "aggregator_visible_answer_reserve_tokens must be between 1 and "
+                "aggregator_max_tokens_cap - 1"
+            )
         self.quorum_grace_seconds = max(0.0, float(quorum_grace_seconds or 0.0))
         self.selection_plan = dict(selection_plan or {})
         self._member_request_budget_bindings = dict(_member_request_budget_bindings or {})
@@ -2138,6 +2396,7 @@ class EnsembleProvider:
             self.selection_plan.get("ranking_thinking_assignment_enabled") is True
             or self.aggregator.thinking_policy_managed
             or any(member.thinking_policy_managed for member in self.proposers)
+            or any(member.thinking_policy_managed for member in self.aggregator_fallbacks)
         )
 
     @property
@@ -2174,9 +2433,7 @@ class EnsembleProvider:
                 profile=self.profile_name,
             )
         )
-        self._accounting_state.usage_missing_count += (
-            _candidate_missing_usage_count([candidate])
-        )
+        self._accounting_state.usage_missing_count += _candidate_missing_usage_count([candidate])
 
     def _record_accounting_rows(
         self,
@@ -2184,9 +2441,7 @@ class EnsembleProvider:
         *,
         missing_count: int = 0,
     ) -> None:
-        self._accounting_state.usage_rows.extend(
-            _canonicalize_usage_row(row) for row in rows
-        )
+        self._accounting_state.usage_rows.extend(_canonicalize_usage_row(row) for row in rows)
         self._accounting_state.usage_missing_count += max(
             0,
             int(missing_count or 0),
@@ -2434,12 +2689,19 @@ class EnsembleProvider:
                 trace_fallbacks.append(dict(record))
         return record
 
-    def _aggregator_error_is_retryable(self, *, message: str, code: str) -> bool:
+    def _aggregator_error_is_retryable(
+        self,
+        *,
+        message: str,
+        code: str,
+        member: EnsembleMemberConfig | None = None,
+    ) -> bool:
         """True when the aggregator failure is a transient upstream condition."""
 
         raw_code = str(code or "")
+        effective_member = member or self.aggregator
         kind = classify_provider_error(
-            provider_name=self.aggregator.provider_config.provider,
+            provider_name=effective_member.provider_config.provider,
             status_code=int(raw_code) if raw_code.isdigit() else None,
             raw_code=raw_code,
             message=message,
@@ -2502,7 +2764,9 @@ class EnsembleProvider:
         """Project every possible ensemble request and return the largest.
 
         Proposers receive the base conversation.  The aggregator receives the
-        same conversation plus exactly one synthetic candidate-bundle message.
+        same conversation plus one synthetic candidate-bundle message. A
+        recovery continuation can add an assistant prefix and one instruction,
+        so projections reserve two more messages whenever recovery is enabled.
         A configured single-provider fallback is included because proposer
         failure can select it without changing the outer request.
         """
@@ -2541,15 +2805,42 @@ class EnsembleProvider:
                     "ensemble_soft_deadline_disable_thinking": False,
                 }
             )
-            if self.aggregator.ready:
-                aggregator_config, _ = self._aggregator_only_chat_config(config)
+            ranked_members = [
+                self.aggregator,
+                *(self.aggregator_fallbacks if self.aggregator_recovery_mode != "off" else []),
+            ]
+            for fallback_index, member in enumerate(ranked_members):
+                if not member.ready:
+                    continue
+                if fallback_index == 0:
+                    aggregator_config, _ = self._aggregator_only_chat_config(config)
+                else:
+                    aggregator_config = _aggregator_chat_config(
+                        downstream_config,
+                        member,
+                        max_tokens_cap=self.aggregator_max_tokens_cap,
+                        visible_answer_reserve_tokens=(
+                            self.aggregator_visible_answer_reserve_tokens
+                        ),
+                        recovery=True,
+                        request_budget_binding=self._member_request_budget_binding(member),
+                        record_budget_rebound=False,
+                    ).model_copy(update={"candidate_output_mode": "normal"})
+                try:
+                    member_provider = _build_provider(member.provider_config)
+                except Exception:  # noqa: BLE001 - projection may use the next ranked member
+                    continue
                 _require_projection(
-                    _build_provider(self.aggregator.provider_config),
+                    member_provider,
                     aggregator_config,
-                    synthetic_messages=additional_messages,
+                    synthetic_messages=(
+                        additional_messages + (2 if self.aggregator_recovery_mode != "off" else 0)
+                    ),
                 )
-            elif (
-                not self._thinking_policy_active()
+            if (
+                not projections
+                and not self._thinking_policy_active()
+                and self.aggregator_recovery_mode != "experiment"
                 and self.all_failed_policy == "fallback_single"
                 and self.fallback_provider is not None
             ):
@@ -2583,19 +2874,40 @@ class EnsembleProvider:
                 synthetic_messages=additional_messages,
             )
 
-        if self.proposers and self.aggregator.ready:
-            aggregator_config = _member_chat_config(
-                config,
+        if self.proposers:
+            ranked_members = [
                 self.aggregator,
-            ).model_copy(update={"candidate_output_mode": "normal"})
-            _require_projection(
-                _build_provider(self.aggregator.provider_config),
-                aggregator_config,
-                synthetic_messages=additional_messages + 1,
-            )
+                *(self.aggregator_fallbacks if self.aggregator_recovery_mode != "off" else []),
+            ]
+            for fallback_index, member in enumerate(ranked_members):
+                if not member.ready:
+                    continue
+                aggregator_config = _aggregator_chat_config(
+                    config,
+                    member,
+                    max_tokens_cap=self.aggregator_max_tokens_cap,
+                    visible_answer_reserve_tokens=(self.aggregator_visible_answer_reserve_tokens),
+                    recovery=fallback_index > 0,
+                    request_budget_binding=self._member_request_budget_binding(member),
+                    record_budget_rebound=False,
+                ).model_copy(update={"candidate_output_mode": "normal"})
+                try:
+                    member_provider = _build_provider(member.provider_config)
+                except Exception:  # noqa: BLE001 - projection may use the next ranked member
+                    continue
+                _require_projection(
+                    member_provider,
+                    aggregator_config,
+                    synthetic_messages=(
+                        additional_messages
+                        + 1
+                        + (2 if self.aggregator_recovery_mode != "off" else 0)
+                    ),
+                )
 
         if (
-            not self._thinking_policy_active()
+            self.aggregator_recovery_mode != "experiment"
+            and not self._thinking_policy_active()
             and self.all_failed_policy == "fallback_single"
             and self.fallback_provider is not None
         ):
@@ -2607,7 +2919,7 @@ class EnsembleProvider:
             _require_projection(
                 self.fallback_provider,
                 fallback_config,
-                synthetic_messages=additional_messages,
+                synthetic_messages=additional_messages + 1,
             )
 
         if not projections:
@@ -2685,6 +2997,7 @@ class EnsembleProvider:
         if validation_error is not None:
             if (
                 validation_error.code == "ensemble_multimodal_unsupported"
+                and self.aggregator_recovery_mode != "experiment"
                 and not self._thinking_policy_active()
                 and self.all_failed_policy == "fallback_single"
                 and self.fallback_provider is not None
@@ -2776,6 +3089,7 @@ class EnsembleProvider:
                     reason="llm ensemble profile has no proposers",
                     code="ensemble_no_proposers",
                     candidates=[],
+                    allow_single_fallback=(self.aggregator_recovery_mode != "experiment"),
                     soft_deadline=soft_deadline,
                     soft_deadline_seconds=soft_deadline_seconds,
                     soft_deadline_triggered=soft_deadline_triggered,
@@ -2786,29 +3100,113 @@ class EnsembleProvider:
                     yield event
             return
 
+        preselected_aggregator_provider: LLMProvider | None = None
+        preselected_aggregator_member: EnsembleMemberConfig | None = None
+        preselected_aggregator_fallback_index = 0
+        preselected_aggregator_trigger = ""
+        preselected_unstarted_attempts: list[dict[str, Any]] = []
         if not self.aggregator.ready:
-            # Without a ready aggregator no draft can ever be fused, so running
-            # (and billing) the proposers first would burn their full spend for
-            # zero output. Route to the single-provider fallback (or a terminal
-            # error) before any proposer request starts.
+            # Do not bill proposers until at least one member in the frozen
+            # aggregator ranking can actually be constructed. A readiness
+            # miss is not a reason to skip Top2/Top3 and silently leave the
+            # ranked recovery policy.
             reason = self.aggregator.unavailable_reason or "deployment_unavailable"
-            async with _closing_async_iterator(
-                self._fallback_or_error(
-                    messages,
-                    tools=tools,
-                    config=config,
-                    reason=f"ensemble aggregator deployment is not ready: {reason}",
-                    code="ensemble_aggregator_error",
-                    candidates=[],
-                    soft_deadline=soft_deadline,
-                    soft_deadline_seconds=soft_deadline_seconds,
-                    soft_deadline_triggered=soft_deadline_triggered,
-                ),
-                phase="ensemble_unready_aggregator_relay",
-            ) as child_stream:
-                async for event in child_stream:
-                    yield event
-            return
+            preselected_unstarted_attempts.append(
+                {
+                    "attempt": 0,
+                    "kind": "primary",
+                    "fallback_index": 0,
+                    "trigger": "member_unavailable",
+                    "request_started": False,
+                    "visible_output_emitted": False,
+                    "stream_closed": True,
+                    "outcome": "member_unavailable",
+                    "code": reason,
+                    "requested_provider": self.aggregator.provider_config.provider,
+                    "requested_model": self.aggregator.provider_config.model,
+                }
+            )
+            if self.aggregator_recovery_mode != "off":
+                for fallback_index, fallback_member in enumerate(
+                    self.aggregator_fallbacks,
+                    start=1,
+                ):
+                    if not fallback_member.ready:
+                        preselected_unstarted_attempts.append(
+                            {
+                                "attempt": 0,
+                                "kind": "model_fallback",
+                                "fallback_index": fallback_index,
+                                "trigger": "member_unavailable",
+                                "request_started": False,
+                                "visible_output_emitted": False,
+                                "stream_closed": True,
+                                "outcome": "member_unavailable",
+                                "code": (
+                                    fallback_member.unavailable_reason or "member_unavailable"
+                                ),
+                                "requested_provider": fallback_member.provider_config.provider,
+                                "requested_model": fallback_member.provider_config.model,
+                            }
+                        )
+                        continue
+                    try:
+                        preselected_aggregator_provider = _build_provider(
+                            fallback_member.provider_config
+                        )
+                    except Exception as exc:  # noqa: BLE001 - skip a broken ranked member
+                        preselected_unstarted_attempts.append(
+                            {
+                                "attempt": 0,
+                                "kind": "model_fallback",
+                                "fallback_index": fallback_index,
+                                "trigger": "member_unavailable",
+                                "request_started": False,
+                                "visible_output_emitted": False,
+                                "stream_closed": True,
+                                "outcome": "provider_build_failed",
+                                "code": type(exc).__name__,
+                                "requested_provider": fallback_member.provider_config.provider,
+                                "requested_model": fallback_member.provider_config.model,
+                            }
+                        )
+                        continue
+                    preselected_aggregator_member = fallback_member
+                    preselected_aggregator_fallback_index = fallback_index
+                    preselected_aggregator_trigger = "member_unavailable"
+                    break
+            if preselected_aggregator_provider is None:
+                async with _closing_async_iterator(
+                    self._fallback_or_error(
+                        messages,
+                        tools=tools,
+                        config=config,
+                        reason=(
+                            "ensemble aggregator deployment is not ready: "
+                            f"{reason}; ranked recovery chain is unavailable"
+                        ),
+                        code="ensemble_aggregator_error",
+                        candidates=[],
+                        trace_overrides={
+                            "aggregator_recovery": {
+                                "schema": "opensquilla.ensemble-aggregator-recovery/v1",
+                                "mode": self.aggregator_recovery_mode,
+                                "attempts": preselected_unstarted_attempts,
+                                "proposer_reused": True,
+                                "success": False,
+                                "terminal_code": "ranked_chain_unavailable",
+                            },
+                        },
+                        allow_single_fallback=(self.aggregator_recovery_mode != "experiment"),
+                        soft_deadline=soft_deadline,
+                        soft_deadline_seconds=soft_deadline_seconds,
+                        soft_deadline_triggered=soft_deadline_triggered,
+                    ),
+                    phase="ensemble_unready_aggregator_relay",
+                ) as child_stream:
+                    async for event in child_stream:
+                        yield event
+                return
 
         yield ProviderHeartbeatEvent(
             phase="ensemble_proposers",
@@ -2927,6 +3325,7 @@ class EnsembleProvider:
                     ),
                     code="ensemble_insufficient_proposers",
                     candidates=candidates,
+                    allow_single_fallback=(self.aggregator_recovery_mode != "experiment"),
                     trace_overrides=insufficient_soft_trace,
                     soft_deadline=soft_deadline,
                     soft_deadline_seconds=soft_deadline_seconds,
@@ -2942,6 +3341,13 @@ class EnsembleProvider:
         candidate_order_seed = (
             random.SystemRandom().getrandbits(64) if self.shuffle_candidates else None
         )
+        aggregator_chain_timeout_seconds = (
+            self._aggregator_only_timeout_seconds(config)
+            if self.aggregator_recovery_mode == "serving"
+            else self.aggregator_timeout_seconds
+            if self.aggregator_timeout_seconds > 0
+            else None
+        )
         ordered_candidates = self._ordered_candidates(
             successful,
             candidate_order_seed=candidate_order_seed,
@@ -2951,12 +3357,17 @@ class EnsembleProvider:
             *,
             finalize_directly: bool,
         ) -> tuple[ChatConfig, list[Message], list[ToolDefinition] | None, dict[str, Any]]:
-            request_config = _member_chat_config(
+            request_config = _aggregator_chat_config(
                 config,
                 self.aggregator,
+                max_tokens_cap=self.aggregator_max_tokens_cap,
+                visible_answer_reserve_tokens=(self.aggregator_visible_answer_reserve_tokens),
                 request_budget_binding=self._member_request_budget_binding(self.aggregator),
-                role="aggregator",
             ).model_copy(update={"candidate_output_mode": "normal"})
+            if self.aggregator_recovery_mode == "serving":
+                request_config = request_config.model_copy(
+                    update={"allow_provider_stream_fallback": False}
+                )
             if (
                 finalize_directly
                 and not self.aggregator.thinking_policy_managed
@@ -2984,9 +3395,9 @@ class EnsembleProvider:
                 )
             ):
                 request_config = request_config.model_copy(update={"tool_choice": None})
-            if self.aggregator_timeout_seconds > 0:
+            if aggregator_chain_timeout_seconds is not None:
                 request_config = request_config.model_copy(
-                    update={"timeout": self.aggregator_timeout_seconds}
+                    update={"timeout": aggregator_chain_timeout_seconds}
                 )
             request_messages = self._build_aggregator_messages(
                 messages,
@@ -3021,7 +3432,7 @@ class EnsembleProvider:
                 final_request_config=request_config,
                 final_request_tools=request_tools,
                 final_request_messages=request_messages,
-                final_request_timeout_seconds=self.aggregator_timeout_seconds,
+                final_request_timeout_seconds=aggregator_chain_timeout_seconds,
                 candidate_order_seed=candidate_order_seed,
                 candidate_display_order=[candidate.index for candidate in ordered_candidates],
             )
@@ -3055,9 +3466,19 @@ class EnsembleProvider:
                 aggregator_request_tools,
                 trace,
             ) = _build_aggregator_request(finalize_directly=True)
-        try:
-            provider = _build_provider(self.aggregator.provider_config)
-        except Exception as exc:  # noqa: BLE001 - provider boundary returns ErrorEvent
+        initial_aggregator_member = preselected_aggregator_member
+        initial_aggregator_fallback_index = preselected_aggregator_fallback_index
+        initial_aggregator_trigger = preselected_aggregator_trigger
+        initial_unstarted_attempts = list(preselected_unstarted_attempts)
+        provider = preselected_aggregator_provider
+        primary_build_error: Exception | None = None
+        if provider is None:
+            try:
+                provider = _build_provider(self.aggregator.provider_config)
+            except Exception as exc:  # noqa: BLE001 - provider boundary is recorded
+                primary_build_error = exc
+        if primary_build_error is not None:
+            exc = primary_build_error
             if _refresh_soft_finalization_request():
                 (
                     aggregator_cfg,
@@ -3065,27 +3486,104 @@ class EnsembleProvider:
                     aggregator_request_tools,
                     trace,
                 ) = _build_aggregator_request(finalize_directly=True)
-            # The completed drafts are reusable, so aggregator construction
-            # failure follows the same fallback path as an unreachable quorum
-            # instead of discarding the whole (already billed) proposer round.
-            async with _closing_async_iterator(
-                self._fallback_or_error(
-                    aggregator_messages,
-                    tools=tools,
-                    config=config,
-                    reason=(f"ensemble aggregator could not be initialized: {type(exc).__name__}"),
-                    code="ensemble_aggregator_error",
-                    candidates=candidates,
-                    trace_overrides=soft_trace_overrides,
-                    soft_deadline=soft_deadline,
-                    soft_deadline_seconds=soft_deadline_seconds,
-                    soft_deadline_triggered=soft_deadline_triggered,
-                ),
-                phase="ensemble_aggregator_build_fallback_relay",
-            ) as child_stream:
-                async for event in child_stream:
-                    yield event
-            return
+            initial_unstarted_attempts.append(
+                {
+                    "attempt": 0,
+                    "kind": "primary",
+                    "fallback_index": 0,
+                    "trigger": "provider_build_failed",
+                    "request_started": False,
+                    "visible_output_emitted": False,
+                    "stream_closed": True,
+                    "outcome": "provider_build_failed",
+                    "code": type(exc).__name__,
+                    "requested_provider": self.aggregator.provider_config.provider,
+                    "requested_model": self.aggregator.provider_config.model,
+                }
+            )
+            provider = None
+            if self.aggregator_recovery_mode != "off":
+                for fallback_index, fallback_member in enumerate(
+                    self.aggregator_fallbacks,
+                    start=1,
+                ):
+                    if not fallback_member.ready:
+                        initial_unstarted_attempts.append(
+                            {
+                                "attempt": 0,
+                                "kind": "model_fallback",
+                                "fallback_index": fallback_index,
+                                "trigger": "provider_build_failed",
+                                "request_started": False,
+                                "visible_output_emitted": False,
+                                "stream_closed": True,
+                                "outcome": "member_unavailable",
+                                "code": (
+                                    fallback_member.unavailable_reason or "member_unavailable"
+                                ),
+                                "requested_provider": (fallback_member.provider_config.provider),
+                                "requested_model": fallback_member.provider_config.model,
+                            }
+                        )
+                        continue
+                    try:
+                        provider = _build_provider(fallback_member.provider_config)
+                    except Exception as fallback_exc:  # noqa: BLE001
+                        initial_unstarted_attempts.append(
+                            {
+                                "attempt": 0,
+                                "kind": "model_fallback",
+                                "fallback_index": fallback_index,
+                                "trigger": "provider_build_failed",
+                                "request_started": False,
+                                "visible_output_emitted": False,
+                                "stream_closed": True,
+                                "outcome": "provider_build_failed",
+                                "code": type(fallback_exc).__name__,
+                                "requested_provider": (fallback_member.provider_config.provider),
+                                "requested_model": fallback_member.provider_config.model,
+                            }
+                        )
+                        continue
+                    initial_aggregator_member = fallback_member
+                    initial_aggregator_fallback_index = fallback_index
+                    initial_aggregator_trigger = "provider_build_failed"
+                    break
+            if provider is None:
+                # A serving caller may use its one legacy fallback when every ranked
+                # member failed before any request. Formal experiment mode fails
+                # closed instead of leaving the frozen recovery chain.
+                async with _closing_async_iterator(
+                    self._fallback_or_error(
+                        aggregator_messages,
+                        tools=tools,
+                        config=config,
+                        reason=(
+                            f"ensemble aggregator could not be initialized: {type(exc).__name__}"
+                        ),
+                        code="ensemble_aggregator_error",
+                        candidates=candidates,
+                        trace_overrides={
+                            **soft_trace_overrides,
+                            "aggregator_recovery": {
+                                "schema": ("opensquilla.ensemble-aggregator-recovery/v1"),
+                                "mode": self.aggregator_recovery_mode,
+                                "attempts": initial_unstarted_attempts,
+                                "proposer_reused": True,
+                                "success": False,
+                                "terminal_code": "provider_build_failed",
+                            },
+                        },
+                        allow_single_fallback=(self.aggregator_recovery_mode != "experiment"),
+                        soft_deadline=soft_deadline,
+                        soft_deadline_seconds=soft_deadline_seconds,
+                        soft_deadline_triggered=soft_deadline_triggered,
+                    ),
+                    phase="ensemble_aggregator_build_fallback_relay",
+                ) as child_stream:
+                    async for event in child_stream:
+                        yield event
+                return
         # Provider construction can perform synchronous credential/deployment
         # resolution. Re-check at the last point before opening a billable
         # stream so crossing the cutoff during setup cannot start a normal
@@ -3099,8 +3597,8 @@ class EnsembleProvider:
             ) = _build_aggregator_request(finalize_directly=True)
 
         def _has_nonempty_visible_aggregator_output(event: StreamEvent) -> bool:
-            if isinstance(event, (TextDeltaEvent, ReasoningDeltaEvent)):
-                return bool(event.text)
+            if isinstance(event, TextDeltaEvent):
+                return bool(event.text.strip())
             if isinstance(event, ToolUseStartEvent):
                 return bool(event.tool_use_id or event.tool_name)
             if isinstance(event, ToolUseDeltaEvent):
@@ -3202,6 +3700,10 @@ class EnsembleProvider:
                     trace=request_trace,
                     timeout_seconds=timeout_seconds,
                     absolute_deadline=absolute_deadline,
+                    initial_member=initial_aggregator_member,
+                    initial_fallback_index=initial_aggregator_fallback_index,
+                    initial_trigger=initial_aggregator_trigger,
+                    initial_unstarted_attempts=initial_unstarted_attempts,
                 ),
                 phase="ensemble_final_aggregator_attempt_relay",
             ) as aggregator_stream:
@@ -3217,7 +3719,8 @@ class EnsembleProvider:
             if terminal_error is None:
                 return
             fallback_allowed = (
-                not visible_output
+                self.aggregator_recovery_mode == "off"
+                and not visible_output
                 and terminal_error.code != "ensemble_aggregator_close_timeout"
                 and not self._thinking_policy_active()
                 and self.all_failed_policy == "fallback_single"
@@ -3243,6 +3746,7 @@ class EnsembleProvider:
                     request_tools=aggregator_request_tools,
                     request_config=aggregator_cfg,
                     request_trace=trace,
+                    timeout_seconds=aggregator_chain_timeout_seconds,
                 ),
                 phase="ensemble_final_aggregator_relay",
             ) as child_stream:
@@ -3257,7 +3761,7 @@ class EnsembleProvider:
         # aggregation quality when it finishes in time without allowing two
         # billable aggregator streams to overlap.
         remaining_soft_seconds = max(0.001, soft_deadline - time.monotonic())
-        configured_aggregator_timeout = float(self.aggregator_timeout_seconds)
+        configured_aggregator_timeout = float(aggregator_chain_timeout_seconds or 0.0)
         soft_budget_is_limiter = (
             configured_aggregator_timeout <= 0
             or remaining_soft_seconds <= configured_aggregator_timeout
@@ -3286,6 +3790,10 @@ class EnsembleProvider:
                 trace=trace,
                 timeout_seconds=first_attempt_timeout,
                 absolute_deadline=soft_deadline,
+                initial_member=initial_aggregator_member,
+                initial_fallback_index=initial_aggregator_fallback_index,
+                initial_trigger=initial_aggregator_trigger,
+                initial_unstarted_attempts=initial_unstarted_attempts,
             ),
             phase="ensemble_soft_deadline_aggregator_relay",
         ) as child_stream:
@@ -3326,7 +3834,8 @@ class EnsembleProvider:
             _has_nonempty_visible_aggregator_output(event) for event in buffered_events
         )
         runtime_fallback_allowed = (
-            terminal_event is not None
+            self.aggregator_recovery_mode == "off"
+            and terminal_event is not None
             and not buffered_visible_output
             and terminal_event.code != "ensemble_aggregator_close_timeout"
             and not self._thinking_policy_active()
@@ -3371,7 +3880,12 @@ class EnsembleProvider:
             if completed_with_tool_after_cutoff
             else "aggregator_timeout"
         )
-        direct_cfg = aggregator_cfg
+        # The caller is already at its promised wrap-up boundary. Give the
+        # direct finalizer one bounded request, but do not start a fresh
+        # continuation/retry/Top-K chain that would extend user-visible tail
+        # latency beyond the purpose of the deadline.
+        trace["soft_deadline_replacement_recovery_disabled"] = True
+        direct_cfg = aggregator_cfg.model_copy(update={"allow_provider_stream_fallback": False})
         if soft_trace_overrides["soft_deadline_disable_thinking"]:
             direct_cfg = direct_cfg.model_copy(
                 update={
@@ -3450,6 +3964,11 @@ class EnsembleProvider:
                     ),
                 ),
                 trace=trace,
+                timeout_seconds=aggregator_chain_timeout_seconds,
+                initial_member=initial_aggregator_member,
+                initial_fallback_index=initial_aggregator_fallback_index,
+                initial_trigger=initial_aggregator_trigger,
+                disable_recovery=True,
             ),
             phase="ensemble_soft_deadline_finalizer_relay",
         ) as child_stream:
@@ -3470,6 +3989,9 @@ class EnsembleProvider:
             for timeout_seconds in (
                 outer_timeout_seconds,
                 self.aggregator_timeout_seconds,
+                self.aggregator_serving_chain_timeout_seconds
+                if self.aggregator_recovery_mode == "serving"
+                else 0.0,
             )
             if timeout_seconds > 0
         ]
@@ -3479,7 +4001,7 @@ class EnsembleProvider:
         self,
         config: ChatConfig,
     ) -> tuple[ChatConfig, float | None]:
-        """Build a finalizer config while preserving routed thinking policy."""
+        """Build a bounded finalizer config while preserving routed policy."""
 
         downstream_config = config.model_copy(
             update={
@@ -3490,32 +4012,39 @@ class EnsembleProvider:
             }
         )
         aggregator_timeout_seconds = self._aggregator_only_timeout_seconds(config)
-        aggregator_updates: dict[str, Any] = {
-            "candidate_output_mode": "normal",
-            "ensemble_execution_mode": "full",
-        }
         if not self.aggregator.thinking_policy_managed:
             # Legacy forced finalization deliberately preserves the outer
             # config. A routed T assignment remains authoritative instead.
-            aggregator_updates.update(
-                {
+            downstream_config = downstream_config.model_copy(
+                update={
                     "thinking": config.thinking,
                     "thinking_level": config.thinking_level,
                     "thinking_budget_tokens": config.thinking_budget_tokens,
                     "thinking_budget_explicit": config.thinking_budget_explicit,
                 }
             )
-        if aggregator_timeout_seconds is not None:
-            aggregator_updates["timeout"] = aggregator_timeout_seconds
-        return (
-            _member_chat_config(
-                downstream_config,
-                self.aggregator,
-                request_budget_binding=self._member_request_budget_binding(self.aggregator),
-                role="aggregator",
-            ).model_copy(update=aggregator_updates),
-            aggregator_timeout_seconds,
+        effective_member = (
+            self.aggregator
+            if self.aggregator.thinking_policy_managed
+            else replace(self.aggregator, thinking=None)
         )
+        effective = _aggregator_chat_config(
+            downstream_config,
+            effective_member,
+            max_tokens_cap=self.aggregator_max_tokens_cap,
+            visible_answer_reserve_tokens=(self.aggregator_visible_answer_reserve_tokens),
+            request_budget_binding=self._member_request_budget_binding(self.aggregator),
+        ).model_copy(
+            update={
+                "candidate_output_mode": "normal",
+                "ensemble_execution_mode": "full",
+            }
+        )
+        if aggregator_timeout_seconds is not None:
+            effective = effective.model_copy(update={"timeout": aggregator_timeout_seconds})
+        if self.aggregator_recovery_mode == "serving":
+            effective = effective.model_copy(update={"allow_provider_stream_fallback": False})
+        return effective, aggregator_timeout_seconds
 
     async def _chat_aggregator_only(
         self,
@@ -3534,23 +4063,6 @@ class EnsembleProvider:
                 "ensemble_soft_deadline_disable_thinking": False,
             }
         )
-        if not self.aggregator.ready:
-            reason = self.aggregator.unavailable_reason or "deployment_unavailable"
-            async with _closing_async_iterator(
-                self._fallback_or_error(
-                    messages,
-                    tools=tools,
-                    config=downstream_config,
-                    reason=f"ensemble aggregator deployment is not ready: {reason}",
-                    code="ensemble_aggregator_error",
-                    candidates=[],
-                ),
-                phase="ensemble_aggregator_only_unready_relay",
-            ) as child_stream:
-                async for event in child_stream:
-                    yield event
-            return
-
         aggregator_cfg, aggregator_timeout_seconds = self._aggregator_only_chat_config(config)
         aggregator_request_tools = tools if self.aggregator_tools else None
         if not aggregator_request_tools and aggregator_cfg.tool_choice is not None:
@@ -3569,17 +4081,120 @@ class EnsembleProvider:
             final_request_timeout_seconds=aggregator_timeout_seconds,
         )
         trace["execution_mode"] = "aggregator_only"
-        try:
-            provider = _build_provider(self.aggregator.provider_config)
-        except Exception as exc:  # noqa: BLE001 - provider boundary returns ErrorEvent
+        initial_member: EnsembleMemberConfig | None = None
+        initial_fallback_index = 0
+        initial_trigger = ""
+        initial_unstarted_attempts: list[dict[str, Any]] = []
+        provider: LLMProvider | None = None
+        primary_failure = "deployment_unavailable"
+        if not self.aggregator.ready:
+            primary_failure = self.aggregator.unavailable_reason or primary_failure
+            initial_unstarted_attempts.append(
+                {
+                    "attempt": 0,
+                    "kind": "primary",
+                    "fallback_index": 0,
+                    "trigger": "member_unavailable",
+                    "request_started": False,
+                    "visible_output_emitted": False,
+                    "stream_closed": True,
+                    "outcome": "member_unavailable",
+                    "code": primary_failure,
+                    "requested_provider": self.aggregator.provider_config.provider,
+                    "requested_model": self.aggregator.provider_config.model,
+                }
+            )
+        else:
+            try:
+                provider = _build_provider(self.aggregator.provider_config)
+            except Exception as exc:  # noqa: BLE001 - provider boundary is recorded
+                primary_failure = type(exc).__name__
+                initial_unstarted_attempts.append(
+                    {
+                        "attempt": 0,
+                        "kind": "primary",
+                        "fallback_index": 0,
+                        "trigger": "provider_build_failed",
+                        "request_started": False,
+                        "visible_output_emitted": False,
+                        "stream_closed": True,
+                        "outcome": "provider_build_failed",
+                        "code": primary_failure,
+                        "requested_provider": self.aggregator.provider_config.provider,
+                        "requested_model": self.aggregator.provider_config.model,
+                    }
+                )
+        if provider is None and self.aggregator_recovery_mode != "off":
+            for fallback_index, fallback_member in enumerate(
+                self.aggregator_fallbacks,
+                start=1,
+            ):
+                if not fallback_member.ready:
+                    initial_unstarted_attempts.append(
+                        {
+                            "attempt": 0,
+                            "kind": "model_fallback",
+                            "fallback_index": fallback_index,
+                            "trigger": "member_unavailable",
+                            "request_started": False,
+                            "visible_output_emitted": False,
+                            "stream_closed": True,
+                            "outcome": "member_unavailable",
+                            "code": (fallback_member.unavailable_reason or "member_unavailable"),
+                            "requested_provider": fallback_member.provider_config.provider,
+                            "requested_model": fallback_member.provider_config.model,
+                        }
+                    )
+                    continue
+                try:
+                    provider = _build_provider(fallback_member.provider_config)
+                except Exception as exc:  # noqa: BLE001 - skip an unbuildable ranked member
+                    initial_unstarted_attempts.append(
+                        {
+                            "attempt": 0,
+                            "kind": "model_fallback",
+                            "fallback_index": fallback_index,
+                            "trigger": "provider_build_failed",
+                            "request_started": False,
+                            "visible_output_emitted": False,
+                            "stream_closed": True,
+                            "outcome": "provider_build_failed",
+                            "code": type(exc).__name__,
+                            "requested_provider": fallback_member.provider_config.provider,
+                            "requested_model": fallback_member.provider_config.model,
+                        }
+                    )
+                    continue
+                initial_member = fallback_member
+                initial_fallback_index = fallback_index
+                initial_trigger = (
+                    "member_unavailable" if not self.aggregator.ready else "provider_build_failed"
+                )
+                break
+        if provider is None:
             async with _closing_async_iterator(
                 self._fallback_or_error(
                     messages,
                     tools=tools,
                     config=downstream_config,
-                    reason=(f"ensemble aggregator could not be initialized: {type(exc).__name__}"),
+                    reason=(
+                        "ensemble ranked aggregator chain could not be initialized: "
+                        f"{primary_failure}"
+                    ),
                     code="ensemble_aggregator_error",
                     candidates=[],
+                    trace_overrides={
+                        "execution_mode": "aggregator_only",
+                        "aggregator_recovery": {
+                            "schema": "opensquilla.ensemble-aggregator-recovery/v1",
+                            "mode": self.aggregator_recovery_mode,
+                            "attempts": initial_unstarted_attempts,
+                            "proposer_reused": True,
+                            "success": False,
+                            "terminal_code": "ranked_chain_unavailable",
+                        },
+                    },
+                    allow_single_fallback=(self.aggregator_recovery_mode != "experiment"),
                 ),
                 phase="ensemble_aggregator_only_build_fallback_relay",
             ) as child_stream:
@@ -3596,6 +4211,10 @@ class EnsembleProvider:
                 prior_missing_count=0,
                 trace=trace,
                 timeout_seconds=aggregator_timeout_seconds,
+                initial_member=initial_member,
+                initial_fallback_index=initial_fallback_index,
+                initial_trigger=initial_trigger,
+                initial_unstarted_attempts=initial_unstarted_attempts,
             ),
             phase="ensemble_aggregator_only_final_relay",
         ) as child_stream:
@@ -3786,8 +4405,7 @@ class EnsembleProvider:
                         )
                         request_started = physical_request_count > 0
                         identity = (
-                            f"{member.provider_config.provider}:"
-                            f"{member.provider_config.model}"
+                            f"{member.provider_config.provider}:{member.provider_config.model}"
                         )
                         execution_fallbacks = self.selection_plan.get(
                             "thinking_execution_fallbacks"
@@ -3796,8 +4414,7 @@ class EnsembleProvider:
                             for row in execution_fallbacks:
                                 if (
                                     isinstance(row, dict)
-                                    and row.get("trigger_stage")
-                                    == "proposer_execution"
+                                    and row.get("trigger_stage") == "proposer_execution"
                                     and row.get("identity") == identity
                                     and row.get("fallback_result") == "retrying"
                                 ):
@@ -3834,25 +4451,17 @@ class EnsembleProvider:
                             0,
                             physical_request_count - published_physical_count,
                         )
-                        latest_snapshot = (
-                            attempt_snapshots[-1]
-                            if attempt_snapshots
-                            else None
-                        )
+                        latest_snapshot = attempt_snapshots[-1] if attempt_snapshots else None
                         results.append(
                             _CandidateResult(
                                 index=index,
                                 sample_index=sample_index,
                                 label=member.label or f"proposer_{index + 1}",
                                 provider=(
-                                    latest_snapshot.provider
-                                    if latest_snapshot is not None
-                                    else ""
+                                    latest_snapshot.provider if latest_snapshot is not None else ""
                                 ),
                                 model=(
-                                    latest_snapshot.model
-                                    if latest_snapshot is not None
-                                    else ""
+                                    latest_snapshot.model if latest_snapshot is not None else ""
                                 ),
                                 requested_provider=cfg.provider,
                                 requested_model=cfg.model,
@@ -4524,19 +5133,13 @@ class EnsembleProvider:
             )
 
             def merge_retry_evidence(*, interrupted: bool) -> None:
-                if (
-                    interrupted
-                    and retry_result.request_started
-                    and not retry_result.usage_reported
-                ):
+                if interrupted and retry_result.request_started and not retry_result.usage_reported:
                     retry_result.usage_missing_count = max(
                         retry_result.usage_missing_count,
                         retry_result.physical_request_count,
                         1,
                     )
-                retry_rows = [
-                    dict(row) for row in retry_result.model_usage_breakdown
-                ]
+                retry_rows = [dict(row) for row in retry_result.model_usage_breakdown]
                 if not retry_rows and _candidate_has_usage(retry_result):
                     retry_rows = [
                         retry_result.usage_row(
@@ -4566,22 +5169,15 @@ class EnsembleProvider:
             def finalize_retry_attempt(attempt_result: str) -> None:
                 fallback_record["fallback_result"] = attempt_result
                 fallback_attempts = list(
-                    retry_result.execution.get(
-                        "thinking_fallback_attempts"
-                    )
-                    or []
+                    retry_result.execution.get("thinking_fallback_attempts") or []
                 )
                 retry_result.execution["thinking_fallback_attempts"] = [
                     {
                         "trigger_stage": "proposer_execution",
                         "fallback_type": "thinking_level_neighbor",
                         "reason": "provider_rejected_thinking_level",
-                        "requested_thinking_level": (
-                            member.requested_thinking_level
-                        ),
-                        "rejected_unified_level": (
-                            member.effective_thinking_level
-                        ),
+                        "requested_thinking_level": (member.requested_thinking_level),
+                        "rejected_unified_level": (member.effective_thinking_level),
                         "rejected_provider_level": member.thinking,
                         "effective_thinking_level": fallback_unified,
                         "effective_provider_level": fallback_provider,
@@ -4606,13 +5202,9 @@ class EnsembleProvider:
                 _overwrite_candidate_result(result, retry_result)
                 raise
             merge_retry_evidence(interrupted=False)
-            actual_unified = (
-                retry_result.effective_thinking_level or fallback_unified
-            )
+            actual_unified = retry_result.effective_thinking_level or fallback_unified
             attempt_result = (
-                "succeeded"
-                if retry_result.ok and actual_unified == fallback_unified
-                else "failed"
+                "succeeded" if retry_result.ok and actual_unified == fallback_unified else "failed"
             )
             finalize_retry_attempt(attempt_result)
             return retry_result
@@ -4705,6 +5297,8 @@ class EnsembleProvider:
     ) -> dict[str, Any]:
         selected = list(selected_candidates or [])
         trace = {
+            "output_binding_schema": "opensquilla.ensemble-output-binding/v1",
+            "output_components": [],
             "mode": "b5_fusion",
             "profile": self.profile_name,
             "selection_strategy": self.selection_plan.get("strategy", "router_dynamic"),
@@ -4718,6 +5312,23 @@ class EnsembleProvider:
             "aggregator_tools": self.aggregator_tools,
             "proposer_timeout_seconds": self.proposer_timeout_seconds,
             "aggregator_timeout_seconds": self.aggregator_timeout_seconds,
+            "aggregator_serving_chain_timeout_seconds": (
+                self.aggregator_serving_chain_timeout_seconds
+            ),
+            "aggregator_recovery": {
+                "schema": "opensquilla.ensemble-aggregator-recovery/v1",
+                "mode": self.aggregator_recovery_mode,
+                "candidate_count": 1 + len(self.aggregator_fallbacks),
+                "candidate_ids": [
+                    (f"{member.provider_config.provider}:{member.provider_config.model}")
+                    for member in [self.aggregator, *self.aggregator_fallbacks]
+                ],
+                "max_tokens_cap": self.aggregator_max_tokens_cap,
+                "visible_answer_reserve_tokens": (self.aggregator_visible_answer_reserve_tokens),
+                "attempts": [],
+                "proposer_reused": True,
+                "success": False,
+            },
             "quorum_grace_seconds": self.quorum_grace_seconds,
             "content_max_chars": TRACE_CONTENT_MAX_CHARS,
             "final_request_role": final_request_role,
@@ -4796,16 +5407,84 @@ class EnsembleProvider:
         trace: dict[str, Any],
         timeout_seconds: float | None = None,
         absolute_deadline: float | None = None,
+        initial_member: EnsembleMemberConfig | None = None,
+        initial_fallback_index: int = 0,
+        initial_trigger: str = "",
+        initial_unstarted_attempts: Sequence[Mapping[str, Any]] = (),
+        disable_recovery: bool = False,
     ) -> AsyncIterator[StreamEvent]:
         final_text_parts: list[str] = []
         aggregator_started = time.monotonic()
         abandoned_rows: list[dict[str, Any]] = []
         abandoned_missing_count = 0
         attempt_request_started = False
-        active_member = self.aggregator
-        active_config = config
+        active_member = initial_member or self.aggregator
+        active_config = (
+            _aggregator_chat_config(
+                config,
+                active_member,
+                max_tokens_cap=self.aggregator_max_tokens_cap,
+                visible_answer_reserve_tokens=(self.aggregator_visible_answer_reserve_tokens),
+                recovery=True,
+                request_budget_binding=self._member_request_budget_binding(active_member),
+                record_budget_rebound=False,
+            )
+            if initial_fallback_index > 0
+            else config
+        )
+        if self.aggregator_recovery_mode == "serving":
+            active_config = active_config.model_copy(
+                update={"allow_provider_stream_fallback": False}
+            )
+        active_messages = list(messages)
+        active_tools = None if initial_fallback_index > 0 else tools
+        primary_messages = list(messages)
+        recovery_mode = self.aggregator_recovery_mode
+        # Keep the full ranked chain available in serving mode as well.
+        # Unavailable/unbuildable candidates do not consume the one allowed
+        # substantive network recovery, so serving may skip Top2 and try Top3
+        # without increasing user-visible retry count.
+        fallback_members = (
+            list(self.aggregator_fallbacks)
+            if recovery_mode != "off" and not disable_recovery
+            else []
+        )
+        active_fallback_index = max(0, int(initial_fallback_index))
+        next_fallback_index = active_fallback_index
+        # Skipping an unavailable/unbuildable candidate starts no request and
+        # therefore must not consume serving's one additional network recovery.
+        recovery_actions_used = 0
+        same_model_recoveries = 0
+        continuation_count = 0
+        last_partial_done_event: DoneEvent | None = None
+        max_continuations = (
+            0
+            if disable_recovery
+            else 2
+            if recovery_mode == "experiment"
+            else 1
+            if recovery_mode == "serving"
+            else 0
+        )
+        # Interactive serving permits only one additional physical request.
+        # Experiments retain the established two transient retries inside the
+        # shared deadline before moving through the frozen recovery chain.
+        max_transient_retries = (
+            0
+            if disable_recovery
+            else 1
+            if recovery_mode == "serving"
+            else _ENSEMBLE_AGGREGATOR_MAX_RETRIES
+        )
+        max_recovery_actions = (
+            0 if disable_recovery else None if recovery_mode == "experiment" else 1
+        )
+        attempt_kind = "model_fallback" if active_fallback_index > 0 else "primary"
+        attempt_trigger = initial_trigger if active_fallback_index > 0 else ""
         thinking_fallbacks = (
-            list(self.aggregator.thinking_fallbacks) if bool(config.thinking) else []
+            list(self.aggregator.thinking_fallbacks)
+            if bool(config.thinking) and not disable_recovery
+            else []
         )
         active_thinking_fallback_record: dict[str, Any] | None = None
         effective_timeout_seconds = (
@@ -4813,6 +5492,252 @@ class EnsembleProvider:
             if timeout_seconds is not None
             else float(self.aggregator_timeout_seconds)
         )
+        if absolute_deadline is None and effective_timeout_seconds > 0:
+            # The timeout covers the complete aggregator chain, not every
+            # retry independently. This bounds interactive tail latency and
+            # also makes experiment attempts comparable.
+            absolute_deadline = aggregator_started + effective_timeout_seconds
+        recovery_trace = trace.get("aggregator_recovery")
+        if not isinstance(recovery_trace, dict):
+            recovery_trace = {
+                "schema": "opensquilla.ensemble-aggregator-recovery/v1",
+                "mode": recovery_mode,
+                "attempts": [],
+                "proposer_reused": True,
+                "success": False,
+            }
+            trace["aggregator_recovery"] = recovery_trace
+        recovery_attempts = recovery_trace.setdefault("attempts", [])
+        existing_attempts = (
+            [dict(row) for row in recovery_attempts if isinstance(row, Mapping)]
+            if isinstance(recovery_attempts, list)
+            else []
+        )
+        if not isinstance(recovery_attempts, list):
+            recovery_attempts = []
+            recovery_trace["attempts"] = recovery_attempts
+        else:
+            recovery_attempts.clear()
+        output_components = trace.get("output_components")
+        if not isinstance(output_components, list):
+            output_components = []
+            trace["output_components"] = output_components
+        else:
+            output_components.clear()
+        trace["output_binding_schema"] = "opensquilla.ensemble-output-binding/v1"
+        recovery_attempt_sequence = 0
+        physical_attempt_sequence = 0
+        current_attempt_recorded_sequence: int | None = None
+        last_visible_attempt_sequence: int | None = None
+
+        def append_recovery_attempt(row: Mapping[str, Any]) -> int:
+            """Append one audit row with stable logical and physical ordinals."""
+
+            nonlocal recovery_attempt_sequence
+            nonlocal physical_attempt_sequence
+            normalized = dict(row)
+            recovery_attempt_sequence += 1
+            normalized["attempt"] = recovery_attempt_sequence
+            request_started = bool(normalized.get("request_started"))
+            physical_request_count = (
+                max(1, int(normalized.get("physical_request_count") or 0)) if request_started else 0
+            )
+            normalized["physical_request_count"] = physical_request_count
+            normalized["physical_attempt_index"] = (
+                physical_attempt_sequence + 1 if request_started else None
+            )
+            physical_attempt_sequence += physical_request_count
+            recovery_attempts.append(normalized)
+            return recovery_attempt_sequence
+
+        def append_output_component(
+            *,
+            attempt_number: int,
+            kind: str,
+            fallback_index: int,
+            member: EnsembleMemberConfig,
+            physical_output_text: str,
+            assembled_contribution_text: str,
+        ) -> None:
+            """Bind one physical response to its deduplicated delivered slice."""
+
+            contribution = assembled_contribution_text or ""
+            if not contribution:
+                return
+            assembled_text = "".join(final_text_parts)
+            assembled_end = len(assembled_text)
+            assembled_start = assembled_end - len(contribution)
+            if assembled_start < 0 or assembled_text[assembled_start:assembled_end] != contribution:
+                trace.setdefault("output_binding_errors", []).append("component_not_suffix")
+                return
+            output_components.append(
+                {
+                    "attempt": attempt_number,
+                    "kind": kind,
+                    "fallback_index": fallback_index,
+                    "requested_provider": member.provider_config.provider,
+                    "requested_model": member.provider_config.model,
+                    "assembled_start": assembled_start,
+                    "assembled_end": assembled_end,
+                    "physical_output": _trace_output_content(physical_output_text),
+                    "assembled_contribution": _trace_output_content(contribution),
+                    "assembled_prefix_sha256": _text_sha256(assembled_text),
+                }
+            )
+
+        for initial_row in [*existing_attempts, *initial_unstarted_attempts]:
+            append_recovery_attempt(initial_row)
+
+        def recovery_budget_available() -> bool:
+            return max_recovery_actions is None or recovery_actions_used < max_recovery_actions
+
+        def update_final_request_for_active_attempt() -> None:
+            final_request = trace.setdefault("final_request", {})
+            if not isinstance(final_request, dict):
+                return
+            final_request["role"] = "aggregator"
+            final_request["execution"] = _member_execution_trace(
+                active_member,
+                role="aggregator",
+                chat_config=active_config,
+                tools=active_tools,
+                timeout_seconds=effective_timeout_seconds,
+                request_budget_binding=self._member_request_budget_binding(active_member),
+            )
+            final_request["input"] = _messages_trace(
+                active_messages,
+                max_chars=TRACE_CONTENT_MAX_CHARS,
+            )
+
+        def activate_recovery_attempt(
+            *,
+            member: EnsembleMemberConfig,
+            kind: str,
+            trigger: str,
+            continuation_text: str = "",
+            fallback_index: int = 0,
+        ) -> bool:
+            nonlocal active_member
+            nonlocal active_config
+            nonlocal active_messages
+            nonlocal active_tools
+            nonlocal active_fallback_index
+            nonlocal attempt_kind
+            nonlocal attempt_trigger
+            nonlocal provider
+            nonlocal recovery_actions_used
+            nonlocal thinking_fallbacks
+
+            if not recovery_budget_available():
+                return False
+            if not member.ready:
+                append_recovery_attempt(
+                    {
+                        "kind": kind,
+                        "fallback_index": fallback_index,
+                        "trigger": trigger,
+                        "request_started": False,
+                        "outcome": "member_unavailable",
+                        "code": member.unavailable_reason or "member_unavailable",
+                        "requested_provider": member.provider_config.provider,
+                        "requested_model": member.provider_config.model,
+                    }
+                )
+                return False
+            try:
+                next_provider = _build_provider(member.provider_config)
+            except Exception as exc:  # noqa: BLE001 - recovery skips unavailable member
+                append_recovery_attempt(
+                    {
+                        "kind": kind,
+                        "fallback_index": fallback_index,
+                        "trigger": trigger,
+                        "request_started": False,
+                        "outcome": "provider_build_failed",
+                        "code": type(exc).__name__,
+                        "requested_provider": member.provider_config.provider,
+                        "requested_model": member.provider_config.model,
+                    }
+                )
+                return False
+
+            active_member = member
+            provider = next_provider
+            active_fallback_index = fallback_index
+            attempt_kind = kind
+            attempt_trigger = trigger
+            active_tools = None
+            if continuation_text:
+                active_messages = [
+                    *primary_messages,
+                    Message(role="assistant", content=continuation_text),
+                    Message(
+                        role="user",
+                        content=(
+                            "Continue exactly from the interrupted answer. "
+                            "Output only the missing remainder, do not repeat "
+                            "the existing answer, and finish concisely."
+                        ),
+                    ),
+                ]
+            else:
+                active_messages = [
+                    *primary_messages,
+                    Message(
+                        role="user",
+                        content=(
+                            "The previous aggregation attempt produced no "
+                            "deliverable final text. Reuse the candidate drafts "
+                            "above and output the final answer now. Do not call "
+                            "tools, do not emit a plan, and keep internal "
+                            "reasoning brief."
+                        ),
+                    ),
+                ]
+            active_config = _aggregator_chat_config(
+                config,
+                active_member,
+                max_tokens_cap=self.aggregator_max_tokens_cap,
+                visible_answer_reserve_tokens=(self.aggregator_visible_answer_reserve_tokens),
+                recovery=True,
+                request_budget_binding=self._member_request_budget_binding(active_member),
+                record_budget_rebound=False,
+            )
+            if recovery_mode == "serving":
+                active_config = active_config.model_copy(
+                    update={"allow_provider_stream_fallback": False}
+                )
+            if effective_timeout_seconds > 0:
+                active_config = active_config.model_copy(
+                    update={"timeout": effective_timeout_seconds}
+                )
+            thinking_fallbacks = []
+            recovery_actions_used += 1
+            update_final_request_for_active_attempt()
+            return True
+
+        def activate_next_fallback(
+            *,
+            trigger: str,
+            continuation_text: str = "",
+        ) -> bool:
+            nonlocal next_fallback_index
+            while next_fallback_index < len(fallback_members):
+                fallback_index = next_fallback_index + 1
+                member = fallback_members[next_fallback_index]
+                next_fallback_index += 1
+                if activate_recovery_attempt(
+                    member=member,
+                    kind=("continuation_fallback" if continuation_text else "model_fallback"),
+                    trigger=trigger,
+                    continuation_text=continuation_text,
+                    fallback_index=fallback_index,
+                ):
+                    return True
+            return False
+
+        if active_fallback_index > 0:
+            update_final_request_for_active_attempt()
 
         def aggregator_progress(
             event_type: str,
@@ -4821,7 +5746,7 @@ class EnsembleProvider:
             error: str = "",
         ) -> EnsembleProgressEvent:
             row = usage or {}
-            cfg = self.aggregator.provider_config
+            cfg = active_member.provider_config
             return EnsembleProgressEvent(
                 event_type=event_type,
                 proposer_index=-1,
@@ -4881,8 +5806,22 @@ class EnsembleProvider:
                         break
             active_thinking_fallback_record = None
 
-        def ensemble_done(event: DoneEvent, *, aggregator_elapsed_ms: int) -> DoneEvent:
-            finalize_thinking_fallback("succeeded")
+        def ensemble_done(
+            event: DoneEvent,
+            *,
+            aggregator_elapsed_ms: int,
+            include_event_usage: bool = True,
+            record_success_attempt: bool = True,
+            recovery_success: bool = True,
+            final_request_event: DoneEvent | None = None,
+            selected_attempt_override: int | None = None,
+            selected_kind_override: str | None = None,
+            physical_output_text: str | None = None,
+            assembled_contribution_text: str | None = None,
+        ) -> DoneEvent:
+            selected_kind = selected_kind_override or attempt_kind
+            finalize_thinking_fallback("succeeded" if recovery_success else "failed")
+            request_evidence = final_request_event or event
             if active_member.thinking_policy_managed:
                 log.info(
                     "llm_ensemble.routing.model_execution_recorded",
@@ -4890,11 +5829,15 @@ class EnsembleProvider:
                     model_id=event.model or active_member.provider_config.model,
                     provider=event.provider or active_member.provider_config.provider,
                     requested_thinking_level=(active_member.requested_thinking_level),
-                    effective_thinking_level=(active_member.effective_thinking_level),
-                    provider_thinking_level=active_member.thinking,
+                    effective_thinking_level=(
+                        active_member.effective_thinking_level if active_config.thinking else "off"
+                    ),
+                    provider_thinking_level=(
+                        active_member.thinking if active_config.thinking else "off"
+                    ),
                     thinking_fallback_reason=(active_member.thinking_fallback_reason),
                     thinking_policy_version=(active_member.thinking_policy_version),
-                    status="succeeded",
+                    status="succeeded" if recovery_success else "failed",
                     elapsed_ms=aggregator_elapsed_ms,
                     input_tokens=event.input_tokens,
                     output_tokens=event.output_tokens,
@@ -4902,14 +5845,36 @@ class EnsembleProvider:
                     billed_cost=_canonical_usage_billed_cost(event)[0],
                     error_code="",
                 )
-            output_text = "".join(final_text_parts)
+            assembled_output_text = "".join(final_text_parts)
+            selected_physical_binding: Mapping[str, Any] | None = None
+            if physical_output_text is None and selected_attempt_override is not None:
+                selected_physical_binding = next(
+                    (
+                        component.get("physical_output")
+                        for component in output_components
+                        if isinstance(component, Mapping)
+                        and component.get("attempt") == selected_attempt_override
+                        and isinstance(component.get("physical_output"), Mapping)
+                    ),
+                    None,
+                )
+            selected_physical_output = (
+                str(selected_physical_binding.get("text") or "")
+                if isinstance(selected_physical_binding, Mapping)
+                else assembled_output_text
+                if physical_output_text is None
+                else physical_output_text
+            )
             _attach_final_request_output(
                 trace,
-                event=event,
-                output_text=output_text,
-                requested_provider=self.aggregator.provider_config.provider,
-                requested_model=self.aggregator.provider_config.model,
+                event=request_evidence,
+                output_text=selected_physical_output,
+                requested_provider=active_member.provider_config.provider,
+                requested_model=active_member.provider_config.model,
             )
+            if isinstance(selected_physical_binding, Mapping):
+                trace.setdefault("final_request", {})["output"] = dict(selected_physical_binding)
+            trace["assembled_output"] = _trace_output_content(assembled_output_text)
             acc = _AggregatorAccumulator(
                 input_tokens=event.input_tokens,
                 output_tokens=event.output_tokens,
@@ -4925,7 +5890,7 @@ class EnsembleProvider:
             )
             aggregator_rows: list[dict[str, Any]] = []
             for inner_index, inner in enumerate(
-                event.model_usage_breakdown,
+                event.model_usage_breakdown if include_event_usage else (),
                 start=1,
             ):
                 if not isinstance(inner, Mapping):
@@ -4936,10 +5901,10 @@ class EnsembleProvider:
                 row.setdefault("label", f"aggregator_inner_{inner_index}")
                 row.setdefault("provider", acc.provider)
                 if not str(row.get("requested_provider") or "").strip():
-                    row["requested_provider"] = self.aggregator.provider_config.provider
+                    row["requested_provider"] = active_member.provider_config.provider
                 row.setdefault("model", acc.model)
                 if not str(row.get("requested_model") or "").strip():
-                    row["requested_model"] = self.aggregator.provider_config.model
+                    row["requested_model"] = active_member.provider_config.model
                 if active_member.thinking_policy_managed:
                     row.setdefault(
                         "requested_thinking_level",
@@ -4962,7 +5927,7 @@ class EnsembleProvider:
                         active_member.thinking_policy_version,
                     )
                 aggregator_rows.append(_canonicalize_usage_row(row))
-            if not aggregator_rows:
+            if not aggregator_rows and include_event_usage:
                 aggregator_rows.append(
                     acc.usage_row(
                         profile=self.profile_name,
@@ -4972,23 +5937,101 @@ class EnsembleProvider:
                         elapsed_ms=aggregator_elapsed_ms,
                     )
                 )
+            aggregator_rows = _annotate_member_thinking_usage_rows(
+                aggregator_rows,
+                active_member,
+                active_config,
+            )
             rows = [
                 *prior_rows,
                 *abandoned_rows,
                 *aggregator_rows,
             ]
+            event_missing_count = (
+                _done_event_missing_usage_count(event) if include_event_usage else 0
+            )
             usage_missing_count = (
-                prior_missing_count
-                + abandoned_missing_count
-                + max(0, int(event.usage_missing_count or 0))
+                prior_missing_count + abandoned_missing_count + event_missing_count
             )
-            self._record_accounting_rows(
-                aggregator_rows,
-                missing_count=max(0, int(event.usage_missing_count or 0)),
-            )
-            _reconcile_nested_done_request_count(trace, event)
+            if include_event_usage:
+                self._record_accounting_rows(
+                    aggregator_rows,
+                    missing_count=event_missing_count,
+                )
+                _reconcile_nested_done_request_count(trace, event)
             if "usage_missing_count" in trace:
                 trace["usage_missing_count"] = usage_missing_count
+            selected_attempt = selected_attempt_override
+            if record_success_attempt:
+                selected_attempt = append_recovery_attempt(
+                    {
+                        "kind": selected_kind,
+                        "fallback_index": active_fallback_index,
+                        "trigger": attempt_trigger,
+                        "request_started": True,
+                        "physical_request_count": _done_event_physical_request_count(event),
+                        "visible_output_emitted": bool((assembled_contribution_text or "").strip()),
+                        "stream_closed": True,
+                        "outcome": "succeeded",
+                        "stop_reason": event.stop_reason,
+                        "requested_provider": active_member.provider_config.provider,
+                        "requested_model": active_member.provider_config.model,
+                        "actual_provider": acc.provider,
+                        "actual_model": acc.model,
+                        "planned_thinking_level": (active_member.effective_thinking_level),
+                        "effective_thinking_level": (
+                            active_member.effective_thinking_level
+                            if active_config.thinking
+                            else "off"
+                        ),
+                        "thinking_budget_tokens": max(
+                            0,
+                            int(active_config.thinking_budget_tokens or 0),
+                        ),
+                    }
+                )
+                append_output_component(
+                    attempt_number=selected_attempt,
+                    kind=selected_kind,
+                    fallback_index=active_fallback_index,
+                    member=active_member,
+                    physical_output_text=selected_physical_output,
+                    assembled_contribution_text=assembled_contribution_text or "",
+                )
+            elif selected_attempt is None:
+                selected_attempt = (
+                    last_visible_attempt_sequence or current_attempt_recorded_sequence or 0
+                )
+            recovery_trace.update(
+                {
+                    "success": recovery_success,
+                    "selected_attempt": selected_attempt,
+                    "selected_kind": selected_kind,
+                    "fallback_index": active_fallback_index,
+                    "fallback_reason": attempt_trigger,
+                    "executed_A": (
+                        f"{active_member.provider_config.provider}:"
+                        f"{active_member.provider_config.model}"
+                    ),
+                    "continuation_count": continuation_count,
+                    "same_model_recovery_count": same_model_recoveries,
+                }
+            )
+            trace["executed_A"] = recovery_trace["executed_A"]
+            trace["fallback_used"] = active_fallback_index > 0
+            trace["fallback_reason"] = attempt_trigger if active_fallback_index > 0 else ""
+            if recovery_trace.get("degraded") is True:
+                trace["run_outcome"] = str(
+                    recovery_trace.get("run_outcome") or "length_capped_usable"
+                )
+                trace["delivery_outcome"] = str(
+                    recovery_trace.get("delivery_outcome") or "partial_usable"
+                )
+            else:
+                trace["run_outcome"] = (
+                    "aggregator_recovered" if selected_kind != "primary" else "success"
+                )
+                trace["delivery_outcome"] = "complete"
             return replace(
                 event,
                 input_tokens=_summed_int(rows, "input_tokens"),
@@ -5000,10 +6043,10 @@ class EnsembleProvider:
                 model=acc.model,
                 provider=acc.provider,
                 requested_model=str(
-                    event.requested_model or self.aggregator.provider_config.model or ""
+                    event.requested_model or active_member.provider_config.model or ""
                 ),
                 requested_provider=str(
-                    event.requested_provider or self.aggregator.provider_config.provider or ""
+                    event.requested_provider or active_member.provider_config.provider or ""
                 ),
                 cost_source=_rollup_cost_source(rows),
                 model_usage_breakdown=rows,
@@ -5015,6 +6058,8 @@ class EnsembleProvider:
             )
 
         def partial_error(event: ErrorEvent) -> ErrorEvent:
+            nonlocal current_attempt_recorded_sequence
+
             finalize_thinking_fallback("failed")
             if active_member.thinking_policy_managed:
                 log.warning(
@@ -5023,8 +6068,12 @@ class EnsembleProvider:
                     model_id=active_member.provider_config.model,
                     provider=active_member.provider_config.provider,
                     requested_thinking_level=(active_member.requested_thinking_level),
-                    effective_thinking_level=(active_member.effective_thinking_level),
-                    provider_thinking_level=active_member.thinking,
+                    effective_thinking_level=(
+                        active_member.effective_thinking_level if active_config.thinking else "off"
+                    ),
+                    provider_thinking_level=(
+                        active_member.thinking if active_config.thinking else "off"
+                    ),
                     thinking_fallback_reason=(active_member.thinking_fallback_reason),
                     thinking_policy_version=(active_member.thinking_policy_version),
                     status="failed",
@@ -5035,26 +6084,36 @@ class EnsembleProvider:
                     billed_cost=0.0,
                     error_code=event.code,
                 )
+            current_attempt_already_recorded = current_attempt_recorded_sequence is not None
             terminal_rows = list(abandoned_rows)
-            event_rows = [
-                _canonicalize_usage_row(item)
-                for item in event.model_usage_breakdown
-                if isinstance(item, Mapping)
-            ]
+            event_rows = (
+                []
+                if current_attempt_already_recorded
+                else [
+                    _canonicalize_usage_row(item)
+                    for item in event.model_usage_breakdown
+                    if isinstance(item, Mapping)
+                ]
+            )
             event_rows = _annotate_member_thinking_usage_rows(
                 event_rows,
                 active_member,
+                active_config,
             )
             terminal_rows.extend(event_rows)
-            event_missing_count = _error_event_missing_usage_count(
-                event,
-                request_started=attempt_request_started,
+            event_missing_count = (
+                0
+                if current_attempt_already_recorded
+                else _error_event_missing_usage_count(
+                    event,
+                    request_started=attempt_request_started,
+                )
             )
             usage_missing_count = (
                 prior_missing_count + abandoned_missing_count + event_missing_count
             )
             diagnostic_rows: list[dict[str, Any]] = []
-            if event.diagnostic_done is not None:
+            if event.diagnostic_done is not None and not current_attempt_already_recorded:
                 diagnostic_rows = _annotate_member_thinking_usage_rows(
                     _unrepresented_diagnostic_usage_rows(
                         event_rows,
@@ -5062,23 +6121,60 @@ class EnsembleProvider:
                         role="aggregator",
                         profile=self.profile_name,
                         label=f"aggregator_attempt_{attempt + 1}",
-                        provider=self.aggregator.provider_config.provider,
-                        model=self.aggregator.provider_config.model,
+                        provider=active_member.provider_config.provider,
+                        model=active_member.provider_config.model,
                     ),
                     active_member,
+                    active_config,
                 )
                 terminal_rows.extend(diagnostic_rows)
-            self._record_accounting_rows(
-                [*event_rows, *diagnostic_rows],
-                missing_count=event_missing_count,
-            )
-            _reconcile_nested_error_request_count(
-                trace,
-                event,
-                outer_request_started=attempt_request_started,
-            )
+            if not current_attempt_already_recorded:
+                self._record_accounting_rows(
+                    [*event_rows, *diagnostic_rows],
+                    missing_count=event_missing_count,
+                )
+                _reconcile_nested_error_request_count(
+                    trace,
+                    event,
+                    outer_request_started=attempt_request_started,
+                )
             trace["usage_missing_count"] = usage_missing_count
             trace["physical_request_count"] = int(trace.get("llm_request_count") or 0)
+            recovery_trace.update(
+                {
+                    "success": False,
+                    "terminal_code": event.code,
+                    "fallback_index": active_fallback_index,
+                    "continuation_count": continuation_count,
+                    "same_model_recovery_count": same_model_recoveries,
+                    "exhausted": True,
+                }
+            )
+            if current_attempt_recorded_sequence is None:
+                physical_request_count = _error_event_physical_request_count(
+                    event,
+                    request_started=attempt_request_started,
+                )
+                current_attempt_recorded_sequence = append_recovery_attempt(
+                    {
+                        "kind": attempt_kind,
+                        "fallback_index": active_fallback_index,
+                        "trigger": attempt_trigger,
+                        "request_started": physical_request_count > 0,
+                        "physical_request_count": physical_request_count,
+                        "visible_output_emitted": bool(final_text_parts),
+                        "stream_closed": event.code != "ensemble_aggregator_close_timeout",
+                        "outcome": "failed",
+                        "code": event.code,
+                        "requested_provider": active_member.provider_config.provider,
+                        "requested_model": active_member.provider_config.model,
+                    }
+                )
+            trace["executed_A"] = (
+                f"{active_member.provider_config.provider}:{active_member.provider_config.model}"
+            )
+            trace["run_outcome"] = "aggregator_failed"
+            trace["delivery_outcome"] = "partial_unusable" if final_text_parts else "no_answer"
             return _attach_error_request_evidence(
                 replace(
                     event,
@@ -5089,8 +6185,31 @@ class EnsembleProvider:
                 trace,
             )
 
-        def record_abandoned_attempt(event: ErrorEvent) -> None:
+        def record_abandoned_attempt(
+            event: ErrorEvent,
+            *,
+            trigger: str = "",
+            stream_closed: bool = True,
+            stop_reason: str = "",
+            attempt_member: EnsembleMemberConfig | None = None,
+            recorded_kind: str | None = None,
+            recorded_fallback_index: int | None = None,
+            attempt_config: ChatConfig | None = None,
+            physical_output_text: str = "",
+            assembled_contribution_text: str = "",
+        ) -> int:
             nonlocal abandoned_missing_count
+            nonlocal current_attempt_recorded_sequence
+            nonlocal last_visible_attempt_sequence
+
+            member = attempt_member or active_member
+            config_for_attempt = attempt_config or active_config
+            kind = recorded_kind or attempt_kind
+            fallback_index = (
+                active_fallback_index
+                if recorded_fallback_index is None
+                else recorded_fallback_index
+            )
             event_rows = [
                 _canonicalize_usage_row(item)
                 for item in event.model_usage_breakdown
@@ -5098,7 +6217,8 @@ class EnsembleProvider:
             ]
             event_rows = _annotate_member_thinking_usage_rows(
                 event_rows,
-                active_member,
+                member,
+                attempt_config or active_config,
             )
             abandoned_rows.extend(event_rows)
             event_missing_count = _error_event_missing_usage_count(
@@ -5116,10 +6236,11 @@ class EnsembleProvider:
                         role="aggregator",
                         profile=self.profile_name,
                         label=f"aggregator_retry_{attempt + 1}",
-                        provider=self.aggregator.provider_config.provider,
-                        model=self.aggregator.provider_config.model,
+                        provider=member.provider_config.provider,
+                        model=member.provider_config.model,
                     ),
-                    active_member,
+                    member,
+                    attempt_config or active_config,
                 )
                 abandoned_rows.extend(diagnostic_rows)
             self._record_accounting_rows(
@@ -5131,26 +6252,78 @@ class EnsembleProvider:
                 event,
                 outer_request_started=attempt_request_started,
             )
+            physical_request_count = _error_event_physical_request_count(
+                event,
+                request_started=attempt_request_started,
+            )
+            recorded_attempt = append_recovery_attempt(
+                {
+                    "kind": kind,
+                    "fallback_index": fallback_index,
+                    "trigger": trigger or attempt_trigger,
+                    "request_started": physical_request_count > 0,
+                    "physical_request_count": physical_request_count,
+                    "visible_output_emitted": bool(assembled_contribution_text.strip()),
+                    "stream_closed": stream_closed,
+                    "outcome": "abandoned",
+                    "code": event.code,
+                    "stop_reason": stop_reason,
+                    "usage_reported": bool(event_rows or event.diagnostic_done is not None),
+                    "usage_missing_count": recorded_missing_count,
+                    "requested_provider": member.provider_config.provider,
+                    "requested_model": member.provider_config.model,
+                    "planned_thinking_level": member.effective_thinking_level,
+                    "effective_thinking_level": (
+                        member.effective_thinking_level if config_for_attempt.thinking else "off"
+                    ),
+                    "thinking_budget_tokens": max(
+                        0,
+                        int(config_for_attempt.thinking_budget_tokens or 0),
+                    ),
+                }
+            )
+            append_output_component(
+                attempt_number=recorded_attempt,
+                kind=kind,
+                fallback_index=fallback_index,
+                member=member,
+                physical_output_text=physical_output_text,
+                assembled_contribution_text=assembled_contribution_text,
+            )
+            current_attempt_recorded_sequence = recorded_attempt
+            if assembled_contribution_text.strip():
+                last_visible_attempt_sequence = recorded_attempt
             final_request = trace.get("final_request")
             if isinstance(final_request, dict):
                 attempts = final_request.setdefault("abandoned_attempts", [])
                 if isinstance(attempts, list):
                     attempts.append(
                         {
-                            "attempt": attempt + 1,
-                            "request_started": attempt_request_started,
+                            "attempt": recorded_attempt,
+                            "request_started": physical_request_count > 0,
+                            "physical_request_count": physical_request_count,
                             "usage_reported": bool(event_rows or event.diagnostic_done is not None),
                             "usage_missing_count": recorded_missing_count,
                             "code": event.code,
+                            "kind": kind,
+                            "fallback_index": fallback_index,
+                            "trigger": trigger or attempt_trigger,
+                            "visible_output_emitted": bool(assembled_contribution_text.strip()),
+                            "stream_closed": stream_closed,
+                            "stop_reason": stop_reason,
+                            "requested_provider": member.provider_config.provider,
+                            "requested_model": member.provider_config.model,
                         }
                     )
             if "usage_missing_count" in trace:
                 trace["usage_missing_count"] = prior_missing_count + abandoned_missing_count
+            return recorded_attempt
 
         yield aggregator_progress("aggregator_start")
         attempt = 0
         physical_attempts_started = 0
         while True:
+            current_attempt_recorded_sequence = None
             attempt_request_started = False
             attempt_timeout_seconds = effective_timeout_seconds
             if absolute_deadline is not None:
@@ -5172,6 +6345,9 @@ class EnsembleProvider:
                     else min(attempt_timeout_seconds, remaining_to_deadline)
                 )
             content_streamed = False
+            attempt_text_parts: list[str] = []
+            reasoning_streamed = False
+            tool_output_streamed = False
             response_observed = False
             retry_error: ErrorEvent | None = None
             thinking_retry_target: tuple[str, str] | None = None
@@ -5183,7 +6359,11 @@ class EnsembleProvider:
             external_close_requested = False
             attempt_request_started = False
             try:
-                stream = provider.chat(messages, tools=tools, config=active_config)
+                stream = provider.chat(
+                    active_messages,
+                    tools=active_tools,
+                    config=active_config,
+                )
                 if attempt == 0:
                     _mark_final_request_started(trace)
                 else:
@@ -5221,12 +6401,12 @@ class EnsembleProvider:
                             event,
                             message=redact_upstream_error_text(
                                 event.message,
-                                api_key=self.aggregator.provider_config.api_key,
+                                api_key=active_member.provider_config.api_key,
                                 max_len=2000,
                             ),
                             code=redact_upstream_error_code(
                                 event.code,
-                                api_key=self.aggregator.provider_config.api_key,
+                                api_key=active_member.provider_config.api_key,
                             ),
                         )
                         safe_event = _preserve_observed_request_evidence(
@@ -5267,10 +6447,15 @@ class EnsembleProvider:
                             break
                         if (
                             not content_streamed
-                            and attempt < _ENSEMBLE_AGGREGATOR_MAX_RETRIES
+                            and attempt < max_transient_retries
+                            and not (
+                                recovery_mode == "serving"
+                                and any(member.ready for member in fallback_members)
+                            )
                             and self._aggregator_error_is_retryable(
                                 message=safe_event.message,
                                 code=safe_event.code,
+                                member=active_member,
                             )
                         ):
                             retry_error = safe_event
@@ -5281,15 +6466,32 @@ class EnsembleProvider:
                         response_observed = True
                         if event.text:
                             content_streamed = True
-                            final_text_parts.append(event.text)
-                        yield event
+                            attempt_text_parts.append(event.text)
+                            if not attempt_kind.startswith("continuation"):
+                                final_text_parts.append(event.text)
+                        if not attempt_kind.startswith("continuation"):
+                            yield event
                     elif isinstance(event, ProviderHeartbeatEvent):
+                        yield event
+                    elif isinstance(event, ReasoningDeltaEvent):
+                        response_observed = True
+                        reasoning_streamed = reasoning_streamed or bool(event.text)
+                        # Reasoning is observable progress but is not a
+                        # deliverable final answer and must not pin a
+                        # reasoning-only attempt against safe recovery.
+                        yield event
+                    elif isinstance(
+                        event,
+                        (ToolUseStartEvent, ToolUseDeltaEvent, ToolUseEndEvent),
+                    ):
+                        response_observed = True
+                        content_streamed = True
+                        tool_output_streamed = True
                         yield event
                     else:
                         response_observed = True
-                        # Reasoning/tool-use deltas are user-visible; replaying
-                        # the aggregator after emitting them would duplicate
-                        # output downstream, so they pin this attempt.
+                        # Unknown non-text output is conservatively treated as
+                        # non-replayable.
                         content_streamed = True
                         yield event
             except (GeneratorExit, asyncio.CancelledError):
@@ -5302,18 +6504,16 @@ class EnsembleProvider:
                     else None
                 )
                 terminal_stream_error = ErrorEvent(
-                    message=(f"ensemble aggregator timed out after {attempt_timeout_seconds:g}s"),
+                    message=(f"ensemble aggregator timed out after {effective_timeout_seconds:g}s"),
                     code="ensemble_aggregator_timeout",
                     diagnostic_done=(
-                        deadline_event
-                        if isinstance(deadline_event, DoneEvent)
-                        else None
+                        deadline_event if isinstance(deadline_event, DoneEvent) else None
                     ),
                 )
             except Exception as exc:  # noqa: BLE001 - provider boundary returns ErrorEvent
                 safe_message = redact_upstream_error_text(
                     f"ensemble aggregator failed: {exc}",
-                    api_key=self.aggregator.provider_config.api_key,
+                    api_key=active_member.provider_config.api_key,
                     max_len=2000,
                 )
                 if (
@@ -5332,10 +6532,15 @@ class EnsembleProvider:
                     )
                 elif (
                     not content_streamed
-                    and attempt < _ENSEMBLE_AGGREGATOR_MAX_RETRIES
+                    and attempt < max_transient_retries
+                    and not (
+                        recovery_mode == "serving"
+                        and any(member.ready for member in fallback_members)
+                    )
                     and self._aggregator_error_is_retryable(
                         message=safe_message,
                         code=type(exc).__name__,
+                        member=active_member,
                     )
                 ):
                     retry_error = ErrorEvent(
@@ -5363,19 +6568,6 @@ class EnsembleProvider:
                     raise _EnsembleStreamCloseError("ensemble_aggregator_external_close")
             if completed_provider_event is not None:
                 aggregator_elapsed_ms = int((time.monotonic() - aggregator_started) * 1000)
-                done_event = ensemble_done(
-                    completed_provider_event,
-                    aggregator_elapsed_ms=aggregator_elapsed_ms,
-                )
-                usage_rows = done_event.model_usage_breakdown or []
-                aggregator_usage = next(
-                    (
-                        row
-                        for row in reversed(usage_rows)
-                        if isinstance(row, Mapping) and row.get("role") == "aggregator"
-                    ),
-                    {},
-                )
                 if not stream_closed:
                     close_error = ErrorEvent(
                         message=(
@@ -5383,28 +6575,360 @@ class EnsembleProvider:
                             "did not close within the cleanup window"
                         ),
                         code="ensemble_aggregator_close_timeout",
-                        model_usage_breakdown=[
-                            dict(row) for row in done_event.model_usage_breakdown
-                        ],
-                        usage_missing_count=max(
-                            0,
-                            int(done_event.usage_missing_count or 0),
+                        diagnostic_done=completed_provider_event,
+                        request_started=True,
+                        physical_request_count=1,
+                    )
+                    yield aggregator_progress(
+                        "aggregator_finish",
+                        error=close_error.message,
+                    )
+                    yield partial_error(close_error)
+                    return
+
+                stop_reason = str(completed_provider_event.stop_reason or "").strip().lower()
+                attempt_visible_text = "".join(attempt_text_parts)
+                if attempt_kind.startswith("continuation"):
+                    attempt_visible_text = _deduplicate_continuation(
+                        "".join(final_text_parts),
+                        attempt_visible_text,
+                    )
+                    if attempt_visible_text:
+                        final_text_parts.append(attempt_visible_text)
+                        yield TextDeltaEvent(text=attempt_visible_text)
+                length_capped = stop_reason in {"length", "max_tokens"}
+                empty_terminal = not attempt_visible_text.strip() and not tool_output_streamed
+                reasoning_only_terminal = empty_terminal and (
+                    reasoning_streamed or int(completed_provider_event.reasoning_tokens or 0) > 0
+                )
+                reasoning_only_length = length_capped and reasoning_only_terminal
+                partial_visible_length = (
+                    length_capped
+                    and bool(attempt_visible_text.strip())
+                    and not tool_output_streamed
+                )
+                diagnostic_error = ErrorEvent(
+                    message=(
+                        "ensemble aggregator produced no deliverable final answer"
+                        if empty_terminal
+                        else "ensemble aggregator exhausted its output budget "
+                        "before producing a complete visible answer"
+                    ),
+                    code=(
+                        "ensemble_aggregator_reasoning_only_length"
+                        if reasoning_only_length
+                        else "ensemble_aggregator_empty_length"
+                        if length_capped and not attempt_visible_text
+                        else "ensemble_aggregator_reasoning_only_terminal"
+                        if reasoning_only_terminal
+                        else "ensemble_aggregator_empty_terminal"
+                        if empty_terminal
+                        else "ensemble_aggregator_visible_length"
+                    ),
+                    diagnostic_done=completed_provider_event,
+                    request_started=True,
+                    physical_request_count=1,
+                )
+
+                if (
+                    partial_visible_length
+                    and continuation_count < max_continuations
+                    and recovery_budget_available()
+                ):
+                    last_partial_done_event = completed_provider_event
+                    record_abandoned_attempt(
+                        diagnostic_error,
+                        trigger="visible_length",
+                        stream_closed=True,
+                        stop_reason=stop_reason,
+                        physical_output_text="".join(attempt_text_parts),
+                        assembled_contribution_text=attempt_visible_text,
+                    )
+                    continuation_count += 1
+                    if activate_recovery_attempt(
+                        member=active_member,
+                        kind="continuation",
+                        trigger="visible_length",
+                        continuation_text="".join(final_text_parts),
+                        fallback_index=active_fallback_index,
+                    ):
+                        attempt += 1
+                        trace.setdefault("final_request", {})["retry_count"] = attempt
+                        yield ProviderHeartbeatEvent(
+                            phase="ensemble_aggregator_continuation",
+                            message=(
+                                "Ensemble aggregator output was truncated; "
+                                "continuing from the visible answer"
+                            ),
+                        )
+                        continue
+                    terminal_stream_error = ErrorEvent(
+                        message="ensemble aggregator continuation could not be initialized",
+                        code="ensemble_aggregator_recovery_unavailable",
+                    )
+                elif empty_terminal and recovery_mode != "off":
+                    empty_trigger = (
+                        "reasoning_only_length"
+                        if reasoning_only_length
+                        else "empty_length"
+                        if length_capped
+                        else "reasoning_only_terminal"
+                        if reasoning_only_terminal
+                        else "empty_terminal"
+                    )
+                    visible_prefix = "".join(final_text_parts)
+                    if not visible_prefix.strip():
+                        visible_prefix = ""
+                    can_continue_visible_prefix = (
+                        bool(visible_prefix)
+                        and continuation_count < max_continuations
+                        and recovery_budget_available()
+                    )
+                    can_same_model_recover = (
+                        not visible_prefix
+                        and same_model_recoveries < 1
+                        and active_fallback_index == 0
+                        and recovery_budget_available()
+                    )
+                    if can_continue_visible_prefix:
+                        record_abandoned_attempt(
+                            diagnostic_error,
+                            trigger=empty_trigger,
+                            stream_closed=True,
+                            stop_reason=stop_reason,
+                        )
+                        continuation_count += 1
+                        if activate_recovery_attempt(
+                            member=active_member,
+                            kind="continuation",
+                            trigger=empty_trigger,
+                            continuation_text=visible_prefix,
+                            fallback_index=active_fallback_index,
+                        ):
+                            attempt += 1
+                            trace.setdefault("final_request", {})["retry_count"] = attempt
+                            yield ProviderHeartbeatEvent(
+                                phase="ensemble_aggregator_continuation",
+                                message=(
+                                    "Ensemble aggregator continuation was empty; "
+                                    "retrying within the bounded continuation budget"
+                                ),
+                            )
+                            continue
+                        if activate_next_fallback(
+                            trigger=empty_trigger,
+                            continuation_text=visible_prefix,
+                        ):
+                            attempt += 1
+                            trace.setdefault("final_request", {})["retry_count"] = attempt
+                            yield ProviderHeartbeatEvent(
+                                phase="ensemble_aggregator_model_fallback",
+                                message=(
+                                    "Ensemble aggregator continuation was unavailable; "
+                                    "switching to the next ranked aggregator"
+                                ),
+                            )
+                            continue
+                        terminal_stream_error = ErrorEvent(
+                            message="ensemble aggregator continuation could not be initialized",
+                            code="ensemble_aggregator_recovery_unavailable",
+                        )
+                    elif can_same_model_recover:
+                        record_abandoned_attempt(
+                            diagnostic_error,
+                            trigger=empty_trigger,
+                            stream_closed=True,
+                            stop_reason=stop_reason,
+                        )
+                        same_model_recoveries += 1
+                        if activate_recovery_attempt(
+                            member=active_member,
+                            kind=(
+                                "continuation_recovery" if visible_prefix else "same_model_recovery"
+                            ),
+                            trigger=empty_trigger,
+                            continuation_text=visible_prefix,
+                            fallback_index=active_fallback_index,
+                        ):
+                            attempt += 1
+                            trace.setdefault("final_request", {})["retry_count"] = attempt
+                            yield ProviderHeartbeatEvent(
+                                phase="ensemble_aggregator_reasoning_recovery",
+                                message=(
+                                    "Ensemble aggregator produced reasoning only; "
+                                    "retrying final synthesis with thinking disabled"
+                                ),
+                            )
+                            continue
+                        if activate_next_fallback(
+                            trigger=empty_trigger,
+                            continuation_text=visible_prefix,
+                        ):
+                            attempt += 1
+                            trace.setdefault("final_request", {})["retry_count"] = attempt
+                            yield ProviderHeartbeatEvent(
+                                phase="ensemble_aggregator_model_fallback",
+                                message=(
+                                    "Ensemble aggregator recovery was unavailable; "
+                                    "switching to the next ranked aggregator"
+                                ),
+                            )
+                            continue
+                        terminal_stream_error = ErrorEvent(
+                            message=(
+                                "ensemble aggregator reasoning-only recovery "
+                                "could not be initialized"
+                            ),
+                            code="ensemble_aggregator_recovery_unavailable",
+                        )
+                    elif (
+                        recovery_mode == "experiment"
+                        or recovery_mode == "serving"
+                        and recovery_budget_available()
+                    ) and fallback_members:
+                        record_abandoned_attempt(
+                            diagnostic_error,
+                            trigger=empty_trigger,
+                            stream_closed=True,
+                            stop_reason=stop_reason,
+                        )
+                        if activate_next_fallback(
+                            trigger=empty_trigger,
+                            continuation_text=visible_prefix,
+                        ):
+                            attempt += 1
+                            trace.setdefault("final_request", {})["retry_count"] = attempt
+                            yield ProviderHeartbeatEvent(
+                                phase="ensemble_aggregator_model_fallback",
+                                message=(
+                                    "Ensemble aggregator recovery failed; "
+                                    "switching to the next ranked aggregator"
+                                ),
+                            )
+                            continue
+                        terminal_stream_error = ErrorEvent(
+                            message="ensemble aggregator fallback chain was unavailable",
+                            code="ensemble_aggregator_recovery_unavailable",
+                        )
+
+                if (
+                    partial_visible_length
+                    and recovery_mode == "experiment"
+                    and terminal_stream_error is None
+                    and continuation_count >= max_continuations
+                ):
+                    last_partial_done_event = completed_provider_event
+                    record_abandoned_attempt(
+                        diagnostic_error,
+                        trigger="visible_length_continuations_exhausted",
+                        stream_closed=True,
+                        stop_reason=stop_reason,
+                        physical_output_text="".join(attempt_text_parts),
+                        assembled_contribution_text=attempt_visible_text,
+                    )
+                    if activate_next_fallback(
+                        trigger="visible_length_continuations_exhausted",
+                        continuation_text="".join(final_text_parts),
+                    ):
+                        attempt += 1
+                        trace.setdefault("final_request", {})["retry_count"] = attempt
+                        yield ProviderHeartbeatEvent(
+                            phase="ensemble_aggregator_model_fallback",
+                            message=(
+                                "Ensemble aggregator continuation remained "
+                                "truncated; switching to the next ranked "
+                                "aggregator"
+                            ),
+                        )
+                        continue
+                    terminal_stream_error = ErrorEvent(
+                        message="ensemble aggregator continuation fallback chain was unavailable",
+                        code="ensemble_aggregator_recovery_unavailable",
+                    )
+
+                if (
+                    partial_visible_length
+                    and recovery_mode == "serving"
+                    and terminal_stream_error is None
+                    and _visible_answer_looks_usable("".join(final_text_parts))
+                ):
+                    # Keep execution failure distinct from a useful degraded
+                    # delivery. The real length-capped request remains the
+                    # selected, fully-accounted attempt; no synthetic success
+                    # attempt is added to the audit trace.
+                    selected_partial_attempt = record_abandoned_attempt(
+                        diagnostic_error,
+                        trigger="visible_length_continuations_exhausted",
+                        stream_closed=True,
+                        stop_reason=stop_reason,
+                        physical_output_text="".join(attempt_text_parts),
+                        assembled_contribution_text=attempt_visible_text,
+                    )
+                    recovery_trace.update(
+                        {
+                            "degraded": True,
+                            "run_outcome": "length_capped_usable",
+                            "delivery_outcome": "partial_usable",
+                            "success": False,
+                        }
+                    )
+                    delivered_event = replace(
+                        completed_provider_event,
+                        stop_reason="end_turn",
+                    )
+                    done_event = ensemble_done(
+                        delivered_event,
+                        aggregator_elapsed_ms=aggregator_elapsed_ms,
+                        include_event_usage=False,
+                        record_success_attempt=False,
+                        recovery_success=False,
+                        final_request_event=completed_provider_event,
+                        selected_attempt_override=selected_partial_attempt,
+                        selected_kind_override="partial_salvage",
+                    )
+                    usage_rows = done_event.model_usage_breakdown or []
+                    aggregator_usage = next(
+                        (
+                            row
+                            for row in reversed(usage_rows)
+                            if isinstance(row, Mapping) and row.get("role") == "aggregator"
                         ),
-                        ensemble_trace=trace,
+                        {},
+                    )
+                    yield aggregator_progress("aggregator_finish", usage=aggregator_usage)
+                    yield done_event
+                    return
+                elif (
+                    partial_visible_length
+                    and recovery_mode == "serving"
+                    and terminal_stream_error is None
+                ):
+                    terminal_stream_error = diagnostic_error
+                elif empty_terminal and terminal_stream_error is None:
+                    terminal_stream_error = diagnostic_error
+
+                if terminal_stream_error is None:
+                    done_event = ensemble_done(
+                        completed_provider_event,
+                        aggregator_elapsed_ms=aggregator_elapsed_ms,
+                        physical_output_text="".join(attempt_text_parts),
+                        assembled_contribution_text=attempt_visible_text,
+                    )
+                    usage_rows = done_event.model_usage_breakdown or []
+                    aggregator_usage = next(
+                        (
+                            row
+                            for row in reversed(usage_rows)
+                            if isinstance(row, Mapping) and row.get("role") == "aggregator"
+                        ),
+                        {},
                     )
                     yield aggregator_progress(
                         "aggregator_finish",
                         usage=aggregator_usage,
-                        error=close_error.message,
                     )
-                    yield _attach_error_request_evidence(close_error, trace)
+                    yield done_event
                     return
-                yield aggregator_progress(
-                    "aggregator_finish",
-                    usage=aggregator_usage,
-                )
-                yield done_event
-                return
             if terminal_stream_error is not None:
                 if not stream_closed:
                     terminal_stream_error = replace(
@@ -5415,6 +6939,197 @@ class EnsembleProvider:
                         ),
                         code="ensemble_aggregator_close_timeout",
                     )
+                if (
+                    recovery_mode == "serving"
+                    and final_text_parts
+                    and not tool_output_streamed
+                    and _visible_answer_looks_usable("".join(final_text_parts))
+                ):
+                    # The strict run failed, but a prior closed attempt already
+                    # produced useful visible text. Do not make the user wait
+                    # for another full chain or discard that answer. The
+                    # failed request is still accounted and the run/delivery
+                    # outcomes remain separate.
+                    recorded_terminal_attempt = record_abandoned_attempt(
+                        terminal_stream_error,
+                        trigger=terminal_stream_error.code or "continuation_failed",
+                        stream_closed=stream_closed,
+                        physical_output_text="".join(attempt_text_parts),
+                        assembled_contribution_text=(
+                            ""
+                            if attempt_kind.startswith("continuation")
+                            else "".join(attempt_text_parts)
+                        ),
+                    )
+                    selected_salvage_attempt = (
+                        last_visible_attempt_sequence or recorded_terminal_attempt
+                    )
+                    recovery_trace.update(
+                        {
+                            "degraded": True,
+                            "run_outcome": "aggregator_recovery_failed",
+                            "delivery_outcome": "partial_usable",
+                            "success": False,
+                        }
+                    )
+                    salvage_evidence = (
+                        last_partial_done_event
+                        or terminal_stream_error.diagnostic_done
+                        or DoneEvent(
+                            model=active_member.provider_config.model,
+                            provider=active_member.provider_config.provider,
+                            requested_model=active_member.provider_config.model,
+                            requested_provider=active_member.provider_config.provider,
+                        )
+                    )
+                    delivered_event = replace(
+                        salvage_evidence,
+                        stop_reason="end_turn",
+                    )
+                    done_event = ensemble_done(
+                        delivered_event,
+                        aggregator_elapsed_ms=int((time.monotonic() - aggregator_started) * 1000),
+                        include_event_usage=False,
+                        record_success_attempt=False,
+                        recovery_success=False,
+                        final_request_event=salvage_evidence,
+                        selected_attempt_override=selected_salvage_attempt,
+                        selected_kind_override="partial_salvage",
+                    )
+                    yield aggregator_progress("aggregator_finish")
+                    yield done_event
+                    return
+                elif recovery_mode == "experiment" and final_text_parts and stream_closed:
+                    pending_error = terminal_stream_error
+                    failed_member = active_member
+                    failed_config = active_config
+                    failed_kind = attempt_kind
+                    failed_fallback_index = active_fallback_index
+                    interrupted_contribution = (
+                        ""
+                        if attempt_kind.startswith("continuation")
+                        else "".join(attempt_text_parts)
+                    )
+                    if attempt_kind.startswith("continuation") and attempt_text_parts:
+                        interrupted_remainder = _deduplicate_continuation(
+                            "".join(final_text_parts),
+                            "".join(attempt_text_parts),
+                        )
+                        if interrupted_remainder:
+                            final_text_parts.append(interrupted_remainder)
+                            interrupted_contribution = interrupted_remainder
+                            yield TextDeltaEvent(text=interrupted_remainder)
+                    visible_prefix = "".join(final_text_parts)
+                    record_abandoned_attempt(
+                        pending_error,
+                        trigger=(pending_error.code or "visible_stream_interrupted"),
+                        stream_closed=True,
+                        attempt_member=failed_member,
+                        attempt_config=failed_config,
+                        recorded_kind=failed_kind,
+                        recorded_fallback_index=failed_fallback_index,
+                        physical_output_text="".join(attempt_text_parts),
+                        assembled_contribution_text=interrupted_contribution,
+                    )
+                    continued = False
+                    if continuation_count < max_continuations and recovery_budget_available():
+                        continuation_count += 1
+                        continued = activate_recovery_attempt(
+                            member=failed_member,
+                            kind="continuation",
+                            trigger=(pending_error.code or "visible_stream_interrupted"),
+                            continuation_text=visible_prefix,
+                            fallback_index=failed_fallback_index,
+                        )
+                    if continued:
+                        attempt += 1
+                        trace.setdefault("final_request", {})["retry_count"] = attempt
+                        yield ProviderHeartbeatEvent(
+                            phase="ensemble_aggregator_continuation",
+                            message=(
+                                "Ensemble aggregator stream was interrupted; "
+                                "continuing from the closed visible answer"
+                            ),
+                        )
+                        continue
+                    if activate_next_fallback(
+                        trigger=pending_error.code or "visible_stream_interrupted",
+                        continuation_text=visible_prefix,
+                    ):
+                        attempt += 1
+                        trace.setdefault("final_request", {})["retry_count"] = attempt
+                        yield ProviderHeartbeatEvent(
+                            phase="ensemble_aggregator_model_fallback",
+                            message=(
+                                "Ensemble aggregator continuation failed; "
+                                "switching to the next ranked aggregator"
+                            ),
+                        )
+                        continue
+                elif (
+                    not content_streamed
+                    and not tool_output_streamed
+                    and recovery_mode != "off"
+                    and recovery_budget_available()
+                ):
+                    pending_error = terminal_stream_error
+                    failed_member = active_member
+                    failed_config = active_config
+                    failed_kind = attempt_kind
+                    failed_fallback_index = active_fallback_index
+                    record_abandoned_attempt(
+                        pending_error,
+                        trigger=pending_error.code or "aggregator_error",
+                        stream_closed=True,
+                        attempt_member=failed_member,
+                        attempt_config=failed_config,
+                        recorded_kind=failed_kind,
+                        recorded_fallback_index=failed_fallback_index,
+                    )
+                    activated_ranked_fallback = activate_next_fallback(
+                        trigger=pending_error.code or "aggregator_error"
+                    )
+                    activated = activated_ranked_fallback
+                    if (
+                        not activated
+                        and recovery_mode == "serving"
+                        and recovery_budget_available()
+                        and pending_error.code
+                        not in {
+                            "ensemble_aggregator_timeout",
+                            "ensemble_aggregator_close_timeout",
+                        }
+                        and self._aggregator_error_is_retryable(
+                            message=pending_error.message,
+                            code=pending_error.code,
+                            member=failed_member,
+                        )
+                    ):
+                        activated = activate_recovery_attempt(
+                            member=failed_member,
+                            kind="same_model_recovery",
+                            trigger=pending_error.code or "aggregator_error",
+                            fallback_index=failed_fallback_index,
+                        )
+                    if activated:
+                        attempt += 1
+                        trace.setdefault("final_request", {})["retry_count"] = attempt
+                        yield ProviderHeartbeatEvent(
+                            phase=(
+                                "ensemble_aggregator_model_fallback"
+                                if activated_ranked_fallback
+                                else "ensemble_aggregator_same_model_recovery"
+                            ),
+                            message=(
+                                "Ensemble aggregator failed without visible output; "
+                                + (
+                                    "switching to the next ranked aggregator"
+                                    if activated_ranked_fallback
+                                    else "retrying once with bounded finalization"
+                                )
+                            ),
+                        )
+                        continue
                 yield aggregator_progress(
                     "aggregator_finish",
                     error=terminal_stream_error.message,
@@ -5441,11 +7156,7 @@ class EnsembleProvider:
                     message="ensemble aggregator stream ended before DoneEvent",
                     code="ensemble_aggregator_incomplete",
                 )
-                if (
-                    stream_closed
-                    and not content_streamed
-                    and attempt < (_ENSEMBLE_AGGREGATOR_MAX_RETRIES)
-                ):
+                if stream_closed and not content_streamed and attempt < max_transient_retries:
                     retry_error = error
                 else:
                     if not stream_closed:
@@ -5458,6 +7169,37 @@ class EnsembleProvider:
                             ),
                             code="ensemble_aggregator_close_timeout",
                         )
+                    elif (
+                        not content_streamed
+                        and not tool_output_streamed
+                        and recovery_mode != "off"
+                        and recovery_budget_available()
+                    ):
+                        failed_member = active_member
+                        failed_config = active_config
+                        failed_kind = attempt_kind
+                        failed_fallback_index = active_fallback_index
+                        record_abandoned_attempt(
+                            error,
+                            trigger="ensemble_aggregator_incomplete",
+                            stream_closed=True,
+                            attempt_member=failed_member,
+                            attempt_config=failed_config,
+                            recorded_kind=failed_kind,
+                            recorded_fallback_index=failed_fallback_index,
+                        )
+                        if activate_next_fallback(trigger="ensemble_aggregator_incomplete"):
+                            attempt += 1
+                            trace.setdefault("final_request", {})["retry_count"] = attempt
+                            yield ProviderHeartbeatEvent(
+                                phase="ensemble_aggregator_model_fallback",
+                                message=(
+                                    "Ensemble aggregator ended without a "
+                                    "completion; switching to the next ranked "
+                                    "aggregator"
+                                ),
+                            )
+                            continue
                     yield aggregator_progress(
                         "aggregator_finish",
                         error=error.message,
@@ -5466,6 +7208,15 @@ class EnsembleProvider:
                     return
             record_abandoned_attempt(retry_error)
             final_request = trace.get("final_request")
+            if recovery_mode == "serving":
+                if not recovery_budget_available():
+                    yield aggregator_progress(
+                        "aggregator_finish",
+                        error=retry_error.message,
+                    )
+                    yield partial_error(retry_error)
+                    return
+                recovery_actions_used += 1
             if thinking_retry_target is not None:
                 # A second neighbor means the previously attempted neighbor
                 # was itself rejected.
@@ -5487,18 +7238,21 @@ class EnsembleProvider:
                 log.warning(
                     "ensemble.aggregator_retry",
                     attempt=attempt,
-                    max_retries=_ENSEMBLE_AGGREGATOR_MAX_RETRIES,
+                    max_retries=max_transient_retries,
                     code=retry_error.code,
-                    provider=self.aggregator.provider_config.provider,
+                    provider=active_member.provider_config.provider,
                 )
                 yield ProviderHeartbeatEvent(
                     phase="ensemble_aggregator_retry",
                     message=(
                         "Ensemble aggregator hit a transient error; retrying "
-                        f"({attempt}/{_ENSEMBLE_AGGREGATOR_MAX_RETRIES})"
+                        f"({attempt}/{max_transient_retries})"
                     ),
                 )
-                delay = _aggregator_retry_backoff_seconds(attempt)
+                delay = max(
+                    _aggregator_retry_backoff_seconds(attempt),
+                    max(0.0, float(retry_error.retry_after_s or 0.0)),
+                )
             if absolute_deadline is not None and time.monotonic() + delay >= absolute_deadline:
                 deadline_error = ErrorEvent(
                     message=("ensemble aggregator retry budget reached the absolute deadline"),
@@ -5521,55 +7275,45 @@ class EnsembleProvider:
                     thinking_fallback_reason="provider_rejected_thinking_level",
                     thinking_fallbacks=tuple(thinking_fallbacks),
                 )
-                active_config = _member_chat_config(
+                active_config = _aggregator_chat_config(
                     config,
                     active_member,
-                    request_budget_binding=self._member_request_budget_binding(
-                        active_member
-                    ),
-                    role="aggregator",
+                    max_tokens_cap=self.aggregator_max_tokens_cap,
+                    visible_answer_reserve_tokens=(self.aggregator_visible_answer_reserve_tokens),
+                    request_budget_binding=self._member_request_budget_binding(active_member),
                     record_budget_rebound=False,
                 )
-                if self.aggregator_timeout_seconds > 0:
+                if effective_timeout_seconds > 0:
                     active_config = active_config.model_copy(
-                        update={"timeout": self.aggregator_timeout_seconds}
+                        update={"timeout": effective_timeout_seconds}
                     )
-                active_thinking_fallback_record = (
-                    self._record_thinking_fallback(
-                        member=rejected_member,
-                        role="aggregator",
-                        rejected_unified_level=(
-                            rejected_member.effective_thinking_level
-                        ),
-                        rejected_provider_level=rejected_member.thinking,
-                        effective_unified_level=fallback_unified,
-                        effective_provider_level=fallback_provider,
-                        fallback_result="retrying",
-                        trace=trace,
-                    )
+                active_thinking_fallback_record = self._record_thinking_fallback(
+                    member=rejected_member,
+                    role="aggregator",
+                    rejected_unified_level=(rejected_member.effective_thinking_level),
+                    rejected_provider_level=rejected_member.thinking,
+                    effective_unified_level=fallback_unified,
+                    effective_provider_level=fallback_provider,
+                    fallback_result="retrying",
+                    trace=trace,
                 )
                 if isinstance(final_request, dict):
                     execution = _member_execution_trace(
                         active_member,
                         role="aggregator",
                         chat_config=active_config,
-                        tools=tools,
+                        tools=active_tools,
                         timeout_seconds=effective_timeout_seconds,
-                        request_budget_binding=(
-                            self._member_request_budget_binding(active_member)
-                        ),
+                        request_budget_binding=(self._member_request_budget_binding(active_member)),
                     )
                     prior_execution = final_request.get("execution")
                     fallback_attempts = list(
-                        prior_execution.get("thinking_fallback_attempts")
-                        or []
+                        prior_execution.get("thinking_fallback_attempts") or []
                         if isinstance(prior_execution, Mapping)
                         else []
                     )
                     if active_thinking_fallback_record is not None:
-                        fallback_attempts.append(
-                            dict(active_thinking_fallback_record)
-                        )
+                        fallback_attempts.append(dict(active_thinking_fallback_record))
                     execution["thinking_fallback_attempts"] = fallback_attempts
                     final_request["execution"] = execution
                 log.warning(
@@ -5579,14 +7323,10 @@ class EnsembleProvider:
                     reason="provider_rejected_thinking_level",
                     selected_backup=fallback_provider,
                     fallback_result="retrying",
-                    requested_thinking_level=(
-                        rejected_member.requested_thinking_level
-                    ),
+                    requested_thinking_level=(rejected_member.requested_thinking_level),
                     rejected_thinking_level=rejected_member.thinking,
                     effective_thinking_level=fallback_unified,
-                    thinking_policy_version=(
-                        rejected_member.thinking_policy_version
-                    ),
+                    thinking_policy_version=(rejected_member.thinking_policy_version),
                     provider=self.aggregator.provider_config.provider,
                     model=self.aggregator.provider_config.model,
                 )
@@ -5610,6 +7350,7 @@ class EnsembleProvider:
         prior_final_missing_count: int = 0,
         prior_final_request_count: int = 0,
         fallback_close_status: _StreamCloseStatus | None = None,
+        allow_single_fallback: bool = True,
     ) -> AsyncIterator[StreamEvent]:
         proposer_rows = [
             *_candidate_usage_rows(candidates, profile=self.profile_name),
@@ -5654,7 +7395,8 @@ class EnsembleProvider:
             )
 
         if (
-            soft_deadline is not None
+            allow_single_fallback
+            and soft_deadline is not None
             and not soft_finalize
             and not self._thinking_policy_active()
             and self.all_failed_policy == "fallback_single"
@@ -5686,6 +7428,7 @@ class EnsembleProvider:
                         prior_final_missing_count=prior_final_missing_count,
                         prior_final_request_count=prior_final_request_count,
                         fallback_close_status=first_physical_close_status,
+                        allow_single_fallback=allow_single_fallback,
                     ),
                     phase="ensemble_fallback_soft_deadline_wait",
                     message="Waiting for ensemble fallback before the soft deadline",
@@ -5889,6 +7632,7 @@ class EnsembleProvider:
                     prior_final_request_count=(
                         max(0, int(prior_final_request_count)) + abandoned_request_count
                     ),
+                    allow_single_fallback=allow_single_fallback,
                 ),
                 phase="ensemble_soft_deadline_fallback_finalizer_relay",
             ) as child_stream:
@@ -5924,7 +7668,8 @@ class EnsembleProvider:
             )
 
         if (
-            self._thinking_policy_active()
+            not allow_single_fallback
+            or self._thinking_policy_active()
             or self.all_failed_policy != "fallback_single"
             or self.fallback_provider is None
         ):
@@ -5962,6 +7707,9 @@ class EnsembleProvider:
         fallback_messages = messages
         fallback_tools = tools
         if soft_finalize:
+            fallback_config = (fallback_config or ChatConfig()).model_copy(
+                update={"allow_provider_stream_fallback": False}
+            )
             fallback_messages = [
                 *messages,
                 Message(
@@ -6357,11 +8105,7 @@ class EnsembleProvider:
                     f"ensemble fallback stalled: no stream events for {fallback_timeout_seconds:g}s"
                 ),
                 code="ensemble_fallback_timeout",
-                diagnostic_done=(
-                    deadline_event
-                    if isinstance(deadline_event, DoneEvent)
-                    else None
-                ),
+                diagnostic_done=(deadline_event if isinstance(deadline_event, DoneEvent) else None),
             )
             if physical_close_status.closed is not True:
                 self._mark_cleanup_unproven("ensemble_fallback_close_unproven")
@@ -6436,6 +8180,20 @@ def _trace_content(text: str, *, max_chars: int = TRACE_CONTENT_MAX_CHARS) -> di
         "chars": len(value),
         "truncated": len(clipped) < len(value),
     }
+
+
+def _text_sha256(text: str) -> str:
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+
+def _trace_output_content(
+    text: str,
+    *,
+    max_chars: int = TRACE_CONTENT_MAX_CHARS,
+) -> dict[str, Any]:
+    content = _trace_content(text, max_chars=max_chars)
+    content["sha256"] = _text_sha256(text)
+    return content
 
 
 def _message_content_text(content: Any) -> str:
@@ -6675,7 +8433,14 @@ def _attach_final_request_output(
     if isinstance(execution, dict):
         execution["actual_provider"] = _done_event_actual_provider(event)
         execution["actual_model"] = str(event.model or "").strip()
-    final_request["output"] = _trace_content(output_text, max_chars=TRACE_CONTENT_MAX_CHARS)
+    final_request["output"] = _trace_output_content(
+        output_text,
+        max_chars=TRACE_CONTENT_MAX_CHARS,
+    )
+    trace["assembled_output"] = _trace_output_content(
+        output_text,
+        max_chars=TRACE_CONTENT_MAX_CHARS,
+    )
     final_request["usage"] = {
         "provider": _done_event_actual_provider(event),
         "model": event.model,
@@ -7748,6 +9513,8 @@ def _build_router_dynamic_members(
     ranking_inputs: Mapping[str, Any] | None = None,
     credential_pool_acquirer: CredentialPoolAcquirer | None = None,
     session_key: str = "",
+    aggregator_fallbacks_out: list[EnsembleMemberConfig] | None = None,
+    aggregator_fallback_limit: int = 2,
 ) -> tuple[str, list[EnsembleMemberConfig], EnsembleMemberConfig, dict[str, Any]]:
     """Build members from the profile-driven Step2 ranking decision."""
 
@@ -8022,19 +9789,14 @@ def _build_router_dynamic_members(
                         remaining,
                         key=lambda level: (
                             abs(level_order.index(level) - current_index),
-                            (
-                                -level_order.index(level)
-                                if high_risk
-                                else level_order.index(level)
-                            ),
+                            (-level_order.index(level) if high_risk else level_order.index(level)),
                         ),
                     )
                     ordered_candidates.append(next_level)
                     remaining.remove(next_level)
                     current_level = next_level
                 fallback_levels = [
-                    (level, str(mapping_map[level]).strip())
-                    for level in ordered_candidates
+                    (level, str(mapping_map[level]).strip()) for level in ordered_candidates
                 ]
         return _EnsembleModelRef(
             provider=model.provider,
@@ -8067,6 +9829,22 @@ def _build_router_dynamic_members(
         credential_pool_acquirer=credential_pool_acquirer,
         session_key=session_key,
     )
+    aggregator_fallbacks = [
+        _member_from_ref(
+            ranked_ref(model, role="aggregator"),
+            config=config,
+            inherited=inherited_provider_config,
+            label=f"aggregator_fallback_{index}",
+            credential_pool_acquirer=credential_pool_acquirer,
+            session_key=session_key,
+        )
+        for index, model in enumerate(
+            decision.aggregator_candidates[1 : 1 + max(0, int(aggregator_fallback_limit))],
+            start=1,
+        )
+    ]
+    if aggregator_fallbacks_out is not None:
+        aggregator_fallbacks_out.extend(aggregator_fallbacks)
     profile_tier = f"c{decision.effective_tier - 1}"
     return f"router_dynamic/{profile_tier}", proposers, aggregator, decision.trace
 
@@ -8563,6 +10341,23 @@ def _runtime_member_request_budget_bindings(
     return bindings
 
 
+def _normalize_aggregator_recovery_policy(
+    mode: object,
+    top_k: object,
+) -> tuple[Literal["off", "serving", "experiment"], int]:
+    normalized_mode = str(mode or "serving").strip().lower()
+    if normalized_mode not in {"off", "serving", "experiment"}:
+        raise ValueError("aggregator_recovery_mode must be one of off, serving, experiment")
+    try:
+        normalized_top_k = int(top_k or 1)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("aggregator_recovery_top_k must be an integer") from exc
+    normalized_top_k = max(1, min(3, normalized_top_k))
+    if normalized_mode == "off":
+        normalized_top_k = 1
+    return normalized_mode, normalized_top_k
+
+
 def build_ensemble_provider_from_config(
     *,
     config: Any,
@@ -8582,6 +10377,11 @@ def build_ensemble_provider_from_config(
     if ensemble_cfg is None:
         raise ValueError("config.llm_ensemble is required")
     selection_mode = str(getattr(ensemble_cfg, "selection_mode", "router_dynamic") or "")
+    recovery_mode, recovery_top_k = _normalize_aggregator_recovery_policy(
+        getattr(ensemble_cfg, "aggregator_recovery_mode", "serving"),
+        getattr(ensemble_cfg, "aggregator_recovery_top_k", 3),
+    )
+    aggregator_fallbacks: list[EnsembleMemberConfig] = []
     static_profile = static_b5_profile(selection_mode)
     if static_profile is not None:
         profile_name, proposers, aggregator, selection_plan = _build_static_b5_members(
@@ -8614,6 +10414,8 @@ def build_ensemble_provider_from_config(
             ranking_inputs=ranking_inputs,
             credential_pool_acquirer=_credential_pool_acquirer,
             session_key=_session_key,
+            aggregator_fallbacks_out=aggregator_fallbacks,
+            aggregator_fallback_limit=recovery_top_k - 1,
         )
     else:
         raise ValueError(f"unknown llm_ensemble.selection_mode {selection_mode!r}")
@@ -8673,11 +10475,27 @@ def build_ensemble_provider_from_config(
     selection_plan["effective_proposer_timeout_seconds"] = proposer_timeout_seconds
     selection_plan["configured_aggregator_timeout_seconds"] = configured_aggregator_timeout_seconds
     selection_plan["effective_aggregator_timeout_seconds"] = aggregator_timeout_seconds
+    selection_plan["aggregator_serving_chain_timeout_seconds"] = float(
+        getattr(ensemble_cfg, "aggregator_serving_chain_timeout_seconds", 120.0) or 120.0
+    )
     selection_plan["configured_shuffle_candidates"] = configured_shuffle_candidates
     selection_plan["effective_shuffle_candidates"] = shuffle_candidates
     selection_plan["quorum_grace_seconds"] = quorum_grace_seconds
     selection_plan["selection_mode"] = selection_mode
     selection_plan["profile"] = profile_name
+    selection_plan["aggregator_recovery_mode"] = recovery_mode
+    selection_plan["aggregator_recovery_top_k"] = recovery_top_k
+    selection_plan["aggregator_max_tokens_cap"] = int(
+        getattr(ensemble_cfg, "aggregator_max_tokens_cap", 65_536) or 65_536
+    )
+    selection_plan["aggregator_visible_answer_reserve_tokens"] = int(
+        getattr(
+            ensemble_cfg,
+            "aggregator_visible_answer_reserve_tokens",
+            8_192,
+        )
+        or 8_192
+    )
     selection_plan.setdefault(
         "selected_P",
         [
@@ -8689,6 +10507,10 @@ def build_ensemble_provider_from_config(
         "selected_A",
         f"{aggregator.provider_config.provider}:{aggregator.provider_config.model}",
     )
+    selection_plan["aggregator_candidates"] = [
+        f"{member.provider_config.provider}:{member.provider_config.model}"
+        for member in [aggregator, *aggregator_fallbacks]
+    ]
     if selection_mode == "router_dynamic":
         selection_plan["proposer_models"] = [
             member.provider_config.model
@@ -8698,14 +10520,25 @@ def build_ensemble_provider_from_config(
         selection_plan["proposer_sample_count"] = len(selection_plan["proposer_models"])
         selection_plan["aggregator_model"] = aggregator.provider_config.model
     inherited_provider = str(inherited_provider_config.provider or "").strip().lower()
+    inherited_model = str(inherited_provider_config.model or "").strip().lower()
+    lineup_members = [*proposers, aggregator, *aggregator_fallbacks]
     cross_provider_lineup = any(
         member.provider_config.provider.strip().lower() != inherited_provider
-        for member in [*proposers, aggregator]
+        for member in lineup_members
     )
-    if cross_provider_lineup:
-        # Once any member crosses providers, no member or single-provider
-        # fallback may replay provider-private history.  This covers both
-        # A -> B and a later B -> configured-primary-A transition.
+    cross_identity_lineup = any(
+        (
+            member.provider_config.provider.strip().lower(),
+            member.provider_config.model.strip().lower(),
+        )
+        != (inherited_provider, inherited_model)
+        for member in lineup_members
+    )
+    if cross_identity_lineup:
+        # Provider-private state is model-specific even when several models
+        # share the same OpenRouter gateway.  Once any member crosses the
+        # inherited (provider, model) identity, no member or single-provider
+        # fallback may replay private history.
         def without_private_replay(
             member: EnsembleMemberConfig,
         ) -> EnsembleMemberConfig:
@@ -8720,6 +10553,7 @@ def build_ensemble_provider_from_config(
 
         proposers = [without_private_replay(member) for member in proposers]
         aggregator = without_private_replay(aggregator)
+        aggregator_fallbacks = [without_private_replay(member) for member in aggregator_fallbacks]
         disable_fallback_replay = getattr(
             fallback_provider,
             "disable_provider_state_replay",
@@ -8739,11 +10573,13 @@ def build_ensemble_provider_from_config(
         )
         if callable(disable_selector_replay):
             disable_selector_replay()
-        selection_plan["provider_state_replay"] = "disabled_cross_provider"
+        selection_plan["provider_state_replay"] = (
+            "disabled_cross_provider" if cross_provider_lineup else "disabled_cross_model"
+        )
     request_budget_bindings = (
         _runtime_member_request_budget_bindings(
             config=config,
-            members=[*proposers, aggregator],
+            members=[*proposers, aggregator, *aggregator_fallbacks],
             model_catalog=_model_catalog,
             context_overflow_threshold=_context_overflow_threshold,
         )
@@ -8754,6 +10590,7 @@ def build_ensemble_provider_from_config(
         profile_name=profile_name,
         proposers=proposers,
         aggregator=aggregator,
+        aggregator_fallbacks=aggregator_fallbacks,
         fallback_provider=fallback_provider,
         fallback_provider_name=inherited_provider_config.provider,
         fallback_model=inherited_provider_config.model,
@@ -8762,11 +10599,27 @@ def build_ensemble_provider_from_config(
         all_failed_policy=getattr(ensemble_cfg, "all_failed_policy", "fallback_single"),
         proposer_timeout_seconds=proposer_timeout_seconds,
         aggregator_timeout_seconds=aggregator_timeout_seconds,
+        aggregator_serving_chain_timeout_seconds=float(
+            getattr(ensemble_cfg, "aggregator_serving_chain_timeout_seconds", 120.0) or 120.0
+        ),
         candidate_max_chars=int(getattr(ensemble_cfg, "candidate_max_chars", 24_000) or 0),
         shuffle_candidates=shuffle_candidates,
         record_candidates=bool(getattr(ensemble_cfg, "record_candidates", False)),
         proposer_tools=bool(getattr(ensemble_cfg, "proposer_tools", False)),
         aggregator_tools=bool(getattr(ensemble_cfg, "aggregator_tools", True)),
+        aggregator_recovery_mode=recovery_mode,
+        aggregator_recovery_top_k=recovery_top_k,
+        aggregator_max_tokens_cap=int(
+            getattr(ensemble_cfg, "aggregator_max_tokens_cap", 65_536) or 65_536
+        ),
+        aggregator_visible_answer_reserve_tokens=int(
+            getattr(
+                ensemble_cfg,
+                "aggregator_visible_answer_reserve_tokens",
+                8_192,
+            )
+            or 8_192
+        ),
         quorum_grace_seconds=quorum_grace_seconds,
         selection_plan=selection_plan,
         _member_request_budget_bindings=request_budget_bindings,

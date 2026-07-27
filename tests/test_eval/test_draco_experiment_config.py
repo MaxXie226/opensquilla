@@ -20,7 +20,7 @@ DEFAULT_CONFIG = ROOT / "configs/benchmarks/draco_b2_g12.json"
 
 def test_default_b2_config_is_g12_derived_quality_first_profile() -> None:
     config = load_draco_experiment_config(DEFAULT_CONFIG).config
-    assert config.profile_id == "opensquilla_b2_quality_first_v1"
+    assert config.profile_id == "opensquilla_b2_quality_first_v2"
 
     assert config.reference.source_commit == ("153e5ff267950b0e285efcdb180cea8724c0471d")
     assert config.reference.group == "G12"
@@ -130,6 +130,23 @@ def test_default_b2_config_is_g12_derived_quality_first_profile() -> None:
     assert config.judge.repeats == 3
     assert config.judge.concurrency == 6
     assert config.judge.max_attempts == 3
+
+
+def test_draco_ensemble_rejects_invalid_aggregator_output_budget() -> None:
+    with pytest.raises(ValidationError, match="greater than or equal to 2"):
+        load_draco_experiment_config(
+            DEFAULT_CONFIG,
+            inline_sets=["ensemble.aggregator_max_tokens_cap=1"],
+        )
+
+    with pytest.raises(
+        ValidationError,
+        match="aggregator_visible_answer_reserve_tokens must be smaller",
+    ):
+        load_draco_experiment_config(
+            DEFAULT_CONFIG,
+            inline_sets=["ensemble.aggregator_max_tokens_cap=8192"],
+        )
 
 
 def test_runner_finalization_fields_default_off_for_legacy_configs() -> None:

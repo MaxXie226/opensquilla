@@ -254,6 +254,40 @@ def test_ranking_trace_embeds_public_frozen_replay_evidence() -> None:
     assert ranking_trace_replay_reasons(trace) == []
 
 
+def test_v3_replay_binds_frozen_aggregator_candidate_chain() -> None:
+    decision = rank_models(
+        task_analysis=_analysis(tier=3),
+        user_profile=None,
+        request_context=_context(),
+        registry_snapshot=_snapshot(
+            _thinking_model("alpha", provider="provider-a", capability=0.95),
+            _thinking_model("beta", provider="provider-b", capability=0.90),
+            _thinking_model("gamma", provider="provider-c", capability=0.85),
+        ),
+        routed_tier="c2",
+        routing_confidence=0.91,
+        decision_id="aggregator-chain-replay",
+        ranking_thinking_assignment_enabled=True,
+    )
+    trace = decision.trace
+    assert trace["ranking_version"] == "step2-ranking-v3"
+
+    tampered = json.loads(json.dumps(trace))
+    tampered["aggregator_candidates"] = list(reversed(tampered["aggregator_candidates"]))
+
+    assert "g1_frozen_ranker_replay_mismatch_aggregator_candidates" in ranking_trace_replay_reasons(
+        tampered
+    )
+
+
+def test_legacy_v2_replay_allows_missing_aggregator_candidate_chain() -> None:
+    trace = json.loads(json.dumps(_replayable_decision().trace))
+    assert trace["ranking_version"] == "step2-ranking-v2"
+    trace.pop("aggregator_candidates")
+
+    assert ranking_trace_replay_reasons(trace) == []
+
+
 @pytest.mark.parametrize("selection_field", ["selected_P", "selected_A"])
 def test_frozen_replay_rejects_valid_pool_selection_swap(
     selection_field: str,
@@ -2282,15 +2316,12 @@ def test_enabled_thinking_assignment_emits_dedicated_router_event() -> None:
     assignment_event = next(
         row
         for row in captured
-        if row["event"]
-        == "llm_ensemble.router_dynamic.thinking_assignment_recorded"
+        if row["event"] == "llm_ensemble.router_dynamic.thinking_assignment_recorded"
     )
     assert assignment_event["decision_id"] == "thinking-log-decision"
     assert assignment_event["thinking_assignment"]["proposers"]
     assert assignment_event["thinking_assignment"]["aggregator"]
-    assert assignment_event["policy_versions"]["thinking"] == (
-        "thinking-policy-v1"
-    )
+    assert assignment_event["policy_versions"]["thinking"] == ("thinking-policy-v1")
 
 
 def test_thinking_assignment_is_default_off_and_selection_is_unchanged() -> None:
@@ -2331,12 +2362,8 @@ def test_disabled_thinking_assignment_preserves_exact_legacy_trace_shape() -> No
             _thinking_model("gamma", provider="provider-c", capability=0.85),
         ],
     }
-    legacy_config = ranking_router._legacy_ranking_config_projection(
-        current_config
-    )
-    legacy_snapshot = ranking_router._legacy_registry_snapshot_projection(
-        current_snapshot
-    )
+    legacy_config = ranking_router._legacy_ranking_config_projection(current_config)
+    legacy_snapshot = ranking_router._legacy_registry_snapshot_projection(current_snapshot)
     common = {
         "task_analysis": _analysis(tier=3),
         "user_profile": mock_user_profile(),
@@ -2374,8 +2401,7 @@ def test_disabled_thinking_assignment_preserves_exact_legacy_trace_shape() -> No
     ):
         assert field not in disabled.trace
     assert all(
-        "thinking_levels" not in row
-        and "thinking_level_mapping" not in row
+        "thinking_levels" not in row and "thinking_level_mapping" not in row
         for row in disabled.trace["candidate_pool"]
     )
 
@@ -2593,13 +2619,16 @@ def test_provider_rejection_fallbacks_recompute_nearest_remaining_level() -> Non
     )
 
     assert assigned.effective_thinking_level == "high"
-    assert [
-        row["unified_level"] for row in assigned.thinking_fallbacks
-    ] == ["medium", "low", "highest"]
-    assert [
-        row["unified_level"]
-        for row in detail["provider_rejection_fallbacks"]
-    ] == ["medium", "low", "highest"]
+    assert [row["unified_level"] for row in assigned.thinking_fallbacks] == [
+        "medium",
+        "low",
+        "highest",
+    ]
+    assert [row["unified_level"] for row in detail["provider_rejection_fallbacks"]] == [
+        "medium",
+        "low",
+        "highest",
+    ]
 
 
 def test_normal_risk_partial_thinking_support_falls_back_without_hard_filter() -> None:
@@ -2758,10 +2787,7 @@ def test_enabled_thinking_assignment_replay_rejects_switch_downgrade() -> None:
     ):
         tampered.pop(field_name)
 
-    assert (
-        "missing_g1_replay_thinking_assignment_switch"
-        in ranking_trace_replay_reasons(tampered)
-    )
+    assert "missing_g1_replay_thinking_assignment_switch" in ranking_trace_replay_reasons(tampered)
 
 
 def test_registry_builder_never_reuses_native_mapping_across_providers() -> None:
@@ -2801,3 +2827,82 @@ def test_packaged_registry_v2_has_valid_unified_thinking_contracts() -> None:
         assert set(mapping) == set(levels)
         assert all(level in {"low", "medium", "high", "highest"} for level in levels)
         assert mapping.get("highest") != "high"
+
+
+def test_aggregator_recovery_candidates_preserve_frozen_top_three_order() -> None:
+    decision = _decision(
+        _model(
+            "proposer-only",
+            roles=["proposer"],
+            capability=0.95,
+            aggregator_fit=0.1,
+        ),
+        _model(
+            "aggregator-alpha",
+            roles=["aggregator"],
+            capability=0.92,
+            aggregator_fit=0.99,
+            price=1.0,
+        ),
+        _model(
+            "aggregator-beta",
+            roles=["aggregator"],
+            capability=0.90,
+            aggregator_fit=0.96,
+            price=1.1,
+        ),
+        _model(
+            "aggregator-gamma",
+            roles=["aggregator"],
+            capability=0.88,
+            aggregator_fit=0.93,
+            price=1.2,
+        ),
+        _model(
+            "aggregator-delta",
+            roles=["aggregator"],
+            capability=0.86,
+            aggregator_fit=0.90,
+            price=1.3,
+        ),
+        user_profile=None,
+    )
+
+    ranked_identities = [row["identity"] for row in decision.trace["aggregator"]["scores"]]
+    candidate_identities = [model.identity for model in decision.aggregator_candidates]
+
+    assert len(candidate_identities) == 3
+    assert candidate_identities == ranked_identities[:3]
+    assert candidate_identities[0] == decision.aggregator.identity
+    assert len(set(candidate_identities)) == 3
+
+
+def test_aggregator_recovery_candidates_do_not_pad_a_small_eligible_pool() -> None:
+    decision = _decision(
+        _model(
+            "proposer-only",
+            roles=["proposer"],
+            capability=0.95,
+            aggregator_fit=0.1,
+        ),
+        _model(
+            "aggregator-alpha",
+            roles=["aggregator"],
+            capability=0.92,
+            aggregator_fit=0.99,
+        ),
+        _model(
+            "aggregator-beta",
+            roles=["aggregator"],
+            capability=0.90,
+            aggregator_fit=0.96,
+        ),
+        user_profile=None,
+    )
+
+    ranked_identities = [row["identity"] for row in decision.trace["aggregator"]["scores"]]
+    candidate_identities = [model.identity for model in decision.aggregator_candidates]
+
+    assert len(candidate_identities) == 2
+    assert candidate_identities == ranked_identities
+    assert len(set(candidate_identities)) == 2

@@ -45,10 +45,11 @@ MANIFEST_SCHEMA = "opensquilla.draco.campaign-final-manifest/v1"
 RESOLUTION_SCHEMA = "opensquilla.draco.openrouter-non-byok-resolution/v1"
 GENERATION_ATTEMPT_EVIDENCE_SCHEMA = "opensquilla.draco-generation-attempt/v1"
 JUDGE_ATTEMPT_EVIDENCE_SCHEMA = "opensquilla.draco-judge-attempt/v1"
+ENSEMBLE_OUTPUT_BINDING_SCHEMA = "opensquilla.ensemble-output-binding/v1"
 JUDGE_ATTEMPT_BUDGET_SCOPE = "criterion_repeat_campaign"
 JUDGE_ATTEMPT_BUDGET_LIMIT = 3
 JUDGE_ATTEMPT_BUDGET_EXHAUSTED_ERROR = "judge_attempt_budget_exhausted"
-FINALIZER_VERSION = 3
+FINALIZER_VERSION = 4
 FROZEN_DRACO_MINI_TASK_COUNT = 10
 FROZEN_DRACO_MINI_SHA256 = "1eb4e618c8df8e7f68bded3d2b6f77a541744aa1072eb338835b776183188a8d"
 FORMAL_REQUIRED_STABLE_POLL_COUNT = 6
@@ -67,10 +68,16 @@ FORMAL_JUDGE_CONCURRENCY = 6
 FORMAL_TASK_TIMEOUT_SECONDS = Decimal("10800")
 FORMAL_PROPOSER_TIMEOUT_SECONDS = Decimal("907.5")
 FORMAL_AGGREGATOR_TIMEOUT_SECONDS = Decimal("2662.5")
-FORMAL_AGENT_MAX_ITERATIONS = 12
+FORMAL_AGENT_MAX_ITERATIONS = 20
 FORMAL_GENERATION_MAX_ATTEMPTS = 3
 FORMAL_GENERATION_RETRY_BACKOFF_SECONDS = Decimal("2")
 FORMAL_GENERATION_MAX_TOKENS = 16_384
+FORMAL_AGGREGATOR_RECOVERY_POLICY = {
+    "aggregator_recovery_mode": "experiment",
+    "aggregator_recovery_top_k": 3,
+    "aggregator_max_tokens_cap": 65_536,
+    "aggregator_visible_answer_reserve_tokens": 8_192,
+}
 FORMAL_JUDGE_MAX_ATTEMPTS = 3
 FORMAL_BLOCKED_DOMAINS = (
     "hf.co",
@@ -1062,7 +1069,7 @@ def validate_formal_campaign_contracts(
                 "cost_policy": {"require_openrouter_non_byok": True},
                 "global_experiment_profile": {
                     "schema_version": 1,
-                    "profile_id": "opensquilla_b2_quality_first_v1",
+                    "profile_id": "opensquilla_b2_quality_first_v2",
                     "benchmark_input": {
                         "sha256": FROZEN_DRACO_MINI_SHA256,
                         "task_count": FROZEN_DRACO_MINI_TASK_COUNT,
@@ -1085,6 +1092,7 @@ def validate_formal_campaign_contracts(
                     "source": "experiment_config",
                     "sandbox_enabled": False,
                     "sandbox_security_grading_enabled": False,
+                    **FORMAL_AGGREGATOR_RECOVERY_POLICY,
                     "g1_user_profile_generation_enabled": False,
                     "g1_user_profile_enabled": False,
                 },
@@ -1153,6 +1161,15 @@ def validate_formal_campaign_contracts(
     ):
         raise FinalizationError("G1 formal contract must use router_dynamic with frozen routes")
     for group, contract in contracts.items():
+        gateway = contract.get("gateway_execution")
+        ensemble = gateway.get("llm_ensemble") if isinstance(gateway, Mapping) else None
+        if not isinstance(ensemble, Mapping):
+            raise FinalizationError(f"{group} formal contract lacks gateway llm_ensemble")
+        require_formal_fields(
+            ensemble,
+            FORMAL_AGGREGATOR_RECOVERY_POLICY,
+            label=f"{group} gateway llm_ensemble",
+        )
         runtime = contract.get("resolved_llm_runtime")
         pins = runtime.get("provider_routing") if isinstance(runtime, Mapping) else None
         if not isinstance(pins, Mapping):
@@ -1764,9 +1781,7 @@ def _formal_openrouter_model_aliases() -> dict[str, frozenset[str]]:
         for model in FORMAL_UPSTREAM_PINS
         if str(model).strip()
     }
-    snapshot = _legacy_registry_snapshot_projection(
-        load_model_registry_snapshot()
-    )
+    snapshot = _legacy_registry_snapshot_projection(load_model_registry_snapshot())
     if canonical_sha256(snapshot) != FORMAL_G1_SOURCE_REGISTRY_SNAPSHOT_SHA256:
         raise FinalizationError("formal OpenRouter model registry snapshot changed")
     rows = snapshot.get("models")
@@ -2266,32 +2281,557 @@ def successful_candidate(candidate: Any) -> bool:
     )
 
 
+def _trace_output_binding_reasons(
+    output: Any,
+    *,
+    label: str,
+    require_nonempty: bool = True,
+) -> tuple[str, int, list[str]]:
+    if not isinstance(output, Mapping):
+        return "", 0, [f"missing_{label}_binding"]
+    output_text = output.get("text")
+    raw_chars = output.get("chars")
+    if (
+        not isinstance(output_text, str)
+        or not isinstance(raw_chars, int)
+        or isinstance(raw_chars, bool)
+        or raw_chars < 0
+        or (require_nonempty and (raw_chars <= 0 or not output_text.strip()))
+    ):
+        return "", 0, [f"missing_{label}_binding"]
+    truncated = output.get("truncated")
+    if not isinstance(truncated, bool):
+        return output_text, raw_chars, [f"invalid_{label}_truncation"]
+    if (truncated and len(output_text) > raw_chars) or (
+        not truncated and len(output_text) != raw_chars
+    ):
+        return output_text, raw_chars, [f"wrong_{label}_length"]
+    output_hash = str(output.get("sha256") or "").strip().lower()
+    if re.fullmatch(r"[0-9a-f]{64}", output_hash) is None:
+        return output_text, raw_chars, [f"missing_{label}_hash"]
+    if not truncated and output_hash != text_sha256(output_text):
+        return output_text, raw_chars, [f"wrong_{label}_hash"]
+    return output_text, raw_chars, []
+
+
 def aggregator_output_reasons(
+    call: Mapping[str, Any],
     final_request: Mapping[str, Any],
     *,
     final_text: str,
 ) -> list[str]:
-    output = final_request.get("output")
-    if not isinstance(output, Mapping):
-        return ["missing_aggregator_output_binding"]
-    output_text = output.get("text")
-    output_chars = nonnegative_int(output.get("chars"))
+    """Validate physical output separately from the assembled user response."""
+
+    reasons: list[str] = []
+    if call.get("output_binding_schema") != ENSEMBLE_OUTPUT_BINDING_SCHEMA:
+        reasons.append("missing_aggregator_output_binding_schema")
+
+    assembled = call.get("assembled_output")
+    assembled_text, assembled_chars, assembled_reasons = _trace_output_binding_reasons(
+        assembled,
+        label="assembled_aggregator_output",
+    )
+    reasons.extend(assembled_reasons)
+    if not assembled_reasons:
+        if assembled_chars > len(final_text):
+            reasons.append("wrong_assembled_aggregator_output_length")
+        else:
+            final_output_tail = final_text[-assembled_chars:]
+            if isinstance(assembled, Mapping) and assembled.get("truncated") is True:
+                if not final_output_tail.startswith(assembled_text):
+                    reasons.append("wrong_assembled_aggregator_output_binding")
+            elif assembled_text != final_output_tail:
+                reasons.append("wrong_assembled_aggregator_output_binding")
+
+    physical_output = final_request.get("output")
+    _, _, physical_reasons = _trace_output_binding_reasons(
+        physical_output,
+        label="aggregator_physical_output",
+    )
+    reasons.extend(physical_reasons)
+
+    recovery = call.get("aggregator_recovery")
+    attempts = recovery.get("attempts") if isinstance(recovery, Mapping) else None
+    attempt_by_number = (
+        {
+            attempt.get("attempt"): attempt
+            for attempt in attempts
+            if isinstance(attempt, Mapping)
+            and isinstance(attempt.get("attempt"), int)
+            and not isinstance(attempt.get("attempt"), bool)
+        }
+        if isinstance(attempts, list)
+        else {}
+    )
+    selected_attempt = recovery.get("selected_attempt") if isinstance(recovery, Mapping) else None
+    selected_kind = (
+        str(recovery.get("selected_kind") or "") if isinstance(recovery, Mapping) else ""
+    )
+    components = call.get("output_components")
+    if not isinstance(components, list) or not components:
+        reasons.append("missing_aggregator_output_components")
+        return list(dict.fromkeys(reasons))
+
+    expected_start = 0
+    selected_component: Mapping[str, Any] | None = None
+    for component in components:
+        if not isinstance(component, Mapping):
+            reasons.append("invalid_aggregator_output_component")
+            continue
+        attempt_number = component.get("attempt")
+        attempt = attempt_by_number.get(attempt_number)
+        if not isinstance(attempt, Mapping):
+            reasons.append("unknown_aggregator_output_component_attempt")
+        else:
+            if attempt.get("visible_output_emitted") is not True:
+                reasons.append("nonvisible_aggregator_output_component_attempt")
+            if str(component.get("kind") or "") != str(attempt.get("kind") or ""):
+                reasons.append("aggregator_output_component_kind_mismatch")
+            if component.get("fallback_index") != attempt.get("fallback_index"):
+                reasons.append("aggregator_output_component_fallback_index_mismatch")
+            if (
+                str(component.get("requested_provider") or "").strip().casefold()
+                != str(attempt.get("requested_provider") or "").strip().casefold()
+                or str(component.get("requested_model") or "").strip()
+                != str(attempt.get("requested_model") or "").strip()
+            ):
+                reasons.append("aggregator_output_component_identity_mismatch")
+
+        raw_start = component.get("assembled_start")
+        raw_end = component.get("assembled_end")
+        if (
+            not isinstance(raw_start, int)
+            or isinstance(raw_start, bool)
+            or not isinstance(raw_end, int)
+            or isinstance(raw_end, bool)
+            or raw_start != expected_start
+            or raw_end <= raw_start
+        ):
+            reasons.append("noncontiguous_aggregator_output_components")
+            continue
+        contribution = component.get("assembled_contribution")
+        contribution_text, contribution_chars, contribution_reasons = _trace_output_binding_reasons(
+            contribution,
+            label="aggregator_output_component",
+        )
+        reasons.extend(contribution_reasons)
+        if contribution_chars != raw_end - raw_start:
+            reasons.append("aggregator_output_component_length_mismatch")
+        if (
+            not contribution_reasons
+            and isinstance(assembled, Mapping)
+            and assembled.get("truncated") is False
+            and isinstance(contribution, Mapping)
+            and contribution.get("truncated") is False
+            and assembled_text[raw_start:raw_end] != contribution_text
+        ):
+            reasons.append("wrong_aggregator_output_component_binding")
+        _, _, component_physical_reasons = _trace_output_binding_reasons(
+            component.get("physical_output"),
+            label="aggregator_component_physical_output",
+        )
+        reasons.extend(component_physical_reasons)
+        prefix_hash = str(component.get("assembled_prefix_sha256") or "").strip().lower()
+        if re.fullmatch(r"[0-9a-f]{64}", prefix_hash) is None:
+            reasons.append("missing_aggregator_output_component_prefix_hash")
+        expected_start = raw_end
+        if attempt_number == selected_attempt:
+            selected_component = component
+
+    if expected_start != assembled_chars:
+        reasons.append("incomplete_aggregator_output_components")
     if (
-        not isinstance(output_text, str)
-        or not output_text.strip()
-        or output_chars <= 0
-        or output_chars > len(final_text)
+        components
+        and isinstance(components[-1], Mapping)
+        and isinstance(assembled, Mapping)
+        and str(components[-1].get("assembled_prefix_sha256") or "").strip().lower()
+        != str(assembled.get("sha256") or "").strip().lower()
     ):
-        return ["missing_aggregator_output_binding"]
-    if output.get("sha256") not in {None, "", text_sha256(output_text)}:
-        return ["wrong_aggregator_output_hash"]
-    final_output_tail = final_text[-output_chars:]
-    if output.get("truncated") is True:
-        if not final_output_tail.startswith(output_text):
-            return ["wrong_aggregator_output_binding"]
-    elif output_text != final_output_tail or len(output_text) != output_chars:
-        return ["wrong_aggregator_output_binding"]
-    return []
+        reasons.append("wrong_aggregator_output_component_prefix_hash")
+    if selected_component is None:
+        reasons.append("missing_selected_aggregator_output_component")
+    elif selected_component.get("physical_output") != physical_output:
+        reasons.append("wrong_selected_aggregator_physical_output_binding")
+    if selected_kind in {"continuation", "continuation_fallback"}:
+        selected_start = (
+            selected_component.get("assembled_start")
+            if isinstance(selected_component, Mapping)
+            else 0
+        )
+        if len(components) < 2 or not isinstance(selected_start, int) or selected_start <= 0:
+            reasons.append("missing_prior_aggregator_output_component")
+    return list(dict.fromkeys(reasons))
+
+
+_STRUCTURAL_AGGREGATOR_RECOVERY_TRIGGERS = frozenset(
+    {
+        "provider_build_failed",
+        "member_unavailable",
+        "reasoning_only_length",
+        "empty_length",
+        "reasoning_only_terminal",
+        "empty_terminal",
+        "visible_length",
+        "visible_length_continuations_exhausted",
+        "continuation_failed",
+        "aggregator_error",
+        "ensemble_aggregator_incomplete",
+    }
+)
+_SEMANTIC_AGGREGATOR_FALLBACK_MARKERS = (
+    "judge",
+    "score",
+    "quality",
+    "rubric",
+    "verdict",
+    "reward",
+)
+_FORMAL_AGGREGATOR_SELECTED_KINDS = frozenset(
+    {
+        "primary",
+        "continuation",
+        "same_model_recovery",
+        "model_fallback",
+        "continuation_fallback",
+    }
+)
+_FORMAL_AGGREGATOR_ATTEMPT_OUTCOMES = frozenset(
+    {"succeeded", "abandoned", "failed", "provider_build_failed", "member_unavailable"}
+)
+
+
+def structural_aggregator_recovery_trigger(value: Any) -> bool:
+    """Return whether a fallback trigger describes an execution failure."""
+
+    trigger = str(value or "").strip().casefold()
+    if not trigger or any(marker in trigger for marker in _SEMANTIC_AGGREGATOR_FALLBACK_MARKERS):
+        return False
+    return bool(
+        trigger in _STRUCTURAL_AGGREGATOR_RECOVERY_TRIGGERS
+        or trigger.startswith(
+            (
+                "ensemble_aggregator_",
+                "provider_",
+                "stream_",
+                "http_",
+                "timeout",
+            )
+        )
+        or re.fullmatch(r"[45]\d\d", trigger)
+    )
+
+
+def _request_identity_reasons(
+    request: Mapping[str, Any],
+    *,
+    expected_identity: str,
+    label: str,
+) -> list[str]:
+    """Bind requested and actual request identity to one frozen candidate."""
+
+    reasons: list[str] = []
+    expected_provider, separator, expected_model = expected_identity.partition(":")
+    if not separator or not expected_provider or not expected_model:
+        return [f"invalid_{label}_expected_identity"]
+    usage = request.get("usage")
+    execution = request.get("execution")
+    if not isinstance(usage, Mapping):
+        reasons.append(f"missing_{label}_usage")
+    if not isinstance(execution, Mapping):
+        reasons.append(f"missing_{label}_execution")
+    for source_name, source in (("usage", usage), ("execution", execution)):
+        if not isinstance(source, Mapping):
+            continue
+        requested_provider = str(source.get("requested_provider") or "").strip().casefold()
+        requested_model = str(source.get("requested_model") or "").strip()
+        actual_provider = (
+            str(source.get("provider") or source.get("actual_provider") or "").strip().casefold()
+        )
+        actual_model = str(source.get("model") or source.get("actual_model") or "").strip()
+        if requested_provider != expected_provider.casefold() or requested_model != expected_model:
+            reasons.append(f"wrong_{label}_{source_name}_requested_identity")
+        if actual_provider != expected_provider.casefold() or actual_model != expected_model:
+            reasons.append(f"wrong_{label}_{source_name}_actual_identity")
+    return reasons
+
+
+def aggregator_recovery_execution_reasons(
+    call: Mapping[str, Any],
+    *,
+    expected_aggregator: str,
+) -> tuple[str, list[str]]:
+    """Validate recovery evidence and return the physically executed model."""
+
+    reasons: list[str] = []
+    primary_identity = f"openrouter:{expected_aggregator}"
+    plan = call.get("selection_plan")
+    raw_candidates = plan.get("aggregator_candidates") if isinstance(plan, Mapping) else None
+    if raw_candidates is None:
+        reasons.append("missing_aggregator_candidate_chain")
+        candidate_chain = (primary_identity,)
+    elif (
+        not isinstance(raw_candidates, list)
+        or not raw_candidates
+        or any(not isinstance(item, str) or not item.strip() for item in raw_candidates)
+    ):
+        reasons.append("invalid_aggregator_candidate_chain")
+        candidate_chain = (primary_identity,)
+    else:
+        candidate_chain = tuple(str(item).strip() for item in raw_candidates)
+        if candidate_chain[0] != primary_identity:
+            reasons.append("aggregator_candidate_chain_primary_mismatch")
+        if len(candidate_chain) > 3 or len(set(candidate_chain)) != len(candidate_chain):
+            reasons.append("invalid_aggregator_candidate_chain")
+
+    fallback_used = call.get("fallback_used")
+    if not isinstance(fallback_used, bool):
+        reasons.append("aggregator_fallback_used_or_unknown")
+        fallback_used = False
+    recovery = call.get("aggregator_recovery")
+    executed_a = str(call.get("executed_A") or "").strip()
+    if not isinstance(recovery, Mapping):
+        reasons.append("missing_aggregator_recovery_evidence")
+        if executed_a and executed_a != primary_identity:
+            reasons.append("unexpected_aggregator_execution_identity")
+        return expected_aggregator, reasons
+
+    if recovery.get("schema") != "opensquilla.ensemble-aggregator-recovery/v1":
+        reasons.append("wrong_aggregator_recovery_schema")
+    if recovery.get("mode") != "experiment":
+        reasons.append("wrong_aggregator_recovery_mode")
+    if (
+        recovery.get("max_tokens_cap")
+        != FORMAL_AGGREGATOR_RECOVERY_POLICY["aggregator_max_tokens_cap"]
+    ):
+        reasons.append("wrong_aggregator_recovery_max_tokens_cap")
+    if (
+        recovery.get("visible_answer_reserve_tokens")
+        != FORMAL_AGGREGATOR_RECOVERY_POLICY["aggregator_visible_answer_reserve_tokens"]
+    ):
+        reasons.append("wrong_aggregator_recovery_visible_answer_reserve_tokens")
+    recovery_candidates = recovery.get("candidate_ids")
+    if recovery_candidates != list(candidate_chain):
+        reasons.append("aggregator_recovery_candidates_mismatch")
+    if nonnegative_int(recovery.get("candidate_count")) != len(candidate_chain):
+        reasons.append("wrong_aggregator_recovery_candidate_count")
+    if recovery.get("proposer_reused") is not True:
+        reasons.append("aggregator_recovery_did_not_reuse_proposers")
+    if recovery.get("success") is not True:
+        reasons.append("aggregator_recovery_not_successful")
+    if recovery.get("degraded") is True:
+        reasons.append("degraded_aggregator_recovery_not_formal")
+    if str(call.get("delivery_outcome") or "") != "complete":
+        reasons.append("aggregator_delivery_not_complete")
+
+    raw_fallback_index = recovery.get("fallback_index")
+    if not isinstance(raw_fallback_index, int) or isinstance(raw_fallback_index, bool):
+        reasons.append("invalid_aggregator_fallback_index")
+    fallback_index = nonnegative_int(raw_fallback_index)
+    if fallback_index >= len(candidate_chain):
+        reasons.append("aggregator_fallback_index_outside_candidate_chain")
+        fallback_index = 0
+    if fallback_used != (fallback_index > 0):
+        reasons.append("aggregator_fallback_flag_index_mismatch")
+    if fallback_index > 2:
+        reasons.append("aggregator_fallback_index_outside_top3")
+    expected_identity = candidate_chain[fallback_index]
+    expected_model = expected_identity.partition(":")[2] or expected_aggregator
+    recovery_executed = str(recovery.get("executed_A") or "").strip()
+    if executed_a != expected_identity or recovery_executed != expected_identity:
+        reasons.append("aggregator_executed_identity_mismatch")
+
+    fallback_reason = str(recovery.get("fallback_reason") or "").strip()
+    call_fallback_reason = str(call.get("fallback_reason") or "").strip()
+    selected_kind = str(recovery.get("selected_kind") or "").strip()
+    if selected_kind not in _FORMAL_AGGREGATOR_SELECTED_KINDS:
+        reasons.append("invalid_aggregator_recovery_selected_kind")
+    expected_run_outcome = "success" if selected_kind == "primary" else "aggregator_recovered"
+    if str(call.get("run_outcome") or "") != expected_run_outcome:
+        reasons.append("aggregator_run_outcome_selected_kind_mismatch")
+    continuation_count = recovery.get("continuation_count")
+    same_model_recovery_count = recovery.get("same_model_recovery_count")
+    if (
+        not isinstance(continuation_count, int)
+        or isinstance(continuation_count, bool)
+        or continuation_count < 0
+    ):
+        reasons.append("invalid_aggregator_recovery_continuation_count")
+    if (
+        not isinstance(same_model_recovery_count, int)
+        or isinstance(same_model_recovery_count, bool)
+        or same_model_recovery_count < 0
+    ):
+        reasons.append("invalid_aggregator_same_model_recovery_count")
+    if selected_kind == "continuation" and nonnegative_int(continuation_count) < 1:
+        reasons.append("aggregator_continuation_count_selected_kind_mismatch")
+    if selected_kind == "same_model_recovery" and nonnegative_int(same_model_recovery_count) < 1:
+        reasons.append("aggregator_same_model_count_selected_kind_mismatch")
+    if selected_kind == "model_fallback" and fallback_index == 0:
+        reasons.append("aggregator_model_fallback_index_mismatch")
+    if selected_kind == "continuation_fallback":
+        if fallback_index == 0:
+            reasons.append("aggregator_continuation_fallback_index_mismatch")
+        if nonnegative_int(continuation_count) < 1:
+            reasons.append("aggregator_continuation_fallback_count_mismatch")
+    if selected_kind != "primary" and not structural_aggregator_recovery_trigger(fallback_reason):
+        reasons.append("nonstructural_aggregator_recovery_trigger")
+    if fallback_index > 0:
+        if fallback_reason != call_fallback_reason:
+            reasons.append("aggregator_fallback_reason_mismatch")
+        if not structural_aggregator_recovery_trigger(fallback_reason):
+            reasons.append("nonstructural_aggregator_fallback_trigger")
+    elif call_fallback_reason:
+        reasons.append("unexpected_aggregator_fallback_reason")
+
+    attempts = recovery.get("attempts")
+    if not isinstance(attempts, list) or not attempts:
+        reasons.append("missing_aggregator_recovery_attempts")
+        attempts = []
+    attempt_numbers: list[int] = []
+    physical_attempt_spans: list[tuple[int, int]] = []
+    failed_candidate_indexes: set[int] = set()
+    for attempt_row in attempts:
+        if not isinstance(attempt_row, Mapping):
+            reasons.append("invalid_aggregator_recovery_attempt")
+            continue
+        raw_attempt_number = attempt_row.get("attempt")
+        if (
+            not isinstance(raw_attempt_number, int)
+            or isinstance(raw_attempt_number, bool)
+            or raw_attempt_number <= 0
+        ):
+            reasons.append("invalid_aggregator_recovery_attempt_number")
+        else:
+            attempt_numbers.append(raw_attempt_number)
+        attempt_kind = str(attempt_row.get("kind") or "").strip()
+        if attempt_kind not in _FORMAL_AGGREGATOR_SELECTED_KINDS:
+            reasons.append("invalid_aggregator_recovery_attempt_kind")
+        outcome = str(attempt_row.get("outcome") or "").strip()
+        if outcome not in _FORMAL_AGGREGATOR_ATTEMPT_OUTCOMES:
+            reasons.append("invalid_aggregator_recovery_attempt_outcome")
+        raw_attempt_index = attempt_row.get("fallback_index")
+        if not isinstance(raw_attempt_index, int) or isinstance(raw_attempt_index, bool):
+            reasons.append("invalid_aggregator_recovery_attempt_fallback_index")
+        attempt_index = nonnegative_int(raw_attempt_index)
+        if attempt_index >= len(candidate_chain):
+            reasons.append("aggregator_recovery_attempt_index_outside_candidate_chain")
+            continue
+        requested_identity = (
+            f"{str(attempt_row.get('requested_provider') or '').strip().casefold()}:"
+            f"{str(attempt_row.get('requested_model') or '').strip()}"
+        )
+        if requested_identity != candidate_chain[attempt_index]:
+            reasons.append("aggregator_recovery_attempt_identity_mismatch")
+        request_started = attempt_row.get("request_started")
+        if not isinstance(request_started, bool):
+            reasons.append("invalid_aggregator_recovery_attempt_started")
+            request_started = False
+        raw_physical_index = attempt_row.get("physical_attempt_index")
+        raw_attempt_physical_count = attempt_row.get("physical_request_count")
+        if request_started:
+            if (
+                not isinstance(raw_physical_index, int)
+                or isinstance(raw_physical_index, bool)
+                or raw_physical_index <= 0
+            ):
+                reasons.append("invalid_aggregator_physical_attempt_index")
+            if (
+                not isinstance(raw_attempt_physical_count, int)
+                or isinstance(raw_attempt_physical_count, bool)
+                or raw_attempt_physical_count <= 0
+            ):
+                reasons.append("invalid_aggregator_attempt_physical_request_count")
+            elif isinstance(raw_physical_index, int) and not isinstance(raw_physical_index, bool):
+                physical_attempt_spans.append((raw_physical_index, raw_attempt_physical_count))
+        elif raw_physical_index is not None:
+            reasons.append("unstarted_aggregator_attempt_has_physical_index")
+        elif raw_attempt_physical_count != 0:
+            reasons.append("unstarted_aggregator_attempt_has_physical_request")
+        if outcome == "succeeded" and request_started is not True:
+            reasons.append("unstarted_aggregator_attempt_succeeded")
+        trigger = str(attempt_row.get("trigger") or "").strip()
+        if outcome != "succeeded":
+            if trigger and not structural_aggregator_recovery_trigger(trigger):
+                reasons.append("nonstructural_aggregator_recovery_attempt")
+            if outcome in {"abandoned", "failed", "provider_build_failed", "member_unavailable"}:
+                failed_candidate_indexes.add(attempt_index)
+    if (
+        attempt_numbers != sorted(attempt_numbers)
+        or len(set(attempt_numbers)) != len(attempt_numbers)
+        or len(attempt_numbers) != len(attempts)
+    ):
+        reasons.append("invalid_aggregator_recovery_attempt_sequence")
+    expected_physical_index = 1
+    for physical_index, physical_count in physical_attempt_spans:
+        if physical_index != expected_physical_index:
+            reasons.append("invalid_aggregator_physical_attempt_sequence")
+            break
+        expected_physical_index += physical_count
+
+    raw_selected_attempt = recovery.get("selected_attempt")
+    if (
+        not isinstance(raw_selected_attempt, int)
+        or isinstance(raw_selected_attempt, bool)
+        or raw_selected_attempt <= 0
+    ):
+        reasons.append("invalid_aggregator_recovery_selected_attempt")
+    selected_attempt = nonnegative_int(raw_selected_attempt)
+    selected_rows = [
+        attempt
+        for attempt in attempts
+        if isinstance(attempt, Mapping)
+        and attempt.get("attempt") == selected_attempt
+        and nonnegative_int(attempt.get("fallback_index")) == fallback_index
+        and attempt.get("outcome") == "succeeded"
+        and attempt.get("request_started") is True
+    ]
+    succeeded_physical_rows = [
+        attempt
+        for attempt in attempts
+        if isinstance(attempt, Mapping)
+        and attempt.get("outcome") == "succeeded"
+        and attempt.get("request_started") is True
+    ]
+    if len(succeeded_physical_rows) != 1:
+        reasons.append("ambiguous_aggregator_recovery_successful_attempt")
+    if len(selected_rows) != 1:
+        reasons.append("ambiguous_aggregator_recovery_selected_attempt")
+    else:
+        selected_row = selected_rows[0]
+        if selected_row.get("kind") != selected_kind:
+            reasons.append("aggregator_recovery_selected_attempt_kind_mismatch")
+        if selected_row.get("stream_closed") is not True:
+            reasons.append("aggregator_recovery_selected_stream_not_closed")
+        requested_identity = (
+            f"{str(selected_row.get('requested_provider') or '').strip().casefold()}:"
+            f"{str(selected_row.get('requested_model') or '').strip()}"
+        )
+        actual_identity = (
+            f"{str(selected_row.get('actual_provider') or '').strip().casefold()}:"
+            f"{str(selected_row.get('actual_model') or '').strip()}"
+        )
+        if requested_identity != expected_identity or actual_identity != expected_identity:
+            reasons.append("aggregator_recovery_selected_attempt_identity_mismatch")
+        selected_trigger = str(selected_row.get("trigger") or "").strip()
+        if selected_kind != "primary" and selected_trigger != fallback_reason:
+            reasons.append("aggregator_recovery_selected_attempt_trigger_mismatch")
+
+    if fallback_index > 0:
+        if 0 not in failed_candidate_indexes:
+            reasons.append("missing_structural_primary_aggregator_failure")
+        if any(index not in failed_candidate_indexes for index in range(fallback_index)):
+            reasons.append("aggregator_fallback_skipped_ranked_candidate")
+
+    final_request = call.get("final_request")
+    if isinstance(final_request, Mapping):
+        reasons.extend(
+            _request_identity_reasons(
+                final_request,
+                expected_identity=expected_identity,
+                label="final_aggregator",
+            )
+        )
+    return expected_model, list(dict.fromkeys(reasons))
 
 
 def ensemble_physical_call_reasons(
@@ -2307,8 +2847,6 @@ def ensemble_physical_call_reasons(
     reasons: list[str] = []
     if str(call.get("request_outcome") or "llm_response") != "llm_response":
         reasons.append("aggregator_call_error")
-    if call.get("fallback_used") is not False:
-        reasons.append("aggregator_fallback_used_or_unknown")
     if str(call.get("final_request_role") or "") != "aggregator":
         reasons.append("final_request_not_aggregator")
 
@@ -2335,6 +2873,11 @@ def ensemble_physical_call_reasons(
             reasons.append("wrong_proposer_models")
         if str(executed_plan.get("aggregator_model") or "") != expected_aggregator:
             reasons.append("wrong_aggregator_model")
+    executed_aggregator, recovery_reasons = aggregator_recovery_execution_reasons(
+        call,
+        expected_aggregator=expected_aggregator,
+    )
+    reasons.extend(recovery_reasons)
 
     candidates = call.get("candidates")
     if not isinstance(candidates, list) or len(candidates) != expected_total:
@@ -2402,6 +2945,67 @@ def ensemble_physical_call_reasons(
             ):
                 reasons.append("wrong_actual_proposer_model")
 
+    if str(call.get("final_request_role") or "") == "aggregator":
+        proposer_physical_count = 0
+        if isinstance(candidates, list):
+            for candidate in candidates:
+                if not isinstance(candidate, Mapping):
+                    continue
+                request_started = candidate.get("request_started")
+                physical_count = candidate.get("physical_request_count")
+                if not isinstance(request_started, bool):
+                    reasons.append("invalid_proposer_request_started_evidence")
+                    continue
+                if request_started:
+                    if (
+                        not isinstance(physical_count, int)
+                        or isinstance(physical_count, bool)
+                        or physical_count <= 0
+                    ):
+                        reasons.append("invalid_proposer_physical_request_count")
+                    else:
+                        proposer_physical_count += physical_count
+                elif physical_count not in {None, 0}:
+                    reasons.append("unstarted_proposer_has_physical_request")
+        recovery = call.get("aggregator_recovery")
+        recovery_attempts = recovery.get("attempts") if isinstance(recovery, Mapping) else []
+        aggregator_physical_count = (
+            sum(
+                int(attempt.get("physical_request_count") or 0)
+                for attempt in recovery_attempts
+                if (
+                    isinstance(attempt, Mapping)
+                    and attempt.get("request_started") is True
+                    and isinstance(attempt.get("physical_request_count"), int)
+                    and not isinstance(attempt.get("physical_request_count"), bool)
+                )
+            )
+            if isinstance(recovery_attempts, list)
+            else 0
+        )
+        raw_llm_request_count = call.get("llm_request_count")
+        raw_physical_request_count = call.get("physical_request_count")
+        if (
+            not isinstance(raw_llm_request_count, int)
+            or isinstance(raw_llm_request_count, bool)
+            or raw_llm_request_count <= 0
+        ):
+            reasons.append("invalid_ensemble_llm_request_count")
+        if (
+            not isinstance(raw_physical_request_count, int)
+            or isinstance(raw_physical_request_count, bool)
+            or raw_physical_request_count <= 0
+        ):
+            reasons.append("invalid_ensemble_physical_request_count")
+        if raw_llm_request_count != raw_physical_request_count:
+            reasons.append("ensemble_request_count_mismatch")
+        minimum_request_count = proposer_physical_count + aggregator_physical_count
+        if (
+            isinstance(raw_physical_request_count, int)
+            and raw_physical_request_count < minimum_request_count
+        ):
+            reasons.append("ensemble_physical_request_count_undercounted")
+
     final_request = call.get("final_request")
     if (
         not isinstance(final_request, Mapping)
@@ -2426,7 +3030,7 @@ def ensemble_physical_call_reasons(
             if isinstance(execution, Mapping)
             else ""
         )
-        if actual_model != expected_aggregator:
+        if actual_model != executed_aggregator:
             reasons.append("wrong_actual_aggregator_model")
         actual_provider = (
             str(usage.get("provider") or "").strip().casefold()
@@ -2451,16 +3055,23 @@ def ensemble_physical_call_reasons(
         )
         if actual_provider != "openrouter" or requested_provider != "openrouter":
             reasons.append("wrong_actual_aggregator_provider")
-        if requested_model != expected_aggregator:
+        if requested_model != executed_aggregator:
             reasons.append("wrong_requested_aggregator_model")
         if require_output_binding:
-            reasons.extend(aggregator_output_reasons(final_request, final_text=final_text))
+            reasons.extend(
+                aggregator_output_reasons(
+                    call,
+                    final_request,
+                    final_text=final_text,
+                )
+            )
     return list(dict.fromkeys(reasons))
 
 
 _ADMISSIBLE_NONTERMINAL_FALLBACK_REASONS = frozenset(
     {
         "aggregator_fallback_used_or_unknown",
+        "missing_aggregator_recovery_evidence",
         "final_request_not_aggregator",
         "proposer_quorum_not_met",
         "insufficient_actual_proposer_quorum",
@@ -2581,7 +3192,13 @@ def agent_call_output_sequence_reasons(
     offset = 0
     for call in calls:
         final_request = call.get("final_request")
-        output = final_request.get("output") if isinstance(final_request, Mapping) else None
+        output = (
+            call.get("assembled_output")
+            if call.get("output_binding_schema") == ENSEMBLE_OUTPUT_BINDING_SCHEMA
+            else final_request.get("output")
+            if isinstance(final_request, Mapping)
+            else None
+        )
         if not isinstance(output, Mapping):
             reasons.append("missing_agent_call_output_binding")
             continue
@@ -2875,6 +3492,42 @@ def g1_registry_plan_reasons(
     aggregator_model = selected_a.partition(":")[2] if selected_a in expected_identities else ""
     if not aggregator_model:
         reasons.append("wrong_g1_selected_aggregator")
+    recovery_fields_present = any(
+        field in plan
+        for field in (
+            "aggregator_candidates",
+            *FORMAL_AGGREGATOR_RECOVERY_POLICY,
+        )
+    )
+    if not recovery_fields_present:
+        reasons.append("missing_g1_aggregator_recovery_policy")
+    if recovery_fields_present:
+        for field, expected in FORMAL_AGGREGATOR_RECOVERY_POLICY.items():
+            if plan.get(field) != expected:
+                reasons.append(f"wrong_g1_{field}")
+        aggregator_trace = plan.get("aggregator")
+        score_rows = (
+            aggregator_trace.get("scores") if isinstance(aggregator_trace, Mapping) else None
+        )
+        frozen_score_identities = (
+            [str(row.get("identity") or "") for row in score_rows if isinstance(row, Mapping)]
+            if isinstance(score_rows, list)
+            else []
+        )
+        expected_chain = frozen_score_identities[
+            : FORMAL_AGGREGATOR_RECOVERY_POLICY["aggregator_recovery_top_k"]
+        ]
+        candidate_chain = plan.get("aggregator_candidates")
+        required_candidate_count = FORMAL_AGGREGATOR_RECOVERY_POLICY["aggregator_recovery_top_k"]
+        if (
+            len(expected_chain) != required_candidate_count
+            or not isinstance(candidate_chain, list)
+            or len(candidate_chain) != required_candidate_count
+            or candidate_chain != expected_chain
+            or len(set(str(value) for value in candidate_chain)) != len(candidate_chain)
+            or str(candidate_chain[0] if candidate_chain else "") != selected_a
+        ):
+            reasons.append("wrong_g1_aggregator_candidate_chain")
     if (
         nonnegative_int(plan.get("proposer_sample_count")) != len(proposer_models)
         or tuple(str(value) for value in plan.get("proposer_models") or []) != proposer_models
@@ -2913,6 +3566,11 @@ _G1_LIFECYCLE_PLAN_MATCH_FIELDS = (
     "selected_A",
     "proposer_models",
     "aggregator_model",
+    "aggregator_candidates",
+    "aggregator_recovery_mode",
+    "aggregator_recovery_top_k",
+    "aggregator_max_tokens_cap",
+    "aggregator_visible_answer_reserve_tokens",
     "task_profile",
     "N_min",
     "N_max",

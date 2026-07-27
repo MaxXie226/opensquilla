@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "profile_id": "opensquilla_b2_quality_first_v1",
+  "profile_id": "opensquilla_b2_quality_first_v2",
   "group": "B2",
   "reference": {
     "repository": "opensquilla/opensquilla",
@@ -132,6 +132,10 @@
     "record_candidates": true,
     "proposer_tools": false,
     "aggregator_tools": true,
+    "aggregator_recovery_mode": "experiment",
+    "aggregator_recovery_top_k": 3,
+    "aggregator_max_tokens_cap": 65536,
+    "aggregator_visible_answer_reserve_tokens": 8192,
     "wait_for_all_proposers": true,
     "quorum_grace_seconds": 0.0
   },

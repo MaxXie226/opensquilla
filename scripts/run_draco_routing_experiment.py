@@ -333,9 +333,7 @@ def validate_g1_registry_contract(
     )
 
     snapshot = load_model_registry_snapshot()
-    thinking_assignment_enabled = bool(
-        config.llm_ensemble.ranking_thinking_assignment_enabled
-    )
+    thinking_assignment_enabled = bool(config.llm_ensemble.ranking_thinking_assignment_enabled)
     if not thinking_assignment_enabled:
         snapshot = _legacy_registry_snapshot_projection(snapshot)
     actual_version = str(snapshot.get("snapshot_version") or "").strip()
@@ -415,6 +413,29 @@ def validate_g1_registry_contract(
     }
 
 
+def aggregator_recovery_policy(
+    experiment: DracoExperimentConfig,
+) -> dict[str, Any]:
+    """Return the frozen aggregator recovery settings from the experiment profile."""
+
+    ensemble = experiment.ensemble
+    return {
+        "aggregator_recovery_mode": ensemble.aggregator_recovery_mode,
+        "aggregator_recovery_top_k": ensemble.aggregator_recovery_top_k,
+        "aggregator_max_tokens_cap": ensemble.aggregator_max_tokens_cap,
+        "aggregator_visible_answer_reserve_tokens": (
+            ensemble.aggregator_visible_answer_reserve_tokens
+        ),
+    }
+
+
+def apply_aggregator_recovery_policy(target: Any, policy: Mapping[str, Any]) -> None:
+    """Apply one normalized recovery policy to a runtime or dry provider config."""
+
+    for field_name, value in policy.items():
+        setattr(target, field_name, value)
+
+
 def enforce_formal_draco_runtime_config(
     config: GatewayConfig,
     experiment: DracoExperimentConfig | None,
@@ -428,10 +449,13 @@ def enforce_formal_draco_runtime_config(
         raise ValueError("formal DRACO requires tools.sandbox_enabled=false")
     config.sandbox.sandbox = False
     config.sandbox.security_grading = False
+    recovery_policy = aggregator_recovery_policy(experiment)
+    apply_aggregator_recovery_policy(config.llm_ensemble, recovery_policy)
     freeze: dict[str, Any] = {
         "source": "experiment_config",
         "sandbox_enabled": False,
         "sandbox_security_grading_enabled": False,
+        **recovery_policy,
     }
     if "G1" in groups:
         g1_routing = experiment.g1_routing
@@ -768,6 +792,20 @@ class DryEnsembleProvider:
         aggregator_provider = (
             str(self.selection_plan.get("selected_A") or "dry:").partition(":")[0].strip() or "dry"
         )
+        aggregator_identity = f"{aggregator_provider}:{self.model}"
+        raw_aggregator_candidates = self.selection_plan.get("aggregator_candidates")
+        aggregator_candidates = (
+            [
+                str(identity).strip()
+                for identity in raw_aggregator_candidates
+                if str(identity).strip()
+            ]
+            if isinstance(raw_aggregator_candidates, list)
+            else []
+        )
+        if not aggregator_candidates or aggregator_candidates[0] != aggregator_identity:
+            aggregator_candidates = [aggregator_identity]
+        self.selection_plan["aggregator_candidates"] = list(aggregator_candidates)
         yield DoneEvent(
             input_tokens=sum(int(candidate["input_tokens"]) for candidate in candidates) + 21,
             output_tokens=max(1, len(text) // 4),
@@ -799,17 +837,76 @@ class DryEnsembleProvider:
                 "shuffle_candidates": False,
                 "proposer_tools": getattr(self, "proposer_tools", False),
                 "aggregator_tools": getattr(self, "aggregator_tools", True),
+                "aggregator_recovery": {
+                    "schema": "opensquilla.ensemble-aggregator-recovery/v1",
+                    "mode": getattr(
+                        self,
+                        "aggregator_recovery_mode",
+                        "serving",
+                    ),
+                    "candidate_count": len(aggregator_candidates),
+                    "candidate_ids": list(aggregator_candidates),
+                    "max_tokens_cap": getattr(
+                        self,
+                        "aggregator_max_tokens_cap",
+                        65_536,
+                    ),
+                    "visible_answer_reserve_tokens": getattr(
+                        self,
+                        "aggregator_visible_answer_reserve_tokens",
+                        8_192,
+                    ),
+                    "attempts": [
+                        {
+                            "attempt": 1,
+                            "physical_attempt_index": 1,
+                            "physical_request_count": 1,
+                            "kind": "primary",
+                            "fallback_index": 0,
+                            "trigger": "",
+                            "request_started": True,
+                            "visible_output_emitted": True,
+                            "stream_closed": True,
+                            "outcome": "succeeded",
+                            "stop_reason": "stop",
+                            "requested_provider": aggregator_provider,
+                            "requested_model": self.model,
+                            "actual_provider": aggregator_provider,
+                            "actual_model": self.model,
+                        }
+                    ],
+                    "proposer_reused": True,
+                    "success": True,
+                    "degraded": False,
+                    "selected_attempt": 1,
+                    "selected_kind": "primary",
+                    "fallback_index": 0,
+                    "fallback_reason": "",
+                    "executed_A": aggregator_identity,
+                    "continuation_count": 0,
+                    "same_model_recovery_count": 0,
+                },
+                "executed_A": aggregator_identity,
+                "fallback_reason": "",
+                "run_outcome": "success",
+                "delivery_outcome": "complete",
                 "final_request_role": "aggregator",
                 "final_request": {
                     "role": "aggregator",
                     "request_started": True,
                     "execution": {
                         "provider": aggregator_provider,
+                        "actual_provider": aggregator_provider,
                         "model": self.model,
+                        "actual_model": self.model,
+                        "requested_provider": aggregator_provider,
+                        "requested_model": self.model,
                     },
                     "usage": {
                         "provider": aggregator_provider,
                         "model": self.model,
+                        "requested_provider": aggregator_provider,
+                        "requested_model": self.model,
                         "stop_reason": "stop",
                     },
                     "output": {
@@ -819,6 +916,7 @@ class DryEnsembleProvider:
                     },
                 },
                 "llm_request_count": len(candidates) + 1,
+                "physical_request_count": len(candidates) + 1,
             },
         )
 
@@ -2047,8 +2145,10 @@ def _packaged_openrouter_thinking_levels() -> dict[str, tuple[str, ...]]:
             continue
         model = _normalized_model_id(str(facts.get("model_id") or ""))
         raw_levels = facts.get("supported_thinking_levels")
-        if not model or not isinstance(raw_levels, Sequence) or isinstance(
-            raw_levels, (str, bytes)
+        if (
+            not model
+            or not isinstance(raw_levels, Sequence)
+            or isinstance(raw_levels, (str, bytes))
         ):
             continue
         levels = tuple(str(level).strip().lower() for level in raw_levels if str(level).strip())
@@ -2072,8 +2172,7 @@ def generation_thinking_for_model(
     raw_mapping = policy.get("model_thinking_levels")
     mapping = raw_mapping if isinstance(raw_mapping, dict) else {}
     normalized_mapping = {
-        _normalized_model_id(str(key)): str(value).strip().lower()
-        for key, value in mapping.items()
+        _normalized_model_id(str(key)): str(value).strip().lower() for key, value in mapping.items()
     }
     normalized_model = _normalized_model_id(model)
     configured = normalized_mapping.get(normalized_model)
@@ -2207,6 +2306,8 @@ def align_b2_provider_to_g12(
     provider.record_candidates = ensemble.record_candidates
     provider.proposer_tools = ensemble.proposer_tools
     provider.aggregator_tools = ensemble.aggregator_tools
+    recovery_policy = aggregator_recovery_policy(experiment)
+    apply_aggregator_recovery_policy(provider, recovery_policy)
     provider.quorum_grace_seconds = ensemble.quorum_grace_seconds
     provider.all_failed_policy = ensemble.all_failed_policy
     provider._member_request_budget_bindings = {}
@@ -2279,6 +2380,7 @@ def align_b2_provider_to_g12(
         "candidate_max_chars": provider.candidate_max_chars,
         "proposer_tools": provider.proposer_tools,
         "aggregator_tools": provider.aggregator_tools,
+        **recovery_policy,
         "record_candidates": provider.record_candidates,
         "require_highest_thinking": experiment.generation.require_highest_thinking,
         "member_generation": member_generation,
@@ -2944,6 +3046,18 @@ async def build_experiment_provider(
     )
     if group == "G1" and g1_routing is None:
         raise ValueError("G1 requires a versioned g1_routing experiment contract")
+    recovery_policy = (
+        aggregator_recovery_policy(experiment_config)
+        if experiment_config is not None
+        else {
+            "aggregator_recovery_mode": config.llm_ensemble.aggregator_recovery_mode,
+            "aggregator_recovery_top_k": config.llm_ensemble.aggregator_recovery_top_k,
+            "aggregator_max_tokens_cap": config.llm_ensemble.aggregator_max_tokens_cap,
+            "aggregator_visible_answer_reserve_tokens": (
+                config.llm_ensemble.aggregator_visible_answer_reserve_tokens
+            ),
+        }
+    )
     if dry_run:
         if kind in {"single", "router_single"}:
             model = spec.get("model") or "dry-routed-single"
@@ -2972,6 +3086,7 @@ async def build_experiment_provider(
                 ),
                 selection_mode=str(spec.get("selection_mode") or ""),
             )
+            apply_aggregator_recovery_policy(dry_provider, recovery_policy)
             if b2_experiment is not None:
                 dry_provider.min_successful_proposers = legal_proposer_quorum(
                     len(dry_provider.proposer_models)
@@ -3061,6 +3176,7 @@ async def build_experiment_provider(
             dry_ensemble.selection_mode = "router_dynamic"
             dry_ensemble.ranking_user_profile_generation_enabled = False
             dry_ensemble.ranking_user_profile_enabled = False
+            apply_aggregator_recovery_policy(dry_ensemble, recovery_policy)
             configured_output_tokens = int(getattr(dry_config.llm, "max_tokens", 0) or 0)
             candidate_output_tokens, aggregator_output_tokens = dynamic_output_token_budgets(
                 configured_output_tokens=configured_output_tokens,
@@ -3119,6 +3235,19 @@ async def build_experiment_provider(
                 }
             )
             dry_provider.selection_plan = copy.deepcopy(plan)
+        if isinstance(dry_provider, DryEnsembleProvider):
+            dry_provider.selection_plan.update(recovery_policy)
+            selected_aggregator = str(dry_provider.selection_plan.get("selected_A") or "").strip()
+            if selected_aggregator:
+                dry_provider.selection_plan.setdefault(
+                    "aggregator_candidates", [selected_aggregator]
+                )
+            dry_routing_trace["aggregator_recovery_policy"] = {
+                "schema": "opensquilla.ensemble-aggregator-recovery-policy/v1",
+                "evidence_kind": "dry_run_policy_only",
+                **dict(recovery_policy),
+            }
+            dry_routing_trace["selection_plan"] = copy.deepcopy(dry_provider.selection_plan)
         result = ProviderBuildResult(
             provider=dry_provider,
             prompt=prompt,
@@ -3219,6 +3348,7 @@ async def build_experiment_provider(
     ensemble_cfg = group_config.llm_ensemble
     ensemble_cfg.enabled = True
     ensemble_cfg.selection_mode = selection_mode
+    apply_aggregator_recovery_policy(ensemble_cfg, recovery_policy)
     if g1_routing is not None:
         ensemble_cfg.ranking_user_profile_generation_enabled = False
         ensemble_cfg.ranking_user_profile_enabled = bool(g1_routing.user_profile_enabled)
@@ -4243,9 +4373,7 @@ def aggregate_agent_ensemble_trace(records: list[dict[str, Any]]) -> dict[str, A
         for call in traces[:-1]
         if call.get("fallback_used") is True
     ]
-    payload["terminal_call_index"] = coerce_metric_int(
-        terminal_trace.get("agent_call_index")
-    )
+    payload["terminal_call_index"] = coerce_metric_int(terminal_trace.get("agent_call_index"))
     payload["any_intermediate_fallback"] = bool(intermediate_fallback_indexes)
     payload["intermediate_fallback_call_indexes"] = intermediate_fallback_indexes
     if terminal_trace.get("output_strategy") == "select_best_candidate":
@@ -6193,7 +6321,11 @@ def ensemble_call_core_reasons(
             reasons.append("wrong_requested_aggregator_identity")
 
     if require_output_binding:
-        output = final_request.get("output")
+        output = (
+            trace.get("assembled_output")
+            if trace.get("output_binding_schema") == "opensquilla.ensemble-output-binding/v1"
+            else final_request.get("output")
+        )
         if not isinstance(output, Mapping):
             reasons.append("missing_aggregator_output_binding")
         else:
@@ -6327,20 +6459,20 @@ def admissible_empty_nonterminal_fallback_reasons(
         or any(provider != "openrouter" for provider in execution_providers)
     ):
         reasons.append("wrong_intermediate_fallback_provider")
-    plan = (
-        dict(expected_selection_plan)
-        if isinstance(expected_selection_plan, Mapping)
-        else {}
-    )
+    plan = dict(expected_selection_plan) if isinstance(expected_selection_plan, Mapping) else {}
     selected_p = plan.get("selected_P")
-    allowed_models = [
-        str(identity).partition(":")[2].strip()
-        for identity in selected_p
-        if isinstance(identity, str)
-        and identity.partition(":")[1] == ":"
-        and identity.partition(":")[0].strip().casefold() == "openrouter"
-        and identity.partition(":")[2].strip()
-    ] if isinstance(selected_p, list) else []
+    allowed_models = (
+        [
+            str(identity).partition(":")[2].strip()
+            for identity in selected_p
+            if isinstance(identity, str)
+            and identity.partition(":")[1] == ":"
+            and identity.partition(":")[0].strip().casefold() == "openrouter"
+            and identity.partition(":")[2].strip()
+        ]
+        if isinstance(selected_p, list)
+        else []
+    )
     if (
         not actual_model
         or not requested_model
@@ -6380,7 +6512,9 @@ def agent_call_output_sequence_reasons(
     for call in calls:
         final_request = call.get("final_request")
         output = (
-            final_request.get("output")
+            call.get("assembled_output")
+            if call.get("output_binding_schema") == "opensquilla.ensemble-output-binding/v1"
+            else final_request.get("output")
             if isinstance(final_request, Mapping)
             else None
         )
@@ -7846,6 +7980,26 @@ async def run_one(
     profile_candidate_max_chars = getattr(provider, "candidate_max_chars", None)
     profile_proposer_tools = getattr(provider, "proposer_tools", None)
     profile_aggregator_tools = getattr(provider, "aggregator_tools", None)
+    profile_aggregator_recovery_mode = getattr(
+        provider,
+        "aggregator_recovery_mode",
+        None,
+    )
+    profile_aggregator_recovery_top_k = getattr(
+        provider,
+        "aggregator_recovery_top_k",
+        None,
+    )
+    profile_aggregator_max_tokens_cap = getattr(
+        provider,
+        "aggregator_max_tokens_cap",
+        None,
+    )
+    profile_aggregator_visible_answer_reserve_tokens = getattr(
+        provider,
+        "aggregator_visible_answer_reserve_tokens",
+        None,
+    )
     profile_wait_for_all_proposers = (
         profile_quorum_grace_s is not None and float(profile_quorum_grace_s) <= 0
     )
@@ -8076,6 +8230,12 @@ async def run_one(
             "profile_candidate_max_chars": profile_candidate_max_chars,
             "profile_proposer_tools": profile_proposer_tools,
             "profile_aggregator_tools": profile_aggregator_tools,
+            "profile_aggregator_recovery_mode": (profile_aggregator_recovery_mode),
+            "profile_aggregator_recovery_top_k": (profile_aggregator_recovery_top_k),
+            "profile_aggregator_max_tokens_cap": (profile_aggregator_max_tokens_cap),
+            "profile_aggregator_visible_answer_reserve_tokens": (
+                profile_aggregator_visible_answer_reserve_tokens
+            ),
             "profile_proposer_early_stop_success_count": (
                 profile_proposer_early_stop_success_count
             ),

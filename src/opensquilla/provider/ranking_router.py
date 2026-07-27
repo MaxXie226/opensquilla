@@ -300,6 +300,9 @@ class RankingDecision:
     trace: dict[str, Any]
     thinking_assignment: dict[str, Any] = field(default_factory=dict)
     thinking_assignment_details: dict[str, Any] = field(default_factory=dict)
+    # Item zero is always the selected primary. The remaining items are
+    # frozen recovery candidates from the same hard-filtered ranking.
+    aggregator_candidates: tuple[RankedModel, ...] = field(default_factory=tuple)
 
 
 def _as_float(value: Any, default: float = 0.0) -> float:
@@ -1499,9 +1502,7 @@ def load_ranking_config() -> dict[str, Any]:
 
 @cache
 def _packaged_legacy_ranking_config() -> _ValidatedRankingConfig:
-    return _validate_ranking_config(
-        _legacy_ranking_config_projection(_packaged_ranking_config())
-    )
+    return _validate_ranking_config(_legacy_ranking_config_projection(_packaged_ranking_config()))
 
 
 def ranking_config_snapshot(
@@ -4360,9 +4361,7 @@ def _ordered_neighbor_thinking_fallbacks(
             remaining,
             key=lambda level: (
                 abs(level_order.index(level) - current_index),
-                -level_order.index(level)
-                if high_risk
-                else level_order.index(level),
+                -level_order.index(level) if high_risk else level_order.index(level),
             ),
         )
         ordered.append(next_level)
@@ -4862,11 +4861,7 @@ def rank_models(
     if ranking_thinking_assignment_enabled:
         effective_ranking_config = _resolve_ranking_config(ranking_config)
     else:
-        source_config = (
-            ranking_config
-            if ranking_config is not None
-            else _packaged_ranking_config()
-        )
+        source_config = ranking_config if ranking_config is not None else _packaged_ranking_config()
         effective_ranking_config = _validate_ranking_config(
             _legacy_ranking_config_projection(source_config)
         )
@@ -4977,8 +4972,7 @@ def rank_models(
         )
     ]
     proposer_thinking_unavailable = any(
-        "thinking_level_unavailable" in row["reasons"]
-        for row in proposer_filters
+        "thinking_level_unavailable" in row["reasons"] for row in proposer_filters
     )
     if generation_policy_exclusions and len(eligible) < minimum:
         excluded = ", ".join(row["identity"] for row in generation_policy_exclusions)
@@ -4986,16 +4980,8 @@ def rank_models(
             "router_dynamic generation-policy filtering left "
             f"{len(eligible)} eligible proposer(s), fewer than N_min={minimum}; "
             f"excluded: {excluded}"
-            + (
-                "; thinking_level_unavailable"
-                if proposer_thinking_unavailable
-                else ""
-            ),
-            reason=(
-                "thinking_level_unavailable"
-                if proposer_thinking_unavailable
-                else ""
-            ),
+            + ("; thinking_level_unavailable" if proposer_thinking_unavailable else ""),
+            reason=("thinking_level_unavailable" if proposer_thinking_unavailable else ""),
         )
     if not eligible:
         no_eligible_reason_counts: dict[str, int] = {}
@@ -5015,13 +5001,10 @@ def rank_models(
             else ""
         )
         raise DynamicRankingError(
-            "router_dynamic has no proposer after hard filtering"
-            + thinking_suffix,
+            "router_dynamic has no proposer after hard filtering" + thinking_suffix,
             reason=(
                 "thinking_level_unavailable"
-                if no_eligible_reason_counts.get(
-                    "thinking_level_unavailable"
-                )
+                if no_eligible_reason_counts.get("thinking_level_unavailable")
                 else ""
             ),
         )
@@ -5228,16 +5211,8 @@ def rank_models(
         raise DynamicRankingError(
             "router_dynamic generation-policy filtering allowed only "
             f"{len(selected)} feasible proposer(s), fewer than N_min={minimum}"
-            + (
-                "; thinking_level_unavailable"
-                if proposer_thinking_unavailable
-                else ""
-            ),
-            reason=(
-                "thinking_level_unavailable"
-                if proposer_thinking_unavailable
-                else ""
-            ),
+            + ("; thinking_level_unavailable" if proposer_thinking_unavailable else ""),
+            reason=("thinking_level_unavailable" if proposer_thinking_unavailable else ""),
         )
     if not selected:
         thinking_infeasible = any(
@@ -5248,9 +5223,7 @@ def rank_models(
         raise DynamicRankingError(
             "router_dynamic cannot select a proposer with a feasible aggregator"
             + (": thinking_level_unavailable" if thinking_infeasible else ""),
-            reason=(
-                "thinking_level_unavailable" if thinking_infeasible else ""
-            ),
+            reason=("thinking_level_unavailable" if thinking_infeasible else ""),
         )
     aggregator_rows, aggregator_filters = _aggregator_rows(
         models,
@@ -5263,8 +5236,7 @@ def rank_models(
     )
     if not aggregator_rows:
         thinking_unavailable = any(
-            "thinking_level_unavailable" in row["reasons"]
-            for row in aggregator_filters
+            "thinking_level_unavailable" in row["reasons"] for row in aggregator_filters
         )
         aggregator_generation_exclusions = [
             row["identity"]
@@ -5278,26 +5250,18 @@ def rank_models(
             raise DynamicRankingError(
                 "router_dynamic generation-policy filtering left no feasible aggregator; "
                 f"excluded: {', '.join(aggregator_generation_exclusions)}"
-                + (
-                    "; thinking_level_unavailable"
-                    if thinking_unavailable
-                    else ""
-                ),
-                reason=(
-                    "thinking_level_unavailable"
-                    if thinking_unavailable
-                    else ""
-                ),
+                + ("; thinking_level_unavailable" if thinking_unavailable else ""),
+                reason=("thinking_level_unavailable" if thinking_unavailable else ""),
             )
         raise DynamicRankingError(
             "router_dynamic has no feasible aggregator"
             + (": thinking_level_unavailable" if thinking_unavailable else ""),
-            reason=(
-                "thinking_level_unavailable" if thinking_unavailable else ""
-            ),
+            reason=("thinking_level_unavailable" if thinking_unavailable else ""),
         )
-    aggregator_row = aggregator_rows[0]
+    aggregator_candidate_rows = aggregator_rows[:3]
+    aggregator_row = aggregator_candidate_rows[0]
     aggregator = aggregator_row["model"]
+    aggregator_candidates = tuple(row["model"] for row in aggregator_candidate_rows)
     coverage_shortfall = len(selected) < minimum
     session_adjusted_ids = sorted(
         {
@@ -5313,6 +5277,7 @@ def rank_models(
 
     assigned_proposers = tuple(selected)
     assigned_aggregator = aggregator
+    assigned_aggregator_candidates = aggregator_candidates
     thinking_assignment: dict[str, Any] = {}
     thinking_assignment_details: dict[str, Any] = {}
     thinking_assignment_reasons: dict[str, Any] = {}
@@ -5339,6 +5304,28 @@ def rank_models(
             },
             "aggregator": list(thinking_assignment_details["aggregator"]["reasons"]),
         }
+        aggregator_target, aggregator_reasons, aggregator_risk_floor = _thinking_target_for_role(
+            role="aggregator",
+            effective_tier=effective_tier,
+            task_profile=task_profile,
+            session_trace=session_trace,
+            policy=thinking_policy,
+        )
+        assigned_fallbacks: list[RankedModel] = []
+        for fallback in aggregator_candidates[1:]:
+            assigned_fallback, _, _ = _resolve_model_thinking_level(
+                fallback,
+                role="aggregator_fallback",
+                requested_level=aggregator_target,
+                reasons=aggregator_reasons,
+                risk_floor=aggregator_risk_floor,
+                policy=thinking_policy,
+            )
+            assigned_fallbacks.append(assigned_fallback)
+        assigned_aggregator_candidates = (
+            assigned_aggregator,
+            *assigned_fallbacks,
+        )
 
     reason_counts: dict[str, int] = {}
     for filter_row in [*proposer_filters, *aggregator_filters]:
@@ -5355,9 +5342,7 @@ def rank_models(
         tier: router_tier for router_tier, tier in router_tier_mapping.items()
     }
     effective_ranking_version = (
-        RANKING_VERSION
-        if ranking_thinking_assignment_enabled
-        else LEGACY_RANKING_VERSION
+        RANKING_VERSION if ranking_thinking_assignment_enabled else LEGACY_RANKING_VERSION
     )
     trace_registry_snapshot = copy.deepcopy(dict(registry_snapshot))
     trace_request_context = copy.deepcopy(dict(request_context))
@@ -5425,6 +5410,7 @@ def rank_models(
         "aggregator_feasibility": aggregator_feasibility,
         "selected_P": selected_ids,
         "selected_A": aggregator.identity,
+        "aggregator_candidates": [model.identity for model in assigned_aggregator_candidates],
         "exploration": copy.deepcopy(
             dict(_ranking_mapping(effective_ranking_config, "exploration"))
         ),
@@ -5448,15 +5434,9 @@ def rank_models(
                 "ranking_thinking_assignment_enabled": True,
                 "thinking_policy_version": str(thinking_policy["policy_version"]),
                 "thinking_assignment": copy.deepcopy(thinking_assignment),
-                "thinking_assignment_details": copy.deepcopy(
-                    thinking_assignment_details
-                ),
-                "assignment_reasons": copy.deepcopy(
-                    thinking_assignment_reasons
-                ),
-                "unsupported_level_fallbacks": copy.deepcopy(
-                    thinking_unsupported_fallbacks
-                ),
+                "thinking_assignment_details": copy.deepcopy(thinking_assignment_details),
+                "assignment_reasons": copy.deepcopy(thinking_assignment_reasons),
+                "unsupported_level_fallbacks": copy.deepcopy(thinking_unsupported_fallbacks),
                 "policy_versions": {
                     "ranking": effective_ranking_version,
                     "thinking": str(thinking_policy["policy_version"]),
@@ -5468,9 +5448,7 @@ def rank_models(
             decision_id=decision_id,
             thinking_assignment=trace["thinking_assignment"],
             assignment_reasons=trace["assignment_reasons"],
-            unsupported_level_fallbacks=trace[
-                "unsupported_level_fallbacks"
-            ],
+            unsupported_level_fallbacks=trace["unsupported_level_fallbacks"],
             policy_versions=trace["policy_versions"],
         )
     log.info(
@@ -5526,9 +5504,7 @@ def rank_models(
                 "thinking_policy_version": trace["thinking_policy_version"],
                 "thinking_assignment": trace["thinking_assignment"],
                 "assignment_reasons": trace["assignment_reasons"],
-                "unsupported_level_fallbacks": trace[
-                    "unsupported_level_fallbacks"
-                ],
+                "unsupported_level_fallbacks": trace["unsupported_level_fallbacks"],
                 "policy_versions": trace["policy_versions"],
             }
         )
@@ -5539,6 +5515,7 @@ def rank_models(
     return RankingDecision(
         proposers=assigned_proposers,
         aggregator=assigned_aggregator,
+        aggregator_candidates=assigned_aggregator_candidates,
         effective_tier=effective_tier,
         trace=trace,
         thinking_assignment=copy.deepcopy(thinking_assignment),
@@ -5586,6 +5563,7 @@ _RANKING_REPLAY_FIELDS = (
     "aggregator_feasibility",
     "selected_P",
     "selected_A",
+    "aggregator_candidates",
     "thinking_policy_version",
     "thinking_assignment",
     "thinking_assignment_details",
@@ -5607,13 +5585,9 @@ def ranking_trace_replay_reasons(trace: Mapping[str, Any]) -> list[str]:
     reasons: list[str] = []
     legacy_trace = (
         trace.get("ranking_version") == "step2-ranking-v2"
-        and trace.get("ranking_config_schema_version")
-        == LEGACY_RANKING_CONFIG_SCHEMA_VERSION
+        and trace.get("ranking_config_schema_version") == LEGACY_RANKING_CONFIG_SCHEMA_VERSION
     )
-    if (
-        "ranking_thinking_assignment_enabled" not in trace
-        and not legacy_trace
-    ):
+    if "ranking_thinking_assignment_enabled" not in trace and not legacy_trace:
         reasons.append("missing_g1_replay_thinking_assignment_switch")
     raw_thinking_assignment_enabled = trace.get(
         "ranking_thinking_assignment_enabled",
@@ -5713,12 +5687,15 @@ def ranking_trace_replay_reasons(trace: Mapping[str, Any]) -> list[str]:
         "unsupported_level_fallbacks",
         "policy_versions",
     }
-    legacy_disabled_replay = (
-        not thinking_assignment_enabled
-        and legacy_trace
-    )
+    legacy_disabled_replay = not thinking_assignment_enabled and legacy_trace
     for field_name in _RANKING_REPLAY_FIELDS:
         if field_name == "ranking_version" and legacy_disabled_replay:
+            continue
+        # ``aggregator_candidates`` became replay-bound evidence in the v3
+        # ranking contract. Historical v2 traces predate that field, so keep
+        # them readable while requiring every newly emitted v3 trace to bind
+        # the complete frozen recovery chain.
+        if field_name == "aggregator_candidates" and field_name not in trace and legacy_trace:
             continue
         if (
             field_name in additive_thinking_fields

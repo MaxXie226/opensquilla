@@ -113,9 +113,7 @@ def validate_router_attestation(
         return
     if provider_usage.get("is_byok") is not False:
         issues.append(f"{label}: raw usage does not prove is_byok=false")
-    actual_cache_namespace = str(
-        provider_usage.get("cache_namespace_sha256") or ""
-    )
+    actual_cache_namespace = str(provider_usage.get("cache_namespace_sha256") or "")
     if actual_cache_namespace != expected_cache_namespace_sha256:
         issues.append(f"{label}: cache namespace evidence differs from runtime contract")
     response_ids = provider_usage.get("response_ids")
@@ -130,9 +128,7 @@ def validate_router_attestation(
         issues.append(f"{label}: missing OpenRouter router metadata")
         return
     if metadata.get("requested") != expected_model:
-        issues.append(
-            f"{label}: router requested model differs from {expected_model}"
-        )
+        issues.append(f"{label}: router requested model differs from {expected_model}")
     if metadata.get("strategy") != "direct":
         issues.append(f"{label}: router strategy is not direct")
     if metadata.get("attempt") != 1 or isinstance(metadata.get("attempt"), bool):
@@ -151,12 +147,11 @@ def validate_router_attestation(
     else:
         selected_endpoint = selected[0]
         if selected_endpoint.get("provider") != expected_provider_name:
-            issues.append(
-                f"{label}: selected provider is not {expected_provider_name}"
-            )
-        if canonical_frozen_model(
-            selected_endpoint.get("model"), (expected_model,)
-        ) != expected_model:
+            issues.append(f"{label}: selected provider is not {expected_provider_name}")
+        if (
+            canonical_frozen_model(selected_endpoint.get("model"), (expected_model,))
+            != expected_model
+        ):
             issues.append(f"{label}: selected endpoint model differs from request")
     attempts = metadata.get("attempts")
     if isinstance(attempts, list) and attempts:
@@ -168,8 +163,7 @@ def validate_router_attestation(
                 not isinstance(attempt, dict)
                 or attempt.get("provider") != expected_provider_name
                 or attempt.get("status") != 200
-                or canonical_frozen_model(attempt.get("model"), (expected_model,))
-                != expected_model
+                or canonical_frozen_model(attempt.get("model"), (expected_model,)) != expected_model
             ):
                 issues.append(f"{label}: router attempt evidence differs from frozen route")
     pipeline = metadata.get("pipeline")
@@ -252,9 +246,7 @@ def capture_timestamp(value: Any) -> float | None:
 
 def manifest_preflight_counts(manifest: Any) -> dict[str, int]:
     tool_policy = manifest.get("tool_policy") if isinstance(manifest, dict) else None
-    local_tools = (
-        tool_policy.get("local_web_tools") if isinstance(tool_policy, dict) else None
-    )
+    local_tools = tool_policy.get("local_web_tools") if isinstance(tool_policy, dict) else None
     preflight = local_tools.get("preflight") if isinstance(local_tools, dict) else None
     calls = preflight.get("preflight_calls") if isinstance(preflight, dict) else None
     if not isinstance(calls, dict):
@@ -495,9 +487,7 @@ def aggregate(calls: Iterable[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         row["nonbillable_zero_usage_calls"] += int(nonbillable_placeholder)
         row["unbilled_usage_calls"] += int(cost <= 0 and has_usage)
         row["anomalous_zero_cost_calls"] += int(cost <= 0 and not nonbillable_placeholder)
-        row["positive_provider_billed_calls"] += int(
-            cost > 0 and cost_source == "provider_billed"
-        )
+        row["positive_provider_billed_calls"] += int(cost > 0 and cost_source == "provider_billed")
         row["cost_sources"][cost_source] += 1
         row["roles"][str(call.get("role") or call.get("phase") or "unknown")] += 1
     clean: dict[str, dict[str, Any]] = {}
@@ -522,9 +512,7 @@ def load_rows(path: Path) -> list[dict[str, Any]]:
             except json.JSONDecodeError as exc:
                 raise SystemExit(f"Invalid JSON on line {line_number}: {exc}") from exc
             if not isinstance(value, dict):
-                raise SystemExit(
-                    f"JSONL row on line {line_number} must be an object"
-                )
+                raise SystemExit(f"JSONL row on line {line_number} must be an object")
             rows.append(value)
     return rows
 
@@ -603,25 +591,30 @@ def markdown(report: dict[str, Any]) -> str:
         )
     else:
         lines.append("未提供汇总指标文件。")
-    lines.extend([
-        "",
-        "## 4. 成本汇总",
-        "",
-        f"- 生成阶段实付成本：${report['generation_billed_cost_usd']:.9f}",
-        f"- 平均每题生成成本（不含 Judge）：${report['average_generation_cost_per_task_usd']:.9f}",
-        f"- Judge 实付成本：${report['judge_billed_cost_usd']:.9f}",
-        f"- 平均每题 Judge 成本：${report['average_judge_cost_per_task_usd']:.9f}",
-        f"- 平均每题 OpenRouter 成本：${report['average_total_cost_per_task_usd']:.9f}",
-        f"- Judge 成本占比：{report['judge_cost_share_pct']:.2f}%",
-        f"- 任务内观察到 web_search：{report['observed_web_search_invocations']} 次",
-        f"- 任务内观察到 web_fetch：{report['observed_web_fetch_invocations']} 次",
-        (
-            "- 未定价外部工具调用保守上界："
-            f"{report['external_unpriced_tool_call_count_upper_bound']} 次"
-        ),
-        f"- 本次命令外部工具 preflight：{report['external_preflight_call_count']} 次",
-        "- 外部工具 USD：未知；全供应商总成本仅给出 OpenRouter 下界，不声明精确值。",
-    ])
+    lines.extend(
+        [
+            "",
+            "## 4. 成本汇总",
+            "",
+            f"- 生成阶段实付成本：${report['generation_billed_cost_usd']:.9f}",
+            (
+                "- 平均每题生成成本（不含 Judge）："
+                f"${report['average_generation_cost_per_task_usd']:.9f}"
+            ),
+            f"- Judge 实付成本：${report['judge_billed_cost_usd']:.9f}",
+            f"- 平均每题 Judge 成本：${report['average_judge_cost_per_task_usd']:.9f}",
+            f"- 平均每题 OpenRouter 成本：${report['average_total_cost_per_task_usd']:.9f}",
+            f"- Judge 成本占比：{report['judge_cost_share_pct']:.2f}%",
+            f"- 任务内观察到 web_search：{report['observed_web_search_invocations']} 次",
+            f"- 任务内观察到 web_fetch：{report['observed_web_fetch_invocations']} 次",
+            (
+                "- 未定价外部工具调用保守上界："
+                f"{report['external_unpriced_tool_call_count_upper_bound']} 次"
+            ),
+            f"- 本次命令外部工具 preflight：{report['external_preflight_call_count']} 次",
+            "- 外部工具 USD：未知；全供应商总成本仅给出 OpenRouter 下界，不声明精确值。",
+        ]
+    )
     if report.get("account_usage_delta_usd") is not None:
         lines.extend(
             [
@@ -645,35 +638,40 @@ def markdown(report: dict[str, Any]) -> str:
                 ),
             ]
         )
-    lines.extend([
-        "",
-        "## 5. Agent Loop 执行证据",
-        "",
-        (
-            f"- 每轮结构：{report['ensemble_calls_per_iteration']} 次模型调用"
-            "（4 proposer + 1 aggregator）"
-        ),
-        (
-            f"- 总生成模型请求：{report['generation_call_count']} 次；平均每题："
-            f"{report['average_llm_requests_per_task']:.1f} 次"
-        ),
-        f"- 平均 ensemble 轮数：{report['average_ensemble_iterations_per_task']:.1f} 轮/题",
-        f"- 进入第 2 轮及以上的任务：{report['multi_iteration_tasks']}/{report['expected_tasks']}",
-        (
-            f"- 单题轮数范围：{report['min_ensemble_iterations']}–"
-            f"{report['max_ensemble_iterations']} 轮"
-        ),
-        (
-            f"- 工具调用：总计 {report['total_tool_calls']} 次，平均 "
-            f"{report['average_tool_calls_per_task']:.1f} 次/题"
-        ),
-        "",
-        (
-            "| Task ID | LLM 请求 | Ensemble 轮数 | 工具调用 | 质量分 | "
-            "生成成本（不含 Judge） | 总耗时（秒） |"
-        ),
-        "|---|---:|---:|---:|---:|---:|---:|",
-    ])
+    lines.extend(
+        [
+            "",
+            "## 5. Agent Loop 执行证据",
+            "",
+            (
+                f"- 每轮结构：{report['ensemble_calls_per_iteration']} 次模型调用"
+                "（4 proposer + 1 aggregator）"
+            ),
+            (
+                f"- 总生成模型请求：{report['generation_call_count']} 次；平均每题："
+                f"{report['average_llm_requests_per_task']:.1f} 次"
+            ),
+            f"- 平均 ensemble 轮数：{report['average_ensemble_iterations_per_task']:.1f} 轮/题",
+            (
+                "- 进入第 2 轮及以上的任务："
+                f"{report['multi_iteration_tasks']}/{report['expected_tasks']}"
+            ),
+            (
+                f"- 单题轮数范围：{report['min_ensemble_iterations']}–"
+                f"{report['max_ensemble_iterations']} 轮"
+            ),
+            (
+                f"- 工具调用：总计 {report['total_tool_calls']} 次，平均 "
+                f"{report['average_tool_calls_per_task']:.1f} 次/题"
+            ),
+            "",
+            (
+                "| Task ID | LLM 请求 | Ensemble 轮数 | 工具调用 | 质量分 | "
+                "生成成本（不含 Judge） | 总耗时（秒） |"
+            ),
+            "|---|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
     for task in report["task_summaries"]:
         lines.append(
             f"| `{task['task_id']}` | {task['llm_request_count']} | "
@@ -681,16 +679,18 @@ def markdown(report: dict[str, Any]) -> str:
             f"{task['quality_total']:.2f} | ${task['generation_cost_usd']:.9f} | "
             f"{task['total_elapsed_ms'] / 1000:.2f} |"
         )
-    lines.extend([
-        "",
-        "## 6. 生成阶段按模型统计",
-        "",
-        (
-            "| 模型 | 记录 | 计费调用 | 正费用 | 零用量占位 | 零费用 Tokens 调用 | "
-            "输入 Tokens | 输出 Tokens | 推理 Tokens | 实付成本 | cost_source | 结论 |"
-        ),
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|",
-    ])
+    lines.extend(
+        [
+            "",
+            "## 6. 生成阶段按模型统计",
+            "",
+            (
+                "| 模型 | 记录 | 计费调用 | 正费用 | 零用量占位 | 零费用 Tokens 调用 | "
+                "输入 Tokens | 输出 Tokens | 推理 Tokens | 实付成本 | cost_source | 结论 |"
+            ),
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|",
+        ]
+    )
     model_checks = report["model_checks"]
     for model, stats in report["generation_models"].items():
         source = ", ".join(f"{k}:{v}" for k, v in stats["cost_sources"].items())
@@ -792,9 +792,7 @@ def main() -> int:
     )
     parser.add_argument("--require-clean-source-now", action="store_true")
     parser.add_argument("--external-preflight-call-count", type=int, default=0)
-    parser.add_argument(
-        "--validation-external-preflight-call-count", type=int, default=0
-    )
+    parser.add_argument("--validation-external-preflight-call-count", type=int, default=0)
     parser.add_argument(
         "--require-account-reconciliation",
         action="store_true",
@@ -807,9 +805,7 @@ def main() -> int:
     ):
         parser.error("--expected-cache-namespace-sha256 must be sha256:<64 lowercase hex>")
     required_observed_tools = {
-        item.strip()
-        for item in args.required_observed_tools.split(",")
-        if item.strip()
+        item.strip() for item in args.required_observed_tools.split(",") if item.strip()
     }
     if not required_observed_tools <= {"web_search", "web_fetch"}:
         parser.error("--required-observed-tools only accepts web_search,web_fetch")
@@ -829,9 +825,7 @@ def main() -> int:
     validation_after_usage = None
     validation_before_byok_usage = None
     validation_after_byok_usage = None
-    if args.require_account_reconciliation and (
-        not args.account_before or not args.account_after
-    ):
+    if args.require_account_reconciliation and (not args.account_before or not args.account_after):
         parser.error(
             "--require-account-reconciliation requires --account-before and --account-after"
         )
@@ -862,9 +856,7 @@ def main() -> int:
         if account_after_byok_usage < account_before_byok_usage:
             parser.error("OpenRouter BYOK usage decreased across the benchmark window")
         args.account_usage_delta_usd = account_after_usage - account_before_usage
-        args.account_byok_usage_delta_usd = (
-            account_after_byok_usage - account_before_byok_usage
-        )
+        args.account_byok_usage_delta_usd = account_after_byok_usage - account_before_byok_usage
     if args.validation_account_before or args.validation_account_after:
         if not args.validation_account_before or not args.validation_account_after:
             parser.error(
@@ -905,9 +897,7 @@ def main() -> int:
         if validation_after_byok_usage < validation_before_byok_usage:
             parser.error("OpenRouter validation BYOK usage decreased across the canary window")
     if args.validation_manifest:
-        validation_manifest = json.loads(
-            args.validation_manifest.read_text(encoding="utf-8")
-        )
+        validation_manifest = json.loads(args.validation_manifest.read_text(encoding="utf-8"))
         if not isinstance(validation_manifest, dict):
             parser.error("OpenRouter validation manifest must contain a JSON object")
 
@@ -968,9 +958,7 @@ def main() -> int:
             task_id = str(normalized_task.get("id") or "")
             if task_id:
                 expected_prompts[task_id] = str(normalized_task.get("prompt") or "")
-                expected_task_input_hashes[task_id] = canonical_json_sha256(
-                    normalized_task
-                )
+                expected_task_input_hashes[task_id] = canonical_json_sha256(normalized_task)
                 rubric = normalized_task.get("rubric")
                 if isinstance(rubric, dict):
                     criteria: list[dict[str, Any]] = []
@@ -993,9 +981,7 @@ def main() -> int:
                                     "section_id": section_id,
                                     "section_title": section_title,
                                     "weight": criterion.get("weight"),
-                                    "requirement": str(
-                                        criterion.get("requirement") or ""
-                                    ),
+                                    "requirement": str(criterion.get("requirement") or ""),
                                 }
                             )
                     expected_rubrics[task_id] = {
@@ -1021,9 +1007,8 @@ def main() -> int:
                 or str(row.get("prompt_sha256") or "") != expected_sha256
             ):
                 prompt_mismatch_task_ids.append(task_id)
-            if (
-                str(row.get("task_input_sha256") or "")
-                != expected_task_input_hashes.get(task_id, "")
+            if str(row.get("task_input_sha256") or "") != expected_task_input_hashes.get(
+                task_id, ""
             ):
                 task_input_mismatch_task_ids.append(task_id)
         prompt_mismatch_task_ids.sort()
@@ -1034,9 +1019,7 @@ def main() -> int:
         for row in load_rows(args.validation_input_jsonl):
             validation_task_id = str(row.get("task_id") or row.get("id") or "")
             validation_prompt = str(
-                row.get("prompt")
-                if row.get("prompt") is not None
-                else row.get("problem") or ""
+                row.get("prompt") if row.get("prompt") is not None else row.get("problem") or ""
             )
             if validation_task_id:
                 validation_input_task_ids.add(validation_task_id)
@@ -1059,9 +1042,7 @@ def main() -> int:
     selected_tool_infrastructure_issues: list[str] = []
     raw_llm_cost = Decimal(0)
 
-    def validate_call(
-        call: dict[str, Any], *, label: str, issues: list[str]
-    ) -> None:
+    def validate_call(call: dict[str, Any], *, label: str, issues: list[str]) -> None:
         nonlocal raw_llm_cost
         try:
             cost = required_decimal(call.get("billed_cost"), label=f"{label} cost")
@@ -1072,9 +1053,7 @@ def main() -> int:
                 "cached_tokens",
                 "cache_write_tokens",
             ):
-                tokens = required_decimal(
-                    call.get(token_field, 0), label=f"{label} {token_field}"
-                )
+                tokens = required_decimal(call.get(token_field, 0), label=f"{label} {token_field}")
                 if tokens != tokens.to_integral_value():
                     raise ValueError(f"{label} {token_field} must be an integer")
         except ValueError as exc:
@@ -1084,19 +1063,14 @@ def main() -> int:
 
     def trace_sequence_is_valid(events: list[Any]) -> bool:
         event_sequences = [
-            event.get("seq") if isinstance(event, dict) else None
-            for event in events
+            event.get("seq") if isinstance(event, dict) else None for event in events
         ]
         sequence_start = (
             0
-            if events
-            and isinstance(events[0], dict)
-            and events[0].get("kind") == "routing_setup"
+            if events and isinstance(events[0], dict) and events[0].get("kind") == "routing_setup"
             else 1
         )
-        return event_sequences == list(
-            range(sequence_start, sequence_start + len(events))
-        )
+        return event_sequences == list(range(sequence_start, sequence_start + len(events)))
 
     def validate_attempt_tool_trace(
         *, task_id: str, scope: str, events_value: Any, selected: bool = False
@@ -1106,9 +1080,7 @@ def main() -> int:
             return 0
         events = events_value
         if not trace_sequence_is_valid(events):
-            tool_trace_issues.append(
-                f"{task_id}/{scope}: trace event sequence is invalid"
-            )
+            tool_trace_issues.append(f"{task_id}/{scope}: trace event sequence is invalid")
         starts: dict[str, list[dict[str, Any]]] = defaultdict(list)
         results: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for event in events:
@@ -1120,9 +1092,7 @@ def main() -> int:
             elif event.get("kind") == "tool_result":
                 results[tool_use_id].append(event)
         if set(starts) != set(results):
-            tool_trace_issues.append(
-                f"{task_id}/{scope}: tool start/result ID sets differ"
-            )
+            tool_trace_issues.append(f"{task_id}/{scope}: tool start/result ID sets differ")
         for tool_use_id in sorted(set(starts) | set(results)):
             start_rows = starts.get(tool_use_id, [])
             result_rows = results.get(tool_use_id, [])
@@ -1137,8 +1107,7 @@ def main() -> int:
             tool_name = str(start_event.get("tool_name") or "")
             if tool_name != str(result_event.get("tool_name") or ""):
                 tool_trace_issues.append(
-                    f"{task_id}/{scope}: tool name differs between start/result "
-                    f"for {tool_use_id}"
+                    f"{task_id}/{scope}: tool name differs between start/result for {tool_use_id}"
                 )
             status = result_event.get("execution_status")
             status_value = status.get("status") if isinstance(status, dict) else None
@@ -1147,9 +1116,7 @@ def main() -> int:
             diagnostic = diagnostic if isinstance(diagnostic, dict) else {}
             diagnostic_status_value = diagnostic.get("status")
             diagnostic_status = str(diagnostic_status_value or "").casefold()
-            diagnostic_reason = str(
-                diagnostic.get("reason") or diagnostic.get("reason_code") or ""
-            )
+            diagnostic_reason = str(diagnostic.get("reason") or diagnostic.get("reason_code") or "")
             diagnostic_http_failure = False
             for http_status_value in (
                 diagnostic.get("http_status"),
@@ -1184,8 +1151,7 @@ def main() -> int:
                 "cancelled",
             }:
                 tool_trace_issues.append(
-                    f"{task_id}/{scope}: tool result lacks a definitive "
-                    "execution status"
+                    f"{task_id}/{scope}: tool result lacks a definitive execution status"
                 )
             is_error = result_event.get("is_error") is True
             effective_error = is_error or envelope_error
@@ -1212,12 +1178,9 @@ def main() -> int:
                 not is_error and status_value in {"error", "timeout", "cancelled"}
             ):
                 tool_trace_issues.append(
-                    f"{task_id}/{scope}: is_error and execution status disagree "
-                    f"for {tool_use_id}"
+                    f"{task_id}/{scope}: is_error and execution status disagree for {tool_use_id}"
                 )
-            control_reason = (
-                f"{reason} {diagnostic_reason} {diagnostic_status}".casefold()
-            )
+            control_reason = f"{reason} {diagnostic_reason} {diagnostic_status}".casefold()
             if any(
                 token in control_reason
                 for token in (
@@ -1230,8 +1193,7 @@ def main() -> int:
                 )
             ):
                 tool_trace_issues.append(
-                    f"{task_id}/{scope}: benchmark control blocked tool execution "
-                    f"({reason})"
+                    f"{task_id}/{scope}: benchmark control blocked tool execution ({reason})"
                 )
         return sum(len(items) for items in starts.values())
 
@@ -1239,21 +1201,15 @@ def main() -> int:
     for row in b2_rows:
         task_id = str(row.get("task_id") or "")
         execution = row.get("execution")
-        attempts = (
-            execution.get("generation_attempts")
-            if isinstance(execution, dict)
-            else None
-        )
+        attempts = execution.get("generation_attempts") if isinstance(execution, dict) else None
         if not isinstance(attempts, list) or not attempts:
             generation_usage_issues.append(f"{task_id}: missing generation attempts")
             attempts = []
         attempt_numbers = [
-            int(number(item.get("attempt"))) if isinstance(item, dict) else 0
-            for item in attempts
+            int(number(item.get("attempt"))) if isinstance(item, dict) else 0 for item in attempts
         ]
-        if (
-            len(attempts) > args.expected_generation_max_attempts
-            or attempt_numbers != list(range(1, len(attempts) + 1))
+        if len(attempts) > args.expected_generation_max_attempts or attempt_numbers != list(
+            range(1, len(attempts) + 1)
         ):
             generation_protocol_issues.append(
                 f"{task_id}: generation attempts are not consecutive 1.."
@@ -1263,9 +1219,7 @@ def main() -> int:
             run = attempt.get("run") if isinstance(attempt, dict) else None
             usage = run.get("usage") if isinstance(run, dict) else None
             calls = (
-                list(iter_usage_calls(usage, phase="generation"))
-                if isinstance(usage, dict)
-                else []
+                list(iter_usage_calls(usage, phase="generation")) if isinstance(usage, dict) else []
             )
             expected_requests = int(number(run.get("llm_request_count"))) if run else 0
             if expected_requests != len(calls):
@@ -1296,9 +1250,7 @@ def main() -> int:
                         expected_model=canonical_model,
                         label=label,
                         issues=generation_usage_issues,
-                        expected_cache_namespace_sha256=(
-                            args.expected_cache_namespace_sha256
-                        ),
+                        expected_cache_namespace_sha256=(args.expected_cache_namespace_sha256),
                     )
                 by_agent_call[agent_call_index][
                     (str(call.get("role") or ""), canonical_model or actual_model)
@@ -1312,8 +1264,7 @@ def main() -> int:
             if by_agent_call:
                 actual_agent_indices = sorted(by_agent_call)
                 if (
-                    actual_agent_indices
-                    != list(range(1, len(actual_agent_indices) + 1))
+                    actual_agent_indices != list(range(1, len(actual_agent_indices) + 1))
                     or actual_agent_indices[-1] > args.expected_agent_max_iterations
                 ):
                     generation_protocol_issues.append(
@@ -1338,15 +1289,11 @@ def main() -> int:
                     judge.get("mode") != "draco_criterion_judgments",
                     judge.get("rubric_id") != rubric.get("id"),
                     judge.get("judge_model") != EXPECTED_JUDGE,
-                    int(number(judge.get("judge_repeats")))
-                    != args.expected_judge_repeats,
-                    int(number(judge.get("rubric_criteria_count")))
-                    != len(rubric_criteria),
-                    int(number(judge.get("criteria_count")))
-                    != expected_judgment_count,
+                    int(number(judge.get("judge_repeats"))) != args.expected_judge_repeats,
+                    int(number(judge.get("rubric_criteria_count"))) != len(rubric_criteria),
+                    int(number(judge.get("criteria_count"))) != expected_judgment_count,
                     len(judgments) != expected_judgment_count,
-                    int(number(judge.get("valid_criteria_count")))
-                    != expected_judgment_count,
+                    int(number(judge.get("valid_criteria_count"))) != expected_judgment_count,
                     int(number(judge.get("invalid_criteria_count"))) != 0,
                     int(number(judge.get("judge_error_count"))) != 0,
                     judge.get("score_status") != "complete",
@@ -1393,11 +1340,9 @@ def main() -> int:
                 expected_criterion = expected_by_key.get(key)
                 if not isinstance(expected_criterion, dict) or any(
                     (
-                        judgment.get("section_title")
-                        != expected_criterion.get("section_title"),
+                        judgment.get("section_title") != expected_criterion.get("section_title"),
                         judgment.get("weight") != expected_criterion.get("weight"),
-                        judgment.get("requirement")
-                        != expected_criterion.get("requirement"),
+                        judgment.get("requirement") != expected_criterion.get("requirement"),
                         not isinstance(judgment.get("met"), bool),
                     )
                 ):
@@ -1405,9 +1350,7 @@ def main() -> int:
                         f"{task_id}: Judge criterion/repeat does not match rubric {key}"
                     )
                 judge_attempts = judgment.get("judge_attempts")
-                judge_attempts = (
-                    judge_attempts if isinstance(judge_attempts, list) else []
-                )
+                judge_attempts = judge_attempts if isinstance(judge_attempts, list) else []
                 logical_attempts = [
                     int(number(item.get("attempt"))) if isinstance(item, dict) else 0
                     for item in judge_attempts
@@ -1416,8 +1359,7 @@ def main() -> int:
                     not judge_attempts
                     or len(judge_attempts) > args.expected_judge_max_attempts
                     or logical_attempts != list(range(1, len(judge_attempts) + 1))
-                    or int(number(judgment.get("judge_attempt_count")))
-                    != len(judge_attempts)
+                    or int(number(judgment.get("judge_attempt_count"))) != len(judge_attempts)
                 ):
                     judge_protocol_issues.append(
                         f"{task_id}: Judge retry attempts violate the configured limit for {key}"
@@ -1450,9 +1392,7 @@ def main() -> int:
             for run_index, run in enumerate(iter_judge_runs(judge_value), 1):
                 usage = run.get("usage")
                 calls = (
-                    list(iter_usage_calls(usage, phase=phase))
-                    if isinstance(usage, dict)
-                    else []
+                    list(iter_usage_calls(usage, phase=phase)) if isinstance(usage, dict) else []
                 )
                 expected_requests = int(number(run.get("llm_request_count")))
                 if expected_requests != len(calls):
@@ -1463,9 +1403,7 @@ def main() -> int:
                 for call_number, call in enumerate(calls, 1):
                     label = f"{task_id}/{phase}-{run_index}/call-{call_number}"
                     validate_call(call, label=label, issues=judge_usage_issues)
-                    judge_model = canonical_frozen_model(
-                        call.get("model"), (EXPECTED_JUDGE,)
-                    )
+                    judge_model = canonical_frozen_model(call.get("model"), (EXPECTED_JUDGE,))
                     if judge_model != EXPECTED_JUDGE:
                         judge_usage_issues.append(f"{label}: unexpected Judge model")
                     else:
@@ -1474,9 +1412,7 @@ def main() -> int:
                             expected_model=EXPECTED_JUDGE,
                             label=label,
                             issues=judge_usage_issues,
-                            expected_cache_namespace_sha256=(
-                                args.expected_cache_namespace_sha256
-                            ),
+                            expected_cache_namespace_sha256=(args.expected_cache_namespace_sha256),
                         )
                     if str(call.get("cost_source") or "") != "provider_billed":
                         judge_usage_issues.append(f"{label}: cost is not provider_billed")
@@ -1511,9 +1447,7 @@ def main() -> int:
             attempt_number = int(number(attempt.get("attempt")))
             attempt_run = attempt.get("run")
             attempt_events = (
-                attempt_run.get("trace_events")
-                if isinstance(attempt_run, dict)
-                else None
+                attempt_run.get("trace_events") if isinstance(attempt_run, dict) else None
             )
             if attempt_number > 0 and isinstance(attempt_events, list):
                 attempt_events_by_number[attempt_number] = attempt_events
@@ -1570,13 +1504,11 @@ def main() -> int:
         ]
     )
     generation_actual_models = {
-        canonical_frozen_model(call.get("model"), EXPECTED_MODELS)
-        or str(call.get("model") or "")
+        canonical_frozen_model(call.get("model"), EXPECTED_MODELS) or str(call.get("model") or "")
         for call in generation_calls
     }
     judge_actual_models = {
-        canonical_frozen_model(call.get("model"), (EXPECTED_JUDGE,))
-        or str(call.get("model") or "")
+        canonical_frozen_model(call.get("model"), (EXPECTED_JUDGE,)) or str(call.get("model") or "")
         for call in judge_calls
     }
     row_accounting_cost = Decimal(0)
@@ -1605,21 +1537,14 @@ def main() -> int:
                     llm_total.get("exact_request_count"),
                     label=f"{task_id} exact_request_count",
                 )
-                if (
-                    llm_total.get("cost_exact") is not True
-                    or request_count != exact_request_count
-                ):
-                    row_accounting_issues.append(
-                        f"{task_id}: row LLM accounting is not exact"
-                    )
+                if llm_total.get("cost_exact") is not True or request_count != exact_request_count:
+                    row_accounting_issues.append(f"{task_id}: row LLM accounting is not exact")
             except ValueError as exc:
                 row_accounting_issues.append(str(exc))
         non_byok = row.get("openrouter_non_byok_audit")
         if not isinstance(non_byok, dict) or non_byok.get("pass") is not True:
             row_accounting_issues.append(f"{task_id}: non-BYOK audit did not pass")
-        external = (
-            accounting.get("external_tools") if isinstance(accounting, dict) else None
-        )
+        external = accounting.get("external_tools") if isinstance(accounting, dict) else None
         if not isinstance(external, dict):
             row_accounting_issues.append(f"{task_id}: missing external tool accounting")
         else:
@@ -1628,19 +1553,11 @@ def main() -> int:
             )
         execution = row.get("execution")
         generation_attempts = (
-            execution.get("generation_attempts")
-            if isinstance(execution, dict)
-            else None
+            execution.get("generation_attempts") if isinstance(execution, dict) else None
         )
-        for attempt in (
-            generation_attempts if isinstance(generation_attempts, list) else []
-        ):
+        for attempt in generation_attempts if isinstance(generation_attempts, list) else []:
             attempt_run = attempt.get("run") if isinstance(attempt, dict) else None
-            events = (
-                attempt_run.get("trace_events")
-                if isinstance(attempt_run, dict)
-                else None
-            )
+            events = attempt_run.get("trace_events") if isinstance(attempt_run, dict) else None
             for event in events if isinstance(events, list) else []:
                 if not isinstance(event, dict) or event.get("kind") != "tool_use_start":
                     continue
@@ -1650,9 +1567,7 @@ def main() -> int:
     model_checks = {}
     selected_tool_success_count = sum(selected_successful_tool_names.values())
     selected_tool_failure_count = sum(selected_failed_tool_names.values())
-    selected_tool_attempt_count = (
-        selected_tool_success_count + selected_tool_failure_count
-    )
+    selected_tool_attempt_count = selected_tool_success_count + selected_tool_failure_count
     selected_tool_failure_rate = (
         selected_tool_failure_count / selected_tool_attempt_count
         if selected_tool_attempt_count
@@ -1687,8 +1602,7 @@ def main() -> int:
         },
         {
             "name": "Result 与 trace 完整且逐行一致",
-            "pass": len(trace_rows) == args.expected_tasks
-            and not trace_integrity_issues,
+            "pass": len(trace_rows) == args.expected_tasks and not trace_integrity_issues,
             "detail": (
                 f"result_rows={len(rows)}, trace_rows={len(trace_rows)}, "
                 f"issues={len(trace_integrity_issues)}"
@@ -1723,8 +1637,7 @@ def main() -> int:
             "pass": not tool_trace_issues
             and not selected_tool_infrastructure_issues
             and required_observed_tools <= set(selected_successful_tool_names)
-            and selected_tool_failure_rate
-            <= args.max_selected_tool_failure_rate,
+            and selected_tool_failure_rate <= args.max_selected_tool_failure_rate,
             "detail": (
                 f"trace_issues={len(tool_trace_issues)}, "
                 f"infrastructure_issues={len(selected_tool_infrastructure_issues)}, "
@@ -1780,8 +1693,7 @@ def main() -> int:
                 )
                 settlement_valid = bool(
                     settlement_attempts >= 1
-                    and settlement_observed + settlement_tolerance
-                    >= settlement_expected
+                    and settlement_observed + settlement_tolerance >= settlement_expected
                 )
                 settlement_detail = (
                     f"attempts={settlement_attempts}, expected={settlement_expected}, "
@@ -1817,22 +1729,12 @@ def main() -> int:
             }
         )
     if validation_account_before is not None and validation_account_after is not None:
-        validation_before_fingerprint = str(
-            validation_account_before.get("api_key_sha256") or ""
-        )
-        validation_after_fingerprint = str(
-            validation_account_after.get("api_key_sha256") or ""
-        )
+        validation_before_fingerprint = str(validation_account_before.get("api_key_sha256") or "")
+        validation_after_fingerprint = str(validation_account_after.get("api_key_sha256") or "")
         benchmark_fingerprint = str((account_before or {}).get("api_key_sha256") or "")
-        validation_before_time = capture_timestamp(
-            validation_account_before.get("captured_at")
-        )
-        validation_after_time = capture_timestamp(
-            validation_account_after.get("captured_at")
-        )
-        benchmark_before_time = capture_timestamp(
-            (account_before or {}).get("captured_at")
-        )
+        validation_before_time = capture_timestamp(validation_account_before.get("captured_at"))
+        validation_after_time = capture_timestamp(validation_account_after.get("captured_at"))
+        benchmark_before_time = capture_timestamp((account_before or {}).get("captured_at"))
         checks.extend(
             [
                 {
@@ -1844,14 +1746,9 @@ def main() -> int:
                 },
                 {
                     "name": "canary 对账 key 与 benchmark 进程环境一致",
-                    "pass": validation_account_before.get(
-                        "benchmark_environment_key_verified"
-                    )
+                    "pass": validation_account_before.get("benchmark_environment_key_verified")
                     is True
-                    and validation_account_after.get(
-                        "benchmark_environment_key_verified"
-                    )
-                    is True,
+                    and validation_account_after.get("benchmark_environment_key_verified") is True,
                     "detail": "environment key fingerprint verified in canary snapshots",
                 },
                 {
@@ -1869,8 +1766,7 @@ def main() -> int:
                 },
                 {
                     "name": "canary OpenRouter BYOK 用量为零",
-                    "pass": validation_after_byok_usage
-                    == validation_before_byok_usage,
+                    "pass": validation_after_byok_usage == validation_before_byok_usage,
                     "detail": "validation byok_usage delta must be exactly zero",
                 },
             ]
@@ -1898,8 +1794,7 @@ def main() -> int:
                 )
                 validation_settlement_valid = bool(
                     validation_attempts >= 1
-                    and validation_observed + validation_tolerance
-                    >= validation_expected
+                    and validation_observed + validation_tolerance >= validation_expected
                 )
                 validation_settlement_detail = (
                     f"attempts={validation_attempts}, expected={validation_expected}, "
@@ -1975,9 +1870,7 @@ def main() -> int:
         if args.require_clean_source_now:
             repo = Path(__file__).resolve().parents[2]
             source_paths = ("scripts", "src", "configs", "pyproject.toml")
-            expected_head = str(
-                (manifest.get("source_provenance") or {}).get("git_head") or ""
-            )
+            expected_head = str((manifest.get("source_provenance") or {}).get("git_head") or "")
             try:
                 current_head = subprocess.run(
                     ["git", "rev-parse", "HEAD"],
@@ -2041,29 +1934,18 @@ def main() -> int:
         )
         compatibility = manifest.get("run_compatibility")
         fingerprints = (
-            compatibility.get("fingerprints")
-            if isinstance(compatibility, dict)
-            else None
+            compatibility.get("fingerprints") if isinstance(compatibility, dict) else None
         )
-        contracts = (
-            compatibility.get("contracts")
-            if isinstance(compatibility, dict)
-            else None
-        )
+        contracts = compatibility.get("contracts") if isinstance(compatibility, dict) else None
         manifest_fingerprint = (
-            str(fingerprints.get("B2") or "")
-            if isinstance(fingerprints, dict)
-            else ""
+            str(fingerprints.get("B2") or "") if isinstance(fingerprints, dict) else ""
         )
         manifest_contract = contracts.get("B2") if isinstance(contracts, dict) else None
         contract_fingerprint = (
-            canonical_json_sha256(manifest_contract)
-            if isinstance(manifest_contract, dict)
-            else ""
+            canonical_json_sha256(manifest_contract) if isinstance(manifest_contract, dict) else ""
         )
         artifact_fingerprints = {
-            str(row.get("run_compatibility_fingerprint") or "")
-            for row in [*rows, *trace_rows]
+            str(row.get("run_compatibility_fingerprint") or "") for row in [*rows, *trace_rows]
         }
         checks.append(
             {
@@ -2090,51 +1972,34 @@ def main() -> int:
             else ""
         )
         routing_matches = isinstance(routing, dict) and all(
-            routing.get(model) == provider
-            for model, provider in EXPECTED_PROVIDER_ROUTING.items()
+            routing.get(model) == provider for model, provider in EXPECTED_PROVIDER_ROUTING.items()
         )
         runtime_provider = runtime.get("provider") if isinstance(runtime, dict) else None
         runtime_strict = (
-            runtime.get("provider_routing_strict")
-            if isinstance(runtime, dict)
-            else None
+            runtime.get("provider_routing_strict") if isinstance(runtime, dict) else None
         )
         runtime_stream_errors = (
-            runtime.get("stream_error_frames")
-            if isinstance(runtime, dict)
-            else None
+            runtime.get("stream_error_frames") if isinstance(runtime, dict) else None
         )
         runtime_router_metadata = (
-            runtime.get("router_metadata_required")
-            if isinstance(runtime, dict)
-            else None
+            runtime.get("router_metadata_required") if isinstance(runtime, dict) else None
         )
         runtime_require_parameters = (
             runtime.get("require_parameters") if isinstance(runtime, dict) else None
         )
         runtime_response_cache_disabled = (
-            runtime.get("response_cache_disabled")
-            if isinstance(runtime, dict)
-            else None
+            runtime.get("response_cache_disabled") if isinstance(runtime, dict) else None
         )
         runtime_cache_namespace_enabled = (
-            runtime.get("cache_namespace_enabled")
-            if isinstance(runtime, dict)
-            else None
+            runtime.get("cache_namespace_enabled") if isinstance(runtime, dict) else None
         )
         runtime_cache_namespace_required = (
-            runtime.get("cache_namespace_required")
-            if isinstance(runtime, dict)
-            else None
+            runtime.get("cache_namespace_required") if isinstance(runtime, dict) else None
         )
         runtime_cache_namespace_sha256 = (
-            str(runtime.get("cache_namespace_sha256") or "")
-            if isinstance(runtime, dict)
-            else ""
+            str(runtime.get("cache_namespace_sha256") or "") if isinstance(runtime, dict) else ""
         )
-        expected_cache_namespace_enabled = bool(
-            args.expected_cache_namespace_sha256
-        )
+        expected_cache_namespace_enabled = bool(args.expected_cache_namespace_sha256)
         runtime_base_url = runtime.get("base_url") if isinstance(runtime, dict) else None
         runtime_base_url_from_env = (
             runtime.get("base_url_from_env") if isinstance(runtime, dict) else None
@@ -2145,8 +2010,7 @@ def main() -> int:
             runtime.get("ambient_proxies") if isinstance(runtime, dict) else None
         )
         runtime_key_matches = bool(
-            isinstance(runtime, dict)
-            and runtime.get("api_key_sha256") == expected_key_fingerprint
+            isinstance(runtime, dict) and runtime.get("api_key_sha256") == expected_key_fingerprint
         )
         runtime_pass = bool(
             isinstance(runtime, dict)
@@ -2156,12 +2020,9 @@ def main() -> int:
             and runtime.get("router_metadata_required") is True
             and runtime.get("require_parameters") is True
             and runtime.get("response_cache_disabled") is True
-            and runtime.get("cache_namespace_enabled")
-            is expected_cache_namespace_enabled
-            and runtime.get("cache_namespace_required")
-            is expected_cache_namespace_enabled
-            and runtime_cache_namespace_sha256
-            == args.expected_cache_namespace_sha256
+            and runtime.get("cache_namespace_enabled") is expected_cache_namespace_enabled
+            and runtime.get("cache_namespace_required") is expected_cache_namespace_enabled
+            and runtime_cache_namespace_sha256 == args.expected_cache_namespace_sha256
             and runtime.get("base_url") == EXPECTED_OPENROUTER_BASE_URL
             and runtime.get("base_url_from_env") is False
             and runtime.get("proxy") == ""
@@ -2232,9 +2093,7 @@ def main() -> int:
             else None
         )
         validation_contract = (
-            validation_contracts.get("B2")
-            if isinstance(validation_contracts, dict)
-            else None
+            validation_contracts.get("B2") if isinstance(validation_contracts, dict) else None
         )
         validation_runtime = (
             validation_contract.get("resolved_llm_runtime")
@@ -2316,7 +2175,7 @@ def main() -> int:
             "tool_mode": tools.get("mode"),
         }
         config_pass = bool(
-            effective_config.get("profile_id") == "opensquilla_b2_quality_first_v1"
+            effective_config.get("profile_id") == "opensquilla_b2_quality_first_v2"
             and effective_config.get("group") == "B2"
             and proposers == EXPECTED_PROPOSERS
             and aggregator == EXPECTED_AGGREGATOR
@@ -2370,7 +2229,7 @@ def main() -> int:
     metrics = None
     if args.summary:
         summary = json.loads(args.summary.read_text(encoding="utf-8"))
-        metrics = ((summary.get("groups") or {}).get("B2") or {})
+        metrics = (summary.get("groups") or {}).get("B2") or {}
         summary_pass = bool(
             int(number(metrics.get("rows"))) == args.expected_tasks
             and int(number(metrics.get("completed"))) == args.expected_tasks
@@ -2438,9 +2297,7 @@ def main() -> int:
         }
     )
     external_preflight_call_count = benchmark_preflight_counts.get("web_search", 0)
-    validation_external_preflight_call_count = validation_preflight_counts.get(
-        "web_search", 0
-    )
+    validation_external_preflight_call_count = validation_preflight_counts.get("web_search", 0)
     launcher_external_preflight_call_count = (
         external_preflight_call_count + validation_external_preflight_call_count
     )
@@ -2473,9 +2330,7 @@ def main() -> int:
                 ),
                 "tool_call_count": int(number(row.get("total_tool_call_count"))),
                 "quality_total": number(row.get("quality_total")),
-                "generation_cost_usd": number(
-                    row.get("generation_attempt_total_billed_cost")
-                ),
+                "generation_cost_usd": number(row.get("generation_attempt_total_billed_cost")),
                 "total_elapsed_ms": int(number(row.get("total_elapsed_ms"))),
             }
         )
@@ -2528,10 +2383,7 @@ def main() -> int:
                 )
                 settlement_matches = bool(
                     abs(settlement_expected - total_cost_decimal) <= tolerance
-                    and abs(
-                        settlement_observed
-                        - decimal_number(args.account_usage_delta_usd)
-                    )
+                    and abs(settlement_observed - decimal_number(args.account_usage_delta_usd))
                     <= tolerance
                 )
                 settlement_match_detail = (
@@ -2587,9 +2439,7 @@ def main() -> int:
         "manifest": str(args.manifest) if args.manifest else None,
         "effective_config": str(args.effective_config) if args.effective_config else None,
         "reference_effective_config": (
-            str(args.reference_effective_config)
-            if args.reference_effective_config
-            else None
+            str(args.reference_effective_config) if args.reference_effective_config else None
         ),
         "configuration_summary": configuration_summary,
         "summary": str(args.summary) if args.summary else None,
@@ -2613,28 +2463,16 @@ def main() -> int:
         "all_provider_recorded_cost_lower_bound_usd": total_cost,
         "external_paid_tool_cost_usd": None,
         "external_preflight_call_count": external_preflight_call_count,
-        "validation_external_preflight_call_count": (
-            validation_external_preflight_call_count
-        ),
-        "launcher_external_preflight_call_count": (
-            launcher_external_preflight_call_count
-        ),
+        "validation_external_preflight_call_count": (validation_external_preflight_call_count),
+        "launcher_external_preflight_call_count": (launcher_external_preflight_call_count),
         "observed_web_search_invocations": observed_web_search_invocations,
         "observed_web_fetch_invocations": observed_web_fetch_invocations,
-        "external_unpriced_tool_call_count_upper_bound": (
-            external_unpriced_call_upper_bound
-        ),
-        "average_generation_cost_per_task_usd": round(
-            generation_cost / args.expected_tasks, 9
-        ),
-        "average_judge_cost_per_task_usd": round(
-            judge_cost / args.expected_tasks, 9
-        ),
+        "external_unpriced_tool_call_count_upper_bound": (external_unpriced_call_upper_bound),
+        "average_generation_cost_per_task_usd": round(generation_cost / args.expected_tasks, 9),
+        "average_judge_cost_per_task_usd": round(judge_cost / args.expected_tasks, 9),
         "average_total_cost_per_task_usd": round(total_cost / args.expected_tasks, 9),
         "ensemble_calls_per_iteration": ensemble_calls_per_iteration,
-        "average_llm_requests_per_task": round(
-            len(generation_calls) / args.expected_tasks, 6
-        ),
+        "average_llm_requests_per_task": round(len(generation_calls) / args.expected_tasks, 6),
         "average_ensemble_iterations_per_task": round(
             len(generation_calls) / ensemble_calls_per_iteration / args.expected_tasks, 6
         ),
@@ -2643,8 +2481,7 @@ def main() -> int:
         "multi_iteration_tasks": sum(value > 1 for value in iteration_counts),
         "total_tool_calls": sum(item["tool_call_count"] for item in task_summaries),
         "average_tool_calls_per_task": round(
-            sum(item["tool_call_count"] for item in task_summaries)
-            / args.expected_tasks,
+            sum(item["tool_call_count"] for item in task_summaries) / args.expected_tasks,
             6,
         ),
         "task_summaries": task_summaries,
@@ -2664,17 +2501,13 @@ def main() -> int:
         "account_before": str(args.account_before) if args.account_before else None,
         "account_after": str(args.account_after) if args.account_after else None,
         "validation_account_before": (
-            str(args.validation_account_before)
-            if args.validation_account_before
-            else None
+            str(args.validation_account_before) if args.validation_account_before else None
         ),
         "validation_account_after": (
             str(args.validation_account_after) if args.validation_account_after else None
         ),
         "validation_account_usage_delta_usd": (
-            float(validation_account_delta)
-            if validation_account_delta is not None
-            else None
+            float(validation_account_delta) if validation_account_delta is not None else None
         ),
         "launcher_account_usage_delta_usd": (
             float(launcher_account_delta) if launcher_account_delta is not None else None
@@ -2689,9 +2522,7 @@ def main() -> int:
         "judge_protocol_issues": judge_protocol_issues,
         "tool_trace_issues": tool_trace_issues,
         "successful_tool_names": dict(sorted(successful_tool_names.items())),
-        "selected_successful_tool_names": dict(
-            sorted(selected_successful_tool_names.items())
-        ),
+        "selected_successful_tool_names": dict(sorted(selected_successful_tool_names.items())),
         "selected_failed_tool_names": dict(sorted(selected_failed_tool_names.items())),
         "selected_tool_failure_rate": selected_tool_failure_rate,
         "max_selected_tool_failure_rate": args.max_selected_tool_failure_rate,
