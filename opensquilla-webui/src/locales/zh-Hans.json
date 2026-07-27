@@ -3332,6 +3332,8 @@
       "activityDetailsTitle": "详情",
       "activityBytesWritten": "已写入 {size}",
       "activityContentSize": "{lines} 行 · {characters} 个字符",
+      "activityExitCode": "退出码 {code}",
+      "activityNotCompleted": "未通过",
       "activityPublished": "已发布"
     }
   },

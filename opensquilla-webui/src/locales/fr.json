@@ -3332,6 +3332,8 @@
       "activityDetailsTitle": "détails",
       "activityBytesWritten": "{size} écrits",
       "activityContentSize": "{lines} lignes · {characters} caractères",
+      "activityExitCode": "Code de sortie {code}",
+      "activityNotCompleted": "Non terminé",
       "activityPublished": "Publié"
     }
   },

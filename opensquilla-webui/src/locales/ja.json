@@ -3332,6 +3332,8 @@
       "activityDetailsTitle": "詳細",
       "activityBytesWritten": "{size} を書き込み",
       "activityContentSize": "{lines} 行 · {characters} 文字",
+      "activityExitCode": "終了コード {code}",
+      "activityNotCompleted": "完了できませんでした",
       "activityPublished": "公開済み"
     }
   },
