@@ -608,6 +608,25 @@ def test_ci_change_classifier_routes_source_and_forced_dist_to_the_same_guard(
     )
 
 
+def test_ci_change_classifier_routes_client_sdk_to_python_and_frontend(
+    tmp_path: Path,
+) -> None:
+    outputs = _classify_changed_files(
+        tmp_path,
+        [
+            "contracts/client/v3/protocol.schema.json",
+            "packages/client-sdk/src/generated.ts",
+        ],
+    )
+
+    assert outputs == _expected_classifier_outputs(
+        runtime_changed="true",
+        frontend_changed="true",
+        python_changed="true",
+        build_wheel_required="true",
+    )
+
+
 def test_ci_change_classifier_tracks_ci_dependency_and_release_changes(tmp_path: Path) -> None:
     outputs = _classify_changed_files(
         tmp_path,
@@ -991,6 +1010,21 @@ def test_default_ci_uses_layered_job_conditions() -> None:
     assert "ubuntu-full" in jobs["ci-result"]["needs"]
     assert "macos-recovery" in jobs["ci-result"]["needs"]
     assert "desktop-recovery-e2e" in jobs["ci-result"]["needs"]
+
+    frontend_steps = jobs["frontend-check"]["steps"]
+    sdk_step = next(
+        step
+        for step in frontend_steps
+        if step.get("name") == "Validate independent client SDK"
+    )
+    assert "npm run typecheck" in sdk_step["run"]
+    assert "npm run verify:package" in sdk_step["run"]
+
+    quality_steps = jobs["ubuntu-quality"]["steps"]
+    contract_step = next(
+        step for step in quality_steps if step.get("name") == "Verify generated client contracts"
+    )
+    assert "generate_client_contracts.py --check" in contract_step["run"]
 
 
 def test_ci_result_gate_covers_every_conditional_job_and_classifier_flag() -> None:

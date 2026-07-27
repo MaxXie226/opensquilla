@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "build:client-sdk": "tsc -p ../packages/client-sdk/tsconfig.json",
     "build": "npm run typecheck && npm run build:artifact",
     "build:artifact": "vite build && node scripts/normalize-dist.mjs && node scripts/check-theme-bundle.mjs && node scripts/check-runtime-bundle.mjs && node scripts/verify-dist.mjs --write",
     "verify:dist": "node scripts/verify-dist.mjs",
@@ -12,8 +13,8 @@
     "preview": "vite preview",
     "check:architecture": "node scripts/check-architecture.mjs && node scripts/check-chat-security.mjs && node scripts/check-webui-colors.mjs && node scripts/check-webui-motion.mjs && node scripts/check-webui-radius.mjs && node scripts/check-theme-contract.mjs && node scripts/check-theme-scope.mjs && node scripts/check-cross-surface-tokens.mjs && node scripts/check-i18n.mjs && node scripts/check-channel-catalog-i18n.mjs && node scripts/check-readme-locales.mjs",
     "check:readme-locales": "node scripts/check-readme-locales.mjs",
-    "typecheck": "npm run check:architecture && vue-tsc --noEmit",
-    "test:unit": "vitest run",
+    "typecheck": "npm run build:client-sdk && npm run check:architecture && vue-tsc --noEmit",
+    "test:unit": "npm run build:client-sdk && vitest run",
     "test:unit:watch": "vitest",
     "test:e2e": "playwright test",
     "test:e2e:ui": "playwright test --ui",
@@ -23,6 +24,7 @@
     "node": ">=22.12.0"
   },
   "dependencies": {
+    "@opensquilla/client-sdk": "file:../packages/client-sdk",
     "@types/dompurify": "^3.0.5",
     "dompurify": "^3.4.11",
     "highlight.js": "^11.11.1",

@@ -105,7 +105,20 @@ jobs:
         with:
           node-version-file: opensquilla-webui/.node-version
           cache: 'npm'
-          cache-dependency-path: opensquilla-webui/package-lock.json
+          cache-dependency-path: |
+            packages/client-sdk/package-lock.json
+            opensquilla-webui/package-lock.json
+
+      - name: Install client SDK dependencies
+        working-directory: packages/client-sdk
+        run: npm ci
+
+      - name: Validate independent client SDK
+        working-directory: packages/client-sdk
+        run: |
+          npm run typecheck
+          npm test
+          npm run verify:package
 
       - name: Install frontend dependencies
         working-directory: opensquilla-webui
@@ -338,9 +351,22 @@ jobs:
         shell: bash
         run: uv sync --extra dev --extra recommended --extra mcp --frozen
 
+      - name: Verify generated client contracts
+        shell: bash
+        run: uv run python scripts/generate_client_contracts.py --check
+
+      - name: Test client contract generation
+        shell: bash
+        run: |
+          uv run pytest \
+            tests/test_contracts \
+            tests/test_scripts/test_export_gateway_client_contract.py \
+            tests/test_scripts/test_generate_client_contracts.py \
+            -q
+
       - name: Lint
         shell: bash
-        run: uv run ruff check src tests
+        run: uv run ruff check src tests scripts/generate_client_contracts.py
 
       - name: Type check
         shell: bash

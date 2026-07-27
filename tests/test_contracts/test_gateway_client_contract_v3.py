@@ -174,7 +174,7 @@ def test_rpc_snapshot_comes_from_complete_locked_registry() -> None:
 
     assert registry.registration_locked is True
     assert contract["source"] == "locked-rpc-registry"
-    assert contract["method_count"] == len(rows) == 206
+    assert contract["method_count"] == len(rows) == 207
     assert [row["name"] for row in rows] == registry.methods()
     assert [row["name"] for row in rows] == sorted(row["name"] for row in rows)
     assert [

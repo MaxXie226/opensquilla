@@ -1,6 +1,6 @@
 {
   "completeness": "method-names-and-required-scopes-only",
-  "method_count": 206,
+  "method_count": 207,
   "methods": [
     {
       "name": "agent",
@@ -440,6 +440,10 @@
     },
     {
       "name": "onboarding.llmProfile.activate",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "onboarding.llmProfile.active.remove",
       "required_scope": "operator.admin"
     },
     {

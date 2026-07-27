@@ -25,7 +25,7 @@
     "gateway.artifacts"
   ],
   "contract": {
-    "digest": "sha256:0d06af1e696bfd22bb23aa341252a7cff14f1b980678be312bb84204b75d3239",
+    "digest": "sha256:5f5a5ab81b3b7ec23ca6dc1e30d520bfe5b6eb214d11f39c15bd741e77b0cf0a",
     "generatedFrom": "gateway",
     "schemaVersion": 1
   },
@@ -154,6 +154,7 @@
       "onboarding.ensemble.configure",
       "onboarding.imageGeneration.configure",
       "onboarding.llmProfile.activate",
+      "onboarding.llmProfile.active.remove",
       "onboarding.llmProfile.credential.clear",
       "onboarding.llmProfile.draft.models.discover",
       "onboarding.llmProfile.draft.probe",

@@ -18,6 +18,7 @@ from pydantic import TypeAdapter
 from starlette.applications import Starlette
 from starlette.routing import Mount, Route, WebSocketRoute
 
+from opensquilla.contracts.client import EVENT_PATTERNS
 from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.contract_identity import (
     CONTRACT_GENERATED_FROM,
@@ -96,11 +97,6 @@ CONTRACT_DIGEST_PATHS = (
     PurePosixPath("http-routes.json"),
     PurePosixPath("golden/connect.json"),
     PurePosixPath("golden/error.json"),
-)
-
-EVENT_PATTERNS = (
-    "session.event.*",
-    "task.*",
 )
 
 # Exact non-internal events registered by the current Web UI through

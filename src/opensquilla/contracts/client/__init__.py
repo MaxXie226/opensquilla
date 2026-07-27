@@ -1,13 +1,15 @@
-"""Gateway compatibility facade for the shared client protocol."""
+"""Implementation-free client protocol owned by the shared contract layer."""
 
-from __future__ import annotations
-
-from typing import Any
-
-from opensquilla.contracts.client import (
-    DECLARED_EVENTS,
-    DEDUPE_MAX_ENTRIES,
-    DEDUPE_TTL_MS,
+from opensquilla.contracts.client.envelope import (
+    EventFrame,
+    PingFrame,
+    PongFrame,
+    ReqFrame,
+    ResFrame,
+    StateVersion,
+)
+from opensquilla.contracts.client.errors import (
+    DECLARED_ERROR_CODES,
     ERROR_AGENT_TIMEOUT,
     ERROR_APPROVAL_NOT_FOUND,
     ERROR_INVALID_REQUEST,
@@ -17,6 +19,12 @@ from opensquilla.contracts.client import (
     ERROR_NOT_PAIRED,
     ERROR_UNAUTHORIZED,
     ERROR_UNAVAILABLE,
+    ErrorShape,
+)
+from opensquilla.contracts.client.events import DECLARED_EVENTS, EVENT_PATTERNS
+from opensquilla.contracts.client.hello import (
+    DEDUPE_MAX_ENTRIES,
+    DEDUPE_TTL_MS,
     HEALTH_REFRESH_INTERVAL_MS,
     MAX_BUFFERED_BYTES,
     MAX_PAYLOAD_BYTES,
@@ -28,23 +36,17 @@ from opensquilla.contracts.client import (
     ClientInfo,
     ConnectParams,
     ContractInfo,
-    ErrorShape,
-    EventFrame,
     FeaturesInfo,
     HelloOk,
-    PingFrame,
     PolicyInfo,
-    PongFrame,
     ProtocolRangeInfo,
-    ReqFrame,
-    ResFrame,
     RuntimeInfo,
     ServerInfo,
     SnapshotInfo,
-    StateVersion,
 )
 
 __all__ = [
+    "DECLARED_ERROR_CODES",
     "DECLARED_EVENTS",
     "DEDUPE_MAX_ENTRIES",
     "DEDUPE_TTL_MS",
@@ -57,6 +59,7 @@ __all__ = [
     "ERROR_NOT_PAIRED",
     "ERROR_UNAUTHORIZED",
     "ERROR_UNAVAILABLE",
+    "EVENT_PATTERNS",
     "HEALTH_REFRESH_INTERVAL_MS",
     "MAX_BUFFERED_BYTES",
     "MAX_PAYLOAD_BYTES",
@@ -82,43 +85,4 @@ __all__ = [
     "ServerInfo",
     "SnapshotInfo",
     "StateVersion",
-    "make_error_res",
-    "make_event",
-    "make_ok_res",
 ]
-
-
-def make_error_res(
-    req_id: str,
-    code: str,
-    message: str,
-    retryable: bool = False,
-    details: Any | None = None,
-    retry_after_ms: int | None = None,
-    accepted: bool | None = None,
-) -> ResFrame:
-    return ResFrame(
-        id=req_id,
-        ok=False,
-        error=ErrorShape(
-            code=code,
-            message=message,
-            retryable=retryable,
-            retry_after_ms=retry_after_ms,
-            accepted=accepted,
-            details=details,
-        ),
-    )
-
-
-def make_ok_res(req_id: str, payload: Any = None) -> ResFrame:
-    return ResFrame(id=req_id, ok=True, payload=payload)
-
-
-def make_event(
-    event: str,
-    payload: Any = None,
-    seq: int | None = None,
-    meta: dict[str, Any] | None = None,
-) -> EventFrame:
-    return EventFrame(event=event, payload=payload, seq=seq, meta=meta)
