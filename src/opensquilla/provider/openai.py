@@ -4872,6 +4872,13 @@ class OpenAIProvider:
                         billing_receipt=billing_receipt,
                     )
 
+        except asyncio.CancelledError:
+            trace.record_error(
+                code="cancelled",
+                message="Provider request cancelled",
+                metadata={"phase": "stream", "cache_shape": cache_shape},
+            )
+            raise
         except httpx.TimeoutException as exc:
             safe_error = redact_upstream_error_text(
                 f"Request timed out: {str(exc) or repr(exc)}",

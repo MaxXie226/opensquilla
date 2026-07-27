@@ -1092,6 +1092,81 @@ def test_openai_compatible_provider_writes_llm_trace(monkeypatch: Any, tmp_path:
     assert rows[-1]["assistant_text"] == "ok"
 
 
+def test_openai_compatible_provider_terminalizes_cancelled_stream_trace(
+    monkeypatch: Any,
+    tmp_path: Any,
+) -> None:
+    trace_path = tmp_path / "cancelled-llm-calls.jsonl"
+    stream_started = asyncio.Event()
+
+    class BlockingResponse:
+        status_code = 200
+        headers: dict[str, str] = {}
+
+        async def aiter_lines(self):
+            stream_started.set()
+            await asyncio.Event().wait()
+            yield ""  # pragma: no cover
+
+    class BlockingStream:
+        async def __aenter__(self) -> BlockingResponse:
+            return BlockingResponse()
+
+        async def __aexit__(self, *_exc: Any) -> None:
+            return None
+
+    class BlockingClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> BlockingClient:
+            return self
+
+        async def __aexit__(self, *_exc: Any) -> None:
+            return None
+
+        def stream(self, *args: Any, **kwargs: Any) -> BlockingStream:
+            return BlockingStream()
+
+    monkeypatch.setenv("OPENSQUILLA_LLM_TRACE_RECORDER", "full")
+    monkeypatch.setenv("OPENSQUILLA_LLM_TRACE_PATH", str(trace_path))
+    monkeypatch.setattr(
+        "opensquilla.provider.openai.httpx.AsyncClient",
+        BlockingClient,
+    )
+    provider = OpenAIProvider(
+        api_key="test",
+        model="qwen3.7-flash-2026-07-15",
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        provider_kind="dashscope",
+    )
+
+    async def _run() -> None:
+        consume_task = asyncio.create_task(
+            anext(
+                provider.chat(
+                    [Message(role="user", content="hi")],
+                    config=ChatConfig(),
+                )
+            )
+        )
+        await asyncio.wait_for(stream_started.wait(), timeout=1.0)
+        consume_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await consume_task
+
+    asyncio.run(_run())
+
+    rows = [
+        json.loads(line)
+        for line in trace_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [row["event"] for row in rows] == ["llm.request", "llm.error"]
+    assert rows[0]["call_id"] == rows[1]["call_id"]
+    assert rows[1]["code"] == "cancelled"
+    assert rows[1]["metadata"]["phase"] == "stream"
+
+
 def test_llm_trace_request_metadata_carries_compaction_proof(
     monkeypatch: Any, tmp_path: Any
 ) -> None:
