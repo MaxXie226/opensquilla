@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import ArtifactPreviewPanel from './ArtifactPreviewPanel.vue'
 import en from '@/locales/en.json'
 import type { ArtifactPayload } from '@/types/rpc'
+import { ARTIFACT_PREVIEW_ESCAPE_MESSAGE } from '@/utils/workbench/artifactPreview'
 
 function artifact(overrides: Partial<ArtifactPayload> = {}): ArtifactPayload {
   return {
@@ -72,6 +73,7 @@ describe('ArtifactPreviewPanel', () => {
     expect(frame?.getAttribute('sandbox')).toBe('allow-scripts')
     expect(frame?.getAttribute('sandbox')).not.toContain('allow-same-origin')
     expect(frame?.getAttribute('referrerpolicy')).toBe('no-referrer')
+    expect(frame?.getAttribute('tabindex')).toBe('0')
     expect(createObjectUrl).toHaveBeenCalledOnce()
     expect(await observed.blob?.text()).toContain("connect-src 'none'")
 
@@ -93,6 +95,71 @@ describe('ArtifactPreviewPanel', () => {
 
     expect(mounted.element.querySelector('.artifact-preview__toolbar')).toBeNull()
     expect(mounted.element.querySelector('.artifact-preview__text')?.textContent).toBe('plain text')
+    mounted.unmount()
+  })
+
+  it('opens PDFs fitted to the panel width without disabling frame interaction', async () => {
+    const onWorkbenchEvent = vi.fn()
+    vi.spyOn(URL, 'createObjectURL').mockReturnValue('about:blank?pdf-preview')
+    vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(
+      new Uint8Array([0x25, 0x50, 0x44, 0x46]),
+      { status: 200, headers: { 'Content-Type': 'application/pdf' } },
+    )))
+
+    const mounted = mountPanel({
+      artifact: artifact({ name: 'report.pdf', mime: 'application/pdf' }),
+      onWorkbenchEvent,
+    })
+    await settlePreview()
+
+    const frame = mounted.element.querySelector<HTMLIFrameElement>(
+      '.artifact-preview__frame--pdf',
+    )!
+    expect(frame.getAttribute('src')).toBe(
+      'about:blank?pdf-preview#zoom=page-width&view=FitH',
+    )
+    expect(frame.getAttribute('aria-hidden')).toBeNull()
+    expect(frame.getAttribute('tabindex')).toBe('0')
+    expect(frame.classList.contains('is-mobile-inert')).toBe(false)
+
+    const frameExit = mounted.element.querySelector<HTMLButtonElement>(
+      '.artifact-preview__frame-exit',
+    )!
+    expect(frame.compareDocumentPosition(frameExit) & Node.DOCUMENT_POSITION_FOLLOWING)
+      .toBeTruthy()
+    expect(frameExit.textContent?.trim()).toBe('Collapse workbench')
+    frameExit.focus()
+    expect(document.activeElement).toBe(frameExit)
+    frameExit.click()
+    expect(onWorkbenchEvent).toHaveBeenCalledWith({ type: 'request-collapse' })
+    mounted.unmount()
+  })
+
+  it('bridges Escape from an opaque HTML frame back to the Workbench', async () => {
+    const onWorkbenchEvent = vi.fn()
+    vi.spyOn(URL, 'createObjectURL').mockReturnValue('about:blank')
+    vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(
+      '<!doctype html><p>Preview</p>',
+      { status: 200, headers: { 'Content-Type': 'text/html' } },
+    )))
+
+    const mounted = mountPanel({
+      artifact: artifact(),
+      onWorkbenchEvent,
+    })
+    await settlePreview()
+    const frame = mounted.element.querySelector<HTMLIFrameElement>(
+      '.artifact-preview__frame--html',
+    )!
+
+    window.dispatchEvent(new MessageEvent('message', {
+      data: ARTIFACT_PREVIEW_ESCAPE_MESSAGE,
+      source: frame.contentWindow,
+    }))
+
+    expect(onWorkbenchEvent).toHaveBeenCalledWith({ type: 'request-collapse' })
     mounted.unmount()
   })
 
@@ -138,4 +205,25 @@ describe('ArtifactPreviewPanel', () => {
     expect(mounted.element.textContent).toContain('no longer matches its recorded checksum')
     mounted.unmount()
   })
+
+  it.each([
+    ['error', 'Preview failed'],
+    ['crashed', 'The preview stopped'],
+  ] as const)(
+    'renders the native %s state in the DOM recovery surface',
+    async (nativeSurfaceState, expectedTitle) => {
+      vi.stubGlobal('fetch', vi.fn(() => new Promise<Response>(() => undefined)))
+
+      const mounted = mountPanel({
+        artifact: artifact(),
+        nativeHtml: true,
+        nativeSurfaceState,
+      })
+      await settlePreview()
+
+      expect(mounted.element.textContent).toContain(expectedTitle)
+      expect(mounted.element.querySelector('[role="alert"]')).not.toBeNull()
+      mounted.unmount()
+    },
+  )
 })

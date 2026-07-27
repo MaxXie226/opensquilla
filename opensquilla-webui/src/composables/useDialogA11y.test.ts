@@ -288,4 +288,56 @@ describe('useDialogA11y modal stack', () => {
     expect(hasOpenDialogLayer()).toBe(false)
     expect(occlusionState()).toBe('false')
   })
+
+  it('keeps embedded document frames in the dialog focus cycle', async () => {
+    const Host = defineComponent({
+      setup() {
+        const open = ref(false)
+        const root = ref<HTMLElement | null>(null)
+        useDialogA11y(root, open, () => { open.value = false })
+        return () => h('div', [
+          h('button', {
+            id: 'frame-dialog-trigger',
+            onClick: () => { open.value = true },
+          }, 'Open frame dialog'),
+          open.value
+            ? h('section', { ref: root, role: 'dialog' }, [
+                h('button', { id: 'frame-dialog-first' }, 'First'),
+                h('iframe', {
+                  id: 'frame-dialog-preview',
+                  src: 'about:blank',
+                  title: 'Preview',
+                  tabindex: '0',
+                }),
+              ])
+            : null,
+        ])
+      },
+    })
+
+    const root = document.createElement('div')
+    document.body.appendChild(root)
+    app = createApp(Host)
+    app.mount(root)
+
+    document.querySelector<HTMLButtonElement>('#frame-dialog-trigger')!.click()
+    await nextTick()
+    await nextTick()
+
+    const first = document.querySelector<HTMLButtonElement>('#frame-dialog-first')!
+    const frame = document.querySelector<HTMLIFrameElement>('#frame-dialog-preview')!
+    expect(document.activeElement).toBe(first)
+
+    frame.focus()
+    expect(document.activeElement).toBe(frame)
+    const tab = new KeyboardEvent('keydown', {
+      key: 'Tab',
+      bubbles: true,
+      cancelable: true,
+    })
+    document.dispatchEvent(tab)
+
+    expect(tab.defaultPrevented).toBe(true)
+    expect(document.activeElement).toBe(first)
+  })
 })

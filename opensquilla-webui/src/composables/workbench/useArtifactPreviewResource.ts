@@ -32,6 +32,7 @@ export type ArtifactPreviewErrorCode =
   | 'integrity-error'
   | 'invalid-content'
   | 'missing-url'
+  | 'native-error'
   | 'native-crashed'
   | 'offline'
   | 'too-large'
@@ -70,6 +71,7 @@ export interface ArtifactPreviewResourceController {
   dispose: () => void
   load: () => Promise<void>
   markNativeCrashed: () => void
+  markNativeError: () => void
   reload: () => Promise<void>
   resume: () => Promise<void>
   suspend: () => void
@@ -449,6 +451,14 @@ export function createArtifactPreviewResource(
     progress.value = null
   }
 
+  function markNativeError() {
+    if (disposed) return
+    abortActive()
+    state.value = 'error'
+    errorCode.value = 'native-error'
+    progress.value = null
+  }
+
   function dispose() {
     if (disposed) return
     disposed = true
@@ -471,6 +481,7 @@ export function createArtifactPreviewResource(
     dispose,
     load,
     markNativeCrashed,
+    markNativeError,
     reload,
     resume,
     suspend,

@@ -2,7 +2,10 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createPinia, setActivePinia } from 'pinia'
 import { WORKBENCH_WIDTH_STORAGE_KEY } from './layout'
-import { useWorkbenchStore } from './store'
+import {
+  useWorkbenchStore,
+  WORKBENCH_PREVIEW_ITEM_LIMIT,
+} from './store'
 import type { WorkbenchItem } from './types'
 
 function item(
@@ -80,6 +83,28 @@ describe('workbench store', () => {
     expect(store.findMostRecentItem(candidate =>
       candidate.scope.type === 'workspace',
     )).toBeNull()
+  })
+
+  it('evicts the least recently used preview after the bounded tab limit', () => {
+    const store = useWorkbenchStore()
+    const disposed: string[] = []
+    store.onLifecycle(event => {
+      if (event.type === 'dispose') {
+        disposed.push(`${event.item.id}:${event.reason}`)
+      }
+    })
+
+    for (let index = 0; index < WORKBENCH_PREVIEW_ITEM_LIMIT; index += 1) {
+      store.openItem(item(`preview-${index}`))
+    }
+    store.activateItem('preview-0')
+    store.openItem(item('preview-new'))
+
+    expect(store.items).toHaveLength(WORKBENCH_PREVIEW_ITEM_LIMIT)
+    expect(store.items.some(candidate => candidate.id === 'preview-0')).toBe(true)
+    expect(store.items.some(candidate => candidate.id === 'preview-1')).toBe(false)
+    expect(disposed).toContain('preview-1:evicted')
+    expect(store.activeItemId).toBe('preview-new')
   })
 
   it('updates background item payloads without stealing the active tab', () => {

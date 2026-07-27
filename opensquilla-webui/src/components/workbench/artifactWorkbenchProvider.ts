@@ -31,7 +31,10 @@ import type {
   NativeWorkbenchSurfaceEvent,
   NativeWorkbenchSurfaceRectRequest,
 } from '@/platform/types'
-import type { NativeHtmlArtifactResource } from '@/composables/workbench/useArtifactPreviewResource'
+import type {
+  ArtifactPreviewResourceState,
+  NativeHtmlArtifactResource,
+} from '@/composables/workbench/useArtifactPreviewResource'
 import ArtifactCollectionPanel from './ArtifactCollectionPanel.vue'
 import ArtifactPreviewPanel from './ArtifactPreviewPanel.vue'
 
@@ -44,6 +47,7 @@ interface ArtifactPreviewPanelHandle {
 export interface ArtifactWorkbenchProviderOptions {
   authToken(): string
   baseOrigin: string
+  confirmRemoteResources(): Promise<boolean>
   currentSessionId(): string
   openArtifact(
     artifact: ArtifactPayload,
@@ -68,6 +72,29 @@ function htmlResourcePayload(
   return payload.data instanceof ArrayBuffer && payload.artifact
     ? payload as NativeHtmlArtifactResource
     : null
+}
+
+function previewStatePayload(
+  event: WorkbenchComponentEvent,
+): ArtifactPreviewResourceState | null {
+  const state = event.payload
+  return typeof state === 'string' && [
+    'crashed',
+    'error',
+    'idle',
+    'loading',
+    'missing-resource',
+    'offline',
+    'ready',
+    'suspended',
+    'unsupported',
+  ].includes(state)
+    ? state as ArtifactPreviewResourceState
+    : null
+}
+
+function surfaceError(operation: string, message?: string): Error {
+  return new Error(message ? `${operation}: ${message}` : operation)
 }
 
 function artifactSessionKey(
@@ -170,6 +197,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     this.context.updateRenderState({
       missingResources: false,
       nativeSurfaceState: 'loading',
+      previewState: 'idle',
       remoteResourcesEnabled: false,
     })
   }
@@ -199,6 +227,14 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
       if (artifact) await openArtifactExternally(item, artifact, this.options)
       return
     }
+    if (event.type === 'preview-state-change') {
+      const state = previewStatePayload(event)
+      if (state) {
+        this.context.updateRenderState({ previewState: state })
+        await this.handlePreviewStateChange(state)
+      }
+      return
+    }
     if (event.type === 'native-html-ready') {
       const resource = htmlResourcePayload(event)
       if (resource) await this.createNativeSurface(resource)
@@ -209,12 +245,26 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     this.item = item
     const artifact = artifactFromWorkbenchItem(item)
     if (actionId === 'refresh') {
+      if (!await this.prepareForReload()) return
       await this.component?.reload()
     } else if (actionId === 'toggle-remote-resources') {
       const enabled = !this.remoteResourcesEnabled()
+      if (enabled && !await this.options.confirmRemoteResources()) return
+      if (!this.context.isItemOpen()) return
       this.context.updateRenderState({ remoteResourcesEnabled: enabled })
-      if (this.resource) await this.createNativeSurface(this.resource)
-      else await this.component?.reload()
+      if (this.resource) {
+        const resource = this.resource
+        if (!await this.releaseNativeSurface(false)) {
+          await this.failNativeSurface(
+            surfaceError('Failed to replace the native Workbench surface'),
+          )
+          return
+        }
+        await this.createNativeSurface(resource)
+      } else {
+        if (!await this.prepareForReload()) return
+        await this.component?.reload()
+      }
     } else if (actionId === 'open-external' && artifact) {
       await openArtifactExternally(item, artifact, this.options)
     } else if (actionId === 'download' && artifact) {
@@ -242,9 +292,10 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
       this.context.updateRenderState({ nativeSurfaceState: 'loading' })
     } else if (event.type === 'ready') {
       this.context.updateRenderState({ nativeSurfaceState: 'ready' })
-    } else if (event.type === 'error' || event.type === 'crashed') {
-      this.context.updateRenderState({ nativeSurfaceState: 'crashed' })
-      if (this.rect) await this.setSurfaceRect({ ...this.rect, visible: false })
+    } else if (event.type === 'error') {
+      await this.showNativeFailure('error')
+    } else if (event.type === 'crashed') {
+      await this.showNativeFailure('crashed')
     }
   }
 
@@ -258,13 +309,9 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
   }
 
   async dispose() {
-    this.generation += 1
     this.component = null
+    await this.releaseNativeSurface(true)
     this.rect = null
-    this.resource = null
-    if (!this.createdSurface || !this.context.nativeWorkbenchApi) return
-    this.createdSurface = false
-    await this.context.nativeWorkbenchApi.destroySurface(this.item.id)
   }
 
   private remoteResourcesEnabled(): boolean {
@@ -274,6 +321,12 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
   private async createNativeSurface(resource: NativeHtmlArtifactResource) {
     const nativeApi = this.context.nativeWorkbenchApi
     if (!nativeApi || this.item.hostKind !== 'native-webcontents') return
+    if (this.createdSurface && !await this.releaseNativeSurface(false)) {
+      await this.failNativeSurface(
+        surfaceError('Failed to replace the native Workbench surface'),
+      )
+      return
+    }
     this.resource = resource
     const generation = this.generation + 1
     this.generation = generation
@@ -283,30 +336,37 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
       nativeSurfaceState: 'loading',
     })
 
-    const result = await nativeApi.createSurface({
-      version: 1,
-      surfaceId: this.item.id,
-      kind: 'artifact-html',
-      payload: {
-        data: resource.data.slice(0),
-        name: artifactFileTitle(resource.artifact),
-        mime: 'text/html',
-        scopeId: resource.sessionKey,
-        allowRemoteResources: this.remoteResourcesEnabled(),
-      },
-    })
+    let result
+    try {
+      result = await nativeApi.createSurface({
+        version: 1,
+        surfaceId: this.item.id,
+        kind: 'artifact-html',
+        payload: {
+          data: resource.data.slice(0),
+          name: artifactFileTitle(resource.artifact),
+          mime: 'text/html',
+          scopeId: resource.sessionKey,
+          allowRemoteResources: this.remoteResourcesEnabled(),
+        },
+      })
+    } catch (error) {
+      if (this.generation === generation && this.context.isItemOpen()) {
+        await this.failNativeSurface(error)
+      }
+      return
+    }
     if (this.generation !== generation) return
     if (!this.context.isItemOpen()) {
       this.createdSurface = false
-      if (result.ok) await nativeApi.destroySurface(this.item.id)
+      if (result.ok) {
+        try { await nativeApi.destroySurface(this.item.id) } catch {}
+      }
       return
     }
     if (!result.ok) {
-      this.createdSurface = false
-      this.context.updateRenderState({ nativeSurfaceState: 'crashed' })
-      this.options.pushToast(
-        result.message || this.options.t('workbench.artifactPreview.failedDetail'),
-        { tone: 'danger' },
+      await this.failNativeSurface(
+        surfaceError('Failed to create the native Workbench surface', result.message),
       )
       return
     }
@@ -318,9 +378,9 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     await this.setSurfaceRect(this.rect)
   }
 
-  private async setSurfaceRect(rect: NativeSurfaceRect) {
+  private async setSurfaceRect(rect: NativeSurfaceRect): Promise<boolean> {
     const nativeApi = this.context.nativeWorkbenchApi
-    if (!nativeApi || !this.createdSurface) return
+    if (!nativeApi || !this.createdSurface) return true
     const request: NativeWorkbenchSurfaceRectRequest = {
       surfaceId: this.item.id,
       x: rect.x,
@@ -329,8 +389,110 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
       height: rect.height,
       visible: rect.visible,
     }
-    await nativeApi.setSurfaceRect(request)
-    if (request.visible) await nativeApi.activateSurface(this.item.id)
+    try {
+      const positioned = await nativeApi.setSurfaceRect(request)
+      if (!positioned.ok) {
+        throw surfaceError('Failed to position the native Workbench surface', positioned.message)
+      }
+      if (request.visible) {
+        const activated = await nativeApi.activateSurface(this.item.id)
+        // The scoped API rejects activation after a tab has already suspended.
+        // That means the surface is safely hidden, not that the preview failed.
+        const becameInactive = activated.message === 'Workbench surface is no longer active'
+        if (!activated.ok && !becameInactive) {
+          throw surfaceError('Failed to activate the native Workbench surface', activated.message)
+        }
+      }
+      return true
+    } catch (error) {
+      if (this.context.isItemOpen()) await this.failNativeSurface(error)
+      return false
+    }
+  }
+
+  private async handlePreviewStateChange(state: ArtifactPreviewResourceState) {
+    if (this.item.hostKind !== 'native-webcontents') return
+    if (state === 'loading') {
+      if (!await this.releaseNativeSurface(true)) {
+        await this.failNativeSurface(
+          surfaceError('Failed to reset the native Workbench surface'),
+        )
+        return
+      }
+      this.context.updateRenderState({
+        missingResources: false,
+        nativeSurfaceState: 'loading',
+      })
+      return
+    }
+    if (state === 'error' || state === 'offline' || state === 'unsupported') {
+      await this.showNativeFailure('error')
+    } else if (state === 'crashed') {
+      await this.showNativeFailure('crashed')
+    } else if (state === 'suspended' && this.rect) {
+      await this.setSurfaceRect({ ...this.rect, visible: false })
+    }
+  }
+
+  private async prepareForReload(): Promise<boolean> {
+    if (!await this.releaseNativeSurface(true)) {
+      await this.failNativeSurface(
+        surfaceError('Failed to reset the native Workbench surface'),
+      )
+      return false
+    }
+    this.context.updateRenderState({
+      missingResources: false,
+      nativeSurfaceState: 'loading',
+    })
+    return true
+  }
+
+  private async releaseNativeSurface(clearResource: boolean): Promise<boolean> {
+    this.generation += 1
+    if (clearResource) this.resource = null
+    const nativeApi = this.context.nativeWorkbenchApi
+    if (!nativeApi || !this.createdSurface) {
+      this.createdSurface = false
+      return true
+    }
+
+    if (this.rect) {
+      try {
+        await nativeApi.setSurfaceRect({
+          surfaceId: this.item.id,
+          x: this.rect.x,
+          y: this.rect.y,
+          width: this.rect.width,
+          height: this.rect.height,
+          visible: false,
+        })
+      } catch {}
+    }
+    try {
+      const result = await nativeApi.destroySurface(this.item.id)
+      if (!result.ok) return false
+      this.createdSurface = false
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  private async showNativeFailure(state: 'crashed' | 'error') {
+    await this.releaseNativeSurface(false)
+    this.context.updateRenderState({ nativeSurfaceState: state })
+  }
+
+  private async failNativeSurface(error: unknown) {
+    await this.releaseNativeSurface(false)
+    if (!this.context.isItemOpen()) return
+    this.context.updateRenderState({ nativeSurfaceState: 'error' })
+    this.context.reportError(error)
+    this.options.pushToast(
+      this.options.t('workbench.artifactPreview.failedDetail'),
+      { tone: 'danger' },
+    )
   }
 }
 
@@ -380,12 +542,28 @@ function artifactToolbarItems(
       text: options.t('workbench.artifactPreview.missingShort'),
     })
   }
-  items.push({
-    kind: 'action',
-    id: 'refresh',
-    icon: 'refresh',
-    label: options.t('workbench.refresh'),
-  })
+  const previewState = runtimeStateValue<ArtifactPreviewResourceState>(
+    state,
+    'previewState',
+    'idle',
+  )
+  if ([
+    'idle',
+    'loading',
+    'ready',
+    'missing-resource',
+    'error',
+    'offline',
+    'crashed',
+  ].includes(previewState)) {
+    items.push({
+      kind: 'action',
+      id: 'refresh',
+      icon: 'refresh',
+      label: options.t('workbench.refresh'),
+      disabled: previewState === 'loading',
+    })
+  }
   if (item.hostKind === 'native-webcontents') {
     const enabled = runtimeStateValue(state, 'remoteResourcesEnabled', false)
     items.push({

@@ -103,10 +103,16 @@ export function createArtifactCollectionWorkbenchItem(options: {
 
 export function createArtifactPreviewWorkbenchItem(options: {
   artifact: ArtifactPayload
+  navigationArtifacts?: readonly ArtifactPayload[]
   nativeHtml: boolean
   sessionKey: string
 }): WorkbenchItem {
-  const { artifact, nativeHtml, sessionKey } = options
+  const {
+    artifact,
+    navigationArtifacts = [],
+    nativeHtml,
+    sessionKey,
+  } = options
   const kind = artifactWorkbenchPreviewKind(artifact)
   return {
     id: artifactWorkbenchItemId(sessionKey, artifact),
@@ -114,9 +120,13 @@ export function createArtifactPreviewWorkbenchItem(options: {
     title: artifactFileTitle(artifact),
     scope: { type: 'session', id: sessionKey },
     hostKind: nativeHtml && kind === 'html' ? 'native-webcontents' : 'dom',
-    retention: 'keep-alive',
+    // DOM previews own cancellable fetches and Blob URLs. Recreate them on
+    // activation instead of retaining every opened document indefinitely.
+    // Native HTML surfaces have their own isolated lifecycle and stay mounted.
+    retention: nativeHtml && kind === 'html' ? 'keep-alive' : 'dispose-on-suspend',
     payload: {
       artifact,
+      navigationArtifacts: [...navigationArtifacts],
       resourceIdentity: artifactIdentity(artifact),
       sessionKey,
     },
@@ -144,6 +154,19 @@ export function artifactFromWorkbenchItem(
   return artifact && typeof artifact === 'object'
     ? artifact as ArtifactPayload
     : null
+}
+
+export function navigationArtifactsFromWorkbenchItem(
+  item: WorkbenchItem | null,
+): readonly ArtifactPayload[] {
+  if (item?.kind !== 'artifact-preview') return []
+  const artifacts = item.payload.navigationArtifacts
+  return Array.isArray(artifacts)
+    ? artifacts.filter(
+      (artifact): artifact is ArtifactPayload =>
+        Boolean(artifact) && typeof artifact === 'object',
+    )
+    : []
 }
 
 export function sessionKeyFromWorkbenchItem(item: WorkbenchItem | null): string {

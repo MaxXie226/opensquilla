@@ -503,6 +503,9 @@ export const ARTIFACT_HTML_OFFLINE_CSP = [
   "form-action 'none'",
 ].join('; ')
 
+export const ARTIFACT_PREVIEW_ESCAPE_MESSAGE =
+  'opensquilla:artifact-preview:escape'
+
 function stripUnsafeNavigationMarkup(source: string): string {
   return source
     .replace(/<base\b[^>]*>/gi, '')
@@ -521,9 +524,10 @@ export function buildOfflineArtifactHtml(source: string): string {
   const sanitizedNavigation = stripUnsafeNavigationMarkup(source)
   const csp = `<meta http-equiv="Content-Security-Policy" content="${ARTIFACT_HTML_OFFLINE_CSP}">`
   const referrer = '<meta name="referrer" content="no-referrer">'
+  const keyboardBridge = `<script>addEventListener("keydown",function(event){if(event.key==="Escape")parent.postMessage(${JSON.stringify(ARTIFACT_PREVIEW_ESCAPE_MESSAGE)},"*")})</script>`
   // Keep the policy ahead of every byte of untrusted markup. Parsing first can
   // start image/frame fetches in some DOM implementations before the CSP node
   // is inserted. A top-level metadata prelude is placed in the implicit head by
   // the HTML parser and preserves the artifact's original html/body attributes.
-  return `<!doctype html>${csp}${referrer}${sanitizedNavigation}`
+  return `<!doctype html>${csp}${referrer}${keyboardBridge}${sanitizedNavigation}`
 }

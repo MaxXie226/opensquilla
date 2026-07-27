@@ -10,6 +10,7 @@ import {
   artifactPreviewLimit,
   artifactWorkbenchPreviewKind,
   buildOfflineArtifactHtml,
+  ARTIFACT_PREVIEW_ESCAPE_MESSAGE,
   detectArtifactHtmlRelativeResources,
   renderArtifactMarkdown,
   responseMatchesArtifactPreviewKind,
@@ -175,6 +176,7 @@ describe('artifact HTML isolation', () => {
     expect(output).not.toMatch(/<base\b/i)
     expect(output).not.toMatch(/http-equiv=" refresh "/i)
     expect(output).toContain('<script>document.body.dataset.ran')
+    expect(output).toContain(ARTIFACT_PREVIEW_ESCAPE_MESSAGE)
   })
 })
 

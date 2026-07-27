@@ -6,6 +6,7 @@ import {
   artifactWorkbenchItemId,
   createArtifactCollectionWorkbenchItem,
   createArtifactPreviewWorkbenchItem,
+  navigationArtifactsFromWorkbenchItem,
 } from './artifactItems'
 
 const artifact: ArtifactPayload = {
@@ -47,13 +48,23 @@ describe('artifact Workbench items', () => {
     })
     const image = createArtifactPreviewWorkbenchItem({
       artifact: { ...artifact, name: 'preview.png', mime: 'image/png' },
+      navigationArtifacts: [artifact],
       nativeHtml: true,
+      sessionKey: 'session-a',
+    })
+    const webHtml = createArtifactPreviewWorkbenchItem({
+      artifact,
+      nativeHtml: false,
       sessionKey: 'session-a',
     })
 
     expect(html.hostKind).toBe('native-webcontents')
+    expect(html.retention).toBe('keep-alive')
     expect(image.hostKind).toBe('dom')
+    expect(image.retention).toBe('dispose-on-suspend')
+    expect(webHtml.retention).toBe('dispose-on-suspend')
     expect(artifactFromWorkbenchItem(html)).toEqual(artifact)
+    expect(navigationArtifactsFromWorkbenchItem(image)).toEqual([artifact])
   })
 
   it('creates one stable session collection containing every artifact', () => {

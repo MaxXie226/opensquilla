@@ -8,6 +8,7 @@ const FOCUSABLE = [
   'textarea:not([disabled]):not([tabindex="-1"])',
   'select:not([disabled]):not([tabindex="-1"])',
   'summary:not([tabindex="-1"])',
+  'iframe:not([tabindex="-1"])',
   '[tabindex]:not([tabindex="-1"])',
 ].join(', ')
 

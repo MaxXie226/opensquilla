@@ -158,6 +158,22 @@ describe('createArtifactPreviewResource', () => {
     expect(new TextDecoder().decode(payload?.data)).toContain('Preview')
   })
 
+  it('keeps recoverable native load errors distinct from renderer crashes', () => {
+    const controller = createArtifactPreviewResource({
+      artifact: () => artifact({ name: 'page.html', mime: 'text/html' }),
+      fetchImpl: vi.fn(),
+      nativeHtml: () => true,
+    })
+
+    controller.markNativeError()
+    expect(controller.state.value).toBe('error')
+    expect(controller.errorCode.value).toBe('native-error')
+
+    controller.markNativeCrashed()
+    expect(controller.state.value).toBe('crashed')
+    expect(controller.errorCode.value).toBe('native-crashed')
+  })
+
   it('builds an offline HTML blob for the web renderer', async () => {
     const observed: { blob?: Blob } = {}
     const controller = createArtifactPreviewResource({

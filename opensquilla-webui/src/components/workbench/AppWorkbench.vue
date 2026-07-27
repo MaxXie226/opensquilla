@@ -7,7 +7,6 @@
     :empty-label="t('workbench.empty')"
     :open-items-label="t('workbench.openItems')"
     :collapse-label="t('workbench.collapse')"
-    :close-label="t('workbench.close')"
     :close-item-label="t('workbench.closeItem')"
     :resize-label="t('workbench.resize')"
     :pixels-label="t('workbench.pixels')"
@@ -33,6 +32,23 @@
     </template>
 
     <template #actions="{ item }">
+      <select
+        v-if="artifactNavigationItems(item).length > 1"
+        class="app-workbench__switcher"
+        :value="item?.id"
+        :aria-label="t('chat.sessionDeliverables')"
+        :title="t('chat.sessionDeliverables')"
+        data-testid="workbench-artifact-switcher"
+        @change="selectNavigationArtifact(item, $event)"
+      >
+        <option
+          v-for="artifact in artifactNavigationItems(item)"
+          :key="artifactNavigationId(item, artifact)"
+          :value="artifactNavigationId(item, artifact)"
+        >
+          {{ artifactFileTitle(artifact) }}
+        </option>
+      </select>
       <template
         v-for="toolbarItem in panelToolbarItems(item)"
         :key="toolbarItem.id"
@@ -103,13 +119,26 @@ import {
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import { useArtifactImageLightbox } from '@/composables/chat/useArtifactImageLightbox'
+import { useConfirm } from '@/composables/useConfirm'
 import { useNativeSurfaceOcclusionState } from '@/composables/useDialogA11y'
 import { useToasts } from '@/composables/useToasts'
 import { usePlatform } from '@/platform'
 import type { NativeWorkbenchSurfaceEvent } from '@/platform/types'
+import type { ArtifactPayload } from '@/types/rpc'
 import { workbenchPanelRegistry } from '@/workbench/registry'
-import { createArtifactPreviewWorkbenchItem } from '@/workbench/artifactItems'
-import { artifactCategory } from '@/utils/chat/artifacts'
+import {
+  artifactWorkbenchItemId,
+  createArtifactPreviewWorkbenchItem,
+  navigationArtifactsFromWorkbenchItem,
+  sessionKeyFromWorkbenchItem,
+} from '@/workbench/artifactItems'
+import {
+  artifactCategory,
+  artifactFileTitle,
+  isInlineMediaArtifact,
+} from '@/utils/chat/artifacts'
+import { focusArtifactInTranscript } from '@/utils/chat/artifactFocus'
+import { artifactWorkbenchPreviewKind } from '@/utils/workbench/artifactPreview'
 import {
   attachWorkbenchRuntime,
   WorkbenchRuntimeManager,
@@ -139,6 +168,7 @@ const props = withDefaults(defineProps<{
 })
 
 const { t } = useI18n()
+const { confirm } = useConfirm()
 const { pushToast } = useToasts()
 const platform = usePlatform()
 const store = useWorkbenchStore()
@@ -169,6 +199,12 @@ function readAuthToken(): string {
 for (const definition of createArtifactWorkbenchDefinitions({
   authToken: readAuthToken,
   baseOrigin,
+  confirmRemoteResources: () => confirm({
+    title: t('workbench.artifactPreview.remoteResourcesConfirmTitle'),
+    body: t('workbench.artifactPreview.remoteResourcesConfirmBody'),
+    primaryLabel: t('workbench.artifactPreview.remoteResourcesConfirmAction'),
+    primaryClass: 'btn--primary',
+  }),
   currentSessionId: () => store.activeSessionId || props.sessionId,
   openArtifact: (artifact, sessionKey, navigationArtifacts) => {
     if (artifactCategory(artifact) === 'visual') {
@@ -181,6 +217,7 @@ for (const definition of createArtifactWorkbenchDefinitions({
     }
     store.openItem(createArtifactPreviewWorkbenchItem({
       artifact,
+      navigationArtifacts,
       nativeHtml: Boolean(
         platform.capabilities.hasNativeWorkbenchSurfaces
         && platform.workbench.native,
@@ -224,6 +261,64 @@ function panelProps(
   ) || {}
 }
 
+function artifactNavigationItems(
+  item: WorkbenchItem | null,
+): readonly ArtifactPayload[] {
+  return navigationArtifactsFromWorkbenchItem(item)
+}
+
+function artifactNavigationId(
+  item: WorkbenchItem | null,
+  artifact: ArtifactPayload,
+): string {
+  return artifactWorkbenchItemId(sessionKeyFromWorkbenchItem(item), artifact)
+}
+
+function selectNavigationArtifact(
+  item: WorkbenchItem | null,
+  event: Event,
+) {
+  if (!item) return
+  const select = event.currentTarget as HTMLSelectElement
+  const artifact = artifactNavigationItems(item).find(
+    candidate => artifactNavigationId(item, candidate) === select.value,
+  )
+  if (!artifact || select.value === item.id) return
+  const navigationArtifacts = navigationArtifactsFromWorkbenchItem(item)
+  const sessionKey = sessionKeyFromWorkbenchItem(item)
+  if (
+    isInlineMediaArtifact(artifact)
+    || artifactWorkbenchPreviewKind(artifact) === 'unsupported'
+  ) {
+    store.setExpanded(false)
+    void nextTick(() => {
+      focusArtifactInTranscript(document, artifact)
+    })
+    return
+  }
+  if (artifactCategory(artifact) === 'visual') {
+    select.focus({ preventScroll: true })
+    artifactImageLightbox.open({
+      artifact,
+      navigationArtifacts,
+      sessionKey,
+    })
+    void nextTick(() => {
+      select.value = item.id
+    })
+    return
+  }
+  store.openItem(createArtifactPreviewWorkbenchItem({
+    artifact,
+    navigationArtifacts,
+    nativeHtml: Boolean(
+      platform.capabilities.hasNativeWorkbenchSurfaces
+      && platform.workbench.native,
+    ),
+    sessionKey,
+  }))
+}
+
 function panelHeader(item: WorkbenchItem | null): WorkbenchPanelHeader {
   if (!item) return { title: '' }
   return workbenchPanelRegistry.resolve(item)?.getHeader?.(
@@ -259,6 +354,11 @@ function panelRefSetter(item: WorkbenchItem): (value: unknown) => void {
 }
 
 function handlePanelEvent(item: WorkbenchItem, event: WorkbenchComponentEvent) {
+  if (event.type === 'request-collapse') {
+    store.setExpanded(false)
+    restoreWorkbenchFocus()
+    return
+  }
   runtimeManager.handleComponentEvent(item, event)
 }
 
@@ -269,7 +369,6 @@ function performPanelAction(item: WorkbenchItem | null, actionId: string) {
 function restoreWorkbenchFocus() {
   void nextTick(() => {
     const candidates = document.querySelectorAll<HTMLElement>([
-      '[data-testid="chat-session-action-workbench"]',
       '[data-testid="chat-session-action-deliverables"]',
       '[data-testid="chat-header-primary-action"][data-action="deliverables"]',
       '.chat-textarea',
@@ -364,6 +463,33 @@ onBeforeUnmount(() => {
   cursor: pointer;
 }
 
+.app-workbench__switcher {
+  width: min(150px, 24vw);
+  min-width: 84px;
+  height: 30px;
+  padding: 0 24px 0 var(--sp-2);
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  background-color: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  font: inherit;
+  font-size: var(--fs-xs);
+  text-overflow: ellipsis;
+}
+
+.app-workbench__switcher:hover {
+  border-color: var(--border);
+  background-color: var(--bg-hover);
+  color: var(--text);
+}
+
+.app-workbench__switcher:focus-visible {
+  border-color: var(--accent);
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
 .app-workbench__action:hover {
   background: var(--bg-hover);
   color: var(--text);
@@ -405,6 +531,10 @@ onBeforeUnmount(() => {
 }
 
 @media (max-width: 600px) {
+  .app-workbench__switcher {
+    width: min(128px, 35vw);
+  }
+
   .app-workbench__warning span {
     display: none;
   }

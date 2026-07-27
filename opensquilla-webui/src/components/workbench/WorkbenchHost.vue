@@ -43,12 +43,15 @@
           :key="item.id"
           class="workbench-host__tab-wrap"
           :class="{ 'is-active': item.id === store.activeItemId }"
+          role="presentation"
         >
           <button
+            :id="tabId(item.id)"
             class="workbench-host__tab"
             role="tab"
             type="button"
             :aria-selected="item.id === store.activeItemId"
+            :aria-controls="panelId(item.id)"
             :tabindex="item.id === store.activeItemId ? 0 : -1"
             @click="store.activateItem(item.id)"
             @keydown="onTabKeydown($event, index)"
@@ -59,6 +62,7 @@
             class="workbench-host__tab-close"
             type="button"
             :aria-label="`${closeItemLabel}: ${item.title}`"
+            :tabindex="item.id === store.activeItemId ? 0 : -1"
             @click="closeWorkbenchItem(item.id)"
           >
             <Icon name="x" :size="13" aria-hidden="true" />
@@ -75,21 +79,12 @@
       <div class="workbench-host__actions">
         <slot name="actions" :item="store.activeItem" />
         <button
-          v-if="layoutMode === 'mobile-dialog'"
-          ref="collapseButtonRef"
+          v-if="store.activeItem"
+          ref="closeButtonRef"
           class="workbench-host__icon-button"
           type="button"
           :aria-label="collapseLabel"
           @click="collapseWorkbench"
-        >
-          <Icon name="panel-right-open" :size="17" aria-hidden="true" />
-        </button>
-        <button
-          v-if="store.activeItem"
-          class="workbench-host__icon-button"
-          type="button"
-          :aria-label="closeLabel"
-          @click="closeWorkbench"
         >
           <Icon name="x" :size="17" aria-hidden="true" />
         </button>
@@ -113,6 +108,10 @@
           "
           v-show="item.id === store.activeItemId"
           class="workbench-host__panel-layer"
+          :id="panelId(item.id)"
+          role="tabpanel"
+          :aria-labelledby="store.hasMultipleItems ? tabId(item.id) : undefined"
+          :aria-label="store.hasMultipleItems ? undefined : item.title"
           :data-workbench-item-id="item.id"
           :aria-hidden="item.id === store.activeItemId ? undefined : 'true'"
           :inert="item.id === store.activeItemId ? undefined : true"
@@ -179,7 +178,6 @@ const props = withDefaults(defineProps<{
   emptyLabel?: string
   openItemsLabel?: string
   collapseLabel?: string
-  closeLabel?: string
   closeItemLabel?: string
   resizeLabel?: string
   pixelsLabel?: string
@@ -193,7 +191,6 @@ const props = withDefaults(defineProps<{
   emptyLabel: 'No preview is available for this item.',
   openItemsLabel: 'Open workbench items',
   collapseLabel: 'Collapse workbench',
-  closeLabel: 'Close',
   closeItemLabel: 'Close tab',
   resizeLabel: 'Resize workbench',
   pixelsLabel: 'pixels',
@@ -210,7 +207,7 @@ const store = useWorkbenchStore()
 const hostRef = ref<HTMLElement | null>(null)
 const surfaceRef = ref<HTMLElement | null>(null)
 const resizerRef = ref<WorkbenchResizerHandle | null>(null)
-const collapseButtonRef = ref<HTMLButtonElement | null>(null)
+const closeButtonRef = ref<HTMLButtonElement | null>(null)
 const viewportWidth = ref(typeof window === 'undefined' ? 0 : window.innerWidth)
 const containerWidth = ref(0)
 const containerRect = ref({ top: 0, right: viewportWidth.value, height: 0 })
@@ -269,7 +266,7 @@ useDialogA11y(
   mobileDialogOpen,
   collapseWorkbench,
   {
-    initialFocus: collapseButtonRef,
+    initialFocus: closeButtonRef,
     occludesNativeSurface: false,
   },
 )
@@ -299,13 +296,9 @@ function closeWorkbenchItem(id: string) {
     const activeTab = hostRef.value?.querySelector<HTMLElement>(
       '[role="tab"][aria-selected="true"]',
     )
-    ;(activeTab || collapseButtonRef.value)?.focus({ preventScroll: true })
+    ;(activeTab || closeButtonRef.value)
+      ?.focus({ preventScroll: true })
   })
-}
-
-function closeWorkbench() {
-  store.closeAllItems()
-  emit('emptied')
 }
 
 function onTabKeydown(event: KeyboardEvent, currentIndex: number) {
@@ -325,6 +318,14 @@ function onTabKeydown(event: KeyboardEvent, currentIndex: number) {
     const tabs = hostRef.value?.querySelectorAll<HTMLElement>('[role="tab"]')
     tabs?.[nextIndex]?.focus()
   })
+}
+
+function tabId(itemId: string): string {
+  return `workbench-tab-${itemId}`
+}
+
+function panelId(itemId: string): string {
+  return `workbench-panel-${itemId}`
 }
 
 function updateViewportWidth() {
@@ -424,7 +425,7 @@ watch([hostRef, surfaceRef], () => {
 
 watch(shouldRender, (visible, previous) => {
   if (visible && !previous && layoutMode.value === 'mobile-dialog') {
-    void nextTick(() => collapseButtonRef.value?.focus({ preventScroll: true }))
+    void nextTick(() => closeButtonRef.value?.focus({ preventScroll: true }))
   }
 })
 

@@ -40,6 +40,7 @@ export interface WorkbenchItem {
 
 export type WorkbenchDisposeReason =
   | 'closed'
+  | 'evicted'
   | 'scope-changed'
   | 'store-reset'
   | 'runtime-detached'

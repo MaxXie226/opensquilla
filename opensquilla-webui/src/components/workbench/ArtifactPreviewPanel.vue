@@ -113,13 +113,29 @@
           :alt="artifactFileTitle(artifact)"
           decoding="async"
         />
-        <iframe
+        <div
           v-else-if="preview.kind.value === 'pdf'"
-          class="artifact-preview__frame artifact-preview__frame--pdf"
-          :src="preview.objectUrl.value"
-          :title="t('chat.previewOf', { title: artifactFileTitle(artifact) })"
-          referrerpolicy="no-referrer"
-        />
+          class="artifact-preview__pdf-stack"
+        >
+          <iframe
+            ref="previewFrameRef"
+            class="artifact-preview__frame artifact-preview__frame--pdf"
+            :src="pdfFrameUrl"
+            :title="t('chat.previewOf', { title: artifactFileTitle(artifact) })"
+            tabindex="0"
+            referrerpolicy="no-referrer"
+          />
+          <!-- The browser-owned PDF viewer cannot run our HTML Escape bridge.
+               This focus-revealed exit follows the frame in DOM order so a
+               keyboard user can leave the viewer and collapse the dialog. -->
+          <button
+            type="button"
+            class="btn artifact-preview__frame-exit"
+            @click="requestWorkbenchCollapse"
+          >
+            {{ t('workbench.collapse') }}
+          </button>
+        </div>
         <div
           v-else-if="preview.kind.value === 'markdown'"
           class="artifact-preview__markdown chat-markdown"
@@ -133,9 +149,11 @@
         >{{ preview.text.value }}</pre>
         <iframe
           v-else-if="preview.kind.value === 'html' && !nativeHtml"
+          ref="previewFrameRef"
           class="artifact-preview__frame artifact-preview__frame--html"
           :src="preview.objectUrl.value"
           :title="t('chat.previewOf', { title: artifactFileTitle(artifact) })"
+          tabindex="0"
           sandbox="allow-scripts"
           referrerpolicy="no-referrer"
         />
@@ -155,7 +173,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import {
@@ -170,13 +188,14 @@ import {
   artifactFileTitle,
   artifactIconName,
 } from '@/utils/chat/artifacts'
+import { ARTIFACT_PREVIEW_ESCAPE_MESSAGE } from '@/utils/workbench/artifactPreview'
 
 const props = withDefaults(defineProps<{
   artifact: ArtifactPayload
   authToken?: string
   baseOrigin?: string
   nativeHtml?: boolean
-  nativeSurfaceState?: 'crashed' | 'loading' | 'ready'
+  nativeSurfaceState?: 'crashed' | 'error' | 'loading' | 'ready'
   sessionKey?: string
   showHeader?: boolean
   suspended?: boolean
@@ -199,6 +218,7 @@ const emit = defineEmits<{
 }>()
 
 const { t } = useI18n()
+const previewFrameRef = ref<HTMLIFrameElement | null>(null)
 
 const preview = useArtifactPreviewResource({
   artifact: () => props.artifact,
@@ -241,8 +261,11 @@ watch(
 watch(
   () => props.nativeSurfaceState,
   state => {
-    if (props.nativeHtml && state === 'crashed') preview.markNativeCrashed()
+    if (!props.nativeHtml) return
+    if (state === 'crashed') preview.markNativeCrashed()
+    else if (state === 'error') preview.markNativeError()
   },
+  { immediate: true },
 )
 
 watch(
@@ -265,6 +288,26 @@ function emitArtifactEvent(
 
 const isRenderable = computed(() =>
   preview.state.value === 'ready' || preview.state.value === 'missing-resource')
+
+const pdfFrameUrl = computed(() => {
+  const url = preview.objectUrl.value
+  return url ? `${url}#zoom=page-width&view=FitH` : ''
+})
+
+function onPreviewFrameMessage(event: MessageEvent) {
+  if (
+    event.data !== ARTIFACT_PREVIEW_ESCAPE_MESSAGE
+    || event.source !== previewFrameRef.value?.contentWindow
+  ) return
+  requestWorkbenchCollapse()
+}
+
+function requestWorkbenchCollapse() {
+  emit('workbench-event', { type: 'request-collapse' })
+}
+
+onMounted(() => window.addEventListener('message', onPreviewFrameMessage))
+onBeforeUnmount(() => window.removeEventListener('message', onPreviewFrameMessage))
 
 const isFailureState = computed(() =>
   preview.state.value === 'crashed'
@@ -473,6 +516,45 @@ defineExpose({
   background: var(--bg);
 }
 
+.artifact-preview__pdf-stack {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  width: 100%;
+}
+
+.artifact-preview__pdf-stack .artifact-preview__frame--pdf {
+  height: auto;
+}
+
+.artifact-preview__frame-exit {
+  align-self: flex-end;
+  block-size: 1px;
+  border: 0;
+  clip-path: inset(50%);
+  inline-size: 1px;
+  margin: 0;
+  opacity: 0;
+  overflow: hidden;
+  padding: 0;
+  transition:
+    opacity var(--dur-fast) var(--ease-standard);
+}
+
+.artifact-preview__frame-exit:focus,
+.artifact-preview__frame-exit:focus-visible {
+  block-size: auto;
+  border: 1px solid transparent;
+  clip-path: none;
+  inline-size: auto;
+  margin: 8px 12px;
+  opacity: 1;
+  overflow: visible;
+  padding: 7px 14px;
+}
+
 .artifact-preview__frame--html,
 .artifact-preview__native-slot {
   background: var(--bg-surface);
@@ -523,6 +605,10 @@ defineExpose({
     animation: none;
     opacity: 0.55;
     transform: none;
+  }
+
+  .artifact-preview__frame-exit {
+    transition: none;
   }
 }
 

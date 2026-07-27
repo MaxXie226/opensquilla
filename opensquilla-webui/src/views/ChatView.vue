@@ -35,13 +35,10 @@
         :run-history-visible="appStore.features.metaRuns"
         :share-mode="shareMode"
         :shareable-message-count="shareableMessageCount"
-        :workbench-available="workbenchAvailable"
-        :workbench-expanded="workbenchStore.expanded"
         @open-deliverables="openDeliverables"
         @open-run-history="openMetaRunHistory"
         @start-share="startShareMode"
         @copy-session-key="onSessionCopyClick"
-        @toggle-workbench="toggleWorkbench"
       />
     </Teleport>
 
@@ -622,11 +619,17 @@ import type {
 import type { ModelRoutingMode } from '@/types/modelRouting'
 import type { SandboxRunMode } from '@/types/sandbox'
 import type { ChatPart, InterruptViewState } from '@/types/parts'
-import { artifactCategory, artifactDownloadUrl } from '@/utils/chat/artifacts'
 import {
-  createArtifactCollectionWorkbenchItem,
+  artifactCategory,
+  artifactDownloadUrl,
+  isInlineMediaArtifact,
+} from '@/utils/chat/artifacts'
+import {
+  artifactFromWorkbenchItem,
   createArtifactPreviewWorkbenchItem,
 } from '@/workbench/artifactItems'
+import { artifactWorkbenchPreviewKind } from '@/utils/workbench/artifactPreview'
+import { focusArtifactInTranscript } from '@/utils/chat/artifactFocus'
 import { fetchDisplayAttachmentBlob } from '@/utils/chat/attachmentAccess'
 import { createHistoryNavigationScrollLock } from '@/utils/chat/historyNavigationScrollLock'
 import {
@@ -724,7 +727,7 @@ const pendingAutoSend = ref('')
 const threadRef = ref<HTMLElement | null>(null)
 const composerRef = ref<ChatComposerHandle | null>(null)
 type ChatHeaderActionsHandle = {
-  focusAction: (action: 'deliverables' | 'runs' | 'share' | 'copy-session-key' | 'workbench') => boolean
+  focusAction: (action: 'deliverables' | 'runs' | 'share' | 'copy-session-key') => boolean
 }
 const chatHeaderActionsRef = ref<ChatHeaderActionsHandle | null>(null)
 
@@ -732,9 +735,6 @@ const chatHeaderActionsRef = ref<ChatHeaderActionsHandle | null>(null)
 
 const sessionKey = ref('')
 const workbenchEnabled = computed(() => appStore.features.artifactWorkbench === true)
-const workbenchAvailable = computed(() =>
-  workbenchEnabled.value
-  && workbenchStore.hasAvailableItemForSession(sessionKey.value || null))
 const inputText = ref('')
 const aborted = ref(false)
 const autoScroll = ref(true)
@@ -2018,7 +2018,7 @@ const deliverablesOpen = ref(false)
 const metaRunsHistoryOpen = ref(false)
 
 function focusHeaderAction(
-  action: 'deliverables' | 'runs' | 'share' | 'copy-session-key' | 'workbench',
+  action: 'deliverables' | 'runs' | 'share' | 'copy-session-key',
 ) {
   void nextTick(() => chatHeaderActionsRef.value?.focusAction(action))
 }
@@ -2026,30 +2026,81 @@ function focusHeaderAction(
 function openDeliverables() {
   if (sessionArtifacts.value.length === 0) return
   if (workbenchEnabled.value) {
-    workbenchStore.openItem(createArtifactCollectionWorkbenchItem({
-      artifacts: sessionArtifacts.value,
-      sessionKey: sessionKey.value,
-      title: t('chat.deliverablesCount', {
-        count: sessionArtifacts.value.length,
-      }),
-    }))
+    const recentPreview = workbenchStore.findMostRecentItem(item => {
+      if (
+        item.kind !== 'artifact-preview'
+        || item.scope.type !== 'session'
+        || item.scope.id !== sessionKey.value
+      ) return false
+      const artifact = artifactFromWorkbenchItem(item)
+      if (!artifact) return false
+      const kind = artifactWorkbenchPreviewKind(artifact)
+      return kind !== 'unsupported' && kind !== 'image'
+    })
+    if (recentPreview) {
+      workbenchStore.activateItem(recentPreview.id)
+      workbenchStore.setExpanded(true)
+      return
+    }
+
+    for (let index = sessionArtifacts.value.length - 1; index >= 0; index -= 1) {
+      const artifact = sessionArtifacts.value[index]
+      if (!artifact) continue
+      const kind = artifactWorkbenchPreviewKind(artifact)
+      if (kind === 'unsupported' || kind === 'image') continue
+      openArtifact(artifact)
+      return
+    }
+
+    const latestArtifact = sessionArtifacts.value[sessionArtifacts.value.length - 1]
+    if (latestArtifact && artifactCategory(latestArtifact) === 'visual') {
+      openArtifact(latestArtifact)
+      return
+    }
+    if (latestArtifact) focusInlineDeliverable(latestArtifact)
     return
   }
   deliverablesOpen.value = true
+}
+
+function focusInlineDeliverable(artifact: ArtifactPayload): boolean {
+  const reduceMotion = typeof window !== 'undefined'
+    && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
+  return focusArtifactInTranscript(
+    threadRef.value,
+    artifact,
+    reduceMotion ? 'auto' : 'smooth',
+  )
 }
 
 watch(sessionArtifacts, artifacts => {
   if (!sessionKey.value) return
   artifactImageLightbox.updateNavigation(artifacts, sessionKey.value)
   if (!workbenchEnabled.value) return
-  workbenchStore.updateItem(createArtifactCollectionWorkbenchItem({
-    artifacts,
-    sessionKey: sessionKey.value,
-    title: t('chat.deliverablesCount', { count: artifacts.length }),
-  }))
+  for (const item of workbenchStore.items) {
+    if (
+      item.kind !== 'artifact-preview'
+      || item.scope.type !== 'session'
+      || item.scope.id !== sessionKey.value
+    ) continue
+    const artifact = artifactFromWorkbenchItem(item)
+    if (!artifact) continue
+    workbenchStore.updateItem(createArtifactPreviewWorkbenchItem({
+      artifact,
+      navigationArtifacts: artifacts,
+      nativeHtml: item.hostKind === 'native-webcontents',
+      sessionKey: sessionKey.value,
+    }))
+  }
 })
 
 function openArtifact(artifact: ArtifactPayload): boolean {
+  if (
+    isInlineMediaArtifact(artifact)
+    || artifactWorkbenchPreviewKind(artifact) === 'unsupported'
+  ) {
+    return focusInlineDeliverable(artifact)
+  }
   if (artifactCategory(artifact) === 'visual' && sessionKey.value) {
     artifactImageLightbox.open({
       artifact,
@@ -2061,6 +2112,7 @@ function openArtifact(artifact: ArtifactPayload): boolean {
   if (!workbenchEnabled.value || !sessionKey.value) return false
   workbenchStore.openItem(createArtifactPreviewWorkbenchItem({
     artifact,
+    navigationArtifacts: sessionArtifacts.value,
     nativeHtml: Boolean(
       platform.capabilities.hasNativeWorkbenchSurfaces
       && platform.workbench.native,
@@ -2068,11 +2120,6 @@ function openArtifact(artifact: ArtifactPayload): boolean {
     sessionKey: sessionKey.value,
   }))
   return true
-}
-
-function toggleWorkbench() {
-  workbenchStore.toggleExpanded()
-  if (!workbenchStore.expanded) focusHeaderAction('workbench')
 }
 
 function closeDeliverables() {

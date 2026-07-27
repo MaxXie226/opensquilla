@@ -154,6 +154,11 @@ describe('WorkbenchHost', () => {
     expect(mounted.host.querySelector('[role="tablist"]')).not.toBeNull()
     const tabs = mounted.host.querySelectorAll<HTMLElement>('[role="tab"]')
     expect(tabs).toHaveLength(2)
+    const activePanel = mounted.host.querySelector<HTMLElement>(
+      '[role="tabpanel"]:not([aria-hidden="true"])',
+    )!
+    expect(tabs[1]?.getAttribute('aria-controls')).toBe(activePanel.id)
+    expect(activePanel.getAttribute('aria-labelledby')).toBe(tabs[1]?.id)
     tabs[1]?.dispatchEvent(new KeyboardEvent('keydown', {
       key: 'ArrowLeft',
       bubbles: true,
@@ -162,22 +167,43 @@ describe('WorkbenchHost', () => {
     expect(mounted.store.activeItemId).toBe('one')
   })
 
-  it('keeps one desktop collapse control and lets the global close clear all tabs', async () => {
+  it('moves focus to the collapse control when closing from two tabs to one', async () => {
+    const mounted = await mountHost(1200)
+    mounted.store.openItem(item('two'))
+    await nextTick()
+
+    const closeSecond = mounted.host.querySelector<HTMLButtonElement>(
+      '[aria-label="Close tab: two.html"]',
+    )!
+    closeSecond.focus()
+    closeSecond.click()
+    await nextTick()
+
+    expect(mounted.store.items).toHaveLength(1)
+    expect(mounted.host.querySelector('[role="tablist"]')).toBeNull()
+    expect(document.activeElement).toBe(
+      mounted.host.querySelector('[aria-label="Collapse workbench"]'),
+    )
+  })
+
+  it('uses one desktop collapse control and preserves open tabs', async () => {
     const mounted = await mountHost(1200)
     mounted.store.openItem(item('two'))
     await nextTick()
     const panel = mounted.host.querySelector<HTMLElement>('[data-testid="workbench-host"]')!
 
-    expect(panel.querySelector('[aria-label="Collapse workbench"]')).toBeNull()
     expect(panel.querySelector('[aria-label="Close tab: one.html"]')).not.toBeNull()
     expect(panel.querySelector('[aria-label="Close tab: two.html"]')).not.toBeNull()
-    const close = panel.querySelector<HTMLButtonElement>('[aria-label="Close"]')!
-    close.click()
+    const collapse = panel.querySelector<HTMLButtonElement>(
+      '[aria-label="Collapse workbench"]',
+    )!
+    collapse.click()
     await nextTick()
 
-    expect(mounted.store.items).toEqual([])
+    expect(mounted.store.items).toHaveLength(2)
     expect(mounted.store.expanded).toBe(false)
-    expect(mounted.host.querySelector('[data-testid="workbench-host"]')).toBeNull()
+    expect(mounted.host.querySelector('[data-testid="workbench-host"]')).not.toBeNull()
+    expect(panel.style.display).toBe('none')
   })
 
   it('keeps inactive retained panels mounted and removes them from the accessibility tree', async () => {
@@ -253,13 +279,12 @@ describe('WorkbenchHost', () => {
     const collapse = panel.querySelector<HTMLButtonElement>(
       '[aria-label="Collapse workbench"]',
     )!
-    const close = panel.querySelector<HTMLButtonElement>('[aria-label="Close"]')!
 
     expect(panel.getAttribute('role')).toBe('dialog')
     expect(hasOpenDialogLayer()).toBe(true)
     expect(document.activeElement).toBe(collapse)
+    expect(panel.querySelectorAll('[aria-label="Collapse workbench"]')).toHaveLength(1)
 
-    close.focus()
     const tab = new KeyboardEvent('keydown', {
       key: 'Tab',
       bubbles: true,

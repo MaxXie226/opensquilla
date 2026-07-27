@@ -65,6 +65,13 @@ async function installWorkbenchGateway(
         body: '<!doctype html><title>Demo</title><p id="preview">Offline demo</p>',
       })
     }
+    if (pathname.endsWith('/workbench-report')) {
+      return route.fulfill({
+        status: 200,
+        contentType: 'application/pdf',
+        body: Buffer.from('%PDF-1.4\\n%EOF\\n'),
+      })
+    }
     if (pathname.endsWith('/workbench-image-a') || pathname.endsWith('/workbench-image-b')) {
       return route.fulfill({
         status: 200,
@@ -157,7 +164,12 @@ async function openWorkbenchSession(
   await installWorkbenchGateway(page, requests, artifacts)
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
   await expect(page.locator('.conn-pill')).toBeVisible({ timeout: 10000 })
-  await expect(page.locator('.msg-artifact-chip, .msg-media-card')).toHaveCount(
+  await expect(page.locator([
+    '.msg-artifact-chip',
+    '.msg-media-card',
+    '.msg-audio-card',
+    '.msg-video-card',
+  ].join(','))).toHaveCount(
     artifacts.length,
     { timeout: 10000 },
   )
@@ -183,7 +195,7 @@ async function deliverablesHeaderAction(page: Page): Promise<Locator> {
 }
 
 test.describe('Application Workbench', () => {
-  test('header opens the complete collection and concrete previews reuse tabs', async ({ page }) => {
+  test('header opens the latest preview and uses a compact artifact switcher', async ({ page }) => {
     const requests = new Map<string, number>()
     await openWorkbenchSession(page, requests)
 
@@ -194,48 +206,40 @@ test.describe('Application Workbench', () => {
     await expect(workbench).toBeVisible()
     await expect(workbench).toHaveAttribute('role', 'complementary')
     await expect(workbench.locator('.workbench-host__single-title'))
-      .toContainText('Deliverables (3)')
+      .toContainText('demo.html')
     await expect(workbench.locator('[data-workbench-item-id]')).toHaveCount(1)
-    await expect(workbench.locator('.artifact-collection__item')).toHaveCount(3)
-    expect(requests.size).toBe(0)
-
-    await workbench.getByRole('button', { name: 'Open demo.html' }).click()
-    await expect(workbench.getByRole('tablist')).toBeVisible()
-    await expect(workbench.getByRole('tab')).toHaveCount(2)
     await expect(workbench.locator('.artifact-preview__frame--html')).toBeVisible()
     expect(requests.get('/api/v1/artifacts/workbench-demo')).toBe(1)
 
-    await page.locator('.msg-artifact-chip', { hasText: 'notes.txt' })
-      .getByRole('button', { name: 'Open notes.txt' })
-      .click()
-    await expect(workbench.getByRole('tab')).toHaveCount(3)
+    const switcher = workbench.getByTestId('workbench-artifact-switcher')
+    await expect(switcher).toHaveCount(1)
+    await expect(switcher.locator('option')).toHaveCount(3)
+    await switcher.selectOption({ label: 'notes.txt' })
+    await expect(workbench.getByRole('tab')).toHaveCount(2)
     await expect(workbench.locator('.artifact-preview__text'))
       .toContainText('Workbench notes stay mounted.')
     expect(requests.get('/api/v1/artifacts/workbench-notes')).toBe(1)
 
-    await page.locator('.msg-artifact-chip', { hasText: 'notes.txt' })
-      .getByRole('button', { name: 'Open notes.txt' })
-      .click()
-    await expect(workbench.getByRole('tab')).toHaveCount(3)
+    await switcher.selectOption({ label: 'notes.txt' })
+    await expect(workbench.getByRole('tab')).toHaveCount(2)
     expect(requests.get('/api/v1/artifacts/workbench-notes')).toBe(1)
 
-    await page.locator('.msg-artifact-chip', { hasText: 'guide.md' })
-      .getByRole('button', { name: 'Open guide.md' })
-      .click()
-    await expect(workbench.getByRole('tab')).toHaveCount(4)
+    await switcher.selectOption({ label: 'guide.md' })
+    await expect(workbench.getByRole('tab')).toHaveCount(3)
     await expect(workbench.locator('.artifact-preview__markdown')).toContainText('Guide')
     expect(requests.get('/api/v1/artifacts/workbench-guide')).toBe(1)
 
-    await workbench.getByRole('button', { name: 'Close workbench' }).click()
-    await expect(page.getByTestId('workbench-host')).toHaveCount(0)
+    await workbench.getByRole('button', { name: 'Collapse workbench' }).click()
+    await expect(workbench).toBeHidden()
 
     await (await deliverablesHeaderAction(page)).click()
     await expect(workbench).toBeVisible()
-    await expect(workbench.locator('.artifact-collection__item')).toHaveCount(3)
-    expect(requests.get('/api/v1/artifacts/workbench-guide')).toBe(1)
+    await expect(workbench.locator('.artifact-preview__markdown')).toContainText('Guide')
+    await expect(workbench.locator('.artifact-collection__item')).toHaveCount(0)
+    expect(requests.get('/api/v1/artifacts/workbench-guide')).toBe(2)
   })
 
-  test('header collection includes download-only deliverables', async ({ page }) => {
+  test('download-only deliverables stay in the conversation instead of opening a panel', async ({ page }) => {
     const downloadOnlyArtifacts = [{
       id: 'workbench-data',
       name: 'data.json',
@@ -248,13 +252,86 @@ test.describe('Application Workbench', () => {
     await (await deliverablesHeaderAction(page)).click()
 
     const workbench = page.getByTestId('workbench-host')
-    await expect(workbench).toBeVisible()
-    await expect(workbench.locator('.artifact-collection__item')).toHaveCount(1)
-    await expect(workbench.getByRole('button', { name: 'Open data.json' })).toBeVisible()
+    await expect(workbench).toHaveCount(0)
     await expect(page.getByRole('dialog', { name: 'Deliverables (1)' })).toHaveCount(0)
+    await expect(page.locator('.msg-artifact-chip', { hasText: 'data.json' })
+      .locator('.msg-artifact-body')).toBeFocused()
   })
 
-  test('images from the collection open the shared Lightbox without creating tabs', async ({ page }) => {
+  test('the compact navigator keeps every mixed deliverable reachable by type', async ({ page }) => {
+    const mixedArtifacts = [
+      {
+        id: 'workbench-data',
+        name: 'data.json',
+        mime: 'application/json',
+        size: 24,
+        download_url: '/api/v1/artifacts/workbench-data',
+      },
+      {
+        id: 'workbench-audio',
+        name: 'sample.wav',
+        mime: 'audio/wav',
+        size: 44,
+        download_url: '/api/v1/artifacts/workbench-audio',
+      },
+      {
+        id: 'workbench-video',
+        name: 'sample.webm',
+        mime: 'video/webm',
+        size: 44,
+        download_url: '/api/v1/artifacts/workbench-video',
+      },
+      {
+        id: 'workbench-image-a',
+        name: 'poster.png',
+        mime: 'image/png',
+        size: PNG_1x1.length,
+        download_url: '/api/v1/artifacts/workbench-image-a',
+        thumbnail_url: '/api/v1/artifacts/workbench-image-a?variant=thumb',
+      },
+      ARTIFACTS[2],
+    ]
+    await openWorkbenchSession(page, new Map(), mixedArtifacts)
+
+    const deliverables = await deliverablesHeaderAction(page)
+    await expect(deliverables).toHaveAccessibleName(/Deliverables \(5\)/)
+    await deliverables.click()
+
+    const workbench = page.getByTestId('workbench-host')
+    await expect(workbench).toBeVisible()
+    await expect(workbench.locator('.artifact-preview__frame--html')).toBeVisible()
+    const switcher = workbench.getByTestId('workbench-artifact-switcher')
+    await expect(switcher.locator('option')).toHaveCount(5)
+    await expect(switcher.locator('option')).toHaveText([
+      'data.json',
+      'sample.wav',
+      'sample.webm',
+      'poster.png',
+      'demo.html',
+    ])
+
+    await switcher.selectOption({ label: 'sample.wav' })
+    await expect(workbench).toBeHidden()
+    await expect(page.locator('.msg-audio-card__action')).toBeFocused()
+
+    await deliverables.click()
+    await expect(workbench).toBeVisible()
+    await workbench.getByTestId('workbench-artifact-switcher')
+      .selectOption({ label: 'sample.webm' })
+    await expect(workbench).toBeHidden()
+    await expect(page.locator('.msg-video-card__action')).toBeFocused()
+
+    await deliverables.click()
+    await expect(workbench).toBeVisible()
+    await workbench.getByTestId('workbench-artifact-switcher')
+      .selectOption({ label: 'data.json' })
+    await expect(workbench).toBeHidden()
+    await expect(page.locator('.msg-artifact-chip', { hasText: 'data.json' })
+      .locator('.msg-artifact-body')).toBeFocused()
+    await expect(workbench.locator('[data-preview-kind="unsupported"]')).toHaveCount(0)
+  })
+
+  test('images selected from the compact navigator open the shared Lightbox', async ({ page }) => {
     const artifacts = [
       {
         id: 'workbench-image-a',
@@ -279,13 +356,13 @@ test.describe('Application Workbench', () => {
 
     const workbench = page.getByTestId('workbench-host')
     await expect(workbench.locator('[data-workbench-item-id]')).toHaveCount(1)
-    const imageRow = workbench.getByRole('button', { name: 'Open first.png' })
-    await imageRow.click()
+    const switcher = workbench.getByTestId('workbench-artifact-switcher')
+    await switcher.selectOption({ label: 'first.png' })
 
     const lightbox = page.locator('.deliv-preview[role="dialog"]')
     await expect(lightbox).toBeVisible()
     await expect(lightbox.locator('.deliv-preview__image')).toBeVisible()
-    await expect(workbench.locator('[data-workbench-item-id]')).toHaveCount(1)
+    await expect(workbench.locator('[data-workbench-item-id]')).toHaveCount(0)
     await expect(workbench.getByRole('tablist')).toHaveCount(0)
 
     await lightbox.getByRole('button', { name: 'Next image' }).click()
@@ -294,14 +371,13 @@ test.describe('Application Workbench', () => {
     await page.keyboard.press('Escape')
     await expect(lightbox).toHaveCount(0)
     await expect(workbench).toBeVisible()
-    await expect(imageRow).toBeFocused()
-
-    await workbench.getByRole('button', { name: 'Open demo.html' }).click()
-    await expect(workbench.getByRole('tab')).toHaveCount(2)
+    await expect(workbench.locator('[data-workbench-item-id]')).toHaveCount(1)
+    await expect(switcher).toBeFocused()
+    await expect(workbench.getByRole('tablist')).toHaveCount(0)
     await expect(workbench.locator('.artifact-preview__frame--html')).toBeVisible()
   })
 
-  test('opening the same artifact card reuses one tab until the workbench is closed', async ({ page }) => {
+  test('opening the same artifact card reuses one tab after the Workbench collapses', async ({ page }) => {
     await openWorkbenchSession(page)
     const notes = page.locator('.msg-artifact-chip', { hasText: 'notes.txt' })
     const open = notes.getByRole('button', { name: 'Open notes.txt' })
@@ -316,15 +392,15 @@ test.describe('Application Workbench', () => {
     await expect(workbench.locator('[data-workbench-item-id]')).toHaveCount(1)
     await expect(workbench.locator('.workbench-host__tabs')).toHaveCount(0)
 
-    await workbench.getByRole('button', { name: 'Close workbench' }).click()
-    await expect(page.getByTestId('workbench-host')).toHaveCount(0)
+    await workbench.getByRole('button', { name: 'Collapse workbench' }).click()
+    await expect(workbench).toBeHidden()
 
     await open.click()
-    await expect(page.getByTestId('workbench-host')).toBeVisible()
-    await expect(page.locator('[data-workbench-item-id]')).toHaveCount(1)
+    await expect(workbench).toBeVisible()
+    await expect(workbench.locator('[data-workbench-item-id]')).toHaveCount(1)
   })
 
-  test('mobile Workbench is a dialog and Escape collapses it with focus restored', async ({ page }) => {
+  test('mobile HTML preview enters the dialog Tab order and bridges Escape', async ({ page }) => {
     await page.setViewportSize({ width: 375, height: 667 })
     await openWorkbenchSession(page)
 
@@ -336,10 +412,66 @@ test.describe('Application Workbench', () => {
     await expect(workbench).toHaveAttribute('role', 'dialog')
     await expect(workbench).toHaveAttribute('aria-modal', 'true')
     await expect(workbench).toHaveCSS('width', '375px')
+    const mobileFrame = workbench.locator('.artifact-preview__frame--html')
+    await expect(mobileFrame).not.toHaveAttribute('aria-hidden', 'true')
+    await expect(mobileFrame).toHaveAttribute('tabindex', '0')
+    await expect(mobileFrame).toHaveCSS('pointer-events', 'auto')
 
+    await expect(
+      workbench.locator('.workbench-host__actions')
+        .getByRole('button', { name: 'Collapse workbench' }),
+    ).toBeFocused()
+    await page.keyboard.press('Tab')
+    await expect(mobileFrame).toBeFocused()
+
+    // The opaque sandbox cannot bubble key events to the parent document.
+    // Its injected bridge posts a narrow Escape message instead.
     await page.keyboard.press('Escape')
     await expect(workbench).toBeHidden()
     await expect(page.getByTestId('chat-header-primary-action')).toBeFocused()
+  })
+
+  test('mobile PDF preview offers a focus-revealed exit after the browser viewer', async ({ page }) => {
+    await page.setViewportSize({ width: 375, height: 667 })
+    await openWorkbenchSession(page, new Map(), [{
+      id: 'workbench-report',
+      name: 'report.pdf',
+      mime: 'application/pdf',
+      size: 16,
+      download_url: '/api/v1/artifacts/workbench-report',
+    }])
+
+    const deliverables = await deliverablesHeaderAction(page)
+    await deliverables.click()
+
+    const workbench = page.getByTestId('workbench-host')
+    const pdfFrame = workbench.locator('.artifact-preview__frame--pdf')
+    const frameExit = workbench.locator('.artifact-preview__frame-exit')
+    await expect(workbench).toHaveAttribute('role', 'dialog')
+    await expect(pdfFrame).toHaveAttribute('tabindex', '0')
+
+    await expect(
+      workbench.locator('.workbench-host__actions')
+        .getByRole('button', { name: 'Collapse workbench' }),
+    ).toBeFocused()
+    await page.keyboard.press('Tab')
+    await expect(pdfFrame).toBeFocused()
+
+    // Chromium's built-in PDF viewer owns its document and cannot receive our
+    // injected HTML Escape bridge. A trailing skip-style control provides a
+    // deterministic keyboard exit without replacing the viewer with PDF.js.
+    await frameExit.focus()
+    await expect(frameExit).toBeFocused()
+    await expect(frameExit).toBeVisible()
+    await expect(frameExit).toHaveCSS('position', 'static')
+    const pdfBox = await pdfFrame.boundingBox()
+    const exitBox = await frameExit.boundingBox()
+    expect(pdfBox).not.toBeNull()
+    expect(exitBox).not.toBeNull()
+    expect(exitBox!.y).toBeGreaterThanOrEqual(pdfBox!.y + pdfBox!.height)
+    await page.keyboard.press('Enter')
+    await expect(workbench).toBeHidden()
+    await expect(deliverables).toBeFocused()
   })
 
   test('mobile image preview hides only the Workbench layer until the Lightbox closes', async ({ page }) => {
@@ -360,8 +492,8 @@ test.describe('Application Workbench', () => {
     const deliverables = await deliverablesHeaderAction(page)
     await deliverables.click()
     const workbench = page.getByTestId('workbench-host')
-    const imageRow = workbench.getByRole('button', { name: 'Open first.png' })
-    await imageRow.click()
+    const switcher = workbench.getByTestId('workbench-artifact-switcher')
+    await switcher.selectOption({ label: 'first.png' })
 
     const lightbox = page.locator('.deliv-preview[role="dialog"]')
     await expect(lightbox).toBeVisible()
@@ -373,7 +505,7 @@ test.describe('Application Workbench', () => {
     await expect(workbench).toBeVisible()
     await expect(workbench).not.toHaveAttribute('aria-hidden', 'true')
     expect(await workbench.evaluate(element => element.hasAttribute('inert'))).toBe(false)
-    await expect(imageRow).toBeFocused()
+    await expect(switcher).toBeFocused()
 
     await page.keyboard.press('Escape')
     await expect(workbench).toBeHidden()
