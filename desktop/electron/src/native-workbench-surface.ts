@@ -28,12 +28,12 @@ function artifactHtmlCsp(allowRemoteResources: boolean): string {
     "frame-src 'none'",
     "child-src 'none'",
     "form-action 'none'",
-    `script-src 'self' 'unsafe-inline'${remote}`,
+    "script-src 'self' 'unsafe-inline'",
     `style-src 'self' 'unsafe-inline'${remote}`,
     `img-src 'self' data: blob:${remote}`,
     `media-src 'self' data: blob:${remote}`,
     `font-src 'self' data:${remote}`,
-    allowRemoteResources ? "connect-src 'self' https:" : "connect-src 'self'",
+    "connect-src 'self'",
     "worker-src 'self' blob:",
     "manifest-src 'none'",
   ].join('; ')
@@ -314,7 +314,11 @@ export class NativeWorkbenchSurfaceManager {
       )
       if (!isDocument) record.subresourceRequestCount += 1
       callback({
-        cancel: !nativeWorkbenchNetworkUrlAllowed(details.url, allowRemoteResources)
+        cancel: !nativeWorkbenchNetworkUrlAllowed(
+          details.url,
+          allowRemoteResources,
+          details.resourceType,
+        )
           || record.subresourceRequestCount > NATIVE_WORKBENCH_MAX_SUBRESOURCE_REQUESTS,
       })
     })

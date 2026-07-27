@@ -101,6 +101,14 @@ try {
         contents.session.protocol.handle('https', request => {
           requestCount += 1
           const url = new URL(request.url)
+          if (url.pathname.endsWith('.css')) {
+            return new Response(':root { --remote-stylesheet-probe: loaded; }', {
+              headers: {
+                'cache-control': 'no-store',
+                'content-type': 'text/css; charset=utf-8',
+              },
+            })
+          }
           if (url.pathname.endsWith('.js')) {
             return new Response(
               'window.__remoteProbe = (window.__remoteProbe || 0) + 1',
@@ -134,6 +142,24 @@ try {
           document.head.append(script)
           setTimeout(() => resolve('timeout'), 3000)
         })`)
+      }
+
+      async function appendRemoteStylesheet(contents, path) {
+        return await contents.executeJavaScript(`new Promise(resolve => {
+          const stylesheet = document.createElement('link')
+          stylesheet.rel = 'stylesheet'
+          stylesheet.href = '${remoteOrigin}' + ${JSON.stringify(path)}
+          stylesheet.onload = () => resolve('loaded')
+          stylesheet.onerror = () => resolve('blocked')
+          document.head.append(stylesheet)
+          setTimeout(() => resolve('timeout'), 3000)
+        })`)
+      }
+
+      async function requestRemoteData(contents, path) {
+        return await contents.executeJavaScript(`fetch(
+          '${remoteOrigin}' + ${JSON.stringify(path)}
+        ).then(() => 'loaded', () => 'blocked')`)
       }
 
       const offline = await manager.createSurface({
@@ -226,10 +252,18 @@ try {
       if (!allowed.ok) throw new Error(allowed.message || 'Allowed surface failed to load.')
       const allowedContents = await waitFor(previewContents, 'allowed preview WebContents')
       const allowedRequestCount = installSyntheticHttpsProtocol(allowedContents)
+      const allowedStylesheetResult = await appendRemoteStylesheet(
+        allowedContents,
+        '/allowed.css',
+      )
+      const allowedStylesheetProbe = await allowedContents.executeJavaScript(
+        "getComputedStyle(document.documentElement).getPropertyValue('--remote-stylesheet-probe').trim()",
+      )
       const allowedScriptResult = await appendRemoteScript(allowedContents, '/allowed.js')
       const allowedProbe = await allowedContents.executeJavaScript(
         'Number(window.__remoteProbe || 0)',
       )
+      const allowedDataResult = await requestRemoteData(allowedContents, '/data.json')
       await manager.destroySurface('artifact:allowed')
       await waitFor(() => allowedContents.isDestroyed(), 'allowed surface destruction')
 
@@ -360,7 +394,10 @@ try {
       return {
         allowedProbe,
         allowedRequestCount: allowedRequestCount(),
+        allowedDataResult,
         allowedScriptResult,
+        allowedStylesheetProbe,
+        allowedStylesheetResult,
         crashActivation,
         dialogsDisabled,
         downloadPrevented,
@@ -385,9 +422,36 @@ try {
   assert.equal(result.offlineScriptResult, 'blocked', 'offline HTTPS script must fail')
   assert.equal(result.offlineProbe, 0, 'offline surfaces must not execute HTTPS scripts')
   assert.equal(result.offlineRequestCount, 0, 'offline HTTPS must stop before protocol dispatch')
-  assert.equal(result.allowedScriptResult, 'loaded', 'explicit HTTPS permission must load scripts')
-  assert.equal(result.allowedProbe, 1, 'explicit HTTPS permission must execute the remote script')
-  assert.equal(result.allowedRequestCount, 1, 'allowed HTTPS must reach the protocol handler')
+  assert.equal(
+    result.allowedStylesheetResult,
+    'loaded',
+    'explicit permission must load passive HTTPS resources',
+  )
+  assert.equal(
+    result.allowedStylesheetProbe,
+    'loaded',
+    'the allowed passive resource must affect the preview',
+  )
+  assert.equal(
+    result.allowedScriptResult,
+    'blocked',
+    'online-resource permission must not load remote scripts',
+  )
+  assert.equal(
+    result.allowedProbe,
+    0,
+    'online-resource permission must not execute remote scripts',
+  )
+  assert.equal(
+    result.allowedDataResult,
+    'blocked',
+    'online-resource permission must not enable remote data requests',
+  )
+  assert.equal(
+    result.allowedRequestCount,
+    1,
+    'only the passive HTTPS resource may reach the protocol handler',
+  )
   assert.equal(
     result.dialogsDisabled,
     true,

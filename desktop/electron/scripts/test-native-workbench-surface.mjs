@@ -97,8 +97,40 @@ assert.equal(nativeWorkbenchNetworkUrlAllowed('https://assets.example.test/app.j
 assert.equal(nativeWorkbenchNetworkUrlAllowed('data:image/png;base64,AA=='), true)
 assert.equal(nativeWorkbenchNetworkUrlAllowed('blob:null/fixture'), true)
 assert.equal(
-  nativeWorkbenchNetworkUrlAllowed('https://assets.example.test/app.js', true),
+  nativeWorkbenchNetworkUrlAllowed(
+    'https://assets.example.test/poster.png',
+    true,
+    'image',
+  ),
   true,
+)
+assert.equal(
+  nativeWorkbenchNetworkUrlAllowed(
+    'https://assets.example.test/theme.css',
+    true,
+    'stylesheet',
+  ),
+  true,
+)
+assert.equal(
+  nativeWorkbenchNetworkUrlAllowed(
+    'https://assets.example.test/app.js',
+    true,
+    'script',
+  ),
+  false,
+)
+assert.equal(
+  nativeWorkbenchNetworkUrlAllowed(
+    'https://assets.example.test/data.json',
+    true,
+    'xhr',
+  ),
+  false,
+)
+assert.equal(
+  nativeWorkbenchNetworkUrlAllowed('https://assets.example.test/unknown', true),
+  false,
 )
 assert.equal(nativeWorkbenchNetworkUrlAllowed('http://assets.example.test/app.js'), false)
 assert.equal(nativeWorkbenchNetworkUrlAllowed('file:///synthetic/secret.txt'), false)

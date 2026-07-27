@@ -189,13 +189,18 @@ export function nativeWorkbenchArtifactUrl(handle: string): string {
 export function nativeWorkbenchNetworkUrlAllowed(
   value: string,
   allowRemoteResources = false,
+  resourceType = '',
 ): boolean {
   try {
     const protocol = new URL(value).protocol
     return protocol === `${NATIVE_WORKBENCH_ARTIFACT_SCHEME}:`
       || protocol === 'data:'
       || protocol === 'blob:'
-      || (allowRemoteResources && protocol === 'https:')
+      || (
+        allowRemoteResources
+        && protocol === 'https:'
+        && ['font', 'image', 'media', 'stylesheet'].includes(resourceType)
+      )
   } catch {
     return false
   }
