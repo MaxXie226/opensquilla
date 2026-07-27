@@ -13,6 +13,137 @@
         }
       ]
     },
+    "ConnectParams": {
+      "additionalProperties": true,
+      "description": "Live parser for the tolerant wire-level ``connect.params`` object.",
+      "properties": {
+        "auth": {
+          "additionalProperties": true,
+          "title": "Auth",
+          "type": "object"
+        },
+        "caps": {
+          "anyOf": [
+            {},
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Caps"
+        },
+        "client": {
+          "anyOf": [
+            {},
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Client"
+        },
+        "commands": {
+          "anyOf": [
+            {},
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Commands"
+        },
+        "locale": {
+          "anyOf": [
+            {},
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Locale"
+        },
+        "maxProtocol": {
+          "default": 3,
+          "title": "Maxprotocol",
+          "type": "integer"
+        },
+        "minProtocol": {
+          "default": 1,
+          "title": "Minprotocol",
+          "type": "integer"
+        },
+        "path_env": {
+          "anyOf": [
+            {},
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Path Env"
+        },
+        "permissions": {
+          "anyOf": [
+            {},
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Permissions"
+        },
+        "role": {
+          "default": "operator",
+          "title": "Role",
+          "type": "string"
+        },
+        "scopes": {
+          "anyOf": [
+            {},
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Scopes"
+        },
+        "user_agent": {
+          "anyOf": [
+            {},
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "User Agent"
+        }
+      },
+      "title": "ConnectParams",
+      "type": "object"
+    },
+    "ContractInfo": {
+      "properties": {
+        "digest": {
+          "title": "Digest",
+          "type": "string"
+        },
+        "generatedFrom": {
+          "title": "Generatedfrom",
+          "type": "string"
+        },
+        "schemaVersion": {
+          "title": "Schemaversion",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "digest",
+        "generatedFrom"
+      ],
+      "title": "ContractInfo",
+      "type": "object"
+    },
     "ErrorShape": {
       "properties": {
         "accepted": {
@@ -205,8 +336,61 @@
           "default": null,
           "title": "Auth"
         },
+        "capabilities": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Capabilities"
+        },
+        "contract": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ContractInfo"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "extensions": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Extensions"
+        },
         "features": {
           "$ref": "#/$defs/FeaturesInfo"
+        },
+        "id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Id"
         },
         "policy": {
           "$ref": "#/$defs/PolicyInfo"
@@ -214,6 +398,28 @@
         "protocol": {
           "title": "Protocol",
           "type": "integer"
+        },
+        "protocolRange": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProtocolRangeInfo"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "runtime": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RuntimeInfo"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "server": {
           "$ref": "#/$defs/ServerInfo"
@@ -237,218 +443,6 @@
         "type"
       ],
       "title": "HelloOk",
-      "type": "object"
-    },
-    "LegacyClientInfo": {
-      "properties": {
-        "device_family": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Device Family"
-        },
-        "display_name": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Display Name"
-        },
-        "id": {
-          "title": "Id",
-          "type": "string"
-        },
-        "instance_id": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Instance Id"
-        },
-        "mode": {
-          "title": "Mode",
-          "type": "string"
-        },
-        "model_identifier": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Model Identifier"
-        },
-        "platform": {
-          "title": "Platform",
-          "type": "string"
-        },
-        "version": {
-          "title": "Version",
-          "type": "string"
-        }
-      },
-      "required": [
-        "id",
-        "version",
-        "platform",
-        "mode"
-      ],
-      "title": "ClientInfo",
-      "type": "object"
-    },
-    "LegacyConnectParams": {
-      "properties": {
-        "auth": {
-          "anyOf": [
-            {
-              "additionalProperties": true,
-              "type": "object"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Auth"
-        },
-        "caps": {
-          "anyOf": [
-            {
-              "items": {
-                "type": "string"
-              },
-              "type": "array"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Caps"
-        },
-        "client": {
-          "$ref": "#/$defs/LegacyClientInfo"
-        },
-        "commands": {
-          "anyOf": [
-            {
-              "items": {
-                "type": "string"
-              },
-              "type": "array"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Commands"
-        },
-        "locale": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Locale"
-        },
-        "max_protocol": {
-          "title": "Max Protocol",
-          "type": "integer"
-        },
-        "min_protocol": {
-          "title": "Min Protocol",
-          "type": "integer"
-        },
-        "path_env": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Path Env"
-        },
-        "permissions": {
-          "anyOf": [
-            {
-              "additionalProperties": {
-                "type": "boolean"
-              },
-              "type": "object"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Permissions"
-        },
-        "role": {
-          "default": "operator",
-          "title": "Role",
-          "type": "string"
-        },
-        "scopes": {
-          "anyOf": [
-            {
-              "items": {
-                "type": "string"
-              },
-              "type": "array"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Scopes"
-        },
-        "user_agent": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "User Agent"
-        }
-      },
-      "required": [
-        "min_protocol",
-        "max_protocol",
-        "client"
-      ],
-      "title": "ConnectParams",
       "type": "object"
     },
     "PingFrame": {
@@ -520,6 +514,24 @@
         "type"
       ],
       "title": "PongFrame",
+      "type": "object"
+    },
+    "ProtocolRangeInfo": {
+      "properties": {
+        "max": {
+          "title": "Max",
+          "type": "integer"
+        },
+        "min": {
+          "title": "Min",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "min",
+        "max"
+      ],
+      "title": "ProtocolRangeInfo",
       "type": "object"
     },
     "ReqFrame": {
@@ -603,6 +615,41 @@
         "type"
       ],
       "title": "ResFrame",
+      "type": "object"
+    },
+    "RuntimeInfo": {
+      "properties": {
+        "arch": {
+          "title": "Arch",
+          "type": "string"
+        },
+        "buildCommit": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Buildcommit"
+        },
+        "coreVersion": {
+          "title": "Coreversion",
+          "type": "string"
+        },
+        "platform": {
+          "title": "Platform",
+          "type": "string"
+        }
+      },
+      "required": [
+        "coreVersion",
+        "platform",
+        "arch"
+      ],
+      "title": "RuntimeInfo",
       "type": "object"
     },
     "ServerFrame": {
@@ -798,12 +845,12 @@
         ],
         "type": "object"
       },
-      "legacy_declared_model": {
+      "live_parser_model": {
         "schema": {
-          "$ref": "#/$defs/LegacyConnectParams"
+          "$ref": "#/$defs/ConnectParams"
         },
-        "status": "not-used-by-websocket-parser",
-        "wire_name_difference": "min_protocol/max_protocol vs minProtocol/maxProtocol"
+        "status": "used-by-websocket-parser",
+        "wire_aliases": "min_protocol/max_protocol serialize as minProtocol/maxProtocol"
       },
       "sequence": [
         "server event connect.challenge",
@@ -883,7 +930,7 @@
       "minimum_supported": 1
     },
     "runtime_validation": {
-      "inbound": "hand-written JSON parsing; Pydantic request models are descriptive",
+      "inbound": "frame shape checks plus Pydantic parsing of connect.params",
       "outbound": "Pydantic response/event/hello serialization"
     },
     "schema_version": 1,

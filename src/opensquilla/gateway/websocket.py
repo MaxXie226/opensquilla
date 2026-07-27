@@ -6,10 +6,12 @@ import asyncio
 import json
 import time
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
 import structlog
+from pydantic import ValidationError
 from starlette.websockets import WebSocket, WebSocketDisconnect, WebSocketState
 
 from opensquilla import __version__
@@ -19,11 +21,18 @@ from opensquilla.gateway.config import (
     effective_agent_stream_idle_timeout_seconds,
     effective_webui_stream_idle_grace_seconds,
 )
+from opensquilla.gateway.hello_capabilities import (
+    build_contract_info,
+    build_protocol_range,
+    build_runtime_info,
+    capabilities_for_methods,
+)
 from opensquilla.gateway.protocol import (
     DECLARED_EVENTS,
     PREAUTH_TIMEOUT_MS,
     PROTOCOL_VERSION,
     WS_CLOSE_SERVICE_RESTART,
+    ConnectParams,
     HelloOk,
     PolicyInfo,
     ResFrame,
@@ -600,6 +609,7 @@ async def handle_ws_connection(
     memory_managers: dict[str, Any] | None = None,
     memory_stores: dict[str, Any] | None = None,
     memory_retrievers: dict[str, Any] | None = None,
+    loaded_capabilities: Sequence[str] = (),
 ) -> None:
     """Main WebSocket connection handler."""
     conn_id = str(uuid.uuid4())
@@ -662,7 +672,8 @@ async def handle_ws_connection(
     if not isinstance(params_raw, dict):
         params_raw = {}
 
-    # Step 4: Resolve auth via server-side ScopeResolver
+    # Step 4: Normalize historically tolerated values, then parse the actual
+    # camelCase wire object through the shared model.
     from opensquilla.gateway.auth import resolve_auth
 
     auth_params = params_raw.get("auth")
@@ -671,11 +682,29 @@ async def handle_ws_connection(
     role_claim = params_raw.get("role", "operator")
     if not isinstance(role_claim, str):
         role_claim = "operator"
+    try:
+        connect_params = ConnectParams.model_validate(
+            {
+                **params_raw,
+                "auth": auth_params,
+                "role": role_claim,
+            }
+        )
+    except ValidationError:
+        await conn.send_res(
+            make_error_res(
+                req_id, "INVALID_REQUEST", "minProtocol and maxProtocol must be integers"
+            )
+        )
+        await conn.close()
+        return
+
+    # Resolve auth via server-side ScopeResolver.
     peer_ip = ws.client.host if ws.client is not None else None
     principal = resolve_auth(
         config,
-        auth_params=auth_params,
-        role_claim=role_claim,
+        auth_params=connect_params.auth,
+        role_claim=connect_params.role,
         peer_ip=peer_ip,
     )
     if principal is None:
@@ -686,19 +715,8 @@ async def handle_ws_connection(
     from opensquilla.sandbox.run_mode_policy import hello_auth_payload
 
     # Step 5: Negotiate protocol version
-    min_proto = params_raw.get("minProtocol", 1)
-    max_proto = params_raw.get("maxProtocol", PROTOCOL_VERSION)
-    if not all(
-        isinstance(bound, int) and not isinstance(bound, bool)
-        for bound in (min_proto, max_proto)
-    ):
-        await conn.send_res(
-            make_error_res(
-                req_id, "INVALID_REQUEST", "minProtocol and maxProtocol must be integers"
-            )
-        )
-        await conn.close()
-        return
+    min_proto = connect_params.min_protocol
+    max_proto = connect_params.max_protocol
     negotiated = min(max_proto, PROTOCOL_VERSION)
     if negotiated < min_proto:
         await conn.send_res(
@@ -711,10 +729,12 @@ async def handle_ws_connection(
     conn.principal = principal
 
     # Step 6: Send HelloOk
+    features = _build_features(dispatcher)
     hello = HelloOk(
+        id=req_id,
         protocol=negotiated,
         server=ServerInfo(version=__version__, conn_id=conn_id),
-        features=_build_features(dispatcher),
+        features=features,
         snapshot=SnapshotInfo(
             uptime_ms=int(time.time() * 1000),
             config_path=config.config_path,
@@ -738,8 +758,18 @@ async def handle_ws_connection(
             ),
         ),
         auth=hello_auth_payload(principal),
+        contract=build_contract_info(),
+        runtime=build_runtime_info(),
+        protocolRange=build_protocol_range(),
+        capabilities=list(
+            capabilities_for_methods(
+                features.methods,
+                loaded_capabilities=loaded_capabilities,
+            )
+        ),
+        extensions=[],
     )
-    await ws.send_text(hello.model_dump_json())
+    await ws.send_text(hello.model_dump_json(by_alias=True))
 
     registry.register(conn)
     # Boundary: pre-auth direct-send ends here. After registry.register(conn),

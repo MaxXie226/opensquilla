@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 # Protocol version negotiated during handshake
 PROTOCOL_VERSION = 3
@@ -120,18 +120,22 @@ class ClientInfo(BaseModel):
 
 
 class ConnectParams(BaseModel):
-    min_protocol: int
-    max_protocol: int
-    client: ClientInfo
-    caps: list[str] | None = None
-    commands: list[str] | None = None
-    permissions: dict[str, bool] | None = None
-    path_env: str | None = None
+    """Live parser for the tolerant wire-level ``connect.params`` object."""
+
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
+
+    min_protocol: int = Field(default=1, alias="minProtocol", strict=True)
+    max_protocol: int = Field(default=PROTOCOL_VERSION, alias="maxProtocol", strict=True)
+    client: Any | None = None
+    caps: Any | None = None
+    commands: Any | None = None
+    permissions: Any | None = None
+    path_env: Any | None = None
     role: str = "operator"
-    scopes: list[str] | None = None
-    auth: dict[str, Any] | None = None
-    locale: str | None = None
-    user_agent: str | None = None
+    scopes: Any | None = None
+    auth: dict[str, Any] = Field(default_factory=dict)
+    locale: Any | None = None
+    user_agent: Any | None = None
 
 
 class ServerInfo(BaseModel):
@@ -164,14 +168,44 @@ class PolicyInfo(BaseModel):
     client_ws_keepalive_timeout_ms: int = 120_000
 
 
+class ContractInfo(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    schema_version: int = Field(alias="schemaVersion")
+    digest: str
+    generated_from: str = Field(alias="generatedFrom")
+
+
+class RuntimeInfo(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    core_version: str = Field(alias="coreVersion")
+    build_commit: str | None = Field(default=None, alias="buildCommit")
+    platform: str
+    arch: str
+
+
+class ProtocolRangeInfo(BaseModel):
+    min: int
+    max: int
+
+
 class HelloOk(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     type: Literal["hello-ok"] = "hello-ok"
+    id: str | None = None
     protocol: int
     server: ServerInfo
     features: FeaturesInfo
     snapshot: SnapshotInfo
     policy: PolicyInfo
     auth: dict[str, Any] | None = None
+    contract: ContractInfo | None = None
+    runtime: RuntimeInfo | None = None
+    protocol_range: ProtocolRangeInfo | None = Field(default=None, alias="protocolRange")
+    capabilities: list[str] | None = None
+    extensions: list[str] | None = None
 
 
 # ---------------------------------------------------------------------------

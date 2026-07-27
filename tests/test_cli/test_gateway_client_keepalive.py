@@ -16,6 +16,11 @@ from opensquilla.cli.gateway_client import (
     _task_terminal_as_session_event,
     session_history_all,
 )
+from opensquilla.gateway.contract_identity import CLIENT_CONTRACT_DIGEST
+from opensquilla.gateway.hello_capabilities import (
+    CAPABILITY_RPC,
+    CAPABILITY_SESSIONS,
+)
 
 _STOP = object()
 
@@ -116,6 +121,7 @@ def _handshake_frames(*, keepalive_ms: int = 60_000) -> list[dict[str, Any]]:
         {"type": "event", "event": "connect.challenge", "payload": {"nonce": "n"}},
         {
             "type": "hello-ok",
+            "protocol": 3,
             "policy": {"client_ws_keepalive_timeout_ms": keepalive_ms},
         },
     ]
@@ -147,6 +153,9 @@ async def test_cli_gateway_connect_frame_is_frozen(
 
     await client.connect(token="<synthetic>")
     try:
+        assert client.hello_capabilities is not None
+        assert client.hello_capabilities.contract_status == "legacy-contract"
+        assert client.hello_capabilities.response_id_status == "legacy-missing"
         frame = json.loads(ws.sent[0])
         assert isinstance(frame["id"], str) and frame["id"]
         assert {key: value for key, value in frame.items() if key != "id"} == {
@@ -160,6 +169,56 @@ async def test_cli_gateway_connect_frame_is_frozen(
                 "auth": {"token": "<synthetic>"},
             },
         }
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_cli_gateway_client_consumes_new_hello_capabilities(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _NewHelloWebSocket(_FakeWebSocket):
+        async def recv(self) -> str:
+            if not self.sent:
+                return json.dumps(
+                    {"type": "event", "event": "connect.challenge", "payload": {"nonce": "n"}}
+                )
+            request_id = json.loads(self.sent[0])["id"]
+            return json.dumps(
+                {
+                    "type": "hello-ok",
+                    "id": request_id,
+                    "protocol": 3,
+                    "server": {"version": "0.5.0"},
+                    "contract": {
+                        "schemaVersion": 1,
+                        "digest": CLIENT_CONTRACT_DIGEST,
+                        "generatedFrom": "gateway",
+                    },
+                    "runtime": {
+                        "coreVersion": "0.5.0",
+                        "buildCommit": None,
+                        "platform": "linux",
+                        "arch": "x86_64",
+                    },
+                    "protocolRange": {"min": 1, "max": 3},
+                    "capabilities": [CAPABILITY_RPC, CAPABILITY_SESSIONS],
+                    "extensions": [],
+                }
+            )
+
+    ws = _NewHelloWebSocket()
+    _install_fake_websockets(monkeypatch, ws)
+    client = GatewayClient()
+
+    await client.connect()
+    try:
+        hello = client.hello_capabilities
+        assert hello is not None
+        assert hello.contract_status == "advertised"
+        assert hello.contract_digest == CLIENT_CONTRACT_DIGEST
+        assert hello.capabilities == frozenset({CAPABILITY_RPC, CAPABILITY_SESSIONS})
+        assert hello.response_id_status == "matched"
     finally:
         await client.close()
 

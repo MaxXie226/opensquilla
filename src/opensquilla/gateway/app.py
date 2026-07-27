@@ -21,6 +21,7 @@ from opensquilla.gateway.approval_events import build_approval_snapshot_item
 from opensquilla.gateway.approval_queue import get_approval_queue
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.control_ui import create_control_ui_routes
+from opensquilla.gateway.hello_capabilities import CAPABILITY_ARTIFACTS
 from opensquilla.gateway.middleware import (
     AuthMiddleware,
     ErrorHandlingMiddleware,
@@ -664,6 +665,7 @@ def create_gateway_app(
             memory_managers=memory_managers,
             memory_stores=memory_stores,
             memory_retrievers=memory_retrievers,
+            loaded_capabilities=(CAPABILITY_ARTIFACTS,),
         )
 
     # ── Routes ───────────────────────────────────────────────────────────────

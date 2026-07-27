@@ -1,16 +1,15 @@
 """Deterministic snapshot of the Gateway surface consumed by clients.
 
-This module records protocol v3 as it behaves today. It deliberately does not
-turn the snapshot into a runtime parser or change the wire contract. In
-particular, the historical ``ConnectParams`` Pydantic model is stricter than
-the hand-written WebSocket handshake parser; both facts are exported rather
-than silently treating the model as the live parser.
+This module records protocol v3 as it behaves today. The deterministic
+snapshot supplies the digest advertised during the runtime Hello handshake;
+the handshake itself uses the aliased ``ConnectParams`` model exported here.
 """
 
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
 from typing import Any
@@ -20,6 +19,14 @@ from starlette.applications import Starlette
 from starlette.routing import Mount, Route, WebSocketRoute
 
 from opensquilla.gateway.auth import Principal
+from opensquilla.gateway.contract_identity import (
+    CONTRACT_GENERATED_FROM,
+    CONTRACT_SCHEMA_VERSION,
+)
+from opensquilla.gateway.hello_capabilities import (
+    CAPABILITY_ARTIFACTS,
+    capabilities_for_methods,
+)
 from opensquilla.gateway.middleware import AuthMiddleware
 from opensquilla.gateway.origin_guard import (
     SAME_CONFIGURED_OR_NO_ORIGIN,
@@ -48,14 +55,17 @@ from opensquilla.gateway.protocol import (
     TICK_INTERVAL_MS,
     WS_CLOSE_SERVICE_RESTART,
     ConnectParams,
+    ContractInfo,
     EventFrame,
     FeaturesInfo,
     HelloOk,
     PingFrame,
     PolicyInfo,
     PongFrame,
+    ProtocolRangeInfo,
     ReqFrame,
     ResFrame,
+    RuntimeInfo,
     ServerInfo,
     SnapshotInfo,
     StateVersion,
@@ -65,17 +75,26 @@ from opensquilla.gateway.rpc import RpcContractEntry
 from opensquilla.gateway.rpc import get_registry as get_rpc_registry
 from opensquilla.sandbox.run_mode_policy import hello_auth_payload
 
-CONTRACT_SCHEMA_VERSION = 1
 CONTRACT_PROTOCOL_MIN = 1
 CONTRACT_PROTOCOL_MAX = PROTOCOL_VERSION
 
 CONTRACT_ARTIFACT_PATHS = (
+    PurePosixPath("contract.json"),
     PurePosixPath("protocol.schema.json"),
     PurePosixPath("rpc-methods.json"),
     PurePosixPath("events.json"),
     PurePosixPath("http-routes.json"),
     PurePosixPath("golden/connect.json"),
     PurePosixPath("golden/hello-ok.json"),
+    PurePosixPath("golden/error.json"),
+)
+
+CONTRACT_DIGEST_PATHS = (
+    PurePosixPath("protocol.schema.json"),
+    PurePosixPath("rpc-methods.json"),
+    PurePosixPath("events.json"),
+    PurePosixPath("http-routes.json"),
+    PurePosixPath("golden/connect.json"),
     PurePosixPath("golden/error.json"),
 )
 
@@ -136,6 +155,8 @@ class ClientContractError(RuntimeError):
 class ClientContractSnapshot:
     """Read-only aggregate used to render the committed v3 artifacts."""
 
+    contract_manifest: dict[str, Any]
+    contract_digest: str
     protocol_schema: dict[str, Any]
     rpc_methods: dict[str, Any]
     events: dict[str, Any]
@@ -150,6 +171,25 @@ def render_json(payload: Any) -> bytes:
 
     text = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     return text.encode("utf-8")
+
+
+def compute_contract_digest(artifacts: dict[PurePosixPath, bytes]) -> str:
+    """Hash the non-circular deterministic contract surface."""
+
+    digest = sha256()
+    digest.update(b"opensquilla-client-contract-v1\0")
+    for path in CONTRACT_DIGEST_PATHS:
+        try:
+            content = artifacts[path]
+        except KeyError as exc:
+            raise ClientContractError(
+                f"Contract digest input is missing {path.as_posix()!r}"
+            ) from exc
+        digest.update(path.as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(content)
+        digest.update(b"\0")
+    return f"sha256:{digest.hexdigest()}"
 
 
 def _protocol_schema() -> dict[str, Any]:
@@ -189,12 +229,12 @@ def _protocol_schema() -> dict[str, Any]:
             {"$ref": "#/$defs/PongFrame"},
         ]
     }
-    legacy_connect = TypeAdapter(ConnectParams).json_schema(
-        ref_template="#/$defs/Legacy{model}"
+    connect_params = TypeAdapter(ConnectParams).json_schema(
+        ref_template="#/$defs/{model}"
     )
-    for name, definition in legacy_connect.pop("$defs", {}).items():
-        definitions[f"Legacy{name}"] = definition
-    definitions["LegacyConnectParams"] = legacy_connect
+    for name, definition in connect_params.pop("$defs", {}).items():
+        definitions[name] = definition
+    definitions["ConnectParams"] = connect_params
     error_codes = sorted(
         {
             ERROR_AGENT_TIMEOUT,
@@ -275,10 +315,10 @@ def _protocol_schema() -> dict[str, Any]:
                     "the advertised supported range"
                 ),
             },
-            "legacy_declared_model": {
-                "schema": {"$ref": "#/$defs/LegacyConnectParams"},
-                "status": "not-used-by-websocket-parser",
-                "wire_name_difference": "min_protocol/max_protocol vs minProtocol/maxProtocol",
+            "live_parser_model": {
+                "schema": {"$ref": "#/$defs/ConnectParams"},
+                "status": "used-by-websocket-parser",
+                "wire_aliases": "min_protocol/max_protocol serialize as minProtocol/maxProtocol",
             },
             "sequence": [
                 "server event connect.challenge",
@@ -367,7 +407,7 @@ def _protocol_schema() -> dict[str, Any]:
             "schema": {"$ref": "#/$defs/ErrorShape"},
         },
         "runtime_validation": {
-            "inbound": "hand-written JSON parsing; Pydantic request models are descriptive",
+            "inbound": "frame shape checks plus Pydantic parsing of connect.params",
             "outbound": "Pydantic response/event/hello serialization",
         },
     }
@@ -732,7 +772,10 @@ def _golden_connect() -> dict[str, Any]:
     }
 
 
-def _golden_hello(entries: tuple[RpcContractEntry, ...]) -> dict[str, Any]:
+def _golden_hello(
+    entries: tuple[RpcContractEntry, ...],
+    contract_digest: str,
+) -> dict[str, Any]:
     principal = Principal(
         role="operator",
         scopes=frozenset({"operator.read", "operator.write"}),
@@ -740,6 +783,7 @@ def _golden_hello(entries: tuple[RpcContractEntry, ...]) -> dict[str, Any]:
         authenticated=True,
     )
     hello = HelloOk(
+        id="contract-connect-1",
         protocol=PROTOCOL_VERSION,
         server=ServerInfo(version="0.0.0-contract", conn_id=_SYNTHETIC_CONN_ID),
         features=FeaturesInfo(
@@ -757,8 +801,30 @@ def _golden_hello(entries: tuple[RpcContractEntry, ...]) -> dict[str, Any]:
         ),
         policy=PolicyInfo(),
         auth=hello_auth_payload(principal),
+        contract=ContractInfo(
+            schemaVersion=CONTRACT_SCHEMA_VERSION,
+            digest=contract_digest,
+            generatedFrom=CONTRACT_GENERATED_FROM,
+        ),
+        runtime=RuntimeInfo(
+            coreVersion="0.0.0-contract",
+            buildCommit=None,
+            platform="synthetic",
+            arch="synthetic",
+        ),
+        protocolRange=ProtocolRangeInfo(
+            min=CONTRACT_PROTOCOL_MIN,
+            max=CONTRACT_PROTOCOL_MAX,
+        ),
+        capabilities=list(
+            capabilities_for_methods(
+                [entry.name for entry in entries],
+                loaded_capabilities=(CAPABILITY_ARTIFACTS,),
+            )
+        ),
+        extensions=[],
     )
-    return hello.model_dump(mode="json")
+    return hello.model_dump(mode="json", by_alias=True)
 
 
 def _golden_error() -> dict[str, Any]:
@@ -775,14 +841,40 @@ def build_client_contract_snapshot() -> ClientContractSnapshot:
     """Build the complete v3 snapshot from locked runtime registries."""
 
     entries = _rpc_contract_entries()
+    protocol_schema = _protocol_schema()
+    rpc_methods = _rpc_methods(entries)
+    events = _events()
+    http_routes = _http_routes()
+    golden_connect = _golden_connect()
+    golden_error = _golden_error()
+    digest_inputs = {
+        PurePosixPath("protocol.schema.json"): render_json(protocol_schema),
+        PurePosixPath("rpc-methods.json"): render_json(rpc_methods),
+        PurePosixPath("events.json"): render_json(events),
+        PurePosixPath("http-routes.json"): render_json(http_routes),
+        PurePosixPath("golden/connect.json"): render_json(golden_connect),
+        PurePosixPath("golden/error.json"): render_json(golden_error),
+    }
+    contract_digest = compute_contract_digest(digest_inputs)
+    contract_manifest = {
+        "digest": contract_digest,
+        "digestAlgorithm": "sha256",
+        "digestDomain": "opensquilla-client-contract-v1",
+        "digestFraming": "domain-nul-(path-nul-content-nul)*",
+        "digestPaths": [path.as_posix() for path in CONTRACT_DIGEST_PATHS],
+        "generatedFrom": CONTRACT_GENERATED_FROM,
+        "schemaVersion": CONTRACT_SCHEMA_VERSION,
+    }
     return ClientContractSnapshot(
-        protocol_schema=_protocol_schema(),
-        rpc_methods=_rpc_methods(entries),
-        events=_events(),
-        http_routes=_http_routes(),
-        golden_connect=_golden_connect(),
-        golden_hello=_golden_hello(entries),
-        golden_error=_golden_error(),
+        contract_manifest=contract_manifest,
+        contract_digest=contract_digest,
+        protocol_schema=protocol_schema,
+        rpc_methods=rpc_methods,
+        events=events,
+        http_routes=http_routes,
+        golden_connect=golden_connect,
+        golden_hello=_golden_hello(entries, contract_digest),
+        golden_error=golden_error,
     )
 
 
@@ -793,6 +885,7 @@ def render_contract_artifacts(
 
     current = snapshot or build_client_contract_snapshot()
     artifacts = {
+        PurePosixPath("contract.json"): render_json(current.contract_manifest),
         PurePosixPath("protocol.schema.json"): render_json(current.protocol_schema),
         PurePosixPath("rpc-methods.json"): render_json(current.rpc_methods),
         PurePosixPath("events.json"): render_json(current.events),

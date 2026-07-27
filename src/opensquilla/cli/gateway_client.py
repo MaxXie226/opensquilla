@@ -12,6 +12,11 @@ from dataclasses import dataclass, field
 from typing import Any, cast
 from urllib.parse import urlparse
 
+from opensquilla.gateway_hello import (
+    HelloValidationError,
+    ParsedHelloCapabilities,
+    parse_hello_frame,
+)
 from opensquilla.session.terminal_reply import build_terminal_reply, sanitize_agent_error
 
 
@@ -351,6 +356,7 @@ class GatewayClient:
         self._heartbeat_interval: float = 48.0
         self._connection_error: ConnectionError | None = None
         self._closing = False
+        self.hello_capabilities: ParsedHelloCapabilities | None = None
         self._http_base: str | None = None
         self._auth_token: str | None = None
         self.surface_id = f"tui:{uuid.uuid4().hex}"
@@ -376,6 +382,7 @@ class GatewayClient:
             await self.close()
         self._closing = False
         self._connection_error = None
+        self.hello_capabilities = None
         try:
             import websockets
         except ImportError:
@@ -452,8 +459,15 @@ class GatewayClient:
             ) from exc
         if not isinstance(hello, dict):
             raise SystemExit(f"Handshake failed: {hello!r}")
-        if hello.get("type") != "hello-ok":
-            raise SystemExit(f"Handshake failed: {hello}")
+        try:
+            self.hello_capabilities = parse_hello_frame(
+                hello,
+                request_id=req_id,
+                client_min_protocol=1,
+                client_max_protocol=3,
+            )
+        except HelloValidationError as exc:
+            raise SystemExit(f"Handshake failed: {exc}") from exc
         policy_value = hello.get("policy")
         policy = cast(dict[str, Any], policy_value) if isinstance(policy_value, dict) else {}
         self._heartbeat_interval = _heartbeat_interval_from_policy(policy)
@@ -1136,6 +1150,7 @@ class GatewayClient:
         self._ws = None
         self._heartbeat_task = None
         self._listener_task = None
+        self.hello_capabilities = None
         self._server_session_subscriptions.clear()
         self._session_event_backlog.clear()
         for subscription in tuple(self._event_subscriptions.values()):
