@@ -2158,6 +2158,47 @@ async def test_agent_preserves_reasoning_content_for_deepseek_tool_replay() -> N
 
 
 @pytest.mark.asyncio
+async def test_agent_preserves_reasoning_content_for_qwen38_tool_replay() -> None:
+    provider = ReasoningToolLoopCapturingProvider()
+
+    async def tool_handler(call: Any) -> ToolResult:
+        return ToolResult(
+            tool_use_id=call.tool_use_id,
+            tool_name=call.tool_name,
+            content="tool ok",
+        )
+
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            max_iterations=2,
+            thinking=ThinkingLevel.XHIGH,
+            model_id="qwen3.8-max-preview",
+            model_capabilities=ModelCapabilities(
+                supports_reasoning=True,
+                supports_tools=True,
+                reasoning_format="dashscope",
+            ),
+        ),
+        tool_handler=tool_handler,
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    assert any(event.kind == "done" for event in events)
+    assert len(provider.calls) == 2
+    replay_messages = provider.calls[1]["messages"]
+    assistant_replay = next(
+        message
+        for message in replay_messages
+        if message.role == "assistant"
+        and isinstance(message.content, list)
+        and any(getattr(block, "type", None) == "tool_use" for block in message.content)
+    )
+    assert assistant_replay.reasoning_content == "I should call echo before finalizing."
+
+
+@pytest.mark.asyncio
 async def test_agent_preserves_allowed_historical_image_blocks_for_vision_models() -> None:
     provider = CapturingProvider()
     agent = Agent(

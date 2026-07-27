@@ -229,6 +229,51 @@ def test_llm_ensemble_config_defaults_disabled_with_profiles() -> None:
     assert g25.proposer_timeout_seconds == 240.0
     assert g25.proposer_early_stop_success_count == 3
     assert g25.proposer_early_stop_after_seconds == 150.0
+    g26 = cfg.llm_ensemble.profiles["g26_g12_qwen3_8_max_preview"]
+    assert [ref.model for ref in g26.proposers] == [
+        "deepseek/deepseek-v4-pro",
+        "z-ai/glm-5.2",
+        "moonshotai/kimi-k2.7-code",
+        "qwen3.8-max-preview",
+    ]
+    assert [ref.provider for ref in g26.proposers] == [
+        "openrouter",
+        "openrouter",
+        "openrouter",
+        "dashscope",
+    ]
+    assert g26.proposers[-1].api_key_env == "DASHSCOPE_API_KEY"
+    assert (
+        g26.proposers[-1].base_url
+        == "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    )
+    assert g26.proposers[-1].max_tokens == 66_384
+    assert g26.proposers[-1].timeout_seconds == 1800.0
+    assert g26.proposers[-1].wait_for_completion is True
+    assert g26.aggregator.model == "z-ai/glm-5.2"
+    assert g26.aggregator.provider == "openrouter"
+    assert g26.proposer_timeout_seconds == 240.0
+    assert g26.proposer_early_stop_success_count == 3
+    assert g26.proposer_early_stop_after_seconds == 150.0
+    g12 = cfg.llm_ensemble.profiles["g12_k2_replace_gemini"]
+    assert g26.model_dump(exclude={"proposers"}) == g12.model_dump(
+        exclude={"proposers"}
+    )
+    assert [ref.model_dump() for ref in g26.proposers[:3]] == [
+        ref.model_dump() for ref in g12.proposers[:3]
+    ]
+    qwen38_route_fields = {
+        "provider",
+        "model",
+        "api_key_env",
+        "base_url",
+        "max_tokens",
+        "timeout_seconds",
+        "wait_for_completion",
+    }
+    assert g26.proposers[-1].model_dump(exclude=qwen38_route_fields) == (
+        g12.proposers[-1].model_dump(exclude=qwen38_route_fields)
+    )
     assert cfg.llm_ensemble.profiles["g3_standard"].record_candidates is False
     assert cfg.llm_ensemble.profiles["g3_standard"].proposer_early_stop_success_count == 0
 

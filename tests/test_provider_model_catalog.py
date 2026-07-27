@@ -7,6 +7,13 @@ import pytest
 from opensquilla.provider.model_catalog import ModelCatalog
 
 
+def test_qwen38_preview_uses_invitation_context_and_output_limits() -> None:
+    catalog = ModelCatalog()
+
+    assert catalog.resolve_context_window("qwen3.8-max-preview") == 1_000_000
+    assert catalog.resolve_max_tokens("qwen3.8-max-preview") == 16_384
+
+
 def test_deepseek_v4_direct_models_use_official_context_and_output_windows() -> None:
     catalog = ModelCatalog()
 

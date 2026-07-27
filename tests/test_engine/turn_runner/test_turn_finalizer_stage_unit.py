@@ -498,6 +498,26 @@ async def test_reasoning_content_included_for_deepseek_model() -> None:
 
 
 @pytest.mark.asyncio
+async def test_reasoning_content_included_for_qwen38_preview() -> None:
+    stage, recs = _make_stage()
+    done = DoneEvent(
+        text="hi",
+        input_tokens=1,
+        output_tokens=1,
+        model="qwen3.8-max-preview",
+        reasoning_content="thinking...",
+    )
+    inp = _make_input(
+        final_text_parts=["hi"],
+        done_event=done,
+        resolved_model="qwen3.8-max-preview",
+    )
+    await stage.run(inp)
+
+    assert recs["transcript_append"].calls[0]["reasoning_content"] == "thinking..."
+
+
+@pytest.mark.asyncio
 async def test_reasoning_content_excluded_for_non_deepseek_model() -> None:
     stage, recs = _make_stage()
     done = DoneEvent(

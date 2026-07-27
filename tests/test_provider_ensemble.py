@@ -114,7 +114,13 @@ class _DelayedProvider:
         return []
 
 
-def _member(model: str, *, k: int = 1) -> EnsembleMemberConfig:
+def _member(
+    model: str,
+    *,
+    k: int = 1,
+    timeout_seconds: float = 0.0,
+    wait_for_completion: bool = False,
+) -> EnsembleMemberConfig:
     return EnsembleMemberConfig(
         provider_config=ProviderConfig(
             provider="openrouter",
@@ -123,6 +129,8 @@ def _member(model: str, *, k: int = 1) -> EnsembleMemberConfig:
             base_url="https://openrouter.ai/api",
         ),
         k=k,
+        timeout_seconds=timeout_seconds,
+        wait_for_completion=wait_for_completion,
     )
 
 
@@ -968,6 +976,97 @@ async def test_ensemble_can_early_stop_slow_proposers(
     assert proposer_requests[1]["cancelled_before_done"] is True
     assert {call["model"] for call in calls[:2]} == {"fast", "slow"}
     assert calls[-1]["model"] == "agg"
+
+
+@pytest.mark.asyncio
+async def test_ensemble_waits_for_protected_member_with_its_own_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, Any]] = []
+    delays = {
+        "fast": 0.0,
+        "protected": 0.05,
+        "agg": 0.0,
+    }
+
+    def fake_build_provider(cfg: ProviderConfig) -> _DelayedProvider:
+        return _DelayedProvider(cfg, calls, delays)
+
+    monkeypatch.setattr("opensquilla.provider.selector._build_provider", fake_build_provider)
+    provider = EnsembleProvider(
+        profile_name="test",
+        proposers=[
+            _member("fast"),
+            _member(
+                "protected",
+                timeout_seconds=0.2,
+                wait_for_completion=True,
+            ),
+        ],
+        aggregator=_member("agg"),
+        record_candidates=True,
+        shuffle_candidates=False,
+        proposer_timeout_seconds=0.02,
+        proposer_early_stop_success_count=1,
+        proposer_early_stop_after_seconds=0.01,
+    )
+
+    events = [event async for event in provider.chat([Message(role="user", content="solve")])]
+
+    done = events[-1]
+    assert isinstance(done, DoneEvent)
+    assert done.ensemble_trace["successful_proposers"] == 2
+    assert all(candidate["ok"] for candidate in done.ensemble_trace["candidates"])
+    protected_request = next(
+        request
+        for request in done.ensemble_trace["requests"]
+        if request["role"] == "proposer" and request["model"] == "protected"
+    )
+    assert protected_request["params"]["member_timeout_seconds"] == 0.2
+    assert protected_request["params"]["member_wait_for_completion"] is True
+    assert protected_request["params"]["effective_config"]["timeout"] == 0.2
+
+
+@pytest.mark.asyncio
+async def test_ensemble_cancels_pending_proposers_when_parent_is_cancelled() -> None:
+    provider = EnsembleProvider(
+        profile_name="test",
+        proposers=[_member("one"), _member("two")],
+        aggregator=_member("agg"),
+        proposer_early_stop_success_count=1,
+        proposer_early_stop_after_seconds=1.0,
+    )
+    both_started = asyncio.Event()
+    blocker = asyncio.Event()
+    started_count = 0
+    cancelled_count = 0
+
+    async def blocking_candidate(**_kwargs):  # noqa: ANN003, ANN202
+        nonlocal started_count, cancelled_count
+        started_count += 1
+        if started_count == 2:
+            both_started.set()
+        try:
+            await blocker.wait()
+        finally:
+            cancelled_count += 1
+
+    provider._collect_candidate = blocking_candidate  # type: ignore[method-assign]
+    parent = asyncio.create_task(
+        provider._run_proposers(
+            [Message(role="user", content="solve")],
+            tools=None,
+            config=None,
+        )
+    )
+    await asyncio.wait_for(both_started.wait(), timeout=1.0)
+
+    parent.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await parent
+
+    assert parent.done()
+    assert cancelled_count == 2
 
 
 @pytest.mark.asyncio

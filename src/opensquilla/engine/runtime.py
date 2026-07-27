@@ -271,6 +271,13 @@ def _is_deepseek_model_id(model: str) -> bool:
     return normalized.startswith("deepseek") or "/deepseek" in normalized
 
 
+def _preserves_reasoning_content_model_id(model: str) -> bool:
+    normalized = model.strip().lower()
+    return _is_deepseek_model_id(normalized) or (
+        normalized.rsplit("/", 1)[-1] == "qwen3.8-max-preview"
+    )
+
+
 # Tools that are safe to run concurrently within a single LLM turn.
 # Any tool name absent from this set is treated as mutex (serial dispatch).
 _SAFE_TOOL_NAMES: frozenset[str] = frozenset(

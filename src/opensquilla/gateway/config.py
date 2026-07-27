@@ -271,6 +271,10 @@ def _ensemble_ref(
     max_tokens: int = 0,
     thinking: str | None = None,
     k: int = 1,
+    api_key_env: str = "",
+    base_url: str = "",
+    timeout_seconds: float = 0.0,
+    wait_for_completion: bool = False,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "provider": provider,
@@ -283,6 +287,14 @@ def _ensemble_ref(
         payload["max_tokens"] = max_tokens
     if thinking:
         payload["thinking"] = thinking
+    if api_key_env:
+        payload["api_key_env"] = api_key_env
+    if base_url:
+        payload["base_url"] = base_url
+    if timeout_seconds > 0:
+        payload["timeout_seconds"] = timeout_seconds
+    if wait_for_completion:
+        payload["wait_for_completion"] = True
     return payload
 
 
@@ -349,6 +361,23 @@ def _default_llm_ensemble_profiles() -> dict[str, dict[str, Any]]:
     ]
     g12_without_qwen3_7_proposers = [
         ref for ref in g12_proposers if ref["model"] != "qwen/qwen3.7-max"
+    ]
+    g12_qwen3_8_max_preview_proposers = [
+        (
+            _ensemble_ref(
+                "qwen3.8-max-preview",
+                provider="dashscope",
+                api_key_env="DASHSCOPE_API_KEY",
+                base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+                thinking="high",
+                max_tokens=66_384,
+                timeout_seconds=1800.0,
+                wait_for_completion=True,
+            )
+            if ref["model"] == "qwen/qwen3.7-max"
+            else ref
+        )
+        for ref in g12_proposers
     ]
     g13_proposers = [
         *list(g8_proposers),
@@ -556,6 +585,13 @@ def _default_llm_ensemble_profiles() -> dict[str, dict[str, Any]]:
             proposer_early_stop_success_count=3,
             proposer_early_stop_after_seconds=150.0,
         ),
+        "g26_g12_qwen3_8_max_preview": _ensemble_profile(
+            list(g12_qwen3_8_max_preview_proposers),
+            _ensemble_ref("z-ai/glm-5.2", thinking="high"),
+            proposer_timeout_seconds=240.0,
+            proposer_early_stop_success_count=3,
+            proposer_early_stop_after_seconds=150.0,
+        ),
     }
 
 
@@ -573,6 +609,8 @@ class EnsembleModelRef(BaseModel):
     max_tokens: int = Field(default=0, ge=0)
     thinking: str | None = None
     k: int = Field(default=1, ge=1)
+    timeout_seconds: float = Field(default=0.0, ge=0.0)
+    wait_for_completion: bool = False
 
 
 class EnsembleProfile(BaseModel):

@@ -88,7 +88,12 @@ def test_zai_glm5_models_use_zai_reasoning_format() -> None:
 def test_dashscope_qwen_thinking_models_use_dashscope_reasoning_format() -> None:
     catalog = ModelCatalog()
 
-    for model in ("qwen3.6-flash", "qwen3.6-plus", "qwen3-max"):
+    for model in (
+        "qwen3.6-flash",
+        "qwen3.6-plus",
+        "qwen3.8-max-preview",
+        "qwen3-max",
+    ):
         caps = catalog.get_capabilities(
             model,
             provider_name="dashscope",
@@ -98,6 +103,8 @@ def test_dashscope_qwen_thinking_models_use_dashscope_reasoning_format() -> None
         assert caps.supports_reasoning is True
         assert caps.supports_tools is True
         assert caps.reasoning_format == "dashscope"
+        if model == "qwen3.8-max-preview":
+            assert caps.supports_vision is True
 
 
 def test_moonshot_distinguishes_kimi_thinking_from_moonshot_v1() -> None:

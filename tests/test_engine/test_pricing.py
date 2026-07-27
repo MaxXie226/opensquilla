@@ -161,6 +161,16 @@ def test_dashscope_beijing_qwen_static_prices_match_official_model_studio_pricin
     assert price.output_per_m == pytest.approx(output_per_m)
 
 
+def test_qwen38_preview_invitation_calls_are_free(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_OPENROUTER_LIVE_PRICING", "0")
+
+    price = lookup_price("qwen3.8-max-preview")
+
+    assert price == PriceEntry(0.0, 0.0)
+
+
 def test_dashscope_beijing_qwen_plus_smoke_usage_estimates_cost_from_tokens(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

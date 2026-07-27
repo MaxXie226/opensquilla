@@ -538,8 +538,8 @@ class TurnFinalizerStage:
         import json as _json
 
         from opensquilla.engine.runtime import (
-            _is_deepseek_model_id,
             _normalize_heartbeat_text,
+            _preserves_reasoning_content_model_id,
         )
         from opensquilla.engine.turn_runner.outcome import StageOutcome
 
@@ -583,7 +583,7 @@ class TurnFinalizerStage:
             if (
                 inp.done_event is not None
                 and inp.done_event.reasoning_content
-                and _is_deepseek_model_id(
+                and _preserves_reasoning_content_model_id(
                     inp.done_event.model or inp.resolved_model or ""
                 )
             ):

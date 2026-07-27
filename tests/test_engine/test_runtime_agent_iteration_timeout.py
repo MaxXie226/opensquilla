@@ -205,3 +205,31 @@ async def test_stream_iteration_timeout_does_not_double_close_provider_stream(
             pass
 
     assert close_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_iteration_wall_deadline_interrupts_active_provider_stream() -> None:
+    agent = Agent.__new__(Agent)
+    agent.config = MagicMock(timeout=1.0, iteration_timeout=1.0)
+
+    async def active_stream() -> AsyncIterator[dict[str, str]]:
+        while True:
+            await asyncio.sleep(0.01)
+            yield {"type": "chunk", "data": "progress"}
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    received = 0
+
+    with pytest.raises(_IterationStreamTimeoutError):
+        async for _event in agent._stream_provider_events_with_deadline(
+            active_stream(),
+            loop=loop,
+            total_deadline=None,
+            iteration_deadline=started + 0.05,
+        ):
+            received += 1
+
+    elapsed = loop.time() - started
+    assert received > 0
+    assert elapsed < 0.2

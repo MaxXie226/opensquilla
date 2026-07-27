@@ -205,15 +205,28 @@ def _should_disable_openrouter_reasoning_by_default(model: str) -> bool:
     return model_name.startswith(("gpt-5.4", "gpt-5.5"))
 
 
-def _direct_openai_uses_max_completion_tokens(
+def _is_dashscope_qwen38_request(provider_kind: str, model: str) -> bool:
+    model_name = model.rsplit("/", 1)[-1].strip().lower()
+    return provider_kind == "dashscope" and model_name == "qwen3.8-max-preview"
+
+
+def _uses_max_completion_tokens(
     provider_kind: str,
     base_url: str,
     model: str,
 ) -> bool:
+    if _is_dashscope_qwen38_request(provider_kind, model):
+        return True
     if provider_kind != "openai" or "api.openai.com" not in base_url.lower():
         return False
     model_name = model.rsplit("/", 1)[-1].strip().lower()
     return model_name.startswith(("gpt-5", "o1", "o3", "o4"))
+
+
+def _effective_temperature(provider_kind: str, model: str, temperature: float) -> float:
+    if _is_dashscope_qwen38_request(provider_kind, model):
+        return max(0.6, temperature)
+    return temperature
 
 
 def _is_kimi_fixed_sampling_model(provider_kind: str, model: str) -> bool:
@@ -569,6 +582,8 @@ def _should_replay_reasoning_content(
     model: str,
     caps: ModelCapabilities | None,
 ) -> bool:
+    if _is_dashscope_qwen38_request(provider_kind, model):
+        return True
     if provider_kind == "openrouter":
         if not caps or not caps.supports_reasoning:
             return False
@@ -813,7 +828,7 @@ class OpenAIProvider:
             "stream": True,
             "stream_options": {"include_usage": True},
         }
-        if _direct_openai_uses_max_completion_tokens(
+        if _uses_max_completion_tokens(
             self._provider_kind,
             self._base_url,
             self._model,
@@ -836,7 +851,11 @@ class OpenAIProvider:
             cfg,
             caps,
         ):
-            payload["temperature"] = cfg.temperature
+            payload["temperature"] = _effective_temperature(
+                self._provider_kind,
+                self._model,
+                cfg.temperature,
+            )
         if cfg.stop_sequences:
             payload["stop"] = cfg.stop_sequences
         if tools:
@@ -852,8 +871,21 @@ class OpenAIProvider:
                 }
 
         # Reasoning injection (gated on thinking being enabled)
+        dashscope_qwen38 = _is_dashscope_qwen38_request(
+            self._provider_kind,
+            self._model,
+        )
         direct_deepseek_v4 = _is_direct_deepseek_v4_request(self._provider_kind, self._model)
-        if (caps and caps.supports_reasoning and cfg.thinking) or (
+        if dashscope_qwen38:
+            # Qwen3.8 Max Preview is thinking-only and preserves prior
+            # reasoning by default. Keep max_tokens as the caller's total
+            # completion cap; the DRACO runner explicitly raises that cap for
+            # its 50K-thinking Qwen3.8 groups instead of mutating it here.
+            thinking_budget = max(0, int(cfg.thinking_budget_tokens))
+            payload["enable_thinking"] = True
+            payload["thinking_budget"] = thinking_budget
+            payload["preserve_thinking"] = True
+        elif (caps and caps.supports_reasoning and cfg.thinking) or (
             direct_deepseek_v4 and cfg.thinking
         ):
             effort = _resolve_reasoning_effort(cfg.thinking_level, cfg.thinking_budget_tokens)

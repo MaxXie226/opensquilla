@@ -1053,6 +1053,71 @@ def test_zai_non_thinking_sends_provider_disabled_for_default_thinking_model(
     assert captured["payload"]["thinking"] == {"type": "disabled"}
 
 
+def test_dashscope_qwen38_uses_preview_protocol_and_replays_reasoning(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="test",
+        model="qwen3.8-max-preview",
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        provider_kind="dashscope",
+    )
+    messages = [
+        Message(
+            role="assistant",
+            content=[
+                ContentBlockToolUse(
+                    id="call_lookup",
+                    name="lookup",
+                    input={"key": "ping"},
+                )
+            ],
+            reasoning_content="I should look up the value before replying.",
+        ),
+        Message(
+            role="user",
+            content=[
+                ContentBlockToolResult(
+                    tool_use_id="call_lookup",
+                    content="PONG",
+                )
+            ],
+        ),
+    ]
+    cfg = ChatConfig(
+        max_tokens=12_048,
+        temperature=0.0,
+        thinking=True,
+        thinking_budget_tokens=10_000,
+        thinking_level=ThinkingLevel.XHIGH,
+        model_capabilities=ModelCapabilities(
+            supports_reasoning=True,
+            supports_tools=True,
+            reasoning_format="dashscope",
+        ),
+    )
+
+    async def _run() -> None:
+        async for _ in provider.chat(messages, config=cfg):
+            pass
+
+    asyncio.run(_run())
+
+    payload = captured["payload"]
+    assert payload["max_completion_tokens"] == 12_048
+    assert "max_tokens" not in payload
+    assert payload["temperature"] == 0.6
+    assert payload["enable_thinking"] is True
+    assert payload["thinking_budget"] == 10_000
+    assert "reasoning_effort" not in payload
+    assert payload["preserve_thinking"] is True
+    assert payload["messages"][0]["reasoning_content"] == (
+        "I should look up the value before replying."
+    )
+
+
 def test_dashscope_thinking_uses_enable_thinking_and_budget(monkeypatch: Any) -> None:
     captured: dict[str, Any] = {}
     _patch_transport(monkeypatch, captured)

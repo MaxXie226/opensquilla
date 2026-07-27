@@ -955,6 +955,49 @@ async def test_iteration_timeout_caps_tool_execution() -> None:
 
 
 @pytest.mark.asyncio
+async def test_hard_iteration_timeout_is_shared_by_stream_and_tool() -> None:
+    class _DelayedToolUseProvider(_ToolUseProvider):
+        async def _stream(self) -> AsyncIterator[Any]:
+            await asyncio.sleep(0.04)
+            async for event in super()._stream():
+                yield event
+
+    async def slow_tool(call: object) -> ToolResult:
+        await asyncio.sleep(0.04)
+        return ToolResult(
+            tool_use_id=getattr(call, "tool_use_id"),
+            tool_name=getattr(call, "tool_name"),
+            content="late",
+        )
+
+    agent = Agent(
+        provider=_DelayedToolUseProvider(),
+        config=AgentConfig(
+            iteration_timeout=1.0,
+            hard_iteration_timeout=0.06,
+            timeout=1.0,
+            tool_timeout=1.0,
+            max_provider_retries=0,
+        ),
+        tool_definitions=[
+            ToolDefinition(
+                name="slow",
+                description="Slow tool.",
+                input_schema=ToolInputSchema(),
+            )
+        ],
+        tool_handler=slow_tool,
+    )
+
+    events = await asyncio.wait_for(_collect_events(agent.run_turn("hello")), timeout=0.3)
+
+    assert any(
+        isinstance(event, ErrorEvent) and event.code == "iteration_timeout"
+        for event in events
+    )
+
+
+@pytest.mark.asyncio
 async def test_provider_timeout_error_is_not_reclassified_as_iteration_timeout() -> None:
     provider = _ProviderRaisesTimeout()
     agent = Agent(

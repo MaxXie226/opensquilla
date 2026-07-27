@@ -22,6 +22,7 @@ DEFAULT_CONTEXT_WINDOW = 200_000
 # Used when OpenRouter API is unreachable at boot.
 # Format: model_id → (max_output_tokens, context_window)
 _STATIC_FALLBACK: dict[str, tuple[int, int]] = {
+    "qwen3.8-max-preview": (DEFAULT_MAX_TOKENS, 1_000_000),
     "gpt-5.4-nano": (128_000, 400_000),
     "gpt-5.4-mini": (128_000, 400_000),
     "gpt-5.5": (128_000, 1_000_000),
@@ -194,7 +195,9 @@ class ModelCatalog:
             return ModelCapabilities(
                 supports_reasoning=supports_reasoning,
                 supports_tools=True,
-                supports_vision=model_l.startswith(("qwen3.5", "qwen3.6", "qwen-vl")),
+                supports_vision=model_l.startswith(
+                    ("qwen3.5", "qwen3.6", "qwen3.8", "qwen-vl")
+                ),
                 reasoning_format="dashscope" if supports_reasoning else "none",
             )
         if provider_id == "moonshot":

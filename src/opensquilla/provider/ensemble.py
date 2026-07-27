@@ -57,6 +57,8 @@ class EnsembleMemberConfig:
     max_tokens: int = 0
     thinking: str | None = None
     k: int = 1
+    timeout_seconds: float = 0.0
+    wait_for_completion: bool = False
 
 
 @dataclass
@@ -413,6 +415,8 @@ def _request_trace(
             "member_max_tokens": member.max_tokens,
             "member_thinking": member.thinking,
             "member_k": member.k,
+            "member_timeout_seconds": member.timeout_seconds,
+            "member_wait_for_completion": member.wait_for_completion,
             "effective_config": _config_trace(config),
         },
         "tool_count": len(tools or []),
@@ -1414,19 +1418,28 @@ class EnsembleProvider:
         successful_count = 0
         started_all = time.monotonic()
         while pending:
+            protected_pending = any(
+                task_meta[task].member.wait_for_completion for task in pending
+            )
             timeout: float | None = None
-            if successful_count >= early_stop_target:
+            if successful_count >= early_stop_target and not protected_pending:
                 remaining = self.proposer_early_stop_after_seconds - (
                     time.monotonic() - started_all
                 )
                 if remaining <= 0:
                     break
                 timeout = remaining
-            done, pending = await asyncio.wait(
-                pending,
-                timeout=timeout,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
+            try:
+                done, pending = await asyncio.wait(
+                    pending,
+                    timeout=timeout,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            except asyncio.CancelledError:
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                raise
             if not done:
                 break
             for task in done:
@@ -1436,6 +1449,9 @@ class EnsembleProvider:
                     successful_count += 1
             if (
                 successful_count >= early_stop_target
+                and not any(
+                    task_meta[task].member.wait_for_completion for task in pending
+                )
                 and time.monotonic() - started_all
                 >= self.proposer_early_stop_after_seconds
             ):
@@ -1512,8 +1528,9 @@ class EnsembleProvider:
             elapsed_ms=int(elapsed_s * 1000),
         )
         chat_cfg = _member_chat_config(meta.config, meta.member)
-        if self.proposer_timeout_seconds > 0:
-            chat_cfg = chat_cfg.model_copy(update={"timeout": self.proposer_timeout_seconds})
+        timeout_s = self._proposer_timeout_for_member(meta.member)
+        if timeout_s > 0:
+            chat_cfg = chat_cfg.model_copy(update={"timeout": timeout_s})
         result.request = _request_trace(
             role="proposer",
             profile=self.profile_name,
@@ -1547,6 +1564,7 @@ class EnsembleProvider:
             model=cfg.model,
         )
         try:
+            timeout_s = self._proposer_timeout_for_member(member)
             return await asyncio.wait_for(
                 self._collect_candidate_inner(
                     result=result,
@@ -1557,13 +1575,11 @@ class EnsembleProvider:
                     started=started,
                 ),
                 timeout=(
-                    self.proposer_timeout_seconds
-                    if self.proposer_timeout_seconds > 0
-                    else None
+                    timeout_s if timeout_s > 0 else None
                 ),
             )
         except TimeoutError:
-            result.error = f"proposer timed out after {self.proposer_timeout_seconds:g}s"
+            result.error = f"proposer timed out after {timeout_s:g}s"
             result.error_code = "timeout"
         except Exception as exc:  # noqa: BLE001 - candidate failures are diagnostic data
             result.error = str(exc)
@@ -1571,6 +1587,12 @@ class EnsembleProvider:
         finally:
             result.elapsed_ms = int((time.monotonic() - started) * 1000)
         return result
+
+    def _proposer_timeout_for_member(self, member: EnsembleMemberConfig) -> float:
+        member_timeout = max(0.0, float(member.timeout_seconds or 0.0))
+        if member_timeout > 0:
+            return member_timeout
+        return self.proposer_timeout_seconds
 
     async def _prefilter_candidates(
         self,
@@ -1711,8 +1733,9 @@ class EnsembleProvider:
     ) -> _CandidateResult:
         provider = _build_provider(member.provider_config)
         chat_cfg = _member_chat_config(config, member)
-        if self.proposer_timeout_seconds > 0:
-            chat_cfg = chat_cfg.model_copy(update={"timeout": self.proposer_timeout_seconds})
+        timeout_s = self._proposer_timeout_for_member(member)
+        if timeout_s > 0:
+            chat_cfg = chat_cfg.model_copy(update={"timeout": timeout_s})
         result.request = _request_trace(
             role="proposer",
             profile=self.profile_name,
@@ -2281,6 +2304,10 @@ def _member_from_ref(ref: Any, inherited: ProviderConfig, *, label: str) -> Ense
         max_tokens=int(getattr(ref, "max_tokens", 0) or 0),
         thinking=getattr(ref, "thinking", None),
         k=max(1, int(getattr(ref, "k", 1) or 1)),
+        timeout_seconds=max(
+            0.0, float(getattr(ref, "timeout_seconds", 0.0) or 0.0)
+        ),
+        wait_for_completion=bool(getattr(ref, "wait_for_completion", False)),
     )
 
 

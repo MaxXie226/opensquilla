@@ -25,21 +25,42 @@ from opensquilla.engine.agent import Agent
 from opensquilla.engine.types import (
     THINKING_BUDGETS,
     AgentConfig,
-    DoneEvent as AgentDoneEvent,
-    ErrorEvent as AgentErrorEvent,
-    RunHeartbeatEvent as AgentRunHeartbeatEvent,
-    StateChangeEvent as AgentStateChangeEvent,
-    TextDeltaEvent as AgentTextDeltaEvent,
-    ThinkingEvent as AgentThinkingEvent,
     ThinkingLevel,
+)
+from opensquilla.engine.types import (
+    DoneEvent as AgentDoneEvent,
+)
+from opensquilla.engine.types import (
+    ErrorEvent as AgentErrorEvent,
+)
+from opensquilla.engine.types import (
+    RunHeartbeatEvent as AgentRunHeartbeatEvent,
+)
+from opensquilla.engine.types import (
+    StateChangeEvent as AgentStateChangeEvent,
+)
+from opensquilla.engine.types import (
+    TextDeltaEvent as AgentTextDeltaEvent,
+)
+from opensquilla.engine.types import (
+    ThinkingEvent as AgentThinkingEvent,
+)
+from opensquilla.engine.types import (
     ToolResultEvent as AgentToolResultEvent,
+)
+from opensquilla.engine.types import (
     ToolUseDeltaEvent as AgentToolUseDeltaEvent,
+)
+from opensquilla.engine.types import (
     ToolUseStartEvent as AgentToolUseStartEvent,
+)
+from opensquilla.engine.types import (
     WarningEvent as AgentWarningEvent,
 )
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.llm_runtime import resolve_llm_runtime_config
 from opensquilla.provider.ensemble import build_ensemble_provider_from_config
+from opensquilla.provider.registry import get_provider_spec
 from opensquilla.provider.selector import ModelSelector, ProviderConfig, SelectorConfig
 from opensquilla.provider.types import (
     ChatConfig,
@@ -59,6 +80,13 @@ from opensquilla.result_budget import build_webresearch_tool_run_budget_policy
 from opensquilla.tools.dispatch import build_tool_handler
 from opensquilla.tools.registry import ToolRegistry
 from opensquilla.tools.types import CallerKind, InteractionMode, ToolContext, ToolSpec
+
+DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+QWEN38_MAX_PREVIEW_MODEL = "qwen3.8-max-preview"
+QWEN38_PROPOSER_TIMEOUT_SECONDS = 1800.0
+QWEN38_DEFAULT_MAX_COMPLETION_TOKENS = (
+    ChatConfig().max_tokens + THINKING_BUDGETS[ThinkingLevel.XHIGH]
+)
 
 GROUP_SPECS: dict[str, dict[str, str]] = {
     "B0": {"kind": "single", "model": "anthropic/claude-opus-4.8"},
@@ -85,6 +113,13 @@ GROUP_SPECS: dict[str, dict[str, str]] = {
         "api_key_env": "OPENROUTER_API_KEY",
     },
     "B12": {"kind": "single", "model": "openai/gpt-5.6-sol"},
+    "B13": {
+        "kind": "single",
+        "model": QWEN38_MAX_PREVIEW_MODEL,
+        "provider": "dashscope",
+        "base_url": DASHSCOPE_BASE_URL,
+        "api_key_env": "DASHSCOPE_API_KEY",
+    },
     "G1": {"kind": "profile", "profile": "g1_code"},
     "G2": {"kind": "profile", "profile": "g2_general"},
     "G3": {"kind": "profile", "profile": "g3_standard"},
@@ -110,6 +145,7 @@ GROUP_SPECS: dict[str, dict[str, str]] = {
     "G23": {"kind": "profile", "profile": "g23_g12_plus_gemini_sampled_top3_prefilter"},
     "G24": {"kind": "profile", "profile": "g24_g12_drop_k2_7_code"},
     "G25": {"kind": "profile", "profile": "g25_g12_drop_qwen3_7"},
+    "G26": {"kind": "profile", "profile": "g26_g12_qwen3_8_max_preview"},
 }
 
 TOOL_MODE_PROVIDER_ONLY = "provider_only"
@@ -159,6 +195,7 @@ DEFAULT_MODEL_MAX_GENERATION_THINKING: dict[str, str] = {
     "openai/gpt-5.5-pro": "xhigh",
     "openai/gpt-5.6-sol": "max",
     "qwen/qwen3.7-max": "xhigh",
+    QWEN38_MAX_PREVIEW_MODEL: "xhigh",
     "sakana/fugu-ultra": "max",
     "z-ai/glm-5.2": "xhigh",
 }
@@ -691,6 +728,46 @@ def validate_runner_mode_for_groups(runner_mode: str, groups: list[str]) -> None
             "OpenRouter Fusion experiment groups are provider-level server-side "
             "agent baselines; run "
             f"{','.join(fusion_groups)} with --runner-mode=provider"
+        )
+
+
+def validate_openrouter_server_tools_for_groups(
+    *,
+    config: GatewayConfig,
+    inherited: ProviderConfig,
+    groups: list[str],
+    enable_proposer_tools: bool,
+) -> None:
+    incompatible: list[str] = []
+    for group in groups:
+        spec = GROUP_SPECS[group]
+        if spec["kind"] == "single":
+            provider = str(spec.get("provider") or inherited.provider).strip().lower()
+            if provider != "openrouter":
+                incompatible.append(f"{group}({provider or 'unknown'})")
+            continue
+
+        profile = config.llm_ensemble.profiles.get(spec["profile"])
+        if profile is None:
+            continue
+        members = [profile.aggregator]
+        if enable_proposer_tools:
+            members.extend(profile.proposers)
+        providers = {
+            str(getattr(member, "provider", "") or inherited.provider).strip().lower()
+            for member in members
+        }
+        non_openrouter = sorted(provider for provider in providers if provider != "openrouter")
+        if non_openrouter:
+            incompatible.append(f"{group}({','.join(non_openrouter)})")
+
+    if incompatible:
+        raise ValueError(
+            "OpenRouter server-side tools cannot be sent to non-OpenRouter runtime "
+            "members: "
+            + ", ".join(incompatible)
+            + ". Use --tool-mode=local_web_tools, or leave proposer tools disabled "
+            "for mixed-provider ensembles whose aggregator is OpenRouter."
         )
 
 
@@ -1227,6 +1304,43 @@ def generation_thinking_for_model(
     )
 
 
+def generation_temperature_for_model(model: str | None) -> float:
+    if _normalized_model_id(model).rsplit("/", 1)[-1] == QWEN38_MAX_PREVIEW_MODEL:
+        # DashScope clamps lower values to 0.6 for this thinking-only preview.
+        return 0.6
+    return DEFAULT_GENERATION_TEMPERATURE
+
+
+def generation_max_tokens_for_model(
+    model: str | None,
+    policy: dict[str, Any],
+) -> int:
+    configured = int(policy.get("max_tokens") or ChatConfig().max_tokens)
+    if (
+        _normalized_model_id(model).rsplit("/", 1)[-1] == QWEN38_MAX_PREVIEW_MODEL
+        and not bool(policy.get("max_tokens_overridden"))
+    ):
+        return QWEN38_DEFAULT_MAX_COMPLETION_TOKENS
+    return configured
+
+
+def validate_qwen38_generation_budget_for_groups(
+    groups: list[str],
+    policy: dict[str, Any],
+) -> None:
+    qwen38_groups = sorted(set(groups) & {"B13", "G26"})
+    if not qwen38_groups or not bool(policy.get("max_tokens_overridden")):
+        return
+    max_completion_tokens = int(policy.get("max_tokens") or 0)
+    thinking_budget = THINKING_BUDGETS[ThinkingLevel.XHIGH]
+    if max_completion_tokens <= thinking_budget:
+        raise ValueError(
+            "--generation-max-tokens must exceed the Qwen3.8 xhigh thinking "
+            f"budget ({thinking_budget}) for groups {','.join(qwen38_groups)}; "
+            f"received {max_completion_tokens}"
+        )
+
+
 def generation_chat_config(
     policy: dict[str, Any],
     *,
@@ -1236,8 +1350,8 @@ def generation_chat_config(
     mode = generation_thinking_for_model(model, policy)
     level = ThinkingLevel(mode)
     return ChatConfig(
-        max_tokens=int(policy.get("max_tokens") or ChatConfig().max_tokens),
-        temperature=DEFAULT_GENERATION_TEMPERATURE,
+        max_tokens=generation_max_tokens_for_model(model, policy),
+        temperature=generation_temperature_for_model(model),
         thinking=True,
         thinking_level=level,
         thinking_budget_tokens=THINKING_BUDGETS[level],
@@ -1249,15 +1363,21 @@ def apply_generation_policy_to_profile(profile: Any, policy: dict[str, Any]) -> 
     preserve_temperature = bool(getattr(profile, "preserve_member_temperature", False))
 
     def _apply_member_policy(member: Any) -> Any:
+        model = str(getattr(member, "model", "") or "")
         update: dict[str, Any] = {
-            "temperature": DEFAULT_GENERATION_TEMPERATURE,
+            "temperature": generation_temperature_for_model(model),
             "thinking": generation_thinking_for_model(
-                str(getattr(member, "model", "") or ""),
+                model,
                 policy,
             ),
         }
         if preserve_temperature and getattr(member, "temperature", None) is not None:
             update.pop("temperature", None)
+        if (
+            _normalized_model_id(model).rsplit("/", 1)[-1]
+            == QWEN38_MAX_PREVIEW_MODEL
+        ):
+            update["max_tokens"] = generation_max_tokens_for_model(model, policy)
         if policy.get("max_tokens_overridden"):
             update["max_tokens"] = int(policy["max_tokens"])
         return member.model_copy(update=update)
@@ -1307,6 +1427,16 @@ def profile_aggregator_request_count(profile: Any) -> int:
     return final_request_count + prefilter_request_count
 
 
+def profile_member_timeout_seconds(profile: Any) -> float:
+    return max(
+        (
+            float(getattr(member, "timeout_seconds", 0.0) or 0.0)
+            for member in getattr(profile, "proposers", ())
+        ),
+        default=0.0,
+    )
+
+
 def profile_timeout_seconds(
     profile: Any,
     *,
@@ -1335,12 +1465,18 @@ def profile_timeout_seconds(
     ):
         return proposer_timeout, aggregator_timeout
     available = max(0.0, float(requested_timeout) - PROFILE_TIMEOUT_MARGIN_SECONDS)
-    base_budget = proposer_timeout + aggregator_timeout * aggregator_request_count
+    effective_proposer_budget = max(
+        proposer_timeout,
+        profile_member_timeout_seconds(profile),
+    )
+    base_budget = (
+        effective_proposer_budget + aggregator_timeout * aggregator_request_count
+    )
     if available <= base_budget:
         return proposer_timeout, aggregator_timeout
     extra = available - base_budget
     return (
-        proposer_timeout + extra * 0.25,
+        effective_proposer_budget + extra * 0.25,
         aggregator_timeout + (extra * 0.75 / aggregator_request_count),
     )
 
@@ -1523,14 +1659,30 @@ def build_single_provider(
 ):
     if dry_run:
         return DryProvider(model=model, group=group)
-    resolved_api_key = api_key if api_key is not None else inherited.api_key
+    resolved_provider = provider or inherited.provider
+    same_provider = resolved_provider == inherited.provider
+    provider_spec = get_provider_spec(resolved_provider)
+
     if api_key_env:
-        resolved_api_key = os.environ.get(api_key_env, resolved_api_key)
+        resolved_api_key = os.environ.get(
+            api_key_env,
+            api_key if api_key is not None else (inherited.api_key if same_provider else ""),
+        )
+    elif api_key is not None:
+        resolved_api_key = api_key
+    elif same_provider:
+        resolved_api_key = inherited.api_key
+    else:
+        resolved_api_key = os.environ.get(provider_spec.env_key, "")
+
+    resolved_base_url = base_url or (
+        inherited.base_url if same_provider else provider_spec.default_base_url
+    )
     cfg = ProviderConfig(
-        provider=provider or inherited.provider,
+        provider=resolved_provider,
         model=model,
         api_key=resolved_api_key,
-        base_url=base_url or inherited.base_url,
+        base_url=resolved_base_url,
         proxy=inherited.proxy,
         provider_routing=inherited.provider_routing if provider is None else {},
     )
@@ -1569,6 +1721,18 @@ def build_profile_provider(
         profile_config = apply_generation_policy_to_profile(
             profile_config,
             generation_policy,
+        )
+    if ensemble_proposer_timeout is not None and ensemble_proposer_timeout > 0:
+        explicit_timeout = float(ensemble_proposer_timeout)
+        profile_config = profile_config.model_copy(
+            update={
+                "proposers": [
+                    member.model_copy(update={"timeout_seconds": explicit_timeout})
+                    if float(getattr(member, "timeout_seconds", 0.0) or 0.0) > 0
+                    else member
+                    for member in profile_config.proposers
+                ]
+            }
         )
     proposer_timeout_s, aggregator_timeout_s = profile_timeout_seconds(
         profile_config,
@@ -1781,13 +1945,20 @@ def agent_config_from_chat_config(
     config: ChatConfig | None,
     *,
     timeout: float,
+    iteration_timeout: float | None = None,
     model_id: str,
     max_iterations: int,
 ) -> AgentConfig:
+    per_iteration_timeout = (
+        float(iteration_timeout)
+        if iteration_timeout is not None and iteration_timeout > 0
+        else timeout
+    )
     return AgentConfig(
         max_iterations=max(0, int(max_iterations or 0)),
         timeout=timeout,
-        iteration_timeout=timeout,
+        iteration_timeout=per_iteration_timeout,
+        hard_iteration_timeout=per_iteration_timeout,
         request_timeout=(
             float(config.timeout)
             if config is not None and getattr(config, "timeout", 0)
@@ -1956,6 +2127,7 @@ async def collect_agent_run(
     prompt: str,
     *,
     timeout: float,
+    iteration_timeout: float | None = None,
     config: ChatConfig | None,
     tools: list[ToolDefinition] | None,
     tool_policy: dict[str, Any],
@@ -2002,6 +2174,7 @@ async def collect_agent_run(
         config=agent_config_from_chat_config(
             config,
             timeout=timeout,
+            iteration_timeout=iteration_timeout,
             model_id=str(model_id or ""),
             max_iterations=max_iterations,
         ),
@@ -2383,6 +2556,7 @@ async def collect_generation_with_retries(
     prompt: str,
     *,
     timeout: float,
+    iteration_timeout: float | None = None,
     config: ChatConfig | None = None,
     tools: list[ToolDefinition] | None = None,
     runner_mode: str = RUNNER_MODE_PROVIDER,
@@ -2404,6 +2578,7 @@ async def collect_generation_with_retries(
                 provider,
                 prompt,
                 timeout=timeout,
+                iteration_timeout=iteration_timeout,
                 config=config,
                 tools=tools,
                 tool_policy=tool_policy or {},
@@ -2899,18 +3074,54 @@ async def run_one(
     generation_retry_backoff_s = bounded_generation_retry_backoff(
         generation_retry_backoff
     )
-    effective_timeout = group_timeout_seconds(
+    single_round_timeout = group_timeout_seconds(
         requested_timeout=timeout,
         config=config,
         group=group,
         ensemble_proposer_timeout=ensemble_proposer_timeout,
         ensemble_aggregator_timeout=ensemble_aggregator_timeout,
     )
+    minimum_round_timeout = group_timeout_seconds(
+        requested_timeout=1.0,
+        config=config,
+        group=group,
+        ensemble_proposer_timeout=ensemble_proposer_timeout,
+        ensemble_aggregator_timeout=ensemble_aggregator_timeout,
+    )
+    agent_iteration_timeout = agent_iteration_timeout_seconds(
+        single_round_timeout=single_round_timeout,
+        minimum_round_timeout=minimum_round_timeout,
+        group=group,
+        expand_ensemble_timeouts_to_task_timeout=(
+            expand_ensemble_timeouts_to_task_timeout
+        ),
+    )
+    effective_timeout = task_timeout_seconds(
+        requested_timeout=timeout,
+        single_round_timeout=single_round_timeout,
+        minimum_round_timeout=minimum_round_timeout,
+        group=group,
+        runner_mode=runner_mode,
+        expand_ensemble_timeouts_to_task_timeout=(
+            expand_ensemble_timeouts_to_task_timeout
+        ),
+    )
     generation_config = generation_chat_config(
         generation_policy,
         model=spec["model"] if spec["kind"] == "single" else None,
         tool_choice=tool_policy.get("openrouter_fusion_tool_choice"),
     )
+    if (
+        spec["kind"] == "single"
+        and str(spec.get("model") or "").strip().lower()
+        == QWEN38_MAX_PREVIEW_MODEL
+        and effective_timeout > 0
+    ):
+        # Keep each provider request alive for one Qwen3.8 round; its long
+        # thinking stream can exceed the generic 120-second request timeout.
+        generation_config = generation_config.model_copy(
+            update={"timeout": minimum_round_timeout}
+        )
     try:
         if spec["kind"] == "single":
             provider = build_single_provider(
@@ -2931,7 +3142,7 @@ async def run_one(
                 profile=spec["profile"],
                 dry_run=dry_run,
                 generation_policy=generation_policy,
-                requested_timeout=effective_timeout,
+                requested_timeout=single_round_timeout,
                 enable_proposer_tools=bool(
                     tool_policy.get("tools_enabled") and enable_proposer_tools
                 ),
@@ -2953,6 +3164,7 @@ async def run_one(
                 provider,
                 str(task["prompt"]),
                 timeout=effective_timeout,
+                iteration_timeout=agent_iteration_timeout,
                 config=generation_config,
                 tools=tools,
                 runner_mode=runner_mode,
@@ -3124,6 +3336,8 @@ async def run_one(
             "run_error": run.error,
             "judge_skipped_reason": "run_not_done" if not should_judge else "",
             "requested_timeout_s": timeout,
+            "single_round_timeout_s": single_round_timeout,
+            "agent_iteration_timeout_s": agent_iteration_timeout,
             "effective_timeout_s": effective_timeout,
             "profile_proposer_timeout_s": profile_proposer_timeout_s,
             "profile_aggregator_timeout_s": profile_aggregator_timeout_s,
@@ -3183,6 +3397,11 @@ def group_timeout_seconds(
         return requested_timeout
     spec = GROUP_SPECS[group]
     if spec["kind"] != "profile":
+        if (
+            str(spec.get("model") or "").strip().lower()
+            == QWEN38_MAX_PREVIEW_MODEL
+        ):
+            return max(float(requested_timeout), QWEN38_PROPOSER_TIMEOUT_SECONDS)
         return requested_timeout
     profile = config.llm_ensemble.profiles.get(spec["profile"])
     if profile is None:
@@ -3192,6 +3411,13 @@ def group_timeout_seconds(
         proposer_timeout_override=ensemble_proposer_timeout,
         aggregator_timeout_override=ensemble_aggregator_timeout,
     )
+    member_timeout_s = (
+        float(ensemble_proposer_timeout)
+        if ensemble_proposer_timeout is not None
+        and ensemble_proposer_timeout > 0
+        else profile_member_timeout_seconds(profile)
+    )
+    proposer_timeout_s = max(proposer_timeout_s, member_timeout_s)
     aggregator_request_count = profile_aggregator_request_count(profile)
     profile_budget = (
         proposer_timeout_s
@@ -3199,6 +3425,53 @@ def group_timeout_seconds(
         + PROFILE_TIMEOUT_MARGIN_SECONDS
     )
     return max(float(requested_timeout), profile_budget)
+
+
+def agent_iteration_timeout_seconds(
+    *,
+    single_round_timeout: float,
+    minimum_round_timeout: float,
+    group: str,
+    expand_ensemble_timeouts_to_task_timeout: bool = False,
+) -> float:
+    """Return the hard wall-clock budget for one Agent LLM/tool round."""
+
+    if group not in {"B13", "G26"}:
+        return single_round_timeout
+    if group == "G26" and expand_ensemble_timeouts_to_task_timeout:
+        return single_round_timeout
+    return minimum_round_timeout
+
+
+def task_timeout_seconds(
+    *,
+    requested_timeout: float,
+    single_round_timeout: float,
+    minimum_round_timeout: float,
+    group: str,
+    runner_mode: str,
+    expand_ensemble_timeouts_to_task_timeout: bool = False,
+) -> float:
+    """Reserve two LLM rounds for Qwen3.8 agent tool-call completion."""
+
+    if (
+        requested_timeout <= 0
+        or runner_mode != RUNNER_MODE_AGENT_LOOP
+        or group not in {"B13", "G26"}
+    ):
+        return single_round_timeout
+    round_timeout = agent_iteration_timeout_seconds(
+        single_round_timeout=single_round_timeout,
+        minimum_round_timeout=minimum_round_timeout,
+        group=group,
+        expand_ensemble_timeouts_to_task_timeout=(
+            expand_ensemble_timeouts_to_task_timeout
+        ),
+    )
+    return max(
+        float(single_round_timeout),
+        float(round_timeout) * 2,
+    )
 
 
 def compact_judge_summary(judge: dict[str, Any] | None) -> dict[str, Any]:
@@ -3935,6 +4208,7 @@ async def amain(args: argparse.Namespace) -> int:
             "OpenRouter server-side tools."
         )
     generation_policy = generation_thinking_policy(args)
+    validate_qwen38_generation_budget_for_groups(groups, generation_policy)
     config = GatewayConfig.load(args.config)
     sandbox_runtime = configure_benchmark_sandbox_runtime(config, tool_policy)
     search_runtime = configure_local_web_search_runtime(config, tool_policy)
@@ -3955,6 +4229,16 @@ async def amain(args: argparse.Namespace) -> int:
         **tool_policy,
         "group_tool_policies": group_tool_policies,
     }
+    if (
+        tool_policy.get("tools_enabled")
+        and tool_policy.get("tool_mode") == TOOL_MODE_OPENROUTER_SERVER_TOOLS
+    ):
+        validate_openrouter_server_tools_for_groups(
+            config=config,
+            inherited=inherited,
+            groups=groups,
+            enable_proposer_tools=bool(getattr(args, "enable_proposer_tools", False)),
+        )
     if (
         tool_policy.get("tools_enabled")
         and tool_policy.get("tool_mode") == TOOL_MODE_OPENROUTER_SERVER_TOOLS

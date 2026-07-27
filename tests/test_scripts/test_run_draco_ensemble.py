@@ -4,6 +4,7 @@ import asyncio
 import json
 from argparse import Namespace
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -22,28 +23,31 @@ from opensquilla.provider.types import (
 )
 from scripts.run_draco_ensemble import (
     GROUP_SPECS,
+    PROFILE_TIMEOUT_MARGIN_SECONDS,
     RunResult,
-    amain,
+    agent_config_from_chat_config,
+    agent_iteration_timeout_seconds,
     aggregate_agent_ensemble_trace,
+    amain,
     benchmark_tool_policy,
     benchmark_tool_policy_for_group,
     benchmark_tools_for_policy,
-    configure_benchmark_sandbox_runtime,
-    build_parser,
     build_benchmark_tool_context,
     build_local_web_tool_registry,
+    build_parser,
     build_profile_provider,
     build_single_provider,
     candidate_texts,
-    command_payload,
-    compact_chat_config,
-    configure_local_web_search_runtime,
     collect_agent_run,
     collect_generation_with_retries,
     collect_run,
+    command_payload,
+    compact_chat_config,
+    configure_benchmark_sandbox_runtime,
+    configure_local_web_search_runtime,
     generation_chat_config,
-    generation_thinking_policy,
     generation_thinking_for_model,
+    generation_thinking_policy,
     group_timeout_seconds,
     judge_text,
     load_tasks,
@@ -54,6 +58,9 @@ from scripts.run_draco_ensemble import (
     run_result_summary,
     score_criterion_judgments,
     summarize,
+    task_timeout_seconds,
+    validate_openrouter_server_tools_for_groups,
+    validate_qwen38_generation_budget_for_groups,
     validate_runner_mode_for_groups,
 )
 
@@ -634,6 +641,193 @@ def test_draco_runner_b11_uses_vllm_semantic_router_endpoint() -> None:
     assert metadata.model == "MoM"
     assert metadata.provider_kind == "openai"
     assert metadata.base_url == "http://127.0.0.1:8888/v1"
+
+
+def test_draco_runner_b13_and_g26_route_only_qwen38_to_dashscope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dashscope_key = "sk-dashscope-test"
+    openrouter_key = "sk-openrouter-test"
+    monkeypatch.setenv("DASHSCOPE_API_KEY", dashscope_key)
+    spec = GROUP_SPECS["B13"]
+    assert spec == {
+        "kind": "single",
+        "model": "qwen3.8-max-preview",
+        "provider": "dashscope",
+        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "api_key_env": "DASHSCOPE_API_KEY",
+    }
+    inherited = ProviderConfig(
+        provider="openrouter",
+        model="z-ai/glm-5.2",
+        api_key=openrouter_key,
+        base_url="https://openrouter.ai/api/v1",
+    )
+
+    baseline = build_single_provider(
+        inherited=inherited,
+        group="B13",
+        model=spec["model"],
+        dry_run=False,
+        provider=spec["provider"],
+        base_url=spec["base_url"],
+        api_key_env=spec["api_key_env"],
+    )
+
+    metadata = baseline.provider_metadata()
+    connection = baseline.provider_connection_config()
+    assert metadata.model == "qwen3.8-max-preview"
+    assert metadata.provider_kind == "dashscope"
+    assert metadata.base_url == "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    assert connection.api_key == dashscope_key
+
+    cfg = GatewayConfig()
+    ensemble = build_profile_provider(
+        config=cfg,
+        inherited=inherited,
+        group="G26",
+        profile="g26_g12_qwen3_8_max_preview",
+        dry_run=False,
+        generation_policy=generation_thinking_policy(),
+    )
+
+    assert GROUP_SPECS["G26"] == {
+        "kind": "profile",
+        "profile": "g26_g12_qwen3_8_max_preview",
+    }
+    assert [member.provider_config.model for member in ensemble.proposers] == [
+        "deepseek/deepseek-v4-pro",
+        "z-ai/glm-5.2",
+        "moonshotai/kimi-k2.7-code",
+        "qwen3.8-max-preview",
+    ]
+    assert [member.provider_config.provider for member in ensemble.proposers] == [
+        "openrouter",
+        "openrouter",
+        "openrouter",
+        "dashscope",
+    ]
+    for member in ensemble.proposers[:3]:
+        assert member.provider_config.api_key == openrouter_key
+        assert member.provider_config.base_url == "https://openrouter.ai/api/v1"
+    qwen38 = ensemble.proposers[-1].provider_config
+    assert qwen38.api_key == dashscope_key
+    assert qwen38.base_url == "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    assert ensemble.proposers[-1].temperature == 0.6
+    assert all(member.temperature == 0.0 for member in ensemble.proposers[:3])
+    assert ensemble.proposers[-1].max_tokens == 66_384
+    assert ensemble.proposers[-1].timeout_seconds == 1800.0
+    assert ensemble.proposers[-1].wait_for_completion is True
+    assert ensemble.proposer_timeout_seconds == 240.0
+    assert ensemble.proposer_early_stop_success_count == 3
+    assert ensemble.proposer_early_stop_after_seconds == 150.0
+    assert ensemble.aggregator.provider_config.provider == "openrouter"
+    assert ensemble.aggregator.provider_config.api_key == openrouter_key
+    assert ensemble.aggregator.provider_config.base_url == (
+        "https://openrouter.ai/api/v1"
+    )
+
+
+def test_draco_runner_cross_provider_env_does_not_leak_inherited_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
+    inherited = ProviderConfig(
+        provider="openrouter",
+        model="z-ai/glm-5.2",
+        api_key="sk-must-not-leak",
+        base_url="https://openrouter.ai/api/v1",
+    )
+
+    provider = build_single_provider(
+        inherited=inherited,
+        group="B13",
+        model="qwen3.8-max-preview",
+        dry_run=False,
+        provider="dashscope",
+        api_key_env="DASHSCOPE_API_KEY",
+    )
+
+    connection = provider.provider_connection_config()
+    assert connection.api_key == ""
+    assert connection.base_url == "https://dashscope.aliyuncs.com/compatible-mode/v1"
+
+
+def test_draco_runner_g26_missing_dashscope_key_does_not_leak_openrouter_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
+    openrouter_key = "openrouter-test-key"
+    inherited = ProviderConfig(
+        provider="openrouter",
+        model="z-ai/glm-5.2",
+        api_key=openrouter_key,
+        base_url="https://openrouter.ai/api/v1",
+    )
+
+    ensemble = build_profile_provider(
+        config=GatewayConfig(),
+        inherited=inherited,
+        group="G26",
+        profile="g26_g12_qwen3_8_max_preview",
+        dry_run=False,
+        generation_policy=generation_thinking_policy(),
+    )
+
+    assert [
+        member.provider_config.api_key for member in ensemble.proposers[:3]
+    ] == [openrouter_key, openrouter_key, openrouter_key]
+    qwen38 = ensemble.proposers[-1].provider_config
+    assert qwen38.provider == "dashscope"
+    assert qwen38.api_key == ""
+    assert qwen38.base_url == (
+        "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    )
+    assert ensemble.aggregator.provider_config.provider == "openrouter"
+    assert ensemble.aggregator.provider_config.api_key == openrouter_key
+
+
+def test_draco_runner_rejects_openrouter_server_tools_for_b13() -> None:
+    cfg = GatewayConfig()
+    inherited = ProviderConfig(
+        provider="openrouter",
+        model="z-ai/glm-5.2",
+        api_key="sk-test",
+        base_url="https://openrouter.ai/api/v1",
+    )
+
+    with pytest.raises(ValueError, match=r"B13\(dashscope\)"):
+        validate_openrouter_server_tools_for_groups(
+            config=cfg,
+            inherited=inherited,
+            groups=["B13"],
+            enable_proposer_tools=False,
+        )
+
+
+def test_draco_runner_mixed_g26_server_tools_require_proposer_tools_off() -> None:
+    cfg = GatewayConfig()
+    inherited = ProviderConfig(
+        provider="openrouter",
+        model="z-ai/glm-5.2",
+        api_key="sk-test",
+        base_url="https://openrouter.ai/api/v1",
+    )
+
+    validate_openrouter_server_tools_for_groups(
+        config=cfg,
+        inherited=inherited,
+        groups=["G26"],
+        enable_proposer_tools=False,
+    )
+
+    with pytest.raises(ValueError, match=r"G26\(dashscope\)"):
+        validate_openrouter_server_tools_for_groups(
+            config=cfg,
+            inherited=inherited,
+            groups=["G26"],
+            enable_proposer_tools=True,
+        )
 
 
 def test_draco_runner_contamination_domains_normalize_and_dedupe() -> None:
@@ -1398,6 +1592,90 @@ def test_draco_runner_profile_timeouts_expand_with_legacy_flag() -> None:
     assert provider.aggregator_timeout_seconds == pytest.approx(637.5)
 
 
+@pytest.mark.parametrize(
+    ("requested_timeout", "expected_proposer", "expected_aggregator"),
+    [
+        (1800.0, 240.0, 300.0),
+        (3600.0, 2167.5, 1402.5),
+    ],
+)
+def test_draco_runner_g26_legacy_timeout_expansion_respects_member_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    requested_timeout: float,
+    expected_proposer: float,
+    expected_aggregator: float,
+) -> None:
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "dashscope-test-key")
+    cfg = GatewayConfig()
+    inherited = ProviderConfig(
+        provider="openrouter",
+        model="z-ai/glm-5.2",
+        api_key="openrouter-test-key",
+        base_url="https://openrouter.ai/api",
+    )
+    effective_timeout = group_timeout_seconds(
+        requested_timeout=requested_timeout,
+        config=cfg,
+        group="G26",
+    )
+
+    provider = build_profile_provider(
+        config=cfg,
+        inherited=inherited,
+        group="G26",
+        profile="g26_g12_qwen3_8_max_preview",
+        dry_run=False,
+        requested_timeout=effective_timeout,
+        generation_policy=generation_thinking_policy(),
+        expand_ensemble_timeouts_to_task_timeout=True,
+    )
+
+    assert provider.proposer_timeout_seconds == pytest.approx(expected_proposer)
+    assert provider.aggregator_timeout_seconds == pytest.approx(expected_aggregator)
+    actual_budget = (
+        max(
+            provider.proposer_timeout_seconds,
+            *(member.timeout_seconds for member in provider.proposers),
+        )
+        + provider.aggregator_timeout_seconds
+        + PROFILE_TIMEOUT_MARGIN_SECONDS
+    )
+    assert actual_budget == pytest.approx(effective_timeout)
+
+
+def test_draco_runner_g26_explicit_proposer_timeout_overrides_qwen_member(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "dashscope-test-key")
+    cfg = GatewayConfig()
+    inherited = ProviderConfig(
+        provider="openrouter",
+        model="z-ai/glm-5.2",
+        api_key="openrouter-test-key",
+        base_url="https://openrouter.ai/api",
+    )
+
+    assert group_timeout_seconds(
+        requested_timeout=180.0,
+        config=cfg,
+        group="G26",
+        ensemble_proposer_timeout=60.0,
+    ) == 390.0
+    provider = build_profile_provider(
+        config=cfg,
+        inherited=inherited,
+        group="G26",
+        profile="g26_g12_qwen3_8_max_preview",
+        dry_run=False,
+        generation_policy=generation_thinking_policy(),
+        ensemble_proposer_timeout=60.0,
+    )
+
+    assert provider.proposer_timeout_seconds == 60.0
+    assert provider.proposers[-1].timeout_seconds == 60.0
+    assert provider.proposers[-1].wait_for_completion is True
+
+
 def test_draco_runner_profile_early_stop_defaults_and_overrides() -> None:
     cfg = GatewayConfig()
     inherited = ProviderConfig(
@@ -1949,6 +2227,18 @@ def test_draco_runner_generation_chat_config_uses_xhigh_by_default() -> None:
     assert config.temperature == 0.0
 
 
+def test_draco_runner_qwen38_uses_dashscope_effective_temperature() -> None:
+    policy = generation_thinking_policy()
+
+    config = generation_chat_config(policy, model="qwen3.8-max-preview")
+
+    assert config.thinking is True
+    assert str(config.thinking_level) == "xhigh"
+    assert config.thinking_budget_tokens == 50_000
+    assert config.max_tokens == 66_384
+    assert config.temperature == 0.6
+
+
 def test_draco_runner_generation_max_tokens_override_is_explicit() -> None:
     args = build_parser().parse_args([
         "--input",
@@ -1966,6 +2256,28 @@ def test_draco_runner_generation_max_tokens_override_is_explicit() -> None:
     assert policy["max_tokens_overridden"] is True
     assert config.max_tokens == 65_536
     assert str(config.thinking_level) == "max"
+
+
+def test_draco_runner_qwen38_generation_override_must_fit_thinking_budget() -> None:
+    too_small = generation_thinking_policy(
+        build_parser().parse_args([
+            "--input",
+            "draco.jsonl",
+            "--groups",
+            "B13,G26",
+            "--generation-max-tokens",
+            "50000",
+        ])
+    )
+
+    with pytest.raises(ValueError, match=r"must exceed.*50000.*B13,G26"):
+        validate_qwen38_generation_budget_for_groups(["B13", "G26"], too_small)
+
+    large_enough = {**too_small, "max_tokens": 65_536}
+    validate_qwen38_generation_budget_for_groups(["B13", "G26"], large_enough)
+    assert generation_chat_config(
+        large_enough, model="qwen3.8-max-preview"
+    ).max_tokens == 65_536
 
 
 def test_draco_runner_generation_chat_config_uses_model_specific_max() -> None:
@@ -2006,6 +2318,73 @@ def test_draco_runner_expands_outer_timeout_for_profile_budget() -> None:
     assert group_timeout_seconds(requested_timeout=600.0, config=cfg, group="G6") == 600.0
     assert group_timeout_seconds(requested_timeout=900.0, config=cfg, group="G3") == 900.0
     assert group_timeout_seconds(requested_timeout=360.0, config=cfg, group="B2") == 360.0
+    assert group_timeout_seconds(
+        requested_timeout=360.0, config=cfg, group="B13"
+    ) == 1800.0
+    assert group_timeout_seconds(
+        requested_timeout=360.0, config=cfg, group="G26"
+    ) == 2130.0
+
+    assert task_timeout_seconds(
+        requested_timeout=180.0,
+        single_round_timeout=1800.0,
+        minimum_round_timeout=1800.0,
+        group="B13",
+        runner_mode="provider",
+    ) == 1800.0
+    assert task_timeout_seconds(
+        requested_timeout=180.0,
+        single_round_timeout=1800.0,
+        minimum_round_timeout=1800.0,
+        group="B13",
+        runner_mode="agent_loop",
+    ) == 3600.0
+    assert task_timeout_seconds(
+        requested_timeout=180.0,
+        single_round_timeout=2130.0,
+        minimum_round_timeout=2130.0,
+        group="G26",
+        runner_mode="agent_loop",
+    ) == 4260.0
+    assert task_timeout_seconds(
+        requested_timeout=3600.0,
+        single_round_timeout=3600.0,
+        minimum_round_timeout=2130.0,
+        group="G26",
+        runner_mode="agent_loop",
+        expand_ensemble_timeouts_to_task_timeout=True,
+    ) == 7200.0
+
+    assert agent_iteration_timeout_seconds(
+        single_round_timeout=3600.0,
+        minimum_round_timeout=1800.0,
+        group="B13",
+    ) == 1800.0
+    assert agent_iteration_timeout_seconds(
+        single_round_timeout=3600.0,
+        minimum_round_timeout=2130.0,
+        group="G26",
+    ) == 2130.0
+    assert agent_iteration_timeout_seconds(
+        single_round_timeout=3600.0,
+        minimum_round_timeout=2130.0,
+        group="G26",
+        expand_ensemble_timeouts_to_task_timeout=True,
+    ) == 3600.0
+
+
+def test_agent_config_can_bound_each_round_below_total_timeout() -> None:
+    config = agent_config_from_chat_config(
+        generation_chat_config(generation_thinking_policy()),
+        timeout=3600.0,
+        iteration_timeout=1800.0,
+        model_id="qwen3.8-max-preview",
+        max_iterations=1,
+    )
+
+    assert config.timeout == 3600.0
+    assert config.iteration_timeout == 1800.0
+    assert config.hard_iteration_timeout == 1800.0
 
 
 def test_draco_summary_compares_avg_quality_and_cost_pct_against_baselines() -> None:
@@ -2633,6 +3012,76 @@ async def test_run_one_controls_proposer_tools_opt_in(
     assert captured["enable_proposer_tools"] is expected
     assert row["proposer_tools_enabled"] is expected
     assert row["execution"]["proposer_tools_enabled"] is expected
+
+
+@pytest.mark.asyncio
+async def test_run_one_b13_aligns_http_and_outer_timeouts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    async def _generation(
+        _provider,
+        _prompt,
+        *,
+        timeout,
+        config,
+        **_kwargs,
+    ):  # noqa: ANN001, ANN202
+        captured["timeout"] = timeout
+        captured["config"] = config
+        captured["iteration_timeout"] = _kwargs["iteration_timeout"]
+        return (
+            RunResult(
+                final_text="answer",
+                done=DoneEvent(model="qwen3.8-max-preview"),
+            ),
+            [],
+            1,
+        )
+
+    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
+    monkeypatch.setattr(
+        "scripts.run_draco_ensemble.collect_generation_with_retries",
+        _generation,
+    )
+
+    row = await run_one(
+        task={"id": "task-1", "prompt": "Solve this."},
+        group="B13",
+        config=GatewayConfig(),
+        inherited=ProviderConfig(
+            provider="openrouter",
+            model="z-ai/glm-5.2",
+            api_key="openrouter-test-key",
+            base_url="https://openrouter.ai/api",
+        ),
+        dry_run=False,
+        judge_provider=None,
+        judge_candidates=False,
+        judge_repeats=1,
+        judge_concurrency=1,
+        judge_max_attempts=3,
+        timeout=3600.0,
+        ensemble_proposer_timeout=None,
+        ensemble_aggregator_timeout=None,
+        ensemble_proposer_early_stop_success_count=None,
+        ensemble_proposer_early_stop_after=None,
+        expand_ensemble_timeouts_to_task_timeout=False,
+        tool_policy={"tool_mode": "provider_only", "tools_enabled": False},
+        generation_policy=generation_thinking_policy(),
+        generation_max_attempts=1,
+        generation_retry_backoff=0.0,
+        runner_mode="agent_loop",
+    )
+
+    assert row["error"] == ""
+    assert captured["timeout"] == 3600.0
+    assert captured["iteration_timeout"] == 1800.0
+    assert captured["config"].timeout == 1800.0
+    assert captured["config"].max_tokens == 66_384
+    assert row["execution"]["agent_iteration_timeout_s"] == 1800.0
+    assert row["execution"]["single_round_timeout_s"] == 3600.0
 
 
 @pytest.mark.asyncio

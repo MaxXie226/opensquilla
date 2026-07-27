@@ -212,6 +212,11 @@ def _is_direct_deepseek_v4_model_id(model_id: str | None) -> bool:
     return normalized in {"deepseek-v4-flash", "deepseek-v4-pro"}
 
 
+def _is_qwen38_max_preview_model_id(model_id: str | None) -> bool:
+    normalized = (model_id or "").strip().lower()
+    return normalized.rsplit("/", 1)[-1] == "qwen3.8-max-preview"
+
+
 _LARGE_JSON_TOOL_FIELD_KEYS: frozenset[str] = frozenset({"body", "body_base64"})
 _LARGE_JSON_TOOL_FIELD_CHARS = 20_000
 _TOOL_ARGUMENT_PROJECTION_PREFIX = "[tool_use_argument_projection]\n"
@@ -1816,6 +1821,7 @@ class Agent:
         )
         preserve_reasoning_content = bool(
             _is_direct_deepseek_v4_model_id(self.config.model_id)
+            or _is_qwen38_max_preview_model_id(self.config.model_id)
             or (
                 thinking_enabled
                 and caps_reasoning_format == "deepseek"
@@ -1953,8 +1959,8 @@ class Agent:
             max_backoff_ms=self.config.retry_max_backoff_ms,
         )
 
-        # Timeout budgets: optional total turn budget, idle LLM stream budget,
-        # and per-tool execution budget.
+        # Timeout budgets: optional total turn budget, optional hard iteration
+        # wall-clock budget, idle LLM stream budget, and per-tool execution budget.
         _loop = asyncio.get_running_loop()
         _total_deadline = _loop.time() + self.config.timeout if self.config.timeout > 0 else None
         tools_supported = True
@@ -2154,6 +2160,26 @@ class Agent:
                     raise TimeoutError(f"Agent total timeout after {self.config.timeout}s")
 
                 iterations += 1
+                _hard_iteration_timeout = _positive_float(
+                    getattr(self.config, "hard_iteration_timeout", 0.0)
+                )
+                _iteration_deadline = (
+                    _loop.time() + _hard_iteration_timeout
+                    if _hard_iteration_timeout is not None
+                    else None
+                )
+                _iteration_timeout_label = (
+                    _hard_iteration_timeout or self.config.iteration_timeout
+                )
+
+                async def _sleep_with_iteration_deadline(delay: float) -> None:
+                    bounded_delay = delay
+                    if _iteration_deadline is not None:
+                        bounded_delay = min(
+                            delay,
+                            max(0.0, _iteration_deadline - _loop.time()),
+                        )
+                    await asyncio.sleep(bounded_delay)
 
                 # ------ THINKING → STREAMING ------
                 yield self._transition(AgentState.STREAMING)
@@ -2314,6 +2340,7 @@ class Agent:
                             raw_stream,
                             loop=_loop,
                             total_deadline=_total_deadline,
+                            iteration_deadline=_iteration_deadline,
                         ):
                             if isinstance(raw_ev, ProviderTextDelta):
                                 assistant_text_parts.append(raw_ev.text)
@@ -2551,7 +2578,7 @@ class Agent:
                             yield _finish_artifact_delivery_degraded(
                                 reason=(
                                     f"Iteration {iterations} exceeded "
-                                    f"iteration_timeout ({self.config.iteration_timeout}s) "
+                                    f"iteration_timeout ({_iteration_timeout_label}s) "
                                     "during final artifact response generation"
                                 ),
                                 code="iteration_timeout",
@@ -2561,7 +2588,7 @@ class Agent:
                         terminal_error = ErrorEvent(
                             message=(
                                 f"Iteration {iterations} exceeded iteration_timeout"
-                                f" ({self.config.iteration_timeout}s) during LLM streaming"
+                                f" ({_iteration_timeout_label}s) during LLM streaming"
                             ),
                             code="iteration_timeout",
                         )
@@ -2806,7 +2833,7 @@ class Agent:
                                 code="provider_empty_retry",
                                 message="The provider returned an empty response; retrying once.",
                             )
-                            await asyncio.sleep(delay)
+                            await _sleep_with_iteration_deadline(delay)
                             _call_attempt += 1
                             continue
 
@@ -2831,7 +2858,7 @@ class Agent:
                                     "The provider stream ended before completion; retrying once."
                                 ),
                             )
-                            await asyncio.sleep(delay)
+                            await _sleep_with_iteration_deadline(delay)
                             _call_attempt += 1
                             continue
 
@@ -3078,7 +3105,7 @@ class Agent:
                                     "execution; retrying once."
                                 ),
                             )
-                            await asyncio.sleep(delay)
+                            await _sleep_with_iteration_deadline(delay)
                             _retry_attempt += 1
                             _call_attempt += 1
                             continue
@@ -3197,7 +3224,7 @@ class Agent:
                             kind=kind.value,
                             delay_s=round(delay, 2),
                         )
-                        await asyncio.sleep(delay)
+                        await _sleep_with_iteration_deadline(delay)
                         _retry_attempt += 1
                         _call_attempt += 1
 
@@ -3418,7 +3445,11 @@ class Agent:
                 tool_calls = [self._coerce_meta_tool_call(tc) for tc in tool_calls]
                 tool_calls = self._force_matched_meta_invoke_tool_calls(tool_calls)
 
-                tool_deadline = _loop.time() + self.config.iteration_timeout
+                tool_deadline = (
+                    _iteration_deadline
+                    if _iteration_deadline is not None
+                    else _loop.time() + self.config.iteration_timeout
+                )
 
                 # ------ STREAMING → TOOL_CALLING ------
                 yield self._transition(AgentState.TOOL_CALLING)
@@ -3513,7 +3544,7 @@ class Agent:
                                             tool_name=tc.tool_name,
                                             content=(
                                                 f"Tool '{tc.tool_name}' timed out after "
-                                                f"{self.config.iteration_timeout}s"
+                                                f"{_iteration_timeout_label}s"
                                             ),
                                             is_error=True,
                                             execution_status=runtime_execution_status(
@@ -3541,7 +3572,7 @@ class Agent:
                                                 tool_name=tc.tool_name,
                                                 content=(
                                                     f"Tool '{tc.tool_name}' timed out after "
-                                                    f"{self.config.iteration_timeout}s"
+                                                    f"{_iteration_timeout_label}s"
                                                 ),
                                                 is_error=True,
                                                 execution_status=runtime_execution_status(
@@ -3820,7 +3851,7 @@ class Agent:
                     terminal_error = ErrorEvent(
                         message=(
                             f"Iteration {iterations} exceeded iteration_timeout"
-                            f" ({self.config.iteration_timeout}s) during tool execution"
+                            f" ({_iteration_timeout_label}s) during tool execution"
                         ),
                         code="iteration_timeout",
                     )
@@ -3980,6 +4011,7 @@ class Agent:
         *,
         loop: asyncio.AbstractEventLoop,
         total_deadline: float | None,
+        iteration_deadline: float | None = None,
     ) -> AsyncIterator[Any]:
         stream_iter = stream.__aiter__()
         while True:
@@ -3990,6 +4022,12 @@ class Agent:
                     await self._close_provider_stream(stream_iter)
                     raise TimeoutError(f"Agent total timeout after {self.config.timeout}s")
                 wait_budget = min(wait_budget, remaining_total)
+            if iteration_deadline is not None:
+                remaining_iteration = iteration_deadline - loop.time()
+                if remaining_iteration <= 0:
+                    await self._close_provider_stream(stream_iter)
+                    raise _IterationStreamTimeoutError
+                wait_budget = min(wait_budget, remaining_iteration)
 
             next_event: asyncio.Future[Any] = asyncio.ensure_future(stream_iter.__anext__())
             done, _ = await asyncio.wait({next_event}, timeout=wait_budget)
@@ -3999,6 +4037,8 @@ class Agent:
                     await next_event
                 if total_deadline is not None and loop.time() >= total_deadline:
                     raise TimeoutError(f"Agent total timeout after {self.config.timeout}s")
+                if iteration_deadline is not None and loop.time() >= iteration_deadline:
+                    raise _IterationStreamTimeoutError
                 raise _IterationStreamTimeoutError
             try:
                 yield next_event.result()

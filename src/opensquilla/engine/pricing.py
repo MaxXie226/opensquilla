@@ -415,6 +415,10 @@ _PRICING_TABLE: list[tuple[str, PriceEntry]] = [
     ("qwen-plus", PriceEntry(0.115, 0.287)),
     ("qwen-flash", PriceEntry(0.022, 0.216)),
     ("qwen-turbo", PriceEntry(0.044, 0.087)),
+    # Qwen3.8 Max Preview is an invite-only evaluation model. The invitation
+    # guide states that preview calls are not billed; the preview model will be
+    # removed when the production release replaces it.
+    ("qwen3.8-max-preview", PriceEntry(0.0, 0.0)),
     ("qwen-max", PriceEntry(0.345, 1.377)),
     # MiniMax.
     ("minimax/minimax-m2.7", PriceEntry(0.118, 0.99)),

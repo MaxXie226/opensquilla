@@ -388,9 +388,7 @@ class AgentConfig:
     # 30 min — see iteration_timeout note below; outer turn budget for
     # meta-skill DAGs (paper-write / arxiv-deck run 5-7 min commonly).
     timeout: float = 1800.0
-    # Per-iteration timeout: one LLM call + its tool executions
-    # 30 min — single iteration may be the whole meta DAG when the soft
-    # path treats meta_invoke as a single tool call.
+    # Idle timeout between LLM stream events and tool-execution timeout.
     iteration_timeout: float = 1800.0
     # HTTP-level timeout for a single LLM API request
     request_timeout: float = 120.0
@@ -480,6 +478,10 @@ class AgentConfig:
     tool_result_store_disk_budget_bytes: int | None = 256 * 1024 * 1024
     tool_result_store_retention_seconds: int | None = 7 * 24 * 60 * 60
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Optional hard wall-clock cap for one LLM call plus its tool executions.
+    # Appended for positional-call compatibility; 0 preserves the historical
+    # idle-timeout behavior of iteration_timeout.
+    hard_iteration_timeout: float = 0.0
 
     def __post_init__(self) -> None:
         self.flush_triggers = list(normalize_flush_triggers_strict(self.flush_triggers))
