@@ -2639,9 +2639,9 @@ watch(pendingSessionIntent, (intent, previous) => {
   persistSession(sessionKey.value, { source: 'chatView.draftMaterialized' })
 })
 
-watch(sessionKey, key => {
-  if (workbenchEnabled.value) workbenchStore.setSessionScope(key || null)
+watch(sessionKey, () => {
   pendingForkBeforeMessageId.value = null
+  if (workbenchEnabled.value) workbenchStore.setSessionScope(sessionKey.value || null)
   if (shareMode.value) endShareMode()
   deliverablesOpen.value = false
   metaRunsHistoryOpen.value = false
