@@ -8,16 +8,14 @@ being guessed together across installations.
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import hashlib
 import json
 import os
 import sqlite3
 import tempfile
-import threading
 import uuid
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -69,6 +67,8 @@ _FINGERPRINT_IGNORED_FIELDS = frozenset(
     }
 )
 _UUID_NAMESPACE = uuid.UUID("edc9a806-a99c-4b24-a7df-0b6d25a147ab")
+
+SessionSchemaPreparer = Callable[[Path], None]
 
 
 @dataclass(frozen=True)
@@ -639,59 +639,12 @@ def _clear_excluded_operational_rows(path: Path) -> tuple[str, ...]:
         connection.close()
 
 
-async def _initialize_current_session_schema(path: Path) -> None:
-    """Run SessionStorage's current-schema initialization and column shims."""
-
-    from opensquilla.session.storage import SessionStorage
-
-    storage = SessionStorage(_native_io_path(path))
-    try:
-        await storage.connect()
-    finally:
-        await storage.close()
-
-
-def _run_session_schema_initialization(path: Path) -> None:
-    """Bridge SessionStorage's async initializer into this synchronous merge."""
-
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        asyncio.run(_initialize_current_session_schema(path))
-        return
-
-    errors: list[BaseException] = []
-
-    def initialize_in_thread() -> None:
-        try:
-            asyncio.run(_initialize_current_session_schema(path))
-        except BaseException as exc:
-            errors.append(exc)
-
-    worker = threading.Thread(
-        target=initialize_in_thread,
-        name="opensquilla-session-schema-upgrade",
-    )
-    worker.start()
-    worker.join()
-    if errors:
-        raise errors[0]
-
-
-def _upgrade_target_session_schema(path: Path) -> None:
-    """Apply the same schema upgrade sequence used by gateway boot."""
-
-    from opensquilla.persistence.migrator import apply_pending, resolve_migrations_dir
-
-    apply_pending(_native_io_path(path), resolve_migrations_dir())
-    _run_session_schema_initialization(path)
-
-
 def _merge_session_database_from_private(
     target: str | Path,
     source: Path,
     *,
     source_id: str,
+    prepare_target_schema: SessionSchemaPreparer,
 ) -> SessionMergeResult:
     target_path = Path(target).expanduser().absolute()
     source_path = source
@@ -741,7 +694,7 @@ def _merge_session_database_from_private(
                     f"{', '.join(sorted(missing))}"
                 )
 
-    _upgrade_target_session_schema(target_path)
+    prepare_target_schema(target_path)
 
     imported_rows: dict[str, int] = {}
     remapped_keys: dict[str, str] = {}
@@ -938,6 +891,7 @@ def merge_session_database(
     source: str | Path,
     *,
     source_id: str,
+    prepare_target_schema: SessionSchemaPreparer,
 ) -> SessionMergeResult:
     """Merge one offline source into a primary ``sessions.db``.
 
@@ -949,6 +903,8 @@ def merge_session_database(
 
     SQLite only opens a stable private copy.  The recovery source bundle is
     never opened by SQLite and therefore cannot gain a transient ``-shm`` file.
+    The upper-layer caller supplies schema preparation so this offline package
+    does not import the runtime session or persistence packages back.
     """
 
     source_path = Path(source).expanduser().absolute()
@@ -957,11 +913,13 @@ def merge_session_database(
             target,
             private_source,
             source_id=source_id,
+            prepare_target_schema=prepare_target_schema,
         )
 
 
 __all__ = [
     "SessionMergeResult",
+    "SessionSchemaPreparer",
     "merge_session_database",
     "snapshot_session_database",
 ]

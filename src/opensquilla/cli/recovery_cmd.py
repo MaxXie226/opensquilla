@@ -11,6 +11,7 @@ from pathlib import Path
 
 import typer
 
+from opensquilla.cli.session_schema import prepare_session_schema
 from opensquilla.recovery import (
     ConsolidationResult,
     RecoveryError,
@@ -419,7 +420,11 @@ def recovery_consolidate_profiles(
     """Merge every legacy recovery profile into the primary profile."""
 
     _emit_consolidation(
-        consolidate_recovery_profiles(user_data, primary_home),
+        consolidate_recovery_profiles(
+            user_data,
+            primary_home,
+            prepare_session_schema=prepare_session_schema,
+        ),
         json_output=json_output,
     )
 

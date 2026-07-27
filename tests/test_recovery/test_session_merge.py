@@ -6,11 +6,30 @@ from pathlib import Path
 
 import pytest
 
+from opensquilla.cli.session_schema import prepare_session_schema
 from opensquilla.recovery.session_merge import (
-    merge_session_database,
+    SessionMergeResult,
     snapshot_session_database,
 )
+from opensquilla.recovery.session_merge import (
+    merge_session_database as _merge_session_database,
+)
 from opensquilla.session.storage import SessionStorage
+
+
+def merge_session_database(
+    target: str | Path,
+    source: str | Path,
+    *,
+    source_id: str,
+) -> SessionMergeResult:
+    return _merge_session_database(
+        target,
+        source,
+        source_id=source_id,
+        prepare_target_schema=prepare_session_schema,
+    )
+
 
 _SCHEMA = """
 CREATE TABLE sessions (
@@ -294,6 +313,42 @@ def test_merge_session_database_imports_complete_supported_session_graph(
         assert merged.execute("SELECT COUNT(*) FROM usage_event_items").fetchone() == (2,)
         assert merged.execute("SELECT COUNT(*) FROM usage_item_billing_receipts").fetchone() == (2,)
         assert merged.execute("SELECT COUNT(*) FROM router_decisions").fetchone() == (0,)
+
+
+def test_merge_uses_injected_schema_preparer_for_existing_target(
+    tmp_path: Path,
+) -> None:
+    target_path = tmp_path / "target.db"
+    source_path = tmp_path / "source.db"
+    target = _database(target_path)
+    source = _database(source_path)
+    _add_session(
+        target,
+        key="agent:main:main",
+        session_id="primary-session",
+        content="primary",
+        suffix="primary",
+    )
+    _add_session(
+        source,
+        key="agent:main:recovered",
+        session_id="recovery-session",
+        content="recovery",
+        suffix="recovery",
+    )
+    target.close()
+    source.close()
+    prepared: list[Path] = []
+
+    result = _merge_session_database(
+        target_path,
+        source_path,
+        source_id="12121212-1212-4212-8212-121212121212",
+        prepare_target_schema=prepared.append,
+    )
+
+    assert result.imported_sessions == 1
+    assert prepared == [target_path.absolute()]
 
 
 def test_merge_session_database_remaps_divergent_collision_and_is_idempotent(

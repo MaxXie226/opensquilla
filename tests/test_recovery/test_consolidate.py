@@ -19,9 +19,26 @@ import pytest
 from typer.testing import CliRunner
 
 from opensquilla.cli.recovery_cmd import recovery_app
+from opensquilla.cli.session_schema import prepare_session_schema
 from opensquilla.recovery.atomic import _native_io_path
-from opensquilla.recovery.consolidate import consolidate_recovery_profiles
+from opensquilla.recovery.consolidate import (
+    ConsolidationResult,
+)
+from opensquilla.recovery.consolidate import (
+    consolidate_recovery_profiles as _consolidate_recovery_profiles,
+)
 from opensquilla.recovery.errors import UnsafePathError
+
+
+def consolidate_recovery_profiles(
+    user_data: str | Path,
+    primary_home: str | Path,
+) -> ConsolidationResult:
+    return _consolidate_recovery_profiles(
+        user_data,
+        primary_home,
+        prepare_session_schema=prepare_session_schema,
+    )
 
 
 def _is_file(path: Path) -> bool:

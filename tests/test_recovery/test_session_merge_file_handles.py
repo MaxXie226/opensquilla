@@ -18,10 +18,29 @@ from urllib.parse import unquote, urlsplit
 
 import pytest
 
+from opensquilla.cli.session_schema import prepare_session_schema
 from opensquilla.recovery.session_merge import (
-    merge_session_database,
+    SessionMergeResult,
     snapshot_session_database,
 )
+from opensquilla.recovery.session_merge import (
+    merge_session_database as _merge_session_database,
+)
+
+
+def merge_session_database(
+    target: str | Path,
+    source: str | Path,
+    *,
+    source_id: str,
+) -> SessionMergeResult:
+    return _merge_session_database(
+        target,
+        source,
+        source_id=source_id,
+        prepare_target_schema=prepare_session_schema,
+    )
+
 
 _SCHEMA = """
 CREATE TABLE sessions (

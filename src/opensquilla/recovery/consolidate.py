@@ -18,6 +18,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
+from opensquilla.agent_ids import normalize_agent_id
 from opensquilla.recovery.atomic import (
     _copy_windows_mount_point_no_follow,
     _native_io_path,
@@ -36,10 +37,10 @@ from opensquilla.recovery.locking import (
 )
 from opensquilla.recovery.session_merge import (
     SessionMergeResult,
+    SessionSchemaPreparer,
     merge_session_database,
     snapshot_session_database,
 )
-from opensquilla.session.keys import normalize_agent_id
 
 ConsolidationOutcome = Literal["noop", "consolidated", "blocked"]
 CredentialAdoptionStatus = Literal["pending", "complete", "not_required"]
@@ -2319,13 +2320,19 @@ def _merge_session_database_idempotent(
     source_id: str,
     transaction_id: str,
     external: bool,
+    prepare_session_schema: SessionSchemaPreparer,
 ) -> SessionMergeResult:
     if not external or _lexists(target):
         if _lexists(target):
             value = os.lstat(_native_io_path(target))
             if _is_link_or_reparse(value) or not stat.S_ISREG(value.st_mode) or value.st_nlink != 1:
                 raise UnsafePathError(f"sessions database target must be a regular file: {target}")
-        return merge_session_database(target, source, source_id=source_id)
+        return merge_session_database(
+            target,
+            source,
+            source_id=source_id,
+            prepare_target_schema=prepare_session_schema,
+        )
 
     _ensure_plain_directory(target.parent)
     temporary = _transaction_temporary(target, f"{transaction_id}-{source_id}")
@@ -2339,7 +2346,12 @@ def _merge_session_database_idempotent(
         if _is_link_or_reparse(value) or not stat.S_ISREG(value.st_mode):
             raise UnsafePathError(f"sessions merge temporary is unsafe: {stale}")
         _unlink_native(stale)
-    result = merge_session_database(temporary, source, source_id=source_id)
+    result = merge_session_database(
+        temporary,
+        source,
+        source_id=source_id,
+        prepare_target_schema=prepare_session_schema,
+    )
     # Windows implements fsync via the CRT ``_commit`` primitive, which rejects
     # descriptors opened read-only with EBADF.  The file is private to this
     # transaction until the no-replace publish below, so open it writable.
@@ -2362,6 +2374,7 @@ def _merge_recovery_data(
     routes: _PrimaryDataRoutes,
     *,
     transaction_id: str,
+    prepare_session_schema: SessionSchemaPreparer,
 ) -> tuple[SessionMergeResult, ...]:
     session_results: list[SessionMergeResult] = []
     state_destination = routes.state.destination(staging)
@@ -2395,6 +2408,7 @@ def _merge_recovery_data(
                 source_id=profile.recovery_id,
                 transaction_id=transaction_id,
                 external=routes.state.external,
+                prepare_session_schema=prepare_session_schema,
             )
             session_results.append(session_result)
         _merge_profile_media(
@@ -2901,12 +2915,14 @@ def _merge_prepared_profiles(
     payload: dict[str, Any],
     profiles: tuple[_RecoveryProfile, ...],
     routes: _PrimaryDataRoutes,
+    prepare_session_schema: SessionSchemaPreparer,
 ) -> dict[str, Any]:
     session_results = _merge_recovery_data(
         Path(str(payload["staging"])),
         profiles,
         routes,
         transaction_id=str(payload["transaction_id"]),
+        prepare_session_schema=prepare_session_schema,
     )
     refreshed_routes = _validate_journal_authority(
         user_data=user_data,
@@ -2931,12 +2947,14 @@ def _verify_external_roots_merged(
     payload: dict[str, Any],
     profiles: tuple[_RecoveryProfile, ...],
     routes: _PrimaryDataRoutes,
+    prepare_session_schema: SessionSchemaPreparer,
 ) -> None:
     _merge_recovery_data(
         Path(str(payload["staging"])),
         profiles,
         routes,
         transaction_id=str(payload["transaction_id"]),
+        prepare_session_schema=prepare_session_schema,
     )
     _validate_journal_authority(
         user_data=user_data,
@@ -3496,6 +3514,7 @@ def _resume(
     primary_home: Path,
     journal_path: Path,
     payload: dict[str, Any],
+    prepare_session_schema: SessionSchemaPreparer,
 ) -> ConsolidationResult:
     result = _result_from_payload(dict(payload["result"]), outcome="consolidated")
     phase = str(payload["phase"])
@@ -3628,6 +3647,7 @@ def _resume(
                     payload=payload,
                     profiles=profiles,
                     routes=routes,
+                    prepare_session_schema=prepare_session_schema,
                 )
             elif phase == "external_roots_merged":
                 if routes is None:
@@ -3638,6 +3658,7 @@ def _resume(
                     payload=payload,
                     profiles=profiles,
                     routes=routes,
+                    prepare_session_schema=prepare_session_schema,
                 )
             payload = _commit_primary(journal_path, payload)
             return _archive_and_finish(user_data, journal_path, payload)
@@ -3646,8 +3667,14 @@ def _resume(
 def consolidate_recovery_profiles(
     user_data: str | Path,
     primary_home: str | Path,
+    *,
+    prepare_session_schema: SessionSchemaPreparer,
 ) -> ConsolidationResult:
-    """Merge all Desktop recovery data and leave only the primary profile active."""
+    """Merge all Desktop recovery data and leave only the primary profile active.
+
+    The CLI composes ``prepare_session_schema`` from runtime capabilities,
+    keeping this offline package below session and persistence.
+    """
 
     user_data_path = _absolute(user_data)
     primary_path = _absolute(primary_home)
@@ -3663,7 +3690,13 @@ def consolidate_recovery_profiles(
                 journal,
             ):
                 try:
-                    return _resume(user_data_path, primary_path, journal_path, journal)
+                    return _resume(
+                        user_data_path,
+                        primary_path,
+                        journal_path,
+                        journal,
+                        prepare_session_schema,
+                    )
                 except (_StagingBaselineDriftedError, _ConsolidationBlockedError) as exc:
                     # A prepared plan pins both the primary it was cloned from and
                     # the recovery sources it measured. Either drifting makes every
@@ -3867,6 +3900,7 @@ def consolidate_recovery_profiles(
                         payload=payload,
                         profiles=profiles,
                         routes=routes,
+                        prepare_session_schema=prepare_session_schema,
                     )
                     payload = _commit_primary(journal_path, payload)
                     return _archive_and_finish(

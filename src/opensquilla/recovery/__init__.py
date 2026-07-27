@@ -59,6 +59,7 @@ from opensquilla.recovery.locking import (
 from opensquilla.recovery.models import RecoveryReport, WorkspaceCandidate
 from opensquilla.recovery.session_merge import (
     SessionMergeResult,
+    SessionSchemaPreparer,
     merge_session_database,
     snapshot_session_database,
 )
@@ -90,6 +91,7 @@ __all__ = [
     "RestoreValidationError",
     "StaleRecoveryTransactionError",
     "SessionMergeResult",
+    "SessionSchemaPreparer",
     "UnsafePathError",
     "WorkspaceCandidate",
     "WorkspaceOverrideError",
