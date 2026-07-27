@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import time
 from collections import deque
 from dataclasses import dataclass
 from typing import Any
+
+
+def _epoch_time_ms() -> int:
+    return time.time_ns() // 1_000_000
 
 
 @dataclass(frozen=True)
@@ -75,6 +80,7 @@ class SessionStreamRegistry:
         enriched = dict(payload or {})
         enriched["session_key"] = session_key
         enriched["stream_seq"] = stream_seq
+        enriched["emitted_at"] = _epoch_time_ms()
 
         event = BufferedSessionEvent(event_name=event_name, payload=enriched, stream_seq=stream_seq)
         events = self._events_by_session.setdefault(session_key, deque())

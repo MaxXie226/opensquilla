@@ -1,3 +1,4 @@
+from opensquilla.gateway import session_streams
 from opensquilla.gateway.session_streams import SessionStreamRegistry
 
 
@@ -23,6 +24,24 @@ def test_session_stream_registry_replays_events_after_cursor() -> None:
     assert replay.current_stream_seq == 2
     assert replay.replay_complete is True
     assert [event.payload["text"] for event in replay.events] == ["b"]
+
+
+def test_session_stream_registry_preserves_original_emitted_at_on_replay(
+    monkeypatch,
+) -> None:
+    registry = SessionStreamRegistry(max_events_per_session=5)
+    monkeypatch.setattr(session_streams, "_epoch_time_ms", lambda: 1_234)
+    recorded = registry.record(
+        "agent:main:test",
+        "session.event.done",
+        {"reason": "stop"},
+    )
+
+    monkeypatch.setattr(session_streams, "_epoch_time_ms", lambda: 9_999)
+    replay = registry.replay("agent:main:test", 0)
+
+    assert recorded["emitted_at"] == 1_234
+    assert replay.events[0].payload["emitted_at"] == 1_234
 
 
 def test_session_stream_registry_reports_incomplete_replay() -> None:

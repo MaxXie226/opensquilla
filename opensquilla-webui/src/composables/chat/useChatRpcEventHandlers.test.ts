@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { effectScope, ref } from 'vue'
+import { effectScope, nextTick, ref } from 'vue'
 import { useChatRpcEventHandlers, type ChatRpcStreamApi } from './useChatRpcEventHandlers'
 import type { ChatMessage, ChatRunStatus, ChatRunStatusSource } from '@/types/chat'
 
@@ -9,9 +9,10 @@ function createHarness(options: {
   sessionRunStatus?: (source: ChatRunStatusSource | null | undefined) => ChatRunStatus
 } = {}) {
   const messages = ref<ChatMessage[]>(options.messages ?? [])
+  const sessionKey = ref('agent:main:test')
+  const lastStreamSeq = ref(0)
   const activeTaskGroups = ref(new Set<string>())
   const activeStreamTaskId = ref('')
-  const lastStreamSeq = ref(0)
   const applySessionRunState = vi.fn()
   const stream: ChatRpcStreamApi = {
     isStreaming: ref(true),
@@ -41,7 +42,7 @@ function createHarness(options: {
   const showWarningToast = vi.fn()
   const scope = effectScope()
   const api = scope.run(() => useChatRpcEventHandlers({
-    sessionKey: ref('agent:main:test'),
+    sessionKey,
     currentEpoch: ref(0),
     lastStreamSeq,
     activeTaskGroups,
@@ -82,10 +83,11 @@ function createHarness(options: {
   return {
     api,
     messages,
+    sessionKey,
+    lastStreamSeq,
     stream,
     activeTaskGroups,
     activeStreamTaskId,
-    lastStreamSeq,
     applySessionRunState,
     markEnsembleHandoff,
     schedulePendingDrainAfterTerminal,
@@ -474,6 +476,147 @@ describe('useChatRpcEventHandlers done usage attachment', () => {
       expect(messages.value[1].output_tokens).toBe(1)
     } finally {
       stop()
+    }
+  })
+})
+
+describe('useChatRpcEventHandlers reasoning timer replay', () => {
+  it('keeps elapsed time across A to B to A replay without leaking into B', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(105_000)
+    const { api, sessionKey, lastStreamSeq, stop } = createHarness()
+
+    try {
+      api.handlers.onAny('session.event.thinking', {
+        session_key: 'agent:main:test',
+        stream_seq: 1,
+        text: 'first',
+        started_at: 100_000,
+      })
+      expect(api.streamThinkingElapsedText.value).toBe('5s')
+
+      vi.setSystemTime(108_000)
+      sessionKey.value = 'agent:main:other'
+      lastStreamSeq.value = 0
+      await nextTick()
+      expect(api.streamThinkingText.value).toBe('')
+
+      sessionKey.value = 'agent:main:test'
+      lastStreamSeq.value = 0
+      await nextTick()
+      api.handlers.onAny('session.event.thinking', {
+        session_key: 'agent:main:test',
+        stream_seq: 1,
+        text: 'first',
+        started_at: 100_000,
+      })
+      expect(api.streamThinkingElapsedText.value).toBe('8s')
+
+      vi.setSystemTime(110_000)
+      api.handlers.onAny('session.event.thinking', {
+        session_key: 'agent:main:test',
+        stream_seq: 2,
+        text: ' second',
+        started_at: 109_000,
+      })
+      expect(api.streamThinkingElapsedText.value).toBe('10s')
+    } finally {
+      stop()
+      vi.useRealTimers()
+    }
+  })
+
+  it('stops replayed reasoning at the original done emission time', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(120_000)
+    const { api, messages, stop } = createHarness({
+      endStreaming(list) {
+        list.push({ role: 'assistant', text: 'answer', ts: 'now' })
+      },
+    })
+
+    try {
+      api.handlers.onAny('session.event.thinking', {
+        session_key: 'agent:main:test',
+        stream_seq: 1,
+        text: 'reasoning',
+        started_at: 100_000,
+      })
+      api.handlers.onAny('session.event.done', {
+        session_key: 'agent:main:test',
+        stream_seq: 2,
+        text: 'answer',
+        reasoning_content: 'reasoning',
+        emitted_at: 108_000,
+      })
+
+      expect(messages.value[0].reasoning).toEqual({
+        text: 'reasoning',
+        seconds: 8,
+      })
+    } finally {
+      stop()
+      vi.useRealTimers()
+    }
+  })
+
+  it('falls back to the local clock for legacy, skewed, and invalid start times', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(5_000_000)
+
+    try {
+      for (const startedAt of [
+        undefined,
+        5_006_000,
+        5_000_000 - 60 * 60 * 1_000 - 1,
+        Number.NaN,
+      ]) {
+        const { api, stop } = createHarness()
+        try {
+          api.handlers.onAny('session.event.thinking', {
+            session_key: 'agent:main:test',
+            stream_seq: 1,
+            text: 'reasoning',
+            started_at: startedAt,
+          })
+          expect(api.streamThinkingElapsedText.value).toBe('0s')
+        } finally {
+          stop()
+        }
+      }
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('falls back to local completion time when emitted_at precedes the start', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(108_000)
+    const { api, messages, stop } = createHarness({
+      endStreaming(list) {
+        list.push({ role: 'assistant', text: 'answer', ts: 'now' })
+      },
+    })
+
+    try {
+      api.handlers.onAny('session.event.thinking', {
+        session_key: 'agent:main:test',
+        stream_seq: 1,
+        text: 'reasoning',
+        started_at: 100_000,
+      })
+      api.handlers.onAny('session.event.done', {
+        session_key: 'agent:main:test',
+        stream_seq: 2,
+        text: 'answer',
+        reasoning_content: 'reasoning',
+        emitted_at: 99_000,
+      })
+
+      expect(messages.value[0].reasoning?.seconds).toBe(8)
+    } finally {
+      stop()
+      vi.useRealTimers()
     }
   })
 })

@@ -4783,6 +4783,7 @@ class Agent:
         self._current_turn_message = message
         _meta_invoke_turn_count.set(0)
         usage_scope = current_usage_accounting_scope()
+        reasoning_started_at_ms = 0
 
         # ------ IDLE → THINKING ------
         yield self._transition(AgentState.THINKING)
@@ -6033,7 +6034,12 @@ class Agent:
                                 # answer: re-emit as ThinkingEvent and keep it
                                 # out of assistant_text_parts. The joined text
                                 # still arrives via DoneEvent.reasoning_content.
-                                yield ThinkingEvent(text=raw_ev.text)
+                                if raw_ev.text and reasoning_started_at_ms == 0:
+                                    reasoning_started_at_ms = time.time_ns() // 1_000_000
+                                yield ThinkingEvent(
+                                    text=raw_ev.text,
+                                    started_at=reasoning_started_at_ms,
+                                )
                                 if (
                                     wrapup_margin_seconds > 0
                                     and _total_deadline is not None

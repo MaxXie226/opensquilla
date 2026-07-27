@@ -209,6 +209,8 @@ export interface StreamEventEnvelope {
 export interface SessionEventPayload extends StreamEventEnvelope {
   task_id?: string
   taskId?: string
+  started_at?: number
+  emitted_at?: number
   reason?: string
   status?: string
   run_status?: string

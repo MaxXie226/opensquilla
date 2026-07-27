@@ -57,6 +57,7 @@ class AgentState(StrEnum):
 class ThinkingEvent:
     kind: Literal["thinking"] = field(default="thinking", init=False)
     text: str = ""
+    started_at: int = 0
 
 
 @dataclass

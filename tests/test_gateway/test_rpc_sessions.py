@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import ANY, AsyncMock
 
 import pytest
 
@@ -5096,6 +5096,7 @@ class TestSessionsMessagesSubscribe:
                         "text": "Inspecting",
                         "session_key": key,
                         "stream_seq": 1,
+                        "emitted_at": ANY,
                     },
                 }
             ],
