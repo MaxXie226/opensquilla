@@ -593,6 +593,7 @@ _DASHSCOPE_THINKING_BUDGET_ENV = "OPENSQUILLA_DASHSCOPE_THINKING_BUDGET"
 _DASHSCOPE_THINKING_BUDGET_MIN = 1024
 _DASHSCOPE_THINKING_BUDGET_MAX = 38_912
 _DASHSCOPE_PARALLEL_TOOL_CALLS_ENV = "OPENSQUILLA_DASHSCOPE_PARALLEL_TOOL_CALLS"
+_DASHSCOPE_NON_STREAM_FALLBACK_ENV = "OPENSQUILLA_DASHSCOPE_NON_STREAM_FALLBACK"
 
 
 def _dashscope_parallel_tool_calls_from_env() -> bool:
@@ -612,6 +613,27 @@ def _dashscope_parallel_tool_calls_from_env() -> bool:
         return False
     raise ValueError(
         f"{_DASHSCOPE_PARALLEL_TOOL_CALLS_ENV} must be one of "
+        "1/true/yes/on or 0/false/no/off"
+    )
+
+
+def _dashscope_non_stream_fallback_from_env() -> bool:
+    """Return whether DashScope may retry a stream as a non-stream request.
+
+    The historical default is enabled. Invalid values fail closed at request
+    construction so benchmark manifests cannot claim a strict streaming arm
+    while silently retaining the fallback.
+    """
+    raw = os.environ.get(_DASHSCOPE_NON_STREAM_FALLBACK_ENV)
+    if raw is None or not raw.strip():
+        return True
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(
+        f"{_DASHSCOPE_NON_STREAM_FALLBACK_ENV} must be one of "
         "1/true/yes/on or 0/false/no/off"
     )
 
@@ -3258,6 +3280,20 @@ class OpenAIProvider:
         tools: list[ToolDefinition] | None,
         cfg: ChatConfig,
     ) -> AsyncIterator[StreamEvent]:
+        non_stream_fallback_allowed = (
+            self._provider_kind != "dashscope"
+            or _dashscope_non_stream_fallback_from_env()
+        )
+        stream_timeout_fallback = (
+            self._compat.stream_timeout_fallback
+            and cfg.physical_attempt_limit != 1
+            and non_stream_fallback_allowed
+        )
+        empty_stream_fallback = (
+            self._compat.empty_stream_fallback
+            and cfg.physical_attempt_limit != 1
+            and non_stream_fallback_allowed
+        )
         payload, wire_active_user_index, fallback_reason = self._build_payload(
             messages,
             tools,
@@ -3531,10 +3567,7 @@ class OpenAIProvider:
             async with httpx.AsyncClient(
                 timeout=(
                     _stream_timeout(cfg.timeout)
-                    if (
-                        self._compat.stream_timeout_fallback
-                        and cfg.physical_attempt_limit != 1
-                    )
+                    if stream_timeout_fallback
                     else cfg.timeout
                 ),
                 trust_env=_trust_env(),
@@ -4470,8 +4503,7 @@ class OpenAIProvider:
                     has_terminal_evidence = active_choice_seen and choice_terminal_seen
                     if not has_terminal_evidence:
                         if (
-                            self._compat.empty_stream_fallback
-                            and cfg.physical_attempt_limit != 1
+                            empty_stream_fallback
                             and not active_choice_seen
                             and not emitted_stream_event
                             and not assistant_text_parts
@@ -4762,8 +4794,7 @@ class OpenAIProvider:
                         gemini_thought_sig = streamed_thought_signature
 
                     if (
-                        self._compat.empty_stream_fallback
-                        and cfg.physical_attempt_limit != 1
+                        empty_stream_fallback
                         and not emitted_stream_event
                         and not assistant_text_parts
                         and not tools_acc.has_calls
@@ -4852,11 +4883,7 @@ class OpenAIProvider:
                 message=safe_error,
                 metadata={"phase": "stream", "cache_shape": cache_shape},
             )
-            if (
-                self._compat.stream_timeout_fallback
-                and cfg.physical_attempt_limit != 1
-                and not emitted_stream_event
-            ):
+            if stream_timeout_fallback and not emitted_stream_event:
                 event_name = (
                     "openrouter.stream_timeout_fallback_started"
                     if self._provider_kind == "openrouter"

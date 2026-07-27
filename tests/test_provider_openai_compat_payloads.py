@@ -623,6 +623,94 @@ def test_dashscope_stream_timeout_emits_heartbeat_before_non_stream_fallback(
     )
 
 
+def test_dashscope_stream_timeout_strict_off_does_not_fallback(
+    monkeypatch: Any,
+) -> None:
+    class TimeoutStream:
+        async def __aenter__(self) -> Any:
+            raise httpx.ReadTimeout("stream idle")
+
+        async def __aexit__(self, *_exc: Any) -> None:
+            return None
+
+    class TimeoutClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> TimeoutClient:
+            return self
+
+        async def __aexit__(self, *_exc: Any) -> None:
+            return None
+
+        def stream(self, *args: Any, **kwargs: Any) -> TimeoutStream:
+            return TimeoutStream()
+
+    class NoFallbackProvider(OpenAIProvider):
+        async def _complete_non_stream(self, **kwargs: Any):
+            pytest.fail("strict DashScope streaming must not call non-stream fallback")
+            yield  # pragma: no cover
+
+    monkeypatch.setenv("OPENSQUILLA_DASHSCOPE_NON_STREAM_FALLBACK", "off")
+    monkeypatch.setattr("opensquilla.provider.openai.httpx.AsyncClient", TimeoutClient)
+    provider = NoFallbackProvider(
+        api_key="test",
+        model="qwen3.7-flash-2026-07-15",
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        provider_kind="dashscope",
+    )
+
+    events = _collect_events(provider, ChatConfig(timeout=1.0))
+
+    assert not any(isinstance(event, ProviderHeartbeatEvent) for event in events)
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert error.code == "timeout"
+
+
+def test_dashscope_empty_stream_strict_off_does_not_fallback(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport_body(monkeypatch, captured, b"data: [DONE]\n\n")
+
+    class NoFallbackProvider(OpenAIProvider):
+        async def _complete_non_stream(self, **kwargs: Any):
+            pytest.fail("strict DashScope streaming must not call non-stream fallback")
+            yield  # pragma: no cover
+
+    monkeypatch.setenv("OPENSQUILLA_DASHSCOPE_NON_STREAM_FALLBACK", "off")
+    provider = NoFallbackProvider(
+        api_key="test",
+        model="qwen3.7-flash-2026-07-15",
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        provider_kind="dashscope",
+    )
+
+    events = _collect_events(provider, ChatConfig(timeout=1.0))
+
+    assert not any(isinstance(event, ProviderHeartbeatEvent) for event in events)
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert error.code == "incomplete_stream"
+
+
+def test_dashscope_non_stream_fallback_invalid_value_fails_closed(
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_DASHSCOPE_NON_STREAM_FALLBACK", "of")
+    provider = OpenAIProvider(
+        api_key="test",
+        model="qwen3.7-flash-2026-07-15",
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        provider_kind="dashscope",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="OPENSQUILLA_DASHSCOPE_NON_STREAM_FALLBACK",
+    ):
+        _collect_events(provider, ChatConfig())
+
+
 @pytest.mark.parametrize(
     ("base_url", "expected_url", "expects_install_id"),
     [
