@@ -28,6 +28,7 @@ export interface UseChatSessionSubscriptionOptions {
   resetStreamIdleTimer: () => void
   resetStreamLiveTurnState: () => void
   onAuthoritativeIdle?: () => void
+  onSnapshot?: (snapshot: SessionMessagesSubscribeResponse) => void
 }
 
 const LIVE_RUN_STATES = ['queued', 'running', 'approval_pending']
@@ -88,6 +89,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
         return UNAVAILABLE_SUBSCRIPTION
       }
       if (res && res.subscribed === false) throw new Error('No subscription manager available')
+      options.onSnapshot?.(res)
       applySessionRunState(res)
       // A pending inline interrupt is newer, stronger evidence than an idle
       // subscription snapshot that raced with the approval request.

@@ -284,6 +284,13 @@ export interface SessionMessagesSubscribeResponse extends SessionEventPayload {
   current_stream_seq?: number
   active_task_group_ids?: string[]
   activeTaskGroupIds?: string[]
+  collaboration?: import('./plans').CollaborationSnapshot
+  currentPlan?: import('./plans').PlanRevisionSnapshot | null
+  current_plan?: unknown
+  activePlanRun?: import('./plans').PlanRunSnapshot | null
+  active_plan_run?: unknown
+  pendingUserInputs?: unknown[]
+  pending_user_inputs?: unknown[]
 }
 
 export interface ChatSendAttachmentPayload {
@@ -303,6 +310,7 @@ export interface ChatSendParams {
   clientMessageId?: string
   _source?: { elevated?: string; runMode?: 'standard' | 'trusted' | 'full' }
   intent?: string
+  collaborationMode?: import('./plans').CollaborationMode
   forkBeforeMessageId?: string
   displayText?: string
   attachments?: ChatSendAttachmentPayload[]
