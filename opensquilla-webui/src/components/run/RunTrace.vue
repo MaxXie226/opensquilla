@@ -124,7 +124,10 @@
             />
             <span v-else class="tool-row__bullet" :class="groupBulletClass(item.group)" aria-hidden="true" />
             <span class="tool-row__label">{{ item.group.label }}</span>
-            <span class="step-count">{{ t('shared.runTrace.callsCount', { count: item.group.calls.length }) }}</span>
+            <!-- Activity groups already carry the call count in their footprint
+                 secondary ("2 web actions"), so the raw call-count pill would
+                 repeat it. -->
+            <span v-if="presentation !== 'activity'" class="step-count">{{ t('shared.runTrace.callsCount', { count: item.group.calls.length }) }}</span>
             <span v-if="item.group.secondary" class="tool-row__arg">{{ item.group.secondary }}</span>
             <Icon
               v-if="presentation === 'activity'"
@@ -169,13 +172,11 @@
                   aria-hidden="true"
                 />
                 <span class="tool-row__trailing">
-                  <span
-                    v-if="activityTerminalStatusText(call)"
-                    class="tool-row__status"
-                    role="status"
-                  >
-                    {{ activityTerminalStatusText(call) }}
-                  </span>
+                  <!-- Failure text is plain row content on purpose: it joins the
+                       button's accessible name, which screen readers announce when
+                       the row is reached. A live region mounted already-populated
+                       would never announce. -->
+                  <span v-if="activityTerminalStatusText(call)" class="tool-row__status">{{ activityTerminalStatusText(call) }}</span>
                   <span v-if="resultCountText(call)" class="tool-row__status">{{ resultCountText(call) }}</span>
                   <span v-if="elapsedFor(call)" class="tool-row__elapsed">{{ elapsedFor(call) }}</span>
                   <Icon v-if="presentation !== 'activity' && iconFor(call).glyph === 'check'" class="tool-row__state-icon tool-row__state-icon--ok" name="check" :size="13" />
@@ -233,13 +234,7 @@
                 aria-hidden="true"
               />
               <span class="tool-row__trailing">
-                <span
-                  v-if="activityTerminalStatusText(call)"
-                  class="tool-row__status"
-                  role="status"
-                >
-                  {{ activityTerminalStatusText(call) }}
-                </span>
+                <span v-if="activityTerminalStatusText(call)" class="tool-row__status">{{ activityTerminalStatusText(call) }}</span>
                 <span v-if="resultCountText(call)" class="tool-row__status">{{ resultCountText(call) }}</span>
                 <span v-if="elapsedFor(call)" class="tool-row__elapsed">{{ elapsedFor(call) }}</span>
                 <Icon v-if="presentation !== 'activity' && iconFor(call).glyph === 'check'" class="tool-row__state-icon tool-row__state-icon--ok" name="check" :size="13" />
@@ -1689,8 +1684,7 @@ function fmtTok(n?: number | null): string {
 
 .tool-timeline--activity .tool-row__arg,
 .tool-timeline--activity .tool-row__trailing,
-.tool-timeline--activity .tool-row__status,
-.tool-timeline--activity .step-count {
+.tool-timeline--activity .tool-row__status {
   color: var(--text-muted);
 }
 
@@ -1717,9 +1711,10 @@ function fmtTok(n?: number | null): string {
   color: color-mix(in srgb, var(--text) 62%, transparent);
 }
 
+/* The header dot is the single working signal for a live turn; the running
+   row's icon identifies itself with the static accent colour alone. */
 .tool-timeline--activity .tool-row__activity-icon--running {
   color: var(--accent);
-  animation: activity-tool-icon-pulse 2.3s var(--ease-standard) infinite;
 }
 
 .tool-timeline--activity .tool-row__activity-icon--error {
@@ -1773,7 +1768,6 @@ function fmtTok(n?: number | null): string {
   color: var(--text-muted);
 }
 
-.tool-timeline--activity .step-count,
 .tool-timeline--activity .tool-row__elapsed,
 .tool-timeline--activity .tool-row--running .tool-row__elapsed {
   padding: 0;
@@ -1788,8 +1782,18 @@ function fmtTok(n?: number | null): string {
   background: transparent;
 }
 
+/* One indent scale for the whole fold: a row's text starts after its icon at
+   0.125rem padding + 0.875rem icon + 0.625rem gap = 1.625rem, and everything
+   subordinate to that row (detail bodies, narration, member rows) aligns to
+   the same origin. Each nesting level therefore adds 1.5rem (icon + gap);
+   the fold's containment comes from the disclosure body's single left rule,
+   not from per-level rules here. */
 .tool-timeline--activity .tool-row-body {
-  padding: 0 0 0.125rem 1.5rem;
+  padding: 0 0 0.125rem 1.625rem;
+}
+
+.tool-timeline--activity .step-group-members {
+  padding-left: 1.5rem;
 }
 
 .tool-timeline--activity .step-group-members::before {
@@ -1797,7 +1801,7 @@ function fmtTok(n?: number | null): string {
 }
 
 .tool-timeline--activity .msg-ai-text {
-  margin: 0.125rem 0 0.25rem 1.5rem;
+  margin: 0.125rem 0 0.25rem 1.625rem;
   color: var(--text-muted);
   font-size: 0.8125rem;
   line-height: 1.55;
@@ -1809,12 +1813,6 @@ function fmtTok(n?: number | null): string {
 
 .tool-timeline--activity .msg-ai-text + .msg-ai-text {
   margin-top: -0.125rem;
-}
-
-@keyframes activity-tool-icon-pulse {
-  0%,
-  100% { opacity: 0.55; }
-  50% { opacity: 1; }
 }
 
 /* Completed, non-open rows soften and tuck in — kept for traceability, not
@@ -1870,12 +1868,19 @@ function fmtTok(n?: number | null): string {
     transform var(--dur-base) var(--ease-out);
 }
 
+/* Touch devices have no hover to reveal the activity chevron, so rest it at
+   a visible opacity there — otherwise the row reads as inert text. The
+   higher-specificity .is-open rules above still win, keeping an open row's
+   rotated chevron. */
+@media (hover: none) {
+  .tool-timeline--activity .tool-row__activity-arrow {
+    opacity: 0.55;
+    transform: translateX(0);
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .tool-row__bullet--running {
-    animation: none;
-  }
-
-  .tool-row__activity-icon--running {
     animation: none;
   }
 

@@ -308,9 +308,8 @@ def _apply_run_context_route_metadata(
         preserve_materialized_user_grants=True,
     )
     route_envelope.metadata["run_mode"] = run_context.run_mode.value
-    # A persisted (non-default) run context reflects a genuine per-session
-    # /sandbox choice; routing uses this to avoid upgrading an explicit
-    # Managed-Execution selection to channel-admin Full Host Access.
+    # Preserve whether this is the default or an explicit per-session choice
+    # for route consumers that need to display or audit its origin.
     route_envelope.metadata["run_mode_explicit"] = run_context.source != "default"
     route_envelope.metadata["sandbox_mounts"] = (
         filtered_run_context.to_origin_payload()["mounts"]
@@ -2190,6 +2189,23 @@ async def _handle_sessions_send(
             *,
             merge_into_task: bool = False,
         ) -> TurnAcceptanceResult:
+            reset_archive_writer = None
+            if atomic_intent_plan.action == "reset":
+                write_session_archive = getattr(
+                    ctx.session_manager,
+                    "write_session_archive",
+                    None,
+                )
+                if not callable(write_session_archive):
+                    raise RuntimeError("Reset requires durable session archive support")
+
+                async def reset_archive_writer(snapshot: Any) -> None:
+                    await write_session_archive(
+                        snapshot.node,
+                        list(snapshot.entries),
+                        list(snapshot.summaries),
+                    )
+
             return await storage.accept_turn(
                 persisted_entry,
                 expected_epoch=expected_epoch,
@@ -2209,6 +2225,7 @@ async def _handle_sessions_send(
                     if atomic_intent_plan.action == "reset"
                     else None
                 ),
+                reset_archive_writer=reset_archive_writer,
                 initial_transcript_entries=(
                     atomic_intent_plan.initial_transcript_entries
                     if atomic_intent_plan.action == "fork"

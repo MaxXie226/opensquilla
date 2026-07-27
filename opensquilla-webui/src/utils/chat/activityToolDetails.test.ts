@@ -123,8 +123,50 @@ describe('activity tool detail projection', () => {
       }),
     }), 'command.run')
 
+    // No input-derived detail line at all: command lines carry credentials in
+    // shapes a browser-only projection cannot classify exhaustively.
     expect(projection.lines).toEqual([])
     expect(projection.rawContent).toContain('OPENAI_API_KEY=sk-secret')
+  })
+
+  it('reports content size for read-shaped and generic operations only', () => {
+    const longOutput = Array.from({ length: 42 }, (_, i) => `line ${i}`).join('\n')
+
+    expect(projectActivityToolDetail(call({
+      name: 'shell',
+      result: longOutput,
+      resultPreview: longOutput,
+    }), 'command.run').lines).toEqual([])
+
+    expect(projectActivityToolDetail(call({
+      name: 'web_search',
+      inputRaw: JSON.stringify({ query: 'vue flexbox wrap' }),
+      result: longOutput,
+      resultPreview: longOutput,
+    }), 'web.search').lines).toEqual([
+      { kind: 'target', text: '“vue flexbox wrap”' },
+    ])
+
+    expect(projectActivityToolDetail(call({
+      name: 'read_file',
+      inputRaw: '{"path":"src/App.vue"}',
+      result: longOutput,
+      resultPreview: longOutput,
+    }), 'file.inspect').lines).toEqual([
+      { kind: 'target', text: 'src/App.vue' },
+      { kind: 'content-size', lines: 42, characters: longOutput.length },
+    ])
+
+    // Generic tools (MCP servers, plan/messaging builtins) rarely carry a
+    // name-like input key, so the size line is their only signal.
+    expect(projectActivityToolDetail(call({
+      name: 'update_plan',
+      inputRaw: JSON.stringify({ plan: 'step one\nstep two' }),
+      result: longOutput,
+      resultPreview: longOutput,
+    }), 'tool.update.plan').lines).toEqual([
+      { kind: 'content-size', lines: 42, characters: longOutput.length },
+    ])
   })
 
   it('reduces absolute error paths to a basename', () => {
@@ -147,6 +189,14 @@ describe('activity tool detail projection', () => {
     expect(activityDisplayPath(
       '/tmp/workspace/../../Users/example/secret/key.txt',
     )).toBe('…/key.txt')
+  })
+
+  it('treats home-anchored paths as absolute, not workspace-relative', () => {
+    expect(activityDisplayPath('~/secret/id_rsa')).toBe('…/id_rsa')
+    expect(activityDisplayPath('$HOME/secret/id_rsa')).toBe('…/id_rsa')
+    expect(activityDisplayPath('%USERPROFILE%\\secret\\id_rsa.pub')).toBe('…/id_rsa.pub')
+    // `$HOMEWORK/...` is an ordinary relative directory, not a home anchor.
+    expect(activityDisplayPath('$HOMEWORK/notes.txt')).toBe('$HOMEWORK/notes.txt')
   })
 
   it('only derives written-byte metadata for file mutations', () => {
@@ -208,5 +258,14 @@ describe('activity tool detail projection', () => {
       'https://[redacted]@example.test/path?access_token=[redacted]',
       '[redacted]',
     ].join('\n'))
+  })
+
+  it('redacts underscore-form provider keys and bare JWTs', () => {
+    expect(redactActivityDetail('sk_live_a1b2c3d4e5f6')).toBe('[redacted]')
+    expect(redactActivityDetail('sk_test_a1b2c3d4e5f6')).toBe('[redacted]')
+    expect(redactActivityDetail('sk_proj_a1b2c3d4e5f6')).toBe('[redacted]')
+    expect(redactActivityDetail(
+      'jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJkdW1teSJ9.c2lnbmF0dXJlLXBhcnQ',
+    )).toBe('jwt [redacted]')
   })
 })

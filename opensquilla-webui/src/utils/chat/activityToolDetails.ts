@@ -102,8 +102,24 @@ export function redactActivityDetail(value: string): string {
       new RegExp(`([?&](?:${SENSITIVE_KEY})=)[^&#\\s]+`, 'gi'),
       '$1[redacted]',
     )
+    // Known-token sweep. Browser-side defense in depth only: the durable
+    // boundary is the server-side pass (src/opensquilla/redaction.py), whose
+    // known-secrets exact replacement and entropy heuristic a browser
+    // projection cannot have.
     .replace(
-      /\b(?:sk-[a-z0-9_-]{8,}|gh[pousr]_[a-z0-9_]{12,}|xox[baprs]-[a-z0-9-]{12,}|AKIA[A-Z0-9]{12,})\b/gi,
+      new RegExp(
+        [
+          '\\b(?:',
+          'sk-[a-z0-9_-]{8,}',
+          '|sk_(?:live|test|proj)_[a-z0-9_]{8,}',
+          '|gh[pousr]_[a-z0-9_]{12,}',
+          '|xox[baprs]-[a-z0-9-]{12,}',
+          '|AKIA[A-Z0-9]{12,}',
+          '|eyJ[a-z0-9_-]{8,}\\.[a-z0-9_-]{8,}\\.[a-z0-9_-]{8,}',
+          ')\\b',
+        ].join(''),
+        'gi',
+      ),
       '[redacted]',
     )
 }
@@ -129,7 +145,12 @@ export function activityDisplayPath(value: string): string {
   }
 
   const relative = normalized.replace(/^\.\//, '')
-  const isAbsolute = relative.startsWith('/') || /^[A-Za-z]:\//.test(relative)
+  // `~`, `$HOME`, and `%USERPROFILE%` are absolute paths in disguise: letting
+  // them into the relative branch would print the out-of-workspace structure
+  // this function exists to hide.
+  const isAbsolute = relative.startsWith('/')
+    || /^[A-Za-z]:\//.test(relative)
+    || /^(?:~|\$home\b|%userprofile%)/i.test(relative)
   const hasParentTraversal = relative.split('/').includes('..')
   if (!isAbsolute && !hasParentTraversal && !relative.includes('://')) {
     return truncateInline(relative, 96)
@@ -163,6 +184,8 @@ function safeUrl(value: string): string {
 function safeInline(value: string): string {
   return truncateInline(redactActivityDetail(value))
 }
+
+const CONTENT_SIZE_OPERATIONS = new Set(['file.inspect', 'web.read'])
 
 function safeTarget(value: string): string {
   const source = String(value || '').trim()
@@ -298,7 +321,14 @@ export function projectActivityToolDetail(
     && String(resultRecord?.status || '').toLowerCase() === 'published'
   ) {
     pushUnique(lines, { kind: 'published' })
-  } else {
+  } else if (
+    CONTENT_SIZE_OPERATIONS.has(operationKey)
+    || operationKey.startsWith('tool.')
+  ) {
+    // Output size is meaningful audit signal for read-shaped operations, and
+    // it is the only signal generic `tool.*` operations (MCP tools, plan or
+    // messaging builtins) reliably have — their inputs rarely carry a
+    // name-like key. Search, command, and write ops stay quiet on purpose.
     const size = contentSize(result)
     if (size) pushUnique(lines, { kind: 'content-size', ...size })
   }

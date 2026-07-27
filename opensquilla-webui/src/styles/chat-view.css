@@ -307,49 +307,24 @@
   color: var(--text-muted);
 }
 
-/* Live model reasoning disclosure (collapsed by default) */
-.thinking-fold {
-  margin: 0 0 0.5rem;
-  font-size: 0.8125rem;
+/* Live answer candidate: provisional text that can still migrate back into
+   the activity transcript when a later tool starts. A quiet left rule plus a
+   small uppercase tag mark it as a draft — flat, no background, no motion. */
+.live-answer-candidate-tag {
+  display: block;
+  margin: 0.375rem 0 0.125rem;
+  padding-left: 0.75rem;
+  border-left: 2px solid color-mix(in srgb, var(--accent) 40%, transparent);
   color: var(--text-dim);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
 }
 
-.thinking-fold__summary {
-  display: inline-flex;
-  align-items: center;
-  gap: 0;
-  padding: 0.125rem 0.25rem;
-  border-radius: var(--radius-sm);
-  cursor: pointer;
-  list-style: none;
-  color: var(--text-dim);
-  line-height: 1.5;
-}
-
-.thinking-fold__summary::-webkit-details-marker {
-  display: none;
-}
-
-.thinking-fold__summary:hover {
-  color: var(--text-muted);
-}
-
-.thinking-fold__summary:focus-visible {
-  outline: none;
-  box-shadow: var(--focus-ring);
-}
-
-.thinking-fold__body {
-  margin: 0.25rem 0 0.375rem;
-  padding: 0.25rem;
-  border: 0;
-  background: transparent;
-  color: var(--text-muted);
-  line-height: 1.55;
-  white-space: pre-wrap;
-  word-break: break-word;
-  max-height: 16rem;
-  overflow-y: auto;
+.live-answer-candidate {
+  padding-left: 0.75rem;
+  border-left: 2px solid color-mix(in srgb, var(--accent) 40%, transparent);
 }
 
 /* ── Jump-to-latest pill (floats above the composer when scrolled up) ─── */
