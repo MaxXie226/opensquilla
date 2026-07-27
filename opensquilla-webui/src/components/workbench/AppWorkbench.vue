@@ -102,12 +102,14 @@ import {
 } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
+import { useArtifactImageLightbox } from '@/composables/chat/useArtifactImageLightbox'
 import { useNativeSurfaceOcclusionState } from '@/composables/useDialogA11y'
 import { useToasts } from '@/composables/useToasts'
 import { usePlatform } from '@/platform'
 import type { NativeWorkbenchSurfaceEvent } from '@/platform/types'
 import { workbenchPanelRegistry } from '@/workbench/registry'
 import { createArtifactPreviewWorkbenchItem } from '@/workbench/artifactItems'
+import { artifactCategory } from '@/utils/chat/artifacts'
 import {
   attachWorkbenchRuntime,
   WorkbenchRuntimeManager,
@@ -140,6 +142,7 @@ const { t } = useI18n()
 const { pushToast } = useToasts()
 const platform = usePlatform()
 const store = useWorkbenchStore()
+const artifactImageLightbox = useArtifactImageLightbox()
 const nativeSurfaceOccluded = useNativeSurfaceOcclusionState()
 const surfaceBlocked = computed(() => props.modalBlocked || nativeSurfaceOccluded.value)
 const baseOrigin = typeof window === 'undefined' ? 'http://localhost' : window.location.origin
@@ -167,7 +170,15 @@ for (const definition of createArtifactWorkbenchDefinitions({
   authToken: readAuthToken,
   baseOrigin,
   currentSessionId: () => store.activeSessionId || props.sessionId,
-  openArtifact: (artifact, sessionKey) => {
+  openArtifact: (artifact, sessionKey, navigationArtifacts) => {
+    if (artifactCategory(artifact) === 'visual') {
+      artifactImageLightbox.open({
+        artifact,
+        navigationArtifacts,
+        sessionKey,
+      })
+      return
+    }
     store.openItem(createArtifactPreviewWorkbenchItem({
       artifact,
       nativeHtml: Boolean(

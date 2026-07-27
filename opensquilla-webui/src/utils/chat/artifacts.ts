@@ -9,6 +9,8 @@ const ARTIFACT_MIME_CATEGORIES: Record<string, string> = {
 
 const ARTIFACT_EXTENSION_CATEGORIES: Record<string, string> = {
   aac: 'audio', flac: 'audio', m4a: 'audio', mp3: 'audio', oga: 'audio', ogg: 'audio', opus: 'audio', wav: 'audio',
+  avif: 'visual', bmp: 'visual', gif: 'visual', ico: 'visual', jpeg: 'visual',
+  jpg: 'visual', png: 'visual', svg: 'visual', webp: 'visual',
   csv: 'data', htm: 'document', html: 'document', ipynb: 'data', json: 'data',
   jsonl: 'data', log: 'document', markdown: 'document', md: 'document',
   ndjson: 'data', pdf: 'document', sql: 'code', tsv: 'data', txt: 'document',

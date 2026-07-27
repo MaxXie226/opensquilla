@@ -361,6 +361,11 @@ describe('WorkbenchHost', () => {
     mounted.modalBlocked.value = true
     await nextTick()
     await nextTick()
+    const workbench = mounted.host.querySelector<HTMLElement>(
+      '[data-testid="workbench-host"]',
+    )!
+    expect(workbench.getAttribute('aria-hidden')).toBe('true')
+    expect(workbench.hasAttribute('inert')).toBe(true)
     expect(mounted.store.hostAvailable).toBe(false)
     expect(mounted.onSurfaceRect).toHaveBeenLastCalledWith(
       expect.objectContaining({ itemId: 'native', visible: false }),
@@ -369,6 +374,8 @@ describe('WorkbenchHost', () => {
     mounted.modalBlocked.value = false
     await nextTick()
     await nextTick()
+    expect(workbench.hasAttribute('aria-hidden')).toBe(false)
+    expect(workbench.hasAttribute('inert')).toBe(false)
     expect(mounted.store.hostAvailable).toBe(true)
   })
 })

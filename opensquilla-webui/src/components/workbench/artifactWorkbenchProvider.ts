@@ -45,7 +45,11 @@ export interface ArtifactWorkbenchProviderOptions {
   authToken(): string
   baseOrigin: string
   currentSessionId(): string
-  openArtifact(artifact: ArtifactPayload, sessionKey: string): void
+  openArtifact(
+    artifact: ArtifactPayload,
+    sessionKey: string,
+    navigationArtifacts: readonly ArtifactPayload[],
+  ): void
   platform: Platform
   pushToast(message: string, options?: { tone: 'danger' }): void
   t: Translate
@@ -342,6 +346,7 @@ class ArtifactCollectionRuntime implements WorkbenchPanelRuntime {
     this.options.openArtifact(
       artifact,
       artifactSessionKey(item, this.options),
+      artifactsFromWorkbenchItem(item),
     )
   }
 }

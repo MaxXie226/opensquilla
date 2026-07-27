@@ -148,7 +148,7 @@
           @regenerate-message="regenerateMessage"
           @toggle-share-message="toggleShareMessage"
           @download-artifact="downloadArtifact"
-          @open-artifact="openArtifactInWorkbench"
+          @open-artifact="openArtifact"
           @toggle-tool-group="toggleToolGroup"
           @toggle-tool-item="toggleToolItem"
           @show-tool-result="showToolResultModal"
@@ -274,7 +274,7 @@
               :auth-token="readAuthToken()"
               :prefer-workbench="workbenchEnabled"
               @download="downloadArtifact"
-              @open="openArtifactInWorkbench"
+              @open="openArtifact"
             />
 
           </div>
@@ -588,6 +588,7 @@ import { useChatRpcSubscriptions } from '@/composables/chat/useChatRpcSubscripti
 import { useChatSend, type ChatSendOutcome } from '@/composables/chat/useChatSend'
 import { useSandboxSetupRecovery } from '@/composables/chat/useSandboxSetupRecovery'
 import { useChatStallWatchdog } from '@/composables/chat/useChatStallWatchdog'
+import { useArtifactImageLightbox } from '@/composables/chat/useArtifactImageLightbox'
 import { useMetaRuns } from '@/composables/chat/useMetaRuns'
 import { runStatusLabelText as sessionRunStatusLabelText } from '@/composables/useSessions'
 import { useChatSessionRoute } from '@/composables/chat/useChatSessionRoute'
@@ -621,7 +622,7 @@ import type {
 import type { ModelRoutingMode } from '@/types/modelRouting'
 import type { SandboxRunMode } from '@/types/sandbox'
 import type { ChatPart, InterruptViewState } from '@/types/parts'
-import { artifactDownloadUrl } from '@/utils/chat/artifacts'
+import { artifactCategory, artifactDownloadUrl } from '@/utils/chat/artifacts'
 import {
   createArtifactCollectionWorkbenchItem,
   createArtifactPreviewWorkbenchItem,
@@ -702,6 +703,7 @@ const toolResultModal = ref<{
 const rpc = useRpcStore()
 const appStore = useAppStore()
 const workbenchStore = useWorkbenchStore()
+const artifactImageLightbox = useArtifactImageLightbox()
 const platform = usePlatform()
 const router = useRouter()
 const { t, locale } = useI18n()
@@ -2037,7 +2039,9 @@ function openDeliverables() {
 }
 
 watch(sessionArtifacts, artifacts => {
-  if (!workbenchEnabled.value || !sessionKey.value) return
+  if (!sessionKey.value) return
+  artifactImageLightbox.updateNavigation(artifacts, sessionKey.value)
+  if (!workbenchEnabled.value) return
   workbenchStore.updateItem(createArtifactCollectionWorkbenchItem({
     artifacts,
     sessionKey: sessionKey.value,
@@ -2045,7 +2049,15 @@ watch(sessionArtifacts, artifacts => {
   }))
 })
 
-function openArtifactInWorkbench(artifact: ArtifactPayload): boolean {
+function openArtifact(artifact: ArtifactPayload): boolean {
+  if (artifactCategory(artifact) === 'visual' && sessionKey.value) {
+    artifactImageLightbox.open({
+      artifact,
+      navigationArtifacts: sessionArtifacts.value,
+      sessionKey: sessionKey.value,
+    })
+    return true
+  }
   if (!workbenchEnabled.value || !sessionKey.value) return false
   workbenchStore.openItem(createArtifactPreviewWorkbenchItem({
     artifact,

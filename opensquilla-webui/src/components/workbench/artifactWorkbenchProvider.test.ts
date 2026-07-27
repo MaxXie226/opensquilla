@@ -232,7 +232,7 @@ describe('artifact Workbench provider', () => {
       payload: artifact,
     }, item)
 
-    expect(openArtifact).toHaveBeenCalledWith(artifact, 'session-a')
+    expect(openArtifact).toHaveBeenCalledWith(artifact, 'session-a', [artifact])
     expect(definition.getProps?.(item, {
       active: true,
       hostAvailable: true,

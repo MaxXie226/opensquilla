@@ -10,6 +10,8 @@
     :role="layoutMode === 'mobile-dialog' ? 'dialog' : 'complementary'"
     :aria-modal="layoutMode === 'mobile-dialog' ? 'true' : undefined"
     :aria-label="ariaLabel"
+    :aria-hidden="modalBlocked ? 'true' : undefined"
+    :inert="modalBlocked ? true : undefined"
     data-testid="workbench-host"
   >
     <WorkbenchResizer

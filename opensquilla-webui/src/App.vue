@@ -289,6 +289,7 @@
         :session-id="currentSessionKey"
         :modal-blocked="workbenchModalBlocked"
       />
+      <ArtifactImageLightbox />
     </div>
   </div>
 
@@ -379,11 +380,13 @@ import SidebarResizer from './components/SidebarResizer.vue'
 import CommandPalette from './components/CommandPalette.vue'
 import LanguageSwitcher from './components/LanguageSwitcher.vue'
 import BgmControl from './components/BgmControl.vue'
+import ArtifactImageLightbox from './components/chat/ArtifactImageLightbox.vue'
 import AppWorkbench from './components/workbench/AppWorkbench.vue'
 import { useBgm } from './composables/useBgm'
 import { useSidebarLayout } from './composables/useSidebarLayout'
 import { useDocumentEvent } from './composables/useDocumentEvent'
 import { useDialogLayer } from './composables/useDialogA11y'
+import { provideArtifactImageLightbox } from './composables/chat/useArtifactImageLightbox'
 import { useAgentOptions } from './composables/useAgentOptions'
 import { useSessionListSubscription } from './composables/useSessionListSubscription'
 import { useToasts } from './composables/useToasts'
@@ -406,6 +409,7 @@ import {
 const appStore = useAppStore()
 const rpcStore = useRpcStore()
 const shortcutsStore = useShortcutsStore()
+const artifactImageLightbox = provideArtifactImageLightbox()
 const { t } = useI18n()
 const $route = useRoute()
 const sidebarRef = ref<HTMLElement | null>(null)
@@ -550,6 +554,21 @@ const currentSessionKey = computed(() => {
 
 // Chat layout applies to both the session view and the draft route.
 const isChatRoute = computed(() => $route.path === '/chat' || $route.path === '/chat/new')
+
+watch(
+  [
+    currentSessionKey,
+    isChatRoute,
+    () => artifactImageLightbox.request.value?.sessionKey || '',
+  ],
+  ([sessionKey, chatRouteActive]) => {
+    const request = artifactImageLightbox.request.value
+    if (request && (!chatRouteActive || request.sessionKey !== sessionKey)) {
+      artifactImageLightbox.close()
+    }
+  },
+  { flush: 'sync' },
+)
 
 // The Settings overlay (route-mounted dialog) is open on these routes. It owns
 // its own Escape/focus, so App-level keyboard shortcuts defer to it. Both web

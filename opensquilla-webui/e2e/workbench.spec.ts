@@ -2,6 +2,10 @@ import { expect, test, type Locator, type Page } from '@playwright/test'
 
 const CONTROL_URL = '/control/'
 const SESSION_KEY = 'agent:main:webchat:e2eworkbench'
+const PNG_1x1 = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
+  'base64',
+)
 
 const ARTIFACTS = [
   {
@@ -59,6 +63,13 @@ async function installWorkbenchGateway(
         status: 200,
         contentType: 'text/html',
         body: '<!doctype html><title>Demo</title><p id="preview">Offline demo</p>',
+      })
+    }
+    if (pathname.endsWith('/workbench-image-a') || pathname.endsWith('/workbench-image-b')) {
+      return route.fulfill({
+        status: 200,
+        contentType: 'image/png',
+        body: PNG_1x1,
       })
     }
     return route.fulfill({ status: 404, body: 'missing artifact' })
@@ -137,10 +148,16 @@ async function openWorkbenchSession(
   requests: Map<string, number> = new Map(),
   artifacts = ARTIFACTS,
 ) {
+  await page.addInitScript(() => {
+    window.OPENSQUILLA_FEATURES = {
+      ...(window.OPENSQUILLA_FEATURES || {}),
+      artifactWorkbench: true,
+    }
+  })
   await installWorkbenchGateway(page, requests, artifacts)
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
   await expect(page.locator('.conn-pill')).toBeVisible({ timeout: 10000 })
-  await expect(page.locator('.msg-artifact-chip')).toHaveCount(
+  await expect(page.locator('.msg-artifact-chip, .msg-media-card')).toHaveCount(
     artifacts.length,
     { timeout: 10000 },
   )
@@ -237,6 +254,53 @@ test.describe('Application Workbench', () => {
     await expect(page.getByRole('dialog', { name: 'Deliverables (1)' })).toHaveCount(0)
   })
 
+  test('images from the collection open the shared Lightbox without creating tabs', async ({ page }) => {
+    const artifacts = [
+      {
+        id: 'workbench-image-a',
+        name: 'first.png',
+        mime: 'image/png',
+        size: PNG_1x1.length,
+        download_url: '/api/v1/artifacts/workbench-image-a',
+        thumbnail_url: '/api/v1/artifacts/workbench-image-a?variant=thumb',
+      },
+      {
+        id: 'workbench-image-b',
+        name: 'second.png',
+        mime: 'image/png',
+        size: PNG_1x1.length,
+        download_url: '/api/v1/artifacts/workbench-image-b',
+        thumbnail_url: '/api/v1/artifacts/workbench-image-b?variant=thumb',
+      },
+      ARTIFACTS[2],
+    ]
+    await openWorkbenchSession(page, new Map(), artifacts)
+    await (await deliverablesHeaderAction(page)).click()
+
+    const workbench = page.getByTestId('workbench-host')
+    await expect(workbench.locator('[data-workbench-item-id]')).toHaveCount(1)
+    const imageRow = workbench.getByRole('button', { name: 'Open first.png' })
+    await imageRow.click()
+
+    const lightbox = page.locator('.deliv-preview[role="dialog"]')
+    await expect(lightbox).toBeVisible()
+    await expect(lightbox.locator('.deliv-preview__image')).toBeVisible()
+    await expect(workbench.locator('[data-workbench-item-id]')).toHaveCount(1)
+    await expect(workbench.getByRole('tablist')).toHaveCount(0)
+
+    await lightbox.getByRole('button', { name: 'Next image' }).click()
+    await expect(lightbox.locator('.deliv-preview__title')).toHaveText('second.png')
+
+    await page.keyboard.press('Escape')
+    await expect(lightbox).toHaveCount(0)
+    await expect(workbench).toBeVisible()
+    await expect(imageRow).toBeFocused()
+
+    await workbench.getByRole('button', { name: 'Open demo.html' }).click()
+    await expect(workbench.getByRole('tab')).toHaveCount(2)
+    await expect(workbench.locator('.artifact-preview__frame--html')).toBeVisible()
+  })
+
   test('opening the same artifact card reuses one tab until the workbench is closed', async ({ page }) => {
     await openWorkbenchSession(page)
     const notes = page.locator('.msg-artifact-chip', { hasText: 'notes.txt' })
@@ -276,5 +340,43 @@ test.describe('Application Workbench', () => {
     await page.keyboard.press('Escape')
     await expect(workbench).toBeHidden()
     await expect(page.getByTestId('chat-header-primary-action')).toBeFocused()
+  })
+
+  test('mobile image preview hides only the Workbench layer until the Lightbox closes', async ({ page }) => {
+    await page.setViewportSize({ width: 375, height: 667 })
+    const artifacts = [
+      {
+        id: 'workbench-image-a',
+        name: 'first.png',
+        mime: 'image/png',
+        size: PNG_1x1.length,
+        download_url: '/api/v1/artifacts/workbench-image-a',
+        thumbnail_url: '/api/v1/artifacts/workbench-image-a?variant=thumb',
+      },
+      ARTIFACTS[2],
+    ]
+    await openWorkbenchSession(page, new Map(), artifacts)
+
+    const deliverables = await deliverablesHeaderAction(page)
+    await deliverables.click()
+    const workbench = page.getByTestId('workbench-host')
+    const imageRow = workbench.getByRole('button', { name: 'Open first.png' })
+    await imageRow.click()
+
+    const lightbox = page.locator('.deliv-preview[role="dialog"]')
+    await expect(lightbox).toBeVisible()
+    await expect(workbench).toHaveAttribute('aria-hidden', 'true')
+    expect(await workbench.evaluate(element => element.hasAttribute('inert'))).toBe(true)
+
+    await page.keyboard.press('Escape')
+    await expect(lightbox).toHaveCount(0)
+    await expect(workbench).toBeVisible()
+    await expect(workbench).not.toHaveAttribute('aria-hidden', 'true')
+    expect(await workbench.evaluate(element => element.hasAttribute('inert'))).toBe(false)
+    await expect(imageRow).toBeFocused()
+
+    await page.keyboard.press('Escape')
+    await expect(workbench).toBeHidden()
+    await expect(deliverables).toBeFocused()
   })
 })
