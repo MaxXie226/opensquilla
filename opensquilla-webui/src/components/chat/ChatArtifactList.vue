@@ -6,6 +6,7 @@
         v-for="artifact in visualArtifacts"
         :key="`media-${artifactKey(artifact)}`"
         class="msg-media-card"
+        :data-artifact-key="artifactKey(artifact)"
         :aria-label="t('chat.artifactTitleSubtitle', { title: artifactFileTitle(artifact), subtitle: artifactFileSubtitle(artifact) })"
       >
         <!-- Reserved aspect-ratio box: the preview only fetches once this scrolls
@@ -102,6 +103,7 @@
       <AudioArtifactCard
         v-for="artifact in audioArtifacts"
         :key="artifactKey(artifact)"
+        :data-artifact-key="artifactKey(artifact)"
         :artifact="artifact"
         :session-key="sessionKey"
         :auth-token="authToken"
@@ -109,11 +111,25 @@
       />
     </TransitionGroup>
 
-    <!-- Non-image/non-audio artifacts: file cards with explicit actions. -->
+    <!-- Video artifacts follow the same authenticated, explicit-load contract. -->
+    <TransitionGroup v-if="videoArtifacts.length" name="artifact-chip" tag="div" class="msg-artifact-files">
+      <VideoArtifactCard
+        v-for="artifact in videoArtifacts"
+        :key="artifactKey(artifact)"
+        :data-artifact-key="artifactKey(artifact)"
+        :artifact="artifact"
+        :session-key="sessionKey"
+        :auth-token="authToken"
+        @download="$emit('download', $event)"
+      />
+    </TransitionGroup>
+
+    <!-- Non-image/non-media artifacts: file cards with explicit actions. -->
     <TransitionGroup v-if="fileArtifacts.length" name="artifact-chip" tag="div" class="msg-artifact-files">
       <ArtifactChip
         v-for="artifact in fileArtifacts"
         :key="artifactKey(artifact)"
+        :data-artifact-key="artifactKey(artifact)"
         :artifact="artifact"
         :category="artifactCategory(artifact)"
         :icon-name="artifactIconName(artifact)"
@@ -136,6 +152,7 @@ import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import ArtifactChip from '@/components/chat/ArtifactChip.vue'
 import AudioArtifactCard from '@/components/chat/AudioArtifactCard.vue'
+import VideoArtifactCard from '@/components/chat/VideoArtifactCard.vue'
 import type { ArtifactPayload } from '@/types/rpc'
 import { useToasts } from '@/composables/useToasts'
 import {
@@ -183,9 +200,10 @@ const rpcStore = useRpcStore()
 
 const visualArtifacts = computed(() => props.artifacts.filter(artifact => artifactCategory(artifact) === 'visual'))
 const audioArtifacts = computed(() => props.artifacts.filter(artifact => artifactCategory(artifact) === 'audio'))
+const videoArtifacts = computed(() => props.artifacts.filter(artifact => artifactCategory(artifact) === 'video'))
 const fileArtifacts = computed(() => props.artifacts.filter(artifact => {
   const category = artifactCategory(artifact)
-  return category !== 'visual' && category !== 'audio'
+  return category !== 'visual' && category !== 'audio' && category !== 'video'
 }))
 
 function artifactKey(artifact: ArtifactPayload): string {

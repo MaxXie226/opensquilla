@@ -1,53 +1,55 @@
 <template>
-  <article class="msg-audio-card" :data-state="state">
-    <span class="msg-audio-card__icon" aria-hidden="true">
-      <Icon name="music" :size="22" />
+  <article class="msg-video-card" :data-state="state">
+    <span class="msg-video-card__icon" aria-hidden="true">
+      <Icon name="video" :size="22" />
     </span>
-    <span class="msg-audio-card__info">
-      <span class="msg-audio-card__name">{{ artifactFileTitle(artifact) }}</span>
-      <span class="msg-audio-card__meta">{{ artifactFileSubtitle(artifact) }}</span>
-      <span v-if="state === 'error'" class="msg-audio-card__status" role="status">
-        {{ t('chat.audioLoadFailed') }}
+    <span class="msg-video-card__info">
+      <span class="msg-video-card__name">{{ artifactFileTitle(artifact) }}</span>
+      <span class="msg-video-card__meta">{{ artifactFileSubtitle(artifact) }}</span>
+      <span v-if="state === 'error'" class="msg-video-card__status" role="status">
+        {{ t('chat.videoLoadFailed') }}
       </span>
-      <span v-else-if="state === 'unsupported'" class="msg-audio-card__status" role="status">
-        {{ t('chat.audioUnsupported') }}
+      <span v-else-if="state === 'unsupported'" class="msg-video-card__status" role="status">
+        {{ t('chat.videoUnsupported') }}
       </span>
     </span>
 
-    <audio
-      v-if="state === 'ready' && objectUrl"
-      ref="audioElement"
-      class="msg-audio-card__player"
-      :src="objectUrl"
-      controls
-      preload="metadata"
-      @error="markUnsupported"
-    />
     <button
-      v-else-if="state !== 'unsupported'"
+      v-if="state !== 'ready' && state !== 'unsupported'"
       type="button"
-      class="msg-audio-card__action"
+      class="msg-video-card__action"
       :disabled="state === 'loading'"
       :aria-busy="state === 'loading'"
       :aria-label="primaryActionLabel"
-      @click="loadAudio"
+      @click="loadVideo"
     >
-      <span v-if="state === 'loading'" class="spinner msg-audio-card__spinner" aria-hidden="true" />
+      <span v-if="state === 'loading'" class="spinner msg-video-card__spinner" aria-hidden="true" />
       <Icon v-else-if="state === 'error'" name="refresh" :size="14" />
-      <Icon v-else name="volume" :size="14" />
+      <Icon v-else name="video" :size="14" />
       <span>{{ primaryActionText }}</span>
     </button>
 
     <button
       type="button"
-      class="msg-audio-card__download"
-      :class="{ 'msg-audio-card__download--labelled': state === 'unsupported' }"
+      class="msg-video-card__download"
+      :class="{ 'msg-video-card__download--labelled': state === 'unsupported' }"
       :aria-label="t('chat.downloadTitle', { title: artifactFileTitle(artifact) })"
       @click="emit('download', artifact)"
     >
       <Icon name="download" :size="16" />
       <span v-if="state === 'unsupported'">{{ t('chat.download') }}</span>
     </button>
+
+    <video
+      v-if="state === 'ready' && objectUrl"
+      ref="videoElement"
+      class="msg-video-card__player"
+      :src="objectUrl"
+      controls
+      playsinline
+      preload="metadata"
+      @error="markUnsupported"
+    />
   </article>
 </template>
 
@@ -70,29 +72,29 @@ const emit = defineEmits<{
 }>()
 
 const { t } = useI18n()
-const audioElement = ref<HTMLAudioElement | null>(null)
+const videoElement = ref<HTMLVideoElement | null>(null)
 const {
   state,
   objectUrl,
-  load: loadAudio,
+  load: loadVideo,
   markUnsupported,
 } = useInlineMediaArtifact({
   artifact: () => props.artifact,
   sessionKey: () => props.sessionKey,
   authToken: () => props.authToken,
-  kind: 'audio',
-  element: audioElement,
+  kind: 'video',
+  element: videoElement,
 })
 const primaryActionText = computed(() =>
-  state.value === 'error' ? t('chat.retry') : t('chat.playAudio'))
+  state.value === 'error' ? t('chat.retry') : t('chat.playVideo'))
 const primaryActionLabel = computed(() =>
   `${primaryActionText.value} ${artifactFileTitle(props.artifact)}`)
 </script>
 
 <style scoped>
-.msg-audio-card {
+.msg-video-card {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) minmax(9rem, auto) auto;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
   align-items: center;
   gap: var(--sp-2);
   width: 100%;
@@ -102,7 +104,7 @@ const primaryActionLabel = computed(() =>
   background: var(--bg-surface);
 }
 
-.msg-audio-card__icon {
+.msg-video-card__icon {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -113,14 +115,14 @@ const primaryActionLabel = computed(() =>
   background: color-mix(in srgb, var(--accent) 10%, var(--bg-surface));
 }
 
-.msg-audio-card__info {
+.msg-video-card__info {
   display: flex;
   flex-direction: column;
   gap: var(--sp-1);
   min-width: 0;
 }
 
-.msg-audio-card__name {
+.msg-video-card__name {
   overflow: hidden;
   color: var(--text);
   font-size: 0.9375rem;
@@ -130,24 +132,27 @@ const primaryActionLabel = computed(() =>
   white-space: nowrap;
 }
 
-.msg-audio-card__meta,
-.msg-audio-card__status {
+.msg-video-card__meta,
+.msg-video-card__status {
   color: var(--text-dim);
   font-family: var(--font-mono);
   font-size: var(--fs-xs);
 }
 
-.msg-audio-card__status {
+.msg-video-card__status {
   color: var(--warn);
 }
 
-.msg-audio-card__player {
-  width: min(25rem, 100%);
-  height: 2.5rem;
+.msg-video-card__player {
+  grid-column: 1 / -1;
+  width: 100%;
+  max-height: min(60vh, 32rem);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--text) 92%, var(--bg));
 }
 
-.msg-audio-card__action,
-.msg-audio-card__download {
+.msg-video-card__action,
+.msg-video-card__download {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -161,50 +166,49 @@ const primaryActionLabel = computed(() =>
   cursor: pointer;
 }
 
-.msg-audio-card__download--labelled {
-  width: auto;
-  padding: 0 var(--sp-3);
-}
-
-.msg-audio-card__download {
+.msg-video-card__download {
   width: var(--sp-8);
   padding: 0;
 }
 
-.msg-audio-card__action:hover:not(:disabled),
-.msg-audio-card__download:hover {
+.msg-video-card__download--labelled {
+  width: auto;
+  padding: 0 var(--sp-3);
+}
+
+.msg-video-card__action:hover:not(:disabled),
+.msg-video-card__download:hover {
   border-color: var(--accent);
   color: var(--accent);
 }
 
-.msg-audio-card__action:focus-visible,
-.msg-audio-card__download:focus-visible {
+.msg-video-card__action:focus-visible,
+.msg-video-card__download:focus-visible {
   outline: none;
   box-shadow: var(--focus-ring);
 }
 
-.msg-audio-card__action:disabled {
+.msg-video-card__action:disabled {
   cursor: wait;
   opacity: 0.68;
 }
 
-.msg-audio-card__spinner {
+.msg-video-card__spinner {
   width: 0.875rem;
   height: 0.875rem;
 }
 
 @media (max-width: 640px) {
-  .msg-audio-card {
+  .msg-video-card {
     grid-template-columns: auto minmax(0, 1fr) auto;
   }
 
-  .msg-audio-card__player,
-  .msg-audio-card__action {
+  .msg-video-card__action {
     grid-column: 1 / -1;
     width: 100%;
   }
 
-  .msg-audio-card__download {
+  .msg-video-card__download {
     grid-column: 3;
     grid-row: 1;
   }

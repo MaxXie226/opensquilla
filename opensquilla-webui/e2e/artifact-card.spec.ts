@@ -9,6 +9,12 @@ const PNG_1x1 = Buffer.from(
   'base64',
 )
 
+// Synthetic 16x16 VP9 WebM with a 0.2-second black frame.
+const WEBM_TINY = Buffer.from(
+  'GkXfo59ChoEBQveBAULygQRC84EIQoKEd2VibUKHgQJChYECGFOAZwEAAAAAAAJeEU2bdLpNu4tTq4QVSalmU6yBoU27i1OrhBZUrmtTrIHYTbuMU6uEElTDZ1OsggElTbuMU6uEHFO7a1OsggJI7AEAAAAAAABZAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAVSalmsirXsYMPQkBNgI1MYXZmNjIuMTIuMTAyV0GNTGF2ZjYyLjEyLjEwMkSJiEBpAAAAAAAAFlSua8iuAQAAAAAAAD/XgQFzxYg+1LSSKAxeUpyBACK1nIN1bmSIgQCGhVZfVlA5g4EBI+ODhAJiWgDgkLCBELqBEJqBAlW5gQESVMNnQIBzc6BjwIBnyJpFo4dFTkNPREVSRIeNTGF2ZjYyLjEyLjEwMnNz2mPAi2PFiD7UtJIoDF5SZ8ilRaOHRU5DT0RFUkSHmExhdmM2Mi4yOC4xMDIgbGlidnB4LXZwOWfIoUWjiERVUkFUSU9ORIeTMDA6MDA6MDAuMjAwMDAwMDAwAB9DtnVAl+eBAKO+gQAAgIJJg0IAAPAA9gY4JBwYQgAAIEAAIpv//6UT+4KU3o8VSrdtJ/1U/RntlFLTcdJsyP6m92VMvCYMgACjk4EAKACGAECSnChJQAADcAAAQkCjk4EAUACGAECSnCxKwAADcAAAQkCjk4EAeACGAECSnCxJwAADcAAAQkCjk4EAoACGAECSnChIoAADcAAAQkAcU7trkbuPs4EAt4r3gQHxggGr8IED',
+  'base64',
+)
+
 // Seed a finished assistant turn carrying one image, one previewable document,
 // and one download-only data file, rewriting chat.history in flight.
 async function seedHistory(
@@ -162,6 +168,21 @@ async function openAudioSeeded(page: Page) {
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
   await page.waitForSelector('.chat-header', { timeout: 10000 })
   await expect(page.locator('.msg-audio-card')).toBeVisible({ timeout: 10000 })
+}
+
+async function openVideoSeeded(page: Page) {
+  await seedHistory(page, {
+    artifacts: [{
+      id: 'art-card-video',
+      name: 'sample.webm',
+      mime: 'video/webm',
+      size: WEBM_TINY.byteLength,
+      download_url: '/api/v1/artifacts/art-card-video',
+    }],
+  })
+  await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
+  await page.waitForSelector('.chat-header', { timeout: 10000 })
+  await expect(page.locator('.msg-video-card')).toBeVisible({ timeout: 10000 })
 }
 
 test.describe('Artifact deliverable cards', () => {
@@ -346,5 +367,43 @@ test.describe('Artifact deliverable cards', () => {
     await card.getByRole('button', { name: 'Retry sample.wav' }).click()
     await expect(card.locator('.msg-audio-card__player')).toBeVisible({ timeout: 10000 })
     expect(requests).toBe(2)
+  })
+
+  test('video stays in the message, performs zero initial requests, and loads authenticated controls', async ({ page }) => {
+    const requests: Array<{
+      authorization?: string
+      sessionKey?: string
+    }> = []
+    await page.addInitScript(() => {
+      sessionStorage.setItem('opensquilla.wsToken', 'video-token-e2e')
+    })
+    await page.route('**/api/v1/artifacts/art-card-video*', route => {
+      const request = route.request()
+      requests.push({
+        authorization: request.headers().authorization,
+        sessionKey: request.headers()['x-opensquilla-session-key'],
+      })
+      return route.fulfill({
+        status: 200,
+        contentType: 'video/webm',
+        body: WEBM_TINY,
+      })
+    })
+    await openVideoSeeded(page)
+
+    await expect(page.locator('.msg-artifact-chip')).toHaveCount(0)
+    await page.waitForTimeout(200)
+    expect(requests).toHaveLength(0)
+
+    await page.getByRole('button', { name: 'Play video sample.webm' }).click()
+    const player = page.locator('.msg-video-card__player')
+    await expect(player).toBeVisible({ timeout: 10000 })
+    await expect(player).toHaveAttribute('controls', '')
+    await expect(player).toHaveAttribute('playsinline', '')
+    await expect(player).toHaveAttribute('preload', 'metadata')
+    expect(requests).toEqual([{
+      authorization: 'Bearer video-token-e2e',
+      sessionKey: SESSION_KEY,
+    }])
   })
 })
