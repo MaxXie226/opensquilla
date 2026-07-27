@@ -2384,7 +2384,7 @@ def _rewrite_session_scoped_media(
             and target_session_key == source_session_key
         ):
             continue
-        target_record = meta_path.parent
+        target_record: Path | None = meta_path.parent
         if target_session_id != source_session_id:
             if store_name == "artifacts":
                 target_record = _remapped_artifact_record(
@@ -2404,6 +2404,7 @@ def _rewrite_session_scoped_media(
                 )
             if target_record is None:
                 continue
+        assert target_record is not None
         payload["session_id"] = target_session_id
         if isinstance(source_session_key, str):
             payload["session_key"] = target_session_key
