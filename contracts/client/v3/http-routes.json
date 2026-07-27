@@ -1,0 +1,1314 @@
+{
+  "coverage": {
+    "control_ui": "enabled-at-/control",
+    "extra_runtime_routes": "excluded; channel webhooks are configuration-dependent",
+    "profile": "default-create_gateway_app",
+    "source": "final-starlette-route-tree-after-dynamic-registration"
+  },
+  "policies": {
+    "auth": {
+      "default_profile_mode": "none",
+      "http": "per-route auth-mode matrix records current middleware behavior",
+      "password_mode": "HTTP falls through; principal resolver unsupported",
+      "trusted_proxy_mode": "HTTP checks X-Forwarded-For only when a proxy is configured; principal resolver unsupported",
+      "websocket": "none/token supported; password/trusted-proxy unsupported"
+    },
+    "cors_default": "no cross-origin response headers",
+    "origin": {
+      "guarded_routes_allow_missing_origin": true,
+      "present_origin_must_be": "same-origin-or-exactly-configured",
+      "wildcard_does_not_bypass_guard": true
+    }
+  },
+  "route_count": 36,
+  "routes": [
+    {
+      "auth": {
+        "modes": {
+          "none": {
+            "credential_transport": "none",
+            "middleware": "bypassed",
+            "principal_resolution": "open-scope-resolver"
+          },
+          "password": {
+            "credential_transport": "none",
+            "middleware": "falls-through-without-validation",
+            "principal_resolution": "unsupported"
+          },
+          "token": {
+            "credential_transport": "header-or-query",
+            "middleware": "token-required",
+            "principal_resolution": "token-scope-resolver"
+          },
+          "trusted-proxy": {
+            "credential_transport": "x-forwarded-for",
+            "middleware": "configured-proxy-substring-check-or-pass-when-unset",
+            "principal_resolution": "unsupported"
+          }
+        },
+        "owner_required": false,
+        "scheme": "gateway-auth-mode-matrix"
+      },
+      "methods": [
+        "GET",
+        "HEAD"
+      ],
+      "order": 0,
+      "origin": {
+        "policy": "not-required"
+      },
+      "path": "/",
+      "surface": "operations",
+      "transport": "http"
+    },
+    {
+      "auth": {
+        "modes": {
+          "none": {
+            "credential_transport": "none",
+            "middleware": "bypassed",
+            "principal_resolution": "open-scope-resolver"
+          },
+          "password": {
+            "credential_transport": "none",
+            "middleware": "falls-through-without-validation",
+            "principal_resolution": "unsupported"
+          },
+          "token": {
+            "credential_transport": "header-or-query",
+            "middleware": "token-required",
+            "principal_resolution": "token-scope-resolver"
+          },
+          "trusted-proxy": {
+            "credential_transport": "x-forwarded-for",
+            "middleware": "configured-proxy-substring-check-or-pass-when-unset",
+            "principal_resolution": "unsupported"
+          }
+        },
+        "owner_required": false,
+        "scheme": "gateway-auth-mode-matrix"
+      },
+      "methods": [
+        "GET",
+        "HEAD"
+      ],
+      "order": 9,
+      "origin": {
+        "policy": "not-required"
+      },
+      "path": "/api/agents",
+      "surface": "client-api",
+      "transport": "http"
+    },
+    {
+      "auth": {
+        "modes": {
+          "none": {
+            "credential_transport": "none",
+            "middleware": "bypassed",
+            "principal_resolution": "open-scope-resolver"
+          },
+          "password": {
+            "credential_transport": "none",
+            "middleware": "falls-through-without-validation",
+            "principal_resolution": "unsupported"
+          },
+          "token": {
+            "credential_transport": "header-or-query",
+            "middleware": "token-required",
+            "principal_resolution": "token-scope-resolver"
+          },
+          "trusted-proxy": {
+            "credential_transport": "x-forwarded-for",
+            "middleware": "configured-proxy-substring-check-or-pass-when-unset",
+            "principal_resolution": "unsupported"
+          }
+        },
+        "owner_required": false,
+        "scheme": "gateway-auth-mode-matrix"
+      },
+      "methods": [
+        "GET",
+        "HEAD"
+      ],
+      "order": 22,
+      "origin": {
+        "policy": "not-required"
+      },
+      "path": "/api/approvals",
+      "surface": "client-api",
+      "transport": "http"
+    },
+    {
+      "auth": {
+        "modes": {
+          "none": {
+            "credential_transport": "none",
+            "middleware": "bypassed",
+            "principal_resolution": "open-scope-resolver"
+          },
+          "password": {
+            "credential_transport": "none",
+            "middleware": "falls-through-without-validation",
+            "principal_resolution": "unsupported"
+          },
+          "token": {
+            "credential_transport": "header-or-query",
+            "middleware": "token-required",
+            "principal_resolution": "token-scope-resolver"
+          },
+          "trusted-proxy": {
+            "credential_transport": "x-forwarded-for",
+            "middleware": "configured-proxy-substring-check-or-pass-when-unset",
+            "principal_resolution": "unsupported"
+          }
+        },
+        "owner_required": false,
+        "scheme": "gateway-auth-mode-matrix"
+      },
+      "methods": [
+        "POST"
+      ],
+      "order": 24,
+      "origin": {
+        "allowed": [
+          "origin-header-absent",
+          "same-scheme-host-effective-port",
+          "exact-configured-origin"
+        ],
+        "configured_wildcard_accepted": false,
+        "policy": "browser-origin-guard"
+      },
+      "path": "/api/approvals/resolve",
+      "surface": "client-api",
+      "transport": "http"
+    },
+    {
+      "auth": {
+        "modes": {
+          "none": {
+            "credential_transport": "none",
+            "middleware": "bypassed",
+            "principal_resolution": "open-scope-resolver"
+          },
+          "password": {
+            "credential_transport": "none",
+            "middleware": "falls-through-without-validation",
+            "principal_resolution": "unsupported"
+          },
+          "token": {
+            "credential_transport": "header-or-query",
+            "middleware": "token-required",
+            "principal_resolution": "token-scope-resolver"
+          },
+          "trusted-proxy": {
+            "credential_transport": "x-forwarded-for",
+            "middleware": "configured-proxy-substring-check-or-pass-when-unset",
+            "principal_resolution": "unsupported"
+          }
+        },
+        "owner_required": false,
+        "scheme": "gateway-auth-mode-matrix"
+      },
+      "methods": [
+        "POST"
+      ],
+      "order": 23,
+      "origin": {
+        "allowed": [
+          "origin-header-absent",
+          "same-scheme-host-effective-port",
+          "exact-configured-origin"
+        ],
+        "configured_wildcard_accepted": false,
+        "policy": "browser-origin-guard"
+      },
+      "path": "/api/approvals/settings",
+      "surface": "client-api",
+      "transport": "http"
+    },
+    {
+      "auth": {
+        "modes": {
+          "none": {
+            "credential_transport": "none",
+            "middleware": "bypassed",
+            "principal_resolution": "open-scope-resolver"
+          },
+          "password": {
+            "credential_transport": "none",
+            "middleware": "falls-through-without-validation",
+            "principal_resolution": "unsupported"
+          },
+          "token": {
+            "credential_transport": "header-only-in-token-mode",
+            "middleware": "token-required",
+            "principal_resolution": "token-scope-resolver"
+          },
+          "trusted-proxy": {
+            "credential_transport": "x-forwarded-for",
+            "middleware": "configured-proxy-substring-check-or-pass-when-unset",
+            "principal_resolution": "unsupported"
+          }
+        },
+        "owner_required": false,
+        "scheme": "gateway-auth-mode-matrix"
+      },
+      "methods": [
+        "POST"
+      ],
+      "order": 34,
+      "origin": {
+        "allowed": [
+          "origin-header-absent",
+          "same-scheme-host-effective-port",
+          "exact-configured-origin"
+        ],
+        "configured_wildcard_accepted": false,
+        "policy": "browser-origin-guard"
+      },
+      "path": "/api/audio/transcribe",
+      "surface": "client-api",
+      "transport": "http"
+    },
+    {
+      "auth": {
+        "modes": {
+          "none": {
+            "credential_transport": "none",
+            "middleware": "bypassed",
+            "principal_resolution": "open-scope-resolver"
+          },
+          "password": {
+            "credential_transport": "none",
+            "middleware": "falls-through-without-validation",
+            "principal_resolution": "unsupported"
+          },
+          "token": {
+            "credential_transport": "header-or-query",
+            "middleware": "token-required",
+            "principal_resolution": "token-scope-resolver"
+          },
+          "trusted-proxy": {
+            "credential_transport": "x-forwarded-for",
+            "middleware": "configured-proxy-substring-check-or-pass-when-unset",
+            "principal_resolution": "unsupported"
+          }
+        },
+        "owner_required": false,
+        "scheme": "gateway-auth-mode-matrix"
+      },
+      "methods": [
+        "POST"
+      ],
+      "order": 18,
+      "origin": {
+        "allowed": [
+          "origin-header-absent",
+          "same-scheme-host-effective-port",
+          "exact-configured-origin"
+        ],
+        "configured_wildcard_accepted": false,
+        "policy": "browser-origin-guard"
+      },
+      "path": "/api/channels/logout",
+      "surface": "client-api",
+      "transport": "http"
+    },
+    {
+      "auth": {
+        "modes": {
+          "none": {
+            "credential_transport": "none",
+            "middleware": "bypassed",
+            "principal_resolution": "open-scope-resolver"
+          },
+          "password": {
+            "credential_transport": "none",
+            "middleware": "falls-through-without-validation",
+            "principal_resolution": "unsupported"
+          },
+          "token": {
+            "credential_transport": "header-or-query",
+            "middleware": "token-required",
+            "principal_resolution": "token-scope-resolver"
+          },
+          "trusted-proxy": {
+            "credential_transport": "x-forwarded-for",
+            "middleware": "configured-proxy-substring-check-or-pass-when-unset",
+            "principal_resolution": "unsupported"
+          }
+        },
+        "owner_required": false,
+        "scheme": "gateway-auth-mode-matrix"
+      },
+      "methods": [
+        "GET",
+        "HEAD"
+      ],
+      "order": 19,
+      "origin": {
+        "policy": "not-required"
+      },
+      "path": "/api/channels/pairings",
+      "surface": "client-api",
+      "transport": "http"
+    },
+    {
+      "auth": {
+        "modes": {
+          "none": {
+            "credential_transport": "none",
+            "middleware": "bypassed",
+            "principal_resolution": "open-scope-resolver"
+          },
+          "password": {
+            "credential_transport": "none",
+            "middleware": "falls-through-without-validation",
+            "principal_resolution": "unsupported"
+          },
+          "token": {
+            "credential_transport": "header-or-query",
+            "middleware": "token-required",
+            "principal_resolution": "token-scope-resolver"
+          },
+          "trusted-proxy": {
+            "credential_transport": "x-forwarded-for",
+            "middleware": "configured-proxy-substring-check-or-pass-when-unset",
+            "principal_resolution": "unsupported"
+          }
+        },
+        "owner_required": false,
+        "scheme": "gateway-auth-mode-matrix"
+      },
+      "methods": [
+        "POST"
+      ],
+      "order": 20,
+      "origin": {
+        "allowed": [
+          "origin-header-absent",
+          "same-scheme-host-effective-port",
+          "exact-configured-origin"
+        ],
+        "configured_wildcard_accepted": false,
+        "policy": "browser-origin-guard"
+      },
+      "path": "/api/channels/pairings/approve",
+      "surface": "client-api",
+      "transport": "http"
+    },
+    {
+      "auth": {
+        "modes": {
+          "none": {
+            "credential_transport": "none",
+            "middleware": "bypassed",
+            "principal_resolution": "open-scope-resolver"
+          },
+          "password": {
+            "credential_transport": "none",
+            "middleware": "falls-through-without-validation",
+            "principal_resolution": "unsupported"
+          },
+          "token": {
+            "credential_transport": "header-or-query",
+            "middleware": "token-required",
+            "principal_resolution": "token-scope-resolver"
+          },
+          "trusted-proxy": {
+            "credential_transport": "x-forwarded-for",
+            "middleware": "configured-proxy-substring-check-or-pass-when-unset",
+            "principal_resolution": "unsupported"
+          }
+        },
+        "owner_required": false,
+        "scheme": "gateway-auth-mode-matrix"
+      },
+      "methods": [
+        "POST"
+      ],
+      "order": 21,
+      "origin": {
+        "allowed": [
+          "origin-header-absent",
+          "same-scheme-host-effective-port",
+          "exact-configured-origin"
+        ],
+        "configured_wildcard_accepted": false,
+        "policy": "browser-origin-guard"
+      },
+      "path": "/api/channels/pairings/revoke",
+      "surface": "client-api",
+      "transport": "http"
+    },
+    {
+      "auth": {
+        "modes": {
+          "none": {
+            "credential_transport": "none",
+            "middleware": "bypassed",
+            "principal_resolution": "open-scope-resolver"
+          },
+          "password": {
+            "credential_transport": "none",
+            "middleware": "falls-through-without-validation",
+            "principal_resolution": "unsupported"
+          },
+          "token": {
+            "credential_transport": "header-or-query",
+            "middleware": "token-required",
+            "principal_resolution": "token-scope-resolver"
+          },
+          "trusted-proxy": {
+            "credential_transport": "x-forwarded-for",
+            "middleware": "configured-proxy-substring-check-or-pass-when-unset",
+            "principal_resolution": "unsupported"
+          }
+        },
+        "owner_required": false,
+        "scheme": "gateway-auth-mode-matrix"
+      },
+      "methods": [
+        "GET",
+        "HEAD"
+      ],
+      "order": 17,
+      "origin": {
+        "policy": "not-required"
+      },
+      "path": "/api/channels/status",
+      "surface": "client-api",
+      "transport": "http"
+    },
+    {
+      "auth": {
+        "modes": {
+          "none": {
+            "credential_transport": "none",
+            "middleware": "bypassed",
+            "principal_resolution": "open-scope-resolver"
+          },
+          "password": {
+            "credential_transport": "none",
+            "middleware": "falls-through-without-validation",
+            "principal_resolution": "unsupported"
+          },
+          "token": {
+            "credential_transport": "header-or-query",
+            "middleware": "token-required",
+            "principal_resolution": "token-scope-resolver"
+          },
+          "trusted-proxy": {
+            "credential_transport": "x-forwarded-for",
+            "middleware": "configured-proxy-substring-check-or-pass-when-unset",
+            "principal_resolution": "unsupported"
+          }
+        },
+        "owner_required": false,
+        "scheme": "gateway-auth-mode-matrix"
+      },
+      "methods": [
+        "POST"
+      ],
+      "order": 7,
+      "origin": {
+        "allowed": [
+          "origin-header-absent",
+          "same-scheme-host-effective-port",
+          "exact-configured-origin"
+        ],
+        "configured_wildcard_accepted": false,
+        "policy": "browser-origin-guard"
+      },
+      "path": "/api/chat",
+      "surface": "client-api",
+      "transport": "http"
+    },
+    {
+      "auth": {
+        "modes": {
+          "none": {
+            "credential_transport": "none",
+            "middleware": "bypassed",
+            "principal_resolution": "open-scope-resolver"
+          },
+          "password": {
+            "credential_transport": "none",
+            "middleware": "falls-through-without-validation",
+            "principal_resolution": "unsupported"
+          },
+          "token": {
+            "credential_transport": "header-or-query",
+            "middleware": "token-required",
+            "principal_resolution": "token-scope-resolver"
+          },
+          "trusted-proxy": {
+            "credential_transport": "x-forwarded-for",
+            "middleware": "configured-proxy-substring-check-or-pass-when-unset",
+            "principal_resolution": "unsupported"
+          }
+        },
+        "owner_required": false,
+        "scheme": "gateway-auth-mode-matrix"
+      },
+      "methods": [
+        "GET",
+        "HEAD"
+      ],
+      "order": 8,
+      "origin": {
+        "policy": "not-required"
+      },
+      "path": "/api/chat/history",
+      "surface": "client-api",
+      "transport": "http"
+    },
+    {
+      "auth": {
+        "modes": {
+          "none": {
+            "credential_transport": "none",
+            "middleware": "bypassed",
+            "principal_resolution": "open-scope-resolver"
+          },
+          "password": {
+            "credential_transport": "none",
+            "middleware": "falls-through-without-validation",
+            "principal_resolution": "unsupported"
+          },
+          "token": {
+            "credential_transport": "header-or-query",
+            "middleware": "token-required",
+            "principal_resolution": "token-scope-resolver"
+          },
+          "trusted-proxy": {
+            "credential_transport": "x-forwarded-for",
+            "middleware": "configured-proxy-substring-check-or-pass-when-unset",
+            "principal_resolution": "unsupported"
+          }
+        },
+        "owner_required": false,
+        "scheme": "gateway-auth-mode-matrix"
+      },
+      "methods": [
+        "GET",
+        "HEAD"
+      ],
+      "order": 5,
+      "origin": {
+        "policy": "not-required"
+      },
+      "path": "/api/config",
+      "surface": "client-api",
+      "transport": "http"
+    },
+    {
+      "auth": {
+        "modes": {
+          "none": {
+            "credential_transport": "none",
+            "middleware": "bypassed",
+            "principal_resolution": "open-scope-resolver"
+          },
+          "password": {
+            "credential_transport": "none",
+            "middleware": "falls-through-without-validation",
+            "principal_resolution": "unsupported"
+          },
+          "token": {
+            "credential_transport": "header-or-query",
+            "middleware": "token-required",
+            "principal_resolution": "token-scope-resolver"
+          },
+          "trusted-proxy": {
+            "credential_transport": "x-forwarded-for",
+            "middleware": "configured-proxy-substring-check-or-pass-when-unset",
+            "principal_resolution": "unsupported"
+          }
+        },
+        "owner_required": false,
+        "scheme": "gateway-auth-mode-matrix"
+      },
+      "methods": [
+        "GET",
+        "HEAD"
+      ],
+      "order": 10,
+      "origin": {
+        "policy": "not-required"
+      },
+      "path": "/api/cron",
+      "surface": "client-api",
+      "transport": "http"
+    },
+    {
+      "auth": {
+        "caller_credential_required": false,
+        "desktop_instance_required": true,
+        "middleware": "bypassed",
+        "network_constraints": [
+          "loopback-bind",
+          "loopback-peer"
+        ],
+        "request_fields": [
+          "challenge"
+        ],
+        "scheme": "desktop-server-identity-challenge"
+      },
+      "methods": [
+        "POST"
+      ],
+      "order": 14,
+      "origin": {
+        "allowed": [
+          "origin-header-absent",
+          "same-scheme-host-effective-port",
+          "exact-configured-origin"
+        ],
+        "configured_wildcard_accepted": false,
+        "policy": "browser-origin-guard"
+      },
+      "path": "/api/desktop/identity",
+      "surface": "client-api",
+      "transport": "http"
+    },
+    {
+      "auth": {
+        "caller_credential_required": true,
+        "desktop_instance_required": true,
+        "middleware": "bypassed",
+        "network_constraints": [
+          "loopback-bind",
+          "loopback-peer"
+        ],
+        "request_fields": [
+          "challenge",
+          "proof"
+        ],
+        "scheme": "desktop-ownership-proof"
+      },
+      "methods": [
+        "POST"
+      ],
+      "order": 15,
+      "origin": {
+        "allowed": [
+          "origin-header-absent",
+          "same-scheme-host-effective-port",
+          "exact-configured-origin"
+        ],
+        "configured_wildcard_accepted": false,
+        "policy": "browser-origin-guard"
+      },
+      "path": "/api/desktop/shutdown",
+      "surface": "client-api",
+      "transport": "http"
+    },
+    {
+      "auth": {
+        "modes": {
+          "none": {
+            "credential_transport": "none",
+            "middleware": "bypassed",
+            "principal_resolution": "open-scope-resolver"
+          },
+          "password": {
+            "credential_transport": "none",
+            "middleware": "falls-through-without-validation",
+            "principal_resolution": "unsupported"
+          },
+          "token": {
+            "credential_transport": "header-or-query",
+            "middleware": "token-required",
+            "principal_resolution": "token-scope-resolver"
+          },
+          "trusted-proxy": {
+            "credential_transport": "x-forwarded-for",
+            "middleware": "configured-proxy-substring-check-or-pass-when-unset",
+            "principal_resolution": "unsupported"
+          }
+        },
+        "owner_required": true,
+        "scheme": "gateway-auth-mode-matrix"
+      },
+      "methods": [
+        "POST"
+      ],
+      "order": 25,
+      "origin": {
+        "allowed": [
+          "origin-header-absent",
+          "same-scheme-host-effective-port",
+          "exact-configured-origin"
+        ],
+        "configured_wildcard_accepted": false,
+        "policy": "browser-origin-guard"
+      },
+      "path": "/api/elevated-mode",
+      "surface": "client-api",
+      "transport": "http"
+    },
+    {
+      "auth": {
+        "modes": {
+          "none": {
+            "credential_transport": "none",
+            "middleware": "bypassed",
+            "principal_resolution": "open-scope-resolver"
+          },
+          "password": {
+            "credential_transport": "none",
+            "middleware": "falls-through-without-validation",
+            "principal_resolution": "unsupported"
+          },
+          "token": {
+            "credential_transport": "header-or-query",
+            "middleware": "token-required",
+            "principal_resolution": "token-scope-resolver"
+          },
+          "trusted-proxy": {
+            "credential_transport": "x-forwarded-for",
+            "middleware": "configured-proxy-substring-check-or-pass-when-unset",
+            "principal_resolution": "unsupported"
+          }
+        },
+        "owner_required": false,
+        "scheme": "gateway-auth-mode-matrix"
+      },
+      "methods": [
+        "GET",
+        "HEAD"
+      ],
+      "order": 6,
+      "origin": {
+        "policy": "not-required"
+      },
+      "path": "/api/sessions",
+      "surface": "client-api",
+      "transport": "http"
+    },
+    {
+      "auth": {
+        "modes": {
+          "none": {
+            "credential_transport": "none",
+            "middleware": "bypassed",
+            "principal_resolution": "open-scope-resolver"
+          },
+          "password": {
+            "credential_transport": "none",
+            "middleware": "falls-through-without-validation",
+            "principal_resolution": "unsupported"
+          },
+          "token": {
+            "credential_transport": "header-or-query",
+            "middleware": "token-required",
+            "principal_resolution": "token-scope-resolver"
+          },
+          "trusted-proxy": {
+            "credential_transport": "x-forwarded-for",
+            "middleware": "configured-proxy-substring-check-or-pass-when-unset",
+            "principal_resolution": "unsupported"
+          }
+        },
+        "owner_required": true,
+        "scheme": "gateway-auth-mode-matrix"
+      },
+      "methods": [
+        "POST"
+      ],
+      "order": 13,
+      "origin": {
+        "allowed": [
+          "origin-header-absent",
+          "same-scheme-host-effective-port",
+          "exact-configured-origin"
+        ],
+        "configured_wildcard_accepted": false,
+        "policy": "browser-origin-guard"
+      },
+      "path": "/api/system/shutdown",
+      "surface": "client-api",
+      "transport": "http"
+    },
+    {
+      "auth": {
+        "modes": {
+          "none": {
+            "credential_transport": "none",
+            "middleware": "bypassed",
+            "principal_resolution": "open-scope-resolver"
+          },
+          "password": {
+            "credential_transport": "none",
+            "middleware": "falls-through-without-validation",
+            "principal_resolution": "unsupported"
+          },
+          "token": {
+            "credential_transport": "header-or-query",
+            "middleware": "token-required",
+            "principal_resolution": "token-scope-resolver"
+          },
+          "trusted-proxy": {
+            "credential_transport": "x-forwarded-for",
+            "middleware": "configured-proxy-substring-check-or-pass-when-unset",
+            "principal_resolution": "unsupported"
+          }
+        },
+        "owner_required": false,
+        "scheme": "gateway-auth-mode-matrix"
+      },
+      "methods": [
+        "GET",
+        "HEAD"
+      ],
+      "order": 11,
+      "origin": {
+        "policy": "not-required"
+      },
+      "path": "/api/system/status",
+      "surface": "client-api",
+      "transport": "http"
+    },
+    {
+      "auth": {
+        "modes": {
+          "none": {
+            "credential_transport": "none",
+            "middleware": "bypassed",
+            "principal_resolution": "open-scope-resolver"
+          },
+          "password": {
+            "credential_transport": "none",
+            "middleware": "falls-through-without-validation",
+            "principal_resolution": "unsupported"
+          },
+          "token": {
+            "credential_transport": "header-or-query",
+            "middleware": "token-required",
+            "principal_resolution": "token-scope-resolver"
+          },
+          "trusted-proxy": {
+            "credential_transport": "x-forwarded-for",
+            "middleware": "configured-proxy-substring-check-or-pass-when-unset",
+            "principal_resolution": "unsupported"
+          }
+        },
+        "owner_required": false,
+        "scheme": "gateway-auth-mode-matrix"
+      },
+      "methods": [
+        "GET",
+        "HEAD"
+      ],
+      "order": 12,
+      "origin": {
+        "policy": "not-required"
+      },
+      "path": "/api/system/update",
+      "surface": "client-api",
+      "transport": "http"
+    },
+    {
+      "auth": {
+        "modes": {
+          "none": {
+            "credential_transport": "none",
+            "middleware": "bypassed",
+            "principal_resolution": "open-scope-resolver"
+          },
+          "password": {
+            "credential_transport": "none",
+            "middleware": "falls-through-without-validation",
+            "principal_resolution": "unsupported"
+          },
+          "token": {
+            "credential_transport": "header-or-query",
+            "middleware": "token-required",
+            "principal_resolution": "token-scope-resolver"
+          },
+          "trusted-proxy": {
+            "credential_transport": "x-forwarded-for",
+            "middleware": "configured-proxy-substring-check-or-pass-when-unset",
+            "principal_resolution": "unsupported"
+          }
+        },
+        "owner_required": false,
+        "scheme": "gateway-auth-mode-matrix"
+      },
+      "methods": [
+        "GET",
+        "HEAD"
+      ],
+      "order": 16,
+      "origin": {
+        "policy": "not-required"
+      },
+      "path": "/api/usage",
+      "surface": "client-api",
+      "transport": "http"
+    },
+    {
+      "auth": {
+        "modes": {
+          "none": {
+            "credential_transport": "none",
+            "middleware": "bypassed",
+            "principal_resolution": "open-scope-resolver"
+          },
+          "password": {
+            "credential_transport": "none",
+            "middleware": "falls-through-without-validation",
+            "principal_resolution": "unsupported"
+          },
+          "token": {
+            "credential_transport": "header-or-query",
+            "middleware": "token-required",
+            "principal_resolution": "token-scope-resolver"
+          },
+          "trusted-proxy": {
+            "credential_transport": "x-forwarded-for",
+            "middleware": "configured-proxy-substring-check-or-pass-when-unset",
+            "principal_resolution": "unsupported"
+          }
+        },
+        "owner_required": false,
+        "scheme": "gateway-auth-mode-matrix"
+      },
+      "methods": [
+        "GET",
+        "HEAD"
+      ],
+      "order": 33,
+      "origin": {
+        "policy": "not-required"
+      },
+      "path": "/api/v1/artifacts/{artifact_id}",
+      "surface": "client-api",
+      "transport": "http"
+    },
+    {
+      "auth": {
+        "modes": {
+          "none": {
+            "credential_transport": "none",
+            "middleware": "bypassed",
+            "principal_resolution": "open-scope-resolver"
+          },
+          "password": {
+            "credential_transport": "none",
+            "middleware": "falls-through-without-validation",
+            "principal_resolution": "unsupported"
+          },
+          "token": {
+            "credential_transport": "header-or-query",
+            "middleware": "token-required",
+            "principal_resolution": "token-scope-resolver"
+          },
+          "trusted-proxy": {
+            "credential_transport": "x-forwarded-for",
+            "middleware": "configured-proxy-substring-check-or-pass-when-unset",
+            "principal_resolution": "unsupported"
+          }
+        },
+        "owner_required": true,
+        "scheme": "gateway-auth-mode-matrix"
+      },
+      "methods": [
+        "POST"
+      ],
+      "order": 32,
+      "origin": {
+        "allowed": [
+          "origin-header-absent",
+          "same-scheme-host-effective-port",
+          "exact-configured-origin"
+        ],
+        "configured_wildcard_accepted": false,
+        "policy": "browser-origin-guard"
+      },
+      "path": "/api/v1/artifacts/{artifact_id}/open",
+      "surface": "client-api",
+      "transport": "http"
+    },
+    {
+      "auth": {
+        "modes": {
+          "none": {
+            "credential_transport": "none",
+            "middleware": "bypassed",
+            "principal_resolution": "open-scope-resolver"
+          },
+          "password": {
+            "credential_transport": "none",
+            "middleware": "falls-through-without-validation",
+            "principal_resolution": "unsupported"
+          },
+          "token": {
+            "credential_transport": "header-or-query",
+            "middleware": "token-required",
+            "principal_resolution": "token-scope-resolver"
+          },
+          "trusted-proxy": {
+            "credential_transport": "x-forwarded-for",
+            "middleware": "configured-proxy-substring-check-or-pass-when-unset",
+            "principal_resolution": "unsupported"
+          }
+        },
+        "owner_required": false,
+        "scheme": "gateway-auth-mode-matrix"
+      },
+      "methods": [
+        "GET",
+        "HEAD"
+      ],
+      "order": 31,
+      "origin": {
+        "policy": "not-required"
+      },
+      "path": "/api/v1/attachments/{sha256}",
+      "surface": "client-api",
+      "transport": "http"
+    },
+    {
+      "auth": {
+        "modes": {
+          "none": {
+            "credential_transport": "none",
+            "middleware": "bypassed",
+            "principal_resolution": "open-scope-resolver"
+          },
+          "password": {
+            "credential_transport": "none",
+            "middleware": "falls-through-without-validation",
+            "principal_resolution": "unsupported"
+          },
+          "token": {
+            "credential_transport": "header-or-query",
+            "middleware": "token-required",
+            "principal_resolution": "token-scope-resolver"
+          },
+          "trusted-proxy": {
+            "credential_transport": "x-forwarded-for",
+            "middleware": "configured-proxy-substring-check-or-pass-when-unset",
+            "principal_resolution": "unsupported"
+          }
+        },
+        "owner_required": true,
+        "scheme": "gateway-auth-mode-matrix"
+      },
+      "methods": [
+        "POST"
+      ],
+      "order": 35,
+      "origin": {
+        "allowed": [
+          "origin-header-absent",
+          "same-scheme-host-effective-port",
+          "exact-configured-origin"
+        ],
+        "configured_wildcard_accepted": false,
+        "policy": "browser-origin-guard"
+      },
+      "path": "/api/v1/diagnostics/bundle",
+      "surface": "client-api",
+      "transport": "http"
+    },
+    {
+      "auth": {
+        "modes": {
+          "none": {
+            "credential_transport": "none",
+            "middleware": "bypassed",
+            "principal_resolution": "open-scope-resolver"
+          },
+          "password": {
+            "credential_transport": "none",
+            "middleware": "falls-through-without-validation",
+            "principal_resolution": "unsupported"
+          },
+          "token": {
+            "credential_transport": "header-only-in-token-mode",
+            "middleware": "token-required",
+            "principal_resolution": "token-scope-resolver"
+          },
+          "trusted-proxy": {
+            "credential_transport": "x-forwarded-for",
+            "middleware": "configured-proxy-substring-check-or-pass-when-unset",
+            "principal_resolution": "unsupported"
+          }
+        },
+        "owner_required": false,
+        "scheme": "gateway-auth-mode-matrix"
+      },
+      "methods": [
+        "POST"
+      ],
+      "order": 30,
+      "origin": {
+        "allowed": [
+          "origin-header-absent",
+          "same-scheme-host-effective-port",
+          "exact-configured-origin"
+        ],
+        "configured_wildcard_accepted": false,
+        "policy": "browser-origin-guard"
+      },
+      "path": "/api/v1/files/upload",
+      "surface": "client-api",
+      "transport": "http"
+    },
+    {
+      "auth": {
+        "middleware": "bypassed",
+        "scheme": "public-control-ui"
+      },
+      "methods": [
+        "GET",
+        "HEAD"
+      ],
+      "order": 29,
+      "origin": {
+        "policy": "not-required"
+      },
+      "path": "/control/",
+      "surface": "control-ui",
+      "transport": "http"
+    },
+    {
+      "auth": {
+        "middleware": "bypassed",
+        "scheme": "public-control-ui"
+      },
+      "methods": [
+        "GET",
+        "HEAD"
+      ],
+      "order": 27,
+      "origin": {
+        "policy": "not-required"
+      },
+      "path": "/control/static/{path}",
+      "surface": "control-ui",
+      "transport": "mount"
+    },
+    {
+      "auth": {
+        "middleware": "bypassed",
+        "scheme": "public-control-ui"
+      },
+      "methods": [
+        "GET",
+        "HEAD"
+      ],
+      "order": 28,
+      "origin": {
+        "policy": "not-required"
+      },
+      "path": "/control/{path:path}",
+      "surface": "control-ui",
+      "transport": "http"
+    },
+    {
+      "auth": {
+        "middleware": "bypassed",
+        "scheme": "public"
+      },
+      "methods": [
+        "GET",
+        "HEAD"
+      ],
+      "order": 1,
+      "origin": {
+        "policy": "not-required"
+      },
+      "path": "/health",
+      "surface": "operations",
+      "transport": "http"
+    },
+    {
+      "auth": {
+        "middleware": "bypassed",
+        "scheme": "public"
+      },
+      "methods": [
+        "GET",
+        "HEAD"
+      ],
+      "order": 2,
+      "origin": {
+        "policy": "not-required"
+      },
+      "path": "/healthz",
+      "surface": "operations",
+      "transport": "http"
+    },
+    {
+      "auth": {
+        "middleware": "bypassed",
+        "scheme": "public"
+      },
+      "methods": [
+        "GET",
+        "HEAD"
+      ],
+      "order": 3,
+      "origin": {
+        "policy": "not-required"
+      },
+      "path": "/ready",
+      "surface": "operations",
+      "transport": "http"
+    },
+    {
+      "auth": {
+        "middleware": "bypassed",
+        "scheme": "public"
+      },
+      "methods": [
+        "GET",
+        "HEAD"
+      ],
+      "order": 4,
+      "origin": {
+        "policy": "not-required"
+      },
+      "path": "/readyz",
+      "surface": "operations",
+      "transport": "http"
+    },
+    {
+      "auth": {
+        "modes": {
+          "none": {
+            "credential_transport": "none",
+            "status": "supported"
+          },
+          "password": {
+            "credential_transport": "none",
+            "status": "unsupported-by-principal-resolver"
+          },
+          "token": {
+            "credential_transport": "connect.params.auth.token",
+            "status": "supported"
+          },
+          "trusted-proxy": {
+            "credential_transport": "none",
+            "status": "unsupported-by-principal-resolver"
+          }
+        },
+        "scheme": "websocket-connect-handshake"
+      },
+      "methods": [],
+      "order": 26,
+      "origin": {
+        "policy": "not-checked"
+      },
+      "path": "/ws",
+      "surface": "gateway-rpc",
+      "transport": "websocket"
+    }
+  ],
+  "schema_version": 1
+}

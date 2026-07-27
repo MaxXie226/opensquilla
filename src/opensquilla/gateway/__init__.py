@@ -11,6 +11,7 @@ from opensquilla.gateway.boot import (
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.control_ui import create_control_ui_routes
 from opensquilla.gateway.protocol import (
+    DECLARED_EVENTS,
     PROTOCOL_VERSION,
     ConnectParams,
     ErrorShape,
@@ -42,6 +43,7 @@ __all__ = [
     "create_control_ui_routes",
     # Protocol frames
     "PROTOCOL_VERSION",
+    "DECLARED_EVENTS",
     "ReqFrame",
     "ResFrame",
     "EventFrame",

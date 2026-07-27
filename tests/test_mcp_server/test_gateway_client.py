@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 from types import SimpleNamespace
@@ -99,3 +100,49 @@ async def test_gateway_connect_closes_socket_after_bad_handshake(monkeypatch) ->
 
     assert ws.closed is True
     assert client._ws is None
+
+
+@pytest.mark.asyncio
+async def test_gateway_rpc_client_connect_frame_is_frozen(monkeypatch) -> None:
+    class HandshakeWebSocket(_SilentWebSocket):
+        def __init__(self) -> None:
+            super().__init__()
+            self._frames = [
+                {"type": "event", "event": "connect.challenge", "payload": {"nonce": "n"}},
+                {"type": "hello-ok", "protocol": 3, "policy": {}},
+            ]
+
+        async def recv(self) -> str:
+            return json.dumps(self._frames.pop(0))
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self) -> str:
+            await asyncio.Event().wait()
+            raise StopAsyncIteration
+
+    ws = HandshakeWebSocket()
+
+    async def connect(_url: str):
+        return ws
+
+    monkeypatch.setitem(sys.modules, "websockets", SimpleNamespace(connect=connect))
+    client = GatewayRPCClient()
+
+    await client.connect("ws://127.0.0.1:18791/ws")
+    try:
+        (frame,) = ws.sent
+        assert isinstance(frame["id"], str) and frame["id"]
+        assert {key: value for key, value in frame.items() if key != "id"} == {
+            "type": "req",
+            "method": "connect",
+            "params": {
+                "minProtocol": 1,
+                "maxProtocol": 3,
+                "role": "operator",
+                "scopes": ["operator.read", "operator.write"],
+            },
+        }
+    finally:
+        await client.close()

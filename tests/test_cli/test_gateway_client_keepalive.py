@@ -138,6 +138,33 @@ async def test_heartbeat_interval_derived_from_hello_policy(
 
 
 @pytest.mark.asyncio
+async def test_cli_gateway_connect_frame_is_frozen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ws = _FakeWebSocket(_handshake_frames())
+    _install_fake_websockets(monkeypatch, ws)
+    client = GatewayClient()
+
+    await client.connect(token="<synthetic>")
+    try:
+        frame = json.loads(ws.sent[0])
+        assert isinstance(frame["id"], str) and frame["id"]
+        assert {key: value for key, value in frame.items() if key != "id"} == {
+            "type": "req",
+            "method": "connect",
+            "params": {
+                "minProtocol": 1,
+                "maxProtocol": 3,
+                "role": "operator",
+                "scopes": ["operator.admin"],
+                "auth": {"token": "<synthetic>"},
+            },
+        }
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
 async def test_heartbeat_interval_stays_below_short_hello_policy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

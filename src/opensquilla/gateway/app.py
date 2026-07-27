@@ -30,6 +30,8 @@ from opensquilla.gateway.middleware import (
 from opensquilla.gateway.origin_guard import (
     extract_http_token,
     forbidden_origin_response,
+    mark_client_auth_handler,
+    mark_same_origin_handler,
     request_origin_allowed,
 )
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
@@ -81,6 +83,7 @@ def create_gateway_app(
     memory_stores: dict[str, Any] | None = None,
     memory_retrievers: dict[str, Any] | None = None,
     extra_routes: list[Route] | None = None,
+    upload_store: Any = None,
 ) -> Starlette:
     """Build and return the Starlette ASGI application."""
     if diagnostics_state is None:
@@ -133,7 +136,7 @@ def create_gateway_app(
                 return forbidden_origin_response()
             return await handler(request)
 
-        return guarded
+        return mark_same_origin_handler(guarded)
 
     # ── HTTP endpoint handlers ───────────────────────────────────────────────
 
@@ -679,7 +682,15 @@ def create_gateway_app(
         Route("/api/cron", api_cron, methods=["GET"]),
         Route("/api/system/status", api_system_status, methods=["GET"]),
         Route("/api/system/update", api_system_update, methods=["GET"]),
-        Route("/api/system/shutdown", _same_origin(api_system_shutdown), methods=["POST"]),
+        Route(
+            "/api/system/shutdown",
+            mark_client_auth_handler(
+                _same_origin(api_system_shutdown),
+                credential_transport="header-or-query",
+                owner_required=True,
+            ),
+            methods=["POST"],
+        ),
         Route("/api/desktop/identity", _same_origin(api_desktop_identity), methods=["POST"]),
         Route("/api/desktop/shutdown", _same_origin(api_desktop_shutdown), methods=["POST"]),
         Route("/api/usage", api_usage, methods=["GET"]),
@@ -699,7 +710,15 @@ def create_gateway_app(
         Route("/api/approvals", api_approvals, methods=["GET"]),
         Route("/api/approvals/settings", _same_origin(api_approvals_settings), methods=["POST"]),
         Route("/api/approvals/resolve", _same_origin(api_approvals_resolve), methods=["POST"]),
-        Route("/api/elevated-mode", _same_origin(api_elevated_mode), methods=["POST"]),
+        Route(
+            "/api/elevated-mode",
+            mark_client_auth_handler(
+                _same_origin(api_elevated_mode),
+                credential_transport="header-or-query",
+                owner_required=True,
+            ),
+            methods=["POST"],
+        ),
         WebSocketRoute("/ws", ws_endpoint),
     ]
 
@@ -760,8 +779,8 @@ def create_gateway_app(
     # across a gateway restart resolves to the specific "lost in restart, please
     # re-upload" error instead of a generic "unknown uuid" (issue #468). Only
     # replace the default in-memory-only singleton; respect a test-injected store.
-    _upload_store = get_upload_store()
-    if getattr(_upload_store, "marker_dir", None) is None:
+    _upload_store = upload_store if upload_store is not None else get_upload_store()
+    if upload_store is None and getattr(_upload_store, "marker_dir", None) is None:
         from opensquilla.gateway.uploads import (  # noqa: PLC0415
             _DEFAULT_MAX_TOTAL_BYTES as _UPLOAD_STORE_DEFAULT_TOTAL,
         )

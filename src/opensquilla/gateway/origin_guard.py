@@ -23,12 +23,63 @@ Policy (matches the bundle-route precedent):
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from typing import Any
 from urllib.parse import urlsplit
 
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from opensquilla.gateway.config import GatewayConfig
+
+CLIENT_ORIGIN_POLICY_ATTR = "__opensquilla_client_origin_policy__"
+CLIENT_AUTH_POLICY_ATTR = "__opensquilla_client_auth_policy__"
+SAME_CONFIGURED_OR_NO_ORIGIN = "same-origin-or-configured-or-no-origin"
+
+
+def mark_same_origin_handler[HandlerT: Callable[..., Any]](handler: HandlerT) -> HandlerT:
+    """Mark a guarded endpoint for deterministic client-route introspection.
+
+    The marker is metadata only; callers remain responsible for executing
+    :func:`request_origin_allowed` before the endpoint performs side effects.
+    """
+
+    setattr(handler, CLIENT_ORIGIN_POLICY_ATTR, SAME_CONFIGURED_OR_NO_ORIGIN)
+    return handler
+
+
+def client_origin_policy(handler: Any) -> str | None:
+    """Return explicit client origin policy metadata for an endpoint."""
+
+    value = getattr(handler, CLIENT_ORIGIN_POLICY_ATTR, None)
+    return value if isinstance(value, str) else None
+
+
+def mark_client_auth_handler[HandlerT: Callable[..., Any]](
+    handler: HandlerT,
+    *,
+    credential_transport: str,
+    owner_required: bool = False,
+) -> HandlerT:
+    """Attach non-behavioral client authentication metadata to an endpoint."""
+
+    setattr(
+        handler,
+        CLIENT_AUTH_POLICY_ATTR,
+        {
+            "credential_transport": credential_transport,
+            "owner_required": owner_required,
+        },
+    )
+    return handler
+
+
+def client_auth_policy(handler: Any) -> dict[str, Any]:
+    """Return a defensive copy of explicit endpoint authentication metadata."""
+
+    value = getattr(handler, CLIENT_AUTH_POLICY_ATTR, None)
+    return dict(value) if isinstance(value, dict) else {}
+
 
 _DEFAULT_SCHEME_PORTS = {"http": 80, "https": 443, "ws": 80, "wss": 443}
 

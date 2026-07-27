@@ -1,0 +1,16 @@
+{
+  "error": {
+    "accepted": null,
+    "code": "INVALID_REQUEST",
+    "details": {
+      "field": "method"
+    },
+    "message": "Synthetic invalid request",
+    "retry_after_ms": null,
+    "retryable": false
+  },
+  "id": "contract-error-1",
+  "ok": false,
+  "payload": null,
+  "type": "res"
+}

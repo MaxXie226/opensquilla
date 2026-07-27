@@ -124,6 +124,14 @@ class RpcMethodEntry:
     required_scope: str
 
 
+@dataclass(frozen=True, slots=True)
+class RpcContractEntry:
+    """Immutable RPC name/scope projection for client-contract export."""
+
+    name: str
+    required_scope: str
+
+
 class RpcUnavailableError(RuntimeError):
     """Raised when a method exists but its backing capability is not wired."""
 
@@ -201,6 +209,12 @@ class RpcRegistry:
         """Prevent additional methods from being registered after boot."""
         self._locked = True
 
+    @property
+    def registration_locked(self) -> bool:
+        """Whether boot-time registration has completed and the surface is frozen."""
+
+        return self._locked
+
     def method(self, name: str, scope: str) -> Callable:
         """Decorator form of :meth:`register`. ``scope`` is required."""
 
@@ -226,6 +240,23 @@ class RpcRegistry:
     def get_entry(self, name: str) -> RpcMethodEntry | None:
         """Return the registered entry for ``name`` or None."""
         return self._methods.get(name)
+
+    def contract_entries(self) -> tuple[RpcContractEntry, ...]:
+        """Copy the locked RPC surface into immutable, handler-free records.
+
+        Importing :mod:`opensquilla.gateway.rpc` loads every release-surface
+        handler, validates its scope classification, and then locks the
+        process-wide registry. Contract export must happen after that point;
+        exporting a partially populated registry would create a plausible but
+        incomplete client baseline.
+        """
+
+        if not self._locked:
+            raise ScopeDriftError("RPC registry must be locked before contract export")
+        return tuple(
+            RpcContractEntry(name=name, required_scope=self._methods[name].required_scope)
+            for name in self.methods()
+        )
 
     async def dispatch(self, req_id: str, method: str, params: Any, ctx: RpcContext) -> ResFrame:
         entry = self._methods.get(method)

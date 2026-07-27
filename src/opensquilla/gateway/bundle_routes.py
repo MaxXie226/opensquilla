@@ -27,6 +27,8 @@ from starlette.routing import Route
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.origin_guard import (
     forbidden_origin_response,
+    mark_client_auth_handler,
+    mark_same_origin_handler,
 )
 from opensquilla.gateway.origin_guard import (
     request_origin_allowed as _request_origin_allowed,
@@ -105,5 +107,15 @@ def register_bundle_routes(app: Starlette, *, config: GatewayConfig) -> None:
         )
 
     app.router.routes.append(
-        Route("/api/v1/diagnostics/bundle", bundle_handler, methods=["POST"])
+        Route(
+            "/api/v1/diagnostics/bundle",
+            mark_same_origin_handler(
+                mark_client_auth_handler(
+                    bundle_handler,
+                    credential_transport="header-or-query",
+                    owner_required=True,
+                )
+            ),
+            methods=["POST"],
+        )
     )

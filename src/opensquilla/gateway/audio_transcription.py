@@ -11,7 +11,12 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from opensquilla.gateway.config import GatewayConfig
-from opensquilla.gateway.origin_guard import forbidden_origin_response, request_origin_allowed
+from opensquilla.gateway.origin_guard import (
+    forbidden_origin_response,
+    mark_client_auth_handler,
+    mark_same_origin_handler,
+    request_origin_allowed,
+)
 from opensquilla.gateway.uploads import _extract_authorization_token
 from opensquilla.provider.audio import (
     ElevenLabsAudioProductionProvider,
@@ -128,4 +133,15 @@ def register_audio_transcription_routes(
             response["language_probability"] = result.language_probability
         return JSONResponse(response)
 
-    app.router.routes.append(Route("/api/audio/transcribe", transcribe_handler, methods=["POST"]))
+    app.router.routes.append(
+        Route(
+            "/api/audio/transcribe",
+            mark_same_origin_handler(
+                mark_client_auth_handler(
+                    transcribe_handler,
+                    credential_transport="header-only-in-token-mode",
+                )
+            ),
+            methods=["POST"],
+        )
+    )

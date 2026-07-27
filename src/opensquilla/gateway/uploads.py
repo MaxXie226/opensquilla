@@ -46,7 +46,12 @@ from opensquilla.contracts.attachments import (
     normalize_attachment_mime,
 )
 from opensquilla.gateway.config import GatewayConfig
-from opensquilla.gateway.origin_guard import forbidden_origin_response, request_origin_allowed
+from opensquilla.gateway.origin_guard import (
+    forbidden_origin_response,
+    mark_client_auth_handler,
+    mark_same_origin_handler,
+    request_origin_allowed,
+)
 from opensquilla.paths import native_io_path
 
 log = logging.getLogger(__name__)
@@ -503,7 +508,16 @@ def register_upload_routes(
         )
 
     app.router.routes.append(
-        Route("/api/v1/files/upload", upload_handler, methods=["POST"])
+        Route(
+            "/api/v1/files/upload",
+            mark_same_origin_handler(
+                mark_client_auth_handler(
+                    upload_handler,
+                    credential_transport="header-only-in-token-mode",
+                )
+            ),
+            methods=["POST"],
+        )
     )
 
 
