@@ -6,8 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+
+- New agent tool `audio_config`: configures the audio (TTS) provider through
+  the same validated path as onboarding — atomic UTF-8 persistence with
+  backup, live hot-apply, and `restartRequired: false`. Agent-driven setup is
+  restricted to the registered ElevenLabs endpoint and credential environment
+  variable; advanced endpoint settings remain operator-managed. API keys are
+  stored but omitted from tool results and validation errors.
+
 ### Fixed
 
+- The `gateway` tool no longer advertises capabilities it cannot deliver:
+  `restart` and `config_set` now report their actual availability, audio
+  settings point to `audio_config`, and `config_get` uses the canonical
+  public-config redactor instead of echoing credentials.
 - Shell commands that would terminate the gateway's own process
   (`Stop-Process -Id <gateway pid>`, `taskkill /PID`, `kill`, and
   name-targeted variants) are structurally refused in every host mode,
