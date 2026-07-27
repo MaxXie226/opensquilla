@@ -592,6 +592,28 @@ def _strip_tool_schema_keywords(value: Any, unsupported: frozenset[str]) -> Any:
 _DASHSCOPE_THINKING_BUDGET_ENV = "OPENSQUILLA_DASHSCOPE_THINKING_BUDGET"
 _DASHSCOPE_THINKING_BUDGET_MIN = 1024
 _DASHSCOPE_THINKING_BUDGET_MAX = 38_912
+_DASHSCOPE_PARALLEL_TOOL_CALLS_ENV = "OPENSQUILLA_DASHSCOPE_PARALLEL_TOOL_CALLS"
+
+
+def _dashscope_parallel_tool_calls_from_env() -> bool:
+    """Return the opt-in DashScope parallel tool-call request setting.
+
+    The default and explicit false forms preserve the historical payload by
+    omitting ``parallel_tool_calls``. Invalid values fail closed so benchmark
+    arms cannot silently become null treatments because of a typo.
+    """
+    raw = os.environ.get(_DASHSCOPE_PARALLEL_TOOL_CALLS_ENV)
+    if raw is None or not raw.strip():
+        return False
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(
+        f"{_DASHSCOPE_PARALLEL_TOOL_CALLS_ENV} must be one of "
+        "1/true/yes/on or 0/false/no/off"
+    )
 
 
 def _thinking_budget_tokens_from_env() -> int | None:
@@ -3082,6 +3104,11 @@ class OpenAIProvider:
                 )
                 for tool in tools
             ]
+            if (
+                self._provider_kind == "dashscope"
+                and _dashscope_parallel_tool_calls_from_env()
+            ):
+                payload["parallel_tool_calls"] = True
             if _should_send_tool_choice(self._provider_kind, cfg, caps):
                 payload["tool_choice"] = cfg.tool_choice
         if self._compat.supports_provider_routing_pin:

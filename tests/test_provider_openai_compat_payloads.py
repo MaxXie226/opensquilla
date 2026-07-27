@@ -2791,6 +2791,88 @@ def test_dashscope_thinking_omits_implicit_level_budget(monkeypatch: Any) -> Non
 
 
 _DASHSCOPE_BUDGET_ENV = "OPENSQUILLA_DASHSCOPE_THINKING_BUDGET"
+_DASHSCOPE_PARALLEL_TOOL_CALLS_ENV = "OPENSQUILLA_DASHSCOPE_PARALLEL_TOOL_CALLS"
+
+
+def _dashscope_tool_payload(
+    monkeypatch: Any,
+    *,
+    provider_kind: str = "dashscope",
+) -> dict[str, Any]:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="test",
+        model="qwen3.7-flash-2026-07-15",
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        provider_kind=provider_kind,
+    )
+    tool = ToolDefinition(
+        name="read_file",
+        description="Read a file",
+        input_schema={
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        },
+    )
+    cfg = ChatConfig(
+        thinking=True,
+        model_capabilities=ModelCapabilities(
+            supports_reasoning=True,
+            supports_tools=True,
+            reasoning_format="dashscope",
+        ),
+    )
+
+    _collect_events(provider, cfg, tools=[tool])
+    return captured["payload"]
+
+
+@pytest.mark.parametrize("value", [None, "", "0", "false", "no", "off"])
+def test_dashscope_parallel_tool_calls_false_forms_omit_field(
+    monkeypatch: Any,
+    value: str | None,
+) -> None:
+    if value is None:
+        monkeypatch.delenv(_DASHSCOPE_PARALLEL_TOOL_CALLS_ENV, raising=False)
+    else:
+        monkeypatch.setenv(_DASHSCOPE_PARALLEL_TOOL_CALLS_ENV, value)
+
+    payload = _dashscope_tool_payload(monkeypatch)
+
+    assert "parallel_tool_calls" not in payload
+
+
+@pytest.mark.parametrize("value", ["1", "true", "yes", "on", " ON "])
+def test_dashscope_parallel_tool_calls_true_forms_send_true(
+    monkeypatch: Any,
+    value: str,
+) -> None:
+    monkeypatch.setenv(_DASHSCOPE_PARALLEL_TOOL_CALLS_ENV, value)
+
+    payload = _dashscope_tool_payload(monkeypatch)
+
+    assert payload["parallel_tool_calls"] is True
+
+
+def test_dashscope_parallel_tool_calls_invalid_value_fails_closed(
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setenv(_DASHSCOPE_PARALLEL_TOOL_CALLS_ENV, "treu")
+
+    with pytest.raises(ValueError, match="OPENSQUILLA_DASHSCOPE_PARALLEL_TOOL_CALLS"):
+        _dashscope_tool_payload(monkeypatch)
+
+
+def test_non_dashscope_provider_ignores_parallel_tool_calls_env(
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setenv(_DASHSCOPE_PARALLEL_TOOL_CALLS_ENV, "on")
+
+    payload = _dashscope_tool_payload(monkeypatch, provider_kind="openrouter")
+
+    assert "parallel_tool_calls" not in payload
 
 
 def test_dashscope_env_thinking_budget_absent_leaves_payload_inert(
