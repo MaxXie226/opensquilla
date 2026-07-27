@@ -187,10 +187,12 @@ def test_frontend_static_assets_are_covered_by_third_party_notices() -> None:
     package = json.loads(
         (ROOT / "opensquilla-webui" / "package.json").read_text(encoding="utf-8")
     )
-    bundled_direct_dependencies = {
-        name for name in package["dependencies"] if not name.startswith("@types/")
+    bundled_third_party_dependencies = {
+        name
+        for name in package["dependencies"]
+        if not name.startswith(("@types/", "@opensquilla/"))
     }
-    for dependency in bundled_direct_dependencies:
+    for dependency in bundled_third_party_dependencies:
         assert f"`{dependency}`" in text
 
     for removed in [
