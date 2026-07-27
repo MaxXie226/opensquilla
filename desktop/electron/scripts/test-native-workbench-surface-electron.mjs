@@ -96,6 +96,21 @@ try {
           contents.getURL().startsWith('opensquilla-artifact://'))
       }
 
+      function emitRendererGone(contents) {
+        // This smoke test owns the manager's Electron event contract, not
+        // Chromium's renderer termination implementation. In particular,
+        // forcefullyCrashRenderer() can silently stall for a hidden
+        // WebContentsView under Linux + Xvfb. Emit the documented lifecycle
+        // event on the real WebContents so every platform deterministically
+        // exercises the registered listener and fail-closed recovery path.
+        const handled = contents.emit(
+          'render-process-gone',
+          {},
+          { reason: 'crashed', exitCode: 1 },
+        )
+        if (!handled) throw new Error('No renderer crash listener was registered.')
+      }
+
       function installSyntheticHttpsProtocol(contents) {
         let requestCount = 0
         contents.session.protocol.handle('https', request => {
@@ -350,7 +365,7 @@ try {
         throw new Error(previewCrashSurface.message || 'Preview-crash surface failed to load.')
       }
       const previewCrashContents = await waitFor(previewContents, 'preview-crash WebContents')
-      previewCrashContents.forcefullyCrashRenderer()
+      emitRendererGone(previewCrashContents)
       await waitFor(
         () => events.some(event =>
           event.surfaceId === 'artifact:preview-crash'
@@ -384,7 +399,7 @@ try {
         throw new Error(ownerCrashSurface.message || 'Owner-crash surface failed to load.')
       }
       const crashContents = await waitFor(previewContents, 'owner-crash preview WebContents')
-      owner.webContents.forcefullyCrashRenderer()
+      emitRendererGone(owner.webContents)
       await waitFor(() => crashContents.isDestroyed(), 'owner renderer crash cleanup')
       const crashActivation = manager.activateSurface('artifact:owner-crash')
 
