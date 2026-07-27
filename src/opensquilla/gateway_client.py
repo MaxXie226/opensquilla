@@ -8,6 +8,12 @@ import uuid
 from typing import Any, cast
 from urllib.parse import urlparse, urlunparse
 
+from opensquilla.gateway_hello import (
+    HelloValidationError,
+    ParsedHelloCapabilities,
+    parse_hello_frame,
+)
+
 
 class GatewayRPCError(Exception):
     """RPC failure returned by the OpenSquilla gateway."""
@@ -76,12 +82,14 @@ class GatewayRPCClient:
         self._heartbeat_interval = 48.0
         self._connection_error: ConnectionError | None = None
         self._closing = False
+        self.hello_capabilities: ParsedHelloCapabilities | None = None
 
     async def connect(self, url: str = "ws://localhost:18791/ws") -> None:
         if self._ws is not None:
             await self.close()
         self._closing = False
         self._connection_error = None
+        self.hello_capabilities = None
         try:
             import websockets
         except ImportError as exc:  # pragma: no cover - dependency is part of base install.
@@ -114,13 +122,23 @@ class GatewayRPCClient:
 
             raw = await self._ws.recv()
             hello = json.loads(raw)
-            if hello.get("type") != "hello-ok":
-                raise RuntimeError(f"Gateway handshake failed: {hello}")
+            if not isinstance(hello, dict):
+                raise RuntimeError(f"Gateway handshake failed: {hello!r}")
+            try:
+                self.hello_capabilities = parse_hello_frame(
+                    hello,
+                    request_id=req_id,
+                    client_min_protocol=1,
+                    client_max_protocol=3,
+                )
+            except HelloValidationError as exc:
+                raise RuntimeError(f"Gateway handshake failed: {exc}") from exc
         except Exception:
             await self._close_failed_connect()
             raise
 
-        policy = hello.get("policy") if isinstance(hello.get("policy"), dict) else {}
+        policy_value = hello.get("policy")
+        policy: dict[str, Any] = policy_value if isinstance(policy_value, dict) else {}
         self._heartbeat_interval = _heartbeat_interval_from_policy(policy)
         self._listener_task = asyncio.create_task(self._listen())
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop(self._ws))
@@ -213,10 +231,12 @@ class GatewayRPCClient:
         self._ws = None
         self._heartbeat_task = None
         self._listener_task = None
+        self.hello_capabilities = None
 
     async def _close_failed_connect(self) -> None:
         ws = self._ws
         self._ws = None
+        self.hello_capabilities = None
         if ws is not None:
             await ws.close()
 

@@ -19,6 +19,17 @@
       "fullHostAccessDisabledReason": null
     }
   },
+  "capabilities": [
+    "gateway.rpc",
+    "gateway.sessions",
+    "gateway.artifacts"
+  ],
+  "contract": {
+    "digest": "sha256:0d06af1e696bfd22bb23aa341252a7cff14f1b980678be312bb84204b75d3239",
+    "generatedFrom": "gateway",
+    "schemaVersion": 1
+  },
+  "extensions": [],
   "features": {
     "events": [
       "connect.challenge",
@@ -241,6 +252,7 @@
       "wizard.status"
     ]
   },
+  "id": "contract-connect-1",
   "policy": {
     "agent_stream_heartbeat_interval_ms": 15000,
     "agent_stream_idle_timeout_ms": 600000,
@@ -251,6 +263,16 @@
     "webui_stream_idle_grace_ms": 630000
   },
   "protocol": 3,
+  "protocolRange": {
+    "max": 3,
+    "min": 1
+  },
+  "runtime": {
+    "arch": "synthetic",
+    "buildCommit": null,
+    "coreVersion": "0.0.0-contract",
+    "platform": "synthetic"
+  },
   "server": {
     "conn_id": "00000000-0000-0000-0000-000000000001",
     "version": "0.0.0-contract"

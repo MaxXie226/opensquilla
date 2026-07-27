@@ -30,6 +30,7 @@ def test_wheel_contains_migrations_and_webui_artifact(
     with zipfile.ZipFile(isolated_core_wheel) as wheel:
         names = wheel.namelist()
         packaged_probe = wheel.read("opensquilla/gateway/static/dist/assets/packaging-probe.js")
+        build_info = wheel.read("opensquilla/_build_info.py").decode("utf-8")
 
     assert any(n.endswith("opensquilla/_migrations/V010__meta_skill_runs.py") for n in names), (
         f"V010 missing from wheel; found: {[n for n in names if '_migrations' in n]}"
@@ -50,6 +51,7 @@ def test_wheel_contains_migrations_and_webui_artifact(
     assert "opensquilla/gateway/static/dist/index.html" in names
     assert f"opensquilla/gateway/static/dist/{MANIFEST_NAME}" in names
     assert packaged_probe == SYNTHETIC_JS
+    assert f"BUILD_COMMIT: str | None = {'1' * 40!r}" in build_info
 
     assert "opensquilla/gateway/templates/legacy_index.html" not in names
     for removed_prefix in (

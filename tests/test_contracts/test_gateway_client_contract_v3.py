@@ -26,6 +26,16 @@ from opensquilla.gateway.client_contract import (
     render_contract_artifacts,
 )
 from opensquilla.gateway.config import AuthConfig, GatewayConfig
+from opensquilla.gateway.contract_identity import (
+    CLIENT_CONTRACT_DIGEST,
+    CONTRACT_GENERATED_FROM,
+    CONTRACT_SCHEMA_VERSION,
+)
+from opensquilla.gateway.hello_capabilities import (
+    CAPABILITY_ARTIFACTS,
+    CAPABILITY_RPC,
+    CAPABILITY_SESSIONS,
+)
 from opensquilla.gateway.protocol import (
     DECLARED_EVENTS,
     PROTOCOL_VERSION,
@@ -70,7 +80,7 @@ def test_committed_inventory_and_bytes_match_runtime_snapshot(
         assert existing[relative_path.as_posix()].read_bytes() == content
 
 
-def test_protocol_v3_and_declared_model_gap_are_explicit() -> None:
+def test_protocol_v3_and_live_connect_model_are_explicit() -> None:
     protocol = _read_json("protocol.schema.json")
     metadata = protocol["x-opensquilla-contract"]
 
@@ -84,13 +94,26 @@ def test_protocol_v3_and_declared_model_gap_are_explicit() -> None:
     assert connect["canonical_client_frame"]["properties"]["params"]["properties"][
         "minProtocol"
     ]["type"] == "integer"
-    assert connect["legacy_declared_model"]["status"] == "not-used-by-websocket-parser"
-    assert connect["legacy_declared_model"]["wire_name_difference"] == (
-        "min_protocol/max_protocol vs minProtocol/maxProtocol"
+    assert connect["live_parser_model"]["status"] == "used-by-websocket-parser"
+    assert connect["live_parser_model"]["wire_aliases"] == (
+        "min_protocol/max_protocol serialize as minProtocol/maxProtocol"
     )
     assert connect["accepted_currently"]["params"] == (
         "non-object values are treated as an empty object"
     )
+
+
+def test_contract_manifest_matches_runtime_identity(
+    snapshot: ClientContractSnapshot,
+) -> None:
+    manifest = _read_json("contract.json")
+
+    assert snapshot.contract_digest == CLIENT_CONTRACT_DIGEST
+    assert manifest == snapshot.contract_manifest
+    assert manifest["digest"] == CLIENT_CONTRACT_DIGEST
+    assert manifest["schemaVersion"] == CONTRACT_SCHEMA_VERSION
+    assert manifest["generatedFrom"] == CONTRACT_GENERATED_FROM
+    assert "golden/hello-ok.json" not in manifest["digestPaths"]
 
 
 def test_declared_payload_limits_are_not_misrepresented_as_enforced() -> None:
@@ -341,10 +364,26 @@ def test_golden_frames_validate_and_contain_only_synthetic_identity() -> None:
     assert connect["params"]["minProtocol"] == 1
     assert connect["params"]["maxProtocol"] == 3
     assert connect["params"]["auth"]["token"] == "<synthetic>"
+    assert hello.id == connect["id"]
     assert hello.protocol == 3
     assert hello.server.conn_id == "00000000-0000-0000-0000-000000000001"
     assert hello.features.methods == get_registry().methods()
     assert hello.features.events == list(DECLARED_EVENTS)
+    assert hello.contract is not None
+    assert hello.contract.schema_version == CONTRACT_SCHEMA_VERSION
+    assert hello.contract.digest == CLIENT_CONTRACT_DIGEST
+    assert hello.contract.generated_from == CONTRACT_GENERATED_FROM
+    assert hello.runtime is not None
+    assert hello.runtime.core_version == "0.0.0-contract"
+    assert hello.runtime.build_commit is None
+    assert hello.protocol_range is not None
+    assert (hello.protocol_range.min, hello.protocol_range.max) == (1, 3)
+    assert hello.capabilities == [
+        CAPABILITY_RPC,
+        CAPABILITY_SESSIONS,
+        CAPABILITY_ARTIFACTS,
+    ]
+    assert hello.extensions == []
     assert error.ok is False
     assert error.error is not None
     assert error.error.code == "INVALID_REQUEST"
@@ -393,7 +432,12 @@ async def test_golden_hello_matches_real_handshake_after_dynamic_fields_are_scru
         ws_writer_queue_enabled=False,
     )
 
-    await handle_ws_connection(websocket, config, get_dispatcher())
+    await handle_ws_connection(
+        websocket,
+        config,
+        get_dispatcher(),
+        loaded_capabilities=(CAPABILITY_ARTIFACTS,),
+    )
 
     actual = next(
         frame
@@ -405,6 +449,12 @@ async def test_golden_hello_matches_real_handshake_after_dynamic_fields_are_scru
         "version": "0.0.0-contract",
     }
     actual["snapshot"]["uptime_ms"] = 1_700_000_000_000
+    actual["runtime"] = {
+        "arch": "synthetic",
+        "buildCommit": None,
+        "coreVersion": "0.0.0-contract",
+        "platform": "synthetic",
+    }
 
     assert actual == _read_json("golden/hello-ok.json")
 

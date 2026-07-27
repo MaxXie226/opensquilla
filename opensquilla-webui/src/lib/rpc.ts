@@ -17,6 +17,24 @@ export interface RpcClientError extends Error {
   accepted?: boolean;
 }
 
+export interface RpcContractInfo {
+  schemaVersion: number;
+  digest: string;
+  generatedFrom: string;
+}
+
+export interface RpcRuntimeInfo {
+  coreVersion: string;
+  buildCommit: string | null;
+  platform?: string;
+  arch?: string;
+}
+
+export interface RpcProtocolRange {
+  min: number;
+  max: number;
+}
+
 export interface RpcFrame {
   type?: string;
   id?: string;
@@ -33,7 +51,18 @@ export interface RpcFrame {
     methods?: string[];
     events?: string[];
   };
+  server?: {
+    version?: string;
+    conn_id?: string;
+  };
   auth?: Record<string, unknown>;
+  contract?: RpcContractInfo;
+  runtime?: RpcRuntimeInfo;
+  protocolRange?: RpcProtocolRange;
+  capabilities?: string[];
+  extensions?: string[];
+  contractStatus?: 'advertised' | 'legacy-contract';
+  capabilitySource?: 'hello' | 'features.methods' | 'none';
   seq?: number;
 }
 
@@ -41,6 +70,116 @@ export type ConnectionState = 'disconnected' | 'connecting' | 'connected';
 export type RpcEventHandler = {
   bivarianceHack(...args: unknown[]): void;
 }['bivarianceHack'];
+
+const CLIENT_MIN_PROTOCOL = 3;
+const CLIENT_MAX_PROTOCOL = 3;
+const CAPABILITY_ID_PATTERN = /^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)+$/;
+const DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/;
+
+const CAPABILITY_METHOD_REQUIREMENTS: ReadonlyArray<readonly [string, readonly string[]]> = [
+  ['gateway.sessions', ['chat.history', 'chat.send', 'sessions.list', 'sessions.resolve']],
+];
+
+function stringList(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
+}
+
+function stableIds(value: unknown): string[] {
+  return stringList(value).filter((item) => CAPABILITY_ID_PATTERN.test(item));
+}
+
+function isWireInteger(value: unknown): value is number {
+  return Number.isInteger(value);
+}
+
+export function capabilitiesForMethods(methods: readonly string[]): string[] {
+  if (methods.length === 0) return [];
+  const available = new Set(methods);
+  return [
+    'gateway.rpc',
+    ...CAPABILITY_METHOD_REQUIREMENTS.filter(([, required]) =>
+      required.every((method) => available.has(method))
+    ).map(([capability]) => capability),
+  ];
+}
+
+export function normalizeHelloFrame(data: RpcFrame, requestId: string): RpcFrame {
+  if (data.type !== 'hello-ok') throw new Error('Expected hello-ok frame');
+  if (
+    !isWireInteger(data.protocol) ||
+    data.protocol < CLIENT_MIN_PROTOCOL ||
+    data.protocol > CLIENT_MAX_PROTOCOL
+  ) {
+    throw new Error('Negotiated protocol is outside the requested range');
+  }
+
+  const hasNewMetadata = ['contract', 'runtime', 'protocolRange', 'capabilities', 'extensions']
+    .some((field) => Object.prototype.hasOwnProperty.call(data, field));
+  if (data.id === undefined) {
+    if (hasNewMetadata) throw new Error('New-format hello-ok frame is missing response id');
+  } else if (data.id !== requestId) {
+    throw new Error('hello-ok response id does not match connect request');
+  }
+
+  const advertisedRange = data.protocolRange;
+  const protocolRange =
+    advertisedRange &&
+    isWireInteger(advertisedRange.min) &&
+    isWireInteger(advertisedRange.max) &&
+    advertisedRange.min <= advertisedRange.max
+      ? advertisedRange
+      : { min: data.protocol, max: data.protocol };
+  if (
+    protocolRange.max < CLIENT_MIN_PROTOCOL ||
+    protocolRange.min > CLIENT_MAX_PROTOCOL
+  ) {
+    throw new Error('Gateway protocol range does not overlap client range');
+  }
+
+  const rawContract = data.contract;
+  const contractValid =
+    !!rawContract &&
+    isWireInteger(rawContract.schemaVersion) &&
+    typeof rawContract.digest === 'string' &&
+    DIGEST_PATTERN.test(rawContract.digest) &&
+    typeof rawContract.generatedFrom === 'string' &&
+    rawContract.generatedFrom.length > 0;
+  const methods = stringList(data.features?.methods);
+  const capabilitiesPresent = Object.prototype.hasOwnProperty.call(data, 'capabilities');
+  const capabilities = capabilitiesPresent
+    ? stableIds(data.capabilities)
+    : capabilitiesForMethods(methods);
+  const capabilitySource =
+    capabilitiesPresent && Array.isArray(data.capabilities)
+      ? 'hello'
+      : !capabilitiesPresent && methods.length > 0
+        ? 'features.methods'
+        : 'none';
+  const serverVersion =
+    typeof data.server?.version === 'string' && data.server.version
+      ? data.server.version
+      : 'unknown';
+  const runtime = data.runtime && typeof data.runtime.coreVersion === 'string'
+    ? {
+        coreVersion: data.runtime.coreVersion || serverVersion,
+        buildCommit:
+          typeof data.runtime.buildCommit === 'string' ? data.runtime.buildCommit : null,
+        ...(typeof data.runtime.platform === 'string' ? { platform: data.runtime.platform } : {}),
+        ...(typeof data.runtime.arch === 'string' ? { arch: data.runtime.arch } : {}),
+      }
+    : { coreVersion: serverVersion, buildCommit: null };
+
+  return {
+    ...data,
+    contract: contractValid ? rawContract : undefined,
+    contractStatus: contractValid ? 'advertised' : 'legacy-contract',
+    runtime,
+    protocolRange,
+    capabilities,
+    capabilitySource,
+    extensions: stableIds(data.extensions),
+  };
+}
 
 export class RpcClient {
   private _ws: WebSocket | null = null;
@@ -62,6 +201,7 @@ export class RpcClient {
   private _lastFrameAt = 0;
   private _tickWatchTimer: ReturnType<typeof setInterval> | null = null;
   private _tickTimeoutMs = 60000;
+  private _connectRequestId: string | null = null;
 
   connect(url: string, token?: string): void {
     this._url = url;
@@ -78,6 +218,7 @@ export class RpcClient {
     }
     this._stopPing();
     this._stopTickWatch();
+    this._connectRequestId = null;
     if (this._ws) {
       this._ws.close();
       this._ws = null;
@@ -136,6 +277,7 @@ export class RpcClient {
     this._lastSeq = 0;
     this._lastFrameAt = Date.now();
     this._stopTickWatch();
+    this._connectRequestId = null;
     try {
       this._ws = new WebSocket(this._url);
     } catch {
@@ -161,6 +303,7 @@ export class RpcClient {
       if (data.type === 'event' && data.event === 'connect.challenge') {
         const authParams = this._token ? { auth: { token: this._token } } : {};
         const id = String(++this._reqId);
+        this._connectRequestId = id;
         this._pending.set(id, {
           resolve: () => {},
           reject: (_err: Error) => {
@@ -174,8 +317,8 @@ export class RpcClient {
             id,
             method: 'connect',
             params: {
-              minProtocol: 3,
-              maxProtocol: 3,
+              minProtocol: CLIENT_MIN_PROTOCOL,
+              maxProtocol: CLIENT_MAX_PROTOCOL,
               client: { name: 'opensquilla-web' },
               ...authParams,
             },
@@ -184,17 +327,31 @@ export class RpcClient {
         return;
       }
 
-      // Handshake: HelloOk frame
-      if (data.protocol !== undefined && this._state === 'connecting') {
-        this._policy = data.policy || null;
-        for (const [pid, p] of this._pending) {
-          this._pending.delete(pid);
-          p.resolve(data);
-          break;
+      // Handshake: only a correlated hello-ok can transition to connected.
+      if (
+        this._state === 'connecting' &&
+        (data.type === 'hello-ok' || data.protocol !== undefined)
+      ) {
+        const requestId = this._connectRequestId;
+        if (!requestId) {
+          this._rejectHandshake(new Error('Received hello-ok before connect request'));
+          return;
         }
+        let hello: RpcFrame;
+        try {
+          hello = normalizeHelloFrame(data, requestId);
+        } catch (error) {
+          this._rejectHandshake(error instanceof Error ? error : new Error('Invalid hello-ok'));
+          return;
+        }
+        this._policy = hello.policy || null;
+        const pending = this._pending.get(requestId);
+        this._pending.delete(requestId);
+        this._connectRequestId = null;
+        pending?.resolve(hello);
         this._setState('connected');
         const helloHandlers = this._listeners.get('_hello');
-        if (helloHandlers) helloHandlers.forEach((h) => h(data));
+        if (helloHandlers) helloHandlers.forEach((h) => h(hello));
         this._startPing();
         this._startTickWatch();
         return;
@@ -235,9 +392,11 @@ export class RpcClient {
     this._ws.onclose = () => {
       this._stopPing();
       this._stopTickWatch();
-      for (const [, p] of this._pending) p.reject(new Error('Connection closed'));
+      const pending = [...this._pending.values()];
       this._pending.clear();
+      for (const p of pending) p.reject(new Error('Connection closed'));
       this._ws = null;
+      this._connectRequestId = null;
       if (this._state !== 'disconnected') {
         this._setState('disconnected');
         this._scheduleReconnect();
@@ -245,6 +404,21 @@ export class RpcClient {
     };
 
     this._ws.onerror = () => {};
+  }
+
+  private _rejectHandshake(error: Error): void {
+    const requestId = this._connectRequestId;
+    if (requestId) {
+      const pending = this._pending.get(requestId);
+      this._pending.delete(requestId);
+      pending?.reject(error);
+    }
+    this._connectRequestId = null;
+    this._autoReconnect = false;
+    this._setState('disconnected');
+    try {
+      this._ws?.close();
+    } catch {}
   }
 
   private _startPing(): void {

@@ -223,6 +223,7 @@ def isolated_core_wheel(tmp_path_factory: pytest.TempPathFactory) -> Path:
         ["uv", "build", "--out-dir", str(wheel_dir)],
         cwd=build_root,
         capture_output=True,
+        env={**os.environ, "OPENSQUILLA_BUILD_COMMIT": "1" * 40},
         text=True,
         timeout=300,
     )

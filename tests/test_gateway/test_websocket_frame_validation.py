@@ -17,6 +17,8 @@ from typing import Any
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 from opensquilla.gateway.config import GatewayConfig
+from opensquilla.gateway.contract_identity import CLIENT_CONTRACT_DIGEST
+from opensquilla.gateway.hello_capabilities import CAPABILITY_RPC
 from opensquilla.gateway.protocol import make_ok_res
 from opensquilla.gateway.websocket import WsConnection, handle_ws_connection
 
@@ -75,6 +77,28 @@ async def _run(frames: list[str]) -> _ScriptedWebSocket:
     ws = _ScriptedWebSocket(frames)
     await handle_ws_connection(ws, _config(), dispatcher=_EchoDispatcher())
     return ws
+
+
+async def test_handshake_emits_correlated_product_neutral_capabilities() -> None:
+    ws = await _run([_CONNECT_FRAME])
+    hello = next(
+        frame
+        for frame in (json.loads(payload) for payload in ws.sent)
+        if frame.get("type") == "hello-ok"
+    )
+
+    assert hello["id"] == "h"
+    assert hello["protocol"] == 3
+    assert hello["protocolRange"] == {"min": 1, "max": 3}
+    assert hello["contract"] == {
+        "schemaVersion": 1,
+        "digest": CLIENT_CONTRACT_DIGEST,
+        "generatedFrom": "gateway",
+    }
+    assert hello["capabilities"] == [CAPABILITY_RPC]
+    assert hello["extensions"] == []
+    assert hello["runtime"]["coreVersion"]
+    assert {"edition", "license", "entitlements"}.isdisjoint(hello)
 
 
 async def test_non_string_req_id_gets_error_res_and_connection_survives() -> None:

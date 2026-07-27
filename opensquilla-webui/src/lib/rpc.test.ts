@@ -69,6 +69,119 @@ describe('RpcClient error responses', () => {
     client.disconnect()
   })
 
+  it('accepts a correlated new Hello and exposes normalized capability metadata', () => {
+    const client = new RpcClient()
+    const hellos: unknown[] = []
+    client.on('_hello', (hello) => hellos.push(hello))
+    client.connect('ws://rpc.test')
+    const socket = MockWebSocket.instances[0]
+
+    socket.receive({ type: 'event', event: 'connect.challenge', payload: { nonce: 'n' } })
+    socket.receive({
+      type: 'hello-ok',
+      id: '1',
+      protocol: 3,
+      server: { version: '0.5.0' },
+      contract: {
+        schemaVersion: 1,
+        digest: `sha256:${'a'.repeat(64)}`,
+        generatedFrom: 'gateway',
+      },
+      runtime: {
+        coreVersion: '0.5.0',
+        buildCommit: null,
+        platform: 'linux',
+        arch: 'x86_64',
+      },
+      protocolRange: { min: 1, max: 3 },
+      capabilities: ['gateway.rpc', 'gateway.sessions'],
+      extensions: [],
+      futureField: { ignored: true },
+    })
+
+    expect(client.state).toBe('connected')
+    expect(hellos).toHaveLength(1)
+    expect(hellos[0]).toMatchObject({
+      contractStatus: 'advertised',
+      capabilitySource: 'hello',
+      capabilities: ['gateway.rpc', 'gateway.sessions'],
+      extensions: [],
+    })
+    client.disconnect()
+  })
+
+  it('accepts a legacy Hello without an id and derives only proven capabilities', () => {
+    const client = new RpcClient()
+    const hellos: unknown[] = []
+    client.on('_hello', (hello) => hellos.push(hello))
+    client.connect('ws://rpc.test')
+    const socket = MockWebSocket.instances[0]
+
+    socket.receive({ type: 'event', event: 'connect.challenge' })
+    socket.receive({
+      type: 'hello-ok',
+      protocol: 3,
+      server: { version: '0.4.0' },
+      features: {
+        methods: ['chat.history', 'chat.send', 'sessions.list', 'sessions.resolve'],
+      },
+    })
+
+    expect(client.state).toBe('connected')
+    expect(hellos[0]).toMatchObject({
+      contractStatus: 'legacy-contract',
+      capabilitySource: 'features.methods',
+      capabilities: ['gateway.rpc', 'gateway.sessions'],
+      runtime: { coreVersion: '0.4.0', buildCommit: null },
+      protocolRange: { min: 3, max: 3 },
+    })
+    client.disconnect()
+  })
+
+  it.each([
+    {
+      name: 'a protocol-shaped frame with the wrong type',
+      frame: { type: 'res', id: '1', protocol: 3 },
+    },
+    {
+      name: 'a new Hello with a mismatched response id',
+      frame: {
+        type: 'hello-ok',
+        id: 'wrong',
+        protocol: 3,
+        protocolRange: { min: 1, max: 3 },
+      },
+    },
+    {
+      name: 'a new Hello with no response id',
+      frame: {
+        type: 'hello-ok',
+        protocol: 3,
+        capabilities: ['gateway.rpc'],
+      },
+    },
+    {
+      name: 'a Hello advertising a non-overlapping range',
+      frame: {
+        type: 'hello-ok',
+        id: '1',
+        protocol: 3,
+        protocolRange: { min: 1, max: 2 },
+      },
+    },
+  ])('rejects $name without reconnecting', ({ frame }) => {
+    const client = new RpcClient()
+    client.connect('ws://rpc.test')
+    const socket = MockWebSocket.instances[0]
+
+    socket.receive({ type: 'event', event: 'connect.challenge' })
+    socket.receive(frame)
+
+    expect(client.state).toBe('disconnected')
+    expect(socket.readyState).toBe(MockWebSocket.CLOSED)
+    expect(MockWebSocket.instances).toHaveLength(1)
+  })
+
   it('preserves structured retry and acceptance metadata on the rejected error', async () => {
     const client = new RpcClient()
     client.connect('ws://rpc.test')

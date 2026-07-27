@@ -1,0 +1,16 @@
+{
+  "digest": "sha256:0d06af1e696bfd22bb23aa341252a7cff14f1b980678be312bb84204b75d3239",
+  "digestAlgorithm": "sha256",
+  "digestDomain": "opensquilla-client-contract-v1",
+  "digestFraming": "domain-nul-(path-nul-content-nul)*",
+  "digestPaths": [
+    "protocol.schema.json",
+    "rpc-methods.json",
+    "events.json",
+    "http-routes.json",
+    "golden/connect.json",
+    "golden/error.json"
+  ],
+  "generatedFrom": "gateway",
+  "schemaVersion": 1
+}

@@ -7,6 +7,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from opensquilla.gateway.contract_identity import CLIENT_CONTRACT_DIGEST
+from opensquilla.gateway.hello_capabilities import CAPABILITY_RPC
 from opensquilla.gateway_client import GatewayRPCClient, normalize_gateway_url
 
 
@@ -132,6 +134,9 @@ async def test_gateway_rpc_client_connect_frame_is_frozen(monkeypatch) -> None:
 
     await client.connect("ws://127.0.0.1:18791/ws")
     try:
+        assert client.hello_capabilities is not None
+        assert client.hello_capabilities.contract_status == "legacy-contract"
+        assert client.hello_capabilities.response_id_status == "legacy-missing"
         (frame,) = ws.sent
         assert isinstance(frame["id"], str) and frame["id"]
         assert {key: value for key, value in frame.items() if key != "id"} == {
@@ -144,5 +149,63 @@ async def test_gateway_rpc_client_connect_frame_is_frozen(monkeypatch) -> None:
                 "scopes": ["operator.read", "operator.write"],
             },
         }
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_gateway_rpc_client_consumes_correlated_new_hello(monkeypatch) -> None:
+    class HandshakeWebSocket(_SilentWebSocket):
+        async def recv(self) -> str:
+            if not self.sent:
+                return json.dumps(
+                    {"type": "event", "event": "connect.challenge", "payload": {"nonce": "n"}}
+                )
+            return json.dumps(
+                {
+                    "type": "hello-ok",
+                    "id": self.sent[0]["id"],
+                    "protocol": 3,
+                    "server": {"version": "0.5.0"},
+                    "contract": {
+                        "schemaVersion": 1,
+                        "digest": CLIENT_CONTRACT_DIGEST,
+                        "generatedFrom": "gateway",
+                    },
+                    "runtime": {
+                        "coreVersion": "0.5.0",
+                        "buildCommit": None,
+                        "platform": "linux",
+                        "arch": "x86_64",
+                    },
+                    "protocolRange": {"min": 1, "max": 3},
+                    "capabilities": [CAPABILITY_RPC],
+                    "extensions": [],
+                }
+            )
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self) -> str:
+            await asyncio.Event().wait()
+            raise StopAsyncIteration
+
+    ws = HandshakeWebSocket()
+
+    async def connect(_url: str):
+        return ws
+
+    monkeypatch.setitem(sys.modules, "websockets", SimpleNamespace(connect=connect))
+    client = GatewayRPCClient()
+
+    await client.connect("ws://127.0.0.1:18791/ws")
+    try:
+        hello = client.hello_capabilities
+        assert hello is not None
+        assert hello.contract_status == "advertised"
+        assert hello.contract_digest == CLIENT_CONTRACT_DIGEST
+        assert hello.capabilities == frozenset({CAPABILITY_RPC})
+        assert hello.response_id_status == "matched"
     finally:
         await client.close()

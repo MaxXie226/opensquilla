@@ -1,6 +1,13 @@
 import { ref, computed } from 'vue'
 import { defineStore } from 'pinia'
-import { RpcClient, type RpcEventHandler } from '@/lib/rpc'
+import {
+  RpcClient,
+  capabilitiesForMethods,
+  type RpcContractInfo,
+  type RpcEventHandler,
+  type RpcProtocolRange,
+  type RpcRuntimeInfo,
+} from '@/lib/rpc'
 
 const WS_URL_KEY = 'opensquilla.wsUrl'
 const WS_TOKEN_KEY = 'opensquilla.wsToken'
@@ -14,7 +21,9 @@ function getDefaultRpcUrl(): string {
 
 function clearStoragePrefix(storage: Storage, prefix: string): void {
   try {
-    for (const key of Object.keys(storage)) {
+    const keys = Array.from({ length: storage.length }, (_, index) => storage.key(index))
+    for (const key of keys) {
+      if (!key) continue
       if (key.startsWith(prefix)) storage.removeItem(key)
     }
   } catch {}
@@ -76,6 +85,13 @@ export const useRpcStore = defineStore('rpc', () => {
   const policy = ref<Record<string, unknown> | null>(null)
   const auth = ref<Record<string, unknown> | null>(null)
   const methods = ref<string[]>([])
+  const contract = ref<RpcContractInfo | null>(null)
+  const contractStatus = ref<'advertised' | 'legacy-contract'>('legacy-contract')
+  const runtime = ref<RpcRuntimeInfo | null>(null)
+  const protocolRange = ref<RpcProtocolRange | null>(null)
+  const capabilities = ref<string[]>([])
+  const capabilitySource = ref<'hello' | 'features.methods' | 'none'>('none')
+  const extensions = ref<string[]>([])
   const unavailableMethods = ref<Set<string>>(new Set())
   const error = ref<string | null>(null)
 
@@ -94,11 +110,35 @@ export const useRpcStore = defineStore('rpc', () => {
       policy?: Record<string, unknown>
       auth?: Record<string, unknown>
       features?: { methods?: unknown }
+      contract?: RpcContractInfo
+      contractStatus?: 'advertised' | 'legacy-contract'
+      runtime?: RpcRuntimeInfo
+      protocolRange?: RpcProtocolRange
+      capabilities?: unknown
+      capabilitySource?: 'hello' | 'features.methods' | 'none'
+      extensions?: unknown
     }) => {
       policy.value = data.policy || null
       auth.value = data.auth || null
       methods.value = Array.isArray(data.features?.methods)
         ? data.features.methods.filter((method): method is string => typeof method === 'string')
+        : []
+      contract.value = data.contract || null
+      contractStatus.value = data.contractStatus || (data.contract ? 'advertised' : 'legacy-contract')
+      runtime.value = data.runtime || null
+      protocolRange.value = data.protocolRange || null
+      capabilities.value = Array.isArray(data.capabilities)
+        ? data.capabilities.filter((item): item is string => typeof item === 'string')
+        : capabilitiesForMethods(methods.value)
+      capabilitySource.value =
+        data.capabilitySource ||
+        (Array.isArray(data.capabilities)
+          ? 'hello'
+          : methods.value.length > 0
+            ? 'features.methods'
+            : 'none')
+      extensions.value = Array.isArray(data.extensions)
+        ? data.extensions.filter((item): item is string => typeof item === 'string')
         : []
       unavailableMethods.value = new Set()
     })
@@ -131,6 +171,13 @@ export const useRpcStore = defineStore('rpc', () => {
       policy.value = null
       auth.value = null
       methods.value = []
+      contract.value = null
+      contractStatus.value = 'legacy-contract'
+      runtime.value = null
+      protocolRange.value = null
+      capabilities.value = []
+      capabilitySource.value = 'none'
+      extensions.value = []
       unavailableMethods.value = new Set()
       client.value.connect(settings.url, settings.token)
     }
@@ -143,11 +190,22 @@ export const useRpcStore = defineStore('rpc', () => {
     policy.value = null
     auth.value = null
     methods.value = []
+    contract.value = null
+    contractStatus.value = 'legacy-contract'
+    runtime.value = null
+    protocolRange.value = null
+    capabilities.value = []
+    capabilitySource.value = 'none'
+    extensions.value = []
     unavailableMethods.value = new Set()
   }
 
   function supportsMethod(method: string): boolean {
     return methods.value.includes(method) && !unavailableMethods.value.has(method)
+  }
+
+  function supportsCapability(capability: string): boolean {
+    return capabilities.value.includes(capability)
   }
 
   function markMethodUnavailable(method: string): void {
@@ -183,6 +241,13 @@ export const useRpcStore = defineStore('rpc', () => {
     policy,
     auth,
     methods,
+    contract,
+    contractStatus,
+    runtime,
+    protocolRange,
+    capabilities,
+    capabilitySource,
+    extensions,
     error,
     isConnected,
     isConnecting,
@@ -191,6 +256,7 @@ export const useRpcStore = defineStore('rpc', () => {
     applyLinkTokenFromUrl,
     disconnect,
     supportsMethod,
+    supportsCapability,
     markMethodUnavailable,
     call,
     on,
