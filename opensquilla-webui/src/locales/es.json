@@ -70,8 +70,8 @@
     "dismiss": "Descartar"
   },
   "nav": {
-    "chat": "Chat",
-    "chat-new": "Nuevo chat",
+    "chat": "Tarea",
+    "chat-new": "Nueva tarea",
     "sessions": "Sesiones",
     "agents": "Agentes",
     "channels": "Canales",
@@ -81,6 +81,7 @@
     "overview": "Resumen",
     "status": "Estado",
     "usage": "Uso",
+    "viewUsage": "Ver uso",
     "logs": "Registros",
     "settings": "Ajustes",
     "groupBuild": "Construir",
@@ -98,7 +99,9 @@
     "settings": "Ajustes",
     "theme": "Tema",
     "language": "Idioma",
-    "newChat": "Nuevo chat",
+    "newTask": "Nueva tarea",
+    "newTaskTitle": "Iniciar una tarea nueva",
+    "searchChats": "Buscar tareas",
     "more": "Más",
     "moreDestinations": "Más destinos",
     "expandSidebar": "Expandir barra lateral",
@@ -235,7 +238,7 @@
       "applyLiveNote": "La mayoría de los cambios se aplican en vivo; algunos requieren reiniciar la puerta de enlace",
       "discardTitle": "¿Descartar los cambios sin guardar?",
       "discardBody": "Tienes ediciones sin guardar. Si cierras ahora se perderán.",
-      "discardPrimary": "Descartar"
+      "discardConfirmPrimary": "Descartar cambios"
     },
     "rail": {
       "connection": "Conexión",
@@ -335,10 +338,10 @@
     "provider": {
       "title": "Proveedor",
       "pageTitle": "Servicio de modelos",
-      "pageDesc": "Conecta proveedores de modelos y gestiona credenciales, endpoints y el modelo directo/de respaldo. Decide cómo se usan los modelos en Enrutamiento de modelos.",
+      "pageDesc": "Conecta proveedores y gestiona sus credenciales y modelos.",
       "configuredTitle": "Proveedores configurados",
       "configuredCount": "{count}",
-      "configuredSummary": "{ready} de {count} credenciales disponibles. La verificación envía una pequeña solicitud y puede generar cargos.",
+      "configuredSummary": "{ready} de {count} listos. La prueba envía una pequeña solicitud.",
       "configuredDesc": "Los proveedores guardados siguen disponibles para el enrutamiento hasta que los elimines. La verificación de la configuración envía una solicitud breve al modelo con los ajustes guardados; el proveedor puede aplicar cargos.",
       "activeBadge": "Activo",
       "editingBadge": "Editando",
@@ -355,6 +358,10 @@
       "allProviders": "Todos los proveedores",
       "providerResultCount": "{count} disponibles",
       "recommendedBadge": "Recomendado",
+      "recommendedProviders": "Recomendados",
+      "otherProviders": "Otros proveedores",
+      "limitedFreeBadge": "Acceso gratis limitado",
+      "alreadyConfigured": "Ya añadido",
       "browseAllProviders": "Explorar todos los proveedores ({count})",
       "providerResults": "Resultados de proveedores",
       "viewAllProviders": "Ver todos ({count})",
@@ -429,7 +436,8 @@
       "modelPlaceholder": "Introduce un ID de modelo",
       "activating": "Activando…",
       "modelDiscoveryFailed": "No se pudieron descubrir modelos. Introduce un ID manualmente.",
-      "upgradeGatewayHint": "Actualiza y reinicia la puerta de enlace para activar proveedores.",
+      "upgradeGatewayHint": "Actualiza y reinicia la puerta de enlace para gestionar proveedores.",
+      "profileSaveUnsupported": "Esta puerta de enlace guarda un proveedor activo. Después de verificarlo, «Guardar cambios» sustituye al proveedor actual.",
       "connectedLatency": "Configuración verificada · Prueba completa {latency} ms",
       "connectionKeyRejected": "Clave rechazada",
       "connectionUnavailable": "Conexión no disponible",
@@ -448,7 +456,10 @@
       "profileModelHint": "El modelo guardado se usará como modelo directo/de reserva si activas este proveedor. Los modelos de ruta siguen separados.",
       "removeConfirmTitle": "¿Eliminar proveedor?",
       "removeConfirmBody": "¿Eliminar {provider} de los proveedores configurados? No se pueden eliminar proveedores en uso.",
+      "removeActiveConfirmBody": "¿Eliminar {provider} y cambiar el proveedor activo a {replacement}? No se pueden eliminar proveedores en uso.",
       "removeConfirmPrimary": "Eliminar proveedor",
+      "saveChanges": "Guardar cambios",
+      "verifyAndConnect": "Verificar y conectar",
       "needs": "El proveedor necesita",
       "choose": "Elige un proveedor",
       "chooseProviderShort": "elegir proveedor",
@@ -460,7 +471,6 @@
       "recommendation": {
         "title": "Recomendado: TokenRhythm",
         "value": "Las llamadas a la API de TokenRhythm son gratis por tiempo limitado.",
-        "registration": "Durante la promoción, regístrate y obtén una clave API para usar gratis DeepSeek, GLM, MiniMax, Kimi y otros modelos líderes.",
         "cta": "Registrarse y obtener una clave API",
         "externalLabel": "Registrarse y obtener una clave API — TokenRhythm (se abre en una pestaña nueva)",
         "stepsLabel": "Cómo conectar TokenRhythm",
@@ -607,42 +617,40 @@
     },
     "modelStrategy": {
       "title": "Enrutamiento de modelos",
-      "desc": "Elige cómo Squilla selecciona y usa los modelos configurados para las solicitudes nuevas.",
+      "desc": "Elige cómo se selecciona el modelo para cada solicitud.",
       "modeTitle": "Elige cómo usar los modelos",
-      "modeDesc": "Elige según el objetivo: el enrutamiento inteligente equilibra el uso de tokens y la capacidad; el modelo fijo mantiene una selección predecible; la colaboración entre varios modelos prioriza la capacidad en tareas complejas y suele usar más tokens.",
       "providerFirstTitle": "Añade primero un servicio de modelos",
-      "providerFirst": "El enrutamiento de modelos necesita al menos un proveedor guardado. Un solo proveedor basta para enrutar entre sus modelos configurados.",
+      "providerFirst": "El enrutado de modelos necesita al menos un proveedor guardado.",
       "providerAction": "Ir al servicio de modelos",
-      "configuredProvidersOnly": "Los proveedores y modelos disponibles proceden del servicio de modelos.",
+      "configuredProvidersOnly": "Los modelos provienen del Servicio de modelos.",
       "manageProviders": "Gestionar el servicio de modelos",
       "routerTitle": "Enrutamiento inteligente de modelos",
       "fallbackTierLabel": "Cuando el enrutamiento no esté seguro",
-      "fallbackTierDesc": "Usa este nivel predeterminado cuando el enrutamiento no pueda determinar con seguridad el nivel de la solicitud.",
+      "fallbackTierDesc": "Se usa cuando el enrutado no puede determinar el nivel.",
       "modelRolesTitle": "Roles de los modelos",
-      "modelRolesDesc": "Define qué modelo gestiona cada nivel de complejidad de las solicitudes.",
-      "advancedTitle": "Opciones de visualización",
-      "advancedDesc": "Cambia cómo aparece la información de enrutamiento en el chat sin afectar la selección de modelos.",
+      "advancedTitle": "Opciones avanzadas",
+      "advancedDesc": "Nivel de respaldo y presentación del enrutado en el chat.",
       "visualModeLabel": "Estilo del panel de decisión de enrutamiento",
-      "visualModeDesc": "Elige cómo aparece el panel de decisión de enrutamiento en las respuestas del chat. Esto no cambia el comportamiento del enrutamiento.",
+      "visualModeDesc": "Cómo se muestra la decisión de enrutado en las respuestas.",
       "crossProviderNotice": "El routing entre proveedores está activo. Revisa cada nivel antes de guardar.",
       "cards": {
         "router": {
           "title": "Enrutamiento inteligente de modelos",
           "badge": "Uso eficiente de tokens",
-          "desc": "Asigna un modelo adecuado a cada solicitud para evitar usar modelos de mayor capacidad en tareas sencillas."
+          "desc": "Cada solicitud va a un modelo adecuado; las tareas simples salen baratas."
         },
         "ensemble": {
           "title": "Colaboración entre varios modelos",
           "badge": "Prioriza capacidad",
-          "desc": "Ejecuta varios modelos en paralelo y combina sus resultados para tareas complejas; normalmente usa más tokens."
+          "desc": "Varios modelos colaboran en tareas complejas. Usa más tokens."
         },
         "single": {
           "title": "Modelo fijo",
           "badge": "Predecible",
-          "desc": "Usa siempre el modelo que elijas, por lo que la selección y el consumo son más fáciles de prever."
+          "desc": "Un solo modelo para todo. Predecible y simple."
         }
       },
-      "routerDependency": "Elige modelos para cada nivel de solicitud. Un proveedor puede cubrir todos los niveles.",
+      "routerDependency": "Elige un modelo para cada nivel de solicitud. Un solo proveedor puede cubrirlos todos.",
       "ensembleTitle": "Colaboración entre varios modelos",
       "ensembleDependency": "Usa credenciales de {provider}; el modelo predeterminado del proveedor es {model}.",
       "ensembleMinimum": "Agrega al menos otro candidato para aprovechar el enrutamiento agregado.",
@@ -670,7 +678,7 @@
       "removeCandidateAria": "Quitar {model}",
       "ensembleEmpty": "Aún no hay modelos candidatos. Guarda la configuración del servicio de modelos para generar niveles de enrutamiento, o agrega candidatos manualmente.",
       "ensemblePipeline": "Cómo funciona: los modelos proponentes redactan en paralelo y el agregador fusiona los borradores en la respuesta final. Solo el agregador puede invocar herramientas.",
-      "ensembleFlowDesc": "Varios modelos redactan en paralelo y un agregador combina su trabajo en una respuesta final. Esto usa más llamadas de modelos y puede costar más.",
+      "ensembleFlowDesc": "Varios modelos redactan en paralelo y un agregador las combina en una respuesta. Usa más llamadas.",
       "legacyDynamicNotice": "Esta configuración usa el modo de ensamble automático retirado. Conviértela en una alineación personalizada para seguir editándola.",
       "legacyDynamicMigrate": "Convertir en alineación personalizada",
       "schemeLabel": "Esquema de ensamble",
@@ -1140,6 +1148,7 @@
       "providerSaved": "Proveedor guardado.",
       "providerSavedRestart": "Proveedor guardado. Se requiere reiniciar.",
       "providerProfileSaved": "{provider} se guardó para el enrutamiento.",
+      "providerActiveRemoveNeedsReplacement": "Añade y verifica otro proveedor antes de eliminar el proveedor activo.",
       "providerProfileRemoved": "Se eliminó {provider}.",
       "providerCredentialRemoved": "Se eliminaron las credenciales de {provider}.",
       "providerCredentialExternalStillActive": "Se eliminó la referencia a las credenciales de {provider} guardada en OpenSquilla, pero la variable de entorno del sistema {envKey} sigue proporcionando credenciales.",
@@ -1441,7 +1450,7 @@
     "filter": {
       "ariaLabel": "Filtrar sesiones",
       "all": "Todas",
-      "chats": "Chats",
+      "chats": "Tareas",
       "automations": "Automatizaciones",
       "channels": "Canales"
     },
@@ -1550,7 +1559,6 @@
     "overview": {
       "title": "Estado",
       "subtitle": "Preparación, uso y estado de ejecución.",
-      "openChat": "Abrir chat",
       "totalTokens": "Total de tokens",
       "totalSessions": "Total de sesiones",
       "totalSessionsTitle": "Total de sesiones en todos los estados",
@@ -1576,6 +1584,7 @@
       "noFindings": "No se devolvieron hallazgos.",
       "recoveryRestart": "La recuperación requiere reiniciar",
       "openSettings": "Abrir ajustes",
+      "findingDetails": "Detalles",
       "findingFallback": "Hallazgo {n}",
       "copyCommand": "Copiar comando",
       "step": "Paso",
@@ -1594,11 +1603,6 @@
         "actionRequired": "Acción requerida",
         "degraded": "Degradado",
         "unavailable": "No disponible"
-      },
-      "steps": {
-        "optional": "Pasos de configuración opcionales",
-        "reference": "Pasos de referencia",
-        "recovery": "Pasos de recuperación"
       },
       "badge": {
         "diagnostic": "Diagnósticos incompletos",
@@ -2501,9 +2505,13 @@
     "bundleReady": "Paquete de soporte descargado"
   },
   "usageLogs": {
+    "tasks": {
+      "unnamed": "Tarea sin título"
+    },
     "usage": {
       "title": "Uso",
-      "subtitle": "Tokens, coste y gasto por modelo en todas las sesiones.",
+      "subtitle": "Tokens, coste y uso de modelos por tarea.",
+      "actions": "Acciones de uso",
       "currency": "Moneda",
       "usDollar": "Dólar estadounidense",
       "chineseYuan": "Yuan chino",
@@ -2515,9 +2523,9 @@
     "summary": {
       "totalTokens": "Total de tokens",
       "totalCost": "Coste total",
-      "sessions": "Sesiones",
+      "sessions": "Tareas",
       "acrossAllModels": "en todos los modelos",
-      "avgCostPerSession": "Coste medio / sesión",
+      "avgCostPerSession": "Coste medio / tarea",
       "runningAverage": "media móvil"
     },
     "tokenParts": {
@@ -2530,10 +2538,10 @@
     "nativeCostHintTitle": "La factura original del proveedor está en CNY; el valor USD usa la tasa fija registrada en el recibo.",
     "nativeMixedCostHintTitle": "La facturación en monedas mixtas o pendiente permanece en USD canónicos; los recibos originales confirmados se muestran por separado.",
     "nativeBillingSubtotals": "Recibos originales: {amounts}",
-    "rangeHiddenHint": "{count} sesiones heredadas sin fecha ocultas",
+    "rangeHiddenHint": "{count} tareas históricas sin fecha ocultas",
     "coverage": {
-      "approximate": "Gateway antiguo: los rangos de fechas son aproximaciones de totales por sesión.",
-      "partial": "La migración del libro de uso sigue en curso; se muestra todo el uso conocido.",
+      "approximate": "Parte del uso histórico se estima a partir de los totales por tarea.",
+      "partial": "Se muestra todo el uso registrado actualmente.",
       "timezoneFallback": "La zona horaria {requested} no es válida; las fechas se agrupan según {effective}.",
       "legacyIncluded": "El uso anterior al libro se incluye en el total, pero no puede asignarse a una fecha.",
       "estimated": "Incluye {count} llamadas estimadas.",
@@ -2551,10 +2559,10 @@
       "input": "Entrada",
       "output": "Salida",
       "emptyWindow": "No hay datos en la ventana seleccionada.",
-      "openSession": "Abrir {session}",
+      "openTask": "Abrir la tarea «{task}»",
       "daily": "Uso diario",
-      "topByCost": "Sesiones principales por coste",
-      "topByTokens": "Sesiones principales por total de tokens",
+      "topByCost": "Tareas principales por coste",
+      "topByTokens": "Tareas principales por total de tokens",
       "showingOf": "mostrando {shown} de {total}"
     },
     "models": {
@@ -2569,19 +2577,19 @@
       "output": "Salida",
       "cacheRead": "Lectura de caché",
       "cacheWrite": "Escritura de caché",
-      "sessions": "Sesiones",
+      "sessions": "Tareas",
       "cost": "Coste"
     },
     "sessions": {
-      "title": "Sesiones",
-      "count": "{count} sesiones",
+      "title": "Por tarea",
+      "count": "{count} tareas",
       "emptyTitle": "Aún no hay datos de uso",
-      "emptyText": "Ejecuta una sesión y el gasto de tokens aparecerá aquí automáticamente.",
-      "openChat": "Abrir chat de {session}",
+      "emptyText": "Ejecuta una tarea y su uso de tokens aparecerá aquí automáticamente.",
+      "openChat": "Abrir la tarea «{task}»",
       "autoModels": "auto · {count} modelos"
     },
     "columns": {
-      "session": "Sesión",
+      "session": "Tarea",
       "modified": "Modificado",
       "input": "Entrada",
       "output": "Salida",
@@ -2733,7 +2741,7 @@
     "retryingSessionDescription": "Restaurando el historial de la conversación…",
     "retryingSessionAction": "Volviendo a cargar…",
     "noMessagesYet": "Aún no hay mensajes.",
-    "newChat": "Nuevo chat",
+    "newChat": "Nueva tarea",
     "chatWithSuffix": "Chat {suffix}",
     "copied": "Copiado",
     "copy": "Copiar",
@@ -3164,17 +3172,19 @@
     "cmdp": {
       "dialogLabel": "Buscar e ir a",
       "resultsLabel": "Resultados",
-      "placeholder": "Buscar páginas, acciones y conversaciones…",
+      "placeholder": "Buscar tareas",
+      "groupRecents": "Tareas recientes",
+      "recentsEmpty": "Aún no hay tareas",
       "noMatches": "Sin coincidencias",
-      "searching": "Buscando conversaciones…",
-      "untitledChat": "Chat sin título",
+      "searching": "Buscando tareas…",
+      "untitledChat": "Tarea sin título",
       "groupWork": "Trabajo",
       "groupManage": "Gestionar",
       "groupMonitor": "Resumen",
       "groupActions": "Acciones",
-      "groupConversations": "Conversaciones",
+      "groupConversations": "Tareas",
       "groupMessages": "Mensajes",
-      "actionNewChat": "Nuevo chat",
+      "actionNewChat": "Nueva tarea",
       "actionOpenSettings": "Abrir Ajustes",
       "actionToggleTheme": "Cambiar tema",
       "actionBgmEnable": "Activar música de fondo",
@@ -3190,14 +3200,14 @@
       "retry": "Reintentar"
     },
     "sidebar": {
-      "recentConversations": "Conversaciones recientes",
+      "recentConversations": "Tareas recientes",
       "recents": "Recientes",
-      "refresh": "Actualizar conversaciones",
+      "refresh": "Recargar tareas",
       "clearAgentFilter": "Borrar filtro de agente: {name}",
-      "loadError": "No se pudieron cargar las sesiones",
+      "loadError": "No se pueden cargar las tareas",
       "noMatches": "Sin coincidencias",
-      "noConversations": "Aún no hay conversaciones.",
-      "startChat": "Inicia un chat",
+      "noConversations": "Aún no hay tareas.",
+      "startChat": "Iniciar una tarea",
       "linkSessions": "Sesiones",
       "linkOverview": "Resumen",
       "renameLabel": "Renombrar {title}",

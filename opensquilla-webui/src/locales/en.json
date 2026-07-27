@@ -70,8 +70,8 @@
     "dismiss": "Dismiss"
   },
   "nav": {
-    "chat": "Chat",
-    "chat-new": "New chat",
+    "chat": "Task",
+    "chat-new": "New task",
     "sessions": "Sessions",
     "agents": "Agents",
     "channels": "Channels",
@@ -81,6 +81,7 @@
     "overview": "Overview",
     "status": "Status",
     "usage": "Usage",
+    "viewUsage": "View usage",
     "logs": "Logs",
     "settings": "Settings",
     "groupBuild": "Build",
@@ -98,7 +99,9 @@
     "settings": "Settings",
     "theme": "Theme",
     "language": "Language",
-    "newChat": "New chat",
+    "newTask": "New task",
+    "newTaskTitle": "Start a new task",
+    "searchChats": "Search tasks",
     "more": "More",
     "moreDestinations": "More destinations",
     "expandSidebar": "Expand sidebar",
@@ -235,7 +238,7 @@
       "applyLiveNote": "Most changes apply live; some need a gateway restart",
       "discardTitle": "Discard unsaved changes?",
       "discardBody": "You have unsaved edits. Closing now will lose them.",
-      "discardPrimary": "Discard"
+      "discardConfirmPrimary": "Discard changes"
     },
     "rail": {
       "connection": "Connection",
@@ -335,10 +338,10 @@
     "provider": {
       "title": "Provider",
       "pageTitle": "Model Service",
-      "pageDesc": "Connect model providers and manage credentials, endpoints, and the direct/fallback model. Choose how models are used in Model Routing.",
+      "pageDesc": "Connect providers and manage their credentials and models.",
       "configuredTitle": "Configured providers",
       "configuredCount": "{count}",
-      "configuredSummary": "{ready} of {count} credentials ready. Verification sends one small model request and may incur provider charges.",
+      "configuredSummary": "{ready} of {count} ready. Testing sends one small model request.",
       "configuredDesc": "Saved providers remain available for routing until you remove them. Configuration verification sends a small model request using the saved settings; provider charges may apply.",
       "activeBadge": "Active",
       "editingBadge": "Editing",
@@ -350,11 +353,15 @@
       "emptyRoutingHint": "Once connected, you can set up intelligent routing; one provider can still route between multiple models.",
       "addProvider": "Add provider",
       "catalogTitle": "Add provider",
-      "catalogDesc": "Choose a provider. Its configuration will open directly below.",
+      "catalogDesc": "Choose a provider, then add its API key and model in one focused window.",
       "featuredProviders": "Featured providers",
       "allProviders": "All providers",
       "providerResultCount": "{count} available",
       "recommendedBadge": "Recommended",
+      "recommendedProviders": "Recommended",
+      "otherProviders": "Other providers",
+      "limitedFreeBadge": "Limited-time free access",
+      "alreadyConfigured": "Already added",
       "browseAllProviders": "Browse all providers ({count})",
       "providerResults": "Provider results",
       "viewAllProviders": "View all ({count})",
@@ -429,7 +436,8 @@
       "modelPlaceholder": "Enter a model id",
       "activating": "Activating…",
       "modelDiscoveryFailed": "Couldn't discover models. Enter a model id manually.",
-      "upgradeGatewayHint": "Update and restart the Gateway to use provider activation.",
+      "upgradeGatewayHint": "Update and restart the Gateway to use provider management.",
+      "profileSaveUnsupported": "This Gateway stores one active provider. After verification, Save changes replaces the current provider.",
       "connectedLatency": "Configuration verified · Complete probe {latency} ms",
       "connectionKeyRejected": "Key rejected",
       "connectionUnavailable": "Connection unavailable",
@@ -448,7 +456,10 @@
       "profileModelHint": "This saved model becomes the direct/fallback model if you make this provider active. Routed models remain separate in Model Routing.",
       "removeConfirmTitle": "Remove provider?",
       "removeConfirmBody": "Remove {provider} from configured providers? Referenced providers cannot be removed.",
+      "removeActiveConfirmBody": "Remove {provider} and switch the active provider to {replacement}? Referenced providers cannot be removed.",
       "removeConfirmPrimary": "Remove provider",
+      "saveChanges": "Save changes",
+      "verifyAndConnect": "Verify and connect",
       "needs": "Provider needs",
       "choose": "Choose a provider",
       "chooseProviderShort": "choose provider",
@@ -460,7 +471,6 @@
       "recommendation": {
         "title": "Recommended: TokenRhythm",
         "value": "TokenRhythm API calls are free for a limited time.",
-        "registration": "During the promotion, register and get an API key to call DeepSeek, GLM, MiniMax, Kimi, and other leading models for free.",
         "cta": "Register and get an API key",
         "externalLabel": "Register and get an API key — TokenRhythm (opens in a new tab)",
         "stepsLabel": "How to connect TokenRhythm",
@@ -607,24 +617,22 @@
     },
     "modelStrategy": {
       "title": "Model routing",
-      "desc": "Choose how Squilla selects and uses configured models for new requests.",
+      "desc": "Choose how models are picked for each request.",
       "modeTitle": "Choose how models are used",
-      "modeDesc": "Choose by outcome: intelligent routing balances token use and model capability; a fixed model keeps selection predictable; multi-model collaboration prioritizes capability for complex tasks and usually uses more tokens.",
       "providerFirstTitle": "Add a model provider to start",
-      "providerFirst": "Model routing needs at least one saved provider. One provider is enough to route among its configured models.",
+      "providerFirst": "Model routing needs at least one saved provider.",
       "providerAction": "Go to Model Service",
-      "configuredProvidersOnly": "Available providers and models come from Model Service.",
+      "configuredProvidersOnly": "Models come from Model Service.",
       "manageProviders": "Manage Model Service",
       "routerTitle": "Intelligent model routing",
       "fallbackTierLabel": "When routing is uncertain",
-      "fallbackTierDesc": "Use this default tier when routing cannot confidently determine the request level.",
+      "fallbackTierDesc": "Used when routing can't judge a request's level.",
       "modelRolesTitle": "Model roles",
-      "modelRolesDesc": "Define which model handles each request complexity level.",
-      "advancedTitle": "Display options",
-      "advancedDesc": "Change how routing information appears in chat without affecting model selection.",
+      "advancedTitle": "Advanced options",
+      "advancedDesc": "Fallback tier and how routing appears in chat.",
       "visualModeLabel": "Routing decision panel style",
-      "visualModeDesc": "Choose how the routing decision panel appears in chat replies. This does not change routing behavior.",
-      "routerDependency": "Choose models for each request level. One provider can supply every level.",
+      "visualModeDesc": "How the routing decision appears in chat replies.",
+      "routerDependency": "Pick a model for each request level. One provider can supply every level.",
       "ensembleTitle": "Multi-model collaboration",
       "ensembleDependency": "Uses {provider} credentials; provider default model is {model}.",
       "ensembleMinimum": "Add at least one more candidate to benefit from ensemble routing.",
@@ -641,17 +649,17 @@
         "router": {
           "title": "Intelligent model routing",
           "badge": "Token-efficient",
-          "desc": "Match each request to an appropriate model so simple tasks avoid unnecessary high-capability usage."
+          "desc": "Each request goes to a fitting model, so simple tasks stay cheap."
         },
         "ensemble": {
           "title": "Multi-model collaboration",
           "badge": "Capability-first",
-          "desc": "Run multiple models in parallel and combine their work for complex tasks; this usually uses more tokens."
+          "desc": "Several models tackle complex tasks together. Uses more tokens."
         },
         "single": {
           "title": "Fixed model",
           "badge": "Predictable",
-          "desc": "Always use the model you choose, making model selection and usage easier to anticipate."
+          "desc": "One model for everything. Predictable and simple."
         }
       },
       "openrouterFixedTitle": "{provider} fixed ensemble",
@@ -670,7 +678,7 @@
       "removeCandidateAria": "Remove {model}",
       "ensembleEmpty": "No candidate models yet. Save your Model Service settings to seed model tiers, or add candidates manually.",
       "ensemblePipeline": "How it works: proposer models draft in parallel, then the aggregator fuses the drafts into the final reply. Only the aggregator can call tools.",
-      "ensembleFlowDesc": "Several models draft in parallel, then an aggregator combines their work into one final answer. This uses more model calls and may cost more.",
+      "ensembleFlowDesc": "Models draft in parallel; an aggregator merges them into one answer. Uses more calls.",
       "legacyDynamicNotice": "This configuration uses the retired automatic ensemble mode. Convert it to a custom lineup to keep editing it here.",
       "legacyDynamicMigrate": "Convert to custom lineup",
       "schemeLabel": "Ensemble scheme",
@@ -1140,6 +1148,7 @@
       "providerSaved": "Provider saved.",
       "providerSavedRestart": "Provider saved. Restart required.",
       "providerProfileSaved": "{provider} was saved for routing.",
+      "providerActiveRemoveNeedsReplacement": "Add and verify another provider before removing the active provider.",
       "providerProfileRemoved": "{provider} was removed.",
       "providerCredentialRemoved": "{provider} credential was removed.",
       "providerCredentialExternalStillActive": "Cleared {provider}'s saved credential reference, but system environment variable {envKey} is still providing a credential.",
@@ -1441,7 +1450,7 @@
     "filter": {
       "ariaLabel": "Filter sessions",
       "all": "All",
-      "chats": "Chats",
+      "chats": "Tasks",
       "automations": "Automations",
       "channels": "Channels"
     },
@@ -1550,7 +1559,6 @@
     "overview": {
       "title": "Status",
       "subtitle": "Readiness, usage, and runtime health.",
-      "openChat": "Open chat",
       "totalTokens": "Total tokens",
       "totalSessions": "Total sessions",
       "totalSessionsTitle": "Total sessions across all statuses",
@@ -1576,6 +1584,7 @@
       "noFindings": "No findings returned.",
       "recoveryRestart": "Recovery requires restart",
       "openSettings": "Open settings",
+      "findingDetails": "Details",
       "findingFallback": "Finding {n}",
       "copyCommand": "Copy command",
       "step": "Step",
@@ -1594,11 +1603,6 @@
         "actionRequired": "Action required",
         "degraded": "Degraded",
         "unavailable": "Unavailable"
-      },
-      "steps": {
-        "optional": "Optional setup steps",
-        "reference": "Reference steps",
-        "recovery": "Recovery steps"
       },
       "badge": {
         "diagnostic": "Diagnostics incomplete",
@@ -2501,9 +2505,13 @@
     "bundleReady": "Support bundle downloaded"
   },
   "usageLogs": {
+    "tasks": {
+      "unnamed": "Untitled task"
+    },
     "usage": {
       "title": "Usage",
-      "subtitle": "Tokens, cost, and per-model spend across every session.",
+      "subtitle": "Tokens, cost, and model usage across tasks.",
+      "actions": "Usage actions",
       "currency": "Currency",
       "usDollar": "US Dollar",
       "chineseYuan": "Chinese Yuan",
@@ -2515,9 +2523,9 @@
     "summary": {
       "totalTokens": "Total tokens",
       "totalCost": "Total cost",
-      "sessions": "Sessions",
+      "sessions": "Tasks",
       "acrossAllModels": "across all models",
-      "avgCostPerSession": "Avg cost / session",
+      "avgCostPerSession": "Avg cost / task",
       "runningAverage": "running average"
     },
     "tokenParts": {
@@ -2530,10 +2538,10 @@
     "nativeCostHintTitle": "The original provider bill is in CNY; USD uses the fixed normalization rate recorded on the receipt.",
     "nativeMixedCostHintTitle": "Mixed-currency or pending billing stays in canonical USD; original confirmed receipts are shown separately.",
     "nativeBillingSubtotals": "Original receipts: {amounts}",
-    "rangeHiddenHint": "{count} undated legacy sessions hidden",
+    "rangeHiddenHint": "{count} undated historical tasks hidden",
     "coverage": {
-      "approximate": "Older Gateway: date ranges use approximate session-lifetime totals.",
-      "partial": "Usage-ledger migration is still completing; all known usage is shown.",
+      "approximate": "Some historical usage is estimated from task totals.",
+      "partial": "All currently recorded usage is shown.",
       "timezoneFallback": "Timezone {requested} is invalid; dates are grouped in {effective}.",
       "legacyIncluded": "Pre-ledger usage is included in the total but cannot be assigned to a date.",
       "estimated": "Includes {count} estimated calls.",
@@ -2551,10 +2559,10 @@
       "input": "Input",
       "output": "Output",
       "emptyWindow": "No data in the selected window.",
-      "openSession": "Open {session}",
+      "openTask": "Open task “{task}”",
       "daily": "Daily usage",
-      "topByCost": "Top sessions by cost",
-      "topByTokens": "Top sessions by total tokens",
+      "topByCost": "Top tasks by cost",
+      "topByTokens": "Top tasks by total tokens",
       "showingOf": "showing {shown} of {total}"
     },
     "models": {
@@ -2569,19 +2577,19 @@
       "output": "Output",
       "cacheRead": "Cache R",
       "cacheWrite": "Cache W",
-      "sessions": "Sessions",
+      "sessions": "Tasks",
       "cost": "Cost"
     },
     "sessions": {
-      "title": "Sessions",
-      "count": "{count} sessions",
+      "title": "By task",
+      "count": "{count} tasks",
       "emptyTitle": "No usage data yet",
-      "emptyText": "Run a session and token spend will appear here automatically.",
-      "openChat": "Open chat for {session}",
+      "emptyText": "Run a task and its token usage will appear here automatically.",
+      "openChat": "Open task “{task}”",
       "autoModels": "auto · {count} models"
     },
     "columns": {
-      "session": "Session",
+      "session": "Task",
       "modified": "Modified",
       "input": "Input",
       "output": "Output",
@@ -2733,7 +2741,7 @@
     "retryingSessionDescription": "Restoring conversation history…",
     "retryingSessionAction": "Reloading…",
     "noMessagesYet": "No messages yet.",
-    "newChat": "New chat",
+    "newChat": "New task",
     "chatWithSuffix": "Chat {suffix}",
     "copied": "Copied",
     "copy": "Copy",
@@ -3164,17 +3172,19 @@
     "cmdp": {
       "dialogLabel": "Search and go to",
       "resultsLabel": "Results",
-      "placeholder": "Search pages, actions, and conversations…",
+      "placeholder": "Search tasks",
+      "groupRecents": "Recent tasks",
+      "recentsEmpty": "No tasks yet",
       "noMatches": "No matches",
-      "searching": "Searching conversations…",
-      "untitledChat": "Untitled chat",
+      "searching": "Searching tasks…",
+      "untitledChat": "Untitled task",
       "groupWork": "Work",
       "groupManage": "Manage",
       "groupMonitor": "Overview",
       "groupActions": "Actions",
-      "groupConversations": "Conversations",
+      "groupConversations": "Tasks",
       "groupMessages": "Messages",
-      "actionNewChat": "New chat",
+      "actionNewChat": "New task",
       "actionOpenSettings": "Open Settings",
       "actionToggleTheme": "Toggle theme",
       "actionBgmEnable": "Enable background music",
@@ -3190,14 +3200,14 @@
       "retry": "Retry"
     },
     "sidebar": {
-      "recentConversations": "Recent conversations",
+      "recentConversations": "Recent tasks",
       "recents": "Recents",
-      "refresh": "Refresh conversations",
+      "refresh": "Reload tasks",
       "clearAgentFilter": "Clear agent filter: {name}",
-      "loadError": "Unable to load sessions",
+      "loadError": "Unable to load tasks",
       "noMatches": "No matches",
-      "noConversations": "No conversations yet.",
-      "startChat": "Start a chat",
+      "noConversations": "No tasks yet.",
+      "startChat": "Start a task",
       "linkSessions": "Sessions",
       "linkOverview": "Overview",
       "renameLabel": "Rename {title}",
