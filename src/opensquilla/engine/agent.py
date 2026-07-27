@@ -8793,8 +8793,16 @@ class Agent:
                                 )
                             ):
                                 _attempt_retries_used[_ProviderAttemptKind.REASONING_ONLY] += 1
-                                _thinking_fallback_done = True
-                                _disable_thinking_for_next_provider_call = True
+                                disable_thinking = bool(
+                                    getattr(
+                                        self.config,
+                                        "reasoning_only_thinking_fallback",
+                                        False,
+                                    )
+                                )
+                                if disable_thinking:
+                                    _thinking_fallback_done = True
+                                    _disable_thinking_for_next_provider_call = True
                                 logger.warning(
                                     "provider.large_context_visible_retry",
                                     session_key=self._session_key,
@@ -8813,13 +8821,18 @@ class Agent:
                                     iter_output_tokens=iter_output_tokens,
                                     iter_reasoning_tokens=iter_reasoning_tokens,
                                     reasoning_chars=len(iter_reasoning_content or ""),
+                                    thinking_disabled=disable_thinking,
                                 )
                                 yield WarningEvent(
                                     code="provider_large_context_visible_retry",
                                     message=(
                                         "The provider returned reasoning without visible "
-                                        "content for a large input; retrying once with "
-                                        "thinking disabled."
+                                        "content for a large input; "
+                                        + (
+                                            "retrying once with thinking disabled."
+                                            if disable_thinking
+                                            else "retrying once to request visible content."
+                                        )
                                     ),
                                 )
                                 _call_attempt += 1
