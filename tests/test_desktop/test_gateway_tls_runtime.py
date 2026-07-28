@@ -1,6 +1,8 @@
 import importlib.util
+import json
 import os
 import runpy
+import subprocess
 import sys
 from collections.abc import Iterator
 from pathlib import Path
@@ -280,6 +282,32 @@ def test_desktop_build_and_smoke_wire_the_ca_contract() -> None:
         "SSL_CERT_FILE",
     ):
         assert f"'{name}'" in smoke_source
+
+
+def test_gateway_entry_runs_hidden_filesystem_worker_without_entering_cli(
+    tmp_path: Path,
+) -> None:
+    gateway_entry = ROOT / "desktop/electron/scripts/gateway-entry.py"
+    target = tmp_path / "worker-probe.txt"
+    target.write_text("worker-ok\n", encoding="utf-8")
+    payload = {
+        "kind": "read_file",
+        "path": str(target),
+        "displayPath": str(target),
+    }
+
+    completed = subprocess.run(
+        [sys.executable, str(gateway_entry), "--_sandbox-filesystem-worker"],
+        input=json.dumps(payload),
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=20,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout) == {"message": "1\tworker-ok\n"}
+    assert completed.stderr == ""
 
 
 def test_desktop_gateway_entry_routes_sandbox_helper_before_cli(

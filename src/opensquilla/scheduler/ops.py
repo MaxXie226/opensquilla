@@ -6,7 +6,6 @@ from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from opensquilla.sandbox.run_mode import RunMode, execution_target, normalize_run_mode
 from opensquilla.session.keys import normalize_agent_id
 
 from .delivery import validate_webhook_url
@@ -25,6 +24,13 @@ from .types import (
     ScheduleKind,
     SessionTarget,
 )
+
+_RUN_MODE_ALIASES = {
+    "bypass": "full",
+    "standard-sandbox": "standard",
+    "standard_sandbox": "standard",
+}
+_PERSISTED_RUN_MODES = frozenset({"standard", "trusted", "full"})
 
 
 def _validate_structured_schedule(
@@ -64,6 +70,20 @@ def _coerce_wake_mode(value: CronWakeMode | str) -> CronWakeMode:
     if isinstance(value, CronWakeMode):
         return value
     return CronWakeMode(str(value or CronWakeMode.NOW.value).strip().lower())
+
+
+def _persisted_run_mode(value: str, *, creator_is_owner: bool) -> str:
+    """Resolve the already-authorized execution mode at the scheduler boundary."""
+
+    normalized = str(value or "").strip().lower()
+    normalized = _RUN_MODE_ALIASES.get(normalized, normalized)
+    if not normalized:
+        normalized = "full" if creator_is_owner else "trusted"
+    if normalized not in _PERSISTED_RUN_MODES:
+        raise ValueError(f"unsupported cron run_mode: {value!r}")
+    if normalized == "full" and not creator_is_owner:
+        return "trusted"
+    return normalized
 
 
 def _delivery_requested(delivery: DeliveryConfig | None) -> bool:
@@ -202,13 +222,10 @@ class SchedulerOps:
             delivery=delivery or DeliveryConfig(),
             explicit_delivery=delivery is not None,
         )
-        effective_run_mode = (
-            normalize_run_mode(run_mode)
-            if run_mode
-            else (RunMode.FULL if creator_is_owner else RunMode.TRUSTED)
+        effective_run_mode = _persisted_run_mode(
+            run_mode,
+            creator_is_owner=creator_is_owner,
         )
-        if effective_run_mode is RunMode.FULL and not creator_is_owner:
-            effective_run_mode = RunMode.TRUSTED
 
         job = CronJob(
             name=name,
@@ -230,9 +247,9 @@ class SchedulerOps:
             creator_session_key=creator_session_key or "",
             creator_sender_id=creator_sender_id or "",
             creator_is_owner=bool(creator_is_owner),
-            run_mode=effective_run_mode.value,
-            elevated="full" if effective_run_mode is RunMode.FULL else "",
-            execution_target=execution_target(effective_run_mode),
+            run_mode=effective_run_mode,
+            elevated="full" if effective_run_mode == "full" else "",
+            execution_target="host" if effective_run_mode == "full" else "sandbox",
             idempotency_key=idempotency_key,
         )
 
