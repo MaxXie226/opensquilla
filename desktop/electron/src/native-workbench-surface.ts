@@ -18,6 +18,7 @@ import {
   type NativeWorkbenchSurfaceRect,
   type NativeWorkbenchSurfaceRectRequest,
 } from './native-workbench-surface-contract.js'
+import { installDesktopZoomShortcuts } from './desktop-zoom-shortcuts.js'
 
 function artifactHtmlCsp(allowRemoteResources: boolean): string {
   const remote = allowRemoteResources ? ' https:' : ''
@@ -55,6 +56,7 @@ interface NativeWorkbenchSurfaceRecord {
   crashed: boolean
   missingResourceReported: boolean
   subresourceRequestCount: number
+  removeZoomShortcuts: () => void
 }
 
 // A single-file preview cannot legitimately need an unbounded number of
@@ -154,7 +156,13 @@ export class NativeWorkbenchSurfaceManager {
       crashed: false,
       missingResourceReported: false,
       subresourceRequestCount: 0,
+      removeZoomShortcuts: () => {},
     }
+    record.removeZoomShortcuts = installDesktopZoomShortcuts(
+      record.view.webContents,
+      owner.webContents,
+      () => this.refreshBounds(owner),
+    )
     this.surfaces.set(record.id, record)
 
     try {
@@ -246,6 +254,9 @@ export class NativeWorkbenchSurfaceManager {
     record.disposed = true
     record.visibleRequested = false
 
+    try {
+      record.removeZoomShortcuts()
+    } catch {}
     try {
       record.view.setVisible(false)
       if (!record.owner.isDestroyed()) record.owner.contentView.removeChildView(record.view)
@@ -429,6 +440,10 @@ export class NativeWorkbenchSurfaceManager {
     try {
       record.view.setVisible(visible)
     } catch {}
+  }
+
+  refreshBounds(owner: BrowserWindow): void {
+    this.reapplyActiveBounds(owner)
   }
 
   private reapplyActiveBounds(owner: BrowserWindow): void {
