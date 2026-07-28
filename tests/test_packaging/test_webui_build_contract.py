@@ -127,6 +127,8 @@ def _build_env(**updates: str) -> dict[str, str]:
     env = os.environ.copy()
     env.pop(BUILD_UI_MODE_ENV, None)
     env.pop(BUILD_UI_ARTIFACT_ENV, None)
+    env.pop("OPENSQUILLA_BUILD_COMMIT", None)
+    env.pop("GITHUB_SHA", None)
     env.update(updates)
     return env
 
