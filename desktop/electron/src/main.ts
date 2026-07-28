@@ -84,6 +84,11 @@ import {
   type DesktopPreferencesFile,
 } from './desktop-window-lifecycle.js'
 import {
+  DESKTOP_DEEP_LINK_SCHEME,
+  desktopDeepLinkArguments,
+  parseDesktopDeepLink,
+} from './desktop-deep-link.js'
+import {
   NATIVE_WORKBENCH_ARTIFACT_SCHEME,
   parseNativeWorkbenchCreateRequest,
   parseNativeWorkbenchSurfaceId,
@@ -332,6 +337,8 @@ let systemSessionEnding = false
 let windowsSessionEndPreviousPhase: DesktopExitPhase | null = null
 let windowsSessionEndResetTimer: NodeJS.Timeout | null = null
 let mainWindowClosePrompt: Promise<void> | null = null
+let pendingDesktopDeepLinkOpen = false
+let desktopDeepLinkActivationReady = false
 let desktopPreferencesCache: {
   value: DesktopPreferencesFile
   writable: boolean
@@ -4149,14 +4156,96 @@ function hideMainWindow(window: BrowserWindow): void {
   showWindowsBackgroundCloseNotice()
 }
 
+async function activateMainWindow(source = 'desktop-activation'): Promise<void> {
+  if (!canRevealDesktopApp(appExitPhase)) {
+    desktopLog('main_window_activation_ignored', { source, appExitPhase })
+    return
+  }
+
+  // Surface an existing window immediately while any single-flight startup or
+  // Gateway recovery continues in the background.
+  if (process.platform === 'darwin') app.focus({ steal: true })
+  const focusedImmediately = focusMainWindow()
+
+  // Profile migration, cleanup, update, and quit drains may safely reveal an
+  // existing renderer, but must not create a replacement window or Gateway.
+  if (isQuitting) {
+    desktopLog('main_window_activation_during_shutdown', {
+      source,
+      focused: focusedImmediately,
+    })
+    return
+  }
+
+  await openOrResumeDesktopApp()
+
+  // openOrResumeDesktopApp creates the window when it was absent. Repeat the
+  // idempotent focus sequence after that asynchronous boundary.
+  if (process.platform === 'darwin') app.focus({ steal: true })
+  const focused = focusMainWindow()
+  desktopLog('main_window_activated', {
+    source,
+    created: !focusedImmediately,
+    focused,
+  })
+}
+
 function revealDesktopApp(): void {
-  if (!canRevealDesktopApp(appExitPhase)) return
-  focusMainWindow()
-  // Profile migration and cleanup reuse isQuitting as a spawn gate. The hidden
-  // renderer is still safe to reveal during those operations, but opening a
-  // missing window or starting another Gateway is not.
-  if (isQuitting) return
-  void openOrResumeDesktopApp()
+  void activateMainWindow('desktop-reveal')
+}
+
+function handleDeepLink(rawUrl: unknown, source = 'unknown'): boolean {
+  const action = parseDesktopDeepLink(rawUrl)
+  if (action !== 'open') {
+    // Never persist an untrusted URL: query strings may contain credentials or
+    // other private browser state even though this parser rejects them.
+    desktopLog('deep_link_ignored', { source })
+    return false
+  }
+
+  desktopLog('deep_link_accepted', {
+    source,
+    action,
+    activationReady: desktopDeepLinkActivationReady,
+  })
+  if (!desktopDeepLinkActivationReady) {
+    pendingDesktopDeepLinkOpen = true
+    return true
+  }
+
+  void activateMainWindow(`deep-link:${source}`)
+  return true
+}
+
+function handleDeepLinksFromCommandLine(
+  commandLine: readonly string[],
+  source: string,
+): boolean {
+  const candidates = desktopDeepLinkArguments(commandLine)
+  for (const candidate of candidates) handleDeepLink(candidate, source)
+  return candidates.length > 0
+}
+
+function activatePendingDesktopDeepLink(): boolean {
+  if (!pendingDesktopDeepLinkOpen) return false
+  pendingDesktopDeepLinkOpen = false
+  void activateMainWindow('deep-link:pending')
+  return true
+}
+
+function registerDesktopDeepLinkProtocolClient(): void {
+  if (!app.isPackaged) {
+    desktopLog('deep_link_protocol_registration_skipped', { reason: 'development' })
+    return
+  }
+  try {
+    const registered = app.setAsDefaultProtocolClient(DESKTOP_DEEP_LINK_SCHEME)
+    desktopLog('deep_link_protocol_registered', { registered })
+  } catch (error) {
+    desktopLog('deep_link_protocol_registration_failed', {
+      error: error instanceof Error ? error.message : String(error),
+    })
+  }
 }
 
 async function promptForMainWindowClose(window: BrowserWindow): Promise<void> {
@@ -12318,6 +12407,10 @@ app.on('will-quit', destroyWindowsTray)
 
 configureChromiumKeychainPolicy()
 
+const initialDesktopDeepLinkArguments = process.platform === 'win32'
+  ? desktopDeepLinkArguments(process.argv)
+  : []
+
 // Bounded retry for the single-instance lock. A relaunch immediately after
 // closing the previous instance can race that instance's teardown (Electron
 // exit + gateway TerminateProcess), during which the lock is briefly still
@@ -12338,6 +12431,14 @@ function acquireSingleInstanceLockWithRetry(): boolean {
       desktopLog('single_instance_lock_acquired', { attempt })
       return true
     }
+    // A Windows protocol launch targets the current instance and does not need
+    // the normal close/relaunch race retry. The failed lock request has already
+    // delivered its command line through second-instance; exit the forwarding
+    // process immediately instead of sending the same deep link for five seconds.
+    if (initialDesktopDeepLinkArguments.length > 0) {
+      desktopLog('single_instance_deep_link_forwarded', { attempt })
+      return false
+    }
     const remaining = deadline - Date.now()
     if (remaining <= 0) {
       desktopLog('single_instance_lock_unavailable', { attempt })
@@ -12347,6 +12448,11 @@ function acquireSingleInstanceLockWithRetry(): boolean {
   }
 }
 
+app.on('open-url', (event, rawUrl) => {
+  event.preventDefault()
+  handleDeepLink(rawUrl, 'open-url')
+})
+
 desktopLog('launch', { platform: process.platform, argv: process.argv.length })
 const gotSingleInstanceLock = acquireSingleInstanceLockWithRetry()
 
@@ -12355,22 +12461,32 @@ if (!gotSingleInstanceLock) {
   // to surface its window (the second-instance handler calls
   // openOrResumeDesktopApp), show an explicit dialog so the launch is never a
   // silent no-op, then quit.
-  desktopLog('launch_aborted_lock_held')
-  try {
-    // This runs before app.whenReady, so app.getLocale() is unreliable; fall back
-    // to the persisted onboarding locale (a plain file read) for this dialog.
-    desktopLocale = loadPersistedDesktopLocale() ?? desktopLocale
-    dialog.showErrorBox(
-      desktopT('launch.alreadyRunningTitle'),
-      desktopT('launch.alreadyRunningMessage'),
-    )
-  } catch {
-    // Dialog is best-effort; the diagnostic log is the durable record.
+  desktopLog('launch_aborted_lock_held', {
+    deepLinkHandoff: initialDesktopDeepLinkArguments.length > 0,
+  })
+  if (initialDesktopDeepLinkArguments.length === 0) {
+    try {
+      // This runs before app.whenReady, so app.getLocale() is unreliable; fall back
+      // to the persisted onboarding locale (a plain file read) for this dialog.
+      desktopLocale = loadPersistedDesktopLocale() ?? desktopLocale
+      dialog.showErrorBox(
+        desktopT('launch.alreadyRunningTitle'),
+        desktopT('launch.alreadyRunningMessage'),
+      )
+    } catch {
+      // Dialog is best-effort; the diagnostic log is the durable record.
+    }
   }
   app.quit()
 } else {
-  app.on('second-instance', () => {
-    desktopLog('second_instance')
+  if (process.platform === 'win32') {
+    handleDeepLinksFromCommandLine(process.argv, 'initial-argv')
+  }
+
+  app.on('second-instance', (_event, commandLine) => {
+    const hadDeepLink = handleDeepLinksFromCommandLine(commandLine, 'second-instance')
+    desktopLog('second_instance', { hadDeepLink })
+    if (hadDeepLink) return
     revealDesktopApp()
   })
 
@@ -12379,7 +12495,9 @@ if (!gotSingleInstanceLock) {
     desktopLocale = loadPersistedDesktopLocale() ?? resolveDesktopLocale()
     createApplicationMenu()
     createWindowsTray()
-    void openOrResumeDesktopApp()
+    registerDesktopDeepLinkProtocolClient()
+    desktopDeepLinkActivationReady = true
+    if (!activatePendingDesktopDeepLink()) void openOrResumeDesktopApp()
     initAutoUpdater()
     if (mockUpdateVersion() !== null) {
       desktopUpdateCheckScheduler.start(MOCK_UPDATE_CHECK_INITIAL_DELAY_MS)

@@ -30,6 +30,7 @@
     "test:gateway-lifecycle": "npm run build && node scripts/test-desktop-gateway-lifecycle.mjs",
     "test:window-lifecycle": "npm run build && node scripts/test-desktop-window-lifecycle.mjs",
     "test:window-background-flow": "npm run build && node scripts/test-desktop-window-background-flow.mjs",
+    "test:deep-link": "npm run build && node scripts/test-desktop-deep-link.mjs",
     "test:gateway-orphan-recovery-flow": "npm run build && node scripts/test-desktop-gateway-orphan-recovery-flow.mjs",
     "test:profile-substrate": "npm run build && node scripts/test-desktop-profile-substrate.mjs && node scripts/test-desktop-profile-consolidation.mjs",
     "test:profile-consolidation-flow": "npm run build && node scripts/test-profile-consolidation-flow.mjs",
@@ -60,6 +61,14 @@
     "appId": "ai.opensquilla.desktop",
     "productName": "OpenSquilla",
     "artifactName": "OpenSquilla-${version}-${os}-${arch}.${ext}",
+    "protocols": [
+      {
+        "name": "OpenSquilla",
+        "schemes": [
+          "opensquilla"
+        ]
+      }
+    ],
     "publish": [
       {
         "provider": "github",
