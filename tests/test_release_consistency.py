@@ -80,6 +80,15 @@ def test_release_workflow_builds_desktop_installers() -> None:
     assert 'gh release upload "${TAG}" dist/* --clobber' in workflow
 
 
+def test_release_workflow_runs_legacy_windows_upgrade_checks_on_server_2022() -> None:
+    workflow = yaml.safe_load(
+        Path(".github/workflows/wheelhouse-release.yml").read_text(encoding="utf-8")
+    )
+
+    assert workflow["jobs"]["build-desktop-windows"]["runs-on"] == "windows-2022"
+    assert workflow["jobs"]["audit-downloaded-windows-release"]["runs-on"] == "windows-2022"
+
+
 def test_tui_companion_remains_development_only() -> None:
     """A normal version tag must not publish the in-repo development host."""
 
@@ -254,6 +263,56 @@ def test_release_profile_preservation_probe_covers_identity_config_and_chat_db(
         320,
     )
     assert last_message == ("Synthetic retained history message 0320 (contract-probe)",)
+
+    runtime_config = (
+        f'state_dir = "{home / "state"}"\n'
+        f'workspace_dir = "{home / "workspace"}"\n'
+        'search_provider = "duckduckgo"\n'
+        "config_version = 1\n"
+        "\n"
+        "[llm]\n"
+        'provider = "ollama"\n'
+        'model = "opensquilla-release-session-recovery-smoke"\n'
+        'base_url = "http://127.0.0.1:11434"\n'
+        "\n"
+        "[squilla_router]\n"
+        "enabled = false\n"
+        "\n"
+        "[llm_ensemble]\n"
+        "enabled = false\n"
+        "\n"
+        "[privacy]\n"
+        "disable_network_observability = false\n"
+        "\n"
+        "[control_ui]\n"
+        'default_locale = "en"\n'
+    )
+    (home / "config.toml").write_text(runtime_config, encoding="utf-8", newline="")
+    runtime_verified = subprocess.run(
+        [
+            sys.executable,
+            str(probe),
+            "verify-runtime",
+            "--home",
+            str(home),
+            "--label",
+            label,
+        ],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    assert "profile preservation verified after runtime migration" in runtime_verified.stdout
+    install_phase_rejected = subprocess.run(
+        [sys.executable, str(probe), "verify", "--home", str(home), "--label", label],
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    assert install_phase_rejected.returncode != 0
+    assert "during installation" in install_phase_rejected.stderr
+
+    (home / "config.toml").write_text(config_text, encoding="utf-8", newline="")
 
     reseed = subprocess.run(
         [sys.executable, str(probe), "seed", "--home", str(home), "--label", label],
@@ -444,6 +503,8 @@ def test_release_workflow_gates_built_and_downloaded_installers_on_profile_reten
     assert windows_helper.index(
         "test-packaged-session-recovery.mjs"
     ) < windows_helper.index("recovery inspect")
+    assert mac_helper.count("verify-runtime") == 2
+    assert windows_helper.count("verify-runtime") == 2
 
     mac_audit = workflow[
         workflow.index("  audit-downloaded-macos-release:") : workflow.index(
