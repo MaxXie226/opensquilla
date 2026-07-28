@@ -35,6 +35,7 @@ from opensquilla.gateway.project_workspace_runtime import (
     apply_accepted_run_mode_override,
     authoritative_project_run_context,
     map_project_workspace_error,
+    persisted_project_workspace_snapshot,
     project_workspace_snapshot,
 )
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, RpcUnavailableError, get_dispatcher
@@ -123,6 +124,7 @@ from opensquilla.session.storage import (
     TaskCollectionUnavailableError,
     TurnAcceptanceResult,
     TurnIngressConflictError,
+    bounded_interactive_storage_reads,
 )
 from opensquilla.session.terminal_reply import (
     append_error_ref,
@@ -144,6 +146,7 @@ _MAX_STAGED_PDF_BYTES = _attachment_ingest.MAX_STAGED_PDF_BYTES
 _MAX_TEXT_ATTACHMENT_BYTES = _attachment_ingest.TEXT_ATTACHMENT_BYTES
 _MAX_TOTAL_ATTACHMENT_BYTES = _attachment_ingest.MAX_TOTAL_ATTACHMENT_BYTES
 _MAX_ATTACHMENTS = _attachment_ingest.MAX_ATTACHMENTS
+_SESSION_SUBSCRIBE_REPLAY_BUDGET_SECONDS = 2.0
 
 
 def _accepts_keyword_arg(func: Any, name: str) -> bool:
@@ -5269,27 +5272,104 @@ async def _handle_sessions_unsubscribe(params: dict | None, ctx: RpcContext) -> 
     return None
 
 
-@_d.method("sessions.messages.subscribe", scope="operator.read")
-async def _handle_sessions_messages_subscribe(params: dict | None, ctx: RpcContext) -> dict:
-    key = _require_key(params)
-    subscription_mgr = getattr(ctx, "subscription_manager", None)
-    if subscription_mgr is not None:
-        subscription_mgr.subscribe_messages(ctx.conn_id, key)
-
+async def _build_sessions_messages_subscription_payload(
+    params: dict | None,
+    ctx: RpcContext,
+    *,
+    key: str,
+    subscribed: bool,
+    fast_ack: bool,
+) -> dict[str, Any]:
     replay = get_session_streams().replay(key, _optional_stream_seq(params))
     replayed_count = 0
-    if subscription_mgr is not None and replay.events:
+    if subscribed and replay.events:
         from opensquilla.gateway.websocket import get_registry
 
         conn = get_registry().get(ctx.conn_id)
         if conn is not None:
+            replay_deadline = (
+                asyncio.get_running_loop().time()
+                + _SESSION_SUBSCRIBE_REPLAY_BUDGET_SECONDS
+            )
             for event in replay.events:
-                await conn.send_event(
-                    event.event_name,
-                    event.payload,
-                    meta={"replayed": True},
-                )
+                remaining = replay_deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise TimeoutError("Session replay send budget exhausted")
+                async with asyncio.timeout(remaining):
+                    await conn.send_event(
+                        event.event_name,
+                        event.payload,
+                        meta={"replayed": True},
+                    )
                 replayed_count += 1
+
+    replay_payload = {
+        "subscribed": subscribed,
+        "key": key,
+        "current_stream_seq": replay.current_stream_seq,
+        "replay_complete": replay.replay_complete,
+        "replay_gap_reason": replay.gap_reason,
+        "replayed_count": replayed_count,
+    }
+    if fast_ack:
+        return {
+            **replay_payload,
+            **_deferred_sessions_messages_metadata(),
+        }
+    # Mixed-version clients still expect the legacy enriched ACK. Keep that
+    # payload shape, but never let its storage reads pin the connection's
+    # serialized dispatcher indefinitely.
+    with bounded_interactive_storage_reads():
+        metadata = await _hydrate_sessions_messages_metadata(
+            ctx,
+            key,
+            include_project_workspace=True,
+        )
+    return {**replay_payload, **metadata}
+
+
+def _deferred_sessions_messages_metadata() -> dict[str, Any]:
+    deferred_fields = [
+        "workspaceId",
+        "projectWorkspace",
+        "tasks",
+        "active_task",
+        "last_task",
+        "run_status",
+        "active_task_group_ids",
+        "run_mode_lock",
+        "pendingUserInputs",
+        "collaboration",
+        "currentPlan",
+        "activePlanRun",
+        "epoch",
+    ]
+    return {
+        "workspaceId": None,
+        "projectWorkspace": None,
+        "projectWorkspaceDeferred": True,
+        "active_task_group_ids": [],
+        "run_mode_lock": {"locked": True, "source": "deferred"},
+        "pendingUserInputs": [],
+        "collaboration": None,
+        "currentPlan": None,
+        "activePlanRun": None,
+        "tasks": [],
+        "active_task": None,
+        "last_task": None,
+        "run_status": "idle",
+        "hydration_complete": False,
+        "deferred_fields": deferred_fields,
+    }
+
+
+async def _hydrate_sessions_messages_metadata(
+    ctx: RpcContext,
+    key: str,
+    *,
+    include_project_workspace: bool = False,
+) -> dict[str, Any]:
+    """Load authoritative subscription metadata outside the fast ACK path."""
 
     storage = get_session_storage(getattr(ctx, "session_manager", None))
     task_rows = await _list_task_rows(ctx, storage, key)
@@ -5308,8 +5388,8 @@ async def _handle_sessions_messages_subscribe(params: dict | None, ctx: RpcConte
     session = await storage.get_session(key) if storage is not None else None
     workspace_id = getattr(session, "workspace_id", None)
     project_snapshot = (
-        await project_workspace_snapshot(storage, session)
-        if storage is not None and session is not None
+        await persisted_project_workspace_snapshot(storage, session)
+        if include_project_workspace and storage is not None and session is not None
         else None
     )
     pending_user_inputs: list[dict[str, Any]] = []
@@ -5356,15 +5436,15 @@ async def _handle_sessions_messages_subscribe(params: dict | None, ctx: RpcConte
         if active_plan_run is not None:
             active_plan_run_payload = plan_run_snapshot(active_plan_run)
 
+    project_workspace_deferred = bool(workspace_id) and not include_project_workspace
     return {
-        "subscribed": subscription_mgr is not None,
         "key": key,
         "workspaceId": workspace_id,
+        # New clients opt into a fast subscribe and refresh this field through
+        # the workspace RPC. Legacy callers retain the old payload shape using
+        # persisted binding state; turn ingress still validates the directory.
         "projectWorkspace": project_snapshot,
-        "current_stream_seq": replay.current_stream_seq,
-        "replay_complete": replay.replay_complete,
-        "replay_gap_reason": replay.gap_reason,
-        "replayed_count": replayed_count,
+        "projectWorkspaceDeferred": project_workspace_deferred,
         "active_task_group_ids": active_task_group_ids,
         "run_mode_lock": _run_mode_lock_payload(
             task_rows=task_rows,
@@ -5379,7 +5459,48 @@ async def _handle_sessions_messages_subscribe(params: dict | None, ctx: RpcConte
         "activePlanRun": active_plan_run_payload,
         **({"epoch": session_epoch} if session_epoch is not None else {}),
         **task_state,
+        "hydration_complete": True,
+        "deferred_fields": (
+            ["projectWorkspace"] if project_workspace_deferred else []
+        ),
     }
+
+
+@_d.method("sessions.messages.subscribe", scope="operator.read")
+async def _handle_sessions_messages_subscribe(params: dict | None, ctx: RpcContext) -> dict:
+    key = _require_key(params)
+    fast_ack = (params or {}).get("fast_ack") is True
+    subscription_mgr = getattr(ctx, "subscription_manager", None)
+    registered_new = False
+    if subscription_mgr is not None:
+        registered_new = ctx.conn_id not in subscription_mgr.get_message_subscribers(key)
+        subscription_mgr.subscribe_messages(ctx.conn_id, key)
+
+    try:
+        return await _build_sessions_messages_subscription_payload(
+            params,
+            ctx,
+            key=key,
+            subscribed=subscription_mgr is not None,
+            fast_ack=fast_ack,
+        )
+    except BaseException:
+        # Registration precedes replay so no event can fall into a subscribe
+        # gap.  If replay or payload assembly then fails, remove only the
+        # registration created by this request; repeated subscribe stays idempotent.
+        if subscription_mgr is not None and registered_new:
+            subscription_mgr.unsubscribe_messages(ctx.conn_id, key)
+        raise
+
+
+@_d.method("sessions.messages.hydrate", scope="operator.read")
+async def _handle_sessions_messages_hydrate(params: dict | None, ctx: RpcContext) -> dict:
+    key = _require_key(params)
+    # This is an interactive continuation of the fast subscribe ACK. Keep all
+    # storage coordination inside the same bounded-read contract as history so
+    # metadata cannot pin the connection's serialized dispatcher indefinitely.
+    with bounded_interactive_storage_reads():
+        return await _hydrate_sessions_messages_metadata(ctx, key)
 
 
 @_d.method("sessions.messages.snapshot", scope="operator.read")
@@ -5482,6 +5603,8 @@ async def _handle_sessions_resolve(params: dict | None, ctx: RpcContext) -> dict
         "status": session.status,
         "agent_id": session.agent_id,
         "model": getattr(session, "model", None),
+        "workspaceId": getattr(session, "workspace_id", None),
+        "projectWorkspaceDeferred": bool(getattr(session, "workspace_id", None)),
         "created_at": session.created_at,
         "updated_at": session.updated_at,
     }

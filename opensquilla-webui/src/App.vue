@@ -453,6 +453,10 @@ import {
   LOCAL_SESSIONS_DELETED_EVENT,
 } from './utils/sessionSync'
 import { activeTaskWasDeletedWithProjectHistory } from './utils/projectHistory'
+import {
+  optionalSessionRpcAllowed,
+  optionalSessionRpcCallOptions,
+} from './composables/chat/sessionBootstrapAdmission'
 
 const appStore = useAppStore()
 const rpcStore = useRpcStore()
@@ -529,7 +533,7 @@ watch(
   () => rpcStore.canManageProjectWorkspaces,
   allowed => {
     if (allowed) {
-      void projectWorkspaces.loadWorkspaces().catch(() => undefined)
+      scheduleSessionRefresh()
       return
     }
     projectCreateOpen.value = false
@@ -874,6 +878,10 @@ const sidebarSections = computed((): SidebarSection[] => {
 })
 
 let sessionRefreshTimer: ReturnType<typeof setTimeout> | null = null
+let sidebarRefreshPending = false
+let sidebarLoadPromise: Promise<void> | null = null
+let appAutomaticRpcMounted = false
+let appAutomaticRpcStarted = false
 
 // Hide the bottom tab bar while the on-screen keyboard owns the bottom edge.
 // A visual-viewport shrink well beyond browser-chrome changes (>140px) is the
@@ -1266,7 +1274,7 @@ function handleLocalSessionsDeleted(event: Event) {
   const deleted = new Set(detail.keys)
   removeLocalSessions(deleted)
   appStore.removePendingApprovalsForSessions(deleted)
-  void loadSessions()
+  scheduleSessionRefresh()
 }
 
 async function deleteSessions(keys: string[]): Promise<DeleteSessionsResponse | null> {
@@ -1361,28 +1369,78 @@ function openConnectionSettings() {
 }
 
 function scheduleSessionRefresh() {
+  sidebarRefreshPending = true
   if (sessionRefreshTimer) clearTimeout(sessionRefreshTimer)
   sessionRefreshTimer = setTimeout(() => {
     sessionRefreshTimer = null
-    void loadSidebarData()
+    flushScheduledSidebarRefresh()
   }, 150)
 }
 
-async function loadSidebarData() {
-  const requests: Promise<unknown>[] = [loadSessions()]
-  if (rpcStore.canManageProjectWorkspaces) {
-    requests.push(projectWorkspaces.loadWorkspaces())
+function flushScheduledSidebarRefresh() {
+  if (
+    !sidebarRefreshPending
+    || !appAutomaticRpcMounted
+    || !optionalSessionRpcAllowed.value
+  ) return
+  sidebarRefreshPending = false
+  if (sessionRefreshTimer) {
+    clearTimeout(sessionRefreshTimer)
+    sessionRefreshTimer = null
   }
-  await Promise.allSettled(requests)
+  void loadSidebarData()
+}
+
+function loadSidebarData(): Promise<void> {
+  if (sidebarLoadPromise) return sidebarLoadPromise
+  const requests: Promise<unknown>[] = [loadSessions()]
+  if (
+    rpcStore.canManageProjectWorkspaces
+    && optionalSessionRpcAllowed.value
+  ) {
+    requests.push(
+      projectWorkspaces.loadWorkspaces(optionalSessionRpcCallOptions),
+    )
+  }
+  const request = Promise.allSettled(requests).then(() => undefined)
+  const tracked = request.finally(() => {
+    if (sidebarLoadPromise === tracked) sidebarLoadPromise = null
+  })
+  sidebarLoadPromise = tracked
+  return tracked
+}
+
+function refreshSidebarDataWhenAdmitted(): void | Promise<void> {
+  if (!optionalSessionRpcAllowed.value) {
+    sidebarRefreshPending = true
+    return
+  }
+  return loadSidebarData()
 }
 
 const sessionListSubscription = useSessionListSubscription({
   rpc: rpcStore,
   isConnected: () => rpcStore.isConnected,
-  refresh: loadSidebarData,
+  isAdmitted: () => optionalSessionRpcAllowed.value,
+  refresh: refreshSidebarDataWhenAdmitted,
   scheduleRefresh: scheduleSessionRefresh,
   warn: (message, error) => console.warn(`[App] ${message}:`, errorMessage(error)),
 })
+
+function resumeAutomaticAppRpc() {
+  if (!appAutomaticRpcMounted || !optionalSessionRpcAllowed.value) return
+  sessionListSubscription.resume()
+  if (!appAutomaticRpcStarted) {
+    appAutomaticRpcStarted = true
+    void loadAgents()
+    void loadSidebarData()
+  }
+  flushScheduledSidebarRefresh()
+}
+
+watch(optionalSessionRpcAllowed, admitted => {
+  if (admitted) resumeAutomaticAppRpc()
+}, { flush: 'sync' })
 
 function handleKeydown(e: KeyboardEvent) {
   // Chord bindings carry the primary modifier as Cmd on Apple platforms and Ctrl
@@ -1593,11 +1651,11 @@ watch(() => appStore.approvalCount, count => {
 useDocumentEvent('keydown', handleKeydown)
 
 onMounted(() => {
+  appAutomaticRpcMounted = true
   window.visualViewport?.addEventListener('resize', syncMobileKeyboard)
   window.addEventListener(LOCAL_SESSIONS_DELETED_EVENT, handleLocalSessionsDeleted)
-  loadAgents()
-  void loadSidebarData()
   sessionListSubscription.subscribe()
+  resumeAutomaticAppRpc()
   // Keep the approval badge/count live app-wide, not just on the Approvals page.
   subscribeApprovals()
   // Seed now in case the socket is already connected (the `_state` listener
@@ -1606,6 +1664,8 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  appAutomaticRpcMounted = false
+  sidebarRefreshPending = false
   window.removeEventListener(LOCAL_SESSIONS_DELETED_EVENT, handleLocalSessionsDeleted)
   if (sessionRefreshTimer) clearTimeout(sessionRefreshTimer)
   sessionListSubscription.cleanup()
