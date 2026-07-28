@@ -139,6 +139,21 @@ def _config_text(home: Path, label: str) -> str:
         f"# Synthetic {label} release-preservation profile\n"
         f"state_dir = {json.dumps(str(home / 'state'))}\n"
         f"workspace_dir = {json.dumps(str(home / 'workspace'))}\n"
+        'search_provider = "duckduckgo"\n'
+        "\n"
+        "[llm]\n"
+        'provider = "ollama"\n'
+        'model = "opensquilla-release-session-recovery-smoke"\n'
+        'base_url = "http://127.0.0.1:11434"\n'
+        "\n"
+        "[squilla_router]\n"
+        "enabled = false\n"
+        "\n"
+        "[llm_ensemble]\n"
+        "enabled = false\n"
+        "\n"
+        "[privacy]\n"
+        "disable_network_observability = false\n"
     )
 
 
