@@ -590,6 +590,10 @@ class ServiceContainer:
     usage_event_sink: Any = None
     usage_backfill_task: asyncio.Task[Any] | None = None
     sandbox_setup_task: asyncio.Task[Any] | None = field(default=None, repr=False)
+    profile_import_maintenance_task: asyncio.Task[Any] | None = field(
+        default=None,
+        repr=False,
+    )
     cron_scheduler: SchedulerEngine | None = None
     model_catalog: ModelCatalog | None = None
     agent_registry: Any = None
@@ -632,6 +636,27 @@ class ServiceContainer:
         an in-flight cron job or heartbeat tick can drive TurnRunner ->
         TurnCaptureService.capture_turn against an already-closed store.
         """
+        profile_import_maintenance_task = self.profile_import_maintenance_task
+        self.profile_import_maintenance_task = None
+        if profile_import_maintenance_task is not None:
+            profile_import_maintenance_task.cancel()
+            try:
+                await profile_import_maintenance_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                log.debug(
+                    "gateway.profile_import_maintenance_close_failed",
+                    exc_info=True,
+                )
+        try:
+            from opensquilla.memory.profile_import.jobs import (
+                shutdown_current_profile_import_job_runner,
+            )
+
+            await shutdown_current_profile_import_job_runner()
+        except Exception:
+            log.debug("gateway.profile_import_jobs_close_failed", exc_info=True)
         if self.usage_backfill_task is not None:
             self.usage_backfill_task.cancel()
             try:
@@ -3255,6 +3280,29 @@ async def start_gateway_server(
         _pid_lock.release()
         raise
 
+    # An interrupted profile import may span USER.md and a separate memory
+    # root. Recover those canonical files before TurnRunner, channels, or the
+    # HTTP server can observe a half-published batch. Recovery is deliberately
+    # serial because every agent shares the same profile operation lock.
+    try:
+        from opensquilla.gateway.rpc_memory_import import (
+            run_profile_import_startup_recovery,
+        )
+
+        recovered_profile_import_batches = await run_profile_import_startup_recovery(
+            config=config,
+            memory_managers=svc.memory_managers,
+        )
+    except BaseException:
+        log.error("gateway.profile_import_recovery_failed", exc_info=True)
+        try:
+            await svc.close()
+        except Exception:
+            log.debug("gateway.services_close_after_recovery_failed", exc_info=True)
+        finally:
+            _pid_lock.release()
+        raise
+
     # Daily usage uses the existing telemetry service's dedicated /v1/usage
     # route and the same unified privacy switch. Upload once at startup and
     # every hour while the gateway is running; failures remain pending.
@@ -3305,6 +3353,34 @@ async def start_gateway_server(
     # Patch deferred callback so memory writes refresh TurnRunner snapshots
     if hasattr(svc, "_turn_runner_ref"):
         svc._turn_runner_ref.append(turn_runner)  # type: ignore[attr-defined]
+
+    # Canonical journal recovery already completed before TurnRunner was built.
+    # Permission hardening, expired private-input cleanup, and derived index
+    # refresh are best-effort and may continue after readiness.
+    async def maintain_profile_imports() -> None:
+        try:
+            from opensquilla.gateway.rpc_memory_import import (
+                run_profile_import_startup_maintenance,
+            )
+
+            failures = await run_profile_import_startup_maintenance(
+                config=config,
+                memory_managers=svc.memory_managers,
+                turn_runner=turn_runner,
+                recovered_batches=recovered_profile_import_batches,
+            )
+            for agent_id, error in failures.items():
+                log.warning(
+                    "gateway.profile_import_maintenance_failed",
+                    agent_id=agent_id,
+                    error=error,
+                )
+        except Exception:
+            log.warning("gateway.profile_import_maintenance_failed", exc_info=True)
+
+    svc.profile_import_maintenance_task = create_background_task(
+        maintain_profile_imports(),
+    )
 
     memory_repair_service = getattr(svc, "memory_repair_service", None)
     if memory_repair_service is not None:
