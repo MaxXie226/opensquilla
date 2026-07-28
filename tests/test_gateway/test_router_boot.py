@@ -809,6 +809,29 @@ async def test_service_container_close_cancels_owned_sandbox_setup_task() -> Non
 
 
 @pytest.mark.asyncio
+async def test_service_container_close_cancels_profile_import_maintenance() -> None:
+    from opensquilla.gateway import boot
+
+    entered = asyncio.Event()
+
+    async def blocked_maintenance() -> None:
+        entered.set()
+        await asyncio.Event().wait()
+
+    task = asyncio.create_task(blocked_maintenance())
+    services = boot.ServiceContainer(
+        config=GatewayConfig(),
+        profile_import_maintenance_task=task,
+    )
+    await entered.wait()
+
+    await services.close()
+
+    assert services.profile_import_maintenance_task is None
+    assert task.cancelled()
+
+
+@pytest.mark.asyncio
 async def test_bare_full_default_boots_standard_capability(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
