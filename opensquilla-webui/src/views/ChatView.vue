@@ -32,11 +32,9 @@
         :copy-icon="sessionCopyIcon"
         :copy-live-text="sessionCopyLiveText"
         :deliverable-count="headerDeliverableCount"
-        :run-history-visible="appStore.features.metaRuns"
         :share-mode="shareMode"
         :shareable-message-count="shareableMessageCount"
         @open-deliverables="openDeliverables"
-        @open-run-history="openMetaRunHistory"
         @start-share="startShareMode"
         @copy-session-key="onSessionCopyClick"
       />
@@ -549,14 +547,6 @@
       @download="downloadArtifact"
     />
 
-    <MetaRunHistoryDrawer
-      v-if="appStore.features.metaRuns"
-      :open="metaRunsHistoryOpen"
-      :rpc="rpc"
-      :session-key="sessionKey"
-      @close="closeMetaRunHistory"
-    />
-
     <SharePreviewModal
       :open="!!sharePreview"
       :image-url="sharePreview?.url || ''"
@@ -607,7 +597,6 @@ import ReasoningPart from '@/components/chat/parts/ReasoningPart.vue'
 import TextPart from '@/components/chat/parts/TextPart.vue'
 import MetaPreflightCard from '@/components/chat/MetaPreflightCard.vue'
 import MetaRibbon from '@/components/chat/MetaRibbon.vue'
-import MetaRunHistoryDrawer from '@/components/chat/MetaRunHistoryDrawer.vue'
 import PendingQueue from '@/components/chat/PendingQueue.vue'
 import PlanCard from '@/components/chat/PlanCard.vue'
 import PlanRunRibbon from '@/components/chat/PlanRunRibbon.vue'
@@ -2755,10 +2744,9 @@ const headerDeliverableCount = computed(() =>
 )
 
 const deliverablesOpen = ref(false)
-const metaRunsHistoryOpen = ref(false)
 
 function focusHeaderAction(
-  action: 'deliverables' | 'runs' | 'share' | 'copy-session-key',
+  action: 'deliverables' | 'share' | 'copy-session-key',
 ) {
   void nextTick(() => chatHeaderActionsRef.value?.focusAction(action))
 }
@@ -2862,15 +2850,6 @@ function openArtifact(artifact: ArtifactPayload): boolean {
 function closeDeliverables() {
   deliverablesOpen.value = false
   focusHeaderAction('deliverables')
-}
-
-function openMetaRunHistory() {
-  metaRunsHistoryOpen.value = true
-}
-
-function closeMetaRunHistory() {
-  metaRunsHistoryOpen.value = false
-  focusHeaderAction('runs')
 }
 
 /* ── Fork ──────────────────────────────────────────────────────────── */
@@ -3663,7 +3642,6 @@ watch(sessionKey, () => {
   if (workbenchEnabled.value) workbenchStore.setSessionScope(sessionKey.value || null)
   if (shareMode.value) endShareMode()
   deliverablesOpen.value = false
-  metaRunsHistoryOpen.value = false
 })
 
 watch(shareableMessageCount, (count) => {
