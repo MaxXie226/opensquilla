@@ -18,6 +18,7 @@ from pydantic import TypeAdapter
 from starlette.applications import Starlette
 from starlette.routing import Mount, Route, WebSocketRoute
 
+from opensquilla.contracts.client import EVENT_PATTERNS
 from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.contract_identity import (
     CONTRACT_GENERATED_FROM,
@@ -98,23 +99,25 @@ CONTRACT_DIGEST_PATHS = (
     PurePosixPath("golden/error.json"),
 )
 
-EVENT_PATTERNS = (
-    "session.event.*",
-    "task.*",
-)
-
 # Exact non-internal events registered by the current Web UI through
 # ``RpcClient.on``. The list is descriptive, not an exhaustive server promise.
 OBSERVED_CLIENT_EVENTS = (
     "channel.status",
+    "collaboration_mode",
     "cron.run.finished",
     "exec.approval.requested",
     "exec.approval.resolved",
+    "exec.approval.updated",
     "models.routing.changed",
+    "plan_revision",
+    "plan_run",
     "plugin.approval.requested",
     "plugin.approval.resolved",
+    "plugin.approval.updated",
+    "sandbox.run_mode.preference.changed",
     "session.epoch_changed",
     "session.event.artifact",
+    "session.event.collaboration_mode",
     "session.event.compaction",
     "session.event.cron_result",
     "session.event.ensemble_progress",
@@ -122,6 +125,8 @@ OBSERVED_CLIENT_EVENTS = (
     "session.event.meta_run_announced",
     "session.event.meta_run_completed",
     "session.event.meta_step_state",
+    "session.event.plan_revision",
+    "session.event.plan_run",
     "session.event.router_control_replay",
     "session.event.router_decision",
     "session.event.run_heartbeat",

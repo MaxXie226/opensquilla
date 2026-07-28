@@ -1,13 +1,18 @@
 /** OpenSquilla Web UI — WebSocket RPC client (TypeScript port). */
 
-export interface RpcErrorDetail {
-  code?: string;
-  message?: string;
-  details?: unknown;
-  retryable?: boolean;
-  retry_after_ms?: number;
-  accepted?: boolean;
-}
+import {
+  CLIENT_MAX_PROTOCOL,
+  CLIENT_MIN_PROTOCOL,
+  capabilitiesForMethods,
+  normalizeHelloFrame as normalizeSdkHelloFrame,
+  type ContractInfo,
+  type ErrorShape,
+  type NormalizedRuntimeInfo,
+  type ProtocolRangeInfo,
+} from '@opensquilla/client-sdk';
+
+export { capabilitiesForMethods };
+export type RpcErrorDetail = Partial<ErrorShape>;
 
 export interface RpcClientError extends Error {
   code?: string;
@@ -17,23 +22,9 @@ export interface RpcClientError extends Error {
   accepted?: boolean;
 }
 
-export interface RpcContractInfo {
-  schemaVersion: number;
-  digest: string;
-  generatedFrom: string;
-}
-
-export interface RpcRuntimeInfo {
-  coreVersion: string;
-  buildCommit: string | null;
-  platform?: string;
-  arch?: string;
-}
-
-export interface RpcProtocolRange {
-  min: number;
-  max: number;
-}
+export type RpcContractInfo = ContractInfo;
+export type RpcRuntimeInfo = NormalizedRuntimeInfo;
+export type RpcProtocolRange = ProtocolRangeInfo;
 
 export interface RpcFrame {
   type?: string;
@@ -56,9 +47,9 @@ export interface RpcFrame {
     conn_id?: string;
   };
   auth?: Record<string, unknown>;
-  contract?: RpcContractInfo;
-  runtime?: RpcRuntimeInfo;
-  protocolRange?: RpcProtocolRange;
+  contract?: Partial<RpcContractInfo>;
+  runtime?: Partial<RpcRuntimeInfo>;
+  protocolRange?: Partial<RpcProtocolRange>;
   capabilities?: string[];
   extensions?: string[];
   contractStatus?: 'advertised' | 'legacy-contract';
@@ -71,114 +62,8 @@ export type RpcEventHandler = {
   bivarianceHack(...args: unknown[]): void;
 }['bivarianceHack'];
 
-const CLIENT_MIN_PROTOCOL = 3;
-const CLIENT_MAX_PROTOCOL = 3;
-const CAPABILITY_ID_PATTERN = /^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)+$/;
-const DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/;
-
-const CAPABILITY_METHOD_REQUIREMENTS: ReadonlyArray<readonly [string, readonly string[]]> = [
-  ['gateway.sessions', ['chat.history', 'chat.send', 'sessions.list', 'sessions.resolve']],
-];
-
-function stringList(value: unknown): string[] {
-  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
-}
-
-function stableIds(value: unknown): string[] {
-  return stringList(value).filter((item) => CAPABILITY_ID_PATTERN.test(item));
-}
-
-function isWireInteger(value: unknown): value is number {
-  return Number.isInteger(value);
-}
-
-export function capabilitiesForMethods(methods: readonly string[]): string[] {
-  if (methods.length === 0) return [];
-  const available = new Set(methods);
-  return [
-    'gateway.rpc',
-    ...CAPABILITY_METHOD_REQUIREMENTS.filter(([, required]) =>
-      required.every((method) => available.has(method))
-    ).map(([capability]) => capability),
-  ];
-}
-
 export function normalizeHelloFrame(data: RpcFrame, requestId: string): RpcFrame {
-  if (data.type !== 'hello-ok') throw new Error('Expected hello-ok frame');
-  if (
-    !isWireInteger(data.protocol) ||
-    data.protocol < CLIENT_MIN_PROTOCOL ||
-    data.protocol > CLIENT_MAX_PROTOCOL
-  ) {
-    throw new Error('Negotiated protocol is outside the requested range');
-  }
-
-  const hasNewMetadata = ['contract', 'runtime', 'protocolRange', 'capabilities', 'extensions']
-    .some((field) => Object.prototype.hasOwnProperty.call(data, field));
-  if (data.id === undefined) {
-    if (hasNewMetadata) throw new Error('New-format hello-ok frame is missing response id');
-  } else if (data.id !== requestId) {
-    throw new Error('hello-ok response id does not match connect request');
-  }
-
-  const advertisedRange = data.protocolRange;
-  const protocolRange =
-    advertisedRange &&
-    isWireInteger(advertisedRange.min) &&
-    isWireInteger(advertisedRange.max) &&
-    advertisedRange.min <= advertisedRange.max
-      ? advertisedRange
-      : { min: data.protocol, max: data.protocol };
-  if (
-    protocolRange.max < CLIENT_MIN_PROTOCOL ||
-    protocolRange.min > CLIENT_MAX_PROTOCOL
-  ) {
-    throw new Error('Gateway protocol range does not overlap client range');
-  }
-
-  const rawContract = data.contract;
-  const contractValid =
-    !!rawContract &&
-    isWireInteger(rawContract.schemaVersion) &&
-    typeof rawContract.digest === 'string' &&
-    DIGEST_PATTERN.test(rawContract.digest) &&
-    typeof rawContract.generatedFrom === 'string' &&
-    rawContract.generatedFrom.length > 0;
-  const methods = stringList(data.features?.methods);
-  const capabilitiesPresent = Object.prototype.hasOwnProperty.call(data, 'capabilities');
-  const capabilities = capabilitiesPresent
-    ? stableIds(data.capabilities)
-    : capabilitiesForMethods(methods);
-  const capabilitySource =
-    capabilitiesPresent && Array.isArray(data.capabilities)
-      ? 'hello'
-      : !capabilitiesPresent && methods.length > 0
-        ? 'features.methods'
-        : 'none';
-  const serverVersion =
-    typeof data.server?.version === 'string' && data.server.version
-      ? data.server.version
-      : 'unknown';
-  const runtime = data.runtime && typeof data.runtime.coreVersion === 'string'
-    ? {
-        coreVersion: data.runtime.coreVersion || serverVersion,
-        buildCommit:
-          typeof data.runtime.buildCommit === 'string' ? data.runtime.buildCommit : null,
-        ...(typeof data.runtime.platform === 'string' ? { platform: data.runtime.platform } : {}),
-        ...(typeof data.runtime.arch === 'string' ? { arch: data.runtime.arch } : {}),
-      }
-    : { coreVersion: serverVersion, buildCommit: null };
-
-  return {
-    ...data,
-    contract: contractValid ? rawContract : undefined,
-    contractStatus: contractValid ? 'advertised' : 'legacy-contract',
-    runtime,
-    protocolRange,
-    capabilities,
-    capabilitySource,
-    extensions: stableIds(data.extensions),
-  };
+  return normalizeSdkHelloFrame(data, requestId) as unknown as RpcFrame;
 }
 
 export class RpcClient {
@@ -373,9 +258,9 @@ export class RpcClient {
             if (err && typeof err === 'object') {
               error.code = err.code;
               error.details = err.details;
-              error.retryable = err.retryable;
-              error.retry_after_ms = err.retry_after_ms;
-              error.accepted = err.accepted;
+              error.retryable = err.retryable ?? undefined;
+              error.retry_after_ms = err.retry_after_ms ?? undefined;
+              error.accepted = err.accepted ?? undefined;
             }
             p.reject(error);
           }

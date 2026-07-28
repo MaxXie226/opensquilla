@@ -66,6 +66,13 @@ mark_frontend_changed() {
   frontend_changed=true
 }
 
+mark_client_contract_changed() {
+  # Public client contracts are generated from Python runtime metadata and
+  # consumed by the standalone TypeScript SDK and WebUI.
+  mark_frontend_changed
+  python_changed=true
+}
+
 mark_tui_changed() {
   mark_runtime_changed
   tui_changed=true
@@ -113,6 +120,9 @@ while IFS= read -r path || [[ -n "${path}" ]]; do
       ;;
     opensquilla-webui/*)
       mark_frontend_changed
+      ;;
+    contracts/client/* | packages/client-sdk/*)
+      mark_client_contract_changed
       ;;
     src/opensquilla/gateway/static/dist/*)
       # Generated WebUI files are forbidden in Git. Route a force-added file to

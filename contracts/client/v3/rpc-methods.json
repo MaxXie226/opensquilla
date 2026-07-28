@@ -1,6 +1,6 @@
 {
   "completeness": "method-names-and-required-scopes-only",
-  "method_count": 206,
+  "method_count": 222,
   "methods": [
     {
       "name": "agent",
@@ -443,6 +443,10 @@
       "required_scope": "operator.admin"
     },
     {
+      "name": "onboarding.llmProfile.active.remove",
+      "required_scope": "operator.admin"
+    },
+    {
       "name": "onboarding.llmProfile.credential.clear",
       "required_scope": "operator.admin"
     },
@@ -509,6 +513,26 @@
     {
       "name": "onboarding.status",
       "required_scope": "operator.read"
+    },
+    {
+      "name": "plans.cancelRun",
+      "required_scope": "operator.write"
+    },
+    {
+      "name": "plans.capabilities",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "plans.implement",
+      "required_scope": "operator.write"
+    },
+    {
+      "name": "plans.revise",
+      "required_scope": "operator.write"
+    },
+    {
+      "name": "plans.setMode",
+      "required_scope": "operator.write"
     },
     {
       "name": "plugin.approval.extend",
@@ -587,6 +611,10 @@
       "required_scope": "operator.write"
     },
     {
+      "name": "sandbox.path.create-directory",
+      "required_scope": "operator.write"
+    },
+    {
       "name": "sandbox.path.list",
       "required_scope": "operator.read"
     },
@@ -604,6 +632,14 @@
     },
     {
       "name": "sandbox.run_context.set",
+      "required_scope": "operator.write"
+    },
+    {
+      "name": "sandbox.run_mode.preference.get",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "sandbox.run_mode.preference.set",
       "required_scope": "operator.write"
     },
     {
@@ -676,6 +712,10 @@
     },
     {
       "name": "sessions.list",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "sessions.messages.snapshot",
       "required_scope": "operator.read"
     },
     {
@@ -825,6 +865,30 @@
     {
       "name": "wizard.status",
       "required_scope": "operator.admin"
+    },
+    {
+      "name": "workspaces.history.delete",
+      "required_scope": "operator.write"
+    },
+    {
+      "name": "workspaces.list",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "workspaces.open",
+      "required_scope": "operator.write"
+    },
+    {
+      "name": "workspaces.pin",
+      "required_scope": "operator.write"
+    },
+    {
+      "name": "workspaces.remove",
+      "required_scope": "operator.write"
+    },
+    {
+      "name": "workspaces.update",
+      "required_scope": "operator.write"
     }
   ],
   "payload_schemas": "not-available-in-protocol-v3-baseline",

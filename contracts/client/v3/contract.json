@@ -1,5 +1,5 @@
 {
-  "digest": "sha256:0d06af1e696bfd22bb23aa341252a7cff14f1b980678be312bb84204b75d3239",
+  "digest": "sha256:333134dc5c7d703e3fa35e2ec7ba6598ac36aa4e4df018fd9b99899df175ccc0",
   "digestAlgorithm": "sha256",
   "digestDomain": "opensquilla-client-contract-v1",
   "digestFraming": "domain-nul-(path-nul-content-nul)*",

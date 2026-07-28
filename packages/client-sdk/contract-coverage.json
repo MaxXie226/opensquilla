@@ -1,0 +1,27 @@
+{
+  "contractDigest": "sha256:333134dc5c7d703e3fa35e2ec7ba6598ac36aa4e4df018fd9b99899df175ccc0",
+  "coverage": {
+    "connectAndHello": "complete",
+    "errorAndPolicyModels": "complete",
+    "events": {
+      "envelope": "complete",
+      "observedEvents": 42,
+      "payloadContracts": "deferred-by-domain",
+      "typedPayloadEvents": 0
+    },
+    "http": {
+      "payloadContracts": "deferred-by-domain",
+      "totalRoutes": 36,
+      "transportErrors": "complete",
+      "typedRoutes": 0
+    },
+    "rpcCatalog": {
+      "namesAndScopes": "complete",
+      "payloadContracts": "deferred-by-domain",
+      "totalMethods": 222,
+      "typedPayloadMethods": 0
+    },
+    "transportEnvelopes": "complete"
+  },
+  "schemaVersion": 1
+}

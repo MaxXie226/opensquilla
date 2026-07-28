@@ -1174,6 +1174,13 @@
     "tests/test_migrations/test_v028_project_workspaces.py": 0.01,
     "tests/test_sandbox/test_stale_approval_authority.py": 0.01,
     "tests/test_session/test_project_workspace_storage.py": 0.01,
-    "tests/test_gateway/test_windows_directory_picker.py": 0.01
+    "tests/test_gateway/test_windows_directory_picker.py": 0.01,
+    "tests/test_contracts/test_client_public_api.py": 0.01,
+    "tests/test_gateway/test_approval_restart_recovery.py": 0.01,
+    "tests/test_gateway/test_hello_capabilities.py": 0.01,
+    "tests/test_gateway/test_rpc_run_mode_preference.py": 0.01,
+    "tests/test_scripts/test_generate_client_contracts.py": 0.01,
+    "tests/test_session/test_runtime_preferences.py": 0.01,
+    "tests/test_thinking_level_propagation.py": 0.01
   }
 }

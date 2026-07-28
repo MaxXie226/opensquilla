@@ -1,3 +1,32 @@
+export {
+  CLIENT_CONTRACT_DIGEST,
+  CLIENT_CONTRACT_SCHEMA_VERSION,
+  DECLARED_ERROR_CODES,
+  DECLARED_EVENTS,
+  EVENT_PATTERNS,
+  OBSERVED_CLIENT_EVENTS,
+  RPC_METHOD_SCOPES,
+} from '@opensquilla/client-sdk'
+export type {
+  ClientFrame,
+  ConnectRequest,
+  ContractInfo,
+  ErrorShape,
+  EventFrame,
+  Frame,
+  HelloOk,
+  PingFrame,
+  PolicyInfo,
+  PongFrame,
+  ProtocolRangeInfo,
+  ReqFrame,
+  ResFrame,
+  RpcMethod,
+  RpcScope,
+  RuntimeInfo,
+  ServerFrame,
+} from '@opensquilla/client-sdk'
+
 export interface AgentOption {
   id: string
   name: string

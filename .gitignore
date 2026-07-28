@@ -86,6 +86,9 @@ tests/functional/reports/
 # Frontend build artifacts
 opensquilla-webui/node_modules/
 opensquilla-webui/dist/
+packages/client-sdk/node_modules/
+packages/client-sdk/dist/
+packages/client-sdk/*.tgz
 src/opensquilla/gateway/static/dist/
 
 # Local-only release-hygiene tests that reference legacy artifact names
