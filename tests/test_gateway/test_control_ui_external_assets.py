@@ -65,7 +65,7 @@ def _artifact(root: Path) -> Path:
         '<link rel="icon" href="./opensquilla-mark.png">',
         encoding="utf-8",
     )
-    (assets / "app.js").write_text("export const external = true;\n", encoding="utf-8")
+    (assets / "app.js").write_bytes(b"export const external = true;\n")
     (assets / "app.css").write_text("body{color:#123}\n", encoding="utf-8")
     (root / "opensquilla-mark.png").write_bytes(b"\x89PNG\r\n\x1a\n")
     _rewrite_manifest(root)
@@ -111,7 +111,7 @@ def test_external_bundle_with_spaces_and_unicode_is_served_from_existing_routes(
     assert index.status_code == 200
     assert "/control/static/dist/assets/app.js" in index.text
     assert script.status_code == 200
-    assert script.text == "export const external = true;\n"
+    assert script.content == b"export const external = true;\n"
     assert script.headers["content-type"].startswith("text/javascript")
     assert "max-age=2592000" in script.headers["cache-control"]
     assert raw_index.status_code == 404
