@@ -70,10 +70,20 @@
     </noscript>
     {% if webui_artifact_missing %}
     <main role="alert" data-webui-artifact-missing
+          data-control-ui-assets-mode="{{ control_ui_assets_mode }}"
+          data-control-ui-assets-reason="{{ control_ui_assets_reason }}"
           style="padding:2rem;font-family:system-ui,-apple-system,sans-serif;color:#222;background:#fff;max-width:720px;margin:3rem auto;border:1px solid #d8d8d8;border-radius:8px;line-height:1.5">
+        {% if control_ui_assets_reason == "explicit_none" %}
+        <h1 style="font-size:1.25rem;margin:0 0 .75rem">Gateway is running without a Control UI</h1>
+        <p style="margin-bottom:0">Use a compatible client, the CLI, or the Gateway RPC interfaces. Core health and readiness are independent of product UI assets.</p>
+        {% elif control_ui_assets_reason.startswith("external:") %}
+        <h1 style="font-size:1.25rem;margin:0 0 .75rem">Configured Control UI assets were rejected</h1>
+        <p style="margin-bottom:0">The Gateway core remains available. Verify the external asset directory and its manifest before trying again.</p>
+        {% else %}
         <h1 style="font-size:1.25rem;margin:0 0 .75rem">Control UI assets are unavailable</h1>
         <p>This installation does not contain a usable Vue build. Release-wheel and Desktop users should reinstall an official package.</p>
         <p style="margin-bottom:0">When running from a source checkout, build it with <code>cd opensquilla-webui &amp;&amp; npm ci &amp;&amp; npm run build</code>, then reload this page.</p>
+        {% endif %}
     </main>
     {% else %}
     <div id="app"></div>
