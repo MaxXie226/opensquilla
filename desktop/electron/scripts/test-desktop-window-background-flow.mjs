@@ -188,11 +188,16 @@ try {
       'revealing a hidden desktop window must preserve renderer state',
     )
 
-    await desktopApp.evaluate(({ BrowserWindow }) => {
+    await desktopApp.evaluate(({ app, BrowserWindow }) => {
       const window = BrowserWindow.getAllWindows().find((candidate) => (
         candidate.webContents.getURL().includes('/control/')
       ))
       if (!window) throw new Error('Main Control UI window is unavailable.')
+      // Reproduce the activation race deterministically: activateMainWindow()
+      // focuses synchronously, then continues across an asynchronous startup
+      // boundary. A user hide after that first focus must not be undone by a
+      // delayed second focus.
+      app.emit('activate')
       window.hide()
     })
     await waitFor(
@@ -201,6 +206,12 @@ try {
         return snapshot && !snapshot.visible ? snapshot : null
       },
       'main window to hide before deep-link activation',
+    )
+    await delay(350)
+    assert.equal(
+      (await mainWindowSnapshot(desktopApp))?.visible,
+      false,
+      'an asynchronous activation tail must not reveal a window hidden afterward',
     )
 
     await desktopApp.evaluate(({ app }) => {

@@ -4179,10 +4179,11 @@ async function activateMainWindow(source = 'desktop-activation'): Promise<void> 
 
   await openOrResumeDesktopApp()
 
-  // openOrResumeDesktopApp creates the window when it was absent. Repeat the
-  // idempotent focus sequence after that asynchronous boundary.
-  if (process.platform === 'darwin') app.focus({ steal: true })
-  const focused = focusMainWindow()
+  // Only focus after the asynchronous boundary when a window had to be
+  // created. Re-focusing an existing window here can undo a later explicit
+  // hide while the startup flow is still completing.
+  if (!focusedImmediately && process.platform === 'darwin') app.focus({ steal: true })
+  const focused = focusedImmediately || focusMainWindow()
   desktopLog('main_window_activated', {
     source,
     created: !focusedImmediately,
