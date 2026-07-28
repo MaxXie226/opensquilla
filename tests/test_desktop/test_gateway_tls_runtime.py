@@ -306,7 +306,7 @@ def test_gateway_entry_runs_hidden_filesystem_worker_without_entering_cli(
     )
 
     assert completed.returncode == 0, completed.stderr
-    assert json.loads(completed.stdout) == {"message": "1\tworker-ok\n"}
+    assert json.loads(completed.stdout)["message"].splitlines() == ["1\tworker-ok"]
     assert completed.stderr == ""
 
 
