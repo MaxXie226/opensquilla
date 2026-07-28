@@ -19,6 +19,21 @@ _CHANNEL_APPROVAL_ROUTING_UNAVAILABLE = (
 )
 
 
+def effective_approval_reviewer(
+    configured: object,
+    run_mode: object,
+) -> ApprovalReviewerName:
+    """Resolve the reviewer, with Standard mode always owned by the user."""
+
+    mode = getattr(run_mode, "value", run_mode)
+    if str(mode or "").strip().lower() == "standard":
+        return "user"
+    return cast(
+        "ApprovalReviewerName",
+        configured if configured in {"user", "auto_review"} else "user",
+    )
+
+
 @dataclass(frozen=True)
 class ElevationAction:
     """The material side effects an approval is allowed to authorize."""
@@ -275,6 +290,22 @@ def request_elevation(
         sender_id=str(routed_metadata.get("senderId") or ""),
     )
     if pending_id is not None:
+        if reviewer == "user":
+            entry = queue.get(pending_id)
+            if (
+                entry.params.get("reviewer") != "user"
+                or entry.params.get("humanActionable") is not True
+            ):
+                pending_params = dict(entry.params)
+                pending_params.update(
+                    {
+                        "reviewer": "user",
+                        "humanActionable": True,
+                        "reviewStatus": "human_confirmation_required",
+                        "reviewSource": "standard_mode_policy",
+                    }
+                )
+                queue.update_params(pending_id, pending_params)
         return ElevationGateResult(
             requested=True,
             allowed=False,
@@ -311,6 +342,7 @@ def consume_approved_elevation(
     action: ElevationAction,
     *,
     expected_session_key: str | None = None,
+    expected_reviewer: ApprovalReviewerName | None = None,
     expected_sender_id: str | None = None,
 ) -> ElevationGateResult:
     """Validate and consume an approved grant before its side effect starts."""
@@ -341,6 +373,20 @@ def consume_approved_elevation(
             status="approval_session_mismatch",
             approval_id=approval_id,
             reason="approval_session_mismatch",
+        )
+    if expected_reviewer is not None and (
+        entry.params.get("reviewer") != expected_reviewer
+        or (
+            expected_reviewer == "user"
+            and entry.params.get("humanActionable") is not True
+        )
+    ):
+        return ElevationGateResult(
+            requested=True,
+            allowed=False,
+            status="approval_reviewer_mismatch",
+            approval_id=approval_id,
+            reason="approval_reviewer_mismatch",
         )
     if expected_sender_id is not None and str(
         entry.params.get("senderId") or ""
@@ -431,10 +477,13 @@ def gate_elevated_action(
 
         runtime = get_runtime()
         configured = getattr(getattr(runtime, "settings", None), "approvals_reviewer", None)
-        reviewer = cast(
-            "ApprovalReviewerName",
+        reviewer = effective_approval_reviewer(
             configured if configured in {"user", "auto_review"} else "auto_review",
+            None,
         )
+    from opensquilla.tools.run_mode import current_run_mode
+
+    reviewer = effective_approval_reviewer(reviewer, current_run_mode())
     routed_metadata, routing_denial = _channel_elevation_metadata(
         session_key=session_key,
         metadata=metadata,
@@ -442,16 +491,25 @@ def gate_elevated_action(
     if routing_denial is not None:
         return routing_denial
     expected_sender_id = str(routed_metadata.get("senderId") or "").strip() or None
-
     if approval_id:
         try:
-            return consume_approved_elevation(
+            consumed = consume_approved_elevation(
                 queue,
                 approval_id,
                 action,
                 expected_session_key=session_key,
+                expected_reviewer=reviewer,
                 expected_sender_id=expected_sender_id,
             )
+            if consumed.status == "approval_reviewer_mismatch":
+                return request_elevation(
+                    queue,
+                    action,
+                    session_key=session_key,
+                    reviewer=reviewer,
+                    metadata=routed_metadata,
+                )
+            return consumed
         except KeyError:
             reason = "approval not found"
         except ValueError as exc:
@@ -479,6 +537,7 @@ __all__ = [
     "SandboxPermissionIntent",
     "channel_admin_approval_identity",
     "consume_approved_elevation",
+    "effective_approval_reviewer",
     "gate_elevated_action",
     "request_elevation",
 ]

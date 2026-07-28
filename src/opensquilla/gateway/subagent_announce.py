@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+from collections.abc import AsyncIterator, Iterable
 from typing import Any
 
 from opensquilla.gateway.session_lifecycle import session_status_for_task_status
@@ -89,6 +91,21 @@ def set_background_completion_manager(manager: Any | None) -> None:
     _background_completion_manager = manager
 
 
+@contextlib.asynccontextmanager
+async def quiesce_background_completion_sessions(
+    session_keys: Iterable[str],
+) -> AsyncIterator[None]:
+    """Fence parent-wake delivery when a manager is installed."""
+
+    manager = _background_completion_manager
+    quiesce = getattr(manager, "quiesce_sessions", None)
+    if not callable(quiesce):
+        yield
+        return
+    async with quiesce(session_keys):
+        yield
+
+
 async def cancel_background_completion_for_session(parent_session_key: str) -> int:
     """Block pending child completions from reviving an aborted parent session."""
     cancel_session = getattr(_background_completion_manager, "cancel_session", None)
@@ -103,6 +120,20 @@ async def active_background_completion_group_ids(parent_session_key: str) -> lis
     if not callable(active_group_ids):
         return []
     return list(await active_group_ids(parent_session_key))
+
+
+async def active_background_completion_run_mode_override(
+    parent_session_key: str,
+) -> Any | None:
+    """Return the accepted mode retained by an active background group."""
+    active_override = getattr(
+        _background_completion_manager,
+        "active_run_mode_override",
+        None,
+    )
+    if not callable(active_override):
+        return None
+    return await active_override(parent_session_key)
 
 
 async def announce_subagent_completion(

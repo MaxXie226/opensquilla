@@ -63,10 +63,30 @@ def test_tool_context_appends_new_runtime_fields_after_legacy_fields() -> None:
     legacy_runtime_tail = [
         "sandbox_file_system_profile",
         "on_sandbox_auto_review",
+        "session_epoch",
+        "workspace_id",
+        "execution_id",
+        "sandbox_session_manager",
+        "sandbox_gateway_config",
         "tool_description_overrides",
         "tool_description_overrides_source",
         "endgame_git_freeze_instrumentation_exempt",
         "scratch_verify_mirror_active",
     ]
-    assert field_names[-7:-1] == legacy_runtime_tail
-    assert field_names[-1] == "channel_admin_verified"
+    legacy_tail_start = field_names.index(legacy_runtime_tail[0])
+    assert (
+        field_names[legacy_tail_start : legacy_tail_start + len(legacy_runtime_tail)]
+        == legacy_runtime_tail
+    )
+    assert field_names[legacy_tail_start + len(legacy_runtime_tail) :] == [
+        "channel_admin_verified",
+        "collaboration_mode",
+        "collaboration_revision",
+        "active_plan_revision_id",
+        "plan_run_id",
+        "plan_storage",
+        "plan_event_emitter",
+        "user_input_provider",
+        "plan_revision",
+        "plan_run",
+    ]

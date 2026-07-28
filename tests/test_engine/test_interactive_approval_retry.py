@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from collections.abc import AsyncIterator
 from typing import Any
@@ -38,7 +39,7 @@ from opensquilla.sandbox.types import (
     SandboxRequest,
     SecurityLevel,
 )
-from opensquilla.tools.types import ToolContext
+from opensquilla.tools.types import ToolContext, current_tool_context
 
 
 class _OneApprovalToolProvider:
@@ -319,6 +320,48 @@ async def test_local_low_risk_review_allows_without_model_call() -> None:
 
 
 @pytest.mark.asyncio
+async def test_standard_mode_converts_legacy_auto_review_to_human() -> None:
+    reset_approval_queue()
+    action = ElevationAction(
+        tool_name="exec_command",
+        action_kind="shell.exec",
+        argv=("powershell", "-Command", "New-Item D:\\legacy-auto-probe"),
+        cwd="D:\\workspace",
+        sandbox_permissions="require_escalated",
+        justification="Create the exact user-requested probe.",
+        target_paths=(("D:\\legacy-auto-probe", "write"),),
+    )
+    pending = gate_elevated_action(
+        action,
+        approval_id=None,
+        session_key="legacy-auto-standard",
+        queue=get_approval_queue(),
+        reviewer="auto_review",
+    )
+    token = current_tool_context.set(
+        ToolContext(
+            session_key="legacy-auto-standard",
+            run_mode="standard",
+        )
+    )
+    try:
+        assessment = await _review_pending_elevation_if_configured(
+            pending.to_envelope(),
+            transcript=[Message(role="user", content="Create the exact probe.")],
+            runtime_events_path=None,
+        )
+        entry = get_approval_queue().get(pending.approval_id or "")
+    finally:
+        current_tool_context.reset(token)
+        reset_approval_queue()
+
+    assert assessment is None
+    assert entry.resolved is False
+    assert entry.params["reviewer"] == "user"
+    assert entry.params["humanActionable"] is True
+
+
+@pytest.mark.asyncio
 async def test_critical_rule_review_requires_human_confirmation_without_model_call() -> None:
     reset_approval_queue()
     provider = _AutoReviewProvider(
@@ -460,7 +503,9 @@ async def test_unknown_high_risk_action_defaults_to_rule_allow() -> None:
 
 
 @pytest.mark.asyncio
-async def test_explicit_named_network_approval_uses_rules(tmp_path) -> None:
+async def test_explicit_named_network_approval_in_standard_requires_human(
+    tmp_path,
+) -> None:
     reset_approval_queue()
     provider = _AutoReviewProvider(
         json.dumps(
@@ -542,22 +587,24 @@ async def test_explicit_named_network_approval_uses_rules(tmp_path) -> None:
     try:
         _ = [event async for event in agent.run_turn("Fetch the exact unknown.test URL")]
 
-        assert decisions == ["allow"]
+        assert decisions == ["block"]
         assert provider.review_model_calls == 0
         assert len(approval_ids) == 1
         entry = get_approval_queue().get(approval_ids[0])
-        assert entry.approved is True
-        assert entry.params["humanActionable"] is False
-        assert entry.params["reviewOutcome"] == "allow"
+        assert entry.approved is False
+        assert entry.params["reviewer"] == "user"
+        assert entry.params["humanActionable"] is True
+        assert "reviewOutcome" not in entry.params
         overlay = resolved_run_context_overlay("network-agent", str(tmp_path))
-        assert overlay is not None
-        assert overlay.temporary_grants == ()
+        assert overlay is None
     finally:
         reset_approval_queue()
 
 
 @pytest.mark.asyncio
-async def test_unknown_network_review_defaults_to_rule_allow_and_replay(tmp_path) -> None:
+async def test_unknown_network_review_fails_closed_without_session_authority(
+    tmp_path,
+) -> None:
     reset_approval_queue()
     provider = _AutoReviewProvider(
         json.dumps(
@@ -570,6 +617,7 @@ async def test_unknown_network_review_defaults_to_rule_allow_and_replay(tmp_path
         )
     )
     calls: list[dict[str, Any]] = []
+    approval_ids: list[str] = []
 
     async def _handler(call: ToolCall) -> ToolResult:
         calls.append(dict(call.arguments))
@@ -584,6 +632,7 @@ async def test_unknown_network_review_defaults_to_rule_allow_and_replay(tmp_path
             params,
             message="Review one exact network target.",
         )
+        approval_ids.append(str(payload["approval_id"]))
         return ToolResult(call.tool_use_id, call.tool_name, json.dumps(payload))
 
     agent = Agent(
@@ -596,8 +645,13 @@ async def test_unknown_network_review_defaults_to_rule_allow_and_replay(tmp_path
     try:
         _ = [event async for event in agent.run_turn("Inspect the project")]
 
-        assert len(calls) == 2
+        assert len(calls) == 1
         assert provider.review_model_calls == 0
+        assert len(approval_ids) == 1
+        entry = get_approval_queue().get(approval_ids[0])
+        assert entry.resolved is True
+        assert entry.approved is False
+        assert entry.params["reviewSource"] == "authority_validation_failure"
     finally:
         reset_approval_queue()
 
@@ -770,6 +824,7 @@ async def test_agent_waits_for_approval_resolution_before_retry_result_reaches_m
                     }
                 ),
             )
+        await asyncio.sleep(0.01)
         return ToolResult(
             tool_use_id=call.tool_use_id,
             tool_name=call.tool_name,
@@ -781,7 +836,8 @@ async def test_agent_waits_for_approval_resolution_before_retry_result_reaches_m
         provider=provider,
         config=AgentConfig(
             max_iterations=2,
-            metadata={"approval_wait_timeout_seconds": 1.0},
+            timeout=0.05,
+            iteration_timeout=0.05,
         ),
         tool_definitions=[_exec_definition()],
         tool_handler=_handler,
@@ -798,7 +854,7 @@ async def test_agent_waits_for_approval_resolution_before_retry_result_reaches_m
     try:
         task = asyncio.create_task(_drive())
         await asyncio.wait_for(approval_prompt_seen.wait(), timeout=2.0)
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.08)
 
         assert len(provider.calls) == 1
         assert len(tool_calls) == 1
@@ -833,7 +889,7 @@ async def test_agent_waits_for_approval_resolution_before_retry_result_reaches_m
 
 
 @pytest.mark.asyncio
-async def test_timed_out_approval_expires_and_pauses_turn_without_model_fallback(
+async def test_pending_approval_ignores_legacy_timeout_and_waits_for_decision(
     tmp_path: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -884,29 +940,37 @@ async def test_timed_out_approval_expires_and_pauses_turn_without_model_fallback
         tool_handler=_handler,
     )
 
-    events = [event async for event in agent.run_turn("what is on this page?")]
+    events: list[Any] = []
+    prompt_seen = asyncio.Event()
 
-    assert len(provider.calls) == 1
-    assert not any(
-        getattr(event, "kind", "") == "text_delta"
-        and "fallback from training knowledge" in event.text
-        for event in events
-    )
-    assert any(
-        isinstance(event, ToolResultEvent) and "approval_required" in event.result
-        for event in events
-    )
-    required_event = next(
-        event
-        for event in events
-        if isinstance(event, ToolResultEvent) and "approval_required" in event.result
-    )
-    approval_id = str(json.loads(required_event.result)["approval_id"])
-    entry = get_approval_queue().get(approval_id)
-    assert get_approval_queue().list_pending("exec") == []
-    assert entry.resolved is True
-    assert entry.approved is False
-    assert entry.resolution == "expired"
+    async def _drive() -> None:
+        async for event in agent.run_turn("what is on this page?"):
+            events.append(event)
+            if isinstance(event, ToolResultEvent) and "approval_required" in event.result:
+                prompt_seen.set()
+
+    task = asyncio.create_task(_drive())
+    try:
+        await asyncio.wait_for(prompt_seen.wait(), timeout=2.0)
+        await asyncio.sleep(0.05)
+
+        required_event = next(
+            event
+            for event in events
+            if isinstance(event, ToolResultEvent) and "approval_required" in event.result
+        )
+        approval_id = str(json.loads(required_event.result)["approval_id"])
+        entry = get_approval_queue().get(approval_id)
+        assert task.done() is False
+        assert get_approval_queue().list_pending("exec")
+        assert entry.resolved is False
+        assert entry.deadline == 0.0
+        assert len(provider.calls) == 1
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        reset_approval_queue()
 
 
 @pytest.mark.asyncio

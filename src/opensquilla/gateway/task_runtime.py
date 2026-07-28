@@ -25,7 +25,7 @@ import inspect
 import time
 import uuid
 from collections import deque
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, TypeVar, cast
@@ -103,6 +103,27 @@ def _task_identity_payload(
     return payload
 
 
+def _accepted_run_mode_payload(override: Any) -> dict[str, str] | None:
+    from opensquilla.gateway.project_workspace_runtime import AcceptedRunModeOverride
+
+    if not isinstance(override, AcceptedRunModeOverride):
+        return None
+    payload = {"run_mode": override.run_mode.value}
+    if isinstance(override.run_mode_source, str) and override.run_mode_source:
+        payload["run_mode_source"] = override.run_mode_source
+    return payload
+
+
+def _reusable_route_envelope(envelope: RouteEnvelope) -> RouteEnvelope:
+    """Detach one route for reuse without execution-scoped freshness."""
+
+    return replace(
+        envelope,
+        metadata=dict(envelope.metadata),
+        sandbox_run_context_fresh=False,
+    )
+
+
 @dataclass(frozen=True)
 class TaskHandle:
     task_id: str
@@ -176,6 +197,10 @@ class TaskRun:
     # This is deliberately off RouteEnvelope.metadata so cached envelopes can
     # never leak one turn's strategy into a later proactive send.
     accepted_config: Any | None = None
+    # Ingress-vetted per-turn run-mode selection. This remains off mutable
+    # RouteEnvelope.metadata so execution cannot manufacture authority from an
+    # arbitrary or cached envelope.
+    accepted_run_mode_override: Any | None = None
     provider_request_correlation: ProviderRequestCorrelation | None = field(
         default=None,
         repr=False,
@@ -274,6 +299,7 @@ class _RuntimeTask:
         repr=False,
     )
     accepted_config_captured: bool = False
+    accepted_run_mode_override: Any | None = None
     done: asyncio.Event = field(default_factory=asyncio.Event)
     terminal_emitted: bool = False
     cancel_requested: bool = False
@@ -506,6 +532,9 @@ class TaskRuntime:
         self._running_heartbeat_interval_s = running_heartbeat_interval_s
         self._accepted_config_provider = accepted_config_provider
         self._pending_overflow_policy = pending_overflow_policy
+        from opensquilla.gateway.user_input_broker import StructuredUserInputBroker
+
+        self._user_input_broker = StructuredUserInputBroker()
         # Per-session write locks shared with TurnRunner and RPC ingress on
         # gateway-dispatched turns. These guard short transcript/session state
         # mutations only.
@@ -515,12 +544,19 @@ class TaskRuntime:
         # status updates behind external I/O.
         self._session_execution_locks: dict[str, asyncio.Lock] = {}
         self._tasks: dict[str, _RuntimeTask] = {}
+        # Driver tasks remain tracked until their whole coroutine returns.
+        # ``_mark_terminal`` intentionally sets ``task.done`` before the
+        # subagent notification tail, so waiters that must fence every possible
+        # follow-up write cannot rely on the durable-task event alone.
+        self._driver_tasks_by_session: dict[str, set[asyncio.Task[None]]] = {}
+        self._driver_state_changed = asyncio.Event()
         self._terminal_fallback_records: dict[str, AgentTaskRecord] = {}
         self._pending_by_session: dict[str, list[_RuntimeTask]] = {}
         self._running_by_session: dict[str, _RuntimeTask] = {}
         self._reservations_by_session: dict[str, list[TaskReservation]] = {}
         self._reserved_overflow_victims: set[str] = set()
         self._last_envelope_by_session: dict[str, RouteEnvelope] = {}
+        self._last_envelope_task_id_by_session: dict[str, str] = {}
         self._state_lock = asyncio.Lock()
         # Admission is per session so durable RPC ingress crosses reserve,
         # commit, and activation in order. This prevents resets from overtaking
@@ -575,6 +611,7 @@ class TaskRuntime:
         message_count: int = 1,
         fresh_user_session: bool = False,
         stream_event_sink: TaskStreamEventSink | None = None,
+        accepted_run_mode_override: Any | None = None,
         *,
         task_id: str | None = None,
         provider_request_correlation: ProviderRequestCorrelation | None = None,
@@ -590,8 +627,8 @@ class TaskRuntime:
         if not self.supports_queue_mode(queue_mode):
             valid = ", ".join(sorted(self.supported_queue_modes))
             raise ValueError(f"mode must be one of {{{valid}}}")
-        if queue_mode == "collect":
-            async with self.collect_admission(envelope.session_key):
+        async with self.collect_admission(envelope.session_key):
+            if queue_mode == "collect":
                 collected = await self._try_collect(
                     envelope=envelope,
                     message=message,
@@ -602,47 +639,30 @@ class TaskRuntime:
                     persisted_user_message_id=persisted_user_message_id,
                     persisted_user_message_ids=persisted_user_message_ids,
                     message_count=message_count,
+                    accepted_run_mode_override=accepted_run_mode_override,
                 )
                 if collected is not None:
                     return collected
-                return await self._reserve_persist_and_activate(
-                    envelope,
-                    message,
-                    attachments=attachments,
-                    mode=queue_mode,
-                    run_kind=run_kind,
-                    no_memory_capture=no_memory_capture,
-                    ingress_pipeline_steps=ingress_pipeline_steps,
-                    semantic_message=semantic_message,
-                    persisted_user_message_id=persisted_user_message_id,
-                    persisted_user_message_ids=persisted_user_message_ids,
-                    message_count=message_count,
-                    fresh_user_session=fresh_user_session,
-                    stream_event_sink=stream_event_sink,
-                    task_id=task_id,
-                    provider_request_correlation=provider_request_correlation,
-                    update_envelope_cache=update_envelope_cache,
-                    overflow_policy=overflow_policy,
-                )
-        return await self._reserve_persist_and_activate(
-            envelope,
-            message,
-            attachments=attachments,
-            mode=queue_mode,
-            run_kind=run_kind,
-            no_memory_capture=no_memory_capture,
-            ingress_pipeline_steps=ingress_pipeline_steps,
-            semantic_message=semantic_message,
-            persisted_user_message_id=persisted_user_message_id,
-            persisted_user_message_ids=persisted_user_message_ids,
-            message_count=message_count,
-            fresh_user_session=fresh_user_session,
-            stream_event_sink=stream_event_sink,
-            task_id=task_id,
-            provider_request_correlation=provider_request_correlation,
-            update_envelope_cache=update_envelope_cache,
-            overflow_policy=overflow_policy,
-        )
+            return await self._reserve_persist_and_activate(
+                envelope,
+                message,
+                attachments=attachments,
+                mode=queue_mode,
+                run_kind=run_kind,
+                no_memory_capture=no_memory_capture,
+                ingress_pipeline_steps=ingress_pipeline_steps,
+                semantic_message=semantic_message,
+                persisted_user_message_id=persisted_user_message_id,
+                persisted_user_message_ids=persisted_user_message_ids,
+                message_count=message_count,
+                fresh_user_session=fresh_user_session,
+                stream_event_sink=stream_event_sink,
+                accepted_run_mode_override=accepted_run_mode_override,
+                task_id=task_id,
+                provider_request_correlation=provider_request_correlation,
+                update_envelope_cache=update_envelope_cache,
+                overflow_policy=overflow_policy,
+            )
 
     @contextlib.asynccontextmanager
     async def collect_admission(self, session_key: str) -> AsyncIterator[None]:
@@ -660,6 +680,183 @@ class TaskRuntime:
         async with lock:
             yield
 
+    @contextlib.asynccontextmanager
+    async def quiesce_sessions(
+        self,
+        session_keys: Iterable[str],
+    ) -> AsyncIterator[None]:
+        """Fence runtime work for a stable, ordered set of sessions.
+
+        Cancellation first drains the real ``_execute`` driver coroutines,
+        including their post-terminal notification/promotion tails. Execution
+        and admission locks are then acquired in stable key order. A final
+        state check closes commit-before-activate and reservation races; if
+        anything appeared while the drivers were draining, every lock is
+        released and the sequence retries.
+        """
+
+        keys = tuple(
+            sorted(
+                {
+                    canonicalize_session_key(session_key)
+                    for session_key in session_keys
+                }
+            )
+        )
+        if not keys:
+            yield
+            return
+
+        key_set = frozenset(keys)
+        while True:
+            await self._cancel_and_drain_session_drivers(keys, key_set)
+
+            async with contextlib.AsyncExitStack() as fences:
+                for session_key in keys:
+                    execution_lock = self._session_execution_locks.setdefault(
+                        session_key,
+                        asyncio.Lock(),
+                    )
+                    await self._acquire_execution_lock_while_quiescing(
+                        execution_lock,
+                        keys,
+                        key_set,
+                    )
+                    fences.callback(execution_lock.release)
+                for session_key in keys:
+                    await fences.enter_async_context(
+                        self.collect_admission(session_key)
+                    )
+
+                async with self._state_lock:
+                    active = any(
+                        self._driver_tasks_by_session.get(session_key)
+                        for session_key in keys
+                    )
+                    if not active:
+                        active = any(
+                            task.envelope.session_key in key_set
+                            for task in self._tasks.values()
+                        )
+                    if not active:
+                        active = any(
+                            self._reservations_by_session.get(session_key)
+                            for session_key in keys
+                        )
+                if active:
+                    continue
+
+                yield
+                return
+
+    async def _acquire_execution_lock_while_quiescing(
+        self,
+        execution_lock: asyncio.Lock,
+        keys: Sequence[str],
+        key_set: frozenset[str],
+    ) -> None:
+        """Acquire one execution fence without waiting behind an uncancelled driver."""
+
+        acquiring = asyncio.create_task(execution_lock.acquire())
+        changed: asyncio.Task[bool] | None = None
+        try:
+            while not acquiring.done():
+                # Capture the current generation's broadcast event before the
+                # state snapshot. A mutation swaps in a fresh event and sets
+                # this one, so concurrent quiescers cannot erase each other's
+                # wake-up by clearing shared state.
+                driver_state_changed = self._driver_state_changed
+                await self._cancel_and_drain_session_drivers(keys, key_set)
+                if acquiring.done():
+                    break
+                if driver_state_changed.is_set():
+                    continue
+
+                changed = asyncio.create_task(driver_state_changed.wait())
+                try:
+                    await asyncio.wait(
+                        {acquiring, changed},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                finally:
+                    if not changed.done():
+                        changed.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await changed
+                    changed = None
+            await acquiring
+        except BaseException:
+            if changed is not None and not changed.done():
+                changed.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await changed
+            if acquiring.done():
+                try:
+                    acquiring.result()
+                except BaseException:
+                    pass
+                else:
+                    execution_lock.release()
+            else:
+                acquiring.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await acquiring
+            raise
+
+    def _signal_driver_state_changed(self) -> None:
+        """Broadcast one driver-state generation change."""
+
+        changed = self._driver_state_changed
+        self._driver_state_changed = asyncio.Event()
+        changed.set()
+
+    async def _cancel_and_drain_session_drivers(
+        self,
+        keys: Sequence[str],
+        key_set: frozenset[str],
+    ) -> None:
+        async with self._state_lock:
+            runtime_tasks = [
+                task
+                for task in self._tasks.values()
+                if task.envelope.session_key in key_set
+                and task.status not in TERMINAL_STATUSES
+            ]
+            drivers = {
+                driver
+                for session_key in keys
+                for driver in self._driver_tasks_by_session.get(
+                    session_key,
+                    (),
+                )
+                if not driver.done()
+            }
+
+        if runtime_tasks:
+            await self._cancel_runtime_tasks(
+                runtime_tasks,
+                source="workspace_history_delete",
+                reason="project_history_deleted",
+            )
+        if drivers:
+            await asyncio.gather(*drivers, return_exceptions=True)
+            for driver in drivers:
+                for session_key in keys:
+                    self._discard_session_driver(session_key, driver)
+
+    def _discard_session_driver(
+        self,
+        session_key: str,
+        driver: asyncio.Task[None],
+    ) -> None:
+        drivers = self._driver_tasks_by_session.get(session_key)
+        if drivers is None:
+            return
+        drivers.discard(driver)
+        if not drivers:
+            self._driver_tasks_by_session.pop(session_key, None)
+        self._signal_driver_state_changed()
+
     async def _reserve_persist_and_activate(
         self,
         envelope: RouteEnvelope,
@@ -675,6 +872,7 @@ class TaskRuntime:
         message_count: int = 1,
         fresh_user_session: bool = False,
         stream_event_sink: TaskStreamEventSink | None = None,
+        accepted_run_mode_override: Any | None = None,
         *,
         task_id: str | None = None,
         provider_request_correlation: ProviderRequestCorrelation | None = None,
@@ -697,6 +895,7 @@ class TaskRuntime:
             message_count=message_count,
             fresh_user_session=fresh_user_session,
             stream_event_sink=stream_event_sink,
+            accepted_run_mode_override=accepted_run_mode_override,
             task_id=task_id,
             provider_request_correlation=provider_request_correlation,
             update_envelope_cache=update_envelope_cache,
@@ -763,6 +962,7 @@ class TaskRuntime:
         message_count: int = 1,
         fresh_user_session: bool = False,
         stream_event_sink: TaskStreamEventSink | None = None,
+        accepted_run_mode_override: Any | None = None,
         *,
         task_id: str | None = None,
         provider_request_correlation: ProviderRequestCorrelation | None = None,
@@ -825,6 +1025,11 @@ class TaskRuntime:
                 user_message_id=persisted_user_message_id,
             ),
         }
+        accepted_run_mode_payload = _accepted_run_mode_payload(
+            accepted_run_mode_override,
+        )
+        if accepted_run_mode_payload is not None:
+            record.details["accepted_run_mode"] = accepted_run_mode_payload
         runtime_task = _RuntimeTask(
             task_id=record.task_id,
             envelope=envelope,
@@ -840,6 +1045,7 @@ class TaskRuntime:
             message_count=message_count,
             fresh_user_session=fresh_user_session,
             stream_event_sink=stream_event_sink,
+            accepted_run_mode_override=accepted_run_mode_override,
             provider_request_correlation=provider_request_correlation,
             primary_input_pending=bool(
                 (persisted_user_message_id or envelope.metadata.get("client_message_id"))
@@ -1060,8 +1266,21 @@ class TaskRuntime:
                 active.add(session_key)
                 rr.append(session_key)
             if reservation.update_envelope_cache:
-                self._last_envelope_by_session[session_key] = runtime_task.envelope
-            runtime_task.asyncio_task = asyncio.create_task(self._execute(runtime_task))
+                self._last_envelope_by_session[session_key] = (
+                    _reusable_route_envelope(runtime_task.envelope)
+                )
+                self._last_envelope_task_id_by_session[session_key] = (
+                    runtime_task.task_id
+                )
+            driver = asyncio.create_task(self._execute(runtime_task))
+            runtime_task.asyncio_task = driver
+            self._driver_tasks_by_session.setdefault(session_key, set()).add(driver)
+            self._signal_driver_state_changed()
+
+            def _discard_driver(completed: asyncio.Task[None]) -> None:
+                self._discard_session_driver(session_key, completed)
+
+            driver.add_done_callback(_discard_driver)
             reservation.activated = True
             queue_depth = len(self._pending_by_session.get(session_key, []))
             queue_position = queue_depth
@@ -1158,6 +1377,29 @@ class TaskRuntime:
             ):
                 return None
             return task.task_id
+
+    async def resolve_user_input(
+        self,
+        *,
+        session_key: str,
+        request_id: str,
+        fields: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Resolve one structured interaction without creating a new turn."""
+
+        return self._user_input_broker.resolve(
+            session_key=session_key,
+            request_id=request_id,
+            fields=fields,
+        )
+
+    def pending_user_inputs(
+        self,
+        session_key: str,
+    ) -> builtins.list[dict[str, Any]]:
+        """Return public pending-interaction payloads for reconnect hydration."""
+
+        return self._user_input_broker.pending_for_session(session_key)
 
     async def _update_transcript_turn_context(
         self,
@@ -1300,6 +1542,7 @@ class TaskRuntime:
                 run_kind="runtime_send",
                 stream_event_sink=stream_event_sink,
             )
+        cached = _reusable_route_envelope(cached)
         if provenance is None:
             return await self.enqueue(
                 cached,
@@ -1329,8 +1572,9 @@ class TaskRuntime:
         message: str,
         provenance: dict[str, Any] | None = None,
         stream_event_sink: TaskStreamEventSink | None = None,
+        accepted_run_mode_override: Any | None = None,
     ) -> TaskHandle:
-        """Send a follow-up while preserving an authoritative routing context."""
+        """Send a follow-up while preserving authoritative routing and mode context."""
         if not isinstance(envelope, RouteEnvelope):
             raise TypeError("envelope must be a RouteEnvelope")
         canonical_session_key = canonicalize_session_key(envelope.session_key)
@@ -1341,10 +1585,11 @@ class TaskRuntime:
             input_provenance=provenance or envelope.input_provenance,
         )
         return await self.enqueue(
-            routed,
+            _reusable_route_envelope(routed),
             message,
             mode="followup",
             stream_event_sink=stream_event_sink,
+            accepted_run_mode_override=accepted_run_mode_override,
             update_envelope_cache=False,
         )
 
@@ -1539,6 +1784,7 @@ class TaskRuntime:
         persisted_user_message_id: str | None = None,
         persisted_user_message_ids: builtins.list[str] | tuple[str, ...] | None = None,
         message_count: int = 1,
+        accepted_run_mode_override: Any | None = None,
     ) -> TaskHandle | None:
         async def persist(
             handle: TaskHandle,
@@ -1605,6 +1851,7 @@ class TaskRuntime:
                 persisted_user_message_id=persisted_user_message_id,
                 persisted_user_message_ids=persisted_user_message_ids,
                 message_count=message_count,
+                accepted_run_mode_override=accepted_run_mode_override,
                 persist=persist,
             )
         except _CollectIdentityRebindError:
@@ -1623,6 +1870,7 @@ class TaskRuntime:
         persisted_user_message_id: str | None = None,
         persisted_user_message_ids: builtins.list[str] | tuple[str, ...] | None = None,
         message_count: int = 1,
+        accepted_run_mode_override: Any | None = None,
         persist: Callable[
             [TaskHandle, dict[str, Any]], Awaitable[_CollectResult]
         ],
@@ -1648,6 +1896,7 @@ class TaskRuntime:
                 persisted_user_message_id=persisted_user_message_id,
                 persisted_user_message_ids=persisted_user_message_ids,
                 message_count=message_count,
+                accepted_run_mode_override=accepted_run_mode_override,
                 persist=persist,
             )
         )
@@ -1671,6 +1920,7 @@ class TaskRuntime:
         persisted_user_message_id: str | None,
         persisted_user_message_ids: builtins.list[str] | tuple[str, ...] | None,
         message_count: int,
+        accepted_run_mode_override: Any | None,
         persist: Callable[
             [TaskHandle, dict[str, Any]], Awaitable[_CollectResult]
         ],
@@ -1705,6 +1955,11 @@ class TaskRuntime:
                     candidate not in pending
                     or candidate.queue_mode != "collect"
                     or candidate.status != AgentTaskStatus.QUEUED
+                ):
+                    return None
+                if (
+                    candidate.accepted_run_mode_override
+                    != accepted_run_mode_override
                 ):
                     return None
                 collected_no_memory_capture = candidate.no_memory_capture
@@ -1832,6 +2087,7 @@ class TaskRuntime:
                     acquired = True
                     async with write_lock:
                         pass
+                    await self._freeze_collaboration_context(task)
                     heartbeat_task = self._start_running_heartbeat(task)
                     metadata = task.envelope.metadata
                     turn_context = {
@@ -1845,6 +2101,25 @@ class TaskRuntime:
                         ),
                         "revision": int(metadata.get("turn_context_revision", 1) or 1),
                     }
+                    if (
+                        metadata.get("collaboration_mode") == "plan"
+                        or int(metadata.get("collaboration_revision", 0) or 0) > 0
+                        or metadata.get("active_plan_revision_id")
+                        or metadata.get("plan_run_id")
+                    ):
+                        turn_context["collaboration_mode"] = metadata.get(
+                            "collaboration_mode",
+                            "default",
+                        )
+                        turn_context["collaboration_revision"] = int(
+                            metadata.get("collaboration_revision", 0) or 0
+                        )
+                    if metadata.get("active_plan_revision_id"):
+                        turn_context["active_plan_revision_id"] = metadata[
+                            "active_plan_revision_id"
+                        ]
+                    if metadata.get("plan_run_id"):
+                        turn_context["plan_run_id"] = metadata["plan_run_id"]
                     for field in ("target_turn_id", "promoted_from_turn_id"):
                         value = metadata.get(field)
                         if isinstance(value, str) and value:
@@ -1891,9 +2166,8 @@ class TaskRuntime:
                         stream_event_sink=task.stream_event_sink,
                         pending_input_provider=task.pending_input_provider,
                         accepted_config=task.accepted_config,
-                        provider_request_correlation=(
-                            task.provider_request_correlation
-                        ),
+                        accepted_run_mode_override=task.accepted_run_mode_override,
+                        provider_request_correlation=task.provider_request_correlation,
                         assistant_message_sink=(
                             task.capture_terminal_assistant_message
                             if task.run_kind == "channel_turn"
@@ -1907,6 +2181,7 @@ class TaskRuntime:
                             run,
                             write_lock=write_lock,
                         )
+                    await self._emit_plan_revision_if_changed(task)
                     await self._record_drained_steers(task)
                     if heartbeat_task is not None:
                         await self._stop_running_heartbeat(heartbeat_task)
@@ -1999,6 +2274,375 @@ class TaskRuntime:
                 error_message=str(exc),
             )
             await self._promote_reclaimed_steers(task)
+        finally:
+            self._user_input_broker.cancel_task(task.task_id)
+            await self._settle_attached_plan_run(task)
+
+    async def _freeze_collaboration_context(self, task: _RuntimeTask) -> None:
+        """Snapshot session collaboration state at the actual turn boundary.
+
+        A queued task intentionally does not capture Plan/Default at admission:
+        a user may toggle while earlier work is still running. Once this task
+        owns both the same-session execution lane and a global slot, the
+        snapshot is immutable for the complete provider/tool loop.
+        """
+
+        metadata = dict(task.envelope.metadata)
+        getter = getattr(self._storage, "get_session", None)
+        node = None
+        if callable(getter):
+            candidate = getter(task.envelope.session_key)
+            node = await candidate if inspect.isawaitable(candidate) else candidate
+        stored_mode = getattr(node, "collaboration_mode", None)
+        stored_revision = getattr(node, "collaboration_revision", None)
+        if stored_mode in {"default", "plan"} and isinstance(stored_revision, int):
+            metadata["collaboration_mode"] = stored_mode
+            metadata["collaboration_revision"] = stored_revision
+            active_revision = getattr(node, "active_plan_revision_id", None)
+            if isinstance(active_revision, str) and active_revision:
+                metadata["active_plan_revision_id"] = str(active_revision)
+            else:
+                metadata.pop("active_plan_revision_id", None)
+        else:
+            metadata.setdefault("collaboration_mode", "default")
+            metadata.setdefault("collaboration_revision", 0)
+        required_mode = metadata.get("required_collaboration_mode")
+        if required_mode is not None:
+            if required_mode not in {"default", "plan"}:
+                raise RuntimeError("Invalid required collaboration mode")
+            # Explicit Plan operations own their turn capability. A sticky mode
+            # toggle made while they wait applies to later ordinary turns; it
+            # cannot turn an implementation into a read-only Plan turn, or a
+            # replan into a write-capable Default turn.
+            metadata["collaboration_mode"] = required_mode
+        required_revision = metadata.get("required_collaboration_revision")
+        if required_revision is not None:
+            if (
+                not isinstance(required_revision, int)
+                or isinstance(required_revision, bool)
+                or required_revision < 0
+            ):
+                raise RuntimeError("Invalid required collaboration revision")
+            metadata["collaboration_revision"] = required_revision
+        metadata["task_id"] = task.task_id
+        runtime_services = {
+            **task.envelope.runtime_services,
+            "plan_storage": self._storage,
+            "plan_event_emitter": self._emit,
+        }
+        # WebChat has a request-id response RPC and reconnect hydration. Other
+        # interactive surfaces retain the terminating compatibility protocol
+        # until they expose the same reply transport; injecting a waiter there
+        # would strand the turn behind its own session execution lock.
+        if task.envelope.source_kind is SourceKind.WEB:
+            runtime_services["user_input_provider"] = self._user_input_broker
+        attached_run_id = str(metadata.get("plan_run_id") or "").strip()
+        if attached_run_id and not str(
+            metadata.get("plan_revision_id") or ""
+        ).strip():
+            get_plan_run = getattr(self._storage, "get_plan_run", None)
+            if not callable(get_plan_run):
+                raise RuntimeError("PlanRun storage is unavailable")
+            run_candidate = get_plan_run(attached_run_id)
+            attached_run = (
+                await run_candidate
+                if inspect.isawaitable(run_candidate)
+                else run_candidate
+            )
+            if attached_run is None:
+                raise RuntimeError("The accepted PlanRun no longer exists")
+            if str(getattr(attached_run, "session_key", "") or "") != (
+                task.envelope.session_key
+            ):
+                raise RuntimeError("The accepted PlanRun belongs to another session")
+            derived_revision_id = str(
+                getattr(attached_run, "plan_revision_id", "") or ""
+            ).strip()
+            if not derived_revision_id:
+                raise RuntimeError("The accepted PlanRun lost its PlanRevision binding")
+            # Goal controllers only need to attach their durable run id. The
+            # immutable revision is derived authoritatively instead of copied
+            # into every future attempt envelope.
+            metadata["plan_revision_id"] = derived_revision_id
+        requested_revision_id = str(
+            metadata.get("plan_revision_id")
+            or (
+                metadata.get("active_plan_revision_id")
+                if metadata.get("collaboration_mode") == "plan"
+                else ""
+            )
+            or ""
+        ).strip()
+        if requested_revision_id:
+            active_revision_id = str(
+                getattr(node, "active_plan_revision_id", "") or ""
+            )
+            if (
+                bool(metadata.get("require_current_plan_revision"))
+                and active_revision_id != requested_revision_id
+            ):
+                raise RuntimeError(
+                    "The selected plan revision is no longer current"
+                )
+            get_revision = getattr(self._storage, "get_plan_revision", None)
+            if not callable(get_revision):
+                raise RuntimeError("PlanRevision storage is unavailable")
+            revision_candidate = get_revision(requested_revision_id)
+            plan_revision = (
+                await revision_candidate
+                if inspect.isawaitable(revision_candidate)
+                else revision_candidate
+            )
+            if plan_revision is None:
+                raise RuntimeError("The selected plan revision no longer exists")
+            runtime_services["plan_revision"] = plan_revision
+        previous_envelope = task.envelope
+        task.envelope = replace(
+            task.envelope,
+            metadata=metadata,
+            runtime_services=runtime_services,
+        )
+        # ``_last_envelope_by_session`` uses identity to avoid deleting a
+        # newer queued envelope during terminal cleanup.  Preserve that
+        # invariant when this turn replaces its envelope with the frozen
+        # collaboration snapshot.
+        async with self._state_lock:
+            if (
+                self._last_envelope_by_session.get(task.envelope.session_key)
+                is previous_envelope
+            ):
+                self._last_envelope_by_session[task.envelope.session_key] = task.envelope
+        if metadata["collaboration_mode"] == "plan":
+            task.no_memory_capture = True
+        plan_run = await self._start_attached_plan_run(task)
+        if plan_run is not None:
+            previous_envelope = task.envelope
+            task.envelope = replace(
+                task.envelope,
+                runtime_services={
+                    **task.envelope.runtime_services,
+                    "plan_run": plan_run,
+                },
+            )
+            async with self._state_lock:
+                if (
+                    self._last_envelope_by_session.get(task.envelope.session_key)
+                    is previous_envelope
+                ):
+                    self._last_envelope_by_session[task.envelope.session_key] = task.envelope
+
+    async def _start_attached_plan_run(self, task: _RuntimeTask) -> Any | None:
+        run_id = str(task.envelope.metadata.get("plan_run_id") or "").strip()
+        if not run_id:
+            return None
+        getter = getattr(self._storage, "get_plan_run", None)
+        mark_running = getattr(self._storage, "mark_plan_run_running", None)
+        if not callable(getter) or not callable(mark_running):
+            raise RuntimeError("PlanRun storage is unavailable")
+        current = await getter(run_id)
+        if current is None:
+            raise RuntimeError("The accepted PlanRun no longer exists")
+        if str(getattr(current, "session_key", "") or "") != (
+            task.envelope.session_key
+        ):
+            raise RuntimeError("The accepted PlanRun belongs to another session")
+        expected_revision_id = str(
+            task.envelope.metadata.get("plan_revision_id") or ""
+        ).strip()
+        if (
+            expected_revision_id
+            and str(getattr(current, "plan_revision_id", "") or "")
+            != expected_revision_id
+        ):
+            raise RuntimeError("The accepted PlanRun changed its PlanRevision binding")
+        updated = await mark_running(
+            run_id,
+            expected_state_revision=int(current.state_revision),
+            active_task_id=task.task_id,
+        )
+        await self._emit_plan_run(task.envelope.session_key, updated)
+        if str(getattr(updated, "status", "")) != "running":
+            raise RuntimeError("The selected plan revision is no longer executable")
+        return updated
+
+    async def _settle_attached_plan_run(self, task: _RuntimeTask) -> None:
+        """Pause an unfinished manual run when its single turn terminates."""
+
+        run_id = str(task.envelope.metadata.get("plan_run_id") or "").strip()
+        if not run_id:
+            return
+        getter = getattr(self._storage, "get_plan_run", None)
+        complete = getattr(self._storage, "complete_plan_run", None)
+        pause = getattr(self._storage, "pause_plan_run", None)
+        cancel = getattr(self._storage, "cancel_plan_run", None)
+        if not callable(getter):
+            return
+        try:
+            current = await getter(run_id)
+            if current is None:
+                return
+            status = str(getattr(current, "status", ""))
+            if status == "queued" and callable(cancel):
+                updated = await cancel(
+                    run_id,
+                    expected_state_revision=int(current.state_revision),
+                    reason="implementation_turn_ended_before_start",
+                    expected_active_task_id=task.task_id,
+                )
+            elif status == "running" and callable(pause):
+                driver_kind = str(getattr(current, "driver_kind", "manual"))
+                step_states = list(getattr(current, "step_states", []) or [])
+                delivery_ready = (
+                    getattr(current, "current_step_id", None) is None
+                    and bool(step_states)
+                    and all(
+                        isinstance(state, dict)
+                        and str(state.get("status") or "")
+                        in {"completed", "skipped"}
+                        for state in step_states
+                    )
+                )
+                if (
+                    task.status == AgentTaskStatus.SUCCEEDED
+                    and delivery_ready
+                    and callable(complete)
+                ):
+                    updated = await complete(
+                        run_id,
+                        expected_state_revision=int(current.state_revision),
+                        expected_active_task_id=task.task_id,
+                    )
+                    await self._emit_plan_run(task.envelope.session_key, updated)
+                    return
+                task_outcome = str(
+                    getattr(task.status, "value", task.status) or "unknown"
+                )
+                updated = await pause(
+                    run_id,
+                    expected_state_revision=int(current.state_revision),
+                    reason=(
+                        (
+                            "manual_turn_finished"
+                            if driver_kind == "manual"
+                            else "goal_turn_finished"
+                        )
+                        if task.status == AgentTaskStatus.SUCCEEDED
+                        else f"{driver_kind}_turn_{task_outcome}"
+                    ),
+                    expected_active_task_id=task.task_id,
+                    expected_driver_kind=driver_kind,
+                    expected_driver_id=(
+                        str(getattr(current, "driver_id", "") or "") or None
+                    ),
+                )
+            else:
+                return
+            await self._emit_plan_run(task.envelope.session_key, updated)
+        except Exception:  # noqa: BLE001 - plan overlay must not mask task terminal state
+            log.warning(
+                "task_runtime.plan_run_settle_failed",
+                session_key=task.envelope.session_key,
+                task_id=task.task_id,
+                plan_run_id=run_id,
+                exc_info=True,
+            )
+
+    async def _emit_plan_run(self, session_key: str, run: Any) -> None:
+        from opensquilla.session.plans import plan_run_snapshot
+
+        await self._emit(
+            session_key,
+            "session.event.plan_run",
+            {
+                "session_key": session_key,
+                "plan_run": plan_run_snapshot(run),
+            },
+        )
+
+    async def _emit_plan_revision_if_changed(self, task: _RuntimeTask) -> None:
+        getter = getattr(self._storage, "get_session", None)
+        get_revision = getattr(self._storage, "get_plan_revision", None)
+        if not callable(getter) or not callable(get_revision):
+            return
+        try:
+            node_candidate = getter(task.envelope.session_key)
+            node = (
+                await node_candidate
+                if inspect.isawaitable(node_candidate)
+                else node_candidate
+            )
+            if getattr(node, "active_plan_revision_id", None) is not None and not isinstance(
+                getattr(node, "active_plan_revision_id", None),
+                str,
+            ):
+                return
+            current_id = (
+                str(getattr(node, "active_plan_revision_id", "") or "")
+                if node is not None
+                else ""
+            )
+            starting_id = str(
+                task.envelope.metadata.get("active_plan_revision_id") or ""
+            )
+            if not current_id or current_id == starting_id:
+                return
+            revision_candidate = get_revision(current_id)
+            revision = (
+                await revision_candidate
+                if inspect.isawaitable(revision_candidate)
+                else revision_candidate
+            )
+            if revision is None:
+                return
+            from opensquilla.session.plans import plan_revision_snapshot
+
+            await self._emit(
+                task.envelope.session_key,
+                "session.event.plan_revision",
+                {
+                    "session_key": task.envelope.session_key,
+                    "plan_revision": plan_revision_snapshot(
+                        revision,
+                        current=True,
+                    ),
+                    "collaboration": {
+                        "mode": str(
+                            getattr(node, "collaboration_mode", "default")
+                            or "default"
+                        ),
+                        "revision": int(
+                            getattr(node, "collaboration_revision", 0) or 0
+                        ),
+                    },
+                },
+            )
+            # Committing a revision also advances the collaboration CAS
+            # revision.  Publish the authoritative snapshot so clients do not
+            # have to guess that increment before their next mode mutation.
+            await self._emit(
+                task.envelope.session_key,
+                "session.event.collaboration_mode",
+                {
+                    "session_key": task.envelope.session_key,
+                    "collaboration": {
+                        "mode": str(
+                            getattr(node, "collaboration_mode", "default")
+                            or "default"
+                        ),
+                        "revision": int(
+                            getattr(node, "collaboration_revision", 0) or 0
+                        ),
+                        "appliesTo": "next_turn",
+                    },
+                },
+            )
+        except Exception:  # noqa: BLE001 - observer must not change task result
+            log.warning(
+                "task_runtime.plan_revision_emit_failed",
+                session_key=task.envelope.session_key,
+                task_id=task.task_id,
+                exc_info=True,
+            )
 
     async def _promote_reclaimed_steers(self, task: _RuntimeTask) -> None:
         """Preserve accepted input when a non-cancel terminal path wins a race."""
@@ -2031,7 +2675,9 @@ class TaskRuntime:
                 "turn_context_revision": 2,
             }
         )
-        envelope = replace(completed_task.envelope, metadata=metadata)
+        envelope = _reusable_route_envelope(
+            replace(completed_task.envelope, metadata=metadata)
+        )
         message = "\n\n".join(item.text for item in items if item.text.strip())
         semantic_parts = [
             item.semantic_message or item.text for item in items if item.text.strip()
@@ -2508,8 +3154,17 @@ class TaskRuntime:
             self._remove_pending(task)
             if self._running_by_session.get(task.envelope.session_key) is task:
                 self._running_by_session.pop(task.envelope.session_key, None)
-            if self._last_envelope_by_session.get(task.envelope.session_key) is task.envelope:
+            if (
+                self._last_envelope_task_id_by_session.get(
+                    task.envelope.session_key
+                )
+                == task.task_id
+            ):
                 self._last_envelope_by_session.pop(task.envelope.session_key, None)
+                self._last_envelope_task_id_by_session.pop(
+                    task.envelope.session_key,
+                    None,
+                )
             # Keep the short write lock stable for this session. Popping it can
             # split callers across old/new lock objects while callbacks or
             # late lifecycle events still reference the old one. The dict grows
@@ -2539,6 +3194,22 @@ class TaskRuntime:
                 task,
                 status=status,
                 terminal_reason=terminal_reason,
+            )
+        # The per-session execution lock makes this task the only possible live
+        # continuation for approvals owned by its session. At terminal state,
+        # any remaining request is orphaned and must fail closed.
+        try:
+            from opensquilla.application.approval_queue import get_approval_queue
+
+            get_approval_queue().expire_pending_for_session(
+                task.envelope.session_key,
+            )
+        except Exception as exc:  # noqa: BLE001 - terminalization must continue.
+            log.warning(
+                "task_runtime.approval_cleanup_failed",
+                task_id=task.task_id,
+                session_key=task.envelope.session_key,
+                error=str(exc),
             )
         for collected_input in collected_terminal_inputs:
             await self._record_collected_primary_input_disposition(

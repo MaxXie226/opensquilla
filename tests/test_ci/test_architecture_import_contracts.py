@@ -118,6 +118,12 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("memory", "agents"),
     ("memory", "compat"),
     ("memory", "engine"),
+    # The project-workspace aggregate owns validation across agent identity,
+    # sandbox run contexts, and persisted session bindings. It remains a
+    # top-level composition module rather than a dependency of those packages.
+    ("project_workspaces.py", "agents"),
+    ("project_workspaces.py", "sandbox"),
+    ("project_workspaces.py", "session"),
     ("memory", "gateway"),
     ("memory", "identity"),
     ("memory", "provider"),

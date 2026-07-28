@@ -24,6 +24,8 @@ from opensquilla.sandbox.run_context import (
     RunContext,
 )
 from opensquilla.sandbox.run_mode import RunMode
+from opensquilla.tools.run_mode import full_host_access_for_context
+from opensquilla.tools.types import CallerKind, ToolContext
 
 
 def _owner_rpc_context(*, is_owner: bool = True) -> RpcContext:
@@ -60,7 +62,57 @@ def test_saved_route_run_mode_wins_over_later_global_full_default() -> None:
     assert ctx.elevated is None
 
 
-def test_channel_route_preserves_default_run_mode_for_verified_admin() -> None:
+def test_disabled_runtime_makes_stale_standard_context_resolve_to_full(monkeypatch) -> None:
+    from opensquilla.sandbox import integration
+
+    monkeypatch.setattr(
+        integration,
+        "get_runtime",
+        lambda: type(
+            "Runtime",
+            (),
+            {
+                "effective": type("Effective", (), {"sandbox_enabled": False})(),
+                "default_run_mode": RunMode.FULL,
+            },
+        )(),
+    )
+    ctx = ToolContext(
+        is_owner=True,
+        caller_kind=CallerKind.CLI,
+        session_key="standard-session",
+        run_mode="standard",
+    )
+
+    assert full_host_access_for_context(ctx) is True
+
+
+def test_enabled_runtime_keeps_valid_standard_context_over_full_default(monkeypatch) -> None:
+    from opensquilla.sandbox import integration
+
+    monkeypatch.setattr(
+        integration,
+        "get_runtime",
+        lambda: type(
+            "Runtime",
+            (),
+            {
+                "effective": type("Effective", (), {"sandbox_enabled": True})(),
+                "default_run_mode": RunMode.FULL,
+            },
+        )(),
+    )
+    ctx = ToolContext(
+        is_owner=True,
+        caller_kind=CallerKind.CLI,
+        session_key="standard-session",
+        run_mode="standard",
+    )
+
+    assert full_host_access_for_context(ctx) is False
+
+
+def test_channel_route_upgrades_owner_default_to_full_but_keeps_members_trusted() -> None:
     envelope = build_channel_route_envelope(
         IncomingMessage(sender_id="u1", channel_id="c1", content="hello"),
         session_key="agent:main:feishu:u1",

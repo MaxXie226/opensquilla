@@ -133,6 +133,17 @@ function approvalPart(
   }
 }
 
+function approvalTimelineItem(
+  part: Extract<ChatPart, { type: 'interrupt' }>,
+): ChatStreamTimelineItem {
+  return {
+    type: 'interrupt',
+    key: part.key,
+    approvalId: part.approval?.approvalId || '',
+    part,
+  }
+}
+
 function baseMessage(overrides: Partial<ChatRenderedMessage> = {}): ChatRenderedMessage {
   return {
     id: 'assistant-1',
@@ -276,6 +287,43 @@ describe('AssistantMessage activity disclosure', () => {
     expect((el.textContent?.match(/Final verified answer\./g) ?? [])).toHaveLength(1)
   })
 
+  it('collapses PlanRun narration and leaves only the terminal delivery outside', async () => {
+    const checkpoint = successfulCall('checkpoint', 'plan_run_checkpoint')
+    const el = mountMessage(baseMessage({
+      text: 'Inspecting files.\n\nImplementation complete.',
+      timelineItems: [
+        {
+          type: 'text',
+          key: 'work',
+          html: '<p>Inspecting files.</p>',
+          rawText: 'Inspecting files.\n\n',
+        },
+        timelineGroup(successfulCall('inspect', 'read_source')),
+        {
+          type: 'text',
+          key: 'delivery',
+          html: '<p>Implementation complete.</p>',
+          rawText: 'Implementation complete.',
+        },
+        timelineGroup(checkpoint),
+      ],
+      parts: [],
+      statusHistory: [],
+    }))
+    await nextTick()
+
+    const activity = el.querySelector<HTMLElement>('.assistant-activity')
+    const answer = [...el.querySelectorAll<HTMLElement>('.msg-ai-text')]
+      .find(node => !activity?.contains(node))
+
+    expect(activity?.querySelector('.assistant-activity__summary')?.getAttribute('aria-expanded'))
+      .toBe('false')
+    expect(activity?.textContent).toContain('Inspecting files.')
+    expect(activity?.textContent).not.toContain('plan_run_checkpoint')
+    expect(answer?.textContent).toBe('Implementation complete.')
+    expect(el.textContent).not.toContain('Inspecting files.Implementation complete.')
+  })
+
   it('keeps a terminal failure open at the failed tool', async () => {
     const timelineItems = failedTimeline().filter(item => item.type === 'tool-group')
     const el = mountMessage(baseMessage({
@@ -316,16 +364,36 @@ describe('AssistantMessage activity disclosure', () => {
   })
 
   it('does not claim completion while approval is unresolved', async () => {
+    const pending = approvalPart(null)
     const el = mountMessage(baseMessage({
-      parts: [approvalPart(null)],
+      timelineItems: [...successfulTimeline(), approvalTimelineItem(pending)],
+      parts: [pending],
     }))
     await nextTick()
 
     const summary = el.querySelector('.assistant-activity__summary')
+    const card = el.querySelector<HTMLElement>('.approval-card')
     expect(summary?.textContent).toContain('1 web action')
-    expect(summary?.textContent).toContain('1 failed')
     expect(summary?.textContent).not.toContain('Completed ·')
-    expect(summary?.textContent).not.toContain('recovered')
+    expect(card).not.toBeNull()
+    expect(el.querySelectorAll('.approval-card')).toHaveLength(1)
+    expect(el.querySelector('.assistant-activity')?.contains(card ?? null)).toBe(false)
+    expect(el.querySelector('.msg-ai-main')?.lastElementChild).toBe(card)
+  })
+
+  it('moves a resolved approval outcome into its chronological activity position', async () => {
+    const approved = approvalPart('approved')
+    const el = mountMessage(baseMessage({
+      timelineItems: [...successfulTimeline(), approvalTimelineItem(approved)],
+      parts: [approved],
+    }))
+    await nextTick()
+
+    const activity = el.querySelector('.assistant-activity')
+    const outcome = el.querySelector<HTMLElement>('.approval-outcome')
+    expect(outcome).not.toBeNull()
+    expect(el.querySelectorAll('.approval-outcome')).toHaveLength(1)
+    expect(activity?.contains(outcome ?? null)).toBe(true)
   })
 
   it('does not claim completion after an approval is denied', async () => {

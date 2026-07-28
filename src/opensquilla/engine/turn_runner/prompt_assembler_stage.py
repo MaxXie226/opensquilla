@@ -111,6 +111,7 @@ class PromptAssemblerPort(Protocol):
         prompt_metadata: dict[str, Any],
         bootstrap_context_mode: str | None,
         fresh_user_session: bool = False,
+        workspace_dir: str | None = None,
     ) -> str | tuple[str, str]: ...
 
 @runtime_checkable
@@ -378,6 +379,7 @@ class PromptAssemblerStage:
             prompt_metadata=prompt_metadata,
             bootstrap_context_mode=inp.bootstrap_context_mode,
             fresh_user_session=inp.fresh_user_session,
+            workspace_dir=getattr(inp.effective_tool_context, "workspace_dir", None),
         )
 
         # 2. Fetch router context (transcript-driven)

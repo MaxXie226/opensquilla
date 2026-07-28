@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import uuid
 
@@ -14,10 +15,11 @@ from opensquilla.provider.correlation_context import (
     current_provider_request_correlation,
 )
 from opensquilla.provider.types import derive_provider_request_correlation
+from opensquilla.sandbox.run_context import RUN_CONTEXT_ORIGIN_KEY
 from opensquilla.session.keys import build_subagent_session_key, parse_agent_id
 from opensquilla.tools.registry import tool
 from opensquilla.tools.run_mode import current_run_mode
-from opensquilla.tools.types import SafeToolError, ToolError, current_tool_context
+from opensquilla.tools.types import PlanAccess, SafeToolError, ToolError, current_tool_context
 
 _log = structlog.get_logger("opensquilla.tools.sessions")
 
@@ -436,6 +438,31 @@ async def sessions_spawn(
         grounded_task = (
             _SUBAGENT_SYSTEM_PROMPT + "\n\n" + _normalize_subagent_task_for_execution(task)
         )
+        envelope = build_subagent_route_envelope(
+            session_key=session_key,
+            parent_session_key=parent_session_key,
+            agent_id=resolved_agent_id,
+            run_id=subagent_run_id,
+            parent_task_id=parent_task_id,
+            spawn_depth=spawn_depth,
+            principal_is_owner=getattr(ctx, "is_owner", None) if ctx is not None else None,
+            elevated=getattr(ctx, "elevated", None) if ctx is not None else None,
+            run_mode=current_run_mode(),
+            sandbox_run_context=(
+                getattr(ctx, "sandbox_run_context", None) if ctx is not None else None
+            ),
+            sandbox_mounts=getattr(ctx, "sandbox_mounts", None) if ctx is not None else None,
+        )
+        child_origin: dict[str, object] = {
+            "kind": "subagent",
+            "parent_session_key": parent_session_key,
+            "parent_task_id": parent_task_id,
+            "task": task,
+            "execution_task": grounded_task,
+        }
+        inherited_context = envelope.metadata.get(RUN_CONTEXT_ORIGIN_KEY)
+        if isinstance(inherited_context, dict):
+            child_origin[RUN_CONTEXT_ORIGIN_KEY] = copy.deepcopy(inherited_context)
         create_kwargs = {
             "session_key": session_key,
             "agent_id": resolved_agent_id,
@@ -443,14 +470,17 @@ async def sessions_spawn(
             "spawn_depth": spawn_depth,
             "parent_session_key": parent_session_key,
             "spawned_by": parent_session_key,
-            "origin": {
-                "kind": "subagent",
-                "parent_session_key": parent_session_key,
-                "parent_task_id": parent_task_id,
-                "task": task,
-                "execution_task": grounded_task,
-            },
+            "origin": child_origin,
         }
+        get_parent_session = getattr(mgr, "get_session", None)
+        if callable(get_parent_session):
+            try:
+                parent_session = await get_parent_session(parent_session_key)
+            except (AttributeError, NotImplementedError):
+                parent_session = None
+            workspace_id = getattr(parent_session, "workspace_id", None)
+            if isinstance(workspace_id, str) and workspace_id.strip():
+                create_kwargs["workspace_id"] = workspace_id
         # ── max_children gate + create are serialized per parent session
         # so two concurrent spawns cannot both observe ``active < cap`` and
         # both create children. The lock spans count + create so the new
@@ -475,21 +505,6 @@ async def sessions_spawn(
                 **create_kwargs,
             )
             await mgr.append_message(session_key, role="user", content=grounded_task)
-        envelope = build_subagent_route_envelope(
-            session_key=session_key,
-            parent_session_key=parent_session_key,
-            agent_id=resolved_agent_id,
-            run_id=subagent_run_id,
-            parent_task_id=parent_task_id,
-            spawn_depth=spawn_depth,
-            principal_is_owner=getattr(ctx, "is_owner", None) if ctx is not None else None,
-            elevated=getattr(ctx, "elevated", None) if ctx is not None else None,
-            run_mode=current_run_mode(),
-            sandbox_run_context=(
-                getattr(ctx, "sandbox_run_context", None) if ctx is not None else None
-            ),
-            sandbox_mounts=getattr(ctx, "sandbox_mounts", None) if ctx is not None else None,
-        )
         handle = await runtime.enqueue(
             envelope,
             grounded_task,
@@ -542,6 +557,7 @@ async def sessions_spawn(
         },
     },
     required=[],
+    plan_access=PlanAccess.READ_ONLY,
 )
 async def sessions_list(
     agent_id: str | None = None,
@@ -583,6 +599,7 @@ async def sessions_list(
         },
     },
     required=["session_key"],
+    plan_access=PlanAccess.READ_ONLY,
 )
 async def sessions_history(session_key: str, limit: int = 20) -> str:
     if not (1 <= limit <= 100):
@@ -792,6 +809,7 @@ async def sessions_yield(
     description="Show current session usage, cost, and model information.",
     params={},
     required=[],
+    plan_access=PlanAccess.READ_ONLY,
 )
 async def session_status() -> str:
     try:

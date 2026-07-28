@@ -87,13 +87,16 @@ from opensquilla.sandbox.operation_profile import (
     shell_command_approval_variants,
 )
 from opensquilla.sandbox.operation_runtime import SandboxToolDescriptor
+from opensquilla.sandbox.path_aliases import resolve_workspace_alias
 from opensquilla.sandbox.path_validation import (
     MountDecision,
     decide_path_access,
+    logical_tool_path,
     trusted_write_auto_grant_allowed,
 )
 from opensquilla.sandbox.policy import LevelHints
 from opensquilla.sandbox.types import (
+    ApprovedHostExecution,
     DenialResult,
     MountMode,
     MountSpec,
@@ -612,6 +615,10 @@ def _resolve_shell_script_path(raw_path: str, *, workdir: str | None = None) -> 
     if not path.is_absolute():
         base = Path(workdir).expanduser() if workdir else Path.cwd()
         path = base / path
+    workspace = _workspace_root_for_path_access()
+    alias = resolve_workspace_alias(path, workspace)
+    if alias is not None:
+        path = alias
     return path.resolve(strict=False)
 
 
@@ -673,9 +680,7 @@ def _script_argument_for_interpreter(
     family: str,
 ) -> str | None:
     inline_flags = _SCRIPT_INTERPRETER_INLINE_FLAGS.get(family, frozenset())
-    options_with_values = _SCRIPT_INTERPRETER_OPTIONS_WITH_VALUES.get(
-        family, frozenset()
-    )
+    options_with_values = _SCRIPT_INTERPRETER_OPTIONS_WITH_VALUES.get(family, frozenset())
     cursor = 1
     while cursor < len(tokens):
         token = tokens[cursor]
@@ -732,9 +737,7 @@ def _referenced_script_file_digests(
             continue
         family = _script_interpreter_family(tokens[0])
         raw_path = (
-            _script_argument_for_interpreter(tokens, family=family)
-            if family is not None
-            else None
+            _script_argument_for_interpreter(tokens, family=family) if family is not None else None
         )
         interpreter = tokens[0]
         if raw_path is None and family is None:
@@ -2729,13 +2732,16 @@ def _sandbox_read_path_access_envelope(
     workspace = _workspace_root_for_path_access()
     if workspace is None:
         return None
+    target_workdir = _shell_redirection_workdir(command, workdir)
     for raw_path in read_paths:
+        resolved = _resolve_shell_write_target(raw_path, target_workdir)
         decision = decide_path_access(
-            _resolve_shell_write_target(raw_path, workdir),
+            resolved,
             workspace=workspace,
             mounts=_active_sandbox_mounts(),
             write=False,
             profile=active_file_system_profile(workspace),
+            logical_path=_logical_shell_write_target(raw_path, target_workdir),
         )
         if decision.status == "allowed":
             continue
@@ -2782,14 +2788,17 @@ def _sandbox_write_path_access_envelope(
     workspace = _workspace_root_for_path_access()
     if workspace is None:
         return None
+    target_workdir = _shell_redirection_workdir(command, workdir)
     shell_file_targets = frozenset(_shell_write_targets_from_inputs(command, stdin))
     for raw_path in write_paths:
+        resolved = _resolve_shell_write_target(raw_path, target_workdir)
         decision = decide_path_access(
-            _resolve_shell_write_target(raw_path, workdir),
+            resolved,
             workspace=workspace,
             mounts=_active_sandbox_mounts(),
             write=True,
             profile=active_file_system_profile(workspace),
+            logical_path=_logical_shell_write_target(raw_path, target_workdir),
         )
         if decision.status == "allowed":
             if allow_trusted_auto_mount:
@@ -2828,11 +2837,24 @@ def _protected_metadata_write_block(
 ) -> dict[str, object] | None:
     if full_host_access_active():
         return None
+    workspace = _workspace_root_for_path_access()
+    file_system_profile = active_file_system_profile(workspace) if workspace is not None else None
+    target_workdir = _shell_redirection_workdir(command, workdir)
     for raw_path in _shell_write_access_targets(command, profile, stdin=stdin):
-        resolved = _resolve_shell_write_target(raw_path, workdir)
-        protected_name = next(
-            (part for part in resolved.parts if part in _PROTECTED_METADATA_NAMES),
-            None,
+        logical = _logical_shell_write_target(raw_path, target_workdir)
+        resolved = _resolve_shell_write_target(raw_path, target_workdir)
+        protected_root = (
+            file_system_profile.protected_metadata_root(logical)
+            if file_system_profile is not None
+            else None
+        )
+        protected_name = (
+            protected_root.name
+            if protected_root is not None
+            else next(
+                (part for part in logical.parts if part in _PROTECTED_METADATA_NAMES),
+                None,
+            )
         )
         if protected_name is None:
             continue
@@ -2921,7 +2943,18 @@ def _resolve_shell_write_target(raw_target: str, workdir: str | None) -> Path:
     if not path.is_absolute():
         base = Path(workdir).expanduser() if workdir else Path.cwd()
         path = base / path
+    alias = resolve_workspace_alias(path, _workspace_root_for_path_access())
+    if alias is not None:
+        path = alias
     return path.resolve(strict=False)
+
+
+def _logical_shell_write_target(raw_target: str, workdir: str | None) -> Path:
+    cleaned = raw_target.strip().strip("'\"")
+    base = (
+        Path(workdir).expanduser() if workdir else (_workspace_root_for_path_access() or Path.cwd())
+    )
+    return logical_tool_path(cleaned, base=base)
 
 
 def _shell_target_is_relative(raw_target: str) -> bool:
@@ -2954,21 +2987,216 @@ def _is_special_shell_write_target(raw_target: object) -> bool:
     return _is_windows_dos_device_target(raw_target)
 
 
-_LEADING_CD_RE = re.compile(r"^\s*cd\s+((?:'[^']*')|(?:\"[^\"]*\")|(?:[^;&|]+?))\s*(?:&&|;)")
+@dataclass(frozen=True)
+class _LeadingCdPrefix:
+    targets: tuple[str, ...] = ()
+    unsafe_reason: str = ""
+
+
+_DYNAMIC_SHELL_PATH_MARKERS = frozenset("$`*?[]{}%()<>")
+_SHELL_COMMAND_BOUNDARIES = frozenset({"&&", "||", "|", "&", "(", ")", "{", "}"})
+_SHELL_COMMAND_PREFIXES = frozenset(
+    {"!", "builtin", "command", "do", "elif", "else", "if", "then", "time", "until", "while"}
+)
+_SHELL_REDIRECTION_OPERATORS = frozenset(
+    {"<", "<<", "<<-", "<<<", "<&", "<>", ">", ">&", ">>", "&>", "&>>", ">|"}
+)
+_UNMODELLED_WORKDIR_COMMANDS = frozenset(
+    {
+        ".",
+        "eval",
+        "pop-location",
+        "popd",
+        "push-location",
+        "pushd",
+        "set-location",
+        "source",
+    }
+)
+_INLINE_SHELL_COMMANDS = frozenset({"bash", "sh"})
+
+
+def _shell_statement_separator(token: str) -> bool:
+    if token == ";":
+        return True
+    if token and set(token) == {"\n"}:
+        return True
+    return token.startswith(";") and bool(token[1:]) and set(token[1:]) == {"\n"}
+
+
+def _literal_shell_cd_target(target: str) -> bool:
+    return bool(target) and not any(marker in target for marker in _DYNAMIC_SHELL_PATH_MARKERS)
+
+
+def _shell_control_token(token: str) -> bool:
+    return _shell_statement_separator(token) or token in _SHELL_COMMAND_BOUNDARIES
+
+
+def _shell_assignment_prefix(token: str) -> bool:
+    return re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", token) is not None
+
+
+def _contains_unmodelled_workdir_change(tokens: tuple[str, ...], start: int = 0) -> bool:
+    """Return whether a simple command can change cwd outside the modelled grammar."""
+
+    command_position = True
+    skip_redirection_target = False
+    for index in range(start, len(tokens)):
+        token = tokens[index]
+        if _shell_control_token(token):
+            command_position = True
+            skip_redirection_target = False
+            continue
+        if not command_position:
+            continue
+        if skip_redirection_target:
+            skip_redirection_target = False
+            continue
+        if token in _SHELL_REDIRECTION_OPERATORS:
+            skip_redirection_target = True
+            continue
+        if (
+            token.isdecimal()
+            and index + 1 < len(tokens)
+            and tokens[index + 1] in _SHELL_REDIRECTION_OPERATORS
+        ):
+            continue
+        command = token.casefold() if token in {".", "!"} else Path(token).name.casefold()
+        if command == "cd" or command in _UNMODELLED_WORKDIR_COMMANDS:
+            return True
+        if command in _INLINE_SHELL_COMMANDS:
+            for argument in tokens[index + 1 :]:
+                if _shell_control_token(argument):
+                    break
+                if (
+                    argument.startswith("-")
+                    and not argument.startswith("--")
+                    and "c" in argument[1:]
+                ):
+                    return True
+        if token in _SHELL_COMMAND_PREFIXES or _shell_assignment_prefix(token):
+            continue
+        command_position = False
+    return False
+
+
+def _inline_shell_script(tokens: tuple[str, ...]) -> str | None:
+    """Return a directly nested ``sh -c`` script when its wrapper is simple."""
+
+    if not tokens or Path(tokens[0]).name.casefold() not in _INLINE_SHELL_COMMANDS:
+        return None
+    command_index: int | None = None
+    for index, token in enumerate(tokens[1:], start=1):
+        if _shell_control_token(token) or token in _SHELL_REDIRECTION_OPERATORS:
+            return None
+        if token == "--":
+            continue
+        if token.startswith("-"):
+            if "c" in token[1:]:
+                command_index = index + 1
+                break
+            continue
+        return None
+    if command_index is None or command_index >= len(tokens):
+        return None
+    if _shell_control_token(tokens[command_index]):
+        return None
+    if any(
+        _shell_control_token(token) or token in _SHELL_REDIRECTION_OPERATORS
+        for token in tokens[command_index + 1 :]
+    ):
+        return None
+    return tokens[command_index]
+
+
+def _leading_cd_prefix(command: str, *, _depth: int = 0) -> _LeadingCdPrefix:
+    """Parse the deliberately small leading-``cd`` grammar used for path gates."""
+
+    lexer = shlex.shlex(
+        command,
+        posix=True,
+        punctuation_chars=";&|<>\n",
+    )
+    lexer.commenters = ""
+    lexer.whitespace = " \t\r"
+    lexer.whitespace_split = True
+    try:
+        tokens = tuple(lexer)
+    except ValueError:
+        return _LeadingCdPrefix(unsafe_reason="untrusted_workdir")
+    if not tokens:
+        return _LeadingCdPrefix()
+    if Path(tokens[0]).name.casefold() in _INLINE_SHELL_COMMANDS:
+        nested = _inline_shell_script(tokens)
+        if nested is None or _depth >= 4:
+            return _LeadingCdPrefix(unsafe_reason="untrusted_workdir")
+        return _leading_cd_prefix(nested, _depth=_depth + 1)
+    if tokens[0] != "cd":
+        if _contains_unmodelled_workdir_change(tokens):
+            return _LeadingCdPrefix(unsafe_reason="untrusted_workdir")
+        return _LeadingCdPrefix()
+
+    targets: list[str] = []
+    index = 0
+    while index < len(tokens) and tokens[index] == "cd":
+        index += 1
+        options_terminated = False
+        if index < len(tokens) and tokens[index] == "--":
+            options_terminated = True
+            index += 1
+        if index >= len(tokens) or _shell_control_token(tokens[index]):
+            return _LeadingCdPrefix(unsafe_reason="dynamic_workdir")
+
+        target = tokens[index]
+        index += 1
+        if (
+            not _literal_shell_cd_target(target)
+            or target == "-"
+            or (target.startswith("-") and not options_terminated)
+        ):
+            return _LeadingCdPrefix(unsafe_reason="dynamic_workdir")
+        targets.append(target)
+        if index == len(tokens):
+            return _LeadingCdPrefix(targets=tuple(targets))
+
+        operator = tokens[index]
+        if operator == "&&":
+            index += 1
+            if index == len(tokens):
+                return _LeadingCdPrefix(unsafe_reason="untrusted_workdir")
+        elif _shell_statement_separator(operator):
+            index += 1
+        elif (
+            operator == "||"
+            and index + 2 < len(tokens)
+            and tokens[index + 1] == "exit"
+            and _shell_statement_separator(tokens[index + 2])
+        ):
+            index += 3
+        else:
+            return _LeadingCdPrefix(unsafe_reason="untrusted_workdir")
+
+        if index == len(tokens):
+            return _LeadingCdPrefix(targets=tuple(targets))
+        if tokens[index] == "cd":
+            continue
+        if _contains_unmodelled_workdir_change(tokens, index):
+            return _LeadingCdPrefix(unsafe_reason="untrusted_workdir")
+        return _LeadingCdPrefix(targets=tuple(targets))
+
+    return _LeadingCdPrefix(targets=tuple(targets))
 
 
 def _shell_redirection_workdir(command: str, workdir: str | None) -> str | None:
-    match = _LEADING_CD_RE.match(command)
-    if match is None:
+    leading_cd = _leading_cd_prefix(command)
+    if not leading_cd.targets:
         return workdir
-    raw_target = match.group(1).strip()
-    if len(raw_target) >= 2 and raw_target[0] == raw_target[-1] and raw_target[0] in {"'", '"'}:
-        raw_target = raw_target[1:-1]
-    path = Path(raw_target).expanduser()
-    if not path.is_absolute():
-        base = Path(workdir).expanduser() if workdir else Path.cwd()
-        path = base / path
-    return str(path.resolve(strict=False))
+    path = Path(workdir).expanduser() if workdir else Path.cwd()
+    for raw_target in leading_cd.targets:
+        target = Path(raw_target).expanduser()
+        path = target if target.is_absolute() else path / target
+        path = path.resolve(strict=False)
+    return str(path)
 
 
 def _is_shell_null_write_target(raw_target: str) -> bool:
@@ -4372,19 +4600,30 @@ def _shell_elevation_required_envelope(
         return None
     target = ""
     reason = ""
-    if profile.host_effect:
+    leading_cd = _leading_cd_prefix(command)
+    candidates = list(_shell_write_access_targets(command, profile, stdin=stdin))
+    workdir_write = bool(cwd and _shell_workdir_requires_write(command, profile, stdin=stdin))
+    relative_write_depends_on_cwd = workdir_write or any(
+        _shell_target_is_relative(raw_path) for raw_path in candidates
+    )
+    if leading_cd.unsafe_reason and relative_write_depends_on_cwd:
+        reason = leading_cd.unsafe_reason
+    elif profile.host_effect:
         reason = profile.host_effect
     else:
-        candidates = list(_shell_write_access_targets(command, profile, stdin=stdin))
-        if cwd and _shell_workdir_requires_write(command, profile, stdin=stdin):
+        if workdir_write:
+            assert cwd is not None
             candidates.insert(0, cwd)
+        target_workdir = _shell_redirection_workdir(command, cwd)
         for raw_path in candidates:
+            resolved = _resolve_shell_write_target(raw_path, target_workdir)
             decision = decide_path_access(
-                _resolve_shell_write_target(raw_path, cwd),
+                resolved,
                 workspace=workspace,
                 mounts=_active_sandbox_mounts(),
                 write=True,
                 profile=active_file_system_profile(workspace),
+                logical_path=_logical_shell_write_target(raw_path, target_workdir),
             )
             if decision.status == "blocked":
                 return _path_access_blocked_envelope(decision)
@@ -5256,106 +5495,110 @@ async def exec_command(
         )
         if isinstance(decision, DenialResult):
             return finish(json.dumps(decision.to_dict()))
-        retry_gate = consume_backend_denial_retry(
-            approval_id,
-            request,
-            policy,
-            runtime=runtime,
-        )
-        if retry_gate is not None:
-            if not retry_gate.allowed:
-                return finish(json.dumps(retry_gate.to_envelope(), ensure_ascii=False))
+        if isinstance(decision, ApprovedHostExecution):
             host_execution = True
             backend_retry_granted = True
         else:
-            backend_cwd = _sandbox_shell_backend_cwd(cwd, request)
-            backend_policy = request.policy
-            backend_policy = _policy_with_active_tool_mounts(backend_policy)
-            backend_policy = _policy_with_windows_shell_runtime_mounts(backend_policy, runtime)
-            backend_policy = _policy_with_wall_timeout(backend_policy, effective_timeout)
-            backend_policy = _trusted_managed_network_policy(backend_policy, runtime)
-            backend_request = SandboxRequest(
-                argv=_sandbox_shell_backend_argv(command, runtime, cwd=backend_cwd),
-                cwd=backend_cwd,
-                action_kind=request.action_kind,
-                policy=backend_policy,
-                stdin=stdin_bytes,
-                env=dict(merged_env),
-                reason=getattr(request, "reason", ""),
-                session_id=getattr(request, "session_id", ""),
-                run_mode=getattr(request, "run_mode", ""),
+            retry_gate = consume_backend_denial_retry(
+                approval_id,
+                request,
+                policy,
+                runtime=runtime,
             )
-            preflight = await preflight_subprocess_managed_network(backend_request, runtime)
-            if isinstance(preflight, DenialResult):
-                return finish(json.dumps(preflight.to_dict()))
-            if isinstance(preflight, dict):
-                return finish(json.dumps(preflight))
-            try:
-                sandbox_result = await _run_backend_with_managed_network(
-                    backend_request,
-                    runtime=runtime,
+            if retry_gate is not None:
+                if not retry_gate.allowed:
+                    return finish(json.dumps(retry_gate.to_envelope(), ensure_ascii=False))
+                host_execution = True
+                backend_retry_granted = True
+            else:
+                backend_cwd = _sandbox_shell_backend_cwd(cwd, request)
+                backend_policy = request.policy
+                backend_policy = _policy_with_active_tool_mounts(backend_policy)
+                backend_policy = _policy_with_windows_shell_runtime_mounts(backend_policy, runtime)
+                backend_policy = _policy_with_wall_timeout(backend_policy, effective_timeout)
+                backend_policy = _trusted_managed_network_policy(backend_policy, runtime)
+                backend_request = SandboxRequest(
+                    argv=_sandbox_shell_backend_argv(command, runtime, cwd=backend_cwd),
+                    cwd=backend_cwd,
+                    action_kind=request.action_kind,
+                    policy=backend_policy,
+                    stdin=stdin_bytes,
+                    env=dict(merged_env),
+                    reason=getattr(request, "reason", ""),
+                    session_id=getattr(request, "session_id", ""),
+                    run_mode=getattr(request, "run_mode", ""),
                 )
-            except SandboxBackendError as exc:
-                review_action = _shell_elevation_action(
-                    tool_name="exec_command",
-                    action_kind="shell.exec",
-                    command=command,
-                    cwd=cwd,
-                    profile=profile,
-                    justification=(
-                        "Sandbox backend unavailable; retry this exact command on host."
-                    ),
-                    env=env,
-                    stdin=stdin,
-                    prefix_rule=prefix_rule,
-                )
-                escalation = await escalate_unavailable_backend_in_managed_mode(
-                    exc,
-                    request,
-                    policy,
-                    runtime=runtime,
-                    review_action=review_action,
-                )
-                if escalation is not None:
+                preflight = await preflight_subprocess_managed_network(backend_request, runtime)
+                if isinstance(preflight, DenialResult):
+                    return finish(json.dumps(preflight.to_dict()))
+                if isinstance(preflight, dict):
+                    return finish(json.dumps(preflight))
+                try:
+                    sandbox_result = await _run_backend_with_managed_network(
+                        backend_request,
+                        runtime=runtime,
+                    )
+                except SandboxBackendError as exc:
+                    review_action = _shell_elevation_action(
+                        tool_name="exec_command",
+                        action_kind="shell.exec",
+                        command=command,
+                        cwd=cwd,
+                        profile=profile,
+                        justification=(
+                            "Sandbox backend unavailable; retry this exact command on host."
+                        ),
+                        env=env,
+                        stdin=stdin,
+                        prefix_rule=prefix_rule,
+                    )
+                    escalation = await escalate_unavailable_backend_in_managed_mode(
+                        exc,
+                        request,
+                        policy,
+                        runtime=runtime,
+                        review_action=review_action,
+                    )
+                    if escalation is not None:
+                        if isinstance(escalation, DenialResult):
+                            return finish(json.dumps(escalation.to_dict(), ensure_ascii=False))
+                        return finish(json.dumps(escalation.to_envelope(), ensure_ascii=False))
+                    raise
+                except Exception as exc:
+                    raise ToolError(f"Sandboxed shell execution failed: {exc}") from exc
+                if is_likely_sandbox_denied(sandbox_result):
+                    review_action = _shell_elevation_action(
+                        tool_name="exec_command",
+                        action_kind="shell.exec",
+                        command=command,
+                        cwd=cwd,
+                        profile=profile,
+                        justification=("Sandbox denied this exact command; retry it on host."),
+                        env=env,
+                        stdin=stdin,
+                        prefix_rule=prefix_rule,
+                    )
+                    escalation = await escalate_backend_denial(
+                        sandbox_result,
+                        request,
+                        policy,
+                        runtime=runtime,
+                        review_action=review_action,
+                    )
                     if isinstance(escalation, DenialResult):
-                        return finish(json.dumps(escalation.to_dict(), ensure_ascii=False))
+                        return finish(json.dumps(escalation.to_dict()))
                     return finish(json.dumps(escalation.to_envelope(), ensure_ascii=False))
-                raise ToolError(f"Sandboxed shell execution failed: {exc}") from exc
-            except Exception as exc:
-                raise ToolError(f"Sandboxed shell execution failed: {exc}") from exc
-            if is_likely_sandbox_denied(sandbox_result):
-                review_action = _shell_elevation_action(
-                    tool_name="exec_command",
-                    action_kind="shell.exec",
-                    command=command,
-                    cwd=cwd,
-                    profile=profile,
-                    justification="Sandbox denied this exact command; retry it on host.",
-                    env=env,
-                    stdin=stdin,
-                    prefix_rule=prefix_rule,
+                output = sandbox_result.stdout
+                if sandbox_result.stderr:
+                    output += sandbox_result.stderr
+                output = _append_sandbox_network_hint(output)
+                output = _append_patch_hygiene_warning(command, cwd, output)
+                output = _append_masked_pipeline_failure_warning(
+                    command,
+                    sandbox_result.returncode,
+                    output,
                 )
-                escalation = await escalate_backend_denial(
-                    sandbox_result,
-                    request,
-                    policy,
-                    runtime=runtime,
-                    review_action=review_action,
-                )
-                if isinstance(escalation, DenialResult):
-                    return finish(json.dumps(escalation.to_dict()))
-                return finish(json.dumps(escalation.to_envelope(), ensure_ascii=False))
-            output = sandbox_result.stdout
-            if sandbox_result.stderr:
-                output += sandbox_result.stderr
-            output = _append_sandbox_network_hint(output)
-            output = _append_patch_hygiene_warning(command, cwd, output)
-            output = _append_masked_pipeline_failure_warning(
-                command,
-                sandbox_result.returncode,
-                output,
-            )
-            return finish(f"exit_code={sandbox_result.returncode}\n{output}")
+                return finish(f"exit_code={sandbox_result.returncode}\n{output}")
 
     if host_execution:
         log.info(
@@ -5394,11 +5637,14 @@ async def _start_host_background_process(
     cwd: str | None,
     effective_timeout: float,
     runtime: object | None,
+    env: dict[str, str] | None = None,
 ) -> str:
     """Start a host background process without sandbox policy or safety preflight."""
 
     session_id = str(uuid.uuid4())[:8]
-    host_env = apply_utf8_child_env(_host_shell_env(os.environ.copy()))
+    host_env = apply_utf8_child_env(
+        _host_shell_env(dict(env) if env is not None else os.environ.copy())
+    )
     _append_windows_app_alias_path(host_env, runtime=runtime)
     host_env = _dedupe_windows_env_keys(host_env)
 
@@ -5658,6 +5904,21 @@ async def background_process(
         )
         if isinstance(decision, DenialResult):
             return json.dumps(decision.to_dict())
+        if isinstance(decision, ApprovedHostExecution):
+            log.info(
+                "background_process_host",
+                command=_audit_command(command),
+                run_mode=_context_run_mode(),
+                elevation_grant=True,
+                host_effect=profile.host_effect,
+            )
+            return await _start_host_background_process(
+                command,
+                cwd=cwd,
+                effective_timeout=effective_timeout,
+                runtime=runtime,
+                env=merged_env,
+            )
         retry_gate = consume_backend_denial_retry(
             approval_id,
             request,

@@ -62,12 +62,25 @@ export interface UseChatSlashCommandsOptions {
   // Send a turn whose provider text bypasses slash parsing (mirrors the TUI
   // override path). Used by /meta <name> to trigger the launch after meta.run.
   dispatchHidden: (providerText: string, displayText: string) => void
+  // Send the optional text after "/plan" through the normal composer path so
+  // attachments, intent, optimistic rendering, and retry restoration are kept.
+  dispatchPlanPrompt: (prompt: string, composerText: string) => void
+  activatePlanMode?: () => boolean | Promise<boolean>
+  planModeAvailable?: () => boolean
+  codingModeEnabled: Ref<boolean>
+  setCodingModeEnabled: (enabled: boolean) => Promise<boolean>
 }
 
 function slashCommandKey(value: string): string {
   const raw = String(value || '').trim().split(/\s+/, 1)[0].toLowerCase()
   if (!raw) return ''
   return raw.startsWith('/') ? raw : '/' + raw
+}
+
+function slashCommandKeys(command: Pick<ChatSlashCommand, 'aliases' | 'cmd' | 'name'>): string[] {
+  return [command.name, command.cmd, ...command.aliases]
+    .map(slashCommandKey)
+    .filter(Boolean)
 }
 
 function normalizeSlashCommand(cmd: SlashCommandPayload): ChatSlashCommand {
@@ -137,7 +150,24 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
       await options.rpc.waitForConnection()
       const res = await options.rpc.call<{ commands?: ChatSlashCommand[] }>('commands.list_for_surface', { surface: 'web_chat' })
       slashCmds.value = (Array.isArray(res?.commands) ? res.commands : []).map(normalizeSlashCommand)
+      if (
+        options.activatePlanMode
+        && (options.planModeAvailable?.() ?? true)
+        && !slashCmds.value.some(command => slashCommandKeys(command).includes('/plan'))
+      ) {
+        slashCmds.value.push({
+          name: '/plan',
+          cmd: '/plan',
+          label: '/plan',
+          desc: i18n.global.t('chat.planMode.commandDescription'),
+          aliases: [],
+          execution: { action: 'plans.setMode' },
+        })
+      }
       slashCatalogLoaded.value = true
+      if (options.inputText.value.startsWith('/') && !options.inputText.value.startsWith('//')) {
+        handleSlashInput()
+      }
     } catch {
       slashCmds.value = []
       slashCatalogLoaded.value = false
@@ -164,7 +194,14 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
     if (firstSpace === -1) {
       // Command-name completion: "/me" -> matching commands.
       const query = val.slice(1).toLowerCase()
-      openWith(slashCmds.value.filter(c => c.cmd.slice(1).startsWith(query)))
+      const matches = slashCmds.value.filter(command =>
+        slashCommandKeys(command).some(key => key.slice(1).startsWith(query)),
+      )
+      const exactKey = slashCommandKey(val)
+      const exactMatches = matches.filter(command =>
+        slashCommandKeys(command).includes(exactKey),
+      )
+      openWith(exactMatches.length > 0 ? exactMatches : matches)
       return
     }
     // Argument completion: "/meta <partial>" -> the command's argument choices.
@@ -189,6 +226,7 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
   }
 
   function selectSlashCmd(cmd: ChatSlashCommand, args = '') {
+    const action = cmd?.execution?.action || cmd.cmd || cmd.name
     // Argument candidate ("/meta <skill>"): Tab-completes into the composer;
     // the user presses Enter to run it.
     if (cmd.argValue) {
@@ -199,7 +237,12 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
     }
     // A command that takes arguments, selected with none yet: complete to
     // "/cmd " and reopen the menu showing its argument candidates.
-    if (!args && (cmd.argumentChoices?.length ?? 0) > 0) {
+    if (
+      action !== 'coding.mode'
+      && action !== '/coding'
+      && !args
+      && (cmd.argumentChoices?.length ?? 0) > 0
+    ) {
       closeSlashMenu()
       options.inputText.value = cmd.cmd + ' '
       options.autoResizeTextarea()
@@ -207,11 +250,56 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
       return
     }
 
+    if (
+      action === 'plans.toggleMode'
+      || action === 'plans.setMode'
+      || action === '/plan'
+    ) {
+      closeSlashMenu()
+      const originalInput = options.inputText.value
+      const planPrompt = String(args || '').trim()
+      void Promise.resolve(options.activatePlanMode?.() ?? false).then((accepted) => {
+        if (!accepted || options.inputText.value !== originalInput) return
+        if (planPrompt) {
+          options.dispatchPlanPrompt(planPrompt, originalInput)
+          return
+        }
+        options.inputText.value = ''
+        options.autoResizeTextarea()
+      })
+      return
+    }
+    if (action === 'coding.mode' || action === '/coding') {
+      closeSlashMenu()
+      const mode = String(args || 'on').trim().toLowerCase()
+      options.inputText.value = ''
+      options.autoResizeTextarea()
+      if (mode === 'status') {
+        options.notify(i18n.global.t(
+          options.codingModeEnabled.value
+            ? 'chat.codingMode.enabled'
+            : 'chat.codingMode.disabled',
+        ))
+        return
+      }
+      if (mode !== 'on' && mode !== 'off') {
+        options.notify(i18n.global.t('chat.codingMode.usage'))
+        return
+      }
+      void options.setCodingModeEnabled(mode === 'on').then((updated) => {
+        options.notify(i18n.global.t(
+          updated
+            ? (mode === 'on' ? 'chat.codingMode.enabled' : 'chat.codingMode.disabled')
+            : 'chat.codingMode.updateFailed',
+        ))
+      })
+      return
+    }
+
     closeSlashMenu()
     options.inputText.value = ''
     options.autoResizeTextarea()
 
-    const action = cmd?.execution?.action || cmd.cmd || cmd.name
     switch (action) {
       case 'new_chat':
       case '/new':
@@ -289,7 +377,10 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
   async function executeSlashCommand(text: string): Promise<boolean> {
     if (!slashCatalogLoaded.value) await loadSlashCommands()
     const [cmdText, ...rest] = text.trim().split(/\s+/)
-    const cmd = slashCmds.value.find(c => slashCommandKey(c.name) === slashCommandKey(cmdText))
+    const commandKey = slashCommandKey(cmdText)
+    const cmd = slashCmds.value.find(command =>
+      slashCommandKeys(command).includes(commandKey),
+    )
     if (!cmd) {
       closeSlashMenu()
       console.warn('Unsupported command:', cmdText)

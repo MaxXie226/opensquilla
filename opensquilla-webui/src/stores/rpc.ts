@@ -97,6 +97,21 @@ export const useRpcStore = defineStore('rpc', () => {
 
   const isConnected = computed(() => state.value === 'connected')
   const isConnecting = computed(() => state.value === 'connecting')
+  const isLocalOwner = computed(() => {
+    if (!isConnected.value) return false
+    const principal = auth.value?.principal
+    return Boolean(
+      principal
+      && typeof principal === 'object'
+      && (principal as Record<string, unknown>).isOwner === true,
+    )
+  })
+  const canManageProjectWorkspaces = computed(() =>
+    isLocalOwner.value
+    && supportsMethod('workspaces.list'))
+  const canChooseProject = computed(() =>
+    canManageProjectWorkspaces.value
+    && supportsMethod('workspaces.open'))
 
   function init() {
     const rpc = new RpcClient()
@@ -104,6 +119,12 @@ export const useRpcStore = defineStore('rpc', () => {
 
     rpc.on('_state', (s: 'disconnected' | 'connecting' | 'connected') => {
       state.value = s
+      if (s !== 'connected') {
+        policy.value = null
+        auth.value = null
+        methods.value = []
+        unavailableMethods.value = new Set()
+      }
     })
 
     rpc.on('_hello', (data: {
@@ -251,6 +272,9 @@ export const useRpcStore = defineStore('rpc', () => {
     error,
     isConnected,
     isConnecting,
+    isLocalOwner,
+    canManageProjectWorkspaces,
+    canChooseProject,
     init,
     connect,
     applyLinkTokenFromUrl,

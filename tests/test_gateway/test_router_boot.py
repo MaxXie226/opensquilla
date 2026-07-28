@@ -50,7 +50,14 @@ from opensquilla.gateway.routing import (
     tool_context_from_envelope,
 )
 from opensquilla.onboarding.mutations import upsert_channel
+from opensquilla.project_workspaces import (
+    ProjectWorkspaceStateError,
+    project_path_key,
+)
 from opensquilla.provider import Message, ProviderRequestCorrelation
+from opensquilla.sandbox.config import SandboxSettings
+from opensquilla.sandbox.run_context import RUN_CONTEXT_ORIGIN_KEY
+from opensquilla.sandbox.run_mode import RunMode
 from opensquilla.scheduler.types import CronJob, JobStatus
 from opensquilla.session.compaction import CompactionConfig
 from opensquilla.session.manager import SessionManager
@@ -318,6 +325,120 @@ def test_build_task_runtime_run_kwargs_forwards_provider_correlation() -> None:
 
     assert kwargs["provider_request_correlation"] is correlation
     assert kwargs["root_turn_id"] == "subagent-run"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("sender_id", "expected_owner"),
+    [("channel-admin", True), ("paired-user", False)],
+)
+async def test_task_runtime_turn_uses_authenticated_channel_admin_boundary(
+    sender_id: str,
+    expected_owner: bool,
+) -> None:
+    class RecordingTurnRunner:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        async def run(self, message: str, session_key: str, **kwargs: Any):
+            self.calls.append(kwargs)
+            yield DoneEvent()
+
+    async def emit(_session_key: str, _event_name: str, _payload: dict[str, Any]) -> None:
+        return None
+
+    config = GatewayConfig(
+        channel_admin_senders={"feishu": ["channel-admin"]},
+        agent_stream_heartbeat_interval_seconds=0.0,
+        agent_stream_idle_timeout_seconds=1.0,
+    )
+    msg = IncomingMessage(
+        sender_id=sender_id,
+        channel_id="oc-channel",
+        content="hello",
+        metadata={"principal_is_owner": True, "channel_admin_verified": True},
+        provenance=IngressProvenance(
+            provider="feishu",
+            verification=IngressVerification.SDK_SESSION,
+            principal=AuthenticatedPrincipal(subject_id=sender_id),
+        ),
+    )
+    envelope = build_channel_route_envelope(
+        msg,
+        session_key=f"agent:main:feishu:{sender_id}",
+        session_prefix="feishu",
+        agent_id="main",
+    )
+    assert "principal_is_owner" not in envelope.metadata
+    assert "channel_admin_verified" not in envelope.metadata
+    assert _stamp_channel_admin_principal(config, envelope, msg) is expected_owner
+    assert envelope.metadata["principal_is_owner"] is expected_owner
+    run = SimpleNamespace(
+        agent_id="main",
+        task_id=f"task-{sender_id}",
+        session_key=envelope.session_key,
+        message="hello",
+        envelope=envelope,
+        attachments=[],
+        input_provenance={},
+        run_kind="channel_turn",
+        no_memory_capture=False,
+        ingress_pipeline_steps=[],
+        semantic_message=None,
+        stream_event_sink=None,
+    )
+    runner = RecordingTurnRunner()
+
+    await dispatch_task_runtime_turn(
+        run,
+        config=config,
+        session_manager=None,
+        turn_runner=runner,
+        event_emitter=emit,
+    )
+
+    tool_context = runner.calls[0]["tool_context"]
+    assert tool_context.is_owner is expected_owner
+    assert tool_context.channel_admin_verified is expected_owner
+    assert tool_context.run_mode == "trusted"
+
+
+@pytest.mark.parametrize(
+    "provenance",
+    [
+        IngressProvenance(),
+        IngressProvenance(
+            provider="feishu",
+            verification=IngressVerification.SDK_SESSION,
+            principal=AuthenticatedPrincipal(subject_id="another-user"),
+        ),
+    ],
+    ids=["unverified", "principal-mismatch"],
+)
+def test_channel_admin_stamp_rejects_unverified_or_mismatched_identity(
+    provenance: IngressProvenance,
+) -> None:
+    msg = IncomingMessage(
+        sender_id="channel-admin",
+        channel_id="oc-channel",
+        content="hello",
+        provenance=provenance,
+    )
+    envelope = build_channel_route_envelope(
+        msg,
+        session_key="agent:main:feishu:channel-admin",
+        session_prefix="feishu",
+    )
+    config = GatewayConfig(channel_admin_senders={"feishu": ["channel-admin"]})
+
+    assert _stamp_channel_admin_principal(config, envelope, msg) is False
+    assert envelope.metadata["principal_is_owner"] is False
+    assert envelope.metadata["channel_admin_verified"] is False
+    assert _task_runtime_envelope_owner(envelope) is False
+
+    context = tool_context_from_envelope(envelope, is_owner=True)
+    assert context.is_owner is False
+    assert context.channel_admin_verified is False
 
 
 def test_build_task_runtime_run_kwargs_forwards_bound_user_message_id() -> None:
@@ -688,20 +809,20 @@ async def test_service_container_close_cancels_owned_sandbox_setup_task() -> Non
 
 
 @pytest.mark.asyncio
-async def test_build_services_normalizes_default_full_host_access_for_sandbox_runtime(
+async def test_bare_full_default_boots_standard_capability(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     from opensquilla.gateway import boot
 
-    captured_settings: list[Any] = []
+    captured: list[tuple[SandboxSettings, RunMode]] = []
 
-    def fake_configure_runtime(settings: Any, **kwargs: Any) -> Any:
-        captured_settings.append(settings)
+    def fake_configure_runtime(settings: SandboxSettings, **kwargs: Any) -> Any:
+        captured.append((settings, kwargs["default_run_mode"]))
         return SimpleNamespace(
             effective=SimpleNamespace(
-                sandbox_enabled=False,
-                as_dict=lambda: {"sandbox_enabled": False},
+                sandbox_enabled=True,
+                as_dict=lambda: {"sandbox_enabled": True},
             )
         )
 
@@ -723,12 +844,12 @@ async def test_build_services_normalizes_default_full_host_access_for_sandbox_ru
         seed_agent_workspaces=False,
     )
     try:
-        assert len(captured_settings) == 1
-        runtime_settings = captured_settings[0]
-        assert runtime_settings.run_mode == "full"
-        assert runtime_settings.sandbox is False
-        assert runtime_settings.security_grading is False
-        assert runtime_settings.network_default == "none"
+        settings, default_mode = captured[0]
+        assert settings.run_mode == "standard"
+        assert settings.sandbox is True
+        assert settings.security_grading is True
+        assert settings.network_default == "proxy_allowlist"
+        assert default_mode is RunMode.FULL
     finally:
         await services.close()
 
@@ -1240,12 +1361,8 @@ async def test_start_gateway_server_wires_cron_failure_dispatcher(
     monkeypatch.setattr(boot, "_setup_file_logging", lambda config: None)
     monkeypatch.setattr(boot, "emit_skill_filter_banner", lambda config: None)
     monkeypatch.setattr(scheduler_jobs, "set_failure_dispatcher", _record_dispatcher)
-    monkeypatch.setattr(
-        "opensquilla.gateway.pidlock.GatewayPidLock.acquire", lambda self: None
-    )
-    monkeypatch.setattr(
-        "opensquilla.gateway.pidlock.GatewayPidLock.release", lambda self: None
-    )
+    monkeypatch.setattr("opensquilla.gateway.pidlock.GatewayPidLock.acquire", lambda self: None)
+    monkeypatch.setattr("opensquilla.gateway.pidlock.GatewayPidLock.release", lambda self: None)
 
     config = GatewayConfig(
         state_dir=str(tmp_path / "state"),
@@ -1262,10 +1379,7 @@ async def test_start_gateway_server_wires_cron_failure_dispatcher(
         )
         # The wire must register DeliveryChain.dispatch_failure_alert
         # (a bound method), not some unrelated callable.
-        assert (
-            getattr(captured["dispatcher"], "__name__", "")
-            == "dispatch_failure_alert"
-        )
+        assert getattr(captured["dispatcher"], "__name__", "") == "dispatch_failure_alert"
         # Handler factories ran, confirming the wire ran inside the cron-init
         # branch (not just by coincidence).
         assert set(cron_sched.registered) >= {
@@ -1413,27 +1527,15 @@ async def test_start_gateway_server_wires_meta_skill_auto_propose_routes(
         "make_memory_dream_handler",
         fake_make_memory_dream_handler,
     )
-    monkeypatch.setattr(
-        runtime_e2e_mod, "make_runtime_e2e_context", fake_make_runtime_e2e_context
-    )
-    monkeypatch.setattr(
-        proposer_mod, "set_runtime_e2e_context", fake_set_runtime_e2e_context
-    )
-    monkeypatch.setattr(
-        proposer_mod, "reset_runtime_e2e_context", fake_reset_runtime_e2e_context
-    )
-    monkeypatch.setattr(
-        proposer_mod, "set_smoke_fixture_context", fake_set_smoke_fixture_context
-    )
+    monkeypatch.setattr(runtime_e2e_mod, "make_runtime_e2e_context", fake_make_runtime_e2e_context)
+    monkeypatch.setattr(proposer_mod, "set_runtime_e2e_context", fake_set_runtime_e2e_context)
+    monkeypatch.setattr(proposer_mod, "reset_runtime_e2e_context", fake_reset_runtime_e2e_context)
+    monkeypatch.setattr(proposer_mod, "set_smoke_fixture_context", fake_set_smoke_fixture_context)
     monkeypatch.setattr(
         proposer_mod, "reset_smoke_fixture_context", fake_reset_smoke_fixture_context
     )
-    monkeypatch.setattr(
-        "opensquilla.gateway.pidlock.GatewayPidLock.acquire", lambda self: None
-    )
-    monkeypatch.setattr(
-        "opensquilla.gateway.pidlock.GatewayPidLock.release", lambda self: None
-    )
+    monkeypatch.setattr("opensquilla.gateway.pidlock.GatewayPidLock.acquire", lambda self: None)
+    monkeypatch.setattr("opensquilla.gateway.pidlock.GatewayPidLock.release", lambda self: None)
 
     config = GatewayConfig(
         state_dir=str(tmp_path / "state"),
@@ -1546,6 +1648,7 @@ async def test_build_flush_service_archive_workspace_falls_back_to_main_workspac
     assert (main_workspace / receipt.flushed_paths[0]).exists()
     assert not (matching_memory_dir / receipt.flushed_paths[0]).exists()
 
+
 @pytest.mark.asyncio
 async def test_build_flush_service_wires_durable_receipt_writer(tmp_path: Path) -> None:
     storage = await SessionStorage.open(str(tmp_path / "sessions.sqlite"))
@@ -1608,7 +1711,7 @@ async def test_build_flush_service_wires_durable_receipt_writer(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
-async def test_build_flush_service_receipt_uses_session_id_captured_before_rotation(
+async def test_build_flush_service_skips_receipt_after_session_rotation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1662,11 +1765,62 @@ async def test_build_flush_service_receipt_uses_session_id_captured_before_rotat
         assert did_rotate
         assert rotated.session_id != original.session_id
         assert receipt.session_id == original.session_id
-        assert len(rows) == 2
-        assert {row.scope for row in rows} == {"preimage", "repair"}
-        for row in rows:
-            assert row.session_id == original.session_id
-            assert row.session_id != rotated.session_id
+        assert rows == []
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_build_flush_service_skips_receipt_after_session_delete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "sessions.sqlite"))
+    session_manager = SessionManager(storage)
+    registry = ToolRegistry()
+    archive_started = Event()
+    allow_archive = Event()
+
+    from opensquilla.memory import session_flush as session_flush_module
+
+    real_archive_writer = session_flush_module.write_raw_fallback_archive
+
+    def archive_writer(*args: Any, **kwargs: Any) -> Any:
+        archive_started.set()
+        assert allow_archive.wait(timeout=2.0)
+        return real_archive_writer(*args, **kwargs)
+
+    monkeypatch.setattr(
+        session_flush_module,
+        "write_raw_fallback_archive",
+        archive_writer,
+    )
+    try:
+        session_key = "agent:main:webchat:deleted-during-flush"
+        original = await session_manager.create(session_key)
+        service = build_flush_service(
+            tool_registry=registry,
+            provider_selector=SimpleNamespace(resolve=lambda: None),
+            config=GatewayConfig(memory={"flush_enabled": True}),
+            session_manager=session_manager,
+            memory_managers={"main": SimpleNamespace(workspace_dir=tmp_path)},
+        )
+
+        task = asyncio.create_task(
+            service.execute(
+                [Message(role="user", content="temporary transcript")],
+                session_key,
+                agent_id="main",
+            )
+        )
+        await asyncio.wait_for(asyncio.to_thread(archive_started.wait), timeout=2.0)
+        await storage.delete_session(session_key)
+        allow_archive.set()
+        receipt = await task
+
+        assert receipt.session_id == original.session_id
+        assert await storage.get_session(session_key) is None
+        assert await storage.list_memory_durable_receipts(session_key=session_key) == []
     finally:
         await storage.close()
 
@@ -1796,9 +1950,7 @@ async def test_build_services_registers_session_search_tool(
     )
     monkeypatch.setattr(
         "opensquilla.sandbox.integration.configure_runtime",
-        lambda *args, **kwargs: SimpleNamespace(
-            effective=SimpleNamespace(as_dict=lambda: {})
-        ),
+        lambda *args, **kwargs: SimpleNamespace(effective=SimpleNamespace(as_dict=lambda: {})),
     )
 
     captured_memory_kwargs: dict[str, Any] = {}
@@ -1833,9 +1985,7 @@ async def test_build_services_registers_session_search_tool(
         assert "Full-text search across persisted session transcripts" in (
             session_search.spec.description
         )
-        assert "defaults to curated memory source files" in (
-            session_search.spec.description
-        )
+        assert "defaults to curated memory source files" in (session_search.spec.description)
         assert "use source=sessions or source=all" in session_search.spec.description
         owner_names = {
             tool["name"]
@@ -1937,9 +2087,7 @@ async def test_build_services_fails_fast_for_explicit_remote_memory_without_key(
 ) -> None:
     monkeypatch.setattr(
         "opensquilla.sandbox.integration.configure_runtime",
-        lambda *args, **kwargs: SimpleNamespace(
-            effective=SimpleNamespace(as_dict=lambda: {})
-        ),
+        lambda *args, **kwargs: SimpleNamespace(effective=SimpleNamespace(as_dict=lambda: {})),
     )
     config = GatewayConfig(
         state_dir=str(tmp_path / "state"),
@@ -2124,13 +2272,8 @@ async def test_task_runtime_turn_uses_agent_registry_model_when_session_has_no_m
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("sender_id", "expected_owner"),
-    [("channel-admin", True), ("paired-user", False)],
-)
-async def test_task_runtime_turn_uses_authenticated_channel_admin_boundary(
-    sender_id: str,
-    expected_owner: bool,
+async def test_task_runtime_turn_uses_workspace_from_saved_run_context(
+    tmp_path: Path,
 ) -> None:
     class RecordingTurnRunner:
         def __init__(self) -> None:
@@ -2140,45 +2283,33 @@ async def test_task_runtime_turn_uses_authenticated_channel_admin_boundary(
             self.calls.append(kwargs)
             yield DoneEvent()
 
-    async def emit(_session_key: str, _event_name: str, _payload: dict[str, Any]) -> None:
-        return None
-
-    config = GatewayConfig(
-        channel_admin_senders={"feishu": ["channel-admin"]},
-        agent_stream_heartbeat_interval_seconds=0.0,
-        agent_stream_idle_timeout_seconds=1.0,
-    )
-    msg = IncomingMessage(
-        sender_id=sender_id,
-        channel_id="oc-channel",
-        content="hello",
-        # Adapter metadata must not be able to promote a sender.
-        metadata={"principal_is_owner": True, "channel_admin_verified": True},
-        provenance=IngressProvenance(
-            provider="feishu",
-            verification=IngressVerification.SDK_SESSION,
-            principal=AuthenticatedPrincipal(subject_id=sender_id),
-        ),
-    )
-    envelope = build_channel_route_envelope(
-        msg,
-        session_key=f"agent:main:feishu:{sender_id}",
-        session_prefix="feishu",
+    default_workspace = tmp_path / "default-workspace"
+    project_workspace = tmp_path / "project-workspace"
+    default_workspace.mkdir()
+    project_workspace.mkdir()
+    envelope = build_cli_route_envelope(
+        session_key="agent:main:project-task",
         agent_id="main",
     )
-    assert "principal_is_owner" not in envelope.metadata
-    assert "channel_admin_verified" not in envelope.metadata
-    assert _stamp_channel_admin_principal(config, envelope, msg) is expected_owner
-    assert envelope.metadata["principal_is_owner"] is expected_owner
+    envelope.metadata["sandbox_run_context"] = {
+        "run_mode": "trusted",
+        "workspace": str(project_workspace),
+        "mounts": [],
+        "domains": [],
+        "bundles": [],
+        "public_network": [],
+        "temporary_grants": [],
+    }
+    object.__setattr__(envelope, "sandbox_run_context_fresh", True)
     run = SimpleNamespace(
         agent_id="main",
-        task_id=f"task-{sender_id}",
-        session_key=envelope.session_key,
-        message="hello",
+        task_id="task-project-workspace",
+        session_key="agent:main:project-task",
+        message="pwd",
         envelope=envelope,
         attachments=[],
         input_provenance={},
-        run_kind="channel_turn",
+        run_kind="interactive",
         no_memory_capture=False,
         ingress_pipeline_steps=[],
         semantic_message=None,
@@ -2186,56 +2317,196 @@ async def test_task_runtime_turn_uses_authenticated_channel_admin_boundary(
     )
     runner = RecordingTurnRunner()
 
+    async def emit(_session_key: str, _event_name: str, _payload: dict[str, Any]) -> None:
+        return None
+
     await dispatch_task_runtime_turn(
         run,
-        config=config,
+        config=GatewayConfig(
+            workspace_dir=str(default_workspace),
+            agent_stream_heartbeat_interval_seconds=0.0,
+            agent_stream_idle_timeout_seconds=1.0,
+        ),
         session_manager=None,
         turn_runner=runner,
         event_emitter=emit,
     )
 
-    tool_context = runner.calls[0]["tool_context"]
-    assert tool_context.is_owner is expected_owner
-    assert tool_context.channel_admin_verified is expected_owner
-    assert tool_context.run_mode == "trusted"
+    assert runner.calls[0]["tool_context"].workspace_dir == str(project_workspace)
 
 
-@pytest.mark.parametrize(
-    "provenance",
-    [
-        IngressProvenance(),
-        IngressProvenance(
-            provider="feishu",
-            verification=IngressVerification.SDK_SESSION,
-            principal=AuthenticatedPrincipal(subject_id="another-user"),
-        ),
-    ],
-    ids=["unverified", "principal-mismatch"],
-)
-def test_channel_admin_stamp_rejects_unverified_or_mismatched_identity(
-    provenance: IngressProvenance,
+@pytest.mark.asyncio
+async def test_task_runtime_turn_restores_bound_project_and_owner_full_default(
+    tmp_path: Path,
 ) -> None:
-    msg = IncomingMessage(
-        sender_id="channel-admin",
-        channel_id="oc-channel",
-        content="hello",
-        provenance=provenance,
+    storage = await SessionStorage.open(str(tmp_path / "queued-project.db"))
+    manager = SessionManager(storage, inject_time_prefix=False)
+    project_path = tmp_path / "project"
+    outside = tmp_path / "outside"
+    project_path.mkdir()
+    outside.mkdir()
+    project = await storage.create_or_restore_project_workspace(
+        path=str(project_path.resolve()),
+        path_key=project_path_key(project_path, strict=True),
+        display_name="project",
+        trusted_at=1,
     )
-    envelope = build_channel_route_envelope(
-        msg,
-        session_key="agent:main:feishu:channel-admin",
-        session_prefix="feishu",
+    key = "agent:main:webchat:queued-forged-envelope"
+    await manager.create(
+        key,
+        workspace_id=project.workspace_id,
+        origin={
+            RUN_CONTEXT_ORIGIN_KEY: {
+                "run_mode": "full",
+                "workspace": str(outside),
+            }
+        },
     )
-    config = GatewayConfig(channel_admin_senders={"feishu": ["channel-admin"]})
+    envelope = build_cli_route_envelope(session_key=key, agent_id="main")
+    envelope.metadata["sandbox_run_context"] = {
+        "run_mode": "full",
+        "workspace": str(outside),
+    }
+    object.__setattr__(envelope, "sandbox_run_context_fresh", True)
+    run = SimpleNamespace(
+        agent_id="main",
+        task_id="queued-forged-envelope-task",
+        session_key=key,
+        message="pwd",
+        envelope=envelope,
+        attachments=[],
+        input_provenance={},
+        run_kind="interactive",
+        no_memory_capture=False,
+        ingress_pipeline_steps=[],
+        semantic_message=None,
+        stream_event_sink=None,
+    )
 
-    assert _stamp_channel_admin_principal(config, envelope, msg) is False
-    assert envelope.metadata["principal_is_owner"] is False
-    assert envelope.metadata["channel_admin_verified"] is False
-    assert _task_runtime_envelope_owner(envelope) is False
+    class RecordingTurnRunner:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
 
-    context = tool_context_from_envelope(envelope, is_owner=True)
-    assert context.is_owner is False
-    assert context.channel_admin_verified is False
+        async def run(self, message: str, session_key: str, **kwargs: Any):
+            self.calls.append(kwargs)
+            yield DoneEvent()
+
+    runner = RecordingTurnRunner()
+
+    async def emit(_session_key: str, _event_name: str, _payload: dict[str, Any]) -> None:
+        return None
+
+    try:
+        await dispatch_task_runtime_turn(
+            run,
+            config=GatewayConfig(
+                workspace_dir=str(tmp_path / "default"),
+                agent_stream_heartbeat_interval_seconds=0.0,
+                agent_stream_idle_timeout_seconds=1.0,
+            ),
+            session_manager=manager,
+            turn_runner=runner,
+            event_emitter=emit,
+        )
+    finally:
+        await storage.close()
+
+    tool_context = runner.calls[0]["tool_context"]
+    assert tool_context.workspace_dir == project.path
+    assert tool_context.run_mode == "full"
+    assert envelope.metadata["sandbox_run_context"]["workspace"] == project.path
+
+
+@pytest.mark.parametrize("invalid_kind", ["missing", "file", "root"])
+@pytest.mark.asyncio
+async def test_task_runtime_turn_rejects_unavailable_bound_project_kinds(
+    tmp_path: Path,
+    invalid_kind: str,
+) -> None:
+    storage = await SessionStorage.open(str(tmp_path / f"queued-{invalid_kind}.db"))
+    manager = SessionManager(storage, inject_time_prefix=False)
+    project_path = tmp_path / f"{invalid_kind}-project"
+    if invalid_kind == "root":
+        canonical = str(Path("/").resolve())
+        path_key = project_path_key(canonical, strict=True)
+    else:
+        project_path.mkdir()
+        canonical = str(project_path.resolve())
+        path_key = project_path_key(project_path, strict=True)
+    project = await storage.create_or_restore_project_workspace(
+        path=canonical,
+        path_key=path_key,
+        display_name=invalid_kind,
+        trusted_at=1,
+    )
+    key = f"agent:main:webchat:queued-{invalid_kind}"
+    await manager.create(
+        key,
+        workspace_id=project.workspace_id,
+        origin={
+            RUN_CONTEXT_ORIGIN_KEY: {
+                "run_mode": "standard",
+                "workspace": project.path,
+            }
+        },
+    )
+    if invalid_kind == "missing":
+        project_path.rmdir()
+    elif invalid_kind == "file":
+        project_path.rmdir()
+        project_path.write_text("not a directory", encoding="utf-8")
+    envelope = build_cli_route_envelope(session_key=key, agent_id="main")
+    envelope.metadata["sandbox_run_context"] = {
+        "run_mode": "standard",
+        "workspace": project.path,
+    }
+    object.__setattr__(envelope, "sandbox_run_context_fresh", True)
+    run = SimpleNamespace(
+        agent_id="main",
+        task_id=f"queued-{invalid_kind}-task",
+        session_key=key,
+        message="pwd",
+        envelope=envelope,
+        attachments=[],
+        input_provenance={},
+        run_kind="interactive",
+        no_memory_capture=False,
+        ingress_pipeline_steps=[],
+        semantic_message=None,
+        stream_event_sink=None,
+    )
+
+    class RecordingTurnRunner:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        async def run(self, message: str, session_key: str, **kwargs: Any):
+            self.calls.append(kwargs)
+            yield DoneEvent()
+
+    runner = RecordingTurnRunner()
+
+    async def emit(_session_key: str, _event_name: str, _payload: dict[str, Any]) -> None:
+        return None
+
+    try:
+        with pytest.raises(ProjectWorkspaceStateError) as raised:
+            await dispatch_task_runtime_turn(
+                run,
+                config=GatewayConfig(
+                    workspace_dir=str(tmp_path / "default"),
+                    agent_stream_heartbeat_interval_seconds=0.0,
+                    agent_stream_idle_timeout_seconds=1.0,
+                ),
+                session_manager=manager,
+                turn_runner=runner,
+                event_emitter=emit,
+            )
+    finally:
+        await storage.close()
+
+    assert raised.value.reason == "unavailable"
+    assert runner.calls == []
 
 
 @pytest.mark.asyncio

@@ -254,7 +254,15 @@ def test_always_from_admin_resolves_plain_exec_approval() -> None:
 def test_always_from_admin_applies_sandbox_same_type_choice(monkeypatch) -> None:
     applied: list[dict] = []
 
-    async def _fake_apply(params, *, choice, approved, session_manager, config):
+    async def _fake_apply(
+        params,
+        *,
+        approval_id=None,
+        choice,
+        approved,
+        session_manager,
+        config,
+    ):
         applied.append({"params": params, "choice": choice, "approved": approved})
 
     monkeypatch.setattr(
@@ -364,7 +372,15 @@ def test_plain_approve_applies_sandbox_allow_once(monkeypatch) -> None:
     # (instead of failing validation and reporting "was already resolved").
     applied: list[dict] = []
 
-    async def _fake_apply(params, *, choice, approved, session_manager, config):
+    async def _fake_apply(
+        params,
+        *,
+        approval_id=None,
+        choice,
+        approved,
+        session_manager,
+        config,
+    ):
         applied.append({"choice": choice, "approved": approved})
 
     monkeypatch.setattr(
@@ -411,7 +427,15 @@ def test_sandbox_apply_failure_reopens_and_replies(monkeypatch) -> None:
     # leave the approval pending for a retry.
     from opensquilla.session.storage import StorageBusyError
 
-    async def _busy_apply(params, *, choice, approved, session_manager, config):
+    async def _busy_apply(
+        params,
+        *,
+        approval_id=None,
+        choice,
+        approved,
+        session_manager,
+        config,
+    ):
         raise StorageBusyError("database is locked")
 
     monkeypatch.setattr(
@@ -534,7 +558,15 @@ def test_sandbox_deny_fans_out_to_duplicate_pending_asks(monkeypatch) -> None:
 def test_finalize_failure_releases_claim_so_a_retry_succeeds(monkeypatch) -> None:
     # A failed finalize must release the resolution claim; otherwise the
     # approval is stuck claimed-but-unresolved and no retry can ever land.
-    async def _fake_apply(params, *, choice, approved, session_manager, config):
+    async def _fake_apply(
+        params,
+        *,
+        approval_id=None,
+        choice,
+        approved,
+        session_manager,
+        config,
+    ):
         return None
 
     monkeypatch.setattr(
