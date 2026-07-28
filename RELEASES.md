@@ -62,8 +62,9 @@ filenames must remain versioned because installers validate the version segment
 inside the wheel filename.
 
 Python wheels, source archives, source installers, wheelhouses, Homebrew, and
-container images are headless and do not require Node.js/npm. They must not
-discover or package a checkout's generated console implicitly. Electron
+container images are headless and do not require Node.js 22.12+ or npm. Client
+and Desktop development remains pinned to Node.js 22.12+. Python artifacts
+must not discover or package a checkout's generated console implicitly. Electron
 Desktop installers may still consume the separately built, verified Vue
 artifact. A transitional embedded Python distribution must explicitly select
 `OPENSQUILLA_BUILD_UI_MODE=embed-ui` and provide

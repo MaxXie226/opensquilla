@@ -75,8 +75,8 @@ For gateway lifecycle, host/port, and exposure details, see
 ## Packaged and Source Installs
 
 Official Python wheels, source archives, source installers, Homebrew packages,
-wheelhouses, and container images are headless. They do not require Node.js or
-npm, do not download a client, and do not package a checkout's residual
+wheelhouses, and container images are headless. They do not require Node.js
+22.12+ or npm, do not download a client, and do not package a checkout's residual
 `gateway/static/dist` directory. With the default `assets_mode = "auto"`,
 `/control/` shows a neutral diagnostic page while Gateway health/readiness,
 WebSocket RPC, CLI, channels, Cron, and MCP continue to work.
@@ -88,7 +88,8 @@ distributed, manifest-validated client; setting `embedded` cannot reactivate
 residual files in a headless wheel.
 
 Desktop distributions may consume a separately built and verified Vue
-artifact. Contributors working on that client build it independently:
+artifact. Contributors working on that client build it independently with the
+repository-pinned Node.js 22.12+:
 
 ```sh
 cd opensquilla-webui
