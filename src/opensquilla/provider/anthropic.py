@@ -283,6 +283,7 @@ def _anthropic_iteration_token_counts(usage: dict[str, Any]) -> tuple[int, int]:
 class AnthropicProvider:
     """Streams from Anthropic Messages API with SSE parsing."""
 
+    final_request_admission_guaranteed = True
     provider_name = "anthropic"
 
     def __init__(
@@ -416,6 +417,13 @@ class AnthropicProvider:
             yield ErrorEvent(
                 message=json.dumps(proof, ensure_ascii=False, sort_keys=True),
                 code="provider_request_budget_exhausted",
+            )
+            return
+        if budget_decision.action == "invalid_request":
+            log.warning("provider.request_serialization_failed")
+            yield ErrorEvent(
+                message="Provider request could not be serialized.",
+                code="provider_internal",
             )
             return
         payload = budget_decision.payload or payload

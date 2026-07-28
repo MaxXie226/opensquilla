@@ -17,7 +17,12 @@ import structlog
 
 from opensquilla.agents.scope import default_workspace_dir, resolve_agent_workspace_dir
 from opensquilla.artifacts import enrich_artifact_event_dict
-from opensquilla.engine.cache_break_monitor import notify_compaction
+from opensquilla.engine.cache_break_monitor import (
+    cancel_active_compactions,
+    compaction_terminal_status,
+    notify_compaction,
+    register_active_compaction,
+)
 from opensquilla.engine.start_turn import reserve_turn_via_runtime, start_turn_via_runtime
 from opensquilla.engine.steps.router_decision_record import (
     drain_pending_flushes_for_sessions,
@@ -84,6 +89,8 @@ from opensquilla.sandbox.run_mode_policy import (
     run_mode_allowed_for_principal,
 )
 from opensquilla.session.compaction import (
+    arm_compaction_deadline,
+    await_compaction_phase,
     build_compaction_config_from_provider,
     call_compact_with_optional_config,
 )
@@ -92,6 +99,7 @@ from opensquilla.session.compaction_lifecycle import (
     COMPACTION_PERSISTED_EVENT,
     COMPACTION_SUMMARY_VERIFIED_EVENT,
     COMPACTION_TRIGGERED_EVENT,
+    CompactionTimeoutError,
     compaction_effect_payload,
     compaction_lifecycle_payload,
     compaction_memory_status,
@@ -402,8 +410,55 @@ _STREAM_IDLE_TIMEOUT_MESSAGE = "Session event stream idle before terminal event"
 _RESET_RUNTIME_SETTLE_SECONDS = 0.25
 _RESET_RUNTIME_CANCEL_DRAIN_SECONDS = 2.0
 _ABORT_RUNTIME_CANCEL_DRAIN_SECONDS = 2.0
+_ABORT_SESSION_LOOKUP_SECONDS = 0.05
 _ABORT_TREE_STABILIZATION_PASSES = 8
 _ACTIVE_TASK_STATUSES = frozenset({"queued", "running"})
+_manual_compaction_tasks: set[asyncio.Task[Any]] = set()
+
+
+def _consume_abort_background_result(task: asyncio.Future[Any]) -> None:
+    with contextlib.suppress(BaseException):
+        task.result()
+
+
+async def _await_abort_operation(
+    awaitable: Any,
+    *,
+    deadline_at_monotonic: float,
+    operation: str,
+    default: Any,
+) -> Any:
+    """Run one Stop operation without letting it extend the shared deadline.
+
+    ``asyncio.wait_for`` may wait past its timeout while a callee handles task
+    cancellation.  Stop must return promptly, so a timed-out operation is
+    cancelled and consumed in the background instead of being synchronously
+    drained.  Cancellation requests already issued by that operation remain
+    best-effort and may still settle after the RPC returns.
+    """
+
+    remaining = max(0.0, deadline_at_monotonic - time.monotonic())
+    if remaining <= 0:
+        close = getattr(awaitable, "close", None)
+        if callable(close):
+            close()
+        log.warning("sessions.abort.operation_budget_exhausted", operation=operation)
+        return default
+
+    task = asyncio.ensure_future(awaitable)
+    try:
+        done, _pending = await asyncio.wait({task}, timeout=remaining)
+    except asyncio.CancelledError:
+        task.cancel()
+        task.add_done_callback(_consume_abort_background_result)
+        raise
+    if task in done:
+        return task.result()
+
+    task.cancel()
+    task.add_done_callback(_consume_abort_background_result)
+    log.warning("sessions.abort.operation_timed_out", operation=operation)
+    return default
 
 
 def _task_status_value(status: Any) -> str:
@@ -491,27 +546,51 @@ async def _drain_cancelled_task_runtime(
     *,
     session_key: str,
     task_ids: tuple[str, ...],
+    deadline_at_monotonic: float | None = None,
 ) -> None:
     if not task_ids or not hasattr(task_runtime, "wait"):
         return
-    for task_id in task_ids:
-        try:
-            await asyncio.wait_for(
-                task_runtime.wait(task_id),
-                timeout=_ABORT_RUNTIME_CANCEL_DRAIN_SECONDS,
-            )
-        except TimeoutError:
+
+    timeout = _ABORT_RUNTIME_CANCEL_DRAIN_SECONDS
+    if deadline_at_monotonic is not None:
+        timeout = max(0.0, deadline_at_monotonic - time.monotonic())
+    if timeout <= 0:
+        for task_id in task_ids:
             log.warning(
                 "sessions.abort.task_runtime_drain_timeout",
                 session_key=session_key,
                 task_id=task_id,
             )
+        return
+
+    waiters = {
+        asyncio.create_task(task_runtime.wait(task_id)): task_id
+        for task_id in task_ids
+    }
+    done, pending = await asyncio.wait(waiters, timeout=timeout)
+    for waiter in done:
+        try:
+            waiter.result()
+        except asyncio.CancelledError:
+            pass
         except Exception:
             log.warning(
                 "sessions.abort.task_runtime_drain_failed",
                 session_key=session_key,
-                task_id=task_id,
+                task_id=waiters[waiter],
             )
+    for waiter in pending:
+        waiter.cancel()
+        waiter.add_done_callback(_consume_abort_background_result)
+        log.warning(
+            "sessions.abort.task_runtime_drain_timeout",
+            session_key=session_key,
+            task_id=waiters[waiter],
+        )
+    if pending:
+        # Give cooperative waiters one loop turn to observe cancellation, but
+        # never synchronously join a waiter that delays or suppresses it.
+        await asyncio.sleep(0)
 
 
 async def _drain_task_runtime_for_reset(task_runtime: Any, session_key: str) -> None:
@@ -4482,15 +4561,14 @@ async def _handle_sessions_steer(params: dict | None, ctx: RpcContext) -> dict:
     }
 
 
-async def _emit_to_subscribers(
+async def _prepare_session_event_payload(
     ctx: RpcContext,
     session_key: str,
     event_name: str,
     payload: dict,
-) -> None:
-    """Send an event to all connections subscribed to a session's messages."""
-    from opensquilla.gateway.websocket import get_registry
-
+) -> dict:
+    """Resolve async epoch metadata before an event enters the replay buffer."""
+    prepared = dict(payload)
     # Inject current epoch into session.event.* and sessions.changed
     # payloads so the frontend _isStaleEpoch guard can filter pre-reset frames.
     # Read from the in-process cache on SessionManager (populated by reset path) to
@@ -4499,7 +4577,7 @@ async def _emit_to_subscribers(
         session_manager = getattr(ctx, "session_manager", None)
         cached_epoch = get_session_epoch(session_manager, session_key)
         if cached_epoch is not None:
-            payload = {**payload, "epoch": cached_epoch}
+            prepared["epoch"] = cached_epoch
         else:
             storage = get_session_storage(session_manager)
             if storage is not None and hasattr(storage, "get_epoch"):
@@ -4507,11 +4585,20 @@ async def _emit_to_subscribers(
                     epoch = await storage.get_epoch(session_key)
                     # Populate cache for subsequent emits.
                     set_session_epoch(session_manager, session_key, epoch)
-                    payload = {**payload, "epoch": epoch}
+                    prepared["epoch"] = epoch
                 except Exception:
                     pass  # best-effort; never block event delivery
+    return prepared
 
-    send_payload = _buffer_session_event(session_key, event_name, payload)
+
+async def _send_prepared_to_subscribers(
+    ctx: RpcContext,
+    session_key: str,
+    event_name: str,
+    send_payload: dict,
+) -> None:
+    """Broadcast an already-buffered event without mutating replay state."""
+    from opensquilla.gateway.websocket import get_registry
 
     sub_mgr = getattr(ctx, "subscription_manager", None)
     if sub_mgr is None:
@@ -4533,6 +4620,28 @@ async def _emit_to_subscribers(
                 log.warning("emit.send_failed", conn_id=conn_id, ws_event=event_name)
 
 
+async def _emit_to_subscribers(
+    ctx: RpcContext,
+    session_key: str,
+    event_name: str,
+    payload: dict,
+) -> None:
+    """Prepare, durably replay-buffer, then broadcast one session event."""
+    prepared = await _prepare_session_event_payload(
+        ctx,
+        session_key,
+        event_name,
+        payload,
+    )
+    send_payload = _buffer_session_event(session_key, event_name, prepared)
+    await _send_prepared_to_subscribers(
+        ctx,
+        session_key,
+        event_name,
+        send_payload,
+    )
+
+
 @_d.method("sessions.abort", scope="operator.write")
 async def _handle_sessions_abort(params: dict | None, ctx: RpcContext) -> dict:
     key = _require_key(params)
@@ -4540,11 +4649,54 @@ async def _handle_sessions_abort(params: dict | None, ctx: RpcContext) -> dict:
     if ctx.session_manager is None:
         return {"aborted": False, "key": key}
 
+    requested_task_id = _optional_string_param(params, "task_id", "taskId")
+    abort_deadline = time.monotonic() + _ABORT_RUNTIME_CANCEL_DRAIN_SECONDS
+    active_compaction_tasks: tuple[asyncio.Task[Any], ...] = ()
+    if requested_task_id is None:
+        # Signal process-local compaction owners before any storage or runtime
+        # admission wait. This mirrors task cancellation tokens: Stop should
+        # become observable immediately even when bookkeeping is congested.
+        active_compaction_tasks = cancel_active_compactions(key)
+
     storage = get_session_storage(ctx.session_manager)
     if storage:
-        session = await storage.get_session(key)
+        lookup_deadline = min(
+            abort_deadline,
+            time.monotonic() + _ABORT_SESSION_LOOKUP_SECONDS,
+        )
+        session_missing = object()
+        session = await _await_abort_operation(
+            storage.get_session(key),
+            deadline_at_monotonic=lookup_deadline,
+            operation="session_lookup",
+            default=session_missing,
+        )
         if session is None:
             raise KeyError(f"Session not found: {key}")
+        if session is session_missing:
+            log.warning(
+                "sessions.abort.session_lookup_deferred",
+                session_key=key,
+            )
+
+    if requested_task_id is None:
+        if active_compaction_tasks:
+            # Drain all cancelled compactions against one shared Stop budget.
+            # A per-task timeout would make N queued operations take N * 2s.
+            done, _pending = await asyncio.wait(
+                active_compaction_tasks,
+                timeout=max(0.0, abort_deadline - time.monotonic()),
+            )
+            for compaction_task in done:
+                try:
+                    compaction_task.result()
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    log.warning(
+                        "sessions.abort.compaction_drain_failed",
+                        session_key=key,
+                    )
 
     task_runtime = getattr(ctx, "task_runtime", None)
     if task_runtime is not None:
@@ -4553,26 +4705,41 @@ async def _handle_sessions_abort(params: dict | None, ctx: RpcContext) -> dict:
             cancel_background_completion_for_session,
         )
 
-        requested_task_id = _optional_string_param(params, "task_id", "taskId")
         if requested_task_id is not None:
-            await cancel_background_completion_for_session(key)
+            await _await_abort_operation(
+                cancel_background_completion_for_session(key),
+                deadline_at_monotonic=abort_deadline,
+                operation="cancel_background_completion",
+                default=0,
+            )
             get_approval_queue().resolve_pending_for_session(key, approved=False)
-            active_task_ids = await _active_task_runtime_ids(task_runtime, key)
+            active_task_ids = await _await_abort_operation(
+                _active_task_runtime_ids(task_runtime, key),
+                deadline_at_monotonic=abort_deadline,
+                operation="list_requested_runtime_task",
+                default=(),
+            )
             if active_task_ids and requested_task_id not in active_task_ids:
                 return {"aborted": False, "key": key}
             active_task_ids = (requested_task_id,)
-            cancelled_count = await _cancel_task_runtime(
-                task_runtime,
-                session_key=key,
-                task_id=requested_task_id,
-                source=_cancel_source_from_params(params, "sessions_abort"),
-                reason="user_abort",
+            cancelled_count = await _await_abort_operation(
+                _cancel_task_runtime(
+                    task_runtime,
+                    session_key=key,
+                    task_id=requested_task_id,
+                    source=_cancel_source_from_params(params, "sessions_abort"),
+                    reason="user_abort",
+                ),
+                deadline_at_monotonic=abort_deadline,
+                operation="cancel_requested_runtime_task",
+                default=0,
             )
             if cancelled_count > 0:
                 await _drain_cancelled_task_runtime(
                     task_runtime,
                     session_key=key,
                     task_ids=active_task_ids,
+                    deadline_at_monotonic=abort_deadline,
                 )
             return {"aborted": cancelled_count > 0, "key": key}
 
@@ -4589,18 +4756,47 @@ async def _handle_sessions_abort(params: dict | None, ctx: RpcContext) -> dict:
         # spawn immediately before receiving cancellation; the next pass picks
         # that session up before the abort is considered complete.
         for pass_index in range(_ABORT_TREE_STABILIZATION_PASSES):
-            tree_keys = await _session_tree_keys(ctx.session_manager, key)
+            if pass_index > 0 and time.monotonic() >= abort_deadline:
+                log.warning(
+                    "sessions.abort.tree_stabilization_deadline",
+                    session_key=key,
+                    passes_completed=pass_index,
+                )
+                break
+            tree_keys = await _await_abort_operation(
+                _session_tree_keys(ctx.session_manager, key),
+                deadline_at_monotonic=abort_deadline,
+                operation="list_session_tree",
+                default=(key,),
+            )
             new_keys = [
                 session_key for session_key in tree_keys if session_key not in processed_keys
             ]
             drains: list[tuple[str, tuple[str, ...]]] = []
             cancelled_this_pass = 0
             for session_key in tree_keys:
+                if time.monotonic() >= abort_deadline:
+                    log.warning(
+                        "sessions.abort.tree_iteration_deadline",
+                        session_key=key,
+                        processed_sessions=len(processed_keys),
+                    )
+                    break
                 first_visit = session_key in new_keys
                 if first_visit:
                     processed_keys.add(session_key)
-                    cancelled_groups += await cancel_background_completion_for_session(session_key)
-                active_task_ids = await _active_task_runtime_ids(task_runtime, session_key)
+                    cancelled_groups += await _await_abort_operation(
+                        cancel_background_completion_for_session(session_key),
+                        deadline_at_monotonic=abort_deadline,
+                        operation="cancel_background_completion",
+                        default=0,
+                    )
+                active_task_ids = await _await_abort_operation(
+                    _active_task_runtime_ids(task_runtime, session_key),
+                    deadline_at_monotonic=abort_deadline,
+                    operation="list_runtime_tasks",
+                    default=(),
+                )
                 new_active_task_ids = tuple(
                     task_id
                     for task_id in active_task_ids
@@ -4608,11 +4804,16 @@ async def _handle_sessions_abort(params: dict | None, ctx: RpcContext) -> dict:
                 )
                 if not first_visit and not new_active_task_ids:
                     continue
-                cancelled_count = await _cancel_task_runtime(
-                    task_runtime,
-                    session_key=session_key,
-                    source=cancel_source,
-                    reason="user_abort",
+                cancelled_count = await _await_abort_operation(
+                    _cancel_task_runtime(
+                        task_runtime,
+                        session_key=session_key,
+                        source=cancel_source,
+                        reason="user_abort",
+                    ),
+                    deadline_at_monotonic=abort_deadline,
+                    operation="cancel_runtime_tasks",
+                    default=0,
                 )
                 cancelled_tasks += cancelled_count
                 cancelled_this_pass += cancelled_count
@@ -4630,6 +4831,7 @@ async def _handle_sessions_abort(params: dict | None, ctx: RpcContext) -> dict:
                     task_runtime,
                     session_key=session_key,
                     task_ids=active_task_ids,
+                    deadline_at_monotonic=abort_deadline,
                 )
             if pass_index > 0 and not new_keys and cancelled_this_pass == 0:
                 break
@@ -4640,27 +4842,40 @@ async def _handle_sessions_abort(params: dict | None, ctx: RpcContext) -> dict:
                 passes=_ABORT_TREE_STABILIZATION_PASSES,
             )
 
-        aborted = any((cancelled_tasks, cancelled_groups, resolved_approvals))
+        aborted = any(
+            (
+                cancelled_tasks,
+                cancelled_groups,
+                resolved_approvals,
+                len(active_compaction_tasks),
+            )
+        )
         if aborted:
-            await _emit_to_subscribers(
-                ctx,
-                key,
-                "sessions.changed",
-                build_sessions_changed_payload(
+            await _await_abort_operation(
+                _emit_to_subscribers(
+                    ctx,
                     key,
-                    "task_terminal",
-                    run_status="cancelled",
-                    last_task={
-                        "status": "cancelled",
-                        "terminal_reason": "user_abort",
-                    },
+                    "sessions.changed",
+                    build_sessions_changed_payload(
+                        key,
+                        "task_terminal",
+                        run_status="cancelled",
+                        last_task={
+                            "status": "cancelled",
+                            "terminal_reason": "user_abort",
+                        },
+                    ),
                 ),
+                deadline_at_monotonic=abort_deadline,
+                operation="broadcast_abort_terminal",
+                default=None,
             )
         return {
             "aborted": aborted,
             "key": key,
             "cancelled_tasks": cancelled_tasks,
             "cancelled_sessions": len(cancelled_session_keys),
+            "cancelled_compactions": len(active_compaction_tasks),
         }
 
     # Cancel running agent task via registry
@@ -4675,9 +4890,18 @@ async def _handle_sessions_abort(params: dict | None, ctx: RpcContext) -> dict:
         and not getattr(task, "_opensquilla_terminal_emitted", False)
     ):
         setattr(task, "_opensquilla_terminal_emitted", True)
-        await _emit_to_subscribers(ctx, key, "session.event.done", {"reason": "aborted"})
+        await _await_abort_operation(
+            _emit_to_subscribers(ctx, key, "session.event.done", {"reason": "aborted"}),
+            deadline_at_monotonic=abort_deadline,
+            operation="broadcast_legacy_abort_terminal",
+            default=None,
+        )
 
-    return {"aborted": cancelled, "key": key}
+    return {
+        "aborted": cancelled or bool(active_compaction_tasks),
+        "key": key,
+        "cancelled_compactions": len(active_compaction_tasks),
+    }
 
 
 @_d.method("sessions.patch", scope="operator.admin")
@@ -5201,11 +5425,47 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
         )
     turn_runner = ctx.turn_runner
     lock = get_session_lock(turn_runner, key)
+    wait_for_terminal = bool((params or {}).get("wait", True))
+    compaction_id = new_compaction_id()
+    started_emitted = False
+    terminal_emitted = False
+    heartbeat_task: asyncio.Task[None] | None = None
+    compaction_stage = "admission"
+    compaction_settings = getattr(getattr(ctx, "config", None), "compaction", None)
+    try:
+        total_timeout_seconds = float(
+            getattr(compaction_settings, "total_timeout_seconds", 120.0)
+        )
+    except (TypeError, ValueError):
+        total_timeout_seconds = 120.0
+    if total_timeout_seconds <= 0:
+        total_timeout_seconds = 120.0
+    operation_deadline = time.monotonic() + total_timeout_seconds
+    try:
+        heartbeat_interval_seconds = float(
+            getattr(compaction_settings, "heartbeat_interval_seconds", 15.0)
+        )
+    except (TypeError, ValueError):
+        heartbeat_interval_seconds = 15.0
+    heartbeat_interval_seconds = max(0.1, heartbeat_interval_seconds)
 
     async def _publish_manual_compaction_event(**payload: Any) -> None:
+        nonlocal started_emitted, terminal_emitted
         status = str(payload.get("status") or "")
+        is_terminal = status.lower() in {
+            "completed",
+            "skipped",
+            "failed",
+            "error",
+            "cancelled",
+            "timed_out",
+            "emergency_ephemeral",
+        }
+        if is_terminal and terminal_emitted:
+            return
         reason = payload.get("reason") or payload.get("skip_reason")
         event_payload = {
+            "key": key,
             "source": "manual",
             "phase": "manual",
             "context_window_tokens": context_window_tokens,
@@ -5217,18 +5477,86 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
             ),
             **payload,
         }
-        notify_compaction(key, notify_listeners=False, **event_payload)
-        await _emit_to_subscribers(
+        prepared = await _prepare_session_event_payload(
             ctx,
             key,
             "session.event.compaction",
-            dict(event_payload),
+            event_payload,
+        )
+        normalized = notify_compaction(
+            key,
+            notify_listeners=False,
+            track_current_task=wait_for_terminal,
+            **prepared,
+        )
+        if normalized is None:
+            # ``notify_compaction`` historically returned None and tests or
+            # integrations may still wrap it with that contract.  A real
+            # duplicate terminal is distinguishable through the lifecycle
+            # registry and must remain suppressed.
+            if compaction_terminal_status(compaction_id) is not None:
+                return
+            normalized = prepared
+        # No await is allowed between terminal claim and replay append. This
+        # prevents cancellation from leaving a claimed terminal that reconnect
+        # cannot observe.
+        send_payload = _buffer_session_event(
+            key,
+            "session.event.compaction",
+            normalized,
+        )
+        if status.lower() == "started":
+            started_emitted = True
+        if is_terminal:
+            terminal_emitted = True
+        await _send_prepared_to_subscribers(
+            ctx,
+            key,
+            "session.event.compaction",
+            send_payload,
         )
 
+    async def _manual_compaction_heartbeat() -> None:
+        started = time.monotonic()
+        try:
+            while not terminal_emitted:
+                await asyncio.sleep(heartbeat_interval_seconds)
+                if terminal_emitted:
+                    return
+                await _publish_manual_compaction_event(
+                    status="observed",
+                    heartbeat=True,
+                    heartbeat_at=int(time.time() * 1000),
+                    elapsed_ms=max(0, int((time.monotonic() - started) * 1000)),
+                    stage=compaction_stage,
+                    **compaction_lifecycle_payload(
+                        compaction_id,
+                        COMPACTION_TRIGGERED_EVENT,
+                    ),
+                )
+        except asyncio.CancelledError:
+            return
+
+    def _start_manual_heartbeat() -> None:
+        nonlocal heartbeat_task
+        if heartbeat_task is None or heartbeat_task.done():
+            heartbeat_task = asyncio.create_task(_manual_compaction_heartbeat())
+
+    async def _stop_manual_heartbeat() -> None:
+        nonlocal heartbeat_task
+        task, heartbeat_task = heartbeat_task, None
+        if task is None:
+            return
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
     async def _run_locked() -> dict[str, Any]:
+        nonlocal heartbeat_task, compaction_stage
         receipt = None
         flush_receipt_status: str | None = None
-        compaction_id = new_compaction_id()
+        durable_commit_won = False
+        committed_terminal_payload: dict[str, Any] = {}
         storage = get_session_storage(ctx.session_manager)
         session = None
         if storage is not None:
@@ -5252,6 +5580,7 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
                     )
                     return {
                         "key": key,
+                        "compaction_id": compaction_id,
                         "compacted": False,
                         "status": "skipped",
                         "reason": "empty_ephemeral_webchat_session",
@@ -5297,10 +5626,20 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
             execution_id=uuid.uuid4().hex,
             call_kind="auxiliary.session_flush",
         )
-        await _publish_manual_compaction_event(
-            status="started",
-            **compaction_lifecycle_payload(compaction_id, COMPACTION_TRIGGERED_EVENT),
+        compaction_config = build_compaction_config_from_provider(
+            _resolve_compaction_provider(ctx, session),
+            model_override=_effective_compaction_model(session),
+            compaction_config=getattr(getattr(ctx, "config", None), "compaction", None),
         )
+        compaction_config.deadline_at_monotonic = operation_deadline
+        arm_compaction_deadline(compaction_config, operation_id=compaction_id)
+        if not started_emitted:
+            await _publish_manual_compaction_event(
+                status="started",
+                heartbeat_interval_seconds=heartbeat_interval_seconds,
+                **compaction_lifecycle_payload(compaction_id, COMPACTION_TRIGGERED_EVENT),
+            )
+        _start_manual_heartbeat()
         transcript = []
         flush_enabled = flush_trigger_enabled(ctx.config, "manual")
         try:
@@ -5317,6 +5656,7 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
                     transcript = await get_transcript(key)
 
             if flush_enabled and transcript:
+                compaction_stage = "flushing"
                 if ctx.flush_service is None:
                     log.warning(
                         "sessions.context_compact.flush_skipped",
@@ -5358,11 +5698,17 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
                             flush_kwargs["provider_request_correlation"] = (
                                 flush_correlation
                             )
-                        receipt = await ctx.flush_service.execute(
-                            transcript,
-                            key,
-                            **flush_kwargs,
+                        receipt = await await_compaction_phase(
+                            ctx.flush_service.execute(
+                                transcript,
+                                key,
+                                **flush_kwargs,
+                            ),
+                            compaction_config,
+                            phase="flushing",
                         )
+                    except CompactionTimeoutError:
+                        raise
                     except Exception as exc:  # noqa: BLE001
                         log.warning(
                             "sessions.context_compact.flush_failed",
@@ -5431,12 +5777,7 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
                         },
                     )
 
-            compaction_config = build_compaction_config_from_provider(
-                _resolve_compaction_provider(ctx, session),
-                model_override=_effective_compaction_model(session),
-                compaction_config=getattr(getattr(ctx, "config", None), "compaction", None),
-            )
-
+            compaction_stage = "summarizing"
             chunk_count = 0
             coverage_status = "unknown"
             missing_obligation_count = 0
@@ -5467,11 +5808,15 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
                     compact_kwargs["provider_request_correlation"] = (
                         compaction_correlation
                     )
-                result = await compact_with_result(
-                    key,
-                    context_window_tokens,
+                result = await await_compaction_phase(
+                    compact_with_result(
+                        key,
+                        context_window_tokens,
+                        compaction_config,
+                        **compact_kwargs,
+                    ),
                     compaction_config,
-                    **compact_kwargs,
+                    phase="summarizing",
                 )
                 summary = getattr(result, "summary", "") or ""
                 removed_count = int(getattr(result, "removed_count", 0) or 0)
@@ -5489,6 +5834,24 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
                 )
                 state_kind = str(getattr(result, "summary_format", "text") or "text")
                 quality_report = dict(getattr(result, "quality_report", None) or {})
+                durable_commit_won = bool(removed_count > 0 and summary)
+                if durable_commit_won:
+                    committed_terminal_payload = {
+                        "tokens_before": tokens_before,
+                        "tokens_after": tokens_after,
+                        "remaining_budget_tokens": remaining_budget_tokens,
+                        "removed_count": removed_count,
+                        "kept_count": kept_count,
+                        "chunk_count": chunk_count,
+                        "coverage_status": coverage_status,
+                        "missing_obligation_count": missing_obligation_count,
+                        "critical_carry_forward_count": critical_carry_forward_count,
+                        "state_kind": state_kind,
+                        "quality_report": quality_report,
+                        "summary_len": len(summary),
+                        "summary_source": summary_source,
+                        "flush_receipt_status": flush_receipt_status,
+                    }
                 if removed_count > 0 and summary:
                     for event in (
                         COMPACTION_CHUNK_SUMMARIZED_EVENT,
@@ -5502,12 +5865,16 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
                         )
             else:
                 compact = ctx.session_manager.compact
-                summary = await call_compact_with_optional_config(
-                    compact,
-                    key,
-                    context_window_tokens,
+                summary = await await_compaction_phase(
+                    call_compact_with_optional_config(
+                        compact,
+                        key,
+                        context_window_tokens,
+                        compaction_config,
+                        provider_request_correlation=compaction_correlation,
+                    ),
                     compaction_config,
-                    provider_request_correlation=compaction_correlation,
+                    phase="summarizing",
                 )
                 removed_count = 1 if summary else 0
                 summary_source = "unknown"
@@ -5516,22 +5883,100 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
                 tokens_before = 0
                 tokens_after = 0
                 remaining_budget_tokens = 0
+                durable_commit_won = bool(summary)
+                if durable_commit_won:
+                    committed_terminal_payload = {
+                        "removed_count": removed_count,
+                        "summary_len": len(summary),
+                        "summary_source": summary_source,
+                        "flush_receipt_status": flush_receipt_status,
+                    }
         except asyncio.CancelledError:
-            await _publish_manual_compaction_event(
-                status="cancelled",
-                message="Compaction was cancelled.",
-                **compaction_lifecycle_payload(compaction_id, COMPACTION_TRIGGERED_EVENT),
-            )
+            if durable_commit_won:
+                committed_lifecycle = compaction_lifecycle_payload(
+                    compaction_id,
+                    COMPACTION_PERSISTED_EVENT,
+                )
+                committed_lifecycle.pop("coverage_status", None)
+                await _publish_manual_compaction_event(
+                    status="completed",
+                    reason="cancelled_after_commit",
+                    cancellation_reconciled=True,
+                    **committed_terminal_payload,
+                    **committed_lifecycle,
+                )
+            else:
+                await _publish_manual_compaction_event(
+                    status="cancelled",
+                    message="Compaction was cancelled.",
+                    **compaction_lifecycle_payload(
+                        compaction_id,
+                        COMPACTION_TRIGGERED_EVENT,
+                    ),
+                )
             raise
+        except CompactionTimeoutError as exc:
+            if durable_commit_won:
+                committed_lifecycle = compaction_lifecycle_payload(
+                    compaction_id,
+                    COMPACTION_PERSISTED_EVENT,
+                )
+                committed_lifecycle.pop("coverage_status", None)
+                await _publish_manual_compaction_event(
+                    status="completed",
+                    reason="deadline_after_commit",
+                    deadline_reconciled=True,
+                    **committed_terminal_payload,
+                    **committed_lifecycle,
+                )
+            else:
+                await _publish_manual_compaction_event(
+                    status="timed_out",
+                    phase=exc.phase,
+                    reason="compaction_deadline_exceeded",
+                    message=str(exc),
+                    **compaction_lifecycle_payload(
+                        compaction_id,
+                        COMPACTION_TRIGGERED_EVENT,
+                    ),
+                )
+            raise RpcHandlerError(
+                code="COMPACTION_TIMEOUT",
+                message="Compaction exceeded its absolute deadline.",
+                details={
+                    "key": key,
+                    "compaction_id": compaction_id,
+                    "phase": exc.phase,
+                },
+            ) from exc
         except Exception as exc:
-            await _publish_manual_compaction_event(
-                status="failed",
-                message=str(exc),
-                **compaction_lifecycle_payload(compaction_id, COMPACTION_TRIGGERED_EVENT),
-            )
+            if durable_commit_won:
+                committed_lifecycle = compaction_lifecycle_payload(
+                    compaction_id,
+                    COMPACTION_PERSISTED_EVENT,
+                )
+                committed_lifecycle.pop("coverage_status", None)
+                await _publish_manual_compaction_event(
+                    status="completed",
+                    reason="post_commit_observation_failed",
+                    observation_error=str(exc),
+                    **committed_terminal_payload,
+                    **committed_lifecycle,
+                )
+            else:
+                await _publish_manual_compaction_event(
+                    status="failed",
+                    message=str(exc),
+                    **compaction_lifecycle_payload(
+                        compaction_id,
+                        COMPACTION_TRIGGERED_EVENT,
+                    ),
+                )
             raise
         payload = {
             "key": key,
+            "compaction_id": compaction_id,
+            "status": "completed" if removed_count > 0 else "skipped",
             "compacted": removed_count > 0,
             "applied": removed_count > 0,
             "durability": "durable" if removed_count > 0 else "none",
@@ -5603,10 +6048,154 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
         with bind_usage_accounting_scope(usage_scope):
             return await _run_locked()
 
-    if lock is None:
-        return await _run_accounted()
-    async with lock:
-        return await _run_accounted()
+    async def _execute() -> dict[str, Any]:
+        acquired = False
+        try:
+            if lock is not None:
+                remaining = max(0.0, operation_deadline - time.monotonic())
+                try:
+                    async with asyncio.timeout(remaining):
+                        await lock.acquire()
+                except TimeoutError as exc:
+                    raise CompactionTimeoutError(
+                        "admission",
+                        total_timeout_seconds,
+                    ) from exc
+                acquired = True
+            remaining = max(0.0, operation_deadline - time.monotonic())
+            if remaining <= 0:
+                raise CompactionTimeoutError("admission", total_timeout_seconds)
+            try:
+                async with asyncio.timeout(remaining):
+                    return await _run_accounted()
+            except TimeoutError as exc:
+                raise CompactionTimeoutError(
+                    compaction_stage,
+                    total_timeout_seconds,
+                ) from exc
+        except asyncio.CancelledError:
+            if started_emitted:
+                await _publish_manual_compaction_event(
+                    status="cancelled",
+                    reason="cancelled",
+                    message="Compaction was cancelled.",
+                    **compaction_lifecycle_payload(
+                        compaction_id,
+                        COMPACTION_TRIGGERED_EVENT,
+                    ),
+                )
+            raise
+        except CompactionTimeoutError as exc:
+            if started_emitted:
+                await _publish_manual_compaction_event(
+                    status="timed_out",
+                    phase=exc.phase,
+                    reason="compaction_deadline_exceeded",
+                    message=str(exc),
+                    **compaction_lifecycle_payload(
+                        compaction_id,
+                        COMPACTION_TRIGGERED_EVENT,
+                    ),
+                )
+            raise RpcHandlerError(
+                code="COMPACTION_TIMEOUT",
+                message="Compaction exceeded its absolute deadline.",
+                details={
+                    "key": key,
+                    "compaction_id": compaction_id,
+                    "phase": exc.phase,
+                },
+            ) from exc
+        except Exception as exc:
+            if started_emitted and not terminal_emitted:
+                await _publish_manual_compaction_event(
+                    status="failed",
+                    reason="compaction_failed",
+                    message=str(exc),
+                    **compaction_lifecycle_payload(
+                        compaction_id,
+                        COMPACTION_TRIGGERED_EVENT,
+                    ),
+                )
+            raise
+        finally:
+            if acquired and lock is not None:
+                lock.release()
+            await _stop_manual_heartbeat()
+            if started_emitted and not terminal_emitted:
+                await _publish_manual_compaction_event(
+                    status="failed",
+                    reason="terminal_missing",
+                    message="Compaction ended without a terminal result.",
+                    **compaction_lifecycle_payload(
+                        compaction_id,
+                        COMPACTION_TRIGGERED_EVENT,
+                    ),
+                )
+
+    if wait_for_terminal:
+        return await _execute()
+
+    background_entered = asyncio.Event()
+    background_start = asyncio.Event()
+
+    async def _run_in_background() -> None:
+        background_entered.set()
+        try:
+            await background_start.wait()
+            await _execute()
+        except asyncio.CancelledError:
+            if started_emitted and not terminal_emitted:
+                await _publish_manual_compaction_event(
+                    status="cancelled",
+                    reason="cancelled",
+                    message="Compaction was cancelled.",
+                    **compaction_lifecycle_payload(
+                        compaction_id,
+                        COMPACTION_TRIGGERED_EVENT,
+                    ),
+                )
+            return
+        except Exception as exc:  # terminal event is emitted by _execute
+            log.warning(
+                "sessions.context_compact.background_failed",
+                key=key,
+                compaction_id=compaction_id,
+                error=str(exc),
+            )
+
+    background_task = asyncio.create_task(_run_in_background())
+    register_active_compaction(key, compaction_id, background_task)
+    _manual_compaction_tasks.add(background_task)
+    background_task.add_done_callback(_manual_compaction_tasks.discard)
+    await background_entered.wait()
+    try:
+        await _publish_manual_compaction_event(
+            status="started",
+            heartbeat_interval_seconds=heartbeat_interval_seconds,
+            **compaction_lifecycle_payload(
+                compaction_id,
+                COMPACTION_TRIGGERED_EVENT,
+            ),
+        )
+        if not terminal_emitted:
+            _start_manual_heartbeat()
+    except BaseException:
+        background_task.cancel()
+        background_start.set()
+        with contextlib.suppress(BaseException):
+            await background_task
+        raise
+    background_start.set()
+    return {
+        "key": key,
+        "compaction_id": compaction_id,
+        "status": "started",
+        "compacted": False,
+        "applied": False,
+        "durability": "none",
+        "user_visible": True,
+    }
 
 
 @_d.method("sessions.compact", scope="operator.write")

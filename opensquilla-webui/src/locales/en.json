@@ -3370,7 +3370,8 @@
       "compacted": "Context compacted",
       "failed": "Compact failed",
       "withinBudget": "Context within budget.",
-      "cancelled": "Compact cancelled"
+      "cancelled": "Compact cancelled",
+      "requestScoped": "Request-scoped; session history was not rewritten"
     },
     "tool": {
       "discoverLinks": "Discover links",

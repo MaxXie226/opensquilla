@@ -31,6 +31,11 @@ from .error_redaction import (
 from .failures import retry_after_from_headers
 from .openai import _http_error_body_text, _resolve_llm_proxy, _versioned_api_url
 from .protocol import ProviderConnectionConfig, ProviderMetadata
+from .request_proof import (
+    RESPONSES_REQUEST_ENVELOPE,
+    ProviderRequestBudgetExceededError,
+    prove_provider_payload_from_env,
+)
 from .stream_assembly import ToolStreamAccumulator, ToolStreamProtocolError
 from .trace_recorder import LLMTraceRecorder
 from .types import (
@@ -182,6 +187,7 @@ class OpenAIResponsesProvider:
     replay is added in later continuity work.
     """
 
+    final_request_admission_guaranteed = True
     provider_name = "openai_responses"
 
     def __init__(
@@ -292,6 +298,49 @@ class OpenAIResponsesProvider:
         if tools:
             payload["tools"] = [_responses_tool(tool) for tool in tools]
             payload["tool_choice"] = config.tool_choice or "auto"
+
+        from opensquilla.engine.context_budget import coordinate_provider_context_budget
+
+        budget_decision = coordinate_provider_context_budget(
+            payload,
+            projection_adapter="openai_responses",
+            proof_budget=config.provider_request_max_chars,
+            status_projection_mode="content_envelope",
+            envelope_shape=RESPONSES_REQUEST_ENVELOPE,
+        )
+        if budget_decision.action == "budget_limited":
+            proof = budget_decision.proof or {}
+            log.warning("provider.request_budget_exhausted", **proof)
+            yield ErrorEvent(
+                message=json.dumps(proof, ensure_ascii=False, sort_keys=True),
+                code="provider_request_budget_exhausted",
+            )
+            return
+        if budget_decision.action == "invalid_request":
+            log.warning("provider.request_serialization_failed")
+            yield ErrorEvent(
+                message="Provider request could not be serialized.",
+                code="provider_internal",
+            )
+            return
+        payload = budget_decision.payload or payload
+        if budget_decision.proof is not None:
+            log.info("provider.request_proof", **budget_decision.proof)
+        try:
+            prove_provider_payload_from_env(
+                payload,
+                projection_adapter="openai_responses",
+                status_projection_mode="content_envelope",
+                envelope_shape=RESPONSES_REQUEST_ENVELOPE,
+            )
+        except ProviderRequestBudgetExceededError as exc:
+            log.warning("provider.request_budget_exhausted", **exc.proof)
+            yield ErrorEvent(
+                message=json.dumps(exc.proof, ensure_ascii=False, sort_keys=True),
+                code="provider_request_budget_exhausted",
+            )
+            return
+
         endpoint = self._api_url("/v1/responses")
         trace = LLMTraceRecorder(
             provider="openai_responses",
@@ -303,7 +352,11 @@ class OpenAIResponsesProvider:
         trace.record_request(
             payload=payload,
             headers=headers,
-            metadata={"timeout_seconds": config.timeout, "tools_count": len(tools or [])},
+            metadata={
+                "timeout_seconds": config.timeout,
+                "tools_count": len(tools or []),
+                "request_proof": budget_decision.proof,
+            },
         )
 
         try:
@@ -854,6 +907,30 @@ class OpenAIResponsesProvider:
             headers["OpenAI-Organization"] = self._org_id
         endpoint = self._api_url("/v1/responses/compact")
         payload = {"model": self._model, "input": input_items}
+
+        from opensquilla.engine.context_budget import coordinate_provider_context_budget
+
+        budget_decision = coordinate_provider_context_budget(
+            payload,
+            projection_adapter="openai_responses_compact",
+            proof_budget=cfg.provider_request_max_chars,
+            status_projection_mode="content_envelope",
+            envelope_shape=RESPONSES_REQUEST_ENVELOPE,
+        )
+        if budget_decision.action == "budget_limited":
+            raise ProviderRequestBudgetExceededError(budget_decision.proof or {})
+        if budget_decision.action == "invalid_request":
+            raise ValueError("provider_request_serialization_failed")
+        if cfg.provider_request_max_chars <= 0:
+            raise ValueError("provider_request_budget_unbound")
+        payload = budget_decision.payload or payload
+        prove_provider_payload_from_env(
+            payload,
+            projection_adapter="openai_responses_compact",
+            status_projection_mode="content_envelope",
+            envelope_shape=RESPONSES_REQUEST_ENVELOPE,
+        )
+
         trace = LLMTraceRecorder(
             provider="openai_responses",
             model=self._model,
@@ -864,7 +941,11 @@ class OpenAIResponsesProvider:
         trace.record_request(
             payload=payload,
             headers=headers,
-            metadata={"timeout_seconds": cfg.timeout, "operation": "compact_window"},
+            metadata={
+                "timeout_seconds": cfg.timeout,
+                "operation": "compact_window",
+                "request_proof": budget_decision.proof,
+            },
         )
 
         try:

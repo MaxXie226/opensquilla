@@ -330,6 +330,15 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       handleRpcEnsembleProgress(payload as EnsembleProgressPayload)
     } else if (event === 'session.event.router_control_replay') {
       handleRpcRouterControlReplay(payload)
+    } else if (event === 'session.event.compaction') {
+      // A live snapshot is the authoritative base for the active stream, not
+      // historical replay. Compaction deliberately ignores replayed
+      // non-terminal events, so mark this as live to restore the busy/Stop
+      // state before subscribing from snapshot.current_stream_seq.
+      handleRpcCompaction(payload as CompactionPayload, {
+        authoritativeLive: true,
+        replayed: false,
+      })
     } else if (event === 'session.event.thinking') {
       handleRpcAny(event, payload)
     }

@@ -202,13 +202,17 @@ from opensquilla.sandbox.elevation import (
 from opensquilla.session.compaction import (
     CompactionConfig,
     CompactionRequest,
+    arm_compaction_deadline,
     build_compaction_config_from_provider,
     compact_context,
+    compaction_remaining_seconds,
+    require_compaction_time,
 )
 from opensquilla.session.compaction_lifecycle import (
     COMPACTION_CHUNK_SUMMARIZED_EVENT,
     COMPACTION_SUMMARY_VERIFIED_EVENT,
     COMPACTION_TRIGGERED_EVENT,
+    CompactionTimeoutError,
     compaction_effect_payload,
     compaction_lifecycle_payload,
     compaction_result_payload,
@@ -2535,23 +2539,24 @@ class Agent:
                 message="Context compaction did not reduce the provider request.",
                 code="compaction_not_smaller",
             )
-        if reason == "provider_recent_tail_too_large":
+        if reason in {
+            "provider_native_overflow_after_admission",
+            "provider_recent_tail_too_large",
+        }:
             return ErrorEvent(
                 message=(
-                    "The request is too large for the provider context window after "
-                    "automatic context compaction and payload reduction. OpenSquilla "
-                    "preserved the recoverable state; retry with a narrower request "
-                    "or a larger-context model."
+                    "The final provider request is too large after safe request-only "
+                    "reduction. Durable session history was not changed; retry with "
+                    "a narrower current request or a larger-context model."
                 ),
                 code="provider_request_too_large",
             )
         if reason == "provider_request_budget_exhausted":
             return ErrorEvent(
                 message=(
-                    "The request is too large for the provider context window after "
-                    "automatic context compaction and payload reduction. OpenSquilla "
-                    "preserved the recoverable state; retry with a narrower request "
-                    "or a larger-context model."
+                    "The final provider request exceeds its request budget. Durable "
+                    "session history was not changed; narrow the current input or "
+                    "tools, or choose a larger-context model."
                 ),
                 code="provider_request_too_large",
             )
@@ -2648,37 +2653,6 @@ class Agent:
                     current_tool_context.reset(token)
 
         return _handler
-
-    def _provider_budget_compaction_window_tokens(
-        self,
-        provider_error: ProviderErrorEvent,
-    ) -> int | None:
-        proof = self._provider_request_budget_proof(provider_error)
-        if proof is None:
-            return None
-        proof_budget = self._positive_int(
-            proof.get("effective_proof_budget") or proof.get("proof_budget")
-        )
-        if proof_budget is None:
-            return None
-        estimated_chars = self._positive_int(proof.get("estimated_chars"))
-        estimated_tokens = self._positive_int(proof.get("estimated_tokens"))
-        if estimated_chars and estimated_tokens:
-            window_tokens = int(proof_budget * (estimated_tokens / estimated_chars))
-        else:
-            window_tokens = proof_budget // 4
-        if window_tokens <= 0:
-            return None
-        return min(self.config.context_window_tokens, window_tokens)
-
-    def _provider_budget_estimated_tokens(
-        self,
-        provider_error: ProviderErrorEvent,
-    ) -> int | None:
-        proof = self._provider_request_budget_proof(provider_error)
-        if proof is None:
-            return None
-        return self._positive_int(proof.get("estimated_tokens"))
 
     def _provider_request_proof_max_chars(self) -> int:
         return self._context_budget_governor().snapshot().provider_request_max_chars
@@ -8182,12 +8156,51 @@ class Agent:
                             continue
                         if failure_kind == ProviderFailureKind.CONTEXT_OVERFLOW:
                             self._record_provider_context_overflow_reason(provider_error)
-                            provider_compaction_window_tokens = (
-                                self._provider_budget_compaction_window_tokens(provider_error)
-                            )
-                            provider_estimated_tokens = self._provider_budget_estimated_tokens(
-                                provider_error
-                            )
+                            if (
+                                provider_error.code
+                                == "provider_request_budget_exhausted"
+                                or bool(
+                                    getattr(
+                                        self.provider,
+                                        "final_request_admission_guaranteed",
+                                        False,
+                                    )
+                                )
+                            ):
+                                # The adapter proved the complete request
+                                # envelope (system, tools, request-scoped
+                                # context, media projection, and history) could
+                                # not fit after request-only reduction. That
+                                # proof does not establish that durable history
+                                # is the pressure source, so mutating the
+                                # canonical transcript here would be an
+                                # attribution error. Fail closed when the
+                                # adapter already admitted the final physical
+                                # payload; before-turn history admission
+                                # remains the durable compaction boundary.
+                                refusal_reason = "request_envelope_source_ambiguous"
+                                if (
+                                    provider_error.code
+                                    != "provider_request_budget_exhausted"
+                                ):
+                                    self._last_compaction_refusal_reason = (
+                                        "provider_native_overflow_after_admission"
+                                    )
+                                    refusal_reason = (
+                                        "provider_native_overflow_after_final_admission"
+                                    )
+                                self._write_turn_call_log(
+                                    "provider_request_budget_recovery_refused",
+                                    reason=refusal_reason,
+                                    iteration=iterations,
+                                    attempt=_call_attempt,
+                                )
+                                yield self._transition(AgentState.ERROR)
+                                terminal_error = self._context_overflow_error()
+                                yield terminal_error
+                                break
+                            provider_compaction_window_tokens = None
+                            provider_estimated_tokens = None
                             provider_compaction_refusal_reason = (
                                 self._last_compaction_refusal_reason
                             )
@@ -8275,6 +8288,12 @@ class Agent:
                             )
                             yield CompactionEvent(
                                 compaction_id=overflow_outcome.compaction_id,
+                                compaction_deadline_at_monotonic=(
+                                    overflow_outcome.compaction_deadline_at_monotonic
+                                ),
+                                compaction_timeout_seconds=(
+                                    overflow_outcome.compaction_timeout_seconds
+                                ),
                                 summary=overflow_outcome.summary,
                                 kept_entries=overflow_outcome.kept_entries,
                                 kept_count=len(overflow_outcome.messages),
@@ -8430,85 +8449,6 @@ class Agent:
 
                 if iter_reasoning_content:
                     final_reasoning_parts.append(iter_reasoning_content)
-
-                # Check overflow against the live provider request, not
-                # cumulative billable usage for the whole turn.
-                estimated_context_tokens = self._estimate_live_request_tokens(
-                    request_messages,
-                    tools=provider_tools_for_call,
-                    config=call_chat_cfg,
-                )
-                overflow_outcome = await self._check_context_overflow(
-                    turn_messages,
-                    estimated_context_tokens,
-                    request_context_insert_index=request_context_insert_index,
-                    runtime_context_insert_index=runtime_context_insert_index,
-                    protected_turn_start_index=current_turn_start_index,
-                )
-                if overflow_outcome is None:
-                    if overflow_retries >= self.config.max_overflow_retries:
-                        yield self._transition(AgentState.ERROR)
-                        terminal_error = self._context_overflow_error()
-                        yield terminal_error
-                        break
-                    overflow_retries += 1
-                    _log.warning(
-                        "compaction.retry",
-                        attempt=overflow_retries,
-                        max=self.config.max_overflow_retries,
-                    )
-                    continue  # retry the tool loop iteration
-                if overflow_outcome.compacted:
-                    # Compaction happened — replace message list. Lifetime
-                    # counters keep feeding DoneEvent usage/cost accounting for
-                    # this turn.
-                    turn_messages = overflow_outcome.messages
-                    if overflow_outcome.request_context_insert_index is not None:
-                        request_context_insert_index = overflow_outcome.request_context_insert_index
-                    if overflow_outcome.runtime_context_insert_index is not None:
-                        runtime_context_insert_index = overflow_outcome.runtime_context_insert_index
-                    if overflow_outcome.protected_turn_start_index is not None:
-                        current_turn_start_index = overflow_outcome.protected_turn_start_index
-                    message_count_request_view = None
-                    yield CompactionEvent(
-                        compaction_id=overflow_outcome.compaction_id,
-                        summary=overflow_outcome.summary,
-                        kept_entries=overflow_outcome.kept_entries,
-                        kept_count=len(overflow_outcome.messages),
-                        removed_count=overflow_outcome.removed_count,
-                    )
-                    overflow_retries = 0  # reset on success
-                    # Rebuild chat_cfg so next LLM call uses refreshed system
-                    # prompt. Read cache_breakpoints from the
-                    # refreshed self.config (re-anchored by
-                    # refresh_system_prompt) — chat_cfg.cache_breakpoints
-                    # would still hold pre-compaction base text and miss the
-                    # cache on the next provider call.
-                    chat_cfg = ChatConfig(
-                        max_tokens=chat_cfg.max_tokens,
-                        temperature=chat_cfg.temperature,
-                        top_p=chat_cfg.top_p,
-                        system=self._context.system_prompt,
-                        thinking=thinking_enabled,
-                        thinking_budget_tokens=thinking_budget,
-                        thinking_budget_explicit=chat_cfg.thinking_budget_explicit,
-                        timeout=chat_cfg.timeout,
-                        stop_sequences=chat_cfg.stop_sequences,
-                        cache_breakpoints=self._cache_breakpoints_without_runtime_context(
-                            self.config.cache_breakpoints
-                        ),
-                        cache_mode=chat_cfg.cache_mode,
-                        output_json_schema=chat_cfg.output_json_schema,
-                        output_json_schema_strict=chat_cfg.output_json_schema_strict,
-                        model_capabilities=self.config.model_capabilities,
-                        thinking_level=(
-                            self.config.thinking
-                            if isinstance(self.config.thinking, ThinkingLevel)
-                            else None
-                        ),
-                        provider_request_max_chars=(self._provider_request_proof_max_chars()),
-                        tool_choice=chat_cfg.tool_choice,
-                    )
 
                 assembled_text = "".join(assistant_text_parts)
                 visible_text = assembled_text
@@ -13857,6 +13797,10 @@ class Agent:
             return None, "no_safe_cut"
 
         compaction_config = self._build_compaction_config()
+        arm_compaction_deadline(
+            compaction_config,
+            operation_id=new_compaction_id(),
+        )
         protected_tail_count = len(messages) - protected_start
         compaction_config.protected_recent_messages = max(
             int(compaction_config.protected_recent_messages or 0),
@@ -14181,6 +14125,8 @@ class Agent:
         )
         config.compaction_profile = self.config.compaction_profile
         config.protected_recent_messages = self.config.compaction_protected_recent_messages
+        config.total_timeout_seconds = self.config.compaction_total_timeout_seconds
+        config.heartbeat_interval_seconds = self.config.compaction_heartbeat_interval_seconds
         return config
 
     @staticmethod
@@ -14206,33 +14152,6 @@ class Agent:
         except TypeError:
             return repr(value)
         return value
-
-    def _estimate_live_request_tokens(
-        self,
-        messages: list[Message],
-        *,
-        tools: list[ToolDefinition] | None = None,
-        config: ChatConfig | None = None,
-    ) -> int:
-        """Estimate the current provider request size without lifetime usage."""
-
-        payload: dict[str, Any] = {
-            "messages": [self._live_request_jsonable(message) for message in messages],
-        }
-        if tools:
-            payload["tools"] = [self._live_request_jsonable(tool) for tool in tools]
-        if config is not None:
-            if config.system:
-                payload["system"] = config.system
-            config_payload = config.model_dump(
-                mode="json",
-                exclude_none=True,
-                exclude={"system", "model_capabilities"},
-            )
-            payload.update(config_payload)
-
-        estimated_chars = len(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str))
-        return max(1, estimated_chars // 4)
 
     async def _check_context_overflow(
         self,
@@ -14260,7 +14179,56 @@ class Agent:
                 protected_turn_start_index=protected_turn_start_index,
             )
 
+        if protected_turn_start_index is not None:
+            protected_tail_start = max(
+                0,
+                min(protected_turn_start_index, len(messages)),
+            )
+            protected_tail_tokens = sum(
+                int(entry["token_count"])
+                for entry in self._message_count_compaction_entries(
+                    messages[protected_tail_start:]
+                )
+            )
+            if protected_tail_tokens > threshold:
+                self._last_compaction_refusal_reason = "provider_recent_tail_too_large"
+                logger.warning(
+                    "compaction.protected_tail_too_large",
+                    protected_tail_tokens=protected_tail_tokens,
+                    threshold_tokens=int(threshold),
+                    context_window_tokens=window_tokens,
+                    protected_message_count=len(messages) - protected_tail_start,
+                )
+                return None
+
+        protected_start: int | None = None
         compaction_id = new_compaction_id()
+        compaction_config = self._build_compaction_config()
+        if protected_turn_start_index is not None:
+            protected_start = max(
+                0,
+                min(protected_turn_start_index, len(messages)),
+            )
+            compaction_config.protected_recent_messages = max(
+                int(compaction_config.protected_recent_messages or 0),
+                len(messages) - protected_start,
+            )
+        arm_compaction_deadline(compaction_config, operation_id=compaction_id)
+        if self._session_key:
+            notify_compaction(
+                self._session_key,
+                source="automatic",
+                phase="agent_inline_overflow",
+                status="started",
+                tokens_before=estimated_context_tokens,
+                context_window_tokens=window_tokens,
+                heartbeat_interval_seconds=compaction_config.heartbeat_interval_seconds,
+                **compaction_effect_payload(status="started"),
+                **compaction_lifecycle_payload(
+                    compaction_id,
+                    COMPACTION_TRIGGERED_EVENT,
+                ),
+            )
         # --- Pre-compaction flush; inline compaction can continue on degraded flush. ---
         flush_task: asyncio.Task | None = None
         self._consume_completed_flush_task()
@@ -14273,15 +14241,21 @@ class Agent:
                 if flush_task is self._flush_wait_timed_out_task:
                     return None
                 try:
+                    require_compaction_time(compaction_config, phase="flushing")
+                    remaining = compaction_remaining_seconds(compaction_config)
+                    wait_timeout = self.config.flush_timeout_seconds
+                    if remaining is not None:
+                        wait_timeout = min(wait_timeout, remaining)
                     receipt = await asyncio.wait_for(
                         asyncio.shield(flush_task),
-                        timeout=self.config.flush_timeout_seconds,
+                        timeout=wait_timeout,
                     )
                     logger.info("memory_flush.completed_after_compaction")
                     self._flush_wait_timed_out_task = None
                     self._mark_flush_task_completed(flush_task)
                     return receipt
                 except TimeoutError:
+                    require_compaction_time(compaction_config, phase="flushing")
                     self._flush_wait_timed_out_task = flush_task
                     next_retry_seconds = self._record_flush_timeout_backoff()
                     logger.warning(
@@ -14289,6 +14263,8 @@ class Agent:
                         timeout_seconds=self.config.flush_timeout_seconds,
                         next_retry_seconds=next_retry_seconds,
                     )
+                except CompactionTimeoutError:
+                    raise
                 except Exception as exc:
                     logger.warning("memory_flush.await_failed", error=str(exc))
                     self._mark_flush_task_completed(flush_task)
@@ -14368,7 +14344,39 @@ class Agent:
                     retry_after_seconds=round(self._flush_backoff_until - time.monotonic(), 3),
                 )
                 self._flush_done_this_cycle = False
-            receipt = await _await_flush_task()
+            try:
+                receipt = await _await_flush_task()
+            except asyncio.CancelledError:
+                if self._session_key:
+                    notify_compaction(
+                        self._session_key,
+                        source="automatic",
+                        phase="flushing",
+                        status="cancelled",
+                        reason="cancelled",
+                        **compaction_effect_payload(status="cancelled"),
+                        **compaction_lifecycle_payload(
+                            compaction_id,
+                            COMPACTION_TRIGGERED_EVENT,
+                        ),
+                    )
+                raise
+            except CompactionTimeoutError as exc:
+                self._last_compaction_refusal_reason = "compaction_deadline_exceeded"
+                if self._session_key:
+                    notify_compaction(
+                        self._session_key,
+                        source="automatic",
+                        phase=exc.phase,
+                        status="timed_out",
+                        reason=self._last_compaction_refusal_reason,
+                        **compaction_effect_payload(status="timed_out"),
+                        **compaction_lifecycle_payload(
+                            compaction_id,
+                            COMPACTION_TRIGGERED_EVENT,
+                        ),
+                    )
+                return None
             if not flush_receipt_allows_destructive_compaction(receipt):
                 reason = "memory_flush_degraded_before_compaction"
                 if flush_task is not None and self._flush_wait_timed_out_task is flush_task:
@@ -14434,7 +14442,7 @@ class Agent:
             session_id="agent-turn",
             entries=entries,
             context_window_tokens=window_tokens,
-            config=self._build_compaction_config(),
+            config=compaction_config,
             provider_request_correlation=derive_provider_request_correlation(
                 self._provider_request_correlation,
                 execution_id=uuid.uuid4().hex,
@@ -14442,23 +14450,43 @@ class Agent:
             ),
         )
 
-        if self._session_key:
-            notify_compaction(
-                self._session_key,
-                source="automatic",
-                phase="agent_inline_overflow",
-                status="started",
-                tokens_before=estimated_context_tokens,
-                context_window_tokens=window_tokens,
-                **compaction_effect_payload(status="started"),
-                **compaction_lifecycle_payload(
-                    compaction_id,
-                    COMPACTION_TRIGGERED_EVENT,
-                ),
-            )
-
         try:
             result = await compact_context(request)
+        except asyncio.CancelledError:
+            if self._session_key:
+                notify_compaction(
+                    self._session_key,
+                    source="automatic",
+                    phase="agent_inline_overflow",
+                    status="cancelled",
+                    reason="cancelled",
+                    tokens_before=estimated_context_tokens,
+                    context_window_tokens=window_tokens,
+                    **compaction_effect_payload(status="cancelled"),
+                    **compaction_lifecycle_payload(
+                        compaction_id,
+                        COMPACTION_TRIGGERED_EVENT,
+                    ),
+                )
+            raise
+        except CompactionTimeoutError as exc:
+            self._last_compaction_refusal_reason = "compaction_deadline_exceeded"
+            if self._session_key:
+                notify_compaction(
+                    self._session_key,
+                    source="automatic",
+                    phase=exc.phase,
+                    status="timed_out",
+                    reason=self._last_compaction_refusal_reason,
+                    tokens_before=estimated_context_tokens,
+                    context_window_tokens=window_tokens,
+                    **compaction_effect_payload(status="timed_out"),
+                    **compaction_lifecycle_payload(
+                        compaction_id,
+                        COMPACTION_TRIGGERED_EVENT,
+                    ),
+                )
+            return None
         except Exception as exc:  # noqa: BLE001
             self._last_compaction_refusal_reason = "compaction_failed"
             if self._session_key:
@@ -14478,6 +14506,23 @@ class Agent:
                     ),
                 )
             return None  # signal failure
+
+        kept_start_index = int(
+            getattr(result, "kept_start_index", result.removed_count)
+            or result.removed_count
+        )
+        if protected_start is not None and (
+            int(result.removed_count) > protected_start
+            or kept_start_index > protected_start
+        ):
+            logger.warning(
+                "compaction.protected_tail_change_rejected",
+                removed_count=result.removed_count,
+                kept_start_index=kept_start_index,
+                protected_turn_start_index=protected_start,
+            )
+            self._last_compaction_refusal_reason = "provider_recent_tail_too_large"
+            return None
 
         if self._session_key and result.removed_count > 0 and result.summary:
             for event in (
@@ -14537,7 +14582,39 @@ class Agent:
         # corrupts row metadata, so short-circuit every no-op skip here.
         if result.removed_count == 0 and not result.summary:
             has_structured_content = any(not isinstance(m.content, str) for m in messages)
-            await _await_flush_task()
+            try:
+                await _await_flush_task()
+            except asyncio.CancelledError:
+                if self._session_key:
+                    notify_compaction(
+                        self._session_key,
+                        source="automatic",
+                        phase="flushing",
+                        status="cancelled",
+                        reason="cancelled",
+                        **compaction_effect_payload(status="cancelled"),
+                        **compaction_lifecycle_payload(
+                            compaction_id,
+                            COMPACTION_TRIGGERED_EVENT,
+                        ),
+                    )
+                raise
+            except CompactionTimeoutError as exc:
+                self._last_compaction_refusal_reason = "compaction_deadline_exceeded"
+                if self._session_key:
+                    notify_compaction(
+                        self._session_key,
+                        source="automatic",
+                        phase=exc.phase,
+                        status="timed_out",
+                        reason=self._last_compaction_refusal_reason,
+                        **compaction_effect_payload(status="timed_out"),
+                        **compaction_lifecycle_payload(
+                            compaction_id,
+                            COMPACTION_TRIGGERED_EVENT,
+                        ),
+                    )
+                return None
             self._flush_done_this_cycle = False
             skip_reason = getattr(result, "skip_reason", None) or (
                 "structured_content_noop" if has_structured_content else "noop"
@@ -14570,36 +14647,65 @@ class Agent:
                 protected_turn_start_index=protected_turn_start_index,
             )
 
-        # Rebuild message list from compacted entries
+        # ``compact_context`` is prefix-only. Keep the exact original tail in
+        # the live provider view so tool IDs, reasoning signatures, images,
+        # and provider-specific content blocks are not flattened by the text
+        # projection used solely as summarizer input.
         compacted: list[Message] = []
         if result.summary:
             compacted.append(Message(role="user", content=f"[Context summary]\n{result.summary}"))
             compacted.append(
                 Message(role="assistant", content="Understood. Continuing from summary.")
             )
-        for entry in result.kept_entries:
-            compacted.append(Message(role=entry["role"], content=entry["content"]))
+        compacted.extend(messages[kept_start_index:])
 
-        await _await_flush_task()
+        try:
+            await _await_flush_task()
+        except asyncio.CancelledError:
+            if self._session_key:
+                notify_compaction(
+                    self._session_key,
+                    source="automatic",
+                    phase="flushing",
+                    status="cancelled",
+                    reason="cancelled",
+                    **compaction_effect_payload(status="cancelled"),
+                    **compaction_lifecycle_payload(
+                        compaction_id,
+                        COMPACTION_TRIGGERED_EVENT,
+                    ),
+                )
+            raise
+        except CompactionTimeoutError as exc:
+            self._last_compaction_refusal_reason = "compaction_deadline_exceeded"
+            if self._session_key:
+                notify_compaction(
+                    self._session_key,
+                    source="automatic",
+                    phase=exc.phase,
+                    status="timed_out",
+                    reason=self._last_compaction_refusal_reason,
+                    **compaction_effect_payload(status="timed_out"),
+                    **compaction_lifecycle_payload(
+                        compaction_id,
+                        COMPACTION_TRIGGERED_EVENT,
+                    ),
+                )
+            return None
 
         # Reset flush flag so it can trigger again after next compaction
         self._flush_done_this_cycle = False
 
         # Trigger 6: post-compaction sync
         if self._memory_sync_manager is not None:
-            self._memory_sync_manager.mark_dirty()
+            try:
+                self._memory_sync_manager.mark_dirty()
+            except Exception as exc:  # sync refresh is non-authoritative
+                logger.warning("memory_sync.mark_dirty_failed", error=str(exc))
 
         kept_entries = [{"role": e["role"], "content": e["content"]} for e in result.kept_entries]
-        # compact_context is prefix-only.  Use its exact cut instead of
-        # content matching: duplicate role/content pairs can otherwise match
-        # an older row and move the protected current-turn boundary forward.
-        # ``getattr`` keeps older/custom compactor result stubs compatible;
-        # prefix-only compaction already guarantees that removed_count is the
-        # same boundary when the additive field is absent.
-        kept_start_index = int(
-            getattr(result, "kept_start_index", result.removed_count)
-            or result.removed_count
-        )
+        # Use the exact cut instead of content matching: duplicate role/content
+        # pairs can otherwise move the protected current-turn boundary.
         adjusted_request_idx = self._adjust_index_after_prefix_compaction(
             request_context_insert_index,
             kept_start_index,
@@ -14622,6 +14728,8 @@ class Agent:
             kept_entries=kept_entries,
             removed_count=result.removed_count,
             compaction_id=compaction_id,
+            compaction_deadline_at_monotonic=compaction_config.deadline_at_monotonic,
+            compaction_timeout_seconds=compaction_config.total_timeout_seconds,
             request_context_insert_index=adjusted_request_idx,
             runtime_context_insert_index=adjusted_runtime_idx,
             protected_turn_start_index=adjusted_protected_idx,
@@ -16643,6 +16751,10 @@ class Agent:
             flush_compaction_safety_mode=self.config.flush_compaction_safety_mode,
             compaction_profile=self.config.compaction_profile,
             compaction_protected_recent_messages=(self.config.compaction_protected_recent_messages),
+            compaction_total_timeout_seconds=self.config.compaction_total_timeout_seconds,
+            compaction_heartbeat_interval_seconds=(
+                self.config.compaction_heartbeat_interval_seconds
+            ),
             tool_result_projection_max_inline_chars=(
                 self.config.tool_result_projection_max_inline_chars
             ),

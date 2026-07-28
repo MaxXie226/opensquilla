@@ -70,6 +70,7 @@ export interface UseChatSlashCommandsOptions {
   resetCurrentSession: () => void
   setCompactInFlight: (active: boolean, key?: string) => void
   showCompactStatus: (status: string, message: string, options?: { tone?: string; detail?: string; dismissMs?: number }) => void
+  showCompactionToast: (payload: Record<string, unknown>, meta?: Record<string, unknown>) => void
   // Surface a short, client-side notice (e.g. the meta-skill list). No provider call.
   notify: (message: string) => void
   // Send a turn whose provider text bypasses slash parsing (mirrors the TUI
@@ -389,14 +390,22 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
         const compactKey = options.sessionKey.value
         options.setCompactInFlight(true, compactKey)
         options.showCompactStatus('started', i18n.global.t('chat.compact.compacting'), { tone: 'info' })
-        options.rpc.call('sessions.contextCompact', { key: compactKey })
-          .then(() => {
+        options.rpc.call<Record<string, unknown>>('sessions.contextCompact', {
+          key: compactKey,
+          wait: false,
+        })
+          .then((result) => {
             if (compactKey !== options.sessionKey.value) return
-            options.showCompactStatus('completed', i18n.global.t('chat.compact.compacted'), { tone: 'ok', dismissMs: 5000 })
+            options.showCompactionToast({ key: compactKey, source: 'manual', ...result })
           })
           .catch((err: unknown) => {
             if (compactKey !== options.sessionKey.value) return
-            options.showCompactStatus('failed', i18n.global.t('chat.compact.failed') + ': ' + (err instanceof Error ? err.message : String(err)), { tone: 'err', dismissMs: 10000 })
+            options.showCompactionToast({
+              key: compactKey,
+              source: 'manual',
+              status: 'failed',
+              detail: err instanceof Error ? err.message : String(err),
+            })
           })
         break
       }

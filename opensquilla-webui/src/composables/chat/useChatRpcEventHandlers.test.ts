@@ -51,6 +51,7 @@ function createHarness(options: {
   const markEnsembleHandoff = vi.fn()
   const schedulePendingDrainAfterTerminal = vi.fn()
   const scheduleHistorySync = vi.fn()
+  const showCompactionToast = vi.fn()
   const showWarningToast = vi.fn()
   const handleSessionConnectionState = vi.fn(
     options.handleSessionConnectionState ?? (() => undefined),
@@ -88,7 +89,7 @@ function createHarness(options: {
     flushPendingRouterDecision: vi.fn(),
     clearPendingRouterDecision: vi.fn(),
     handleRouterControlReplay: vi.fn(),
-    showCompactionToast: vi.fn(),
+    showCompactionToast,
     showWarningToast,
     scheduleHistorySync,
     schedulePendingDrainAfterTerminal,
@@ -112,6 +113,7 @@ function createHarness(options: {
     markEnsembleHandoff,
     schedulePendingDrainAfterTerminal,
     scheduleHistorySync,
+    showCompactionToast,
     showWarningToast,
     handleSessionConnectionState,
     loadCurrentSessionUsage,
@@ -196,6 +198,52 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
       }))
       expect(stream.appendDelta).toHaveBeenCalledWith('Recovered answer')
       expect(activeStreamTaskId.value).toBe('task-live')
+      expect(lastStreamSeq.value).toBe(2400)
+    } finally {
+      stop()
+    }
+  })
+
+  it('restores an active compaction from the authoritative live snapshot', () => {
+    const {
+      api,
+      lastStreamSeq,
+      showCompactionToast,
+      stop,
+    } = createHarness()
+    try {
+      api.restoreLiveTurnSnapshot({
+        key: 'agent:main:test',
+        task_id: null,
+        current_stream_seq: 2400,
+        events: [
+          {
+            event: 'session.event.compaction',
+            payload: {
+              session_key: 'agent:main:test',
+              status: 'started',
+              phase: 'summarizing',
+              compaction_id: 'cmp-live',
+              sequence: 1,
+              stream_seq: 2399,
+            },
+          },
+        ],
+      })
+
+      expect(showCompactionToast).toHaveBeenCalledWith(
+        expect.objectContaining({
+          status: 'started',
+          phase: 'summarizing',
+          compaction_id: 'cmp-live',
+          sequence: 1,
+        }),
+        {
+          authoritativeLive: true,
+          replayed: false,
+        },
+      )
+      expect(showCompactionToast.mock.calls[0][0]).not.toHaveProperty('stream_seq')
       expect(lastStreamSeq.value).toBe(2400)
     } finally {
       stop()

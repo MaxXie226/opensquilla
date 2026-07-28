@@ -36,6 +36,7 @@ import structlog
 from opensquilla.engine.hooks.types import CompactionState
 from opensquilla.engine.route_plan import route_plan_snapshot
 from opensquilla.observability.decision_log import build_vision_followup_gate_reason_code
+from opensquilla.session.compaction_lifecycle import CompactionTimeoutError
 
 if TYPE_CHECKING:
     from opensquilla.engine.agent import Agent
@@ -110,7 +111,14 @@ class CompactionPersistPort(Protocol):
         summary: str,
         kept_entries: list[Any],
         compaction_id: str | None = None,
-    ) -> None: ...
+        compaction_deadline_at_monotonic: float | None = None,
+        compaction_timeout_seconds: float | None = None,
+        removed_count: int = 0,
+        source_entries: tuple[Any, ...] | None = None,
+        source_preimage: tuple[tuple[Any, ...], ...] | None = None,
+        source_boundary_message_id: str | None = None,
+        source_boundary_entry_id: int | None = None,
+    ) -> bool | None: ...
 
 @runtime_checkable
 class MemorySnapshotRefreshPort(Protocol):
@@ -267,6 +275,12 @@ class StreamConsumerStageInput:
     # Live delivery-ready authorization resolved on the event loop before the
     # blocking omitted-artifact publish enters its worker thread.
     attached_plan_run_ready: bool | None = None
+    # Frozen durable prefix used by in-turn compaction persistence. The storage
+    # adapter compares it atomically and preserves later append-only queue rows.
+    compaction_source_entries: tuple[Any, ...] | None = None
+    compaction_source_preimage: tuple[tuple[Any, ...], ...] | None = None
+    compaction_source_boundary_message_id: str | None = None
+    compaction_source_boundary_entry_id: int | None = None
 
 # ---------------------------------------------------------------------------
 # Per-event handler classes
@@ -1017,12 +1031,96 @@ class _CompactionHandler:
         await self._fire_before_compact(state)
         if inp.session_manager_present:
             try:
-                await self._persist.persist_and_notify(
-                    session_key=inp.session_key,
-                    summary=event.summary,
-                    kept_entries=event.kept_entries,
-                    compaction_id=event.compaction_id,
+                persist_kwargs: dict[str, Any] = {
+                    "session_key": inp.session_key,
+                    "summary": event.summary,
+                    "kept_entries": event.kept_entries,
+                    "compaction_id": event.compaction_id,
+                    "removed_count": event.removed_count,
+                    "source_entries": inp.compaction_source_entries,
+                    "source_preimage": inp.compaction_source_preimage,
+                    "source_boundary_message_id": (
+                        inp.compaction_source_boundary_message_id
+                    ),
+                    "source_boundary_entry_id": (
+                        inp.compaction_source_boundary_entry_id
+                    ),
+                }
+                if event.compaction_deadline_at_monotonic is not None:
+                    persist_kwargs["compaction_deadline_at_monotonic"] = (
+                        event.compaction_deadline_at_monotonic
+                    )
+                if event.compaction_timeout_seconds is not None:
+                    persist_kwargs["compaction_timeout_seconds"] = (
+                        event.compaction_timeout_seconds
+                    )
+                installed = await self._persist.persist_and_notify(**persist_kwargs)
+                if installed is False:
+                    await self._fire_after_compact(
+                        state,
+                        {
+                            "status": "skipped",
+                            "reason": "stale_preimage",
+                        },
+                    )
+                    return
+            except asyncio.CancelledError:
+                from opensquilla.engine.cache_break_monitor import notify_compaction
+                from opensquilla.session.compaction_lifecycle import (
+                    COMPACTION_TRIGGERED_EVENT,
+                    compaction_effect_payload,
+                    compaction_lifecycle_payload,
+                    new_compaction_id,
                 )
+
+                compaction_id = event.compaction_id or new_compaction_id()
+                notify_compaction(
+                    inp.session_key,
+                    source="automatic",
+                    phase="agent_inline_overflow",
+                    status="cancelled",
+                    reason="cancelled",
+                    **compaction_effect_payload(status="cancelled"),
+                    **compaction_lifecycle_payload(
+                        compaction_id,
+                        COMPACTION_TRIGGERED_EVENT,
+                    ),
+                )
+                await self._fire_after_compact(
+                    state,
+                    {"status": "cancelled", "reason": "cancelled"},
+                )
+                raise
+            except CompactionTimeoutError as exc:
+                from opensquilla.engine.cache_break_monitor import notify_compaction
+                from opensquilla.session.compaction_lifecycle import (
+                    COMPACTION_TRIGGERED_EVENT,
+                    compaction_effect_payload,
+                    compaction_lifecycle_payload,
+                    new_compaction_id,
+                )
+
+                compaction_id = event.compaction_id or new_compaction_id()
+                notify_compaction(
+                    inp.session_key,
+                    source="automatic",
+                    phase=exc.phase,
+                    status="timed_out",
+                    reason="compaction_deadline_exceeded",
+                    **compaction_effect_payload(status="timed_out"),
+                    **compaction_lifecycle_payload(
+                        compaction_id,
+                        COMPACTION_TRIGGERED_EVENT,
+                    ),
+                )
+                await self._fire_after_compact(
+                    state,
+                    {
+                        "status": "timed_out",
+                        "reason": "compaction_deadline_exceeded",
+                    },
+                )
+                return
             except Exception as exc:  # noqa: BLE001 - preserve turn recoverability
                 log.warning("compaction_persist_failed", error=str(exc))
                 from opensquilla.engine.cache_break_monitor import notify_compaction

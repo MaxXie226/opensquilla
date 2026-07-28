@@ -2752,6 +2752,7 @@ def _prompt_json_schema_config(
 class OpenAIProvider:
     """Streams from OpenAI-compatible Chat Completions API (SSE)."""
 
+    final_request_admission_guaranteed = True
     provider_name = "openai"
 
     def __init__(
@@ -2861,9 +2862,10 @@ class OpenAIProvider:
         ):
             raise ValueError("additional_messages must be a non-negative integer")
         cfg = config or ChatConfig()
+        wire_cfg = _prompt_json_schema_config(cfg, policy=self._compat)
         wire_messages = _build_openai_wire_messages(
             messages,
-            cfg,
+            wire_cfg,
             policy=self._compat,
             provider_kind=self._provider_kind,
             model=self._model,
@@ -3123,6 +3125,13 @@ class OpenAIProvider:
             yield ErrorEvent(
                 message=json.dumps(proof, ensure_ascii=False, sort_keys=True),
                 code="provider_request_budget_exhausted",
+            )
+            return
+        if budget_decision.action == "invalid_request":
+            log.warning("provider.request_serialization_failed")
+            yield ErrorEvent(
+                message="Provider request could not be serialized.",
+                code="provider_internal",
             )
             return
         payload = budget_decision.payload or payload

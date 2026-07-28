@@ -572,7 +572,7 @@ _GOLDEN_RAISE_PROOF_JSON = (
     'austed","top_contributors":[{"path":"$.messages[4].content[1].input.note","chars":695},{'
     '"path":"$.messages[2].reasoning_content","chars":392},{"path":"$.messages[2].tool_calls['
     '0].function.arguments","chars":389},{"path":"$.messages[3].content","chars":388},{"path"'
-    ':"$.messages[6].content","chars":388}],"retry_count":2,"messages_chars":4331,"tools_char'
+    ':"$.messages[6].content","chars":388}],"retry_count":4,"messages_chars":4331,"tools_char'
     's":0,"system_chars":73,"top_level_chars":43,"tool_schema_too_large":false,"tool_payload_'
     'compaction_not_smaller":false,"tail_compaction_not_smaller":false,"emergency_current_tur'
     'n_compacted":true,"emergency_compaction_not_smaller":false,"final_hard_cap_compacted":tr'

@@ -228,6 +228,7 @@ from opensquilla.session.compaction_lifecycle import (
     COMPACTION_REPLAYED_EVENT,
     COMPACTION_SUMMARY_VERIFIED_EVENT,
     COMPACTION_TRIGGERED_EVENT,
+    CompactionTimeoutError,
     compaction_effect_payload,
     compaction_lifecycle_payload,
     compaction_memory_status,
@@ -3640,6 +3641,77 @@ class TurnRunner:
             ch_out = ch_outcome.require_output()
             agent.config.request_context_prompt = ch_out.final_request_context_prompt
 
+            compaction_source_entries: tuple[Any, ...] | None = None
+            compaction_source_preimage: tuple[tuple[Any, ...], ...] | None = None
+            compaction_source_boundary_message_id: str | None = None
+            compaction_source_boundary_entry_id: int | None = None
+            capture_compaction_source = getattr(
+                self._session_manager,
+                "capture_compaction_source",
+                None,
+            )
+            if callable(capture_compaction_source):
+                try:
+                    source_snapshot = await capture_compaction_source(
+                        session_key,
+                        boundary_message_id=(
+                            bound_user_message_id
+                            if history_has_persisted_user
+                            else None
+                        ),
+                    )
+                except Exception as exc:  # noqa: BLE001 - inline path fails closed
+                    log.warning(
+                        "turn_runner.compaction_source_capture_failed",
+                        session_key=session_key,
+                        error=str(exc),
+                    )
+                    # An explicit empty source makes the new persistence path
+                    # reject any inline compaction instead of falling back to
+                    # a length-derived destructive rewrite.
+                    compaction_source_entries = ()
+                    compaction_source_preimage = ()
+                else:
+                    source_entries = source_snapshot.entries
+                    source_history_entries = source_entries
+                    if (
+                        history_has_persisted_user
+                        and source_entries
+                        and source_entries[-1].role == "user"
+                    ):
+                        source_history_entries = source_entries[:-1]
+                    source_is_entry_aligned = (
+                        int(getattr(agent.config, "max_history_turns", 0) or 0) <= 0
+                        and len(agent.history_snapshot()) == len(source_history_entries)
+                        and all(
+                            entry.role in {"user", "assistant"}
+                            and bool(entry.content)
+                            and not entry.tool_calls
+                            for entry in source_history_entries
+                        )
+                    )
+                    if source_is_entry_aligned:
+                        compaction_source_entries = source_entries
+                        compaction_source_preimage = source_snapshot.preimage
+                        compaction_source_boundary_message_id = (
+                            source_snapshot.boundary_message_id
+                        )
+                        compaction_source_boundary_entry_id = (
+                            source_snapshot.boundary_entry_id
+                        )
+                    else:
+                        # ``CompactionEvent.removed_count`` is a provider
+                        # Message count. Only use it as a durable row boundary
+                        # when the loaded source is provably one-row/one-message.
+                        compaction_source_entries = ()
+                        compaction_source_preimage = ()
+                        log.info(
+                            "turn_runner.compaction_source_not_entry_aligned",
+                            session_key=session_key,
+                            source_entry_count=len(source_history_entries),
+                            loaded_history_count=len(agent.history_snapshot()),
+                        )
+
             # 8. Build extra messages for attachments + turn_input rebind.
             # AttachmentStage owns the slice.
             attachment_materialization_session_id = None
@@ -3700,6 +3772,14 @@ class TurnRunner:
                 state=stream_state,
                 tool_context=tool_context,
                 pending_input_provider=pending_input_provider,
+                compaction_source_entries=compaction_source_entries,
+                compaction_source_preimage=compaction_source_preimage,
+                compaction_source_boundary_message_id=(
+                    compaction_source_boundary_message_id
+                ),
+                compaction_source_boundary_entry_id=(
+                    compaction_source_boundary_entry_id
+                ),
             )
             router_control_replay_event: RouterControlReplayEvent | None = None
             with bind_usage_accounting_scope(turn_usage_scope):
@@ -6426,6 +6506,7 @@ class TurnRunner:
         *,
         turn_id: str,
         source: str,
+        compaction_config: Any | None = None,
     ) -> bool:
         if self._session_manager is None:
             return False
@@ -6439,11 +6520,20 @@ class TurnRunner:
         if not callable(method):
             return False
         async with self._session_write_context(session_key):
-            receipt = await self._session_manager.record_memory_checkpoint(
+            checkpoint_method = self._session_manager.record_memory_checkpoint
+            checkpoint_kwargs: dict[str, Any] = {
+                "turn_id": turn_id,
+                "source": source,
+            }
+            if compaction_config is not None and _accepts_keyword_arg(
+                checkpoint_method,
+                "compaction_config",
+            ):
+                checkpoint_kwargs["compaction_config"] = compaction_config
+            receipt = await checkpoint_method(
                 session_key,
                 list(transcript),
-                turn_id=turn_id,
-                source=source,
+                **checkpoint_kwargs,
             )
         return durable_receipt_allows_destructive_compaction(receipt)
 
@@ -6846,6 +6936,67 @@ class TurnRunner:
         except Exception as exc:  # pragma: no cover — capture must not break turns
             log.warning("router_self_learning.capture_failed", error=str(exc))
 
+    @staticmethod
+    def _active_persisted_user_index(
+        transcript: Sequence[Any],
+        *,
+        history_has_persisted_user: bool,
+        bound_user_message_id: str | None,
+    ) -> int | None:
+        if not history_has_persisted_user or not transcript:
+            return None
+        if bound_user_message_id:
+            for index, entry in enumerate(transcript):
+                if getattr(entry, "message_id", None) == bound_user_message_id:
+                    return index
+            return None
+        for index in range(len(transcript) - 1, -1, -1):
+            if getattr(transcript[index], "role", None) == "user":
+                return index
+        return None
+
+    @classmethod
+    def _protected_current_turn_suffix_count(
+        cls,
+        transcript: Sequence[Any],
+        *,
+        history_has_persisted_user: bool,
+        bound_user_message_id: str | None,
+    ) -> int:
+        """Return the transcript suffix that is not durable prior history.
+
+        Ingress may persist the active user prompt and later queued prompts
+        before preflight runs. They belong to the pending request, so neither
+        durable nor emergency compaction may summarize them as old history.
+        """
+
+        if not history_has_persisted_user or not transcript:
+            return 0
+        protected_start = cls._active_persisted_user_index(
+            transcript,
+            history_has_persisted_user=history_has_persisted_user,
+            bound_user_message_id=bound_user_message_id,
+        )
+        if protected_start is None:
+            if bound_user_message_id:
+                # The caller says the active prompt is durable but the
+                # transcript snapshot cannot bind it. Treat the whole snapshot
+                # as protected instead of guessing at a different user row.
+                return len(transcript)
+            return 0
+        return len(transcript) - protected_start
+
+    def _durable_compaction_accepts_config(self) -> bool:
+        if self._session_manager is None:
+            return False
+        from opensquilla.session.compaction import compact_accepts_config
+
+        compact_with_result = getattr(type(self._session_manager), "compact_with_result", None)
+        if callable(compact_with_result):
+            return compact_accepts_config(self._session_manager.compact_with_result)
+        compact_method = getattr(self._session_manager, "compact", None)
+        return callable(compact_method) and compact_accepts_config(compact_method)
+
     async def _maybe_compact_on_t3_upgrade(
         self,
         session_key: str,
@@ -6854,6 +7005,8 @@ class TurnRunner:
         *,
         compaction_provider: Any | None = None,
         compaction_model: str | None = None,
+        history_has_persisted_user: bool = False,
+        bound_user_message_id: str | None = None,
         provider_request_correlation: ProviderRequestCorrelation | None = None,
     ) -> str:
         """Flush memory and compact transcript when the router upgrades into t3.
@@ -6918,6 +7071,11 @@ class TurnRunner:
             return _T3_HANDLED
         if not transcript:
             return _T3_HANDLED
+        protected_suffix_count = self._protected_current_turn_suffix_count(
+            transcript,
+            history_has_persisted_user=history_has_persisted_user,
+            bound_user_message_id=bound_user_message_id,
+        )
 
         compaction_config = None
         configured_compaction = getattr(getattr(self, "_config", None), "compaction", None)
@@ -6936,6 +7094,8 @@ class TurnRunner:
 
         from opensquilla.session.compaction import (
             CompactionConfig,
+            arm_compaction_deadline,
+            await_compaction_phase,
             estimate_entry_model_replay_tokens,
         )
 
@@ -6957,6 +7117,42 @@ class TurnRunner:
                 safety_margin=safety_margin,
             )
             return _T3_HANDLED
+        if protected_suffix_count >= len(transcript):
+            log.info(
+                "t3_upgrade_compaction.skipped",
+                session_key=session_key,
+                reason="current_request_only",
+                protected_recent_messages=protected_suffix_count,
+            )
+            return _T3_HANDLED
+        active_user_index = self._active_persisted_user_index(
+            transcript,
+            history_has_persisted_user=history_has_persisted_user,
+            bound_user_message_id=bound_user_message_id,
+        )
+        protected_request_tokens = (
+            estimate_entry_model_replay_tokens(transcript[active_user_index])
+            if active_user_index is not None
+            else 0
+        )
+        if (
+            protected_request_tokens > 0
+            and protected_request_tokens * safety_margin > context_window_tokens
+        ):
+            log.info(
+                "t3_upgrade_compaction.skipped",
+                session_key=session_key,
+                reason="current_request_too_large",
+                protected_request_tokens=protected_request_tokens,
+                context_window_tokens=context_window_tokens,
+                safety_margin=safety_margin,
+            )
+            return _T3_HANDLED
+        compaction_config = compaction_config or CompactionConfig()
+        compaction_config.protected_recent_messages = max(
+            int(compaction_config.protected_recent_messages or 0),
+            protected_suffix_count,
+        )
         if self._compaction_circuit_open(session_key):
             self.mark_compaction_attempted_this_turn(session_key)
             await self._record_emergency_ephemeral_compaction(
@@ -6966,6 +7162,19 @@ class TurnRunner:
                 compaction_id=new_compaction_id(),
                 phase="t3_upgrade",
                 reason="durable_compaction_circuit_open",
+                protected_recent_messages=protected_suffix_count,
+            )
+            return _T3_HANDLED
+        if protected_suffix_count and not self._durable_compaction_accepts_config():
+            self.mark_compaction_attempted_this_turn(session_key)
+            await self._record_emergency_ephemeral_compaction(
+                session_key,
+                transcript,
+                context_window_tokens,
+                compaction_id=new_compaction_id(),
+                phase="t3_upgrade",
+                reason="protected_history_boundary_unsupported",
+                protected_recent_messages=protected_suffix_count,
             )
             return _T3_HANDLED
 
@@ -6978,6 +7187,7 @@ class TurnRunner:
         )
         self.mark_compaction_attempted_this_turn(session_key)
         compaction_id = new_compaction_id()
+        arm_compaction_deadline(compaction_config, operation_id=compaction_id)
         notify_compaction(
             session_key,
             source="automatic",
@@ -6985,29 +7195,114 @@ class TurnRunner:
             status="started",
             previous_tier=previous,
             context_window_tokens=context_window_tokens,
+            heartbeat_interval_seconds=compaction_config.heartbeat_interval_seconds,
             **compaction_effect_payload(status="started"),
             **compaction_lifecycle_payload(compaction_id, COMPACTION_TRIGGERED_EVENT),
         )
 
-        checkpoint_saved = await self._record_checkpoint_before_compaction(
-            session_key,
-            transcript,
-            turn_id=compaction_id,
-            source="t3_upgrade_compaction",
-        )
+        try:
+            checkpoint_saved = await self._record_checkpoint_before_compaction(
+                session_key,
+                transcript,
+                turn_id=compaction_id,
+                source="t3_upgrade_compaction",
+                compaction_config=compaction_config,
+            )
+        except asyncio.CancelledError:
+            notify_compaction(
+                session_key,
+                source="automatic",
+                phase="t3_upgrade",
+                status="cancelled",
+                reason="cancelled",
+                **compaction_effect_payload(status="cancelled"),
+                **compaction_lifecycle_payload(compaction_id, COMPACTION_TRIGGERED_EVENT),
+            )
+            raise
+        except CompactionTimeoutError as exc:
+            notify_compaction(
+                session_key,
+                source="automatic",
+                phase=exc.phase,
+                status="timed_out",
+                reason="compaction_deadline_exceeded",
+                **compaction_effect_payload(status="timed_out"),
+                **compaction_lifecycle_payload(compaction_id, COMPACTION_TRIGGERED_EVENT),
+            )
+            return _T3_COMPACT_FAILED
+        except Exception as exc:
+            notify_compaction(
+                session_key,
+                source="automatic",
+                phase="checkpointing",
+                status="failed",
+                reason="checkpoint_failed",
+                message=str(exc),
+                **compaction_effect_payload(status="failed"),
+                **compaction_lifecycle_payload(compaction_id, COMPACTION_TRIGGERED_EVENT),
+            )
+            raise
         flush_receipt = None
         flush_receipt_status = "not_required"
         requires_safe_receipt = self._pre_compaction_flush_requires_safe_receipt()
         if self._pre_compaction_flush_enabled():
-            flush_receipt = await self._await_pre_compaction_flush_grace(
-                transcript,
-                session_key,
-                event_prefix="t3_upgrade_compaction",
-                wait_for_receipt=requires_safe_receipt,
-                turn_id=compaction_id,
-                checkpoint_exists=checkpoint_saved,
-                provider_request_correlation=provider_request_correlation,
-            )
+            try:
+                flush_receipt = await await_compaction_phase(
+                    self._await_pre_compaction_flush_grace(
+                        transcript,
+                        session_key,
+                        event_prefix="t3_upgrade_compaction",
+                        wait_for_receipt=requires_safe_receipt,
+                        turn_id=compaction_id,
+                        checkpoint_exists=checkpoint_saved,
+                        provider_request_correlation=provider_request_correlation,
+                    ),
+                    compaction_config,
+                    phase="flushing",
+                )
+            except asyncio.CancelledError:
+                notify_compaction(
+                    session_key,
+                    source="automatic",
+                    phase="flushing",
+                    status="cancelled",
+                    reason="cancelled",
+                    **compaction_effect_payload(status="cancelled"),
+                    **compaction_lifecycle_payload(
+                        compaction_id,
+                        COMPACTION_TRIGGERED_EVENT,
+                    ),
+                )
+                raise
+            except CompactionTimeoutError as exc:
+                notify_compaction(
+                    session_key,
+                    source="automatic",
+                    phase=exc.phase,
+                    status="timed_out",
+                    reason="compaction_deadline_exceeded",
+                    **compaction_effect_payload(status="timed_out"),
+                    **compaction_lifecycle_payload(
+                        compaction_id,
+                        COMPACTION_TRIGGERED_EVENT,
+                    ),
+                )
+                return _T3_COMPACT_FAILED
+            except Exception as exc:
+                notify_compaction(
+                    session_key,
+                    source="automatic",
+                    phase="flushing",
+                    status="failed",
+                    reason="flush_failed",
+                    message=str(exc),
+                    **compaction_effect_payload(status="failed"),
+                    **compaction_lifecycle_payload(
+                        compaction_id,
+                        COMPACTION_TRIGGERED_EVENT,
+                    ),
+                )
+                raise
             flush_receipt_status = flush_receipt_status_for_compaction(
                 flush_receipt,
                 self._config,
@@ -7072,11 +7367,15 @@ class TurnRunner:
                     compact_kwargs["provider_request_correlation"] = (
                         provider_request_correlation
                     )
-                compaction_result = await self._session_manager.compact_with_result(
-                    session_key,
-                    context_window_tokens,
+                compaction_result = await await_compaction_phase(
+                    self._session_manager.compact_with_result(
+                        session_key,
+                        context_window_tokens,
+                        compaction_config,
+                        **compact_kwargs,
+                    ),
                     compaction_config,
-                    **compact_kwargs,
+                    phase="summarizing",
                 )
                 result = getattr(compaction_result, "summary", "") or ""
             else:
@@ -7085,12 +7384,16 @@ class TurnRunner:
                     compact_call_kwargs["provider_request_correlation"] = (
                         provider_request_correlation
                     )
-                result = await call_compact_with_optional_config(
-                    self._session_manager.compact,
-                    session_key,
-                    context_window_tokens,
+                result = await await_compaction_phase(
+                    call_compact_with_optional_config(
+                        self._session_manager.compact,
+                        session_key,
+                        context_window_tokens,
+                        compaction_config,
+                        **compact_call_kwargs,
+                    ),
                     compaction_config,
-                    **compact_call_kwargs,
+                    phase="summarizing",
                 )
             if (
                 compaction_result is not None
@@ -7142,6 +7445,7 @@ class TurnRunner:
                         compaction_id=compaction_id,
                         phase="t3_upgrade",
                         reason=skip_reason,
+                        protected_recent_messages=protected_suffix_count,
                     )
                     if emergency_applied:
                         return _T3_HANDLED
@@ -7169,7 +7473,39 @@ class TurnRunner:
                 summary_length=len(result) if result else 0,
             )
         except asyncio.CancelledError:
+            notify_compaction(
+                session_key,
+                source="automatic",
+                phase="t3_upgrade",
+                status="cancelled",
+                reason="cancelled",
+                **compaction_effect_payload(status="cancelled"),
+                **compaction_lifecycle_payload(
+                    compaction_id,
+                    COMPACTION_TRIGGERED_EVENT,
+                ),
+            )
             raise
+        except CompactionTimeoutError as exc:
+            log.warning(
+                "t3_upgrade_compaction.timed_out",
+                session_key=session_key,
+                phase=exc.phase,
+            )
+            self._record_compaction_failure(session_key)
+            notify_compaction(
+                session_key,
+                source="automatic",
+                phase=exc.phase,
+                status="timed_out",
+                reason="compaction_deadline_exceeded",
+                **compaction_effect_payload(status="timed_out"),
+                **compaction_lifecycle_payload(
+                    compaction_id,
+                    COMPACTION_TRIGGERED_EVENT,
+                ),
+            )
+            return _T3_COMPACT_FAILED
         except Exception as exc:  # noqa: BLE001
             log.warning(
                 "t3_upgrade_compaction.compact_failed",
@@ -7184,6 +7520,7 @@ class TurnRunner:
                 compaction_id=compaction_id,
                 phase="t3_upgrade",
                 reason="compact_failed",
+                protected_recent_messages=protected_suffix_count,
             )
             if emergency_applied:
                 return _T3_COMPACT_FAILED
@@ -7212,6 +7549,8 @@ class TurnRunner:
         *,
         compaction_provider: Any | None = None,
         compaction_model: str | None = None,
+        history_has_persisted_user: bool = False,
+        bound_user_message_id: str | None = None,
         provider_request_correlation: ProviderRequestCorrelation | None = None,
     ) -> None:
         """Compact proactively if session history exceeds token budget.
@@ -7232,6 +7571,27 @@ class TurnRunner:
                 reason="already_compacted_this_turn",
             )
             return
+
+        from opensquilla.session.compaction import (
+            CompactionConfig,
+            arm_compaction_deadline,
+            await_compaction_phase,
+            build_compaction_config_from_provider,
+        )
+
+        configured_compaction = getattr(getattr(self, "_config", None), "compaction", None)
+        if (
+            compaction_provider is not None
+            or compaction_model
+            or configured_compaction is not None
+        ):
+            compaction_config = build_compaction_config_from_provider(
+                compaction_provider,
+                model_override=compaction_model,
+                compaction_config=configured_compaction,
+            )
+        else:
+            compaction_config = CompactionConfig()
         if self.has_attempted_compaction_this_turn(session_key):
             log.info(
                 "preflight_compaction.skipped",
@@ -7245,6 +7605,11 @@ class TurnRunner:
             return  # session doesn't exist yet
         if not transcript:
             return
+        protected_suffix_count = self._protected_current_turn_suffix_count(
+            transcript,
+            history_has_persisted_user=history_has_persisted_user,
+            bound_user_message_id=bound_user_message_id,
+        )
 
         from opensquilla.session.compaction import estimate_entry_model_replay_tokens
 
@@ -7253,6 +7618,42 @@ class TurnRunner:
         threshold = int(context_window_tokens * ratio)
         if total_tokens <= threshold:
             return
+        if protected_suffix_count >= len(transcript):
+            log.info(
+                "preflight_compaction.skipped",
+                session_key=session_key,
+                reason="current_request_only",
+                protected_recent_messages=protected_suffix_count,
+            )
+            return
+        active_user_index = self._active_persisted_user_index(
+            transcript,
+            history_has_persisted_user=history_has_persisted_user,
+            bound_user_message_id=bound_user_message_id,
+        )
+        protected_request_tokens = (
+            estimate_entry_model_replay_tokens(transcript[active_user_index])
+            if active_user_index is not None
+            else 0
+        )
+        safety_margin = float(getattr(compaction_config, "safety_margin", 1.2) or 1.2)
+        if (
+            protected_request_tokens > 0
+            and protected_request_tokens * safety_margin > context_window_tokens
+        ):
+            log.info(
+                "preflight_compaction.skipped",
+                session_key=session_key,
+                reason="current_request_too_large",
+                protected_request_tokens=protected_request_tokens,
+                context_window_tokens=context_window_tokens,
+                safety_margin=safety_margin,
+            )
+            return
+        compaction_config.protected_recent_messages = max(
+            int(compaction_config.protected_recent_messages or 0),
+            protected_suffix_count,
+        )
         if self._compaction_circuit_open(session_key):
             self.mark_compaction_attempted_this_turn(session_key)
             await self._record_emergency_ephemeral_compaction(
@@ -7262,6 +7663,19 @@ class TurnRunner:
                 compaction_id=new_compaction_id(),
                 phase="preflight",
                 reason="durable_compaction_circuit_open",
+                protected_recent_messages=protected_suffix_count,
+            )
+            return
+        if protected_suffix_count and not self._durable_compaction_accepts_config():
+            self.mark_compaction_attempted_this_turn(session_key)
+            await self._record_emergency_ephemeral_compaction(
+                session_key,
+                transcript,
+                context_window_tokens,
+                compaction_id=new_compaction_id(),
+                phase="preflight",
+                reason="protected_history_boundary_unsupported",
+                protected_recent_messages=protected_suffix_count,
             )
             return
 
@@ -7274,6 +7688,7 @@ class TurnRunner:
         )
         self.mark_compaction_attempted_this_turn(session_key)
         compaction_id = new_compaction_id()
+        arm_compaction_deadline(compaction_config, operation_id=compaction_id)
         notify_compaction(
             session_key,
             source="automatic",
@@ -7281,28 +7696,113 @@ class TurnRunner:
             status="started",
             tokens_before=total_tokens,
             context_window_tokens=context_window_tokens,
+            heartbeat_interval_seconds=compaction_config.heartbeat_interval_seconds,
             **compaction_effect_payload(status="started"),
             **compaction_lifecycle_payload(compaction_id, COMPACTION_TRIGGERED_EVENT),
         )
-        checkpoint_saved = await self._record_checkpoint_before_compaction(
-            session_key,
-            transcript,
-            turn_id=compaction_id,
-            source="preflight_compaction",
-        )
+        try:
+            checkpoint_saved = await self._record_checkpoint_before_compaction(
+                session_key,
+                transcript,
+                turn_id=compaction_id,
+                source="preflight_compaction",
+                compaction_config=compaction_config,
+            )
+        except asyncio.CancelledError:
+            notify_compaction(
+                session_key,
+                source="automatic",
+                phase="preflight",
+                status="cancelled",
+                reason="cancelled",
+                **compaction_effect_payload(status="cancelled"),
+                **compaction_lifecycle_payload(compaction_id, COMPACTION_TRIGGERED_EVENT),
+            )
+            raise
+        except CompactionTimeoutError as exc:
+            notify_compaction(
+                session_key,
+                source="automatic",
+                phase=exc.phase,
+                status="timed_out",
+                reason="compaction_deadline_exceeded",
+                **compaction_effect_payload(status="timed_out"),
+                **compaction_lifecycle_payload(compaction_id, COMPACTION_TRIGGERED_EVENT),
+            )
+            return
+        except Exception as exc:
+            notify_compaction(
+                session_key,
+                source="automatic",
+                phase="checkpointing",
+                status="failed",
+                reason="checkpoint_failed",
+                message=str(exc),
+                **compaction_effect_payload(status="failed"),
+                **compaction_lifecycle_payload(compaction_id, COMPACTION_TRIGGERED_EVENT),
+            )
+            raise
         flush_receipt = None
         flush_receipt_status = "not_required"
         requires_safe_receipt = self._pre_compaction_flush_requires_safe_receipt()
         if self._pre_compaction_flush_enabled():
-            flush_receipt = await self._await_pre_compaction_flush_grace(
-                transcript,
-                session_key,
-                event_prefix="preflight_compaction",
-                wait_for_receipt=requires_safe_receipt,
-                turn_id=compaction_id,
-                checkpoint_exists=checkpoint_saved,
-                provider_request_correlation=provider_request_correlation,
-            )
+            try:
+                flush_receipt = await await_compaction_phase(
+                    self._await_pre_compaction_flush_grace(
+                        transcript,
+                        session_key,
+                        event_prefix="preflight_compaction",
+                        wait_for_receipt=requires_safe_receipt,
+                        turn_id=compaction_id,
+                        checkpoint_exists=checkpoint_saved,
+                        provider_request_correlation=provider_request_correlation,
+                    ),
+                    compaction_config,
+                    phase="flushing",
+                )
+            except asyncio.CancelledError:
+                notify_compaction(
+                    session_key,
+                    source="automatic",
+                    phase="flushing",
+                    status="cancelled",
+                    reason="cancelled",
+                    **compaction_effect_payload(status="cancelled"),
+                    **compaction_lifecycle_payload(
+                        compaction_id,
+                        COMPACTION_TRIGGERED_EVENT,
+                    ),
+                )
+                raise
+            except CompactionTimeoutError as exc:
+                notify_compaction(
+                    session_key,
+                    source="automatic",
+                    phase=exc.phase,
+                    status="timed_out",
+                    reason="compaction_deadline_exceeded",
+                    **compaction_effect_payload(status="timed_out"),
+                    **compaction_lifecycle_payload(
+                        compaction_id,
+                        COMPACTION_TRIGGERED_EVENT,
+                    ),
+                )
+                return
+            except Exception as exc:
+                notify_compaction(
+                    session_key,
+                    source="automatic",
+                    phase="flushing",
+                    status="failed",
+                    reason="flush_failed",
+                    message=str(exc),
+                    **compaction_effect_payload(status="failed"),
+                    **compaction_lifecycle_payload(
+                        compaction_id,
+                        COMPACTION_TRIGGERED_EVENT,
+                    ),
+                )
+                raise
             flush_receipt_status = flush_receipt_status_for_compaction(
                 flush_receipt,
                 self._config,
@@ -7343,20 +7843,6 @@ class TurnRunner:
                 )
                 return
         skip_reason = "empty_summary"
-        compaction_config = None
-        configured_compaction = getattr(getattr(self, "_config", None), "compaction", None)
-        if (
-            compaction_provider is not None
-            or compaction_model
-            or configured_compaction is not None
-        ):
-            from opensquilla.session.compaction import build_compaction_config_from_provider
-
-            compaction_config = build_compaction_config_from_provider(
-                compaction_provider,
-                model_override=compaction_model,
-                compaction_config=configured_compaction,
-            )
         from opensquilla.session.compaction import call_compact_with_optional_config
 
         try:
@@ -7382,11 +7868,15 @@ class TurnRunner:
                     compact_kwargs["provider_request_correlation"] = (
                         provider_request_correlation
                     )
-                compaction_result = await self._session_manager.compact_with_result(
-                    session_key,
-                    context_window_tokens,
+                compaction_result = await await_compaction_phase(
+                    self._session_manager.compact_with_result(
+                        session_key,
+                        context_window_tokens,
+                        compaction_config,
+                        **compact_kwargs,
+                    ),
                     compaction_config,
-                    **compact_kwargs,
+                    phase="summarizing",
                 )
                 result = getattr(compaction_result, "summary", "") or ""
             else:
@@ -7395,12 +7885,16 @@ class TurnRunner:
                     compact_call_kwargs["provider_request_correlation"] = (
                         provider_request_correlation
                     )
-                result = await call_compact_with_optional_config(
-                    self._session_manager.compact,
-                    session_key,
-                    context_window_tokens,
+                result = await await_compaction_phase(
+                    call_compact_with_optional_config(
+                        self._session_manager.compact,
+                        session_key,
+                        context_window_tokens,
+                        compaction_config,
+                        **compact_call_kwargs,
+                    ),
                     compaction_config,
-                    **compact_call_kwargs,
+                    phase="summarizing",
                 )
             if (
                 compaction_result is not None
@@ -7429,7 +7923,43 @@ class TurnRunner:
                         **observed_payload,
                     )
         except asyncio.CancelledError:
+            notify_compaction(
+                session_key,
+                source="automatic",
+                phase="preflight",
+                status="cancelled",
+                reason="cancelled",
+                tokens_before=total_tokens,
+                context_window_tokens=context_window_tokens,
+                **compaction_effect_payload(status="cancelled"),
+                **compaction_lifecycle_payload(
+                    compaction_id,
+                    COMPACTION_TRIGGERED_EVENT,
+                ),
+            )
             raise
+        except CompactionTimeoutError as exc:
+            log.warning(
+                "preflight_compaction.timed_out",
+                session_key=session_key,
+                phase=exc.phase,
+            )
+            self._record_compaction_failure(session_key)
+            notify_compaction(
+                session_key,
+                source="automatic",
+                phase=exc.phase,
+                status="timed_out",
+                reason="compaction_deadline_exceeded",
+                tokens_before=total_tokens,
+                context_window_tokens=context_window_tokens,
+                **compaction_effect_payload(status="timed_out"),
+                **compaction_lifecycle_payload(
+                    compaction_id,
+                    COMPACTION_TRIGGERED_EVENT,
+                ),
+            )
+            return
         except Exception as exc:  # noqa: BLE001
             log.warning(
                 "preflight_compaction.compact_failed",
@@ -7444,6 +7974,7 @@ class TurnRunner:
                 compaction_id=compaction_id,
                 phase="preflight",
                 reason="compact_failed",
+                protected_recent_messages=protected_suffix_count,
             )
             if emergency_applied:
                 return
@@ -7494,6 +8025,7 @@ class TurnRunner:
                 compaction_id=compaction_id,
                 phase="preflight",
                 reason=skip_reason,
+                protected_recent_messages=protected_suffix_count,
             )
             if emergency_applied:
                 return
@@ -7941,6 +8473,7 @@ class TurnRunner:
     @staticmethod
     def _entry_for_emergency_compaction(entry: Any) -> dict[str, Any]:
         return {
+            "message_id": getattr(entry, "message_id", None),
             "role": getattr(entry, "role", "user"),
             "content": getattr(entry, "content", "") or "",
             "token_count": getattr(entry, "token_count", None),
@@ -7953,6 +8486,7 @@ class TurnRunner:
     @staticmethod
     def _emergency_replay_entry(raw: Mapping[str, Any]) -> Any:
         return SimpleNamespace(
+            message_id=raw.get("message_id"),
             role=str(raw.get("role") or "user"),
             content=str(raw.get("content") or ""),
             token_count=raw.get("token_count"),
@@ -7971,6 +8505,7 @@ class TurnRunner:
         compaction_id: str,
         phase: str,
         reason: str,
+        protected_recent_messages: int = 0,
     ) -> bool:
         if not transcript:
             return False
@@ -7988,10 +8523,30 @@ class TurnRunner:
                     session_id=session_id,
                     entries=raw_entries,
                     context_window_tokens=context_window_tokens,
-                    config=CompactionConfig(model=None, api_key=""),
+                    config=CompactionConfig(
+                        model=None,
+                        api_key="",
+                        operation_id=compaction_id,
+                        protected_recent_messages=max(
+                            0,
+                            int(protected_recent_messages or 0),
+                        ),
+                    ),
                 )
             )
         except asyncio.CancelledError:
+            notify_compaction(
+                session_key,
+                source="automatic",
+                phase=phase,
+                status="cancelled",
+                reason="cancelled",
+                **compaction_effect_payload(status="cancelled"),
+                **compaction_lifecycle_payload(
+                    compaction_id,
+                    COMPACTION_TRIGGERED_EVENT,
+                ),
+            )
             raise
         except Exception as exc:  # noqa: BLE001
             log.warning(

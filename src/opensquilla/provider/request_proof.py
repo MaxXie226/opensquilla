@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from copy import deepcopy
+from dataclasses import dataclass
 from typing import Any
 
 _COMPACTED_STRING_MAX_CHARS = 1200
@@ -16,6 +17,16 @@ _COMPACTED_ARGUMENT_TAIL_CHARS = 120
 _PROOF_BUDGET_HEADROOM_RATIO = 0.10
 _PROOF_BUDGET_HEADROOM_MAX_CHARS = 16_384
 _PROOF_BUDGET_HEADROOM_MIN_CHARS = 512
+_CHARS_PER_TOKEN_EQUIVALENT = 4
+# Provider-neutral conservative reserves for model-visible media. Raw base64
+# bytes are not text tokens, but treating them as free lets media-only requests
+# bypass final-envelope admission. Each block therefore pays a fixed floor plus
+# a decoded-size increment. PDFs use a larger floor and denser byte-to-token
+# ratio because they may expand into page text and page images upstream.
+_IMAGE_MEDIA_TOKEN_FLOOR = 1_024
+_IMAGE_MEDIA_BYTES_PER_TOKEN = 512
+_PDF_MEDIA_TOKEN_FLOOR = 4_096
+_PDF_MEDIA_BYTES_PER_TOKEN = 128
 _TOOL_ARGUMENT_PROJECTION_PREFIX = "[tool_use_argument_projection]\n"
 _INVALID_PROVIDER_CONTEXT_ARGUMENTS_KEY = "_invalid_provider_context_arguments"
 _COMPACTED_TOOL_ARGUMENT_MARKERS = frozenset(
@@ -127,8 +138,54 @@ class ProviderRequestBudgetExceededError(RuntimeError):
 ProviderRequestBudgetExceeded = ProviderRequestBudgetExceededError
 
 
+@dataclass(frozen=True)
+class ProviderRequestEnvelopeShape:
+    """Describe where one provider's final request stores model-visible input.
+
+    Chat-style adapters use ``messages``/``system`` and can reuse the existing
+    request-only reduction ladder. Responses-style adapters use
+    ``input``/``instructions``; their item protocol is intentionally
+    fail-closed until it has a shape-specific, tool-safe reducer.
+    """
+
+    conversation_key: str = "messages"
+    system_key: str = "system"
+    allow_request_compaction: bool = True
+
+
+CHAT_REQUEST_ENVELOPE = ProviderRequestEnvelopeShape()
+RESPONSES_REQUEST_ENVELOPE = ProviderRequestEnvelopeShape(
+    conversation_key="input",
+    system_key="instructions",
+    allow_request_compaction=False,
+)
+
+
+@dataclass(frozen=True)
+class _MediaBudgetEstimate:
+    excluded_chars: int = 0
+    excluded_blocks: int = 0
+    reserved_blocks: int = 0
+    image_blocks: int = 0
+    pdf_blocks: int = 0
+    remote_blocks: int = 0
+    decoded_bytes: int = 0
+    reserve_tokens: int = 0
+
+    @property
+    def reserve_chars(self) -> int:
+        return self.reserve_tokens * _CHARS_PER_TOKEN_EQUIVALENT
+
+
 def _payload_chars(payload: Any) -> int:
-    return len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+    return len(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    )
 
 
 def _effective_proof_budget(proof_budget: int) -> tuple[int, int]:
@@ -150,22 +207,91 @@ def _media_placeholder(kind: str, value: str) -> str:
     return f"[provider_request_{kind}_omitted: {len(value)} chars]"
 
 
-def _budget_projection(payload: Any) -> tuple[Any, int, int]:
+def _estimated_base64_decoded_bytes(value: str) -> int:
+    encoded_start = value.find(",") + 1 if _is_data_url(value) else 0
+    encoded_chars = max(0, len(value) - encoded_start)
+    padding = 0
+    if encoded_chars and value.endswith("="):
+        padding = 2 if value.endswith("==") else 1
+    return max(0, (encoded_chars * 3) // 4 - padding)
+
+
+def _media_reserve_tokens(kind: str, decoded_bytes: int) -> int:
+    if kind == "pdf":
+        floor = _PDF_MEDIA_TOKEN_FLOOR
+        bytes_per_token = _PDF_MEDIA_BYTES_PER_TOKEN
+    else:
+        floor = _IMAGE_MEDIA_TOKEN_FLOOR
+        bytes_per_token = _IMAGE_MEDIA_BYTES_PER_TOKEN
+    size_tokens = (
+        (decoded_bytes + bytes_per_token - 1) // bytes_per_token
+        if decoded_bytes > 0
+        else 0
+    )
+    return floor + size_tokens
+
+
+def _budget_projection(
+    payload: Any,
+    envelope_shape: ProviderRequestEnvelopeShape,
+) -> tuple[Any, _MediaBudgetEstimate]:
     media_chars = 0
     media_blocks = 0
+    reserved_blocks = 0
+    image_blocks = 0
+    pdf_blocks = 0
+    remote_blocks = 0
+    decoded_bytes = 0
+    reserve_tokens = 0
 
-    def visit(value: Any) -> Any:
+    def reserve_media(
+        kind: str,
+        *,
+        encoded_value: str | None = None,
+        remote: bool = False,
+    ) -> None:
+        nonlocal reserved_blocks
+        nonlocal image_blocks
+        nonlocal pdf_blocks
+        nonlocal remote_blocks
+        nonlocal decoded_bytes
+        nonlocal reserve_tokens
+        estimated_bytes = (
+            _estimated_base64_decoded_bytes(encoded_value)
+            if encoded_value is not None
+            else 0
+        )
+        reserved_blocks += 1
+        image_blocks += kind == "image"
+        pdf_blocks += kind == "pdf"
+        remote_blocks += remote
+        decoded_bytes += estimated_bytes
+        reserve_tokens += _media_reserve_tokens(kind, estimated_bytes)
+
+    def visit(value: Any, path: tuple[str | int, ...] = ()) -> Any:
         nonlocal media_chars, media_blocks
         if isinstance(value, list):
-            return [visit(item) for item in value]
+            return [visit(item, (*path, index)) for index, item in enumerate(value)]
         if not isinstance(value, dict):
             return value
 
-        if value.get("type") == "image_url":
+        is_direct_content_block = (
+            len(path) == 4
+            and path[0] == envelope_shape.conversation_key
+            and isinstance(path[1], int)
+            and path[2] == "content"
+            and isinstance(path[3], int)
+        )
+
+        if is_direct_content_block and value.get("type") in {
+            "image_url",
+            "input_image",
+        }:
             image_url = value.get("image_url")
             if isinstance(image_url, dict):
                 url = image_url.get("url")
                 if isinstance(url, str) and _is_data_url(url):
+                    reserve_media("image", encoded_value=url)
                     media_chars += len(url)
                     media_blocks += 1
                     replaced = dict(value)
@@ -174,9 +300,79 @@ def _budget_projection(payload: Any) -> tuple[Any, int, int]:
                         "url": _media_placeholder("image_url", url),
                     }
                     return replaced
+                if isinstance(url, str):
+                    reserve_media("image", remote=True)
+                    return {
+                        key: visit(item, (*path, key))
+                        for key, item in value.items()
+                    }
+            if isinstance(image_url, str) and _is_data_url(image_url):
+                reserve_media("image", encoded_value=image_url)
+                media_chars += len(image_url)
+                media_blocks += 1
+                replaced = dict(value)
+                replaced["image_url"] = _media_placeholder(
+                    "image_url",
+                    image_url,
+                )
+                return replaced
+            if isinstance(image_url, str):
+                reserve_media("image", remote=True)
+                return {
+                    key: visit(item, (*path, key))
+                    for key, item in value.items()
+                }
+
+        # Ollama carries native image bytes as a list of bare base64 strings
+        # on each message rather than as typed content blocks.
+        images = value.get("images")
+        is_direct_ollama_message = (
+            len(path) == 2
+            and path[0] == "messages"
+            and isinstance(path[1], int)
+        )
+        if is_direct_ollama_message and isinstance(images, list):
+            replaced_images: list[Any] = []
+            changed = False
+            for image in images:
+                if isinstance(image, str):
+                    reserve_media("image", encoded_value=image)
+                    media_chars += len(image)
+                    media_blocks += 1
+                    replaced_images.append(
+                        _media_placeholder("base64_image", image)
+                    )
+                    changed = True
+                else:
+                    replaced_images.append(visit(image, (*path, "images")))
+            if changed:
+                return {
+                    key: (
+                        replaced_images
+                        if key == "images"
+                        else visit(item, (*path, key))
+                    )
+                    for key, item in value.items()
+                }
 
         source = value.get("source")
-        if isinstance(source, dict) and source.get("type") == "base64":
+        if (
+            is_direct_content_block
+            and value.get("type") == "image"
+            and isinstance(source, dict)
+            and source.get("type") == "url"
+            and isinstance(source.get("url"), str)
+        ):
+            reserve_media("image", remote=True)
+            return {
+                key: visit(item, (*path, key))
+                for key, item in value.items()
+            }
+        if (
+            is_direct_content_block
+            and isinstance(source, dict)
+            and source.get("type") == "base64"
+        ):
             data = source.get("data")
             media_type = source.get("media_type")
             if (
@@ -184,6 +380,10 @@ def _budget_projection(payload: Any) -> tuple[Any, int, int]:
                 and isinstance(media_type, str)
                 and (media_type.startswith("image/") or media_type == "application/pdf")
             ):
+                reserve_media(
+                    "pdf" if media_type == "application/pdf" else "image",
+                    encoded_value=data,
+                )
                 media_chars += len(data)
                 media_blocks += 1
                 replaced = dict(value)
@@ -193,9 +393,22 @@ def _budget_projection(payload: Any) -> tuple[Any, int, int]:
                 }
                 return replaced
 
-        return {key: visit(item) for key, item in value.items()}
+        return {
+            key: visit(item, (*path, key))
+            for key, item in value.items()
+        }
 
-    return visit(payload), media_chars, media_blocks
+    projected = visit(payload)
+    return projected, _MediaBudgetEstimate(
+        excluded_chars=media_chars,
+        excluded_blocks=media_blocks,
+        reserved_blocks=reserved_blocks,
+        image_blocks=image_blocks,
+        pdf_blocks=pdf_blocks,
+        remote_blocks=remote_blocks,
+        decoded_bytes=decoded_bytes,
+        reserve_tokens=reserve_tokens,
+    )
 
 
 def _top_contributors(payload: Any, *, limit: int = 5) -> list[dict[str, Any]]:
@@ -718,6 +931,16 @@ def _compact_user_content_for_provider(content: Any) -> Any:
     return compacted
 
 
+def _is_user_prompt_message(message: Any) -> bool:
+    if not isinstance(message, dict) or message.get("role") != "user":
+        return False
+    content = message.get("content")
+    if not isinstance(content, list):
+        return True
+    blocks = [block for block in content if isinstance(block, dict)]
+    return not blocks or any(block.get("type") != "tool_result" for block in blocks)
+
+
 def _hard_compact_content_for_provider(content: Any, *, label: str) -> Any:
     if isinstance(content, str):
         return _hard_compact_string(content, label=label)
@@ -1045,7 +1268,7 @@ def _emergency_compact_current_turn_payload_once(payload: dict[str, Any]) -> dic
     last_user_index = None
     if isinstance(messages, list):
         for index, message in enumerate(messages):
-            if isinstance(message, dict) and message.get("role") == "user":
+            if _is_user_prompt_message(message):
                 last_user_index = index
     for index, message in enumerate(messages):
         if not isinstance(message, dict):
@@ -1124,7 +1347,7 @@ def _final_hard_cap_payload_once(payload: dict[str, Any]) -> dict[str, Any]:
     latest_user_index = None
     if isinstance(messages, list):
         for index, message in enumerate(messages):
-            if isinstance(message, dict) and message.get("role") == "user":
+            if _is_user_prompt_message(message):
                 latest_user_index = index
     for index, message in enumerate(messages if isinstance(messages, list) else []):
         if not isinstance(message, dict):
@@ -1140,7 +1363,11 @@ def _final_hard_cap_payload_once(payload: dict[str, Any]) -> dict[str, Any]:
         content = message.get("content")
         if role == "user":
             if index == latest_user_index:
-                message["content"] = _compact_user_content_for_provider(content)
+                # The active user request is an admission boundary, not
+                # request-view history. If the remaining envelope cannot fit
+                # without rewriting it, fail closed instead of silently
+                # changing what the user asked.
+                continue
             else:
                 message["content"] = _hard_compact_content_for_provider(
                     content,
@@ -1201,32 +1428,53 @@ def _message_role_chars(payload: dict[str, Any], role: str) -> int:
     return _payload_chars(role_messages) if role_messages else 0
 
 
-def _top_level_chars(payload: dict[str, Any]) -> int:
+def _top_level_chars(
+    payload: dict[str, Any],
+    envelope_shape: ProviderRequestEnvelopeShape,
+) -> int:
     top_level_payload = {
         key: value
         for key, value in payload.items()
-        if key not in {"messages", "tools", "system"}
+        if key
+        not in {
+            envelope_shape.conversation_key,
+            "tools",
+            envelope_shape.system_key,
+        }
     }
     return _payload_chars(top_level_payload) if top_level_payload else 0
 
 
-def _payload_component_chars(payload: dict[str, Any], proof_budget: int) -> dict[str, Any]:
-    messages_chars = _component_chars(payload, "messages")
-    tools_chars = _component_chars(payload, "tools")
-    system_chars = _component_chars(payload, "system") + _message_role_chars(
+def _payload_component_chars(
+    payload: dict[str, Any],
+    proof_budget: int,
+    envelope_shape: ProviderRequestEnvelopeShape,
+) -> dict[str, Any]:
+    conversation_chars = _component_chars(
         payload,
-        "system",
+        envelope_shape.conversation_key,
     )
+    tools_chars = _component_chars(payload, "tools")
+    system_chars = _component_chars(payload, envelope_shape.system_key)
+    if envelope_shape.conversation_key == "messages":
+        system_chars += _message_role_chars(payload, "system")
     tool_schema_too_large = False
     if proof_budget > 0 and tools_chars > 0:
         tool_schema_too_large = tools_chars >= max(16_000, proof_budget // 4)
-    return {
-        "messages_chars": messages_chars,
+    components = {
+        # ``messages_chars`` remains the compatibility field consumed by
+        # existing diagnostics. For Responses requests it represents ``input``
+        # rather than a literal top-level ``messages`` member.
+        "messages_chars": conversation_chars,
         "tools_chars": tools_chars,
         "system_chars": system_chars,
-        "top_level_chars": _top_level_chars(payload),
+        "top_level_chars": _top_level_chars(payload, envelope_shape),
         "tool_schema_too_large": tool_schema_too_large,
     }
+    if envelope_shape != CHAT_REQUEST_ENVELOPE:
+        components["conversation_chars"] = conversation_chars
+    return components
+
 
 def prove_provider_payload(
     payload: dict[str, Any],
@@ -1235,10 +1483,26 @@ def prove_provider_payload(
     proof_budget: int,
     status_projection_mode: str = "native_or_none",
     fallback_reason: str | None = None,
+    envelope_shape: ProviderRequestEnvelopeShape = CHAT_REQUEST_ENVELOPE,
 ) -> dict[str, Any]:
-    budget_payload, media_chars, media_blocks = _budget_projection(payload)
-    estimated_chars = _payload_chars(budget_payload)
-    estimated_tokens = max(1, estimated_chars // 4)
+    wire_json = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    wire_json_chars = len(wire_json)
+    wire_json_bytes = len(wire_json.encode("utf-8"))
+    budget_payload, media = _budget_projection(
+        payload,
+        envelope_shape,
+    )
+    projected_text_chars = _payload_chars(budget_payload)
+    estimated_chars = projected_text_chars + media.reserve_chars
+    estimated_tokens = max(
+        1,
+        estimated_chars // _CHARS_PER_TOKEN_EQUIVALENT,
+    )
     effective_budget, headroom_chars = _effective_proof_budget(proof_budget)
     fits = proof_budget <= 0 or estimated_chars <= effective_budget
     proof: dict[str, Any] = {
@@ -1262,8 +1526,26 @@ def prove_provider_payload(
         "fallback_reason": fallback_reason,
         "top_contributors": _top_contributors(budget_payload),
         "retry_count": 0,
-        **_payload_component_chars(budget_payload, effective_budget),
+        **_payload_component_chars(
+            budget_payload,
+            effective_budget,
+            envelope_shape,
+        ),
     }
+    if envelope_shape != CHAT_REQUEST_ENVELOPE:
+        proof.update(
+            {
+                "request_sequence_key": envelope_shape.conversation_key,
+                "request_system_key": envelope_shape.system_key,
+                "request_compaction_supported": envelope_shape.allow_request_compaction,
+                "usage_source": "projected_text_envelope_chars",
+                "token_estimate_source": "chars_div_4",
+                "usage_confidence": "estimated",
+                "projected_context_chars": estimated_chars,
+                "wire_json_chars": wire_json_chars,
+                "wire_json_bytes": wire_json_bytes,
+            }
+        )
     # Stamped only when enabled so default-off proofs stay byte-identical.
     protect_recent_results = _protect_recent_results_count()
     if protect_recent_results:
@@ -1277,9 +1559,33 @@ def prove_provider_payload(
         proof["compaction_stub_preview_chars"] = stub_preview_chars
     if _never_worse_enabled():
         proof["compaction_never_worse"] = True
-    if media_blocks:
-        proof["media_chars_excluded"] = media_chars
-        proof["media_blocks_excluded"] = media_blocks
+    if media.reserved_blocks:
+        media_contributor = {
+            "path": "$.__media_token_equivalent_reserve",
+            "chars": media.reserve_chars,
+        }
+        proof["top_contributors"] = sorted(
+            [*proof["top_contributors"], media_contributor],
+            key=lambda item: int(item["chars"]),
+            reverse=True,
+        )[:5]
+        proof["media_blocks_reserved"] = media.reserved_blocks
+        proof["media_image_blocks"] = media.image_blocks
+        proof["media_pdf_blocks"] = media.pdf_blocks
+        proof["media_remote_blocks"] = media.remote_blocks
+        proof["media_decoded_bytes_estimated"] = media.decoded_bytes
+        proof["media_reserve_tokens"] = media.reserve_tokens
+        proof["media_reserve_chars"] = media.reserve_chars
+        proof["usage_source"] = "projected_text_plus_media_reserve"
+        proof["token_estimate_source"] = "chars_div_4_plus_media_reserve"
+        proof["usage_confidence"] = "conservative_estimate"
+        proof["projected_text_chars"] = projected_text_chars
+        proof["projected_context_chars"] = estimated_chars
+        proof["wire_json_chars"] = wire_json_chars
+        proof["wire_json_bytes"] = wire_json_bytes
+    if media.excluded_blocks:
+        proof["media_chars_excluded"] = media.excluded_chars
+        proof["media_blocks_excluded"] = media.excluded_blocks
     if not fits:
         proof["fallback_reason"] = "provider_request_budget_exhausted"
         raise ProviderRequestBudgetExceededError(proof)
@@ -1293,9 +1599,30 @@ def prove_or_compact_provider_payload(
     proof_budget: int,
     status_projection_mode: str = "native_or_none",
     fallback_reason: str | None = None,
+    envelope_shape: ProviderRequestEnvelopeShape = CHAT_REQUEST_ENVELOPE,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     if proof_budget <= 0:
+        # A disabled size proof is not permission to bypass the physical
+        # transport's JSON contract. HTTPX rejects NaN/Infinity and other
+        # non-JSON values, so validate with the same strictness here and let
+        # the coordinator map failures to ``invalid_request``.
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
         return payload, None
+    if not envelope_shape.allow_request_compaction:
+        proof = prove_provider_payload(
+            payload,
+            projection_adapter=projection_adapter,
+            proof_budget=proof_budget,
+            status_projection_mode=status_projection_mode,
+            fallback_reason=fallback_reason,
+            envelope_shape=envelope_shape,
+        )
+        return payload, proof
     payload, scrubbed_projection = _scrub_leaked_tool_argument_projections_once(payload)
     try:
         proof = prove_provider_payload(
@@ -1304,6 +1631,7 @@ def prove_or_compact_provider_payload(
             proof_budget=proof_budget,
             status_projection_mode=status_projection_mode,
             fallback_reason=fallback_reason,
+            envelope_shape=envelope_shape,
         )
     except ProviderRequestBudgetExceededError as first_error:
         first_chars = int(first_error.proof["estimated_chars"])
@@ -1322,6 +1650,7 @@ def prove_or_compact_provider_payload(
             proof_budget=proof_budget,
             status_projection_mode=status_projection_mode,
             fallback_reason=fallback_reason,
+            envelope_shape=envelope_shape,
         )
     except ProviderRequestBudgetExceededError:
         pass
@@ -1342,6 +1671,7 @@ def prove_or_compact_provider_payload(
             proof_budget=proof_budget,
             status_projection_mode=status_projection_mode,
             fallback_reason=fallback_reason,
+            envelope_shape=envelope_shape,
         )
     except ProviderRequestBudgetExceededError as tail_error:
         emergency_compacted = _emergency_compact_current_turn_payload_once(tail_compacted)
@@ -1353,6 +1683,7 @@ def prove_or_compact_provider_payload(
                 proof_budget=proof_budget,
                 status_projection_mode=status_projection_mode,
                 fallback_reason=fallback_reason,
+                envelope_shape=envelope_shape,
             )
         except ProviderRequestBudgetExceededError as exc:
             hard_compacted = _final_hard_cap_payload_once(emergency_compacted)
@@ -1364,6 +1695,7 @@ def prove_or_compact_provider_payload(
                     proof_budget=proof_budget,
                     status_projection_mode=status_projection_mode,
                     fallback_reason=fallback_reason,
+                    envelope_shape=envelope_shape,
                 )
             except ProviderRequestBudgetExceededError:
                 pass
@@ -1389,7 +1721,7 @@ def prove_or_compact_provider_payload(
                 proof["recent_tail_too_large"] = False
                 proof.update(tail_metadata)
                 return hard_compacted, proof
-            exc.proof["retry_count"] = 2
+            exc.proof["retry_count"] = 4
             exc.proof["compact_needed"] = True
             exc.proof["compaction_tier"] = 4
             exc.proof["tool_payload_compaction_not_smaller"] = (
@@ -1439,6 +1771,7 @@ def prove_provider_payload_from_env(
     projection_adapter: str,
     status_projection_mode: str = "native_or_none",
     fallback_reason: str | None = None,
+    envelope_shape: ProviderRequestEnvelopeShape = CHAT_REQUEST_ENVELOPE,
 ) -> dict[str, Any] | None:
     raw = os.environ.get("OPENSQUILLA_PROVIDER_REQUEST_PROOF_MAX_CHARS")
     if not raw:
@@ -1453,4 +1786,5 @@ def prove_provider_payload_from_env(
         proof_budget=proof_budget,
         status_projection_mode=status_projection_mode,
         fallback_reason=fallback_reason,
+        envelope_shape=envelope_shape,
     )

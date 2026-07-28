@@ -137,6 +137,42 @@ def _collect(provider: OpenAICodexProvider, *, tools=None, cfg=None):
     return asyncio.run(_run())
 
 
+def test_openai_codex_final_request_proof_blocks_before_http(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(500)
+
+    _patch_codex_transport(monkeypatch, handler)
+    provider = OpenAICodexProvider(
+        auth_path=str(_write_auth(tmp_path / "auth.json")),
+    )
+
+    async def _run() -> list[Any]:
+        return [
+            event
+            async for event in provider.chat(
+                [Message(role="user", content="x" * 5000)],
+                config=ChatConfig(provider_request_max_chars=1000),
+            )
+        ]
+
+    events = asyncio.run(_run())
+
+    assert requests == []
+    assert isinstance(events[0], ErrorEvent)
+    assert events[0].code == "provider_request_budget_exhausted"
+    proof = json.loads(events[0].message)
+    assert proof["projection_adapter"] == "openai_codex"
+    assert proof["request_sequence_key"] == "input"
+    assert proof["request_system_key"] == "instructions"
+    assert proof["request_compaction_supported"] is False
+
+
 _SEARCH_TOOL = ToolDefinition(
     name="search",
     description="Search things.",
@@ -226,7 +262,14 @@ def test_stream_maps_responses_events(tmp_path: Path, monkeypatch) -> None:
         base_url="https://chatgpt.com",  # normalization adds /backend-api
         auth_path=str(auth),
     )
-    events = _collect(provider, tools=[_SEARCH_TOOL], cfg=ChatConfig(system="be brief"))
+    events = _collect(
+        provider,
+        tools=[_SEARCH_TOOL],
+        cfg=ChatConfig(
+            system="be brief",
+            provider_request_max_chars=100_000,
+        ),
+    )
 
     assert captured["url"] == "https://chatgpt.com/backend-api/codex/responses"
     assert captured["headers"]["authorization"] == "Bearer tok-access"

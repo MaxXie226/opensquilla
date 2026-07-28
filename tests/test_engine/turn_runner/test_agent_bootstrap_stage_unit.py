@@ -80,6 +80,8 @@ def _default_aux(
         flush_compaction_safety_mode="protect",
         compaction_profile="conversation",
         compaction_protected_recent_messages=0,
+        compaction_total_timeout_seconds=120.0,
+        compaction_heartbeat_interval_seconds=15.0,
         tool_result_projection_max_inline_chars=60_000,
         tool_result_fresh_diagnostic_policy_enabled=False,
         tool_result_diagnostic_retrieval_gate_enabled=False,
@@ -272,6 +274,8 @@ async def test_case01_success_all_defaults() -> None:
     assert o.agent_config.context_window_tokens == 200_000
     assert o.agent_config.max_history_turns == 0
     assert o.agent_config.preserve_historical_images is False
+    assert o.agent_config.compaction_total_timeout_seconds == 120.0
+    assert o.agent_config.compaction_heartbeat_interval_seconds == 15.0
     assert o.agent_config.length_capped_continuations == 3
     assert o.agent_config.metadata["agent_max_iterations"] == 10
     assert o.agent_config.metadata["agent_max_iterations_source"] == "test budget"

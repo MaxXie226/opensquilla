@@ -1656,6 +1656,7 @@ watch(activeWorkspaceStatus, (status, previousStatus) => {
 const sessionHasActiveWork = computed(() => (
   isStreaming.value
   || activeTaskGroups.value.size > 0
+  || isCompactInFlightForCurrentSession()
   || ['queued', 'running', 'approval_pending'].includes(runStatus.value.status)
   || activePlanRun.value?.status === 'queued'
   || activePlanRun.value?.status === 'running'
@@ -1751,6 +1752,7 @@ const chatSlashCommands = useChatSlashCommands({
   },
   setCompactInFlight,
   showCompactStatus,
+  showCompactionToast,
   notify: (message: string) => pushToast(message, { duration: 6000 }),
   dispatchHidden: (providerText: string, displayText: string) => dispatchHiddenForMeta(providerText, displayText),
   dispatchPlanPrompt: (prompt: string, composerText: string) => {

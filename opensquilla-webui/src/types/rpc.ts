@@ -574,8 +574,31 @@ export interface EnsembleProgressPayload extends SessionEventPayload {
 }
 
 export interface CompactionPayload extends SessionEventPayload {
+  status?:
+    | 'started'
+    | 'observed'
+    | 'completed'
+    | 'skipped'
+    | 'failed'
+    | 'error'
+    | 'cancelled'
+    | 'timed_out'
+    | 'emergency_ephemeral'
+    | (string & {})
   compacted?: boolean
   detail?: string
+  source?: string
+  phase?: string
+  compaction_id?: string
+  compactionId?: string
+  sequence?: number
+  heartbeat?: boolean
+  heartbeat_at?: number
+  elapsed_ms?: number
+  stage?: string
+  refused?: boolean
+  safe_to_send?: boolean
+  safeToSend?: boolean
 }
 
 /* ── MetaSkill run events ──────────────────────────────────────────────

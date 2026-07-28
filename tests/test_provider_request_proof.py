@@ -83,7 +83,7 @@ def test_provider_request_proof_excludes_native_image_payload_from_text_budget()
             ]
         },
         projection_adapter="openrouter",
-        proof_budget=1000,
+        proof_budget=10_000,
         status_projection_mode="content_envelope",
     )
 
@@ -91,6 +91,14 @@ def test_provider_request_proof_excludes_native_image_payload_from_text_budget()
     assert proof["media_blocks_excluded"] == 1
     assert proof["media_chars_excluded"] > 5000
     assert proof["top_contributors"][0]["chars"] < 5000
+    assert proof["media_blocks_reserved"] == 1
+    assert proof["media_image_blocks"] == 1
+    assert proof["media_pdf_blocks"] == 0
+    assert proof["media_reserve_tokens"] >= 1024
+    assert proof["media_reserve_chars"] == proof["media_reserve_tokens"] * 4
+    assert proof["usage_source"] == "projected_text_plus_media_reserve"
+    assert proof["wire_json_chars"] > proof["projected_context_chars"]
+    assert proof["wire_json_bytes"] >= proof["wire_json_chars"]
 
 
 def test_provider_request_proof_excludes_anthropic_base64_media_from_text_budget() -> None:
@@ -114,7 +122,7 @@ def test_provider_request_proof_excludes_anthropic_base64_media_from_text_budget
             ]
         },
         projection_adapter="anthropic",
-        proof_budget=1000,
+        proof_budget=10_000,
         status_projection_mode="content_envelope",
     )
 
@@ -122,6 +130,117 @@ def test_provider_request_proof_excludes_anthropic_base64_media_from_text_budget
     assert proof["media_blocks_excluded"] == 1
     assert proof["media_chars_excluded"] == 5000
     assert proof["top_contributors"][0]["chars"] < 5000
+    assert proof["media_decoded_bytes_estimated"] > 0
+
+
+def test_provider_request_proof_reserves_nonzero_budget_for_small_image() -> None:
+    proof = prove_provider_payload(
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": "data:image/png;base64," + ("a" * 128),
+                            },
+                        },
+                    ],
+                }
+            ]
+        },
+        projection_adapter="openai",
+        proof_budget=10_000,
+        status_projection_mode="content_envelope",
+    )
+
+    assert proof["fits"] is True
+    assert proof["media_blocks_reserved"] == 1
+    assert proof["media_reserve_tokens"] > 0
+    assert proof["estimated_chars"] > proof["projected_text_chars"]
+
+
+def test_provider_request_proof_blocks_media_only_request_when_reserve_exceeds_budget() -> None:
+    with pytest.raises(ProviderRequestBudgetExceeded) as exc_info:
+        prove_provider_payload(
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": "data:image/png;base64," + ("a" * 500_000),
+                                },
+                            },
+                        ],
+                    }
+                ]
+            },
+            projection_adapter="openai",
+            proof_budget=7000,
+            status_projection_mode="content_envelope",
+        )
+
+    proof = exc_info.value.proof
+    assert proof["fits"] is False
+    assert proof["media_blocks_reserved"] == 1
+    assert proof["media_reserve_chars"] > proof["effective_proof_budget"]
+    assert proof["top_contributors"][0]["path"] == "$.__media_token_equivalent_reserve"
+
+
+def test_provider_request_proof_uses_larger_reserve_for_pdf_than_image() -> None:
+    encoded = "a" * 4096
+    image_proof = prove_provider_payload(
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": encoded,
+                            },
+                        }
+                    ],
+                }
+            ]
+        },
+        projection_adapter="anthropic",
+        proof_budget=100_000,
+    )
+    pdf_proof = prove_provider_payload(
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "document",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "application/pdf",
+                                "data": encoded,
+                            },
+                        }
+                    ],
+                }
+            ]
+        },
+        projection_adapter="anthropic",
+        proof_budget=100_000,
+    )
+
+    assert image_proof["media_image_blocks"] == 1
+    assert image_proof["media_pdf_blocks"] == 0
+    assert pdf_proof["media_image_blocks"] == 0
+    assert pdf_proof["media_pdf_blocks"] == 1
+    assert pdf_proof["media_reserve_tokens"] > image_proof["media_reserve_tokens"]
 
 
 def test_provider_request_proof_still_blocks_large_text_next_to_native_media() -> None:
@@ -177,7 +296,7 @@ def test_provider_request_proof_compacts_tool_payload_once() -> None:
     assert len(compacted["messages"][1]["content"]) < 2000
 
 
-def test_provider_request_proof_blocks_after_one_retry_when_still_oversized() -> None:
+def test_provider_request_proof_blocks_after_all_reduction_tiers_fail() -> None:
     payload = {"messages": [{"role": "tool", "content": "x" * 5000}]}
 
     with pytest.raises(ProviderRequestBudgetExceeded) as exc_info:
@@ -189,7 +308,7 @@ def test_provider_request_proof_blocks_after_one_retry_when_still_oversized() ->
         )
 
     assert exc_info.value.proof["fits"] is False
-    assert exc_info.value.proof["retry_count"] == 2
+    assert exc_info.value.proof["retry_count"] == 4
 
 
 def test_provider_request_proof_compacts_large_tool_args_preserving_protocol() -> None:
@@ -607,7 +726,7 @@ def test_provider_request_proof_reports_recent_tail_after_tail_compaction_fails(
 
     proof = exc_info.value.proof
     assert proof["fits"] is False
-    assert proof["retry_count"] == 2
+    assert proof["retry_count"] == 4
     assert proof["recent_tail_too_large"] is True
     # All 4 escalating compaction tiers were exhausted before this raise.
     assert proof["compaction_tier"] == 4
@@ -843,7 +962,7 @@ def test_provider_request_proof_emergency_compacts_old_user_tail_but_keeps_lates
     assert compacted["messages"][3]["content"] == "hi"
 
 
-def test_provider_request_proof_final_hard_cap_digests_oversized_latest_user() -> None:
+def test_provider_request_proof_rejects_instead_of_rewriting_oversized_latest_user() -> None:
     huge_current_message = "please answer the LONG_CURRENT_INPUT marker\n" + ("x" * 500_000)
     payload = {
         "messages": [
@@ -852,21 +971,53 @@ def test_provider_request_proof_final_hard_cap_digests_oversized_latest_user() -
         ]
     }
 
-    compacted, proof = prove_or_compact_provider_payload(
-        payload,
-        projection_adapter="openrouter",
-        proof_budget=12_000,
-        status_projection_mode="content_envelope",
-    )
+    with pytest.raises(ProviderRequestBudgetExceeded) as exc_info:
+        prove_or_compact_provider_payload(
+            payload,
+            projection_adapter="openrouter",
+            proof_budget=12_000,
+            status_projection_mode="content_envelope",
+        )
 
-    assert proof is not None
-    assert proof["fits"] is True
+    proof = exc_info.value.proof
+    assert proof["fits"] is False
     assert proof["final_hard_cap_compacted"] is True
-    assert proof["recent_tail_too_large"] is False
-    latest = compacted["messages"][-1]["content"]
-    assert latest != huge_current_message
-    assert "LONG_CURRENT_INPUT" in latest
-    assert "original_chars=500" in latest
+    assert proof["recent_tail_too_large"] is True
+    assert proof["top_contributors"][0]["chars"] == len(huge_current_message)
+
+
+def test_provider_request_proof_does_not_exclude_nested_tool_argument_images() -> None:
+    nested_image = "x" * 5000
+    payload = {
+        "messages": [
+            {
+                "role": "assistant",
+                "content": "calling tool",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "inspect",
+                            "arguments": {"images": [nested_image]},
+                        },
+                    }
+                ],
+            }
+        ]
+    }
+
+    with pytest.raises(ProviderRequestBudgetExceeded) as exc_info:
+        prove_provider_payload(
+            payload,
+            projection_adapter="ollama",
+            proof_budget=1000,
+        )
+
+    proof = exc_info.value.proof
+    assert proof["estimated_chars"] > len(nested_image)
+    assert "media_blocks_excluded" not in proof
+    assert "media_blocks_reserved" not in proof
 
 
 def test_provider_request_proof_final_hard_cap_preserves_critical_tool_result() -> None:

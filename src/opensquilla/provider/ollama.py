@@ -22,6 +22,10 @@ from .error_redaction import (
     redact_upstream_error_text,
     redacted_httpx_error,
 )
+from .request_proof import (
+    ProviderRequestBudgetExceededError,
+    prove_provider_payload_from_env,
+)
 from .stream_assembly import ToolStreamAccumulator, ToolStreamProtocolError
 from .trace_recorder import LLMTraceRecorder
 from .types import (
@@ -172,6 +176,7 @@ def _convert_messages(messages: list[Message], system: str | None) -> list[dict[
 class OllamaProvider:
     """Streams from an Ollama instance (local or cloud) using /api/chat."""
 
+    final_request_admission_guaranteed = True
     provider_name = "ollama"
 
     def __init__(
@@ -236,6 +241,45 @@ class OllamaProvider:
         }
         if tools:
             payload["tools"] = [_build_ollama_tool(t) for t in tools]
+
+        from opensquilla.engine.context_budget import coordinate_provider_context_budget
+
+        budget_decision = coordinate_provider_context_budget(
+            payload,
+            projection_adapter="ollama",
+            proof_budget=cfg.provider_request_max_chars,
+        )
+        if budget_decision.action == "budget_limited":
+            proof = budget_decision.proof or {}
+            log.warning("provider.request_budget_exhausted", **proof)
+            yield ErrorEvent(
+                message=json.dumps(proof, ensure_ascii=False, sort_keys=True),
+                code="provider_request_budget_exhausted",
+            )
+            return
+        if budget_decision.action == "invalid_request":
+            log.warning("provider.request_serialization_failed")
+            yield ErrorEvent(
+                message="Provider request could not be serialized.",
+                code="provider_internal",
+            )
+            return
+        payload = budget_decision.payload or payload
+        if budget_decision.proof is not None:
+            log.info("provider.request_proof", **budget_decision.proof)
+        try:
+            prove_provider_payload_from_env(
+                payload,
+                projection_adapter="ollama",
+            )
+        except ProviderRequestBudgetExceededError as exc:
+            log.warning("provider.request_budget_exhausted", **exc.proof)
+            yield ErrorEvent(
+                message=json.dumps(exc.proof, ensure_ascii=False, sort_keys=True),
+                code="provider_request_budget_exhausted",
+            )
+            return
+
         endpoint = f"{self._base_url}/api/chat"
         trace = LLMTraceRecorder(
             provider="ollama",
@@ -246,7 +290,11 @@ class OllamaProvider:
         )
         trace.record_request(
             payload=payload,
-            metadata={"timeout_seconds": cfg.timeout, "tools_count": len(tools or [])},
+            metadata={
+                "timeout_seconds": cfg.timeout,
+                "tools_count": len(tools or []),
+                "request_proof": budget_decision.proof,
+            },
         )
 
         input_tokens = 0

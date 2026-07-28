@@ -1296,6 +1296,11 @@ class CompactionLlmConfig(BaseSettings):
 
     model: str | None = None  # None = use session model
     timeout_seconds: float = 90.0
+    # Absolute budget shared by all summarization chunks and fallbacks.  The
+    # durable commit has separate bounded SQLite semantics and is reconciled if
+    # cancellation races with commit completion.
+    total_timeout_seconds: float = Field(default=120.0, gt=0.0)
+    heartbeat_interval_seconds: float = Field(default=15.0, gt=0.0)
     enabled: bool = True
     compaction_profile: Literal["conversation", "coding", "research", "support"] = "conversation"
     protected_recent_messages: int = Field(default=0, ge=0)

@@ -928,6 +928,134 @@ async def test_ensemble_forwards_uniform_proposer_message_limit_proof(
 
 
 @pytest.mark.asyncio
+async def test_ensemble_forwards_uniform_proposer_request_budget_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proof = json.dumps(
+        {
+            "fits": False,
+            "fallback_reason": "provider_request_budget_exhausted",
+        }
+    )
+    registry = _FakeRegistry(
+        {
+            "p1": _FakePlan(
+                [
+                    ErrorEvent(
+                        message=proof,
+                        code="provider_request_budget_exhausted",
+                    )
+                ]
+            ),
+            "p2": _FakePlan(
+                [
+                    ErrorEvent(
+                        message=proof,
+                        code="provider_request_budget_exhausted",
+                    )
+                ]
+            ),
+            "agg": _FakePlan([]),
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    provider = EnsembleProvider(
+        profile_name="request-budget-forwarding",
+        proposers=[_member("p1"), _member("p2")],
+        aggregator=_member("agg"),
+        all_failed_policy="error",
+        min_successful_proposers=1,
+        shuffle_candidates=False,
+    )
+
+    events = await _collect(provider)
+
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert error.code == "provider_request_budget_exhausted"
+    assert json.loads(error.message)["fits"] is False
+    assert [call["model"] for call in registry.calls] == ["p1", "p2"]
+
+
+@pytest.mark.asyncio
+async def test_ensemble_does_not_promote_mixed_proposer_errors_to_request_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _FakeRegistry(
+        {
+            "p1": _FakePlan(
+                [
+                    ErrorEvent(
+                        message='{"fits":false}',
+                        code="provider_request_budget_exhausted",
+                    )
+                ]
+            ),
+            "p2": _FakePlan([ErrorEvent(message="upstream failed", code="500")]),
+            "agg": _FakePlan([]),
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    provider = EnsembleProvider(
+        profile_name="mixed-error-forwarding",
+        proposers=[_member("p1"), _member("p2")],
+        aggregator=_member("agg"),
+        all_failed_policy="error",
+        min_successful_proposers=1,
+        shuffle_candidates=False,
+    )
+
+    events = await _collect(provider)
+
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert error.code == "ensemble_insufficient_proposers"
+
+
+@pytest.mark.asyncio
+async def test_ensemble_fallback_trace_preserves_uniform_request_budget_root_cause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _FakeRegistry(
+        {
+            "p1": _FakePlan(
+                [
+                    ErrorEvent(
+                        message='{"fits":false}',
+                        code="provider_request_budget_exhausted",
+                    )
+                ]
+            ),
+            "agg": _FakePlan([]),
+            "fallback": _FakePlan(
+                [TextDeltaEvent(text="fallback answer"), DoneEvent(model="fallback")]
+            ),
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    fallback = _FakeProvider(
+        ProviderConfig(provider="fake", model="fallback"),
+        registry,
+    )
+    provider = EnsembleProvider(
+        profile_name="request-budget-fallback",
+        proposers=[_member("p1")],
+        aggregator=_member("agg"),
+        fallback_provider=fallback,
+        fallback_provider_name="fake",
+        fallback_model="fallback",
+        all_failed_policy="fallback_single",
+        min_successful_proposers=1,
+        shuffle_candidates=False,
+    )
+
+    events = await _collect(provider)
+
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert done.ensemble_trace is not None
+    assert done.ensemble_trace["fallback_code"] == "provider_request_budget_exhausted"
+    assert [call["model"] for call in registry.calls] == ["p1", "fallback"]
+
+
+@pytest.mark.asyncio
 async def test_no_fallback_error_preserves_completed_proposer_usage(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

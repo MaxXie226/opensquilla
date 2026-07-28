@@ -6,13 +6,17 @@ from opensquilla.provider.types import ProviderRequestCorrelation
 from opensquilla.session.compaction import (
     CompactionConfig,
     CompactionRequest,
+    arm_compaction_deadline,
+    await_compaction_phase,
     build_compaction_config_from_provider,
     call_compaction_llm,
     compact_context,
+    compaction_remaining_seconds,
     estimate_entry_model_replay_tokens,
     estimate_entry_replay_tokens,
 )
 from opensquilla.session.compaction_lifecycle import (
+    CompactionTimeoutError,
     compaction_effect_payload,
     compaction_result_payload,
 )
@@ -64,6 +68,65 @@ def test_compaction_effect_payload_marks_durable_completion_applied():
     assert payload["applied"] is True
     assert payload["durability"] == "durable"
     assert payload["user_visible"] is True
+
+
+def test_compaction_deadline_is_armed_only_once(monkeypatch):
+    class Clock:
+        now = 100.0
+
+        def monotonic(self) -> float:
+            return self.now
+
+    clock = Clock()
+    monkeypatch.setattr("opensquilla.session.compaction.time", clock)
+    config = CompactionConfig(total_timeout_seconds=10.0)
+
+    first_deadline = arm_compaction_deadline(config, operation_id="cmp_deadline")
+    clock.now = 106.0
+    second_deadline = arm_compaction_deadline(config)
+
+    assert first_deadline == 110.0
+    assert second_deadline == first_deadline
+    assert config.deadline_at_monotonic == first_deadline
+    assert config.operation_id == "cmp_deadline"
+    assert compaction_remaining_seconds(config) == 4.0
+
+
+def test_reused_compaction_config_rearms_for_a_new_operation(monkeypatch):
+    class Clock:
+        now = 100.0
+
+        def monotonic(self) -> float:
+            return self.now
+
+    clock = Clock()
+    monkeypatch.setattr("opensquilla.session.compaction.time", clock)
+    config = CompactionConfig(total_timeout_seconds=10.0)
+
+    first_deadline = arm_compaction_deadline(config, operation_id="cmp_first")
+    clock.now = 106.0
+    second_deadline = arm_compaction_deadline(config, operation_id="cmp_second")
+
+    assert first_deadline == 110.0
+    assert second_deadline == 116.0
+    assert config.operation_id == "cmp_second"
+
+
+@pytest.mark.asyncio
+async def test_nested_compaction_deadline_keeps_precise_phase():
+    config = CompactionConfig(total_timeout_seconds=10.0)
+
+    async def validation_phase() -> None:
+        raise CompactionTimeoutError("validating", 10.0)
+
+    with pytest.raises(CompactionTimeoutError) as exc_info:
+        await await_compaction_phase(
+            validation_phase(),
+            config,
+            phase="summarizing",
+        )
+
+    assert exc_info.value.phase == "validating"
 
 
 @pytest.mark.asyncio
@@ -442,6 +505,48 @@ async def test_compaction_source_is_llm_when_all_chunks_use_llm(monkeypatch):
     assert calls
     assert result.removed_count > 0
     assert result.summary_source == "llm"
+
+
+@pytest.mark.asyncio
+async def test_multichunk_compaction_reuses_remaining_absolute_budget(monkeypatch):
+    class Clock:
+        now = 100.0
+
+        def monotonic(self) -> float:
+            return self.now
+
+    clock = Clock()
+    request_timeouts: list[float] = []
+
+    async def fake_llm(**kwargs):
+        request_timeouts.append(kwargs["timeout"])
+        clock.now += 6.0
+        return f"summary {len(request_timeouts)}"
+
+    monkeypatch.setattr("opensquilla.session.compaction.time", clock)
+    monkeypatch.setattr("opensquilla.session.compaction.call_compaction_llm", fake_llm)
+    config = CompactionConfig(
+        model="test/model",
+        api_key="test-key",
+        timeout_seconds=90.0,
+        total_timeout_seconds=10.0,
+        base_chunk_ratio=0.1,
+        min_chunk_ratio=0.1,
+    )
+
+    with pytest.raises(CompactionTimeoutError) as exc_info:
+        await compact_context(
+            CompactionRequest(
+                session_id="shared-deadline",
+                entries=_make_entries(30, tokens_each=200),
+                context_window_tokens=500,
+                config=config,
+            )
+        )
+
+    assert exc_info.value.phase == "summarizing"
+    assert request_timeouts == pytest.approx([10.0, 4.0])
+    assert config.deadline_at_monotonic == 110.0
 
 
 @pytest.mark.asyncio

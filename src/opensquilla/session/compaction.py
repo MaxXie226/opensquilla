@@ -6,6 +6,8 @@ import asyncio
 import hashlib
 import inspect
 import json
+import time
+from collections.abc import Awaitable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -18,6 +20,7 @@ from opensquilla.provider.protocol import provider_connection_config
 from opensquilla.provider.tokenrhythm_correlation import (
     tokenrhythm_correlation_headers,
 )
+from opensquilla.session.compaction_lifecycle import CompactionTimeoutError
 from opensquilla.session.compaction_state import (
     build_structured_summary_from_text,
     extract_compaction_obligations,
@@ -45,6 +48,15 @@ class CompactionConfig:
     api_key: str = ""
     base_url: str = "https://openrouter.ai/api/v1"
     timeout_seconds: float = 90.0
+    # One wall-clock budget shared by checkpoint/flush, every summary chunk,
+    # validation, and commit admission. Invalid/non-positive values fail back
+    # to the bounded default rather than silently disabling the safety guard.
+    total_timeout_seconds: float = 120.0
+    heartbeat_interval_seconds: float = 15.0
+    # Runtime-only fields. They are armed once when a logical operation starts
+    # and then propagated through the existing synchronous call chain.
+    deadline_at_monotonic: float | None = None
+    operation_id: str | None = None
     provider: str = ""
     coverage_blocking: bool = False
     compaction_profile: CompactionProfile = "conversation"
@@ -122,6 +134,8 @@ def build_compaction_config_from_provider(
     for attr in (
         "compaction_profile",
         "protected_recent_messages",
+        "total_timeout_seconds",
+        "heartbeat_interval_seconds",
     ):
         if compaction_config is not None and hasattr(compaction_config, attr):
             setattr(cfg, attr, getattr(compaction_config, attr))
@@ -142,6 +156,78 @@ def build_compaction_config_from_provider(
     return cfg
 
 
+def arm_compaction_deadline(
+    config: CompactionConfig,
+    *,
+    operation_id: str | None = None,
+) -> float | None:
+    """Arm one absolute deadline without resetting an existing operation."""
+
+    if operation_id:
+        if config.operation_id and config.operation_id != operation_id:
+            # Config objects are normally built per operation, but public and
+            # compatibility callers may reuse one. A new operation id starts a
+            # new wall-clock budget; nested calls with the same id never do.
+            config.deadline_at_monotonic = None
+        config.operation_id = operation_id
+    if config.deadline_at_monotonic is not None:
+        return config.deadline_at_monotonic
+    try:
+        total = float(config.total_timeout_seconds)
+    except (TypeError, ValueError):
+        total = 120.0
+    if total <= 0:
+        total = 120.0
+        config.total_timeout_seconds = total
+    config.deadline_at_monotonic = time.monotonic() + total
+    return config.deadline_at_monotonic
+
+
+def compaction_remaining_seconds(config: CompactionConfig) -> float | None:
+    """Return the remaining shared wall-clock budget, or None when disabled."""
+
+    deadline = arm_compaction_deadline(config)
+    if deadline is None:  # defensive; arm_compaction_deadline always bounds
+        return 120.0
+    return max(0.0, deadline - time.monotonic())
+
+
+def require_compaction_time(config: CompactionConfig, *, phase: str) -> None:
+    """Refuse to start another destructive phase after the deadline."""
+
+    remaining = compaction_remaining_seconds(config)
+    if remaining is not None and remaining <= 0:
+        raise CompactionTimeoutError(phase, float(config.total_timeout_seconds))
+
+
+async def await_compaction_phase[T](
+    awaitable: Awaitable[T],
+    config: CompactionConfig,
+    *,
+    phase: str,
+) -> T:
+    """Await one cancellable phase under the operation's remaining budget."""
+
+    remaining = compaction_remaining_seconds(config)
+    if remaining is None:
+        return await awaitable
+    if remaining <= 0:
+        close = getattr(awaitable, "close", None)
+        if callable(close):
+            close()
+        raise CompactionTimeoutError(phase, float(config.total_timeout_seconds))
+    try:
+        async with asyncio.timeout(remaining):
+            return await awaitable
+    except CompactionTimeoutError:
+        # Nested phases already identify the stage that exhausted the shared
+        # deadline; do not relabel validation/commit admission as the caller's
+        # broader summarizing phase.
+        raise
+    except TimeoutError as exc:
+        raise CompactionTimeoutError(phase, float(config.total_timeout_seconds)) from exc
+
+
 def compact_accepts_config(compact_fn: Any) -> bool:
     """Return whether a compact callable can accept the optional config arg."""
 
@@ -154,21 +240,32 @@ def compact_accepts_config(compact_fn: Any) -> bool:
     except (TypeError, ValueError):
         return True
 
-    variadic_kinds = {
-        inspect.Parameter.VAR_POSITIONAL,
-        inspect.Parameter.VAR_KEYWORD,
-    }
-    if any(p.kind in variadic_kinds for p in params):
-        return True
     if any(p.name == "config" for p in params):
         return True
 
     positional_kinds = {
         inspect.Parameter.POSITIONAL_ONLY,
         inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        inspect.Parameter.KEYWORD_ONLY,
     }
+    # Do not infer semantic support from generic ``*args``/``**kwargs``.  That
+    # would add a new argument to legacy adapters which merely forward calls.
     return len([p for p in params if p.kind in positional_kinds]) >= 3
+
+
+def _compact_config_accepts_keyword(compact_fn: Any) -> bool:
+    """Return whether ``config`` can be supplied without adding a positional arg."""
+
+    side_effect = getattr(compact_fn, "side_effect", None)
+    if callable(side_effect):
+        compact_fn = side_effect
+    try:
+        params = inspect.signature(compact_fn).parameters
+    except (TypeError, ValueError):
+        return False
+    explicit = params.get("config")
+    if explicit is not None and explicit.kind is not inspect.Parameter.POSITIONAL_ONLY:
+        return True
+    return False
 
 
 async def call_compact_with_optional_config(
@@ -193,6 +290,16 @@ async def call_compact_with_optional_config(
     ):
         kwargs["provider_request_correlation"] = provider_request_correlation
     if config is not None and compact_accepts_config(compact_fn):
+        if _compact_config_accepts_keyword(compact_fn):
+            kwargs["config"] = config
+            return cast(
+                str,
+                await compact_fn(
+                    session_key,
+                    context_window_tokens,
+                    **kwargs,
+                ),
+            )
         return cast(
             str,
             await compact_fn(
@@ -585,6 +692,8 @@ async def call_compaction_llm(
     custom_instructions: str | None = None,
     provider: str = "",
     provider_request_correlation: ProviderRequestCorrelation | None = None,
+    compaction_id: str | None = None,
+    chunk_index: int | None = None,
 ) -> str | None:
     """Call LLM to summarize a conversation chunk. Returns None on failure."""
     if not api_key:
@@ -648,6 +757,13 @@ async def call_compaction_llm(
         base_url=url,
     )
 
+    log.info(
+        "compaction.llm_call_started",
+        compaction_id=compaction_id,
+        chunk_index=chunk_index,
+        model=model,
+        timeout_seconds=timeout,
+    )
     try:
         async with httpx.AsyncClient(
             timeout=timeout,
@@ -661,13 +777,26 @@ async def call_compaction_llm(
                 data,
                 raw_json=str(getattr(resp, "text", "") or ""),
             )
-            return cast(str, data["choices"][0]["message"]["content"])
+            result = cast(str, data["choices"][0]["message"]["content"])
+            log.info(
+                "compaction.llm_call_completed",
+                compaction_id=compaction_id,
+                chunk_index=chunk_index,
+                model=model,
+            )
+            return result
     except asyncio.CancelledError:
         await usage.mark_unknown("cancelled")
         raise
     except Exception as exc:
         await usage.mark_unknown("direct_request_failed")
-        log.warning("compaction.llm_call_failed", model=model, error=str(exc))
+        log.warning(
+            "compaction.llm_call_failed",
+            compaction_id=compaction_id,
+            chunk_index=chunk_index,
+            model=model,
+            error=str(exc),
+        )
         return None
 
 
@@ -896,22 +1025,31 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
     summaries: list[str] = []
     llm_chunks = 0
     fallback_chunks = 0
-    for chunk in chunks:
+    for chunk_index, chunk in enumerate(chunks, start=1):
         if cfg.api_key and cfg.model:
             llm_kwargs: dict[str, Any] = {}
             if request.provider_request_correlation is not None:
                 llm_kwargs["provider_request_correlation"] = (
                     request.provider_request_correlation
                 )
+            require_compaction_time(cfg, phase="summarizing")
+            remaining = compaction_remaining_seconds(cfg)
+            request_timeout = float(cfg.timeout_seconds)
+            if remaining is not None:
+                request_timeout = min(request_timeout, remaining)
+            if request_timeout <= 0:
+                raise CompactionTimeoutError("summarizing", float(cfg.total_timeout_seconds))
             llm_result = await call_compaction_llm(
                 chunk_text=_format_chunk_for_llm(chunk),
                 identifier_instruction=id_instruction,
                 model=cfg.model,
                 api_key=cfg.api_key,
                 base_url=cfg.base_url,
-                timeout=cfg.timeout_seconds,
+                timeout=request_timeout,
                 custom_instructions=custom_instructions or None,
                 provider=cfg.provider,
+                compaction_id=cfg.operation_id,
+                chunk_index=chunk_index,
                 **llm_kwargs,
             )
             if llm_result:
@@ -1047,4 +1185,9 @@ async def compact_context(request: CompactionRequest) -> CompactionResult:
     turn-boundary-aware pipeline.  The public signature is unchanged so
     every existing call site keeps working without modification.
     """
-    return await compact_context_new(request)
+    arm_compaction_deadline(request.config)
+    return await await_compaction_phase(
+        compact_context_new(request),
+        request.config,
+        phase="summarizing",
+    )

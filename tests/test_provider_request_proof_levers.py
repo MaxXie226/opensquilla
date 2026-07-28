@@ -176,6 +176,41 @@ def test_protect_recent_assistant_hard_cap_degrades_to_emergency(
     assert "emergency_compacted" in protected
 
 
+def test_hard_cap_keeps_user_prompt_before_anthropic_tool_result() -> None:
+    active_prompt = "ACTIVE_USER_REQUEST " + ("u" * 5000)
+    payload = {
+        "messages": [
+            {"role": "user", "content": active_prompt},
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "call-1",
+                        "name": "lookup",
+                        "input": {"query": "x" * 2000},
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "call-1",
+                        "content": "result " + ("r" * 5000),
+                    }
+                ],
+            },
+        ]
+    }
+
+    compacted = _final_hard_cap_payload_once(payload)
+
+    assert compacted["messages"][0]["content"] == active_prompt
+    assert compacted["messages"][2]["content"] != payload["messages"][2]["content"]
+
+
 def test_proof_reports_tier_and_lever_state(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(TINY_GUARD_ENV, "120")
     monkeypatch.setenv(PROTECT_RECENT_ENV, "on")

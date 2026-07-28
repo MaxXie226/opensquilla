@@ -36,6 +36,11 @@ from .error_redaction import redact_upstream_error_code, redact_upstream_error_t
 from .openai import _http_error_body_text, _resolve_llm_proxy
 from .openai_responses import _responses_input
 from .protocol import ProviderConnectionConfig, ProviderMetadata
+from .request_proof import (
+    RESPONSES_REQUEST_ENVELOPE,
+    ProviderRequestBudgetExceededError,
+    prove_provider_payload_from_env,
+)
 from .stream_assembly import (
     DEFAULT_MAX_TOOL_CALLS,
     ReasoningAccumulator,
@@ -118,6 +123,7 @@ def _reasoning_effort(cfg: ChatConfig) -> str:
 class OpenAICodexProvider:
     """Streams from the ChatGPT backend-api Responses endpoint via OAuth."""
 
+    final_request_admission_guaranteed = True
     provider_name = "openai_codex"
 
     def __init__(
@@ -237,6 +243,48 @@ class OpenAICodexProvider:
             return
 
         payload = self._build_payload(messages, tools, cfg)
+
+        from opensquilla.engine.context_budget import coordinate_provider_context_budget
+
+        budget_decision = coordinate_provider_context_budget(
+            payload,
+            projection_adapter="openai_codex",
+            proof_budget=cfg.provider_request_max_chars,
+            status_projection_mode="content_envelope",
+            envelope_shape=RESPONSES_REQUEST_ENVELOPE,
+        )
+        if budget_decision.action == "budget_limited":
+            proof = budget_decision.proof or {}
+            log.warning("provider.request_budget_exhausted", **proof)
+            yield ErrorEvent(
+                message=json.dumps(proof, ensure_ascii=False, sort_keys=True),
+                code="provider_request_budget_exhausted",
+            )
+            return
+        if budget_decision.action == "invalid_request":
+            log.warning("provider.request_serialization_failed")
+            yield ErrorEvent(
+                message="Provider request could not be serialized.",
+                code="provider_internal",
+            )
+            return
+        payload = budget_decision.payload or payload
+        if budget_decision.proof is not None:
+            log.info("provider.request_proof", **budget_decision.proof)
+        try:
+            prove_provider_payload_from_env(
+                payload,
+                projection_adapter="openai_codex",
+                status_projection_mode="content_envelope",
+                envelope_shape=RESPONSES_REQUEST_ENVELOPE,
+            )
+        except ProviderRequestBudgetExceededError as exc:
+            log.warning("provider.request_budget_exhausted", **exc.proof)
+            yield ErrorEvent(
+                message=json.dumps(exc.proof, ensure_ascii=False, sort_keys=True),
+                code="provider_request_budget_exhausted",
+            )
+            return
 
         try:
             async with httpx.AsyncClient(

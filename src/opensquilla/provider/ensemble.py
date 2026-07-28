@@ -718,6 +718,26 @@ def _uniform_message_limit_proof(
     return min(proofs, key=lambda proof: proof.limit)
 
 
+def _uniform_request_budget_error(
+    candidates: Sequence[_CandidateResult],
+) -> str | None:
+    """Preserve final-envelope admission failures when every proposer agrees."""
+
+    if not candidates:
+        return None
+    for candidate in candidates:
+        if (
+            not candidate.request_started
+            or candidate.ok
+            or candidate.error_code != "provider_request_budget_exhausted"
+        ):
+            return None
+    return next(
+        (candidate.error for candidate in candidates if candidate.error),
+        "provider_request_budget_exhausted",
+    )
+
+
 def _done_usage_row(
     event: DoneEvent,
     *,
@@ -750,6 +770,7 @@ def _done_usage_row(
 class EnsembleProvider:
     """G8 fusion provider: proposer candidates first, one aggregator stream after."""
 
+    final_request_admission_guaranteed = True
     provider_name = "ensemble"
     # Replaying one failed chat would rerun every proposer plus aggregation.
     # Selector fallback may still hop to a single provider, whose default is
@@ -1860,9 +1881,17 @@ class EnsembleProvider:
                 usage_missing_count=proposer_missing_count,
             )
 
+        request_budget_error = _uniform_request_budget_error(candidates)
         if self.all_failed_policy != "fallback_single" or self.fallback_provider is None:
             message_limit_proof = _uniform_message_limit_proof(candidates)
-            if message_limit_proof is not None:
+            if request_budget_error is not None:
+                yield proposer_error(
+                    ErrorEvent(
+                        message=request_budget_error,
+                        code="provider_request_budget_exhausted",
+                    )
+                )
+            elif message_limit_proof is not None:
                 first_error = next(
                     (candidate.error for candidate in candidates if candidate.error),
                     reason,
@@ -1904,7 +1933,11 @@ class EnsembleProvider:
             final_request_messages=messages,
             final_request_timeout_seconds=fallback_timeout_seconds,
         )
-        trace["fallback_code"] = code
+        trace["fallback_code"] = (
+            "provider_request_budget_exhausted"
+            if request_budget_error is not None
+            else code
+        )
         def partial_error(event: ErrorEvent) -> ErrorEvent:
             return replace(
                 event,

@@ -92,6 +92,8 @@ class T3UpgradeCompactionPort(Protocol):
         context_window_tokens: int,
         compaction_provider: Any | None,
         compaction_model: str | None,
+        history_has_persisted_user: bool = False,
+        bound_user_message_id: str | None = None,
         provider_request_correlation: ProviderRequestCorrelation | None = None,
     ) -> str: ...
 
@@ -117,6 +119,8 @@ class PreflightCompactionPort(Protocol):
         context_window_tokens: int,
         compaction_provider: Any | None,
         compaction_model: str | None,
+        history_has_persisted_user: bool = False,
+        bound_user_message_id: str | None = None,
         provider_request_correlation: ProviderRequestCorrelation | None = None,
     ) -> None: ...
 
@@ -309,6 +313,8 @@ class CompactionAndHistoryStage:
             context_window_tokens=compaction_context_window_tokens,
             compaction_provider=compaction_provider,
             compaction_model=compaction_model,
+            history_has_persisted_user=inp.history_has_persisted_user,
+            bound_user_message_id=inp.bound_user_message_id,
             provider_request_correlation=inp.provider_request_correlation,
         )
         await self._fire_after_compact(t3_state, {"status": t3_status})
@@ -330,6 +336,8 @@ class CompactionAndHistoryStage:
                 context_window_tokens=compaction_context_window_tokens,
                 compaction_provider=compaction_provider,
                 compaction_model=compaction_model,
+                history_has_persisted_user=inp.history_has_persisted_user,
+                bound_user_message_id=inp.bound_user_message_id,
                 provider_request_correlation=inp.provider_request_correlation,
             )
             await self._fire_after_compact(preflight_state, {"status": "ran"})

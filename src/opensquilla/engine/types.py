@@ -406,6 +406,8 @@ class CompactionEvent:
 
     kind: Literal["compaction"] = field(default="compaction", init=False)
     compaction_id: str | None = None
+    compaction_deadline_at_monotonic: float | None = None
+    compaction_timeout_seconds: float | None = None
     summary: str = ""
     kept_entries: list[dict] = field(default_factory=list)
     kept_count: int = 0
@@ -422,6 +424,8 @@ class CompactionOutcome:
     kept_entries: list[dict] = field(default_factory=list)
     removed_count: int = 0
     compaction_id: str | None = None
+    compaction_deadline_at_monotonic: float | None = None
+    compaction_timeout_seconds: float | None = None
     request_context_insert_index: int | None = None
     runtime_context_insert_index: int | None = None
     protected_turn_start_index: int | None = None
@@ -546,6 +550,8 @@ class AgentConfig:
     flush_compaction_safety_mode: Literal["protect", "best_effort", "block", "off"] = "protect"
     compaction_profile: Literal["conversation", "coding", "research", "support"] = "conversation"
     compaction_protected_recent_messages: int = 0
+    compaction_total_timeout_seconds: float = 120.0
+    compaction_heartbeat_interval_seconds: float = 15.0
     repair_enabled: bool = True
     repair_interval_seconds: float = 60.0
     repair_max_items_per_tick: int = 5
@@ -791,6 +797,10 @@ class AgentConfig:
             0,
             int(self.compaction_protected_recent_messages or 0),
         )
+        if float(self.compaction_total_timeout_seconds or 0) <= 0:
+            self.compaction_total_timeout_seconds = 120.0
+        if float(self.compaction_heartbeat_interval_seconds or 0) <= 0:
+            self.compaction_heartbeat_interval_seconds = 15.0
 
     def resolve_thinking(self, prompt: str | None = None) -> tuple[bool, int]:
         """Return (enabled, budget_tokens) based on the thinking field.

@@ -2499,6 +2499,183 @@ async def test_persist_compaction_result_stores_summary_out_of_band(manager):
 
 
 @pytest.mark.asyncio
+async def test_persist_compaction_result_preserves_structured_tail_metadata(manager):
+    node = await manager.create("agent:main:structured-tail")
+    await manager.append_message(node.session_key, "user", "old question")
+    await manager.append_message(node.session_key, "assistant", "old answer")
+    await manager.append_message(
+        node.session_key,
+        "assistant",
+        "",
+        tool_calls=[
+            {
+                "id": "tool-live",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": '{"path":"x"}'},
+            }
+        ],
+        reasoning_content="signed reasoning",
+    )
+    await manager.append_message(
+        node.session_key,
+        "tool",
+        "result",
+        tool_call_id="tool-live",
+    )
+
+    await manager.persist_compaction_result(
+        node.session_key,
+        "older context",
+        [
+            {"role": "assistant", "content": "[flattened tool request]"},
+            {"role": "tool", "content": "[flattened tool result]"},
+        ],
+        compaction_id="cmp-structured-tail",
+    )
+
+    transcript = await manager.get_transcript(node.session_key)
+    assert len(transcript) == 2
+    assert transcript[0].tool_calls is not None
+    assert transcript[0].tool_calls[0]["id"] == "tool-live"
+    assert transcript[0].reasoning_content == "signed reasoning"
+    assert transcript[1].tool_call_id == "tool-live"
+    assert transcript[1].content == "result"
+
+
+@pytest.mark.asyncio
+async def test_inline_compaction_preserves_queued_append_only_suffix(manager):
+    node = await manager.create("agent:main:inline-queued-suffix")
+    old_user = await manager.append_message(node.session_key, "user", "old question")
+    old_assistant = await manager.append_message(
+        node.session_key,
+        "assistant",
+        "old answer",
+    )
+    active_user = await manager.append_message(
+        node.session_key,
+        "user",
+        "active request",
+    )
+    source = await manager.capture_compaction_source(
+        node.session_key,
+        boundary_message_id=active_user.message_id,
+    )
+    queued_user = await manager.append_message(
+        node.session_key,
+        "user",
+        "queued request",
+    )
+    entries_before = {
+        entry.message_id: entry
+        for entry in await manager.get_transcript(node.session_key)
+    }
+
+    installed = await manager.persist_compaction_result(
+        node.session_key,
+        "summary of the old exchange",
+        [
+            {"role": "user", "content": "[Available skills for this turn]"},
+            {"role": "user", "content": "active request"},
+        ],
+        compaction_id="cmp-inline-queued",
+        removed_count=2,
+        source_entries=source.entries,
+        source_preimage=source.preimage,
+        source_boundary_message_id=source.boundary_message_id,
+        source_boundary_entry_id=source.boundary_entry_id,
+    )
+
+    assert installed is True
+    transcript = await manager.get_transcript(node.session_key)
+    assert [entry.message_id for entry in transcript] == [
+        active_user.message_id,
+        queued_user.message_id,
+    ]
+    assert [entry.id for entry in transcript] == [
+        entries_before[active_user.message_id].id,
+        entries_before[queued_user.message_id].id,
+    ]
+    assert transcript[0].content == "active request"
+    assert transcript[1].content == "queued request"
+    queued_before = entries_before[queued_user.message_id]
+    assert queued_before.id is not None
+    page_before_queued, _ = await manager._storage.get_canonical_transcript_page(
+        node.session_id,
+        limit=1,
+        before=(queued_before.created_at, queued_before.id),
+    )
+    assert [entry.message_id for entry in page_before_queued] == [
+        active_user.message_id,
+    ]
+    async with manager._storage.conn.execute(
+        "SELECT message_id FROM compacted_transcript_entries "
+        "WHERE session_id = ? ORDER BY original_entry_id",
+        (node.session_id,),
+    ) as cur:
+        archived = await cur.fetchall()
+    assert [row[0] for row in archived] == [
+        old_user.message_id,
+        old_assistant.message_id,
+    ]
+    summaries = await manager._storage.get_all_summaries(node.session_id)
+    assert len(summaries) == 1
+    assert summaries[0].removed_count == 2
+    assert summaries[0].kept_count == 1
+
+
+@pytest.mark.asyncio
+async def test_inline_compaction_rejects_stale_source_without_partial_install(manager):
+    node = await manager.create("agent:main:inline-stale-source")
+    old_user = await manager.append_message(node.session_key, "user", "old question")
+    active_user = await manager.append_message(
+        node.session_key,
+        "user",
+        "active request",
+    )
+    source = await manager.capture_compaction_source(
+        node.session_key,
+        boundary_message_id=active_user.message_id,
+    )
+    assert await manager.update_message_turn_context(
+        node.session_key,
+        old_user.message_id,
+        {"status": "changed-after-source-capture"},
+    )
+
+    installed = await manager.persist_compaction_result(
+        node.session_key,
+        "stale summary",
+        [{"role": "user", "content": "active request"}],
+        compaction_id="cmp-inline-stale",
+        removed_count=1,
+        source_entries=source.entries,
+        source_preimage=source.preimage,
+        source_boundary_message_id=source.boundary_message_id,
+        source_boundary_entry_id=source.boundary_entry_id,
+    )
+
+    assert installed is False
+    transcript = await manager.get_transcript(node.session_key)
+    assert [entry.message_id for entry in transcript] == [
+        old_user.message_id,
+        active_user.message_id,
+    ]
+    assert transcript[0].turn_context == {
+        "status": "changed-after-source-capture",
+    }
+    assert await manager._storage.get_all_summaries(node.session_id) == []
+    assert await manager.get_context_states(node.session_key) == []
+    current_node = await manager.get_session(node.session_key)
+    assert current_node is not None
+    assert current_node.compaction_count == 0
+    async with manager._storage.conn.execute(
+        "SELECT COUNT(*) FROM compacted_transcript_entries WHERE session_id = ?",
+        (node.session_id,),
+    ) as cur:
+        assert (await cur.fetchone())[0] == 0
+
+
+@pytest.mark.asyncio
 async def test_canonical_transcript_page_crosses_multiple_compaction_boundaries(manager):
     node = await manager.create("agent:main:main")
     for index in range(10):

@@ -47,6 +47,12 @@ interface ChatCompactPayload extends Record<string, unknown> {
   contextWindowTokens?: unknown
   tokens_before?: unknown
   tokensBefore?: unknown
+  compaction_id?: unknown
+  compactionId?: unknown
+  sequence?: unknown
+  heartbeat?: unknown
+  stage?: unknown
+  phase?: unknown
 }
 
 interface SettleCompactOptions {
@@ -55,7 +61,21 @@ interface SettleCompactOptions {
 }
 
 interface ChatCompactMeta {
-  replayed?: boolean
+  replayed?: unknown
+}
+
+const COMPACTION_TERMINAL_STATUSES = new Set([
+  'completed',
+  'skipped',
+  'failed',
+  'error',
+  'cancelled',
+  'timed_out',
+  'emergency_ephemeral',
+])
+
+function isCompactionTerminalStatus(status: string): boolean {
+  return COMPACTION_TERMINAL_STATUSES.has(status)
 }
 
 const EMPTY_COMPACT_STATUS: ChatCompactStatus = {
@@ -101,7 +121,10 @@ function parseContextOccupancy(payload: ChatCompactPayload): { percent: number; 
 export function useChatCompaction(options: UseChatCompactionOptions) {
   const compactInFlight = ref(false)
   const compactInFlightKey = ref('')
+  const activeCompactionId = ref('')
   const compactStatus = ref<ChatCompactStatus>(createEmptyCompactStatus())
+  const lastSequenceById = new Map<string, number>()
+  const terminalCompactionIds = new Set<string>()
   let dismissTimer: ReturnType<typeof setTimeout> | null = null
 
   const compactTick = ref(0)
@@ -167,9 +190,11 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
     return !compactInFlightKey.value || compactInFlightKey.value === options.sessionKey.value
   }
 
-  function setCompactInFlight(active: boolean, key = options.sessionKey.value) {
+  function setCompactInFlight(active: boolean, key = options.sessionKey.value, compactionId = '') {
     compactInFlight.value = active
     compactInFlightKey.value = active ? String(key || options.sessionKey.value || '') : ''
+    if (active && compactionId) activeCompactionId.value = compactionId
+    if (!active) activeCompactionId.value = ''
   }
 
   function hideCompactStatus() {
@@ -222,7 +247,12 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
     setCompactInFlight(false)
     const status = String(payload.status || '').toLowerCase()
     const compactedFlag = Object.prototype.hasOwnProperty.call(payload, 'compacted') ? !!payload.compacted : null
-    if (status === 'completed' || status === 'skipped' || (status === '' && compactedFlag !== null)) {
+    if (
+      status === 'completed'
+      || status === 'skipped'
+      || status === 'emergency_ephemeral'
+      || (status === '' && compactedFlag !== null)
+    ) {
       options.schedulePendingDrainAfterTerminal()
     } else if (settleOptions.preservePending) {
       // Pending queue remains blocked until the user acts.
@@ -232,21 +262,84 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
     return true
   }
 
+  function payloadCompactionId(payload: ChatCompactPayload): string {
+    return String(payload.compaction_id ?? payload.compactionId ?? '').trim()
+  }
+
+  function rememberTerminalCompactionId(compactionId: string) {
+    terminalCompactionIds.add(compactionId)
+    if (terminalCompactionIds.size <= 256) return
+    const oldest = terminalCompactionIds.values().next().value
+    if (typeof oldest === 'string') terminalCompactionIds.delete(oldest)
+  }
+
+  function acceptCompactionEvent(
+    payload: ChatCompactPayload,
+    status: string,
+  ): boolean {
+    const payloadKey = String(payload.key || '')
+    if (payloadKey && payloadKey !== options.sessionKey.value) return false
+    const incomingId = payloadCompactionId(payload)
+    const terminal = isCompactionTerminalStatus(status)
+    // The wait:false RPC acknowledgement can race a very fast terminal event.
+    // Once an operation is terminal, its delayed "started" acknowledgement
+    // must not resurrect the busy indicator.
+    if (!terminal && incomingId && terminalCompactionIds.has(incomingId)) return false
+    if (terminal && incomingId && activeCompactionId.value && incomingId !== activeCompactionId.value) {
+      return false
+    }
+    // A reconnect terminal is authoritative even while an optimistic
+    // wait:false /compact is still waiting for its acknowledgement and has no
+    // id yet. Session stream cursors already scope replay to this session; the
+    // terminal-id cache prevents the delayed started acknowledgement from
+    // resurrecting the operation afterwards.
+    const sequence = toFiniteNumber(payload.sequence)
+    if (incomingId && sequence !== null) {
+      const previous = lastSequenceById.get(incomingId) ?? 0
+      if (sequence <= previous) return false
+      lastSequenceById.set(incomingId, sequence)
+    }
+    if (status === 'started' && incomingId) activeCompactionId.value = incomingId
+    if (terminal) {
+      if (incomingId) rememberTerminalCompactionId(incomingId)
+      activeCompactionId.value = ''
+    }
+    return true
+  }
+
   function showCompactionToast(payload: ChatCompactPayload, meta: ChatCompactMeta = {}) {
-    if (meta.replayed) return
     let status = String(payload.status || '').toLowerCase()
     if (!status && Object.prototype.hasOwnProperty.call(payload, 'compacted')) {
       status = payload.compacted ? 'completed' : 'skipped'
     }
+    // Reconnect replay is authoritative for terminal state, but a replayed
+    // progress event must never resurrect an already-finished busy indicator.
+    // Legacy payloads without `status` remain supported via `compacted` above.
+    if (meta.replayed === true && !isCompactionTerminalStatus(status)) return
+    if (!acceptCompactionEvent(payload, status)) return
     const source = String(payload.source || '').toLowerCase()
 
     if (status === 'started') {
-      if (source === 'manual') setCompactInFlight(true, payload.key || options.sessionKey.value)
+      if (source === 'manual') {
+        setCompactInFlight(
+          true,
+          String(payload.key || options.sessionKey.value),
+          payloadCompactionId(payload),
+        )
+      }
       const occupancy = parseContextOccupancy(payload)
       showCompactStatus('started', i18n.global.t('chat.compact.compacting'), {
         tone: 'info',
         occupancyPercent: occupancy ? occupancy.percent : null,
         contextWindowLabel: occupancy ? occupancy.windowLabel : '',
+      })
+      return
+    }
+    if (status === 'observed' || payload.heartbeat === true) {
+      const stage = String(payload.stage || payload.phase || '').trim()
+      showCompactStatus('started', i18n.global.t('chat.compact.compacting'), {
+        tone: 'info',
+        detail: stage,
       })
       return
     }
@@ -261,9 +354,29 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
       showCompactStatus('failed', i18n.global.t('chat.compact.failed'), { tone: 'err', dismissMs: 10000 })
       return
     }
+    if (status === 'timed_out') {
+      const preservePending = compactFailureBlocksPending(payload || {})
+      settleCompactInFlight(payload || {}, {
+        preservePending,
+        recoverPending: !preservePending,
+      })
+      showCompactStatus('timed_out', i18n.global.t('chat.compact.failed'), { tone: 'warn', dismissMs: 10000 })
+      return
+    }
     if (status === 'cancelled') {
       settleCompactInFlight(payload || {}, { recoverPending: true })
       showCompactStatus('cancelled', i18n.global.t('chat.compact.cancelled'), { tone: 'warn', dismissMs: 8000 })
+      return
+    }
+    if (status === 'emergency_ephemeral') {
+      settleCompactInFlight(payload || {})
+      showCompactStatus('emergency_ephemeral', i18n.global.t('chat.compact.compacted'), {
+        tone: 'warn',
+        detail: typeof payload.detail === 'string'
+          ? payload.detail
+          : i18n.global.t('chat.compact.requestScoped'),
+        dismissMs: 8000,
+      })
       return
     }
     if (status === 'completed') {
@@ -275,6 +388,9 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
   function cleanup() {
     clearDismissTimer()
     resetElapsedTicker()
+    activeCompactionId.value = ''
+    lastSequenceById.clear()
+    terminalCompactionIds.clear()
   }
 
   return {

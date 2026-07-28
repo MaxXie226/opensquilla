@@ -8,8 +8,9 @@ import json
 import os
 import re
 import tempfile
+import time
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -22,7 +23,11 @@ from opensquilla.session.compaction import (
     CompactionConfig,
     CompactionRequest,
     CompactionResult,
+    arm_compaction_deadline,
+    await_compaction_phase,
     compact_context,
+    compaction_remaining_seconds,
+    require_compaction_time,
 )
 from opensquilla.session.compaction_lifecycle import new_compaction_id
 from opensquilla.session.compaction_state import (
@@ -59,6 +64,42 @@ class CanonicalTranscriptPage:
     entries: list[TranscriptEntry]
     has_more: bool
     canonical_complete: bool
+
+
+@dataclass(frozen=True, slots=True)
+class CompactionSourceSnapshot:
+    """Frozen durable prefix that one in-turn compaction was derived from."""
+
+    entries: tuple[TranscriptEntry, ...]
+    preimage: tuple[tuple[Any, ...], ...]
+    boundary_message_id: str | None
+    boundary_entry_id: int | None
+
+
+async def _await_compaction_commit_barrier(
+    task: asyncio.Task[Any],
+) -> tuple[Any, bool]:
+    """Wait until an atomic rewrite settles, even if cancellation races it.
+
+    Returns the task result and whether cancellation was observed. A successful
+    durable commit is authoritative and therefore wins the race; if the rewrite
+    fails, the pending cancellation is re-raised instead of claiming a false
+    completion.
+    """
+
+    cancellation: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as exc:
+            cancellation = cancellation or exc
+    try:
+        task.result()
+    except BaseException as exc:
+        if cancellation is not None:
+            raise cancellation from exc
+        raise
+    return task.result(), cancellation is not None
 
 
 def _validate_iana_name(name: str) -> str | None:
@@ -234,13 +275,22 @@ def _compaction_entry_payloads(entries: list[TranscriptEntry]) -> list[dict[str,
 def _transcript_preimage(entries: list[TranscriptEntry]) -> tuple[tuple[Any, ...], ...]:
     return tuple(
         (
+            entry.session_id,
+            entry.session_key,
             entry.id,
             entry.message_id,
             entry.role,
             entry.content,
             entry.tool_call_id,
             entry.reasoning_content,
+            entry.created_at,
             entry.token_count,
+            entry.provenance_kind,
+            entry.provenance_origin_session_id,
+            entry.provenance_source_session_key,
+            entry.provenance_source_channel,
+            entry.provenance_source_tool,
+            entry.schema_version,
             _stable_json(entry.tool_calls),
             _stable_json(entry.turn_usage),
             _stable_json(entry.turn_context),
@@ -1432,6 +1482,43 @@ class SessionManager:
             raise KeyError(f"Session not found: {session_key}")
         return await self._storage.get_transcript(node.session_id, limit=limit)
 
+    async def capture_compaction_source(
+        self,
+        session_key: str,
+        *,
+        boundary_message_id: str | None = None,
+    ) -> CompactionSourceSnapshot:
+        """Freeze the exact durable prefix visible to the active turn.
+
+        A bound user message cuts off already-persisted queued prompts.  An
+        empty snapshot is an explicit fail-closed marker when the requested
+        boundary cannot be found.
+        """
+
+        transcript = await self.get_transcript(session_key)
+        source_entries = transcript
+        if boundary_message_id is not None:
+            boundary_index = next(
+                (
+                    index
+                    for index, entry in enumerate(transcript)
+                    if entry.message_id == boundary_message_id
+                ),
+                None,
+            )
+            source_entries = (
+                transcript[: boundary_index + 1]
+                if boundary_index is not None
+                else []
+            )
+        boundary = source_entries[-1] if source_entries else None
+        return CompactionSourceSnapshot(
+            entries=tuple(source_entries),
+            preimage=_transcript_preimage(source_entries),
+            boundary_message_id=boundary.message_id if boundary is not None else None,
+            boundary_entry_id=boundary.id if boundary is not None else None,
+        )
+
     async def record_memory_checkpoint(
         self,
         session_key: str,
@@ -1439,6 +1526,7 @@ class SessionManager:
         *,
         turn_id: str | None = None,
         source: str = "session_manager",
+        compaction_config: CompactionConfig | None = None,
     ) -> MemoryDurableReceipt:
         """Persist a durable transcript checkpoint receipt before compaction."""
         from opensquilla.memory.checkpoint import (
@@ -1451,14 +1539,31 @@ class SessionManager:
         )
 
         session_key = canonicalize_session_key(session_key)
-        node = await self._storage.get_session(session_key)
+        node_call = self._storage.get_session(session_key)
+        node = (
+            await await_compaction_phase(
+                node_call,
+                compaction_config,
+                phase="checkpointing",
+            )
+            if compaction_config is not None
+            else await node_call
+        )
         if node is None:
             raise KeyError(f"Session not found: {session_key}")
-        entries = (
-            list(transcript)
-            if transcript is not None
-            else await self._storage.get_transcript(node.session_id)
-        )
+        if transcript is not None:
+            entries = list(transcript)
+        else:
+            entries_call = self._storage.get_transcript(node.session_id)
+            entries = (
+                await await_compaction_phase(
+                    entries_call,
+                    compaction_config,
+                    phase="checkpointing",
+                )
+                if compaction_config is not None
+                else await entries_call
+            )
         if not entries:
             raise ValueError("checkpoint transcript cannot be empty")
 
@@ -1481,10 +1586,27 @@ class SessionManager:
             f"checkpoint:{session_key}:{resolved_turn_id}:"
             f"{event_body_hash}"
         )
+        checkpoint_started = time.monotonic()
         try:
             if workspace is None:
                 raise RuntimeError("checkpoint workspace_dir is not configured")
-            result = await asyncio.to_thread(append_checkpoint_events, workspace, events)
+            checkpoint_worker = asyncio.create_task(
+                asyncio.to_thread(append_checkpoint_events, workspace, events)
+            )
+
+            def _consume_late_checkpoint(done: asyncio.Task[Any]) -> None:
+                with contextlib.suppress(BaseException):
+                    done.result()
+
+            checkpoint_worker.add_done_callback(_consume_late_checkpoint)
+            if compaction_config is None:
+                result = await checkpoint_worker
+            else:
+                result = await await_compaction_phase(
+                    asyncio.shield(checkpoint_worker),
+                    compaction_config,
+                    phase="checkpointing",
+                )
         except Exception as exc:
             failure_key = (
                 f"{failure_key}:failed:{checkpoint_event_hash(str(exc))[:16]}"
@@ -1504,12 +1626,32 @@ class SessionManager:
                 attempt_count=1,
             )
             try:
-                await self._storage.upsert_memory_durable_receipt(
+                persist_failure = self._storage.upsert_memory_durable_receipt(
                     receipt,
                     expected_session_id=node.session_id,
                 )
+                if compaction_config is None:
+                    await persist_failure
+                elif (compaction_remaining_seconds(compaction_config) or 0.0) > 0:
+                    await await_compaction_phase(
+                        persist_failure,
+                        compaction_config,
+                        phase="checkpointing",
+                    )
+                else:
+                    close = getattr(persist_failure, "close", None)
+                    if callable(close):
+                        close()
             except Exception:
                 pass
+            import structlog as _structlog
+
+            _structlog.get_logger(__name__).warning(
+                "session_compaction.checkpoint_failed",
+                compaction_id=resolved_turn_id,
+                duration_ms=max(0, int((time.monotonic() - checkpoint_started) * 1000)),
+                error=type(exc).__name__,
+            )
             raise
 
         receipt = MemoryDurableReceipt(
@@ -1528,10 +1670,27 @@ class SessionManager:
             status="checkpoint_saved",
             attempt_count=1,
         )
-        return await self._storage.upsert_memory_durable_receipt(
+        persisted_call = self._storage.upsert_memory_durable_receipt(
             receipt,
             expected_session_id=node.session_id,
         )
+        persisted = (
+            await await_compaction_phase(
+                persisted_call,
+                compaction_config,
+                phase="checkpointing",
+            )
+            if compaction_config is not None
+            else await persisted_call
+        )
+        import structlog as _structlog
+
+        _structlog.get_logger(__name__).info(
+            "session_compaction.checkpoint_completed",
+            compaction_id=resolved_turn_id,
+            duration_ms=max(0, int((time.monotonic() - checkpoint_started) * 1000)),
+        )
+        return persisted
 
     async def get_canonical_transcript(
         self, session_key: str, limit: int | None = None
@@ -1727,12 +1886,27 @@ class SessionManager:
         """Compact the session transcript and return full compaction metadata."""
 
         session_key = canonicalize_session_key(session_key)
+        effective_config = config or CompactionConfig()
+        persisted_compaction_id = compaction_id or new_compaction_id()
+        arm_compaction_deadline(
+            effective_config,
+            operation_id=persisted_compaction_id,
+        )
+        require_compaction_time(effective_config, phase="snapshotting")
         async with _session_mutation_context(mutation_context):
-            node = await self._storage.get_session(session_key)
+            node = await await_compaction_phase(
+                self._storage.get_session(session_key),
+                effective_config,
+                phase="snapshotting",
+            )
             if node is None:
                 raise KeyError(f"Session not found: {session_key}")
 
-            entries = await self._storage.get_transcript(node.session_id)
+            entries = await await_compaction_phase(
+                self._storage.get_transcript(node.session_id),
+                effective_config,
+                phase="snapshotting",
+            )
             preimage = _transcript_preimage(entries)
             raw = _compaction_entry_payloads(entries)
 
@@ -1741,7 +1915,7 @@ class SessionManager:
                 session_id=node.session_id,
                 entries=raw,
                 context_window_tokens=context_window_tokens,
-                config=config or CompactionConfig(),
+                config=effective_config,
                 custom_instructions=custom_instructions,
                 provider_request_correlation=provider_request_correlation,
             )
@@ -1759,11 +1933,20 @@ class SessionManager:
             )
             return replace(result, skip_reason=result.skip_reason or "empty_summary")
 
+        require_compaction_time(effective_config, phase="validating")
         async with _session_mutation_context(mutation_context):
-            current_node = await self._storage.get_session(session_key)
+            current_node = await await_compaction_phase(
+                self._storage.get_session(session_key),
+                effective_config,
+                phase="validating",
+            )
             if current_node is None:
                 raise KeyError(f"Session not found: {session_key}")
-            current_entries = await self._storage.get_transcript(current_node.session_id)
+            current_entries = await await_compaction_phase(
+                self._storage.get_transcript(current_node.session_id),
+                effective_config,
+                phase="validating",
+            )
             if _transcript_preimage(current_entries) != preimage:
                 import structlog as _structlog
 
@@ -1790,7 +1973,6 @@ class SessionManager:
 
             removed_entries = current_entries[: len(current_entries) - len(result.kept_entries)]
             kept_entries = current_entries[len(removed_entries) :]
-            persisted_compaction_id = compaction_id or new_compaction_id()
             summary_record = SessionSummary(
                 session_id=current_node.session_id,
                 session_key=session_key,
@@ -1821,12 +2003,32 @@ class SessionManager:
                 current_node,
                 summary_record,
             )
-            await self._storage.rewrite_compacted_session(
-                node=current_node,
-                summary=summary_record,
-                entries=kept_entries,
-                context_states=[context_state] if context_state is not None else None,
-                archived_entries=removed_entries,
+            # Cancellation/deadline wins until this point. Once the atomic
+            # SQLite rewrite starts, wait for its real outcome so a committed
+            # summary can never be reported as cancelled.
+            require_compaction_time(effective_config, phase="committing")
+            commit_started = time.monotonic()
+            import structlog as _structlog
+
+            _structlog.get_logger(__name__).info(
+                "session_compaction.commit_started",
+                compaction_id=persisted_compaction_id,
+            )
+            commit_task = asyncio.create_task(
+                self._storage.rewrite_compacted_session(
+                    node=current_node,
+                    summary=summary_record,
+                    entries=kept_entries,
+                    context_states=[context_state] if context_state is not None else None,
+                    archived_entries=removed_entries,
+                )
+            )
+            _, cancellation_reconciled = await _await_compaction_commit_barrier(commit_task)
+            _structlog.get_logger(__name__).info(
+                "session_compaction.commit_completed",
+                compaction_id=persisted_compaction_id,
+                cancellation_reconciled=cancellation_reconciled,
+                duration_ms=max(0, int((time.monotonic() - commit_started) * 1000)),
             )
         return result
 
@@ -1839,7 +2041,14 @@ class SessionManager:
         compaction_id: str | None = None,
         trigger_reason: str | None = None,
         flush_receipt_status: str | None = None,
-    ) -> None:
+        compaction_deadline_at_monotonic: float | None = None,
+        compaction_timeout_seconds: float | None = None,
+        removed_count: int | None = None,
+        source_entries: Sequence[TranscriptEntry] | None = None,
+        source_preimage: Sequence[Sequence[Any]] | None = None,
+        source_boundary_message_id: str | None = None,
+        source_boundary_entry_id: int | None = None,
+    ) -> bool:
         """Persist a pre-computed compaction result directly (no LLM re-compaction).
 
         Called by TurnRunner when Agent emits CompactionEvent. Writes the Agent's
@@ -1850,15 +2059,87 @@ class SessionManager:
         import structlog as _structlog
 
         _log = _structlog.get_logger(__name__)
+        persisted_compaction_id = compaction_id or new_compaction_id()
+        deadline_config: CompactionConfig | None = None
+        if compaction_deadline_at_monotonic is not None:
+            try:
+                deadline = float(compaction_deadline_at_monotonic)
+                total_timeout = float(compaction_timeout_seconds or 120.0)
+            except (TypeError, ValueError):
+                deadline = 0.0
+                total_timeout = 120.0
+            deadline_config = CompactionConfig(
+                total_timeout_seconds=total_timeout if total_timeout > 0 else 120.0,
+                deadline_at_monotonic=deadline,
+                operation_id=persisted_compaction_id,
+            )
+            require_compaction_time(deadline_config, phase="snapshotting")
 
-        node = await self._storage.get_session(session_key)
+        node_call = self._storage.get_session(session_key)
+        node = (
+            await await_compaction_phase(
+                node_call,
+                deadline_config,
+                phase="snapshotting",
+            )
+            if deadline_config is not None
+            else await node_call
+        )
         if node is None:
             _log.warning("persist_compaction.session_not_found", session_key=session_key)
-            return
+            return False
 
-        entries = await self._storage.get_transcript(node.session_id)
-        removed_entries = entries[: max(0, len(entries) - len(kept_entries))]
-        preserved_entries = entries[len(removed_entries) :]
+        expected_source_entries: list[TranscriptEntry] | None = None
+        expected_source_preimage: tuple[tuple[Any, ...], ...] | None = None
+        if source_entries is not None:
+            expected_source_entries = list(source_entries)
+            expected_source_preimage = tuple(tuple(item) for item in (source_preimage or ()))
+            actual_source_preimage = _transcript_preimage(expected_source_entries)
+            boundary = expected_source_entries[-1] if expected_source_entries else None
+            source_is_valid = (
+                bool(expected_source_entries)
+                and expected_source_preimage == actual_source_preimage
+                and boundary is not None
+                and (
+                    source_boundary_message_id is None
+                    or boundary.message_id == source_boundary_message_id
+                )
+                and (
+                    source_boundary_entry_id is None
+                    or boundary.id == source_boundary_entry_id
+                )
+                and isinstance(removed_count, int)
+                and not isinstance(removed_count, bool)
+                and 0 <= removed_count <= len(expected_source_entries)
+            )
+            if not source_is_valid:
+                _log.warning(
+                    "persist_compaction.invalid_source_boundary_skipped",
+                    session_key=session_key,
+                    source_count=len(expected_source_entries),
+                    removed_count=removed_count,
+                )
+                return False
+            assert isinstance(removed_count, int) and not isinstance(removed_count, bool)
+            exact_removed_count = removed_count
+            removed_entries = expected_source_entries[:exact_removed_count]
+            preserved_entries = expected_source_entries[exact_removed_count:]
+        else:
+            # Compatibility path for older embedders that do not yet carry a
+            # frozen source boundary. Keep its historical behavior, while all
+            # TurnRunner calls use the exact-boundary branch above.
+            entries_call = self._storage.get_transcript(node.session_id)
+            entries = (
+                await await_compaction_phase(
+                    entries_call,
+                    deadline_config,
+                    phase="snapshotting",
+                )
+                if deadline_config is not None
+                else await entries_call
+            )
+            removed_entries = entries[: max(0, len(entries) - len(kept_entries))]
+            preserved_entries = entries[len(removed_entries) :]
         if removed_entries and not summary:
             _log.warning(
                 "persist_compaction.empty_summary_not_persisted",
@@ -1866,14 +2147,21 @@ class SessionManager:
                 removed=len(removed_entries),
                 kept=len(kept_entries),
             )
-            return
+            return False
+
+        persisted_kept_count = (
+            len(preserved_entries)
+            if expected_source_entries is not None
+            else len(kept_entries)
+        )
 
         # Store summary out-of-band. New compactions must not prepend a
         # transcript system marker because history loading would make that
         # marker provider-visible and cache-hostile.
         summary_record = None
         if summary:
-            persisted_compaction_id = compaction_id or new_compaction_id()
+            if deadline_config is not None:
+                require_compaction_time(deadline_config, phase="validating")
             raw_removed_entries = [
                 {
                     "id": entry.id,
@@ -1898,7 +2186,7 @@ class SessionManager:
                 missing_obligations=coverage.missing_obligations,
                 critical_carry_forward=coverage.critical_carry_forward,
                 removed_count=len(removed_entries),
-                kept_count=len(kept_entries),
+                kept_count=persisted_kept_count,
                 flush_receipt_status=_compaction_flush_status_for_persistence(
                     flush_receipt_status
                 ),
@@ -1907,42 +2195,79 @@ class SessionManager:
                 else 0,
             )
 
-        # Insert kept entries, preserving original metadata where possible
-        rewritten_entries: list[TranscriptEntry] = []
-        for index, raw in enumerate(kept_entries):
-            if index < len(preserved_entries):
-                preserved = preserved_entries[index]
-                if preserved.role == raw.get("role") and preserved.content == raw.get("content"):
-                    rewritten_entries.append(preserved)
-                    continue
-            entry = TranscriptEntry(
-                session_id=node.session_id,
-                session_key=session_key,
-                role=raw.get("role", "user"),
-                content=raw.get("content", ""),
-                tool_calls=raw.get("tool_calls"),
-                tool_call_id=raw.get("tool_call_id"),
-                turn_usage=raw.get("turn_usage"),
-                turn_context=raw.get("turn_context"),
-            )
-            rewritten_entries.append(entry)
+        if expected_source_entries is not None:
+            # Only rewrite the durable source projection. ``kept_entries`` may
+            # also contain current-turn skills, attachments, tool traffic, and
+            # retry scaffolding. Those are finalized through the normal turn
+            # persistence path and must never become synthetic transcript rows.
+            rewritten_entries = list(preserved_entries)
+        else:
+            # Insert kept entries, preserving original metadata where possible.
+            rewritten_entries = []
+            for index, raw in enumerate(kept_entries):
+                if index < len(preserved_entries):
+                    preserved = preserved_entries[index]
+                    # Agent compaction uses a flattened text projection only
+                    # for summary generation. Prefix-only tail rows remain
+                    # canonical; preserve their structured metadata by
+                    # position.
+                    if preserved.role == raw.get("role"):
+                        rewritten_entries.append(preserved)
+                        continue
+                entry = TranscriptEntry(
+                    session_id=node.session_id,
+                    session_key=session_key,
+                    role=raw.get("role", "user"),
+                    content=raw.get("content", ""),
+                    tool_calls=raw.get("tool_calls"),
+                    tool_call_id=raw.get("tool_call_id"),
+                    turn_usage=raw.get("turn_usage"),
+                    turn_context=raw.get("turn_context"),
+                )
+                rewritten_entries.append(entry)
 
         node.compaction_count = (node.compaction_count or 0) + 1
         node.updated_at = _now_ms()
         context_state = self._portable_structured_summary_state(node, summary_record)
-        await self._storage.rewrite_compacted_session(
-            node=node,
-            summary=summary_record,
-            entries=rewritten_entries,
-            context_states=[context_state] if context_state is not None else None,
-            archived_entries=removed_entries if summary_record is not None else None,
+        if deadline_config is not None:
+            require_compaction_time(deadline_config, phase="committing")
+        commit_started = time.monotonic()
+        rewrite_kwargs: dict[str, Any] = {}
+        if expected_source_entries is not None:
+            rewrite_kwargs = {
+                "expected_source_entries": expected_source_entries,
+                "expected_source_preimage": expected_source_preimage,
+                "expected_source_boundary_message_id": source_boundary_message_id,
+                "expected_source_boundary_entry_id": source_boundary_entry_id,
+            }
+        commit_task = asyncio.create_task(
+            self._storage.rewrite_compacted_session(
+                node=node,
+                summary=summary_record,
+                entries=rewritten_entries,
+                context_states=[context_state] if context_state is not None else None,
+                archived_entries=removed_entries if summary_record is not None else None,
+                **rewrite_kwargs,
+            )
         )
+        installed, cancellation_reconciled = await _await_compaction_commit_barrier(commit_task)
+        if installed is False:
+            _log.warning(
+                "persist_compaction.stale_preimage_skipped",
+                compaction_id=persisted_compaction_id,
+                session_key=session_key,
+            )
+            return False
         _log.info(
             "persist_compaction.done",
+            compaction_id=persisted_compaction_id,
+            cancellation_reconciled=cancellation_reconciled,
+            commit_ms=max(0, int((time.monotonic() - commit_started) * 1000)),
             session_key=session_key,
             summary_len=len(summary),
-            kept=len(kept_entries),
+            kept=persisted_kept_count,
         )
+        return True
 
     async def truncate(self, session_key: str, max_messages: int = 20) -> dict:
         """Truncate transcript to the most recent *max_messages* entries.

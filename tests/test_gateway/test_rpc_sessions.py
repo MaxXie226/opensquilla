@@ -482,7 +482,7 @@ def _capture_compaction_emits(
     ) -> None:
         emitted.append((session_key, event_name, payload))
 
-    monkeypatch.setattr(rpc_sessions, "_emit_to_subscribers", _record_emit)
+    monkeypatch.setattr(rpc_sessions, "_send_prepared_to_subscribers", _record_emit)
     return emitted
 
 
@@ -3843,6 +3843,192 @@ class TestSessionsAbort:
         assert runtime.wait_calls == ["task-live"]
 
     @pytest.mark.asyncio
+    async def test_abort_runtime_drain_waits_concurrently_under_one_deadline(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        class Runtime:
+            def __init__(self) -> None:
+                self.entered: set[str] = set()
+                self.cancelled: set[str] = set()
+                self.active_waits = 0
+                self.peak_active_waits = 0
+                self.never_release = asyncio.Event()
+
+            async def wait(self, task_id: str):
+                self.entered.add(task_id)
+                self.active_waits += 1
+                self.peak_active_waits = max(self.peak_active_waits, self.active_waits)
+                try:
+                    await self.never_release.wait()
+                finally:
+                    self.active_waits -= 1
+                    self.cancelled.add(task_id)
+
+        monkeypatch.setattr(rpc_sessions, "_ABORT_RUNTIME_CANCEL_DRAIN_SECONDS", 0.25)
+        runtime = Runtime()
+        started_at = rpc_sessions.time.monotonic()
+        deadline = started_at + 0.05
+
+        await asyncio.wait_for(
+            rpc_sessions._drain_cancelled_task_runtime(
+                runtime,
+                session_key="agent:main:shared-drain",
+                task_ids=("task-one", "task-two"),
+                deadline_at_monotonic=deadline,
+            ),
+            timeout=0.5,
+        )
+        elapsed = rpc_sessions.time.monotonic() - started_at
+
+        assert runtime.entered == {"task-one", "task-two"}
+        assert runtime.peak_active_waits == 2
+        assert runtime.cancelled == {"task-one", "task-two"}
+        assert runtime.active_waits == 0
+        assert elapsed < 0.15
+
+    @pytest.mark.asyncio
+    async def test_abort_runtime_drain_does_not_join_stubborn_cancelled_waiter(
+        self,
+    ):
+        release = asyncio.Event()
+        cancellation_seen = asyncio.Event()
+        finished = asyncio.Event()
+
+        class Runtime:
+            async def wait(self, _task_id: str):
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    cancellation_seen.set()
+                    await release.wait()
+                finally:
+                    finished.set()
+
+        started_at = rpc_sessions.time.monotonic()
+        await asyncio.wait_for(
+            rpc_sessions._drain_cancelled_task_runtime(
+                Runtime(),
+                session_key="agent:main:stubborn-drain",
+                task_ids=("task-stubborn",),
+                deadline_at_monotonic=started_at + 0.02,
+            ),
+            timeout=0.15,
+        )
+        elapsed = rpc_sessions.time.monotonic() - started_at
+
+        assert cancellation_seen.is_set()
+        assert finished.is_set() is False
+        assert elapsed < 0.1
+
+        release.set()
+        await asyncio.wait_for(finished.wait(), timeout=0.2)
+
+    @pytest.mark.asyncio
+    async def test_abort_slow_session_lookup_does_not_delay_compaction_cancel(
+        self,
+        dispatcher,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        session_key = "agent:main:abort-slow-lookup"
+        owner_release = asyncio.Event()
+        lookup_cancelled = asyncio.Event()
+
+        async def compaction_owner() -> None:
+            await owner_release.wait()
+
+        class SlowStorage:
+            async def get_session(self, key: str):
+                assert key == session_key
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    lookup_cancelled.set()
+
+        class Manager:
+            storage = SlowStorage()
+
+        monkeypatch.setattr(rpc_sessions, "_ABORT_RUNTIME_CANCEL_DRAIN_SECONDS", 0.05)
+        monkeypatch.setattr(rpc_sessions, "_ABORT_SESSION_LOOKUP_SECONDS", 0.01)
+        owner = asyncio.create_task(compaction_owner())
+        rpc_sessions.register_active_compaction(
+            session_key,
+            "cmp-slow-lookup",
+            owner,
+        )
+        started_at = rpc_sessions.time.monotonic()
+        try:
+            res = await dispatcher.dispatch(
+                "r1",
+                "sessions.abort",
+                {"key": session_key},
+                make_ctx(session_manager=Manager()),
+            )
+            elapsed = rpc_sessions.time.monotonic() - started_at
+            await asyncio.gather(owner, return_exceptions=True)
+            await asyncio.wait_for(lookup_cancelled.wait(), timeout=0.2)
+        finally:
+            if not owner.done():
+                owner.cancel()
+                await asyncio.gather(owner, return_exceptions=True)
+
+        assert res.ok is True
+        assert res.payload["aborted"] is True
+        assert res.payload["cancelled_compactions"] == 1
+        assert owner.cancelled() is True
+        assert elapsed < 0.15
+
+    @pytest.mark.asyncio
+    async def test_abort_slow_runtime_cancel_cannot_extend_shared_stop_budget(
+        self,
+        dispatcher,
+        session,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        cancel_entered = asyncio.Event()
+        cancel_cancelled = asyncio.Event()
+
+        class Runtime:
+            async def list(self, session_key: str | None = None):
+                assert session_key == session.session_key
+                return [SimpleNamespace(task_id="task-stuck", status="running")]
+
+            async def cancel(self, **_kwargs: Any) -> int:
+                cancel_entered.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    cancel_cancelled.set()
+                return 1
+
+        async def cancel_background(_session_key: str) -> int:
+            return 0
+
+        async def emit(*_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        monkeypatch.setattr(rpc_sessions, "_ABORT_RUNTIME_CANCEL_DRAIN_SECONDS", 0.05)
+        monkeypatch.setattr(
+            "opensquilla.gateway.subagent_announce.cancel_background_completion_for_session",
+            cancel_background,
+        )
+        monkeypatch.setattr(rpc_sessions, "_emit_to_subscribers", emit)
+        started_at = rpc_sessions.time.monotonic()
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.abort",
+            {"key": session.session_key},
+            make_ctx(session_manager=FakeSessionManager([session]), task_runtime=Runtime()),
+        )
+        elapsed = rpc_sessions.time.monotonic() - started_at
+        await asyncio.wait_for(cancel_entered.wait(), timeout=0.2)
+        await asyncio.wait_for(cancel_cancelled.wait(), timeout=0.2)
+
+        assert res.ok is True
+        assert elapsed < 0.15
+
+    @pytest.mark.asyncio
     async def test_abort_no_manager(self, dispatcher, ctx_no_manager):
         res = await dispatcher.dispatch("r1", "sessions.abort", {"key": "any"}, ctx_no_manager)
         assert res.ok is True  # no-op
@@ -5055,6 +5241,339 @@ class TestSessionsContextCompact:
             "cancelled",
         ]
         assert manager.compact_calls == []
+
+    @pytest.mark.asyncio
+    async def test_context_compact_background_is_cancelled_by_session_abort(
+        self,
+        dispatcher,
+        session,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        manager = SlowCompactionSessionManager([session])
+        ctx = make_ctx(session_manager=manager)
+        emitted = _capture_compaction_emits(monkeypatch)
+
+        compact_response = await dispatcher.dispatch(
+            "r-compact",
+            "sessions.contextCompact",
+            {
+                "key": session.session_key,
+                "contextWindowTokens": 1234,
+                "wait": False,
+            },
+            ctx,
+        )
+
+        assert compact_response.ok is True
+        assert compact_response.payload["status"] == "started"
+        compaction_id = compact_response.payload["compaction_id"]
+        await asyncio.wait_for(manager.started.wait(), timeout=1.0)
+
+        loop = asyncio.get_running_loop()
+        abort_started = loop.time()
+        abort_response = await asyncio.wait_for(
+            dispatcher.dispatch(
+                "r-abort",
+                "sessions.abort",
+                {"key": session.session_key, "source": "webui_stop"},
+                ctx,
+            ),
+            timeout=2.1,
+        )
+        abort_elapsed = loop.time() - abort_started
+
+        assert abort_response.ok is True
+        assert abort_response.payload["aborted"] is True
+        assert abort_response.payload["cancelled_compactions"] == 1
+        assert abort_elapsed < 2.1
+        compaction_events = [
+            payload
+            for key, event_name, payload in emitted
+            if key == session.session_key and event_name == "session.event.compaction"
+        ]
+        assert [payload["status"] for payload in compaction_events] == [
+            "started",
+            "cancelled",
+        ]
+        assert {payload["compaction_id"] for payload in compaction_events} == {
+            compaction_id
+        }
+        assert all(payload["status"] != "completed" for payload in compaction_events)
+        assert manager.compact_calls == []
+
+    @pytest.mark.asyncio
+    async def test_context_compact_stop_during_started_broadcast_emits_one_terminal(
+        self,
+        dispatcher,
+        session,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        manager = SlowCompactionSessionManager([session])
+        ctx = make_ctx(session_manager=manager)
+        started_broadcast_entered = asyncio.Event()
+        release_started_broadcast = asyncio.Event()
+        emitted: list[tuple[str, str, dict[str, Any]]] = []
+        stream_cursor = get_session_streams().current_seq(session.session_key)
+
+        async def _block_started_broadcast(
+            _ctx: RpcContext,
+            session_key: str,
+            event_name: str,
+            payload: dict[str, Any],
+        ) -> None:
+            emitted.append((session_key, event_name, payload))
+            if payload["status"] == "started":
+                started_broadcast_entered.set()
+                await release_started_broadcast.wait()
+
+        monkeypatch.setattr(
+            rpc_sessions,
+            "_send_prepared_to_subscribers",
+            _block_started_broadcast,
+        )
+        monkeypatch.setattr(rpc_sessions, "_ABORT_RUNTIME_CANCEL_DRAIN_SECONDS", 0.1)
+        compact_task = asyncio.create_task(
+            dispatcher.dispatch(
+                "r-compact-started-broadcast",
+                "sessions.contextCompact",
+                {
+                    "key": session.session_key,
+                    "contextWindowTokens": 1234,
+                    "wait": False,
+                },
+                ctx,
+            )
+        )
+        try:
+            await asyncio.wait_for(started_broadcast_entered.wait(), timeout=1.0)
+            compaction_id = emitted[0][2]["compaction_id"]
+
+            abort_response = await asyncio.wait_for(
+                dispatcher.dispatch(
+                    "r-abort-started-broadcast",
+                    "sessions.abort",
+                    {"key": session.session_key, "source": "webui_stop"},
+                    ctx,
+                ),
+                timeout=0.5,
+            )
+            release_started_broadcast.set()
+            compact_response = await asyncio.wait_for(compact_task, timeout=0.5)
+
+            assert abort_response.ok is True
+            assert abort_response.payload["aborted"] is True
+            assert abort_response.payload["cancelled_compactions"] == 1
+            assert compact_response.ok is True
+            assert compact_response.payload["status"] == "started"
+
+            operation_events = [
+                payload
+                for key, event_name, payload in emitted
+                if key == session.session_key
+                and event_name == "session.event.compaction"
+                and payload["compaction_id"] == compaction_id
+            ]
+            terminal_events = [
+                payload
+                for payload in operation_events
+                if payload["status"]
+                in {"completed", "skipped", "failed", "cancelled", "timed_out"}
+            ]
+            assert [payload["status"] for payload in operation_events] == [
+                "started",
+                "cancelled",
+            ]
+            assert [payload["status"] for payload in terminal_events] == ["cancelled"]
+            assert manager.started.is_set() is False
+            assert manager.compact_calls == []
+
+            replay = get_session_streams().replay(session.session_key, stream_cursor)
+            replayed_terminals = [
+                event.payload
+                for event in replay.events
+                if event.event_name == "session.event.compaction"
+                and event.payload.get("compaction_id") == compaction_id
+                and event.payload.get("status")
+                in {"completed", "skipped", "failed", "cancelled", "timed_out"}
+            ]
+            assert [payload["status"] for payload in replayed_terminals] == ["cancelled"]
+        finally:
+            release_started_broadcast.set()
+            manager.release.set()
+            if not compact_task.done():
+                compact_task.cancel()
+            await asyncio.gather(compact_task, return_exceptions=True)
+
+    @pytest.mark.asyncio
+    async def test_context_compact_cancelled_during_observed_emit_reconciles_durable_commit(
+        self,
+        dispatcher,
+        session,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        class DurableResultManager(FakeSessionManager):
+            def __init__(self, sessions: list[FakeSession]) -> None:
+                super().__init__(sessions)
+                self.durable_result_returned = asyncio.Event()
+
+            async def compact_with_result(
+                self,
+                session_key: str,
+                context_window_tokens: int,
+                config=None,
+                custom_instructions: str | None = None,
+                **kwargs: Any,
+            ) -> Any:
+                result = await super().compact_with_result(
+                    session_key,
+                    context_window_tokens,
+                    config,
+                    custom_instructions=custom_instructions,
+                    **kwargs,
+                )
+                self.durable_result_returned.set()
+                return result
+
+        manager = DurableResultManager([session])
+        ctx = make_ctx(session_manager=manager)
+        emitted: list[tuple[str, str, dict[str, Any]]] = []
+        observed_emit_started = asyncio.Event()
+        hold_observed_emit = asyncio.Event()
+        stream_cursor = get_session_streams().current_seq(session.session_key)
+
+        async def _block_first_observed_emit(
+            _ctx: RpcContext,
+            session_key: str,
+            event_name: str,
+            payload: dict[str, Any],
+        ) -> None:
+            emitted.append((session_key, event_name, payload))
+            if payload["status"] == "observed" and not observed_emit_started.is_set():
+                observed_emit_started.set()
+                await hold_observed_emit.wait()
+
+        monkeypatch.setattr(
+            rpc_sessions,
+            "_send_prepared_to_subscribers",
+            _block_first_observed_emit,
+        )
+
+        task = asyncio.create_task(
+            dispatcher.dispatch(
+                "r-compact-post-commit-cancel",
+                "sessions.contextCompact",
+                {"key": session.session_key, "contextWindowTokens": 1234},
+                ctx,
+            )
+        )
+        await asyncio.wait_for(observed_emit_started.wait(), timeout=1.0)
+        assert manager.durable_result_returned.is_set()
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        compaction_id = emitted[0][2]["compaction_id"]
+        terminal_events = [
+            payload
+            for key, event_name, payload in emitted
+            if key == session.session_key
+            and event_name == "session.event.compaction"
+            and payload["compaction_id"] == compaction_id
+            and payload["status"]
+            in {"completed", "skipped", "failed", "cancelled", "timed_out"}
+        ]
+        assert len(terminal_events) == 1
+        assert terminal_events[0]["status"] == "completed"
+        assert terminal_events[0]["reason"] == "cancelled_after_commit"
+        assert terminal_events[0]["cancellation_reconciled"] is True
+
+        replay = get_session_streams().replay(session.session_key, stream_cursor)
+        replayed_terminals = [
+            event.payload
+            for event in replay.events
+            if event.event_name == "session.event.compaction"
+            and event.payload.get("compaction_id") == compaction_id
+            and event.payload.get("status")
+            in {"completed", "skipped", "failed", "cancelled", "timed_out"}
+        ]
+        assert [payload["status"] for payload in replayed_terminals] == ["completed"]
+
+    @pytest.mark.asyncio
+    async def test_context_compact_cancelled_during_terminal_epoch_resolve_retries_terminal(
+        self,
+        dispatcher,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        session = FakeSession(
+            session_key="agent:main:terminal-epoch-cancel",
+            session_id="terminal-epoch-cancel",
+        )
+        manager = FakeSessionManager([session])
+        manager.compact_summary = ""
+        ctx = make_ctx(session_manager=manager)
+        terminal_epoch_resolve_started = asyncio.Event()
+        hold_terminal_epoch_resolve = asyncio.Event()
+        epoch_calls = 0
+
+        async def _resolve_epoch(session_key: str) -> int:
+            nonlocal epoch_calls
+            assert session_key == session.session_key
+            epoch_calls += 1
+            if epoch_calls == 2:
+                terminal_epoch_resolve_started.set()
+                await hold_terminal_epoch_resolve.wait()
+            return session.epoch
+
+        monkeypatch.setattr(manager._storage, "get_epoch", _resolve_epoch, raising=False)
+        stream_cursor = get_session_streams().current_seq(session.session_key)
+
+        compact_response = await dispatcher.dispatch(
+            "r-compact-terminal-epoch",
+            "sessions.contextCompact",
+            {
+                "key": session.session_key,
+                "contextWindowTokens": 1234,
+                "wait": False,
+            },
+            ctx,
+        )
+        compaction_id = compact_response.payload["compaction_id"]
+        await asyncio.wait_for(terminal_epoch_resolve_started.wait(), timeout=1.0)
+
+        assert rpc_sessions.compaction_terminal_status(compaction_id) is None
+        replay_before_cancel = get_session_streams().replay(session.session_key, stream_cursor)
+        assert not any(
+            event.payload.get("compaction_id") == compaction_id
+            and event.payload.get("status")
+            in {"completed", "skipped", "failed", "cancelled", "timed_out"}
+            for event in replay_before_cancel.events
+        )
+
+        abort_response = await asyncio.wait_for(
+            dispatcher.dispatch(
+                "r-abort-terminal-epoch",
+                "sessions.abort",
+                {"key": session.session_key, "source": "webui_stop"},
+                ctx,
+            ),
+            timeout=2.1,
+        )
+
+        assert abort_response.ok is True
+        assert abort_response.payload["cancelled_compactions"] == 1
+        assert epoch_calls >= 3
+        replay = get_session_streams().replay(session.session_key, stream_cursor)
+        replayed_terminals = [
+            event.payload
+            for event in replay.events
+            if event.event_name == "session.event.compaction"
+            and event.payload.get("compaction_id") == compaction_id
+            and event.payload.get("status")
+            in {"completed", "skipped", "failed", "cancelled", "timed_out"}
+        ]
+        assert [payload["status"] for payload in replayed_terminals] == ["cancelled"]
+        assert rpc_sessions.compaction_terminal_status(compaction_id) == "cancelled"
 
     @pytest.mark.asyncio
     async def test_context_compact_emits_skipped_when_nothing_removed(
