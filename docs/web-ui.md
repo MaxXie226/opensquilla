@@ -10,6 +10,42 @@ The Control UI is the Vue product UI served by the gateway. The historical
 profiles still start, but it is deprecated, normalized to `"vue"`, and no
 longer activates the vanilla-JS client.
 
+## Control UI Asset Modes
+
+The Gateway resolves product UI assets independently from Core startup:
+
+```toml
+[control_ui]
+enabled = true
+assets_mode = "auto"       # auto | embedded | external | none
+assets_path = ""           # required only for external
+base_path = "/control"
+```
+
+- `auto` is the compatibility default. It uses a valid embedded bundle when
+  present and otherwise keeps the Gateway running with a neutral headless page.
+- `embedded` selects only the bundle packaged with OpenSquilla.
+- `external` selects an explicit local Vite `dist` directory (or its parent
+  containing `dist/`). The directory must include
+  `webui-artifact-manifest.json`; paths, inventory, sizes, SHA-256 digests,
+  symlinks, permissions, and entrypoint references are validated before files
+  are served.
+- `none` intentionally runs without a product UI. Gateway health/readiness,
+  WebSocket RPC, CLI, channels, Cron, and MCP do not depend on UI assets.
+- `enabled = false` removes the `/control` routes entirely.
+
+Relative `assets_path` values resolve from the Gateway config directory.
+Runtime overrides may use either
+`OPENSQUILLA_CONTROL_UI_ASSETS_MODE` / `OPENSQUILLA_CONTROL_UI_ASSETS_PATH`
+or the nested Gateway spellings
+`OPENSQUILLA_GATEWAY_CONTROL_UI__ASSETS_MODE` /
+`OPENSQUILLA_GATEWAY_CONTROL_UI__ASSETS_PATH`.
+
+External bundles are executable browser code. Do not point `assets_path` at an
+agent workspace, profile/state directory, session artifact, world-writable
+directory, symlink, junction, archive, or network URL. A rejected or missing
+bundle disables only the product UI; it does not make the Gateway unhealthy.
+
 ## Start the Web UI
 
 Run the gateway in the foreground:

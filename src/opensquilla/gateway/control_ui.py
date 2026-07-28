@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import time
 from pathlib import Path, PurePosixPath
 
+import anyio
 import structlog
+from starlette.exceptions import HTTPException
 from starlette.requests import Request
 from starlette.responses import HTMLResponse
 from starlette.routing import Mount, Route
@@ -16,6 +19,11 @@ from starlette.staticfiles import StaticFiles
 
 from opensquilla import __version__
 from opensquilla.gateway.config import GatewayConfig
+from opensquilla.gateway.control_ui_assets import (
+    ControlUiArtifactManifest,
+    ControlUiAssetResolver,
+    ControlUiAssets,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -99,6 +107,95 @@ class _CachedStaticFiles(StaticFiles):
         return response
 
 
+class _ManifestStaticFiles(_CachedStaticFiles):
+    """Serve only files admitted by a validated external artifact manifest."""
+
+    def __init__(
+        self,
+        *,
+        directory: str,
+        manifest: ControlUiArtifactManifest,
+    ) -> None:
+        super().__init__(directory=directory, check_dir=False)
+        self._directory = Path(directory)
+        self._expected = {
+            entry.path: entry for entry in manifest.files if entry.path != "index.html"
+        }
+        self._integrity_cache: dict[str, tuple[int, int, int, int]] = {}
+
+    @staticmethod
+    def _sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    async def get_response(self, path: str, scope):  # type: ignore[override]
+        normalized = PurePosixPath(path.replace(os.sep, "/")).as_posix().lstrip("/")
+        expected = self._expected.get(normalized)
+        if expected is None:
+            raise HTTPException(status_code=404)
+        candidate = self._directory.joinpath(*PurePosixPath(normalized).parts)
+        if candidate.is_symlink():
+            raise HTTPException(status_code=404)
+        try:
+            file_stat = candidate.stat()
+        except OSError as error:
+            raise HTTPException(status_code=404) from error
+        cache_key = (
+            int(getattr(file_stat, "st_ino", 0)),
+            file_stat.st_size,
+            file_stat.st_mtime_ns,
+            file_stat.st_ctime_ns,
+        )
+        if file_stat.st_size != expected.size:
+            raise HTTPException(status_code=404)
+        if self._integrity_cache.get(normalized) != cache_key:
+            try:
+                digest = await anyio.to_thread.run_sync(self._sha256, candidate)
+            except OSError as error:
+                raise HTTPException(status_code=404) from error
+            if digest != expected.sha256:
+                raise HTTPException(status_code=404)
+            self._integrity_cache[normalized] = cache_key
+        return await super().get_response(path, scope)
+
+
+class _ControlUiStaticFiles(_CachedStaticFiles):
+    """Keep one public static mount while allowing the Vite dist root to vary."""
+
+    def __init__(self, assets: ControlUiAssets) -> None:
+        super().__init__(
+            directory=str(assets.static_root) if assets.static_root is not None else None,
+            check_dir=False,
+        )
+        self._dist: _CachedStaticFiles | None = None
+        if assets.dist_root is not None:
+            if assets.mode == "external" and assets.manifest is not None:
+                self._dist = _ManifestStaticFiles(
+                    directory=str(assets.dist_root),
+                    manifest=assets.manifest,
+                )
+            else:
+                self._dist = _CachedStaticFiles(
+                    directory=str(assets.dist_root),
+                    check_dir=False,
+                )
+
+    async def get_response(self, path: str, scope):  # type: ignore[override]
+        normalized = path.replace(os.sep, "/").lstrip("/")
+        if normalized.startswith("dist/"):
+            if self._dist is None:
+                raise HTTPException(status_code=404)
+            return await self._dist.get_response(normalized.removeprefix("dist/"), scope)
+        if normalized == "dist":
+            if self._dist is None:
+                raise HTTPException(status_code=404)
+            return await self._dist.get_response("", scope)
+        return await super().get_response(path, scope)
+
+
 _TEMPLATE_DIR = Path(__file__).parent / "templates"
 _STATIC_DIR = Path(__file__).parent / "static"
 _DIST_DIR = _STATIC_DIR / "dist"
@@ -108,16 +205,20 @@ _TEMPLATE_VERSION_SUFFIX = str(int(time.time()))
 _jinja_env = None
 
 
-def _get_jinja_env():
+def _get_jinja_env(template_root: Path | None = None):
     global _jinja_env
-    if _jinja_env is None:
+    root = template_root or _TEMPLATE_DIR
+    if _jinja_env is None or root != _TEMPLATE_DIR:
         import jinja2
 
-        _jinja_env = jinja2.Environment(
-            loader=jinja2.FileSystemLoader(str(_TEMPLATE_DIR)),
+        env = jinja2.Environment(
+            loader=jinja2.FileSystemLoader(str(root)),
             autoescape=True,
         )
-        _jinja_env.filters["tojson"] = lambda v, **kw: json.dumps(v)
+        env.filters["tojson"] = lambda v, **kw: json.dumps(v)
+        if root != _TEMPLATE_DIR:
+            return env
+        _jinja_env = env
     return _jinja_env
 
 
@@ -233,7 +334,10 @@ def _vite_asset_url(raw_url: str, base_path: str) -> str:
     return raw_url
 
 
-def _read_vite_assets(base_path: str) -> tuple[str, list[str]]:
+def _read_vite_assets(
+    base_path: str,
+    dist_root: Path | None = None,
+) -> tuple[str, list[str]]:
     """Read the Vite-generated index.html and extract the main JS module and
     every entry stylesheet.
 
@@ -243,7 +347,7 @@ def _read_vite_assets(base_path: str) -> tuple[str, list[str]]:
     drops the main bundle and renders the page unstyled, so all of them must be
     injected.
     """
-    dist_index = _DIST_DIR / "index.html"
+    dist_index = (dist_root or _DIST_DIR) / "index.html"
     if not dist_index.exists():
         # The template turns this into an actionable diagnostic instead of a
         # blank Vue mount point. Standard distributions cannot reach this state
@@ -265,42 +369,133 @@ def _read_vite_assets(base_path: str) -> tuple[str, list[str]]:
     return (js_url, css_urls)
 
 
-def create_control_ui_routes(config: GatewayConfig) -> list[Route | Mount]:
-    """Create routes for the Control UI. Returns empty list if disabled."""
+def resolve_control_ui_assets(config: GatewayConfig) -> ControlUiAssets:
+    """Resolve assets using the compatibility globals existing tests may patch."""
+
+    return ControlUiAssetResolver(
+        config,
+        embedded_static_root=_STATIC_DIR,
+        embedded_dist_root=_DIST_DIR,
+        template_root=_TEMPLATE_DIR,
+    ).resolve()
+
+
+def _missing_assets_detail(assets: ControlUiAssets) -> str:
+    reason = assets.reason or "unavailable"
+    if reason == "explicit_none":
+        return (
+            "The Gateway is intentionally running without a product Control UI. "
+            "Use the CLI, a compatible client, or the public RPC interfaces."
+        )
+    if reason.startswith("external:"):
+        return (
+            "The configured external Control UI bundle was rejected by its path "
+            "or manifest validation. The Gateway core remains available."
+        )
+    return (
+        "The built Vue console was not found or failed validation, so the Control "
+        "UI will serve an 'assets are unavailable' notice instead of the console. "
+        "From a source checkout, build it with `cd opensquilla-webui && npm ci && "
+        "npm run build` (Node.js 22.12+ with npm) and restart or reload the page. "
+        "Release-wheel and Desktop installs should reinstall an official package."
+    )
+
+
+def _fallback_index_html(assets: ControlUiAssets) -> str:
+    reason = assets.reason or "unavailable"
+    if reason == "explicit_none":
+        title = "Gateway is running without a Control UI"
+        detail = "Use a compatible client, the CLI, or the Gateway RPC interfaces."
+    elif reason.startswith("external:"):
+        title = "Configured Control UI assets were rejected"
+        detail = "The Gateway core is healthy; verify the external bundle manifest."
+    else:
+        title = "Control UI assets are unavailable"
+        detail = "The Gateway core is healthy; reinstall or rebuild the Control UI bundle."
+    return (
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+        f"<title>{title}</title></head><body><main role=\"alert\"><h1>{title}</h1>"
+        f"<p>{detail}</p></main></body></html>"
+    )
+
+
+def create_control_ui_routes(
+    config: GatewayConfig,
+    assets: ControlUiAssets | None = None,
+) -> list[Route | Mount]:
+    """Create Control UI routes from a resolved, immutable asset description."""
+
     if not config.control_ui.enabled:
         return []
 
-    if not (_DIST_DIR / "index.html").exists():
-        # The served page already shows an actionable notice, but headless
-        # operators only watch logs — surface the same guidance at startup.
-        log.warning(
-            "control_ui.webui_assets_missing",
-            detail=(
-                "The built Vue console was not found, so the Control UI will "
-                "serve an 'assets are unavailable' notice instead of the "
-                "console. From a source checkout, build it with "
-                "`cd opensquilla-webui && npm ci && npm run build` "
-                "(Node.js 22.12+ with npm) and restart or reload the page. "
-                "Release-wheel and Desktop installs should reinstall an "
-                "official package."
-            ),
-            dist_dir=str(_DIST_DIR),
-        )
+    resolved = assets or resolve_control_ui_assets(config)
+    if not resolved.available:
+        detail = _missing_assets_detail(resolved)
+        if resolved.reason == "explicit_none":
+            log.info(
+                "control_ui.assets_disabled",
+                assets_mode="none",
+                detail=detail,
+            )
+        else:
+            # The served page already shows an actionable notice, but headless
+            # operators only watch logs — surface the same guidance at startup.
+            log.warning(
+                "control_ui.webui_assets_missing",
+                assets_mode=config.control_ui.assets_mode,
+                reason=resolved.reason,
+                detail=detail,
+                # Preserve the existing diagnostic field for embedded/source
+                # installs without exposing a configured external absolute path.
+                dist_dir=(
+                    str(_DIST_DIR)
+                    if config.control_ui.assets_mode in {"auto", "embedded"}
+                    else ""
+                ),
+            )
 
     base = config.control_ui.base_path
-    template = _get_jinja_env().get_template("index.html")
+    try:
+        template = _get_jinja_env(resolved.template_root).get_template("index.html")
+    except Exception:
+        template = None
+        log.warning(
+            "control_ui.template_missing",
+            detail="The neutral Control UI bootstrap template is unavailable.",
+        )
+    external_entry = (
+        (
+            _vite_asset_url(resolved.manifest.entry_scripts[0], base),
+            [
+                _vite_asset_url(relative, base)
+                for relative in resolved.manifest.entry_styles
+            ],
+        )
+        if resolved.mode == "external"
+        and resolved.manifest is not None
+        and resolved.manifest.entry_scripts
+        else None
+    )
 
     async def serve_index(request: Request) -> HTMLResponse:
         ctx = _build_bootstrap_context(config, request)
-        # Re-read latest Vite assets on every request so rebuilds are picked up
-        # without restarting the gateway.
-        live_js, live_css_urls = _read_vite_assets(base)
+        # Re-read the selected entrypoint on each request so an embedded source
+        # build is picked up without a restart. External entry URLs are frozen
+        # after validation and their files stay behind the manifest allowlist.
+        if external_entry is not None:
+            live_js, live_css_urls = external_entry
+        elif resolved.dist_root is not None:
+            live_js, live_css_urls = _read_vite_assets(base, resolved.dist_root)
+        else:
+            live_js, live_css_urls = ("", [])
         ctx["vite_js_url"] = live_js
         ctx["vite_css_urls"] = live_css_urls
         ctx["webui_artifact_missing"] = not live_js
+        ctx["control_ui_assets_mode"] = resolved.mode
+        ctx["control_ui_assets_reason"] = resolved.reason or ""
         # Back-compat single URL (first) for any consumer expecting one.
         ctx["vite_css_url"] = live_css_urls[0] if live_css_urls else ""
-        html = template.render(**ctx)
+        html = template.render(**ctx) if template is not None else _fallback_index_html(resolved)
         response = HTMLResponse(html)
         response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
         response.headers["Pragma"] = "no-cache"
@@ -310,7 +505,7 @@ def create_control_ui_routes(config: GatewayConfig) -> list[Route | Mount]:
     routes: list[Route | Mount] = [
         Mount(
             f"{base}/static",
-            app=_CachedStaticFiles(directory=str(_STATIC_DIR)),
+            app=_ControlUiStaticFiles(resolved),
             name="control_ui_static",
         ),
         Route(f"{base}/{{path:path}}", serve_index, methods=["GET"]),

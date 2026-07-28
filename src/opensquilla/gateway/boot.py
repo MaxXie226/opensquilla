@@ -3162,19 +3162,39 @@ async def start_gateway_server(
         config.mark_runtime_secret("auth.token")
         log.info("gateway.auth_token_generated")
 
-    # Gateway-specific: resolve Control UI root directory (boot order 17)
+    # Gateway-specific: resolve Control UI assets (boot order 17). A missing or
+    # rejected UI bundle must never make Core health, RPC, CLI, or channels fail
+    # to boot; the resolver degrades to an explicit ``none`` description.
+    control_ui_assets = None
     if config.control_ui.enabled:
-        from opensquilla.gateway.control_ui import _STATIC_DIR, _TEMPLATE_DIR
+        from opensquilla.gateway.control_ui import resolve_control_ui_assets
 
-        if not _TEMPLATE_DIR.is_dir():
-            log.warning("gateway.control_ui.templates_missing", path=str(_TEMPLATE_DIR))
-        if not _STATIC_DIR.is_dir():
-            log.warning("gateway.control_ui.static_missing", path=str(_STATIC_DIR))
+        control_ui_assets = resolve_control_ui_assets(config)
+        if not control_ui_assets.template_root.is_dir():
+            log.warning(
+                "gateway.control_ui.templates_missing",
+                path=str(control_ui_assets.template_root),
+            )
+        if control_ui_assets.static_root is None:
+            log.warning("gateway.control_ui.static_missing")
         log.info(
             "gateway.control_ui.resolved",
             base_path=config.control_ui.base_path,
-            templates=str(_TEMPLATE_DIR),
-            static=str(_STATIC_DIR),
+            requested_mode=config.control_ui.assets_mode,
+            effective_mode=control_ui_assets.mode,
+            assets_available=control_ui_assets.available,
+            reason=control_ui_assets.reason,
+            templates=str(control_ui_assets.template_root),
+            static=(
+                str(control_ui_assets.static_root)
+                if control_ui_assets.static_root is not None
+                else ""
+            ),
+            dist=(
+                str(control_ui_assets.dist_root)
+                if control_ui_assets.dist_root is not None
+                else ""
+            ),
         )
     else:
         log.info("gateway.control_ui.disabled")
@@ -4044,6 +4064,7 @@ async def start_gateway_server(
         memory_stores=svc.memory_stores,
         memory_retrievers=svc.memory_retrievers,
         extra_routes=webhook_routes or None,
+        control_ui_assets=control_ui_assets,
     )
     app.state.gateway_ready = False
     app.state.desktop_gateway_ownership = _desktop_gateway_ownership

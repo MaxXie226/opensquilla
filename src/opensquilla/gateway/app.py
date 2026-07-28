@@ -21,6 +21,7 @@ from opensquilla.gateway.approval_events import build_approval_snapshot_item
 from opensquilla.gateway.approval_queue import get_approval_queue
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.control_ui import create_control_ui_routes
+from opensquilla.gateway.control_ui_assets import ControlUiAssets
 from opensquilla.gateway.hello_capabilities import CAPABILITY_ARTIFACTS
 from opensquilla.gateway.middleware import (
     AuthMiddleware,
@@ -85,6 +86,7 @@ def create_gateway_app(
     memory_retrievers: dict[str, Any] | None = None,
     extra_routes: list[Route] | None = None,
     upload_store: Any = None,
+    control_ui_assets: ControlUiAssets | None = None,
 ) -> Starlette:
     """Build and return the Starlette ASGI application."""
     if diagnostics_state is None:
@@ -729,7 +731,7 @@ def create_gateway_app(
         routes.extend(extra_routes)
 
     # ── Control UI routes ────────────────────────────────────────────────
-    routes.extend(create_control_ui_routes(config))
+    routes.extend(create_control_ui_routes(config, control_ui_assets))
 
     # ── Middleware ───────────────────────────────────────────────────────────
 

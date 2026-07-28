@@ -52,6 +52,16 @@ _LEGACY_CONTROL_UI_FRONTEND_WARNING = (
     "retired vanilla-JS UI; Vue is always served. Remove this setting or set "
     "it to 'vue'."
 )
+_CONTROL_UI_ASSET_ENV_KEYS = {
+    "assets_mode": (
+        "OPENSQUILLA_GATEWAY_CONTROL_UI__ASSETS_MODE",
+        "OPENSQUILLA_CONTROL_UI_ASSETS_MODE",
+    ),
+    "assets_path": (
+        "OPENSQUILLA_GATEWAY_CONTROL_UI__ASSETS_PATH",
+        "OPENSQUILLA_CONTROL_UI_ASSETS_PATH",
+    ),
+}
 
 
 class ContextOverflowPolicy(StrEnum):
@@ -138,6 +148,12 @@ class ControlUiConfig(BaseSettings):
 
     enabled: bool = True
     base_path: str = "/control"
+    # ``auto`` preserves current installs: use the verified bundle embedded in
+    # the Python package when present, otherwise keep the Gateway headless.
+    # ``external`` is an explicit, manifest-validated client/deployment input;
+    # the Gateway never scans workspaces or profile directories for a bundle.
+    assets_mode: Literal["auto", "embedded", "external", "none"] = "auto"
+    assets_path: str = ""
     # Retained temporarily so existing TOML files and environment overrides do
     # not fail gateway validation after the vanilla-JS client is retired. Vue
     # is the only runtime value; the validator below maps the historical
@@ -154,6 +170,16 @@ class ControlUiConfig(BaseSettings):
     @classmethod
     def _strip_trailing_slash(cls, v: str) -> str:
         return v.rstrip("/")
+
+    @field_validator("assets_mode", mode="before")
+    @classmethod
+    def _normalize_assets_mode(cls, v: object) -> object:
+        return v.strip().lower() if isinstance(v, str) else v
+
+    @field_validator("assets_path", mode="before")
+    @classmethod
+    def _normalize_assets_path(cls, v: object) -> object:
+        return v.strip() if isinstance(v, str) else v
 
     @field_validator("frontend", mode="before")
     @classmethod
@@ -2829,6 +2855,52 @@ class GatewayConfig(BaseSettings):
             cfg.record_runtime_override(field_name, stored, applied)
 
     @classmethod
+    def _apply_control_ui_asset_env_overrides(
+        cls,
+        cfg: GatewayConfig,
+        stored_payload: dict[str, Any] | None,
+    ) -> None:
+        """Apply both supported UI-asset env spellings without persisting them.
+
+        Nested Pydantic settings correctly handle either spelling for a bare
+        ``GatewayConfig()``, but explicit TOML constructor data has higher
+        source priority. Runtime configuration promises env-over-TOML
+        precedence, so disk-load boundaries apply these two fields explicitly
+        and record their stored values for sparse persistence.
+        """
+
+        raw_control_ui = (
+            stored_payload.get("control_ui")
+            if isinstance(stored_payload, dict)
+            else None
+        )
+        stored_section = raw_control_ui if isinstance(raw_control_ui, dict) else {}
+        updates: dict[str, str] = {}
+        stored_values: dict[str, Any] = {}
+        for field_name, keys in _CONTROL_UI_ASSET_ENV_KEYS.items():
+            selected = next((os.environ[key] for key in keys if key in os.environ), None)
+            if selected is None:
+                continue
+            updates[field_name] = selected
+            stored_values[field_name] = stored_section.get(
+                field_name,
+                ControlUiConfig.model_fields[field_name].default,
+            )
+        if not updates:
+            return
+
+        payload = cfg.control_ui.model_dump(mode="python")
+        payload.update(updates)
+        updated = ControlUiConfig(**payload)
+        cfg.control_ui = updated
+        for field_name, stored in stored_values.items():
+            cfg.record_runtime_override(
+                f"control_ui.{field_name}",
+                stored,
+                getattr(updated, field_name),
+            )
+
+    @classmethod
     def load_from_toml(cls, path: str | Path) -> GatewayConfig:
         """Load config from a TOML file."""
         import tomllib
@@ -2838,6 +2910,7 @@ class GatewayConfig(BaseSettings):
             data = tomllib.load(f)
         migration = migrate_config_payload(data)
         cfg = cls(**migration.payload)
+        cls._apply_control_ui_asset_env_overrides(cfg, migration.payload)
         cfg._mark_env_absorbed_secrets(data)
         cls._apply_profile_path_overrides(cfg, target)
         if migration.changed:
@@ -2877,6 +2950,7 @@ class GatewayConfig(BaseSettings):
                     data = tomllib.load(f)
                 migration = migrate_config_payload(data, emit_diagnostics=not read_only)
                 cfg = cls(**migration.payload)
+                cls._apply_control_ui_asset_env_overrides(cfg, migration.payload)
                 cls._apply_profile_path_overrides(cfg, path)
                 if migration.changed and not read_only:
                     _rewrite_migrated_config_best_effort(path, migration)
@@ -2886,6 +2960,7 @@ class GatewayConfig(BaseSettings):
                 return cfg
 
         cfg = cls()
+        cls._apply_control_ui_asset_env_overrides(cfg, None)
         default_config_path = (
             candidates[0]
             if candidates

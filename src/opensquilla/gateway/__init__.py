@@ -9,7 +9,12 @@ from opensquilla.gateway.boot import (
     start_gateway_server,
 )
 from opensquilla.gateway.config import GatewayConfig
-from opensquilla.gateway.control_ui import create_control_ui_routes
+from opensquilla.gateway.control_ui import create_control_ui_routes, resolve_control_ui_assets
+from opensquilla.gateway.control_ui_assets import (
+    ControlUiArtifactManifest,
+    ControlUiAssetResolver,
+    ControlUiAssets,
+)
 from opensquilla.gateway.protocol import (
     DECLARED_EVENTS,
     PROTOCOL_VERSION,
@@ -44,6 +49,10 @@ __all__ = [
     "GatewayConfig",
     # Control UI
     "create_control_ui_routes",
+    "resolve_control_ui_assets",
+    "ControlUiArtifactManifest",
+    "ControlUiAssetResolver",
+    "ControlUiAssets",
     # Protocol frames
     "PROTOCOL_VERSION",
     "DECLARED_EVENTS",

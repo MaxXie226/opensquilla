@@ -58,6 +58,19 @@
 # diagnostics_enabled = false
 
 [control_ui]
+# Runtime asset selection. "auto" preserves current releases by using the
+# verified bundle embedded in the Python package and otherwise running
+# headless. "external" requires assets_path to name a local Vite dist directory
+# (or its parent containing dist/) with webui-artifact-manifest.json.
+# "embedded" requires the packaged bundle; "none" intentionally serves only a
+# neutral headless notice while Gateway health, RPC, CLI, and channels continue.
+# assets_mode = "auto"       # auto | embedded | external | none
+# assets_path = ""           # used only by external; relative to this config file
+#
+# Equivalent runtime overrides:
+# OPENSQUILLA_CONTROL_UI_ASSETS_MODE / OPENSQUILLA_CONTROL_UI_ASSETS_PATH
+# OPENSQUILLA_GATEWAY_CONTROL_UI__ASSETS_MODE / ...__ASSETS_PATH
+#
 # Vue is the only Control UI. The optional frontend key is retained temporarily
 # for config compatibility; historical "legacy" values are deprecated and are
 # treated as "vue" rather than selecting the retired vanilla-JS client.
