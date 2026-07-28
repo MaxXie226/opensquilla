@@ -265,8 +265,8 @@ def test_release_profile_preservation_probe_covers_identity_config_and_chat_db(
     assert last_message == ("Synthetic retained history message 0320 (contract-probe)",)
 
     runtime_config = (
-        f'state_dir = "{home / "state"}"\n'
-        f'workspace_dir = "{home / "workspace"}"\n'
+        f"state_dir = {json.dumps(str(home / 'state'))}\n"
+        f"workspace_dir = {json.dumps(str(home / 'workspace'))}\n"
         'search_provider = "duckduckgo"\n'
         "config_version = 1\n"
         "\n"
