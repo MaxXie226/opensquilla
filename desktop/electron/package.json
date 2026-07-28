@@ -41,7 +41,8 @@
     "test:profile-consolidation": "npm run build && node scripts/test-profile-consolidation-flow.mjs && node scripts/test-primary-repair-accessibility.mjs && node scripts/test-unsafe-legacy-recovery-no-write.mjs",
     "test:desktop-cleanup": "npm run build && node scripts/test-desktop-cleanup-contract.mjs",
     "test:desktop-cleanup-flow": "npm run build && node scripts/test-desktop-cleanup-flow.mjs",
-    "test:desktop-workbench": "npm run build && node scripts/test-native-workbench-surface.mjs && node scripts/test-native-workbench-surface-electron.mjs",
+    "test:preview-lease-broker": "npm run build && node scripts/test-artifact-preview-lease-broker.mjs",
+    "test:desktop-workbench": "npm run build && node scripts/test-artifact-preview-lease-broker.mjs && node scripts/test-native-workbench-surface.mjs && node scripts/test-native-workbench-surface-electron.mjs && node scripts/test-native-workbench-v2-electron.mjs",
     "test:mock-update-flow": "npm run build && node scripts/test-mock-update-flow.mjs",
     "test:onboarding-flow": "npm run build && node scripts/test-onboarding-flow.mjs",
     "start": "electron .",
@@ -55,8 +56,11 @@
     "@types/node": "^25.9.1",
     "electron": "^42.4.0",
     "electron-builder": "^26.8.1",
+    "gsap": "^3.15.0",
+    "lottie-web": "^5.13.0",
     "playwright": "^1.60.0",
-    "typescript": "^6.0.3"
+    "typescript": "^6.0.3",
+    "ws": "^8.21.1"
   },
   "build": {
     "appId": "ai.opensquilla.desktop",

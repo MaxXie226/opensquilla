@@ -1310,6 +1310,7 @@ def test_start_gateway_server_passes_tls_files_to_uvicorn(
         try:
             assert captured_config["ssl_keyfile"] == keyfile
             assert captured_config["ssl_certfile"] == certfile
+            assert captured_config["access_log"] is False
         finally:
             await server.close()
 

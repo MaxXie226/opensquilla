@@ -82,6 +82,7 @@ import {
   type DesktopExitPhase,
   type DesktopMainWindowCloseBehavior,
   type DesktopPreferencesFile,
+  type DesktopWorkbenchPreviewMode,
 } from './desktop-window-lifecycle.js'
 import {
   DESKTOP_DEEP_LINK_SCHEME,
@@ -89,8 +90,11 @@ import {
   parseDesktopDeepLink,
 } from './desktop-deep-link.js'
 import {
+  NATIVE_WORKBENCH_CAPABILITIES,
   NATIVE_WORKBENCH_ARTIFACT_SCHEME,
   parseNativeWorkbenchCreateRequest,
+  parseNativeWorkbenchNavigationRequest,
+  parseNativeWorkbenchPermissionResponse,
   parseNativeWorkbenchSurfaceId,
   parseNativeWorkbenchSurfaceRectRequest,
   type NativeWorkbenchSurfaceEvent,
@@ -99,6 +103,9 @@ import {
   NativeWorkbenchSurfaceManager,
 } from './native-workbench-surface.js'
 import { installDesktopZoomShortcuts } from './desktop-zoom-shortcuts.js'
+import {
+  ArtifactPreviewLeaseBroker,
+} from './artifact-preview-lease-broker.js'
 
 protocol.registerSchemesAsPrivileged([{
   scheme: NATIVE_WORKBENCH_ARTIFACT_SCHEME,
@@ -231,10 +238,17 @@ interface DesktopSettingsSnapshot {
 
 interface DesktopPreferencesPayload {
   mainWindowCloseBehavior?: unknown
+  workbenchPreviewMode?: unknown
+  workbenchPreviewNoticeShown?: unknown
 }
 
 interface DesktopPreferencesSnapshot {
+  schemaVersion: 2
   mainWindowCloseBehavior: DesktopMainWindowCloseBehavior
+  workbenchPreviewMode: DesktopWorkbenchPreviewMode
+  effectiveWorkbenchPreviewMode: DesktopWorkbenchPreviewMode
+  workbenchPreviewNoticeShown: boolean
+  workbenchPreviewForcedOffline: boolean
   canRunInBackground: boolean
   platform: 'darwin' | 'win32' | 'linux' | 'other'
 }
@@ -473,11 +487,26 @@ const gatewayState: GatewayState = {
   logPath: '',
 }
 
+const artifactPreviewLeaseBroker = new ArtifactPreviewLeaseBroker({
+  getOwnedGatewayUrl: () => (
+    gatewayState.owned && gatewayState.status === 'ready'
+      ? gatewayState.url
+      : null
+  ),
+})
+
 const nativeWorkbenchSurfaces = new NativeWorkbenchSurfaceManager({
+  forceArtifactPreviewsOffline: process.env.OPENSQUILLA_PREVIEW_FORCE_OFFLINE === '1',
+  getPrivilegedGatewayUrl: () => (
+    gatewayState.status === 'ready' && gatewayState.url
+      ? gatewayState.url
+      : null
+  ),
   getWindow: () => currentMainWindow(),
   emit: event => {
     if (event.type === 'error' || event.type === 'crashed') {
       desktopLog('native_workbench_surface_failed', {
+        platform: process.platform,
         type: event.type,
         reason: nativeWorkbenchFailureReason(event),
       })
@@ -1994,8 +2023,16 @@ function loadDesktopPreferencesRecord(): {
 
 function desktopPreferencesSnapshot(): DesktopPreferencesSnapshot {
   const preferences = loadDesktopPreferencesRecord().value
+  const previewForcedOffline = process.env.OPENSQUILLA_PREVIEW_FORCE_OFFLINE === '1'
   return {
+    schemaVersion: 2,
     mainWindowCloseBehavior: preferences.main_window_close_behavior,
+    workbenchPreviewMode: preferences.workbench_preview_mode,
+    effectiveWorkbenchPreviewMode: previewForcedOffline
+      ? 'offline'
+      : preferences.workbench_preview_mode,
+    workbenchPreviewNoticeShown: preferences.workbench_preview_notice_shown,
+    workbenchPreviewForcedOffline: previewForcedOffline,
     canRunInBackground: canRunDesktopInBackground(),
     platform: desktopPlatformName(),
   }
@@ -2034,15 +2071,39 @@ async function saveDesktopPreferences(
   payload: DesktopPreferencesPayload,
 ): Promise<DesktopPreferencesSnapshot> {
   const behavior = payload?.mainWindowCloseBehavior
-  if (behavior !== 'background' && behavior !== 'quit' && behavior !== 'ask') {
+  const previewMode = payload?.workbenchPreviewMode
+  const previewNoticeShown = payload?.workbenchPreviewNoticeShown
+  if (
+    behavior !== undefined
+    && behavior !== 'background'
+    && behavior !== 'quit'
+    && behavior !== 'ask'
+  ) {
     throw new Error('Choose a supported main-window close behavior.')
   }
-  if (behavior !== 'quit' && !canRunDesktopInBackground()) {
+  if (behavior !== undefined && behavior !== 'quit' && !canRunDesktopInBackground()) {
     throw new Error('Background window mode is unavailable because no restore surface is active.')
+  }
+  if (previewMode !== undefined && previewMode !== 'full' && previewMode !== 'offline') {
+    throw new Error('Choose a supported Workbench preview mode.')
+  }
+  if (previewNoticeShown !== undefined && typeof previewNoticeShown !== 'boolean') {
+    throw new Error('The Workbench preview notice state is invalid.')
+  }
+  if (
+    behavior === undefined
+    && previewMode === undefined
+    && previewNoticeShown === undefined
+  ) {
+    throw new Error('No supported Desktop preference was provided.')
   }
   return await enqueueDesktopPreferencesUpdate((current) => ({
     ...current,
-    main_window_close_behavior: behavior,
+    ...(behavior !== undefined ? { main_window_close_behavior: behavior } : {}),
+    ...(previewMode !== undefined ? { workbench_preview_mode: previewMode } : {}),
+    ...(previewNoticeShown !== undefined
+      ? { workbench_preview_notice_shown: previewNoticeShown }
+      : {}),
   }))
 }
 
@@ -2549,6 +2610,7 @@ async function saveDesktopSettings(payload: DesktopSettingsPayload): Promise<Des
 }
 
 function clearReusableGatewayState(): void {
+  artifactPreviewLeaseBroker.clear()
   gatewayState.url = ''
   gatewayState.port = 0
   gatewayState.owned = false
@@ -7671,6 +7733,7 @@ async function recoverVerifiedOrphanGatewayBeforeSpawn(
 async function startGateway(): Promise<GatewayState> {
   const reusableGateway = forceOnboardingOnNextStartup ? null : await reuseHealthyGatewayState()
   if (reusableGateway) return reusableGateway
+  artifactPreviewLeaseBroker.clear()
 
   assertSupportedMacInstallLocation()
 
@@ -8462,6 +8525,7 @@ function terminateGatewayProcess(
 }
 
 function stopGateway(): void {
+  artifactPreviewLeaseBroker.clear()
   if (!gatewayProcess || !gatewayState.owned) return
   const child = gatewayProcess
   const url = gatewayState.url
@@ -10065,11 +10129,57 @@ ipcMain.handle('desktop:workspace:choose-directory', async (event) => {
   if (choice.canceled || choice.filePaths.length !== 1) return null
   return { path: resolve(choice.filePaths[0]!) }
 })
+ipcMain.handle('desktop:workbench:capabilities', (event) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted native Workbench request.')
+  return process.env.OPENSQUILLA_PREVIEW_FORCE_OFFLINE === '1'
+    ? { ...NATIVE_WORKBENCH_CAPABILITIES, modes: ['offline'] as const }
+    : NATIVE_WORKBENCH_CAPABILITIES
+})
+ipcMain.handle('desktop:workbench:preview-lease:create', async (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted native Workbench request.')
+  return await artifactPreviewLeaseBroker.create(payload)
+})
+ipcMain.handle('desktop:workbench:preview-lease:renew', async (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted native Workbench request.')
+  return await artifactPreviewLeaseBroker.renew(payload)
+})
+ipcMain.handle('desktop:workbench:preview-lease:revoke', async (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted native Workbench request.')
+  return await artifactPreviewLeaseBroker.revoke(payload)
+})
 ipcMain.handle('desktop:workbench:surface:create', async (event, payload: unknown) => {
   if (!trustedControlUiIpc(event)) throw new Error('Untrusted native Workbench request.')
   try {
-    return await nativeWorkbenchSurfaces.createSurface(
-      parseNativeWorkbenchCreateRequest(payload),
+    const request = parseNativeWorkbenchCreateRequest(payload)
+    if (
+      request.kind === 'artifact-preview'
+      && !artifactPreviewLeaseBroker.authorizesSurface(request.payload)
+    ) {
+      return {
+        ok: false,
+        message: 'The artifact preview lease is not authorized by this Desktop Gateway.',
+      }
+    }
+    return await nativeWorkbenchSurfaces.createSurface(request)
+  } catch (error) {
+    return { ok: false, message: error instanceof Error ? error.message : String(error) }
+  }
+})
+ipcMain.handle('desktop:workbench:surface:navigate', async (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted native Workbench request.')
+  try {
+    return await nativeWorkbenchSurfaces.navigateSurface(
+      parseNativeWorkbenchNavigationRequest(payload),
+    )
+  } catch (error) {
+    return { ok: false, message: error instanceof Error ? error.message : String(error) }
+  }
+})
+ipcMain.handle('desktop:workbench:permission:respond', (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted native Workbench request.')
+  try {
+    return nativeWorkbenchSurfaces.respondToPermission(
+      parseNativeWorkbenchPermissionResponse(payload),
     )
   } catch (error) {
     return { ok: false, message: error instanceof Error ? error.message : String(error) }
@@ -12281,6 +12391,7 @@ async function drainOwnedGatewayForQuit(
 
 app.on('before-quit', (event) => {
   desktopUpdateCheckScheduler.stop()
+  artifactPreviewLeaseBroker.clear()
   // Remove native child views immediately so they cannot outlive the trusted
   // Control UI while the gateway/writer shutdown drain keeps Electron alive.
   void nativeWorkbenchSurfaces.destroyAll()
