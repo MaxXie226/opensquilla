@@ -1085,7 +1085,7 @@ def test_handle_bound_reads_preserve_mode_mtime_and_history_order(tmp_path: Path
     )
 
     assert exists is True
-    assert content == "# User\nAlice\n"
+    assert content.encode("utf-8") == paths.user_path.read_bytes()
     assert mode == expected_mode
 
     paths.imports_dir.mkdir(parents=True)
@@ -1606,7 +1606,7 @@ async def test_rollback_restores_a_crash_gap_only_when_the_candidate_is_still_ow
         target,
         transaction_id,
     )
-    temporary.write_text(plan.after_content, encoding="utf-8")
+    temporary.write_bytes(plan.after_content.encode("utf-8"))
     profile_import_transaction.native_move_no_replace(target, backup)
 
     profile_import_transaction._rollback_plan(
@@ -1615,7 +1615,7 @@ async def test_rollback_restores_a_crash_gap_only_when_the_candidate_is_still_ow
         transaction_id=transaction_id,
     )
 
-    assert target.read_text(encoding="utf-8") == plan.before_content
+    assert target.read_bytes() == plan.before_content.encode("utf-8")
     assert not backup.exists()
     assert not temporary.exists()
 
