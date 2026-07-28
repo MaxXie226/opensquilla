@@ -8,6 +8,7 @@ import os
 import re
 import stat
 from dataclasses import dataclass, replace
+from html.parser import HTMLParser
 from pathlib import Path, PurePosixPath
 from typing import Literal
 
@@ -186,7 +187,68 @@ def _directory_files(root: Path) -> dict[str, Path]:
     return files
 
 
-def _entry_references(index: bytes) -> tuple[str, ...]:
+class _IndexReferenceParser(HTMLParser):
+    """Collect URL-bearing tags while preserving their entrypoint roles."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.references: list[str] = []
+        self.entry_scripts: list[str] = []
+        self.entry_styles: list[str] = []
+
+    def handle_starttag(
+        self,
+        tag: str,
+        attrs: list[tuple[str, str | None]],
+    ) -> None:
+        attributes = {
+            name.lower(): value
+            for name, value in attrs
+            if value is not None
+        }
+        src = attributes.get("src")
+        href = attributes.get("href")
+        if src is not None:
+            self.references.append(src)
+        if href is not None:
+            self.references.append(href)
+
+        if (
+            tag.lower() == "script"
+            and attributes.get("type", "").strip().lower() == "module"
+            and src is not None
+        ):
+            self.entry_scripts.append(src)
+        if (
+            tag.lower() == "link"
+            and "stylesheet" in attributes.get("rel", "").lower().split()
+            and href is not None
+        ):
+            self.entry_styles.append(href)
+
+
+def _normalize_index_reference(raw: str) -> str | None:
+    if raw.startswith(("data:", "#")):
+        return None
+    if raw.lower().startswith(("http://", "https://", "//")):
+        raise ControlUiAssetError(
+            "index_remote_asset",
+            "The Control UI index references a network asset.",
+        )
+    relative = raw.split("?", 1)[0].split("#", 1)[0]
+    marker = "/static/dist/"
+    if relative.startswith("/") and marker in relative:
+        relative = relative.split(marker, 1)[1]
+    else:
+        relative = relative.removeprefix("./")
+    if not relative:
+        return None
+    return _safe_manifest_path(relative)
+
+
+def _index_references(
+    index: bytes,
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
     try:
         html = index.decode("utf-8")
     except UnicodeDecodeError as error:
@@ -195,25 +257,21 @@ def _entry_references(index: bytes) -> tuple[str, ...]:
             "The Control UI index is not valid UTF-8.",
         ) from error
 
-    references: list[str] = []
-    for raw in re.findall(r'\b(?:src|href)="([^"]+)"', html):
-        if raw.startswith(("data:", "#")):
-            continue
-        if raw.startswith(("http://", "https://", "//")):
-            raise ControlUiAssetError(
-                "index_remote_asset",
-                "The Control UI index references a network asset.",
-            )
-        relative = raw.split("?", 1)[0].split("#", 1)[0]
-        marker = "/static/dist/"
-        if relative.startswith("/") and marker in relative:
-            relative = relative.split(marker, 1)[1]
-        else:
-            relative = relative.removeprefix("./")
-        if not relative:
-            continue
-        references.append(_safe_manifest_path(relative))
-    return tuple(references)
+    parser = _IndexReferenceParser()
+    parser.feed(html)
+
+    def normalized(values: list[str]) -> tuple[str, ...]:
+        return tuple(
+            reference
+            for raw in values
+            if (reference := _normalize_index_reference(raw)) is not None
+        )
+
+    return (
+        normalized(parser.references),
+        normalized(parser.entry_scripts),
+        normalized(parser.entry_styles),
+    )
 
 
 def _parse_manifest(raw: object) -> ControlUiArtifactManifest:
@@ -384,11 +442,9 @@ def validate_control_ui_artifact(
             "index_missing",
             "The Control UI entrypoint is missing.",
         )
-    references = _entry_references(validated_index_path.read_bytes())
-    entry_scripts = tuple(
-        path for path in references if path.lower().endswith((".js", ".mjs"))
+    references, entry_scripts, entry_styles = _index_references(
+        validated_index_path.read_bytes()
     )
-    entry_styles = tuple(path for path in references if path.lower().endswith(".css"))
     if not entry_scripts:
         raise ControlUiAssetError(
             "index_script_missing",
@@ -481,7 +537,7 @@ class ControlUiAssetResolver:
             )
         try:
             resolved = candidate.resolve(strict=True)
-        except OSError as error:
+        except (OSError, RuntimeError) as error:
             raise ControlUiAssetError(
                 "external_path_missing",
                 "The external Control UI asset directory is unavailable.",
@@ -506,7 +562,13 @@ class ControlUiAssetResolver:
                 "external_dist_link",
                 "The external Control UI bundle cannot be a symbolic link or junction.",
             )
-        return dist_root.resolve(strict=True)
+        try:
+            return dist_root.resolve(strict=True)
+        except (OSError, RuntimeError) as error:
+            raise ControlUiAssetError(
+                "external_path_missing",
+                "The external Control UI asset directory is unavailable.",
+            ) from error
 
     def _reject_runtime_data_root(self, dist_root: Path) -> None:
         roots: list[Path] = [default_opensquilla_home()]
@@ -516,7 +578,7 @@ class ControlUiAssetResolver:
         for root in roots:
             try:
                 resolved_root = root.resolve(strict=False)
-            except OSError:
+            except (OSError, RuntimeError):
                 continue
             if dist_root == resolved_root or _is_within(dist_root, resolved_root):
                 raise ControlUiAssetError(

@@ -133,6 +133,31 @@ def test_external_path_may_point_to_static_parent_containing_dist(tmp_path: Path
     assert resolved.dist_root == dist.resolve()
 
 
+def test_external_entry_ignores_modulepreload_before_main_script(tmp_path: Path) -> None:
+    dist = _artifact(tmp_path / "modulepreload-first")
+    (dist / "assets/vendor.js").write_text("export const vendor = true;\n", encoding="utf-8")
+    (dist / "index.html").write_text(
+        '<link rel="modulepreload" href="./assets/vendor.js">'
+        '<link href="./assets/app.css" rel="stylesheet">'
+        '<script crossorigin src="./assets/app.js" type="module"></script>',
+        encoding="utf-8",
+    )
+    _rewrite_manifest(dist)
+    config = GatewayConfig(
+        control_ui={
+            "assets_mode": "external",
+            "assets_path": str(dist),
+        }
+    )
+
+    resolved = _resolve(config, tmp_path)
+
+    assert resolved.mode == "external"
+    assert resolved.manifest is not None
+    assert resolved.manifest.entry_scripts == ("assets/app.js",)
+    assert resolved.manifest.entry_styles == ("assets/app.css",)
+
+
 def test_relative_external_path_resolves_from_config_directory(tmp_path: Path) -> None:
     profile = tmp_path / "operator-config"
     profile.mkdir()
@@ -268,6 +293,27 @@ def test_external_bundle_rejects_symbolic_linked_root(tmp_path: Path) -> None:
 
     assert resolved.mode == "none"
     assert resolved.reason == "external:external_root_link"
+
+
+def test_external_bundle_symlink_loop_does_not_break_gateway_resolution(
+    tmp_path: Path,
+) -> None:
+    loop = tmp_path / "loop"
+    try:
+        loop.symlink_to(loop, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"symlinks unavailable on this platform: {error}")
+    config = GatewayConfig(
+        control_ui={
+            "assets_mode": "external",
+            "assets_path": str(loop / "dist"),
+        }
+    )
+
+    resolved = _resolve(config, tmp_path)
+
+    assert resolved.mode == "none"
+    assert resolved.reason == "external:external_path_missing"
 
 
 def test_external_bundle_cannot_live_under_runtime_workspace(tmp_path: Path) -> None:
