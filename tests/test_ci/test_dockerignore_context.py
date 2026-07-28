@@ -43,9 +43,8 @@ def test_dockerignore_filters_real_build_context(tmp_path: Path) -> None:
         "stale bundle\n",
     )
 
-    # Nested dotfiles and private BGM remain supported inputs. The former is
-    # harmless build metadata; the latter is deliberately allowed for local
-    # images and rejected separately for official images.
+    # The public runtime image is headless, so even otherwise harmless client
+    # metadata and local-only media must remain outside its build context.
     _write(context / "opensquilla-webui/.node-version", "22.12.0\n")
     _write(context / "opensquilla-webui/public/music/local.mp3", "local music\n")
     _write(context / "src/opensquilla/__init__.py")
@@ -69,13 +68,10 @@ def test_dockerignore_filters_real_build_context(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stdout + result.stderr
 
     copied = output / "context"
-    assert (copied / "opensquilla-webui/.node-version").is_file()
-    assert (copied / "opensquilla-webui/public/music/local.mp3").is_file()
     assert (copied / "src/opensquilla/__init__.py").is_file()
 
     assert not (copied / ".env").exists()
-    assert not (copied / "opensquilla-webui/.env.local").exists()
-    assert not (copied / "opensquilla-webui/.npmrc").exists()
+    assert not (copied / "opensquilla-webui").exists()
     assert not (copied / "config/tls/server.pem").exists()
     assert not (copied / "config/tls/server.key").exists()
     assert not (copied / "src/opensquilla/gateway/static/dist").exists()
