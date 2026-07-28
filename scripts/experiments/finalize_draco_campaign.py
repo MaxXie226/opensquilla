@@ -32,6 +32,15 @@ from functools import cache
 from pathlib import Path
 from typing import Any
 
+from opensquilla.usage_evidence import (
+    MISSING_USAGE_PLACEHOLDER_ROLES,
+    UsageEvidenceError,
+    canonical_run_usage_units,
+    canonicalize_run_usage,
+    derive_physical_request_count,
+    usage_units,
+)
+
 GROUPS = ("B0", "B1", "B2", "B4", "G1")
 GROUP_SET = frozenset(GROUPS)
 RESULT_EVIDENCE_SCHEMA = "opensquilla.draco.result-evidence/v1"
@@ -49,7 +58,7 @@ ENSEMBLE_OUTPUT_BINDING_SCHEMA = "opensquilla.ensemble-output-binding/v1"
 JUDGE_ATTEMPT_BUDGET_SCOPE = "criterion_repeat_campaign"
 JUDGE_ATTEMPT_BUDGET_LIMIT = 3
 JUDGE_ATTEMPT_BUDGET_EXHAUSTED_ERROR = "judge_attempt_budget_exhausted"
-FINALIZER_VERSION = 4
+FINALIZER_VERSION = 5
 FROZEN_DRACO_MINI_TASK_COUNT = 10
 FROZEN_DRACO_MINI_SHA256 = "1eb4e618c8df8e7f68bded3d2b6f77a541744aa1072eb338835b776183188a8d"
 FORMAL_REQUIRED_STABLE_POLL_COUNT = 6
@@ -167,18 +176,6 @@ ALLOWED_NON_GENERATION_ERRORS = frozenset(
         "judge_incomplete",
         "openrouter_non_byok_metadata_incomplete",
         "openrouter_non_byok_verification_failed",
-    }
-)
-MISSING_USAGE_PLACEHOLDER_ROLES = frozenset(
-    {
-        "abandoned_stream",
-        "usage_missing",
-        "unknown_call",
-        "abandoned_stream_request",
-        "agent_llm_request_unknown",
-        "abandoned_provider_request",
-        "unknown_request",
-        "incomplete_stream",
     }
 )
 POLICY_VIOLATION_ERRORS = frozenset(
@@ -1275,14 +1272,20 @@ def immutable_attempt_payload(attempt: Mapping[str, Any]) -> dict[str, Any]:
     """Project attempt fields a later receipt repair may not change."""
 
     run = attempt.get("run")
+    attempt_id = str(attempt.get("attempt_id") or "")
+    canonical_run = (
+        _canonicalized_run(run, identity_seed=f"generation-attempt:{attempt_id}")
+        if isinstance(run, Mapping)
+        else None
+    )
     immutable_run = (
         {
-            "error": run.get("error"),
-            "final_text_sha256": run.get("final_text_sha256"),
-            "llm_request_count": run.get("llm_request_count"),
-            "usage": usage_generation_identity_contract(run.get("usage")),
+            "error": canonical_run.get("error"),
+            "final_text_sha256": canonical_run.get("final_text_sha256"),
+            "llm_request_count": canonical_run.get("llm_request_count"),
+            "usage": usage_generation_identity_contract(canonical_run.get("usage")),
         }
-        if isinstance(run, Mapping)
+        if canonical_run is not None
         else None
     )
     return {
@@ -1386,8 +1389,16 @@ def validate_generation_attempt_evidence(
             run = attempt.get("run")
             if not isinstance(run, Mapping):
                 raise FinalizationError("generation attempt lacks a run payload")
+            canonical_run = _canonicalized_run(
+                run,
+                identity_seed=f"generation-attempt:{attempt_id}",
+            )
             if attempt.get("attempt_kind") == "provider_build_after_paid_setup" and (
-                run_expected_request_count(run) < 1 or not usage_units(run.get("usage"))
+                run_expected_request_count(canonical_run) < 1
+                or not canonical_run_usage_units(
+                    canonical_run,
+                    identity_seed=f"generation-attempt:{attempt_id}",
+                )
             ):
                 raise FinalizationError("paid provider-build attempt lacks physical setup evidence")
             payload_sha = canonical_sha256(immutable_attempt_payload(attempt))
@@ -1477,15 +1488,6 @@ def generation_attempt_count(row: Mapping[str, Any]) -> int:
     return count
 
 
-def usage_units(usage: Any) -> list[dict[str, Any]]:
-    if not isinstance(usage, Mapping) or not usage:
-        return []
-    breakdown = usage.get("model_usage_breakdown")
-    if isinstance(breakdown, list) and breakdown:
-        return [dict(item) for item in breakdown if isinstance(item, Mapping)]
-    return [dict(usage)]
-
-
 def selected_usage_models(row: Mapping[str, Any]) -> set[str]:
     return {
         str(unit.get("model") or "").strip()
@@ -1531,6 +1533,60 @@ def _is_unknown_task_analyzer_placeholder(unit: Mapping[str, Any]) -> bool:
     )
 
 
+def _is_unknown_judge_placeholder(unit: Mapping[str, Any]) -> bool:
+    """Return whether *unit* is a fail-closed unknown Judge request.
+
+    A transiently failed OpenRouter request has no actual serving identity or
+    successful router receipt to authenticate.  It may still be represented
+    in the physical ledger, but only when its frozen requested route and
+    explicit unknown-usage provenance are present.
+    """
+
+    def explicit_zero(field: str, *, optional: bool = False) -> bool:
+        if optional and field not in unit:
+            return True
+        value = unit.get(field)
+        return (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+            and float(value) == 0.0
+        )
+
+    provider_usage = unit.get("provider_usage")
+    evidence_id = str(unit.get("usage_evidence_id") or "")
+    return (
+        str(unit.get("role") or "").strip().casefold() in MISSING_USAGE_PLACEHOLDER_ROLES
+        and str(unit.get("provider") or "").strip() == ""
+        and str(unit.get("model") or "").strip() == ""
+        and str(unit.get("requested_provider") or "").strip().casefold() == "openrouter"
+        and str(unit.get("requested_model") or "").strip() == JUDGE_MODEL
+        and explicit_zero("input_tokens")
+        and explicit_zero("output_tokens")
+        and explicit_zero("reasoning_tokens")
+        and explicit_zero("cached_tokens")
+        and explicit_zero("cache_read_tokens", optional=True)
+        and explicit_zero("cache_write_tokens")
+        and finite_number(unit.get("billed_cost"))
+        and float(unit["billed_cost"]) == 0.0
+        and str(unit.get("cost_source") or "").strip().casefold() == "none"
+        and unit.get("usage_unknown") is True
+        and unit.get("usage_evidence_schema") == "opensquilla.usage-evidence/v1"
+        and unit.get("usage_evidence_source") == "physical_request_counter_deficit"
+        and SHA256_VALUE.fullmatch(evidence_id) is not None
+        and isinstance(unit.get("physical_request_ordinal"), int)
+        and not isinstance(unit.get("physical_request_ordinal"), bool)
+        and int(unit["physical_request_ordinal"]) >= 1
+        and isinstance(provider_usage, Mapping)
+        and provider_usage.get("usage_unknown") is True
+        and provider_usage.get("usage_evidence_schema")
+        == "opensquilla.usage-evidence/v1"
+        and provider_usage.get("usage_evidence_id") == evidence_id
+        and not response_ids(unit)
+        and not _successful_router_bindings(unit)
+    )
+
+
 def usage_route_reasons(
     usage: Any,
     *,
@@ -1538,6 +1594,7 @@ def usage_route_reasons(
     provider_pins: Mapping[str, str] | None = None,
     role_model_pins: Mapping[str, str] | None = None,
     allow_unknown_task_analyzer_attempts: bool = False,
+    allow_unknown_judge_attempts: bool = False,
 ) -> list[str]:
     reasons: list[str] = []
     units = usage_units(usage)
@@ -1562,6 +1619,9 @@ def usage_route_reasons(
         if role in MISSING_USAGE_PLACEHOLDER_ROLES:
             unknown_analyzer_allowed = (
                 allow_unknown_task_analyzer_attempts and _is_unknown_task_analyzer_placeholder(unit)
+            )
+            unknown_judge_allowed = (
+                allow_unknown_judge_attempts and _is_unknown_judge_placeholder(unit)
             )
             provider = str(unit.get("provider") or "").strip().casefold()
             requested_provider = str(unit.get("requested_provider") or "").strip().casefold()
@@ -1666,6 +1726,10 @@ def usage_route_reasons(
                     reasons.append("router_receipt_provider_not_bound_to_formal_route")
             if unknown_analyzer_allowed:
                 represented += 1
+            elif unknown_judge_allowed:
+                represented += 1
+            elif allow_unknown_judge_attempts:
+                reasons.append("invalid_unknown_judge_usage_placeholder")
             # The runner emits an explicit placeholder for a physical request whose
             # response usage could not be recovered.  Preserve it for account-level
             # reconciliation.  Missing fields remain unknown, while every field and
@@ -1852,13 +1916,44 @@ def _successful_router_bindings(unit: Mapping[str, Any]) -> set[tuple[str, str]]
     return bindings
 
 
+def _canonicalized_run(
+    run: Mapping[str, Any],
+    *,
+    identity_seed: str,
+    requested_provider: str | None = None,
+    requested_model: str | None = None,
+    role: str | None = None,
+) -> dict[str, Any]:
+    """Return an in-memory canonical run without changing sealed wave input."""
+
+    normalized = copy.deepcopy(dict(run))
+    try:
+        normalized["usage"] = canonicalize_run_usage(
+            run,
+            identity_seed=identity_seed,
+            requested_provider=requested_provider,
+            requested_model=requested_model,
+            role=role,
+        )
+    except UsageEvidenceError as exc:
+        raise FinalizationError(
+            f"{identity_seed} has invalid physical usage evidence: {exc}"
+        ) from exc
+    return normalized
+
+
 def run_receipt_enrichment(
     run: Any,
     *,
+    identity_seed: str,
     source_index: int,
     line: int,
 ) -> tuple[int, int, int]:
-    units = usage_units(run.get("usage")) if isinstance(run, Mapping) else []
+    units = (
+        canonical_run_usage_units(run, identity_seed=identity_seed)
+        if isinstance(run, Mapping)
+        else []
+    )
     score = 0
     for unit in units:
         score += len(response_ids(unit)) * 20
@@ -1887,27 +1982,43 @@ def validate_and_select_monotonic_run_version(
     versions: Sequence[tuple[SourceRecord, Mapping[str, Any]]],
     *,
     label: str,
+    identity_seed: str,
+    requested_provider: str | None = None,
+    requested_model: str | None = None,
+    role: str | None = None,
 ) -> tuple[SourceRecord, Mapping[str, Any]]:
     """Allow receipt backfill only; reject conflicting or regressive copies."""
 
     if not versions:
         raise FinalizationError(f"{label} has no physical run versions")
     ordered = sorted(
-        versions,
+        (
+            (
+                record,
+                _canonicalized_run(
+                    run,
+                    identity_seed=identity_seed,
+                    requested_provider=requested_provider,
+                    requested_model=requested_model,
+                    role=role,
+                ),
+            )
+            for record, run in versions
+        ),
         key=lambda value: (value[0].source_index, value[0].line),
     )
     expected_request_count: int | None = None
     prior_units: list[dict[str, Any]] | None = None
     exact_costs_by_unit: dict[int, set[Decimal]] = defaultdict(set)
     for record, run in ordered:
-        request_count = run_expected_request_count(run)
+        request_count = derive_physical_request_count(run)
         if expected_request_count is None:
             expected_request_count = request_count
         elif request_count != expected_request_count:
             raise FinalizationError(
                 f"{label} changed its physical request count across receipt repairs"
             )
-        units = usage_units(run.get("usage"))
+        units = canonical_run_usage_units(run, identity_seed=identity_seed)
         if len(units) != expected_request_count:
             raise FinalizationError(f"{label} does not represent every physical request in usage")
         if prior_units is not None and len(units) != len(prior_units):
@@ -1965,6 +2076,7 @@ def validate_and_select_monotonic_run_version(
         ordered,
         key=lambda version: run_receipt_enrichment(
             version[1],
+            identity_seed=identity_seed,
             source_index=version[0].source_index,
             line=version[0].line,
         ),
@@ -1972,16 +2084,63 @@ def validate_and_select_monotonic_run_version(
     return selected_record, selected_run
 
 
+def canonical_judge_run_route_reasons(
+    run: Mapping[str, Any],
+    *,
+    attempt_id: str,
+) -> tuple[dict[str, Any], list[str]]:
+    """Canonicalize one Judge run and apply the frozen route contract."""
+
+    canonical_run = _canonicalized_run(
+        run,
+        identity_seed=f"judge-attempt:{attempt_id}",
+        requested_provider="openrouter",
+        requested_model=JUDGE_MODEL,
+        role="unknown_request",
+    )
+    has_unknown_placeholders = any(
+        str(unit.get("role") or "").strip().casefold() in MISSING_USAGE_PLACEHOLDER_ROLES
+        for unit in canonical_run_usage_units(
+            canonical_run,
+            identity_seed=f"judge-attempt:{attempt_id}",
+        )
+    )
+    reasons: list[str] = []
+    if has_unknown_placeholders and not str(canonical_run.get("error") or "").strip():
+        reasons.append("successful_judge_has_unknown_usage")
+    reasons.extend(
+        usage_route_reasons(
+            canonical_run.get("usage"),
+            allowed_models={JUDGE_MODEL},
+            provider_pins={JUDGE_MODEL: FORMAL_UPSTREAM_PINS[JUDGE_MODEL]},
+            allow_unknown_judge_attempts=has_unknown_placeholders,
+        )
+    )
+    return canonical_run, list(dict.fromkeys(reasons))
+
+
 def immutable_judge_attempt_payload(attempt: Mapping[str, Any]) -> dict[str, Any]:
     run = attempt.get("run")
+    attempt_id = str(attempt.get("attempt_id") or "")
+    canonical_run = (
+        _canonicalized_run(
+            run,
+            identity_seed=f"judge-attempt:{attempt_id}",
+            requested_provider="openrouter",
+            requested_model=JUDGE_MODEL,
+            role="unknown_request",
+        )
+        if isinstance(run, Mapping)
+        else None
+    )
     immutable_run = (
         {
-            "error": run.get("error"),
-            "final_text_sha256": run.get("final_text_sha256"),
-            "llm_request_count": run.get("llm_request_count"),
-            "usage": usage_generation_identity_contract(run.get("usage")),
+            "error": canonical_run.get("error"),
+            "final_text_sha256": canonical_run.get("final_text_sha256"),
+            "llm_request_count": canonical_run.get("llm_request_count"),
+            "usage": usage_generation_identity_contract(canonical_run.get("usage")),
         }
-        if isinstance(run, Mapping)
+        if canonical_run is not None
         else None
     )
     return {
@@ -2201,11 +2360,14 @@ def validate_judge_attempt_evidence(
         _, run = validate_and_select_monotonic_run_version(
             versions,
             label=f"Judge attempt {attempt_id}",
+            identity_seed=f"judge-attempt:{attempt_id}",
+            requested_provider="openrouter",
+            requested_model=JUDGE_MODEL,
+            role="unknown_request",
         )
-        route_failures = usage_route_reasons(
-            run.get("usage"),
-            allowed_models={JUDGE_MODEL},
-            provider_pins={JUDGE_MODEL: FORMAL_UPSTREAM_PINS[JUDGE_MODEL]},
+        _, route_failures = canonical_judge_run_route_reasons(
+            run,
+            attempt_id=attempt_id,
         )
         if route_failures:
             raise FinalizationError(
@@ -2565,7 +2727,14 @@ def aggregator_recovery_execution_reasons(
     reasons: list[str] = []
     primary_identity = f"openrouter:{expected_aggregator}"
     plan = call.get("selection_plan")
+    recovery = call.get("aggregator_recovery")
     raw_candidates = plan.get("aggregator_candidates") if isinstance(plan, Mapping) else None
+    if raw_candidates is None and isinstance(recovery, Mapping):
+        # Static B2 plans name one aggregator but historically store the
+        # concrete serving chain in the execution receipt.  That receipt is
+        # the authoritative physical evidence; dynamic G1 separately requires
+        # its ranked candidate chain in the frozen selection plan.
+        raw_candidates = recovery.get("candidate_ids")
     if raw_candidates is None:
         reasons.append("missing_aggregator_candidate_chain")
         candidate_chain = (primary_identity,)
@@ -2587,7 +2756,6 @@ def aggregator_recovery_execution_reasons(
     if not isinstance(fallback_used, bool):
         reasons.append("aggregator_fallback_used_or_unknown")
         fallback_used = False
-    recovery = call.get("aggregator_recovery")
     executed_a = str(call.get("executed_A") or "").strip()
     if not isinstance(recovery, Mapping):
         reasons.append("missing_aggregator_recovery_evidence")
@@ -3213,9 +3381,12 @@ def agent_call_output_sequence_reasons(
         ):
             reasons.append("invalid_agent_call_output_binding")
             continue
-        if output.get("sha256") not in {None, "", text_sha256(output_text)}:
-            reasons.append("wrong_agent_call_output_hash")
         segment = final_text[offset : offset + output_chars]
+        # Trace text may be clipped, while chars/sha256 intentionally bind the
+        # complete contribution.  Validate the hash against the reconstructed
+        # full segment rather than the clipped prefix.
+        if output.get("sha256") not in {None, "", text_sha256(segment)}:
+            reasons.append("wrong_agent_call_output_hash")
         if output.get("truncated") is True:
             if not segment.startswith(output_text):
                 reasons.append("wrong_agent_call_output_binding")
@@ -3722,7 +3893,11 @@ def g1_provider_lifecycle_analyzer_reasons(
     ]
     if not request_attempts:
         return ["missing_g1_provider_lifecycle_attempt"]
-    first_units = usage_units(request_attempts[0]["run"].get("usage"))
+    first_attempt_id = str(request_attempts[0].get("attempt_id") or "")
+    first_units = canonical_run_usage_units(
+        request_attempts[0]["run"],
+        identity_seed=f"generation-attempt:{first_attempt_id}",
+    )
     analyzers = [
         unit
         for unit in first_units
@@ -3751,7 +3926,11 @@ def g1_provider_lifecycle_analyzer_reasons(
             ):
                 return ["wrong_g1_task_analyzer_route"]
     for attempt in request_attempts[1:]:
-        later_units = usage_units(attempt["run"].get("usage"))
+        attempt_id = str(attempt.get("attempt_id") or "")
+        later_units = canonical_run_usage_units(
+            attempt["run"],
+            identity_seed=f"generation-attempt:{attempt_id}",
+        )
         if any(
             str(unit.get("role") or "").strip().casefold() == "task_analyzer"
             or _is_unknown_task_analyzer_placeholder(unit)
@@ -3987,9 +4166,10 @@ def validate_physical_generation_routes(
         record, run = validate_and_select_monotonic_run_version(
             [(version[0], version[1]) for version in versions],
             label=f"generation attempt {attempt_id}",
+            identity_seed=f"generation-attempt:{attempt_id}",
         )
         selected_versions = [
-            version for version in versions if version[0] is record and version[1] is run
+            version for version in versions if version[0] is record
         ]
         if not selected_versions:
             raise FinalizationError(
@@ -4004,7 +4184,11 @@ def validate_physical_generation_routes(
             allow_unknown_task_analyzer_attempts=record.key[0] == "G1",
         )
         roles = {
-            str(unit.get("role") or "").strip().casefold() for unit in usage_units(run.get("usage"))
+            str(unit.get("role") or "").strip().casefold()
+            for unit in canonical_run_usage_units(
+                run,
+                identity_seed=f"generation-attempt:{attempt_id}",
+            )
         }
         if record.key[0] == "B2" and "task_analyzer" in roles:
             reasons.append("unexpected_b2_task_analyzer_request")
@@ -4181,13 +4365,14 @@ def judge_reasons(
             if not isinstance(run, Mapping):
                 reasons.append("missing_judge_physical_attempt")
                 continue
+            attempt_id = str(attempt.get("attempt_id") or "")
+            _, route_failures = canonical_judge_run_route_reasons(
+                run,
+                attempt_id=attempt_id,
+            )
             reasons.extend(
                 "wrong_judge_model_route"
-                for reason in usage_route_reasons(
-                    run.get("usage"),
-                    allowed_models={JUDGE_MODEL},
-                    provider_pins={JUDGE_MODEL: FORMAL_UPSTREAM_PINS[JUDGE_MODEL]},
-                )
+                for reason in route_failures
                 if reason
             )
         final_attempt = attempts[-1] if attempts and isinstance(attempts[-1], Mapping) else {}
@@ -4713,21 +4898,36 @@ def bind_selected_generation_attempts(
                 if not isinstance(attempt, Mapping):
                     continue
                 run = attempt.get("run")
+                attempt_id = str(attempt.get("attempt_id") or "")
+                canonical_run = (
+                    _canonicalized_run(
+                        run,
+                        identity_seed=f"generation-attempt:{attempt_id}",
+                    )
+                    if isinstance(run, Mapping)
+                    else None
+                )
                 if (
-                    not isinstance(run, Mapping)
-                    or str(run.get("final_text_sha256") or "") != selected_final_sha
-                    or usage_generation_identity_contract(run.get("usage")) != selected_usage
-                    or run_expected_request_count(run) <= 0
-                    or len(usage_units(run.get("usage"))) != run_expected_request_count(run)
+                    canonical_run is None
+                    or str(canonical_run.get("final_text_sha256") or "") != selected_final_sha
+                    or usage_generation_identity_contract(canonical_run.get("usage"))
+                    != selected_usage
+                    or run_expected_request_count(canonical_run) <= 0
+                    or len(
+                        canonical_run_usage_units(
+                            canonical_run,
+                            identity_seed=f"generation-attempt:{attempt_id}",
+                        )
+                    )
+                    != run_expected_request_count(canonical_run)
                 ):
                     continue
-                run_error = str(run.get("error") or "")
+                run_error = str(canonical_run.get("error") or "")
                 if run_error and not selected_legacy_attempt_error_is_reclassified(
                     selected_record.row,
                     attempt,
                 ):
                     continue
-                attempt_id = str(attempt.get("attempt_id") or "")
                 if HEX32.fullmatch(attempt_id):
                     matching_ids.add(attempt_id)
         pair = f"{selected_record.key[0]}/{selected_record.key[1]}"
@@ -4759,37 +4959,10 @@ def response_ids(unit: Mapping[str, Any]) -> set[str]:
 
 
 def run_expected_request_count(run: Mapping[str, Any]) -> int:
-    usage = run.get("usage")
-    units = usage_units(usage)
-    declared = nonnegative_int(run.get("llm_request_count"))
-    usage_missing = (
-        nonnegative_int(usage.get("usage_missing_count")) if isinstance(usage, Mapping) else 0
-    )
-    represented_missing = sum(
-        1
-        for unit in units
-        if str(unit.get("role") or "").strip().casefold() in MISSING_USAGE_PLACEHOLDER_ROLES
-    )
-    represented = len(units) + max(0, usage_missing - represented_missing)
-    trace_events = run.get("trace_events")
-    if isinstance(trace_events, list):
-        for event in reversed(trace_events):
-            if not isinstance(event, Mapping):
-                continue
-            physical = event.get("physical_request_count")
-            if isinstance(physical, int) and not isinstance(physical, bool):
-                if (
-                    physical == 0
-                    and event.get("request_started") is False
-                    and not units
-                    and declared == 0
-                ):
-                    return 0
-                represented = max(represented, max(0, physical))
-                break
-    if units or declared:
-        return max(declared, represented)
-    return 0
+    try:
+        return derive_physical_request_count(run)
+    except UsageEvidenceError as exc:
+        raise FinalizationError(f"invalid physical usage evidence: {exc}") from exc
 
 
 def iter_judge_runs(judge: Any) -> Iterable[tuple[str, Mapping[str, Any]]]:
@@ -4824,6 +4997,79 @@ def iter_judge_runs(judge: Any) -> Iterable[tuple[str, Mapping[str, Any]]]:
             run = attempt.get("run") if isinstance(attempt, Mapping) else None
             if isinstance(run, Mapping):
                 yield f"attempt/{index}", run
+
+
+def proof_only_usage_evidence_reasons(row: Mapping[str, Any]) -> list[str]:
+    """Check that a campaign-proof-only row can enter canonical finalization.
+
+    This deliberately uses the same canonicalizer and strict Judge route
+    validator as finalization.  The campaign gate calls it only after the
+    resume classifier has established valid generation and complete Judge
+    semantics.
+    """
+
+    reasons: list[str] = []
+    execution = row.get("execution")
+    generation_attempts = (
+        execution.get("generation_attempts")
+        if isinstance(execution, Mapping)
+        and isinstance(execution.get("generation_attempts"), list)
+        else []
+    )
+    for index, attempt in enumerate(generation_attempts):
+        if not isinstance(attempt, Mapping):
+            reasons.append(f"generation_attempt/{index}/not_object")
+            continue
+        attempt_id = str(attempt.get("attempt_id") or "")
+        run = attempt.get("run")
+        if HEX32.fullmatch(attempt_id) is None or not isinstance(run, Mapping):
+            reasons.append(f"generation_attempt/{index}/invalid_identity_or_run")
+            continue
+        try:
+            canonical = _canonicalized_run(
+                run,
+                identity_seed=f"generation-attempt:{attempt_id}",
+            )
+            units = canonical_run_usage_units(
+                canonical,
+                identity_seed=f"generation-attempt:{attempt_id}",
+            )
+            if len(units) != run_expected_request_count(canonical):
+                reasons.append(f"generation_attempt/{attempt_id}/usage_shape")
+        except (FinalizationError, UsageEvidenceError, TypeError) as exc:
+            reasons.append(f"generation_attempt/{attempt_id}/{type(exc).__name__}")
+
+    judge_scopes: list[tuple[str, Any]] = [("judge", row.get("judge"))]
+    candidate_judges = row.get("candidate_judges")
+    if candidate_judges is not None:
+        if not isinstance(candidate_judges, list):
+            reasons.append("candidate_judges/not_list")
+        else:
+            judge_scopes.extend(
+                (f"candidate_judge/{index}", judge)
+                for index, judge in enumerate(candidate_judges)
+            )
+    for scope, judge in judge_scopes:
+        if judge is None:
+            continue
+        if not isinstance(judge, Mapping):
+            reasons.append(f"{scope}/not_object")
+            continue
+        for path, run in iter_judge_runs(judge):
+            attempt_id = path.rsplit("/", 1)[-1]
+            if HEX32.fullmatch(attempt_id) is None:
+                reasons.append(f"{scope}/{path}/invalid_attempt_id")
+                continue
+            try:
+                _, route_reasons = canonical_judge_run_route_reasons(
+                    run,
+                    attempt_id=attempt_id,
+                )
+            except (FinalizationError, UsageEvidenceError, TypeError) as exc:
+                reasons.append(f"{scope}/{path}/{type(exc).__name__}")
+                continue
+            reasons.extend(f"{scope}/{path}/{reason}" for reason in route_reasons)
+    return list(dict.fromkeys(reasons))
 
 
 def unit_identity_signature(unit: Mapping[str, Any]) -> str:
@@ -4885,8 +5131,8 @@ def _record_run(
     reference: Mapping[str, Any],
     occurrence_counter: Counter[str],
 ) -> None:
-    units = usage_units(run.get("usage"))
-    expected = run_expected_request_count(run)
+    units = canonical_run_usage_units(run, identity_seed=base_identity)
+    expected = derive_physical_request_count(run)
     for unit in units:
         ids = response_ids(unit)
         signature = unit_identity_signature(unit)
@@ -4907,22 +5153,9 @@ def _record_run(
             scope=scope,
             reference=reference,
         )
-    missing = max(0, expected - len(units))
-    for missing_index in range(missing):
-        placeholder = {
-            "role": "missing_usage",
-            "provider": "",
-            "model": "",
-            "cost_source": "none",
-        }
-        _record_unit(
-            entries,
-            response_id_bindings,
-            identity=f"{base_identity}:missing:{missing_index}",
-            logical_physical_identity=(f"{base_identity}:missing:{missing_index}"),
-            unit=placeholder,
-            scope=scope,
-            reference=reference,
+    if len(units) != expected:
+        raise FinalizationError(
+            f"{base_identity} canonical usage shape does not match its physical request count"
         )
 
 
@@ -4998,9 +5231,10 @@ def build_actual_spend_ledger(
                 if isinstance(attempt.get("run"), Mapping)
             ],
             label=f"generation attempt {attempt_id}",
+            identity_seed=f"generation-attempt:{attempt_id}",
         )
         matching_versions = [
-            version for version in versions if version[0] is record and version[1].get("run") is run
+            version for version in versions if version[0] is record
         ]
         if not matching_versions:
             raise FinalizationError(
@@ -5044,12 +5278,20 @@ def build_actual_spend_ledger(
             (version[0] for version in versions),
             key=lambda candidate: (candidate.source_index, candidate.line),
         )
+        judge_path = versions[0][3]
+        attempt_id = judge_path.rsplit("/", 1)[-1]
+        if HEX32.fullmatch(attempt_id) is None:
+            raise FinalizationError(f"{identity} lacks a stable Judge attempt identity")
         record, run = validate_and_select_monotonic_run_version(
             [(version[0], version[2]) for version in versions],
             label=identity,
+            identity_seed=f"judge-attempt:{attempt_id}",
+            requested_provider="openrouter",
+            requested_model=JUDGE_MODEL,
+            role="unknown_request",
         )
         matching_versions = [
-            version for version in versions if version[0] is record and version[2] is run
+            version for version in versions if version[0] is record
         ]
         if not matching_versions:
             raise FinalizationError(f"{identity} selected an unknown receipt version")

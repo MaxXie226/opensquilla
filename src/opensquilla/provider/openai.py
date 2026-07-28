@@ -23,6 +23,10 @@ from opensquilla.env import trust_env as _trust_env
 from opensquilla.execution_status import compact_provider_status, derive_is_error
 from opensquilla.safety.secret_redaction import redact_secret_text
 from opensquilla.secrets import clean_header_secret
+from opensquilla.usage_evidence import (
+    MISSING_USAGE_PLACEHOLDER_ROLES as _MISSING_USAGE_PLACEHOLDER_ROLES,
+)
+from opensquilla.usage_evidence import canonical_run_usage_units
 
 from .app_attribution import is_provider_app_host, provider_app_headers
 from .candidate_artifact import (
@@ -193,16 +197,6 @@ _OPENAI_STREAM_NOOP_CHOICE_KEYS = frozenset(
     {"index", "delta", "finish_reason", "native_finish_reason"}
 )
 _OPENAI_STREAM_NOOP_DELTA_KEYS = frozenset({"content", "role"})
-_MISSING_USAGE_PLACEHOLDER_ROLES = frozenset(
-    {
-        "abandoned_stream",
-        "usage_missing",
-        "unknown_call",
-        "abandoned_stream_request",
-        "agent_llm_request_unknown",
-        "abandoned_provider_request",
-    }
-)
 # Some OpenAI-compatible API roots carry a non-integer version segment before
 # an adapter namespace.  Gemini's documented compatibility root is
 # ``/v1beta/openai``: appending our canonical ``/v1`` again produces the
@@ -2212,6 +2206,33 @@ def _fallback_error_placeholder_count(event: ErrorEvent) -> int:
     return count
 
 
+def _unknown_physical_request_usage_row(
+    *,
+    provider_kind: str,
+    requested_model: str,
+    role: str = "usage_missing",
+    identity_seed: str | None = None,
+) -> dict[str, Any]:
+    """Create one canonical usage unit for a started request with no receipt."""
+
+    return canonical_run_usage_units(
+        {
+            "physical_request_count": 1,
+            "request_started": True,
+            "requested_provider": provider_kind,
+            "requested_model": requested_model,
+            "usage": {},
+        },
+        identity_seed=identity_seed or f"provider-request:{uuid4().hex}",
+        requested_provider=provider_kind,
+        requested_model=requested_model,
+        role=role,
+    )[0]
+
+
+_STREAM_FALLBACK_WRAPPER_EVIDENCE_CONTEXT = "stream_fallback_wrapper"
+
+
 def _mark_stream_fallback_cost_unknown(
     event: StreamEvent,
     *,
@@ -2226,6 +2247,20 @@ def _mark_stream_fallback_cost_unknown(
     request. An exact receipt for the fallback does not cover the abandoned
     stream request.
     """
+    existing_rows = (
+        event.model_usage_breakdown
+        if isinstance(event, (DoneEvent, ErrorEvent))
+        else []
+    )
+    if any(
+        isinstance(row, Mapping)
+        and str(row.get("role") or "").strip().casefold()
+        == "abandoned_stream_request"
+        and row.get("usage_evidence_context")
+        == _STREAM_FALLBACK_WRAPPER_EVIDENCE_CONTEXT
+        for row in existing_rows
+    ):
+        return event
     if isinstance(event, ErrorEvent):
         declared_fallback_request_count = (
             max(0, int(event.physical_request_count))
@@ -2321,11 +2356,27 @@ def _mark_stream_fallback_cost_unknown(
                     int(merged_trace.get("llm_request_count") or 0),
                     total_physical_request_count,
                 )
+        unknown_stream = _unknown_physical_request_usage_row(
+            provider_kind=provider_kind,
+            requested_model=requested_model,
+            role="abandoned_stream_request",
+        )
+        unknown_stream["usage_evidence_context"] = (
+            _STREAM_FALLBACK_WRAPPER_EVIDENCE_CONTEXT
+        )
         return replace(
             event,
             request_started=True,
             physical_request_count=1 + fallback_request_count,
             usage_missing_count=1 + fallback_missing_count,
+            model_usage_breakdown=[
+                unknown_stream,
+                *[
+                    dict(row)
+                    for row in event.model_usage_breakdown
+                    if isinstance(row, Mapping)
+                ],
+            ],
             ensemble_trace=merged_trace,
         )
     if not isinstance(event, DoneEvent):
@@ -2354,20 +2405,14 @@ def _mark_stream_fallback_cost_unknown(
                 ),
             }
         ]
-    unknown_stream = {
-        "role": "abandoned_stream_request",
-        "provider": "",
-        "requested_provider": provider_kind,
-        "model": "",
-        "requested_model": requested_model,
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "reasoning_tokens": 0,
-        "cached_tokens": 0,
-        "cache_write_tokens": 0,
-        "billed_cost": 0.0,
-        "cost_source": "none",
-    }
+    unknown_stream = _unknown_physical_request_usage_row(
+        provider_kind=provider_kind,
+        requested_model=requested_model,
+        role="abandoned_stream_request",
+    )
+    unknown_stream["usage_evidence_context"] = (
+        _STREAM_FALLBACK_WRAPPER_EVIDENCE_CONTEXT
+    )
     return replace(
         event,
         cost_source="mixed",
@@ -3920,6 +3965,7 @@ class OpenAIProvider:
         trace_tool_calls: list[dict[str, Any]] = []
         usage_evidence_seen = False
         physical_request_attempted = False
+        request_usage_identity_seed = f"provider-request:{uuid4().hex}"
 
         if os.environ.get("OPENSQUILLA_TRACE_ROUTING"):
             print(
@@ -4035,6 +4081,17 @@ class OpenAIProvider:
                     "usage_missing_count",
                     1 if request_started else 0,
                 )
+                if request_started:
+                    error_kwargs.setdefault(
+                        "model_usage_breakdown",
+                        [
+                            _unknown_physical_request_usage_row(
+                                provider_kind=self._provider_kind,
+                                requested_model=self._model,
+                                identity_seed=request_usage_identity_seed,
+                            )
+                        ],
+                    )
                 return ErrorEvent(message=message, code=code, **error_kwargs)
             return ErrorEvent(
                 message=message,
@@ -4235,7 +4292,7 @@ class OpenAIProvider:
                                     "message_limit_proof": proof_fields,
                                 },
                             )
-                            yield ErrorEvent(
+                            yield response_validation_error(
                                 message=message,
                                 code=str(response.status_code),
                                 retry_after_s=retry_after_from_headers(
@@ -4271,7 +4328,7 @@ class OpenAIProvider:
                             response_body=safe_body_text,
                             metadata={"cache_shape": cache_shape},
                         )
-                        yield ErrorEvent(
+                        yield response_validation_error(
                             message=message,
                             code=str(response.status_code),
                             retry_after_s=retry_after_from_headers(
@@ -5655,6 +5712,29 @@ class OpenAIProvider:
                 ),
             },
         )
+        fallback_usage_identity_seed = f"provider-fallback-request:{uuid4().hex}"
+
+        def fallback_request_error(
+            *,
+            message: str,
+            code: str,
+            **kwargs: Any,
+        ) -> ErrorEvent:
+            return ErrorEvent(
+                message=message,
+                code=code,
+                request_started=True,
+                physical_request_count=1,
+                usage_missing_count=1,
+                model_usage_breakdown=[
+                    _unknown_physical_request_usage_row(
+                        provider_kind=self._provider_kind,
+                        requested_model=self._model,
+                        identity_seed=fallback_usage_identity_seed,
+                    )
+                ],
+                **kwargs,
+            )
 
         try:
             async with httpx.AsyncClient(
@@ -5684,7 +5764,7 @@ class OpenAIProvider:
                 message=safe_error,
                 metadata={"phase": "non_stream_fallback", "cache_shape": cache_shape},
             )
-            yield ErrorEvent(message=safe_error, code="timeout")
+            yield fallback_request_error(message=safe_error, code="timeout")
             return
         except httpx.RequestError as exc:
             safe_error = redact_upstream_error_text(
@@ -5697,7 +5777,7 @@ class OpenAIProvider:
                 message=safe_error,
                 metadata={"phase": "non_stream_fallback", "cache_shape": cache_shape},
             )
-            yield ErrorEvent(message=safe_error, code="request_error")
+            yield fallback_request_error(message=safe_error, code="request_error")
             return
 
         if response.status_code != 200:
@@ -5722,7 +5802,7 @@ class OpenAIProvider:
                 response_body=safe_response_body,
                 metadata={"cache_shape": cache_shape},
             )
-            yield ErrorEvent(
+            yield fallback_request_error(
                 message=safe_message,
                 code=str(response.status_code),
                 retry_after_s=retry_after_from_headers(
@@ -5746,11 +5826,14 @@ class OpenAIProvider:
                 response_body=safe_response_body,
                 metadata={"cache_shape": cache_shape},
             )
-            yield ErrorEvent(message="Invalid JSON response from provider", code="invalid_json")
+            yield fallback_request_error(
+                message="Invalid JSON response from provider",
+                code="invalid_json",
+            )
             return
 
         if not isinstance(data, dict):
-            yield ErrorEvent(
+            yield fallback_request_error(
                 message="Provider returned an invalid response object",
                 code="invalid_response",
             )
@@ -5786,18 +5869,18 @@ class OpenAIProvider:
                 ),
                 metadata={"cache_shape": cache_shape},
             )
-            yield ErrorEvent(message=error_message, code=error_code)
+            yield fallback_request_error(message=error_message, code=error_code)
             return
         choices = data.get("choices")
         if not isinstance(choices, list) or len(choices) != 1:
-            yield ErrorEvent(
+            yield fallback_request_error(
                 message="Provider returned an invalid choice batch",
                 code="invalid_response",
             )
             return
         choice = choices[0]
         if not isinstance(choice, Mapping):
-            yield ErrorEvent(
+            yield fallback_request_error(
                 message="Provider returned a malformed choice",
                 code="invalid_response",
             )
@@ -5818,7 +5901,7 @@ class OpenAIProvider:
             )
             or not isinstance(message, Mapping)
         ):
-            yield ErrorEvent(
+            yield fallback_request_error(
                 message="Provider returned an invalid choice terminal",
                 code="invalid_response",
             )
@@ -5899,7 +5982,7 @@ class OpenAIProvider:
             code: str,
         ) -> ErrorEvent:
             if diagnostic_done is None:
-                return ErrorEvent(message=message, code=code)
+                return fallback_request_error(message=message, code=code)
             return ErrorEvent(
                 message=message,
                 code=code,

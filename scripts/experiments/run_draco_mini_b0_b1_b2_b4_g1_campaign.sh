@@ -87,6 +87,7 @@ PYTHON="$SNAPSHOT_REPO/.venv/bin/python"
 MAIN_RUNNER="$SNAPSHOT_REPO/scripts/run_draco_routing_experiment.py"
 RESUME_RUNNER="$SNAPSHOT_REPO/scripts/run_draco_routing_experiment_resume.py"
 FINALIZER="$SNAPSHOT_REPO/scripts/experiments/finalize_draco_campaign.py"
+RECOVERY_STATUS="$SNAPSHOT_REPO/scripts/experiments/recover_draco_finalization.py"
 CAPTURE_ACCOUNT="$SNAPSHOT_REPO/scripts/experiments/capture_openrouter_account_usage.py"
 CAPTURE_RUNTIME="$SNAPSHOT_REPO/scripts/experiments/capture_draco_runtime_environment.py"
 ROUTE_PREFLIGHT="$SNAPSHOT_REPO/scripts/experiments/validate_openrouter_b2_routes.py"
@@ -102,6 +103,7 @@ for required_path in \
   "$MAIN_RUNNER" \
   "$RESUME_RUNNER" \
   "$FINALIZER" \
+  "$RECOVERY_STATUS" \
   "$CAPTURE_ACCOUNT" \
   "$CAPTURE_RUNTIME" \
   "$ROUTE_PREFLIGHT"; do
@@ -900,6 +902,7 @@ write_actionable_keys() {
   shift 2
   "$PYTHON" - \
     "$RESUME_RUNNER" \
+    "$FINALIZER" \
     "$INPUT" \
     "$COMPATIBILITY_MANIFEST" \
     "$output" \
@@ -914,11 +917,12 @@ import sys
 from pathlib import Path
 
 runner_path = Path(sys.argv[1])
-input_path = Path(sys.argv[2])
-manifest_path = Path(sys.argv[3])
-output_path = Path(sys.argv[4])
-summary_path = Path(sys.argv[5])
-result_paths = [Path(value) for value in sys.argv[6:]]
+finalizer_path = Path(sys.argv[2])
+input_path = Path(sys.argv[3])
+manifest_path = Path(sys.argv[4])
+output_path = Path(sys.argv[5])
+summary_path = Path(sys.argv[6])
+result_paths = [Path(value) for value in sys.argv[7:]]
 
 spec = importlib.util.spec_from_file_location("draco_campaign_resume_gate", runner_path)
 if spec is None or spec.loader is None:
@@ -926,6 +930,16 @@ if spec is None or spec.loader is None:
 module = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = module
 spec.loader.exec_module(module)
+
+finalizer_spec = importlib.util.spec_from_file_location(
+    "draco_campaign_finalizer_gate",
+    finalizer_path,
+)
+if finalizer_spec is None or finalizer_spec.loader is None:
+    raise SystemExit("unable to load the DRACO finalizer usage contract")
+finalizer = importlib.util.module_from_spec(finalizer_spec)
+sys.modules[finalizer_spec.name] = finalizer
+finalizer_spec.loader.exec_module(finalizer)
 
 groups = ("B0", "B1", "B2", "B4", "G1")
 tasks = module.load_tasks(input_path, max_tasks=0)
@@ -989,6 +1003,15 @@ for group, task_id in sorted(selected):
         # generation or Judge; any gap left afterwards belongs to the locked
         # campaign account proof/finalizer and must not create another wave.
         if state.get("metadata_repair_attempted") is True:
+            proof_only_reasons = finalizer.proof_only_usage_evidence_reasons(
+                state["row"]
+            )
+            if proof_only_reasons:
+                raise SystemExit(
+                    "metadata repair left usage evidence that finalization "
+                    f"cannot canonicalize for {group}/{task_id}: "
+                    f"{proof_only_reasons[:5]}"
+                )
             campaign_proof_only.append({"group": group, "task_id": task_id})
         else:
             actionable.append(
@@ -1146,6 +1169,34 @@ done
 
 capture_stable_after
 ACCOUNT_WINDOW_OPEN=0
+
+# A model-attempt budget exhaustion cannot be repaired by the offline
+# finalizer.  Persist a machine-readable terminal disposition and stop before
+# running a finalizer that is guaranteed to reject the incomplete pair.
+if jq -e '
+  (.generation_budget_exhausted_pair_count // 0) > 0
+  or (.judge_budget_exhausted_pair_count // 0) > 0
+' "$GATE_SUMMARY" >/dev/null; then
+  FINALIZATION_STATUS_TMP="$ARCHIVE_DIR/.finalization-status.json.tmp-$$"
+  if "$PYTHON" "$RECOVERY_STATUS" status "$OUTPUT_DIR" \
+      >"$FINALIZATION_STATUS_TMP"; then
+    FINALIZATION_STATUS_RC=0
+  else
+    FINALIZATION_STATUS_RC=$?
+  fi
+  if [[ "$FINALIZATION_STATUS_RC" != "2" ]] || ! jq -e '
+    .state == "blocked"
+    and .reason_code == "model_attempt_budget_exhausted"
+  ' "$FINALIZATION_STATUS_TMP" >/dev/null; then
+    rm -f -- "$FINALIZATION_STATUS_TMP"
+    echo "Unable to persist the terminal model-budget disposition" >&2
+    exit 2
+  fi
+  chmod 600 "$FINALIZATION_STATUS_TMP"
+  mv "$FINALIZATION_STATUS_TMP" "$ARCHIVE_DIR/finalization-status.json"
+  echo "Campaign exhausted a model-attempt budget; offline finalization is blocked" >&2
+  exit 2
+fi
 
 FINALIZER_ARGS=(
   --input "$INPUT"

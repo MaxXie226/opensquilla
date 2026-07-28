@@ -121,19 +121,14 @@ from opensquilla.tool_boundary import ToolCall
 from opensquilla.tools.dispatch import build_tool_handler
 from opensquilla.tools.registry import ToolRegistry
 from opensquilla.tools.types import CallerKind, InteractionMode, ToolContext, ToolSpec
+from opensquilla.usage_evidence import (
+    MISSING_USAGE_PLACEHOLDER_ROLES,
+    canonicalize_run_usage,
+    derive_physical_request_count,
+    is_missing_usage_placeholder,
+)
 
 DEFAULT_B2_EXPERIMENT_CONFIG_PATH = ROOT / "configs/benchmarks/draco_b2_g12.json"
-MISSING_USAGE_PLACEHOLDER_ROLES = frozenset(
-    {
-        "abandoned_stream",
-        "usage_missing",
-        "unknown_call",
-        "abandoned_stream_request",
-        "agent_llm_request_unknown",
-        "abandoned_provider_request",
-        "unknown_request",
-    }
-)
 
 
 GROUP_SPECS: dict[str, dict[str, Any]] = {
@@ -4947,34 +4942,16 @@ def llm_request_count_for_run(
 ) -> int:
     if not provider_attempted:
         return 0
-    traced = 0
-    if done is not None and isinstance(done.ensemble_trace, dict):
-        traced = max(
-            coerce_metric_int(done.ensemble_trace.get("llm_request_count")),
-            coerce_metric_int(done.ensemble_trace.get("physical_request_count")),
-        )
-    if done is not None and done.model_usage_breakdown:
-        represented_missing = sum(
-            1
-            for row in done.model_usage_breakdown
-            if isinstance(row, Mapping)
-            and str(row.get("role") or "").strip().casefold() in MISSING_USAGE_PLACEHOLDER_ROLES
-        )
-        return max(
-            traced,
-            len(done.model_usage_breakdown)
-            + max(
-                0,
-                coerce_metric_int(done.usage_missing_count) - represented_missing,
-            ),
-        )
     if done is not None:
-        return max(
-            traced,
-            1 + max(0, coerce_metric_int(done.usage_missing_count)),
-        )
-    if spec.get("kind") == "single":
-        return 1
+        usage = done_payload(done)
+        trace = done.ensemble_trace if isinstance(done.ensemble_trace, Mapping) else {}
+        evidence: dict[str, Any] = {
+            "usage": usage,
+            "request_started": True,
+        }
+        if trace:
+            evidence["ensemble_trace"] = trace
+        return derive_physical_request_count(evidence, default_request_count=1)
     return 1
 
 
@@ -5012,6 +4989,38 @@ def done_payload(done: DoneEvent | None) -> dict[str, Any]:
         payload["cost_source"] = "provider_billed"
     elif billing_receipt is not None:
         payload["cost_source"] = "unavailable"
+    trace = done.ensemble_trace if isinstance(done.ensemble_trace, Mapping) else {}
+    evidence_run: dict[str, Any] = {
+        "usage": payload,
+        "request_started": True,
+    }
+    if trace:
+        evidence_run["ensemble_trace"] = trace
+    identity_material = {
+        "provider": payload["provider"],
+        "model": payload["model"],
+        "requested_provider": payload["requested_provider"],
+        "requested_model": payload["requested_model"],
+        "stop_reason": payload["stop_reason"],
+        "provider_usage": payload["provider_usage"],
+        "usage_missing_count": payload["usage_missing_count"],
+    }
+    identity_seed = "done:" + hashlib.sha256(
+        json.dumps(
+            identity_material,
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    payload = canonicalize_run_usage(
+        evidence_run,
+        identity_seed=identity_seed,
+        requested_provider=payload["requested_provider"],
+        requested_model=payload["requested_model"],
+        default_request_count=1,
+    )
     server_tool_use = server_tool_counts_from_usage_payload(payload)
     payload["server_tool_use"] = server_tool_use
     payload["server_tool_call_count"] = sum(server_tool_use.values())
@@ -5019,7 +5028,7 @@ def done_payload(done: DoneEvent | None) -> dict[str, Any]:
 
 
 def usage_row_is_missing_placeholder(row: Mapping[str, Any]) -> bool:
-    return str(row.get("role") or "").strip().casefold() in MISSING_USAGE_PLACEHOLDER_ROLES
+    return is_missing_usage_placeholder(row)
 
 
 def usage_row_response_ids(row: Mapping[str, Any]) -> frozenset[str]:
@@ -5687,43 +5696,27 @@ def run_result_summary(result: RunResult) -> dict[str, Any]:
     llm_request_count = 0
     usage_unknown_count = 0
     if result.done is not None:
-        if isinstance(result.done.ensemble_trace, dict):
-            llm_request_count = max(
-                coerce_metric_int(result.done.ensemble_trace.get("llm_request_count")),
-                coerce_metric_int(result.done.ensemble_trace.get("physical_request_count")),
-            )
-            usage_unknown_count = ensemble_usage_unknown_count(result.done.ensemble_trace)
+        done_usage = done_payload(result.done)
+        trace = (
+            result.done.ensemble_trace
+            if isinstance(result.done.ensemble_trace, Mapping)
+            else {}
+        )
+        done_evidence: dict[str, Any] = {
+            "usage": done_usage,
+            "request_started": True,
+        }
+        if trace:
+            done_evidence["ensemble_trace"] = trace
+        llm_request_count = derive_physical_request_count(
+            done_evidence,
+            default_request_count=1,
+        )
+        usage_unknown_count = ensemble_usage_unknown_count(trace)
         usage_unknown_count = max(
             usage_unknown_count,
             coerce_metric_int(result.done.usage_missing_count),
-        )
-        if result.done.model_usage_breakdown:
-            represented_missing = sum(
-                1
-                for row in result.done.model_usage_breakdown
-                if isinstance(row, Mapping)
-                and str(row.get("role") or "").strip().casefold() in MISSING_USAGE_PLACEHOLDER_ROLES
-            )
-            llm_request_count = max(
-                llm_request_count,
-                len(result.done.model_usage_breakdown)
-                + max(
-                    0,
-                    coerce_metric_int(result.done.usage_missing_count) - represented_missing,
-                ),
-            )
-        else:
-            llm_request_count = max(
-                llm_request_count,
-                1
-                + max(
-                    0,
-                    coerce_metric_int(result.done.usage_missing_count),
-                ),
-            )
-        usage_unknown_count = max(
-            usage_unknown_count,
-            usage_unknown_count_from_usage_payload(usage),
+            usage_unknown_count_from_usage_payload(done_usage),
         )
     elif result.error or result.final_text:
         explicit_request_count = run_result_error_physical_request_count(result)
@@ -5740,6 +5733,34 @@ def run_result_summary(result: RunResult) -> dict[str, Any]:
     if result.done is None and result.setup_usage:
         usage_unknown_count += usage_unknown_count_from_usage_payload(
             {"model_usage_breakdown": result.setup_usage}
+        )
+    if llm_request_count:
+        identity_seed = "run-result:" + hashlib.sha256(
+            json.dumps(
+                {
+                    "trace_events": result.trace_events,
+                    "latency_ms": result.latency_ms,
+                    "final_text_sha256": text_sha256(result.final_text),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        usage = canonicalize_run_usage(
+            {
+                "usage": usage,
+                "physical_request_count": llm_request_count,
+                "request_started": True,
+            },
+            identity_seed=identity_seed,
+            requested_provider=str(usage.get("requested_provider") or ""),
+            requested_model=str(usage.get("requested_model") or ""),
+        )
+        usage_unknown_count = max(
+            usage_unknown_count,
+            usage_unknown_count_from_usage_payload(usage),
         )
     return {
         "latency_ms": result.latency_ms,
@@ -9773,42 +9794,38 @@ def row_total_tool_call_count(row: dict[str, Any]) -> int:
 def row_llm_request_count(row: dict[str, Any]) -> int:
     if row.get("selected_generation_succeeded") is False:
         return 0
-    declared = (
-        row_metric_int(row, "llm_request_count") if row.get("llm_request_count") is not None else 0
-    )
-    usage = row.get("usage") or {}
-    breakdown = usage.get("model_usage_breakdown") if isinstance(usage, dict) else None
-    if isinstance(breakdown, list) and breakdown:
-        represented_missing = sum(
-            1
-            for item in breakdown
-            if isinstance(item, Mapping)
-            and str(item.get("role") or "").strip().casefold() in MISSING_USAGE_PLACEHOLDER_ROLES
-        )
-        return max(
-            declared,
-            len(breakdown)
-            + max(
-                0,
-                coerce_metric_int(usage.get("usage_missing_count")) - represented_missing,
-            ),
-        )
-    if isinstance(usage, dict) and usage:
-        return max(
-            declared,
-            1
-            + max(
-                0,
-                coerce_metric_int(usage.get("usage_missing_count")),
-            ),
-        )
-    if declared:
-        return declared
     provider_spec = row.get("provider_spec") or {}
     execution = row.get("execution") or {}
-    if provider_spec.get("kind") == "single" and not execution.get("provider_error"):
-        return 1
-    return 0
+    default_request_count = int(
+        provider_spec.get("kind") == "single"
+        and not execution.get("provider_error")
+    )
+    usage = row.get("usage")
+    if isinstance(usage, Mapping) and isinstance(
+        usage.get("model_usage_breakdown"),
+        list,
+    ):
+        usage = dict(usage)
+        usage["model_usage_breakdown"] = deduplicate_stable_usage_receipts(
+            [
+                dict(unit) if isinstance(unit, Mapping) else unit
+                for unit in usage["model_usage_breakdown"]
+            ]
+        )
+    # Row-level accounting is an audit boundary: never let a stale/undersized
+    # scalar hide additional distinct receipts.  Newly persisted runs are
+    # canonicalized strictly, while legacy or deliberately adversarial rows
+    # are charged/audited at the larger of their declaration and evidence.
+    evidence_count = derive_physical_request_count(
+        {"usage": usage},
+        default_request_count=default_request_count,
+    )
+    declared_count = (
+        row_metric_int(row, "llm_request_count")
+        if row.get("llm_request_count") is not None
+        else 0
+    )
+    return max(evidence_count, declared_count)
 
 
 def ensemble_usage_unknown_count(trace: Any) -> int:

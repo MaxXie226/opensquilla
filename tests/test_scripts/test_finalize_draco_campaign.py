@@ -46,6 +46,10 @@ def test_formal_model_thinking_levels_match_campaign_config(module) -> None:
     assert set(config["g1_routing"]["expected_routes"]) <= set(module.FORMAL_MODEL_THINKING_LEVELS)
 
 
+def test_finalizer_version_covers_canonical_usage_evidence(module) -> None:
+    assert module.FINALIZER_VERSION == 5
+
+
 def test_text_sha256_matches_runner_wire_format(module) -> None:
     assert module.text_sha256("value") == hashlib.sha256(b"value").hexdigest()
 
@@ -84,6 +88,184 @@ def test_run_expected_request_count_does_not_double_count_placeholder(module) ->
     }
 
     assert module.run_expected_request_count(run) == 2
+
+
+@pytest.mark.parametrize("ordinal", range(5))
+def test_counter_only_failed_judge_request_is_canonical_and_route_bound(
+    module,
+    tmp_path: Path,
+    ordinal: int,
+) -> None:
+    """The five observed 503 shapes each become one strict unknown receipt."""
+
+    attempt_id = f"{0x5100 + ordinal:032x}"
+    run = {
+        "error": (
+            "OpenRouter chat request failed (HTTP 503): "
+            "Cloudflare Worker exceeded resource limits"
+        ),
+        "llm_request_count": 1,
+        "usage_unknown_count": 1,
+        "usage": {},
+        "trace_events": [
+            {
+                "kind": "error",
+                "code": "503",
+                "request_started": None,
+                "physical_request_count": None,
+            }
+        ],
+    }
+    wave1 = module.SourceRecord(
+        path=tmp_path / "wave-1.jsonl",
+        source_index=0,
+        line=ordinal + 1,
+        row={"group": "B1", "task_id": f"task-{ordinal}"},
+    )
+    wave2 = module.SourceRecord(
+        path=tmp_path / "wave-2.jsonl",
+        source_index=1,
+        line=ordinal + 1,
+        row={"group": "B1", "task_id": f"task-{ordinal}"},
+    )
+
+    _, canonical = module.validate_and_select_monotonic_run_version(
+        [(wave1, run), (wave2, deepcopy(run))],
+        label=f"Judge attempt {attempt_id}",
+        identity_seed=f"judge-attempt:{attempt_id}",
+        requested_provider="openrouter",
+        requested_model=module.JUDGE_MODEL,
+        role="unknown_request",
+    )
+    units = module.canonical_run_usage_units(
+        canonical,
+        identity_seed=f"judge-attempt:{attempt_id}",
+    )
+
+    assert module.run_expected_request_count(canonical) == 1
+    assert len(units) == 1
+    assert module._is_unknown_judge_placeholder(units[0]) is True
+    assert units[0]["provider"] == ""
+    assert units[0]["model"] == ""
+    assert units[0]["requested_provider"] == "openrouter"
+    assert units[0]["requested_model"] == module.JUDGE_MODEL
+    ledger_entries = {}
+    module._record_run(
+        ledger_entries,
+        {},
+        run=canonical,
+        scope="judge",
+        base_identity=f"judge:B1:task-{ordinal}:judge:criterion/x/0/{attempt_id}",
+        reference={"group": "B1", "task_id": f"task-{ordinal}"},
+        occurrence_counter=module.Counter(),
+    )
+    assert len(ledger_entries) == 1
+    assert (
+        next(iter(ledger_entries.values())).units[0]["usage_evidence_id"]
+        == units[0]["usage_evidence_id"]
+    )
+    assert (
+        module.usage_route_reasons(
+            canonical["usage"],
+            allowed_models={module.JUDGE_MODEL},
+            provider_pins={
+                module.JUDGE_MODEL: module.FORMAL_UPSTREAM_PINS[module.JUDGE_MODEL]
+            },
+            allow_unknown_judge_attempts=True,
+        )
+        == []
+    )
+    assert (
+        module.proof_only_usage_evidence_reasons(
+            {
+                "judge": {
+                    "criterion_judgments": [
+                        {
+                            "id": "criterion",
+                            "repeat_index": 0,
+                            "judge_attempts": [
+                                {
+                                    "attempt_id": attempt_id,
+                                    "attempt": 1,
+                                    "run": deepcopy(run),
+                                }
+                            ],
+                        }
+                    ]
+                }
+            }
+        )
+        == []
+    )
+
+
+def test_unknown_judge_placeholder_cannot_claim_success_or_actual_identity(
+    module,
+    tmp_path: Path,
+) -> None:
+    attempt_id = "5" * 32
+    record = module.SourceRecord(
+        path=tmp_path / "wave.jsonl",
+        source_index=0,
+        line=1,
+        row={"group": "B1", "task_id": "task"},
+    )
+    _, canonical = module.validate_and_select_monotonic_run_version(
+        [
+            (
+                record,
+                {
+                    "error": "HTTP 503",
+                    "llm_request_count": 1,
+                    "usage_unknown_count": 1,
+                    "usage": {},
+                },
+            )
+        ],
+        label=f"Judge attempt {attempt_id}",
+        identity_seed=f"judge-attempt:{attempt_id}",
+        requested_provider="openrouter",
+        requested_model=module.JUDGE_MODEL,
+        role="unknown_request",
+    )
+    tampered = deepcopy(canonical["usage"])
+    tampered["model_usage_breakdown"][0]["provider"] = "openrouter"
+
+    assert set(
+        module.usage_route_reasons(
+            tampered,
+            allowed_models={module.JUDGE_MODEL},
+            provider_pins={
+                module.JUDGE_MODEL: module.FORMAL_UPSTREAM_PINS[module.JUDGE_MODEL]
+            },
+            allow_unknown_judge_attempts=True,
+        )
+    ) == {
+        "invalid_unknown_judge_usage_placeholder",
+        "missing_generation_usage_route_evidence",
+    }
+    tampered_run = deepcopy(canonical)
+    tampered_run["usage"] = tampered
+    proof_reasons = module.proof_only_usage_evidence_reasons(
+        {
+            "judge": {
+                "criterion_judgments": [
+                    {
+                        "id": "criterion",
+                        "repeat_index": 0,
+                        "judge_attempts": [
+                            {
+                                "attempt_id": attempt_id,
+                                "attempt": 1,
+                                "run": tampered_run,
+                            }
+                        ],
+                    }
+                ]
+            }
+        }
+    )
+    assert any("invalid_unknown_judge_usage_placeholder" in reason for reason in proof_reasons)
 
 
 def test_selected_endpoint_receipt_binds_serving_alias_and_provider(module) -> None:
@@ -1735,7 +1917,7 @@ def test_g1_ensemble_gate_rejects_forged_or_semantic_aggregator_fallback(
 @pytest.mark.parametrize(
     ("mutation", "expected_reason"),
     [
-        ("missing_candidates", "missing_aggregator_candidate_chain"),
+        ("missing_all_candidates", "missing_aggregator_candidate_chain"),
         ("missing_recovery", "missing_aggregator_recovery_evidence"),
         ("partial_salvage", "invalid_aggregator_recovery_selected_kind"),
         ("degraded", "degraded_aggregator_recovery_not_formal"),
@@ -1764,8 +1946,9 @@ def test_formal_ensemble_recovery_evidence_fails_closed(
     call = trace["calls"][0]
     recovery = call["aggregator_recovery"]
     selected_attempt = recovery["attempts"][0]
-    if mutation == "missing_candidates":
+    if mutation == "missing_all_candidates":
         call["selection_plan"].pop("aggregator_candidates")
+        recovery.pop("candidate_ids")
     elif mutation == "missing_recovery":
         call.pop("aggregator_recovery")
     elif mutation == "partial_salvage":
@@ -1805,6 +1988,69 @@ def test_formal_ensemble_recovery_evidence_fails_closed(
     )
 
     assert expected_reason in reasons
+
+
+def test_static_aggregator_chain_can_be_bound_by_execution_receipt(module) -> None:
+    final_text = "formal static answer"
+    trace = _ensemble_trace(
+        list(module.B2_PROPOSERS),
+        module.B2_AGGREGATOR,
+        final_text=final_text,
+        selection_mode="static_openrouter_b5",
+    )
+    call = trace["calls"][0]
+    call["selection_plan"].pop("aggregator_candidates")
+    row = {
+        "final_text": final_text,
+        "routing_trace": {"selection_plan": deepcopy(call["selection_plan"])},
+        "ensemble_trace": trace,
+    }
+
+    assert (
+        module.ensemble_gate(
+            row,
+            expected_proposers=module.B2_PROPOSERS,
+            expected_aggregator=module.B2_AGGREGATOR,
+        )
+        == []
+    )
+
+
+def test_agent_call_sequence_hashes_full_segment_when_trace_text_is_clipped(
+    module,
+) -> None:
+    first = "short"
+    second = "long-" + ("x" * 9_000)
+    calls = [
+        {
+            "output_binding_schema": module.ENSEMBLE_OUTPUT_BINDING_SCHEMA,
+            "assembled_output": {
+                "text": first,
+                "chars": len(first),
+                "truncated": False,
+                "sha256": module.text_sha256(first),
+            },
+        },
+        {
+            "output_binding_schema": module.ENSEMBLE_OUTPUT_BINDING_SCHEMA,
+            "assembled_output": {
+                "text": second[:8_000],
+                "chars": len(second),
+                "truncated": True,
+                "sha256": module.text_sha256(second),
+            },
+        },
+    ]
+
+    assert module.agent_call_output_sequence_reasons(
+        calls,
+        final_text=first + second,
+    ) == []
+    calls[1]["assembled_output"]["sha256"] = module.text_sha256(second + "tampered")
+    assert module.agent_call_output_sequence_reasons(
+        calls,
+        final_text=first + second,
+    ) == ["wrong_agent_call_output_hash"]
 
 
 def test_g1_candidate_chain_must_equal_unique_frozen_aggregator_top3(
@@ -3079,6 +3325,98 @@ def test_unknown_failed_analyzer_attempt_is_preserved_without_rerun(
         proof["cost_scope"]["attribution_precision"]
         == "account_window_only_external-use-not-provable"
     )
+
+
+def test_five_counter_only_failed_judge_attempts_finalize_without_rerun(
+    module,
+    tmp_path: Path,
+) -> None:
+    args, _, lock_fd = _campaign(module, tmp_path, with_repair=False)
+    path = args.result[0]
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    row = rows[0]
+    judgments = row["judge"]["criterion_judgments"]
+
+    for index, judgment in enumerate(judgments[:5]):
+        successful = judgment["judge_attempts"][0]
+        successful["attempt"] = 2
+        failed = {
+            "attempt_id": f"{0x5030 + index:032x}",
+            "attempt": 1,
+            "verdict": "",
+            "met": None,
+            "retry_suppressed_reason": "",
+            "run": {
+                "error": (
+                    "OpenRouter chat request failed (HTTP 503): "
+                    "Cloudflare Worker exceeded resource limits"
+                ),
+                "llm_request_count": 1,
+                "usage_unknown_count": 1,
+                "usage": {},
+                "trace_events": [
+                    {
+                        "kind": "error",
+                        "code": "503",
+                        "request_started": None,
+                        "physical_request_count": None,
+                    }
+                ],
+            },
+        }
+        judgment["judge_attempts"] = [failed, successful]
+        judgment.update(
+            {
+                "judge_attempt_count": 2,
+                "judge_attempt_budget_used": 2,
+                "judge_attempt_budget_remaining": 1,
+                "judge_new_attempt_count": 2,
+            }
+        )
+
+    row["judge"]["judge_attempt_count"] += 5
+    row["judge"]["judge_new_attempt_count"] += 5
+    row["error"] = "openrouter_non_byok_metadata_incomplete"
+    row["completion_status"].update(
+        {
+            "cost_metadata_complete": False,
+            "status": "incomplete",
+        }
+    )
+    row["cost_accounting"]["actual_llm_cost_complete"] = False
+    row["cost_accounting"]["actual_spend_cost_complete"] = False
+    row["openrouter_non_byok_audit"].update(
+        {
+            "pass": False,
+            "status": "metadata_incomplete",
+        }
+    )
+    rows[0] = module.seal_result_row(row)
+    path.write_text("".join(json.dumps(item) + "\n" for item in rows))
+    path.chmod(0o600)
+
+    try:
+        manifest = module.run_finalization(args)
+    finally:
+        os.close(lock_fd)
+
+    assert manifest["status"] == "complete"
+    ledger = [
+        json.loads(line)
+        for line in (args.output_dir / "actual-spend-ledger.jsonl").read_text().splitlines()
+    ]
+    unknown_judge = [
+        item
+        for item in ledger
+        if item["cost_precision"] == "unknown"
+        and item["scopes"] == ["judge"]
+        and item["group_task_pairs"] == [
+            {"group": row["group"], "task_id": row["task_id"]}
+        ]
+    ]
+    assert len(ledger) == 41
+    assert len(unknown_judge) == 5
+    assert all(item["recorded_cost_usd"] is None for item in unknown_judge)
 
 
 def test_cleanup_failure_setup_attempt_survives_later_success_end_to_end(

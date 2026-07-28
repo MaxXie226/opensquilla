@@ -143,6 +143,78 @@ async def test_http_error_echoed_key_is_redacted_from_event_trace_and_log(
         assert any(event == "provider.chat_http_error" for _, event, _, _ in captured_log.records)
 
 
+async def test_openrouter_http_503_persists_one_unknown_physical_usage_unit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = OpenAIProvider(
+        api_key=_API_KEY,
+        model="google/gemini-3.1-pro-preview",
+        base_url="https://openrouter.ai/api/v1",
+        provider_kind="openrouter",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            503,
+            request=request,
+            json={"error": {"message": "synthetic upstream resource limit"}},
+        )
+
+    _patch_transport(monkeypatch, handler)
+    errors = [
+        event
+        for event in await _events(provider)
+        if isinstance(event, ErrorEvent)
+    ]
+
+    assert len(errors) == 1
+    error = errors[0]
+    assert error.code == "503"
+    assert error.request_started is True
+    assert error.physical_request_count == 1
+    assert error.usage_missing_count == 1
+    assert len(error.model_usage_breakdown) == 1
+    unit = error.model_usage_breakdown[0]
+    assert unit["provider"] == ""
+    assert unit["model"] == ""
+    assert unit["requested_provider"] == "openrouter"
+    assert unit["requested_model"] == "google/gemini-3.1-pro-preview"
+    assert unit["usage_unknown"] is True
+    assert unit["provider_usage"]["usage_unknown"] is True
+    assert unit["billed_cost"] == 0.0
+    assert unit["cost_source"] == "none"
+
+
+def test_stream_fallback_unknown_marker_is_idempotent() -> None:
+    fallback_error = ErrorEvent(
+        message="synthetic fallback failure",
+        code="timeout",
+        request_started=True,
+        physical_request_count=1,
+        usage_missing_count=1,
+    )
+
+    first = openai_module._mark_stream_fallback_cost_unknown(
+        fallback_error,
+        provider_kind="openrouter",
+        requested_model="requested-model",
+    )
+    second = openai_module._mark_stream_fallback_cost_unknown(
+        first,
+        provider_kind="openrouter",
+        requested_model="requested-model",
+    )
+
+    assert second is first
+    assert isinstance(second, ErrorEvent)
+    assert second.physical_request_count == 2
+    assert second.usage_missing_count == 2
+    assert sum(
+        row.get("usage_evidence_context") == "stream_fallback_wrapper"
+        for row in second.model_usage_breakdown
+    ) == 1
+
+
 @pytest.mark.parametrize("kind", ["openai", "openai_responses", "anthropic", "ollama"])
 async def test_transport_error_echoed_key_is_redacted_from_event_and_trace(
     kind: str,

@@ -721,6 +721,32 @@ def test_output_layout_archives_process_material_and_has_no_final_directory() ->
     assert finalizer < publisher < unlock
 
 
+def test_terminal_model_budget_exhaustion_is_recorded_before_finalizer() -> None:
+    script = _script()
+
+    settlement = script.index("capture_stable_after")
+    terminal_gate = script.index(
+        "(.generation_budget_exhausted_pair_count // 0) > 0",
+        settlement,
+    )
+    status = script.index(
+        '"$RECOVERY_STATUS" status "$OUTPUT_DIR"',
+        terminal_gate,
+    )
+    finalizer = script.index(
+        '"$PYTHON" "$FINALIZER" "${FINALIZER_ARGS[@]}"',
+        status,
+    )
+
+    assert settlement < terminal_gate < status < finalizer
+    assert '.reason_code == "model_attempt_budget_exhausted"' in script
+    assert '"$ARCHIVE_DIR/finalization-status.json"' in script
+    assert (
+        'RECOVERY_STATUS="$SNAPSHOT_REPO/scripts/experiments/'
+        'recover_draco_finalization.py"'
+    ) in script
+
+
 def test_final_artifacts_are_promoted_with_manifest_as_commit_marker(
     tmp_path: Path,
 ) -> None:

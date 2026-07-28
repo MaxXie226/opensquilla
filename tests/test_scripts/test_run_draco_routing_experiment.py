@@ -3943,7 +3943,7 @@ def test_unrepresented_missing_request_increases_all_request_counts(module) -> N
 
 
 @pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
-def test_no_breakdown_receipt_plus_missing_increases_all_request_counts(module) -> None:
+def test_no_breakdown_receipt_plus_missing_respects_total_request_count(module) -> None:
     done = DoneEvent(
         provider="openrouter",
         model="model-a",
@@ -3953,12 +3953,12 @@ def test_no_breakdown_receipt_plus_missing_increases_all_request_counts(module) 
         cost_source="provider_billed",
         usage_missing_count=2,
         ensemble_trace={
-            "llm_request_count": 1,
-            "physical_request_count": 1,
+            "llm_request_count": 3,
+            "physical_request_count": 3,
         },
     )
     result = module.RunResult(final_text="answer", done=done)
-    row = {"llm_request_count": 1, "usage": module.done_payload(done)}
+    row = {"llm_request_count": 3, "usage": module.done_payload(done)}
 
     assert (
         module.llm_request_count_for_run(
@@ -3970,6 +3970,24 @@ def test_no_breakdown_receipt_plus_missing_increases_all_request_counts(module) 
     )
     assert module.run_result_summary(result)["llm_request_count"] == 3
     assert module.row_llm_request_count(row) == 3
+
+
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+def test_conflicting_ensemble_request_counts_fail_closed(module) -> None:
+    done = DoneEvent(
+        provider="openrouter",
+        model="model-a",
+        ensemble_trace={
+            "llm_request_count": 2,
+            "physical_request_count": 3,
+        },
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="conflicting physical request count declarations",
+    ):
+        module.done_payload(done)
 
 
 @pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
