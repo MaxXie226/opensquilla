@@ -263,8 +263,11 @@ def test_desktop_build_and_smoke_wire_the_ca_contract() -> None:
     assert "'--hidden-import',\n  'certifi'," in build_source
     assert '"certifi>=2024.7.4"' in project_source
     assert "--_desktop-ca-probe" in entry_source
+    assert "--_sandbox-filesystem-worker" in entry_source
+    assert "--elevated-helper" in entry_source
     assert "x509_ca={ca_certificate_count}" in entry_source
     assert "spawnSync(gatewayBinary, ['--_desktop-ca-probe']" in smoke_source
+    assert "spawnSync(gatewayBinary, ['--_sandbox-filesystem-worker']" in smoke_source
     assert "caCertificateCount <= 0" in smoke_source
     for name in (
         "ALL_PROXY",

@@ -6,6 +6,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from opensquilla.sandbox.run_mode import RunMode, execution_target, normalize_run_mode
 from opensquilla.session.keys import normalize_agent_id
 
 from .delivery import validate_webhook_url
@@ -145,6 +146,8 @@ class SchedulerOps:
         creator_session_key: str = "",
         creator_sender_id: str = "",
         creator_is_owner: bool = False,
+        run_mode: str = "",
+        idempotency_key: str = "",
     ) -> CronJob:
         """Validate the structured schedule, compute jitter, persist a new CronJob.
 
@@ -199,6 +202,13 @@ class SchedulerOps:
             delivery=delivery or DeliveryConfig(),
             explicit_delivery=delivery is not None,
         )
+        effective_run_mode = (
+            normalize_run_mode(run_mode)
+            if run_mode
+            else (RunMode.FULL if creator_is_owner else RunMode.TRUSTED)
+        )
+        if effective_run_mode is RunMode.FULL and not creator_is_owner:
+            effective_run_mode = RunMode.TRUSTED
 
         job = CronJob(
             name=name,
@@ -220,6 +230,10 @@ class SchedulerOps:
             creator_session_key=creator_session_key or "",
             creator_sender_id=creator_sender_id or "",
             creator_is_owner=bool(creator_is_owner),
+            run_mode=effective_run_mode.value,
+            elevated="full" if effective_run_mode is RunMode.FULL else "",
+            execution_target=execution_target(effective_run_mode),
+            idempotency_key=idempotency_key,
         )
 
         if kind == ScheduleKind.AT:
@@ -234,8 +248,7 @@ class SchedulerOps:
             # CRON or EVERY with cron expression: scan forward
             job.next_run_at = _next_run(job, now)
 
-        await self._store.save(job)
-        return job
+        return await self._store.create_or_get(job)
 
     async def update(self, job_id: str, **patch) -> CronJob | None:
         """Apply a partial update to an existing job. Returns None if not found."""
