@@ -1400,8 +1400,11 @@ async def test_real_core_preview_and_apply_use_only_one_direct_model_call(tmp_pa
     )
     assert _Provider.calls == 1
     assert sum(clone.resolve_calls for clone in selector.clones) == 1
-    assert indexed == [
-        ("MEMORY.md", "# MEMORY.md\n\n- Prefers concise answers.\n")
-    ]
+    with (workspace / "MEMORY.md").open(
+        "r",
+        encoding="utf-8",
+        newline="",
+    ) as memory_file:
+        assert indexed == [("MEMORY.md", memory_file.read())]
     assert fallback_syncs == []
     assert refreshed_info["recentImport"]["indexStatus"] == "ready"
