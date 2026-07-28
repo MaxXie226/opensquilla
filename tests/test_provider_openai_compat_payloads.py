@@ -3232,14 +3232,26 @@ def test_dashscope_request_logs_qwen_provider_profile(monkeypatch: Any) -> None:
     assert profile["stream_fallback"] == "non_stream_once"
 
 
-def test_dashscope_qwen36_flash_thinking_does_not_replay_reasoning_content(
+@pytest.mark.parametrize(
+    "model",
+    [
+        "qwen3.6-flash",
+        "qwen3.7-flash-2026-07-15",
+    ],
+)
+@pytest.mark.parametrize("env_value", [None, "on"])
+def test_dashscope_documented_preserve_model_replays_reasoning_content(
     monkeypatch: Any,
+    model: str,
+    env_value: str | None,
 ) -> None:
     captured: dict[str, Any] = {}
     _patch_transport(monkeypatch, captured)
+    if env_value is not None:
+        monkeypatch.setenv("OPENSQUILLA_DASHSCOPE_PRESERVE_THINKING", env_value)
     provider = OpenAIProvider(
         api_key="test",
-        model="qwen3.6-flash",
+        model=model,
         base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
         provider_kind="dashscope",
     )
@@ -3283,8 +3295,144 @@ def test_dashscope_qwen36_flash_thinking_does_not_replay_reasoning_content(
     asyncio.run(_run())
 
     assert captured["payload"]["enable_thinking"] is True
+    assert captured["payload"]["preserve_thinking"] is True
+    assert captured["payload"]["messages"][0]["reasoning_content"] == (
+        "I chose a minimal patch before calling the tool."
+    )
+
+
+def test_dashscope_preserve_thinking_off_keeps_supported_model_history_hidden(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    monkeypatch.setenv("OPENSQUILLA_DASHSCOPE_PRESERVE_THINKING", "off")
+    provider = OpenAIProvider(
+        api_key="test",
+        model="qwen3.7-flash-2026-07-15",
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        provider_kind="dashscope",
+    )
+    messages = [
+        Message(
+            role="assistant",
+            content="previous visible answer",
+            reasoning_content="previous DashScope thinking",
+        ),
+        Message(role="user", content="continue"),
+    ]
+    cfg = ChatConfig(
+        thinking=True,
+        model_capabilities=ModelCapabilities(
+            supports_reasoning=True,
+            supports_tools=True,
+            reasoning_format="dashscope",
+        ),
+    )
+
+    async def _run() -> None:
+        async for _ in provider.chat(messages, config=cfg):
+            pass
+
+    asyncio.run(_run())
+
+    assert captured["payload"]["enable_thinking"] is True
     assert "preserve_thinking" not in captured["payload"]
     assert "reasoning_content" not in captured["payload"]["messages"][0]
+
+
+def test_dashscope_preserve_thinking_invalid_value_fails_closed(
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_DASHSCOPE_PRESERVE_THINKING", "treu")
+    provider = OpenAIProvider(
+        api_key="test",
+        model="qwen3.7-flash-2026-07-15",
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        provider_kind="dashscope",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="OPENSQUILLA_DASHSCOPE_PRESERVE_THINKING",
+    ):
+        _collect(
+            provider,
+            ChatConfig(
+                thinking=True,
+                model_capabilities=ModelCapabilities(
+                    supports_reasoning=True,
+                    supports_tools=True,
+                    reasoning_format="dashscope",
+                ),
+            ),
+        )
+
+
+def test_dashscope_preserve_thinking_auto_keeps_unsupported_model_history_hidden(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="test",
+        model="qwen3-max",
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        provider_kind="dashscope",
+    )
+    messages = [
+        Message(
+            role="assistant",
+            content="previous visible answer",
+            reasoning_content="unsupported reasoning history",
+        ),
+        Message(role="user", content="continue"),
+    ]
+    cfg = ChatConfig(
+        thinking=True,
+        model_capabilities=ModelCapabilities(
+            supports_reasoning=True,
+            supports_tools=True,
+            reasoning_format="dashscope",
+        ),
+    )
+
+    async def _run() -> None:
+        async for _ in provider.chat(messages, config=cfg):
+            pass
+
+    asyncio.run(_run())
+
+    assert "preserve_thinking" not in captured["payload"]
+    assert "reasoning_content" not in captured["payload"]["messages"][0]
+
+
+def test_dashscope_preserve_thinking_on_rejects_unsupported_model(
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_DASHSCOPE_PRESERVE_THINKING", "on")
+    provider = OpenAIProvider(
+        api_key="test",
+        model="qwen3-max",
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        provider_kind="dashscope",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="not supported.*qwen3-max",
+    ):
+        _collect(
+            provider,
+            ChatConfig(
+                thinking=True,
+                model_capabilities=ModelCapabilities(
+                    supports_reasoning=True,
+                    supports_tools=True,
+                    reasoning_format="dashscope",
+                ),
+            ),
+        )
 
 
 def test_dashscope_preserve_thinking_model_replays_reasoning_content(

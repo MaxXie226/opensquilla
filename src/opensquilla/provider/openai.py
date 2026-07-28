@@ -730,14 +730,37 @@ def _should_send_tool_choice(
 
 _DASHSCOPE_PRESERVE_THINKING_MODEL_IDS = frozenset(
     {
+        "qwen3.6-flash",
+        "qwen3.6-flash-2026-04-16",
         "qwen3.6-max-preview",
+        "qwen3.7-flash",
+        "qwen3.7-flash-2026-07-15",
     }
 )
+_DASHSCOPE_PRESERVE_THINKING_ENV = "OPENSQUILLA_DASHSCOPE_PRESERVE_THINKING"
 
 
 def _dashscope_supports_preserve_thinking(model: str) -> bool:
     model_name = model.rsplit("/", 1)[-1].strip().lower()
     return model_name in _DASHSCOPE_PRESERVE_THINKING_MODEL_IDS
+
+
+def _dashscope_preserve_thinking_override_from_env() -> bool | None:
+    """Return an explicit preserve-thinking treatment, or None for model auto-detection."""
+    raw = os.environ.get(_DASHSCOPE_PRESERVE_THINKING_ENV)
+    if raw is None or not raw.strip():
+        return None
+    normalized = raw.strip().lower()
+    if normalized == "auto":
+        return None
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(
+        f"{_DASHSCOPE_PRESERVE_THINKING_ENV} must be one of "
+        "auto, 1/true/yes/on, or 0/false/no/off"
+    )
 
 
 def _should_send_temperature(
@@ -2634,7 +2657,16 @@ def _should_replay_reasoning_content(
     if caps.reasoning_format == "dashscope":
         if not effective_thinking:
             return False
-        return _dashscope_supports_preserve_thinking(model)
+        supported = _dashscope_supports_preserve_thinking(model)
+        override = _dashscope_preserve_thinking_override_from_env()
+        if override is None:
+            return supported
+        if override and not supported:
+            raise ValueError(
+                f"{_DASHSCOPE_PRESERVE_THINKING_ENV}=on is not supported "
+                f"for DashScope model {model!r}"
+            )
+        return override
     return bool(policy.replay_reasoning_format) and (
         caps.reasoning_format == policy.replay_reasoning_format
     )
