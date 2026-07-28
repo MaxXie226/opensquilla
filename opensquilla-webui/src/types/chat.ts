@@ -107,17 +107,24 @@ export interface ChatToolCallGroup {
 }
 
 export interface ChatStreamSegment {
-  type: 'text' | 'tool-group'
+  type: 'text' | 'tool-group' | 'interrupt'
   raw?: string
   html?: string
   dirty?: boolean
   groupId?: string
   operationKey?: string
+  approvalId?: string
 }
 
 export type ChatStreamTimelineItem =
   | { type: 'text'; key: string; html: string; rawText?: string }
   | { type: 'tool-group'; key: string; group: ChatToolCallGroup }
+  | {
+      type: 'interrupt'
+      key: string
+      approvalId: string
+      part: Extract<import('./parts').ChatPart, { type: 'interrupt' }>
+    }
 
 export type ChatRole = 'user' | 'assistant' | 'system' | 'error' | 'router' | string
 
@@ -186,6 +193,8 @@ export interface ChatTimelineSegment extends Record<string, unknown> {
   text?: string
   groupId?: string
   group_id?: string
+  approvalId?: string
+  approval_id?: string
 }
 
 export interface ChatUsagePayload {
@@ -310,6 +319,7 @@ export interface ChatMessage {
   routerDecision?: import('./rpc').RouterDecisionPayload | null
   artifacts?: ArtifactPayload[]
   tool_calls?: RawToolCallPayload[]
+  planRevisions?: import('./plans').PlanRevisionSnapshot[]
   timeline?: ChatTimelineSegment[]
   attachments?: DisplayAttachment[]
   provenanceKind?: string
@@ -333,6 +343,8 @@ export interface ChatMessage {
   output_tokens?: number
   restoredFromHistory?: boolean
   statusHistory?: import('./parts').StatusPart[]
+  /** Live approval/clarify snapshots referenced by interrupt timeline segments. */
+  interrupts?: Extract<import('./parts').ChatPart, { type: 'interrupt' }>[]
   stopNotice?: boolean
   /** Client terminal error retained until history contains a durable error row. */
   terminalNotice?: boolean
@@ -378,6 +390,7 @@ export interface ChatRenderedMessage {
   hasAttachments?: boolean
   attachments?: DisplayAttachment[]
   toolCalls?: ChatToolCall[]
+  planRevisions?: import('./plans').PlanRevisionSnapshot[]
   timelineItems?: ChatStreamTimelineItem[]
   artifacts?: ArtifactPayload[]
   meta?: ChatMessageMeta

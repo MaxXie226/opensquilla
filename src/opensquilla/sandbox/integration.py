@@ -50,6 +50,7 @@ from opensquilla.sandbox.elevation import (
     ElevationAction,
     ElevationGateResult,
     consume_approved_elevation,
+    effective_approval_reviewer,
     gate_elevated_action,
 )
 from opensquilla.sandbox.escalation import (
@@ -138,6 +139,8 @@ class _ApprovalQueueLike(Protocol):
 
     def resolve(self, approval_id: str, approved: bool) -> None: ...
 
+    def consume(self, approval_id: str) -> None: ...
+
 
 # ─── Runtime state ────────────────────────────────────────────────────────
 
@@ -160,6 +163,7 @@ class SandboxRuntime:
     cache: StaleOutputCache
     workspace: Path
     approval_queue: Any
+    default_run_mode: RunMode
 
 
 @dataclass(frozen=True)
@@ -180,6 +184,7 @@ def configure_runtime(
     approval_queue: _ApprovalQueueLike | None = None,
     stale_cache: StaleOutputCache | None = None,
     workspace: Path | None = None,
+    default_run_mode: RunMode | str | None = None,
 ) -> SandboxRuntime:
     """Build the process-wide :class:`SandboxRuntime`.
 
@@ -189,6 +194,11 @@ def configure_runtime(
     """
     global _runtime
 
+    request_default = (
+        normalize_run_mode(default_run_mode)
+        if default_run_mode is not None
+        else normalize_run_mode(settings.run_mode)
+    )
     effective = settings.validate_combination()
     cache = stale_cache if stale_cache is not None else get_stale_output_cache()
     ledger = DenialLedger(
@@ -236,6 +246,7 @@ def configure_runtime(
         cache=cache,
         workspace=ws,
         approval_queue=queue,
+        default_run_mode=request_default,
     )
     log.info(
         "sandbox.runtime_configured: backend=%s level=%s grading=%s insecure=%s",
@@ -410,7 +421,7 @@ def _resolve_request_run_mode(runtime: SandboxRuntime | None) -> str:
     if isinstance(context, RunContext):
         return context.run_mode.value
     if runtime is not None:
-        return normalize_run_mode(runtime.settings.run_mode).value
+        return runtime.default_run_mode.value
     return RunMode.FULL.value
 
 
@@ -820,7 +831,7 @@ async def gate_action(
         session_mounts=_session_mounts_for_policy(workspace),
     )
     run_context = current_tool_run_context()
-    configured_mode = getattr(rt.settings, "run_mode", None)
+    configured_mode = rt.default_run_mode
     try:
         from opensquilla.tools.run_mode import current_run_mode
 
@@ -918,13 +929,13 @@ def _network_grant_workspace(request: SandboxRequest, runtime: SandboxRuntime) -
     return str(getattr(runtime, "workspace", None) or request.cwd)
 
 
-def _configured_approval_reviewer(runtime: SandboxRuntime | object) -> ApprovalReviewerName:
+def _configured_approval_reviewer(
+    runtime: SandboxRuntime | object,
+    run_mode: object = None,
+) -> ApprovalReviewerName:
     settings = getattr(runtime, "settings", None)
     reviewer = str(getattr(settings, "approvals_reviewer", "user") or "user")
-    return cast(
-        "ApprovalReviewerName",
-        reviewer if reviewer in {"user", "auto_review"} else "user",
-    )
+    return effective_approval_reviewer(reviewer, run_mode)
 
 
 def _current_sandbox_persistence_handles() -> tuple[Any | None, Any | None]:
@@ -1499,7 +1510,7 @@ async def _preflight_cached_network_artifact_access(
                 session_key=_resolve_session_id(runtime, None),
                 workspace=_network_grant_workspace(request, runtime),
                 fingerprint=fingerprint,
-                reviewer=_configured_approval_reviewer(runtime),
+                reviewer=_configured_approval_reviewer(runtime, context.run_mode),
             )
             if params is not None:
                 return request_sandbox_approval(
@@ -1559,7 +1570,7 @@ async def _preflight_request_package_bundle(
         session_key=_resolve_session_id(runtime, None),
         workspace=_network_grant_workspace(request, runtime),
         fingerprint=fingerprint,
-        reviewer=_configured_approval_reviewer(runtime),
+        reviewer=_configured_approval_reviewer(runtime, context.run_mode),
     )
     return request_sandbox_approval(
         params,
@@ -2016,11 +2027,14 @@ def consume_backend_denial_retry(
                 "profile contains denied reads."
             ),
         )
+    from opensquilla.tools.run_mode import current_run_mode
+
     return consume_approved_elevation(
         rt.approval_queue,  # type: ignore[arg-type]
         approval_id,
         action,
         expected_session_key=_resolve_session_id(rt, None),
+        expected_reviewer=_configured_approval_reviewer(rt, current_run_mode()),
     )
 
 
@@ -2036,9 +2050,7 @@ def _runtime_is_full_host_access(runtime: SandboxRuntime) -> bool:
     context = current_tool_run_context()
     if context is not None:
         return context.run_mode == RunMode.FULL
-    if runtime.settings.run_mode is not None:
-        return normalize_run_mode(runtime.settings.run_mode) == RunMode.FULL
-    return False
+    return runtime.default_run_mode == RunMode.FULL
 
 
 __all__ = [

@@ -74,6 +74,13 @@ class RouteEnvelope:
     metadata: dict[str, Any] = field(default_factory=dict)
     interaction_mode: InteractionMode = InteractionMode.INTERACTIVE
     sandbox_run_context_fresh: bool = False
+    # Process-local services attached only after durable acceptance. Keeping
+    # them out of ``metadata`` prevents serialization of live handles.
+    runtime_services: dict[str, Any] = field(
+        default_factory=dict,
+        repr=False,
+        compare=False,
+    )
 
     def delivery_fields(self) -> dict[str, Any]:
         """Return session routing fields derived from the reply target."""
@@ -509,6 +516,11 @@ def tool_context_from_envelope(
         source="route_metadata",
         preserve_materialized_user_grants=sandbox_run_context_fresh,
     )
+    effective_workspace_dir = (
+        sandbox_run_context.workspace
+        if sandbox_run_context is not None and sandbox_run_context.workspace
+        else workspace_dir
+    )
     if (
         sandbox_run_context is not None
         and sandbox_run_context.run_mode == RunMode.FULL
@@ -528,7 +540,7 @@ def tool_context_from_envelope(
         interaction_mode=interaction_mode,
         subagent_depth=int(envelope.metadata.get("spawn_depth") or 0),
         agent_id=envelope.agent_id,
-        workspace_dir=workspace_dir,
+        workspace_dir=effective_workspace_dir,
         workspace_strict=workspace_strict,
         run_mode=run_mode.value if run_mode is not None else None,
         sandbox_mounts=sandbox_mounts,
@@ -545,7 +557,38 @@ def tool_context_from_envelope(
         tool_policy=(
             envelope.metadata.get("tool_policy") if cron_trusted_owner else None
         ),
+        task_id=(
+            str(envelope.metadata["task_id"])
+            if envelope.metadata.get("task_id")
+            else None
+        ),
+        collaboration_mode=str(
+            envelope.metadata.get("collaboration_mode") or "default"
+        ),
+        collaboration_revision=int(
+            envelope.metadata.get("collaboration_revision") or 0
+        ),
+        active_plan_revision_id=(
+            str(envelope.metadata["active_plan_revision_id"])
+            if envelope.metadata.get("active_plan_revision_id")
+            else None
+        ),
+        plan_run_id=(
+            str(envelope.metadata["plan_run_id"])
+            if envelope.metadata.get("plan_run_id")
+            else None
+        ),
+        plan_storage=envelope.runtime_services.get("plan_storage"),
+        plan_event_emitter=envelope.runtime_services.get("plan_event_emitter"),
+        user_input_provider=envelope.runtime_services.get("user_input_provider"),
+        plan_revision=envelope.runtime_services.get("plan_revision"),
+        plan_run=envelope.runtime_services.get("plan_run"),
     )
+    if sandbox_run_context_fresh:
+        # Runtime-only authority marker copied from the RouteEnvelope field,
+        # never from mutable metadata. Execution-time workspace validation is
+        # the only ingress that sets this field for ordinary turns.
+        setattr(ctx, "_sandbox_run_context_fresh", True)
     if caller_kind is CallerKind.CRON:
         if not cron_trusted_owner:
             ctx = apply_tool_policy_layer(

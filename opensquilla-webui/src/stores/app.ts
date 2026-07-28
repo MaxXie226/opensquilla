@@ -46,12 +46,19 @@ function hydrateSidebarWidthPreference(): SidebarWidthPreference {
   }
 }
 
-/** One pending approval, ordered oldest-first (closest to timeout). */
+/** One pending approval, ordered oldest-first. */
 export interface PendingApproval {
   approvalId: string
   sessionKey: string
   tool: string
   command: string
+}
+
+/** One-shot request for ChatView to reveal and focus a pending approval card. */
+export interface ApprovalFocusRequest {
+  requestId: number
+  approvalId: string
+  sessionKey: string
 }
 
 export const useAppStore = defineStore('app', () => {
@@ -73,6 +80,8 @@ export const useAppStore = defineStore('app', () => {
   // still supports snapshot consumers (back-compat).
   const pendingApprovals = ref<PendingApproval[]>([])
   const approvalCountRaw = ref(0)
+  const approvalFocusRequest = ref<ApprovalFocusRequest | null>(null)
+  let approvalFocusRequestId = 0
 
   // True once App.vue has wired the live approval source (push events + seed
   // fetch). While live, `approvalCount` is derived from `pendingApprovals`;
@@ -83,7 +92,7 @@ export const useAppStore = defineStore('app', () => {
   const approvalCount = computed(() =>
     approvalsLive.value ? pendingApprovals.value.length : approvalCountRaw.value)
 
-  // The oldest pending approval with a routable session (closest to timeout).
+  // The oldest pending approval with a routable session.
   const oldestPendingWithSession = computed<PendingApproval | null>(() =>
     pendingApprovals.value.find(item => !!item.sessionKey) ?? null)
 
@@ -353,6 +362,26 @@ export const useAppStore = defineStore('app', () => {
   function removePendingApproval(approvalId: string) {
     approvalsLive.value = true
     pendingApprovals.value = pendingApprovals.value.filter(a => a.approvalId !== approvalId)
+    if (approvalFocusRequest.value?.approvalId === approvalId) {
+      approvalFocusRequest.value = null
+    }
+  }
+
+  function requestApprovalFocus(
+    approval: Pick<PendingApproval, 'approvalId' | 'sessionKey'>,
+  ) {
+    if (!approval.approvalId || !approval.sessionKey) return
+    approvalFocusRequest.value = {
+      requestId: ++approvalFocusRequestId,
+      approvalId: approval.approvalId,
+      sessionKey: approval.sessionKey,
+    }
+  }
+
+  function clearApprovalFocusRequest(requestId: number) {
+    if (approvalFocusRequest.value?.requestId === requestId) {
+      approvalFocusRequest.value = null
+    }
   }
 
   const features = ref<Record<string, boolean>>({
@@ -363,6 +392,9 @@ export const useAppStore = defineStore('app', () => {
     // window.OPENSQUILLA_FEATURES. The preflight + ribbon cards are always-on
     // (driven by stream events) regardless of this flag.
     metaRuns: true,
+    // Application-level artifact Workbench. Operators can temporarily disable
+    // it to retain the previous Drawer/lightbox flow for one release cycle.
+    artifactWorkbench: true,
     ...((window as FeatureWindow).OPENSQUILLA_FEATURES || {}),
   })
 
@@ -376,6 +408,7 @@ export const useAppStore = defineStore('app', () => {
     approvalCount,
     pendingApprovals,
     oldestPendingWithSession,
+    approvalFocusRequest,
     features,
     initTheme,
     destroyTheme,
@@ -392,5 +425,7 @@ export const useAppStore = defineStore('app', () => {
     setPendingApprovals,
     upsertPendingApproval,
     removePendingApproval,
+    requestApprovalFocus,
+    clearApprovalFocusRequest,
   }
 })

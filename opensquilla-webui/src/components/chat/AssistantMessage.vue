@@ -24,6 +24,17 @@
       <Icon v-if="shareSelected" name="check" :size="13" />
     </button>
     <div class="msg-ai-main">
+      <PlanCard
+        v-for="part in planParts"
+        :key="part.key"
+        class="plan-message-card"
+        :plan="part.plan"
+        :disabled="planActionsDisabled"
+        :pending-action="planActionPending"
+        @implement-current="$emit('planImplementCurrent', $event)"
+        @implement-new="$emit('planImplementNew', $event)"
+        @replan="$emit('planReplan', $event)"
+      />
       <template v-if="activityProjection.canSeparateActivity">
         <ActivityDisclosure
           v-if="hasActivity"
@@ -40,7 +51,7 @@
           <ReasoningPart v-if="reasoningPart" :part="reasoningPart" embedded />
           <AssistantActivityTimeline
             v-if="
-              activityProjection.activityClusters.length
+              activityProjection.activityItems.length
               || activityProjection.statusSteps.length
             "
             :projection="activityProjection"
@@ -54,7 +65,19 @@
             @toggle-group="$emit('toggleToolGroup', $event)"
             @toggle-item="$emit('toggleToolItem', $event)"
             @show-result="(content, title, context) => $emit('showToolResult', content, title, context)"
-          />
+          >
+            <template #interrupt="{ part }">
+              <InterruptPart
+                v-if="part.resolution"
+                :part="part"
+                timeline
+                @resolve="(id, decision, note) => $emit('resolveInterrupt', id, decision, note)"
+                @extend="id => $emit('extendInterrupt', id)"
+                @clarify-submit="(fields, request) => $emit('clarifySubmit', fields, request)"
+                @clarify-dismiss="$emit('clarifyDismiss')"
+              />
+            </template>
+          </AssistantActivityTimeline>
         </ActivityDisclosure>
         <TextPart
           v-if="activityProjection.answerPart"
@@ -80,24 +103,24 @@
           @toggle-group="$emit('toggleToolGroup', $event)"
           @toggle-item="$emit('toggleToolItem', $event)"
           @show-result="(content, title, context) => $emit('showToolResult', content, title, context)"
-        />
+        >
+          <template #interrupt="{ part }">
+            <InterruptPart
+              v-if="part.resolution"
+              :part="part"
+              timeline
+              @resolve="(id, decision, note) => $emit('resolveInterrupt', id, decision, note)"
+              @extend="id => $emit('extendInterrupt', id)"
+              @clarify-submit="(fields, request) => $emit('clarifySubmit', fields, request)"
+              @clarify-dismiss="$emit('clarifyDismiss')"
+            />
+          </template>
+        </ToolCallTimeline>
         <StatusHistoryPart
           v-if="statusHistory.length"
           :entries="statusHistory"
         />
       </template>
-
-      <!-- Inline interrupts: approval / clarify requests that blocked the run,
-           rendered after the body and before the ending deliverables. -->
-      <InterruptPart
-        v-for="part in interruptParts"
-        :key="part.key"
-        :part="part"
-        @resolve="(id, decision, note) => $emit('resolveInterrupt', id, decision, note)"
-        @extend="id => $emit('extendInterrupt', id)"
-        @clarify-submit="(fields, request) => $emit('clarifySubmit', fields, request)"
-        @clarify-dismiss="$emit('clarifyDismiss')"
-      />
 
       <div
         class="msg-ai-ending"
@@ -110,7 +133,9 @@
           :navigation-artifacts="artifactNavigationItems"
           :session-key="sessionKey"
           :auth-token="authToken"
+          :prefer-workbench="workbenchEnabled"
           @download="$emit('downloadArtifact', $event)"
+          @open="$emit('openArtifact', $event)"
         />
 
         <SourcesRow v-if="message.toolCalls?.length" ref="sourcesRowRef" :calls="message.toolCalls" :sources="message.sources ?? []" />
@@ -258,6 +283,18 @@
           </time>
         </div>
       </div>
+
+      <!-- A pending interrupt is the turn's active control and must remain the
+           final item. Once resolved it folds back into the activity timeline. -->
+      <InterruptPart
+        v-for="part in standaloneInterruptParts"
+        :key="part.key"
+        :part="part"
+        @resolve="(id, decision, note) => $emit('resolveInterrupt', id, decision, note)"
+        @extend="id => $emit('extendInterrupt', id)"
+        @clarify-submit="(fields, request) => $emit('clarifySubmit', fields, request)"
+        @clarify-dismiss="$emit('clarifyDismiss')"
+      />
     </div>
   </div>
 </template>
@@ -272,6 +309,7 @@ import ChatArtifactList from '@/components/chat/ChatArtifactList.vue'
 import SourcesRow from '@/components/chat/SourcesRow.vue'
 import ToolCallTimeline from '@/components/chat/ToolCallTimeline.vue'
 import InterruptPart from '@/components/chat/parts/InterruptPart.vue'
+import PlanCard from '@/components/chat/PlanCard.vue'
 import ReasoningPart from '@/components/chat/parts/ReasoningPart.vue'
 import StatusHistoryPart from '@/components/chat/parts/StatusHistoryPart.vue'
 import TextPart from '@/components/chat/parts/TextPart.vue'
@@ -288,6 +326,10 @@ import type {
 } from '@/types/chat'
 import type { ChatPart } from '@/types/parts'
 import type { ArtifactPayload } from '@/types/rpc'
+import type {
+  PlanCardAction,
+  PlanCardActionTarget,
+} from '@/types/plans'
 import {
   projectAssistantActivity,
   type AssistantActivityLifecycle,
@@ -316,15 +358,19 @@ const props = defineProps<{
   artifactNavigationItems?: ArtifactPayload[]
   sessionKey?: string
   authToken?: string
+  workbenchEnabled?: boolean
   /** True on the thread's last assistant message — the only place the whole-conversation fork action renders. */
   isTip?: boolean
   forkBusy?: boolean
+  planActionPending?: PlanCardAction | null
+  planActionsDisabled?: boolean
 }>()
 
 const emit = defineEmits<{
   regenerate: [message: ChatRenderedMessage]
   toggleShare: [messageId: string]
   downloadArtifact: [artifact: ArtifactPayload]
+  openArtifact: [artifact: ArtifactPayload]
   toggleToolGroup: [groupId: string]
   toggleToolItem: [renderKey: string]
   showToolResult: [content: string, title: string, context?: ToolResultContext]
@@ -333,6 +379,9 @@ const emit = defineEmits<{
   extendInterrupt: [id: string]
   clarifySubmit: [fields: Record<string, string>, request?: NonNullable<Extract<import('@/types/parts').ChatPart, { type: 'interrupt' }>['clarify']>]
   clarifyDismiss: []
+  planImplementCurrent: [target: PlanCardActionTarget]
+  planImplementNew: [target: PlanCardActionTarget]
+  planReplan: [target: PlanCardActionTarget]
 }>()
 
 // Absolute label is static; only the relative label subscribes to the shared
@@ -381,6 +430,23 @@ const interruptParts = computed(
       (part): part is Extract<ChatPart, { type: 'interrupt' }> => part.type === 'interrupt',
     ) ?? [],
 )
+const timelineResolvedInterruptKeys = computed(() => new Set(
+  props.message.timelineItems
+    ?.filter(
+      (item): item is Extract<import('@/types/chat').ChatStreamTimelineItem, { type: 'interrupt' }> =>
+        item.type === 'interrupt' && !!item.part.resolution,
+    )
+    .map(item => item.part.key) ?? [],
+))
+const standaloneInterruptParts = computed(() =>
+  interruptParts.value.filter(part => !timelineResolvedInterruptKeys.value.has(part.key)),
+)
+const planParts = computed(
+  () =>
+    props.message.parts?.filter(
+      (part): part is Extract<ChatPart, { type: 'plan' }> => part.type === 'plan',
+    ) ?? [],
+)
 // The persisted activity timeline for this finished turn. Empty (fold hidden)
 // for OFF-mode turns and reloaded threads, which carry no snapshot.
 const statusHistory = computed(() => props.message.statusHistory ?? [])
@@ -414,7 +480,10 @@ const safeCronSourceTool = computed(() => {
 const cronBadgeTitle = computed(() => safeCronSourceTool.value
   ? t('chat.provenance.cronSource', { tool: safeCronSourceTool.value })
   : t('chat.provenance.cron'))
-const showFooter = computed(() => !!props.message.meta || (!props.shareMode && !props.message.stopNotice))
+const showFooter = computed(() =>
+  planParts.value.length === 0
+  && (!!props.message.meta || (!props.shareMode && !props.message.stopNotice)),
+)
 
 // A citation pill in the body asks the paired SourcesRow to reveal + highlight
 // the source it points at. No-op when no SourcesRow is mounted (which only
@@ -655,6 +724,14 @@ function ensembleRole(role: string, label: string): string {
 </script>
 
 <style scoped>
+.msg-ai-main > :deep(.approval-card),
+.msg-ai-main > :deep(.clarify-card) {
+  width: 100%;
+  max-width: 100%;
+  margin-inline: 0;
+  box-sizing: border-box;
+}
+
 .msg-ai {
   position: relative;
   display: flex;
@@ -734,6 +811,12 @@ function ensembleRole(role: string, label: string): string {
   min-width: 0;
   max-width: none;
   padding-top: 0.0625rem;
+}
+
+.plan-message-card {
+  width: 100%;
+  max-width: none;
+  margin: 0;
 }
 
 .msg-ai--stop-notice .msg-ai-main {

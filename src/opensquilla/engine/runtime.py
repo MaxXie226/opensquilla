@@ -2642,6 +2642,10 @@ class TurnRunner:
         self._turn_compaction_attempted_sessions: set[str] = set()
         self._turn_compacted_sessions: set[str] = set()
         self._active_pre_compaction_flush_tasks: dict[str, asyncio.Task] = {}
+        self._pre_compaction_flush_status_tasks: dict[
+            str,
+            set[asyncio.Task[None]],
+        ] = {}
         self._emergency_compaction_overrides: dict[str, _EmergencyCompactionOverride] = {}
         # TurnRunner stage decomposition InputStage instance. Holds no per-turn state;
         # constructed once. Active unconditionally as of.
@@ -2848,7 +2852,9 @@ class TurnRunner:
     ) -> ToolContext:
         attachments_cfg = getattr(self._config, "attachments", None)
         media_root = self._attachment_media_root()
-        session_id = await self._resolve_session_id_for_log(session_key)
+        session_id, session_epoch, workspace_id = (
+            await self._resolve_session_identity_for_log(session_key)
+        )
         if not session_id:
             session_id = session_key.split(":")[-1] or session_key
         return replace(
@@ -2858,6 +2864,10 @@ class TurnRunner:
             artifact_session_id=session_id,
             tool_result_store_dir=str(media_root / "tool-results"),
             tool_result_store_session_id=session_id,
+            session_epoch=session_epoch,
+            workspace_id=workspace_id,
+            sandbox_session_manager=self._session_manager,
+            sandbox_gateway_config=self._config,
             workspace_file_writes=[],
             artifact_max_bytes=getattr(attachments_cfg, "artifact_max_bytes", None),
             artifact_disk_budget_bytes=getattr(
@@ -3097,6 +3107,13 @@ class TurnRunner:
                 else None
             ),
         )
+        # Planning is deliberately ephemeral analysis: it may inspect durable
+        # memory, but the planning conversation itself must not be harvested
+        # into long-lived memory. The frozen collaboration mode is authoritative
+        # for the whole turn even if the user toggles the next-turn mode while
+        # this task is already running.
+        if str(getattr(effective_tool_context, "collaboration_mode", "default")) == "plan":
+            no_memory_capture = True
         # Re-entry detection: check whether this call chain already serializes
         # the turn lifecycle. On the gateway path TaskRuntime marks ownership
         # while holding its execution lock, so TurnRunner skips the legacy
@@ -3244,6 +3261,8 @@ class TurnRunner:
             if is_subagent_run
             else uuid.uuid4().hex
         )
+        if tool_context is not None:
+            tool_context = replace(tool_context, execution_id=turn_id)
         resolved_model = ""
         final_prompt_str = ""
         turn_obj: Any | None = None
@@ -4132,11 +4151,14 @@ class TurnRunner:
                 source["input_provenance_kind"] = provenance_kind
         return source
 
-    async def _resolve_session_id_for_log(self, session_key: str) -> str | None:
-        """Best-effort lookup of the transcript identity for observability."""
+    async def _resolve_session_identity_for_log(
+        self,
+        session_key: str,
+    ) -> tuple[str | None, int | None, str | None]:
+        """Best-effort lookup of the current durable session identity."""
 
         if self._session_manager is None:
-            return None
+            return None, None, None
         try:
             if hasattr(self._session_manager, "get_session"):
                 node = await self._session_manager.get_session(session_key)
@@ -4146,15 +4168,29 @@ class TurnRunner:
                 storage = get_session_storage(self._session_manager)
                 node = await storage.get_session(session_key) if storage is not None else None
         except Exception:
-            return None
+            return None, None, None
         session_id = getattr(node, "session_id", None)
+        session_epoch: int | None = None
         if isinstance(session_id, str) and session_id:
             try:
                 session_epoch = max(0, int(getattr(node, "epoch", 0) or 0))
             except (TypeError, ValueError, OverflowError):
                 session_epoch = 0
             self._usage_session_epoch_by_key[session_key] = session_epoch
-        return session_id if isinstance(session_id, str) and session_id else None
+        else:
+            session_id = None
+        workspace_id = getattr(node, "workspace_id", None)
+        if not isinstance(workspace_id, str) or not workspace_id:
+            workspace_id = None
+        return session_id, session_epoch, workspace_id
+
+    async def _resolve_session_id_for_log(self, session_key: str) -> str | None:
+        """Best-effort lookup of the transcript identity for observability."""
+
+        session_id, _session_epoch, _workspace_id = (
+            await self._resolve_session_identity_for_log(session_key)
+        )
+        return session_id
 
     def _resolve_provider(self) -> tuple[Any | None, Any | None]:
         """Clone the selector and resolve provider (no shared state mutation)."""
@@ -4220,10 +4256,26 @@ class TurnRunner:
             # TurnErrorWriter is deliberately synchronous and may wait for its
             # SQLite busy timeout. Keep that wait off the shared turn loop while
             # preserving its existing best-effort return contract.
-            recorded = await asyncio.to_thread(
-                self._turn_error_writer.record_error,
-                record,
+            operation = asyncio.create_task(
+                asyncio.to_thread(
+                    self._turn_error_writer.record_error,
+                    record,
+                )
             )
+            cancellation: asyncio.CancelledError | None = None
+            while not operation.done():
+                try:
+                    await asyncio.shield(operation)
+                except asyncio.CancelledError as exc:
+                    cancellation = cancellation or exc
+            if cancellation is not None:
+                # ``to_thread`` cancellation cannot stop the worker. Do not
+                # return control to cleanup until its SQLite transaction has
+                # settled; caller cancellation remains authoritative.
+                with contextlib.suppress(BaseException):
+                    operation.result()
+                raise cancellation
+            recorded = operation.result()
             return error_id if recorded else None
         except Exception as record_exc:  # noqa: BLE001 - must not mask the turn error
             log.warning(
@@ -4842,7 +4894,20 @@ class TurnRunner:
             and not getattr(skill, "disable_model_invocation", False)
             for skill in loaded_skills
         )
-        submit_review_enabled = _resolve_submit_review(self._config)
+        plan_mode = (
+            ctx is not None
+            and str(getattr(ctx, "collaboration_mode", "default")) == "plan"
+        )
+        attached_plan_run = bool(
+            ctx is not None and str(getattr(ctx, "plan_run_id", "") or "").strip()
+        )
+        # The coding submit/review handshake is a mutation workflow and has no
+        # meaning in Plan mode or an attached PlanRun implementation. It is
+        # suppressed at schema construction and again in Agent's special
+        # dispatch branch.
+        submit_review_enabled = (
+            _resolve_submit_review(self._config) and not plan_mode and not attached_plan_run
+        )
         if ctx is not None:
             if meta_skill_enabled and meta_auto_trigger and has_invokable_meta_skill:
                 if ctx.surfaced_tools is None:
@@ -4854,6 +4919,24 @@ class TurnRunner:
                 if ctx.surfaced_tools is None:
                     ctx.surfaced_tools = set()
                 ctx.surfaced_tools.add("submit")
+            if plan_mode:
+                if ctx.surfaced_tools is None:
+                    ctx.surfaced_tools = set()
+                plan_control_tools = {"submit_plan"}
+                if ctx.interaction_mode is InteractionMode.INTERACTIVE:
+                    plan_control_tools.add("request_user_input")
+                ctx.surfaced_tools.update(plan_control_tools)
+                ctx.denied_tools.update({"submit", "meta_invoke"})
+                if ctx.allowed_tools is not None:
+                    ctx.allowed_tools = set(ctx.allowed_tools) | plan_control_tools
+            elif attached_plan_run:
+                if ctx.surfaced_tools is None:
+                    ctx.surfaced_tools = set()
+                plan_run_tools = {"plan_run_checkpoint", "publish_artifact"}
+                ctx.surfaced_tools.update(plan_run_tools)
+                ctx.denied_tools.add("submit")
+                if ctx.allowed_tools is not None:
+                    ctx.allowed_tools = set(ctx.allowed_tools) | plan_run_tools
         if metadata is not None:
             metadata["meta_skill_enabled"] = meta_skill_enabled
             if skill_catalog is not None:
@@ -4878,15 +4961,17 @@ class TurnRunner:
                     hard_denied=None,
                 )
             ctx = self._apply_runtime_capability_denies(ctx)
-            # Surfacing (surfaced_tools) lifts the exposed_by_default gate but,
-            # by design, does NOT relax the allowed_tools allowlist (see
-            # ToolContext.surfaced_tools). When submit-review is enabled the
-            # active profile allowlist (e.g. repo_coding_scaffold_edit) omits
-            # "submit", so surfacing alone left it filtered as not_allowed and
-            # the tool never reached the provider schema. Add it to the
-            # allowlist here so the surfaced tool is actually exposed.
+            # Surfacing lifts the exposed-by-default gate but deliberately does
+            # not relax a profile allowlist. Restore only controls authorized
+            # by this frozen turn context; explicit denies still win in the
+            # registry visibility check.
             if submit_review_enabled and ctx.allowed_tools is not None:
                 ctx.allowed_tools = set(ctx.allowed_tools) | {"submit"}
+            if not plan_mode and attached_plan_run and ctx.allowed_tools is not None:
+                ctx.allowed_tools = set(ctx.allowed_tools) | {
+                    "plan_run_checkpoint",
+                    "publish_artifact",
+                }
             from opensquilla.tools.policy_config import coding_mode_denied_tools
 
             skills_cfg = getattr(self._config, "skills", None)
@@ -4967,6 +5052,63 @@ class TurnRunner:
         return resolve_runtime_tool_surface(ctx, capabilities=capabilities)
 
     @staticmethod
+    def _render_plan_revision_context(revision: Any) -> str:
+        """Render one validated immutable revision as bounded prompt data."""
+
+        payload = {
+            "revision_id": str(getattr(revision, "revision_id", "")),
+            "plan_id": str(getattr(revision, "plan_id", "")),
+            "generation": int(getattr(revision, "generation", 0) or 0),
+            "title": str(getattr(revision, "title", "")),
+            "markdown": str(getattr(revision, "markdown", "")),
+            "steps": list(getattr(revision, "steps", []) or []),
+            "content_hash": str(getattr(revision, "content_hash", "")),
+        }
+        rendered = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        # Domain validation bounds the canonical body below this ceiling. Keep
+        # a defense-in-depth prompt cap in case a foreign storage adapter
+        # returns an invalid record.
+        # A valid record can approach 360k raw characters, and JSON escaping
+        # can nearly double quote/backslash-heavy content. Keep the cap above
+        # that worst-case envelope so validation never silently truncates or
+        # rejects an otherwise valid authoritative revision.
+        if len(rendered) > 800_000:
+            raise RuntimeError("The selected PlanRevision exceeds the prompt boundary")
+        return rendered
+
+    @staticmethod
+    def _render_plan_run_context(run: Any) -> str:
+        """Render the mutable execution overlay without duplicating plan content."""
+
+        steps = []
+        for raw_state in list(getattr(run, "step_states", []) or []):
+            if not isinstance(raw_state, Mapping):
+                continue
+            state = {
+                "stepId": str(raw_state.get("step_id") or ""),
+                "status": str(raw_state.get("status") or ""),
+            }
+            reason = raw_state.get("reason")
+            if isinstance(reason, str) and reason:
+                state["reason"] = reason
+            steps.append(state)
+        payload = {
+            "runId": str(getattr(run, "run_id", "")),
+            "status": str(getattr(run, "status", "")),
+            "stateRevision": int(getattr(run, "state_revision", 0) or 0),
+            "currentStepId": (
+                str(getattr(run, "current_step_id"))
+                if getattr(run, "current_step_id", None)
+                else None
+            ),
+            "steps": steps,
+        }
+        rendered = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        if len(rendered) > 160_000:
+            raise RuntimeError("The selected PlanRun exceeds the prompt boundary")
+        return rendered
+
+    @staticmethod
     def _extra_context_for_tool_context(ctx: ToolContext | None) -> dict[str, str]:
         if ctx is None:
             return {}
@@ -5026,9 +5168,92 @@ class TurnRunner:
                             sandbox_line,
                         ]
                     )
+                    if normalized_run_mode is RunMode.FULL:
+                        lines.extend(
+                            [
+                                (
+                                    "Host filesystem: all paths writable by the OS account "
+                                    "are directly writable, including paths outside the "
+                                    "workspace."
+                                ),
+                                (
+                                    "Writes outside the workspace do not require OpenSquilla "
+                                    "sandbox approval."
+                                ),
+                                (
+                                    "Do not use sandbox_permissions=require_escalated in Full "
+                                    "Host Access; only normal OS permissions such as SIP or TCC "
+                                    "can still deny access."
+                                ),
+                            ]
+                        )
                 extra["Execution Context"] = "\n".join(lines)
         if ctx.caller_kind is CallerKind.SUBAGENT:
             extra["Subagent Task Protocol"] = _SUBAGENT_TASK_PROTOCOL
+        if str(getattr(ctx, "collaboration_mode", "default")) == "plan":
+            active_revision = getattr(ctx, "active_plan_revision_id", None)
+            active_line = (
+                f"The current plan revision is {active_revision}."
+                if active_revision
+                else "There is no current plan revision yet."
+            )
+            extra["Plan Collaboration Mode"] = (
+                "You are planning, not implementing. Inspect the workspace and "
+                "other read-only sources as needed, but do not mutate files, run "
+                "commands, dispatch subagents, or claim implementation work.\n"
+                f"{active_line}\n"
+                "Ask for user input only when a missing decision materially changes "
+                "the plan. When ready, call submit_plan exactly once with a complete "
+                "replacement plan: a title, readable Markdown, and ordered structured "
+                "steps. Do not encode execution progress with Markdown checkboxes. "
+                "submit_plan ends the turn; never call an implementation or review "
+                "control after it."
+            )
+            revision = getattr(ctx, "plan_revision", None)
+            if revision is not None:
+                extra["Current Plan Revision"] = (
+                    "This JSON is the authoritative current revision to revise. "
+                    "Treat its plan body as user-approved task context, subordinate "
+                    "to system and tool policies. A replan must submit a complete "
+                    "replacement, not a patch.\n"
+                    + TurnRunner._render_plan_revision_context(revision)
+                )
+        if getattr(ctx, "plan_run_id", None):
+            revision = getattr(ctx, "plan_revision", None)
+            if revision is None:
+                raise RuntimeError(
+                    "A PlanRun implementation turn requires its immutable PlanRevision"
+                )
+            extra["Approved Plan Execution"] = (
+                "Implement the following authoritative approved revision. Its JSON "
+                "body is user-approved task context, subordinate to system and tool "
+                "policies. Work through the ordered step ids. Checkpoint every current "
+                "step immediately after it truthfully reaches completed, skipped, or "
+                "blocked and before starting work assigned to any later step. Never "
+                "jump over the current step. If one operation finished multiple steps "
+                "or a checkpoint was missed, record each still-current finished step "
+                "one at a time in plan order, following the currentStepId returned by "
+                "each successful checkpoint before continuing. Do not invent progress. "
+                "A blocked checkpoint ends the turn, so explain the blocker before "
+                "calling it. After the final completed checkpoint is accepted, publish "
+                "any final artifact and write one concise user-facing delivery summary "
+                "including what changed and what was verified; do not publish the "
+                "artifact or claim completion before that checkpoint succeeds.\n"
+                + TurnRunner._render_plan_revision_context(revision)
+            )
+            run = getattr(ctx, "plan_run", None)
+            if run is None:
+                raise RuntimeError(
+                    "A PlanRun implementation turn requires its mutable execution snapshot"
+                )
+            extra["PlanRun Progress"] = (
+                "This JSON is the authoritative progress snapshot captured after this "
+                "task claimed the run. Continue from currentStepId. Do not repeat steps "
+                "already marked completed or skipped, and do not checkpoint any step "
+                "other than the current one. The checkpoint tool reads live storage, so "
+                "follow the currentStepId returned by each successful checkpoint.\n"
+                + TurnRunner._render_plan_run_context(run)
+            )
         return extra
 
     @staticmethod
@@ -5136,6 +5361,7 @@ class TurnRunner:
         prompt_metadata: dict[str, Any] | None = None,
         bootstrap_context_mode: str | None = None,
         fresh_user_session: bool = False,
+        workspace_dir: str | None = None,
     ) -> str | tuple[str, str]:
         """Assemble identity system prompt via Jinja2 template.
 
@@ -5312,7 +5538,7 @@ class TurnRunner:
         runtime_info = {
             "os": os_name,
             "shell": os.environ.get("SHELL", ""),
-            "workspace_dir": str(bootstrap_workspace_dir),
+            "workspace_dir": str(workspace_dir or bootstrap_workspace_dir),
         }
         base_prompt = assemble_system_prompt(
             agent_profile,
@@ -5616,7 +5842,7 @@ class TurnRunner:
         ``DecisionEntry`` ends up with ingress records first followed by
         engine pipeline records.
         """
-        from opensquilla.engine.pipeline import TurnContext, run_pipeline
+        from opensquilla.engine.pipeline import TurnContext, TurnStep, run_pipeline
         from opensquilla.engine.steps import (
             apply_prompt_cache,
             apply_squilla_router,
@@ -5835,22 +6061,30 @@ class TurnRunner:
             skill_catalog=skill_catalog,
             provider_request_correlation=provider_request_correlation,
         )
-        turn = await run_pipeline(
-            turn,
+        planning_turn = (
+            tool_context is not None
+            and str(getattr(tool_context, "collaboration_mode", "default"))
+            == "plan"
+        )
+        pipeline_steps: list[TurnStep] = [
+            resolve_model,
+            apply_vision_followup_gate,
+            _bounded_apply_squilla_router,
+            observe_reasoning_hint,
+        ]
+        if not planning_turn:
+            pipeline_steps.extend([meta_resolution, enforce_coding_mode])
+        pipeline_steps.extend(
             [
-                resolve_model,
-                apply_vision_followup_gate,
-                _bounded_apply_squilla_router,
-                observe_reasoning_hint,
-                meta_resolution,
-                enforce_coding_mode,
-                meta_command_launch,
                 filter_skills,
                 inject_subagent_grounding,
                 inject_platform_hint,
                 apply_prompt_cache,
-            ],
+            ]
         )
+        if not planning_turn:
+            pipeline_steps.insert(-4, meta_command_launch)
+        turn = await run_pipeline(turn, pipeline_steps)
 
         # Apply routed model back to cloned selector (local, not shared)
         if turn.model and cloned_selector is not None:
@@ -7489,7 +7723,7 @@ class TurnRunner:
         mark_status = getattr(self._session_manager, "mark_compaction_flush_receipt_status", None)
         if not callable(mark_status):
             return
-        asyncio.create_task(
+        task = asyncio.create_task(
             mark_compaction_flush_status_with_retry(
                 mark_status,
                 session_key=session_key,
@@ -7501,6 +7735,90 @@ class TurnRunner:
                 skipped_event=f"{event_prefix}.flush_status_update_skipped",
             )
         )
+        tasks = self._pre_compaction_flush_status_tasks.setdefault(
+            session_key,
+            set(),
+        )
+        tasks.add(task)
+
+        def _discard(completed: asyncio.Task[None]) -> None:
+            current = self._pre_compaction_flush_status_tasks.get(session_key)
+            if current is None:
+                return
+            current.discard(completed)
+            if not current:
+                self._pre_compaction_flush_status_tasks.pop(session_key, None)
+
+        task.add_done_callback(_discard)
+
+    async def drain_session_background_writes(
+        self,
+        session_keys: Sequence[str],
+    ) -> None:
+        """Wait for detached pre-compaction writes for exactly these sessions."""
+
+        keys = tuple(
+            sorted(
+                {
+                    canonicalize_session_key(session_key)
+                    for session_key in session_keys
+                }
+            )
+        )
+        if not keys:
+            return
+
+        def _snapshot_pending() -> set[asyncio.Task[Any]]:
+            pending = {
+                task
+                for session_key in keys
+                if (
+                    task := self._active_pre_compaction_flush_tasks.get(
+                        session_key
+                    )
+                )
+                is not None
+                and not task.done()
+            }
+            pending.update(
+                task
+                for session_key in keys
+                for task in self._pre_compaction_flush_status_tasks.get(
+                    session_key,
+                    (),
+                )
+                if not task.done()
+            )
+            return pending
+
+        cancellation: asyncio.CancelledError | None = None
+        while True:
+            tasks = _snapshot_pending()
+            if not tasks:
+                # Completion callbacks can schedule the status-update tail.
+                # One loop turn plus a complete second snapshot closes both a
+                # new-flush admission and the flush -> status hand-off.
+                try:
+                    await asyncio.sleep(0)
+                except asyncio.CancelledError as exc:
+                    cancellation = cancellation or exc
+                tasks = _snapshot_pending()
+                if not tasks:
+                    if cancellation is not None:
+                        raise cancellation
+                    return
+
+            settling = asyncio.gather(*tasks, return_exceptions=True)
+            while not settling.done():
+                try:
+                    await asyncio.shield(settling)
+                except asyncio.CancelledError as exc:
+                    # Cancelling gather would cancel a flush wrapper while its
+                    # underlying ``to_thread`` writer keeps running. Keep the
+                    # exact tasks alive and settle every retry/status tail
+                    # before cancellation escapes this drain primitive.
+                    cancellation = cancellation or exc
+            settling.result()
 
     def _log_pre_compaction_flush_receipt(
         self,

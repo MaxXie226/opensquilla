@@ -38,6 +38,7 @@ from opensquilla.sandbox.stale_output_cache import StaleOutputCache, get_stale_o
 from opensquilla.sandbox.types import (
     ALLOW,
     ApprovalDecision,
+    ApprovedHostExecution,
     DenialReason,
     DenialResult,
     FollowupTag,
@@ -50,7 +51,7 @@ from opensquilla.sandbox.types import (
 log = logging.getLogger(__name__)
 
 DEFAULT_DENIAL_THRESHOLD = 3
-DEFAULT_APPROVAL_TIMEOUT_S = 300.0
+DEFAULT_APPROVAL_TIMEOUT_S: float | None = None
 
 
 # ─── Fingerprinting ────────────────────────────────────────────────────────
@@ -100,6 +101,8 @@ class _ApprovalQueueLike(Protocol):
     async def wait(self, approval_id: str, timeout: float | None = ...) -> bool: ...
 
     def resolve(self, approval_id: str, approved: bool) -> None: ...
+
+    def consume(self, approval_id: str) -> None: ...
 
 
 # ─── Denial ledger ─────────────────────────────────────────────────────────
@@ -239,6 +242,7 @@ _THRESHOLD_NEXT_STEP = SuggestedNextStep.ASK_USER
 _REPEAT_INTENT_NEXT_STEP = SuggestedNextStep.NARROWER_APPROVAL
 _POLICY_DENY_NEXT_STEP = SuggestedNextStep.REPLAN
 _NETWORK_ACTION_PREFIXES = ("network.", "web.")
+_L3_HOST_EXEC_ACTIONS = frozenset({"shell.exec", "shell.background", "code.exec"})
 
 
 def _channel_approval_routing(
@@ -295,7 +299,7 @@ class ApprovalGate:
     * If ``policy.require_approval`` is false, :meth:`gate` returns
       :data:`ALLOW` immediately.
     * Otherwise it enqueues an approval request on the provided queue,
-      awaits the human decision (with a timeout → deny), and returns
+      awaits the human decision for as long as the owning task lives, and returns
       :data:`ALLOW` on approve or a :class:`DenialResult` on reject.
     * ``namespace`` selects which approval queue namespace to use — the
       existing code uses ``"exec"`` for shell/code and ``"plugin"`` for
@@ -307,7 +311,7 @@ class ApprovalGate:
         queue: _ApprovalQueueLike,
         *,
         namespace: str = "exec",
-        timeout: float = DEFAULT_APPROVAL_TIMEOUT_S,
+        timeout: float | None = DEFAULT_APPROVAL_TIMEOUT_S,
     ) -> None:
         self._queue = queue
         self._namespace = namespace
@@ -411,6 +415,34 @@ class ApprovalGate:
             approved = False
 
         if approved:
+            if (
+                policy.level is SecurityLevel.LOCKED
+                and request.action_kind in _L3_HOST_EXEC_ACTIONS
+            ):
+                try:
+                    self._queue.consume(approval_id)
+                except Exception as exc:
+                    result = DenialResult(
+                        reason=DenialReason.POLICY_DENIED,
+                        suggested_next_step=SuggestedNextStep.ASK_USER,
+                        level=policy.level,
+                        action_fingerprint=fingerprint,
+                        message=(
+                            "The approved L3 execution grant could not be consumed; "
+                            "the action was not executed."
+                        ),
+                        retryable=False,
+                    )
+                    _log_decision(
+                        request,
+                        policy,
+                        fingerprint,
+                        decision="deny",
+                        approval_required=True,
+                        session_id=session_id,
+                        reason=f"{result.reason.value}:{type(exc).__name__}",
+                    )
+                    return result
             _log_decision(
                 request,
                 policy,
@@ -419,6 +451,15 @@ class ApprovalGate:
                 approval_required=True,
                 session_id=session_id,
             )
+            if (
+                policy.level is SecurityLevel.LOCKED
+                and request.action_kind in _L3_HOST_EXEC_ACTIONS
+            ):
+                return ApprovedHostExecution(
+                    approval_id=approval_id,
+                    action_fingerprint=fingerprint,
+                    level=policy.level,
+                )
             return ALLOW
 
         result = DenialResult(

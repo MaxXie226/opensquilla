@@ -34,24 +34,41 @@ def sandbox_disabled_full_host_fallback() -> bool:
 def full_host_access_for_context(ctx: object | None) -> bool:
     """Return Full Host Access state without consulting approval storage."""
 
-    if ctx is not None:
-        mode = getattr(ctx, "run_mode", None)
-        if getattr(mode, "value", mode) == "full":
-            return True
-        run_context_mode = getattr(getattr(ctx, "sandbox_run_context", None), "run_mode", None)
-        if getattr(run_context_mode, "value", run_context_mode) == "full":
-            return True
-        if getattr(ctx, "elevated", None) == "full":
-            return True
-    if not sandbox_disabled_full_host_fallback():
-        return False
+    runtime = None
     try:
         from opensquilla.sandbox.integration import get_runtime
 
         runtime = get_runtime()
     except Exception:
+        pass
+    sandbox_disabled_without_fallback = bool(
+        runtime is not None
+        and not runtime.effective.sandbox_enabled
+        and not sandbox_disabled_full_host_fallback()
+    )
+    if (
+        runtime is not None
+        and not runtime.effective.sandbox_enabled
+        and not sandbox_disabled_without_fallback
+    ):
+        return True
+
+    if ctx is not None:
+        mode = getattr(ctx, "run_mode", None)
+        mode_value = getattr(mode, "value", mode)
+        if mode_value in _VALID_RUN_MODES:
+            return bool(mode_value == "full")
+        run_context_mode = getattr(getattr(ctx, "sandbox_run_context", None), "run_mode", None)
+        run_context_mode_value = getattr(run_context_mode, "value", run_context_mode)
+        if run_context_mode_value in _VALID_RUN_MODES:
+            return bool(run_context_mode_value == "full")
+        if getattr(ctx, "elevated", None) == "full":
+            return True
+    if sandbox_disabled_without_fallback:
         return False
-    return bool(runtime is not None and not runtime.effective.sandbox_enabled)
+    return bool(
+        runtime is not None and getattr(runtime, "default_run_mode", None) == "full"
+    )
 
 
 def current_run_mode() -> str | None:

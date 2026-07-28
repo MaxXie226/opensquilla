@@ -134,7 +134,12 @@ class _FlushReceiptSessionStorage(Protocol):
 
     async def list_memory_durable_receipts(self, **kwargs: Any) -> list[Any]: ...
 
-    async def upsert_memory_durable_receipt(self, receipt: Any) -> Any: ...
+    async def upsert_memory_durable_receipt(
+        self,
+        receipt: Any,
+        *,
+        expected_session_id: str | None = None,
+    ) -> Any: ...
 
 
 _AUTO_PROPOSE_TOOL_ALLOWLIST = frozenset(
@@ -1027,13 +1032,18 @@ async def _ensure_sandbox_setup_on_boot(config: GatewayConfig) -> Any | None:
 def _sandbox_settings_for_runtime(config: GatewayConfig) -> Any:
     """Return sandbox settings normalized to the config-level run mode."""
 
-    from opensquilla.sandbox.run_mode import RunMode, config_run_mode, run_mode_config_patch
+    from opensquilla.sandbox.run_mode import (
+        RunMode,
+        config_run_mode,
+        run_mode_config_patch,
+        sandbox_runtime_capability_mode,
+    )
 
-    mode = config_run_mode(config)
-    if mode != RunMode.FULL:
+    configured = config_run_mode(config)
+    if configured in {RunMode.STANDARD, RunMode.TRUSTED}:
         return config.sandbox
 
-    patch = run_mode_config_patch(mode)
+    patch = run_mode_config_patch(sandbox_runtime_capability_mode(config))
     return config.sandbox.model_copy(
         update={
             "run_mode": patch.run_mode.value,
@@ -1088,9 +1098,60 @@ async def dispatch_task_runtime_turn(
     and capture every kwarg actually flowing into ``turn_runner.run``
     (including the ``semantic_message`` regression surface).
     """
+    from opensquilla.gateway.project_workspace_runtime import (
+        apply_accepted_run_mode_override,
+        authoritative_project_run_context,
+        map_project_workspace_error,
+    )
     from opensquilla.gateway.routing import tool_context_from_envelope
+    from opensquilla.project_workspaces import ProjectWorkspaceStateError
 
-    workspace_dir = resolve_agent_workspace_dir(run.agent_id, config)
+    workspace_dir: Path | str | None = resolve_agent_workspace_dir(run.agent_id, config)
+    session = None
+    storage = get_session_storage(session_manager)
+    if storage is not None:
+        session = await storage.get_session(run.session_key)
+        if session is None:
+            raise KeyError(f"Session not found: {run.session_key}")
+        try:
+            run_context, _workspace_guard = await authoritative_project_run_context(
+                storage=storage,
+                session_manager=session_manager,
+                session=session,
+                config=config,
+                default_workspace=(str(workspace_dir) if workspace_dir is not None else None),
+            )
+        except ProjectWorkspaceStateError as exc:
+            mapped = map_project_workspace_error(
+                exc,
+                owner=_task_runtime_envelope_owner(run.envelope),
+            )
+            await event_emitter(
+                run.session_key,
+                "session.event.error",
+                {
+                    "message": mapped.message,
+                    "code": mapped.code,
+                    "details": mapped.details,
+                    "task_id": getattr(run, "task_id", None),
+                },
+            )
+            raise
+        from opensquilla.gateway.rpc_sessions import (
+            _apply_run_context_route_metadata,
+        )
+
+        run_context = apply_accepted_run_mode_override(
+            run_context,
+            getattr(run, "accepted_run_mode_override", None),
+        )
+        _apply_run_context_route_metadata(
+            run.envelope,
+            run_context,
+            principal_is_owner=_task_runtime_envelope_owner(run.envelope),
+        )
+        if run_context.workspace is not None:
+            workspace_dir = run_context.workspace
     workspace_strict = getattr(config, "workspace_strict", None)
     if not isinstance(workspace_strict, bool):
         workspace_strict = bool(workspace_dir)
@@ -1098,13 +1159,19 @@ async def dispatch_task_runtime_turn(
     tool_context = tool_context_from_envelope(
         run.envelope,
         is_owner=is_owner,
-        workspace_dir=str(workspace_dir),
+        workspace_dir=(str(workspace_dir) if workspace_dir is not None else None),
         workspace_strict=workspace_strict,
         default_elevated=configured_default_elevated(config),
     )
     tool_context.task_id = run.task_id
-    session = None
-    if session_manager is not None and hasattr(session_manager, "get_session"):
+    if (
+        session is None
+        and session_manager is not None
+        and hasattr(
+            session_manager,
+            "get_session",
+        )
+    ):
         session = await session_manager.get_session(run.session_key)
     run_kwargs = build_task_runtime_run_kwargs(
         run,
@@ -1136,9 +1203,7 @@ async def dispatch_task_runtime_turn(
                 stream_event_sink=getattr(run, "stream_event_sink", None),
                 task_id=getattr(run, "task_id", None),
                 session_id=getattr(run.envelope, "session_id", None),
-                client_message_id=getattr(run.envelope, "metadata", {}).get(
-                    "client_message_id"
-                ),
+                client_message_id=getattr(run.envelope, "metadata", {}).get("client_message_id"),
                 user_message_id=getattr(run, "persisted_user_message_id", None),
                 surface_id=getattr(run.envelope, "metadata", {}).get("surface_id"),
             )
@@ -1156,11 +1221,7 @@ async def dispatch_task_runtime_turn(
                 getattr(run, "persisted_user_message_id", None),
                 *(raw_message_ids if isinstance(raw_message_ids, list | tuple) else ()),
             ):
-                if (
-                    isinstance(message_id, str)
-                    and message_id
-                    and message_id not in message_ids
-                ):
+                if isinstance(message_id, str) and message_id and message_id not in message_ids:
                     message_ids.append(message_id)
 
             async def _remove_persisted_messages() -> None:
@@ -1913,7 +1974,16 @@ def build_flush_service(
             if current_session is not None
             else ""
         )
-        if current_session_id and current_session_id != captured_session_id:
+        if not current_session_id:
+            log.warning(
+                "session_flush.receipt_write_skipped",
+                reason="session_missing",
+                session_key=session_key,
+                captured_session_id=captured_session_id,
+                result_status=getattr(receipt, "result_status", None),
+            )
+            return
+        if current_session_id != captured_session_id:
             log.warning(
                 "session_flush.receipt_session_mismatch",
                 session_key=session_key,
@@ -1921,6 +1991,7 @@ def build_flush_service(
                 current_session_id=current_session_id,
                 result_status=getattr(receipt, "result_status", None),
             )
+            return
 
         scope = str(row.get("scope") or "")
         status = str(row.get("status") or "")
@@ -1963,7 +2034,8 @@ def build_flush_service(
                 status=status,
                 reason=str(reason) if reason else None,
                 attempt_count=1,
-            )
+            ),
+            expected_session_id=captured_session_id,
         )
 
     def _resolve_archive_workspace(agent_id: str) -> Path | None:
@@ -2177,6 +2249,32 @@ def apply_model_catalog_overrides(catalog: ModelCatalog, config: GatewayConfig) 
         log.warning("model_catalog.user_override_rejected", error=str(exc))
 
 
+def _expire_restart_orphaned_approvals(
+    session_storage: Any,
+    approval_queue: Any,
+) -> int:
+    """Expire every approval whose in-memory continuation died on restart."""
+
+    take_session_keys = getattr(
+        session_storage,
+        "take_restart_abandoned_session_keys",
+        None,
+    )
+    if callable(take_session_keys):
+        take_session_keys()
+    try:
+        expired = int(approval_queue.expire_all_pending() or 0)
+    except Exception:
+        log.exception("approval.restart_recovery_failed")
+        return 0
+    if expired:
+        log.info(
+            "approval.restart_recovery_completed",
+            expired_count=expired,
+        )
+    return expired
+
+
 async def build_services(
     config: GatewayConfig | None = None,
     session_manager: Any = None,
@@ -2245,11 +2343,13 @@ async def build_services(
     # through the ``@sandboxed`` decorator.
     try:
         from opensquilla.sandbox.integration import configure_runtime
+        from opensquilla.sandbox.run_mode import config_run_mode
 
         sandbox_settings = _sandbox_settings_for_runtime(config)
         effective = configure_runtime(
             sandbox_settings,
             workspace=Path(config.workspace_dir) if config.workspace_dir else None,
+            default_run_mode=config_run_mode(config),
         )
         log.info(
             "build_services.sandbox_ready",
@@ -2319,6 +2419,12 @@ async def build_services(
     set_session_manager(session_manager)
     _set_sessions_gateway_config(config)
     session_storage = get_session_storage(session_manager)
+    from opensquilla.application.approval_queue import get_approval_queue
+
+    _expire_restart_orphaned_approvals(
+        session_storage,
+        get_approval_queue(),
+    )
 
     # Establish the ledger cutover before any TurnRunner can send a provider
     # request.  This is intentionally a short sessions-only transaction; the
@@ -2786,9 +2892,7 @@ async def build_services(
         router_cfg_for_decisions = getattr(config, "squilla_router", None)
         decisions_storage = get_session_storage(session_manager)
         decisions_db_path = (
-            getattr(decisions_storage, "_db_path", None)
-            if decisions_storage is not None
-            else None
+            getattr(decisions_storage, "_db_path", None) if decisions_storage is not None else None
         )
         if decisions_db_path and decisions_db_path != ":memory:":
             from opensquilla.engine.steps.router_decision_record import (
@@ -2802,8 +2906,7 @@ async def build_services(
             router_decision_writer = open_router_decision_writer(
                 decisions_db_path,
                 retention_days=int(
-                    getattr(router_cfg_for_decisions, "decision_retention_days", 30)
-                    or 30
+                    getattr(router_cfg_for_decisions, "decision_retention_days", 30) or 30
                 ),
             )
             set_decision_writer(router_decision_writer)
@@ -4032,7 +4135,5 @@ async def start_gateway_server(
     if usage_storage is not None and hasattr(usage_storage, "get_usage_backfill_batch"):
         from opensquilla.gateway.usage_backfill import run_usage_backfill
 
-        svc.usage_backfill_task = create_background_task(
-            run_usage_backfill(usage_storage)
-        )
+        svc.usage_backfill_task = create_background_task(run_usage_backfill(usage_storage))
     return server_handle

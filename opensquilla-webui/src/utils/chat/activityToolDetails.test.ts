@@ -157,14 +157,14 @@ describe('activity tool detail projection', () => {
       { kind: 'content-size', lines: 42, characters: longOutput.length },
     ])
 
-    // Generic tools (MCP servers, plan/messaging builtins) rarely carry a
+    // Generic tools (MCP servers and custom integrations) rarely carry a
     // name-like input key, so the size line is their only signal.
     expect(projectActivityToolDetail(call({
-      name: 'update_plan',
-      inputRaw: JSON.stringify({ plan: 'step one\nstep two' }),
+      name: 'custom_connector_action',
+      inputRaw: JSON.stringify({ payload: 'step one\nstep two' }),
       result: longOutput,
       resultPreview: longOutput,
-    }), 'tool.update.plan').lines).toEqual([
+    }), 'tool.custom.connector.action').lines).toEqual([
       { kind: 'content-size', lines: 42, characters: longOutput.length },
     ])
   })
@@ -180,6 +180,46 @@ describe('activity tool detail projection', () => {
     expect(projection.lines).toEqual([
       { kind: 'error', text: 'Unable to open …/file.txt: permission denied' },
     ])
+  })
+
+  it('prefers a safe structured user message while retaining raw error details', () => {
+    const raw = JSON.stringify({
+      status: 'error',
+      tool: 'image',
+      error_class: 'SafeToolError',
+      message: 'Internal wrapper failed',
+      user_message: 'Image path is not accessible by the image tool.',
+    })
+    const projection = projectActivityToolDetail(call({
+      status: 'error',
+      isError: true,
+      result: raw,
+      resultPreview: '{"status":"error","tool":"image",…',
+    }), 'tool.image')
+
+    expect(projection.lines).toEqual([
+      {
+        kind: 'error',
+        text: 'Image path is not accessible by the image tool.',
+      },
+    ])
+    expect(projection.rawContent).toContain('"error_class":"SafeToolError"')
+    expect(projection.rawContent).toContain('"message":"Internal wrapper failed"')
+  })
+
+  it('projects failed shell results as a localizable exit-code fact', () => {
+    const projection = projectActivityToolDetail(call({
+      name: 'shell',
+      status: 'error',
+      isError: true,
+      result: 'exit_code=1\nstderr=synthetic failure',
+      resultPreview: 'exit_code=1',
+    }), 'command.run')
+
+    expect(projection.lines).toEqual([
+      { kind: 'exit-code', code: 1 },
+    ])
+    expect(projection.rawContent).toContain('stderr=synthetic failure')
   })
 
   it('keeps relative paths and hides external directory structure', () => {

@@ -13,6 +13,7 @@ import type {
   EnsembleProgressPayload,
   RouterDecisionPayload,
   SessionEventPayload,
+  SessionMessagesSnapshotResponse,
   StreamEventEnvelope,
   SubagentCompletionPayload,
   TextDeltaPayload,
@@ -66,6 +67,7 @@ export interface ChatRpcStreamApi {
   appendToolResult: (payload: ToolResultPayload) => void
   appendArtifact: (payload: ArtifactPayload) => void
   reconcileFinalText: (finalText: string | null | undefined) => void
+  resetLiveTurnState?: () => void
   resetStreamIdleTimer: () => void
   clearStreamIdleTimer: () => void
   setStreamActivity: (label: string) => void
@@ -148,6 +150,33 @@ type BufferedPendingStreamEvent = {
 
 const MAX_PENDING_TASK_BUCKETS = 8
 const MAX_PENDING_STREAM_EVENTS_PER_TASK = 64
+const SERVER_CLOCK_TOLERANCE_MS = 5_000
+const MAX_TRUSTED_REASONING_AGE_MS = 60 * 60 * 1_000
+
+type LiveThinking = {
+  text: string
+  startedAt: number
+  serverStartedAt: number | null
+}
+
+function trustedReasoningStartedAt(raw: unknown, now: number): number | null {
+  if (typeof raw !== 'number' || !Number.isFinite(raw) || raw <= 0) return null
+  if (raw > now + SERVER_CLOCK_TOLERANCE_MS) return null
+  if (raw < now - MAX_TRUSTED_REASONING_AGE_MS) return null
+  return raw
+}
+
+function trustedReasoningDoneAt(
+  raw: unknown,
+  serverStartedAt: number,
+  now: number,
+): number | null {
+  if (typeof raw !== 'number' || !Number.isFinite(raw) || raw <= 0) return null
+  if (raw < serverStartedAt) return null
+  if (raw > now + SERVER_CLOCK_TOLERANCE_MS) return null
+  if (raw - serverStartedAt > MAX_TRUSTED_REASONING_AGE_MS) return null
+  return raw
+}
 
 function doneTextSnapshot(
   donePayload: ChatDoneUsagePayload,
@@ -205,7 +234,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   } = options
 
   // Live thinking deltas for the current turn (session.event.thinking).
-  const streamThinking = ref<{ text: string; startedAt: number } | null>(null)
+  const streamThinking = ref<LiveThinking | null>(null)
   const turnReasoningLog: TurnReasoningRecord[] = []
   const pendingTerminalEvents = new Map<string, BufferedTerminalEvent>()
   const pendingStreamEvents = new Map<string, BufferedPendingStreamEvent[]>()
@@ -301,6 +330,38 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     }
   }
 
+  function restoreLiveTurnSnapshot(snapshot: SessionMessagesSnapshotResponse) {
+    if (!snapshot || snapshot.key !== sessionKey.value) return
+
+    stream.resetLiveTurnState?.()
+    clearLiveThinking()
+    pendingTerminalEvents.clear()
+    pendingStreamEvents.clear()
+    settledTaskIds.clear()
+    options.clearPendingRouterDecision()
+    activeStreamTaskId.value = typeof snapshot.task_id === 'string'
+      ? snapshot.task_id
+      : ''
+
+    for (const entry of snapshot.events || []) {
+      if (!entry || typeof entry.event !== 'string') continue
+      const payload = { ...(entry.payload || {}) }
+      // Snapshot events retain their original sequence for diagnostics, but
+      // they form an authoritative base rather than fresh deltas. Replaying
+      // them through the normal render handlers without the old sequence
+      // rebuilds the bubble even when this client already had a newer cursor.
+      delete payload.stream_seq
+      replayPendingStreamEvent({ event: entry.event, payload })
+    }
+
+    if (
+      typeof snapshot.current_stream_seq === 'number'
+      && Number.isFinite(snapshot.current_stream_seq)
+    ) {
+      lastStreamSeq.value = Math.max(0, snapshot.current_stream_seq)
+    }
+  }
+
   function bindActiveStreamTask(taskId: string) {
     if (!taskId) return
     const bufferedTerminal = pendingTerminalEvents.get(taskId)
@@ -352,13 +413,21 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     return `${seconds}s`
   })
 
-  function appendThinkingDelta(text: string) {
+  function appendThinkingDelta(text: string, payload: SessionEventPayload) {
     if (!text) return
     if (!stream.isStreaming.value) stream.startStreaming()
     const current = streamThinking.value
-    streamThinking.value = current
-      ? { text: current.text + text, startedAt: current.startedAt }
-      : { text, startedAt: Date.now() }
+    if (current) {
+      streamThinking.value = { ...current, text: current.text + text }
+    } else {
+      const now = Date.now()
+      const serverStartedAt = trustedReasoningStartedAt(payload.started_at, now)
+      streamThinking.value = {
+        text,
+        startedAt: serverStartedAt ?? now,
+        serverStartedAt,
+      }
+    }
     // The fold concats the same text into its thinkingText. Gating already
     // passed upstream (handleRpcAny), so this frame mirrors an accepted delta.
     if (stream.useReducer.value) stream.appendFrame({ kind: 'thinking', text, at: Date.now() })
@@ -896,7 +965,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       const thinkingText = (payload as SessionEventPayload).text
       if (typeof thinkingText !== 'string' || !thinkingText) return
       stream.resetStreamIdleTimer()
-      appendThinkingDelta(thinkingText)
+      appendThinkingDelta(thinkingText, payload)
       return
     }
 
@@ -929,9 +998,21 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
         : ''
       const liveThinking = streamThinking.value
       const reasoningText = doneReasoning || liveThinking?.text.trim() || ''
-      const reasoningSeconds = liveThinking
-        ? Math.max(0, Math.floor((Date.now() - liveThinking.startedAt) / 1000))
-        : 0
+      const reasoningSeconds = (() => {
+        if (!liveThinking) return 0
+        const now = Date.now()
+        const serverStartedAt = liveThinking.serverStartedAt
+        let elapsedMs = now - liveThinking.startedAt
+        if (serverStartedAt != null) {
+          const serverDoneAt = trustedReasoningDoneAt(
+            (payload as SessionEventPayload).emitted_at,
+            serverStartedAt,
+            now,
+          )
+          if (serverDoneAt != null) elapsedMs = serverDoneAt - serverStartedAt
+        }
+        return Math.max(0, Math.floor(elapsedMs / 1000))
+      })()
       clearLiveThinking()
       const messageCountBeforeEnd = messages.value.length
       stream.endStreaming()
@@ -1054,6 +1135,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   return {
     handlers,
     bindActiveStreamTask,
+    restoreLiveTurnSnapshot,
     streamThinkingText,
     streamThinkingElapsedText,
     attachTurnReasoning,

@@ -24,6 +24,7 @@ from opensquilla.gateway.channel_dispatch import (
 )
 from opensquilla.gateway.routing import RouteEnvelope, build_channel_route_envelope
 from opensquilla.gateway.task_runtime import TaskRuntime
+from opensquilla.project_workspaces import project_path_key
 from opensquilla.session.manager import SessionIntent, SessionManager
 from opensquilla.session.models import AgentTaskStatus
 from opensquilla.session.storage import (
@@ -150,6 +151,25 @@ async def _accept(
     )
 
 
+async def _bind_project_session(
+    stack: _ChannelIngressStack,
+    project_path: Path,
+) -> Any:
+    project_path.mkdir()
+    project = await stack.storage.create_or_restore_project_workspace(
+        path=str(project_path.resolve()),
+        path_key=project_path_key(project_path, strict=True),
+        display_name=project_path.name,
+        trusted_at=1,
+    )
+    await stack.manager.create(
+        SESSION_KEY,
+        agent_id="main",
+        workspace_id=project.workspace_id,
+    )
+    return project
+
+
 def _table_counts(db_path: Path) -> dict[str, int]:
     connection = sqlite3.connect(db_path)
     try:
@@ -233,6 +253,56 @@ async def test_channel_turn_atomically_creates_delivery_session_message_task_and
             "agent_tasks": 1,
             "turn_ingress_receipts": 1,
         }
+
+
+@pytest.mark.asyncio
+async def test_channel_reserve_waits_inside_atomic_session_admission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _open_stack(tmp_path / "sessions.db") as stack:
+        reserve_called = asyncio.Event()
+        admission_attempted = asyncio.Event()
+        original_reserve = stack.runtime.reserve
+        original_admission = stack.runtime.collect_admission
+
+        async def observed_reserve(*args: Any, **kwargs: Any) -> Any:
+            reserve_called.set()
+            return await original_reserve(*args, **kwargs)
+
+        @asynccontextmanager
+        async def observed_admission(session_key: str) -> AsyncIterator[None]:
+            admission_attempted.set()
+            async with original_admission(session_key):
+                yield
+
+        monkeypatch.setattr(stack.runtime, "reserve", observed_reserve)
+        monkeypatch.setattr(
+            stack.runtime,
+            "collect_admission",
+            observed_admission,
+        )
+        admission_lock = stack.runtime._collect_admission_locks.setdefault(
+            SESSION_KEY,
+            asyncio.Lock(),
+        )
+        async with admission_lock:
+            accepting = asyncio.create_task(
+                _accept(stack, "reserve must remain behind admission")
+            )
+            await asyncio.wait_for(admission_attempted.wait(), timeout=1.0)
+
+            assert accepting.done() is False
+            assert reserve_called.is_set() is False
+            assert stack.runtime._reservations_by_session == {}
+            assert await stack.storage.get_session(SESSION_KEY) is None
+
+        handle, _text, _relay, replayed = await asyncio.wait_for(
+            accepting,
+            timeout=2.0,
+        )
+        assert handle is not None
+        assert replayed is False
 
 
 @pytest.mark.asyncio
@@ -672,6 +742,56 @@ async def test_channel_turn_rejects_native_message_id_reuse_with_different_conte
             "agent_tasks": 1,
             "turn_ingress_receipts": 1,
         }
+
+
+@pytest.mark.asyncio
+async def test_channel_project_replay_survives_removal_and_missing_directory(
+    tmp_path: Path,
+) -> None:
+    async with _open_stack(tmp_path / "sessions.db") as stack:
+        project_path = tmp_path / "project"
+        project = await _bind_project_session(stack, project_path)
+        first_handle, _, _, first_replayed = await _accept(
+            stack,
+            "project channel payload",
+        )
+        await stack.wait_until_running()
+        await stack.storage.remove_project_workspace(project.workspace_id)
+        project_path.rmdir()
+
+        replay_handle, _, _, replayed = await _accept(
+            stack,
+            "project channel payload",
+        )
+
+        assert first_handle is not None
+        assert first_replayed is False
+        assert replay_handle is not None
+        assert replay_handle.task_id == first_handle.task_id
+        assert replayed is True
+        assert len(stack.received_runs) == 1
+
+
+@pytest.mark.asyncio
+async def test_channel_project_conflict_precedes_workspace_unavailable(
+    tmp_path: Path,
+) -> None:
+    async with _open_stack(tmp_path / "sessions.db") as stack:
+        project_path = tmp_path / "project"
+        project = await _bind_project_session(stack, project_path)
+        first_handle, _, _, _ = await _accept(
+            stack,
+            "original project channel payload",
+        )
+        await stack.wait_until_running()
+        await stack.storage.remove_project_workspace(project.workspace_id)
+        project_path.rmdir()
+
+        with pytest.raises(TurnIngressConflictError):
+            await _accept(stack, "changed project channel payload")
+
+        assert first_handle is not None
+        assert len(stack.received_runs) == 1
 
 
 def test_debounced_channel_native_request_id_is_stable_and_order_sensitive() -> None:

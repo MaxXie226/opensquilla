@@ -59,6 +59,16 @@
              disabled (Settings → Keyboard), so it never advertises a dead key. -->
         <kbd v-if="newChatHint" class="sidebar-kbd" aria-hidden="true">{{ newChatHint }}</kbd>
       </button>
+      <button
+        v-if="rpcStore.canChooseProject"
+        type="button"
+        class="sidebar-fn-item"
+        :title="t('workspaces.chooseProject')"
+        @click="openProjectPicker"
+      >
+        <Icon name="sessions" :size="16" />
+        <span class="sidebar-fn-label">{{ t('workspaces.chooseProject') }}</span>
+      </button>
       <!-- Overview / Skills & Channels / Cron, single-sourced from route
            metadata so the rail, mobile drawer, and palette never drift. -->
       <router-link
@@ -85,11 +95,18 @@
       :current-key="currentSessionKey"
       :contract-debug-enabled="contractDebugEnabled"
       :search-hint="commandPaletteHint"
+      :can-manage-projects="rpcStore.canManageProjectWorkspaces"
       @select="switchToSession"
-      @refresh="loadSessions"
+      @refresh="loadSidebarData"
       @rename="onRenameSession"
       @delete="onDeleteSession"
       @bulk-delete="onBulkDeleteSessions"
+      @new-chat="startNewChatInstant"
+      @new-project-task="startProjectTask"
+      @project-pin="onProjectPin"
+      @project-edit="openProjectEditor"
+      @project-delete-history="onProjectDeleteHistory"
+      @project-remove="onProjectRemove"
       @search="openCommandPalette"
     />
 
@@ -254,34 +271,43 @@
         </div>
       </div>
     </header>
-    <main
-      class="content"
-      :class="{ 'content--chat': isChatRoute }"
-      :data-skin="skinId || undefined"
-      :data-skin-variant="variants || undefined"
-      id="content"
-    >
-      <ErrorBoundary>
-        <router-view v-slot="{ Component, route }">
-          <!-- out-in: one view in the DOM at a time, so pages never overlap (no
-               double-exposure, and never two composers/textareas mid-swap).
-               Console views are kept-alive, so the entering page is instant —
-               out-in no longer incurs the old remount/fetch "dead gap". -->
-          <template v-if="route.meta.routeTransition === 'none'">
-            <KeepAlive v-if="route.meta.keepAlive" :max="12">
-              <component :is="Component" :key="route.meta.viewKey || route.name" />
-            </KeepAlive>
-            <component v-else :is="Component" :key="route.meta.viewKey || route.name" />
-          </template>
-          <Transition v-else name="route-fade" mode="out-in">
-            <KeepAlive v-if="route.meta.keepAlive" :max="12">
-              <component :is="Component" :key="route.meta.viewKey || route.name" />
-            </KeepAlive>
-            <component v-else :is="Component" :key="route.meta.viewKey || route.name" />
-          </Transition>
-        </router-view>
-      </ErrorBoundary>
-    </main>
+    <div class="app-workspace">
+      <main
+        class="content"
+        :class="{ 'content--chat': isChatRoute }"
+        :data-skin="skinId || undefined"
+        :data-skin-variant="variants || undefined"
+        id="content"
+      >
+        <ErrorBoundary>
+          <router-view v-slot="{ Component, route }">
+            <!-- out-in: one view in the DOM at a time, so pages never overlap (no
+                 double-exposure, and never two composers/textareas mid-swap).
+                 Console views are kept-alive, so the entering page is instant —
+                 out-in no longer incurs the old remount/fetch "dead gap". -->
+            <template v-if="route.meta.routeTransition === 'none'">
+              <KeepAlive v-if="route.meta.keepAlive" :max="12">
+                <component :is="Component" :key="route.meta.viewKey || route.name" />
+              </KeepAlive>
+              <component v-else :is="Component" :key="route.meta.viewKey || route.name" />
+            </template>
+            <Transition v-else name="route-fade" mode="out-in">
+              <KeepAlive v-if="route.meta.keepAlive" :max="12">
+                <component :is="Component" :key="route.meta.viewKey || route.name" />
+              </KeepAlive>
+              <component v-else :is="Component" :key="route.meta.viewKey || route.name" />
+            </Transition>
+          </router-view>
+        </ErrorBoundary>
+      </main>
+      <AppWorkbench
+        :enabled="appStore.features.artifactWorkbench === true"
+        :route-active="isChatRoute"
+        :session-id="currentSessionKey"
+        :modal-blocked="workbenchModalBlocked"
+      />
+      <ArtifactImageLightbox />
+    </div>
   </div>
 
   <!-- Mobile bottom tab bar (<=768px only; hides while the keyboard is up):
@@ -336,6 +362,24 @@
 
   <ConfirmModal />
 
+  <ProjectWorkspacePickerDialog
+    v-if="rpcStore.canChooseProject"
+    :open="projectPickerOpen"
+    :enabled="rpcStore.canChooseProject"
+    :session-key="currentSessionKey || 'agent:main:webchat:workspace-picker'"
+    @close="projectPickerOpen = false"
+    @choose="onProjectPathChosen"
+  />
+
+  <ProjectWorkspaceEditDialog
+    v-if="rpcStore.canManageProjectWorkspaces"
+    :open="Boolean(editingProject)"
+    :initial-name="editingProject?.name || ''"
+    :path="editingProject?.path || ''"
+    @close="editingProjectId = ''"
+    @save="onProjectRename"
+  />
+
   <UpdateBanner />
 
   <!-- Single app-wide announcer for the pending-approval count. The nav badge
@@ -363,6 +407,8 @@ import Icon from './components/Icon.vue'
 import ErrorBoundary from './components/ErrorBoundary.vue'
 import ToastHost from './components/ToastHost.vue'
 import ConfirmModal from './components/ConfirmModal.vue'
+import ProjectWorkspaceEditDialog from './components/ProjectWorkspaceEditDialog.vue'
+import ProjectWorkspacePickerDialog from './components/ProjectWorkspacePickerDialog.vue'
 import UpdateBanner from './components/UpdateBanner.vue'
 import DesktopUpdateIndicator from './components/DesktopUpdateIndicator.vue'
 import SidebarConversations from './components/SidebarConversations.vue'
@@ -371,12 +417,19 @@ import SidebarResizer from './components/SidebarResizer.vue'
 import CommandPalette from './components/CommandPalette.vue'
 import LanguageSwitcher from './components/LanguageSwitcher.vue'
 import BgmControl from './components/BgmControl.vue'
+import ArtifactImageLightbox from './components/chat/ArtifactImageLightbox.vue'
+import AppWorkbench from './components/workbench/AppWorkbench.vue'
 import { useBgm } from './composables/useBgm'
 import { useSidebarLayout } from './composables/useSidebarLayout'
 import { useDocumentEvent } from './composables/useDocumentEvent'
+import { useDialogLayer } from './composables/useDialogA11y'
+import { provideArtifactImageLightbox } from './composables/chat/useArtifactImageLightbox'
 import { useAgentOptions } from './composables/useAgentOptions'
 import { useSessionListSubscription } from './composables/useSessionListSubscription'
 import { useToasts } from './composables/useToasts'
+import { useConfirm } from './composables/useConfirm'
+import { useProjectWorkspaces } from './composables/useProjectWorkspaces'
+import { useFreshTaskDraft } from './composables/useFreshTaskDraft'
 import { useNavigation } from './app/useNavigation'
 import { useSurfaceSkin } from './themes/useSurfaceSkin'
 import { themePickerOptions, getManifest } from './themes/registry'
@@ -392,10 +445,12 @@ import {
   localSessionsDeletedDetail,
   LOCAL_SESSIONS_DELETED_EVENT,
 } from './utils/sessionSync'
+import { activeTaskWasDeletedWithProjectHistory } from './utils/projectHistory'
 
 const appStore = useAppStore()
 const rpcStore = useRpcStore()
 const shortcutsStore = useShortcutsStore()
+const artifactImageLightbox = provideArtifactImageLightbox()
 const { t } = useI18n()
 const $route = useRoute()
 const sidebarRef = ref<HTMLElement | null>(null)
@@ -447,6 +502,27 @@ const { bottomRoutes, workNav } = useNavigation()
 // Axis-B: the active expressive skin for the routed content area (meta.skin).
 const { skinId, variants } = useSurfaceSkin()
 const { pushToast } = useToasts()
+const { confirm } = useConfirm()
+const projectWorkspaces = useProjectWorkspaces()
+const freshTaskDraft = useFreshTaskDraft()
+const projectPickerOpen = ref(false)
+const editingProjectId = ref('')
+const editingProject = computed(() =>
+  editingProjectId.value
+    ? projectWorkspaces.byId.value.get(editingProjectId.value) || null
+    : null,
+)
+watch(
+  () => rpcStore.canManageProjectWorkspaces,
+  allowed => {
+    if (allowed) {
+      void projectWorkspaces.loadWorkspaces().catch(() => undefined)
+      return
+    }
+    projectPickerOpen.value = false
+    editingProjectId.value = ''
+  },
+)
 // Feature-gated topbar music control; the singleton `enabled` ref is written by
 // Settings → Appearance and the command palette.
 const { enabled: bgmEnabled } = useBgm()
@@ -497,6 +573,7 @@ const themeIconName = computed(() => {
 })
 
 const themeMenuOpen = ref(false)
+useDialogLayer(themeMenuOpen)
 const themeButtonRef = ref<HTMLButtonElement | null>(null)
 
 // The compact topbar menu deliberately lists only the basic modes (Light / Dark
@@ -540,11 +617,31 @@ const currentSessionKey = computed(() => {
 // Chat layout applies to both the session view and the draft route.
 const isChatRoute = computed(() => $route.path === '/chat' || $route.path === '/chat/new')
 
+watch(
+  [
+    currentSessionKey,
+    isChatRoute,
+    () => artifactImageLightbox.request.value?.sessionKey || '',
+  ],
+  ([sessionKey, chatRouteActive]) => {
+    const request = artifactImageLightbox.request.value
+    if (request && (!chatRouteActive || request.sessionKey !== sessionKey)) {
+      artifactImageLightbox.close()
+    }
+  },
+  { flush: 'sync' },
+)
+
 // The Settings overlay (route-mounted dialog) is open on these routes. It owns
 // its own Escape/focus, so App-level keyboard shortcuts defer to it. Both web
 // and desktop mount the same overlay now (webConfigEnabled is true on both).
 const settingsOverlayOpen = computed(() =>
   webConfigEnabled && ($route.name === 'settings' || $route.name === 'settings-section'))
+const workbenchModalBlocked = computed(() =>
+  commandPaletteOpen.value
+  || themeMenuOpen.value
+  || settingsOverlayOpen.value
+  || (appStore.sidebarOpen && isSidebarDrawer.value))
 
 const contractDebugEnabled = computed(() => appStore.features.contractDebug === true)
 
@@ -588,7 +685,7 @@ function sidebarConversationTitle(item: SessionItem): string {
     const text = String(candidate || '').trim()
     if (text && !looksLikeRawSessionId(text)) return text
   }
-  return 'Untitled session'
+  return t('shared.sidebar.untitledTask')
 }
 
 // A draft / current-session row the backend list does not yet carry. The
@@ -638,12 +735,12 @@ const sidebarSessionItems = computed((): SessionItem[] => {
   for (const [key, local] of Object.entries(localChatSessions.value)) {
     if (seen.has(key)) continue
     seen.add(key)
-    items.push(syntheticChatSession(key, local.effectiveAgentId, local.title || 'New chat', local.updatedAt))
+    items.push(syntheticChatSession(key, local.effectiveAgentId, local.title || t('chrome.newChat'), local.updatedAt))
   }
   const current = currentSessionKey.value
   if (current && !seen.has(current)) {
     const currentAgentId = normalizeAgentId(current.split(':')[1] || 'main')
-    items.push(syntheticChatSession(current, currentAgentId, 'Current session', Date.now()))
+    items.push(syntheticChatSession(current, currentAgentId, t('shared.sidebar.currentTask'), Date.now()))
   }
   return items
 })
@@ -653,10 +750,15 @@ const sidebarSessionItems = computed((): SessionItem[] => {
 // lookup stay in App.vue; subagents indent under their parent via the helper.
 const sidebarSections = computed((): SidebarSection[] => {
   const byKey = new Map(sidebarSessionItems.value.map(item => [item.key, item]))
-  return arrangeSidebarSections(sidebarSessionItems.value).map(section => ({
+  return arrangeSidebarSections(
+    sidebarSessionItems.value,
+    rpcStore.canManageProjectWorkspaces && projectWorkspaces.hasLoaded.value
+      ? projectWorkspaces.workspaces.value
+      : undefined,
+  ).map(section => ({
     ...section,
     rows: section.rows.map((row): SidebarSectionRow => {
-      if (row.rowKind === 'workspace') return { ...row, agentName: '' }
+      if (row.rowKind !== 'session') return { ...row, agentName: '' }
       const source = byKey.get(row.key)
       const title = renameOverrides.value[row.key]
         || (source ? sidebarConversationTitle(source) : row.title)
@@ -785,12 +887,116 @@ watch(sidebarDynamicMaximum, () => {
 // Explicit custom-Agent launches still receive their Agent-scoped session key
 // from advanced Agent administration.
 function openDefaultDraft() {
+  freshTaskDraft.requestFreshTask('main')
   return router.push({ path: '/chat/new', query: { agent: 'main' } })
 }
 
 function startNewChatInstant() {
   handleNavClick()
   void openDefaultDraft()
+}
+
+function openProjectPicker() {
+  if (!rpcStore.canChooseProject) return
+  handleNavClick()
+  projectPickerOpen.value = true
+}
+
+function startProjectTask(workspaceId: string) {
+  if (!workspaceId || !rpcStore.canManageProjectWorkspaces) return
+  handleNavClick()
+  freshTaskDraft.requestFreshTask('main', workspaceId)
+  void router.push({
+    path: '/chat/new',
+    query: { agent: 'main', project: workspaceId },
+  })
+}
+
+async function onProjectPathChosen(path: string) {
+  projectPickerOpen.value = false
+  if (!rpcStore.canChooseProject) return
+  const trusted = await confirm({
+    title: t('workspaces.trustTitle'),
+    body: t('workspaces.trustBody', { path }),
+    primaryLabel: t('workspaces.trustConfirm'),
+    primaryClass: 'btn--primary',
+  })
+  if (!trusted) return
+  try {
+    const workspace = await projectWorkspaces.openWorkspace(path)
+    if (workspace) startProjectTask(workspace.id)
+  } catch (err) {
+    pushToast(t('workspaces.openFailed', { error: errorMessage(err) }), { tone: 'danger' })
+  }
+}
+
+async function onProjectPin(payload: { workspaceId: string; pinned: boolean }) {
+  if (!rpcStore.canManageProjectWorkspaces) return
+  try {
+    await projectWorkspaces.setPinned(payload.workspaceId, payload.pinned)
+  } catch (err) {
+    pushToast(t('workspaces.updateFailed', { error: errorMessage(err) }), { tone: 'danger' })
+  }
+}
+
+function openProjectEditor(workspaceId: string) {
+  if (!rpcStore.canManageProjectWorkspaces) return
+  editingProjectId.value = workspaceId
+}
+
+async function onProjectRename(name: string) {
+  if (!rpcStore.canManageProjectWorkspaces) return
+  const workspaceId = editingProjectId.value
+  if (!workspaceId) return
+  try {
+    await projectWorkspaces.renameWorkspace(workspaceId, name)
+    editingProjectId.value = ''
+  } catch (err) {
+    pushToast(t('workspaces.updateFailed', { error: errorMessage(err) }), { tone: 'danger' })
+  }
+}
+
+async function onProjectDeleteHistory(workspaceId: string) {
+  if (!rpcStore.canManageProjectWorkspaces) return
+  try {
+    const result = await projectWorkspaces.deleteWorkspaceHistory(workspaceId)
+    const leaveDeletedTask = activeTaskWasDeletedWithProjectHistory({
+      workspaceId,
+      currentSessionKey: currentSessionKey.value,
+      sessions: allSessions.value,
+      deletedSessionKeys: result.deletedSessionKeys,
+    })
+    await loadSessions()
+    if (leaveDeletedTask) void openDefaultDraft()
+    pushToast(t('workspaces.historyDeleted'), { tone: 'ok' })
+  } catch (err) {
+    pushToast(t('workspaces.deleteHistoryFailed', { error: errorMessage(err) }), { tone: 'danger' })
+  }
+}
+
+async function onProjectRemove(workspaceId: string) {
+  if (!rpcStore.canManageProjectWorkspaces) return
+  const project = projectWorkspaces.byId.value.get(workspaceId)
+  if (!project) return
+  const approved = await confirm({
+    title: t('workspaces.removeTitle'),
+    body: t('workspaces.removeBody', { name: project.name }),
+    primaryLabel: t('workspaces.removeConfirm'),
+  })
+  if (!approved) return
+  try {
+    await projectWorkspaces.removeWorkspace(workspaceId)
+    if (editingProjectId.value === workspaceId) editingProjectId.value = ''
+    if (
+      $route.path === '/chat/new'
+      && String($route.query.project || '') === workspaceId
+    ) {
+      freshTaskDraft.requestFreshTask('main')
+      await router.replace({ path: '/chat/new', query: { agent: 'main' } })
+    }
+  } catch (err) {
+    pushToast(t('workspaces.removeFailed', { error: errorMessage(err) }), { tone: 'danger' })
+  }
 }
 
 // Command palette: ⌘K / Ctrl+K and the rail "Search / Go to…" row both open it.
@@ -932,12 +1138,12 @@ async function onDeleteSession(key: string) {
 // Topbar approval pill: jump straight to the blocked session's chat so the
 // in-thread card can be answered. The live `pendingApprovals` list (kept fresh
 // by the push subscription + reconnect seed) is the source of truth — no
-// re-fetch — and the oldest pending session (closest to timeout) is the
-// deterministic target. With no routable session, fall back to the Approvals
-// page.
+// re-fetch — and the oldest pending session is the deterministic target. With
+// no routable session, fall back to the Sessions page.
 function openBlockedApprovalSession() {
   const oldest = appStore.oldestPendingWithSession
   if (oldest?.sessionKey) {
+    appStore.requestApprovalFocus(oldest)
     switchToSession(oldest.sessionKey, 'approval.openBlockedSession')
     return
   }
@@ -964,14 +1170,22 @@ function scheduleSessionRefresh() {
   if (sessionRefreshTimer) clearTimeout(sessionRefreshTimer)
   sessionRefreshTimer = setTimeout(() => {
     sessionRefreshTimer = null
-    loadSessions()
+    void loadSidebarData()
   }, 150)
+}
+
+async function loadSidebarData() {
+  const requests: Promise<unknown>[] = [loadSessions()]
+  if (rpcStore.canManageProjectWorkspaces) {
+    requests.push(projectWorkspaces.loadWorkspaces())
+  }
+  await Promise.allSettled(requests)
 }
 
 const sessionListSubscription = useSessionListSubscription({
   rpc: rpcStore,
   isConnected: () => rpcStore.isConnected,
-  refresh: loadSessions,
+  refresh: loadSidebarData,
   scheduleRefresh: scheduleSessionRefresh,
   warn: (message, error) => console.warn(`[App] ${message}:`, errorMessage(error)),
 })
@@ -1136,7 +1350,11 @@ function onApprovalResolved(payload: ApprovalPushPayload) {
 // Reconnect re-seeds the list (recovers approvals that arrived while the socket
 // was down); the push events keep it live thereafter.
 function onApprovalConnectionState(state: unknown) {
-  if (state === 'connected') void seedPendingApprovals()
+  if (state !== 'connected') {
+    appStore.setPendingApprovals([])
+    return
+  }
+  void seedPendingApprovals()
 }
 
 function subscribeApprovals() {
@@ -1184,7 +1402,7 @@ onMounted(() => {
   window.visualViewport?.addEventListener('resize', syncMobileKeyboard)
   window.addEventListener(LOCAL_SESSIONS_DELETED_EVENT, handleLocalSessionsDeleted)
   loadAgents()
-  loadSessions()
+  void loadSidebarData()
   sessionListSubscription.subscribe()
   // Keep the approval badge/count live app-wide, not just on the Approvals page.
   subscribeApprovals()
@@ -1209,6 +1427,14 @@ onUnmounted(() => {
 </script>
 
 <style scoped>
+.app-workspace {
+  position: relative;
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+}
+
 /* Topbar connection pill as a button (web): inherits the base .conn-pill look
    and state colors, adds button reset + an affordance that it is clickable. */
 .conn-pill--link {

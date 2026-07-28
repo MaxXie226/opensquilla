@@ -69,7 +69,7 @@ describe('SidebarConversations bulk actions', () => {
 
   it('uses a disabled trash action until a task is selected', async () => {
     const root = await mountSidebar()
-    const manage = root.querySelector<HTMLButtonElement>('[aria-label="Manage sessions"]')
+    const manage = root.querySelector<HTMLButtonElement>('[aria-label="Manage tasks"]')
     manage?.click()
     await nextTick()
 
@@ -87,7 +87,7 @@ describe('SidebarConversations bulk actions', () => {
 
   it('exits selection mode and clears the current selection', async () => {
     const root = await mountSidebar()
-    root.querySelector<HTMLButtonElement>('[aria-label="Manage sessions"]')?.click()
+    root.querySelector<HTMLButtonElement>('[aria-label="Manage tasks"]')?.click()
     await nextTick()
 
     root.querySelector<HTMLButtonElement>('.sidebar-history-item')?.click()
@@ -100,9 +100,9 @@ describe('SidebarConversations bulk actions', () => {
     await nextTick()
 
     expect(root.querySelector('[aria-label="Exit selection"]')).toBeNull()
-    expect(root.querySelector('[aria-label="Manage sessions"]')).not.toBeNull()
+    expect(root.querySelector('[aria-label="Manage tasks"]')).not.toBeNull()
 
-    root.querySelector<HTMLButtonElement>('[aria-label="Manage sessions"]')?.click()
+    root.querySelector<HTMLButtonElement>('[aria-label="Manage tasks"]')?.click()
     await nextTick()
     expect(root.querySelector('[aria-label="Delete 0 selected"]')).not.toBeNull()
   })

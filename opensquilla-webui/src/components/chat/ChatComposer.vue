@@ -27,6 +27,49 @@
         </div>
       </div>
       <div class="chat-input-panel">
+        <div
+          v-if="projectWorkspace"
+          class="chat-project-chip"
+          :data-status="projectWorkspaceStatus || 'ready'"
+          :title="projectWorkspace.path"
+        >
+          <Icon name="folder" :size="14" />
+          <span class="chat-project-chip__name">{{ projectWorkspace.name }}</span>
+          <span class="chat-project-chip__path">{{ projectWorkspace.path }}</span>
+          <span v-if="projectStatusMessage" class="chat-project-chip__status">
+            {{ projectStatusMessage }}
+          </span>
+          <button
+            v-if="canCloseProject"
+            type="button"
+            :aria-label="t('workspaces.closeProjectDraft')"
+            :title="t('workspaces.closeProjectDraft')"
+            @click="emit('closeProject')"
+          >
+            <Icon name="x" :size="12" />
+          </button>
+        </div>
+        <div
+          v-if="replanActive"
+          class="chat-replan-draft"
+          role="status"
+          aria-live="polite"
+        >
+          <span class="chat-replan-draft__icon" aria-hidden="true">
+            <Icon name="pencil" :size="14" />
+          </span>
+          <span class="chat-replan-draft__copy">
+            <strong>{{ t('chat.plan.revising') }}</strong>
+            {{ t('chat.plan.reviseDraftHint') }}
+          </span>
+          <button
+            type="button"
+            class="chat-replan-draft__cancel"
+            @click="emit('cancelReplan')"
+          >
+            {{ t('common.cancel') }}
+          </button>
+        </div>
         <div class="chat-input-wrap">
           <textarea
             ref="textareaEl"
@@ -36,7 +79,7 @@
             :placeholder="placeholder"
             maxlength="100000"
             :aria-label="t('chat.messageToSend')"
-            :aria-describedby="sendBlockedMessage ? 'chat-composer-image-send-status' : undefined"
+            :aria-describedby="sendBlockedMessage ? 'chat-composer-send-status' : undefined"
             @beforeinput="emit('beforeinput', $event)"
             @input="emit('input', $event)"
             @keydown="emit('keydown', $event)"
@@ -46,8 +89,43 @@
         </div>
         <div class="chat-input-footer">
           <div class="chat-input-actions chat-input-actions--left">
-            <button class="btn btn--icon btn--ghost chat-plus-btn" :title="t('chat.attachFilesTitle')" :aria-label="t('chat.attachFiles')" @click="fileInputEl?.click()">
-              <Icon name="plus" :size="18" />
+            <div ref="addMenuAnchorEl" class="chat-settings-anchor">
+              <button
+                class="btn btn--icon btn--ghost chat-plus-btn"
+                :class="{ 'is-active': addMenuOpen }"
+                :title="t('chat.add')"
+                :aria-label="t('chat.add')"
+                aria-haspopup="menu"
+                :aria-expanded="addMenuOpen ? 'true' : 'false'"
+                @click="toggleAddMenu"
+              >
+                <Icon name="plus" :size="18" />
+              </button>
+              <ChatComposerAddMenu
+                v-if="addMenuOpen"
+                :attachments-disabled="replanActive"
+                :plan-mode-active="collaborationMode === 'plan'"
+                :plan-mode-available="planModeAvailable === true"
+                :plan-mode-busy="planModeBusy === true || planModeDisabled === true"
+                @activate-plan-mode="emit('setCollaborationMode', 'plan')"
+                @attach-files="fileInputEl?.click()"
+                @close="addMenuOpen = false"
+              />
+            </div>
+            <button
+              v-if="
+                canChooseProject
+                && isNewLanding
+                && !projectWorkspace
+                && (!projectWorkspaceStatus || projectWorkspaceStatus === 'none')
+              "
+              type="button"
+              class="chat-project-choose"
+              @click="emit('chooseProject')"
+            >
+              <Icon name="folder" :size="15" />
+              <span>{{ t('workspaces.chooseProject') }}</span>
+              <Icon class="chat-project-choose__chevron" name="chevronDown" :size="12" />
             </button>
             <div ref="modelRoutingAnchorEl" class="chat-settings-anchor">
               <button
@@ -76,17 +154,29 @@
                 @set-model-routing-mode="emit('setModelRoutingMode', $event)"
               />
             </div>
-            <div ref="runModeAnchorEl" class="chat-settings-anchor">
+            <div ref="runModeAnchorEl" class="chat-settings-anchor chat-run-mode-anchor">
               <button
                 class="btn btn--icon btn--ghost chat-run-mode-btn"
-                :class="[`chat-run-mode-btn--${runMode}`, { 'is-active': runModeOpen }]"
-                :title="t('chat.composer.runMode')"
+                :class="[`chat-run-mode-btn--${runMode}`, {
+                  'is-active': runModeOpen,
+                  'is-locked': runModeLocked,
+                }]"
+                :title="runModeLocked ? undefined : t('chat.composer.runMode')"
                 :aria-label="t('chat.composer.runMode')"
                 :aria-expanded="runModeOpen ? 'true' : 'false'"
+                :aria-disabled="runModeLocked ? 'true' : 'false'"
+                :aria-describedby="runModeLocked ? 'chat-run-mode-lock-tip' : undefined"
+                :disabled="runModeLocked"
                 @click="toggleRunMode"
               >
                 <Icon name="shield" :size="17" />
               </button>
+              <span
+                v-if="runModeLocked"
+                id="chat-run-mode-lock-tip"
+                class="chat-run-mode-lock-tip"
+                role="tooltip"
+              >{{ runModeLockMessage }}</span>
               <ChatComposerRunMode
                 v-if="runModeOpen"
                 :run-mode="runMode"
@@ -98,7 +188,7 @@
             <div ref="moreActionsAnchorEl" class="chat-settings-anchor">
               <button
                 class="btn btn--icon btn--ghost chat-more-actions-btn"
-                :class="{ 'is-active': moreActionsOpen || settingsOpen }"
+                :class="{ 'is-active': moreActionsOpen }"
                 :title="t('chrome.more')"
                 :aria-label="t('chrome.more')"
                 aria-haspopup="menu"
@@ -113,15 +203,6 @@
                 role="menu"
                 :aria-label="t('chrome.more')"
               >
-                <button
-                  type="button"
-                  role="menuitem"
-                  :aria-label="t('chat.composerSettings')"
-                  @click="openSettings"
-                >
-                  <Icon name="settings" :size="16" />
-                  <span>{{ t('chat.composerSettings') }}</span>
-                </button>
                 <button
                   type="button"
                   role="menuitem"
@@ -144,31 +225,40 @@
                   <span>{{ t('chat.exportMarkdown') }}</span>
                 </button>
               </div>
-              <ChatComposerSettings
-                v-if="settingsOpen"
-                :visual-effects-enabled="routerVisualEffectsEnabled"
-                :coding-mode-enabled="codingModeEnabled"
-                :coding-mode-settings-busy="codingModeSettingsBusy"
-                @close="settingsOpen = false"
-                @set-visual-effects-enabled="emit('setVisualEffectsEnabled', $event)"
-                @set-coding-mode-enabled="emit('setCodingModeEnabled', $event)"
-              />
             </div>
           </div>
+          <ChatComposerPlanMode
+            :available="planModeAvailable === true"
+            :mode="collaborationMode || 'default'"
+            :busy="planModeBusy === true"
+            :disabled="planModeDisabled === true"
+            :applies-next-turn="planModeAppliesNextTurn === true"
+            @set-mode="emit('setCollaborationMode', $event)"
+          />
           <div class="chat-input-actions chat-input-actions--right">
             <button
               class="btn btn--icon btn--primary chat-send-btn"
               :class="{ 'is-ready': hasSendContent && !sendBlockedMessage }"
               :title="sendBlockedMessage || sendButtonTitle"
-              :aria-label="t('chat.send')"
-              :aria-describedby="sendBlockedMessage ? 'chat-composer-image-send-status' : undefined"
+              :aria-label="replanActive ? t('chat.plan.reviseSend') : t('chat.send')"
+              :aria-describedby="sendBlockedMessage ? 'chat-composer-send-status' : undefined"
               :disabled="Boolean(sendBlockedMessage)"
               @click="emit('send')"
             >
               <Icon name="arrowUp" :size="17" />
             </button>
             <Transition name="composer-ctl">
-              <button v-if="canStop" class="btn btn--icon btn--danger chat-send-btn" :title="t('chat.stopResponseEsc')" :aria-label="t('chat.stopResponse')" @click="emit('stop')">
+              <button
+                v-if="canStop"
+                class="btn btn--icon btn--danger chat-send-btn"
+                :title="stopTargetsPlanRun
+                  ? t('chat.planRun.stopExecutionEsc')
+                  : t('chat.stopResponseEsc')"
+                :aria-label="stopTargetsPlanRun
+                  ? t('chat.planRun.stopExecution')
+                  : t('chat.stopResponse')"
+                @click="emit('stop')"
+              >
                 <Icon name="stop" :size="16" />
               </button>
             </Transition>
@@ -177,7 +267,7 @@
       </div>
       <p
         v-if="sendBlockedMessage"
-        id="chat-composer-image-send-status"
+        id="chat-composer-send-status"
         class="chat-composer-send-status"
         role="status"
         aria-live="polite"
@@ -200,12 +290,14 @@ import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import type { IconName } from '@/utils/icons'
+import ChatComposerAddMenu from '@/components/chat/ChatComposerAddMenu.vue'
 import ChatComposerModelRouting from '@/components/chat/ChatComposerModelRouting.vue'
-import ChatComposerSettings from '@/components/chat/ChatComposerSettings.vue'
+import ChatComposerPlanMode from '@/components/chat/ChatComposerPlanMode.vue'
 import ChatComposerRunMode from '@/components/chat/ChatComposerRunMode.vue'
 import type { Attachment } from '@/types/chat'
 import type { ModelRoutingMode } from '@/types/modelRouting'
 import type { SandboxRunMode } from '@/types/sandbox'
+import type { CollaborationMode } from '@/types/plans'
 import { isAttachmentBusy, isImageDisplayAttachment } from '@/utils/chat/attachments'
 
 interface ChatComposerExpose {
@@ -215,27 +307,40 @@ interface ChatComposerExpose {
   resizeTextarea: () => void
 }
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   attachments: Attachment[]
   busySendMode: 'queue' | 'steer'
   hasSendContent: boolean
   isStreaming: boolean
   canStop: boolean
+  stopTargetsPlanRun?: boolean
   isNewLanding: boolean
   placeholder: string
   sendButtonTitle: string
   sendBlockedMessage?: string
   runMode: SandboxRunMode
   allowedRunModes: SandboxRunMode[]
+  runModeLocked: boolean
+  runModeLockMessage: string
   modelRoutingMode: ModelRoutingMode
   modelRoutingSettingsBusy: boolean
-  routerVisualEffectsEnabled: boolean
-  codingModeEnabled: boolean
-  codingModeSettingsBusy: boolean
   voiceBusy: boolean
   voiceRecording: boolean
   voiceReady: boolean
-}>()
+  projectWorkspace?: { id: string; name: string; path: string } | null
+  projectWorkspaceStatus?: 'none' | 'resolving' | 'ready' | 'unavailable' | 'removed' | 'unknown' | 'error'
+  projectStatusMessage?: string
+  canCloseProject?: boolean
+  canChooseProject?: boolean
+  planModeAvailable?: boolean
+  collaborationMode?: CollaborationMode
+  planModeBusy?: boolean
+  planModeDisabled?: boolean
+  planModeAppliesNextTurn?: boolean
+  replanActive?: boolean
+}>(), {
+  canChooseProject: true,
+})
 
 const emit = defineEmits<{
   beforeinput: [event: InputEvent]
@@ -249,12 +354,14 @@ const emit = defineEmits<{
   setBusySendMode: [mode: 'queue' | 'steer']
   setRunMode: [mode: 'standard' | 'trusted' | 'full']
   setModelRoutingMode: [mode: ModelRoutingMode]
-  setVisualEffectsEnabled: [enabled: boolean]
-  setCodingModeEnabled: [enabled: boolean]
+  setCollaborationMode: [mode: CollaborationMode]
+  cancelReplan: []
   voiceInput: []
   voiceSetup: []
   exportMarkdown: []
   stop: []
+  chooseProject: []
+  closeProject: []
 }>()
 
 const { t } = useI18n()
@@ -263,7 +370,7 @@ const inputText = defineModel<string>({ required: true })
 const composerEl = ref<HTMLElement | null>(null)
 const textareaEl = ref<HTMLTextAreaElement | null>(null)
 const fileInputEl = ref<HTMLInputElement | null>(null)
-const settingsOpen = ref(false)
+const addMenuOpen = ref(false)
 const modelRoutingOpen = ref(false)
 const moreActionsOpen = ref(false)
 
@@ -283,12 +390,16 @@ function dismissRouterNewBadge() {
   } catch { /* localStorage unavailable */ }
 }
 const runModeOpen = ref(false)
+const addMenuAnchorEl = ref<HTMLElement | null>(null)
 const modelRoutingAnchorEl = ref<HTMLElement | null>(null)
 const runModeAnchorEl = ref<HTMLElement | null>(null)
 const moreActionsAnchorEl = ref<HTMLElement | null>(null)
 
-const anyPopoverOpen = computed(
-  () => settingsOpen.value || modelRoutingOpen.value || runModeOpen.value || moreActionsOpen.value,
+const anyPopoverOpen = computed(() =>
+  addMenuOpen.value
+  || modelRoutingOpen.value
+  || runModeOpen.value
+  || moreActionsOpen.value,
 )
 
 function eventInsideRoot(event: PointerEvent, root: HTMLElement | null): boolean {
@@ -299,11 +410,13 @@ function eventInsideRoot(event: PointerEvent, root: HTMLElement | null): boolean
 }
 
 function closeOpenPopoversFromOutside(event: PointerEvent) {
+  if (addMenuOpen.value && !eventInsideRoot(event, addMenuAnchorEl.value)) {
+    addMenuOpen.value = false
+  }
   if (
-    (settingsOpen.value || moreActionsOpen.value) &&
+    moreActionsOpen.value &&
     !eventInsideRoot(event, moreActionsAnchorEl.value)
   ) {
-    settingsOpen.value = false
     moreActionsOpen.value = false
   }
   if (modelRoutingOpen.value && !eventInsideRoot(event, modelRoutingAnchorEl.value)) {
@@ -330,39 +443,42 @@ function toggleModelRouting() {
   modelRoutingOpen.value = !modelRoutingOpen.value
   if (modelRoutingOpen.value) {
     dismissRouterNewBadge()
-    settingsOpen.value = false
+    addMenuOpen.value = false
     runModeOpen.value = false
     moreActionsOpen.value = false
   }
 }
 
 function toggleRunMode() {
+  if (props.runModeLocked) return
   runModeOpen.value = !runModeOpen.value
   if (runModeOpen.value) {
-    settingsOpen.value = false
+    addMenuOpen.value = false
     modelRoutingOpen.value = false
     moreActionsOpen.value = false
   }
 }
 
+watch(() => props.runModeLocked, (locked) => {
+  if (locked) runModeOpen.value = false
+})
+
 function toggleMoreActions() {
-  if (settingsOpen.value) {
-    settingsOpen.value = false
-    moreActionsOpen.value = true
-  } else {
-    moreActionsOpen.value = !moreActionsOpen.value
-  }
+  moreActionsOpen.value = !moreActionsOpen.value
   if (moreActionsOpen.value) {
+    addMenuOpen.value = false
     modelRoutingOpen.value = false
     runModeOpen.value = false
   }
 }
 
-function openSettings() {
-  moreActionsOpen.value = false
-  settingsOpen.value = true
-  modelRoutingOpen.value = false
-  runModeOpen.value = false
+function toggleAddMenu() {
+  addMenuOpen.value = !addMenuOpen.value
+  if (addMenuOpen.value) {
+    moreActionsOpen.value = false
+    modelRoutingOpen.value = false
+    runModeOpen.value = false
+  }
 }
 
 function triggerVoice() {
@@ -462,6 +578,76 @@ defineExpose<ChatComposerExpose>({
 .chat-composer-inner {
   width: min(100%, var(--composer-col, 820px));
   margin: 0 auto;
+}
+
+.chat-project-chip {
+  width: fit-content;
+  max-width: 100%;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin: 0.625rem 0.875rem 0;
+  padding: 4px 8px;
+  border: 0;
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, var(--accent) 7%, var(--bg-surface));
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+}
+.chat-project-chip__name,
+.chat-project-chip__path {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chat-project-chip__name { flex-shrink: 0; font-weight: 650; }
+.chat-project-chip__path { color: var(--text-muted); font-family: var(--font-mono); }
+.chat-project-chip__status {
+  flex-shrink: 0;
+  color: var(--warning, var(--text-muted));
+  font-size: var(--fs-xs);
+}
+.chat-project-chip button {
+  display: inline-flex;
+  padding: 2px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+}
+.chat-project-choose {
+  flex-shrink: 0;
+  max-width: 100%;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 30px;
+  padding: 3px 7px;
+  border: 0;
+  border-radius: var(--radius-full);
+  background: transparent;
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    color var(--dur-fast),
+    background var(--dur-fast),
+    transform var(--dur-fast);
+}
+.chat-project-choose > .icon:first-child { color: var(--accent); }
+.chat-project-choose__chevron {
+  opacity: 0.55;
+  transition: opacity var(--dur-fast);
+}
+.chat-project-choose:hover,
+.chat-project-choose:focus-visible {
+  color: var(--text);
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+}
+.chat-project-choose:hover .chat-project-choose__chevron,
+.chat-project-choose:focus-visible .chat-project-choose__chevron {
+  opacity: 0.9;
 }
 
 .chat-composer--new-landing .chat-composer-inner {
@@ -589,6 +775,54 @@ defineExpose<ChatComposerExpose>({
   background: var(--bg-surface);
   box-shadow: var(--shadow-xs);
   position: relative;
+}
+
+.chat-replan-draft {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  border-bottom: 1px solid color-mix(in srgb, var(--accent) 24%, var(--border));
+  background: color-mix(in srgb, var(--accent) 6%, transparent);
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+}
+
+.chat-replan-draft__icon {
+  display: inline-flex;
+  color: var(--accent);
+}
+
+.chat-replan-draft__copy {
+  min-width: 0;
+}
+
+.chat-replan-draft__copy strong {
+  margin-right: var(--sp-1);
+  color: var(--text);
+}
+
+.chat-replan-draft__cancel {
+  padding: 2px 7px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  font: inherit;
+}
+
+.chat-replan-draft__cancel:hover,
+.chat-replan-draft__cancel:focus-visible {
+  border-color: var(--border);
+  background: var(--bg-hover);
+  color: var(--text);
+  outline: none;
+}
+
+.chat-replan-draft__cancel:focus-visible {
+  box-shadow: var(--focus-ring);
 }
 
 .chat-composer--new-landing .chat-input-panel {
@@ -866,6 +1100,60 @@ defineExpose<ChatComposerExpose>({
   color: var(--run-mode-tone);
 }
 
+.chat-run-mode-btn.is-locked {
+  opacity: 0.46;
+  filter: grayscale(0.6);
+  cursor: default;
+}
+
+.chat-run-mode-lock-tip {
+  position: absolute;
+  bottom: calc(100% + 10px);
+  left: 50%;
+  z-index: 220;
+  width: max-content;
+  max-width: min(240px, calc(100vw - 24px));
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-elevated);
+  color: var(--text);
+  box-shadow: var(--shadow-md);
+  font-size: var(--fs-xs);
+  font-weight: 500;
+  line-height: 1.35;
+  white-space: nowrap;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transform: translate(-50%, 3px) scale(0.98);
+  transform-origin: bottom center;
+  transition:
+    opacity var(--dur-fast) var(--ease-out),
+    transform var(--dur-fast) var(--ease-out),
+    visibility 0s linear var(--dur-fast);
+}
+
+.chat-run-mode-lock-tip::after {
+  content: "";
+  position: absolute;
+  top: 100%;
+  left: 50%;
+  width: 7px;
+  height: 7px;
+  border-right: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-elevated);
+  transform: translate(-50%, -4px) rotate(45deg);
+}
+
+.chat-run-mode-anchor:hover > .chat-run-mode-lock-tip {
+  opacity: 1;
+  visibility: visible;
+  transform: translate(-50%, 0) scale(1);
+  transition-delay: var(--dur-base), var(--dur-base), 0s;
+}
+
 .chat-send-btn.btn--primary {
   background: var(--bg-hover);
   color: var(--text-dim);
@@ -906,9 +1194,19 @@ defineExpose<ChatComposerExpose>({
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .chat-run-mode-lock-tip {
+    transition: none;
+  }
+
   .composer-ctl-enter-active,
   .composer-ctl-leave-active {
     transition: none;
+  }
+}
+
+@media (hover: none) {
+  .chat-run-mode-lock-tip {
+    display: none;
   }
 }
 </style>

@@ -3,7 +3,7 @@
   <div
     v-if="resolution"
     class="approval-outcome"
-    :class="outcomeClass"
+    :class="[outcomeClass, { 'approval-outcome--timeline': timeline }]"
     data-testid="approval-outcome"
     role="status"
   >
@@ -16,7 +16,10 @@
   <article
     v-else
     class="approval-card"
+    :class="{ 'approval-card--timeline': timeline }"
     data-testid="approval-card"
+    :data-approval-id="approval.id"
+    tabindex="-1"
     role="group"
     :aria-label="t('chat.approval.requiredFor', { tool: approval.toolName })"
   >
@@ -109,14 +112,12 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import type { ChatApprovalItem, ChatApprovalResolution } from '@/composables/chat/useChatApprovals'
 import { formatCountdown } from '@/composables/chat/useChatApprovals'
 
-// Below this remaining time the countdown switches to the warning token and
-// reveals the Extend affordance (WCAG 2.2.1: a countdown alone is not enough).
 const WARN_THRESHOLD_SECONDS = 60
 
 const { t } = useI18n()
@@ -126,6 +127,7 @@ const props = defineProps<{
   resolution: ChatApprovalResolution | null
   busy?: boolean
   error?: string
+  timeline?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -136,43 +138,66 @@ const emit = defineEmits<{
 }>()
 
 const denyNote = ref('')
-
-// A 1s tick drives the countdown; only mounted while a pending card is shown.
-// Skip ticks while the tab is hidden so background-tab CPU is not wasted and
-// the visible countdown does not jump on tab restore.
 const now = ref(Date.now())
+let mounted = false
 let tick: ReturnType<typeof setInterval> | null = null
 
-function startTick() {
-  if (tick) return
-  tick = setInterval(() => {
-    if (!document.hidden) now.value = Date.now()
-  }, 1000)
+const deadline = computed(() => {
+  const value = Number(props.approval.deadline)
+  return Number.isFinite(value) && value > 0 ? value : null
+})
+const remainingSeconds = computed(() =>
+  deadline.value === null
+    ? null
+    : Math.max(0, Math.round(deadline.value - now.value / 1000)))
+const showCountdown = computed(() =>
+  !props.resolution && remainingSeconds.value !== null)
+const timeIsLow = computed(() =>
+  remainingSeconds.value !== null
+  && remainingSeconds.value <= WARN_THRESHOLD_SECONDS)
+const countdownText = computed(() =>
+  remainingSeconds.value === null
+    ? ''
+    : t('chat.approval.expiresIn', {
+        time: formatCountdown(remainingSeconds.value),
+      }))
+
+function stopTick() {
+  if (tick) clearInterval(tick)
+  tick = null
+}
+
+function syncTick() {
+  now.value = Date.now()
+  if (!mounted || !showCountdown.value) {
+    stopTick()
+    return
+  }
+  if (!tick) {
+    tick = setInterval(() => {
+      if (!document.hidden) now.value = Date.now()
+    }, 1000)
+  }
 }
 
 function onVisibilityChange() {
   if (!document.hidden) now.value = Date.now()
 }
 
+watch(
+  () => [props.approval.deadline, props.resolution],
+  syncTick,
+)
 onMounted(() => {
-  startTick()
+  mounted = true
   document.addEventListener('visibilitychange', onVisibilityChange)
+  syncTick()
 })
 onBeforeUnmount(() => {
-  if (tick) clearInterval(tick)
+  mounted = false
+  stopTick()
   document.removeEventListener('visibilitychange', onVisibilityChange)
 })
-
-const remainingSeconds = computed(() => {
-  if (!props.approval.deadline) return null
-  return Math.max(0, Math.round(props.approval.deadline - now.value / 1000))
-})
-
-const showCountdown = computed(() => !props.resolution && remainingSeconds.value !== null)
-const timeIsLow = computed(() =>
-  remainingSeconds.value !== null && remainingSeconds.value <= WARN_THRESHOLD_SECONDS)
-const countdownText = computed(() =>
-  remainingSeconds.value === null ? '' : t('chat.approval.expiresIn', { time: formatCountdown(remainingSeconds.value) }))
 
 const isSandboxApproval = computed(() =>
   String(props.approval.approvalKind || props.approval.args?.approvalKind || '').startsWith('sandbox_'))
@@ -264,6 +289,11 @@ function emitDeny() {
      scrolls. */
   flex-shrink: 0;
   animation: card-enter var(--dur-enter) var(--ease-out) both;
+}
+
+.approval-card:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
 }
 
 .approval-card__head {
@@ -489,6 +519,20 @@ function emitDeny() {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.approval-outcome--timeline {
+  width: 100%;
+  margin: 0;
+  padding: 7px 8px;
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, currentColor 5%, transparent);
+}
+
+.approval-card--timeline {
+  width: 100%;
+  margin: var(--sp-2) 0;
+  box-shadow: none;
 }
 
 @keyframes card-enter {

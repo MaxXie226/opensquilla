@@ -9,6 +9,10 @@ import type {
   DesktopUpdateState,
   DesktopSettings,
   DesktopSettingsPayload,
+  NativeWorkbenchCreateSurfaceRequest,
+  NativeWorkbenchSurfaceEvent,
+  NativeWorkbenchSurfaceRectRequest,
+  NativeWorkbenchSurfaceResult,
 } from './platform/types'
 
 type MigrationSourceKind = 'cli-home' | 'desktop-home' | 'windows-portable'
@@ -71,6 +75,18 @@ declare global {
     abandonCleanupTransaction?: () => Promise<unknown>
     setNativeTheme?: (payload: { source: 'light' | 'dark' | 'system' }) => Promise<unknown>
     openArtifact: (payload: ArtifactOpenRequest) => Promise<ArtifactNativeOpenResult>
+    chooseProjectDirectory: () => Promise<{ path: string } | null>
+    createWorkbenchSurface?: (
+      payload: NativeWorkbenchCreateSurfaceRequest,
+    ) => Promise<NativeWorkbenchSurfaceResult>
+    setWorkbenchSurfaceRect?: (
+      payload: NativeWorkbenchSurfaceRectRequest,
+    ) => Promise<NativeWorkbenchSurfaceResult>
+    activateWorkbenchSurface?: (surfaceId: string) => Promise<NativeWorkbenchSurfaceResult>
+    destroyWorkbenchSurface?: (surfaceId: string) => Promise<NativeWorkbenchSurfaceResult>
+    onWorkbenchSurfaceEvent?: (
+      callback: (payload: NativeWorkbenchSurfaceEvent) => void,
+    ) => () => void
     getOnboardingDefaults: () => Promise<unknown>
     saveOnboarding: (payload: unknown) => Promise<unknown>
     cancelOnboarding: () => Promise<unknown>

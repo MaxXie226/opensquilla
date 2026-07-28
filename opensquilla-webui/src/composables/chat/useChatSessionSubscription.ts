@@ -4,6 +4,8 @@ import type {
   ChatRunStatusSource,
 } from '@/types/chat'
 import type {
+  SessionProjectWorkspaceSnapshot,
+  SessionMessagesSnapshotResponse,
   SessionMessagesSubscribeParams,
   SessionMessagesSubscribeResponse,
 } from '@/types/rpc'
@@ -27,7 +29,22 @@ export interface UseChatSessionSubscriptionOptions {
   loadHistory: () => void | Promise<void>
   resetStreamIdleTimer: () => void
   resetStreamLiveTurnState: () => void
+  onLiveSnapshot?: (snapshot: SessionMessagesSnapshotResponse) => void
   onAuthoritativeIdle?: () => void
+  onRunModeLock?: (
+    lock: NonNullable<SessionMessagesSubscribeResponse['run_mode_lock']>,
+  ) => void
+  beginSessionMetadataResolution?: (key: string) => number
+  onSessionMetadata?: (
+    key: string,
+    generation: number,
+    metadata: {
+      workspaceId?: string
+      projectWorkspace?: SessionProjectWorkspaceSnapshot | null
+    },
+  ) => void
+  onSessionMetadataError?: (key: string, generation: number) => void
+  onSnapshot?: (snapshot: SessionMessagesSubscribeResponse) => void
 }
 
 const LIVE_RUN_STATES = ['queued', 'running', 'approval_pending']
@@ -76,18 +93,54 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     token: symbol,
   ): Promise<SessionSubscriptionOutcome> {
     const attempt = ++subscriptionAttempt
+    const metadataGeneration = options.beginSessionMetadataResolution?.(key)
     if (sinceStreamSeq === 0) isHydrating.value = true
     try {
       await options.rpc.waitForConnection()
       if (attempt !== subscriptionAttempt || key !== options.sessionKey.value) {
         return UNAVAILABLE_SUBSCRIPTION
       }
-      const params: SessionMessagesSubscribeParams = { key, since_stream_seq: sinceStreamSeq }
+      let subscribeFrom = sinceStreamSeq
+      if (options.onLiveSnapshot) {
+        try {
+          const snapshot = await options.rpc.call<SessionMessagesSnapshotResponse>(
+            'sessions.messages.snapshot',
+            { key },
+          )
+          if (attempt !== subscriptionAttempt || key !== options.sessionKey.value) {
+            return UNAVAILABLE_SUBSCRIPTION
+          }
+          if (
+            snapshot?.key === key
+            && Array.isArray(snapshot.events)
+            && typeof snapshot.current_stream_seq === 'number'
+          ) {
+            options.onLiveSnapshot(snapshot)
+            subscribeFrom = Math.max(0, snapshot.current_stream_seq)
+            options.lastStreamSeq.value = subscribeFrom
+          }
+        } catch {
+          // Older gateways do not expose the snapshot RPC. Continue with the
+          // bounded replay protocol so mixed-version client updates still work.
+        }
+      }
+      const params: SessionMessagesSubscribeParams = { key, since_stream_seq: subscribeFrom }
       const res = await options.rpc.call<SessionMessagesSubscribeResponse>('sessions.messages.subscribe', params)
       if (attempt !== subscriptionAttempt || key !== options.sessionKey.value) {
         return UNAVAILABLE_SUBSCRIPTION
       }
       if (res && res.subscribed === false) throw new Error('No subscription manager available')
+      if (metadataGeneration !== undefined) {
+        options.onSessionMetadata?.(key, metadataGeneration, {
+          workspaceId: res.workspaceId,
+          projectWorkspace: res.projectWorkspace,
+        })
+      }
+      const runModeLock = res.run_mode_lock || res.runModeLock
+      if (runModeLock && typeof runModeLock === 'object') {
+        options.onRunModeLock?.(runModeLock)
+      }
+      options.onSnapshot?.(res)
       applySessionRunState(res)
       // A pending inline interrupt is newer, stronger evidence than an idle
       // subscription snapshot that raced with the approval request.
@@ -145,6 +198,13 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
       return outcome
     } catch (err: unknown) {
       console.warn('Session stream subscription failed:', err instanceof Error ? err.message : err)
+      if (
+        metadataGeneration !== undefined
+        && attempt === subscriptionAttempt
+        && key === options.sessionKey.value
+      ) {
+        options.onSessionMetadataError?.(key, metadataGeneration)
+      }
       return UNAVAILABLE_SUBSCRIPTION
     } finally {
       if (attempt === subscriptionAttempt) isHydrating.value = false
