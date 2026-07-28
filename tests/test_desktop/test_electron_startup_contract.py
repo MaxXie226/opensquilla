@@ -1963,6 +1963,31 @@ def test_package_verifier_hard_fails_stale_runtime_and_boot_contract() -> None:
         assert expected in verifier
 
 
+def test_packaged_session_recovery_gate_uses_installed_electron_and_real_gateway() -> None:
+    package_json = json.loads(_read("desktop/electron/package.json"))
+    recovery = _read("desktop/electron/scripts/test-packaged-session-recovery.mjs")
+    helpers = _read("desktop/electron/scripts/packaged-smoke-helpers.mjs")
+
+    assert (
+        package_json["scripts"]["test:packaged-session-recovery"]
+        == "node scripts/test-packaged-session-recovery.mjs"
+    )
+    assert "_electron as electron" in helpers
+    assert "executablePath" in helpers
+    assert "--user-data-dir=" in helpers
+    assert "connectToServer()" in recovery
+    assert "chat.history" in recovery
+    assert "sessions.messages.subscribe" in recovery
+    assert "client.onMessage" in recovery
+    assert "server.onMessage" in recovery
+    assert "server.send(message)" in recovery
+    assert "client.send(message)" in recovery
+    assert "page.clock" not in recovery
+    assert "socketCount > 1" in recovery
+    assert "expectedLastMessage" in recovery
+    assert "preservedDraft" in recovery
+
+
 def test_desktop_gateway_build_and_verifier_cover_runtime_capabilities() -> None:
     build_gateway = _read("desktop/electron/scripts/build-gateway.mjs")
     verifier = _read("desktop/electron/scripts/verify-package.mjs")

@@ -24,6 +24,7 @@
 import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRpcCall } from '@/composables/useRpc'
+import { optionalSessionRpcCallOptions } from '@/composables/chat/sessionBootstrapAdmission'
 
 const { t } = useI18n()
 
@@ -69,7 +70,11 @@ const FALLBACK_CHIPS = computed(() => [
   ordinaryChip(t('chat.chips.planWeek')),
 ])
 
-const capabilityStatus = useRpcCall<CapabilityStatus>('onboarding.status')
+const capabilityStatus = useRpcCall<CapabilityStatus>(
+  'onboarding.status',
+  undefined,
+  { callOptions: optionalSessionRpcCallOptions },
+)
 
 const greeting = computed(() => {
   const hour = new Date().getHours()
