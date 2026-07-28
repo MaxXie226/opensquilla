@@ -18,6 +18,7 @@ from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
 from opensquilla import __version__
+from opensquilla._build_info import BUILD_UI_MODE
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.control_ui_assets import (
     ControlUiArtifactManifest,
@@ -377,10 +378,14 @@ def resolve_control_ui_assets(config: GatewayConfig) -> ControlUiAssets:
         embedded_static_root=_STATIC_DIR,
         embedded_dist_root=_DIST_DIR,
         template_root=_TEMPLATE_DIR,
+        allow_embedded=BUILD_UI_MODE != "headless",
     ).resolve()
 
 
-def _missing_assets_detail(assets: ControlUiAssets) -> str:
+def _missing_assets_detail(
+    assets: ControlUiAssets,
+    requested_mode: str,
+) -> str:
     reason = assets.reason or "unavailable"
     if reason == "explicit_none":
         return (
@@ -392,16 +397,22 @@ def _missing_assets_detail(assets: ControlUiAssets) -> str:
             "The configured external Control UI bundle was rejected by its path "
             "or manifest validation. The Gateway core remains available."
         )
+    if reason == "build:headless" or (
+        requested_mode == "auto" and reason == "embedded:asset_directory_missing"
+    ):
+        return (
+            "The public Gateway runtime is running headless as expected. Use "
+            "the CLI, a compatible client, or configure an explicit external "
+            "Control UI artifact."
+        )
     return (
-        "The built Vue console was not found or failed validation, so the Control "
-        "UI will serve an 'assets are unavailable' notice instead of the console. "
-        "From a source checkout, build it with `cd opensquilla-webui && npm ci && "
-        "npm run build` (Node.js 22.12+ with npm) and restart or reload the page. "
-        "Release-wheel and Desktop installs should reinstall an official package."
+        "The selected embedded Control UI artifact is missing or failed "
+        "validation. The Gateway core remains available; use a compatible "
+        "client or provide a verified external/embedded artifact."
     )
 
 
-def _fallback_index_html(assets: ControlUiAssets) -> str:
+def _fallback_index_html(assets: ControlUiAssets, requested_mode: str) -> str:
     reason = assets.reason or "unavailable"
     if reason == "explicit_none":
         title = "Gateway is running without a Control UI"
@@ -409,9 +420,14 @@ def _fallback_index_html(assets: ControlUiAssets) -> str:
     elif reason.startswith("external:"):
         title = "Configured Control UI assets were rejected"
         detail = "The Gateway core is healthy; verify the external bundle manifest."
+    elif reason == "build:headless" or (
+        requested_mode == "auto" and reason == "embedded:asset_directory_missing"
+    ):
+        title = "Gateway is running in headless mode"
+        detail = "Use a compatible client, the CLI, or the Gateway RPC interfaces."
     else:
         title = "Control UI assets are unavailable"
-        detail = "The Gateway core is healthy; reinstall or rebuild the Control UI bundle."
+        detail = "The Gateway core is healthy; verify the selected Control UI artifact."
     return (
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
         f"<title>{title}</title></head><body><main role=\"alert\"><h1>{title}</h1>"
@@ -430,10 +446,20 @@ def create_control_ui_routes(
 
     resolved = assets or resolve_control_ui_assets(config)
     if not resolved.available:
-        detail = _missing_assets_detail(resolved)
+        detail = _missing_assets_detail(resolved, config.control_ui.assets_mode)
         if resolved.reason == "explicit_none":
             log.info(
                 "control_ui.assets_disabled",
+                assets_mode="none",
+                detail=detail,
+            )
+        elif (
+            config.control_ui.assets_mode == "auto"
+            and resolved.reason
+            in {"build:headless", "embedded:asset_directory_missing"}
+        ):
+            log.info(
+                "control_ui.headless",
                 assets_mode="none",
                 detail=detail,
             )
@@ -493,9 +519,14 @@ def create_control_ui_routes(
         ctx["webui_artifact_missing"] = not live_js
         ctx["control_ui_assets_mode"] = resolved.mode
         ctx["control_ui_assets_reason"] = resolved.reason or ""
+        ctx["control_ui_requested_mode"] = config.control_ui.assets_mode
         # Back-compat single URL (first) for any consumer expecting one.
         ctx["vite_css_url"] = live_css_urls[0] if live_css_urls else ""
-        html = template.render(**ctx) if template is not None else _fallback_index_html(resolved)
+        html = (
+            template.render(**ctx)
+            if template is not None
+            else _fallback_index_html(resolved, config.control_ui.assets_mode)
+        )
         response = HTMLResponse(html)
         response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
         response.headers["Pragma"] = "no-cache"

@@ -42,12 +42,14 @@ def _resolve(
     static_root: Path,
     dist_root: Path,
     template_root: Path | None = None,
+    allow_embedded: bool = True,
 ) -> ControlUiAssets:
     return ControlUiAssetResolver(
         config,
         embedded_static_root=static_root,
         embedded_dist_root=dist_root,
         template_root=template_root or control_ui._TEMPLATE_DIR,
+        allow_embedded=allow_embedded,
     ).resolve()
 
 
@@ -67,6 +69,52 @@ def test_auto_uses_existing_embedded_bundle_without_requiring_new_manifest(
     assert assets.dist_root == dist_root
     assert assets.manifest is None
     assert assets.reason is None
+
+
+@pytest.mark.parametrize("mode", ["auto", "embedded"])
+def test_headless_wheel_ignores_residual_embedded_bundle(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    static_root, dist_root = _embedded_tree(tmp_path)
+    config = GatewayConfig(control_ui={"assets_mode": mode})
+
+    assets = _resolve(
+        config,
+        static_root=static_root,
+        dist_root=dist_root,
+        allow_embedded=False,
+    )
+    client = TestClient(Starlette(routes=create_control_ui_routes(config, assets)))
+
+    assert assets.mode == "none"
+    assert assets.dist_root is None
+    assert assets.reason == "build:headless"
+    assert client.get("/control/static/dist/assets/app.js").status_code == 404
+    response = client.get("/control/")
+    assert response.status_code == 200
+    assert "Gateway is running in headless mode" in response.text
+
+
+def test_resolve_control_ui_assets_uses_wheel_build_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    static_root, dist_root = _embedded_tree(tmp_path)
+    monkeypatch.setattr(control_ui, "_STATIC_DIR", static_root)
+    monkeypatch.setattr(control_ui, "_DIST_DIR", dist_root)
+    monkeypatch.setattr(control_ui, "BUILD_UI_MODE", "headless")
+
+    assets = control_ui.resolve_control_ui_assets(GatewayConfig())
+
+    assert assets.mode == "none"
+    assert assets.reason == "build:headless"
+
+    monkeypatch.setattr(control_ui, "BUILD_UI_MODE", None)
+    source_assets = control_ui.resolve_control_ui_assets(GatewayConfig())
+
+    assert source_assets.mode == "embedded"
+    assert source_assets.dist_root == dist_root
 
 
 @pytest.mark.parametrize("mode", ["auto", "embedded"])
@@ -154,7 +202,7 @@ def test_none_mode_keeps_core_health_and_readiness_available(tmp_path: Path) -> 
     assert 'data-control-ui-assets-mode="none"' in response.text
 
 
-def test_auto_missing_bundle_keeps_source_checkout_recovery_guidance(
+def test_auto_missing_bundle_reports_expected_headless_runtime(
     tmp_path: Path,
 ) -> None:
     config = GatewayConfig(control_ui={"assets_mode": "auto"})
@@ -168,8 +216,9 @@ def test_auto_missing_bundle_keeps_source_checkout_recovery_guidance(
     response = TestClient(app).get("/control/")
 
     assert response.status_code == 200
-    assert "Control UI assets are unavailable" in response.text
-    assert "npm ci &amp;&amp; npm run build" in response.text
+    assert "Gateway is running in headless mode" in response.text
+    assert "compatible client" in response.text
+    assert "npm ci" not in response.text
 
 
 def test_missing_neutral_template_falls_back_without_breaking_route(

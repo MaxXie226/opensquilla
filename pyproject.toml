@@ -106,15 +106,16 @@ requires = ["hatchling>=1.31,<2"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.hooks.custom]
-# Standard wheel/sdist builds fail closed unless the generated WebUI matches
-# the current frontend source. Editable installs intentionally skip this hook.
+# Standard wheel/sdist builds are headless. A prebuilt WebUI can enter a
+# distribution only through the hook's explicit, manifest-validated mode.
+# Editable installs intentionally skip distribution packaging policy.
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/opensquilla"]
-# Hatch normally honors .gitignore. This explicit artifact rule lets a
-# verified, generated WebUI bundle enter wheels without tracking it in Git.
-artifacts = ["src/opensquilla/gateway/static/dist/**"]
 exclude = [
+    # Never discover a checkout's ignored/stale UI bundle implicitly. The
+    # explicit embed-ui hook force-includes a caller-selected artifact.
+    "src/opensquilla/gateway/static/dist/**",
     "src/opensquilla/scheduler/templates/*.md",
     "src/opensquilla/skills/bundled/**/THIRD_PARTY_NOTICES.md",
     "src/opensquilla/skills/bundled/**/README.md",
@@ -145,12 +146,12 @@ exclude = [
 "src/opensquilla/skills/bundled/pptx/references/python_pptx.md" = "opensquilla/skills/bundled/pptx/references/python_pptx.md"
 
 [tool.hatch.build.targets.sdist]
-# Published sdists remain self-contained: downstream wheel builds do not need
-# Node.js because release CI embeds the already-verified WebUI artifact here.
-# Standard sdists deliberately reject ignored personal BGM so an ordinary
-# source-archive build cannot leak private or copyrighted audio. Developers who
-# need a private customized artifact can build a direct local wheel instead.
-artifacts = ["src/opensquilla/gateway/static/dist/**"]
+# Public source archives are headless and never carry generated UI assets.
+# Explicit embed-ui builds use the same hook and manifest validation as wheels.
+exclude = [
+    "opensquilla-webui/**",
+    "src/opensquilla/gateway/static/dist/**",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -39,7 +39,6 @@ logs
 tests
 docs
 scripts/*
-!scripts/verify_webui_artifact.py
 CHANGELOG.md
 KNOWN_LIMITATIONS.md
 
@@ -62,10 +61,10 @@ dist
 build
 *.egg-info
 **/node_modules
-opensquilla-webui/test-results
+opensquilla-webui
 
-# The WebUI bundle is rebuilt in the builder stage. Never merge a local,
-# potentially stale bundle into the generated artifact copied from that stage.
+# The public runtime image is headless. Never send a local, potentially stale
+# or private WebUI bundle into its build context.
 src/opensquilla/gateway/static/dist
 
 # --- CI / local tooling -----------------------------------------------------

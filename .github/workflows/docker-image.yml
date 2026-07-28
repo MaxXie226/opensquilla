@@ -143,11 +143,6 @@ jobs:
           push: ${{ github.event_name == 'push' || inputs.publish == true }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          # Official/tag and edge builds must never publish a checkout's
-          # ignored personal BGM. Local `docker build` keeps the opt-in custom
-          # music behavior because the Dockerfile argument defaults to 0.
-          build-args: |
-            OPENSQUILLA_FORBID_PERSONAL_BGM=1
           # Keep the pushed artifact a plain two-entry manifest list; the
           # default provenance attestation adds an unknown/unknown entry that
           # confuses registry UIs and `docker pull` inspection.
@@ -230,47 +225,12 @@ jobs:
             exit 1
           fi
 
-          control_html="${RUNNER_TEMP}/opensquilla-control.html"
-          entry_urls="${RUNNER_TEMP}/opensquilla-control-entry-urls.txt"
           docker exec "${container_id}" curl --fail --silent --show-error \
-            http://127.0.0.1:18791/control/ > "${control_html}"
-          python3 - "${control_html}" "${entry_urls}" <<'PY'
-          import sys
-          from html.parser import HTMLParser
-          from pathlib import Path
-          from urllib.parse import urljoin, urlparse
-
-          class Entrypoints(HTMLParser):
-              def __init__(self) -> None:
-                  super().__init__()
-                  self.urls: set[str] = set()
-
-              def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-                  values = dict(attrs)
-                  raw = values.get("src") if tag == "script" else values.get("href")
-                  if not raw:
-                      return
-                  url = urljoin("http://127.0.0.1:18791/control/", raw)
-                  parsed = urlparse(url)
-                  if (
-                      parsed.netloc == "127.0.0.1:18791"
-                      and parsed.path.endswith((".js", ".css"))
-                  ):
-                      self.urls.add(url)
-
-          parser = Entrypoints()
-          parser.feed(Path(sys.argv[1]).read_text(encoding="utf-8"))
-          paths = [urlparse(url).path for url in parser.urls]
-          if not any(path.endswith(".js") for path in paths):
-              raise SystemExit("/control/ has no JavaScript entrypoint")
-          if not any(path.endswith(".css") for path in paths):
-              raise SystemExit("/control/ has no stylesheet entrypoint")
-          Path(sys.argv[2]).write_text("\n".join(sorted(parser.urls)) + "\n", encoding="utf-8")
-          PY
-          while IFS= read -r entry_url; do
-            docker exec "${container_id}" curl --fail --silent --show-error \
-              --output /dev/null "${entry_url}"
-          done < "${entry_urls}"
+            --output /dev/null http://127.0.0.1:18791/healthz
+          docker exec "${container_id}" curl --fail --silent --show-error \
+            --output /dev/null http://127.0.0.1:18791/readyz
+          docker exec "${container_id}" python -c \
+            'from opensquilla.gateway.control_ui import _DIST_DIR; assert not (_DIST_DIR / "index.html").is_file()'
 
       # Promotion happens only after the immutable release image passes both
       # remote-manifest verification and its image-defined HEALTHCHECK.

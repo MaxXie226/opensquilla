@@ -79,10 +79,14 @@
         {% elif control_ui_assets_reason.startswith("external:") %}
         <h1 style="font-size:1.25rem;margin:0 0 .75rem">Configured Control UI assets were rejected</h1>
         <p style="margin-bottom:0">The Gateway core remains available. Verify the external asset directory and its manifest before trying again.</p>
+        {% elif control_ui_assets_reason == "build:headless" or (control_ui_requested_mode == "auto" and control_ui_assets_reason == "embedded:asset_directory_missing") %}
+        <h1 style="font-size:1.25rem;margin:0 0 .75rem">Gateway is running in headless mode</h1>
+        <p>The public runtime does not embed a product UI. Core health, readiness, RPC, CLI, channels, Cron, and MCP remain available.</p>
+        <p style="margin-bottom:0">Use a compatible client or configure an explicit, verified external Control UI artifact.</p>
         {% else %}
         <h1 style="font-size:1.25rem;margin:0 0 .75rem">Control UI assets are unavailable</h1>
-        <p>This installation does not contain a usable Vue build. Release-wheel and Desktop users should reinstall an official package.</p>
-        <p style="margin-bottom:0">When running from a source checkout, build it with <code>cd opensquilla-webui &amp;&amp; npm ci &amp;&amp; npm run build</code>, then reload this page.</p>
+        <p>The selected embedded Control UI artifact is missing or invalid. The Gateway core remains available.</p>
+        <p style="margin-bottom:0">Use a compatible client or provide a manifest-validated external or embedded artifact.</p>
         {% endif %}
     </main>
     {% else %}

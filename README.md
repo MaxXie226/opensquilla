@@ -82,7 +82,7 @@ the GitHub Release: `OpenSquilla-0.5.0-mac-arm64.dmg` on macOS and
 | --- | :---: | :---: | :---: |
 | Python 3.12+ | via `uv` | via `uv` or system | via `uv` |
 | Git + Git LFS | — | required | required |
-| Node.js 22.12+ + npm | — | required to build the Web UI | required for Web UI and wheels |
+| Node.js 22.12+ + npm | — | — | required only for Web UI/Desktop development |
 | `uv` | installed if missing | recommended | required |
 
 The default `recommended` profile installs **SquillaRouter** —
@@ -232,25 +232,17 @@ modify the code.
    powershell -ExecutionPolicy Bypass -File ./scripts/install_source.ps1
    ```
 
-   The script installs `.[recommended]` (SquillaRouter + memory + local
-   models) into a dedicated user environment via `uv tool install`. Before the
-   Python install, it runs `npm ci` and `npm run build` in
-   `opensquilla-webui`. Every source reinstall recreates the locked
-   `node_modules` tree and rebuilds the console; the first run normally has the
-   largest dependency download, while a warm npm cache reduces later network
-   use but not all build time or disk writes. It then installs the built console
-   with the Python package,
-   falling back to `python -m pip install --user` when `uv` is
-   unavailable. If `opensquilla` is not on `PATH` after install (common
+   The script installs the headless `.[recommended]` Gateway runtime
+   (SquillaRouter + memory + local models) into a dedicated user environment
+   via `uv tool install`; it does not require Node.js/npm and does not download
+   or build a client. It falls back to `python -m pip install --user` when `uv`
+   is unavailable. If `opensquilla` is not on `PATH` after install (common
    on a fresh host where `~/.local/bin` is not yet on `PATH`), run
    `uv tool update-shell` and open a new terminal; see
    [Troubleshooting](#troubleshooting) for details.
 
-   Direct `pip install .`, `uv tool install .`, and VCS URL installs are
-   low-level source-build paths, not substitutes for this installer. A local
-   checkout works only after its Web UI has been built; a VCS URL checkout has
-   no generated artifact and is intentionally rejected. Use this source
-   installer or an official release wheel instead.
+   Direct `pip install .`, `uv tool install .`, and VCS URL installs also build
+   the headless runtime and do not require generated Web UI assets.
 
 3. **(optional) Install advanced extras.** Most channels — Feishu,
    Telegram, DingTalk, QQ, WeCom, Slack, and Discord — work from the
@@ -333,17 +325,25 @@ checkout. It is not the normal install path. Unlike
 commands against the files in this checkout.
 
 ```sh
-cd opensquilla-webui
-npm ci
-npm run build
-cd ..
 uv sync --extra recommended --extra dev
 uv run opensquilla --help
 ```
 
-Run `npm run build` again after changing Web UI sources. Standard wheel builds
-fail closed when the generated console is missing or stale; editable `uv sync`
-installs remain available for backend-only work.
+Standard wheel/sdist builds are headless and ignore any residual generated
+console. The wheel records this mode, so runtime discovery also ignores
+`static/dist` files left by an older installation. When developing the Web UI
+itself, install its dependencies and build it separately:
+
+```sh
+cd opensquilla-webui
+npm ci
+npm run build
+```
+
+An embedded transitional distribution must explicitly set
+`OPENSQUILLA_BUILD_UI_MODE=embed-ui` and
+`OPENSQUILLA_BUILD_UI_ARTIFACT=<verified-dist-directory>`; there is no implicit
+pickup from `gateway/static/dist`.
 
 The `recommended` extra includes SquillaRouter for development too;
 the `dev` extra installs the test, lint, and typecheck tools. Install
@@ -564,9 +564,9 @@ opensquilla agent -m "your prompt"     # one-shot, automation-friendly
 > [docs/features/tui-frontend.md](docs/features/tui-frontend.md) for backend
 > details.
 
-Open the Web UI at <http://127.0.0.1:18791/control/>. The **Health**
-view shows whether OpenSquilla is ready, what is not ready, and the
-next recovery steps. From the CLI, run:
+Python wheels, source installs, and container images are headless by default.
+`/control/` serves a neutral diagnostic page unless an embedded or explicit
+external client bundle is configured. Use the CLI readiness surface:
 
 ```sh
 opensquilla doctor
@@ -575,7 +575,7 @@ opensquilla doctor --config ./opensquilla.toml --json
 ```
 
 `/health` and `/healthz` are lightweight liveness endpoints for process
-checks. `opensquilla doctor` and the Web UI Health view are the readiness
+checks. `opensquilla doctor` and a configured client Health view are the readiness
 surfaces for provider config, memory, logs, search, channels, sandbox
 posture, router, image generation, and recovery guidance. Press
 `Ctrl+C` to stop a foreground gateway.
@@ -736,7 +736,7 @@ Full notes: [`CHANGELOG.md`](CHANGELOG.md) ·
 | **Persistent local memory** | A curated `MEMORY.md` plus dated Markdown notes, searched with SQLite full-text keyword search and `sqlite-vec` semantic recall. Embeddings run on-device via bundled ONNX, or swap to OpenAI/Ollama. Optional exponential decay and opt-in "dream" consolidation are available. |
 | **Layered security sandbox** | Three policy tiers (Standard / Strict / Locked) on a permission matrix. Bubblewrap isolates code execution on Linux; macOS runs commands through Seatbelt (`sandbox-exec`) with generated SBPL profiles; Windows uses the native `windows_default` backend after setup readiness checks. A denial ledger auto-pauses autonomous runs after repeated denials, rejected outputs are purged, and skill metadata and tool results are XML-escaped against prompt injection. |
 | **Built-in tools** | File read/write/edit, shell and background processes, git, web search (DuckDuckGo, Bocha, Brave, IQS, Tavily, or Exa) and fetch behind an SSRF guard, spreadsheet/PPTX/PDF authoring, image generation, and text-to-speech. |
-| **Unified gateway** | A Starlette ASGI server on `127.0.0.1:18791` with WebSocket RPC and an embedded control console (`/control/`). Web UI, CLI, and channels for Terminal, WebSocket, Slack, Telegram, Discord, Feishu, DingTalk, WeCom, Matrix, and QQ all share one `TurnRunner`. |
+| **Unified gateway** | A headless-capable Starlette ASGI server on `127.0.0.1:18791` with WebSocket RPC and optional manifest-validated embedded/external control UI assets. Clients, CLI, and channels for Terminal, WebSocket, Slack, Telegram, Discord, Feishu, DingTalk, WeCom, Matrix, and QQ all share one `TurnRunner`. |
 | **Durable sessions, subagents, and scheduling** | SQLite-backed session, transcript, and replay storage with per-agent workspaces. Agents spawn depth-bounded subagents, and a `SchedulerEngine` with an in-tree cron parser runs recurring jobs via `opensquilla cron`. |
 | **Operator controls** | Human-in-the-loop approvals can pause sensitive tool calls for a decision; per-turn and per-session token and cost rollups (`opensquilla cost`) and diagnostics are available from the CLI and Web UI. |
 

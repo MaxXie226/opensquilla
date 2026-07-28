@@ -136,13 +136,13 @@ def _undo_leaked_cli_structlog_default():
 
 @pytest.fixture(scope="session")
 def isolated_core_wheel(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """Build the core wheel from an isolated source tree with a synthetic UI.
+    """Build an explicit embedded-UI wheel from an isolated source tree.
 
     A source checkout intentionally has no generated Vue ``dist`` tree, while
-    standard wheel builds fail closed without a verified artifact. Packaging
-    contract tests share this minimal artifact so they continue to test the
-    real Hatch wheel selection without requiring a frontend build or mutating
-    the checkout under test.
+    standard wheel builds are headless. Packaging contract tests that exercise
+    the embedded variant share this minimal verified artifact so they continue
+    to test the real Hatch selection without requiring a frontend build or
+    mutating the checkout under test.
     """
 
     import hashlib
@@ -223,7 +223,12 @@ def isolated_core_wheel(tmp_path_factory: pytest.TempPathFactory) -> Path:
         ["uv", "build", "--out-dir", str(wheel_dir)],
         cwd=build_root,
         capture_output=True,
-        env={**os.environ, "OPENSQUILLA_BUILD_COMMIT": "1" * 40},
+        env={
+            **os.environ,
+            "OPENSQUILLA_BUILD_COMMIT": "1" * 40,
+            "OPENSQUILLA_BUILD_UI_MODE": "embed-ui",
+            "OPENSQUILLA_BUILD_UI_ARTIFACT": str(dist),
+        },
         text=True,
         timeout=300,
     )

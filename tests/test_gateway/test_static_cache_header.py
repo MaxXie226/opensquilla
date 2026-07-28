@@ -158,11 +158,11 @@ def test_control_ui_defaults_to_vue_bootstrap(
     assert "/control/static/js/app.js" not in response.text
 
 
-def test_control_ui_explains_how_to_build_missing_vue_assets(
+def test_control_ui_explains_expected_headless_auto_mode(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(control_ui, "_DIST_DIR", tmp_path)
+    monkeypatch.setattr(control_ui, "_DIST_DIR", tmp_path / "dist")
     config = GatewayConfig()
     config.control_ui.enabled = True
     app = Starlette(routes=create_control_ui_routes(config))
@@ -170,18 +170,18 @@ def test_control_ui_explains_how_to_build_missing_vue_assets(
     response = TestClient(app).get("/control/")
 
     assert response.status_code == 200
-    assert "Control UI assets are unavailable" in response.text
-    assert "npm ci &amp;&amp; npm run build" in response.text
+    assert "Gateway is running in headless mode" in response.text
+    assert "compatible client" in response.text
+    assert "npm ci" not in response.text
     assert "data-webui-artifact-missing" in response.text
     assert '<div id="app"></div>' not in response.text
 
 
-def test_control_ui_startup_logs_warning_when_vue_assets_missing(
+def test_control_ui_startup_logs_expected_headless_auto_mode(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Headless operators never see the in-page notice, so the missing-artifact
-    # diagnostic must also reach the gateway log at startup.
+    # Headless is the normal public-runtime state, so log it without warning.
     import structlog
 
     monkeypatch.setattr(control_ui, "_DIST_DIR", tmp_path / "dist")
@@ -191,11 +191,11 @@ def test_control_ui_startup_logs_warning_when_vue_assets_missing(
     with structlog.testing.capture_logs() as captured:
         create_control_ui_routes(config)
 
-    events = [e for e in captured if e["event"] == "control_ui.webui_assets_missing"]
+    events = [e for e in captured if e["event"] == "control_ui.headless"]
     assert events, captured
-    assert events[0]["log_level"] == "warning"
-    assert "npm ci && npm run build" in events[0]["detail"]
-    assert events[0]["dist_dir"] == str(tmp_path / "dist")
+    assert events[0]["log_level"] == "info"
+    assert "public Gateway runtime is running headless" in events[0]["detail"]
+    assert "npm ci" not in events[0]["detail"]
 
 
 def test_control_ui_startup_warning_absent_when_vue_assets_present(
@@ -236,8 +236,8 @@ def test_missing_vue_asset_recovery_is_in_troubleshooting_guide() -> None:
 
     assert "## Control UI Assets Are Unavailable" in troubleshooting
     assert "npm ci\nnpm run build" in troubleshooting
-    assert "Direct VCS URL installs" in troubleshooting
-    assert "official release wheel" in normalized
+    assert "Standard wheel/sdist builds remain headless" in normalized
+    assert "explicit `external` asset mode" in normalized
 
 
 def test_control_ui_legacy_frontend_compat_input_serves_vue(

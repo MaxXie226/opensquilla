@@ -85,9 +85,9 @@ def test_ci_result_gate_requires_ubuntu_full_matrix_only_for_full_ci() -> None:
     targeted[_flag_env("runtime_changed")] = "true"
     targeted[_flag_env("python_changed")] = "true"
     targeted[_flag_env("build_wheel_required")] = "true"
-    targeted["RESULT_FRONTEND"] = "success"
     targeted["RESULT_UBUNTU"] = "success"
     targeted["RESULT_WINDOWS_SMOKE"] = "success"
+    targeted["RESULT_RELEASE"] = "success"
     assert check_ci_results(targeted) == []
 
     for result in ("skipped", "failure", "cancelled", ""):
@@ -99,7 +99,7 @@ def test_ci_result_gate_requires_ubuntu_full_matrix_only_for_full_ci() -> None:
         assert any("Ubuntu full test matrix" in error for error in errors)
 
 
-def test_ci_result_gate_requires_verified_frontend_for_wheel_builds() -> None:
+def test_ci_result_gate_requires_headless_packaging_for_wheel_builds() -> None:
     env = _base_env()
     env[_flag_env("docs_only")] = "false"
     env[_flag_env("runtime_changed")] = "true"
@@ -110,7 +110,8 @@ def test_ci_result_gate_requires_verified_frontend_for_wheel_builds() -> None:
 
     errors = check_ci_results(env)
 
-    assert any("Frontend build, tests, and artifact" in error for error in errors)
+    assert any("Release packaging contracts" in error for error in errors)
+    assert not any("Frontend build, tests, and artifact" in error for error in errors)
 
 
 def test_ci_result_gate_rejects_failure_cancellation_and_missing_results() -> None:

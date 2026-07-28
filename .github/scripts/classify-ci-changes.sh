@@ -57,20 +57,17 @@ mark_release_changed() {
 }
 
 mark_frontend_changed() {
-  # WebUI source becomes runtime wheel content, but it is neither Python nor
-  # platform-native code. Build the exact wheel without waking unrelated
-  # Python/Windows jobs for a frontend-only pull request.
+  # WebUI source is a client/Desktop input, not Python runtime wheel content.
+  # Keep its own build and consumer E2E checks without waking Python packaging.
   mark_non_docs_changed
-  runtime_changed=true
-  build_wheel_required=true
   frontend_changed=true
 }
 
 mark_client_contract_changed() {
   # Public client contracts are generated from Python runtime metadata and
   # consumed by the standalone TypeScript SDK and WebUI.
-  mark_frontend_changed
-  python_changed=true
+  mark_runtime_changed
+  frontend_changed=true
 }
 
 mark_tui_changed() {

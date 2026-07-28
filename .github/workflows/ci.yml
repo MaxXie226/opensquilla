@@ -91,9 +91,9 @@ jobs:
   frontend-check:
     name: Frontend build, tests, and artifact
     needs: classify-changes
-    # This job owns the generated package input. Source-only Python tests stay
-    # parallel; only packaging/browser/desktop consumers wait for this artifact.
-    if: ${{ needs.classify-changes.outputs.frontend_changed == 'true' || needs.classify-changes.outputs.build_wheel_required == 'true' || needs.classify-changes.outputs.platform_sensitive_changed == 'true' || needs.classify-changes.outputs.desktop_changed == 'true' || needs.classify-changes.outputs.full_required == 'true' }}
+    # This artifact is a client/Desktop test input, never a Python package
+    # prerequisite. Headless wheel/sdist checks run in release-packaging.
+    if: ${{ needs.classify-changes.outputs.frontend_changed == 'true' || needs.classify-changes.outputs.platform_sensitive_changed == 'true' || needs.classify-changes.outputs.desktop_changed == 'true' || needs.classify-changes.outputs.full_required == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -159,55 +159,6 @@ jobs:
             exit 1
           fi
           npm run verify:release-dist
-
-      - name: Set up Python
-        if: ${{ needs.classify-changes.outputs.build_wheel_required == 'true' || needs.classify-changes.outputs.full_required == 'true' }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Set up uv
-        if: ${{ needs.classify-changes.outputs.build_wheel_required == 'true' || needs.classify-changes.outputs.full_required == 'true' }}
-        uses: astral-sh/setup-uv@v5
-        with:
-          enable-cache: true
-
-      - name: Verify sdist-to-wheel frontend artifact round trip
-        if: ${{ needs.classify-changes.outputs.build_wheel_required == 'true' || needs.classify-changes.outputs.full_required == 'true' }}
-        shell: bash
-        run: |
-          package_dir="${RUNNER_TEMP}/webui-package"
-          wheel_dir="${RUNNER_TEMP}/webui-wheel"
-          mkdir -p "${package_dir}" "${wheel_dir}"
-
-          # Finder metadata is ignored by Git and must not affect the canonical
-          # source fingerprint or enter a source distribution.
-          junk="opensquilla-webui/src/.DS_Store"
-          trap 'rm -f "${junk}"' EXIT
-          printf 'CI-only Finder metadata\n' > "${junk}"
-
-          uv build --sdist --out-dir "${package_dir}"
-          sdists=("${package_dir}"/opensquilla-*.tar.gz)
-          if [[ "${#sdists[@]}" -ne 1 || ! -f "${sdists[0]}" ]]; then
-            echo "ERROR: expected exactly one OpenSquilla sdist" >&2
-            exit 1
-          fi
-          tar_listing="${package_dir}/sdist-files.txt"
-          tar -tzf "${sdists[0]}" > "${tar_listing}"
-          if grep -qE '(^|/)\.DS_Store$' "${tar_listing}"; then
-            echo "ERROR: ignored Finder metadata leaked into the sdist" >&2
-            exit 1
-          fi
-
-          uv build --wheel --out-dir "${wheel_dir}" "${sdists[0]}"
-          wheels=("${wheel_dir}"/opensquilla-*.whl)
-          if [[ "${#wheels[@]}" -ne 1 || ! -f "${wheels[0]}" ]]; then
-            echo "ERROR: expected exactly one OpenSquilla wheel" >&2
-            exit 1
-          fi
-          python scripts/verify_webui_artifact.py \
-            --forbid-personal-bgm \
-            --wheel "${wheels[0]}"
 
       - name: Upload verified frontend artifact
         uses: actions/upload-artifact@v4
@@ -969,7 +920,7 @@ jobs:
   release-packaging:
     name: Release packaging contracts
     needs: classify-changes
-    if: ${{ needs.classify-changes.outputs.release_changed == 'true' || needs.classify-changes.outputs.full_required == 'true' }}
+    if: ${{ needs.classify-changes.outputs.release_changed == 'true' || needs.classify-changes.outputs.build_wheel_required == 'true' || needs.classify-changes.outputs.full_required == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -1008,6 +959,46 @@ jobs:
             tests/test_release_consistency.py \
             tests/test_public_release_hygiene.py \
             -q
+
+      - name: Build and verify headless distributions
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_dir="${RUNNER_TEMP}/opensquilla-package"
+          direct_wheel_dir="${package_dir}/direct-wheel"
+          sdist_wheel_dir="${package_dir}/sdist-wheel"
+          mkdir -p "${direct_wheel_dir}" "${sdist_wheel_dir}"
+
+          uv build --sdist --out-dir "${package_dir}"
+          uv build --wheel --out-dir "${direct_wheel_dir}"
+          sdists=("${package_dir}"/opensquilla-*.tar.gz)
+          direct_wheels=("${direct_wheel_dir}"/opensquilla-*.whl)
+          if [[ "${#sdists[@]}" -ne 1 || ! -f "${sdists[0]}" ]]; then
+            echo "ERROR: expected exactly one OpenSquilla sdist" >&2
+            exit 1
+          fi
+          if [[ "${#direct_wheels[@]}" -ne 1 || ! -f "${direct_wheels[0]}" ]]; then
+            echo "ERROR: expected exactly one direct OpenSquilla wheel" >&2
+            exit 1
+          fi
+
+          tar_listing="${package_dir}/sdist-files.txt"
+          tar -tzf "${sdists[0]}" > "${tar_listing}"
+          if grep -qE '(^|/)opensquilla-webui/|gateway/static/dist/' "${tar_listing}"; then
+            echo "ERROR: client source or generated WebUI leaked into the headless sdist" >&2
+            exit 1
+          fi
+          python scripts/verify_webui_artifact.py \
+            --headless-wheel "${direct_wheels[0]}"
+
+          uv build --wheel --out-dir "${sdist_wheel_dir}" "${sdists[0]}"
+          sdist_wheels=("${sdist_wheel_dir}"/opensquilla-*.whl)
+          if [[ "${#sdist_wheels[@]}" -ne 1 || ! -f "${sdist_wheels[0]}" ]]; then
+            echo "ERROR: expected exactly one wheel built from the sdist" >&2
+            exit 1
+          fi
+          python scripts/verify_webui_artifact.py \
+            --headless-wheel "${sdist_wheels[0]}"
 
   readme-locale-check:
     name: README locale parity

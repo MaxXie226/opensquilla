@@ -1,7 +1,5 @@
 # frozen_string_literal: true
 
-require "language/node"
-
 # OpenSquilla — microkernel Python agent runtime. See caveats for the loopback-safe
 # gateway default and the documented `--listen 0.0.0.0` opt-in.
 class Opensquilla < Formula
@@ -14,17 +12,12 @@ class Opensquilla < Formula
   license "Apache-2.0"
   head "https://github.com/OpenSquilla/opensquilla.git", branch: "main"
 
-  depends_on "node" => :build
   depends_on "python@3.13"
 
   # First-draft formula: pip_install_and_link resolves runtime deps from
   # PyPI at brew-install time. Once OpenSquilla ships a 0.1.0 tag, each runtime
   # dep will be pinned here as a `resource` block for audit-grade install.
   def install
-    cd "opensquilla-webui" do
-      system "npm", "ci", "--#{Language::Node.npm_cache_config}"
-      system "npm", "run", "build"
-    end
     venv = virtualenv_create(libexec, "python3.13")
     venv.pip_install_and_link buildpath
   end
@@ -32,6 +25,8 @@ class Opensquilla < Formula
   def caveats
     <<~EOS
       OpenSquilla installed.
+
+      This formula installs the headless Gateway runtime without an embedded Web UI.
 
       Default gateway bind: 127.0.0.1:18790 (loopback only).
       Network exposure is opt-in only. To expose the gateway on the network:

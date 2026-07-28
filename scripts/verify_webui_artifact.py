@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Validate the generated WebUI directory and its packaged wheel copy."""
+"""Validate a WebUI artifact, an embedded wheel copy, or a headless wheel."""
 
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import json
 import re
@@ -14,6 +15,7 @@ from pathlib import Path, PurePosixPath
 
 MANIFEST_NAME = "webui-artifact-manifest.json"
 WHEEL_PREFIX = "opensquilla/gateway/static/dist/"
+WHEEL_BUILD_INFO = "opensquilla/_build_info.py"
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_WEBUI_ROOT = REPOSITORY_ROOT / "opensquilla-webui"
 DEFAULT_DIST_DIR = REPOSITORY_ROOT / "src/opensquilla/gateway/static/dist"
@@ -61,6 +63,37 @@ OFFICIAL_MUSIC_FILES = {"music/README.md", "music/playlist.json"}
 
 class ArtifactError(RuntimeError):
     """The WebUI artifact is missing, incomplete, or internally inconsistent."""
+
+
+def _wheel_build_ui_mode(wheel: zipfile.ZipFile) -> str:
+    try:
+        source = wheel.read(WHEEL_BUILD_INFO).decode("utf-8")
+    except KeyError as error:
+        raise ArtifactError(
+            f"wheel is missing its UI build-mode marker: {WHEEL_BUILD_INFO}"
+        ) from error
+    except UnicodeDecodeError as error:
+        raise ArtifactError("wheel UI build-mode marker is not valid UTF-8") from error
+
+    try:
+        module = ast.parse(source, filename=WHEEL_BUILD_INFO)
+    except SyntaxError as error:
+        raise ArtifactError("wheel UI build-mode marker is invalid Python") from error
+    for statement in module.body:
+        if not isinstance(statement, ast.AnnAssign):
+            continue
+        if not isinstance(statement.target, ast.Name):
+            continue
+        if statement.target.id != "BUILD_UI_MODE" or statement.value is None:
+            continue
+        try:
+            value = ast.literal_eval(statement.value)
+        except (ValueError, TypeError) as error:
+            raise ArtifactError("wheel UI build-mode marker is not a literal") from error
+        if isinstance(value, str):
+            return value
+        break
+    raise ArtifactError("wheel UI build-mode marker does not declare BUILD_UI_MODE")
 
 
 def _verify_official_music(files: dict[str, bytes]) -> None:
@@ -229,10 +262,16 @@ def verify_sdist_source_inventory(webui_root: Path = DEFAULT_WEBUI_ROOT) -> None
 def verify_dist(
     dist_dir: Path,
     *,
-    webui_root: Path = DEFAULT_WEBUI_ROOT,
+    webui_root: Path | None = DEFAULT_WEBUI_ROOT,
     forbid_personal_bgm: bool = False,
 ) -> dict[str, bytes]:
-    """Return artifact files after checking manifest and entrypoint integrity."""
+    """Return artifact files after checking manifest and entrypoint integrity.
+
+    ``webui_root=None`` validates a prebuilt artifact without requiring its
+    source checkout. The manifest file inventory and digests are still checked
+    fail-closed; callers with the matching source should pass it to additionally
+    verify the source fingerprint.
+    """
 
     dist_dir = dist_dir.resolve()
     files = _files(dist_dir)
@@ -259,12 +298,13 @@ def verify_dist(
         or not isinstance(manifest.get("files"), list)
     ):
         raise ArtifactError("WebUI artifact manifest has an unsupported schema")
-    current_fingerprint = source_fingerprint(webui_root)
-    if manifest["sourceFingerprint"] != current_fingerprint:
-        raise ArtifactError(
-            "WebUI artifact is stale for the current frontend source; "
-            "run `cd opensquilla-webui && npm run build`"
-        )
+    if webui_root is not None:
+        current_fingerprint = source_fingerprint(webui_root)
+        if manifest["sourceFingerprint"] != current_fingerprint:
+            raise ArtifactError(
+                "WebUI artifact is stale for the current frontend source; "
+                "run `cd opensquilla-webui && npm run build`"
+            )
 
     expected_records = [
         {
@@ -309,7 +349,7 @@ def verify_wheel(
     dist_dir: Path,
     wheel_path: Path,
     *,
-    webui_root: Path = DEFAULT_WEBUI_ROOT,
+    webui_root: Path | None = DEFAULT_WEBUI_ROOT,
     forbid_personal_bgm: bool = False,
 ) -> None:
     """Require the wheel's WebUI tree to be byte-identical to ``dist_dir``."""
@@ -322,11 +362,17 @@ def verify_wheel(
     if not wheel_path.is_file():
         raise ArtifactError(f"wheel is missing: {wheel_path}")
     with zipfile.ZipFile(wheel_path) as wheel:
+        ui_mode = _wheel_build_ui_mode(wheel)
         packaged = {
             name.removeprefix(WHEEL_PREFIX): wheel.read(name)
             for name in wheel.namelist()
             if name.startswith(WHEEL_PREFIX) and not name.endswith("/")
         }
+    if ui_mode != "embed-ui":
+        raise ArtifactError(
+            "embedded-UI wheel must declare BUILD_UI_MODE='embed-ui', "
+            f"got {ui_mode!r}"
+        )
     expected_names = set(files)
     packaged_names = set(packaged)
     if packaged_names != expected_names:
@@ -339,6 +385,30 @@ def verify_wheel(
     changed = sorted(name for name in expected_names if packaged[name] != files[name])
     if changed:
         raise ArtifactError(f"wheel contains changed WebUI bytes: {changed}")
+
+
+def verify_headless_wheel(wheel_path: Path) -> None:
+    """Reject any embedded WebUI entry in a headless runtime wheel."""
+
+    if not wheel_path.is_file():
+        raise ArtifactError(f"wheel is missing: {wheel_path}")
+    with zipfile.ZipFile(wheel_path) as wheel:
+        ui_mode = _wheel_build_ui_mode(wheel)
+        embedded = sorted(
+            name
+            for name in wheel.namelist()
+            if name.startswith(WHEEL_PREFIX) and not name.endswith("/")
+        )
+    if ui_mode != "headless":
+        raise ArtifactError(
+            "headless wheel must declare BUILD_UI_MODE='headless', "
+            f"got {ui_mode!r}"
+        )
+    if embedded:
+        raise ArtifactError(
+            "headless wheel unexpectedly contains embedded WebUI files: "
+            f"{embedded}"
+        )
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
@@ -355,7 +425,22 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         default=DEFAULT_WEBUI_ROOT,
         help="frontend source directory used to validate the artifact fingerprint",
     )
-    parser.add_argument("--wheel", type=Path, help="optional wheel to compare byte-for-byte")
+    wheel_mode = parser.add_mutually_exclusive_group()
+    wheel_mode.add_argument(
+        "--wheel",
+        type=Path,
+        help="optional embedded-UI wheel to compare byte-for-byte",
+    )
+    wheel_mode.add_argument(
+        "--headless-wheel",
+        type=Path,
+        help="optional headless wheel that must not contain embedded WebUI files",
+    )
+    parser.add_argument(
+        "--artifact-only",
+        action="store_true",
+        help="validate the artifact manifest without requiring its source checkout",
+    )
     parser.add_argument(
         "--forbid-personal-bgm",
         action="store_true",
@@ -367,16 +452,21 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(sys.argv[1:] if argv is None else argv)
     try:
+        if args.headless_wheel is not None:
+            verify_headless_wheel(args.headless_wheel)
+            print(f"Verified headless wheel {args.headless_wheel}.")
+            return 0
+        webui_root = None if args.artifact_only else args.webui_root
         files = verify_dist(
             args.dist,
-            webui_root=args.webui_root,
+            webui_root=webui_root,
             forbid_personal_bgm=args.forbid_personal_bgm,
         )
         if args.wheel is not None:
             verify_wheel(
                 args.dist,
                 args.wheel,
-                webui_root=args.webui_root,
+                webui_root=webui_root,
                 forbid_personal_bgm=args.forbid_personal_bgm,
             )
     except (ArtifactError, OSError, zipfile.BadZipFile) as exc:

@@ -152,31 +152,33 @@ def test_html_coder_reference_files_are_packaged() -> None:
         ), f"{source} should be packaged at its import-time skill path"
 
 
-def test_standard_distributions_require_verified_generated_webui() -> None:
+def test_standard_distributions_are_headless_by_default() -> None:
     data = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
     build = data["build-system"]
     hatch = data["tool"]["hatch"]["build"]
     artifact_rule = "src/opensquilla/gateway/static/dist/**"
+    hook = (PYPROJECT.parent / "hatch_build.py").read_text(encoding="utf-8")
 
     assert build["requires"] == ["hatchling>=1.31,<2"]
     assert "custom" in hatch["hooks"]
-    assert artifact_rule in hatch["targets"]["wheel"]["artifacts"]
-    assert artifact_rule in hatch["targets"]["sdist"]["artifacts"]
-    assert "opensquilla-webui/public/music/**" not in hatch["targets"]["sdist"][
-        "artifacts"
-    ]
+    assert "artifacts" not in hatch["targets"]["wheel"]
+    assert "artifacts" not in hatch["targets"]["sdist"]
+    assert artifact_rule in hatch["targets"]["wheel"]["exclude"]
+    assert artifact_rule in hatch["targets"]["sdist"]["exclude"]
+    assert "opensquilla-webui/**" in hatch["targets"]["sdist"]["exclude"]
+    assert "OPENSQUILLA_BUILD_UI_MODE" in hook
+    assert "OPENSQUILLA_BUILD_UI_ARTIFACT" in hook
+    assert '"headless"' in hook
+    assert '"embed-ui"' in hook
     assert (PYPROJECT.parent / "hatch_build.py").is_file()
     assert (PYPROJECT.parent / "scripts" / "verify_webui_artifact.py").is_file()
 
 
-def test_homebrew_head_install_builds_the_generated_webui_before_python() -> None:
+def test_homebrew_head_install_is_headless_and_has_no_node_dependency() -> None:
     formula = FORMULA.read_text(encoding="utf-8")
 
-    assert 'depends_on "node" => :build' in formula
-    assert 'require "language/node"' in formula
-    npm_ci = formula.index(
-        'system "npm", "ci", "--#{Language::Node.npm_cache_config}"'
-    )
-    npm_build = formula.index('system "npm", "run", "build"')
-    pip_install = formula.index("venv.pip_install_and_link buildpath")
-    assert npm_ci < npm_build < pip_install
+    assert 'depends_on "node" => :build' not in formula
+    assert 'require "language/node"' not in formula
+    assert 'system "npm"' not in formula
+    assert "venv.pip_install_and_link buildpath" in formula
+    assert "headless Gateway runtime" in formula

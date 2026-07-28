@@ -113,7 +113,6 @@ jobs:
 
   build-release-assets:
     name: Build Python release assets
-    needs: build-control-ui
     runs-on: windows-latest
     timeout-minutes: 90
     steps:
@@ -131,12 +130,6 @@ jobs:
           lfs: true
           persist-credentials: false
           ref: ${{ env.RELEASE_TAG != '' && env.RELEASE_TAG || github.ref }}
-
-      - name: Download verified Web UI artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: opensquilla-release-webui-dist
-          path: src/opensquilla/gateway/static/dist/
 
       - name: Hydrate router assets
         shell: bash
@@ -202,7 +195,7 @@ jobs:
           rm -rf dist build/wheelhouse-zip
           uv build --wheel --out-dir dist
 
-      - name: Verify wheel contains the exact Web UI artifact
+      - name: Verify wheel is headless
         shell: bash
         run: |
           set -euo pipefail
@@ -211,33 +204,7 @@ jobs:
             echo "Expected exactly one versioned wheel" >&2
             exit 1
           fi
-          if [[ -f scripts/verify_webui_artifact.py ]]; then
-            python scripts/verify_webui_artifact.py \
-              --forbid-personal-bgm \
-              --wheel "${wheels[0]}"
-          else
-            WHEEL_PATH="${wheels[0]}" python - <<'PY'
-          import os
-          from pathlib import Path
-          from zipfile import ZipFile
-
-          root = Path("src/opensquilla/gateway/static/dist")
-          prefix = "opensquilla/gateway/static/dist/"
-          expected = {
-              path.relative_to(root).as_posix(): path.read_bytes()
-              for path in root.rglob("*")
-              if path.is_file()
-          }
-          with ZipFile(os.environ["WHEEL_PATH"]) as archive:
-              packaged = {
-                  name.removeprefix(prefix): archive.read(name)
-                  for name in archive.namelist()
-                  if name.startswith(prefix) and not name.endswith("/")
-              }
-          assert packaged == expected, "legacy wheel Web UI differs from committed artifact"
-          print(f"Verified legacy wheel Web UI ({len(expected)} files)")
-          PY
-          fi
+          python scripts/verify_webui_artifact.py --headless-wheel "${wheels[0]}"
 
       - name: Smoke versioned release artifacts
         shell: bash
@@ -259,13 +226,10 @@ jobs:
 
           with ZipFile(wheels[0]) as archive:
               names = set(archive.namelist())
-              assert "opensquilla/gateway/static/dist/index.html" in names, (
-                  "release wheel is missing the Web UI entrypoint"
-              )
-              if Path("scripts/verify_webui_artifact.py").is_file():
-                  assert "opensquilla/gateway/static/dist/webui-artifact-manifest.json" in names, (
-                      "release wheel is missing the verified Web UI manifest"
-                  )
+              assert not any(
+                  name.startswith("opensquilla/gateway/static/dist/")
+                  for name in names
+              ), "release wheel unexpectedly embeds Web UI files"
               for info in archive.infolist():
                   if not info.filename.endswith((".bin", ".onnx", ".pkl", ".joblib")):
                       continue

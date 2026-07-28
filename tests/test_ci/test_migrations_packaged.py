@@ -1,4 +1,4 @@
-"""Verify migrations and the Control UI are packaged and discoverable post-install.
+"""Verify migrations and the explicit embedded-UI wheel variant post-install.
 
 Critical (C1): without this, default-enabled persistence would silently
 boot on an out-of-date schema after fresh install.
@@ -22,7 +22,7 @@ SYNTHETIC_JS = b"window.__opensquillaPackagingProbe = true;\n"
 
 
 @pytest.mark.skipif(shutil.which("uv") is None, reason="uv not on PATH")
-def test_wheel_contains_migrations_and_webui_artifact(
+def test_explicit_embed_wheel_contains_migrations_and_webui_artifact(
     isolated_core_wheel: Path,
 ) -> None:
     """The wheel carries migration history and the generated-artifact tree."""
@@ -52,6 +52,7 @@ def test_wheel_contains_migrations_and_webui_artifact(
     assert f"opensquilla/gateway/static/dist/{MANIFEST_NAME}" in names
     assert packaged_probe == SYNTHETIC_JS
     assert f"BUILD_COMMIT: str | None = {'1' * 40!r}" in build_info
+    assert "BUILD_UI_MODE: str | None = 'embed-ui'" in build_info
 
     assert "opensquilla/gateway/templates/legacy_index.html" not in names
     for removed_prefix in (

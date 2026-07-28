@@ -732,7 +732,9 @@ def test_container_workflow_gates_latest_promotion() -> None:
     assert "type=ref,event=tag" in workflow
     assert "type=raw,value=latest" not in workflow
     assert "provenance: false" in workflow
-    assert "OPENSQUILLA_FORBID_PERSONAL_BGM=1" in workflow
+    assert "OPENSQUILLA_FORBID_PERSONAL_BGM" not in workflow
+    assert 'assert not (_DIST_DIR / "index.html").is_file()' in workflow
+    assert "http://127.0.0.1:18791/readyz" in workflow
     assert "most recently pushed release tag" in workflow
     assert '["docker", "buildx", "imagetools", "inspect", image_ref, "--raw"]' in workflow
     assert 'expected = {"linux/amd64", "linux/arm64"}' in workflow

@@ -8,7 +8,8 @@ Docker is the right install path when:
 
 - the host has no Python 3.12+ toolchain (or you do not want one),
 - you want the gateway to survive reboots and upgrade by pulling a new image,
-- you deploy on a NAS or headless server and use the Web UI from another device.
+- you deploy a headless Gateway on a NAS/server for channels, CLI, or a
+  separately distributed client.
 
 For a desktop machine, the [quickstart](quickstart.md) installs are simpler.
 
@@ -52,7 +53,7 @@ services:
       # decided by `ports` below, not by this value.
       OPENSQUILLA_LISTEN: "0.0.0.0"
       # Token auth is required to administer a containerized gateway through
-      # the Web UI, even from the same host. Generate a token with:
+      # a remote client, even from the same host. Generate a token with:
       #   openssl rand -hex 32
       OPENSQUILLA_AUTH_MODE: token
       OPENSQUILLA_AUTH_TOKEN: ${OPENSQUILLA_AUTH_TOKEN:?generate one with openssl rand -hex 32}
@@ -64,7 +65,7 @@ services:
       - opensquilla-state:/var/lib/opensquilla
     ports:
       # Loopback-only: reachable from this host, invisible to the network.
-      # For NAS/LAN access see "Reach the Web UI from Your LAN" below.
+      # For NAS/LAN access see "Reach the Gateway from Your LAN" below.
       - "127.0.0.1:18791:18791"
     restart: unless-stopped
 
@@ -87,31 +88,30 @@ docker compose up -d
 docker compose logs -f gateway
 ```
 
-Then open the Web UI with the token in the URL:
+Verify the Core endpoints:
 
-```text
-http://127.0.0.1:18791/control/?token=<your OPENSQUILLA_AUTH_TOKEN>
+```sh
+curl --fail http://127.0.0.1:18791/healthz
+curl --fail http://127.0.0.1:18791/readyz
 ```
 
-The token is consumed once and stored for the browser session. The first
-request also writes the token into the gateway access log, so treat
-`docker compose logs` output as sensitive — or open `/control/` without the
-query parameter and paste the token into the connection panel instead. From
-there, finish provider onboarding and configuration in the Web UI — provider
-changes apply immediately and persist in the state volume.
+The public container image is headless and contains no embedded Web UI.
+`/control/` therefore shows a neutral diagnostic page. A separately
+distributed client can connect through the Gateway protocol, or an operator
+can bind-mount a verified Vite artifact and select
+`control_ui.assets_mode = "external"` as described in
+[`web-ui.md`](web-ui.md#control-ui-asset-modes).
 
 Why token auth is not optional here: the container binds a wildcard address,
-so the gateway treats every browser — including one on the same host — as a
+so the gateway treats every remote client — including one on the same host — as a
 remote operator. Remote operators without a token can chat but cannot
 administer configuration or onboarding (only a small allowlist of safe
 runtime toggles stays writable). With `OPENSQUILLA_AUTH_MODE=token` the token
-grants the operator scopes that Web UI administration needs. Use `token` mode
-specifically; `password` and `trusted-proxy` modes do not support the Web UI
-connection.
+grants the operator scopes that client administration needs.
 
-## Reach the Web UI from Your LAN
+## Reach the Gateway from Your LAN
 
-On a headless NAS you will use the Web UI from another device. Two rules:
+On a headless NAS a client may connect from another device. Two rules:
 
 1. Publish the port on all interfaces by changing the `ports` entry — do
    **not** change `OPENSQUILLA_LISTEN`:
@@ -125,8 +125,8 @@ On a headless NAS you will use the Web UI from another device. Two rules:
    The gateway warns, but does not refuse, when it is network-reachable —
    exposure is your call, auth is not.
 
-Recreate the container (`docker compose up -d`) and open
-`http://<server-address>:18791/control/?token=<token>` from your device.
+Recreate the container (`docker compose up -d`) and connect the client to
+`http://<server-address>:18791`.
 If the host runs a firewall, allow inbound TCP 18791 from your LAN only.
 LAN traffic to the gateway is plain HTTP, so the token is visible to anyone
 who can observe that network — if your LAN is not fully trusted, put the
@@ -158,15 +158,11 @@ and an optional `.env`.
 
 ## Configure Providers and Secrets
 
-Three ways, in order of preference:
+Three ways:
 
-1. **Web UI** — provider onboarding and most config changes at `/control/`
-   hot-apply and persist to `config.toml` in the state volume. Channel,
-   memory-embedding, and sandbox-posture changes need a restart — the Web UI
-   marks these, and `docker compose restart gateway` applies them.
-2. **Compose `environment`** — pass provider keys by env-var name, as in the
+1. **Compose `environment`** — pass provider keys by env-var name, as in the
    quick start. Environment values always win over `.env` files.
-3. **A `.env` inside the state volume** — the gateway loads
+2. **A `.env` inside the state volume** — the gateway loads
    `/var/lib/opensquilla/.env` at startup, so keys survive image upgrades
    without appearing in `compose.yaml`. On a bind mount, keep it owned by the
    container user and private: `chown 10001:10001 .env && chmod 600 .env`.
@@ -174,12 +170,15 @@ Three ways, in order of preference:
    state-volume `.env` even when the host variable is unset (Compose passes
    an empty value through) — remove it from `environment:` if you manage it
    in the state volume.
+3. **A configured external client or direct `config.toml` edit** — clients can
+   hot-apply supported settings through Gateway RPC. Hand-edited settings are
+   read at boot and require `docker compose restart gateway`.
 
 One precedence caveat for auth: values saved to `config.toml` — for example
-by the Web UI — take precedence over environment variables at boot. If the
+by a client — take precedence over environment variables at boot. If the
 `OPENSQUILLA_AUTH_*` variables stop taking effect after configuring through
-the Web UI, `config.toml` now owns the `[auth]` settings; rotate the token
-there (or in the Web UI) and restart.
+a client, `config.toml` now owns the `[auth]` settings; rotate the token
+there and restart.
 
 Hand-edits to `/var/lib/opensquilla/config.toml` are read at boot only —
 restart to apply them:

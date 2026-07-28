@@ -81,7 +81,7 @@ opensquilla gateway status
 Default address:
 
 ```text
-http://127.0.0.1:18791/control/
+http://127.0.0.1:18791/
 ```
 
 The gateway defaults to loopback for safety. To bind elsewhere, opt in:
@@ -94,17 +94,15 @@ Only expose a non-loopback gateway behind appropriate auth and network controls.
 
 ## First Useful Run
 
-Open the Web UI:
-
-```text
-http://127.0.0.1:18791/control/
-```
-
 Start terminal chat:
 
 ```sh
 opensquilla chat
 ```
+
+Python installs are headless by default. `/control/` shows a neutral
+diagnostic page unless a Desktop distribution or an explicit external client
+bundle supplies Control UI assets; see [`web-ui.md`](web-ui.md).
 
 Run one automation turn:
 

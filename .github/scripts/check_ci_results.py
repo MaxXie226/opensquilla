@@ -80,7 +80,6 @@ def check_ci_results(env: Mapping[str, str]) -> list[str]:
             "RESULT_FRONTEND",
             "Frontend build, tests, and artifact",
             flags["frontend_changed"]
-            or flags["build_wheel_required"]
             or flags["platform_sensitive_changed"]
             or flags["desktop_changed"]
             or full,
@@ -119,7 +118,7 @@ def check_ci_results(env: Mapping[str, str]) -> list[str]:
         (
             "RESULT_RELEASE",
             "Release packaging contracts",
-            flags["release_changed"] or full,
+            flags["release_changed"] or flags["build_wheel_required"] or full,
         ),
     )
     for variable, label, required in conditional_results:
