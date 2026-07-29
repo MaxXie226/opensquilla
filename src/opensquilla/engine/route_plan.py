@@ -96,6 +96,7 @@ def _fallback_chain(
     value: object,
     *,
     default_provider: str,
+    primary_model: str,
     capability_snapshots: Mapping[
         tuple[str, str],
         tuple[int, ModelCapabilities | None],
@@ -104,6 +105,7 @@ def _fallback_chain(
     if not isinstance(value, list):
         return ()
     result: list[RouteFallback] = []
+    seen: set[tuple[str, str]] = {(default_provider, primary_model)}
     for item in value:
         if not isinstance(item, Mapping):
             continue
@@ -111,8 +113,12 @@ def _fallback_chain(
         if not model:
             continue
         provider = _text(item.get("provider")) or default_provider
+        identity = (provider, model)
+        if identity in seen:
+            continue
+        seen.add(identity)
         context_window, capabilities = (capability_snapshots or {}).get(
-            (provider, model),
+            identity,
             (0, None),
         )
         result.append(
@@ -200,20 +206,27 @@ def pin_route_plan(
         return None
 
     route_provider = _text(metadata.get("routed_provider")) or _text(provider)
+    route_model = _text(metadata.get("routed_model")) or _text(model)
+    fallback_candidates: list[object] = []
+    for key in ("router_fallback_chain", "selector_execution_chain"):
+        value = metadata.get(key)
+        if isinstance(value, list):
+            fallback_candidates.extend(value)
     plan = RoutePlan(
         version=1,
         plan_id=turn_id,
         turn_id=turn_id,
         tier=tier,
         provider=route_provider,
-        model=_text(metadata.get("routed_model")) or _text(model),
+        model=route_model,
         source=_text(metadata.get("routing_source")) or "none",
         routing_applied=bool(metadata.get("routing_applied", True)),
         thinking=_thinking_snapshot(metadata, effective_thinking),
         prompt_policy=_text(metadata.get("prompt_policy")),
         fallback_chain=_fallback_chain(
-            metadata.get("router_fallback_chain"),
+            fallback_candidates,
             default_provider=route_provider,
+            primary_model=route_model,
             capability_snapshots=fallback_capabilities,
         ),
         capabilities=_capability_snapshot(

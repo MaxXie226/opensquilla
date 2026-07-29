@@ -766,8 +766,13 @@ class AgentBootstrapStage:
             or inp.active_provider_id
             or ""
         )
-        raw_fallbacks = agent_metadata.get("router_fallback_chain")
-        if isinstance(raw_fallbacks, list):
+        fallback_sources = (
+            agent_metadata.get("router_fallback_chain"),
+            agent_metadata.get("selector_execution_chain"),
+        )
+        for raw_fallbacks in fallback_sources:
+            if not isinstance(raw_fallbacks, list):
+                continue
             for raw_fallback in raw_fallbacks:
                 if not isinstance(raw_fallback, dict):
                     continue

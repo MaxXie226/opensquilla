@@ -107,3 +107,57 @@ def test_router_event_uses_pinned_plan_not_mutable_execution_metadata() -> None:
     assert event.source == "classifier"
     assert event.fallback is False
     assert event.context_window == 64_000
+
+
+def test_route_plan_adds_deduplicated_selector_execution_candidates() -> None:
+    turn = _turn()
+    turn.metadata["selector_execution_chain"] = [
+        {
+            "provider": "provider-b",
+            "model": "routed/model",
+        },
+        {
+            "provider": "provider-a",
+            "model": "fallback/model",
+        },
+        {
+            "provider": "provider-b",
+            "model": "configured/fallback",
+        },
+    ]
+
+    plan = pin_route_plan(
+        turn,
+        turn_id="turn-3",
+        provider="provider-b",
+        model="routed/model",
+        context_window=64_000,
+        capabilities=ModelCapabilities(supports_tools=True),
+        effective_thinking=False,
+        fallback_capabilities={
+            ("provider-a", "fallback/model"): (
+                32_000,
+                ModelCapabilities(supports_tools=True),
+            ),
+            ("provider-b", "routed/model"): (
+                64_000,
+                ModelCapabilities(supports_tools=True),
+            ),
+            ("provider-b", "configured/fallback"): (
+                128_000,
+                ModelCapabilities(supports_tools=True),
+            ),
+        },
+    )
+
+    assert plan is not None
+    assert [
+        (item.provider, item.model)
+        for item in plan.fallback_chain
+    ] == [
+        ("provider-a", "fallback/model"),
+        ("provider-b", "routed/model"),
+        ("provider-b", "configured/fallback"),
+    ]
+    assert plan.fallback_chain[-1].capabilities.context_window == 128_000
+    assert plan.fallback_chain[-1].capabilities.supports_tools is True
