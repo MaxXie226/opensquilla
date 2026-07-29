@@ -1,6 +1,6 @@
 {
   "completeness": "method-names-and-required-scopes-only",
-  "method_count": 232,
+  "method_count": 233,
   "methods": [
     {
       "name": "agent",
@@ -792,6 +792,10 @@
     },
     {
       "name": "sessions.steer",
+      "required_scope": "operator.write"
+    },
+    {
+      "name": "sessions.steer.v2",
       "required_scope": "operator.write"
     },
     {

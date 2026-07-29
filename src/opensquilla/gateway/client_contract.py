@@ -121,6 +121,7 @@ OBSERVED_CLIENT_EVENTS = (
     "session.event.compaction",
     "session.event.cron_result",
     "session.event.ensemble_progress",
+    "session.event.input_disposition",
     "session.event.meta_preflight",
     "session.event.meta_run_announced",
     "session.event.meta_run_completed",
