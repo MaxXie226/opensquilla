@@ -526,7 +526,9 @@ test('terminates stalled history and live hydration despite ongoing ticks, then 
   // Advance past the 15-second aggregate bootstrap budget one second at a
   // time, delivering a server tick after each increment. This models a socket
   // that remains healthy while individual RPCs never produce responses.
-  await page.clock.pauseAt((await page.evaluate(() => Date.now())) + 1)
+  // Leave enough headroom for the page-to-runner round trip on slower hosts.
+  // A 1 ms offset can already be in the past when Windows receives pauseAt.
+  await page.clock.pauseAt((await page.evaluate(() => Date.now())) + 1000)
   for (let elapsed = 0; elapsed < 16_000; elapsed += 1000) {
     await page.clock.runFor(1000)
     tickSenders.forEach(sendTick => sendTick())
