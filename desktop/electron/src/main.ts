@@ -276,7 +276,6 @@ interface RecoveryProtocolResult {
   schema_version: number
   outcome: RecoveryOutcome
   stable_code: string
-  failure_detail?: string
   primary_home: string
   effective_workspace: string | null
   candidates: RecoveryCandidate[]
@@ -303,14 +302,18 @@ interface DesktopProfileConsolidationResult {
   credential_adoption_status: DesktopCredentialAdoptionStatus
   revision: number
   errors: string[]
-  // Only meaningful when `outcome` is 'blocked': the canonical primary profile
-  // survived, so startup may continue to the independent profile inspector and
-  // retry the fan-in on a later launch instead of stranding the user.
-  primary_home_intact: boolean
+}
+
+interface DesktopProfileConsolidationMaintenance {
+  kind: 'profile-consolidation'
+  stable_code: string
+  retryable: true
+  recovery_profile_count: number
 }
 
 interface DesktopRecoveryViewState {
   inspection: RecoveryProtocolResult | null
+  maintenance: DesktopProfileConsolidationMaintenance | null
   blocked: boolean
   busy: boolean
   error: string | null
@@ -6486,9 +6489,6 @@ function parseRecoveryProtocol(value: unknown): RecoveryProtocolResult {
     schema_version: RECOVERY_PROTOCOL_SCHEMA_VERSION,
     outcome,
     stable_code: record.stable_code,
-    ...(typeof record.failure_detail === 'string' && record.failure_detail
-      ? { failure_detail: record.failure_detail }
-      : {}),
     primary_home: record.primary_home,
     effective_workspace: record.effective_workspace as string | null,
     candidates,
@@ -6657,22 +6657,6 @@ function parseDesktopProfileConsolidationProtocol(
     credential_adoption_status: credentialAdoptionStatus,
     revision: Number(record.revision),
     errors: record.errors as string[],
-    // Optional so an older runtime that predates the field still parses; absent
-    // means "assume not intact", which keeps the stricter blocking behavior.
-    primary_home_intact: record.primary_home_intact === true,
-  }
-}
-
-// A boolean second opinion on the consolidation protocol's own verdict that the
-// primary profile survived a failed fan-in. Intentionally shallow: the protocol
-// owns the journal contract, and duplicating that here would create a second copy
-// to drift out of sync.
-function isPlainDesktopDirectory(path: string): boolean {
-  try {
-    const info = lstatSync(path)
-    return info.isDirectory() && !info.isSymbolicLink()
-  } catch {
-    return false
   }
 }
 
@@ -6891,16 +6875,11 @@ async function acknowledgeConsolidatedDesktopCredential(
   }
 }
 
-function recoveryFailureResult(
-  home: string,
-  stableCode: string,
-  failureDetail = '',
-): RecoveryProtocolResult {
+function recoveryFailureResult(home: string, stableCode: string): RecoveryProtocolResult {
   return {
     schema_version: RECOVERY_PROTOCOL_SCHEMA_VERSION,
     outcome: 'recovery_required',
     stable_code: stableCode,
-    ...(failureDetail ? { failure_detail: failureDetail } : {}),
     primary_home: home,
     effective_workspace: null,
     candidates: [],
@@ -7007,6 +6986,25 @@ async function inspectDesktopProfile(profile: DesktopProfilePaths): Promise<Reco
       'desktop_recovery_inspect_failed',
     )
   }
+}
+
+async function recoverInspectedProfileTransaction(
+  profile: DesktopProfilePaths,
+  inspection: RecoveryProtocolResult,
+): Promise<RecoveryProtocolResult> {
+  if (
+    !inspection.allowed_actions.includes('recover-transaction')
+    || !inspection.transaction_id
+  ) {
+    throw new Error('The interrupted profile operation cannot be recovered automatically.')
+  }
+  return await runRecoveryCli(profile, [
+    'recover-transaction',
+    '--home', profile.home,
+    '--transaction-id', inspection.transaction_id,
+    '--expected-revision', String(inspection.revision),
+    '--json',
+  ])
 }
 
 async function readVerifiedConsolidatedCredential(
@@ -7282,43 +7280,20 @@ async function adoptConsolidatedDesktopCredential(
 }
 
 let desktopProfilesConsolidatedThisProcess = false
-let desktopProfileConsolidationPromise: Promise<RecoveryProtocolResult | null> | null = null
+let desktopProfileConsolidationPromise: Promise<DesktopProfileConsolidationResult | null> | null = null
 let pendingDesktopCredentialConsolidation: DesktopProfileConsolidationResult | null = null
+let desktopProfileConsolidationMaintenance: DesktopProfileConsolidationMaintenance | null = null
+let desktopProfileConsolidationFailureDetail = ''
 
-// Operator escape hatch. Consolidation gates startup, and its own retry path
-// re-runs the same work, so a profile layout it cannot process leaves the user
-// with no in-app way forward. Opting out skips the fan-in entirely: the primary
-// profile starts untouched, every legacy recovery profile stays byte-for-byte on
-// disk, and a later launch without the opt-out retries.
-//
-// This remains useful alongside the automatic deferral below, which only applies
-// when the fan-in reports the primary profile as physically usable. The opt-out
-// skips the fan-in outright, so it also covers a primary the protocol refuses to
-// judge — and it lets support and CI take the same path deliberately.
-function profileConsolidationOptOut(): boolean {
-  const raw = (process.env.OPENSQUILLA_DESKTOP_SKIP_PROFILE_CONSOLIDATION || '').trim()
-  return ['1', 'true', 'yes', 'on'].includes(raw.toLowerCase())
-}
-
-// Set when a blocked fan-in was allowed to defer. Deliberately separate from
-// `desktopProfilesConsolidatedThisProcess`, which must stay false so a blocked
-// attempt is never recorded as a completed consolidation; this one only stops a
-// window-reopen loop from re-spawning the same failing CLI within one process.
+// A blocked fan-in is maintenance, not a startup verdict. The independent
+// primary inspector decides whether the product can open. This flag only stops
+// window reopens from repeating the same maintenance command in one process; an
+// explicit in-app repair clears it for one safe retry.
 let desktopProfileConsolidationDeferredThisProcess = false
 
 async function consolidateLegacyRecoveryProfilesBeforeStartup(
-): Promise<RecoveryProtocolResult | null> {
+): Promise<DesktopProfileConsolidationResult | null> {
   if (desktopProfileConsolidationDeferredThisProcess) return null
-  if (profileConsolidationOptOut()) {
-    // Logged every launch, never once: a silently skipped consolidation would
-    // leave sessions split across profiles with no trace of why.
-    desktopLog('desktop_profile_consolidation_skipped', {
-      reason: 'operator_opt_out',
-      variable: 'OPENSQUILLA_DESKTOP_SKIP_PROFILE_CONSOLIDATION',
-      legacyRecoveryProfileCount: legacyRecoveryProfiles().length,
-    })
-    return null
-  }
   if (desktopProfilesConsolidatedThisProcess) return null
   if (desktopProfileConsolidationPromise) return await desktopProfileConsolidationPromise
 
@@ -7346,27 +7321,10 @@ async function consolidateLegacyRecoveryProfilesBeforeStartup(
         consumedRecoveryProfileCount: result.consumed_recovery_ids.length,
       })
       if (result.outcome === 'blocked') {
-        const failureDetail = result.errors.find((value) => value.trim())?.trim() ?? ''
-        if (result.primary_home_intact && isPlainDesktopDirectory(primary.home)) {
-          // The legacy fan-in failed but the primary profile itself is usable, so
-          // continue to the normal profile inspector rather than completing the
-          // merge now. Nothing was moved: every recovery profile is still on disk
-          // and a later launch retries. The local directory check is a second
-          // opinion on the protocol's own verdict, deliberately narrow so this
-          // does not grow a duplicate of the journal contract.
-          desktopProfileConsolidationDeferredThisProcess = true
-          desktopLog('desktop_profile_consolidation_deferred', {
-            stableCode: result.stable_code,
-            detail: failureDetail,
-            recoveryProfileCount: recoveryProfiles.length,
-          })
-          return null
-        }
-        // A protocol-level block is a primary-profile repair state, not an
-        // unexpected Electron boot failure. Keep the operation retryable and
-        // expose the offending path plus the safe repair actions.
-        return recoveryFailureResult(primary.home, result.stable_code, failureDetail)
+        return result
       }
+      desktopProfileConsolidationMaintenance = null
+      desktopProfileConsolidationFailureDetail = ''
       pendingDesktopCredentialConsolidation = (
         result.credential_adoption_status === 'pending'
       )
@@ -7384,9 +7342,30 @@ async function consolidateLegacyRecoveryProfilesBeforeStartup(
   return await desktopProfileConsolidationPromise
 }
 
+function deferProfileConsolidationMaintenance(
+  result: DesktopProfileConsolidationResult,
+): void {
+  desktopProfileConsolidationDeferredThisProcess = true
+  desktopProfileConsolidationFailureDetail = (
+    result.errors.find((value) => value.trim())?.trim() ?? ''
+  )
+  desktopProfileConsolidationMaintenance = {
+    kind: 'profile-consolidation',
+    stable_code: result.stable_code,
+    retryable: true,
+    recovery_profile_count: legacyRecoveryProfiles().length,
+  }
+  desktopLog('desktop_profile_consolidation_deferred', {
+    stableCode: result.stable_code,
+    detail: desktopProfileConsolidationFailureDetail,
+    recoveryProfileCount: desktopProfileConsolidationMaintenance.recovery_profile_count,
+  })
+}
+
 function recoveryStateSnapshot(): DesktopRecoveryViewState {
   return {
     inspection: recoveryInspection,
+    maintenance: desktopProfileConsolidationMaintenance,
     blocked: recoveryInspection?.outcome === 'recovery_required',
     busy: recoveryOperationBusy,
     error: recoveryOperationError,
@@ -7424,7 +7403,12 @@ function sanitizedRecoveryDiagnostics(): string {
     profile_kind: 'primary',
     outcome: report?.outcome ?? 'recovery_required',
     stable_code: report?.stable_code ?? 'desktop_recovery_state_unavailable',
-    failure_detail: redactText(report?.failure_detail),
+    maintenance: desktopProfileConsolidationMaintenance
+      ? {
+          ...desktopProfileConsolidationMaintenance,
+          detail: redactText(desktopProfileConsolidationFailureDetail),
+        }
+      : null,
     primary_home: redactPath(report?.primary_home ?? primaryDesktopProfile().home),
     effective_workspace: redactPath(report?.effective_workspace ?? null),
     candidates: (report?.candidates ?? []).map((candidate) => ({
@@ -8211,19 +8195,7 @@ async function stopOwnedGatewayAndWait(): Promise<void> {
 }
 
 async function inspectActiveProfileBeforeStartup(): Promise<boolean> {
-  const consolidationRepair = await consolidateLegacyRecoveryProfilesBeforeStartup()
-  if (consolidationRepair) {
-    recoveryOperationError = null
-    recoveryInspection = consolidationRepair
-    primaryRecoveryInspection = consolidationRepair
-    publishRecoveryState()
-    createApplicationMenu()
-    if (gatewayProcess && gatewayState.owned) await stopOwnedGatewayAndWait()
-    bootError = null
-    await restoreMainWindowToBootPage()
-    publishRecoveryState()
-    return false
-  }
+  const consolidationFailure = await consolidateLegacyRecoveryProfilesBeforeStartup()
   const active = activeDesktopProfile()
   // On a hard Electron crash, the Python Gateway can remain healthy and keep
   // the profile writer lease. Prove and stop that exact prior Desktop instance
@@ -8250,6 +8222,22 @@ async function inspectActiveProfileBeforeStartup(): Promise<boolean> {
         error: error instanceof Error ? error.message : 'unknown error',
       })
       inspection = recoveryFailureResult(active.home, 'settings_transaction_recovery_failed')
+    }
+  }
+
+  if (
+    inspection.outcome === 'recovery_required'
+    && inspection.allowed_actions.includes('recover-transaction')
+    && inspection.transaction_id
+  ) {
+    if (gatewayProcess && gatewayState.owned) await stopOwnedGatewayAndWait()
+    try {
+      inspection = await recoverInspectedProfileTransaction(active, inspection)
+    } catch (error) {
+      desktopLog('profile_transaction_auto_recovery_failed', {
+        error: error instanceof Error ? error.message : 'unknown error',
+      })
+      inspection = recoveryFailureResult(active.home, 'profile_transaction_auto_recovery_failed')
     }
   }
 
@@ -8297,6 +8285,17 @@ async function inspectActiveProfileBeforeStartup(): Promise<boolean> {
     // config.toml bytes. Refresh the authoritative primary state before the
     // boot page or any later repair action consumes it.
     inspection = await inspectDesktopProfile(active)
+  }
+
+  if (consolidationFailure) {
+    if (inspection.outcome === 'recovery_required') {
+      desktopLog('desktop_profile_consolidation_primary_blocked', {
+        consolidationStableCode: consolidationFailure.stable_code,
+        primaryStableCode: inspection.stable_code,
+      })
+    } else {
+      deferProfileConsolidationMaintenance(consolidationFailure)
+    }
   }
 
   recoveryInspection = inspection
@@ -11962,25 +11961,32 @@ async function inspectPrimaryForRepair(): Promise<RecoveryProtocolResult> {
   return inspection
 }
 
+async function retryDeferredProfileConsolidation(): Promise<{
+  ok: boolean
+  error?: string
+}> {
+  if (!desktopProfileConsolidationMaintenance) return { ok: true }
+  const exited = await stopAndJoinAllLifecycleOwnedGateways()
+  if (!exited) return { ok: false, error: desktopGatewayStillRunningMessage() }
+
+  desktopProfileConsolidationDeferredThisProcess = false
+  desktopProfileConsolidationMaintenance = null
+  desktopProfileConsolidationFailureDetail = ''
+  clearReusableGatewayState()
+  bootError = null
+  publishRecoveryState()
+  await currentMainWindow()?.loadFile(bootPagePath()).catch(() => null)
+  void openOrResumeDesktopApp()
+  return { ok: true }
+}
+
 async function recoverPrimaryProfileTransaction(): Promise<RecoveryProtocolResult> {
   const primary = primaryDesktopProfile()
   let inspection = primaryRecoveryInspection
   if (!inspection) inspection = await inspectPrimaryForRepair()
-  if (
-    !inspection.allowed_actions.includes('recover-transaction')
-    || !inspection.transaction_id
-  ) {
-    throw new Error('The interrupted profile operation cannot be recovered automatically.')
-  }
 
   await stopOwnedGatewayAndWait()
-  const result = await runRecoveryCli(primary, [
-    'recover-transaction',
-    '--home', primary.home,
-    '--transaction-id', inspection.transaction_id,
-    '--expected-revision', String(inspection.revision),
-    '--json',
-  ])
+  const result = await recoverInspectedProfileTransaction(primary, inspection)
   primaryRecoveryInspection = result
   recoveryInspection = result
   if (result.outcome !== 'recovery_required') {
@@ -12129,6 +12135,12 @@ async function choosePrimaryWorkspace(
 }
 
 ipcMain.handle('desktop:recovery:state', () => recoveryStateSnapshot())
+ipcMain.handle('desktop:recovery:retry-consolidation', async (event) => {
+  if (!trustedControlUiIpc(event)) {
+    return { ok: false, error: 'Automatic repair is available only inside OpenSquilla.' }
+  }
+  return await retryDeferredProfileConsolidation()
+})
 ipcMain.handle('desktop:recovery:choose-workspace', async (
   event,
   payload?: { workspace?: unknown },

@@ -1520,7 +1520,7 @@ def test_real_recovery_accepts_normal_unrelated_primary_directory(
 
 
 @pytest.mark.parametrize("target_kind", ["dangling", "inside", "outside"])
-def test_real_recovery_defers_for_unrelated_unsafe_primary_directory_link(
+def test_real_recovery_rejects_unrelated_unsafe_primary_directory_link(
     tmp_path: Path,
     monkeypatch,
     target_kind: str,
@@ -1548,9 +1548,9 @@ def test_real_recovery_defers_for_unrelated_unsafe_primary_directory_link(
 
         assert result.outcome == "blocked"
         assert result.stable_code == "unsafe_path"
-        # Consolidation remains fail-closed, but Electron may pass this untouched
-        # primary to its normal profile inspector instead of stranding the user.
-        assert result.primary_home_intact is True
+        # The CLI remains strictly fail-closed. Electron independently inspects
+        # primary before deciding whether this maintenance failure may defer.
+        assert result.primary_home_intact is False
         assert str(unrelated_link) in result.errors[0]
         assert recovery_root.is_dir()
         assert os.path.lexists(_native_io_path(unrelated_link))
@@ -1559,7 +1559,7 @@ def test_real_recovery_defers_for_unrelated_unsafe_primary_directory_link(
         _remove_directory_link(unrelated_link)
 
 
-def test_consolidate_cli_preserves_recovery_and_reports_primary_fallback(
+def test_consolidate_cli_preserves_recovery_and_reports_offending_path(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -1590,7 +1590,7 @@ def test_consolidate_cli_preserves_recovery_and_reports_primary_fallback(
         payload = json.loads(completed.stdout)
         assert payload["outcome"] == "blocked"
         assert payload["stable_code"] == "unsafe_path"
-        assert payload["primary_home_intact"] is True
+        assert payload["primary_home_intact"] is False
         assert str(unrelated_link) in payload["errors"][0]
         assert recovery_root.is_dir()
         assert os.path.lexists(_native_io_path(unrelated_link))
