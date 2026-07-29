@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import io
 import json
+import os
 import tarfile
 import zipfile
 from pathlib import Path
@@ -156,6 +157,46 @@ def test_runtime_archive_is_reproducible_for_equal_inputs(tmp_path: Path) -> Non
 
     for key in ("archive", "manifest", "provenance", "sbom"):
         assert first[key].read_bytes() == second[key].read_bytes()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows CI cannot create unprivileged symlinks")
+def test_runtime_packaging_dereferences_only_internal_bundle_links(tmp_path: Path) -> None:
+    bundle = _bundle(tmp_path / "internal", platform_name="linux")
+    target = bundle / "_internal/libpython.so"
+    target.write_bytes(b"synthetic-python-runtime")
+    (bundle / "_internal/Python").symlink_to("libpython.so")
+
+    artifacts = package_runtime_artifact(
+        bundle_dir=bundle,
+        artifacts_dir=tmp_path / "internal/artifacts",
+        version=VERSION,
+        platform_name="linux",
+        arch="x64",
+        build_commit=BUILD_COMMIT,
+        created_by="unit-test",
+        epoch=1_700_000_000,
+    )
+    verify_runtime_artifact(artifacts["manifest"])
+    with tarfile.open(artifacts["archive"], "r:gz") as archive:
+        link = archive.getmember("_internal/Python")
+        assert link.isfile()
+        assert archive.extractfile(link).read() == b"synthetic-python-runtime"
+
+    outside = tmp_path / "outside.txt"
+    outside.write_text("private", encoding="utf-8")
+    escaped = _bundle(tmp_path / "escaped", platform_name="linux")
+    (escaped / "_internal/Python").symlink_to(outside)
+    with pytest.raises(RuntimeArtifactError, match="link escapes or is broken"):
+        package_runtime_artifact(
+            bundle_dir=escaped,
+            artifacts_dir=tmp_path / "escaped/artifacts",
+            version=VERSION,
+            platform_name="linux",
+            arch="x64",
+            build_commit=BUILD_COMMIT,
+            created_by="unit-test",
+            epoch=1_700_000_000,
+        )
 
 
 @pytest.mark.parametrize(

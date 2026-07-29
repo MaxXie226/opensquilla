@@ -166,16 +166,33 @@ def _tar_filter(info: tarfile.TarInfo, *, epoch: int) -> tarfile.TarInfo:
 
 
 def _archive_paths(bundle_dir: Path) -> list[Path]:
-    return sorted(
-        (path for path in bundle_dir.rglob("*") if path.is_file() or path.is_dir()),
+    root = bundle_dir.resolve(strict=True)
+    paths = sorted(
+        (
+            path
+            for path in bundle_dir.rglob("*")
+            if path.is_symlink() or path.is_file() or path.is_dir()
+        ),
         key=lambda path: path.relative_to(bundle_dir).as_posix(),
     )
+    for path in paths:
+        if not path.is_symlink():
+            continue
+        try:
+            target = path.resolve(strict=True)
+            target.relative_to(root)
+        except (OSError, ValueError) as error:
+            raise RuntimeArtifactError(
+                f"Runtime bundle link escapes or is broken: {path.relative_to(bundle_dir)}"
+            ) from error
+    return paths
 
 
 def _build_tar_archive(bundle_dir: Path, output: Path, *, epoch: int) -> None:
     with output.open("wb") as raw:
         with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=epoch) as compressed:
             with tarfile.open(fileobj=compressed, mode="w", format=tarfile.PAX_FORMAT) as archive:
+                archive.dereference = True
                 for path in _archive_paths(bundle_dir):
                     relative = path.relative_to(bundle_dir).as_posix()
                     info = archive.gettarinfo(os.fspath(path), arcname=relative)
