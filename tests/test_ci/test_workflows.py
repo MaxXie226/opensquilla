@@ -1533,6 +1533,76 @@ def test_release_python_assets_are_independent_from_desktop_webui_artifact() -> 
     assert "release wheel unexpectedly embeds Web UI files" in smoke["run"]
 
 
+def test_release_builds_and_attests_public_gateway_runtime_matrix() -> None:
+    workflow = _workflow("wheelhouse-release.yml")
+    jobs = workflow["jobs"]
+    runtime = jobs["build-gateway-runtime"]
+    matrix = runtime["strategy"]["matrix"]["include"]
+
+    assert matrix == [
+        {"runner": "macos-15", "platform": "darwin", "arch": "arm64"},
+        {"runner": "ubuntu-22.04", "platform": "linux", "arch": "x64"},
+        {"runner": "windows-2022", "platform": "win32", "arch": "x64"},
+    ]
+    assert runtime["permissions"] == {
+        "contents": "read",
+        "id-token": "write",
+        "attestations": "write",
+    }
+    build = next(
+        step for step in runtime["steps"] if step.get("name") == "Build headless Gateway Runtime"
+    )
+    assert "scripts.gateway_runtime.build" in build["run"]
+    assert "--no-dev" in build["run"]
+    assert "--ui-artifact" not in build["run"]
+    assert "--expected-platform" in build["run"]
+    assert "--expected-arch" in build["run"]
+    verify = next(
+        step for step in runtime["steps"] if step.get("name") == "Verify and smoke Gateway Runtime"
+    )
+    for contract in (
+        "scripts.gateway_runtime.verify",
+        "--forbid-path",
+        "scripts.gateway_runtime.smoke",
+        "--runtime-dir",
+        "--timeout 360",
+    ):
+        assert contract in verify["run"]
+    assert verify["run"].count("uv run --no-dev python") == 2
+    attestation = next(
+        step
+        for step in runtime["steps"]
+        if step.get("name") == "Attest Gateway Runtime build provenance"
+    )
+    assert attestation["uses"] == "actions/attest-build-provenance@v2"
+    upload = next(
+        step
+        for step in runtime["steps"]
+        if step.get("name") == "Upload Gateway Runtime artifact"
+    )
+    assert upload["with"]["name"] == (
+        "opensquilla-gateway-runtime-${{ matrix.platform }}-${{ matrix.arch }}"
+    )
+
+    publish = jobs["publish-release"]
+    assert "build-gateway-runtime" in publish["needs"]
+    download = next(
+        step
+        for step in publish["steps"]
+        if step.get("name") == "Download Gateway Runtime assets"
+    )
+    assert download["with"] == {
+        "pattern": "opensquilla-gateway-runtime-*",
+        "path": "dist",
+        "merge-multiple": True,
+    }
+    workflow_text = (WORKFLOW_DIR / "wheelhouse-release.yml").read_text(encoding="utf-8")
+    assert workflow_text.count("scripts/gateway_runtime/release_assets.py") == 3
+    assert "Gateway Runtime assets are write-once" in workflow_text
+    assert "cmp -s" in workflow_text
+    assert '[[ "${name}" == gateway-runtime-* ]]' in workflow_text
+
+
 def test_container_release_smoke_verifies_headless_core_endpoints() -> None:
     data = _workflow("docker-image.yml")
     steps = data["jobs"]["build-and-publish"]["steps"]

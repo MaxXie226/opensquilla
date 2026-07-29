@@ -272,6 +272,103 @@ jobs:
             dist/SHA256SUMS
           overwrite: true
 
+  build-gateway-runtime:
+    name: Build Gateway Runtime (${{ matrix.platform }}-${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            platform: darwin
+            arch: arm64
+          - runner: ubuntu-22.04
+            platform: linux
+            arch: x64
+          - runner: windows-2022
+            platform: win32
+            arch: x64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+          persist-credentials: false
+          ref: ${{ env.RELEASE_TAG != '' && env.RELEASE_TAG || github.ref }}
+
+      - name: Hydrate router assets
+        shell: bash
+        run: git lfs pull --include="src/opensquilla/squilla_router/models/**"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Build headless Gateway Runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run \
+            --no-dev \
+            --extra recommended \
+            --extra mcp \
+            --extra msg \
+            --extra matrix \
+            --extra document-extras \
+            --with pyinstaller \
+            python -m scripts.gateway_runtime.build \
+              --bundle-root build/gateway-runtime \
+              --work-root build/pyinstaller-gateway-runtime \
+              --artifacts-dir dist/gateway-runtime \
+              --expected-platform "${{ matrix.platform }}" \
+              --expected-arch "${{ matrix.arch }}" \
+              --build-commit "${GITHUB_SHA}" \
+              --created-by "https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+      - name: Verify and smoke Gateway Runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifests=(dist/gateway-runtime/*.manifest.json)
+          if [[ "${#manifests[@]}" -ne 1 || ! -f "${manifests[0]}" ]]; then
+            echo "Expected exactly one Gateway Runtime manifest" >&2
+            exit 1
+          fi
+          uv run --no-dev python -m scripts.gateway_runtime.verify \
+            --manifest "${manifests[0]}" \
+            --expected-platform "${{ matrix.platform }}" \
+            --expected-arch "${{ matrix.arch }}" \
+            --forbid-path "${GITHUB_WORKSPACE}" \
+            --extract-to build/verified-gateway-runtime
+          uv run --no-dev python -m scripts.gateway_runtime.smoke \
+            --runtime-dir build/verified-gateway-runtime \
+            --manifest "${manifests[0]}" \
+            --timeout 360
+
+      - name: Attest Gateway Runtime build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/gateway-runtime/*
+
+      - name: Upload Gateway Runtime artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: opensquilla-gateway-runtime-${{ matrix.platform }}-${{ matrix.arch }}
+          path: dist/gateway-runtime/*
+          if-no-files-found: error
+          overwrite: true
+
   build-desktop-macos:
     name: Build macOS Electron installer
     needs: build-control-ui
@@ -468,6 +565,7 @@ jobs:
     name: Publish release assets
     needs:
       - build-release-assets
+      - build-gateway-runtime
       - build-desktop-macos
       - build-desktop-windows
     runs-on: ubuntu-latest
@@ -475,12 +573,11 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Checkout release notes
-        if: ${{ github.event_name == 'push' || github.event.inputs.tag != '' }}
+      - name: Checkout release metadata
         uses: actions/checkout@v4
         with:
           persist-credentials: false
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ env.RELEASE_TAG != '' && env.RELEASE_TAG || github.ref }}
 
       - name: Download release assets
         uses: actions/download-artifact@v4
@@ -501,6 +598,13 @@ jobs:
           name: opensquilla-electron-windows
           path: dist
 
+      - name: Download Gateway Runtime assets
+        uses: actions/download-artifact@v4
+        with:
+          pattern: opensquilla-gateway-runtime-*
+          path: dist
+          merge-multiple: true
+
       - name: Regenerate release checksums
         shell: bash
         run: |
@@ -508,6 +612,8 @@ jobs:
           import hashlib
           import os
           import re
+          import subprocess
+          import sys
           from pathlib import Path
 
           def desktop_asset_version(version: str) -> str:
@@ -522,6 +628,15 @@ jobs:
               assert len(wheels) == 1, f"expected one wheel when RELEASE_TAG is empty, got {len(wheels)}"
               version = wheels[0].name.removeprefix("opensquilla-").removesuffix("-py3-none-any.whl")
           desktop_version = desktop_asset_version(version)
+          runtime_asset_names = subprocess.check_output(
+              [
+                  sys.executable,
+                  "scripts/gateway_runtime/release_assets.py",
+                  "--version",
+                  version,
+              ],
+              text=True,
+          ).splitlines()
           asset_names = [
               f"OpenSquilla-{desktop_version}-mac-arm64.dmg",
               f"OpenSquilla-{desktop_version}-mac-arm64.zip",
@@ -532,6 +647,7 @@ jobs:
               f"OpenSquilla-{desktop_version}-win-x64.exe.blockmap",
               "latest.yml",
               f"opensquilla-{version}-py3-none-any.whl",
+              *runtime_asset_names,
           ]
           lines = []
           for name in asset_names:
@@ -548,6 +664,8 @@ jobs:
           import hashlib
           import os
           import re
+          import subprocess
+          import sys
           from pathlib import Path
 
           def desktop_asset_version(version: str) -> str:
@@ -562,6 +680,15 @@ jobs:
               assert len(wheels) == 1, f"expected one wheel when RELEASE_TAG is empty, got {len(wheels)}"
               version = wheels[0].name.removeprefix("opensquilla-").removesuffix("-py3-none-any.whl")
           desktop_version = desktop_asset_version(version)
+          runtime_asset_names = subprocess.check_output(
+              [
+                  sys.executable,
+                  "scripts/gateway_runtime/release_assets.py",
+                  "--version",
+                  version,
+              ],
+              text=True,
+          ).splitlines()
           sha256s = dist / "SHA256SUMS"
           asset_names = [
               f"OpenSquilla-{desktop_version}-mac-arm64.dmg",
@@ -573,6 +700,7 @@ jobs:
               f"OpenSquilla-{desktop_version}-win-x64.exe.blockmap",
               "latest.yml",
               f"opensquilla-{version}-py3-none-any.whl",
+              *runtime_asset_names,
           ]
           assets = [dist / name for name in asset_names]
           assert sha256s.is_file(), "missing SHA256SUMS"
@@ -693,7 +821,47 @@ jobs:
                   )
           PY
           assert_release_is_safe_draft
-          gh release upload "${TAG}" dist/* --clobber
+          existing_runtime_dir="$(mktemp -d)"
+          gh release view "${TAG}" --json assets > "${existing_runtime_dir}/release.json"
+          EXISTING_RUNTIME_DIR="${existing_runtime_dir}" python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ["EXISTING_RUNTIME_DIR"])
+          payload = json.loads((root / "release.json").read_text(encoding="utf-8"))
+          names = sorted(
+              asset["name"]
+              for asset in payload.get("assets", [])
+              if asset["name"].startswith("gateway-runtime-")
+          )
+          (root / "asset-names.txt").write_text(
+              "".join(f"{name}\n" for name in names),
+              encoding="utf-8",
+          )
+          PY
+          while IFS= read -r name; do
+            if [[ ! -f "dist/${name}" ]]; then
+              echo "Refusing to replace unexpected Gateway Runtime asset: ${name}" >&2
+              exit 1
+            fi
+            gh release download "${TAG}" --pattern "${name}" --dir "${existing_runtime_dir}"
+            if ! cmp -s "dist/${name}" "${existing_runtime_dir}/${name}"; then
+              echo "Gateway Runtime assets are write-once; byte mismatch for ${name}" >&2
+              exit 1
+            fi
+          done < "${existing_runtime_dir}/asset-names.txt"
+
+          for path in dist/*; do
+            name="${path##*/}"
+            if [[ "${name}" == gateway-runtime-* ]]; then
+              if [[ ! -f "${existing_runtime_dir}/${name}" ]]; then
+                gh release upload "${TAG}" "${path}"
+              fi
+            else
+              gh release upload "${TAG}" "${path}" --clobber
+            fi
+          done
           assert_release_is_safe_draft
 
       - name: Verify GitHub Release assets
@@ -717,6 +885,15 @@ jobs:
           tag = os.environ["TAG"]
           version = tag.removeprefix("v")
           desktop_version = desktop_asset_version(version)
+          runtime_asset_names = subprocess.check_output(
+              [
+                  sys.executable,
+                  "scripts/gateway_runtime/release_assets.py",
+                  "--version",
+                  version,
+              ],
+              text=True,
+          ).splitlines()
           expected = {
               f"OpenSquilla-{desktop_version}-mac-arm64.dmg",
               f"OpenSquilla-{desktop_version}-mac-arm64.zip",
@@ -727,6 +904,7 @@ jobs:
               f"OpenSquilla-{desktop_version}-win-x64.exe.blockmap",
               "latest.yml",
               f"opensquilla-{version}-py3-none-any.whl",
+              *runtime_asset_names,
               "SHA256SUMS",
           }
           raw = subprocess.check_output(

@@ -1983,27 +1983,28 @@ def test_packaged_session_recovery_gate_uses_installed_electron_and_real_gateway
 
 def test_desktop_gateway_build_and_verifier_cover_runtime_capabilities() -> None:
     build_gateway = _read("desktop/electron/scripts/build-gateway.mjs")
+    public_builder = _read("scripts/gateway_runtime/build.py")
     verifier = _read("desktop/electron/scripts/verify-package.mjs")
 
     for extra in ["recommended", "mcp", "msg", "matrix", "document-extras"]:
         assert f"'{extra}'" in build_gateway
     for module in ["joblib", "sklearn", "lightgbm", "tokenizers", "tiktoken", "onnxruntime", "mcp"]:
-        assert f"'{module}'" in build_gateway
-    assert "'--collect-all',\n  'sklearn'" not in build_gateway
-    assert "'--collect-all',\n  'lightgbm'" not in build_gateway
-    assert "'--collect-binaries',\n  'sklearn'" in build_gateway
-    assert "join('bin', 'lib_lightgbm.dll')" in build_gateway
-    assert "platformLightgbmBundleDir()" in build_gateway
-    assert "'lightgbm/bin'" in build_gateway
-    assert "lib_lightgbm.dylib" in build_gateway
-    assert "libomp.dylib" in build_gateway
-    assert "Git LFS pointer file, not the real router artifact" in build_gateway
-    assert "git lfs pull --include=" in build_gateway
-    assert "findFilesByName(runtimeGatewayDir, 'libomp.dylib')" in build_gateway
-    assert "install_name_tool" in build_gateway
-    assert "codesign" in build_gateway
-    assert "'--force', '--sign', '-'" in build_gateway
-    assert "@loader_path/libomp.dylib" in build_gateway
+        assert f'"{module}"' in public_builder
+    assert '"--collect-all",\n        "sklearn"' not in public_builder
+    assert '"--collect-all",\n        "lightgbm"' not in public_builder
+    assert '"--collect-binaries",\n        "sklearn"' in public_builder
+    assert 'Path("bin/lib_lightgbm.dll")' in public_builder
+    assert '"lightgbm/bin"' in public_builder
+    assert "lib_lightgbm.dylib" in public_builder
+    assert "libomp.dylib" in public_builder
+    assert "Git LFS pointer file, not the real Router artifact" in public_builder
+    assert "git lfs pull --include=" in public_builder
+    assert '_find_files(bundle_dir, "libomp.dylib")' in public_builder
+    assert "install_name_tool" in public_builder
+    assert "codesign" in public_builder
+    assert '"--force", "--sign", "-"' in public_builder
+    assert "@loader_path/libomp.dylib" in public_builder
+    assert "scripts.gateway_runtime.build" in build_gateway
     assert "verifyMacLightgbmRuntime" in verifier
     assert "lightgbm/lib/lib_lightgbm.dylib" in verifier
     assert "bundled libomp.dylib" in verifier
@@ -2064,17 +2065,16 @@ def test_desktop_gateway_bundle_collects_usage_ledger_and_verifies_query_ui() ->
     """
 
     build_script = _read("desktop/electron/scripts/build-gateway.mjs")
+    public_builder = _read("scripts/gateway_runtime/build.py")
     migration = ROOT / "migrations" / "V021__usage_ledger.py"
     usage_query = _read("opensquilla-webui/src/composables/usage/useUsageQuery.ts")
 
-    assert "'--collect-all',\n  'opensquilla'," in build_script
+    assert '"--collect-all",\n        "opensquilla",' in public_builder
     assert migration.is_file()
     assert "const USAGE_QUERY_METHOD = 'usage.query'" in usage_query
-    assert "controlUiVerifier" in build_script
-    assert "spawnSync(process.execPath, [controlUiVerifier, controlUiDistDir]" in build_script
-    assert build_script.index("\nassertControlUiArtifactReady()\n") < build_script.index(
-        "'--collect-all',\n  'opensquilla',"
-    )
+    assert "'--ui-artifact'" in build_script
+    assert "verify_ui_artifact" in public_builder
+    assert "validate_control_ui_artifact" in public_builder
 
 
 def test_windows_release_workflow_fails_fast_after_gateway_build_failure() -> None:
