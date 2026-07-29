@@ -229,10 +229,10 @@ def test_default_ci_keeps_main_pushes_targeted_and_manual_runs_full() -> None:
     assert 'printf \'.ci/run-all\\n\' > "${changed_files}"' in text
 
 
-def test_ci_rejects_tracked_frontend_dist_and_builds_a_verified_artifact() -> None:
+def test_ci_keeps_frontend_artifact_out_of_python_packaging() -> None:
     # Generated WebUI files belong to CI artifacts and release packages, not Git.
-    # Fail closed if a contributor force-adds dist, then prove the generated tree
-    # is exactly what enters the wheel before sharing it with downstream jobs.
+    # Fail closed if a contributor force-adds dist, while Python packaging
+    # independently proves wheel/sdist outputs remain headless.
     ci_path = WORKFLOW_DIR / "ci.yml"
     if not ci_path.exists():
         return
@@ -245,15 +245,6 @@ def test_ci_rejects_tracked_frontend_dist_and_builds_a_verified_artifact() -> No
     assert "> public/.DS_Store" in text
     assert "Finder metadata survived WebUI artifact normalization" in text
     assert "npm run verify:release-dist" in text
-    assert "Verify sdist-to-wheel frontend artifact round trip" in text
-    assert "uv build --sdist" in text
-    assert 'printf \'CI-only Finder metadata\\n\' > "${junk}"' in text
-    assert "tar -tzf" in text
-    assert "ignored Finder metadata leaked into the sdist" in text
-    assert 'uv build --wheel --out-dir "${wheel_dir}" "${sdists[0]}"' in text
-    assert "python scripts/verify_webui_artifact.py" in text
-    assert "--forbid-personal-bgm" in text
-    assert '--wheel "${wheels[0]}"' in text
     assert "Upload verified frontend artifact" in text
     assert "name: opensquilla-webui-dist" in text
     assert "overwrite: true" in text
@@ -266,13 +257,17 @@ def test_ci_rejects_tracked_frontend_dist_and_builds_a_verified_artifact() -> No
     assert upload["with"]["retention-days"] >= 31
     assert upload["with"]["overwrite"] is True
     assert "opensquilla-webui-dist-attempt-${{ github.run_attempt }}" not in text
-    wheel = next(
+    frontend_steps = workflow["jobs"]["frontend-check"]["steps"]
+    assert not any("uv build" in step.get("run", "") for step in frontend_steps)
+    package = next(
         step
-        for step in workflow["jobs"]["frontend-check"]["steps"]
-        if step.get("name") == "Verify sdist-to-wheel frontend artifact round trip"
+        for step in workflow["jobs"]["release-packaging"]["steps"]
+        if step.get("name") == "Build and verify headless distributions"
     )
-    assert "build_wheel_required == 'true'" in wheel["if"]
-    assert "full_required == 'true'" in wheel["if"]
+    assert "uv build --sdist" in package["run"]
+    assert "uv build --wheel" in package["run"]
+    assert "--headless-wheel" in package["run"]
+    assert "client source or generated WebUI leaked" in package["run"]
 
 
 def test_webui_text_and_docker_context_contracts_are_enforced_in_ci() -> None:
@@ -560,7 +555,7 @@ def test_ci_change_classifier_fails_closed_for_unclassified_tests(tmp_path: Path
     )
 
 
-def test_ci_change_classifier_builds_webui_source_into_the_runtime_wheel(
+def test_ci_change_classifier_keeps_webui_source_out_of_runtime_wheel(
     tmp_path: Path,
 ) -> None:
     outputs = _classify_changed_files(
@@ -568,11 +563,7 @@ def test_ci_change_classifier_builds_webui_source_into_the_runtime_wheel(
         ["opensquilla-webui/src/views/ChatView.vue"],
     )
 
-    assert outputs == _expected_classifier_outputs(
-        runtime_changed="true",
-        frontend_changed="true",
-        build_wheel_required="true",
-    )
+    assert outputs == _expected_classifier_outputs(frontend_changed="true")
 
 
 def test_ci_change_classifier_fails_closed_for_force_added_webui_dist(
@@ -583,11 +574,7 @@ def test_ci_change_classifier_fails_closed_for_force_added_webui_dist(
         ["src/opensquilla/gateway/static/dist/assets/index-example.js"],
     )
 
-    assert outputs == _expected_classifier_outputs(
-        runtime_changed="true",
-        frontend_changed="true",
-        build_wheel_required="true",
-    )
+    assert outputs == _expected_classifier_outputs(frontend_changed="true")
 
 
 def test_ci_change_classifier_routes_source_and_forced_dist_to_the_same_guard(
@@ -601,11 +588,7 @@ def test_ci_change_classifier_routes_source_and_forced_dist_to_the_same_guard(
         ],
     )
 
-    assert outputs == _expected_classifier_outputs(
-        runtime_changed="true",
-        frontend_changed="true",
-        build_wheel_required="true",
-    )
+    assert outputs == _expected_classifier_outputs(frontend_changed="true")
 
 
 def test_ci_change_classifier_routes_client_sdk_to_python_and_frontend(
@@ -993,6 +976,7 @@ def test_default_ci_uses_layered_job_conditions() -> None:
     assert "tui-check" in jobs
     assert "frontend_changed == 'true'" in jobs["frontend-check"]["if"]
     assert "full_required == 'true'" in jobs["frontend-check"]["if"]
+    assert "build_wheel_required == 'true'" not in jobs["frontend-check"]["if"]
     assert "tui_changed == 'true'" in jobs["tui-check"]["if"]
     assert "desktop_changed == 'true'" in jobs["desktop-check"]["if"]
     assert "python_changed == 'true'" in jobs["ubuntu-quality"]["if"]
@@ -1006,6 +990,7 @@ def test_default_ci_uses_layered_job_conditions() -> None:
     assert "desktop_changed == 'true'" in jobs["desktop-recovery-e2e"]["if"]
     assert "platform_sensitive_changed == 'true'" in jobs["webui-chat-recovery"]["if"]
     assert "release_changed == 'true'" in jobs["release-packaging"]["if"]
+    assert "build_wheel_required == 'true'" in jobs["release-packaging"]["if"]
     assert "tui-check" in jobs["ci-result"]["needs"]
     assert "webui-chat-recovery" in jobs["ci-result"]["needs"]
     assert "desktop-check" in jobs["ci-result"]["needs"]
@@ -1477,7 +1462,7 @@ def test_wheelhouse_release_publishes_only_recommended_router_profile() -> None:
     assert "- core" not in text
 
 
-def test_release_jobs_share_one_rerun_stable_verified_webui_artifact() -> None:
+def test_release_python_assets_are_independent_from_desktop_webui_artifact() -> None:
     workflow = _workflow("wheelhouse-release.yml")
     jobs = workflow["jobs"]
     artifact_name = "opensquilla-release-webui-dist"
@@ -1503,11 +1488,7 @@ def test_release_jobs_share_one_rerun_stable_verified_webui_artifact() -> None:
     assert "src/opensquilla/gateway/static/dist/index.html" in detect["run"]
     assert legacy["if"] == "steps.webui-contract.outputs.mode == 'legacy-committed'"
     assert 'data.get("tracks") == []' in legacy["run"]
-    for job_name in (
-        "build-release-assets",
-        "build-desktop-macos",
-        "build-desktop-windows",
-    ):
+    for job_name in ("build-desktop-macos", "build-desktop-windows"):
         job = jobs[job_name]
         assert job["needs"] == "build-control-ui"
         download = next(
@@ -1520,6 +1501,13 @@ def test_release_jobs_share_one_rerun_stable_verified_webui_artifact() -> None:
             "path": "src/opensquilla/gateway/static/dist/",
         }
 
+    python_job = jobs["build-release-assets"]
+    assert "needs" not in python_job
+    assert not any(
+        step.get("name") == "Download verified Web UI artifact"
+        for step in python_job["steps"]
+    )
+
     all_uploads = [
         step
         for job in jobs.values()
@@ -1529,37 +1517,34 @@ def test_release_jobs_share_one_rerun_stable_verified_webui_artifact() -> None:
     assert all_uploads
     assert all(step["with"].get("overwrite") is True for step in all_uploads)
 
-    wheel_steps = jobs["build-release-assets"]["steps"]
+    wheel_steps = python_job["steps"]
     verify = next(
         step
         for step in wheel_steps
-        if step.get("name") == "Verify wheel contains the exact Web UI artifact"
+        if step.get("name") == "Verify wheel is headless"
     )
     assert "python scripts/verify_webui_artifact.py" in verify["run"]
-    assert "--forbid-personal-bgm" in verify["run"]
-    assert '--wheel "${wheels[0]}"' in verify["run"]
-    assert "legacy wheel Web UI differs from committed artifact" in verify["run"]
+    assert "--headless-wheel" in verify["run"]
     smoke = next(
         step
         for step in wheel_steps
         if step.get("name") == "Smoke versioned release artifacts"
     )
-    assert 'if Path("scripts/verify_webui_artifact.py").is_file()' in smoke["run"]
+    assert "release wheel unexpectedly embeds Web UI files" in smoke["run"]
 
 
-def test_container_release_smoke_serves_control_ui_entry_assets() -> None:
+def test_container_release_smoke_verifies_headless_core_endpoints() -> None:
     data = _workflow("docker-image.yml")
     steps = data["jobs"]["build-and-publish"]["steps"]
     smoke = next(step for step in steps if step.get("name") == "Smoke pushed image HEALTHCHECK")
     script = smoke["run"]
 
-    assert "http://127.0.0.1:18791/control/" in script
-    assert 'parsed.netloc == "127.0.0.1:18791"' in script
-    assert 'path.endswith(".js")' in script
-    assert 'path.endswith(".css")' in script
+    assert "http://127.0.0.1:18791/healthz" in script
+    assert "http://127.0.0.1:18791/readyz" in script
+    assert '_DIST_DIR / "index.html"' in script
     assert 'docker exec "${container_id}" curl --fail --silent --show-error' in script
     build = next(step for step in steps if step.get("name") == "Build multi-arch image")
-    assert build["with"]["build-args"] == "OPENSQUILLA_FORBID_PERSONAL_BGM=1\n"
+    assert "build-args" not in build["with"]
 
 
 def test_wheelhouse_release_hydrates_current_router_bundle() -> None:

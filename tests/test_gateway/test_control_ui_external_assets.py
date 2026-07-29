@@ -72,7 +72,12 @@ def _artifact(root: Path) -> Path:
     return root
 
 
-def _resolve(config: GatewayConfig, tmp_path: Path) -> ControlUiAssets:
+def _resolve(
+    config: GatewayConfig,
+    tmp_path: Path,
+    *,
+    allow_embedded: bool = True,
+) -> ControlUiAssets:
     embedded_static = tmp_path / "embedded-static"
     embedded_static.mkdir(exist_ok=True)
     return ControlUiAssetResolver(
@@ -80,6 +85,7 @@ def _resolve(config: GatewayConfig, tmp_path: Path) -> ControlUiAssets:
         embedded_static_root=embedded_static,
         embedded_dist_root=embedded_static / "dist",
         template_root=control_ui._TEMPLATE_DIR,
+        allow_embedded=allow_embedded,
     ).resolve()
 
 
@@ -131,6 +137,22 @@ def test_external_path_may_point_to_static_parent_containing_dist(tmp_path: Path
 
     assert resolved.mode == "external"
     assert resolved.dist_root == dist.resolve()
+
+
+def test_headless_wheel_still_allows_verified_external_bundle(tmp_path: Path) -> None:
+    dist = _artifact(tmp_path / "external-ui")
+    config = GatewayConfig(
+        control_ui={
+            "assets_mode": "external",
+            "assets_path": str(dist),
+        }
+    )
+
+    resolved = _resolve(config, tmp_path, allow_embedded=False)
+
+    assert resolved.mode == "external"
+    assert resolved.dist_root == dist.resolve()
+    assert resolved.manifest is not None
 
 
 def test_external_entry_ignores_modulepreload_before_main_script(tmp_path: Path) -> None:

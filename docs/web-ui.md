@@ -74,13 +74,22 @@ For gateway lifecycle, host/port, and exposure details, see
 
 ## Packaged and Source Installs
 
-Official Python wheels, Desktop installers, and container images already
-include the built Vue console. Those install paths do not require Node.js or
-npm on the user's machine.
+Official Python wheels, source archives, source installers, Homebrew packages,
+wheelhouses, and container images are headless. They do not require Node.js
+22.12+ or npm, do not download a client, and do not package a checkout's residual
+`gateway/static/dist` directory. With the default `assets_mode = "auto"`,
+`/control/` shows a neutral diagnostic page while Gateway health/readiness,
+WebSocket RPC, CLI, channels, Cron, and MCP continue to work.
 
-A Git checkout contains the Web UI sources instead of a committed build tree.
-The source installers run the following automatically and then package the
-result with OpenSquilla:
+Every wheel records its UI build mode. A headless wheel refuses to serve an
+embedded `static/dist` tree even if files remain from an older installation or
+an overlay extraction. Use `assets_mode = "external"` for a separately
+distributed, manifest-validated client; setting `embedded` cannot reactivate
+residual files in a headless wheel.
+
+Desktop distributions may consume a separately built and verified Vue
+artifact. Contributors working on that client build it independently with the
+repository-pinned Node.js 22.12+:
 
 ```sh
 cd opensquilla-webui
@@ -88,23 +97,19 @@ npm ci
 npm run build
 ```
 
-Source installers and contributors therefore need Node.js 22.12+ and npm.
-Every source reinstall runs `npm ci` and rebuilds the console; the first run
-normally downloads the most, while a warm npm cache reduces later network use
-but not all build time or disk writes. Contributors should rerun the build after
-Web UI changes. A standard wheel build rejects a missing or stale console rather
-than silently producing a wheel with an empty `/control/` page.
+To produce a transitional Python distribution with embedded assets, select it
+explicitly:
 
-That fail-closed rule also applies to direct `pip install .`,
-`uv tool install .`, and VCS URL installs. Build the Web UI first when working
-from a local checkout; VCS URL users should clone the repository and run the
-source installer, or install the official release wheel.
+```sh
+OPENSQUILLA_BUILD_UI_MODE=embed-ui \
+OPENSQUILLA_BUILD_UI_ARTIFACT=/absolute/path/to/verified-dist \
+uv build --wheel
+```
 
-Standard source archives (`sdist`) also reject ignored personal BGM files so a
-shareable archive cannot accidentally leak private or copyrighted audio. A
-direct locally built wheel or local Docker image can still contain an explicitly
-customized library; official release artifacts always require the tracked
-playlist to remain empty.
+The selected directory must contain `webui-artifact-manifest.json`; inventory,
+sizes, SHA-256 digests, sensitive paths, and entrypoint references are checked
+fail-closed. Without both variables the build remains headless. Explicit
+embedded sdists also reject personal BGM content.
 
 ## Main Areas
 

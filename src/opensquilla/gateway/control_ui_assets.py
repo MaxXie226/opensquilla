@@ -478,11 +478,13 @@ class ControlUiAssetResolver:
         embedded_static_root: Path,
         embedded_dist_root: Path,
         template_root: Path,
+        allow_embedded: bool = True,
     ) -> None:
         self._config = config
         self._embedded_static_root = embedded_static_root
         self._embedded_dist_root = embedded_dist_root
         self._template_root = template_root
+        self._allow_embedded = allow_embedded
 
     def _static_root(self) -> Path | None:
         root = self._embedded_static_root
@@ -611,6 +613,11 @@ class ControlUiAssetResolver:
         requested: ControlUiAssetsRequestMode = self._config.control_ui.assets_mode
         if requested == "none":
             return self._none("explicit_none")
+        if requested in {"auto", "embedded"} and not self._allow_embedded:
+            # Every standard wheel declares whether embedded UI files belong to
+            # that artifact. A headless wheel must not revive static/dist files
+            # left behind by an older installation or an overlay extraction.
+            return self._none("build:headless")
 
         try:
             if requested == "external":

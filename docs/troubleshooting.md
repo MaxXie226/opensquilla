@@ -56,13 +56,12 @@ For a focused gateway guide, see [`gateway.md`](gateway.md).
 
 ## Control UI Assets Are Unavailable
 
-This diagnostic means a source checkout is missing the generated Vue artifact,
-or the artifact no longer matches the current Web UI sources. Official release
-wheels, Desktop installers, and container images already include a verified
-artifact and do not require Node.js or npm on the user's machine.
+This is expected for headless Python wheels, source installs, Homebrew,
+wheelhouses, and container images. The Gateway remains healthy; use the CLI,
+channels, or a separately distributed client. Desktop distributions may still
+provide a verified embedded artifact.
 
-From a repository checkout, rebuild the artifact before starting the gateway or
-building a wheel:
+From a repository checkout, build the client only when developing its UI:
 
 ```sh
 cd opensquilla-webui
@@ -70,10 +69,12 @@ npm ci
 npm run build
 ```
 
-Direct VCS URL installs such as `pip install git+https://...` cannot do this
-because generated assets are intentionally not tracked. Install an official
-release wheel instead, or clone the repository and run the source installer as
-described in the [source installation guide](quickstart.md#install-from-source).
+Standard wheel/sdist builds remain headless even when that generated directory
+exists. To serve it, configure the explicit `external` asset mode, or use the
+manifest-validated `embed-ui` build mode documented in [`web-ui.md`](web-ui.md).
+A headless wheel also ignores `static/dist` files left by an older installation,
+so removing or reinstalling those residual files is not required for safe
+Gateway startup.
 
 ## Desktop Gateway Startup Reports a Migration Lock
 
@@ -290,7 +291,7 @@ opensquilla agent --max-iterations 20 --timeout 600 -m "Bounded task"
 For large tool outputs, see
 [`features/tool-compression.md`](features/tool-compression.md).
 
-## Docker: Web UI Is Unreachable from Another Machine
+## Docker: Gateway Is Unreachable from Another Machine
 
 The default compose port publish is loopback-only
 (`127.0.0.1:18791:18791`), so other devices cannot reach the gateway.
@@ -306,7 +307,7 @@ Keep `OPENSQUILLA_LISTEN` at `0.0.0.0`; exposure is controlled by the
 allow inbound TCP 18791 from your LAN. Full flow:
 [`docker.md`](docker.md).
 
-## Docker: Web UI Connects but Configuration Changes Are Rejected
+## Docker: A Remote Client Connects but Configuration Changes Are Rejected
 
 A containerized gateway binds a wildcard address, so every browser —
 including one on the same host — is treated as a remote operator.
@@ -319,18 +320,11 @@ environment:
   OPENSQUILLA_AUTH_TOKEN: ${OPENSQUILLA_AUTH_TOKEN:?generate one with openssl rand -hex 32}
 ```
 
-Put the token value in a git-ignored `.env` next to `compose.yaml`, then log
-in with the token in the URL:
-
-```text
-http://<server-address>:18791/control/?token=<value>
-```
-
-Use `token` mode specifically — `password` and `trusted-proxy` modes do
-not support the Web UI connection. If the variables have no effect, the
+Put the token value in a git-ignored `.env` next to `compose.yaml`, then
+configure the external client with that token. If the variables have no effect, the
 state volume's `config.toml` may already contain an `[auth]` table —
 TOML values take precedence over `OPENSQUILLA_AUTH_*` at boot; edit the
-token there (or in the Web UI) and restart.
+token there (or through the client) and restart.
 
 ## Docker: Gateway Fails at Boot on a Bind-Mounted State Directory
 

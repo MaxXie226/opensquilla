@@ -15,6 +15,7 @@ from scripts.verify_webui_artifact import (
     ArtifactError,
     source_fingerprint,
     verify_dist,
+    verify_headless_wheel,
     verify_wheel,
 )
 
@@ -117,6 +118,17 @@ def test_verify_dist_accepts_artifact_bound_to_current_source(tmp_path: Path) ->
         "index.html",
         MANIFEST_NAME,
     }
+
+
+def test_verify_dist_accepts_manifest_only_artifact_without_source_checkout(
+    tmp_path: Path,
+) -> None:
+    _webui, dist = _artifact(tmp_path)
+
+    files = verify_dist(dist, webui_root=None)
+
+    assert "index.html" in files
+    assert MANIFEST_NAME in files
 
 
 def test_verify_dist_rejects_artifact_after_source_changes(tmp_path: Path) -> None:
@@ -259,6 +271,10 @@ def test_verify_wheel_requires_byte_identical_artifact(tmp_path: Path) -> None:
     webui, dist = _artifact(tmp_path)
     wheel = tmp_path / "opensquilla-0-py3-none-any.whl"
     with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr(
+            "opensquilla/_build_info.py",
+            "BUILD_UI_MODE: str | None = 'embed-ui'\n",
+        )
         for path in sorted(dist.rglob("*")):
             if path.is_file():
                 archive.write(path, f"{WHEEL_PREFIX}{path.relative_to(dist).as_posix()}")
@@ -269,6 +285,48 @@ def test_verify_wheel_requires_byte_identical_artifact(tmp_path: Path) -> None:
         archive.writestr(f"{WHEEL_PREFIX}unexpected.txt", "not allowed")
     with pytest.raises(ArtifactError, match="file set differs"):
         verify_wheel(dist, wheel, webui_root=webui)
+
+
+def test_verify_headless_wheel_rejects_any_embedded_webui_file(tmp_path: Path) -> None:
+    wheel = tmp_path / "opensquilla-0-py3-none-any.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr("opensquilla/__init__.py", "")
+        archive.writestr(
+            "opensquilla/_build_info.py",
+            "BUILD_UI_MODE: str | None = 'headless'\n",
+        )
+
+    verify_headless_wheel(wheel)
+
+    with zipfile.ZipFile(wheel, "a") as archive:
+        archive.writestr(f"{WHEEL_PREFIX}index.html", "not allowed")
+    with pytest.raises(ArtifactError, match="unexpectedly contains embedded WebUI"):
+        verify_headless_wheel(wheel)
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    [
+        ("embed-ui", "must declare BUILD_UI_MODE='headless'"),
+        (None, "missing its UI build-mode marker"),
+    ],
+)
+def test_verify_headless_wheel_requires_headless_build_marker(
+    tmp_path: Path,
+    mode: str | None,
+    expected: str,
+) -> None:
+    wheel = tmp_path / "opensquilla-0-py3-none-any.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr("opensquilla/__init__.py", "")
+        if mode is not None:
+            archive.writestr(
+                "opensquilla/_build_info.py",
+                f"BUILD_UI_MODE: str | None = {mode!r}\n",
+            )
+
+    with pytest.raises(ArtifactError, match=expected):
+        verify_headless_wheel(wheel)
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not on PATH")
