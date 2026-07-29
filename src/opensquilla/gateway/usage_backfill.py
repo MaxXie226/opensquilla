@@ -28,6 +28,10 @@ from opensquilla.session.usage_ledger import (
 
 log = structlog.get_logger(__name__)
 
+_DEFAULT_BACKFILL_BATCH_SIZE = 50
+_SLOW_BACKFILL_OPERATION_SECONDS = 1.0
+_TERMINAL_BACKFILL_STATUSES = frozenset({"complete", "partial"})
+
 
 class UsageBackfillAnomalyError(ValueError):
     """A historical row cannot be converted without inventing accounting data."""
@@ -306,35 +310,59 @@ def normalize_usage_backfill_entry(entry: UsageBackfillEntry) -> UsageBackfillWr
 async def run_usage_backfill(
     storage: Any,
     *,
-    batch_size: int = 500,
+    batch_size: int = _DEFAULT_BACKFILL_BATCH_SIZE,
 ) -> None:
     """Resume backfill until the cutover prefix is exhausted.
 
     The storage layer owns the atomic ``events + cursor`` transaction.  Any
-    failure is converted into durable ``partial`` state and never propagates
+    failure is converted into durable ``failed`` state and never propagates
     into gateway readiness.
     """
 
     cursor = None
+    phase = "read_state"
+    batch_count = 0
+    source_row_count = 0
+    started = time.monotonic()
     try:
         state = await storage.get_usage_ledger_state()
-        if state is None or state.backfill_status == "complete":
+        if state is None or state.backfill_status in _TERMINAL_BACKFILL_STATUSES:
+            log.debug(
+                "usage.backfill_skipped",
+                status=getattr(state, "backfill_status", None),
+            )
             return
+        log.info(
+            "usage.backfill_started",
+            status=state.backfill_status,
+            batch_size=batch_size,
+        )
         prepare_indexes = getattr(storage, "prepare_usage_backfill_indexes", None)
         if callable(prepare_indexes):
+            phase = "prepare_indexes"
+            index_started = time.monotonic()
             await prepare_indexes()
+            index_duration = time.monotonic() - index_started
+            if index_duration >= _SLOW_BACKFILL_OPERATION_SECONDS:
+                log.warning(
+                    "usage.backfill_index_prepare_slow",
+                    duration_ms=int(index_duration * 1_000),
+                )
         if state.cursor_created_at_ms is not None:
             cursor = UsageBackfillCursor(
                 created_at_ms=state.cursor_created_at_ms,
                 session_id=state.cursor_session_id or "",
                 message_id=state.cursor_message_id or "",
             )
+        phase = "mark_running"
         await storage.update_usage_backfill_progress(
             status="running",
             cursor=cursor,
             now_ms=int(time.time() * 1000),
         )
         while True:
+            phase = "read_batch"
+            batch_started = time.monotonic()
             batch = await storage.get_usage_backfill_batch(
                 before_ms=state.ledger_started_at_ms,
                 after=cursor,
@@ -347,21 +375,55 @@ async def run_usage_backfill(
                     writes.append(normalize_usage_backfill_entry(entry))
                 except UsageBackfillAnomalyError:
                     anomalies += 1
-            cursor = batch.next_cursor or cursor
-            await storage.apply_usage_backfill_batch(
+            next_cursor = batch.next_cursor or cursor
+            phase = "apply_batch"
+            updated_state = await storage.apply_usage_backfill_batch(
                 writes,
-                cursor=cursor,
+                cursor=next_cursor,
                 exhausted=batch.exhausted,
                 anomaly_delta=anomalies,
                 now_ms=int(time.time() * 1000),
             )
+            cursor = next_cursor
+            batch_count += 1
+            source_row_count += len(batch.entries)
+            batch_duration = time.monotonic() - batch_started
+            batch_log = (
+                log.warning
+                if batch_duration >= _SLOW_BACKFILL_OPERATION_SECONDS
+                else log.debug
+            )
+            batch_log(
+                "usage.backfill_batch_completed",
+                batch=batch_count,
+                duration_ms=int(batch_duration * 1_000),
+                source_rows=len(batch.entries),
+                writes=len(writes),
+                anomalies=anomalies,
+                exhausted=batch.exhausted,
+            )
             if batch.exhausted:
+                log.info(
+                    "usage.backfill_completed",
+                    status=getattr(updated_state, "backfill_status", None),
+                    duration_ms=int((time.monotonic() - started) * 1_000),
+                    batches=batch_count,
+                    source_rows=source_row_count,
+                )
                 return
             await asyncio.sleep(0)
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001 - backfill must never break gateway readiness
-        log.warning("usage.backfill_failed", error=type(exc).__name__)
+        log.warning(
+            "usage.backfill_failed",
+            phase=phase,
+            duration_ms=int((time.monotonic() - started) * 1_000),
+            batches=batch_count,
+            source_rows=source_row_count,
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
         try:
             await storage.update_usage_backfill_progress(
                 status="failed",
