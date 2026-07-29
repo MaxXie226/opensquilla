@@ -32,6 +32,8 @@ from opensquilla.provider import (
     ContentBlockToolResult,
     ContentBlockToolUse,
     Message,
+    ModelCapabilities,
+    ProviderFinalRequestProjection,
     ProviderHeartbeatEvent,
     ToolDefinition,
     ToolInputSchema,
@@ -42,6 +44,7 @@ from opensquilla.provider import TextDeltaEvent as ProviderText
 from opensquilla.provider import ToolUseDeltaEvent as ProviderToolUseDelta
 from opensquilla.provider import ToolUseEndEvent as ProviderToolUseEnd
 from opensquilla.provider import ToolUseStartEvent as ProviderToolUseStart
+from opensquilla.provider.openai import OpenAIProvider
 from opensquilla.provider.request_proof import (
     ProviderRequestBudgetExceeded,
     prove_provider_payload,
@@ -51,6 +54,10 @@ from opensquilla.sandbox.integration import configure_runtime, reset_runtime
 from opensquilla.sandbox.run_context import RunContext
 from opensquilla.sandbox.run_mode import RunMode
 from opensquilla.session.compaction import CompactionResult
+from opensquilla.session.compaction_deployment import (
+    CompactionExecutionPlan,
+    CompactionExecutionTarget,
+)
 from opensquilla.tools.dispatch import build_tool_handler
 from opensquilla.tools.mutation_receipts import (
     fingerprint_path,
@@ -63,6 +70,72 @@ RAW_CURRENT_TURN_OVERFLOW_MESSAGE = (
     "Context overflow is in the current turn's recent tool calls or "
     "reasoning tail; history compaction cannot reduce it."
 )
+
+
+def test_agent_compaction_uses_frozen_physical_plan() -> None:
+    target_provider = _StallingProvider()
+    plan = CompactionExecutionPlan(
+        candidates=(
+            CompactionExecutionTarget(
+                provider=target_provider,
+                provider_id="physical-provider",
+                model="summary-model",
+                context_window_tokens=32_000,
+                provider_request_max_chars=80_000,
+            ),
+        )
+    )
+    agent = Agent(
+        provider=_StallingProvider(),
+        config=AgentConfig(
+            model_id="turn-model",
+            compaction_execution_plan=plan,
+        ),
+    )
+
+    config = agent._build_compaction_config()
+
+    assert config.llm_plan is plan
+    assert config.provider == "physical-provider"
+    assert config.model == "summary-model"
+
+
+@pytest.mark.parametrize("refresh_mode", ["unavailable", "error"])
+def test_agent_compaction_plan_refresh_never_reuses_stale_provider(
+    refresh_mode: str,
+) -> None:
+    stale_plan = CompactionExecutionPlan(
+        candidates=(
+            CompactionExecutionTarget(
+                provider=_StallingProvider(),
+                provider_id="stale-provider",
+                model="stale-model",
+                context_window_tokens=32_000,
+                provider_request_max_chars=80_000,
+            ),
+        )
+    )
+
+    def refresh() -> None:
+        if refresh_mode == "error":
+            raise RuntimeError("credential refresh failed")
+        return None
+
+    agent = Agent(
+        provider=_StallingProvider(),
+        config=AgentConfig(
+            model_id="turn-model",
+            compaction_execution_plan=stale_plan,
+            compaction_execution_plan_factory=refresh,
+        ),
+    )
+
+    config = agent._build_compaction_config()
+
+    assert config.llm_plan is None
+    assert config.api_key == ""
+    assert config.provider == ""
+    assert config.model == "turn-model"
 
 
 class _StallingProvider:
@@ -156,6 +229,27 @@ class _ContextOverflowProvider:
         self.calls.append(messages)
         return self._stream(len(self.calls))
 
+    def project_final_request(
+        self,
+        messages: list[Message],
+        tools: list[Any] | None = None,
+        config: ChatConfig | None = None,
+        *,
+        message_limit: int | None = None,
+    ) -> ProviderFinalRequestProjection:
+        del tools, config
+        fits_message_count = (
+            None if message_limit is None else len(messages) <= message_limit
+        )
+        return ProviderFinalRequestProjection(
+            payload={"messages": [message.model_dump() for message in messages]},
+            proof={"fits": fits_message_count is not False},
+            wire_message_count=len(messages),
+            message_limit=message_limit,
+            fits_message_count=fits_message_count,
+            fits=fits_message_count is not False,
+        )
+
     async def _stream(self, call_number: int) -> AsyncIterator[Any]:
         if self.success_after is not None and call_number > self.success_after:
             yield ProviderText(text="ok")
@@ -169,6 +263,15 @@ class _ContextOverflowProvider:
 
 class _FinalAdmissionContextOverflowProvider(_ContextOverflowProvider):
     final_request_admission_guaranteed = True
+
+
+class _HangingRetryAfterOverflowProvider(_ContextOverflowProvider):
+    async def _stream(self, call_number: int) -> AsyncIterator[Any]:
+        if call_number == 1:
+            yield ProviderError(message="context length exceeded", code="400")
+            return
+        await asyncio.Event().wait()
+        yield ProviderText(text="unreachable")
 
 
 class _ProviderRequestBudgetExceededProvider:
@@ -207,6 +310,176 @@ class _ProviderRequestBudgetExceededProvider:
 
     async def list_models(self) -> list[Any]:
         return []
+
+
+class _FinalProofBudgetProvider:
+    provider_name = "openrouter"
+    final_request_admission_guaranteed = True
+
+    def __init__(self) -> None:
+        self.calls: list[list[Message]] = []
+        self.projected_configs: list[ChatConfig] = []
+
+    def project_final_request(
+        self,
+        messages: list[Message],
+        tools: list[Any] | None = None,
+        config: ChatConfig | None = None,
+        *,
+        message_limit: int | None = None,
+    ) -> ProviderFinalRequestProjection:
+        cfg = config or ChatConfig()
+        self.projected_configs.append(cfg)
+        payload = {
+            "messages": [
+                message.model_dump(mode="json", exclude_none=True)
+                for message in messages
+            ],
+            "system": cfg.system,
+            "tools": [
+                tool.model_dump(mode="json", exclude_none=True)
+                if hasattr(tool, "model_dump")
+                else tool
+                for tool in (tools or [])
+            ],
+            "max_tokens": cfg.max_tokens,
+        }
+        try:
+            proof = prove_provider_payload(
+                payload,
+                projection_adapter="openrouter",
+                proof_budget=cfg.provider_request_max_chars,
+            )
+        except ProviderRequestBudgetExceeded as exc:
+            proof = exc.proof
+        fits_message_count = (
+            None if message_limit is None else len(messages) <= message_limit
+        )
+        fits = bool(proof["fits"]) and fits_message_count is not False
+        return ProviderFinalRequestProjection(
+            payload=payload,
+            proof=proof,
+            wire_message_count=len(messages),
+            message_limit=message_limit,
+            fits_message_count=fits_message_count,
+            fits=fits,
+        )
+
+    def chat(
+        self,
+        messages: list[Message],
+        tools: list[Any] | None = None,
+        config: ChatConfig | None = None,
+    ) -> AsyncIterator[Any]:
+        self.calls.append(messages)
+        projection = self.project_final_request(messages, tools, config)
+        return self._stream(projection)
+
+    async def _stream(
+        self,
+        projection: ProviderFinalRequestProjection,
+    ) -> AsyncIterator[Any]:
+        if not projection.fits:
+            yield ProviderError(
+                message=json.dumps(projection.proof),
+                code="provider_request_budget_exhausted",
+            )
+            return
+        yield ProviderText(text="ok")
+        yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
+
+    async def list_models(self) -> list[Any]:
+        return []
+
+
+def test_preflight_history_capacity_reserves_non_history_envelope() -> None:
+    agent = Agent(
+        provider=_ContextOverflowProvider(),
+        config=AgentConfig(
+            model_id="test-model",
+            context_window_tokens=4_000,
+            max_tokens=512,
+            system_prompt="system policy " * 100,
+            request_context_prompt="request capsule " * 50,
+            flush_enabled=False,
+        ),
+    )
+    active_prompt = "active user " * 300
+
+    persisted_capacity, persisted_char_capacity = agent.preflight_history_capacity(
+        active_user_message=active_prompt,
+        active_user_in_history=True,
+        context_window_tokens=4_000,
+    )
+    unpersisted_capacity, unpersisted_char_capacity = agent.preflight_history_capacity(
+        active_user_message=active_prompt,
+        active_user_in_history=False,
+        context_window_tokens=4_000,
+    )
+    attachment_capacity, attachment_char_capacity = agent.preflight_history_capacity(
+        active_user_message=active_prompt,
+        active_user_in_history=True,
+        attachments=[{"type": "text", "content": "attachment " * 4_000}],
+        context_window_tokens=4_000,
+    )
+
+    assert 0 < persisted_capacity < 4_000
+    assert unpersisted_capacity < persisted_capacity
+    assert attachment_capacity < persisted_capacity
+    assert 0 < persisted_char_capacity
+    assert unpersisted_char_capacity < persisted_char_capacity
+    assert attachment_char_capacity < persisted_char_capacity
+    assert agent.preflight_history_capacity_tokens(
+        active_user_message=active_prompt,
+        active_user_in_history=True,
+        context_window_tokens=4_000,
+    ) == persisted_capacity
+
+
+def test_durable_consumer_projection_uses_base_model_config() -> None:
+    base_provider = OpenAIProvider(
+        api_key="test",
+        model="base-model",
+    )
+    agent = Agent(
+        provider=_ContextOverflowProvider(),
+        config=AgentConfig(
+            model_id="routed-dashscope-model",
+            context_window_tokens=8_000,
+            max_tokens=1_024,
+            thinking=True,
+            model_capabilities=ModelCapabilities(
+                supports_reasoning=True,
+                reasoning_format="dashscope",
+            ),
+            flush_enabled=False,
+        ),
+    )
+
+    projection = agent._project_compaction_consumer_request(
+        consumer_provider=base_provider,
+        replay_summary="stable checkpoint",
+        kept_entries=[],
+        active_user_message="continue",
+        active_user_in_history=False,
+        bound_user_message_id=None,
+        attachment_messages=None,
+        runtime_context_message=Message(role="user", content="runtime"),
+        context_window_tokens=128_000,
+        max_output_tokens=256,
+        consumer_model_id="base-model",
+        consumer_model_capabilities=ModelCapabilities(
+            supports_reasoning=False,
+        ),
+        consumer_provider_request_max_chars=12_000,
+    )
+
+    assert projection is not None
+    assert projection.payload["model"] == "base-model"
+    assert projection.payload["max_tokens"] == 256
+    assert "enable_thinking" not in projection.payload
+    assert "reasoning_effort" not in projection.payload
+    assert projection.proof["raw_proof_budget"] == 12_000
 
 
 class _RepeatedToolFailureThenDoneProvider:
@@ -4908,7 +5181,180 @@ async def test_context_overflow_effective_compaction_allows_single_retry(
 
     assert len(provider.calls) == 2
     assert _provider_payload_is_smaller(provider.calls[0], provider.calls[1])
+    compaction_indexes = [
+        index for index, event in enumerate(events) if isinstance(event, CompactionEvent)
+    ]
+    assert len(compaction_indexes) == 1
+    first_provider_output = next(
+        index
+        for index, event in enumerate(events)
+        if getattr(event, "kind", None) == "text_delta"
+    )
+    assert compaction_indexes[0] < first_provider_output
     assert any(event.kind == "done" and getattr(event, "text", "") == "ok" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_narrow_routed_window_never_durably_compacts_base_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _unexpected_compaction(_request: Any) -> CompactionResult:
+        raise AssertionError(
+            "a one-turn routed window must not rewrite stable session history"
+        )
+
+    monkeypatch.setattr(
+        "opensquilla.engine.agent.compact_context",
+        _unexpected_compaction,
+    )
+    provider = _ContextOverflowProvider()
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            context_window_tokens=8_000,
+            max_provider_retries=0,
+            max_overflow_retries=1,
+            flush_enabled=False,
+        ),
+    )
+    history = [
+        Message(role="user", content="old question " + ("q" * 5000)),
+        Message(role="assistant", content="old answer " + ("a" * 5000)),
+    ]
+    agent.set_history(history)
+    agent.bind_durable_consumer(
+        provider=provider,
+        model_id="stable-128k",
+        context_window_tokens=128_000,
+        max_output_tokens=8_000,
+    )
+
+    events = [event async for event in agent.run_turn("current request")]
+
+    assert len(provider.calls) == 1
+    assert not any(isinstance(event, CompactionEvent) for event in events)
+    assert agent.history_snapshot() == history
+    assert any(
+        isinstance(event, ErrorEvent)
+        and event.code == "provider_request_too_large"
+        for event in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_inline_compaction_candidate_gets_terminal_when_retry_never_admits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _effective_compact(request: Any) -> CompactionResult:
+        protected = int(request.config.protected_recent_messages or 0)
+        cut = max(0, len(request.entries) - protected)
+        return CompactionResult(
+            summary="short summary",
+            kept_entries=request.entries[cut:],
+            removed_count=cut,
+            kept_start_index=cut,
+            chunks_processed=1,
+        )
+
+    notifications: list[dict[str, Any]] = []
+
+    def _record_notification(_session_key: str, **payload: Any) -> None:
+        notifications.append(payload)
+
+    monkeypatch.setattr("opensquilla.engine.agent.compact_context", _effective_compact)
+    monkeypatch.setattr("opensquilla.engine.agent.notify_compaction", _record_notification)
+    provider = _ContextOverflowProvider()
+    agent = Agent(
+        provider=provider,
+        session_key="agent:main:test",
+        config=AgentConfig(
+            max_provider_retries=0,
+            max_overflow_retries=1,
+            flush_enabled=False,
+        ),
+    )
+    agent.set_history(
+        [
+            Message(role="user", content="old question " + ("q" * 5000)),
+            Message(role="assistant", content="old answer " + ("a" * 5000)),
+        ]
+    )
+
+    events = [event async for event in agent.run_turn("x" * 4000)]
+
+    assert len(provider.calls) == 2
+    assert not any(isinstance(event, CompactionEvent) for event in events)
+    terminal = [
+        item
+        for item in notifications
+        if item.get("status")
+        in {"completed", "skipped", "cancelled", "timed_out", "stale", "failed"}
+    ]
+    assert len(terminal) == 1
+    assert terminal[0]["status"] == "failed"
+    assert terminal[0]["reason"] == "rebuilt_request_not_admitted"
+
+
+@pytest.mark.asyncio
+async def test_inline_compaction_install_wait_obeys_absolute_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _effective_compact(request: Any) -> CompactionResult:
+        protected = int(request.config.protected_recent_messages or 0)
+        cut = max(0, len(request.entries) - protected)
+        return CompactionResult(
+            summary="short summary",
+            kept_entries=request.entries[cut:],
+            removed_count=cut,
+            kept_start_index=cut,
+            chunks_processed=1,
+        )
+
+    notifications: list[dict[str, Any]] = []
+    monkeypatch.setattr("opensquilla.engine.agent.compact_context", _effective_compact)
+    monkeypatch.setattr(
+        "opensquilla.engine.agent.notify_compaction",
+        lambda _session_key, **payload: notifications.append(payload),
+    )
+    provider = _HangingRetryAfterOverflowProvider()
+    agent = Agent(
+        provider=provider,
+        session_key="agent:main:deadline",
+        config=AgentConfig(
+            max_provider_retries=0,
+            max_overflow_retries=1,
+            iteration_timeout=5.0,
+            timeout=5.0,
+            compaction_total_timeout_seconds=0.05,
+            flush_enabled=False,
+        ),
+    )
+    agent.set_history(
+        [
+            Message(role="user", content="old question " + ("q" * 5000)),
+            Message(role="assistant", content="old answer " + ("a" * 5000)),
+        ]
+    )
+
+    started = asyncio.get_running_loop().time()
+    events = [event async for event in agent.run_turn("x" * 4000)]
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert elapsed < 1.0
+    assert any(
+        isinstance(event, ErrorEvent)
+        and event.code == "compaction_deadline_exceeded"
+        for event in events
+    )
+    terminal = [
+        item
+        for item in notifications
+        if item.get("status")
+        in {"completed", "skipped", "cancelled", "timed_out", "stale", "failed"}
+    ]
+    assert len(terminal) == 1
+    assert terminal[0]["status"] == "timed_out"
+    assert terminal[0]["reason"] == "compaction_deadline_exceeded"
 
 
 @pytest.mark.asyncio
@@ -4940,7 +5386,9 @@ async def test_native_overflow_after_final_admission_does_not_compact_history(
 @pytest.mark.asyncio
 async def test_inline_overflow_compaction_reduces_tool_heavy_structured_context() -> None:
     big_output = ("synthetic log line: lorem ipsum dolor sit amet 0123456789\n" * 700)[:40_000]
-    window_tokens = 8_000
+    # Leave room for the two most recent raw tool results protected by the
+    # default semantic-tail policy while still forcing older rounds to compact.
+    window_tokens = 30_000
     messages: list[Message] = [
         Message(role="user", content="Please analyze every log file in the workspace."),
         Message(role="assistant", content="Reading the logs now."),
@@ -5061,6 +5509,198 @@ async def test_inline_overflow_refuses_when_protected_current_turn_alone_is_too_
 
     assert outcome is None
     assert agent._last_compaction_refusal_reason == "provider_recent_tail_too_large"
+
+
+@pytest.mark.asyncio
+async def test_inline_overflow_projects_completed_live_rounds_without_mutating_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    compact_requests: list[Any] = []
+
+    async def _summarize_completed_rounds(request: Any) -> CompactionResult:
+        compact_requests.append(request)
+        return CompactionResult(
+            summary="completed work summary",
+            kept_entries=[],
+            removed_count=len(request.entries),
+            kept_start_index=len(request.entries),
+            chunks_processed=1,
+            tokens_before=4000,
+            tokens_after=20,
+        )
+
+    monkeypatch.setattr(
+        "opensquilla.engine.agent.compact_context",
+        _summarize_completed_rounds,
+    )
+    current_user = Message(role="user", content="finish the active task exactly")
+    rounds: list[Message] = []
+    for index in range(3):
+        rounds.extend(
+            [
+                Message(
+                    role="assistant",
+                    content=[
+                        ContentBlockToolUse(
+                            id=f"live-{index}",
+                            name="read_file",
+                            input={"path": f"part-{index}.txt"},
+                        )
+                    ],
+                ),
+                Message(
+                    role="user",
+                    content=[
+                        ContentBlockToolResult(
+                            tool_use_id=f"live-{index}",
+                            content="result " + ("x" * 4000),
+                        )
+                    ],
+                ),
+            ]
+        )
+    messages = [
+        Message(role="user", content="old question"),
+        Message(role="assistant", content="old answer"),
+        current_user,
+        *rounds,
+    ]
+    canonical_snapshot = list(messages)
+    agent = Agent(
+        provider=_ContextOverflowProvider(),
+        config=AgentConfig(
+            context_window_tokens=1000,
+            context_overflow_threshold=0.85,
+            flush_enabled=False,
+        ),
+    )
+
+    outcome = await agent._check_context_overflow(
+        messages,
+        estimated_context_tokens=5000,
+        protected_turn_start_index=2,
+    )
+
+    assert outcome is not None
+    assert outcome.ephemeral_only is True
+    assert outcome.messages[2] is current_user
+    assert outcome.messages[-4:] == rounds[-4:]
+    assert messages == canonical_snapshot
+    assert compact_requests
+    assert compact_requests[0].config.protect_semantic_tail is False
+    assert all(
+        entry["content"] != current_user.content
+        for entry in compact_requests[0].entries
+    )
+
+
+@pytest.mark.asyncio
+async def test_durable_and_live_turn_recovery_share_one_compaction_call_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen_configs: list[Any] = []
+    seen_operation_ids: list[str | None] = []
+    seen_deadlines: list[float | None] = []
+
+    async def _bounded_summary(request: Any) -> CompactionResult:
+        seen_configs.append(request.config)
+        seen_operation_ids.append(request.config.operation_id)
+        seen_deadlines.append(request.config.deadline_at_monotonic)
+        request.config.llm_calls_started += 1
+        if request.forced_prefix_cut is not None:
+            cut = int(request.forced_prefix_cut)
+        else:
+            protected = int(request.config.protected_recent_messages or 0)
+            cut = max(0, len(request.entries) - protected)
+        return CompactionResult(
+            summary=f"summary-{len(seen_configs)}",
+            kept_entries=request.entries[cut:],
+            removed_count=cut,
+            kept_start_index=cut,
+            chunks_processed=1,
+        )
+
+    monkeypatch.setattr(
+        "opensquilla.engine.agent.compact_context",
+        _bounded_summary,
+    )
+    current_user = Message(role="user", content="finish the active task exactly")
+    rounds: list[Message] = []
+    for index in range(3):
+        rounds.extend(
+            [
+                Message(
+                    role="assistant",
+                    content=[
+                        ContentBlockToolUse(
+                            id=f"shared-{index}",
+                            name="read_file",
+                            input={"path": f"part-{index}.txt"},
+                        )
+                    ],
+                ),
+                Message(
+                    role="user",
+                    content=[
+                        ContentBlockToolResult(
+                            tool_use_id=f"shared-{index}",
+                            content=f"result {index}",
+                        )
+                    ],
+                ),
+            ]
+        )
+    messages = [
+        Message(role="user", content="old question " + ("q" * 40_000)),
+        Message(role="assistant", content="old answer " + ("a" * 40_000)),
+        current_user,
+        *rounds,
+    ]
+    agent = Agent(
+        provider=_ContextOverflowProvider(),
+        config=AgentConfig(
+            context_window_tokens=8_000,
+            context_overflow_threshold=0.85,
+            flush_enabled=False,
+        ),
+    )
+
+    durable = await agent._check_context_overflow(
+        messages,
+        estimated_context_tokens=20_000,
+        protected_turn_start_index=2,
+        compaction_window_tokens=16_000,
+        durable_consumer_overflow_proven=True,
+    )
+
+    assert durable is not None
+    assert durable.ephemeral_only is False
+    shared_config = durable.runtime_compaction_config
+    assert shared_config is not None
+    assert shared_config.llm_calls_started == 1
+    assert "runtime_compaction_config" not in repr(durable)
+
+    ephemeral = await agent._recover_live_turn_request_overflow(
+        durable.messages,
+        protected_turn_start_index=(
+            durable.protected_turn_start_index or 0
+        ),
+        context_window_tokens=8_000,
+        request_context_insert_index=durable.request_context_insert_index,
+        runtime_context_insert_index=durable.runtime_context_insert_index,
+        shared_compaction_config=shared_config,
+    )
+
+    assert ephemeral is not None
+    assert ephemeral.ephemeral_only is True
+    assert ephemeral.runtime_compaction_config is shared_config
+    assert len(seen_configs) == 2
+    assert seen_configs[0] is seen_configs[1]
+    assert seen_operation_ids[0] == seen_operation_ids[1]
+    assert seen_operation_ids[0] is not None
+    assert seen_deadlines[0] == seen_deadlines[1]
+    assert seen_deadlines[0] is not None
+    assert shared_config.llm_calls_started == 2
 
 
 @pytest.mark.asyncio
@@ -5459,6 +6099,302 @@ async def test_provider_budget_effective_cap_remains_request_only(
     assert len(provider.calls) == 1
     errors = [event for event in events if isinstance(event, ErrorEvent)]
     assert errors[-1].code == "provider_request_too_large"
+
+
+@pytest.mark.asyncio
+async def test_equal_window_routed_cap_does_not_compact_when_stable_consumer_fits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _unexpected_compact(_request: Any) -> CompactionResult:
+        raise AssertionError("route-only request pressure must not compact durable history")
+
+    monkeypatch.setattr("opensquilla.engine.agent.compact_context", _unexpected_compact)
+    routed = _FinalProofBudgetProvider()
+    stable = _FinalProofBudgetProvider()
+    agent = Agent(
+        provider=routed,
+        config=AgentConfig(
+            context_window_tokens=8_000,
+            max_tokens=4_096,
+            provider_request_proof_max_chars=4_000,
+            max_provider_retries=0,
+            max_overflow_retries=1,
+            flush_enabled=False,
+        ),
+    )
+    history = [
+        Message(role="user", content="old question " + ("q" * 3_000)),
+        Message(role="assistant", content="old answer " + ("a" * 3_000)),
+    ]
+    agent.set_history(history)
+    agent.bind_durable_consumer(
+        provider=stable,
+        model_id="stable-same-window",
+        context_window_tokens=8_000,
+        max_output_tokens=512,
+        provider_request_proof_max_chars=20_000,
+    )
+
+    events = [event async for event in agent.run_turn("current request stays exact")]
+
+    assert len(routed.calls) == 1
+    assert stable.projected_configs
+    assert stable.projected_configs[-1].max_tokens == 512
+    assert stable.projected_configs[-1].provider_request_max_chars == 20_000
+    assert not any(isinstance(event, CompactionEvent) for event in events)
+    assert agent.history_snapshot() == history
+    assert any(
+        isinstance(event, ErrorEvent)
+        and event.code == "provider_request_too_large"
+        for event in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_equal_window_stable_overflow_still_allows_durable_compaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    compact_requests: list[Any] = []
+
+    async def _effective_compact(request: Any) -> CompactionResult:
+        compact_requests.append(request)
+        protected = int(request.config.protected_recent_messages or 0)
+        cut = max(0, len(request.entries) - protected)
+        return CompactionResult(
+            summary="short stable checkpoint",
+            kept_entries=request.entries[cut:],
+            removed_count=cut,
+            kept_start_index=cut,
+            chunks_processed=1,
+        )
+
+    monkeypatch.setattr("opensquilla.engine.agent.compact_context", _effective_compact)
+    routed = _FinalProofBudgetProvider()
+    stable = _FinalProofBudgetProvider()
+    agent = Agent(
+        provider=routed,
+        config=AgentConfig(
+            context_window_tokens=8_000,
+            max_tokens=4_096,
+            provider_request_proof_max_chars=4_000,
+            max_provider_retries=0,
+            max_overflow_retries=1,
+            flush_enabled=False,
+        ),
+    )
+    agent.set_history(
+        [
+            Message(role="user", content="old question " + ("q" * 3_000)),
+            Message(role="assistant", content="old answer " + ("a" * 3_000)),
+        ]
+    )
+    agent.bind_durable_consumer(
+        provider=stable,
+        model_id="stable-same-window",
+        context_window_tokens=8_000,
+        max_output_tokens=512,
+        provider_request_proof_max_chars=4_000,
+    )
+
+    events = [event async for event in agent.run_turn("current request stays exact")]
+
+    assert len(compact_requests) == 1
+    assert len(routed.calls) == 2
+    assert stable.projected_configs
+    assert any(isinstance(event, CompactionEvent) for event in events)
+    assert any(isinstance(event, DoneEvent) for event in events)
+
+
+@pytest.mark.asyncio
+async def test_narrow_route_uses_stable_window_when_stable_consumer_also_overflows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    compact_requests: list[Any] = []
+
+    async def _effective_compact(request: Any) -> CompactionResult:
+        compact_requests.append(request)
+        protected = int(request.config.protected_recent_messages or 0)
+        cut = max(0, len(request.entries) - protected)
+        return CompactionResult(
+            summary="short stable checkpoint",
+            kept_entries=request.entries[cut:],
+            removed_count=cut,
+            kept_start_index=cut,
+            chunks_processed=1,
+        )
+
+    monkeypatch.setattr("opensquilla.engine.agent.compact_context", _effective_compact)
+    routed = _FinalProofBudgetProvider()
+    stable = _FinalProofBudgetProvider()
+    agent = Agent(
+        provider=routed,
+        config=AgentConfig(
+            context_window_tokens=8_000,
+            max_tokens=4_096,
+            provider_request_proof_max_chars=4_000,
+            max_provider_retries=0,
+            max_overflow_retries=1,
+            flush_enabled=False,
+        ),
+    )
+    agent.set_history(
+        [
+            Message(role="user", content="old question " + ("q" * 30_000)),
+            Message(role="assistant", content="old answer " + ("a" * 30_000)),
+        ]
+    )
+    agent.bind_durable_consumer(
+        provider=stable,
+        model_id="stable-16k",
+        context_window_tokens=16_000,
+        max_output_tokens=512,
+        provider_request_proof_max_chars=40_000,
+    )
+
+    events = [event async for event in agent.run_turn("current request stays exact")]
+
+    assert len(compact_requests) == 1
+    assert compact_requests[0].context_window_tokens == 16_000
+    assert len(routed.calls) == 2
+    assert len(stable.projected_configs) >= 2
+    assert all(config.max_tokens == 512 for config in stable.projected_configs)
+    assert all(
+        config.provider_request_max_chars == 40_000
+        for config in stable.projected_configs
+    )
+    assert any(isinstance(event, CompactionEvent) for event in events)
+    assert any(isinstance(event, DoneEvent) for event in events)
+
+
+@pytest.mark.asyncio
+async def test_narrow_route_cannot_force_stable_compaction_to_its_request_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    compact_requests: list[Any] = []
+
+    async def _stable_only_compact(request: Any) -> CompactionResult:
+        compact_requests.append(request)
+        protected = int(request.config.protected_recent_messages or 0)
+        cut = max(0, len(request.entries) - protected)
+        return CompactionResult(
+            summary="s" * 10_000,
+            kept_entries=request.entries[cut:],
+            removed_count=cut,
+            kept_start_index=cut,
+            chunks_processed=1,
+        )
+
+    monkeypatch.setattr(
+        "opensquilla.engine.agent.compact_context",
+        _stable_only_compact,
+    )
+    routed = _FinalProofBudgetProvider()
+    stable = _FinalProofBudgetProvider()
+    agent = Agent(
+        provider=routed,
+        config=AgentConfig(
+            context_window_tokens=8_000,
+            max_tokens=4_096,
+            provider_request_proof_max_chars=4_000,
+            max_provider_retries=0,
+            max_overflow_retries=1,
+            flush_enabled=False,
+        ),
+    )
+    history = [
+        Message(role="user", content="old question " + ("q" * 30_000)),
+        Message(role="assistant", content="old answer " + ("a" * 30_000)),
+    ]
+    agent.set_history(history)
+    agent.bind_durable_consumer(
+        provider=stable,
+        model_id="stable-16k",
+        context_window_tokens=16_000,
+        max_output_tokens=512,
+        provider_request_proof_max_chars=40_000,
+    )
+
+    events = [event async for event in agent.run_turn("current request stays exact")]
+
+    assert len(compact_requests) == 1
+    assert compact_requests[0].context_window_tokens == 16_000
+    assert len(stable.projected_configs) >= 2
+    assert len(routed.calls) == 1
+    compaction_events = [
+        event for event in events if isinstance(event, CompactionEvent)
+    ]
+    assert len(compaction_events) == 1
+    assert compaction_events[0].summary == "s" * 10_000
+    assert compaction_events[0].removed_count == 2
+    assert agent.history_snapshot() == history
+    assert any(
+        isinstance(event, ErrorEvent)
+        and event.code == "provider_request_too_large"
+        for event in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_mixed_pressure_does_not_install_candidate_that_stable_consumer_rejects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    compact_requests: list[Any] = []
+
+    async def _still_too_large_for_stable(request: Any) -> CompactionResult:
+        compact_requests.append(request)
+        protected = int(request.config.protected_recent_messages or 0)
+        cut = max(0, len(request.entries) - protected)
+        return CompactionResult(
+            summary="s" * 50_000,
+            kept_entries=request.entries[cut:],
+            removed_count=cut,
+            kept_start_index=cut,
+            chunks_processed=1,
+        )
+
+    monkeypatch.setattr(
+        "opensquilla.engine.agent.compact_context",
+        _still_too_large_for_stable,
+    )
+    routed = _FinalProofBudgetProvider()
+    stable = _FinalProofBudgetProvider()
+    agent = Agent(
+        provider=routed,
+        config=AgentConfig(
+            context_window_tokens=8_000,
+            max_tokens=4_096,
+            provider_request_proof_max_chars=4_000,
+            max_provider_retries=0,
+            max_overflow_retries=1,
+            flush_enabled=False,
+        ),
+    )
+    history = [
+        Message(role="user", content="old question " + ("q" * 30_000)),
+        Message(role="assistant", content="old answer " + ("a" * 30_000)),
+    ]
+    agent.set_history(history)
+    agent.bind_durable_consumer(
+        provider=stable,
+        model_id="stable-16k",
+        context_window_tokens=16_000,
+        max_output_tokens=512,
+        provider_request_proof_max_chars=40_000,
+    )
+
+    events = [event async for event in agent.run_turn("current request stays exact")]
+
+    assert len(compact_requests) == 1
+    assert compact_requests[0].context_window_tokens == 16_000
+    assert len(stable.projected_configs) >= 2
+    assert len(routed.calls) == 1
+    assert not any(isinstance(event, CompactionEvent) for event in events)
+    assert agent.history_snapshot() == history
+    assert any(
+        isinstance(event, ErrorEvent)
+        and event.code == "compaction_exhausted"
+        for event in events
+    )
 
 
 @pytest.mark.asyncio

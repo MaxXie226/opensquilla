@@ -382,6 +382,11 @@ def test_openai_request_proof_serialization_failure_is_controlled(
 def test_openai_final_request_proof_compacts_adapter_payload_with_tools(
     monkeypatch: Any,
 ) -> None:
+    # Exercise the documented one-version rollback path for installations
+    # that still permit request-only rewriting of recent/unresolved results.
+    monkeypatch.setenv("OPENSQUILLA_PROVIDER_COMPACTION_PROTECT_RECENT_RESULTS", "0")
+    monkeypatch.setenv("OPENSQUILLA_PROVIDER_COMPACTION_PROTECT_ERROR_RESULTS", "0")
+    monkeypatch.setenv("OPENSQUILLA_PROVIDER_COMPACTION_PROTECT_UNRESOLVED_RESULTS", "0")
     requests: list[httpx.Request] = []
     payloads: list[dict[str, Any]] = []
     proofs: list[dict[str, Any]] = []
@@ -467,6 +472,11 @@ def test_openai_final_request_proof_compacts_adapter_payload_with_tools(
 def test_anthropic_final_request_proof_compacts_adapter_payload_with_tools(
     monkeypatch: Any,
 ) -> None:
+    # Exercise the documented one-version rollback path for installations
+    # that still permit request-only rewriting of recent/unresolved results.
+    monkeypatch.setenv("OPENSQUILLA_PROVIDER_COMPACTION_PROTECT_RECENT_RESULTS", "0")
+    monkeypatch.setenv("OPENSQUILLA_PROVIDER_COMPACTION_PROTECT_ERROR_RESULTS", "0")
+    monkeypatch.setenv("OPENSQUILLA_PROVIDER_COMPACTION_PROTECT_UNRESOLVED_RESULTS", "0")
     requests: list[httpx.Request] = []
     payloads: list[dict[str, Any]] = []
     proofs: list[dict[str, Any]] = []

@@ -24,6 +24,8 @@ from .error_redaction import (
 )
 from .request_proof import (
     ProviderRequestBudgetExceededError,
+    project_final_request_payload,
+    protected_tool_result_indexes,
     prove_provider_payload_from_env,
 )
 from .stream_assembly import ToolStreamAccumulator, ToolStreamProtocolError
@@ -34,6 +36,7 @@ from .types import (
     ErrorEvent,
     Message,
     ModelInfo,
+    ProviderFinalRequestProjection,
     StreamEvent,
     TextDeltaEvent,
     ToolDefinition,
@@ -155,7 +158,12 @@ def _build_ollama_messages(
     return out
 
 
-def _convert_messages(messages: list[Message], system: str | None) -> list[dict[str, Any]]:
+def _convert_messages(
+    messages: list[Message],
+    system: str | None,
+    *,
+    logical_index_map: dict[int, int] | None = None,
+) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     if system:
         out.append({"role": "system", "content": system})
@@ -168,7 +176,9 @@ def _convert_messages(messages: list[Message], system: str | None) -> list[dict[
                 if block.type == "tool_use":
                     tool_names[block.id] = block.name
 
-    for msg in messages:
+    for index, msg in enumerate(messages):
+        if logical_index_map is not None:
+            logical_index_map[index] = len(out)
         out.extend(_build_ollama_messages(msg, tool_names))
     return out
 
@@ -209,6 +219,61 @@ class OllamaProvider:
             return {"Authorization": f"Bearer {self._api_key}"}
         return {}
 
+    def _build_payload(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition] | None,
+        cfg: ChatConfig,
+    ) -> tuple[dict[str, Any], int | None]:
+        logical_index_map: dict[int, int] = {}
+        ollama_messages = _convert_messages(
+            messages,
+            cfg.system,
+            logical_index_map=logical_index_map,
+        )
+        wire_active_user_index = (
+            logical_index_map.get(cfg.active_user_message_index)
+            if cfg.active_user_message_index is not None
+            else None
+        )
+        options: dict[str, Any] = {
+            "num_predict": cfg.max_tokens,
+            "num_ctx": self._num_ctx,
+        }
+        if cfg.temperature is not None:
+            options["temperature"] = cfg.temperature
+        payload: dict[str, Any] = {
+            "model": self._model,
+            "messages": ollama_messages,
+            "stream": True,
+            "options": options,
+        }
+        if tools:
+            payload["tools"] = [_build_ollama_tool(tool) for tool in tools]
+        return payload, wire_active_user_index
+
+    def project_final_request(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition] | None = None,
+        config: ChatConfig | None = None,
+        *,
+        message_limit: int | None = None,
+    ) -> ProviderFinalRequestProjection:
+        """Project the exact Ollama payload without transport or shaping."""
+
+        cfg = config or ChatConfig()
+        payload, wire_active_user_index = self._build_payload(messages, tools, cfg)
+        protected_result_indexes = protected_tool_result_indexes(messages)
+        return project_final_request_payload(
+            payload,
+            projection_adapter="ollama",
+            proof_budget=cfg.provider_request_max_chars,
+            active_user_message_index=wire_active_user_index,
+            message_limit=message_limit,
+            protected_tool_result_indexes=protected_result_indexes,
+        )
+
     def chat(
         self,
         messages: list[Message],
@@ -224,23 +289,8 @@ class OllamaProvider:
         tools: list[ToolDefinition] | None,
         cfg: ChatConfig,
     ) -> AsyncIterator[StreamEvent]:
-        ollama_messages = _convert_messages(messages, cfg.system)
-
-        options: dict[str, Any] = {
-            "num_predict": cfg.max_tokens,
-            "num_ctx": self._num_ctx,
-        }
-        if cfg.temperature is not None:
-            options["temperature"] = cfg.temperature
-
-        payload: dict[str, Any] = {
-            "model": self._model,
-            "messages": ollama_messages,
-            "stream": True,
-            "options": options,
-        }
-        if tools:
-            payload["tools"] = [_build_ollama_tool(t) for t in tools]
+        payload, wire_active_user_index = self._build_payload(messages, tools, cfg)
+        protected_result_indexes = protected_tool_result_indexes(messages)
 
         from opensquilla.engine.context_budget import coordinate_provider_context_budget
 
@@ -248,6 +298,8 @@ class OllamaProvider:
             payload,
             projection_adapter="ollama",
             proof_budget=cfg.provider_request_max_chars,
+            active_user_message_index=wire_active_user_index,
+            protected_tool_result_indexes=protected_result_indexes,
         )
         if budget_decision.action == "budget_limited":
             proof = budget_decision.proof or {}
@@ -271,6 +323,8 @@ class OllamaProvider:
             prove_provider_payload_from_env(
                 payload,
                 projection_adapter="ollama",
+                active_user_message_index=wire_active_user_index,
+                protected_tool_result_indexes=protected_result_indexes,
             )
         except ProviderRequestBudgetExceededError as exc:
             log.warning("provider.request_budget_exhausted", **exc.proof)

@@ -11,7 +11,7 @@ import time
 import uuid
 from dataclasses import asdict, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, NoReturn, cast
 
 import structlog
 
@@ -29,6 +29,15 @@ from opensquilla.engine.steps.router_decision_record import (
 )
 from opensquilla.gateway import attachment_ingest as _attachment_ingest
 from opensquilla.gateway.agent_tasks import get_agent_task_registry
+from opensquilla.gateway.compaction_target import (
+    build_gateway_consumer_admission,
+    effective_session_model,
+    limit_gateway_consumer_budget,
+    resolve_gateway_compaction_target,
+    resolve_gateway_consumer_budget,
+    resolve_selected_compaction_provider,
+    validate_gateway_session_deployment_override,
+)
 from opensquilla.gateway.config import effective_agent_stream_idle_timeout_seconds
 from opensquilla.gateway.input_normalization import (
     infer_normalized_input_from_attachments,
@@ -923,41 +932,29 @@ def _context_window_tokens(params: dict | None, ctx: RpcContext) -> int:
     return value
 
 
+_MANUAL_COMPACTION_STALE_REASONS = frozenset(
+    {
+        "stale_preimage",
+        "stale_context_state",
+        "consumer_admission_stale_or_failed",
+    }
+)
+
+
+def _manual_compaction_terminal_status(*, applied: bool, skip_reason: str) -> str:
+    if applied:
+        return "completed"
+    if skip_reason in _MANUAL_COMPACTION_STALE_REASONS:
+        return "stale"
+    return "skipped"
+
+
 def _effective_compaction_model(session: Any | None) -> str | None:
-    if session is None:
-        return None
-    return getattr(session, "model_override", None) or getattr(session, "model", None)
+    return effective_session_model(session)
 
 
 def _resolve_compaction_provider(ctx: RpcContext, session: Any | None) -> Any | None:
-    selector = getattr(ctx, "provider_selector", None)
-    if selector is None:
-        return None
-
-    resolved_selector = selector
-    clone = getattr(selector, "clone", None)
-    if callable(clone):
-        try:
-            resolved_selector = clone()
-        except Exception:  # noqa: BLE001
-            resolved_selector = selector
-
-    model = _effective_compaction_model(session)
-    if model and resolved_selector is not selector:
-        override = getattr(resolved_selector, "override_model", None)
-        if callable(override):
-            try:
-                override(model)
-            except Exception:  # noqa: BLE001
-                pass
-
-    resolver = getattr(resolved_selector, "resolve", None)
-    if not callable(resolver):
-        return None
-    try:
-        return resolver()
-    except Exception:  # noqa: BLE001
-        return None
+    return resolve_selected_compaction_provider(ctx, session)
 
 
 def _enum_value(value: Any) -> Any:
@@ -969,6 +966,82 @@ def _model_value(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _aliased_optional_string_param(
+    params: dict[str, Any],
+    *names: str,
+) -> tuple[bool, str | None]:
+    """Read one nullable string field while rejecting conflicting aliases."""
+
+    values: list[str | None] = []
+    for name in names:
+        if name not in params:
+            continue
+        value = params[name]
+        if value is not None and not isinstance(value, str):
+            raise ValueError(f"params.{name} must be a string or null")
+        values.append(value.strip() or None if isinstance(value, str) else None)
+    if not values:
+        return False, None
+    if any(value != values[0] for value in values[1:]):
+        raise ValueError(f"params aliases for {names[0]} must agree")
+    return True, values[0]
+
+
+def _rpc_session_deployment_fields(
+    params: dict[str, Any],
+) -> tuple[bool, str | None, bool, str | None]:
+    provider_present, provider = _aliased_optional_string_param(
+        params,
+        "provider",
+        "providerOverride",
+        "provider_override",
+    )
+    auth_profile_present, auth_profile = _aliased_optional_string_param(
+        params,
+        "authProfile",
+        "authProfileOverride",
+        "auth_profile",
+        "auth_profile_override",
+    )
+    return (
+        provider_present,
+        provider.lower() if provider else None,
+        auth_profile_present,
+        auth_profile,
+    )
+
+
+def _validate_rpc_session_deployment(
+    ctx: RpcContext,
+    *,
+    session_key: str,
+    provider: str | None,
+    model: str | None,
+    auth_profile: str | None,
+) -> None:
+    reason = validate_gateway_session_deployment_override(
+        getattr(ctx, "config", None),
+        provider_id=provider or "",
+        model=model or "",
+        auth_profile_id=auth_profile or "",
+        session_key=session_key,
+    )
+    if reason:
+        raise RpcHandlerError(
+            code="INVALID_PARAMS",
+            message="Invalid session deployment override.",
+            details={"reason": reason},
+        )
+
+
+def _raise_explicit_session_deployment_model_required() -> NoReturn:
+    raise RpcHandlerError(
+        code="INVALID_PARAMS",
+        message="A session provider binding requires an explicit model.",
+        details={"reason": "session_deployment_requires_explicit_model"},
+    )
 
 
 def _agent_registry_model(ctx: RpcContext, agent_id: str) -> str | None:
@@ -1709,8 +1782,31 @@ async def _handle_sessions_create(params: dict | None, ctx: RpcContext) -> dict:
     agent_id = normalize_agent_id(params.get("agentId", "main"))
     display_name = params.get("displayName")
     message = params.get("message")
-    model = _model_value(params.get("model")) or _agent_registry_model(ctx, agent_id)
+    requested_model = _model_value(params.get("model"))
+    model = requested_model or _agent_registry_model(ctx, agent_id)
     kind = params.get("kind") or params.get("sessionKind")
+    session_key = _create_session_key(agent_id, kind)
+    (
+        provider_present,
+        provider_override,
+        auth_profile_present,
+        auth_profile_override,
+    ) = _rpc_session_deployment_fields(params)
+    deployment_requested = bool(provider_override or auth_profile_override)
+    if deployment_requested:
+        if (
+            "model" not in params
+            or not isinstance(params.get("model"), str)
+            or requested_model is None
+        ):
+            _raise_explicit_session_deployment_model_required()
+        _validate_rpc_session_deployment(
+            ctx,
+            session_key=session_key,
+            provider=provider_override,
+            model=requested_model,
+            auth_profile=auth_profile_override,
+        )
     if message is not None and not isinstance(message, str):
         raise ValueError("params.message must be a string")
 
@@ -1724,18 +1820,31 @@ async def _handle_sessions_create(params: dict | None, ctx: RpcContext) -> dict:
     if ctx.session_manager is None:
         if message:
             raise RpcUnavailableError("sessions.create(message=...) requires a session manager")
-        key = _create_session_key(agent_id, kind)
+        if provider_present or auth_profile_present:
+            raise RpcUnavailableError(
+                "sessions.create deployment overrides require a session manager"
+            )
         return {
-            "key": key,
-            "sessionId": key.rsplit(":", 1)[-1],
+            "key": session_key,
+            "sessionId": session_key.rsplit(":", 1)[-1],
             "note": "session manager not available",
         }
 
+    create_kwargs: dict[str, Any] = {
+        "session_key": session_key,
+        "agent_id": agent_id,
+        "display_name": display_name,
+        "model": model,
+    }
+    if provider_present:
+        create_kwargs["provider_override"] = provider_override
+    if auth_profile_present:
+        create_kwargs["auth_profile_override"] = auth_profile_override
+        create_kwargs["auth_profile_override_source"] = (
+            "rpc" if auth_profile_override else None
+        )
     session = await ctx.session_manager.create(
-        session_key=_create_session_key(agent_id, kind),
-        agent_id=agent_id,
-        display_name=display_name,
-        model=model,
+        **create_kwargs,
     )
     result = {"key": session.session_key, "sessionId": session.session_id}
 
@@ -4904,23 +5013,86 @@ async def _handle_sessions_abort(params: dict | None, ctx: RpcContext) -> dict:
     }
 
 
-@_d.method("sessions.patch", scope="operator.admin")
-async def _handle_sessions_patch(params: dict | None, ctx: RpcContext) -> dict:
-    key = _require_key(params)
-
-    if ctx.session_manager is None:
-        raise KeyError("No session manager available")
-
-    storage = get_session_storage(ctx.session_manager)
-    if storage is None:
-        raise KeyError("No session storage available")
+async def _apply_sessions_patch(
+    params: dict[str, Any],
+    ctx: RpcContext,
+    *,
+    key: str,
+    storage: Any,
+) -> dict[str, Any]:
+    """Validate and persist one patch while the caller holds its turn fence."""
 
     session = await storage.get_session(key)
     if session is None:
         raise KeyError(f"Session not found: {key}")
 
     update_values: dict[str, Any] = {}
-    assert isinstance(params, dict)
+    (
+        provider_present,
+        provider_override,
+        auth_profile_present,
+        auth_profile_override,
+    ) = _rpc_session_deployment_fields(params)
+    model_present = "model" in params
+    existing_provider_value = _model_value(
+        getattr(session, "provider_override", None)
+    )
+    existing_provider = (
+        existing_provider_value.lower() if existing_provider_value else None
+    )
+    existing_model = _model_value(getattr(session, "model", None))
+    existing_auth_profile = _model_value(
+        getattr(session, "auth_profile_override", None)
+    )
+    final_provider = provider_override if provider_present else existing_provider
+    final_auth_profile = (
+        auth_profile_override
+        if auth_profile_present
+        else existing_auth_profile
+    )
+    raw_model = params.get("model")
+    requested_model = _model_value(raw_model) if model_present else existing_model
+    final_model = requested_model if model_present else existing_model
+
+    provider_changed = bool(
+        provider_present and provider_override != existing_provider
+    )
+    auth_profile_changed = bool(
+        auth_profile_present
+        and auth_profile_override != existing_auth_profile
+    )
+    if (
+        (provider_changed and provider_override)
+        or (auth_profile_changed and auth_profile_override)
+    ):
+        if (
+            not model_present
+            or not isinstance(raw_model, str)
+            or requested_model is None
+        ):
+            _raise_explicit_session_deployment_model_required()
+
+    if model_present and (
+        provider_present
+        or auth_profile_present
+        or existing_provider
+        or existing_auth_profile
+    ):
+        if raw_model is not None and not isinstance(raw_model, str):
+            raise ValueError("params.model must be a string or null")
+    if (
+        provider_present
+        or auth_profile_present
+        or (model_present and (existing_provider or existing_auth_profile))
+    ):
+        _validate_rpc_session_deployment(
+            ctx,
+            session_key=key,
+            provider=final_provider,
+            model=final_model,
+            auth_profile=final_auth_profile,
+        )
+
     field_map = {
         "displayName": "display_name",
         "model": "model",
@@ -4932,6 +5104,36 @@ async def _handle_sessions_patch(params: dict | None, ctx: RpcContext) -> dict:
         if field in params and hasattr(session, attr):
             update_values[attr] = params[field]
             updated_fields.append(field)
+    if model_present and (
+        provider_present
+        or auth_profile_present
+        or existing_provider
+        or existing_auth_profile
+    ):
+        update_values["model"] = final_model
+    if provider_present:
+        update_values["provider_override"] = provider_override
+        updated_fields.append("provider")
+    if auth_profile_present:
+        update_values["auth_profile_override"] = auth_profile_override
+        update_values["auth_profile_override_source"] = (
+            "rpc" if auth_profile_override else None
+        )
+        updated_fields.append("authProfile")
+
+    model_changed = bool(model_present and final_model != existing_model)
+    deployment_binding_changed = bool(
+        provider_changed
+        or auth_profile_changed
+        or model_changed
+    )
+    if deployment_binding_changed:
+        # Physical provenance describes the deployment that already executed.
+        # Once an operator changes the future session binding it is no longer a
+        # valid pair for compaction target/consumer resolution, so clear rather
+        # than forge it as the newly requested deployment.
+        update_values["model_provider"] = None
+        update_values["model_override"] = None
 
     if update_values:
         update = getattr(ctx.session_manager, "update", None)
@@ -4945,6 +5147,52 @@ async def _handle_sessions_patch(params: dict | None, ctx: RpcContext) -> dict:
                 await upsert(session)
 
     return {"key": key, "updated": updated_fields}
+
+
+_SESSION_DEPLOYMENT_PATCH_FIELDS = frozenset(
+    {
+        "model",
+        "provider",
+        "providerOverride",
+        "provider_override",
+        "authProfile",
+        "authProfileOverride",
+        "auth_profile",
+        "auth_profile_override",
+    }
+)
+
+
+@_d.method("sessions.patch", scope="operator.admin")
+async def _handle_sessions_patch(params: dict | None, ctx: RpcContext) -> dict:
+    key = _require_key(params)
+
+    if ctx.session_manager is None:
+        raise KeyError("No session manager available")
+
+    storage = get_session_storage(ctx.session_manager)
+    if storage is None:
+        raise KeyError("No session storage available")
+
+    assert isinstance(params, dict)
+    deployment_patch = any(
+        field in params for field in _SESSION_DEPLOYMENT_PATCH_FIELDS
+    )
+    lock = get_session_lock(ctx.turn_runner, key) if deployment_patch else None
+    if lock is not None:
+        async with lock:
+            return await _apply_sessions_patch(
+                params,
+                ctx,
+                key=key,
+                storage=storage,
+            )
+    return await _apply_sessions_patch(
+        params,
+        ctx,
+        key=key,
+        storage=storage,
+    )
 
 
 @_d.method("sessions.reset", scope="operator.write")
@@ -5415,7 +5663,22 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
     if ctx.session_manager is None:
         raise KeyError("No session manager available")
 
-    context_window_tokens = _context_window_tokens(params, ctx)
+    requested_context_window_tokens = _context_window_tokens(params, ctx)
+    budget_session = None
+    budget_storage = get_session_storage(ctx.session_manager)
+    if budget_storage is not None:
+        budget_session = await budget_storage.get_session(key)
+    elif callable(getattr(ctx.session_manager, "get_session", None)):
+        budget_session = await ctx.session_manager.get_session(key)
+    consumer_budget = resolve_gateway_consumer_budget(ctx, budget_session)
+    consumer_budget = limit_gateway_consumer_budget(
+        consumer_budget,
+        requested_context_window_tokens,
+    )
+    context_window_tokens = consumer_budget.context_window_tokens
+    consumer_admission, consumer_admission_fingerprint = (
+        build_gateway_consumer_admission(consumer_budget)
+    )
     custom_instructions = (params or {}).get("instructions")
     if custom_instructions is not None and not isinstance(custom_instructions, str):
         raise RpcHandlerError(
@@ -5455,6 +5718,7 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
         is_terminal = status.lower() in {
             "completed",
             "skipped",
+            "stale",
             "failed",
             "error",
             "cancelled",
@@ -5552,10 +5816,12 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
             await task
 
     async def _run_locked() -> dict[str, Any]:
-        nonlocal heartbeat_task, compaction_stage
+        nonlocal heartbeat_task, compaction_stage, context_window_tokens
+        nonlocal consumer_admission, consumer_admission_fingerprint, consumer_budget
         receipt = None
         flush_receipt_status: str | None = None
         durable_commit_won = False
+        applied = False
         committed_terminal_payload: dict[str, Any] = {}
         storage = get_session_storage(ctx.session_manager)
         session = None
@@ -5608,6 +5874,15 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
             session = await ctx.session_manager.get_session(key)
             if session is None:
                 raise KeyError(f"Session not found: {key}")
+        consumer_budget = resolve_gateway_consumer_budget(ctx, session)
+        consumer_budget = limit_gateway_consumer_budget(
+            consumer_budget,
+            requested_context_window_tokens,
+        )
+        context_window_tokens = consumer_budget.context_window_tokens
+        consumer_admission, consumer_admission_fingerprint = (
+            build_gateway_consumer_admission(consumer_budget)
+        )
         durable_session_id = getattr(session, "session_id", None)
         compaction_correlation = (
             ProviderRequestCorrelation(
@@ -5626,10 +5901,12 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
             execution_id=uuid.uuid4().hex,
             call_kind="auxiliary.session_flush",
         )
+        compaction_target = resolve_gateway_compaction_target(ctx, session)
         compaction_config = build_compaction_config_from_provider(
-            _resolve_compaction_provider(ctx, session),
-            model_override=_effective_compaction_model(session),
+            compaction_target.provider,
+            model_override=compaction_target.model or _effective_compaction_model(session),
             compaction_config=getattr(getattr(ctx, "config", None), "compaction", None),
+            compaction_plan=compaction_target.plan,
         )
         compaction_config.deadline_at_monotonic = operation_deadline
         arm_compaction_deadline(compaction_config, operation_id=compaction_id)
@@ -5808,6 +6085,19 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
                     compact_kwargs["provider_request_correlation"] = (
                         compaction_correlation
                     )
+                if _accepts_keyword_arg(compact_with_result, "context_window_chars"):
+                    compact_kwargs["context_window_chars"] = (
+                        consumer_budget.provider_request_max_chars
+                    )
+                if _accepts_keyword_arg(compact_with_result, "consumer_admission"):
+                    compact_kwargs["consumer_admission"] = consumer_admission
+                if _accepts_keyword_arg(
+                    compact_with_result,
+                    "consumer_admission_fingerprint",
+                ):
+                    compact_kwargs["consumer_admission_fingerprint"] = (
+                        consumer_admission_fingerprint
+                    )
                 result = await await_compaction_phase(
                     compact_with_result(
                         key,
@@ -5834,7 +6124,14 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
                 )
                 state_kind = str(getattr(result, "summary_format", "text") or "text")
                 quality_report = dict(getattr(result, "quality_report", None) or {})
-                durable_commit_won = bool(removed_count > 0 and summary)
+                replaced_previous_summary = bool(
+                    getattr(result, "replaced_previous_summary", False)
+                )
+                applied = bool(
+                    summary
+                    and (removed_count > 0 or replaced_previous_summary)
+                )
+                durable_commit_won = applied
                 if durable_commit_won:
                     committed_terminal_payload = {
                         "tokens_before": tokens_before,
@@ -5852,7 +6149,7 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
                         "summary_source": summary_source,
                         "flush_receipt_status": flush_receipt_status,
                     }
-                if removed_count > 0 and summary:
+                if applied:
                     for event in (
                         COMPACTION_CHUNK_SUMMARIZED_EVENT,
                         COMPACTION_SUMMARY_VERIFIED_EVENT,
@@ -5884,6 +6181,7 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
                 tokens_after = 0
                 remaining_budget_tokens = 0
                 durable_commit_won = bool(summary)
+                applied = durable_commit_won
                 if durable_commit_won:
                     committed_terminal_payload = {
                         "removed_count": removed_count,
@@ -5905,17 +6203,8 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
                     **committed_terminal_payload,
                     **committed_lifecycle,
                 )
-            else:
-                await _publish_manual_compaction_event(
-                    status="cancelled",
-                    message="Compaction was cancelled.",
-                    **compaction_lifecycle_payload(
-                        compaction_id,
-                        COMPACTION_TRIGGERED_EVENT,
-                    ),
-                )
             raise
-        except CompactionTimeoutError as exc:
+        except CompactionTimeoutError:
             if durable_commit_won:
                 committed_lifecycle = compaction_lifecycle_payload(
                     compaction_id,
@@ -5929,26 +6218,7 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
                     **committed_terminal_payload,
                     **committed_lifecycle,
                 )
-            else:
-                await _publish_manual_compaction_event(
-                    status="timed_out",
-                    phase=exc.phase,
-                    reason="compaction_deadline_exceeded",
-                    message=str(exc),
-                    **compaction_lifecycle_payload(
-                        compaction_id,
-                        COMPACTION_TRIGGERED_EVENT,
-                    ),
-                )
-            raise RpcHandlerError(
-                code="COMPACTION_TIMEOUT",
-                message="Compaction exceeded its absolute deadline.",
-                details={
-                    "key": key,
-                    "compaction_id": compaction_id,
-                    "phase": exc.phase,
-                },
-            ) from exc
+            raise
         except Exception as exc:
             if durable_commit_won:
                 committed_lifecycle = compaction_lifecycle_payload(
@@ -5963,23 +6233,18 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
                     **committed_terminal_payload,
                     **committed_lifecycle,
                 )
-            else:
-                await _publish_manual_compaction_event(
-                    status="failed",
-                    message=str(exc),
-                    **compaction_lifecycle_payload(
-                        compaction_id,
-                        COMPACTION_TRIGGERED_EVENT,
-                    ),
-                )
             raise
+        terminal_status = _manual_compaction_terminal_status(
+            applied=applied,
+            skip_reason=skip_reason,
+        )
         payload = {
             "key": key,
             "compaction_id": compaction_id,
-            "status": "completed" if removed_count > 0 else "skipped",
-            "compacted": removed_count > 0,
-            "applied": removed_count > 0,
-            "durability": "durable" if removed_count > 0 else "none",
+            "status": terminal_status,
+            "compacted": applied,
+            "applied": applied,
+            "durability": "durable" if applied else "none",
             "user_visible": True,
             "mode": "summary",
             "summary_len": len(summary),
@@ -5998,7 +6263,7 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
         }
         if quality_report:
             payload["quality_report"] = quality_report
-        if not removed_count:
+        if not applied:
             payload["skip_reason"] = skip_reason or "empty_summary"
             payload["reason"] = payload["skip_reason"]
         if receipt is not None:
@@ -6006,13 +6271,13 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
         if flush_receipt_status is not None:
             payload["flush_receipt_status"] = flush_receipt_status
         final_event = (
-            COMPACTION_PERSISTED_EVENT if removed_count > 0 else COMPACTION_TRIGGERED_EVENT
+            COMPACTION_PERSISTED_EVENT if applied else COMPACTION_TRIGGERED_EVENT
         )
         final_lifecycle_payload = compaction_lifecycle_payload(compaction_id, final_event)
         final_lifecycle_payload.pop("coverage_status", None)
-        final_status = "completed" if removed_count > 0 else "skipped"
+        final_status = terminal_status
         final_payload: dict[str, Any] = {}
-        if removed_count <= 0:
+        if not applied:
             final_payload["reason"] = skip_reason or "empty_summary"
         await _publish_manual_compaction_event(
             status=final_status,
@@ -6074,7 +6339,7 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
                     total_timeout_seconds,
                 ) from exc
         except asyncio.CancelledError:
-            if started_emitted:
+            if started_emitted and not terminal_emitted:
                 await _publish_manual_compaction_event(
                     status="cancelled",
                     reason="cancelled",
@@ -6086,7 +6351,7 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
                 )
             raise
         except CompactionTimeoutError as exc:
-            if started_emitted:
+            if started_emitted and not terminal_emitted:
                 await _publish_manual_compaction_event(
                     status="timed_out",
                     phase=exc.phase,

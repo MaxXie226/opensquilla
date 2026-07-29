@@ -7599,6 +7599,7 @@ class SessionStorage:
         expected_source_preimage: Sequence[Sequence[Any]] | None = None,
         expected_source_boundary_message_id: str | None = None,
         expected_source_boundary_entry_id: int | None = None,
+        expected_context_fingerprint: str | None = None,
     ) -> bool:
         """Atomically persist a compaction rewrite for one session."""
         node.session_key = canonicalize_session_key(node.session_key)
@@ -7608,8 +7609,6 @@ class SessionStorage:
             preserve_surviving_rows = expected_source_entries is not None
             if expected_source_entries is not None:
                 expected_prefix = list(expected_source_entries)
-                if not expected_prefix:
-                    return False
                 async with conn.execute(
                     "SELECT * FROM transcript_entries WHERE session_id = ? "
                     "ORDER BY created_at ASC, id ASC",
@@ -7630,15 +7629,15 @@ class SessionStorage:
                     != frozen_preimage
                 ):
                     return False
-                boundary = expected_prefix[-1]
-                if (
-                    expected_source_boundary_message_id is not None
-                    and boundary.message_id != expected_source_boundary_message_id
+                boundary = expected_prefix[-1] if expected_prefix else None
+                if expected_source_boundary_message_id is not None and (
+                    boundary is None
+                    or boundary.message_id != expected_source_boundary_message_id
                 ):
                     return False
-                if (
-                    expected_source_boundary_entry_id is not None
-                    and boundary.id != expected_source_boundary_entry_id
+                if expected_source_boundary_entry_id is not None and (
+                    boundary is None
+                    or boundary.id != expected_source_boundary_entry_id
                 ):
                     return False
                 archived_prefix = list(archived_entries or [])
@@ -7650,6 +7649,35 @@ class SessionStorage:
                     or _transcript_preimage(entries)
                     != _transcript_preimage(expected_prefix[archived_count:])
                     or any(entry.id is None for entry in archived_prefix)
+                ):
+                    return False
+
+            if expected_context_fingerprint is not None:
+                from opensquilla.session.context_view import (
+                    compaction_context_fingerprint,
+                )
+
+                current_summaries = await self._select_all_summaries(
+                    conn,
+                    node.session_id,
+                )
+                async with conn.execute(
+                    "SELECT * FROM session_context_states "
+                    "WHERE session_key = ? AND valid = 1 "
+                    "ORDER BY created_at ASC, id ASC",
+                    (node.session_key,),
+                ) as cur:
+                    context_rows = await cur.fetchall()
+                current_context_states = [
+                    SessionContextState(**_deserialize_row(dict(row)))
+                    for row in context_rows
+                ]
+                if (
+                    compaction_context_fingerprint(
+                        context_states=current_context_states,
+                        summaries=current_summaries,
+                    )
+                    != expected_context_fingerprint
                 ):
                     return False
 

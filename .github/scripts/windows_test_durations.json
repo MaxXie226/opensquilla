@@ -1184,6 +1184,14 @@
     "tests/test_gateway/test_websocket_request_concurrency.py": 0.01,
     "tests/test_cli/test_gateway_client_steer.py": 0.01,
     "tests/test_engine/test_route_plan.py": 0.01,
-    "tests/test_gateway/test_steer_restart_recovery.py": 0.01
+    "tests/test_gateway/test_steer_restart_recovery.py": 0.01,
+    "tests/test_engine/test_subagent_execution_target.py": 0.01,
+    "tests/test_gateway/test_compaction_target.py": 0.01,
+    "tests/test_gateway/test_config_compaction.py": 0.01,
+    "tests/test_provider_active_user_wire_mapping.py": 0.01,
+    "tests/test_provider_auxiliary_budget.py": 0.01,
+    "tests/test_session/test_compaction_execution_plan.py": 0.01,
+    "tests/test_session/test_compaction_provider_runtime.py": 0.01,
+    "tests/test_session/test_tokenizer.py": 0.01
   }
 }

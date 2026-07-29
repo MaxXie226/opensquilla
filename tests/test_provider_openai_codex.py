@@ -17,6 +17,7 @@ from opensquilla.provider.codex_auth import (
     refresh_codex_credentials,
 )
 from opensquilla.provider.openai_codex import OpenAICodexProvider, _candidate_wire_digest
+from opensquilla.provider.protocol import project_provider_final_request
 from opensquilla.provider.registry import get_provider_spec
 from opensquilla.provider.selector import build_provider
 from opensquilla.provider.types import (
@@ -171,6 +172,50 @@ def test_openai_codex_final_request_proof_blocks_before_http(
     assert proof["request_sequence_key"] == "input"
     assert proof["request_system_key"] == "instructions"
     assert proof["request_compaction_supported"] is False
+
+
+def test_openai_codex_projection_matches_exact_transport_payload(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_happy_sse(),
+        )
+
+    _patch_codex_transport(monkeypatch, handler)
+    provider = OpenAICodexProvider(
+        auth_path=str(_write_auth(tmp_path / "auth.json")),
+    )
+    config = ChatConfig(
+        system="Synthetic system",
+        thinking=True,
+        provider_request_max_chars=100_000,
+    )
+    messages = [Message(role="user", content="hi")]
+    projection = project_provider_final_request(
+        provider,
+        messages,
+        [_SEARCH_TOOL],
+        config,
+        message_limit=10,
+    )
+    assert requests == []
+
+    events = _collect(provider, tools=[_SEARCH_TOOL], cfg=config)
+
+    assert not [event for event in events if isinstance(event, ErrorEvent)]
+    assert len(requests) == 1
+    assert projection is not None
+    assert projection.payload == json.loads(requests[0].content)
+    assert projection.wire_message_count == 1
+    assert projection.fits_message_count is True
+    assert projection.fits is True
 
 
 _SEARCH_TOOL = ToolDefinition(

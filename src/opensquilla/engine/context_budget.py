@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from dataclasses import asdict, dataclass
 from typing import Any, Literal
 
@@ -39,6 +40,8 @@ def coordinate_provider_context_budget(
     status_projection_mode: str = "native_or_none",
     fallback_reason: str | None = None,
     envelope_shape: ProviderRequestEnvelopeShape = CHAT_REQUEST_ENVELOPE,
+    active_user_message_index: int | None = None,
+    protected_tool_result_indexes: Collection[int] | None = None,
 ) -> ContextBudgetDecision:
     """Reuse the provider proof path as the single budget decision point."""
 
@@ -50,6 +53,8 @@ def coordinate_provider_context_budget(
             status_projection_mode=status_projection_mode,
             fallback_reason=fallback_reason,
             envelope_shape=envelope_shape,
+            active_user_message_index=active_user_message_index,
+            protected_tool_result_indexes=protected_tool_result_indexes,
         )
     except ProviderRequestBudgetExceededError as exc:
         return ContextBudgetDecision(

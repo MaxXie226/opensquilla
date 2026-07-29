@@ -361,6 +361,33 @@ def test_notify_compaction_delivers_terminal_once(monkeypatch: pytest.MonkeyPatc
     assert cache_break_monitor.compaction_terminal_status(compaction_id) == "completed"
 
 
+def test_notify_compaction_treats_stale_as_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _isolate_compaction_lifecycle(monkeypatch)
+    compaction_id = "compaction-stale-terminal"
+
+    cache_break_monitor.notify_compaction(
+        "agent:main:stale-terminal",
+        status="started",
+        compaction_id=compaction_id,
+    )
+    terminal = cache_break_monitor.notify_compaction(
+        "agent:main:stale-terminal",
+        status="stale",
+        compaction_id=compaction_id,
+    )
+    duplicate = cache_break_monitor.notify_compaction(
+        "agent:main:stale-terminal",
+        status="failed",
+        compaction_id=compaction_id,
+    )
+
+    assert terminal is not None
+    assert duplicate is None
+    assert cache_break_monitor.compaction_terminal_status(compaction_id) == "stale"
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("cancel_owner", "expected_status", "expected_reason"),

@@ -520,6 +520,24 @@ async def test_catalog_sampling_controls_thread_to_agent_config() -> None:
 
 
 @pytest.mark.asyncio
+async def test_global_context_window_override_threads_to_agent_config() -> None:
+    catalog = _RecordingModelCatalog(
+        catalog=_ResolvedCatalog(
+            max_tokens=2_048,
+            context_window=8_192,
+            context_window_tokens_global_override=8_192,
+            capabilities=None,
+        )
+    )
+    stage = _make_stage(catalog=catalog)
+
+    out = await stage.run(_make_input())
+
+    assert out.output.agent_config.context_window_tokens == 8_192
+    assert out.output.agent_config.context_window_tokens_global_override == 8_192
+
+
+@pytest.mark.asyncio
 async def test_case06_model_with_capabilities_and_projection_limit() -> None:
     caps = SimpleNamespace(supports_reasoning=True)
     catalog = _RecordingModelCatalog(

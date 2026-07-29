@@ -498,6 +498,7 @@ class _TurnRunnerModelCatalogAdapter(ModelCatalogPort):
             max_tokens=max_tokens,
             context_window=context_window,
             capabilities=capabilities,
+            context_window_tokens_global_override=user_context_window,
             temperature=getattr(llm_cfg, "temperature", None),
             top_p=getattr(llm_cfg, "top_p", None),
             provider_request_proof_max_chars=user_proof_max_chars,
@@ -812,9 +813,14 @@ class _TurnRunnerT3UpgradeCompactionAdapter(T3UpgradeCompactionPort):
         context_window_tokens: int,
         compaction_provider: Any | None,
         compaction_model: str | None,
+        compaction_plan: Any | None = None,
+        history_capacity_tokens: int | None = None,
+        history_capacity_chars: int | None = None,
         history_has_persisted_user: bool = False,
         bound_user_message_id: str | None = None,
         provider_request_correlation: Any | None = None,
+        consumer_admission: Any | None = None,
+        consumer_admission_fingerprint: str = "",
     ) -> str:
         from opensquilla.engine.runtime import _accepts_keyword_arg
 
@@ -838,6 +844,33 @@ class _TurnRunnerT3UpgradeCompactionAdapter(T3UpgradeCompactionPort):
             "bound_user_message_id",
         ):
             correlation_kwargs["bound_user_message_id"] = bound_user_message_id
+        if _accepts_keyword_arg(
+            self._runner._maybe_compact_on_t3_upgrade,
+            "compaction_plan",
+        ):
+            correlation_kwargs["compaction_plan"] = compaction_plan
+        if _accepts_keyword_arg(
+            self._runner._maybe_compact_on_t3_upgrade,
+            "history_capacity_tokens",
+        ):
+            correlation_kwargs["history_capacity_tokens"] = history_capacity_tokens
+        if _accepts_keyword_arg(
+            self._runner._maybe_compact_on_t3_upgrade,
+            "history_capacity_chars",
+        ):
+            correlation_kwargs["history_capacity_chars"] = history_capacity_chars
+        if _accepts_keyword_arg(
+            self._runner._maybe_compact_on_t3_upgrade,
+            "consumer_admission",
+        ):
+            correlation_kwargs["consumer_admission"] = consumer_admission
+        if _accepts_keyword_arg(
+            self._runner._maybe_compact_on_t3_upgrade,
+            "consumer_admission_fingerprint",
+        ):
+            correlation_kwargs["consumer_admission_fingerprint"] = (
+                consumer_admission_fingerprint
+            )
         return await self._runner._maybe_compact_on_t3_upgrade(
             session_key,
             turn,
@@ -864,9 +897,14 @@ class _TurnRunnerPreflightCompactionAdapter(PreflightCompactionPort):
         context_window_tokens: int,
         compaction_provider: Any | None,
         compaction_model: str | None,
+        compaction_plan: Any | None = None,
+        history_capacity_tokens: int | None = None,
+        history_capacity_chars: int | None = None,
         history_has_persisted_user: bool = False,
         bound_user_message_id: str | None = None,
         provider_request_correlation: Any | None = None,
+        consumer_admission: Any | None = None,
+        consumer_admission_fingerprint: str = "",
     ) -> None:
         from opensquilla.engine.runtime import _accepts_keyword_arg
 
@@ -890,6 +928,33 @@ class _TurnRunnerPreflightCompactionAdapter(PreflightCompactionPort):
             "bound_user_message_id",
         ):
             correlation_kwargs["bound_user_message_id"] = bound_user_message_id
+        if _accepts_keyword_arg(
+            self._runner._maybe_preflight_compact,
+            "compaction_plan",
+        ):
+            correlation_kwargs["compaction_plan"] = compaction_plan
+        if _accepts_keyword_arg(
+            self._runner._maybe_preflight_compact,
+            "history_capacity_tokens",
+        ):
+            correlation_kwargs["history_capacity_tokens"] = history_capacity_tokens
+        if _accepts_keyword_arg(
+            self._runner._maybe_preflight_compact,
+            "history_capacity_chars",
+        ):
+            correlation_kwargs["history_capacity_chars"] = history_capacity_chars
+        if _accepts_keyword_arg(
+            self._runner._maybe_preflight_compact,
+            "consumer_admission",
+        ):
+            correlation_kwargs["consumer_admission"] = consumer_admission
+        if _accepts_keyword_arg(
+            self._runner._maybe_preflight_compact,
+            "consumer_admission_fingerprint",
+        ):
+            correlation_kwargs["consumer_admission_fingerprint"] = (
+                consumer_admission_fingerprint
+            )
         await self._runner._maybe_preflight_compact(
             session_key,
             context_window_tokens,
@@ -998,6 +1063,11 @@ class _TurnRunnerCompactionPersistAdapter(CompactionPersistPort):
         session_key: str,
         summary: str,
         kept_entries: list[Any],
+        summary_payload: dict[str, Any] | None = None,
+        summary_format: str = "text",
+        coverage_status: str = "unknown",
+        missing_obligations: list[str] | None = None,
+        critical_carry_forward: list[str] | None = None,
         compaction_id: str | None = None,
         compaction_deadline_at_monotonic: float | None = None,
         compaction_timeout_seconds: float | None = None,
@@ -1029,6 +1099,16 @@ class _TurnRunnerCompactionPersistAdapter(CompactionPersistPort):
         persist_kwargs: dict[str, Any] = {}
         if "compaction_id" in params or accepts_kwargs:
             persist_kwargs["compaction_id"] = resolved_compaction_id
+        if "summary_payload" in params or accepts_kwargs:
+            persist_kwargs["summary_payload"] = summary_payload
+        if "summary_format" in params or accepts_kwargs:
+            persist_kwargs["summary_format"] = summary_format
+        if "coverage_status" in params or accepts_kwargs:
+            persist_kwargs["coverage_status"] = coverage_status
+        if "missing_obligations" in params or accepts_kwargs:
+            persist_kwargs["missing_obligations"] = missing_obligations
+        if "critical_carry_forward" in params or accepts_kwargs:
+            persist_kwargs["critical_carry_forward"] = critical_carry_forward
         if "trigger_reason" in params or accepts_kwargs:
             persist_kwargs["trigger_reason"] = "agent_inline_overflow"
         if "compaction_deadline_at_monotonic" in params or accepts_kwargs:
@@ -1453,6 +1533,9 @@ class _TurnRunnerSessionTotalsAdapter(SessionTotalsPort):
             next_model_override = done_event.model or getattr(
                 current_session, "model_override", None
             )
+            next_model_provider = done_event.provider or getattr(
+                current_session, "model_provider", None
+            )
 
             # Persist the last actual model into usage metadata only.
             # Writing it to session.model would pin future turns and
@@ -1472,6 +1555,7 @@ class _TurnRunnerSessionTotalsAdapter(SessionTotalsPort):
                 cache_read=next_cache_read,
                 cache_write=next_cache_write,
                 model_override=next_model_override,
+                model_provider=next_model_provider,
             )
         return CostRollupResult(
             input_tokens=next_input_tokens,
@@ -1486,6 +1570,7 @@ class _TurnRunnerSessionTotalsAdapter(SessionTotalsPort):
             cache_read=next_cache_read,
             cache_write=next_cache_write,
             model_override=next_model_override,
+            model_provider=next_model_provider,
         )
 
 class _TurnRunnerTurnErrorPersistAdapter(TurnErrorPersistPort):

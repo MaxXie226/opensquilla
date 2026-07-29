@@ -5,8 +5,21 @@ from opensquilla.session.context_view import (
     build_compaction_context_items,
     build_compaction_context_records,
     build_provider_compaction_context,
+    format_compaction_summary_context,
 )
 from opensquilla.session.models import SessionContextState, SessionSummary
+
+
+def test_compaction_summary_formatter_is_deterministic_and_deduplicates() -> None:
+    rendered = format_compaction_summary_context(
+        [" first checkpoint ", "second checkpoint", "first checkpoint"]
+    )
+
+    assert rendered == (
+        "[Compacted Session Summaries]\n"
+        "[Summary 1]\nfirst checkpoint\n\n"
+        "[Summary 2]\nsecond checkpoint"
+    )
 
 
 def test_provider_compaction_context_dropped_for_non_anthropic_provider() -> None:
@@ -148,3 +161,52 @@ def test_compaction_context_records_expose_correlation_metadata() -> None:
     assert records[0].compaction_id == "cmp_state_1"
     assert records[0].source == "context_state"
     assert records[0].covered_through_id == 9
+
+
+def test_rolling_context_state_supersedes_older_checkpoint_chain() -> None:
+    older = SessionContextState(
+        session_id="session",
+        session_key="agent:main:ctx",
+        provider="portable",
+        state_kind="structured_summary_v1",
+        payload={
+            "schema_version": 1,
+            "current_status": "obsolete checkpoint",
+        },
+        covered_through_id=5,
+        created_at=1000,
+        portable=True,
+        cacheable=True,
+    )
+    rolling = SessionContextState(
+        session_id="session",
+        session_key="agent:main:ctx",
+        provider="portable",
+        state_kind="structured_summary_v1",
+        payload={
+            "schema_version": 1,
+            "current_status": "replacement checkpoint",
+            "source_coverage": {"replaces_prior_context": True},
+        },
+        covered_through_id=9,
+        created_at=2000,
+        portable=True,
+        cacheable=True,
+    )
+    older_summary = SessionSummary(
+        session_id="session",
+        session_key="agent:main:ctx",
+        summary_text="obsolete summary fallback",
+        covered_through_id=5,
+    )
+
+    items = build_compaction_context_items(
+        context_states=[older, rolling],
+        summaries=[older_summary],
+        now_ms=3000,
+    )
+
+    rendered = "\n".join(items)
+    assert "replacement checkpoint" in rendered
+    assert "obsolete checkpoint" not in rendered
+    assert "obsolete summary fallback" not in rendered

@@ -53,6 +53,8 @@ from .reasoning_dialects import (
 )
 from .request_proof import (
     ProviderRequestBudgetExceededError,
+    project_final_request_payload,
+    protected_tool_result_indexes,
     prove_provider_payload_from_env,
 )
 from .stream_assembly import (
@@ -77,6 +79,7 @@ from .types import (
     ModelCapabilities,
     ModelInfo,
     ProviderBillingReceipt,
+    ProviderFinalRequestProjection,
     ProviderHeartbeatEvent,
     ProviderMessageCountProjection,
     ProviderMessageLimitProof,
@@ -2636,6 +2639,7 @@ def _build_openai_wire_messages(
     model: str,
     replay_provider_state: bool,
     reasoning_echo_turns: int | None,
+    logical_index_map: dict[int, int] | None = None,
 ) -> list[dict[str, Any]]:
     """Build the exact OpenAI-compatible wire-message array, without I/O."""
     openai_messages: list[dict[str, Any]] = []
@@ -2673,6 +2677,8 @@ def _build_openai_wire_messages(
         else None
     )
     for message_index, message in enumerate(messages):
+        if logical_index_map is not None:
+            logical_index_map[message_index] = len(openai_messages)
         effective_thinking = _effective_policy_thinking(
             policy, model, thinking=cfg.thinking
         )
@@ -2887,21 +2893,12 @@ class OpenAIProvider:
             base_host=_base_url_hostname(self._base_url),
         )
 
-    def chat(
-        self,
-        messages: list[Message],
-        tools: list[ToolDefinition] | None = None,
-        config: ChatConfig | None = None,
-    ) -> AsyncIterator[StreamEvent]:
-        cfg = config or ChatConfig()
-        return self._stream(messages, tools, cfg)
-
-    async def _stream(
+    def _build_payload(
         self,
         messages: list[Message],
         tools: list[ToolDefinition] | None,
         cfg: ChatConfig,
-    ) -> AsyncIterator[StreamEvent]:
+    ) -> tuple[dict[str, Any], int | None, str | None]:
         wire_cfg = _prompt_json_schema_config(cfg, policy=self._compat)
         caps = cfg.model_capabilities
         include_reasoning_content = _should_replay_reasoning_content(
@@ -2910,6 +2907,7 @@ class OpenAIProvider:
             caps=caps,
             thinking=cfg.thinking,
         )
+        logical_index_map: dict[int, int] = {}
         openai_messages = _build_openai_wire_messages(
             messages,
             wire_cfg,
@@ -2918,8 +2916,13 @@ class OpenAIProvider:
             model=self._model,
             replay_provider_state=self._replay_provider_state,
             reasoning_echo_turns=self._reasoning_echo_turns,
+            logical_index_map=logical_index_map,
         )
-
+        wire_active_user_index = (
+            logical_index_map.get(cfg.active_user_message_index)
+            if cfg.active_user_message_index is not None
+            else None
+        )
         payload: dict[str, Any] = {
             "model": self._model,
             "messages": openai_messages,
@@ -2960,8 +2963,6 @@ class OpenAIProvider:
         if self._compat.sends_usage_include:
             payload["usage"] = {"include": True}
         if self._compat.sends_disable_fallbacks:
-            # Gateway proxies must not silently substitute another model:
-            # SquillaRouter is the single routing authority.
             payload["disable_fallbacks"] = True
         if (
             self._compat.anthropic_top_level_cache
@@ -2984,24 +2985,11 @@ class OpenAIProvider:
         if tools:
             payload["tools"] = [
                 _build_openai_tool(
-                    t,
+                    tool,
                     unsupported_keywords=self._compat.tool_schema_unsupported_keywords,
                 )
-                for t in tools
+                for tool in tools
             ]
-            tool_names = [tool.get("function", {}).get("name", "") for tool in payload["tools"]]
-            tool_schema_hash = hashlib.sha256(
-                json.dumps(payload["tools"], ensure_ascii=False, sort_keys=True).encode("utf-8")
-            ).hexdigest()[:16]
-            log.info(
-                "provider.request_tool_surface",
-                provider=self._provider_kind,
-                model=self._model,
-                provider_visible_tool_names=tool_names,
-                tool_schema_hash=tool_schema_hash,
-                temperature=payload.get("temperature"),
-                top_p=payload.get("top_p"),
-            )
             if _should_send_tool_choice(self._provider_kind, cfg, caps):
                 payload["tool_choice"] = cfg.tool_choice
         if self._compat.supports_provider_routing_pin:
@@ -3018,9 +3006,6 @@ class OpenAIProvider:
                         "allow_fallbacks": True,
                     }
 
-        # Reasoning injection (gated on thinking being enabled). Gating —
-        # which model/capability profile triggers a payload at all — lives
-        # here; how each dialect spells it lives in reasoning_dialects.
         thinking_toggle_model = (
             self._model.strip().lower() in self._compat.thinking_toggle_model_ids
         )
@@ -3045,9 +3030,6 @@ class OpenAIProvider:
                 ),
             )
             if reasoning_format == "dashscope":
-                # DashScope thinking budget: the local env override wins;
-                # without an explicit per-call budget the field is omitted
-                # entirely so the endpoint applies its own default.
                 env_thinking_budget = _thinking_budget_tokens_from_env()
                 if env_thinking_budget is not None:
                     payload["thinking_budget"] = env_thinking_budget
@@ -3062,13 +3044,8 @@ class OpenAIProvider:
                 )
             )
         ):
-            # Forced-thinking endpoints reject enable_thinking=False; omit the
-            # off-payload so the request still succeeds. The model will still
-            # think — that is the only mode the endpoint supports.
             pass
         elif thinking_toggle_model:
-            # Toggle models need an explicit off payload even without a
-            # capability profile (policy gating, independent of dialect).
             payload["thinking"] = {"type": "disabled"}
         elif caps and caps.supports_reasoning:
             apply_reasoning_disable(
@@ -3089,7 +3066,85 @@ class OpenAIProvider:
             cfg=cfg,
             has_tools=bool(tools),
         )
+        fallback_reason = (
+            "native_is_error_unavailable"
+            if any(message.get("role") == "tool" for message in openai_messages)
+            else None
+        )
+        return payload, wire_active_user_index, fallback_reason
 
+    def project_final_request(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition] | None = None,
+        config: ChatConfig | None = None,
+        *,
+        message_limit: int | None = None,
+    ) -> ProviderFinalRequestProjection:
+        """Project the exact Chat Completions payload without I/O or shaping."""
+
+        cfg = config or ChatConfig()
+        payload, wire_active_user_index, fallback_reason = self._build_payload(
+            messages,
+            tools,
+            cfg,
+        )
+        protected_result_indexes = protected_tool_result_indexes(messages)
+        return project_final_request_payload(
+            payload,
+            projection_adapter=self._provider_kind,
+            proof_budget=cfg.provider_request_max_chars,
+            status_projection_mode="content_envelope",
+            fallback_reason=fallback_reason,
+            active_user_message_index=wire_active_user_index,
+            message_limit=message_limit,
+            protected_tool_result_indexes=protected_result_indexes,
+        )
+
+    def chat(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition] | None = None,
+        config: ChatConfig | None = None,
+    ) -> AsyncIterator[StreamEvent]:
+        cfg = config or ChatConfig()
+        return self._stream(messages, tools, cfg)
+
+    async def _stream(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition] | None,
+        cfg: ChatConfig,
+    ) -> AsyncIterator[StreamEvent]:
+        payload, wire_active_user_index, fallback_reason = self._build_payload(
+            messages,
+            tools,
+            cfg,
+        )
+        protected_result_indexes = protected_tool_result_indexes(messages)
+        openai_messages = cast(list[dict[str, Any]], payload["messages"])
+        if tools:
+            provider_tools = cast(list[dict[str, Any]], payload.get("tools", []))
+            tool_names = [
+                tool.get("function", {}).get("name", "")
+                for tool in provider_tools
+            ]
+            tool_schema_hash = hashlib.sha256(
+                json.dumps(
+                    provider_tools,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest()[:16]
+            log.info(
+                "provider.request_tool_surface",
+                provider=self._provider_kind,
+                model=self._model,
+                provider_visible_tool_names=tool_names,
+                tool_schema_hash=tool_schema_hash,
+                temperature=payload.get("temperature"),
+                top_p=payload.get("top_p"),
+            )
         if self._provider_kind == "dashscope":
             log.info(
                 "provider.qwen_provider_profile",
@@ -3105,11 +3160,6 @@ class OpenAIProvider:
                 stream_fallback="non_stream_once",
             )
 
-        fallback_reason = (
-            "native_is_error_unavailable"
-            if any(message.get("role") == "tool" for message in openai_messages)
-            else None
-        )
         from opensquilla.engine.context_budget import coordinate_provider_context_budget
 
         budget_decision = coordinate_provider_context_budget(
@@ -3118,6 +3168,8 @@ class OpenAIProvider:
             proof_budget=cfg.provider_request_max_chars,
             status_projection_mode="content_envelope",
             fallback_reason=fallback_reason,
+            active_user_message_index=wire_active_user_index,
+            protected_tool_result_indexes=protected_result_indexes,
         )
         if budget_decision.action == "budget_limited":
             proof = budget_decision.proof or {}
@@ -3143,6 +3195,8 @@ class OpenAIProvider:
                 projection_adapter=self._provider_kind,
                 status_projection_mode="content_envelope",
                 fallback_reason=fallback_reason,
+                active_user_message_index=wire_active_user_index,
+                protected_tool_result_indexes=protected_result_indexes,
             )
         except ProviderRequestBudgetExceededError as exc:
             log.warning("provider.request_budget_exhausted", **exc.proof)
@@ -3315,7 +3369,10 @@ class OpenAIProvider:
             async with httpx.AsyncClient(
                 timeout=(
                     _stream_timeout(cfg.timeout)
-                    if self._compat.stream_timeout_fallback
+                    if (
+                        self._compat.stream_timeout_fallback
+                        and cfg.physical_attempt_limit != 1
+                    )
                     else cfg.timeout
                 ),
                 trust_env=_trust_env(),
@@ -4221,6 +4278,7 @@ class OpenAIProvider:
                     if not has_terminal_evidence:
                         if (
                             self._compat.empty_stream_fallback
+                            and cfg.physical_attempt_limit != 1
                             and not active_choice_seen
                             and not emitted_stream_event
                             and not assistant_text_parts
@@ -4500,6 +4558,7 @@ class OpenAIProvider:
 
                     if (
                         self._compat.empty_stream_fallback
+                        and cfg.physical_attempt_limit != 1
                         and not emitted_stream_event
                         and not assistant_text_parts
                         and not tools_acc.has_calls
@@ -4588,7 +4647,11 @@ class OpenAIProvider:
                 message=safe_error,
                 metadata={"phase": "stream", "cache_shape": cache_shape},
             )
-            if self._compat.stream_timeout_fallback and not emitted_stream_event:
+            if (
+                self._compat.stream_timeout_fallback
+                and cfg.physical_attempt_limit != 1
+                and not emitted_stream_event
+            ):
                 event_name = (
                     "openrouter.stream_timeout_fallback_started"
                     if self._provider_kind == "openrouter"

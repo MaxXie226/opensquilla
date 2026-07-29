@@ -18,7 +18,7 @@ import stat
 import subprocess
 import time
 import uuid
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -57,7 +57,11 @@ from opensquilla.engine.finalize_evidence_gate import (
 from opensquilla.engine.finalize_evidence_gate import (
     WRITE_TOOL_NAMES as _GATE_WRITE_TOOL_NAMES,
 )
-from opensquilla.engine.history import limit_turns, repair_tool_pairing
+from opensquilla.engine.history import (
+    limit_turns,
+    reconstruct_messages_from_entry,
+    repair_tool_pairing,
+)
 from opensquilla.engine.patch_evidence_ledger import PatchEvidenceLedger
 from opensquilla.engine.post_write_convergence import (
     PostWriteConvergenceDecision,
@@ -134,6 +138,7 @@ from opensquilla.engine.usage_accounting import (
 )
 from opensquilla.execution_status import (
     mark_execution_status_truncated,
+    normalize_execution_status,
     runtime_execution_status,
 )
 from opensquilla.observability.turn_call_log import TurnCallLogger
@@ -170,12 +175,20 @@ from opensquilla.provider import (
 from opensquilla.provider.correlation_context import bind_provider_request_correlation
 from opensquilla.provider.failures import ProviderFailureKind, classify_provider_error
 from opensquilla.provider.protocol import (
+    project_provider_final_request,
     project_provider_message_count,
+    provider_metadata,
     validate_provider_chat_request,
+)
+from opensquilla.provider.request_proof import (
+    ProviderRequestBudgetExceededError,
+    prove_provider_payload,
 )
 from opensquilla.provider.types import (
     ContentBlockImage,
     FailureInjector,
+    ModelCapabilities,
+    ProviderFinalRequestProjection,
     ProviderMessageCountProjection,
     ProviderMessageLimitProof,
     ProviderRequestCorrelation,
@@ -206,6 +219,7 @@ from opensquilla.session.compaction import (
     build_compaction_config_from_provider,
     compact_context,
     compaction_remaining_seconds,
+    compaction_replay_summary,
     require_compaction_time,
 )
 from opensquilla.session.compaction_lifecycle import (
@@ -222,6 +236,7 @@ from opensquilla.session.compaction_lifecycle import (
     new_compaction_id,
     pre_compaction_flush_requires_safe_receipt,
 )
+from opensquilla.session.context_view import format_compaction_summary_context
 from opensquilla.session.terminal_reply import build_terminal_reply
 from opensquilla.tool_boundary import AgentToolHandler as ToolHandler
 from opensquilla.tools.patch_classification import is_instrumentation_only_patch
@@ -236,7 +251,16 @@ from opensquilla.usage_reasons import (
 )
 
 from .context import ContextAssembly
-from .subagent import SubagentManager, SubagentSpec, SubagentUsage
+from .subagent import (
+    MAX_REFERENCED_SUBAGENT_TASK_BYTES,
+    SubagentManager,
+    SubagentSpec,
+    SubagentUsage,
+    render_subagent_task_reference,
+    resolve_subagent_execution_target,
+    subagent_task_inline_limit_bytes,
+    subagent_task_reference_slice_limit_chars,
+)
 from .types import (
     _THINKING_BUDGET_DEFAULT,
     AgentConfig,
@@ -1957,6 +1981,51 @@ def _tail_has_tool_result(messages: list[Message], *, lookback: int = 2) -> bool
     return any(_message_has_tool_result(message) for message in messages[-lookback:])
 
 
+_SYNTHETIC_USER_CONTEXT_PREFIXES = (
+    "[Available skills for this turn]",
+    "[Context summary]",
+    "[Request context for this turn]",
+    "[Runtime context for this turn]",
+    "[Current user request reminder]",
+    "Runtime state capsule:",
+)
+
+
+def _active_user_message_index_for_request(
+    messages: list[Message],
+    *,
+    current_user_text: str = "",
+) -> int | None:
+    """Locate the real user request before provider wrappers add synthetic users."""
+
+    normalized_current = current_user_text.strip()
+    if normalized_current:
+        for index in range(len(messages) - 1, -1, -1):
+            message = messages[index]
+            if message.role != "user" or _message_has_tool_result(message):
+                continue
+            content = (
+                message.content
+                if isinstance(message.content, str)
+                else _flatten_content_blocks(message.content)
+            )
+            if content.strip() == normalized_current:
+                return index
+
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if message.role != "user" or _message_has_tool_result(message):
+            continue
+        content = (
+            message.content
+            if isinstance(message.content, str)
+            else _flatten_content_blocks(message.content)
+        )
+        if not content.lstrip().startswith(_SYNTHETIC_USER_CONTEXT_PREFIXES):
+            return index
+    return None
+
+
 def _is_mid_budget_nudge_message(message: Message) -> bool:
     return (
         message.role == "user"
@@ -2311,6 +2380,12 @@ def _chat_config_with_thinking_disabled(chat_cfg: ChatConfig) -> ChatConfig:
         model_capabilities=chat_cfg.model_capabilities,
         thinking_level=None,
         provider_request_max_chars=chat_cfg.provider_request_max_chars,
+        context_window_tokens_global_override=(
+            chat_cfg.context_window_tokens_global_override
+        ),
+        provider_request_max_chars_explicit_cap=(
+            chat_cfg.provider_request_max_chars_explicit_cap
+        ),
         tool_choice=chat_cfg.tool_choice,
     )
 
@@ -2485,6 +2560,25 @@ class Agent:
         self._flush_backoff_seconds: float = 0.0
         self._session_flush_service = session_flush_service
         self._last_compaction_refusal_reason: str | None = None
+        self._pending_durable_compaction_event: CompactionEvent | None = None
+        # Stable session/base consumer identity. Turn routing and ensemble
+        # wrapping may replace ``self.provider`` with a narrower physical leg,
+        # but that one-call choice must never redefine the window that owns
+        # durable history.
+        self._durable_consumer_provider: Any = self.provider
+        self._durable_consumer_model_id = self.config.model_id
+        self._durable_consumer_window_tokens = self.config.context_window_tokens
+        self._durable_consumer_max_output_tokens = self.config.max_tokens
+        self._durable_consumer_model_capabilities = (
+            self.config.model_capabilities
+        )
+        self._durable_consumer_provider_request_max_chars = (
+            self.config.provider_request_proof_max_chars
+        )
+        # Frozen before durable admission and consumed by the ensuing turn.
+        # Compaction can take long enough to cross a minute boundary; reusing
+        # the same runtime message keeps the admitted and sent envelopes equal.
+        self._preflight_runtime_context_message: Message | None = None
         self._tool_failure_loop_counts: dict[tuple[str, str], int] = {}
         self._identical_request_last_sha: str | None = None
         self._identical_request_streak: int = 0
@@ -2563,6 +2657,66 @@ class Agent:
         return ErrorEvent(
             message="Context overflow persists after compaction",
             code="compaction_exhausted",
+        )
+
+    def _terminalize_pending_durable_compaction(
+        self,
+        *,
+        status: Literal["cancelled", "failed", "stale", "timed_out"],
+        reason: str,
+    ) -> None:
+        """Close a generated-but-uninstalled inline compaction candidate."""
+
+        event = self._pending_durable_compaction_event
+        if event is None:
+            return
+        self._pending_durable_compaction_event = None
+        if not self._session_key:
+            return
+        compaction_id = event.compaction_id or new_compaction_id()
+        notify_compaction(
+            self._session_key,
+            source="automatic",
+            phase="agent_inline_overflow",
+            status=status,
+            reason=reason,
+            removed_count=event.removed_count,
+            kept_count=event.kept_count,
+            **compaction_effect_payload(status=status, reason=reason),
+            **compaction_lifecycle_payload(
+                compaction_id,
+                COMPACTION_TRIGGERED_EVENT,
+            ),
+        )
+
+    def _stage_pending_durable_compaction(
+        self,
+        outcome: CompactionOutcome,
+    ) -> None:
+        """Track a durable candidate before any fallible request rebuilding.
+
+        Inline compaction emits ``started`` while producing the candidate.
+        Registering it immediately after generation ensures every later exit
+        path can emit a terminal event with the same operation id.
+        """
+
+        if outcome.ephemeral_only:
+            return
+        self._pending_durable_compaction_event = CompactionEvent(
+            compaction_id=outcome.compaction_id,
+            compaction_deadline_at_monotonic=(
+                outcome.compaction_deadline_at_monotonic
+            ),
+            compaction_timeout_seconds=outcome.compaction_timeout_seconds,
+            summary=outcome.summary,
+            summary_payload=outcome.summary_payload,
+            summary_format=outcome.summary_format,
+            coverage_status=outcome.coverage_status,
+            missing_obligations=outcome.missing_obligations,
+            critical_carry_forward=outcome.critical_carry_forward,
+            kept_entries=outcome.kept_entries,
+            kept_count=len(outcome.messages),
+            removed_count=outcome.removed_count,
         )
 
     def _record_provider_context_overflow_reason(
@@ -2656,6 +2810,752 @@ class Agent:
 
     def _provider_request_proof_max_chars(self) -> int:
         return self._context_budget_governor().snapshot().provider_request_max_chars
+
+    def bind_durable_consumer(
+        self,
+        *,
+        provider: Any,
+        model_id: str | None,
+        context_window_tokens: int,
+        max_output_tokens: int,
+        model_capabilities: ModelCapabilities | None = None,
+        provider_request_proof_max_chars: int = 0,
+    ) -> None:
+        """Freeze the deployment that owns durable session-history pressure."""
+
+        self._durable_consumer_provider = provider
+        self._durable_consumer_model_id = model_id
+        self._durable_consumer_window_tokens = max(
+            1,
+            int(context_window_tokens or 0),
+        )
+        self._durable_consumer_max_output_tokens = max(
+            1,
+            int(max_output_tokens or 0),
+        )
+        self._durable_consumer_model_capabilities = model_capabilities
+        self._durable_consumer_provider_request_max_chars = max(
+            0,
+            int(provider_request_proof_max_chars or 0),
+        )
+
+    def _freeze_preflight_runtime_context_message(self) -> Message:
+        message = self._preflight_runtime_context_message
+        if message is None:
+            message = self._runtime_context_message(self._runtime_context_block())
+            self._preflight_runtime_context_message = message
+        return message
+
+    def _provider_admission_chat_config(
+        self,
+        active_user_message: str,
+        *,
+        context_window_tokens: int,
+        max_output_tokens: int | None = None,
+        model_capabilities: ModelCapabilities | None = None,
+        provider_request_proof_max_chars: int | None = None,
+    ) -> ChatConfig:
+        """Build the same baseline request config used by the physical turn."""
+
+        resolved_capabilities = (
+            model_capabilities
+            if model_capabilities is not None
+            else self.config.model_capabilities
+        )
+        if (
+            resolved_capabilities is not None
+            and not isinstance(resolved_capabilities, ModelCapabilities)
+        ):
+            # Catalog extensions and older test doubles may expose a
+            # capability-shaped object rather than the concrete dataclass.
+            # Exact admission must remain compatible without passing an
+            # unvalidated object through the ChatConfig protocol boundary.
+            try:
+                resolved_capabilities = ModelCapabilities(
+                    supports_reasoning=bool(
+                        getattr(resolved_capabilities, "supports_reasoning", False)
+                    ),
+                    supports_tools=bool(
+                        getattr(resolved_capabilities, "supports_tools", True)
+                    ),
+                    supports_streaming=bool(
+                        getattr(resolved_capabilities, "supports_streaming", True)
+                    ),
+                    supports_vision=bool(
+                        getattr(resolved_capabilities, "supports_vision", False)
+                    ),
+                    reasoning_format=str(
+                        getattr(resolved_capabilities, "reasoning_format", "none")
+                        or "none"
+                    ),
+                )
+            except Exception:  # noqa: BLE001 - admission can omit unknown hints
+                resolved_capabilities = None
+        thinking_enabled, thinking_budget = self.config.resolve_thinking(
+            active_user_message
+        )
+        output_tokens = max(
+            1,
+            int(max_output_tokens or self.config.max_tokens or 1),
+        )
+        explicit_proof_budget = max(
+            0,
+            int(provider_request_proof_max_chars or 0),
+        )
+        if (
+            int(context_window_tokens) == int(self.config.context_window_tokens)
+            and output_tokens == int(self.config.max_tokens)
+            and model_capabilities is None
+            and provider_request_proof_max_chars is None
+        ):
+            proof_budget = self._provider_request_proof_max_chars()
+        else:
+            proof_budget = ContextBudgetGovernor.from_values(
+                context_window_tokens=max(1, int(context_window_tokens)),
+                max_output_tokens=output_tokens,
+                thinking_budget_tokens=(
+                    thinking_budget if thinking_enabled else 0
+                ),
+                context_overflow_threshold=(
+                    self.config.context_overflow_threshold
+                ),
+                provider_request_proof_max_chars=explicit_proof_budget,
+            ).snapshot().provider_request_max_chars
+        return ChatConfig(
+            max_tokens=output_tokens,
+            temperature=self.config.temperature,
+            top_p=self.config.top_p,
+            system=self.config.system_prompt or "",
+            thinking=thinking_enabled,
+            thinking_budget_tokens=thinking_budget,
+            thinking_budget_explicit=(
+                self.config.thinking_budget_tokens != _THINKING_BUDGET_DEFAULT
+            ),
+            timeout=self.config.request_timeout,
+            stop_sequences=self.config.stop_sequences,
+            cache_breakpoints=self._cache_breakpoints_without_runtime_context(
+                self.config.cache_breakpoints
+            ),
+            cache_mode=self.config.cache_mode,
+            output_json_schema=self.config.output_json_schema,
+            output_json_schema_strict=self.config.output_json_schema_strict,
+            model_capabilities=(
+                resolved_capabilities
+            ),
+            thinking_level=(
+                self.config.thinking
+                if isinstance(self.config.thinking, ThinkingLevel)
+                else None
+            ),
+            provider_request_max_chars=proof_budget,
+            context_window_tokens_global_override=(
+                self.config.context_window_tokens_global_override
+            ),
+            provider_request_max_chars_explicit_cap=(
+                max(0, int(provider_request_proof_max_chars or 0))
+                if provider_request_proof_max_chars is not None
+                else (
+                    max(0, int(self.config.provider_request_proof_max_chars or 0))
+                    if self.config.provider_request_proof_max_chars_explicit
+                    else 0
+                )
+            ),
+            tool_choice=None,
+            provider_request_correlation=self._provider_request_correlation,
+        )
+
+    def _project_durable_consumer_final_request(
+        self,
+        messages: list[Message],
+        *,
+        tools: list[ToolDefinition] | None,
+        active_config: ChatConfig,
+    ) -> ProviderFinalRequestProjection | None:
+        """Re-prove one live logical request against the stable session consumer."""
+
+        provider = self._durable_consumer_provider
+        if provider is None:
+            return None
+        max_output_tokens = max(
+            1,
+            int(self._durable_consumer_max_output_tokens or 0),
+        )
+        proof_budget = max(
+            0,
+            int(self._durable_consumer_provider_request_max_chars or 0),
+        )
+        if proof_budget <= 0:
+            proof_budget = ContextBudgetGovernor.from_values(
+                context_window_tokens=max(
+                    1,
+                    int(self._durable_consumer_window_tokens or 0),
+                ),
+                max_output_tokens=max_output_tokens,
+                thinking_budget_tokens=(
+                    max(
+                        0,
+                        int(active_config.thinking_budget_tokens or 0),
+                    )
+                    if active_config.thinking
+                    else 0
+                ),
+                context_overflow_threshold=self.config.context_overflow_threshold,
+            ).snapshot().provider_request_max_chars
+        stable_config = active_config.model_copy(
+            update={
+                "max_tokens": max_output_tokens,
+                "model_capabilities": self._durable_consumer_model_capabilities,
+                "provider_request_max_chars": proof_budget,
+                "provider_request_max_chars_explicit_cap": proof_budget,
+            }
+        )
+        return project_provider_final_request(
+            provider,
+            messages,
+            tools,
+            stable_config,
+        )
+
+    def _history_messages_for_compaction_admission(
+        self,
+        entries: list[dict[str, Any]],
+        *,
+        active_user_in_history: bool,
+        bound_user_message_id: str | None,
+        active_user_message: str,
+        consumer_model_id: str | None = None,
+        consumer_model_capabilities: ModelCapabilities | None = None,
+    ) -> list[Message] | None:
+        """Rebuild the candidate's provider-visible durable history."""
+
+        skip_indexes: set[int] = set()
+        if active_user_in_history and entries:
+            if bound_user_message_id:
+                bound_index = next(
+                    (
+                        index
+                        for index, entry in enumerate(entries)
+                        if str(entry.get("message_id") or "")
+                        == bound_user_message_id
+                    ),
+                    None,
+                )
+                if bound_index is None:
+                    # A bound active prompt must never be guessed from position.
+                    return None
+                skip_indexes = {
+                    index
+                    for index, entry in enumerate(entries)
+                    if index >= bound_index
+                    and str(entry.get("role") or "") == "user"
+                }
+            else:
+                for index in range(len(entries) - 1, -1, -1):
+                    if str(entries[index].get("role") or "") == "user":
+                        skip_indexes.add(index)
+                        break
+
+        history: list[Message] = []
+        for index, entry in enumerate(entries):
+            if index in skip_indexes:
+                continue
+            history.extend(
+                reconstruct_messages_from_entry(
+                    str(entry.get("role") or ""),
+                    entry.get("content") or "",
+                    entry.get("tool_calls"),
+                    entry.get("reasoning_content"),
+                )
+            )
+
+        thinking_enabled, _thinking_budget = self.config.resolve_thinking(
+            active_user_message
+        )
+        effective_capabilities = (
+            consumer_model_capabilities
+            if consumer_model_capabilities is not None
+            else self.config.model_capabilities
+        )
+        effective_model_id = consumer_model_id or self.config.model_id
+        caps_reasoning_format = (
+            getattr(effective_capabilities, "reasoning_format", "")
+            if effective_capabilities is not None
+            else ""
+        )
+        preserve_reasoning_content = bool(
+            _is_direct_deepseek_v4_model_id(effective_model_id)
+            or (
+                thinking_enabled
+                and caps_reasoning_format == "deepseek"
+                and _is_deepseek_model_id(effective_model_id)
+            )
+            or (thinking_enabled and caps_reasoning_format == "dashscope")
+        )
+        history, _sanitize_result = sanitize_session_messages(history)
+        history, _projection_result = project_historical_tool_payloads(
+            history,
+            preserve_reasoning_content=preserve_reasoning_content,
+        )
+        history = repair_tool_pairing(history)
+        history = drop_reasoning(
+            history,
+            preserve_tool_call_reasoning=thinking_enabled,
+            preserve_reasoning_content=preserve_reasoning_content,
+        )
+        preserve_historical_images = bool(
+            self.config.preserve_historical_images
+            and getattr(effective_capabilities, "supports_vision", False)
+            if effective_capabilities is not None
+            else False
+        )
+        history = _strip_historical_image_blocks(
+            history,
+            preserve_images=preserve_historical_images,
+        )
+        return repair_tool_pairing(
+            limit_turns(history, self.config.max_history_turns)
+        )
+
+    def _assemble_compaction_consumer_request(
+        self,
+        *,
+        replay_summary: str,
+        kept_entries: list[dict[str, Any]],
+        active_user_message: str,
+        active_user_in_history: bool,
+        bound_user_message_id: str | None,
+        attachment_messages: list[Message] | None,
+        runtime_context_message: Message,
+        consumer_model_id: str | None = None,
+        consumer_model_capabilities: ModelCapabilities | None = None,
+    ) -> list[Message] | None:
+        history = self._history_messages_for_compaction_admission(
+            kept_entries,
+            active_user_in_history=active_user_in_history,
+            bound_user_message_id=bound_user_message_id,
+            active_user_message=active_user_message,
+            consumer_model_id=consumer_model_id,
+            consumer_model_capabilities=consumer_model_capabilities,
+        )
+        if history is None:
+            return None
+
+        turn_messages = list(history)
+        skills_message = self._skills_context_message()
+        if skills_message is not None:
+            turn_messages.append(skills_message)
+        request_context_insert_index = len(turn_messages)
+        runtime_context_insert_index = len(turn_messages)
+        if attachment_messages:
+            turn_messages.extend(attachment_messages)
+        elif active_user_message:
+            turn_messages.append(
+                Message(role="user", content=active_user_message)
+            )
+
+        summary_context = (
+            format_compaction_summary_context([replay_summary])
+            if replay_summary.strip()
+            else None
+        )
+        existing_context: str | None = self.config.request_context_prompt
+        request_context: str | None
+        if summary_context and existing_context and existing_context.strip():
+            request_context = (
+                f"{summary_context.strip()}\n\n{existing_context.strip()}"
+            )
+        elif summary_context:
+            request_context = summary_context.strip()
+        else:
+            request_context = existing_context
+        request_context_message = self._request_context_message(request_context)
+        turn_objective_message = self._turn_objective_message(
+            active_user_message,
+            enabled=self._turn_objective_reminder_enabled,
+            max_chars=self._turn_objective_reminder_max_chars,
+        )
+        return self._provider_request_messages_for_count_projection(
+            turn_messages,
+            request_context_message=request_context_message,
+            request_context_insert_index=request_context_insert_index,
+            runtime_context_message=runtime_context_message,
+            runtime_context_insert_index=runtime_context_insert_index,
+            turn_objective_message=turn_objective_message,
+        )
+
+    def _project_compaction_consumer_request(
+        self,
+        *,
+        consumer_provider: Any,
+        replay_summary: str,
+        kept_entries: list[dict[str, Any]],
+        active_user_message: str,
+        active_user_in_history: bool,
+        bound_user_message_id: str | None,
+        attachment_messages: list[Message] | None,
+        runtime_context_message: Message,
+        context_window_tokens: int,
+        max_output_tokens: int | None,
+        consumer_model_id: str | None = None,
+        consumer_model_capabilities: ModelCapabilities | None = None,
+        consumer_provider_request_max_chars: int | None = None,
+    ) -> Any | None:
+        request_messages = self._assemble_compaction_consumer_request(
+            replay_summary=replay_summary,
+            kept_entries=kept_entries,
+            active_user_message=active_user_message,
+            active_user_in_history=active_user_in_history,
+            bound_user_message_id=bound_user_message_id,
+            attachment_messages=attachment_messages,
+            runtime_context_message=runtime_context_message,
+            consumer_model_id=consumer_model_id,
+            consumer_model_capabilities=consumer_model_capabilities,
+        )
+        if request_messages is None:
+            return None
+        chat_config = self._provider_admission_chat_config(
+            active_user_message,
+            context_window_tokens=context_window_tokens,
+            max_output_tokens=max_output_tokens,
+            model_capabilities=consumer_model_capabilities,
+            provider_request_proof_max_chars=(
+                consumer_provider_request_max_chars
+            ),
+        )
+        active_user_index = _active_user_message_index_for_request(
+            request_messages,
+            current_user_text=active_user_message,
+        )
+        if active_user_message and active_user_index is None:
+            return None
+        if active_user_index is not None:
+            chat_config = chat_config.model_copy(
+                update={"active_user_message_index": active_user_index}
+            )
+        return project_provider_final_request(
+            consumer_provider,
+            request_messages,
+            self.tool_definitions,
+            chat_config,
+        )
+
+    def build_compaction_consumer_admission(
+        self,
+        *,
+        consumer_provider: Any,
+        active_user_message: str,
+        active_user_in_history: bool,
+        bound_user_message_id: str | None,
+        attachment_messages: list[Message] | None,
+        context_window_tokens: int,
+        max_output_tokens: int | None = None,
+        consumer_model_id: str | None = None,
+        consumer_model_capabilities: ModelCapabilities | None = None,
+        consumer_provider_request_max_chars: int | None = None,
+    ) -> tuple[
+        Callable[[str, list[dict[str, Any]]], bool],
+        str,
+    ]:
+        """Freeze a pure final-envelope gate and its singleflight identity."""
+
+        runtime_context_message = self._freeze_preflight_runtime_context_message()
+        template_summary = "[candidate checkpoint]"
+        template_projection = self._project_compaction_consumer_request(
+            consumer_provider=consumer_provider,
+            replay_summary=template_summary,
+            kept_entries=[],
+            active_user_message=active_user_message,
+            active_user_in_history=False,
+            bound_user_message_id=None,
+            attachment_messages=attachment_messages,
+            runtime_context_message=runtime_context_message,
+            context_window_tokens=context_window_tokens,
+            max_output_tokens=max_output_tokens,
+            consumer_model_id=consumer_model_id,
+            consumer_model_capabilities=consumer_model_capabilities,
+            consumer_provider_request_max_chars=(
+                consumer_provider_request_max_chars
+            ),
+        )
+        metadata = provider_metadata(consumer_provider)
+        fingerprint_payload = {
+            "provider": metadata.provider_id or metadata.provider_kind,
+            "model": metadata.model,
+            "consumer_model_id": consumer_model_id or metadata.model,
+            "context_window_tokens": int(context_window_tokens),
+            "max_output_tokens": int(
+                max_output_tokens or self.config.max_tokens or 0
+            ),
+            "system_sha256": hashlib.sha256(
+                (self.config.system_prompt or "").encode("utf-8")
+            ).hexdigest(),
+            "tools_sha256": hashlib.sha256(
+                json.dumps(
+                    self._live_request_jsonable(self.tool_definitions),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+            "active_user_sha256": hashlib.sha256(
+                active_user_message.encode("utf-8")
+            ).hexdigest(),
+            "attachments_sha256": hashlib.sha256(
+                json.dumps(
+                    self._live_request_jsonable(attachment_messages or []),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+            "request_context_sha256": hashlib.sha256(
+                (self.config.request_context_prompt or "").encode("utf-8")
+            ).hexdigest(),
+            "runtime_context_sha256": hashlib.sha256(
+                json.dumps(
+                    self._live_request_jsonable(runtime_context_message),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+            "template_payload_sha256": (
+                hashlib.sha256(
+                    json.dumps(
+                        template_projection.payload,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+                if template_projection is not None
+                else "projection_unavailable"
+            ),
+        }
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                fingerprint_payload,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+
+        def _consumer_admission(
+            replay_summary: str,
+            kept_entries: list[dict[str, Any]],
+        ) -> bool:
+            projection = self._project_compaction_consumer_request(
+                consumer_provider=consumer_provider,
+                replay_summary=replay_summary,
+                kept_entries=kept_entries,
+                active_user_message=active_user_message,
+                active_user_in_history=active_user_in_history,
+                bound_user_message_id=bound_user_message_id,
+                attachment_messages=attachment_messages,
+                runtime_context_message=runtime_context_message,
+                context_window_tokens=context_window_tokens,
+                max_output_tokens=max_output_tokens,
+                consumer_model_id=consumer_model_id,
+                consumer_model_capabilities=consumer_model_capabilities,
+                consumer_provider_request_max_chars=(
+                    consumer_provider_request_max_chars
+                ),
+            )
+            return bool(projection is not None and projection.fits)
+
+        return _consumer_admission, fingerprint
+
+    def preflight_history_capacity(
+        self,
+        *,
+        active_user_message: str,
+        active_user_in_history: bool,
+        attachments: list[dict[str, Any]] | None = None,
+        attachment_messages: list[Message] | None = None,
+        context_window_tokens: int | None = None,
+        consumer_provider: Any | None = None,
+        consumer_max_output_tokens: int | None = None,
+        consumer_model_id: str | None = None,
+        consumer_model_capabilities: ModelCapabilities | None = None,
+        consumer_provider_request_max_chars: int | None = None,
+    ) -> tuple[int, int]:
+        """Return token/character budgets left for checkpoint + raw history.
+
+        This is deliberately conservative. It uses the same proof budget and
+        media-aware serializer as provider adapters, but includes only the
+        fixed/current-turn components that preflight compaction cannot remove.
+        The protected persisted user prompt remains part of the durable
+        candidate and is therefore not double-counted here.
+        """
+
+        effective_window = int(
+            context_window_tokens or self.config.context_window_tokens
+        )
+        exact_provider = (
+            consumer_provider
+            if consumer_provider is not None
+            else self.provider
+        )
+        if exact_provider is not None and (attachment_messages or not attachments):
+            projection = self._project_compaction_consumer_request(
+                consumer_provider=exact_provider,
+                replay_summary="[candidate checkpoint]",
+                kept_entries=[],
+                active_user_message=active_user_message,
+                active_user_in_history=False,
+                bound_user_message_id=None,
+                attachment_messages=attachment_messages,
+                runtime_context_message=(
+                    self._freeze_preflight_runtime_context_message()
+                ),
+                context_window_tokens=effective_window,
+                max_output_tokens=consumer_max_output_tokens,
+                consumer_model_id=consumer_model_id,
+                consumer_model_capabilities=consumer_model_capabilities,
+                consumer_provider_request_max_chars=(
+                    consumer_provider_request_max_chars
+                ),
+            )
+            if projection is not None:
+                proof = projection.proof
+                required_budget_fields = {
+                    "effective_proof_token_budget",
+                    "estimated_tokens",
+                    "effective_proof_budget",
+                    "estimated_chars",
+                }
+                if required_budget_fields.issubset(proof):
+                    return (
+                        max(
+                            0,
+                            int(proof["effective_proof_token_budget"] or 0)
+                            - int(proof["estimated_tokens"] or 0),
+                        ),
+                        max(
+                            0,
+                            int(proof["effective_proof_budget"] or 0)
+                            - int(proof["estimated_chars"] or 0),
+                        ),
+                    )
+
+        fixed_messages: list[Message] = []
+        skills_message = self._skills_context_message()
+        if skills_message is not None:
+            fixed_messages.append(skills_message)
+        request_context_message = self._request_context_message(
+            self.config.request_context_prompt
+        )
+        if request_context_message is None:
+            # Durable compaction creates this request-scoped wrapper even when
+            # the turn had no pre-existing request context. Reserve the
+            # message/framing now; the candidate gate counts its summary text.
+            request_context_message = self._request_context_message(
+                "[Compaction summary candidate]"
+            )
+        if request_context_message is not None:
+            fixed_messages.append(request_context_message)
+        fixed_messages.append(
+            self._runtime_context_message(self._runtime_context_block())
+        )
+        turn_objective = self._turn_objective_message(
+            active_user_message,
+            enabled=self._turn_objective_reminder_enabled,
+            max_chars=self._turn_objective_reminder_max_chars,
+        )
+        if turn_objective is not None:
+            fixed_messages.append(turn_objective)
+        if attachment_messages:
+            # AttachmentStage has already produced the exact typed message
+            # that the provider call will consume. It also carries the active
+            # user text, so the plain user message must not be counted again.
+            fixed_messages.extend(attachment_messages)
+        elif active_user_message and not active_user_in_history:
+            fixed_messages.append(Message(role="user", content=active_user_message))
+        fixed_message_payload = self._live_request_jsonable(fixed_messages)
+        if attachments and not attachment_messages:
+            # These are ingress records before AttachmentStage has converted
+            # them to typed provider content blocks. Keep them JSON-shaped so
+            # the proof can conservatively count bytes/media without asking
+            # Message validation to accept a not-yet-canonical protocol.
+            fixed_message_payload.append(
+                {
+                    "role": "user",
+                    "content": self._live_request_jsonable(attachments),
+                }
+            )
+
+        payload: dict[str, Any] = {
+            "model": self.config.model_id or "",
+            "system": self.config.system_prompt or "",
+            "messages": fixed_message_payload,
+            "tools": self._live_request_jsonable(self.tool_definitions),
+            "max_tokens": self.config.max_tokens,
+        }
+        if self.config.output_json_schema is not None:
+            payload["response_format"] = self._live_request_jsonable(
+                self.config.output_json_schema
+            )
+        proof_budget = self._provider_request_proof_max_chars()
+        if context_window_tokens is not None:
+            try:
+                thinking_enabled, thinking_budget = self.config.resolve_thinking(
+                    active_user_message
+                )
+            except Exception:  # noqa: BLE001 - lightweight config compatibility
+                thinking_enabled = False
+                thinking_budget = 0
+            proof_budget = ContextBudgetGovernor.from_values(
+                context_window_tokens=context_window_tokens,
+                max_output_tokens=(
+                    consumer_max_output_tokens or self.config.max_tokens
+                ),
+                thinking_budget_tokens=thinking_budget if thinking_enabled else 0,
+                context_overflow_threshold=self.config.context_overflow_threshold,
+                provider_request_proof_max_chars=max(
+                    0,
+                    int(consumer_provider_request_max_chars or 0),
+                ),
+            ).snapshot().provider_request_max_chars
+        try:
+            proof = prove_provider_payload(
+                payload,
+                projection_adapter="preflight_history_capacity",
+                proof_budget=proof_budget,
+            )
+        except ProviderRequestBudgetExceededError as exc:
+            proof = exc.proof
+        effective_token_budget = max(
+            0,
+            int(proof.get("effective_proof_token_budget", 0) or 0),
+        )
+        fixed_tokens = max(0, int(proof.get("estimated_tokens", 0) or 0))
+        effective_char_budget = max(
+            0,
+            int(proof.get("effective_proof_budget", 0) or 0),
+        )
+        fixed_chars = max(0, int(proof.get("estimated_chars", 0) or 0))
+        return (
+            max(0, effective_token_budget - fixed_tokens),
+            max(0, effective_char_budget - fixed_chars),
+        )
+
+    def preflight_history_capacity_tokens(
+        self,
+        *,
+        active_user_message: str,
+        active_user_in_history: bool,
+        attachments: list[dict[str, Any]] | None = None,
+        context_window_tokens: int | None = None,
+    ) -> int:
+        """Compatibility projection of the token side of preflight capacity."""
+
+        tokens, _chars = self.preflight_history_capacity(
+            active_user_message=active_user_message,
+            active_user_in_history=active_user_in_history,
+            attachments=attachments,
+            context_window_tokens=context_window_tokens,
+        )
+        return tokens
 
     def _context_budget_governor(self) -> ContextBudgetGovernor:
         return ContextBudgetGovernor.from_config(self.config)
@@ -4920,6 +5820,10 @@ class Agent:
                 ):
                     yield event
         finally:
+            self._terminalize_pending_durable_compaction(
+                status="cancelled",
+                reason="turn_closed_before_compaction_install",
+            )
             approval_cleanup = asyncio.create_task(
                 clear_approval_run_context_deltas_for_tool_context(
                     self._tool_context,
@@ -5089,8 +5993,16 @@ class Agent:
             turn_messages,
             image_blocks=self._count_image_blocks(turn_messages),
         )
-        runtime_context = self._runtime_context_block()
-        runtime_context_message = self._runtime_context_message(runtime_context)
+        runtime_context_message = (
+            self._preflight_runtime_context_message
+            or self._runtime_context_message(self._runtime_context_block())
+        )
+        self._preflight_runtime_context_message = None
+        runtime_context = (
+            runtime_context_message.content
+            if isinstance(runtime_context_message.content, str)
+            else self._runtime_context_block()
+        )
         request_context_message = self._request_context_message(self.config.request_context_prompt)
         turn_objective_message = self._turn_objective_message(
             semantic_message if semantic_message is not None else message,
@@ -5099,30 +6011,10 @@ class Agent:
         )
         runtime_context_hash = hashlib.sha256(runtime_context.encode("utf-8")).hexdigest()[:16]
 
-        chat_cfg = ChatConfig(
-            max_tokens=self.config.max_tokens,
-            temperature=self.config.temperature,
-            top_p=self.config.top_p,
-            system=self._context.system_prompt,
-            thinking=thinking_enabled,
-            thinking_budget_tokens=thinking_budget,
-            thinking_budget_explicit=(
-                self.config.thinking_budget_tokens != _THINKING_BUDGET_DEFAULT
-            ),
-            timeout=self.config.request_timeout,
-            stop_sequences=self.config.stop_sequences,
-            cache_breakpoints=self._cache_breakpoints_without_runtime_context(
-                self.config.cache_breakpoints
-            ),
-            cache_mode=self.config.cache_mode,
-            output_json_schema=self.config.output_json_schema,
-            output_json_schema_strict=self.config.output_json_schema_strict,
-            model_capabilities=self.config.model_capabilities,
-            thinking_level=(
-                self.config.thinking if isinstance(self.config.thinking, ThinkingLevel) else None
-            ),
-            provider_request_max_chars=self._provider_request_proof_max_chars(),
-            tool_choice=None,
+        chat_cfg = self._provider_admission_chat_config(
+            thinking_prompt,
+            context_window_tokens=self.config.context_window_tokens,
+            max_output_tokens=self.config.max_tokens,
         )
         _thinking_fallback_done = False
         _disable_thinking_for_next_provider_call = False
@@ -5205,6 +6097,10 @@ class Agent:
         )
         turn_llm_calls = 0
         turn_tool_errors = 0
+        # A durable inline candidate is installed only after the rebuilt
+        # request crosses the provider adapter's final admission boundary.
+        self._pending_durable_compaction_event = None
+
         async def _review_inflight_sandbox_request(
             payload: dict[str, object],
         ) -> RuleAssessment | None:
@@ -6317,6 +7213,18 @@ class Agent:
                                 )
                             }
                         )
+                    active_user_message_index = _active_user_message_index_for_request(
+                        request_messages,
+                        current_user_text=self._current_turn_message or "",
+                    )
+                    if active_user_message_index is not None:
+                        call_chat_cfg = call_chat_cfg.model_copy(
+                            update={
+                                "active_user_message_index": (
+                                    active_user_message_index
+                                )
+                            }
+                        )
 
                     self._write_turn_call_log(
                         "llm_request",
@@ -6387,10 +7295,23 @@ class Agent:
                                 tools=provider_tools_for_call,
                                 config=call_chat_cfg,
                             )
+                        pending_install_deadline: float | None = (
+                            self._pending_durable_compaction_event
+                            .compaction_deadline_at_monotonic
+                            if self._pending_durable_compaction_event is not None
+                            else None
+                        )
+                        provider_stream_deadline = _total_deadline
+                        if pending_install_deadline is not None:
+                            provider_stream_deadline = (
+                                min(_total_deadline, pending_install_deadline)
+                                if _total_deadline is not None
+                                else pending_install_deadline
+                            )
                         async for raw_ev in self._stream_provider_events_with_deadline(
                             raw_stream,
                             loop=_loop,
-                            total_deadline=_total_deadline,
+                            total_deadline=provider_stream_deadline,
                         ):
                             if not isinstance(raw_ev, ProviderErrorEvent):
                                 # Provider.chat commonly returns an async
@@ -6402,6 +7323,13 @@ class Agent:
                                     iteration=iterations,
                                     model_call_id=call_id,
                                 )
+                                if self._pending_durable_compaction_event is not None:
+                                    pending_event = self._pending_durable_compaction_event
+                                    # Clear before yielding: if the consumer closes
+                                    # immediately after persisting this event, the
+                                    # wrapper must not emit a second terminal state.
+                                    self._pending_durable_compaction_event = None
+                                    yield pending_event
                             if first_event_at is None:
                                 first_event_at = time.monotonic()
                             if isinstance(raw_ev, ProviderTextDelta):
@@ -7107,6 +8035,30 @@ class Agent:
                         usage_unknown_reason = "cancelled"
                         raise
                     except TimeoutError:
+                        if (
+                            pending_install_deadline is not None
+                            and _loop.time() >= pending_install_deadline
+                            and self._pending_durable_compaction_event is not None
+                        ):
+                            usage_unknown_reason = "compaction_install_timeout"
+                            _notify_call_outcome(
+                                ok=False,
+                                failure_kind="compaction_install_timeout",
+                            )
+                            self._terminalize_pending_durable_compaction(
+                                status="timed_out",
+                                reason="compaction_deadline_exceeded",
+                            )
+                            yield self._transition(AgentState.ERROR)
+                            terminal_error = ErrorEvent(
+                                message=(
+                                    "Context compaction could not be installed "
+                                    "before its absolute deadline."
+                                ),
+                                code="compaction_deadline_exceeded",
+                            )
+                            yield terminal_error
+                            break
                         # Total-deadline timeout raised by the stream wrapper:
                         # record the failed call, then propagate unchanged.
                         usage_unknown_reason = "total_timeout"
@@ -8156,42 +9108,77 @@ class Agent:
                             continue
                         if failure_kind == ProviderFailureKind.CONTEXT_OVERFLOW:
                             self._record_provider_context_overflow_reason(provider_error)
-                            if (
-                                provider_error.code
-                                == "provider_request_budget_exhausted"
-                                or bool(
-                                    getattr(
-                                        self.provider,
-                                        "final_request_admission_guaranteed",
-                                        False,
+                            durable_consumer_overflow_proven: bool | None = None
+                            if provider_error.code == "provider_request_budget_exhausted":
+                                durable_projection = (
+                                    self._project_durable_consumer_final_request(
+                                        request_messages,
+                                        tools=provider_tools_for_call,
+                                        active_config=call_chat_cfg,
                                     )
                                 )
+                                durable_consumer_overflow_proven = bool(
+                                    durable_projection is not None
+                                    and not durable_projection.fits
+                                )
+                                live_turn_recovery_possible = (
+                                    self._live_turn_compaction_boundary(
+                                        turn_messages,
+                                        protected_turn_start_index=(
+                                            current_turn_start_index
+                                        ),
+                                    )
+                                    is not None
+                                )
+                                if durable_consumer_overflow_proven:
+                                    self._write_turn_call_log(
+                                        "provider_request_budget_durable_pressure_proven",
+                                        durable_consumer_fits=False,
+                                        iteration=iterations,
+                                        attempt=_call_attempt,
+                                    )
+                                elif live_turn_recovery_possible:
+                                    self._write_turn_call_log(
+                                        "provider_request_budget_live_turn_recovery",
+                                        durable_consumer_fits=(
+                                            durable_projection.fits
+                                            if durable_projection is not None
+                                            else None
+                                        ),
+                                        iteration=iterations,
+                                        attempt=_call_attempt,
+                                    )
+                                else:
+                                    self._write_turn_call_log(
+                                        "provider_request_budget_recovery_refused",
+                                        reason="request_envelope_source_ambiguous",
+                                        durable_consumer_fits=(
+                                            durable_projection.fits
+                                            if durable_projection is not None
+                                            else None
+                                        ),
+                                        iteration=iterations,
+                                        attempt=_call_attempt,
+                                    )
+                                    yield self._transition(AgentState.ERROR)
+                                    terminal_error = self._context_overflow_error()
+                                    yield terminal_error
+                                    break
+                            elif bool(
+                                getattr(
+                                    self.provider,
+                                    "final_request_admission_guaranteed",
+                                    False,
+                                )
                             ):
-                                # The adapter proved the complete request
-                                # envelope (system, tools, request-scoped
-                                # context, media projection, and history) could
-                                # not fit after request-only reduction. That
-                                # proof does not establish that durable history
-                                # is the pressure source, so mutating the
-                                # canonical transcript here would be an
-                                # attribution error. Fail closed when the
-                                # adapter already admitted the final physical
-                                # payload; before-turn history admission
-                                # remains the durable compaction boundary.
-                                refusal_reason = "request_envelope_source_ambiguous"
-                                if (
-                                    provider_error.code
-                                    != "provider_request_budget_exhausted"
-                                ):
-                                    self._last_compaction_refusal_reason = (
-                                        "provider_native_overflow_after_admission"
-                                    )
-                                    refusal_reason = (
-                                        "provider_native_overflow_after_final_admission"
-                                    )
+                                self._last_compaction_refusal_reason = (
+                                    "provider_native_overflow_after_admission"
+                                )
                                 self._write_turn_call_log(
                                     "provider_request_budget_recovery_refused",
-                                    reason=refusal_reason,
+                                    reason=(
+                                        "provider_native_overflow_after_final_admission"
+                                    ),
                                     iteration=iterations,
                                     attempt=_call_attempt,
                                 )
@@ -8199,7 +9186,14 @@ class Agent:
                                 terminal_error = self._context_overflow_error()
                                 yield terminal_error
                                 break
-                            provider_compaction_window_tokens = None
+                            provider_compaction_window_tokens = (
+                                max(
+                                    1,
+                                    int(self._durable_consumer_window_tokens or 0),
+                                )
+                                if durable_consumer_overflow_proven is True
+                                else None
+                            )
                             provider_estimated_tokens = None
                             provider_compaction_refusal_reason = (
                                 self._last_compaction_refusal_reason
@@ -8210,7 +9204,11 @@ class Agent:
                                     provider_compaction_window_tokens
                                     or self.config.context_window_tokens
                                 ) + 1
-                            if overflow_retries >= self.config.max_overflow_retries:
+                            effective_overflow_retries = min(
+                                1,
+                                max(0, int(self.config.max_overflow_retries or 0)),
+                            )
+                            if overflow_retries >= effective_overflow_retries:
                                 yield self._transition(AgentState.ERROR)
                                 terminal_error = self._context_overflow_error()
                                 yield terminal_error
@@ -8230,6 +9228,9 @@ class Agent:
                                 runtime_context_insert_index=runtime_context_insert_index,
                                 protected_turn_start_index=current_turn_start_index,
                                 compaction_window_tokens=provider_compaction_window_tokens,
+                                durable_consumer_overflow_proven=(
+                                    durable_consumer_overflow_proven
+                                ),
                             )
                             if overflow_outcome is None:
                                 yield self._transition(AgentState.ERROR)
@@ -8243,6 +9244,7 @@ class Agent:
                                 self._last_compaction_refusal_reason = (
                                     provider_compaction_refusal_reason
                                 )
+                            self._stage_pending_durable_compaction(overflow_outcome)
                             next_request_context_insert_index = (
                                 overflow_outcome.request_context_insert_index
                                 if overflow_outcome.request_context_insert_index is not None
@@ -8253,14 +9255,82 @@ class Agent:
                                 if overflow_outcome.runtime_context_insert_index is not None
                                 else runtime_context_insert_index
                             )
-                            next_request_messages = await self._provider_request_messages_async(
-                                overflow_outcome.messages,
-                                request_context_message=request_context_message,
-                                request_context_insert_index=next_request_context_insert_index,
-                                runtime_context_message=runtime_context_message,
-                                runtime_context_insert_index=next_runtime_context_insert_index,
-                                turn_objective_message=turn_objective_message,
-                            )
+                            try:
+                                rebuild_deadline = (
+                                    overflow_outcome.compaction_deadline_at_monotonic
+                                    if not overflow_outcome.ephemeral_only
+                                    else None
+                                )
+                                if rebuild_deadline is None:
+                                    next_request_messages = (
+                                        await self._provider_request_messages_async(
+                                            overflow_outcome.messages,
+                                            request_context_message=(
+                                                request_context_message
+                                            ),
+                                            request_context_insert_index=(
+                                                next_request_context_insert_index
+                                            ),
+                                            runtime_context_message=(
+                                                runtime_context_message
+                                            ),
+                                            runtime_context_insert_index=(
+                                                next_runtime_context_insert_index
+                                            ),
+                                            turn_objective_message=(
+                                                turn_objective_message
+                                            ),
+                                        )
+                                    )
+                                else:
+                                    async with asyncio.timeout_at(rebuild_deadline):
+                                        next_request_messages = (
+                                            await self._provider_request_messages_async(
+                                                overflow_outcome.messages,
+                                                request_context_message=(
+                                                    request_context_message
+                                                ),
+                                                request_context_insert_index=(
+                                                    next_request_context_insert_index
+                                                ),
+                                                runtime_context_message=(
+                                                    runtime_context_message
+                                                ),
+                                                runtime_context_insert_index=(
+                                                    next_runtime_context_insert_index
+                                                ),
+                                                turn_objective_message=(
+                                                    turn_objective_message
+                                                ),
+                                            )
+                                        )
+                            except asyncio.CancelledError:
+                                self._terminalize_pending_durable_compaction(
+                                    status="cancelled",
+                                    reason="request_rebuild_cancelled",
+                                )
+                                raise
+                            except TimeoutError:
+                                self._terminalize_pending_durable_compaction(
+                                    status="timed_out",
+                                    reason="compaction_deadline_exceeded",
+                                )
+                                yield self._transition(AgentState.ERROR)
+                                terminal_error = ErrorEvent(
+                                    message=(
+                                        "Context compaction could not rebuild the "
+                                        "provider request before its absolute deadline."
+                                    ),
+                                    code="compaction_deadline_exceeded",
+                                )
+                                yield terminal_error
+                                break
+                            except Exception:
+                                self._terminalize_pending_durable_compaction(
+                                    status="failed",
+                                    reason="request_rebuild_failed",
+                                )
+                                raise
                             if not self._provider_request_is_smaller(
                                 request_messages,
                                 next_request_messages,
@@ -8271,33 +9341,303 @@ class Agent:
                                     != "provider_recent_tail_too_large"
                                 ):
                                     self._last_compaction_refusal_reason = "compaction_not_smaller"
+                                self._terminalize_pending_durable_compaction(
+                                    status="failed",
+                                    reason="compaction_not_smaller",
+                                )
                                 terminal_error = self._context_overflow_error()
                                 yield terminal_error
                                 break
-                            turn_messages = overflow_outcome.messages
-                            request_context_insert_index = next_request_context_insert_index
-                            runtime_context_insert_index = next_runtime_context_insert_index
-                            if overflow_outcome.protected_turn_start_index is not None:
-                                current_turn_start_index = (
-                                    overflow_outcome.protected_turn_start_index
+                            next_active_user_index = (
+                                _active_user_message_index_for_request(
+                                    next_request_messages,
+                                    current_user_text=(
+                                        self._current_turn_message or ""
+                                    ),
                                 )
-                            message_count_request_view = None
+                            )
+                            next_chat_cfg = call_chat_cfg.model_copy(
+                                update={
+                                    "active_user_message_index": (
+                                        next_active_user_index
+                                    )
+                                }
+                            )
+                            if durable_consumer_overflow_proven is True:
+                                durable_next_projection = (
+                                    self._project_durable_consumer_final_request(
+                                        next_request_messages,
+                                        tools=provider_tools_for_call,
+                                        active_config=next_chat_cfg,
+                                    )
+                                )
+                                if (
+                                    next_active_user_index is None
+                                    or durable_next_projection is None
+                                    or not durable_next_projection.fits
+                                ):
+                                    self._last_compaction_refusal_reason = (
+                                        "compaction_consumer_admission_failed"
+                                    )
+                                    self._terminalize_pending_durable_compaction(
+                                        status="failed",
+                                        reason="compaction_consumer_admission_failed",
+                                    )
+                                    yield self._transition(AgentState.ERROR)
+                                    terminal_error = self._context_overflow_error()
+                                    yield terminal_error
+                                    break
+                                if not overflow_outcome.ephemeral_only:
+                                    pending_event = (
+                                        self._pending_durable_compaction_event
+                                    )
+                                    if pending_event is None:
+                                        self._last_compaction_refusal_reason = (
+                                            "compaction_consumer_admission_failed"
+                                        )
+                                        yield self._transition(AgentState.ERROR)
+                                        terminal_error = self._context_overflow_error()
+                                        yield terminal_error
+                                        break
+                                    # Stable consumer admission, rather than the
+                                    # temporary routed leg, owns installation.
+                                    # Clear before yielding so cancellation after
+                                    # persistence cannot produce a second
+                                    # terminal lifecycle event.
+                                    self._pending_durable_compaction_event = None
+                                    yield pending_event
+                                    turn_messages = overflow_outcome.messages
+                                    request_context_insert_index = (
+                                        next_request_context_insert_index
+                                    )
+                                    runtime_context_insert_index = (
+                                        next_runtime_context_insert_index
+                                    )
+                                    if (
+                                        overflow_outcome.protected_turn_start_index
+                                        is not None
+                                    ):
+                                        current_turn_start_index = (
+                                            overflow_outcome.protected_turn_start_index
+                                        )
+                                    message_count_request_view = None
+                            next_projection = project_provider_final_request(
+                                self.provider,
+                                next_request_messages,
+                                provider_tools_for_call,
+                                next_chat_cfg,
+                            )
+                            if (
+                                next_active_user_index is None
+                                or next_projection is None
+                                or not next_projection.fits
+                            ):
+                                routed_recovery: CompactionOutcome | None = None
+                                routed_protected_start = (
+                                    overflow_outcome.protected_turn_start_index
+                                    if overflow_outcome.protected_turn_start_index
+                                    is not None
+                                    else current_turn_start_index
+                                )
+                                if (
+                                    durable_consumer_overflow_proven is True
+                                    and not overflow_outcome.ephemeral_only
+                                    and next_active_user_index is not None
+                                    and next_projection is not None
+                                    and self._live_turn_compaction_boundary(
+                                        overflow_outcome.messages,
+                                        protected_turn_start_index=(
+                                            routed_protected_start
+                                        ),
+                                    )
+                                    is not None
+                                ):
+                                    try:
+                                        routed_recovery = (
+                                            await self._recover_live_turn_request_overflow(
+                                                overflow_outcome.messages,
+                                                protected_turn_start_index=(
+                                                    routed_protected_start
+                                                ),
+                                                context_window_tokens=(
+                                                    self.config.context_window_tokens
+                                                ),
+                                                request_context_insert_index=(
+                                                    next_request_context_insert_index
+                                                ),
+                                                runtime_context_insert_index=(
+                                                    next_runtime_context_insert_index
+                                                ),
+                                                shared_compaction_config=(
+                                                    overflow_outcome
+                                                    .runtime_compaction_config
+                                                ),
+                                            )
+                                        )
+                                    except asyncio.CancelledError:
+                                        raise
+                                    except Exception as exc:  # noqa: BLE001
+                                        logger.warning(
+                                            "compaction.routed_live_turn_projection_failed",
+                                            error_type=type(exc).__name__,
+                                            error=str(exc),
+                                        )
+                                if routed_recovery is not None:
+                                    routed_request_index = (
+                                        routed_recovery.request_context_insert_index
+                                        if (
+                                            routed_recovery
+                                            .request_context_insert_index
+                                            is not None
+                                        )
+                                        else next_request_context_insert_index
+                                    )
+                                    routed_runtime_index = (
+                                        routed_recovery.runtime_context_insert_index
+                                        if (
+                                            routed_recovery
+                                            .runtime_context_insert_index
+                                            is not None
+                                        )
+                                        else next_runtime_context_insert_index
+                                    )
+                                    routed_request_messages = (
+                                        await self._provider_request_messages_async(
+                                            routed_recovery.messages,
+                                            request_context_message=(
+                                                request_context_message
+                                            ),
+                                            request_context_insert_index=(
+                                                routed_request_index
+                                            ),
+                                            runtime_context_message=(
+                                                runtime_context_message
+                                            ),
+                                            runtime_context_insert_index=(
+                                                routed_runtime_index
+                                            ),
+                                            turn_objective_message=(
+                                                turn_objective_message
+                                            ),
+                                        )
+                                    )
+                                    routed_active_user_index = (
+                                        _active_user_message_index_for_request(
+                                            routed_request_messages,
+                                            current_user_text=(
+                                                self._current_turn_message or ""
+                                            ),
+                                        )
+                                    )
+                                    routed_chat_cfg = call_chat_cfg.model_copy(
+                                        update={
+                                            "active_user_message_index": (
+                                                routed_active_user_index
+                                            )
+                                        }
+                                    )
+                                    routed_projection = (
+                                        project_provider_final_request(
+                                            self.provider,
+                                            routed_request_messages,
+                                            provider_tools_for_call,
+                                            routed_chat_cfg,
+                                        )
+                                    )
+                                    if (
+                                        routed_active_user_index is not None
+                                        and routed_projection is not None
+                                        and routed_projection.fits
+                                    ):
+                                        message_count_request_view = (
+                                            _MessageCountRequestView(
+                                                messages=(
+                                                    routed_recovery.messages
+                                                ),
+                                                canonical_tail_start=len(
+                                                    turn_messages
+                                                ),
+                                                request_context_insert_index=(
+                                                    routed_request_index
+                                                ),
+                                                runtime_context_insert_index=(
+                                                    routed_runtime_index
+                                                ),
+                                                protected_turn_start_index=(
+                                                    routed_recovery
+                                                    .protected_turn_start_index
+                                                    if (
+                                                        routed_recovery
+                                                        .protected_turn_start_index
+                                                        is not None
+                                                    )
+                                                    else current_turn_start_index
+                                                ),
+                                            )
+                                        )
+                                        self._last_compaction_refusal_reason = None
+                                        yield WarningEvent(
+                                            code=(
+                                                "context_auto_compaction_retry"
+                                            ),
+                                            message=(
+                                                "Stable context compacted and "
+                                                "the routed request was reduced "
+                                                "without changing durable history; "
+                                                "retrying the provider request."
+                                            ),
+                                        )
+                                        _call_attempt += 1
+                                        continue
+                                self._last_compaction_refusal_reason = (
+                                    "provider_request_budget_exhausted"
+                                    if durable_consumer_overflow_proven is True
+                                    else "compaction_final_admission_failed"
+                                )
+                                self._terminalize_pending_durable_compaction(
+                                    status="failed",
+                                    reason=self._last_compaction_refusal_reason,
+                                )
+                                yield self._transition(AgentState.ERROR)
+                                terminal_error = self._context_overflow_error()
+                                yield terminal_error
+                                break
+                            if overflow_outcome.ephemeral_only:
+                                message_count_request_view = _MessageCountRequestView(
+                                    messages=overflow_outcome.messages,
+                                    canonical_tail_start=len(turn_messages),
+                                    request_context_insert_index=(
+                                        next_request_context_insert_index
+                                    ),
+                                    runtime_context_insert_index=(
+                                        next_runtime_context_insert_index
+                                    ),
+                                    protected_turn_start_index=(
+                                        overflow_outcome.protected_turn_start_index
+                                        if overflow_outcome.protected_turn_start_index
+                                        is not None
+                                        else current_turn_start_index
+                                    ),
+                                )
+                            else:
+                                turn_messages = overflow_outcome.messages
+                                request_context_insert_index = (
+                                    next_request_context_insert_index
+                                )
+                                runtime_context_insert_index = (
+                                    next_runtime_context_insert_index
+                                )
+                                if (
+                                    overflow_outcome.protected_turn_start_index
+                                    is not None
+                                ):
+                                    current_turn_start_index = (
+                                        overflow_outcome.protected_turn_start_index
+                                    )
+                                message_count_request_view = None
                             yield WarningEvent(
                                 code="context_auto_compaction_retry",
                                 message="Context compacted; retrying the provider request.",
-                            )
-                            yield CompactionEvent(
-                                compaction_id=overflow_outcome.compaction_id,
-                                compaction_deadline_at_monotonic=(
-                                    overflow_outcome.compaction_deadline_at_monotonic
-                                ),
-                                compaction_timeout_seconds=(
-                                    overflow_outcome.compaction_timeout_seconds
-                                ),
-                                summary=overflow_outcome.summary,
-                                kept_entries=overflow_outcome.kept_entries,
-                                kept_count=len(overflow_outcome.messages),
-                                removed_count=overflow_outcome.removed_count,
                             )
                             _call_attempt += 1
                             continue
@@ -11058,6 +12398,10 @@ class Agent:
         )
         if final_ensemble_trace is not None and turn_ensemble_request_count > 0:
             final_ensemble_trace["llm_request_count"] = turn_ensemble_request_count
+        self._terminalize_pending_durable_compaction(
+            status="failed",
+            reason="rebuilt_request_not_admitted",
+        )
         await self._write_patch_evidence_ledger(
             final_status=(
                 "ok"
@@ -13505,15 +14849,6 @@ class Agent:
         mode = str(getattr(self.config, "runtime_state_capsule_mode", "off") or "off")
         if mode not in {"log", "inject"}:
             return None
-        if preview:
-            # Count projection needs the exact assembly rule, not capsule
-            # contents.  Avoid filesystem reads, metadata writes, and runtime
-            # events while preserving the one-message injection cardinality.
-            return (
-                Message(role="user", content="[runtime state capsule preview]")
-                if mode == "inject"
-                else None
-            )
         ctx = self._tool_context or current_tool_context.get()
         workspace = (
             getattr(ctx, "workspace_dir", None)
@@ -13521,6 +14856,19 @@ class Agent:
             else self.config.workspace_dir
         )
         capsule = build_runtime_state_capsule(workspace=workspace, tool_context=ctx)
+        if preview:
+            # Durable final-envelope admission needs the real serialized
+            # capsule bytes. Keep preview side-effect free, but do not replace
+            # variable workspace state with a tiny placeholder that could
+            # admit an envelope the physical call cannot send.
+            return (
+                Message(
+                    role="user",
+                    content=runtime_state_capsule_message(capsule),
+                )
+                if mode == "inject"
+                else None
+            )
         self.config.metadata["runtime_state_capsule_observed"] = (
             self.config.metadata.get("runtime_state_capsule_observed", 0) + 1
         )
@@ -13706,6 +15054,376 @@ class Agent:
             )
         return entries
 
+    @staticmethod
+    def _tool_result_requires_raw_preservation(message: Message) -> bool:
+        if not isinstance(message.content, list):
+            return False
+        unresolved_markers = {
+            "pending",
+            "queued",
+            "running",
+            "in_progress",
+            "requires_action",
+            "awaiting_approval",
+        }
+        for block in message.content:
+            if not isinstance(block, ContentBlockToolResult):
+                continue
+            if bool(getattr(block, "is_error", False)):
+                return True
+            raw_status = getattr(block, "execution_status", None)
+            if isinstance(raw_status, dict):
+                raw_status_name = str(
+                    raw_status.get("status") or ""
+                ).strip().lower()
+                if raw_status_name in unresolved_markers | {
+                    "error",
+                    "failed",
+                    "failure",
+                    "timeout",
+                    "timed_out",
+                    "cancelled",
+                    "unresolved",
+                }:
+                    return True
+                normalized_status = normalize_execution_status(raw_status)
+                normalized_name = normalized_status["status"]
+                if normalized_name in {"error", "timeout", "cancelled"}:
+                    return True
+                if normalized_name == "unknown" and (
+                    normalized_status["source"] != "legacy"
+                    or normalized_status["reason"]
+                    not in {None, "legacy_missing_status"}
+                    or normalized_status["preservation_class"] == "ephemeral"
+                ):
+                    return True
+            raw = block.content
+            if not isinstance(raw, str):
+                continue
+            try:
+                parsed = json.loads(raw)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if isinstance(parsed, dict) and str(
+                parsed.get("status") or parsed.get("execution_status") or ""
+            ).lower() in unresolved_markers:
+                return True
+        return False
+
+    def _live_turn_compaction_boundary(
+        self,
+        messages: list[Message],
+        *,
+        protected_turn_start_index: int,
+    ) -> tuple[int, int] | None:
+        """Return the active-user index and raw-tail start for a live tool loop."""
+
+        protected_start = max(
+            0,
+            min(protected_turn_start_index, len(messages)),
+        )
+        active_user_index = _active_user_message_index_for_request(
+            messages[protected_start:],
+            current_user_text=getattr(self, "_current_turn_message", "") or "",
+        )
+        if active_user_index is None:
+            return None
+        active_user_index += protected_start
+
+        assistant_starts = [
+            index
+            for index in range(active_user_index + 1, len(messages))
+            if messages[index].role == "assistant"
+        ]
+        # Preserve the latest two complete physical rounds. At least one older
+        # round must exist before a live-turn summary is worthwhile.
+        if len(assistant_starts) < 3:
+            return None
+
+        rounds: list[tuple[int, int, bool]] = []
+        for position, start in enumerate(assistant_starts):
+            end = (
+                assistant_starts[position + 1]
+                if position + 1 < len(assistant_starts)
+                else len(messages)
+            )
+            group = messages[start:end]
+            has_result = any(_message_has_tool_result(message) for message in group)
+            unresolved = (
+                _message_has_tool_use(messages[start])
+                and not has_result
+            )
+            critical = unresolved or any(
+                self._tool_result_requires_raw_preservation(message)
+                for message in group
+            )
+            rounds.append((start, end, critical))
+
+        keep_round = max(0, len(rounds) - 2)
+        critical_rounds = [
+            index for index, (_, _, critical) in enumerate(rounds) if critical
+        ]
+        if critical_rounds:
+            keep_round = min(keep_round, min(critical_rounds))
+        if keep_round <= 0:
+            return None
+        return active_user_index, rounds[keep_round][0]
+
+    @staticmethod
+    def _live_turn_mapped_index(
+        original_index: int | None,
+        *,
+        protected_start: int,
+        active_user_index: int,
+        keep_start: int,
+        active_prefix_count: int,
+    ) -> int | None:
+        if original_index is None:
+            return None
+        if original_index <= active_user_index:
+            return 2 + max(0, original_index - protected_start)
+        if original_index >= keep_start:
+            return 2 + active_prefix_count + (original_index - keep_start)
+        return 2 + active_prefix_count
+
+    async def _recover_live_turn_request_overflow(
+        self,
+        messages: list[Message],
+        *,
+        protected_turn_start_index: int,
+        context_window_tokens: int,
+        request_context_insert_index: int | None,
+        runtime_context_insert_index: int | None,
+        shared_compaction_config: CompactionConfig | None = None,
+    ) -> CompactionOutcome | None:
+        """Summarize completed live rounds into an ephemeral provider view."""
+
+        boundary = self._live_turn_compaction_boundary(
+            messages,
+            protected_turn_start_index=protected_turn_start_index,
+        )
+        if boundary is None:
+            return None
+        active_user_index, keep_start = boundary
+        protected_start = max(
+            0,
+            min(protected_turn_start_index, len(messages)),
+        )
+        active_prefix = messages[protected_start : active_user_index + 1]
+        raw_tail = messages[keep_start:]
+        summary_messages = [
+            *messages[:protected_start],
+            *messages[active_user_index + 1 : keep_start],
+        ]
+        if not summary_messages:
+            return None
+
+        config = shared_compaction_config or self._build_compaction_config()
+        # This request contains only the already-completed prefix. The caller
+        # retains the active user and the verified recent/error raw tail.
+        compaction_id = new_compaction_id()
+        if shared_compaction_config is None:
+            arm_compaction_deadline(config, operation_id=compaction_id)
+        original_protect_semantic_tail = config.protect_semantic_tail
+        original_protected_recent_messages = config.protected_recent_messages
+        config.protect_semantic_tail = False
+        config.protected_recent_messages = 0
+        try:
+            result = await compact_context(
+                CompactionRequest(
+                    session_id="agent-live-turn-request-view",
+                    entries=self._message_count_compaction_entries(
+                        summary_messages
+                    ),
+                    context_window_tokens=context_window_tokens,
+                    config=config,
+                    forced_prefix_cut=len(summary_messages),
+                    trigger="message_count",
+                    reason="live_turn_request_overflow",
+                    provider_request_correlation=(
+                        derive_provider_request_correlation(
+                            self._provider_request_correlation,
+                            execution_id=uuid.uuid4().hex,
+                            call_kind="auxiliary.compaction",
+                        )
+                    ),
+                )
+            )
+        finally:
+            if shared_compaction_config is not None:
+                config.protect_semantic_tail = original_protect_semantic_tail
+                config.protected_recent_messages = (
+                    original_protected_recent_messages
+                )
+        replacement_applied = bool(
+            result.removed_count > 0
+            or getattr(result, "replaced_previous_summary", False)
+        )
+        # Rejected candidates intentionally keep their structured payload for
+        # diagnostics. They are not installed state and must never be replayed
+        # ahead of the unchanged raw history.
+        replay_summary = (
+            compaction_replay_summary(result)
+            if replacement_applied
+            else ""
+        )
+        if (
+            result.removed_count != len(summary_messages)
+            or not replay_summary
+        ):
+            return None
+
+        projected = [
+            Message(
+                role="user",
+                content=(
+                    "[Context summary]\n"
+                    "Completed work from this still-active request:\n"
+                    f"{replay_summary}"
+                ),
+            ),
+            Message(
+                role="assistant",
+                content="Understood. Continuing the active request.",
+            ),
+            *active_prefix,
+            *raw_tail,
+        ]
+        if projected[2 : 2 + len(active_prefix)] != active_prefix:
+            return None
+        if projected[-len(raw_tail) :] != raw_tail:
+            return None
+        if repair_tool_pairing(projected) != projected:
+            return None
+
+        mapped_request_index = self._live_turn_mapped_index(
+            request_context_insert_index,
+            protected_start=protected_start,
+            active_user_index=active_user_index,
+            keep_start=keep_start,
+            active_prefix_count=len(active_prefix),
+        )
+        mapped_runtime_index = self._live_turn_mapped_index(
+            runtime_context_insert_index,
+            protected_start=protected_start,
+            active_user_index=active_user_index,
+            keep_start=keep_start,
+            active_prefix_count=len(active_prefix),
+        )
+        if self._session_key:
+            notify_compaction(
+                self._session_key,
+                source="automatic",
+                phase="agent_live_turn",
+                status="emergency_ephemeral",
+                reason="live_turn_request_overflow",
+                removed_count=result.removed_count,
+                kept_count=len(projected),
+                tokens_before=result.tokens_before,
+                tokens_after=result.tokens_after,
+                **compaction_effect_payload(
+                    status="emergency_ephemeral",
+                    reason="live_turn_request_overflow",
+                ),
+                **compaction_lifecycle_payload(
+                    compaction_id,
+                    COMPACTION_TRIGGERED_EVENT,
+                ),
+            )
+        return CompactionOutcome(
+            messages=projected,
+            compacted=True,
+            summary=replay_summary,
+            removed_count=result.removed_count,
+            compaction_id=compaction_id,
+            compaction_deadline_at_monotonic=config.deadline_at_monotonic,
+            compaction_timeout_seconds=config.total_timeout_seconds,
+            request_context_insert_index=mapped_request_index,
+            runtime_context_insert_index=mapped_runtime_index,
+            protected_turn_start_index=2,
+            ephemeral_only=True,
+            runtime_compaction_config=config,
+        )
+
+    async def _recover_live_turn_message_count_limit(
+        self,
+        messages: list[Message],
+        *,
+        request_suffix_messages: list[Message],
+        target_wire_messages: int,
+        config: ChatConfig,
+        identical_request_perturbed: bool,
+        request_context_message: Message | None,
+        request_context_insert_index: int,
+        runtime_context_message: Message,
+        runtime_context_insert_index: int,
+        turn_objective_message: Message | None,
+        protected_turn_start_index: int,
+    ) -> tuple[_MessageCountRecoveryOutcome | None, str]:
+        """Project completed live rounds when durable count recovery cannot fit.
+
+        The canonical turn remains untouched.  The shared live-turn projector
+        preserves the active user plus its recent, error, and unresolved tool
+        rounds as raw ``Message`` objects; this adapter only re-runs the exact
+        provider wire-count proof for the resulting request view.
+        """
+
+        try:
+            outcome = await self._recover_live_turn_request_overflow(
+                messages,
+                protected_turn_start_index=protected_turn_start_index,
+                context_window_tokens=self.config.context_window_tokens,
+                request_context_insert_index=request_context_insert_index,
+                runtime_context_insert_index=runtime_context_insert_index,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - refusal is surfaced as a stable reason
+            return None, "live_turn_summary_failed"
+        if outcome is None or not outcome.ephemeral_only:
+            return None, "no_safe_cut_or_live_turn_boundary"
+
+        mapped_request_index = (
+            outcome.request_context_insert_index
+            if outcome.request_context_insert_index is not None
+            else request_context_insert_index
+        )
+        mapped_runtime_index = (
+            outcome.runtime_context_insert_index
+            if outcome.runtime_context_insert_index is not None
+            else runtime_context_insert_index
+        )
+        verified = self._project_provider_request_message_count(
+            [*outcome.messages, *request_suffix_messages],
+            config=config,
+            identical_request_perturbed=identical_request_perturbed,
+            request_context_message=request_context_message,
+            request_context_insert_index=mapped_request_index,
+            runtime_context_message=runtime_context_message,
+            runtime_context_insert_index=mapped_runtime_index,
+            turn_objective_message=turn_objective_message,
+        )
+        if verified is None:
+            return None, "projection_unavailable_after_live_turn_summary"
+        if verified.actual_wire_messages > target_wire_messages:
+            return None, "projection_above_target_after_live_turn_summary"
+
+        return (
+            _MessageCountRecoveryOutcome(
+                messages=outcome.messages,
+                request_context_insert_index=mapped_request_index,
+                runtime_context_insert_index=mapped_runtime_index,
+                protected_turn_start_index=(
+                    outcome.protected_turn_start_index
+                    if outcome.protected_turn_start_index is not None
+                    else protected_turn_start_index
+                ),
+                projected_wire_messages=verified.actual_wire_messages,
+                removed_count=outcome.removed_count,
+            ),
+            "recovered_live_turn",
+        )
+
     async def _recover_provider_message_count_limit(
         self,
         messages: list[Message],
@@ -13794,7 +15512,19 @@ class Agent:
                 break
 
         if selected_cut is None or selected_projection is None:
-            return None, "no_safe_cut"
+            return await self._recover_live_turn_message_count_limit(
+                messages,
+                request_suffix_messages=request_suffix_messages,
+                target_wire_messages=target,
+                config=config,
+                identical_request_perturbed=identical_request_perturbed,
+                request_context_message=request_context_message,
+                request_context_insert_index=request_context_insert_index,
+                runtime_context_message=runtime_context_message,
+                runtime_context_insert_index=runtime_context_insert_index,
+                turn_objective_message=turn_objective_message,
+                protected_turn_start_index=protected_start,
+            )
 
         compaction_config = self._build_compaction_config()
         arm_compaction_deadline(
@@ -13824,6 +15554,18 @@ class Agent:
             result = await compact_context(request)
         except Exception:  # noqa: BLE001 - refusal is surfaced as a stable terminal state
             return None, "summary_failed"
+        replacement_applied = bool(
+            result.removed_count > 0
+            or getattr(result, "replaced_previous_summary", False)
+        )
+        # Quality/coverage rejection returns the candidate payload for
+        # diagnostics, but it is not installed state. Replaying that payload
+        # while retaining the full raw history would make the request larger.
+        replay_summary = (
+            compaction_replay_summary(result)
+            if replacement_applied
+            else ""
+        )
         kept_start_index = int(
             getattr(result, "kept_start_index", result.removed_count)
             or result.removed_count
@@ -13831,12 +15573,12 @@ class Agent:
         if (
             result.removed_count != selected_cut
             or kept_start_index != selected_cut
-            or not result.summary
+            or not replay_summary
         ):
             return None, str(result.skip_reason or "summary_failed")
 
         compacted = [
-            Message(role="user", content=f"[Context summary]\n{result.summary}"),
+            Message(role="user", content=f"[Context summary]\n{replay_summary}"),
             summary_ack,
             *messages[selected_cut:],
         ]
@@ -14119,9 +15861,29 @@ class Agent:
         return "The generated file is ready."
 
     def _build_compaction_config(self) -> CompactionConfig:
+        compaction_plan = self.config.compaction_execution_plan
+        plan_factory = self.config.compaction_execution_plan_factory
+        provider_for_compaction: Any | None = self.provider
+        if plan_factory is not None:
+            # A factory exists specifically because credentials and selector
+            # state must be rebound for each logical compaction operation.
+            # Never fall back to the previously frozen provider objects when
+            # refresh fails or produces no executable deployment.
+            compaction_plan = None
+            try:
+                compaction_plan = plan_factory()
+            except Exception as exc:  # noqa: BLE001 - fail closed to deterministic
+                logger.warning(
+                    "compaction.execution_plan_refresh_failed",
+                    error=type(exc).__name__,
+                )
+            if compaction_plan is None:
+                provider_for_compaction = None
         config = build_compaction_config_from_provider(
-            self.provider,
+            provider_for_compaction,
             default_model=self.config.model_id,
+            compaction_plan=compaction_plan,
+            context_window_tokens=self.config.context_window_tokens,
         )
         config.compaction_profile = self.config.compaction_profile
         config.protected_recent_messages = self.config.compaction_protected_recent_messages
@@ -14162,6 +15924,7 @@ class Agent:
         runtime_context_insert_index: int | None = None,
         protected_turn_start_index: int | None = None,
         compaction_window_tokens: int | None = None,
+        durable_consumer_overflow_proven: bool | None = None,
     ) -> CompactionOutcome | None:
         """Check if estimated live context tokens exceed the overflow threshold.
 
@@ -14179,6 +15942,61 @@ class Agent:
                 protected_turn_start_index=protected_turn_start_index,
             )
 
+        durable_window_tokens = max(
+            1,
+            int(self._durable_consumer_window_tokens or 0),
+        )
+        request_scoped_only = durable_consumer_overflow_proven is False
+        routed_window_is_narrower = (
+            durable_window_tokens > window_tokens
+            and durable_consumer_overflow_proven is not True
+        )
+        if request_scoped_only or routed_window_is_narrower:
+            # A temporary route/member window is request scope. Preflight has
+            # already admitted durable history against the stable session
+            # consumer, so rewriting that history to satisfy a deployment-only
+            # physical budget would permanently over-compact the session.
+            if (
+                protected_turn_start_index is not None
+                and self._live_turn_compaction_boundary(
+                    messages,
+                    protected_turn_start_index=protected_turn_start_index,
+                )
+                is not None
+            ):
+                try:
+                    ephemeral = await self._recover_live_turn_request_overflow(
+                        messages,
+                        protected_turn_start_index=protected_turn_start_index,
+                        context_window_tokens=window_tokens,
+                        request_context_insert_index=request_context_insert_index,
+                        runtime_context_insert_index=runtime_context_insert_index,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - refusal remains bounded
+                    logger.warning(
+                        "compaction.routed_live_turn_projection_failed",
+                        error_type=type(exc).__name__,
+                        error=str(exc),
+                    )
+                    ephemeral = None
+                if ephemeral is not None:
+                    return ephemeral
+            self._last_compaction_refusal_reason = (
+                "provider_request_budget_exhausted"
+            )
+            logger.warning(
+                "compaction.durable_rewrite_refused_for_routed_window",
+                routed_context_window_tokens=window_tokens,
+                durable_context_window_tokens=durable_window_tokens,
+                durable_consumer_overflow_proven=(
+                    durable_consumer_overflow_proven
+                ),
+                protected_turn_start_index=protected_turn_start_index,
+            )
+            return None
+
         if protected_turn_start_index is not None:
             protected_tail_start = max(
                 0,
@@ -14191,6 +16009,25 @@ class Agent:
                 )
             )
             if protected_tail_tokens > threshold:
+                try:
+                    ephemeral = await self._recover_live_turn_request_overflow(
+                        messages,
+                        protected_turn_start_index=protected_tail_start,
+                        context_window_tokens=window_tokens,
+                        request_context_insert_index=request_context_insert_index,
+                        runtime_context_insert_index=runtime_context_insert_index,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - refusal remains bounded
+                    logger.warning(
+                        "compaction.live_turn_projection_failed",
+                        error_type=type(exc).__name__,
+                        error=str(exc),
+                    )
+                    ephemeral = None
+                if ephemeral is not None:
+                    return ephemeral
                 self._last_compaction_refusal_reason = "provider_recent_tail_too_large"
                 logger.warning(
                     "compaction.protected_tail_too_large",
@@ -14507,6 +16344,18 @@ class Agent:
                 )
             return None  # signal failure
 
+        replacement_applied = bool(
+            result.removed_count > 0
+            or getattr(result, "replaced_previous_summary", False)
+        )
+        # Quality/coverage rejection returns the candidate payload for
+        # diagnostics, but it is not installed state. Replaying that payload
+        # while retaining the full raw history would make the request larger.
+        replay_summary = (
+            compaction_replay_summary(result)
+            if replacement_applied
+            else ""
+        )
         kept_start_index = int(
             getattr(result, "kept_start_index", result.removed_count)
             or result.removed_count
@@ -14524,7 +16373,7 @@ class Agent:
             self._last_compaction_refusal_reason = "provider_recent_tail_too_large"
             return None
 
-        if self._session_key and result.removed_count > 0 and result.summary:
+        if self._session_key and result.removed_count > 0 and replay_summary:
             for event in (
                 COMPACTION_CHUNK_SUMMARIZED_EVENT,
                 COMPACTION_SUMMARY_VERIFIED_EVENT,
@@ -14549,7 +16398,7 @@ class Agent:
         # Removing history without a replacement summary is equivalent to
         # bare truncation; reject it so the caller takes the existing
         # compaction failure path instead of silently dropping context.
-        if result.removed_count > 0 and not result.summary:
+        if result.removed_count > 0 and not replay_summary:
             logger.warning(
                 "compaction.empty_summary_rejected",
                 removed_count=result.removed_count,
@@ -14580,7 +16429,7 @@ class Agent:
         # compacted=True (the old behavior for string-only history) emits a
         # spurious CompactionEvent that rewrites the durable transcript and
         # corrupts row metadata, so short-circuit every no-op skip here.
-        if result.removed_count == 0 and not result.summary:
+        if not replacement_applied:
             has_structured_content = any(not isinstance(m.content, str) for m in messages)
             try:
                 await _await_flush_task()
@@ -14652,8 +16501,8 @@ class Agent:
         # and provider-specific content blocks are not flattened by the text
         # projection used solely as summarizer input.
         compacted: list[Message] = []
-        if result.summary:
-            compacted.append(Message(role="user", content=f"[Context summary]\n{result.summary}"))
+        if replay_summary:
+            compacted.append(Message(role="user", content=f"[Context summary]\n{replay_summary}"))
             compacted.append(
                 Message(role="assistant", content="Understood. Continuing from summary.")
             )
@@ -14709,22 +16558,33 @@ class Agent:
         adjusted_request_idx = self._adjust_index_after_prefix_compaction(
             request_context_insert_index,
             kept_start_index,
-            summary_present=bool(result.summary),
+            summary_present=bool(replay_summary),
         )
         adjusted_runtime_idx = self._adjust_index_after_prefix_compaction(
             runtime_context_insert_index,
             kept_start_index,
-            summary_present=bool(result.summary),
+            summary_present=bool(replay_summary),
         )
         adjusted_protected_idx = self._adjust_index_after_prefix_compaction(
             protected_turn_start_index,
             kept_start_index,
-            summary_present=bool(result.summary),
+            summary_present=bool(replay_summary),
         )
         return CompactionOutcome(
             messages=compacted,
             compacted=True,
-            summary=result.summary,
+            summary=str(getattr(result, "summary", "") or ""),
+            summary_payload=getattr(result, "summary_payload", None),
+            summary_format=str(getattr(result, "summary_format", "text") or "text"),
+            coverage_status=str(
+                getattr(result, "coverage_status", "unknown") or "unknown"
+            ),
+            missing_obligations=getattr(result, "missing_obligations", None),
+            critical_carry_forward=getattr(
+                result,
+                "critical_carry_forward",
+                None,
+            ),
             kept_entries=kept_entries,
             removed_count=result.removed_count,
             compaction_id=compaction_id,
@@ -14733,6 +16593,7 @@ class Agent:
             request_context_insert_index=adjusted_request_idx,
             runtime_context_insert_index=adjusted_runtime_idx,
             protected_turn_start_index=adjusted_protected_idx,
+            runtime_compaction_config=compaction_config,
         )
 
     def _consume_completed_flush_task(self) -> None:
@@ -16584,6 +18445,96 @@ class Agent:
         )
 
     # ------------------------------------------------------------------
+    def _prepare_subagent_execution_task(
+        self,
+        spec: SubagentSpec,
+        *,
+        execution_id: str,
+        child_target: Any,
+        child_context: ToolContext,
+        child_tool_definitions: list[ToolDefinition],
+    ) -> None:
+        """Keep oversized delegated tasks out of the child's initial request."""
+
+        task_bytes = len(spec.task.encode("utf-8"))
+        inline_limit = subagent_task_inline_limit_bytes(child_target)
+        if task_bytes <= inline_limit:
+            spec.execution_task = None
+            return
+        if task_bytes > MAX_REFERENCED_SUBAGENT_TASK_BYTES:
+            raise ValueError(
+                "Subagent task exceeds the safe handoff limit "
+                f"({task_bytes} > {MAX_REFERENCED_SUBAGENT_TASK_BYTES} bytes). "
+                "Publish the material as an artifact or workspace file and pass "
+                "a focused reference instead of copying the full parent context."
+            )
+        reference_slice_limit = subagent_task_reference_slice_limit_chars(
+            child_target
+        )
+        if reference_slice_limit < 1:
+            raise ValueError(
+                "Subagent deployment has no safe capacity for a referenced "
+                "task slice. Choose a larger child model or pass a focused "
+                "workspace-file reference."
+            )
+        if self._raw_tool_handler is None:
+            raise ValueError(
+                "Subagent task exceeds its inline request budget "
+                f"({task_bytes} > {inline_limit} bytes), and no retrieval-capable "
+                "tool handler is available. Pass an artifact/workspace reference."
+            )
+
+        has_retrieval_tool = any(
+            definition.name == "retrieve_tool_result"
+            for definition in child_tool_definitions
+        )
+        if not has_retrieval_tool and self._tool_registry is not None:
+            if child_context.surfaced_tools is None:
+                child_context.surfaced_tools = set()
+            child_context.surfaced_tools.add("retrieve_tool_result")
+            retrieval_definition = next(
+                (
+                    definition
+                    for definition in self._tool_registry.to_tool_definitions(child_context)
+                    if definition.name == "retrieve_tool_result"
+                ),
+                None,
+            )
+            if retrieval_definition is not None:
+                child_tool_definitions.append(retrieval_definition)
+                has_retrieval_tool = True
+        if not has_retrieval_tool:
+            raise ValueError(
+                "Subagent task exceeds its inline request budget "
+                f"({task_bytes} > {inline_limit} bytes), but retrieve_tool_result "
+                "is not available under the child tool policy. Pass an artifact "
+                "or workspace-file reference."
+            )
+
+        stored = self._store_tool_result_snapshot(
+            spec.task,
+            tool_use_id=f"subagent-task-{execution_id}",
+            tool_name="subagent_task_handoff",
+        )
+        if stored is None:
+            raise ValueError(
+                "Subagent task exceeds its inline request budget "
+                f"({task_bytes} > {inline_limit} bytes), and the configured "
+                "reference store could not persist it. Pass an artifact or "
+                "workspace-file reference."
+            )
+        spec.execution_task = render_subagent_task_reference(
+            stored,
+            slice_limit_chars=reference_slice_limit,
+        )
+        logger.info(
+            "subagent.task_externalized",
+            task_bytes=task_bytes,
+            inline_limit_bytes=inline_limit,
+            handle=stored.handle,
+            sha256=stored.sha256,
+        )
+
     # Subagent factory
     # ------------------------------------------------------------------
 
@@ -16610,6 +18561,11 @@ class Agent:
         parent_session_key = self._session_key or "unknown"
         subagent_label = spec.label or "subagent"
         child_execution_id = execution_id or uuid.uuid4().hex
+        child_target = resolve_subagent_execution_target(
+            self.provider,
+            self.config,
+            spec.model_id,
+        )
         child_provider_request_correlation = derive_provider_request_correlation(
             self._provider_request_correlation,
             execution_id=child_execution_id,
@@ -16699,6 +18655,13 @@ class Agent:
             if self.config.runtime_events_path
             else None,
         )
+        self._prepare_subagent_execution_task(
+            spec,
+            execution_id=child_execution_id,
+            child_target=child_target,
+            child_context=subagent_ctx,
+            child_tool_definitions=filtered_defs,
+        )
 
         async def _subagent_tool_handler(tc: ToolCall) -> ToolResult:
             if self._raw_tool_handler is None:
@@ -16724,8 +18687,9 @@ class Agent:
         child_cfg = AgentConfig(
             max_iterations=spec.max_iterations,
             timeout=spec.timeout,
-            provider_id=self.config.provider_id,
-            max_tokens=self.config.max_tokens,
+            provider_id=child_target.provider_id,
+            model_id=child_target.model_id or self.config.model_id,
+            max_tokens=child_target.max_output_tokens,
             temperature=self.config.temperature,
             top_p=self.config.top_p,
             max_turn_llm_calls=self.config.max_turn_llm_calls,
@@ -16735,7 +18699,7 @@ class Agent:
             max_turn_cost_usd=self.config.max_turn_cost_usd,
             max_turn_tool_errors=self.config.max_turn_tool_errors,
             length_capped_continuations=self.config.length_capped_continuations,
-            context_window_tokens=self.config.context_window_tokens,
+            context_window_tokens=child_target.context_window_tokens,
             workspace_dir=spec.workspace_dir or self.config.workspace_dir,
             flush_enabled=self.config.flush_enabled,
             flush_triggers=list(self.config.flush_triggers),
@@ -16774,7 +18738,8 @@ class Agent:
             tool_result_provider_request_max_chars=(
                 self.config.tool_result_provider_request_max_chars
             ),
-            provider_request_proof_max_chars=self.config.provider_request_proof_max_chars,
+            provider_request_proof_max_chars=child_target.provider_request_max_chars,
+            provider_request_proof_max_chars_explicit=False,
             tool_use_argument_provider_request_max_chars=(
                 self.config.tool_use_argument_provider_request_max_chars
             ),
@@ -16859,9 +18824,11 @@ class Agent:
             tool_result_store_max_bytes=self.config.tool_result_store_max_bytes,
             tool_result_store_disk_budget_bytes=(self.config.tool_result_store_disk_budget_bytes),
             tool_result_store_retention_seconds=(self.config.tool_result_store_retention_seconds),
+            model_capabilities=child_target.model_capabilities,
+            compaction_execution_plan=child_target.compaction_plan,
         )
         return Agent(
-            provider=self.provider,
+            provider=child_target.provider,
             config=child_cfg,
             tool_definitions=filtered_defs,
             tool_handler=_subagent_tool_handler,

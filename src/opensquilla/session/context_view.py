@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -19,6 +21,8 @@ from opensquilla.session.context_state_selection import (
 from opensquilla.session.models import SessionContextState, SessionSummary
 
 _ANTHROPIC_COMPACTION_STATE_KIND = "anthropic_compaction_block"
+_COMPACTION_SUMMARY_CONTEXT_HEADER = "[Compacted Session Summaries]"
+_COMPACTION_SUMMARY_CONTEXT_MAX_CHARS = 16_000
 
 
 @dataclass(frozen=True)
@@ -33,6 +37,72 @@ class CompactionContextItem:
     compaction_id: str | None
     source: str
     covered_through_id: int
+
+
+def format_compaction_summary_context(summary_texts: Sequence[str]) -> str | None:
+    """Render portable checkpoints exactly as the request-context path does."""
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for raw in summary_texts:
+        text = raw.strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        deduped.append(text)
+    if not deduped:
+        return None
+
+    blocks = [
+        f"[Summary {index}]\n{text}"
+        for index, text in enumerate(deduped, start=1)
+    ]
+    rendered = (
+        f"{_COMPACTION_SUMMARY_CONTEXT_HEADER}\n"
+        + "\n\n".join(blocks)
+    )
+    if len(rendered) <= _COMPACTION_SUMMARY_CONTEXT_MAX_CHARS:
+        return rendered
+    tail_budget = (
+        _COMPACTION_SUMMARY_CONTEXT_MAX_CHARS
+        - len(_COMPACTION_SUMMARY_CONTEXT_HEADER)
+        - 80
+    )
+    tail_budget = max(1000, tail_budget)
+    return (
+        f"{_COMPACTION_SUMMARY_CONTEXT_HEADER}\n"
+        "[Earlier compaction summary context truncated to fit request budget.]\n"
+        f"{rendered[-tail_budget:]}"
+    )
+
+
+def compaction_context_fingerprint(
+    *,
+    context_states: Sequence[SessionContextState],
+    summaries: Sequence[SessionSummary],
+) -> str:
+    """Hash the exact active portable context projection for CAS validation."""
+
+    records = build_compaction_context_records(
+        context_states=context_states,
+        summaries=summaries,
+    )
+    payload = [
+        {
+            "text": record.text,
+            "compaction_id": record.compaction_id,
+            "source": record.source,
+            "covered_through_id": record.covered_through_id,
+        }
+        for record in records
+    ]
+    serialized = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
 def _now_ms() -> int:
@@ -72,6 +142,16 @@ def _valid_anthropic_compaction_state(
         and not state.portable
         and isinstance(content, str)
         and bool(content.strip())
+    )
+
+
+def _replaces_prior_context(payload: object) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    coverage = payload.get("source_coverage")
+    return bool(
+        isinstance(coverage, dict)
+        and coverage.get("replaces_prior_context") is True
     )
 
 
@@ -160,7 +240,24 @@ def build_compaction_context_records(
         for state in ordered_context_states(context_states)
         if _valid_structured_summary_state(state, now_ms=now)
     ]
-    for state in latest_context_states_by_covered_through_id(structured_states):
+    selected_states = latest_context_states_by_covered_through_id(
+        structured_states
+    )
+    replacement_index = next(
+        (
+            index
+            for index in range(len(selected_states) - 1, -1, -1)
+            if _replaces_prior_context(selected_states[index].payload)
+        ),
+        None,
+    )
+    replacement_active = replacement_index is not None
+    replacement_floor = 0
+    if replacement_index is not None:
+        selected_states = selected_states[replacement_index:]
+        replacement_floor = selected_states[0].covered_through_id
+
+    for state in selected_states:
         if state.covered_through_id in state_covered_ids:
             continue
         try:
@@ -186,6 +283,11 @@ def build_compaction_context_records(
 
     for summary in summaries:
         if summary.covered_through_id in state_covered_ids:
+            continue
+        if (
+            replacement_active
+            and summary.covered_through_id <= replacement_floor
+        ):
             continue
         text = summary.summary_text.strip()
         if text:

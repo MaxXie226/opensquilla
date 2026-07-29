@@ -378,6 +378,11 @@ class _ResolvedCatalog:
     max_tokens: int
     context_window: int
     capabilities: ModelCapabilities | None
+    # Raw positive global ``llm.context_window_tokens`` value, or zero when
+    # unset. This is deliberately distinct from ``context_window`` because a
+    # per-model override may win for the current deployment while the global
+    # value still governs a later selector fallback without its own override.
+    context_window_tokens_global_override: int = 0
     temperature: float | None = None
     top_p: float | None = None
     # Explicit provider-request proof budget (chars); 0 keeps the derived path.
@@ -846,7 +851,13 @@ class AgentBootstrapStage:
             temperature=catalog.temperature,
             top_p=catalog.top_p,
             context_window_tokens=catalog.context_window,
+            context_window_tokens_global_override=(
+                catalog.context_window_tokens_global_override
+            ),
             provider_request_proof_max_chars=catalog.provider_request_proof_max_chars,
+            provider_request_proof_max_chars_explicit=(
+                catalog.provider_request_proof_max_chars > 0
+            ),
             max_history_turns=_route_max_history_turns(inp.turn.metadata),
             preserve_historical_images=_preserve_historical_images(inp.turn.metadata),
             materialize_historical_attachments=bool(

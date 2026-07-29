@@ -28,7 +28,7 @@ from opensquilla.gateway.attachment_ingest import (
     MAX_TOTAL_ATTACHMENT_BYTES,
 )
 from opensquilla.gateway.auth import Principal
-from opensquilla.gateway.config import AgentEntryConfig, GatewayConfig
+from opensquilla.gateway.config import AgentEntryConfig, GatewayConfig, LlmProviderProfile
 from opensquilla.gateway.input_normalization import LARGE_PASTE_CHARS, estimate_text_tokens
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.gateway.rpc_sessions import _normalize_terminal_event_payload
@@ -37,6 +37,7 @@ from opensquilla.gateway.session_streams import get_session_streams
 from opensquilla.gateway.uploads import set_upload_store
 from opensquilla.gateway.websocket import SubscriptionManager, WsConnection, get_registry
 from opensquilla.project_workspaces import ProjectWorkspaceStateError
+from opensquilla.provider.selector import ProviderConfig
 from opensquilla.provider.types import ProviderRequestCorrelation
 from opensquilla.sandbox.run_context import RUN_CONTEXT_ORIGIN_KEY
 from opensquilla.session import storage as session_storage
@@ -79,7 +80,11 @@ class FakeSession:
     spawned_by: str | None = None
     origin: dict | None = None
     model: str | None = None
+    model_provider: str | None = None
+    provider_override: str | None = None
     model_override: str | None = None
+    auth_profile_override: str | None = None
+    auth_profile_override_source: str | None = None
     epoch: int = 0
     workspace_id: str | None = None
 
@@ -354,6 +359,11 @@ class FakeSessionManager:
         agent_id: str = "main",
         display_name: str | None = None,
         model: str | None = None,
+        model_provider: str | None = None,
+        provider_override: str | None = None,
+        model_override: str | None = None,
+        auth_profile_override: str | None = None,
+        auth_profile_override_source: str | None = None,
     ):
         session = FakeSession(
             session_key=session_key,
@@ -361,6 +371,11 @@ class FakeSessionManager:
             agent_id=agent_id,
             display_name=display_name,
             model=model,
+            model_provider=model_provider,
+            provider_override=provider_override,
+            model_override=model_override,
+            auth_profile_override=auth_profile_override,
+            auth_profile_override_source=auth_profile_override_source,
         )
         self._storage._sessions[session_key] = session
         return session
@@ -732,6 +747,112 @@ class TestSessionsCreate:
         assert res.ok is True
         session = session_manager._storage._sessions[res.payload["key"]]
         assert session.model == "explicit/model"
+
+    @pytest.mark.asyncio
+    async def test_create_provider_does_not_inherit_agent_registry_model(self, dispatcher):
+        cfg = GatewayConfig(agents=[AgentEntryConfig(id="ops", model="claude/default")])
+        registry = AgentRegistry(cfg, persist_changes=False)
+        session_manager = FakeSessionManager()
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.create",
+            {"agentId": "ops", "provider": "openai"},
+            make_ctx(
+                session_manager=session_manager,
+                config=cfg,
+                agent_registry=registry,
+            ),
+        )
+
+        assert res.ok is False
+        assert res.error.code == "INVALID_PARAMS"
+        assert res.error.details == {
+            "reason": "session_deployment_requires_explicit_model"
+        }
+        assert session_manager._storage._sessions == {}
+
+    @pytest.mark.asyncio
+    async def test_create_persists_complete_named_profile_deployment(self, dispatcher):
+        cfg = GatewayConfig(memory={"flush_enabled": False})
+        cfg.llm_profiles["openai:work"] = LlmProviderProfile(
+            api_key="synthetic-named-secret",
+            base_url="https://api.openai.com/v1",
+        )
+        session_manager = FakeSessionManager()
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.create",
+            {
+                "agentId": "main",
+                "provider": "OpenAI",
+                "model": "gpt-session",
+                "authProfile": "openai:work",
+            },
+            make_ctx(session_manager=session_manager, config=cfg),
+        )
+
+        assert res.ok is True
+        session = session_manager._storage._sessions[res.payload["key"]]
+        assert session.provider_override == "openai"
+        assert session.model == "gpt-session"
+        assert session.auth_profile_override == "openai:work"
+        assert session.auth_profile_override_source == "rpc"
+        assert session.model_provider is None
+        assert "synthetic-named-secret" not in repr(res.payload)
+        assert "openai:work" not in repr(res.payload)
+
+    @pytest.mark.asyncio
+    async def test_create_rejects_incomplete_named_profile_deployment(self, dispatcher):
+        session_manager = FakeSessionManager()
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.create",
+            {
+                "agentId": "main",
+                "model": "gpt-session",
+                "authProfile": "openai:work",
+            },
+            make_ctx(session_manager=session_manager),
+        )
+
+        assert res.ok is False
+        assert res.error.code == "INVALID_PARAMS"
+        assert res.error.details == {
+            "reason": "named_auth_profile_requires_provider"
+        }
+        assert session_manager._storage._sessions == {}
+
+    @pytest.mark.asyncio
+    async def test_create_rejects_named_profile_provider_mismatch(self, dispatcher):
+        cfg = GatewayConfig(memory={"flush_enabled": False})
+        cfg.llm_profiles["anthropic:work"] = LlmProviderProfile(
+            api_key="synthetic-named-secret",
+            base_url="https://api.anthropic.com",
+        )
+        session_manager = FakeSessionManager()
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.create",
+            {
+                "agentId": "main",
+                "provider": "openai",
+                "model": "gpt-session",
+                "authProfile": "anthropic:work",
+            },
+            make_ctx(session_manager=session_manager, config=cfg),
+        )
+
+        assert res.ok is False
+        assert res.error.code == "INVALID_PARAMS"
+        assert res.error.details == {
+            "reason": "named_auth_profile_provider_mismatch"
+        }
+        assert "synthetic-named-secret" not in repr(res.error)
+        assert session_manager._storage._sessions == {}
 
     @pytest.mark.asyncio
     async def test_create_rejects_missing_agent_when_registry_present(self, dispatcher):
@@ -4083,6 +4204,250 @@ class TestSessionsPatch:
         assert resolved.payload["model"] is None
 
     @pytest.mark.asyncio
+    async def test_patch_rebinds_complete_named_profile_and_clears_stale_actual_pair(
+        self,
+        dispatcher,
+    ):
+        cfg = GatewayConfig(memory={"flush_enabled": False})
+        cfg.llm_profiles["openai:work"] = LlmProviderProfile(
+            api_key="synthetic-named-secret",
+            base_url="https://api.openai.com/v1",
+        )
+        session = FakeSession(
+            provider_override="anthropic",
+            model="claude-pin",
+            model_provider="anthropic",
+            model_override="claude-actual",
+        )
+        manager = FakeSessionManager([session])
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.patch",
+            {
+                "key": session.session_key,
+                "provider": "openai",
+                "model": "gpt-pin",
+                "authProfile": "openai:work",
+            },
+            make_ctx(session_manager=manager, config=cfg),
+        )
+
+        assert res.ok is True
+        assert res.payload["updated"] == ["model", "provider", "authProfile"]
+        assert session.provider_override == "openai"
+        assert session.model == "gpt-pin"
+        assert session.auth_profile_override == "openai:work"
+        assert session.auth_profile_override_source == "rpc"
+        assert session.model_provider is None
+        assert session.model_override is None
+        assert "synthetic-named-secret" not in repr(res.payload)
+        assert "openai:work" not in repr(res.payload)
+
+    @pytest.mark.asyncio
+    async def test_patch_provider_change_requires_model_in_same_request(
+        self,
+        dispatcher,
+    ):
+        session = FakeSession(
+            provider_override="anthropic",
+            model="claude-old",
+            model_provider="anthropic",
+            model_override="claude-actual",
+        )
+        manager = FakeSessionManager([session])
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.patch",
+            {
+                "key": session.session_key,
+                "provider": "openai",
+            },
+            make_ctx(session_manager=manager),
+        )
+
+        assert res.ok is False
+        assert res.error.code == "INVALID_PARAMS"
+        assert res.error.details == {
+            "reason": "session_deployment_requires_explicit_model"
+        }
+        assert session.provider_override == "anthropic"
+        assert session.model == "claude-old"
+        assert session.model_provider == "anthropic"
+        assert session.model_override == "claude-actual"
+
+    @pytest.mark.asyncio
+    async def test_patch_auth_profile_change_requires_model_in_same_request(
+        self,
+        dispatcher,
+    ):
+        cfg = GatewayConfig(memory={"flush_enabled": False})
+        cfg.llm_profiles["openai:work"] = LlmProviderProfile(
+            api_key="synthetic-named-secret",
+            base_url="https://api.openai.com/v1",
+        )
+        session = FakeSession(
+            provider_override="openai",
+            model="gpt-old",
+        )
+        manager = FakeSessionManager([session])
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.patch",
+            {
+                "key": session.session_key,
+                "authProfile": "openai:work",
+            },
+            make_ctx(session_manager=manager, config=cfg),
+        )
+
+        assert res.ok is False
+        assert res.error.code == "INVALID_PARAMS"
+        assert res.error.details == {
+            "reason": "session_deployment_requires_explicit_model"
+        }
+        assert session.auth_profile_override is None
+
+    @pytest.mark.asyncio
+    async def test_patch_can_atomically_clear_complete_deployment(self, dispatcher):
+        session = FakeSession(
+            provider_override="openai",
+            model="gpt-old",
+            model_provider="openai",
+            model_override="gpt-actual",
+            auth_profile_override="openai:work",
+            auth_profile_override_source="rpc",
+        )
+        manager = FakeSessionManager([session])
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.patch",
+            {
+                "key": session.session_key,
+                "provider": None,
+                "model": None,
+                "authProfile": None,
+            },
+            make_ctx(session_manager=manager),
+        )
+
+        assert res.ok is True
+        assert session.provider_override is None
+        assert session.model is None
+        assert session.auth_profile_override is None
+        assert session.auth_profile_override_source is None
+        assert session.model_provider is None
+        assert session.model_override is None
+
+    @pytest.mark.asyncio
+    async def test_model_only_patch_clears_stale_physical_provenance(self, dispatcher):
+        session = FakeSession(
+            model="gpt-old",
+            model_provider="openai",
+            model_override="gpt-actual",
+        )
+        manager = FakeSessionManager([session])
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.patch",
+            {
+                "key": session.session_key,
+                "model": "gpt-new",
+            },
+            make_ctx(session_manager=manager),
+        )
+
+        assert res.ok is True
+        assert session.model == "gpt-new"
+        assert session.model_provider is None
+        assert session.model_override is None
+
+    @pytest.mark.asyncio
+    async def test_deployment_patch_waits_for_turn_lock_before_read_and_update(
+        self,
+        dispatcher,
+    ):
+        session = FakeSession(
+            provider_override="anthropic",
+            model="claude-old",
+        )
+        manager = FakeSessionManager([session])
+        turn_runner = _RecordingTurnRunner()
+        lock = turn_runner._get_session_lock(session.session_key)
+        await lock.acquire()
+
+        patch_task = asyncio.create_task(
+            dispatcher.dispatch(
+                "r1",
+                "sessions.patch",
+                {
+                    "key": session.session_key,
+                    "provider": "openai",
+                    "model": "gpt-new",
+                },
+                make_ctx(session_manager=manager, turn_runner=turn_runner),
+            )
+        )
+        await asyncio.sleep(0)
+
+        assert patch_task.done() is False
+        # Simulate the active turn finalizer persisting its old physical pair
+        # while it still owns the same per-session turn lock.
+        session.model_provider = "anthropic"
+        session.model_override = "claude-actual"
+        lock.release()
+
+        res = await patch_task
+
+        assert res.ok is True
+        assert session.provider_override == "openai"
+        assert session.model == "gpt-new"
+        assert session.model_provider is None
+        assert session.model_override is None
+
+    @pytest.mark.asyncio
+    async def test_patch_rejects_profile_mismatch_without_partial_mutation(
+        self,
+        dispatcher,
+    ):
+        cfg = GatewayConfig(memory={"flush_enabled": False})
+        cfg.llm_profiles["openai:work"] = LlmProviderProfile(
+            api_key="synthetic-named-secret",
+            base_url="https://api.openai.com/v1",
+        )
+        session = FakeSession(
+            provider_override="openai",
+            model="gpt-old",
+            auth_profile_override="openai:work",
+            auth_profile_override_source="rpc",
+        )
+        manager = FakeSessionManager([session])
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.patch",
+            {
+                "key": session.session_key,
+                "provider": "anthropic",
+                "model": "claude-new",
+            },
+            make_ctx(session_manager=manager, config=cfg),
+        )
+
+        assert res.ok is False
+        assert res.error.code == "INVALID_PARAMS"
+        assert res.error.details == {
+            "reason": "named_auth_profile_provider_mismatch"
+        }
+        assert session.provider_override == "openai"
+        assert session.model == "gpt-old"
+        assert session.auth_profile_override == "openai:work"
+
+    @pytest.mark.asyncio
     async def test_patch_not_found(self, dispatcher, ctx_with_sessions):
         res = await dispatcher.dispatch(
             "r1",
@@ -5111,6 +5476,59 @@ class TestSessionsContextCompact:
         assert correlation.call_kind == "auxiliary.compaction"
 
     @pytest.mark.asyncio
+    async def test_context_compact_client_window_cannot_expand_stable_consumer(
+        self,
+        dispatcher,
+        session,
+    ):
+        manager = FakeSessionManager([session])
+        config = GatewayConfig(
+            llm={
+                "provider": "openai",
+                "model": "gpt-stable",
+                "api_key": "dummy-key",
+                "base_url": "https://api.openai.com/v1",
+                "context_window_tokens": 4096,
+                "max_tokens": 512,
+            },
+            context_budget_tokens=100_000,
+            memory={"flush_enabled": False},
+        )
+        current = ProviderConfig(
+            provider="openai",
+            model="gpt-stable",
+            api_key="dummy-key",
+            base_url="https://api.openai.com/v1",
+        )
+        selector = SimpleNamespace(
+            current_config=current,
+            remaining_chain=lambda: [current],
+        )
+        ctx = make_ctx(
+            session_manager=manager,
+            provider_selector=selector,
+            config=config,
+        )
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.contextCompact",
+            {
+                "key": session.session_key,
+                "contextWindowTokens": 999_999,
+            },
+            ctx,
+        )
+
+        assert res.ok is True
+        assert res.payload["context_window_tokens"] == 4096
+        assert manager.compact_calls[0][:2] == (session.session_key, 4096)
+        compact_kwargs = manager.compact_kwargs[0]
+        assert compact_kwargs["context_window_chars"] > 0
+        assert callable(compact_kwargs["consumer_admission"])
+        assert len(compact_kwargs["consumer_admission_fingerprint"]) == 64
+
+    @pytest.mark.asyncio
     async def test_context_compact_emits_started_and_completed_events(
         self,
         dispatcher,
@@ -5610,6 +6028,105 @@ class TestSessionsContextCompact:
         assert [payload["status"] for _, _, payload in emitted] == [
             "started",
             "skipped",
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "stale_reason",
+        [
+            "stale_preimage",
+            "stale_context_state",
+            "consumer_admission_stale_or_failed",
+        ],
+    )
+    async def test_context_compact_maps_stale_noop_to_one_stale_terminal(
+        self,
+        dispatcher,
+        session,
+        stale_reason: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        manager = FakeSessionManager([session])
+
+        async def _stale(*_args: Any, **_kwargs: Any) -> Any:
+            return SimpleNamespace(
+                summary="",
+                removed_count=0,
+                kept_entries=[],
+                summary_source="skipped",
+                tokens_before=1200,
+                tokens_after=1200,
+                remaining_budget_tokens=0,
+                chunks_processed=0,
+                coverage_status="unknown",
+                skip_reason=stale_reason,
+            )
+
+        manager.compact_with_result = _stale  # type: ignore[method-assign]
+        ctx = make_ctx(session_manager=manager)
+        events: list[tuple[str, dict[str, Any]]] = []
+        monkeypatch.setattr(
+            rpc_sessions,
+            "notify_compaction",
+            lambda session_key, **payload: events.append((session_key, payload)),
+        )
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.contextCompact",
+            {"key": session.session_key},
+            ctx,
+        )
+
+        assert res.ok is True
+        assert res.payload["status"] == "stale"
+        assert res.payload["reason"] == stale_reason
+        assert [payload["status"] for _, payload in events] == [
+            "started",
+            "stale",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_context_compact_timeout_emits_exactly_one_terminal(
+        self,
+        dispatcher,
+        session,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        manager = FakeSessionManager([session])
+        blocked = asyncio.Event()
+
+        async def _blocked(*_args: Any, **_kwargs: Any) -> Any:
+            await blocked.wait()
+
+        manager.compact_with_result = _blocked  # type: ignore[method-assign]
+        config = GatewayConfig(
+            memory={"flush_enabled": False},
+            compaction={
+                "total_timeout_seconds": 0.02,
+                "heartbeat_interval_seconds": 1.0,
+            },
+        )
+        ctx = make_ctx(session_manager=manager, config=config)
+        events: list[tuple[str, dict[str, Any]]] = []
+        monkeypatch.setattr(
+            rpc_sessions,
+            "notify_compaction",
+            lambda session_key, **payload: events.append((session_key, payload)),
+        )
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.contextCompact",
+            {"key": session.session_key},
+            ctx,
+        )
+
+        assert res.ok is False
+        assert res.error.code == "COMPACTION_TIMEOUT"
+        assert [payload["status"] for _, payload in events] == [
+            "started",
+            "timed_out",
         ]
 
     @pytest.mark.asyncio

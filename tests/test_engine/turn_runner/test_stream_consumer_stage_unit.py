@@ -103,6 +103,11 @@ class _RecordingCompactionPersist:
         session_key: str,
         summary: str,
         kept_entries: list[Any],
+        summary_payload: dict[str, Any] | None = None,
+        summary_format: str = "text",
+        coverage_status: str = "unknown",
+        missing_obligations: list[str] | None = None,
+        critical_carry_forward: list[str] | None = None,
         compaction_id: str | None = None,
         compaction_deadline_at_monotonic: float | None = None,
         compaction_timeout_seconds: float | None = None,
@@ -117,6 +122,11 @@ class _RecordingCompactionPersist:
                 "session_key": session_key,
                 "summary": summary,
                 "kept_entries": kept_entries,
+                "summary_payload": summary_payload,
+                "summary_format": summary_format,
+                "coverage_status": coverage_status,
+                "missing_obligations": missing_obligations,
+                "critical_carry_forward": critical_carry_forward,
                 "compaction_id": compaction_id,
                 "compaction_deadline_at_monotonic": (
                     compaction_deadline_at_monotonic

@@ -30,6 +30,8 @@ def test_render_structured_summary_uses_stable_sections_not_raw_json() -> None:
             }
         ],
         known_failures=[{"command": "pytest old", "error": "missing summary_payload column"}],
+        executed_commands_and_tests=["uv run pytest tests/test_session/test_compaction.py"],
+        pending_tool_and_approval_ids=["call_waiting_1"],
         important_identifiers=["cmp_123"],
         constraints_and_preferences=["do not enable coverage blocking by default"],
         do_not_repeat=["do not force-add ignored docs"],
@@ -45,6 +47,8 @@ def test_render_structured_summary_uses_stable_sections_not_raw_json() -> None:
     assert "Files and Artifacts:" in rendered
     assert "- path: src/opensquilla/session/models.py" in rendered
     assert "Known Failures:" in rendered
+    assert "Executed Commands and Tests:" in rendered
+    assert "Pending Tool and Approval IDs:" in rendered
     assert "Critical Carry Forward:" in rendered
     assert '{"' not in rendered
     assert "source_coverage" not in rendered
@@ -112,6 +116,103 @@ def test_extract_compaction_obligations_keeps_high_signal_facts_bounded() -> Non
         "Do not repeat git reset --hard; keep summary_text compatible.",
     ) in by_kind
     assert all(len(item.value) <= 240 for item in obligations)
+
+
+def test_structured_summary_exposes_command_and_pending_tool_workset() -> None:
+    entries = [
+        {
+            "role": "assistant",
+            "content": "Next I will run uv run pytest tests/test_session/test_compaction.py.",
+            "tool_calls": [
+                {"id": "call_done", "type": "function"},
+                {"id": "call_waiting", "type": "function"},
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_done",
+            "content": "uv run pytest tests/test_session/test_compaction.py passed",
+        },
+    ]
+
+    obligations = extract_compaction_obligations(entries)
+    summary, _coverage = build_structured_summary_from_text(
+        "One test completed and another tool call is awaiting its result.",
+        obligations,
+    )
+
+    assert any(
+        command.startswith("uv run pytest tests/test_session/test_compaction.py")
+        for command in summary.executed_commands_and_tests
+    )
+    assert summary.pending_tool_and_approval_ids == ["call_waiting"]
+    assert summary.open_steps == [
+        "Next I will run uv run pytest tests/test_session/test_compaction.py."
+    ]
+    assert "call_done" not in summary.pending_tool_and_approval_ids
+
+
+def test_canonical_nested_tool_results_populate_failure_and_pending_workset() -> None:
+    entries = [
+        {
+            "role": "assistant",
+            "content": "Checking the implementation.",
+            "tool_calls": [
+                {
+                    "type": "tool_use",
+                    "tool_use_id": "call_failed",
+                    "name": "exec_command",
+                    "input": {"command": "uv run pytest tests/test_session"},
+                },
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "call_failed",
+                    "result": (
+                        "uv run pytest tests/test_session failed\n"
+                        "Error: assertion failed in src/opensquilla/session/manager.py"
+                    ),
+                    "is_error": True,
+                    "execution_status": {
+                        "status": "error",
+                        "reason": "nonzero_exit",
+                    },
+                },
+                {
+                    "type": "tool_use",
+                    "tool_use_id": "call_waiting",
+                    "name": "request_approval",
+                    "input": {},
+                },
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "call_waiting",
+                    "result": "Approval is still pending.",
+                    "execution_status": {
+                        "status": "unknown",
+                        "reason": "awaiting_approval",
+                        "preservation_class": "ephemeral",
+                    },
+                },
+            ],
+        }
+    ]
+
+    obligations = extract_compaction_obligations(entries)
+    summary, _coverage = build_structured_summary_from_text(
+        "The check failed and an approval remains pending.",
+        obligations,
+    )
+
+    assert any(
+        "assertion failed" in item.get("detail", "").lower()
+        for item in summary.known_failures
+    )
+    assert any(
+        command.startswith("uv run pytest tests/test_session")
+        for command in summary.executed_commands_and_tests
+    )
+    assert summary.pending_tool_and_approval_ids == ["call_waiting"]
+    assert "call_failed" not in summary.pending_tool_and_approval_ids
 
 
 def test_extract_compaction_obligations_prioritizes_goals_when_bounded() -> None:
@@ -198,13 +299,39 @@ def test_structured_summary_preserves_decisions_and_identifiers() -> None:
     assert summary.important_identifiers == ["550e8400-e29b-41d4-a716-446655440000"]
 
 
-def test_structured_summary_can_block_missing_critical_obligations_when_opted_in() -> None:
+def test_structured_summary_coverage_checks_the_replayed_backfill() -> None:
     obligations = extract_compaction_obligations(
         [
             {
                 "role": "user",
                 "content": (
                     "Goal: finish compaction continuity. Keep src/opensquilla/session/models.py."
+                ),
+            }
+        ]
+    )
+
+    summary, coverage = build_structured_summary_from_text(
+        "The session is being compacted.",
+        obligations,
+        block_missing_critical=True,
+    )
+
+    assert coverage.status == "pass"
+    assert coverage.blocked is False
+    assert coverage.missing_obligations == []
+    assert summary.source_coverage["status"] == "pass"
+    assert "src/opensquilla/session/models.py" in render_structured_summary(summary)
+
+
+def test_structured_summary_blocks_when_bounded_replay_still_misses_critical_facts() -> None:
+    obligations = extract_compaction_obligations(
+        [
+            {
+                "role": "user",
+                "content": "\n".join(
+                    f"Goal: preserve independent objective {index}"
+                    for index in range(40)
                 ),
             }
         ]

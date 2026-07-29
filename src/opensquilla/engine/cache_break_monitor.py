@@ -257,6 +257,7 @@ _COMPACTION_TERMINAL_STATUSES = frozenset(
         "error",
         "cancelled",
         "timed_out",
+        "stale",
         "emergency_ephemeral",
     }
 )

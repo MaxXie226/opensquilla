@@ -40,11 +40,56 @@ def test_context_budget_reports_send_compacted_when_provider_proof_compacts() ->
     payload = {
         "messages": [
             {
+                "role": "user",
+                "content": "Update the file.",
+            },
+            {
                 "role": "assistant",
                 "content": "",
                 "tool_calls": [
                     {
                         "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "write_file",
+                            "arguments": "x" * 5000,
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "File updated.",
+            },
+            {
+                "role": "assistant",
+                "content": "The file was updated successfully.",
+            },
+        ]
+    }
+
+    decision = coordinate_provider_context_budget(
+        payload,
+        projection_adapter="test",
+        proof_budget=2000,
+    )
+
+    assert decision.action == "send_compacted"
+    assert decision.proof is not None
+    assert decision.proof["compact_needed"] is True
+    assert decision.payload is not None
+
+
+def test_context_budget_does_not_compact_unresolved_tool_call() -> None:
+    payload = {
+        "messages": [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_unresolved",
                         "type": "function",
                         "function": {
                             "name": "write_file",
@@ -62,10 +107,10 @@ def test_context_budget_reports_send_compacted_when_provider_proof_compacts() ->
         proof_budget=2000,
     )
 
-    assert decision.action == "send_compacted"
+    assert decision.action == "budget_limited"
+    assert decision.payload is None
+    assert decision.reason == "provider_request_budget_exhausted"
     assert decision.proof is not None
-    assert decision.proof["compact_needed"] is True
-    assert decision.payload is not None
 
 
 def test_context_budget_accounts_for_responses_input_and_instructions() -> None:
@@ -96,8 +141,11 @@ def test_context_budget_accounts_for_responses_input_and_instructions() -> None:
     assert decision.proof["tools_chars"] > 0
     assert decision.proof["top_level_chars"] > 0
     assert decision.proof["retry_count"] == 0
-    assert decision.proof["usage_source"] == "projected_text_envelope_chars"
-    assert decision.proof["usage_confidence"] == "estimated"
+    assert decision.proof["usage_source"] == "projected_text_envelope_tokens"
+    assert decision.proof["usage_confidence"] in {
+        "tokenizer_estimate",
+        "conservative_estimate",
+    }
     assert decision.proof["wire_json_chars"] >= decision.proof["projected_context_chars"]
 
 

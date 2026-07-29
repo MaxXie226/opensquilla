@@ -6,12 +6,14 @@ from opensquilla.provider.types import ProviderRequestCorrelation
 from opensquilla.session.compaction import (
     CompactionConfig,
     CompactionRequest,
+    _api_round_groups,
     arm_compaction_deadline,
     await_compaction_phase,
     build_compaction_config_from_provider,
     call_compaction_llm,
     compact_context,
     compaction_remaining_seconds,
+    estimate_entries_model_replay_chars,
     estimate_entry_model_replay_tokens,
     estimate_entry_replay_tokens,
 )
@@ -31,6 +33,27 @@ def _make_entries(n: int, tokens_each: int = 100) -> list[dict]:
         }
         for i in range(n)
     ]
+
+
+def test_api_round_groups_keep_user_role_tool_result_with_its_call() -> None:
+    active_user = {"role": "user", "content": "inspect the file"}
+    tool_call = {
+        "role": "assistant",
+        "content": "[tool_call: read_file]",
+        "tool_calls": [{"id": "call-1", "name": "read_file"}],
+    }
+    tool_result = {
+        "role": "user",
+        "content": "[Tool result call-1]\ncontents",
+    }
+    next_assistant = {"role": "assistant", "content": "The file is valid."}
+
+    groups = _api_round_groups(
+        [active_user, tool_call, tool_result, next_assistant]
+    )
+
+    assert groups[0] == [active_user, tool_call, tool_result]
+    assert groups[1] == [next_assistant]
 
 
 def test_compaction_effect_payload_marks_automatic_noop_not_user_visible():
@@ -144,6 +167,11 @@ async def test_no_compaction_needed_small_context():
     assert result.summary_source == "skipped"
     assert result.skip_reason == "within_compaction_budget"
     assert result.kept_start_index == 0
+    assert result.quality_report["pressure_kind"] == "token_budget"
+    assert result.quality_report["physical_call_count"] == 0
+    assert result.quality_report["consumer_window_source"] == "consumer_capacity"
+    assert result.quality_report["consumer_window_tokens"] == 10_000
+    assert result.quality_report["degraded_reason"] == "within_compaction_budget"
 
 
 @pytest.mark.asyncio
@@ -195,6 +223,9 @@ async def test_message_count_compaction_uses_exact_forced_prefix_within_token_bu
     assert result.tokens_after >= result.tokens_before
     assert result.quality_report["fits_context_window"] is True
     assert result.quality_report["passes_structural_gate"] is True
+    assert result.quality_report["pressure_kind"] == "message_count"
+    assert result.quality_report["physical_call_count"] == 1
+    assert result.quality_report["target_source"] == "legacy_raw_compat"
 
 
 @pytest.mark.asyncio
@@ -462,6 +493,77 @@ def test_replay_token_estimate_uses_tool_payload_summary_not_raw_arguments():
     assert tokens < 500
 
 
+def test_model_replay_estimate_does_not_trust_underreported_persisted_count():
+    content = "x" * 8_000
+    entry = {
+        "role": "user",
+        "content": content,
+        "token_count": 1,
+    }
+
+    tokens = estimate_entry_model_replay_tokens(entry)
+    chars = estimate_entries_model_replay_chars([entry])
+
+    assert tokens > 1
+    assert chars >= len(content)
+
+
+@pytest.mark.asyncio
+async def test_character_pressure_triggers_compaction_when_token_window_fits():
+    entries = [
+        {
+            "role": "user" if index % 2 == 0 else "assistant",
+            "content": f"message {index} " + ("x" * 1_000),
+            "token_count": 1,
+        }
+        for index in range(12)
+    ]
+
+    result = await compact_context(
+        CompactionRequest(
+            session_id="character-pressure",
+            entries=entries,
+            context_window_tokens=20_000,
+            context_window_chars=4_000,
+            config=CompactionConfig(safety_margin=1.0),
+            summary_replay_renderer=lambda summary: (
+                f"[Compacted Session Summaries]\n[Summary 1]\n{summary}\n\n"
+            ),
+        )
+    )
+
+    assert result.removed_count > 0
+    assert result.quality_report["fits_context_window"] is True
+    assert result.quality_report["fits_character_window"] is True
+    assert result.quality_report["chars_after"] <= 4_000
+
+
+@pytest.mark.asyncio
+async def test_character_gate_counts_replay_wrapper_before_durable_install():
+    entries = [
+        {"role": "user", "content": "old " + ("x" * 2_000), "token_count": 1},
+        {"role": "assistant", "content": "old answer", "token_count": 1},
+        {"role": "user", "content": "latest request", "token_count": 1},
+        {"role": "assistant", "content": "latest answer", "token_count": 1},
+    ]
+
+    result = await compact_context(
+        CompactionRequest(
+            session_id="wrapper-pressure",
+            entries=entries,
+            context_window_tokens=20_000,
+            context_window_chars=350,
+            config=CompactionConfig(safety_margin=1.0),
+            summary_replay_renderer=lambda summary: ("W" * 300) + summary,
+        )
+    )
+
+    assert result.removed_count == 0
+    assert result.skip_reason == "quality_gate_failed"
+    assert result.quality_report["fits_character_window"] is False
+    assert result.quality_report["passes_structural_gate"] is False
+
+
 def test_provider_config_preserves_profile_when_compaction_llm_disabled():
     cfg = build_compaction_config_from_provider(
         None,
@@ -652,18 +754,134 @@ async def test_quality_report_marks_compaction_that_still_exceeds_window():
         )
     )
 
-    assert result.removed_count > 0
+    assert result.removed_count == 0
+    assert result.skip_reason == "quality_gate_failed"
     assert result.quality_report["fits_context_window"] is False
-    assert result.quality_report["passes_structural_gate"] is True
+    assert result.quality_report["passes_structural_gate"] is False
     assert compaction_result_payload(result)["quality_report"][
         "fits_context_window"
     ] is False
 
 
 @pytest.mark.asyncio
+async def test_latest_assistant_is_never_removed_when_it_alone_exceeds_window():
+    entries = [
+        {"role": "user", "content": "old question", "token_count": 400},
+        {"role": "assistant", "content": "old answer", "token_count": 400},
+        {
+            "role": "assistant",
+            "content": "LATEST_ASSISTANT_RAW",
+            "token_count": 2_000,
+        },
+    ]
+
+    result = await compact_context(
+        CompactionRequest(
+            session_id="latest-assistant-protected",
+            entries=entries,
+            context_window_tokens=500,
+            config=CompactionConfig(safety_margin=1.0),
+        )
+    )
+
+    assert result.removed_count == 0
+    assert result.kept_entries == entries
+    assert result.skip_reason == "quality_gate_failed"
+
+
+@pytest.mark.asyncio
+async def test_error_tool_result_and_its_call_remain_raw() -> None:
+    call = {
+        "role": "assistant",
+        "content": "calling checker",
+        "tool_calls": [{"id": "call_error", "type": "function"}],
+        "token_count": 10,
+    }
+    error_result = {
+        "role": "tool",
+        "content": "Error: checker failed: exact diagnostic",
+        "tool_call_id": "call_error",
+        "is_error": True,
+        "token_count": 100,
+    }
+    entries = [
+        {"role": "user", "content": "ancient request", "token_count": 1_000},
+        {"role": "assistant", "content": "ancient answer", "token_count": 1_000},
+        {"role": "user", "content": "tool request", "token_count": 10},
+        call,
+        error_result,
+        {"role": "user", "content": "continue", "token_count": 10},
+        {"role": "assistant", "content": "latest answer", "token_count": 10},
+    ]
+
+    result = await compact_context(
+        CompactionRequest(
+            session_id="error-result-protected",
+            entries=entries,
+            context_window_tokens=600,
+            config=CompactionConfig(safety_margin=1.0),
+        )
+    )
+
+    assert result.removed_count == 2
+    assert result.kept_entries[0]["content"] == "tool request"
+    assert result.kept_entries[1] == call
+    assert result.kept_entries[2] == error_result
+
+
+@pytest.mark.asyncio
+async def test_canonical_nested_error_tool_result_remains_raw() -> None:
+    canonical_tool_round = {
+        "role": "assistant",
+        "content": "calling checker",
+        "tool_calls": [
+            {
+                "type": "tool_use",
+                "tool_use_id": "call_nested_error",
+                "name": "exec_command",
+                "input": {"command": "pytest -q"},
+            },
+            {
+                "type": "tool_result",
+                "tool_use_id": "call_nested_error",
+                "result": "FAILED exact canonical diagnostic",
+                "is_error": True,
+                "execution_status": {
+                    "status": "error",
+                    "reason": "nonzero_exit",
+                },
+            },
+        ],
+        "token_count": 100,
+    }
+    entries = [
+        {"role": "user", "content": "ancient request", "token_count": 1_000},
+        {"role": "assistant", "content": "ancient answer", "token_count": 1_000},
+        {"role": "user", "content": "run the checker", "token_count": 10},
+        canonical_tool_round,
+        {"role": "user", "content": "continue", "token_count": 10},
+        {"role": "assistant", "content": "latest answer", "token_count": 10},
+    ]
+
+    result = await compact_context(
+        CompactionRequest(
+            session_id="nested-error-result-protected",
+            entries=entries,
+            context_window_tokens=600,
+            config=CompactionConfig(safety_margin=1.0),
+        )
+    )
+
+    assert canonical_tool_round in result.kept_entries
+    assert result.kept_entries.index(canonical_tool_round) >= 1
+
+
+@pytest.mark.asyncio
 async def test_protected_tail_retreats_to_tool_boundary():
     entries = [
-        {"role": "user", "content": "old context", "token_count": 300},
+        {"role": "user", "content": "ancient request", "token_count": 1_000},
+        {"role": "assistant", "content": "ancient answer", "token_count": 1_000},
+        {"role": "user", "content": "tool request", "token_count": 5},
         {
             "role": "assistant",
             "content": "[Used tool: read_file]",
@@ -682,7 +900,7 @@ async def test_protected_tail_retreats_to_tool_boundary():
         CompactionRequest(
             session_id="s1",
             entries=entries,
-            context_window_tokens=100,
+            context_window_tokens=600,
             config=CompactionConfig(
                 safety_margin=1.0,
                 protected_recent_messages=3,
@@ -691,15 +909,18 @@ async def test_protected_tail_retreats_to_tool_boundary():
     )
 
     assert result.removed_count > 0
-    assert result.kept_entries[0]["content"] == "[Used tool: read_file]"
-    assert result.kept_entries[1]["content"].startswith("[Tool result ")
+    assert result.kept_entries[0]["content"] == "tool request"
+    assert result.kept_entries[1]["content"] == "[Used tool: read_file]"
+    assert result.kept_entries[2]["content"].startswith("[Tool result ")
     assert result.quality_report["protected_tail_preserved"] is True
 
 
 @pytest.mark.asyncio
 async def test_protected_tail_retreats_over_multi_result_tool_segment():
     entries = [
-        {"role": "user", "content": "old context", "token_count": 300},
+        {"role": "user", "content": "ancient request", "token_count": 1_000},
+        {"role": "assistant", "content": "ancient answer", "token_count": 1_000},
+        {"role": "user", "content": "tool request", "token_count": 5},
         {
             "role": "assistant",
             "content": "calling tool",
@@ -726,7 +947,7 @@ async def test_protected_tail_retreats_over_multi_result_tool_segment():
         CompactionRequest(
             session_id="s1",
             entries=entries,
-            context_window_tokens=120,
+            context_window_tokens=600,
             config=CompactionConfig(
                 safety_margin=1.0,
                 protected_recent_messages=3,
@@ -735,9 +956,10 @@ async def test_protected_tail_retreats_over_multi_result_tool_segment():
     )
 
     assert result.removed_count > 0
-    assert result.kept_entries[0]["role"] == "assistant"
-    assert result.kept_entries[1]["content"] == "first result"
-    assert result.kept_entries[2]["content"] == "second result"
+    assert result.kept_entries[0]["content"] == "tool request"
+    assert result.kept_entries[1]["role"] == "assistant"
+    assert result.kept_entries[2]["content"] == "first result"
+    assert result.kept_entries[3]["content"] == "second result"
     assert result.quality_report["protected_tail_preserved"] is True
 
 

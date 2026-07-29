@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import os
 import re
 import tempfile
+import threading
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -31,8 +33,14 @@ from opensquilla.session.compaction import (
 )
 from opensquilla.session.compaction_lifecycle import new_compaction_id
 from opensquilla.session.compaction_state import (
+    StructuredCompactionSummary,
     build_structured_summary_from_text,
     extract_compaction_obligations,
+)
+from opensquilla.session.context_view import (
+    build_compaction_context_records,
+    compaction_context_fingerprint,
+    format_compaction_summary_context,
 )
 from opensquilla.session.keys import canonicalize_session_key, normalize_agent_id
 from opensquilla.session.models import (
@@ -74,6 +82,71 @@ class CompactionSourceSnapshot:
     preimage: tuple[tuple[Any, ...], ...]
     boundary_message_id: str | None
     boundary_entry_id: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class _CompactionSingleflightKey:
+    """Secret-free identity for one frozen durable compaction input."""
+
+    session_key: str
+    frozen_prefix_hash: str
+    target_fingerprint: str
+
+
+@dataclass(frozen=True, slots=True)
+class _CompactionSingleflight:
+    """One process-local owner task shared by equivalent waiters."""
+
+    task: asyncio.Task[CompactionResult]
+    operation_id: str
+
+
+_COMPACTION_SINGLEFLIGHT_LOCK = threading.Lock()
+_COMPACTION_SINGLEFLIGHTS: dict[
+    tuple[asyncio.AbstractEventLoop, int, _CompactionSingleflightKey],
+    _CompactionSingleflight,
+] = {}
+
+
+def _acquire_compaction_singleflight(
+    key: _CompactionSingleflightKey,
+    *,
+    storage_scope: object,
+    operation_id: str,
+    owner_factory: Callable[[], Awaitable[CompactionResult]],
+) -> tuple[_CompactionSingleflight, bool]:
+    """Return the existing flight or atomically register a new owner.
+
+    Asyncio tasks cannot be awaited across event loops, and independent storage
+    instances must never share a rewrite owner. Those are implementation-level
+    namespaces; the meaningful flight key remains session + frozen prefix +
+    physical target fingerprint.
+    """
+
+    loop = asyncio.get_running_loop()
+    registry_key = (loop, id(storage_scope), key)
+    with _COMPACTION_SINGLEFLIGHT_LOCK:
+        existing = _COMPACTION_SINGLEFLIGHTS.get(registry_key)
+        if existing is not None and not existing.task.done():
+            return existing, False
+
+        async def run_owner() -> CompactionResult:
+            return await owner_factory()
+
+        flight = _CompactionSingleflight(
+            task=loop.create_task(run_owner()),
+            operation_id=operation_id,
+        )
+        _COMPACTION_SINGLEFLIGHTS[registry_key] = flight
+
+    def discard(completed: asyncio.Task[CompactionResult]) -> None:
+        with _COMPACTION_SINGLEFLIGHT_LOCK:
+            current = _COMPACTION_SINGLEFLIGHTS.get(registry_key)
+            if current is not None and current.task is completed:
+                _COMPACTION_SINGLEFLIGHTS.pop(registry_key, None)
+
+    flight.task.add_done_callback(discard)
+    return flight, True
 
 
 async def _await_compaction_commit_barrier(
@@ -259,6 +332,8 @@ def _successful_submit_plan_input(
 def _compaction_entry_payloads(entries: list[TranscriptEntry]) -> list[dict[str, Any]]:
     return [
         {
+            "id": e.id,
+            "message_id": e.message_id,
             "role": e.role,
             "content": e.content or "",
             "token_count": e.token_count,
@@ -297,6 +372,83 @@ def _transcript_preimage(entries: list[TranscriptEntry]) -> tuple[tuple[Any, ...
         )
         for entry in entries
     )
+
+
+def _compaction_target_fingerprint(config: CompactionConfig) -> str:
+    """Hash the frozen physical target chain without retaining credentials."""
+
+    plan = config.llm_plan
+    if plan is not None:
+        target_payload = {
+            "max_calls": plan.max_calls,
+            "candidates": [
+                {
+                    "deployment": candidate.deployment_fingerprint,
+                    "context_window_tokens": candidate.context_window_tokens,
+                    "max_output_tokens": candidate.max_output_tokens,
+                    "provider_request_max_chars": candidate.provider_request_max_chars,
+                }
+                for candidate in plan.candidates
+            ],
+        }
+    else:
+        target_payload = {
+            "provider": config.provider,
+            "model": config.model,
+            "base_url": config.base_url,
+        }
+    return hashlib.sha256(_stable_json(target_payload).encode("utf-8")).hexdigest()
+
+
+def _frozen_compaction_prefix_hash(
+    *,
+    preimage: tuple[tuple[Any, ...], ...],
+    previous_summary: str,
+    context_window_tokens: int,
+    context_window_chars: int | None,
+    custom_instructions: str | None,
+    flush_receipt_status: str | None,
+    config: CompactionConfig,
+    consumer_admission_fingerprint: str = "",
+) -> str:
+    """Hash the frozen source plus output- and persistence-affecting settings."""
+
+    digest = hashlib.sha256()
+    for row in preimage:
+        digest.update(_stable_json(row).encode("utf-8"))
+        digest.update(b"\n")
+    request_shape = {
+        "previous_summary_sha256": hashlib.sha256(
+            previous_summary.encode("utf-8")
+        ).hexdigest(),
+        "custom_instructions_sha256": hashlib.sha256(
+            (custom_instructions or "").encode("utf-8")
+        ).hexdigest(),
+        "flush_receipt_status": flush_receipt_status,
+        "context_window_tokens": context_window_tokens,
+        "context_window_chars": context_window_chars,
+        "base_chunk_ratio": config.base_chunk_ratio,
+        "min_chunk_ratio": config.min_chunk_ratio,
+        "safety_margin": config.safety_margin,
+        "default_parts": config.default_parts,
+        "identifier_policy": config.identifier_policy,
+        "coverage_blocking": config.coverage_blocking,
+        "compaction_profile": config.compaction_profile,
+        "protected_recent_messages": config.protected_recent_messages,
+        "consumer_admission_fingerprint": consumer_admission_fingerprint,
+    }
+    digest.update(_stable_json(request_shape).encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _durable_summary_replay(summary: str) -> str:
+    """Render one checkpoint as the request-context path will consume it."""
+
+    rendered = format_compaction_summary_context([summary]) or ""
+    # Existing request context, when present, is separated from the prepended
+    # checkpoint by two newlines. Reserving them unconditionally is harmless
+    # and keeps the no-existing-context path conservative.
+    return f"{rendered}\n\n" if rendered else ""
 
 
 def _branch_origin(parent_origin: Any) -> dict[str, Any] | None:
@@ -1847,8 +1999,11 @@ class SessionManager:
         config: CompactionConfig | None = None,
         custom_instructions: str | None = None,
         *,
+        context_window_chars: int | None = None,
         mutation_context: Callable[[], contextlib.AbstractAsyncContextManager[None]] | None = None,
         provider_request_correlation: ProviderRequestCorrelation | None = None,
+        consumer_admission: Callable[[str, list[dict[str, Any]]], Any] | None = None,
+        consumer_admission_fingerprint: str = "",
     ) -> str:
         """
         Compact the session transcript when context is filling up.
@@ -1865,10 +2020,17 @@ class SessionManager:
             context_window_tokens,
             config,
             custom_instructions,
+            context_window_chars=context_window_chars,
             mutation_context=mutation_context,
+            consumer_admission=consumer_admission,
+            consumer_admission_fingerprint=consumer_admission_fingerprint,
             **correlation_kwargs,
         )
-        return result.summary if result.removed_count else ""
+        return (
+            result.summary
+            if result.removed_count or result.replaced_previous_summary
+            else ""
+        )
 
     async def compact_with_result(
         self,
@@ -1880,13 +2042,19 @@ class SessionManager:
         compaction_id: str | None = None,
         trigger_reason: str | None = None,
         flush_receipt_status: str | None = None,
+        context_window_chars: int | None = None,
         mutation_context: Callable[[], contextlib.AbstractAsyncContextManager[None]] | None = None,
         provider_request_correlation: ProviderRequestCorrelation | None = None,
+        consumer_admission: Callable[[str, list[dict[str, Any]]], Any] | None = None,
+        consumer_admission_fingerprint: str = "",
     ) -> CompactionResult:
         """Compact the session transcript and return full compaction metadata."""
 
         session_key = canonicalize_session_key(session_key)
-        effective_config = config or CompactionConfig()
+        # Runtime counters/deadlines belong to one logical operation. Public
+        # callers may reuse a config object, so isolate it before arming; a
+        # concurrent waiter must never reset the owner's deadline or call cap.
+        effective_config = replace(config) if config is not None else CompactionConfig()
         persisted_compaction_id = compaction_id or new_compaction_id()
         arm_compaction_deadline(
             effective_config,
@@ -1907,21 +2075,137 @@ class SessionManager:
                 effective_config,
                 phase="snapshotting",
             )
+            summaries = await await_compaction_phase(
+                self._storage.get_all_summaries(node.session_id),
+                effective_config,
+                phase="snapshotting",
+            )
+            context_states = await await_compaction_phase(
+                self._storage.get_context_states(session_key),
+                effective_config,
+                phase="snapshotting",
+            )
+            previous_context_records = build_compaction_context_records(
+                context_states=context_states,
+                summaries=summaries,
+            )
+            previous_summary = "\n\n".join(
+                record.text.strip()
+                for record in previous_context_records
+                if record.text.strip()
+            )
+            previous_covered_through_id = max(
+                (
+                    int(record.covered_through_id or 0)
+                    for record in previous_context_records
+                ),
+                default=0,
+            )
+            previous_context_fingerprint = compaction_context_fingerprint(
+                context_states=context_states,
+                summaries=summaries,
+            )
             preimage = _transcript_preimage(entries)
             raw = _compaction_entry_payloads(entries)
+
+        singleflight_key = _CompactionSingleflightKey(
+            session_key=session_key,
+            frozen_prefix_hash=_frozen_compaction_prefix_hash(
+                preimage=preimage,
+                previous_summary=previous_summary,
+                context_window_tokens=context_window_tokens,
+                context_window_chars=context_window_chars,
+                custom_instructions=custom_instructions,
+                flush_receipt_status=flush_receipt_status,
+                config=effective_config,
+                consumer_admission_fingerprint=consumer_admission_fingerprint,
+            ),
+            target_fingerprint=_compaction_target_fingerprint(effective_config),
+        )
+        flight, is_owner = _acquire_compaction_singleflight(
+            singleflight_key,
+            storage_scope=self._storage,
+            operation_id=persisted_compaction_id,
+            owner_factory=lambda: self._compact_snapshot_with_result(
+                session_key=session_key,
+                node=node,
+                entries=entries,
+                previous_summary=previous_summary,
+                previous_context_fingerprint=previous_context_fingerprint,
+                previous_covered_through_id=previous_covered_through_id,
+                preimage=preimage,
+                raw=raw,
+                context_window_tokens=context_window_tokens,
+                context_window_chars=context_window_chars,
+                effective_config=effective_config,
+                custom_instructions=custom_instructions,
+                persisted_compaction_id=persisted_compaction_id,
+                trigger_reason=trigger_reason,
+                flush_receipt_status=flush_receipt_status,
+                mutation_context=mutation_context,
+                provider_request_correlation=provider_request_correlation,
+                consumer_admission=consumer_admission,
+            ),
+        )
+        if is_owner:
+            return await flight.task
+
+        import structlog as _structlog
+
+        _structlog.get_logger(__name__).info(
+            "session_compaction.singleflight_joined",
+            compaction_id=persisted_compaction_id,
+            owner_compaction_id=flight.operation_id,
+            session_key=session_key,
+            frozen_prefix_hash=singleflight_key.frozen_prefix_hash,
+            target_fingerprint=singleflight_key.target_fingerprint,
+        )
+        return await await_compaction_phase(
+            asyncio.shield(flight.task),
+            effective_config,
+            phase="singleflight_waiting",
+        )
+
+    async def _compact_snapshot_with_result(
+        self,
+        *,
+        session_key: str,
+        node: SessionNode,
+        entries: list[TranscriptEntry],
+        previous_summary: str,
+        previous_context_fingerprint: str,
+        previous_covered_through_id: int,
+        preimage: tuple[tuple[Any, ...], ...],
+        raw: list[dict[str, Any]],
+        context_window_tokens: int,
+        context_window_chars: int | None,
+        effective_config: CompactionConfig,
+        custom_instructions: str | None,
+        persisted_compaction_id: str,
+        trigger_reason: str | None,
+        flush_receipt_status: str | None,
+        mutation_context: Callable[[], contextlib.AbstractAsyncContextManager[None]] | None,
+        provider_request_correlation: ProviderRequestCorrelation | None,
+        consumer_admission: Callable[[str, list[dict[str, Any]]], Any] | None,
+    ) -> CompactionResult:
+        """Generate and atomically install one frozen compaction candidate."""
 
         result = await compact_context(
             CompactionRequest(
                 session_id=node.session_id,
                 entries=raw,
                 context_window_tokens=context_window_tokens,
+                context_window_chars=context_window_chars,
                 config=effective_config,
                 custom_instructions=custom_instructions,
+                previous_summary=previous_summary or None,
+                summary_replay_renderer=_durable_summary_replay,
+                consumer_admission=consumer_admission,
                 provider_request_correlation=provider_request_correlation,
             )
         )
 
-        if result.removed_count == 0:
+        if result.removed_count == 0 and not result.replaced_previous_summary:
             return result
         if not result.summary:
             import structlog as _structlog
@@ -1934,6 +2218,31 @@ class SessionManager:
             return replace(result, skip_reason=result.skip_reason or "empty_summary")
 
         require_compaction_time(effective_config, phase="validating")
+        from opensquilla.session.compaction import (
+            compaction_replay_summary,
+            consumer_admission_accepts,
+        )
+
+        if not consumer_admission_accepts(
+            consumer_admission,
+            compaction_replay_summary(result),
+            result.kept_entries,
+        ):
+            return replace(
+                result,
+                summary="",
+                kept_entries=raw,
+                removed_count=0,
+                replaced_previous_summary=False,
+                chunks_processed=0,
+                summary_source="skipped",
+                skip_reason="consumer_admission_stale_or_failed",
+                tokens_after=result.tokens_before,
+                remaining_budget_tokens=max(
+                    context_window_tokens - result.tokens_before,
+                    0,
+                ),
+            )
         async with _session_mutation_context(mutation_context):
             current_node = await await_compaction_phase(
                 self._storage.get_session(session_key),
@@ -1961,9 +2270,47 @@ class SessionManager:
                     summary="",
                     kept_entries=_compaction_entry_payloads(current_entries),
                     removed_count=0,
+                    replaced_previous_summary=False,
                     chunks_processed=0,
                     summary_source="skipped",
                     skip_reason="stale_preimage",
+                    tokens_after=result.tokens_before,
+                    remaining_budget_tokens=max(
+                        context_window_tokens - result.tokens_before,
+                        0,
+                    ),
+                )
+
+            current_summaries = await await_compaction_phase(
+                self._storage.get_all_summaries(current_node.session_id),
+                effective_config,
+                phase="validating",
+            )
+            current_context_states = await await_compaction_phase(
+                self._storage.get_context_states(session_key),
+                effective_config,
+                phase="validating",
+            )
+            current_context_fingerprint = compaction_context_fingerprint(
+                context_states=current_context_states,
+                summaries=current_summaries,
+            )
+            if current_context_fingerprint != previous_context_fingerprint:
+                import structlog as _structlog
+
+                _structlog.get_logger(__name__).warning(
+                    "session_compaction.stale_context_state_skipped",
+                    session_key=session_key,
+                )
+                return replace(
+                    result,
+                    summary="",
+                    kept_entries=_compaction_entry_payloads(current_entries),
+                    removed_count=0,
+                    replaced_previous_summary=False,
+                    chunks_processed=0,
+                    summary_source="skipped",
+                    skip_reason="stale_context_state",
                     tokens_after=result.tokens_before,
                     remaining_budget_tokens=max(
                         context_window_tokens - result.tokens_before,
@@ -1993,9 +2340,12 @@ class SessionManager:
                 flush_receipt_status=_compaction_flush_status_for_persistence(
                     flush_receipt_status
                 ),
-                covered_through_id=max((entry.id or 0) for entry in removed_entries)
-                if removed_entries
-                else 0,
+                covered_through_id=max(
+                    previous_covered_through_id,
+                    max((entry.id or 0) for entry in removed_entries)
+                    if removed_entries
+                    else 0,
+                ),
             )
             current_node.compaction_count = (current_node.compaction_count or 0) + 1
             current_node.updated_at = _now_ms()
@@ -2014,6 +2364,7 @@ class SessionManager:
                 "session_compaction.commit_started",
                 compaction_id=persisted_compaction_id,
             )
+            boundary = current_entries[-1] if current_entries else None
             commit_task = asyncio.create_task(
                 self._storage.rewrite_compacted_session(
                     node=current_node,
@@ -2021,9 +2372,36 @@ class SessionManager:
                     entries=kept_entries,
                     context_states=[context_state] if context_state is not None else None,
                     archived_entries=removed_entries,
+                    expected_source_entries=current_entries,
+                    expected_source_preimage=preimage,
+                    expected_source_boundary_message_id=(
+                        boundary.message_id if boundary is not None else None
+                    ),
+                    expected_source_boundary_entry_id=(
+                        boundary.id if boundary is not None else None
+                    ),
+                    expected_context_fingerprint=previous_context_fingerprint,
                 )
             )
-            _, cancellation_reconciled = await _await_compaction_commit_barrier(commit_task)
+            installed, cancellation_reconciled = await _await_compaction_commit_barrier(
+                commit_task
+            )
+            if installed is False:
+                return replace(
+                    result,
+                    summary="",
+                    kept_entries=_compaction_entry_payloads(current_entries),
+                    removed_count=0,
+                    replaced_previous_summary=False,
+                    chunks_processed=0,
+                    summary_source="skipped",
+                    skip_reason="stale_preimage",
+                    tokens_after=result.tokens_before,
+                    remaining_budget_tokens=max(
+                        context_window_tokens - result.tokens_before,
+                        0,
+                    ),
+                )
             _structlog.get_logger(__name__).info(
                 "session_compaction.commit_completed",
                 compaction_id=persisted_compaction_id,
@@ -2038,6 +2416,11 @@ class SessionManager:
         summary: str,
         kept_entries: list[dict],
         *,
+        summary_payload: dict[str, Any] | None = None,
+        summary_format: str = "text",
+        coverage_status: str = "unknown",
+        missing_obligations: list[str] | None = None,
+        critical_carry_forward: list[str] | None = None,
         compaction_id: str | None = None,
         trigger_reason: str | None = None,
         flush_receipt_status: str | None = None,
@@ -2172,8 +2555,27 @@ class SessionManager:
                 }
                 for entry in removed_entries
             ]
-            obligations = extract_compaction_obligations(raw_removed_entries)
-            structured_summary, coverage = build_structured_summary_from_text(summary, obligations)
+            if summary_format == "structured_v1" and summary_payload is not None:
+                structured_summary = StructuredCompactionSummary.model_validate(
+                    summary_payload
+                )
+                resolved_coverage_status = coverage_status
+                resolved_missing_obligations = list(missing_obligations or ())
+                resolved_critical_carry_forward = list(
+                    critical_carry_forward
+                    if critical_carry_forward is not None
+                    else structured_summary.critical_carry_forward
+                )
+            else:
+                obligations = extract_compaction_obligations(raw_removed_entries)
+                structured_summary, coverage = build_structured_summary_from_text(
+                    summary,
+                    obligations,
+                )
+                resolved_coverage_status = coverage.status
+                resolved_missing_obligations = coverage.missing_obligations
+                resolved_critical_carry_forward = coverage.critical_carry_forward
+
             summary_record = SessionSummary(
                 session_id=node.session_id,
                 session_key=session_key,
@@ -2182,9 +2584,9 @@ class SessionManager:
                 summary_text=summary,
                 summary_payload=structured_summary.model_dump(mode="json"),
                 summary_format="structured_v1",
-                coverage_status=coverage.status,
-                missing_obligations=coverage.missing_obligations,
-                critical_carry_forward=coverage.critical_carry_forward,
+                coverage_status=resolved_coverage_status,
+                missing_obligations=resolved_missing_obligations,
+                critical_carry_forward=resolved_critical_carry_forward,
                 removed_count=len(removed_entries),
                 kept_count=persisted_kept_count,
                 flush_receipt_status=_compaction_flush_status_for_persistence(

@@ -34,6 +34,7 @@ from .protocol import ProviderConnectionConfig, ProviderMetadata
 from .request_proof import (
     RESPONSES_REQUEST_ENVELOPE,
     ProviderRequestBudgetExceededError,
+    project_final_request_payload,
     prove_provider_payload_from_env,
 )
 from .stream_assembly import ToolStreamAccumulator, ToolStreamProtocolError
@@ -48,6 +49,7 @@ from .types import (
     ErrorEvent,
     Message,
     ModelInfo,
+    ProviderFinalRequestProjection,
     StreamEvent,
     TextDeltaEvent,
     ToolDefinition,
@@ -81,9 +83,16 @@ def _responses_message_item(role: str, content: list[dict[str, Any]]) -> dict[st
     return {"type": "message", "role": role, "content": content}
 
 
-def _responses_input(messages: list[Message]) -> list[dict[str, Any]]:
+def _responses_input(
+    messages: list[Message],
+    *,
+    logical_index_map: dict[int, int] | None = None,
+    emit_warnings: bool = True,
+) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
-    for message in messages:
+    for message_index, message in enumerate(messages):
+        if logical_index_map is not None:
+            logical_index_map[message_index] = len(items)
         if isinstance(message.content, str):
             items.append({"role": message.role, "content": message.content})
             continue
@@ -104,10 +113,11 @@ def _responses_input(messages: list[Message]) -> list[dict[str, Any]]:
                 # output. Drop (with a warning) on assistant turns rather than
                 # emit an invalid part.
                 if message.role == "assistant":
-                    log.warning(
-                        "openai_responses.dropped_assistant_image",
-                        note="input_image is not valid on assistant output",
-                    )
+                    if emit_warnings:
+                        log.warning(
+                            "openai_responses.dropped_assistant_image",
+                            note="input_image is not valid on assistant output",
+                        )
                     continue
                 if block.source_type == "url":
                     image_url = block.data
@@ -237,16 +247,96 @@ class OpenAIResponsesProvider:
     def _api_url(self, path: str) -> str:
         return _versioned_api_url(self._base_url, path)
 
+    def _build_payload(
+        self,
+        input_items: list[dict[str, Any]],
+        tools: list[ToolDefinition] | None,
+        config: ChatConfig,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "model": self._model,
+            "input": input_items,
+            "max_output_tokens": config.max_tokens,
+            "store": False,
+        }
+        if config.output_json_schema is not None:
+            payload["text"] = {
+                "format": {
+                    "type": "json_schema",
+                    "name": "structured_output",
+                    "strict": config.output_json_schema_strict,
+                    "schema": config.output_json_schema,
+                }
+            }
+        if config.system:
+            payload["instructions"] = config.system
+        if config.temperature is not None:
+            payload["temperature"] = config.temperature
+        if config.stop_sequences:
+            payload["stop"] = config.stop_sequences
+        if tools:
+            payload["tools"] = [_responses_tool(tool) for tool in tools]
+            payload["tool_choice"] = config.tool_choice or "auto"
+        return payload
+
+    def project_final_request(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition] | None = None,
+        config: ChatConfig | None = None,
+        *,
+        message_limit: int | None = None,
+    ) -> ProviderFinalRequestProjection:
+        """Project the exact Responses payload without transport or shaping."""
+
+        cfg = config or ChatConfig()
+        logical_index_map: dict[int, int] = {}
+        input_items = _responses_input(
+            messages,
+            logical_index_map=logical_index_map,
+            emit_warnings=False,
+        )
+        wire_active_user_index = (
+            logical_index_map.get(cfg.active_user_message_index)
+            if cfg.active_user_message_index is not None
+            else None
+        )
+        payload = self._build_payload(input_items, tools, cfg)
+        return project_final_request_payload(
+            payload,
+            projection_adapter="openai_responses",
+            proof_budget=cfg.provider_request_max_chars,
+            status_projection_mode="content_envelope",
+            envelope_shape=RESPONSES_REQUEST_ENVELOPE,
+            active_user_message_index=wire_active_user_index,
+            message_limit=message_limit,
+        )
+
     def chat(
         self,
         messages: list[Message],
         tools: list[ToolDefinition] | None = None,
         config: ChatConfig | None = None,
     ) -> AsyncIterator[StreamEvent]:
+        cfg = config or ChatConfig()
+        logical_index_map: dict[int, int] = {}
+        input_items = _responses_input(
+            messages,
+            logical_index_map=logical_index_map,
+        )
+        wire_active_user_index = (
+            logical_index_map.get(cfg.active_user_message_index)
+            if cfg.active_user_message_index is not None
+            else None
+        )
+        if wire_active_user_index != cfg.active_user_message_index:
+            cfg = cfg.model_copy(
+                update={"active_user_message_index": wire_active_user_index}
+            )
         return self.chat_items(
-            _responses_input(messages),
+            input_items,
             tools=tools,
-            config=config or ChatConfig(),
+            config=cfg,
         )
 
     def chat_items(
@@ -274,30 +364,7 @@ class OpenAIResponsesProvider:
         if self._org_id:
             headers["OpenAI-Organization"] = self._org_id
 
-        payload: dict[str, Any] = {
-            "model": self._model,
-            "input": input_items,
-            "max_output_tokens": config.max_tokens,
-            "store": False,
-        }
-        if config.output_json_schema is not None:
-            payload["text"] = {
-                "format": {
-                    "type": "json_schema",
-                    "name": "structured_output",
-                    "strict": config.output_json_schema_strict,
-                    "schema": config.output_json_schema,
-                }
-            }
-        if config.system:
-            payload["instructions"] = config.system
-        if config.temperature is not None:
-            payload["temperature"] = config.temperature
-        if config.stop_sequences:
-            payload["stop"] = config.stop_sequences
-        if tools:
-            payload["tools"] = [_responses_tool(tool) for tool in tools]
-            payload["tool_choice"] = config.tool_choice or "auto"
+        payload = self._build_payload(input_items, tools, config)
 
         from opensquilla.engine.context_budget import coordinate_provider_context_budget
 
@@ -307,6 +374,7 @@ class OpenAIResponsesProvider:
             proof_budget=config.provider_request_max_chars,
             status_projection_mode="content_envelope",
             envelope_shape=RESPONSES_REQUEST_ENVELOPE,
+            active_user_message_index=config.active_user_message_index,
         )
         if budget_decision.action == "budget_limited":
             proof = budget_decision.proof or {}
@@ -332,6 +400,7 @@ class OpenAIResponsesProvider:
                 projection_adapter="openai_responses",
                 status_projection_mode="content_envelope",
                 envelope_shape=RESPONSES_REQUEST_ENVELOPE,
+                active_user_message_index=config.active_user_message_index,
             )
         except ProviderRequestBudgetExceededError as exc:
             log.warning("provider.request_budget_exhausted", **exc.proof)
@@ -916,6 +985,7 @@ class OpenAIResponsesProvider:
             proof_budget=cfg.provider_request_max_chars,
             status_projection_mode="content_envelope",
             envelope_shape=RESPONSES_REQUEST_ENVELOPE,
+            active_user_message_index=cfg.active_user_message_index,
         )
         if budget_decision.action == "budget_limited":
             raise ProviderRequestBudgetExceededError(budget_decision.proof or {})
@@ -929,6 +999,7 @@ class OpenAIResponsesProvider:
             projection_adapter="openai_responses_compact",
             status_projection_mode="content_envelope",
             envelope_shape=RESPONSES_REQUEST_ENVELOPE,
+            active_user_message_index=cfg.active_user_message_index,
         )
 
         trace = LLMTraceRecorder(
