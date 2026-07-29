@@ -2591,9 +2591,15 @@ class EnsembleProvider:
                     ),
                     code="ensemble_aggregator_timeout",
                 )
-                yield aggregator_progress("aggregator_finish", error=error.message)
-                yield partial_error(error)
-                return
+                if (
+                    not content_streamed
+                    and attempt < _ENSEMBLE_AGGREGATOR_MAX_RETRIES
+                ):
+                    retry_error = error
+                else:
+                    yield aggregator_progress("aggregator_finish", error=error.message)
+                    yield partial_error(error)
+                    return
             except Exception as exc:  # noqa: BLE001 - provider boundary returns ErrorEvent
                 safe_message = redact_upstream_error_text(
                     f"ensemble aggregator failed: {exc}",
@@ -2625,9 +2631,15 @@ class EnsembleProvider:
                     message="ensemble aggregator stream ended before DoneEvent",
                     code="ensemble_aggregator_incomplete",
                 )
-                yield aggregator_progress("aggregator_finish", error=error.message)
-                yield partial_error(error)
-                return
+                if (
+                    not content_streamed
+                    and attempt < _ENSEMBLE_AGGREGATOR_MAX_RETRIES
+                ):
+                    retry_error = error
+                else:
+                    yield aggregator_progress("aggregator_finish", error=error.message)
+                    yield partial_error(error)
+                    return
             close_stream = getattr(heartbeat_stream, "aclose", None)
             if callable(close_stream):
                 with contextlib.suppress(Exception):

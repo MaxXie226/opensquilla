@@ -220,6 +220,12 @@ candidate body comes only from the last successful attempt, while trace and
 usage accounting retain every started attempt, including zero-usage rows marked
 `usage_receipt_missing = true`.
 
+The aggregator already retries bounded transient upstream failures in place.
+It also retries a timeout or a stream that ends before `DoneEvent` when that
+attempt has emitted no text, reasoning, or tool delta, reusing the completed
+proposer drafts. Once any user-visible delta has been emitted, the attempt is
+terminal so a retry cannot duplicate text or tool activity downstream.
+
 Proposers never own an executable tool boundary. By default they receive no
 current tool schemas. Setting `proposer_tools = true` exposes those schemas only
 as advisory vocabulary: native or textual tool-shaped output is converted into

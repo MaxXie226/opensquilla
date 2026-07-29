@@ -3551,6 +3551,84 @@ async def test_aggregator_transient_exception_is_retried_in_place(
 
 
 @pytest.mark.asyncio
+async def test_aggregator_empty_incomplete_stream_is_retried_in_place(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, call_count = _flaky_aggregator_harness(
+        monkeypatch,
+        [
+            [],
+            [
+                TextDeltaEvent(text="final"),
+                DoneEvent(input_tokens=2, output_tokens=3, model="agg"),
+            ],
+        ],
+    )
+
+    events = await _collect(_retry_test_provider())
+
+    assert call_count[0] == 2
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert done.usage_missing_count == 1
+    assert done.ensemble_trace is not None
+    assert done.ensemble_trace["final_request"]["retry_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_aggregator_timeout_before_content_is_retried_in_place(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _FakeRegistry(
+        {"p1": _FakePlan([TextDeltaEvent(text="draft"), DoneEvent(model="p1")])}
+    )
+    call_count = [0]
+
+    class _TimeoutOnceAggregator:
+        provider_name = "fake"
+
+        def chat(
+            self,
+            messages: list[Message],
+            tools: list[ToolDefinition] | None = None,
+            config: ChatConfig | None = None,
+        ) -> AsyncIterator[StreamEvent]:
+            async def _stream() -> AsyncIterator[StreamEvent]:
+                call_count[0] += 1
+                if call_count[0] == 1:
+                    await asyncio.sleep(0.05)
+                yield TextDeltaEvent(text="final")
+                yield DoneEvent(model="agg")
+
+            return _stream()
+
+        async def list_models(self) -> list[Any]:
+            return []
+
+    def build_provider(cfg: ProviderConfig) -> Any:
+        if cfg.model == "agg":
+            return _TimeoutOnceAggregator()
+        return registry.provider_for(cfg)
+
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", build_provider)
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._ENSEMBLE_AGGREGATOR_RETRY_BACKOFF_SECONDS",
+        (0.0,),
+    )
+    provider = _retry_test_provider()
+    provider.aggregator_timeout_seconds = 0.01
+
+    events = await _collect(provider)
+
+    assert call_count[0] == 2
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert done.usage_missing_count == 1
+    assert done.ensemble_trace is not None
+    assert done.ensemble_trace["final_request"]["retry_count"] == 1
+
+
+@pytest.mark.asyncio
 async def test_aggregator_non_transient_error_is_not_retried(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3947,7 +4025,8 @@ async def test_ensemble_emits_aggregator_finish_before_terminal_error(
     assert expected_error in aggregator_progress[-1].error
     assert terminal_error.code == expected_code
     assert [row["model"] for row in terminal_error.model_usage_breakdown] == ["p1"]
-    assert terminal_error.usage_missing_count == 1  # aggregator supplied no receipt
+    expected_missing_count = 3 if mode == "timeout" else 1
+    assert terminal_error.usage_missing_count == expected_missing_count
     assert events.index(aggregator_progress[-1]) < events.index(terminal_error)
 
 
