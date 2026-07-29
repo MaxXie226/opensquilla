@@ -9,8 +9,10 @@ function successResponse(id: string, payload: unknown) {
   return JSON.stringify({ type: 'res', id, ok: true, payload })
 }
 
-function helloResponse(tickIntervalMs: number) {
+function helloResponse(requestId: string, tickIntervalMs: number) {
   return JSON.stringify({
+    type: 'hello-ok',
+    id: requestId,
     protocol: 3,
     policy: {
       tick_interval_ms: tickIntervalMs,
@@ -92,7 +94,7 @@ test('keeps the conversation usable while startup and long history are delayed',
         const frame = JSON.parse(String(message))
         if (frame?.type !== 'req') return
         if (frame.method === 'connect') {
-          ws.send(helloResponse(30000))
+          ws.send(helloResponse(String(frame.id), 30000))
           return
         }
         const method = String(frame.method || '')
@@ -257,7 +259,7 @@ test('recovers from stuck automatic metadata before sending', async ({ page }) =
         if (frame?.type !== 'req') return
         const method = String(frame.method || '')
         if (method === 'connect') {
-          ws.send(helloResponse(30000))
+          ws.send(helloResponse(String(frame.id), 30000))
           return
         }
         if (socketNumber === 1 && method === 'config.get') {
@@ -346,7 +348,7 @@ test('shows a recoverable initial failure and retries it', async ({ page }) => {
         const frame = JSON.parse(String(message))
         if (frame?.type !== 'req') return
         if (frame.method === 'connect') {
-          ws.send(helloResponse(30000))
+          ws.send(helloResponse(String(frame.id), 30000))
           return
         }
         if (frame.method === 'config.get') {
@@ -457,7 +459,7 @@ test('terminates stalled history and live hydration despite ongoing ticks, then 
         const frame = JSON.parse(String(message))
         if (frame?.type !== 'req') return
         if (frame.method === 'connect') {
-          ws.send(helloResponse(1000))
+          ws.send(helloResponse(String(frame.id), 1000))
           return
         }
         if (frame.method === 'sessions.messages.snapshot') {
@@ -588,7 +590,7 @@ test('preserves a Sessions Hub auto-send draft when live recovery terminates', a
         const frame = JSON.parse(String(message))
         if (frame?.type !== 'req') return
         if (frame.method === 'connect') {
-          ws.send(helloResponse(1000))
+          ws.send(helloResponse(String(frame.id), 1000))
           return
         }
         if (frame.method === 'sessions.messages.snapshot') {
@@ -673,7 +675,7 @@ test('cancels delayed auto-send when the user edits the draft before live is rea
         const frame = JSON.parse(String(message))
         if (frame?.type !== 'req') return
         if (frame.method === 'connect') {
-          ws.send(helloResponse(30000))
+          ws.send(helloResponse(String(frame.id), 30000))
           return
         }
         if (frame.method === 'sessions.messages.snapshot') {
@@ -736,7 +738,7 @@ test('keeps loaded messages visible when an earlier page fails and retries inlin
         const frame = JSON.parse(String(message))
         if (frame?.type !== 'req') return
         if (frame.method === 'connect') {
-          ws.send(helloResponse(30000))
+          ws.send(helloResponse(String(frame.id), 30000))
           return
         }
         if (frame.method === 'config.get') {
@@ -824,7 +826,7 @@ test('ignores a late history response after navigating to another session', asyn
         const frame = JSON.parse(String(message))
         if (frame?.type !== 'req') return
         if (frame.method === 'connect') {
-          ws.send(helloResponse(30000))
+          ws.send(helloResponse(String(frame.id), 30000))
           return
         }
         if (frame.method === 'sessions.list') {
