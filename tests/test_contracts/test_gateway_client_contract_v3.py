@@ -174,7 +174,7 @@ def test_rpc_snapshot_comes_from_complete_locked_registry() -> None:
 
     assert registry.registration_locked is True
     assert contract["source"] == "locked-rpc-registry"
-    assert contract["method_count"] == len(rows) == 222
+    assert contract["method_count"] == len(rows) == 232
     assert [row["name"] for row in rows] == registry.methods()
     assert [row["name"] for row in rows] == sorted(row["name"] for row in rows)
     assert [
@@ -237,7 +237,7 @@ def test_final_route_tree_freezes_dynamic_routes_and_security_policy() -> None:
     routes = contract["routes"]
     by_path = {row["path"]: row for row in routes}
 
-    assert contract["route_count"] == len(routes) == 36
+    assert contract["route_count"] == len(routes) == 41
     assert by_path["/ws"]["transport"] == "websocket"
     assert by_path["/ws"]["auth"]["scheme"] == "websocket-connect-handshake"
     assert by_path["/ws"]["auth"]["modes"]["trusted-proxy"]["status"] == (
@@ -251,6 +251,11 @@ def test_final_route_tree_freezes_dynamic_routes_and_security_policy() -> None:
         "/api/v1/attachments/{sha256}",
         "/api/v1/artifacts/{artifact_id}/open",
         "/api/v1/artifacts/{artifact_id}",
+        "/api/v1/artifacts/{artifact_id}/preview-leases",
+        "/api/v1/artifact-preview-leases/{lease_id}/renew",
+        "/api/v1/artifact-preview-leases/{lease_id}",
+        "/api/v1/artifact-preview/{token}",
+        "/api/v1/artifact-preview/{token}/{resource_path:path}",
         "/api/audio/transcribe",
         "/api/v1/diagnostics/bundle",
     }

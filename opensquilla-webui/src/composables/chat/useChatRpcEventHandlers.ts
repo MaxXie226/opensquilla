@@ -23,6 +23,7 @@ import type {
   WarningPayload,
 } from '@/types/rpc'
 import type { ChatRpcSubscriptionHandlers } from '@/composables/chat/useChatRpcSubscriptions'
+import type { SessionBootstrapRun } from '@/composables/chat/useChatSessionBootstrap'
 import type { FrameInput } from '@/types/turnlog'
 import type { FoldLiveTurnMode } from '@/composables/chat/useChatTurnLog'
 import {
@@ -109,9 +110,9 @@ export interface UseChatRpcEventHandlersOptions {
   schedulePendingDrainAfterTerminal: () => void
   popAllPendingIntoComposer: () => boolean
   saveWidgetState: () => void
-  subscribeSession: () => void
-  loadHistory: () => void
+  handleSessionConnectionState: (state: string) => SessionBootstrapRun | undefined
   loadCurrentSessionUsage: () => void
+  refreshRunModePreference?: () => void | Promise<void>
 }
 
 type ChatDoneUsageFields = {
@@ -694,11 +695,15 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     stream.resetStreamIdleTimer()
     if (stream.streamBubble.value && !stream.streamHasVisibleOutput.value) {
       const phase = String(payload.phase || '')
+      // The channel wrapper emits a generic keepalive on the same cadence as
+      // ensemble heartbeats. It proves liveness but does not represent a phase
+      // transition, so changing the activity would restart its timer.
+      const isPhaseAgnosticKeepalive = phase === 'channel'
       if (phase.startsWith('ensemble_proposers')) {
         stream.setStreamActivity('Generating candidates')
       } else if (phase.startsWith('ensemble_aggregator')) {
         stream.setStreamActivity('Synthesizing candidates')
-      } else {
+      } else if (!isPhaseAgnosticKeepalive) {
         stream.setStreamActivity('Planning next step')
       }
     } else if (!stream.streamBubble.value) {
@@ -1084,13 +1089,27 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   }
 
   let connectionLostNoted = false
+  let connectionStateGeneration = 0
   function handleRpcConnectionState(state: string) {
+    const stateGeneration = ++connectionStateGeneration
+    const recovery = options.handleSessionConnectionState(state)
     if (state === 'connected' && sessionKey.value) {
+      const connectedSessionKey = sessionKey.value
       connectionLostNoted = false
       stream.hideThinkingIndicator()
-      options.subscribeSession()
-      options.loadCurrentSessionUsage()
-      options.loadHistory()
+      // Preserve critical frame ordering after reconnect without waiting for a
+      // potentially slow history response before refreshing independent UI.
+      const criticalRequestsQueued = recovery?.criticalRequestsQueued
+        ?? Promise.resolve()
+      void criticalRequestsQueued.then(() => {
+        if (
+          connectionStateGeneration === stateGeneration
+          && sessionKey.value === connectedSessionKey
+        ) {
+          options.loadCurrentSessionUsage()
+          void options.refreshRunModePreference?.()
+        }
+      })
       if (stream.isStreaming.value) stream.resetStreamIdleTimer()
     }
     if (state === 'disconnected' && stream.isStreaming.value) {

@@ -303,6 +303,7 @@ def _build_bootstrap_context(config: GatewayConfig, request: Request) -> dict:
         "ws_url": _request_ws_url(request, config),
         "auth_mode": config.auth.mode,
         "base_path": config.control_ui.base_path,
+        "asset_base_path": config.control_ui.base_path.rstrip("/"),
         "config_path": config.config_path or "",
         "locale": _resolve_locale(config, request),
         "update": _update_payload(config),
@@ -481,6 +482,7 @@ def create_control_ui_routes(
             )
 
     base = config.control_ui.base_path
+    route_base = "" if base == "/" else base
     try:
         template = _get_jinja_env(resolved.template_root).get_template("index.html")
     except Exception:
@@ -535,11 +537,11 @@ def create_control_ui_routes(
 
     routes: list[Route | Mount] = [
         Mount(
-            f"{base}/static",
+            f"{route_base}/static",
             app=_ControlUiStaticFiles(resolved),
             name="control_ui_static",
         ),
-        Route(f"{base}/{{path:path}}", serve_index, methods=["GET"]),
-        Route(f"{base}/", serve_index, methods=["GET"]),
+        Route(f"{route_base}/{{path:path}}", serve_index, methods=["GET"]),
+        Route(f"{route_base}/", serve_index, methods=["GET"]),
     ]
     return routes

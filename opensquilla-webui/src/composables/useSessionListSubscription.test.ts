@@ -67,8 +67,14 @@ describe('useSessionListSubscription', () => {
   it('subscribes once per connection and resubscribes after reconnect', async () => {
     const harness = makeRpc()
     const refresh = vi.fn(async () => {})
+    const callOptions = {
+      timeoutMs: 2_000,
+      timeoutAction: 'reconnect' as const,
+      abortAction: 'reconnect' as const,
+    }
     const subscription = useSessionListSubscription({
       rpc: harness.rpc,
+      callOptions,
       isConnected: harness.isConnected,
       refresh,
       scheduleRefresh: vi.fn(),
@@ -83,8 +89,18 @@ describe('useSessionListSubscription', () => {
     harness.emit('_state', 'connected')
     await flushAsyncWork()
 
-    expect(harness.rpc.call).toHaveBeenNthCalledWith(1, 'sessions.subscribe')
-    expect(harness.rpc.call).toHaveBeenNthCalledWith(2, 'sessions.subscribe')
+    expect(harness.rpc.call).toHaveBeenNthCalledWith(
+      1,
+      'sessions.subscribe',
+      undefined,
+      callOptions,
+    )
+    expect(harness.rpc.call).toHaveBeenNthCalledWith(
+      2,
+      'sessions.subscribe',
+      undefined,
+      callOptions,
+    )
     expect(refresh).toHaveBeenCalledTimes(2)
   })
 
@@ -95,8 +111,14 @@ describe('useSessionListSubscription', () => {
       .mockResolvedValue(undefined)
     const refresh = vi.fn(async () => {})
     const warn = vi.fn()
+    const callOptions = {
+      timeoutMs: 2_000,
+      timeoutAction: 'reconnect' as const,
+      abortAction: 'reconnect' as const,
+    }
     const subscription = useSessionListSubscription({
       rpc: harness.rpc,
+      callOptions,
       isConnected: harness.isConnected,
       refresh,
       scheduleRefresh: vi.fn(),
@@ -116,8 +138,47 @@ describe('useSessionListSubscription', () => {
     subscription.cleanup()
     await flushAsyncWork()
 
-    expect(harness.rpc.call).toHaveBeenLastCalledWith('sessions.unsubscribe')
+    expect(harness.rpc.call).toHaveBeenLastCalledWith(
+      'sessions.unsubscribe',
+      undefined,
+      callOptions,
+    )
     expect(harness.listenerCount('_state')).toBe(0)
     expect(harness.listenerCount('sessions.changed')).toBe(0)
+  })
+
+  it('defers initial and reconnect subscriptions until optional RPCs are admitted', async () => {
+    const harness = makeRpc()
+    let admitted = false
+    const refresh = vi.fn(async () => {})
+    const subscription = useSessionListSubscription({
+      rpc: harness.rpc,
+      isConnected: harness.isConnected,
+      isAdmitted: () => admitted,
+      refresh,
+      scheduleRefresh: vi.fn(),
+    })
+
+    subscription.subscribe()
+    await flushAsyncWork()
+    expect(harness.rpc.call).not.toHaveBeenCalled()
+
+    admitted = true
+    subscription.resume()
+    await flushAsyncWork()
+    expect(harness.rpc.call).toHaveBeenCalledOnce()
+    expect(refresh).toHaveBeenCalledOnce()
+
+    harness.emit('_state', 'disconnected')
+    admitted = false
+    harness.emit('_state', 'connected')
+    await flushAsyncWork()
+    expect(harness.rpc.call).toHaveBeenCalledOnce()
+
+    admitted = true
+    subscription.resume()
+    await flushAsyncWork()
+    expect(harness.rpc.call).toHaveBeenCalledTimes(2)
+    expect(refresh).toHaveBeenCalledTimes(2)
   })
 })

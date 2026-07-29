@@ -9,10 +9,17 @@ import type {
   DesktopUpdateState,
   DesktopSettings,
   DesktopSettingsPayload,
+  NativeArtifactPreviewLeaseBrokerResult,
+  NativeArtifactPreviewLeaseControlRequest,
+  NativeArtifactPreviewLeaseCreateRequest,
   NativeWorkbenchCreateSurfaceRequest,
+  NativeWorkbenchNavigateRequest,
+  NativeWorkbenchPermissionResponse,
   NativeWorkbenchSurfaceEvent,
   NativeWorkbenchSurfaceRectRequest,
   NativeWorkbenchSurfaceResult,
+  ProjectDirectoryPickerRequest,
+  WorkbenchPreviewMode,
 } from './platform/types'
 
 type MigrationSourceKind = 'cli-home' | 'desktop-home' | 'windows-portable'
@@ -47,7 +54,11 @@ declare global {
     resetDesktopSettings: () => Promise<{ ok: boolean }>
     getDesktopPreferences?: () => Promise<DesktopPreferences>
     saveDesktopPreferences?: (
-      payload: { mainWindowCloseBehavior: DesktopMainWindowCloseBehavior },
+      payload: {
+        mainWindowCloseBehavior?: DesktopMainWindowCloseBehavior
+        workbenchPreviewMode?: WorkbenchPreviewMode
+        workbenchPreviewNoticeShown?: boolean
+      },
     ) => Promise<DesktopPreferences>
     onWindowHidden?: (callback: () => void) => () => void
     inspectDesktopCleanup?: (payload: { mode: DesktopCleanupMode }) => Promise<{
@@ -75,9 +86,27 @@ declare global {
     abandonCleanupTransaction?: () => Promise<unknown>
     setNativeTheme?: (payload: { source: 'light' | 'dark' | 'system' }) => Promise<unknown>
     openArtifact: (payload: ArtifactOpenRequest) => Promise<ArtifactNativeOpenResult>
-    chooseProjectDirectory: () => Promise<{ path: string } | null>
+    chooseProjectDirectory: (
+      request?: ProjectDirectoryPickerRequest,
+    ) => Promise<{ path: string } | null>
     createWorkbenchSurface?: (
       payload: NativeWorkbenchCreateSurfaceRequest,
+    ) => Promise<NativeWorkbenchSurfaceResult>
+    createArtifactPreviewLease?: (
+      payload: NativeArtifactPreviewLeaseCreateRequest,
+    ) => Promise<NativeArtifactPreviewLeaseBrokerResult>
+    renewArtifactPreviewLease?: (
+      payload: NativeArtifactPreviewLeaseControlRequest,
+    ) => Promise<NativeArtifactPreviewLeaseBrokerResult>
+    revokeArtifactPreviewLease?: (
+      payload: NativeArtifactPreviewLeaseControlRequest,
+    ) => Promise<NativeArtifactPreviewLeaseBrokerResult>
+    getWorkbenchCapabilities?: () => Promise<unknown>
+    navigateWorkbenchSurface?: (
+      payload: NativeWorkbenchNavigateRequest,
+    ) => Promise<NativeWorkbenchSurfaceResult>
+    respondToWorkbenchPermission?: (
+      payload: NativeWorkbenchPermissionResponse,
     ) => Promise<NativeWorkbenchSurfaceResult>
     setWorkbenchSurfaceRect?: (
       payload: NativeWorkbenchSurfaceRectRequest,

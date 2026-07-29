@@ -32,11 +32,9 @@
         :copy-icon="sessionCopyIcon"
         :copy-live-text="sessionCopyLiveText"
         :deliverable-count="headerDeliverableCount"
-        :run-history-visible="appStore.features.metaRuns"
         :share-mode="shareMode"
         :shareable-message-count="shareableMessageCount"
         @open-deliverables="openDeliverables"
-        @open-run-history="openMetaRunHistory"
         @start-share="startShareMode"
         @copy-session-key="onSessionCopyClick"
       />
@@ -77,7 +75,7 @@
           role="region"
           tabindex="0"
           :aria-label="t('chat.conversation')"
-          :aria-busy="isStreaming || initialSessionLoadState === 'loading'"
+          :aria-busy="isStreaming"
           @scroll="onThreadScroll"
         >
         <template v-if="isNewChatLanding">
@@ -91,25 +89,31 @@
             />
           </div>
         </template>
-        <ChatSessionLoadState
-          v-else-if="initialSessionLoadState"
-          :key="sessionKey"
-          :state="initialSessionLoadState"
+        <ChatSessionRecoveryStatus
+          v-if="visibleHistoryRecoveryState"
+          :key="`${sessionKey}:history`"
+          :state="visibleHistoryRecoveryState"
           @retry="retryHistory"
         />
+        <ChatSessionRecoveryStatus
+          v-if="liveRecoveryState"
+          :key="`${sessionKey}:live`"
+          :state="liveRecoveryState"
+          @retry="retryLive"
+        />
         <div
-          v-else-if="messages.length === 0 && !isStreaming"
+          v-if="showConfirmedEmptySession"
           class="chat-empty"
         >
           {{ t('chat.noMessagesYet') }}
         </div>
         <HistoryLoadSentinel
-          v-if="!isNewChatLanding && !initialSessionLoadState"
+          v-if="!isNewChatLanding"
           :scroll-container="threadRef"
           :has-more="historyState.hasMore"
-          :loading="historySentinelLoading"
+          :loading="historyState.loadingEarlier"
           :blocked="historyState.loading"
-          :error="historySentinelError"
+          :error="historyState.loadEarlierError"
           :canonical-available="historyState.canonicalAvailable"
           :canonical-complete="historyState.canonicalComplete"
           :cursor="historyState.oldestCursor"
@@ -357,16 +361,6 @@
           />
         </template>
         </div>
-        <!-- Keep the loading announcer outside the busy conversation region:
-             assistive technology may defer live-region updates inside an
-             aria-busy subtree until after this short-lived state unmounts. -->
-        <span
-          class="chat-session-load-announcer"
-          role="status"
-          aria-live="polite"
-          aria-atomic="true"
-          data-testid="chat-session-load-announcer"
-        >{{ initialSessionLoadAnnouncement }}</span>
         <ConversationMinimap
           v-if="!isNewChatLanding && !shareMode"
           :messages="renderedMessages"
@@ -553,14 +547,6 @@
       @download="downloadArtifact"
     />
 
-    <MetaRunHistoryDrawer
-      v-if="appStore.features.metaRuns"
-      :open="metaRunsHistoryOpen"
-      :rpc="rpc"
-      :session-key="sessionKey"
-      @close="closeMetaRunHistory"
-    />
-
     <SharePreviewModal
       :open="!!sharePreview"
       :image-url="sharePreview?.url || ''"
@@ -601,7 +587,7 @@ import DeliverablesDrawer from '@/components/chat/DeliverablesDrawer.vue'
 import ChatComposer from '@/components/chat/ChatComposer.vue'
 import ProjectWorkspacePickerDialog from '@/components/ProjectWorkspacePickerDialog.vue'
 import ChatMessageList from '@/components/chat/ChatMessageList.vue'
-import ChatSessionLoadState from '@/components/chat/ChatSessionLoadState.vue'
+import ChatSessionRecoveryStatus from '@/components/chat/ChatSessionRecoveryStatus.vue'
 import ChatStallNotice from '@/components/chat/ChatStallNotice.vue'
 import ClarifyCard from '@/components/chat/ClarifyCard.vue'
 import ConversationMinimap from '@/components/chat/ConversationMinimap.vue'
@@ -611,7 +597,6 @@ import ReasoningPart from '@/components/chat/parts/ReasoningPart.vue'
 import TextPart from '@/components/chat/parts/TextPart.vue'
 import MetaPreflightCard from '@/components/chat/MetaPreflightCard.vue'
 import MetaRibbon from '@/components/chat/MetaRibbon.vue'
-import MetaRunHistoryDrawer from '@/components/chat/MetaRunHistoryDrawer.vue'
 import PendingQueue from '@/components/chat/PendingQueue.vue'
 import PlanCard from '@/components/chat/PlanCard.vue'
 import PlanRunRibbon from '@/components/chat/PlanRunRibbon.vue'
@@ -660,6 +645,13 @@ import {
   useChatRunModePreference,
   type RunModePolicy,
 } from '@/composables/chat/useChatRunModePreference'
+import { useChatSessionBootstrap } from '@/composables/chat/useChatSessionBootstrap'
+import { autoSendDraftIsUnchanged } from '@/composables/chat/sessionBootstrapContract'
+import {
+  acquireSessionBootstrapAdmission,
+  claimSessionBootstrapAdmission,
+  optionalSessionRpcCallOptions,
+} from '@/composables/chat/sessionBootstrapAdmission'
 import { useChatSessionRuntime } from '@/composables/chat/useChatSessionRuntime'
 import { useChatSessionSubscription } from '@/composables/chat/useChatSessionSubscription'
 import { useChatSlashCommands } from '@/composables/chat/useChatSlashCommands'
@@ -682,6 +674,7 @@ import {
 } from '@/composables/useActiveProjectWorkspace'
 import { useFreshTaskDraft } from '@/composables/useFreshTaskDraft'
 import type {
+  Attachment,
   ChatMessage,
   ChatPendingItem,
   ChatRenderedMessage,
@@ -748,9 +741,9 @@ import { agentIdFromSessionKey } from '@/utils/chat/sessionKeys'
 import { shouldDisableLandingSuggestions } from '@/utils/chat/landingSuggestions'
 import { clearAssistantActivityExpansionState } from '@/utils/chat/activityDisclosureState'
 import {
-  resolveChatSessionLoadState,
-  shouldShowHistorySentinelError,
-  shouldShowHistorySentinelLoading,
+  resolveChatHistoryRecoveryState,
+  shouldShowConfirmedEmptySession,
+  visibleChatHistoryRecoveryState,
 } from '@/utils/chat/sessionLoadState'
 import {
   isSemanticActivityStatusStep,
@@ -795,12 +788,18 @@ const toolResultModal = ref<{
 /* ── Stores / Router ───────────────────────────────────────────────── */
 
 const rpc = useRpcStore()
+// Setup runs before this view's/ancestor children's mounted hooks. Holding the
+// admission gate here prevents global onboarding/workspace metadata calls from
+// entering the serialized Gateway queue ahead of session recovery.
+let releaseOptionalRpcAdmission: (() => void) | null =
+  claimSessionBootstrapAdmission()
+let optionalRpcAdmissionGeneration = 0
 const appStore = useAppStore()
 const workbenchStore = useWorkbenchStore()
 const artifactImageLightbox = useArtifactImageLightbox()
 const platform = usePlatform()
 const router = useRouter()
-const { t, locale } = useI18n()
+const { t } = useI18n()
 const { pushToast } = useToasts()
 const { confirm } = useConfirm()
 const projectWorkspaces = useProjectWorkspaces()
@@ -814,6 +813,13 @@ const {
   sendBlockedReason: activeWorkspaceSendBlockedReason,
 } = activeProjectWorkspace
 const projectPickerOpen = ref(false)
+let activeProjectValidationController: AbortController | null = null
+
+function cancelActiveProjectValidation() {
+  activeProjectValidationController?.abort()
+  activeProjectValidationController = null
+}
+
 const isCompactViewport = useMediaQuery('(max-width: 480px)')
 const isDesktopViewport = useMediaQuery('(min-width: 769px)')
 const landingAgentId = computed(() => agentIdFromSessionKey(sessionKey.value))
@@ -839,6 +845,7 @@ const chatHeaderActionsRef = ref<ChatHeaderActionsHandle | null>(null)
 const sessionKey = ref('')
 const workbenchEnabled = computed(() => appStore.features.artifactWorkbench === true)
 const inputText = ref('')
+const composerRevision = ref(0)
 const aborted = ref(false)
 const autoScroll = ref(true)
 const historyNavigationScrollLock = createHistoryNavigationScrollLock(autoScroll)
@@ -883,20 +890,35 @@ const {
   applyRunModePreferenceChanged,
 } = useChatRunModePreference({
   rpc,
+  hydrateCallOptions: optionalSessionRpcCallOptions,
   runModePolicy: () => {
     const auth = rpc.auth as RpcAuthPayload | null
     return auth?.runModePolicy
   },
 })
+async function refreshRunModePreference() {
+  try {
+    await hydrateRunModePreference()
+  } catch (cause) {
+    console.warn(
+      'Failed to hydrate global sandbox run mode:',
+      cause instanceof Error ? cause.message : String(cause),
+    )
+  }
+}
 const activeRunModeLock = ref<SandboxRunMode | null>(null)
 const runMode = computed<SandboxRunMode>(
   () => activeRunModeLock.value ?? globalRunMode.value,
 )
 
 const sandboxSetupRecovery = useSandboxSetupRecovery({
-  rpc,
+  rpc: {
+    call: (method, params) =>
+      rpc.call(method, params, optionalSessionRpcCallOptions),
+  },
   connectionState: computed(() => rpc.state),
   runMode,
+  autoRefresh: false,
 })
 const {
   status: sandboxSetupStatus,
@@ -907,6 +929,13 @@ const {
   ensureSetup: ensureSandboxSetup,
   dismiss: dismissSandboxSetup,
 } = sandboxSetupRecovery
+
+async function refreshPostBootstrapMetadata() {
+  await refreshRunModePreference()
+  if (!chatViewDisposed && rpc.state === 'connected') {
+    await sandboxSetupRecovery.refresh()
+  }
+}
 
 // Run status
 const runStatus = ref<ChatRunStatus>({ status: 'idle', label: t('chat.status.idle'), task: null })
@@ -1010,16 +1039,33 @@ const {
   hasPendingAttachmentWork,
   prepareAttachmentsForSend,
 } = chatAttachments
+watch(
+  [inputText, pendingAttachments],
+  () => {
+    composerRevision.value += 1
+  },
+  { deep: true, flush: 'sync' },
+)
 
 let sendCurrentInput: () => void = () => {}
+let sendAutomaticInput: () => void = () => {}
 // Late-bound: dispatchHiddenSend is created below (useChatSend) but the /meta
 // slash handler (useChatSlashCommands, created earlier) needs it at call time.
 let dispatchHiddenForMeta: (providerText: string, displayText: string) => void = () => {}
 let dispatchPlanComposerPrompt: (prompt: string, composerText: string) => void = () => {}
 let isCompactInFlightForCurrentSession: () => boolean = () => false
 let isQueuedDeliveryBlocked: () => boolean = () => false
-let dispatchHiddenControl: (providerText: string, displayText: string) => void = () => {}
-let dispatchQueuedItem: (item: ChatPendingItem) => Promise<ChatSendOutcome> = async () => 'not_sent'
+let isLiveDeliveryBlocked: () => boolean = () => true
+let dispatchHiddenControl: (
+  providerText: string,
+  displayText: string,
+  ownerSessionKey?: string,
+  queuedItem?: ChatPendingItem,
+) => Promise<ChatSendOutcome> = async () => 'not_sent'
+let dispatchQueuedItem: (
+  item: ChatPendingItem,
+  ownerSessionKey?: string,
+) => Promise<ChatSendOutcome> = async () => 'not_sent'
 const pendingQueueOwnerContext = ref<PendingQueueOwnerContext | null>(null)
 const chatPendingQueue = useChatPendingQueue({
   sessionKey,
@@ -1031,6 +1077,10 @@ const chatPendingQueue = useChatPendingQueue({
   isBlocked: () => (
     isCompactInFlightForCurrentSession()
     || isQueuedDeliveryBlocked()
+    || isLiveDeliveryBlocked()
+    || ['resolving', 'unavailable', 'removed', 'error'].includes(
+      activeWorkspaceStatus.value,
+    )
     || hasPendingAttachmentWork()
     || pendingQueueOwnerContext.value?.sessionKey === sessionKey.value
   ),
@@ -1038,14 +1088,22 @@ const chatPendingQueue = useChatPendingQueue({
   sendCurrentInput: () => sendCurrentInput(),
   resetInputHistory: () => resetComposerInputHistory(),
   hasComposer: () => Boolean(composerRef.value),
-  dispatchHiddenControl: (providerText, displayText) => dispatchHiddenControl(providerText, displayText),
-  dispatchPendingItem: item => dispatchQueuedItem(item),
+  dispatchHiddenControl: (item, ownerSessionKey) =>
+    dispatchHiddenControl(
+      item.text,
+      item.displayTextOverride || '',
+      ownerSessionKey,
+      item,
+    ),
+  dispatchPendingItem: (item, ownerSessionKey) =>
+    dispatchQueuedItem(item, ownerSessionKey),
 })
 const {
   pendingQueue,
   canQueueMore,
   busySendMode,
   maxPending,
+  enqueuePendingPayload,
   enqueuePendingInput,
   enqueueHiddenControl,
   removePendingChip,
@@ -1087,6 +1145,7 @@ const compactGaugeVisible = computed(() =>
 
 const chatUsageWidget = useChatUsageWidget({
   rpc,
+  readCallOptions: optionalSessionRpcCallOptions,
   sessionKey,
   tokenVizEnabled: () => appStore.features.tokenViz,
 })
@@ -1101,6 +1160,7 @@ const {
 
 const chatFeatureToggles = useChatFeatureToggles({
   rpc,
+  readCallOptions: optionalSessionRpcCallOptions,
   setGlobalElevatedMode,
   loadCurrentSessionUsage,
 })
@@ -1328,9 +1388,10 @@ const {
   historyState,
   loadHistory,
   loadEarlierHistory,
-  retryHistory,
+  retryHistory: retryHistoryRequest,
   scheduleHistorySync,
   cancelAnchorStabilization,
+  cancelActiveHistory,
   cleanup: cleanupHistory,
 } = chatHistory
 planMutationAccepted = () => scheduleHistorySync()
@@ -1348,7 +1409,11 @@ const {
 // (including env-var keys the browser can't see), so audioConfigured is a true
 // "voice will work" signal — this keeps the button from being clicked into a
 // guaranteed failure. It's the same snapshot the empty-state chips read.
-const voiceCapability = useRpcCall<{ audioConfigured?: boolean }>('onboarding.status')
+const voiceCapability = useRpcCall<{ audioConfigured?: boolean }>(
+  'onboarding.status',
+  undefined,
+  { callOptions: optionalSessionRpcCallOptions },
+)
 const voiceReady = computed(() => voiceCapability.data.value?.audioConfigured === true)
 
 const chatMessageActions = useChatMessageActions({
@@ -1362,6 +1427,12 @@ const chatMessageActions = useChatMessageActions({
   focusComposer: () => composerRef.value?.focusTextarea(),
   pendingForkBeforeMessageId,
   aiGeneratedLabel: () => aiGeneratedLabel.value,
+  canDeliver: () => !composerSendBlockedMessage.value,
+  notifyDeliveryBlocked: () => {
+    if (liveSendBlockedReason.value) {
+      pushToast(liveSendBlockedReason.value, { tone: 'info' })
+    }
+  },
   notifyMessagePending: () => pushToast(t('chat.toast.messageStillSaving'), { tone: 'info' }),
 })
 const {
@@ -1426,11 +1497,158 @@ const chatSessionSubscription = useChatSessionSubscription({
   },
 })
 const {
-  isHydrating: isSessionHydrating,
   subscribeSession,
+  retrySessionMetadata,
   unsubscribeSession,
+  cancelActiveSubscription,
 } = chatSessionSubscription
 applySessionRunState = chatSessionSubscription.applySessionRunState
+
+const chatSessionBootstrap = useChatSessionBootstrap({
+  sessionKey,
+  loadHistory: async (context, retry) => (
+    retry
+      ? await retryHistoryRequest(context)
+      : await loadHistory({}, context)
+  ),
+  subscribeSession,
+  cancelHistory: cancelActiveHistory,
+  cancelSubscription: cancelActiveSubscription,
+  unsubscribeSession,
+})
+const {
+  livePhase,
+  startSessionBootstrap: startSessionBootstrapCoordinator,
+  cancelSessionBootstrap: cancelSessionBootstrapCoordinator,
+  retryHistory: retryHistoryCoordinator,
+  retryLive: retryLiveCoordinator,
+  handleConnectionState: handleSessionConnectionStateCoordinator,
+  isSessionBootstrapCurrent,
+} = chatSessionBootstrap
+
+function holdOptionalRpcAdmission() {
+  if (!releaseOptionalRpcAdmission) {
+    releaseOptionalRpcAdmission = acquireSessionBootstrapAdmission()
+  }
+  return ++optionalRpcAdmissionGeneration
+}
+
+function releaseOptionalRpcAdmissionAfter(
+  promises: readonly Promise<unknown>[],
+  admissionGeneration: number,
+) {
+  void Promise.allSettled(promises).then(() => {
+    if (admissionGeneration !== optionalRpcAdmissionGeneration) return
+    releaseOptionalRpcAdmission?.()
+    releaseOptionalRpcAdmission = null
+  })
+}
+
+function trackSessionBootstrapAdmission<T extends {
+  criticalRequestsQueued: Promise<void>
+}>(run: T): T {
+  const admissionGeneration = holdOptionalRpcAdmission()
+  releaseOptionalRpcAdmissionAfter(
+    [run.criticalRequestsQueued],
+    admissionGeneration,
+  )
+  return run
+}
+
+let postBootstrapMetadataStarted = false
+function schedulePostBootstrapMetadata(
+  run: {
+    generation: number
+    criticalRequestsQueued: Promise<void>
+  },
+  key: string,
+) {
+  if (postBootstrapMetadataStarted) return
+  void run.criticalRequestsQueued.then(() => {
+    if (
+      postBootstrapMetadataStarted
+      || chatViewDisposed
+      || sessionKey.value !== key
+      || !isSessionBootstrapCurrent(run.generation, key)
+    ) return
+    postBootstrapMetadataStarted = true
+    void refreshPostBootstrapMetadata()
+    void loadFeatureToggles().then(() => {
+      if (!chatViewDisposed) unsubs.push(bindFeatureRefresh(scheduleHistorySync))
+    })
+    loadSlashCommands()
+  })
+}
+
+function startSessionBootstrap(options?: {
+  includeHistory?: boolean
+  force?: boolean
+}) {
+  const key = sessionKey.value
+  const run = trackSessionBootstrapAdmission(
+    startSessionBootstrapCoordinator(options),
+  )
+  schedulePostBootstrapMetadata(run, key)
+  return run
+}
+
+function retryHistory() {
+  return retryHistoryCoordinator()
+}
+
+function retryLive() {
+  return retryLiveCoordinator()
+}
+
+function cancelSessionBootstrap() {
+  optionalRpcAdmissionGeneration += 1
+  cancelSessionBootstrapCoordinator()
+}
+
+function handleSessionConnectionState(
+  state: string,
+  includeHistory = true,
+) {
+  const run = handleSessionConnectionStateCoordinator(state, includeHistory)
+  if (
+    run
+    && (historyState.value.initialLoadStatus === 'loading'
+      || livePhase.value === 'connecting')
+  ) {
+    return trackSessionBootstrapAdmission(run)
+  }
+  return run
+}
+
+const isSessionHydrating = computed(() => livePhase.value === 'connecting')
+const liveSendBlockedReason = computed<string | null>(() => {
+  if (!sessionKey.value || livePhase.value === 'ready') return null
+  return t(
+    livePhase.value === 'degraded'
+      ? 'chat.liveSendBlockedDegraded'
+      : 'chat.liveSendBlockedConnecting',
+  )
+})
+isLiveDeliveryBlocked = () => Boolean(liveSendBlockedReason.value)
+watch(livePhase, (phase, previousPhase) => {
+  if (
+    phase !== 'ready'
+    || previousPhase === 'ready'
+    || pendingQueue.value.length === 0
+  ) return
+  schedulePendingDrainAfterTerminal()
+  flushDeferredPendingDrain()
+})
+watch(activeWorkspaceStatus, (status, previousStatus) => {
+  if (
+    status !== 'ready'
+    || previousStatus === 'ready'
+    || pendingQueue.value.length === 0
+  ) return
+  schedulePendingDrainAfterTerminal()
+  flushDeferredPendingDrain()
+})
+
 const sessionHasActiveWork = computed(() => (
   isStreaming.value
   || activeTaskGroups.value.size > 0
@@ -1473,9 +1691,14 @@ const chatSessionRuntime = useChatSessionRuntime({
   usageModel,
   createSessionKey,
   persistSession,
-  unsubscribeSession,
-  subscribeSession,
-  loadHistory,
+  cancelSessionBootstrap: () => {
+    // Retire draft-project work on the old socket before the next session's
+    // coordinator can start, so its abort/reconnect cannot tear down B.
+    draftProjectHydration.invalidate()
+    cancelActiveProjectValidation()
+    cancelSessionBootstrap()
+  },
+  startSessionBootstrap,
   loadCurrentSessionUsage,
   applySessionRunState,
   setCompactInFlight,
@@ -1510,6 +1733,7 @@ function switchToSession(nextSessionKey: string) {
 
 const chatSlashCommands = useChatSlashCommands({
   rpc,
+  catalogCallOptions: optionalSessionRpcCallOptions,
   inputText,
   sessionKey,
   autoResizeTextarea,
@@ -1581,9 +1805,10 @@ const chatSend = useChatSend({
   elevatedMode,
   runMode,
   pendingAttachments,
+  composerRevision,
   pendingSessionIntent,
   pendingWorkspaceId,
-  sendBlockedReason: activeWorkspaceSendBlockedReason,
+  sendBlockedReason: liveSendBlockedReason,
   validateActiveProjectBeforeSend,
   acceptPendingWorkspaceBinding: activeProjectWorkspace.acceptPendingBinding,
   initialCollaborationMode,
@@ -1621,6 +1846,7 @@ const chatSend = useChatSend({
   hasPendingAttachmentWork,
   prepareAttachmentsForSend,
   enqueuePendingInput,
+  enqueuePendingPayload,
   enqueueHiddenControl,
   popAllPendingIntoComposer,
   executeSlashCommand,
@@ -1639,6 +1865,9 @@ const {
 } = chatSend
 
 async function onComposerSend() {
+  // All composer submission modes, including keyboard-driven plan revision,
+  // share the same fail-closed delivery gate.
+  if (composerSendBlockedMessage.value) return
   // Serialize an existing-session mode mutation before accepting another
   // composer turn, so the send cannot race the collaboration CAS update.
   if (planModeBusy.value) return
@@ -1649,13 +1878,19 @@ async function onComposerSend() {
   }
   const prompt = inputText.value.trim()
   if (!prompt) return
+  const submittedRevision = composerRevision.value
   const accepted = await chatPlans.revise({ ...target, prompt })
   if (!accepted) return
-  inputText.value = ''
-  autoResizeTextarea()
+  if (composerRevision.value === submittedRevision) {
+    inputText.value = ''
+    autoResizeTextarea()
+  }
 }
 
 sendCurrentInput = onComposerSend
+sendAutomaticInput = () => {
+  void onSend({ cancelIfComposerChanged: true })
+}
 dispatchHiddenForMeta = dispatchHiddenSend
 dispatchPlanComposerPrompt = (prompt, composerText) => {
   void dispatchComposerPrompt(prompt, composerText)
@@ -1681,30 +1916,47 @@ function editPendingMessage(index: number) {
 }
 
 async function steerPendingMessage(index: number) {
-  const item = beginPendingDelivery(index)
+  const candidate = pendingQueue.value[index]
+  const item = beginPendingDelivery(index, candidate?.hiddenControl === true)
   if (!item) return
 
   let outcome: ChatSendOutcome = 'retryable_failure'
   try {
-    outcome = await sendQueuedSteer(item)
+    outcome = item.hiddenControl
+      ? await dispatchHiddenSend(
+          item.text,
+          item.displayTextOverride || '',
+          item.ownerSessionKey || sessionKey.value,
+          item,
+        )
+      : await sendQueuedSteer(item)
   } finally {
     settlePendingDelivery(item, outcome)
   }
 }
 
-// Deny notes ride the normal send path: queued while the turn is streaming,
-// sent immediately otherwise.
+// Deny notes are immutable queue payloads. They never borrow or clear the
+// operator's editable composer, even if project validation or live recovery
+// delays delivery.
 function queueDenyFeedback(note: string) {
-  if (isStreaming.value || isCompactInFlightForCurrentSession()) {
-    enqueuePendingInput(note)
+  const context = pendingQueueOwnerContext.value
+  const owner = context?.sessionKey === sessionKey.value
+    ? { ownerRequestId: context.ownerRequestId }
+    : undefined
+  const queued = enqueuePendingPayload({
+    text: note,
+    attachments: [],
+    intent: null,
+  }, owner)
+  if (!queued) {
+    inputText.value = [note, inputText.value].filter(text => text.trim()).join('\n')
+    autoResizeTextarea()
+    pushToast(t('chat.toast.queueFull'), { tone: 'info' })
     return
   }
-  const prior = inputText.value
-  inputText.value = note
-  void onSend()
-  if (prior.trim()) {
-    inputText.value = prior
-    autoResizeTextarea()
+  if (!isStreaming.value && !isCompactInFlightForCurrentSession()) {
+    schedulePendingDrainAfterTerminal()
+    flushDeferredPendingDrain()
   }
 }
 
@@ -1760,9 +2012,10 @@ const rpcEventHandlers = useChatRpcEventHandlers({
   schedulePendingDrainAfterTerminal,
   popAllPendingIntoComposer,
   saveWidgetState,
-  subscribeSession,
-  loadHistory,
+  handleSessionConnectionState: state =>
+    handleSessionConnectionState(state, !isDraftRoute()),
   loadCurrentSessionUsage,
+  refreshRunModePreference: refreshPostBootstrapMetadata,
 })
 bindActiveStreamTask = rpcEventHandlers.bindActiveStreamTask
 restoreLiveTurnSnapshot = rpcEventHandlers.restoreLiveTurnSnapshot
@@ -1982,13 +2235,39 @@ const metaRuns = useMetaRuns({
   pushToast,
 })
 
-// Refill the composer with `text` and fire the send path (mirrors vanilla's
-// retry/replay tail: `_textarea.value = text; _autoResizeTextarea(); _onSend()`).
+// Meta retries/replays and landing suggestions must never overwrite an
+// operator-owned draft. Occupied composers keep the generated prompt as an
+// immutable queue item; an empty but blocked composer stages it for explicit
+// retry without pretending it was sent.
 function sendComposerText(text: string) {
   const next = String(text || '')
   if (!next) return
+  if (inputText.value.trim() || pendingAttachments.value.length > 0) {
+    const context = pendingQueueOwnerContext.value
+    const owner = context?.sessionKey === sessionKey.value
+      ? { ownerRequestId: context.ownerRequestId }
+      : undefined
+    const queued = enqueuePendingPayload({
+      text: next,
+      attachments: [],
+      intent: null,
+    }, owner)
+    if (!queued) {
+      pushToast(t('chat.toast.queueFull'), { tone: 'info' })
+      return
+    }
+    if (!isStreaming.value && !isCompactInFlightForCurrentSession()) {
+      schedulePendingDrainAfterTerminal()
+      flushDeferredPendingDrain()
+    }
+    return
+  }
   inputText.value = next
   autoResizeTextarea()
+  if (composerSendBlockedMessage.value) {
+    composerRef.value?.focusTextarea()
+    return
+  }
   void sendCurrentInput()
 }
 
@@ -2043,47 +2322,36 @@ const isNewChatLanding = computed(() => {
     !compactStatus.value.visible
 })
 
-const initialSessionLoadState = computed<'loading' | 'error' | null>(() => {
-  return resolveChatSessionLoadState({
+const historyRecoveryState = computed(() => {
+  return resolveChatHistoryRecoveryState({
     isDraftLanding: isNewChatLanding.value,
-    isStreaming: isStreaming.value,
-    messageCount: messages.value.length,
     initialHistoryStatus: historyState.value.initialLoadStatus,
-    sessionHydrating: isSessionHydrating.value,
+    retrying: historyState.value.retrying,
+    recoveryError: historyState.value.recoveryError,
   })
 })
 
-const historySentinelError = computed(() => shouldShowHistorySentinelError({
-  loadEarlierError: historyState.value.loadEarlierError,
-  initialHistoryStatus: historyState.value.initialLoadStatus,
-  initialLoadSurface: initialSessionLoadState.value,
-}))
+const visibleHistoryRecoveryState = computed(() => (
+  visibleChatHistoryRecoveryState(historyRecoveryState.value)
+))
 
-const historySentinelLoading = computed(() => shouldShowHistorySentinelLoading({
-  loadingEarlier: historyState.value.loadingEarlier,
-  historyLoading: historyState.value.loading,
-  historyRetrying: historyState.value.retrying,
-  initialHistoryStatus: historyState.value.initialLoadStatus,
-  initialLoadSurface: initialSessionLoadState.value,
-}))
+const liveRecoveryState = computed(() => {
+  if (livePhase.value === 'degraded') return 'live-degraded' as const
+  if (
+    livePhase.value === 'connecting'
+    && historyRecoveryState.value === null
+  ) {
+    return 'live-connecting' as const
+  }
+  return null
+})
 
-const initialSessionLoadAnnouncement = ref('')
-watch(
-  [initialSessionLoadState, locale, sessionKey],
-  ([state, , activeSession]) => {
-    initialSessionLoadAnnouncement.value = ''
-    if (state !== 'loading') return
-    void nextTick(() => {
-      if (
-        initialSessionLoadState.value === 'loading'
-        && sessionKey.value === activeSession
-      ) {
-        initialSessionLoadAnnouncement.value = t('chat.loadingSession')
-      }
-    })
-  },
-  { immediate: true },
-)
+const showConfirmedEmptySession = computed(() => shouldShowConfirmedEmptySession({
+  isDraftLanding: isNewChatLanding.value,
+  isStreaming: isStreaming.value,
+  messageCount: messages.value.length,
+  initialHistoryStatus: historyState.value.initialLoadStatus,
+}))
 
 const composerPlaceholder = computed(() => {
   if (replanActive.value) return t('chat.plan.revisePromptPlaceholder')
@@ -2115,6 +2383,7 @@ const planCardPendingAction = computed<PlanCardAction | null>(() => {
 const planActionsDisabled = computed(() =>
   isStreaming.value
   || planModeBusy.value
+  || Boolean(liveSendBlockedReason.value)
   || planActionPending.value !== null
   || activePlanRun.value?.status === 'queued'
   || activePlanRun.value?.status === 'running',
@@ -2212,8 +2481,21 @@ const activeProjectStatusMessage = computed(() => {
   }
 })
 
+const activeProjectComposerBlockMessage = computed(() => {
+  switch (activeWorkspaceStatus.value) {
+    case 'resolving':
+    case 'unavailable':
+    case 'removed':
+      return activeProjectStatusMessage.value
+    default:
+      return ''
+  }
+})
+
 const composerSendBlockedMessage = computed(() =>
-  modelImageSendBlockedMessage.value || activeProjectStatusMessage.value,
+  modelImageSendBlockedMessage.value
+  || liveSendBlockedReason.value
+  || activeProjectComposerBlockMessage.value,
 )
 
 const sendButtonTitle = computed(() => {
@@ -2229,10 +2511,12 @@ const sendButtonTitle = computed(() => {
 })
 
 function implementCurrentPlan(target: PlanCardActionTarget) {
+  if (liveSendBlockedReason.value) return
   void chatPlans.implement(target, false)
 }
 
 function implementPlanInNewTask(target: PlanCardActionTarget) {
+  if (liveSendBlockedReason.value) return
   void chatPlans.implement(target, true)
 }
 
@@ -2303,6 +2587,7 @@ async function setComposerRunMode(mode: SandboxRunMode) {
   if (runModeLocked.value) return
   try {
     await setGlobalRunMode(mode)
+    void sandboxSetupRecovery.refresh()
   } catch (cause) {
     const detail = cause instanceof Error ? cause.message : String(cause)
     console.warn('Failed to persist sandbox run mode:', detail)
@@ -2489,10 +2774,9 @@ const headerDeliverableCount = computed(() =>
 )
 
 const deliverablesOpen = ref(false)
-const metaRunsHistoryOpen = ref(false)
 
 function focusHeaderAction(
-  action: 'deliverables' | 'runs' | 'share' | 'copy-session-key',
+  action: 'deliverables' | 'share' | 'copy-session-key',
 ) {
   void nextTick(() => chatHeaderActionsRef.value?.focusAction(action))
 }
@@ -2581,7 +2865,7 @@ function openArtifact(artifact: ArtifactPayload): boolean {
     return true
   }
   if (!workbenchEnabled.value || !sessionKey.value) return false
-  workbenchStore.openItem(createArtifactPreviewWorkbenchItem({
+  const opened = workbenchStore.openItem(createArtifactPreviewWorkbenchItem({
     artifact,
     navigationArtifacts: sessionArtifacts.value,
     nativeHtml: Boolean(
@@ -2590,21 +2874,15 @@ function openArtifact(artifact: ArtifactPayload): boolean {
     ),
     sessionKey: sessionKey.value,
   }))
-  return true
+  if (!opened) {
+    pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
+  }
+  return opened
 }
 
 function closeDeliverables() {
   deliverablesOpen.value = false
   focusHeaderAction('deliverables')
-}
-
-function openMetaRunHistory() {
-  metaRunsHistoryOpen.value = true
-}
-
-function closeMetaRunHistory() {
-  metaRunsHistoryOpen.value = false
-  focusHeaderAction('runs')
 }
 
 /* ── Fork ──────────────────────────────────────────────────────────── */
@@ -3030,14 +3308,42 @@ function closeProjectDraft() {
 }
 
 async function validateActiveProjectBeforeSend(): Promise<string | null> {
-  const workspaceId = boundWorkspaceId.value
-  if (!workspaceId) return activeWorkspaceSendBlockedReason.value
-  if (!rpc.canManageProjectWorkspaces) {
-    return activeWorkspaceSendBlockedReason.value
-  }
+  const key = sessionKey.value
+  const deadlineAt = Date.now() + 7_000
+  cancelActiveProjectValidation()
+  const controller = new AbortController()
+  activeProjectValidationController = controller
+  let workspaceId = boundWorkspaceId.value
   try {
-    const workspaces = await projectWorkspaces.loadWorkspaces()
-    if (boundWorkspaceId.value !== workspaceId) {
+    if (
+      !workspaceId
+      && activeWorkspaceStatus.value === 'error'
+    ) {
+      const recovered = await retrySessionMetadata({
+        timeoutMs: Math.max(1, deadlineAt - Date.now()),
+        signal: controller.signal,
+        timeoutAction: 'reconnect',
+        abortAction: 'reconnect',
+      })
+      if (!recovered) {
+        if (!controller.signal.aborted && sessionKey.value === key) {
+          pushToast(t('workspaces.activeProjectBlocksSending'), { tone: 'warn' })
+        }
+        return activeWorkspaceSendBlockedReason.value || 'error'
+      }
+      workspaceId = boundWorkspaceId.value
+    }
+    if (!workspaceId) return activeWorkspaceSendBlockedReason.value
+    if (!rpc.canManageProjectWorkspaces) {
+      return activeWorkspaceSendBlockedReason.value
+    }
+    const workspaces = await projectWorkspaces.loadWorkspaces({
+      timeoutMs: Math.max(1, deadlineAt - Date.now()),
+      signal: controller.signal,
+      timeoutAction: 'reconnect',
+      abortAction: 'reconnect',
+    })
+    if (sessionKey.value !== key || boundWorkspaceId.value !== workspaceId) {
       return activeWorkspaceSendBlockedReason.value || 'resolving'
     }
     const workspace = workspaces.find(item => item.id === workspaceId) || null
@@ -3045,8 +3351,16 @@ async function validateActiveProjectBeforeSend(): Promise<string | null> {
       workspace ? activeSnapshot(workspace) : null,
     )
   } catch {
-    if (boundWorkspaceId.value === workspaceId) {
+    if (
+      !controller.signal.aborted
+      && sessionKey.value === key
+      && boundWorkspaceId.value === workspaceId
+    ) {
       activeProjectWorkspace.failWorkspaceRefresh()
+    }
+  } finally {
+    if (activeProjectValidationController === controller) {
+      activeProjectValidationController = null
     }
   }
   return activeWorkspaceSendBlockedReason.value
@@ -3062,6 +3376,7 @@ function draftProjectHydrationIsCurrent(
 }
 
 async function syncDraftProjectFromRoute(generation: number): Promise<boolean> {
+  const deadlineAt = Date.now() + 7_000
   const workspaceId = readProjectFromUrl()
   if (!draftProjectHydrationIsCurrent(generation, workspaceId)) return false
   if (!workspaceId) {
@@ -3084,10 +3399,21 @@ async function syncDraftProjectFromRoute(generation: number): Promise<boolean> {
     return true
   }
   activeProjectWorkspace.beginUnknownProjectDraft(workspaceId)
+  const controller = draftProjectHydration.createController(generation)
+  if (!controller) return false
   try {
-    await rpc.waitForConnection()
+    await rpc.waitForConnection(
+      Math.max(1, deadlineAt - Date.now()),
+      controller.signal,
+      { timeoutAction: 'reconnect', abortAction: 'reconnect' },
+    )
     if (!draftProjectHydrationIsCurrent(generation, workspaceId)) return false
-    await projectWorkspaces.loadWorkspaces()
+    await projectWorkspaces.loadWorkspaces({
+      timeoutMs: Math.max(1, deadlineAt - Date.now()),
+      signal: controller.signal,
+      timeoutAction: 'reconnect',
+      abortAction: 'reconnect',
+    })
     if (!draftProjectHydrationIsCurrent(generation, workspaceId)) return false
     const workspace = projectWorkspaces.byId.value.get(workspaceId)
     if (workspace) {
@@ -3100,6 +3426,8 @@ async function syncDraftProjectFromRoute(generation: number): Promise<boolean> {
     activeProjectWorkspace.failWorkspaceRefresh()
     const detail = cause instanceof Error ? cause.message : String(cause)
     pushToast(t('workspaces.loadFailed', { error: detail }), { tone: 'warn' })
+  } finally {
+    draftProjectHydration.complete(generation, controller)
   }
   return true
 }
@@ -3124,13 +3452,24 @@ onMounted(async () => {
   // draft instead of restoring a previous session.
   const initialSession = resolveInitialSession()
   sessionKey.value = initialSession.sessionKey
+  let initialDraftProjectGeneration: number | null = null
+  let initialAutoSendSnapshot: {
+    text: string
+    revision: number
+    attachments: Attachment[]
+  } | null = null
   if (initialSession.draft) {
     pendingSessionIntent.value = 'new_chat'
-    const generation = draftProjectHydration.begin()
-    const synced = await syncDraftProjectFromRoute(generation)
-    if (synced) {
-      if (!isDraftRoute() || hasLegacyNewChatQuery()) goToDraft({ replace: true })
-      consumeDraftPrefill()
+    initialDraftProjectGeneration = draftProjectHydration.begin()
+    // Apply the hand-off before any asynchronous project/live work. A later
+    // completion must never overwrite text the operator typed while waiting.
+    consumeDraftPrefill()
+    if (pendingAutoSend.value) {
+      initialAutoSendSnapshot = {
+        text: pendingAutoSend.value,
+        revision: composerRevision.value,
+        attachments: [...pendingAttachments.value],
+      }
     }
   } else {
     activeProjectWorkspace.beginSessionResolution(initialSession.sessionKey)
@@ -3140,40 +3479,27 @@ onMounted(async () => {
   // Load elevated mode
   loadElevatedMode()
 
-  const refreshRunModePreference = async () => {
-    try {
-      await hydrateRunModePreference()
-    } catch (cause) {
-      console.warn(
-        'Failed to hydrate global sandbox run mode:',
-        cause instanceof Error ? cause.message : String(cause),
-      )
-    }
-  }
   unsubs.push(rpc.on(
     'sandbox.run_mode.preference.changed',
     payload => applyRunModePreferenceChanged(payload),
   ))
-  unsubs.push(rpc.on('_state', state => {
-    if (state === 'connected') void refreshRunModePreference()
-  }))
-  void refreshRunModePreference()
 
   // Register event handlers before sessions.messages.subscribe can replay
-  // buffered events. Session hydration and unrelated feature configuration
-  // then start together, so a slow config/model RPC cannot hold long history
-  // behind it.
+  // buffered events, then start the two critical phases before any optional
+  // config, usage, slash-command, or project-list RPC can enter the Gateway's
+  // serialized dispatch queue.
   unsubs.push(chatRpcSubscriptions.subscribe())
   unsubs.push(chatApprovals.subscribe())
   unsubs.push(metaRuns.subscribe())
   unsubs.push(chatPlans.subscribe())
-  const sessionSubscription = subscribeSession()
-  if (!initialSession.draft) loadHistory()
-  void loadFeatureToggles().then(() => {
-    if (!chatViewDisposed) unsubs.push(bindFeatureRefresh(scheduleHistorySync))
+  const sessionBootstrap = startSessionBootstrap({
+    includeHistory: !initialSession.draft,
   })
-  loadSlashCommands()
-
+  const initialDraftProjectSync = initialDraftProjectGeneration === null
+    ? Promise.resolve(true)
+    : sessionBootstrap.live.then(() =>
+        syncDraftProjectFromRoute(initialDraftProjectGeneration!),
+      )
   // Composer resize observer
   const composerEl = composerRef.value?.composerElement()
   if (composerEl) {
@@ -3189,19 +3515,54 @@ onMounted(async () => {
     composerRef.value?.focusTextarea()
   }
 
+  if (initialDraftProjectGeneration !== null) {
+    const synced = await initialDraftProjectSync
+    if (synced) {
+      if (!isDraftRoute() || hasLegacyNewChatQuery()) goToDraft({ replace: true })
+    }
+  }
+
   // Sessions Hub "Start task" hand-off: send the prefilled draft in one step.
   // Wait for the subscription first so the first turn streams into this view
   // rather than being missed before sessions.messages.subscribe registers.
-  if (pendingAutoSend.value) {
-    const text = pendingAutoSend.value
+  if (pendingAutoSend.value && initialAutoSendSnapshot) {
+    const text = initialAutoSendSnapshot.text
+    const autoSendSessionKey = sessionKey.value
+    const autoSendGeneration = sessionBootstrap.generation
+    const subscription = await sessionBootstrap.live
     pendingAutoSend.value = ''
-    await sessionSubscription
-    sendComposerText(text)
+    const composerUnchanged = autoSendDraftIsUnchanged(
+      text,
+      inputText.value,
+      initialAutoSendSnapshot.attachments,
+      pendingAttachments.value,
+      initialAutoSendSnapshot.revision,
+      composerRevision.value,
+    )
+    if (
+      !chatViewDisposed
+      && sessionKey.value === autoSendSessionKey
+      && isSessionBootstrapCurrent(autoSendGeneration, autoSendSessionKey)
+      && subscription.authoritative
+      && livePhase.value === 'ready'
+      && composerUnchanged
+    ) {
+      sendAutomaticInput()
+    } else {
+      // Fail closed: the Sessions Hub hand-off remains an editable draft. The
+      // inline live-recovery state owns retry and explains why sending paused.
+      composerRef.value?.focusTextarea()
+    }
   }
 })
 
 onUnmounted(() => {
   chatViewDisposed = true
+  draftProjectHydration.invalidate()
+  cancelSessionBootstrap()
+  releaseOptionalRpcAdmission?.()
+  releaseOptionalRpcAdmission = null
+  cancelActiveProjectValidation()
   clearExecutionDockHideTimer()
   unsubs.forEach(fn => fn())
   unsubs = []
@@ -3219,7 +3580,6 @@ onUnmounted(() => {
     URL.revokeObjectURL(sharePreview.value.url)
     sharePreview.value = null
   }
-  unsubscribeSession()
 })
 
 useDocumentEvent('paste', onDocumentPaste)
@@ -3301,7 +3661,6 @@ watch(sessionKey, () => {
   if (workbenchEnabled.value) workbenchStore.setSessionScope(sessionKey.value || null)
   if (shareMode.value) endShareMode()
   deliverablesOpen.value = false
-  metaRunsHistoryOpen.value = false
 })
 
 watch(shareableMessageCount, (count) => {
@@ -3334,11 +3693,9 @@ watch(
 
 <style scoped>
 /* No shared sr-only utility exists in this repo (each component scopes its
-   own), so these persistent announcers clip out here: zero visual footprint,
-   still exposed to assistive tech. The session announcer intentionally sits
-   outside the aria-busy conversation region. */
-.chat-turn-settled-announcer,
-.chat-session-load-announcer {
+   own), so the completion announcer's clip-out lives here: zero visual
+   footprint, still exposed to assistive tech. */
+.chat-turn-settled-announcer {
   position: absolute;
   width: 1px;
   height: 1px;

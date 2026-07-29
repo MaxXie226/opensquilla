@@ -25,6 +25,42 @@ export interface RpcClientError extends Error {
 export type RpcContractInfo = ContractInfo;
 export type RpcRuntimeInfo = NormalizedRuntimeInfo;
 export type RpcProtocolRange = ProtocolRangeInfo;
+export type RpcTerminationAction = 'reject' | 'reconnect';
+
+export interface RpcCallOptions {
+  timeoutMs?: number;
+  signal?: AbortSignal;
+  timeoutAction?: RpcTerminationAction;
+  abortAction?: RpcTerminationAction;
+  /** Called synchronously only after the request frame is accepted by send(). */
+  onSent?: (socketGeneration: number) => void;
+}
+
+export interface RpcConnectionWaitOptions {
+  timeoutAction?: RpcTerminationAction;
+  abortAction?: RpcTerminationAction;
+}
+
+export class RpcTimeoutError extends Error implements RpcClientError {
+  readonly code = 'RPC_TIMEOUT';
+
+  constructor(
+    readonly method: string,
+    readonly timeoutMs: number
+  ) {
+    super(`${method} timed out after ${timeoutMs}ms`);
+    this.name = 'RpcTimeoutError';
+  }
+}
+
+export class RpcAbortError extends Error implements RpcClientError {
+  readonly code = 'RPC_ABORTED';
+
+  constructor(readonly method: string) {
+    super(`${method} was aborted`);
+    this.name = 'RpcAbortError';
+  }
+}
 
 export interface RpcFrame {
   type?: string;
@@ -66,10 +102,21 @@ export function normalizeHelloFrame(data: RpcFrame, requestId: string): RpcFrame
   return normalizeSdkHelloFrame(data, requestId) as unknown as RpcFrame;
 }
 
+interface PendingRequest {
+  resolve: (value: unknown) => void;
+  reject: (error: Error) => void;
+  method: string;
+  generation: number;
+  timeoutTimer: ReturnType<typeof setTimeout> | null;
+  signal: AbortSignal | null;
+  abortHandler: (() => void) | null;
+}
+
 export class RpcClient {
   private _ws: WebSocket | null = null;
+  private _socketGeneration = 0;
   private _reqId = 0;
-  private _pending = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
+  private _pending = new Map<string, PendingRequest>();
   private _listeners = new Map<string, Set<RpcEventHandler>>();
   private _state: ConnectionState = 'disconnected';
   private _url = '';
@@ -86,40 +133,112 @@ export class RpcClient {
   private _lastFrameAt = 0;
   private _tickWatchTimer: ReturnType<typeof setInterval> | null = null;
   private _tickTimeoutMs = 60000;
-  private _connectRequestId: string | null = null;
 
   connect(url: string, token?: string): void {
     this._url = url;
     this._token = token || null;
     this._autoReconnect = true;
+    this._clearReconnectTimer();
+    if (this._ws) {
+      this._retireCurrentSocket(new Error('Connection replaced'), false);
+    }
     this._doConnect();
   }
 
   disconnect(): void {
     this._autoReconnect = false;
-    if (this._reconnectTimer !== null) {
-      clearTimeout(this._reconnectTimer);
-      this._reconnectTimer = null;
-    }
-    this._stopPing();
-    this._stopTickWatch();
-    this._connectRequestId = null;
-    if (this._ws) {
-      this._ws.close();
-      this._ws = null;
-    }
+    this._clearReconnectTimer();
+    this._retireCurrentSocket(new Error('Disconnected'), false);
+    this._rejectAllPending(new Error('Disconnected'));
     this._setState('disconnected');
   }
 
-  call(method: string, params: Record<string, unknown> = {}): Promise<unknown> {
+  call(
+    method: string,
+    params: Record<string, unknown> = {},
+    options: RpcCallOptions = {}
+  ): Promise<unknown> {
     return new Promise((resolve, reject) => {
-      if (!this._ws || this._ws.readyState !== WebSocket.OPEN) {
+      const socket = this._ws;
+      const generation = this._socketGeneration;
+      if (!socket || socket.readyState !== WebSocket.OPEN) {
         reject(new Error('Not connected'));
         return;
       }
+      if (options.signal?.aborted) {
+        reject(new RpcAbortError(method));
+        return;
+      }
+
       const id = String(++this._reqId);
-      this._pending.set(id, { resolve, reject });
-      this._ws.send(JSON.stringify({ type: 'req', id, method, params }));
+      const pending: PendingRequest = {
+        resolve,
+        reject,
+        method,
+        generation,
+        timeoutTimer: null,
+        signal: options.signal || null,
+        abortHandler: null,
+      };
+      this._pending.set(id, pending);
+
+      const terminate = (error: Error, action: RpcTerminationAction): void => {
+        if (!this._rejectPending(id, error, generation)) return;
+        if (action === 'reconnect') {
+          this._recycleConnection(
+            generation,
+            new Error(`Connection recycled after ${method} terminated`)
+          );
+        }
+      };
+
+      if (options.signal) {
+        pending.abortHandler = () => {
+          terminate(new RpcAbortError(method), options.abortAction || 'reject');
+        };
+        options.signal.addEventListener('abort', pending.abortHandler, { once: true });
+      }
+
+      if (
+        options.timeoutMs !== undefined &&
+        options.timeoutMs > 0 &&
+        Number.isFinite(options.timeoutMs)
+      ) {
+        pending.timeoutTimer = setTimeout(() => {
+          terminate(
+            new RpcTimeoutError(method, options.timeoutMs!),
+            options.timeoutAction || 'reject'
+          );
+        }, options.timeoutMs);
+      }
+
+      let frame: string;
+      try {
+        frame = JSON.stringify({ type: 'req', id, method, params });
+      } catch (error) {
+        this._rejectPending(
+          id,
+          error instanceof Error ? error : new Error('Failed to serialize RPC request'),
+          generation
+        );
+        return;
+      }
+
+      try {
+        socket.send(frame);
+      } catch (error) {
+        const sendError =
+          error instanceof Error ? error : new Error('Failed to send RPC request');
+        this._rejectPending(id, sendError, generation);
+        this._recycleConnection(generation, sendError);
+        return;
+      }
+      try {
+        options.onSent?.(generation);
+      } catch {
+        // A send receipt is observational. It must never fail a request whose
+        // frame is already on the wire.
+      }
     });
   }
 
@@ -137,45 +256,108 @@ export class RpcClient {
     return this._policy || {};
   }
 
-  waitForConnection(timeoutMs: number = 30000): Promise<void> {
+  waitForConnection(
+    timeoutMs: number = 30000,
+    signal?: AbortSignal,
+    actions: RpcConnectionWaitOptions = {}
+  ): Promise<void> {
+    if (signal?.aborted) {
+      // No wait and no request ever started, so this caller owns no socket to
+      // recycle. Retiring the current connection here could kill a newer
+      // session's healthy generation.
+      return Promise.reject(new RpcAbortError('waitForConnection'));
+    }
     if (this._state === 'connected') return Promise.resolve();
+
     return new Promise((resolve, reject) => {
       let timer: ReturnType<typeof setTimeout> | null = null;
-      const off = this.on('_state', (s: ConnectionState) => {
-        if (s === 'connected') {
-          if (timer !== null) clearTimeout(timer);
-          off();
+      let settled = false;
+      let off: () => void = () => {};
+
+      const cleanup = (): void => {
+        if (timer !== null) {
+          clearTimeout(timer);
+          timer = null;
+        }
+        off();
+        signal?.removeEventListener('abort', onAbort);
+      };
+      const finish = (
+        error?: Error,
+        action: RpcTerminationAction = 'reject'
+      ): void => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        if (!error) {
           resolve();
+          return;
+        }
+        reject(error);
+        if (action === 'reconnect') {
+          // A disconnected waiter spans the reconnect gap. Its originally
+          // observed generation may already have been retired before the
+          // replacement handshake started; recycle the current still-
+          // unconnected generation so the next attempt gets a fresh socket.
+          if (this._state !== 'connected') {
+            this._recycleConnection(
+              this._socketGeneration,
+              new Error('Connection recycled after waitForConnection terminated')
+            );
+          }
+        }
+      };
+      const onAbort = (): void => {
+        finish(
+          new RpcAbortError('waitForConnection'),
+          actions.abortAction || 'reject'
+        );
+      };
+
+      off = this.on('_state', (s: ConnectionState) => {
+        if (s === 'connected') {
+          finish();
         }
       });
+      signal?.addEventListener('abort', onAbort, { once: true });
       if (timeoutMs > 0 && Number.isFinite(timeoutMs)) {
         timer = setTimeout(() => {
-          off();
-          reject(new Error(`waitForConnection timed out after ${timeoutMs}ms`));
+          finish(
+            new RpcTimeoutError('waitForConnection', timeoutMs),
+            actions.timeoutAction || 'reject'
+          );
         }, timeoutMs);
       }
     });
   }
 
   private _doConnect(): void {
+    if (this._ws) return;
     this._setState('connecting');
     this._lastSeq = 0;
     this._lastFrameAt = Date.now();
     this._stopTickWatch();
-    this._connectRequestId = null;
+    const generation = ++this._socketGeneration;
+    let socket: WebSocket;
     try {
-      this._ws = new WebSocket(this._url);
+      socket = new WebSocket(this._url);
     } catch {
+      if (generation !== this._socketGeneration) return;
+      this._setState('disconnected');
       this._scheduleReconnect();
       return;
     }
+    this._ws = socket;
+    let handshakeRequestId: string | null = null;
 
-    this._ws.onopen = () => {
+    socket.onopen = () => {
+      if (!this._isCurrentSocket(socket, generation)) return;
       this._reconnectDelay = 800;
       // Don't send connect yet — wait for connect.challenge from server
     };
 
-    this._ws.onmessage = (ev: MessageEvent) => {
+    socket.onmessage = (ev: MessageEvent) => {
+      if (!this._isCurrentSocket(socket, generation)) return;
       let data: RpcFrame;
       try {
         data = JSON.parse(ev.data);
@@ -188,52 +370,72 @@ export class RpcClient {
       if (data.type === 'event' && data.event === 'connect.challenge') {
         const authParams = this._token ? { auth: { token: this._token } } : {};
         const id = String(++this._reqId);
-        this._connectRequestId = id;
+        if (handshakeRequestId) return;
+        handshakeRequestId = id;
         this._pending.set(id, {
           resolve: () => {},
           reject: (_err: Error) => {
-            this._ws?.close();
-            this._setState('disconnected');
+            if (this._autoReconnect) {
+              this._recycleConnection(generation, new Error('Connect handshake failed'));
+            }
           },
+          method: 'connect',
+          generation,
+          timeoutTimer: null,
+          signal: null,
+          abortHandler: null,
         });
-        this._ws?.send(
-          JSON.stringify({
-            type: 'req',
-            id,
-            method: 'connect',
-            params: {
-              minProtocol: CLIENT_MIN_PROTOCOL,
-              maxProtocol: CLIENT_MAX_PROTOCOL,
-              client: { name: 'opensquilla-web' },
-              ...authParams,
-            },
-          })
-        );
+        try {
+          socket.send(
+            JSON.stringify({
+              type: 'req',
+              id,
+              method: 'connect',
+              params: {
+                minProtocol: CLIENT_MIN_PROTOCOL,
+                maxProtocol: CLIENT_MAX_PROTOCOL,
+                client: { name: 'opensquilla-web' },
+                ...authParams,
+              },
+            })
+          );
+        } catch (error) {
+          const sendError =
+            error instanceof Error ? error : new Error('Failed to send connect request');
+          this._rejectPending(id, sendError, generation);
+          this._recycleConnection(generation, sendError);
+        }
         return;
       }
 
-      // Handshake: only a correlated hello-ok can transition to connected.
+      // Handshake: only a correlated, compatible Hello can transition to connected.
       if (
         this._state === 'connecting' &&
         (data.type === 'hello-ok' || data.protocol !== undefined)
       ) {
-        const requestId = this._connectRequestId;
+        const requestId = handshakeRequestId;
         if (!requestId) {
-          this._rejectHandshake(new Error('Received hello-ok before connect request'));
+          this._rejectHandshake(
+            null,
+            new Error('Received hello-ok before connect request'),
+            generation
+          );
           return;
         }
         let hello: RpcFrame;
         try {
           hello = normalizeHelloFrame(data, requestId);
         } catch (error) {
-          this._rejectHandshake(error instanceof Error ? error : new Error('Invalid hello-ok'));
+          this._rejectHandshake(
+            requestId,
+            error instanceof Error ? error : new Error('Invalid hello-ok'),
+            generation
+          );
           return;
         }
         this._policy = hello.policy || null;
-        const pending = this._pending.get(requestId);
-        this._pending.delete(requestId);
-        this._connectRequestId = null;
-        pending?.resolve(hello);
+        this._resolvePending(requestId, hello, generation);
+        handshakeRequestId = null;
         this._setState('connected');
         const helloHandlers = this._listeners.get('_hello');
         if (helloHandlers) helloHandlers.forEach((h) => h(hello));
@@ -243,27 +445,24 @@ export class RpcClient {
       }
 
       if (data.type === 'res') {
-        const p = this._pending.get(data.id ?? '');
-        if (p) {
-          this._pending.delete(data.id!);
-          if (data.ok) {
-            p.resolve(data.payload);
-          } else {
-            const err = data.error;
-            const message =
-              typeof err === 'string'
-                ? err
-                : (err && (err.message || err.code)) || 'RPC error';
-            const error = new Error(message) as RpcClientError;
-            if (err && typeof err === 'object') {
-              error.code = err.code;
-              error.details = err.details;
-              error.retryable = err.retryable ?? undefined;
-              error.retry_after_ms = err.retry_after_ms ?? undefined;
-              error.accepted = err.accepted ?? undefined;
-            }
-            p.reject(error);
+        const id = data.id ?? '';
+        if (data.ok) {
+          this._resolvePending(id, data.payload, generation);
+        } else {
+          const err = data.error;
+          const message =
+            typeof err === 'string'
+              ? err
+              : (err && (err.message || err.code)) || 'RPC error';
+          const error = new Error(message) as RpcClientError;
+          if (err && typeof err === 'object') {
+            error.code = err.code;
+            error.details = err.details;
+            error.retryable = err.retryable ?? undefined;
+            error.retry_after_ms = err.retry_after_ms ?? undefined;
+            error.accepted = err.accepted ?? undefined;
           }
+          this._rejectPending(id, error, generation);
         }
       } else if (data.type === 'event') {
         const meta = data.meta || {};
@@ -274,36 +473,116 @@ export class RpcClient {
       }
     };
 
-    this._ws.onclose = () => {
+    socket.onclose = () => {
+      if (!this._isCurrentSocket(socket, generation)) return;
+      this._ws = null;
+      ++this._socketGeneration;
       this._stopPing();
       this._stopTickWatch();
-      const pending = [...this._pending.values()];
-      this._pending.clear();
-      for (const p of pending) p.reject(new Error('Connection closed'));
-      this._ws = null;
-      this._connectRequestId = null;
-      if (this._state !== 'disconnected') {
-        this._setState('disconnected');
-        this._scheduleReconnect();
-      }
+      this._rejectPendingForGeneration(generation, new Error('Connection closed'));
+      this._setState('disconnected');
+      this._scheduleReconnect();
     };
 
-    this._ws.onerror = () => {};
+    socket.onerror = () => {};
   }
 
-  private _rejectHandshake(error: Error): void {
-    const requestId = this._connectRequestId;
-    if (requestId) {
-      const pending = this._pending.get(requestId);
-      this._pending.delete(requestId);
-      pending?.reject(error);
+  private _isCurrentSocket(socket: WebSocket, generation: number): boolean {
+    return this._ws === socket && this._socketGeneration === generation;
+  }
+
+  private _takePending(id: string, generation?: number): PendingRequest | undefined {
+    const pending = this._pending.get(id);
+    if (!pending || (generation !== undefined && pending.generation !== generation)) {
+      return undefined;
     }
-    this._connectRequestId = null;
-    this._autoReconnect = false;
+    this._pending.delete(id);
+    if (pending.timeoutTimer !== null) {
+      clearTimeout(pending.timeoutTimer);
+      pending.timeoutTimer = null;
+    }
+    if (pending.signal && pending.abortHandler) {
+      pending.signal.removeEventListener('abort', pending.abortHandler);
+      pending.abortHandler = null;
+    }
+    return pending;
+  }
+
+  private _resolvePending(id: string, value: unknown, generation?: number): boolean {
+    const pending = this._takePending(id, generation);
+    if (!pending) return false;
+    pending.resolve(value);
+    return true;
+  }
+
+  private _rejectPending(id: string, error: Error, generation?: number): boolean {
+    const pending = this._takePending(id, generation);
+    if (!pending) return false;
+    pending.reject(error);
+    return true;
+  }
+
+  private _rejectPendingForGeneration(generation: number, error: Error): void {
+    for (const [id, pending] of [...this._pending]) {
+      if (pending.generation === generation) {
+        this._rejectPending(id, error, generation);
+      }
+    }
+  }
+
+  private _rejectAllPending(error: Error): void {
+    for (const id of [...this._pending.keys()]) {
+      this._rejectPending(id, error);
+    }
+  }
+
+  private _retireCurrentSocket(error: Error, reconnect: boolean): void {
+    const socket = this._ws;
+    const generation = this._socketGeneration;
+    if (!socket) {
+      this._stopPing();
+      this._stopTickWatch();
+      this._setState('disconnected');
+      if (reconnect) this._scheduleReconnect(true);
+      return;
+    }
+
+    this._ws = null;
+    ++this._socketGeneration;
+    this._stopPing();
+    this._stopTickWatch();
+    this._rejectPendingForGeneration(generation, error);
     this._setState('disconnected');
     try {
-      this._ws?.close();
+      socket.close();
     } catch {}
+    if (reconnect) this._scheduleReconnect(true);
+  }
+
+  private _recycleConnection(generation: number, error: Error): void {
+    if (generation !== this._socketGeneration) return;
+    this._retireCurrentSocket(error, true);
+  }
+
+  private _clearReconnectTimer(): void {
+    if (this._reconnectTimer !== null) {
+      clearTimeout(this._reconnectTimer);
+      this._reconnectTimer = null;
+    }
+  }
+
+  private _rejectHandshake(
+    requestId: string | null,
+    error: Error,
+    generation: number
+  ): void {
+    this._autoReconnect = false;
+    if (requestId) {
+      this._rejectPending(requestId, error, generation);
+    }
+    if (generation === this._socketGeneration) {
+      this._retireCurrentSocket(error, false);
+    }
   }
 
   private _startPing(): void {
@@ -364,10 +643,16 @@ export class RpcClient {
     }
   }
 
-  private _scheduleReconnect(): void {
+  private _scheduleReconnect(immediate: boolean = false): void {
     if (!this._autoReconnect) return;
-    if (this._reconnectTimer !== null) clearTimeout(this._reconnectTimer);
-    this._reconnectTimer = setTimeout(() => this._doConnect(), this._reconnectDelay);
+    this._clearReconnectTimer();
+    const delay = immediate ? 0 : this._reconnectDelay;
+    this._reconnectTimer = setTimeout(() => {
+      this._reconnectTimer = null;
+      if (!this._autoReconnect || this._ws) return;
+      this._doConnect();
+    }, delay);
+    if (immediate) return;
     this._reconnectDelay = Math.min(
       this._reconnectDelay * this._reconnectFactor,
       this._maxReconnectDelay

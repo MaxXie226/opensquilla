@@ -477,6 +477,11 @@
           "title": "Client Ws Keepalive Timeout Ms",
           "type": "integer"
         },
+        "concurrent_history_reads": {
+          "default": false,
+          "title": "Concurrent History Reads",
+          "type": "boolean"
+        },
         "max_buffered_bytes": {
           "default": 52428800,
           "title": "Max Buffered Bytes",
