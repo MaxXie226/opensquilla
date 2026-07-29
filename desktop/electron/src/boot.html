@@ -376,6 +376,7 @@
       min-height: 1.5em;
       color: var(--danger);
       font-size: 12px;
+      white-space: pre-line;
     }
 
     .recovery button:focus-visible,
@@ -595,6 +596,7 @@
         resetFailed: 'Reset failed',
         recoveryTitle: 'Your primary profile needs recovery',
         recoveryIntro: 'OpenSquilla paused the primary gateway because it could not prove that writing is safe. Primary data and any completed consolidation backups remain preserved.',
+        unsafePathHelp: 'OpenSquilla preserved the primary profile and every recovery profile. Exit the app, inspect the reported junction or symbolic link, and remove only that link without recursion or move it outside the primary profile, then retry. Do not delete the primary profile or recovery-profiles.',
         cleanupRecoveryTitle: 'A data cleanup stopped partway through',
         cleanupRecoveryIntro: 'Some confirmed items may already have been deleted. OpenSquilla stopped before touching anything it could not verify and preserved every remaining file.',
         workspaceLabel: 'Choose a verified workspace', chooseWorkspace: 'Use selected workspace', browseWorkspace: 'Browse…',
@@ -617,6 +619,7 @@
         resetFailed: '重置失败',
         recoveryTitle: '主配置需要恢复',
         recoveryIntro: 'OpenSquilla 无法确认主配置可安全写入，因此已暂停主网关。主配置数据及已完成的聚合备份均会保留。',
+        unsafePathHelp: 'OpenSquilla 已保留主配置和全部恢复配置。请退出应用，检查上面报告的目录联接或符号链接；只移除该链接本身（不要递归删除）或将其移出主配置目录，然后重试。不要删除整个主配置或 recovery-profiles。',
         cleanupRecoveryTitle: '数据清理在中途停止',
         cleanupRecoveryIntro: '部分已确认条目可能已经删除。OpenSquilla 在遇到无法验证的内容前已停止，并保留了所有剩余文件。',
         workspaceLabel: '选择已验证的工作区', chooseWorkspace: '使用所选工作区', browseWorkspace: '浏览…',
@@ -861,7 +864,19 @@
       document.getElementById('cleanupAbandonGroup').hidden = !mayAbandonCleanup;
       document.getElementById('revealBackups').hidden = !allowedActions.has('show-backups');
       document.getElementById('copyDiagnostics').hidden = !allowedActions.has('copy-diagnostics');
-      recoveryStatus.textContent = state.error ? String(state.error) : (state.busy ? msg.recoveryWorking : '');
+      const recoveryDetails = [];
+      if (inspection.failure_detail) {
+        recoveryDetails.push(String(inspection.failure_detail));
+      }
+      if (inspection.stable_code === 'unsafe_path') {
+        recoveryDetails.push(msg.unsafePathHelp || MESSAGES.en.unsafePathHelp);
+      }
+      if (state.error) {
+        recoveryDetails.push(String(state.error));
+      } else if (state.busy) {
+        recoveryDetails.push(msg.recoveryWorking);
+      }
+      recoveryStatus.textContent = recoveryDetails.join('\n\n');
       for (const button of recoveryPanel.querySelectorAll('button')) button.disabled = Boolean(state.busy);
       document.getElementById('chooseWorkspace').disabled = (
         Boolean(state.busy) || !mayChooseWorkspace || candidates.length === 0

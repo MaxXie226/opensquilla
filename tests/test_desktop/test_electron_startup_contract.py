@@ -703,7 +703,7 @@ def test_blocked_profile_consolidation_is_presented_as_retryable_primary_repair(
     assert "Promise<RecoveryProtocolResult | null>" in consolidation
     assert "result.outcome === 'blocked'" in consolidation
     assert (
-        "return recoveryFailureResult(primary.home, result.stable_code)"
+        "return recoveryFailureResult(primary.home, result.stable_code, failureDetail)"
         in consolidation
     )
     assert "Desktop profile consolidation is blocked" not in consolidation
@@ -712,8 +712,17 @@ def test_blocked_profile_consolidation_is_presented_as_retryable_primary_repair(
     )
 
     assert "outcome: 'recovery_required'" in failure_result
+    assert "failure_detail: failureDetail" in failure_result
     assert "'show-backups'" in failure_result
     assert "'copy-diagnostics'" in failure_result
+    assert "failure_detail?: string" in main_ts
+    assert "const failureDetail = result.errors.find" in consolidation
+    assert "detail: failureDetail" in consolidation
+    assert "inspection.failure_detail" in boot_html
+    assert "unsafePathHelp" in boot_html
+    assert "remove only that link without recursion" in boot_html
+    assert "只移除该链接本身（不要递归删除）" in boot_html
+    assert "failure_detail: redactText(report?.failure_detail)" in main_ts
     assert "recoveryInspection = consolidationRepair" in blocked_mapping
     assert "primaryRecoveryInspection = consolidationRepair" in blocked_mapping
     assert "bootError = null" in blocked_mapping
@@ -3169,7 +3178,10 @@ def test_blocked_consolidation_defers_startup_when_the_primary_survives() -> Non
     )
     assert "desktop_profile_consolidation_deferred" in consolidation
     # Still fails closed for every state the protocol does not vouch for.
-    assert "return recoveryFailureResult(primary.home, result.stable_code)" in consolidation
+    assert (
+        "return recoveryFailureResult(primary.home, result.stable_code, failureDetail)"
+        in consolidation
+    )
     # A blocked attempt must never be recorded as a completed consolidation.
     deferral = consolidation.split("desktop_profile_consolidation_deferred")[1]
     assert "desktopProfilesConsolidatedThisProcess = true" not in deferral.split("return null")[0]

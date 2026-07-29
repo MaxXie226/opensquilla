@@ -277,6 +277,7 @@ interface RecoveryProtocolResult {
   schema_version: number
   outcome: RecoveryOutcome
   stable_code: string
+  failure_detail?: string
   primary_home: string
   effective_workspace: string | null
   candidates: RecoveryCandidate[]
@@ -303,9 +304,9 @@ interface DesktopProfileConsolidationResult {
   credential_adoption_status: DesktopCredentialAdoptionStatus
   revision: number
   errors: string[]
-  // Only meaningful when `outcome` is 'blocked': the canonical primary profile is
-  // physically usable, so startup may continue against it and retry the fan-in on
-  // a later launch instead of stranding the user.
+  // Only meaningful when `outcome` is 'blocked': the canonical primary profile
+  // survived, so startup may continue to the independent profile inspector and
+  // retry the fan-in on a later launch instead of stranding the user.
   primary_home_intact: boolean
 }
 
@@ -6486,6 +6487,9 @@ function parseRecoveryProtocol(value: unknown): RecoveryProtocolResult {
     schema_version: RECOVERY_PROTOCOL_SCHEMA_VERSION,
     outcome,
     stable_code: record.stable_code,
+    ...(typeof record.failure_detail === 'string' && record.failure_detail
+      ? { failure_detail: record.failure_detail }
+      : {}),
     primary_home: record.primary_home,
     effective_workspace: record.effective_workspace as string | null,
     candidates,
@@ -6888,11 +6892,16 @@ async function acknowledgeConsolidatedDesktopCredential(
   }
 }
 
-function recoveryFailureResult(home: string, stableCode: string): RecoveryProtocolResult {
+function recoveryFailureResult(
+  home: string,
+  stableCode: string,
+  failureDetail = '',
+): RecoveryProtocolResult {
   return {
     schema_version: RECOVERY_PROTOCOL_SCHEMA_VERSION,
     outcome: 'recovery_required',
     stable_code: stableCode,
+    ...(failureDetail ? { failure_detail: failureDetail } : {}),
     primary_home: home,
     effective_workspace: null,
     candidates: [],
@@ -7338,24 +7347,26 @@ async function consolidateLegacyRecoveryProfilesBeforeStartup(
         consumedRecoveryProfileCount: result.consumed_recovery_ids.length,
       })
       if (result.outcome === 'blocked') {
+        const failureDetail = result.errors.find((value) => value.trim())?.trim() ?? ''
         if (result.primary_home_intact && isPlainDesktopDirectory(primary.home)) {
           // The legacy fan-in failed but the primary profile itself is usable, so
-          // reaching the product matters more than completing the merge right
-          // now. Nothing was moved: every recovery profile is still on disk and a
-          // later launch retries. The local directory check is a second opinion
-          // on the protocol's own verdict, deliberately narrow so this does not
-          // grow a duplicate of the journal contract.
+          // continue to the normal profile inspector rather than completing the
+          // merge now. Nothing was moved: every recovery profile is still on disk
+          // and a later launch retries. The local directory check is a second
+          // opinion on the protocol's own verdict, deliberately narrow so this
+          // does not grow a duplicate of the journal contract.
           desktopProfileConsolidationDeferredThisProcess = true
           desktopLog('desktop_profile_consolidation_deferred', {
             stableCode: result.stable_code,
+            detail: failureDetail,
             recoveryProfileCount: recoveryProfiles.length,
           })
           return null
         }
         // A protocol-level block is a primary-profile repair state, not an
         // unexpected Electron boot failure. Keep the operation retryable and
-        // expose only the stable diagnostic plus the safe repair actions.
-        return recoveryFailureResult(primary.home, result.stable_code)
+        // expose the offending path plus the safe repair actions.
+        return recoveryFailureResult(primary.home, result.stable_code, failureDetail)
       }
       pendingDesktopCredentialConsolidation = (
         result.credential_adoption_status === 'pending'
@@ -7401,6 +7412,12 @@ function sanitizedRecoveryDiagnostics(): string {
     }
     return '<EXTERNAL_PATH>'
   }
+  const redactText = (value: string | undefined): string | null => {
+    if (!value) return null
+    return value
+      .split(app.getPath('userData')).join('<USER_DATA>')
+      .split(homedir()).join('<HOME>')
+  }
   return JSON.stringify({
     schema_version: RECOVERY_PROTOCOL_SCHEMA_VERSION,
     app_version: app.getVersion(),
@@ -7408,6 +7425,7 @@ function sanitizedRecoveryDiagnostics(): string {
     profile_kind: 'primary',
     outcome: report?.outcome ?? 'recovery_required',
     stable_code: report?.stable_code ?? 'desktop_recovery_state_unavailable',
+    failure_detail: redactText(report?.failure_detail),
     primary_home: redactPath(report?.primary_home ?? primaryDesktopProfile().home),
     effective_workspace: redactPath(report?.effective_workspace ?? null),
     candidates: (report?.candidates ?? []).map((candidate) => ({

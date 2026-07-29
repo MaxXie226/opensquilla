@@ -174,10 +174,10 @@ class ConsolidationResult:
     credential_adoption_status: CredentialAdoptionStatus
     revision: int
     errors: tuple[str, ...] = ()
-    #: Whether the canonical primary profile is physically usable despite this
-    #: result. Only meaningful when ``outcome`` is ``blocked``: it tells Desktop
-    #: that startup may continue against the existing primary and retry the
-    #: fan-in later, instead of stranding the user on a repair page. Defaults to
+    #: Whether the canonical primary profile survived and contains user authority
+    #: despite this result. Only meaningful when ``outcome`` is ``blocked``: it
+    #: tells Desktop that its independent profile inspector may decide whether
+    #: startup can continue while the fan-in remains pending. Defaults to
     #: ``False`` so every construction site stays fail-closed.
     primary_home_intact: bool = False
 
@@ -3512,32 +3512,64 @@ def _primary_profile_is_populated(primary_home: Path) -> bool:
     reserves configuration adoption for a primary with nothing in it.
     """
 
-    # Only ask about a config that is actually there.
-    # ``_primary_config_has_user_configuration`` answers ``True`` for an
-    # unreadable file on purpose — malformed bytes may hold the user's only
-    # settings, so its authority is preserved — and that includes a missing file,
-    # which for this question means the opposite.
+    # Inspect only the authority-bearing leaves needed to distinguish a real
+    # primary from an empty shell.  Do not recursively inspect the whole profile:
+    # that is the consolidation safety check's job, and a failure there may be an
+    # unrelated junction that must not also make an untouched primary disappear
+    # as a boot fallback.
     config = primary_home / "config.toml"
-    if _lexists(config) and _primary_config_has_user_configuration(config):
-        return True
-    for dotenv in (primary_home / ".env", primary_home / "state" / ".env"):
-        if _lexists(dotenv) and _dotenv_has_user_configuration(dotenv):
-            return True
-    sessions = primary_home / "state" / "sessions.db"
+    config_is_populated = (
+        _plain_optional_file(config, label="primary config.toml")
+        and _primary_config_has_user_configuration(config)
+    )
+    dotenv = primary_home / ".env"
+    dotenv_is_populated = (
+        _plain_optional_file(dotenv, label="primary .env")
+        and _dotenv_has_user_configuration(dotenv)
+    )
+
+    # ``state`` is an authority-bearing ancestor.  Never follow a junction or
+    # reparse point merely to decide whether Desktop may fall back to primary.
+    state = primary_home / "state"
     try:
-        value = os.lstat(_native_io_path(sessions))
-    except OSError:
-        return False
-    return not _is_link_or_reparse(value) and stat.S_ISREG(value.st_mode)
+        state_stat = os.lstat(_native_io_path(state))
+    except FileNotFoundError:
+        state_exists = False
+    except OSError as exc:
+        raise UnsafePathError(f"primary state cannot be inspected: {state}") from exc
+    else:
+        if _is_link_or_reparse(state_stat) or not stat.S_ISDIR(state_stat.st_mode):
+            raise UnsafePathError(f"primary state must be a real directory: {state}")
+        state_exists = True
+
+    legacy_dotenv_is_populated = False
+    sessions_exist = False
+    if state_exists:
+        legacy_dotenv = state / ".env"
+        legacy_dotenv_is_populated = (
+            _plain_optional_file(legacy_dotenv, label="primary legacy .env")
+            and _dotenv_has_user_configuration(legacy_dotenv)
+        )
+        sessions_exist = _plain_optional_file(
+            state / "sessions.db",
+            label="primary sessions database",
+        )
+    return (
+        config_is_populated
+        or dotenv_is_populated
+        or legacy_dotenv_is_populated
+        or sessions_exist
+    )
 
 
 def _primary_home_survives_failure(user_data: Path, primary_home: Path) -> bool:
-    """Whether Desktop may start against the primary despite a blocked fan-in.
+    """Whether Desktop may inspect the primary despite a blocked fan-in.
 
     Deliberately decided from physical state rather than from ``stable_code``: the
     same codes are raised both when the primary was never touched and when it sits
-    half-moved, so a code-based rule would eventually let the caller boot a
-    profile that is not there.
+    half-moved, so a code-based rule would eventually let the caller inspect a
+    profile that is not there.  A ``True`` result does not bypass Desktop's normal
+    profile inspector; it only permits that independent safety gate to run.
 
     The one transaction phase that must keep blocking is ``primary_parked``, where
     the primary has been moved into the transaction backup and the replacement is
@@ -3546,7 +3578,10 @@ def _primary_home_survives_failure(user_data: Path, primary_home: Path) -> bool:
     or has already published it.
 
     Fails closed on anything unexpected, including an unreadable or invalid
-    journal.
+    journal.  It deliberately does not repeat ``profile_no_follow_manifest``:
+    that strict whole-tree check already blocked the fan-in and must continue to
+    do so, but an unrelated link must not prevent read-only startup inspection of
+    an otherwise intact primary.
     """
 
     try:
@@ -3558,7 +3593,6 @@ def _primary_home_survives_failure(user_data: Path, primary_home: Path) -> bool:
         stat_result = os.lstat(_native_io_path(primary_home))
         if _is_link_or_reparse(stat_result) or not stat.S_ISDIR(stat_result.st_mode):
             return False
-        profile_no_follow_manifest(primary_home)
         return _primary_profile_is_populated(primary_home)
     except Exception:
         return False
@@ -3742,7 +3776,7 @@ def _is_stale_prepared_plan(error: BaseException) -> bool:
 
 
 def _recover_from_failure(user_data: Path, primary_home: Path) -> bool:
-    """Report whether startup may continue, recording the deferral if it may.
+    """Report whether Desktop may inspect primary, recording a possible deferral.
 
     Never raises: bookkeeping about a failure must not become a second failure
     that hides the first.
