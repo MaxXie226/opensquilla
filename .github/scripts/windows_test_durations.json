@@ -301,6 +301,7 @@
     "tests/test_engine/test_spawn_depth_unified.py": 0.01,
     "tests/test_engine/test_stream_wrappers.py": 0.357,
     "tests/test_engine/test_subagent_run_mode_inheritance.py": 0.01,
+    "tests/test_engine/test_subagent_usage_rollup.py": 0.03,
     "tests/test_engine/test_t3_upgrade_compaction.py": 0.172,
     "tests/test_engine/test_text_only_tool_recovery.py": 0.268,
     "tests/test_engine/test_tokenjuice_tool_result_projection.py": 0.622,
@@ -1182,6 +1183,13 @@
     "tests/test_gateway/test_rpc_run_mode_preference.py": 0.01,
     "tests/test_scripts/test_generate_client_contracts.py": 0.01,
     "tests/test_session/test_runtime_preferences.py": 0.01,
-    "tests/test_thinking_level_propagation.py": 0.01
+    "tests/test_thinking_level_propagation.py": 0.01,
+    "tests/test_gateway/test_rpc_memory_import.py": 0.01,
+    "tests/test_memory/test_profile_import.py": 0.01,
+    "tests/test_artifact_bundles.py": 0.01,
+    "tests/test_gateway/test_artifact_preview.py": 0.01,
+    "tests/test_gateway/test_artifact_preview_middleware.py": 0.01,
+    "tests/test_gateway/test_root_control_ui_security.py": 0.01,
+    "tests/test_gateway/test_websocket_request_concurrency.py": 0.01
   }
 }

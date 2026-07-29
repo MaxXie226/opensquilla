@@ -21,6 +21,7 @@ from opensquilla.gateway.boot import (
     _configured_agent_ids,
     _gateway_home,
     _register_dream_crons,
+    _sandbox_settings_for_runtime,
     _task_runtime_envelope_owner,
     _task_runtime_turn_hard_deadline_s,
     _warn_workspace_state_mismatch,
@@ -809,6 +810,29 @@ async def test_service_container_close_cancels_owned_sandbox_setup_task() -> Non
 
 
 @pytest.mark.asyncio
+async def test_service_container_close_cancels_profile_import_maintenance() -> None:
+    from opensquilla.gateway import boot
+
+    entered = asyncio.Event()
+
+    async def blocked_maintenance() -> None:
+        entered.set()
+        await asyncio.Event().wait()
+
+    task = asyncio.create_task(blocked_maintenance())
+    services = boot.ServiceContainer(
+        config=GatewayConfig(),
+        profile_import_maintenance_task=task,
+    )
+    await entered.wait()
+
+    await services.close()
+
+    assert services.profile_import_maintenance_task is None
+    assert task.cancelled()
+
+
+@pytest.mark.asyncio
 async def test_bare_full_default_boots_standard_capability(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1287,6 +1311,7 @@ def test_start_gateway_server_passes_tls_files_to_uvicorn(
         try:
             assert captured_config["ssl_keyfile"] == keyfile
             assert captured_config["ssl_certfile"] == certfile
+            assert captured_config["access_log"] is False
         finally:
             await server.close()
 
@@ -2641,6 +2666,9 @@ async def test_task_runtime_turn_uses_owner_boundary_for_owner_cron_job() -> Non
         name="Owner",
         payload={"kind": "agent_turn", "agent_id": "ops"},
         creator_is_owner=True,
+        run_mode="full",
+        elevated="full",
+        execution_target="host",
         tool_policy={
             "profile": "minimal",
             "also_allow": ["memory_search", "exec_command"],
@@ -2676,7 +2704,18 @@ async def test_task_runtime_turn_uses_owner_boundary_for_owner_cron_job() -> Non
     )
 
     tool_context = runner.calls[0]["tool_context"]
+    assert tool_context.task_id == "task-1"
     assert tool_context.is_owner is True
+    assert tool_context.run_mode == "full"
+    assert tool_context.elevated == "full"
     assert tool_context.allowed_tools is None
     assert tool_context.tool_policy == job.tool_policy
     assert "exec_command" not in tool_context.denied_tools
+
+
+def test_default_bypass_keeps_sandbox_capability_for_explicit_restricted_calls() -> None:
+    settings = _sandbox_settings_for_runtime(GatewayConfig())
+
+    assert settings.run_mode == "standard"
+    assert settings.sandbox is True
+    assert settings.security_grading is True

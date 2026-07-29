@@ -804,7 +804,7 @@ def _golden_hello(
             state_dir="synthetic-state",
             auth_mode="token",
         ),
-        policy=PolicyInfo(),
+        policy=PolicyInfo(concurrent_history_reads=True),
         auth=hello_auth_payload(principal),
         contract=ContractInfo(
             schemaVersion=CONTRACT_SCHEMA_VERSION,

@@ -1,12 +1,16 @@
 import { describe, expect, it, vi } from 'vitest'
 import { effectScope, nextTick, ref } from 'vue'
 import { useChatRpcEventHandlers, type ChatRpcStreamApi } from './useChatRpcEventHandlers'
+import type { SessionBootstrapRun } from './useChatSessionBootstrap'
 import type { ChatMessage, ChatRunStatus, ChatRunStatusSource } from '@/types/chat'
 
 function createHarness(options: {
   messages?: ChatMessage[]
   endStreaming?: (messages: ChatMessage[]) => void
   sessionRunStatus?: (source: ChatRunStatusSource | null | undefined) => ChatRunStatus
+  handleSessionConnectionState?: (state: string) => SessionBootstrapRun | undefined
+  loadCurrentSessionUsage?: () => void
+  refreshRunModePreference?: () => void | Promise<void>
 } = {}) {
   const messages = ref<ChatMessage[]>(options.messages ?? [])
   const sessionKey = ref('agent:main:test')
@@ -40,6 +44,11 @@ function createHarness(options: {
   const schedulePendingDrainAfterTerminal = vi.fn()
   const scheduleHistorySync = vi.fn()
   const showWarningToast = vi.fn()
+  const handleSessionConnectionState = vi.fn(
+    options.handleSessionConnectionState ?? (() => undefined),
+  )
+  const loadCurrentSessionUsage = vi.fn(options.loadCurrentSessionUsage ?? (() => {}))
+  const refreshRunModePreference = vi.fn(options.refreshRunModePreference ?? (() => {}))
   const scope = effectScope()
   const api = scope.run(() => useChatRpcEventHandlers({
     sessionKey,
@@ -76,9 +85,9 @@ function createHarness(options: {
     schedulePendingDrainAfterTerminal,
     popAllPendingIntoComposer: vi.fn(() => false),
     saveWidgetState: vi.fn(),
-    subscribeSession: vi.fn(),
-    loadHistory: vi.fn(),
-    loadCurrentSessionUsage: vi.fn(),
+    handleSessionConnectionState,
+    loadCurrentSessionUsage,
+    refreshRunModePreference,
   }))!
   return {
     api,
@@ -93,6 +102,9 @@ function createHarness(options: {
     schedulePendingDrainAfterTerminal,
     scheduleHistorySync,
     showWarningToast,
+    handleSessionConnectionState,
+    loadCurrentSessionUsage,
+    refreshRunModePreference,
     stop: () => scope.stop(),
   }
 }
@@ -678,17 +690,20 @@ describe('useChatRpcEventHandlers ensemble activity', () => {
     }
   })
 
-  it('maps ensemble heartbeats to neutral proposer and aggregator phase copy', () => {
+  it('maps ensemble heartbeats without letting channel keepalives replace the phase', () => {
     const { api, stream, stop } = createHarness()
 
     try {
       api.handlers.onRunHeartbeat({ stream_seq: 1, phase: 'ensemble_proposers_wait' })
       expect(stream.setStreamActivity).toHaveBeenLastCalledWith('Generating candidates')
 
-      api.handlers.onRunHeartbeat({ stream_seq: 2, phase: 'ensemble_aggregator_stream' })
+      api.handlers.onRunHeartbeat({ stream_seq: 2, phase: 'channel' })
+      expect(stream.setStreamActivity).toHaveBeenCalledTimes(1)
+
+      api.handlers.onRunHeartbeat({ stream_seq: 3, phase: 'ensemble_aggregator_stream' })
       expect(stream.setStreamActivity).toHaveBeenLastCalledWith('Synthesizing candidates')
 
-      api.handlers.onRunHeartbeat({ stream_seq: 3, phase: 'provider_wait' })
+      api.handlers.onRunHeartbeat({ stream_seq: 4, phase: 'provider_wait' })
       expect(stream.setStreamActivity).toHaveBeenLastCalledWith('Planning next step')
     } finally {
       stop()
@@ -704,6 +719,57 @@ describe('useChatRpcEventHandlers ensemble activity', () => {
       expect(stream.resetStreamIdleTimer).toHaveBeenCalledTimes(1)
     } finally {
       stop()
+    }
+  })
+
+  it('refreshes reconnect metadata once critical requests are queued', async () => {
+    let resolveCriticalRequestsQueued!: () => void
+    let resolveHistory!: () => void
+    let resolveLive!: () => void
+    const criticalRequestsQueued = new Promise<void>(resolve => {
+      resolveCriticalRequestsQueued = resolve
+    })
+    const history = new Promise<{ ok: boolean }>(resolve => {
+      resolveHistory = () => resolve({ ok: true })
+    })
+    const live = new Promise<{
+      authoritative: boolean
+      live: boolean
+      backgroundOnly: boolean
+    }>(resolve => {
+      resolveLive = () => resolve({
+        authoritative: true,
+        live: false,
+        backgroundOnly: false,
+      })
+    })
+    const run: SessionBootstrapRun = {
+      generation: 2,
+      criticalRequestsQueued,
+      history,
+      live,
+    }
+    const harness = createHarness({
+      handleSessionConnectionState: () => run,
+    })
+
+    try {
+      harness.api.handlers.onConnectionState('connected')
+      await Promise.resolve()
+      expect(harness.loadCurrentSessionUsage).not.toHaveBeenCalled()
+      expect(harness.refreshRunModePreference).not.toHaveBeenCalled()
+
+      resolveCriticalRequestsQueued()
+      await vi.waitFor(() => {
+        expect(harness.loadCurrentSessionUsage).toHaveBeenCalledOnce()
+        expect(harness.refreshRunModePreference).toHaveBeenCalledOnce()
+      })
+
+      resolveLive()
+      resolveHistory()
+      await Promise.all([live, history])
+    } finally {
+      harness.stop()
     }
   })
 })

@@ -1,6 +1,6 @@
 {
   "completeness": "method-names-and-required-scopes-only",
-  "method_count": 222,
+  "method_count": 232,
   "methods": [
     {
       "name": "agent",
@@ -297,6 +297,42 @@
     {
       "name": "logs.trace",
       "required_scope": "operator.read"
+    },
+    {
+      "name": "memory.import.apply",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "memory.import.cancel",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "memory.import.discard",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "memory.import.info",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "memory.import.preview",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "memory.import.retry",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "memory.import.start",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "memory.import.status",
+      "required_scope": "operator.admin"
+    },
+    {
+      "name": "memory.import.undo",
+      "required_scope": "operator.admin"
     },
     {
       "name": "memory.index",
@@ -712,6 +748,10 @@
     },
     {
       "name": "sessions.list",
+      "required_scope": "operator.read"
+    },
+    {
+      "name": "sessions.messages.hydrate",
       "required_scope": "operator.read"
     },
     {

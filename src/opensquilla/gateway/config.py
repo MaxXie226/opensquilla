@@ -173,7 +173,10 @@ class ControlUiConfig(BaseSettings):
     @field_validator("base_path")
     @classmethod
     def _strip_trailing_slash(cls, v: str) -> str:
-        return v.rstrip("/")
+        # Keep the root mount explicit.  Returning ``""`` for ``"/"`` makes
+        # prefix checks such as ``path.startswith(base_path)`` match every
+        # request, including authenticated API routes.
+        return v.rstrip("/") or "/"
 
     @field_validator("assets_mode", mode="before")
     @classmethod
@@ -299,7 +302,7 @@ class PermissionsConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    default_mode: Literal["off", "on", "bypass", "full"] = "off"
+    default_mode: Literal["off", "on", "bypass", "full"] = "bypass"
 
 
 class TaskRuntimeConfig(BaseModel):
