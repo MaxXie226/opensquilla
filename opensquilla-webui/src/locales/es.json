@@ -1705,7 +1705,7 @@
       "failed": "Falló",
       "timeout": "Tiempo agotado",
       "interrupted": "Interrumpida",
-      "cancelled": "Cancelada",
+      "cancelled": "Detenida",
       "outputInterrupted": "Salida interrumpida",
       "stoppedAfterSeconds": "Detenido tras {seconds} s",
       "idle": "Inactiva"
@@ -2957,8 +2957,13 @@
     "queueMode": "Cola",
     "steerMode": "Redirigir",
     "queueModeHint": "Cola: el mensaje espera y se envía automáticamente cuando termina la respuesta actual",
-    "steerModeHint": "Redirigir: el mensaje se envía ahora y redirige la respuesta en curso",
-    "deliveryModeLabel": "Modo de entrega mientras el agente responde",
+    "steerModeHint": "Guiar tarea actual: aplicar en el siguiente límite seguro sin cancelar ni volver a enrutar",
+    "steerStatus": {
+      "waiting": "Pendiente de aplicar",
+      "applied": "Aplicado a este turno",
+      "promoted": "En cola para el siguiente turno",
+      "notApplied": "No aplicado"
+    },
     "conversation": "Conversación de chat",
     "historyNavigatorLabel": "Historial de la conversación, {count} mensajes",
     "historyNavigatorLoadedLabel": "Historial cargado, {count} mensajes; hay mensajes anteriores disponibles",
@@ -3330,12 +3335,12 @@
     "pending": {
       "label": "Pendientes {count}/{max}",
       "hint": "Alt+↑ devuelve el más reciente a la entrada · ESC recupera todos a la entrada · se envían en orden FIFO cuando termina la respuesta actual",
-      "steerHint": "Modo redirigir: los nuevos envíos interrumpen la respuesta ahora; estos mensajes en cola se siguen enviando automáticamente tras el turno",
+      "steerHint": "Modo redirigir: el texto nuevo se aplica en el siguiente límite seguro sin detener la tarea actual; los mensajes en cola se envían tras el turno",
       "queueHint": "Modo cola: estos mensajes se envían automáticamente en orden cuando termina la respuesta actual",
       "clearAll": "Borrar todo",
       "editMessage": "Editar mensaje",
       "attachmentNeedsAttention": "Revisar adjunto",
-      "fixAttachmentBeforeSteer": "Edita este mensaje y vuelve a intentar o elimina el adjunto fallido antes de redirigir",
+      "fixAttachmentBeforeSteer": "Edita este mensaje y vuelve a intentar o elimina el adjunto fallido antes de enviarlo",
       "clearQueue": "Vaciar cola",
       "removeMessage": "Quitar el mensaje pendiente {index}"
     },

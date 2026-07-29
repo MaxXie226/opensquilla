@@ -1705,7 +1705,7 @@
       "failed": "Failed",
       "timeout": "Timed out",
       "interrupted": "Interrupted",
-      "cancelled": "Cancelled",
+      "cancelled": "Stopped",
       "outputInterrupted": "Output interrupted",
       "stoppedAfterSeconds": "Stopped after {seconds}s",
       "idle": "Idle"
@@ -2957,8 +2957,13 @@
     "queueMode": "Queue",
     "steerMode": "Steer",
     "queueModeHint": "Queue: the message waits and auto-sends when the current response finishes",
-    "steerModeHint": "Steer: the message sends now and redirects the response in progress",
-    "deliveryModeLabel": "Delivery mode while the agent is responding",
+    "steerModeHint": "Guide current task: apply at the next safe boundary without cancelling or rerouting",
+    "steerStatus": {
+      "waiting": "Waiting to apply",
+      "applied": "Applied to this turn",
+      "promoted": "Queued for the next turn",
+      "notApplied": "Not applied"
+    },
     "conversation": "Chat conversation",
     "historyNavigatorLabel": "Conversation history, {count} prompts",
     "historyNavigatorLoadedLabel": "Loaded conversation history, {count} prompts; earlier messages available",
@@ -3330,12 +3335,12 @@
     "pending": {
       "label": "Pending {count}/{max}",
       "hint": "Alt+↑ pulls the most recent back into the input · ESC recovers all to input · sends FIFO when the current response finishes",
-      "steerHint": "Steer mode: new sends interrupt the response now; these queued messages still auto-send after the turn",
+      "steerHint": "Steer mode: new text is applied at the next safe boundary without stopping the current task; queued messages still send after the turn",
       "queueHint": "Queue mode: these messages auto-send in order when the current response finishes",
       "clearAll": "Clear all",
       "editMessage": "Edit message",
       "attachmentNeedsAttention": "Needs attention",
-      "fixAttachmentBeforeSteer": "Edit this message and retry or remove the failed attachment before steering",
+      "fixAttachmentBeforeSteer": "Edit this message and retry or remove the failed attachment before sending",
       "clearQueue": "Clear queue",
       "removeMessage": "Remove pending message {index}"
     },

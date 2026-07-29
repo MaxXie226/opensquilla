@@ -1705,7 +1705,7 @@
       "failed": "失敗",
       "timeout": "タイムアウト",
       "interrupted": "中断",
-      "cancelled": "キャンセル",
+      "cancelled": "停止",
       "outputInterrupted": "出力が中断されました",
       "stoppedAfterSeconds": "{seconds}秒後に停止",
       "idle": "アイドル"
@@ -2957,8 +2957,13 @@
     "queueMode": "キュー",
     "steerMode": "誘導",
     "queueModeHint": "キュー: メッセージは待機し、現在の応答が完了すると自動送信されます",
-    "steerModeHint": "誘導: メッセージを今すぐ送信し、進行中の応答を方向転換します",
-    "deliveryModeLabel": "エージェントの応答中の配信モード",
+    "steerModeHint": "現在のタスクを誘導: キャンセルや再ルーティングをせず、次の安全な境界で適用します",
+    "steerStatus": {
+      "waiting": "適用待ち",
+      "applied": "現在のターンに適用済み",
+      "promoted": "次のターンにキュー済み",
+      "notApplied": "未適用"
+    },
     "conversation": "チャットの会話",
     "historyNavigatorLabel": "会話履歴、{count} 件のプロンプト",
     "historyNavigatorLoadedLabel": "読み込み済みの会話履歴、{count} 件のプロンプト。さらに前のメッセージがあります",
@@ -3330,12 +3335,12 @@
     "pending": {
       "label": "保留中 {count}/{max}",
       "hint": "Alt+↑ で最新のものを入力欄に戻す · ESC ですべて入力欄に戻す · 現在の応答が完了すると FIFO で送信",
-      "steerHint": "誘導モード: 新しい送信は応答を今すぐ中断します。これらのキュー済みメッセージはターン後に自動送信されます",
+      "steerHint": "誘導モード: 新しいテキストは現在のタスクを停止せず、次の安全な境界で適用されます。キュー済みメッセージはターン後に送信されます",
       "queueHint": "キューモード: これらのメッセージは現在の応答が完了すると順番に自動送信されます",
       "clearAll": "すべてクリア",
       "editMessage": "メッセージを編集",
       "attachmentNeedsAttention": "添付を確認",
-      "fixAttachmentBeforeSteer": "先にこのメッセージを編集し、失敗した添付を再試行または削除してから割り込み送信してください",
+      "fixAttachmentBeforeSteer": "このメッセージを編集し、失敗した添付を再試行または削除してから送信してください",
       "clearQueue": "キューをクリア",
       "removeMessage": "保留中のメッセージ {index} を削除"
     },
