@@ -102,7 +102,18 @@ exclude = [
 ]
 
 [tool.hatch.build.targets.sdist]
-exclude = ["src/opensquilla/gateway/static/dist/**"]
+exclude = [
+  "opensquilla-webui/**",
+  "**/node_modules/**",
+  "desktop/electron/dist/**",
+  "desktop/electron/.pyinstaller/**",
+  "desktop/electron/runtime/**",
+  "packages/*/dist/**",
+  "src/opensquilla/cli/tui/opentui/package/bin/**",
+  "src/opensquilla/cli/tui/opentui/package/build/**",
+  "src/opensquilla/cli/tui/opentui/package/dist/**",
+  "src/opensquilla/gateway/static/dist/**",
+]
 
 [tool.hatch.build.hooks.custom]
 """,
@@ -163,6 +174,21 @@ def test_default_build_is_headless_even_with_residual_dist(tmp_path: Path) -> No
     residual = probe / "src/opensquilla/gateway/static/dist"
     residual.mkdir(parents=True)
     (residual / "index.html").write_text("stale private checkout content", encoding="utf-8")
+    generated_outputs = (
+        "desktop/electron/node_modules/example/package.json",
+        "desktop/electron/dist/main.js",
+        "desktop/electron/.pyinstaller/gateway.spec",
+        "desktop/electron/runtime/gateway",
+        "packages/client-sdk/node_modules/example/package.json",
+        "packages/client-sdk/dist/index.js",
+        "src/opensquilla/cli/tui/opentui/package/bin/host",
+        "src/opensquilla/cli/tui/opentui/package/build/index.js",
+        "src/opensquilla/cli/tui/opentui/package/dist/index.js",
+    )
+    for relative_path in generated_outputs:
+        output = probe / relative_path
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text("synthetic local build output\n", encoding="utf-8")
 
     wheel_dir = tmp_path / "wheel"
     sdist_dir = tmp_path / "sdist"
@@ -192,7 +218,10 @@ def test_default_build_is_headless_even_with_residual_dist(tmp_path: Path) -> No
     assert "BUILD_COMMIT: str | None = None" in _wheel_build_info(built_wheel)
     assert "BUILD_UI_MODE: str | None = 'headless'" in _wheel_build_info(built_wheel)
     with tarfile.open(_only(sdist_dir, "*.tar.gz"), "r:gz") as archive:
-        assert not any("gateway/static/dist/" in name for name in archive.getnames())
+        archive_names = archive.getnames()
+        assert not any("gateway/static/dist/" in name for name in archive_names)
+        for relative_path in generated_outputs:
+            assert not any(name.endswith(relative_path) for name in archive_names)
 
 
 @pytest.mark.skipif(shutil.which("uv") is None, reason="uv not on PATH")

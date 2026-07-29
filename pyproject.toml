@@ -150,10 +150,19 @@ exclude = [
 "src/opensquilla/skills/bundled/pptx/references/python_pptx.md" = "opensquilla/skills/bundled/pptx/references/python_pptx.md"
 
 [tool.hatch.build.targets.sdist]
-# Public source archives are headless and never carry generated UI assets.
-# Explicit embed-ui builds use the same hook and manifest validation as wheels.
+# Public source archives are headless and never carry generated UI assets,
+# dependency installs, or local desktop/TUI build outputs. Explicit embed-ui
+# builds use the same hook and manifest validation as wheels.
 exclude = [
     "opensquilla-webui/**",
+    "**/node_modules/**",
+    "desktop/electron/dist/**",
+    "desktop/electron/.pyinstaller/**",
+    "desktop/electron/runtime/**",
+    "packages/*/dist/**",
+    "src/opensquilla/cli/tui/opentui/package/bin/**",
+    "src/opensquilla/cli/tui/opentui/package/build/**",
+    "src/opensquilla/cli/tui/opentui/package/dist/**",
     "src/opensquilla/gateway/static/dist/**",
 ]
 

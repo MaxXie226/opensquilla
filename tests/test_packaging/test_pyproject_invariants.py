@@ -167,6 +167,20 @@ def test_standard_distributions_are_headless_by_default() -> None:
     assert "src/opensquilla/_build_info.py" in hatch["targets"]["wheel"]["exclude"]
     assert artifact_rule in hatch["targets"]["sdist"]["exclude"]
     assert "opensquilla-webui/**" in hatch["targets"]["sdist"]["exclude"]
+    assert "**/node_modules/**" in hatch["targets"]["sdist"]["exclude"]
+    assert "desktop/electron/dist/**" in hatch["targets"]["sdist"]["exclude"]
+    assert "desktop/electron/.pyinstaller/**" in hatch["targets"]["sdist"]["exclude"]
+    assert "desktop/electron/runtime/**" in hatch["targets"]["sdist"]["exclude"]
+    assert "packages/*/dist/**" in hatch["targets"]["sdist"]["exclude"]
+    assert "src/opensquilla/cli/tui/opentui/package/bin/**" in (
+        hatch["targets"]["sdist"]["exclude"]
+    )
+    assert "src/opensquilla/cli/tui/opentui/package/build/**" in (
+        hatch["targets"]["sdist"]["exclude"]
+    )
+    assert "src/opensquilla/cli/tui/opentui/package/dist/**" in (
+        hatch["targets"]["sdist"]["exclude"]
+    )
     assert "OPENSQUILLA_BUILD_UI_MODE" in hook
     assert "OPENSQUILLA_BUILD_UI_ARTIFACT" in hook
     assert '"headless"' in hook
