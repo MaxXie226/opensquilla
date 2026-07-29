@@ -1439,6 +1439,41 @@ def test_fresh_noop_ignores_unrelated_primary_directory_link(
         _remove_dangling_directory_link(unrelated_link)
 
 
+def test_consolidate_cli_no_recovery_ignores_primary_directory_link(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_USER_STATE_DIR", str(tmp_path / "locks"))
+    user_data = tmp_path / "user-data"
+    primary = user_data / "opensquilla"
+    primary.mkdir(parents=True)
+    (primary / "config.toml").write_text("primary = true\n", encoding="utf-8")
+    unrelated_link = primary / "unrelated-link"
+    _make_dangling_directory_link(unrelated_link)
+
+    try:
+        completed = CliRunner().invoke(
+            recovery_app,
+            [
+                "consolidate-profiles",
+                "--user-data",
+                str(user_data),
+                "--primary-home",
+                str(primary),
+                "--json",
+            ],
+        )
+
+        assert completed.exit_code == 0, completed.output
+        payload = json.loads(completed.stdout)
+        assert payload["outcome"] == "noop"
+        assert payload["stable_code"] == "no_recovery_profiles"
+        assert payload["errors"] == []
+        assert os.path.lexists(_native_io_path(unrelated_link))
+    finally:
+        _remove_dangling_directory_link(unrelated_link)
+
+
 def test_real_recovery_still_rejects_unsafe_primary_directory_link(
     tmp_path: Path,
     monkeypatch,
