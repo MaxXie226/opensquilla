@@ -188,6 +188,8 @@ not a public configuration field:
 | Parameter | Legacy (`router_dynamic`) | Fixed-lineup default |
 |-----------|---------------------------|----------------------|
 | `min_successful_proposers` | 1 | 3 (presets) / `N-1` (custom, "all but one") |
+| `target_successful_proposers` | unset (same as minimum) | unset (same as minimum) |
+| `proposer_max_retries` | 0 | 0 |
 | `proposer_timeout_seconds` | 3600 | 300 |
 | `aggregator_timeout_seconds` | 3600 | 480 |
 | `shuffle_candidates` | `True` | `False` |
@@ -201,6 +203,22 @@ The legacy value `0` disables quorum early-exit and waits for every proposer; it
 does not mean an immediate, zero-delay cutoff. Fixed lineups instead allow ten
 seconds after reaching quorum so a nearly complete final draft can still join
 the fusion without waiting for the full proposer timeout.
+
+For score-oriented runs, `target_successful_proposers` separates the preferred
+draft count from the minimum acceptance floor. For example, `target = 4` and
+`min = 3` waits for all four fixed B5 proposers. If one proposer exhausts its
+configured retries, the remaining three may still be aggregated; two or fewer
+still follow `all_failed_policy`. The fixed-lineup grace starts only after the
+target is reached. A target above the fixed four-member lineup, or above a
+custom lineup's proposer count, is rejected as a configuration error.
+
+`proposer_max_retries` is the number of in-place attempts after the initial
+request. When non-zero, transient 429/5xx/transport failures, blank completed
+outputs, and `length` completions without visible candidate text are retried.
+Every attempt receives its own `proposer_timeout_seconds` budget. The accepted
+candidate body comes only from the last successful attempt, while trace and
+usage accounting retain every started attempt, including zero-usage rows marked
+`usage_receipt_missing = true`.
 
 Proposers never own an executable tool boundary. By default they receive no
 current tool schemas. Setting `proposer_tools = true` exposes those schemas only
@@ -260,7 +278,23 @@ Static presets expose no lineup tuning — the models are fixed in code. Custom
 lineups are tuned entirely through the `candidates` list (subject to the bounds
 above). Both share the fixed-lineup runtime defaults, which an operator may
 still override explicitly (`min_successful_proposers`,
+`target_successful_proposers`, `proposer_max_retries`,
 `proposer_timeout_seconds`, `aggregator_timeout_seconds`, `shuffle_candidates`).
+
+A resilient score-oriented fixed-lineup posture is:
+
+```toml
+[llm_ensemble]
+enabled = true
+selection_mode = "static_openrouter_b5"
+min_successful_proposers = 3
+target_successful_proposers = 4
+proposer_max_retries = 2
+all_failed_policy = "error"
+```
+
+This never falls back to a single model: four successful drafts are preferred,
+three are accepted after retries, and two or fewer terminate the ensemble turn.
 
 ---
 
@@ -458,6 +492,10 @@ What operators can tune:
   anchor and configured router tiers.
 - `llm_ensemble.min_successful_proposers` — desired minimum successful
   proposers (clamped per-turn as described above).
+- `llm_ensemble.target_successful_proposers` — preferred successful proposer
+  count above the minimum floor (clamped per-turn for dynamic templates).
+- `llm_ensemble.proposer_max_retries` — opt-in per-proposer retries; zero keeps
+  the historical single-attempt behavior.
 - `squilla_router.tiers[*].model` — indirectly expands the candidate pool and
   determines which model becomes the anchor for a given tier.
 

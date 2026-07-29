@@ -22,6 +22,7 @@ from opensquilla.provider import (
     Message,
     ProviderHeartbeatEvent,
     ProviderRequestCorrelation,
+    ReasoningDeltaEvent,
     TextDeltaEvent,
     ToolDefinition,
     ToolInputSchema,
@@ -174,6 +175,64 @@ class _FakeProvider(_ExactProjectionMixin):
             provider_kind="fake",
             model=self._cfg.model,
         )
+
+
+@dataclass
+class _AttemptRegistry:
+    plans: dict[str, list[_FakePlan]]
+    calls: list[dict[str, Any]] = field(default_factory=list)
+
+    def provider_for(self, cfg: ProviderConfig) -> _AttemptProvider:
+        return _AttemptProvider(cfg, self)
+
+
+class _AttemptProvider:
+    """Fake provider whose plan advances on every same-model request."""
+
+    provider_name = "fake"
+
+    def __init__(self, cfg: ProviderConfig, registry: _AttemptRegistry) -> None:
+        self._cfg = cfg
+        self._registry = registry
+
+    def chat(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition] | None = None,
+        config: ChatConfig | None = None,
+    ) -> AsyncIterator[StreamEvent]:
+        return self._chat(messages, tools=tools, config=config)
+
+    async def _chat(
+        self,
+        messages: list[Message],
+        *,
+        tools: list[ToolDefinition] | None,
+        config: ChatConfig | None,
+    ) -> AsyncIterator[StreamEvent]:
+        same_model_calls = sum(
+            1 for call in self._registry.calls if call["model"] == self._cfg.model
+        )
+        plans = self._registry.plans[self._cfg.model]
+        plan = plans[min(same_model_calls, len(plans) - 1)]
+        self._registry.calls.append(
+            {
+                "model": self._cfg.model,
+                "messages": messages,
+                "tools": tools,
+                "config": config,
+                "started_at": time.monotonic(),
+            }
+        )
+        if plan.delay > 0:
+            await asyncio.sleep(plan.delay)
+        if plan.failure is not None:
+            raise plan.failure
+        for event in plan.events:
+            yield event
+
+    async def list_models(self) -> list[Any]:
+        return []
 
 
 def _member(model: str, *, thinking: str | None = "high") -> EnsembleMemberConfig:
@@ -3942,6 +4001,292 @@ async def test_ensemble_streams_proposer_progress_live_not_buffered(
         if isinstance(e, EnsembleProgressEvent) and e.event_type == "proposer_finish"
     }
     assert finishes == {"p1", "p2"}
+
+
+@pytest.mark.asyncio
+async def test_target_four_waits_past_floor_three_before_aggregation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fourth_gate = asyncio.Event()
+    aggregator_started = asyncio.Event()
+    registry = _FakeRegistry(
+        {
+            "p1": _FakePlan([TextDeltaEvent(text="d1"), DoneEvent(model="p1")]),
+            "p2": _FakePlan([TextDeltaEvent(text="d2"), DoneEvent(model="p2")]),
+            "p3": _FakePlan([TextDeltaEvent(text="d3"), DoneEvent(model="p3")]),
+            "p4": _FakePlan(
+                [TextDeltaEvent(text="d4"), DoneEvent(model="p4")],
+                gate=fourth_gate,
+            ),
+            "agg": _FakePlan(
+                [TextDeltaEvent(text="final"), DoneEvent(model="agg")],
+                started=aggregator_started,
+            ),
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    provider = EnsembleProvider(
+        profile_name="score-max",
+        proposers=[_member("p1"), _member("p2"), _member("p3"), _member("p4")],
+        aggregator=_member("agg"),
+        min_successful_proposers=3,
+        target_successful_proposers=4,
+        proposer_timeout_seconds=1,
+        aggregator_timeout_seconds=1,
+        quorum_grace_seconds=0.01,
+        all_failed_policy="error",
+        shuffle_candidates=False,
+    )
+
+    consume_task = asyncio.create_task(_collect(provider))
+    await asyncio.sleep(0.05)
+    assert aggregator_started.is_set() is False
+
+    fourth_gate.set()
+    events = await asyncio.wait_for(consume_task, timeout=1.0)
+
+    assert aggregator_started.is_set() is True
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert done.ensemble_trace is not None
+    assert done.ensemble_trace["successful_proposers"] == 4
+    assert done.ensemble_trace["min_successful_proposers"] == 3
+    assert done.ensemble_trace["target_successful_proposers"] == 4
+    assert done.ensemble_trace["selected_candidate_count"] == 4
+
+
+@pytest.mark.asyncio
+async def test_transient_partial_504_retries_then_degrades_to_floor_three(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _AttemptRegistry(
+        {
+            "p1": [_FakePlan([TextDeltaEvent(text="d1"), DoneEvent(model="p1")])],
+            "p2": [_FakePlan([TextDeltaEvent(text="d2"), DoneEvent(model="p2")])],
+            "p3": [_FakePlan([TextDeltaEvent(text="d3"), DoneEvent(model="p3")])],
+            "glm": [
+                _FakePlan(
+                    [
+                        TextDeltaEvent(text=f"discard partial {attempt}"),
+                        ErrorEvent(
+                            message="Upstream idle timeout exceeded",
+                            code="504",
+                        ),
+                    ]
+                )
+                for attempt in range(1, 4)
+            ],
+            "agg": [_FakePlan([TextDeltaEvent(text="final"), DoneEvent(model="agg")])],
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._ENSEMBLE_PROPOSER_RETRY_BACKOFF_SECONDS",
+        (),
+    )
+    provider = EnsembleProvider(
+        profile_name="score-max",
+        proposers=[_member("p1"), _member("p2"), _member("p3"), _member("glm")],
+        aggregator=_member("agg"),
+        min_successful_proposers=3,
+        target_successful_proposers=4,
+        proposer_max_retries=2,
+        proposer_timeout_seconds=1,
+        aggregator_timeout_seconds=1,
+        quorum_grace_seconds=0.01,
+        all_failed_policy="error",
+        shuffle_candidates=False,
+    )
+
+    events = await _collect(provider)
+
+    assert [call["model"] for call in registry.calls].count("glm") == 3
+    assert [call["model"] for call in registry.calls][-1] == "agg"
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert done.usage_missing_count == 3
+    assert done.ensemble_trace is not None
+    assert done.ensemble_trace["successful_proposers"] == 3
+    assert done.ensemble_trace["selected_candidate_count"] == 3
+    assert done.ensemble_trace["llm_request_count"] == 7
+    glm_trace = next(
+        row
+        for row in done.ensemble_trace["candidates"]
+        if row["model"] == "glm"
+    )
+    assert glm_trace["ok"] is False
+    assert glm_trace["content"]["text"] == "discard partial 3"
+    assert glm_trace["attempt_count"] == 3
+    assert [attempt["retry_reason"] for attempt in glm_trace["attempts"]] == [
+        "transient_upstream",
+        "transient_upstream",
+        "transient_upstream",
+    ]
+    glm_usage = [
+        row
+        for row in done.model_usage_breakdown
+        if row["model"] == "glm"
+    ]
+    assert [row["attempt_index"] for row in glm_usage] == [1, 2, 3]
+    assert all(row["usage_receipt_missing"] is True for row in glm_usage)
+
+
+@pytest.mark.asyncio
+async def test_empty_and_length_only_attempts_retry_without_losing_usage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    receipts = [
+        ProviderBillingReceipt(
+            currency="USD",
+            status="confirmed",
+            amount_nanos=index,
+            usd_equivalent_nanos=index,
+            fx_native_per_usd_nanos=1_000_000_000,
+        )
+        for index in (10_000_000, 20_000_000, 30_000_000)
+    ]
+    registry = _AttemptRegistry(
+        {
+            "kimi": [
+                _FakePlan(
+                    [
+                        TextDeltaEvent(text=" \n"),
+                        DoneEvent(
+                            input_tokens=10,
+                            output_tokens=62,
+                            stop_reason="tool_calls",
+                            model="kimi",
+                            billed_cost=0.01,
+                            cost_source="provider_billed",
+                            billing_receipt=receipts[0],
+                        ),
+                    ]
+                ),
+                _FakePlan(
+                    [
+                        ReasoningDeltaEvent(text="private reasoning"),
+                        DoneEvent(
+                            input_tokens=20,
+                            output_tokens=8192,
+                            reasoning_tokens=8192,
+                            stop_reason="length",
+                            model="kimi",
+                            billed_cost=0.02,
+                            cost_source="provider_billed",
+                            billing_receipt=receipts[1],
+                        ),
+                    ]
+                ),
+                _FakePlan(
+                    [
+                        TextDeltaEvent(text="usable draft"),
+                        DoneEvent(
+                            input_tokens=30,
+                            output_tokens=40,
+                            reasoning_tokens=20,
+                            stop_reason="stop",
+                            model="kimi",
+                            billed_cost=0.03,
+                            cost_source="provider_billed",
+                            billing_receipt=receipts[2],
+                        ),
+                    ]
+                ),
+            ],
+            "agg": [
+                _FakePlan(
+                    [
+                        TextDeltaEvent(text="final"),
+                        DoneEvent(
+                            input_tokens=5,
+                            output_tokens=6,
+                            model="agg",
+                        ),
+                    ]
+                )
+            ],
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._ENSEMBLE_PROPOSER_RETRY_BACKOFF_SECONDS",
+        (),
+    )
+    provider = EnsembleProvider(
+        profile_name="score-max",
+        proposers=[_member("kimi")],
+        aggregator=_member("agg"),
+        min_successful_proposers=1,
+        target_successful_proposers=1,
+        proposer_max_retries=2,
+        proposer_timeout_seconds=1,
+        aggregator_timeout_seconds=1,
+        all_failed_policy="error",
+        shuffle_candidates=False,
+    )
+
+    events = await _collect(provider)
+
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert done.input_tokens == 65
+    assert done.output_tokens == 8300
+    assert done.reasoning_tokens == 8212
+    assert done.billed_cost == pytest.approx(0.06)
+    assert done.usage_missing_count == 0
+    assert done.ensemble_trace is not None
+    assert done.ensemble_trace["llm_request_count"] == 4
+    kimi_trace = done.ensemble_trace["candidates"][0]
+    assert kimi_trace["ok"] is True
+    assert kimi_trace["content"]["text"] == "usable draft"
+    assert [attempt["error_code"] for attempt in kimi_trace["attempts"]] == [
+        "candidate_empty_output",
+        "candidate_length_no_visible_text",
+        "",
+    ]
+    proposer_rows = [
+        row
+        for row in done.model_usage_breakdown
+        if row["role"] == "proposer"
+    ]
+    assert [row["attempt_index"] for row in proposer_rows] == [1, 2, 3]
+    assert [row["output_tokens"] for row in proposer_rows] == [62, 8192, 40]
+    assert [row["billing_receipt"] for row in proposer_rows] == receipts
+    assert all(row["usage_receipt_missing"] is False for row in proposer_rows)
+
+
+@pytest.mark.asyncio
+async def test_floor_not_met_errors_without_single_model_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _AttemptRegistry(
+        {
+            "p1": [_FakePlan([TextDeltaEvent(text="d1"), DoneEvent(model="p1")])],
+            "p2": [_FakePlan([TextDeltaEvent(text="d2"), DoneEvent(model="p2")])],
+            "p3": [_FakePlan([ErrorEvent(message="unauthorized", code="401")])],
+            "p4": [_FakePlan([ErrorEvent(message="bad request", code="400")])],
+            "agg": [_FakePlan([TextDeltaEvent(text="unused"), DoneEvent(model="agg")])],
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    provider = EnsembleProvider(
+        profile_name="score-max",
+        proposers=[_member("p1"), _member("p2"), _member("p3"), _member("p4")],
+        aggregator=_member("agg"),
+        min_successful_proposers=3,
+        target_successful_proposers=4,
+        proposer_max_retries=2,
+        proposer_timeout_seconds=1,
+        aggregator_timeout_seconds=1,
+        all_failed_policy="error",
+        shuffle_candidates=False,
+    )
+
+    events = await _collect(provider)
+
+    terminal = next(event for event in events if isinstance(event, ErrorEvent))
+    assert terminal.code == "ensemble_insufficient_proposers"
+    assert "requires 3" in terminal.message
+    assert "agg" not in [call["model"] for call in registry.calls]
+    assert [call["model"] for call in registry.calls].count("p3") == 1
+    assert [call["model"] for call in registry.calls].count("p4") == 1
 
 
 @pytest.mark.asyncio
