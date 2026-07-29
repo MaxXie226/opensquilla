@@ -112,6 +112,7 @@ from .types import (
 
 _OPENAI_API_BASE = "https://api.openai.com"
 log = structlog.get_logger(__name__)
+_OPENROUTER_GENERATION_ID_RE = re.compile(r"\Agen-[A-Za-z0-9_-]{1,255}\Z")
 _DASHSCOPE_PARAMETER_RE = re.compile(
     r"<parameter(?:\s[^>]*)?>(?P<body>[\s\S]*?)</parameter>",
     re.IGNORECASE,
@@ -458,6 +459,19 @@ def _base_url_hostname(base_url: str) -> str:
         return (parsed.hostname or "").lower()
     except ValueError:
         return ""
+
+
+def _openrouter_generation_id_from_headers(
+    headers: Mapping[str, Any] | None,
+) -> str | None:
+    """Return only a bounded, official-shaped OpenRouter generation ID."""
+
+    if headers is None:
+        return None
+    value = str(headers.get("x-generation-id") or "").strip()
+    if not _OPENROUTER_GENERATION_ID_RE.fullmatch(value):
+        return None
+    return value
 
 
 def _safe_validation_message(value: object) -> str:
@@ -3512,6 +3526,7 @@ class OpenAIProvider:
         terminal_native_finish_reason_present = False
         terminal_native_finish_reason: Any = None
         active_choice_seen = False
+        response_ids: set[str] = set()
 
         if os.environ.get("OPENSQUILLA_TRACE_ROUTING"):
             print(
@@ -3620,6 +3635,14 @@ class OpenAIProvider:
                     headers=headers,
                     json=payload,
                 ) as response:
+                    response_generation_id = _openrouter_generation_id_from_headers(
+                        response.headers
+                    )
+                    if response_generation_id:
+                        response_ids.add(response_generation_id)
+                        trace.record_response_headers(
+                            response_ids=[response_generation_id]
+                        )
                     if self._compat.attribution_response_headers:
                         attribution = {
                             name: response.headers[name]
@@ -3740,7 +3763,6 @@ class OpenAIProvider:
                         )
                         return
 
-                    response_ids: set[str] = set()
                     trace_tool_calls: list[dict[str, Any]] = []
                     async for line in response.aiter_lines():
                         if not line.startswith("data:"):
@@ -5241,6 +5263,14 @@ class OpenAIProvider:
             yield ErrorEvent(message=safe_error, code="request_error")
             return
 
+        response_ids: set[str] = set()
+        response_generation_id = _openrouter_generation_id_from_headers(
+            response.headers
+        )
+        if response_generation_id:
+            response_ids.add(response_generation_id)
+            trace.record_response_headers(response_ids=[response_generation_id])
+
         if response.status_code != 200:
             safe_response_body = redact_upstream_error_text(
                 response.text,
@@ -5800,6 +5830,9 @@ class OpenAIProvider:
         ):
             reasoning_text = _extract_think_tags("".join(assistant_text_parts)) or None
 
+        response_id = data.get("id")
+        if isinstance(response_id, str) and response_id:
+            response_ids.add(response_id)
         trace.record_response(
             response=data,
             usage={
@@ -5816,7 +5849,7 @@ class OpenAIProvider:
             assistant_text="".join(visible_assistant_text_parts),
             reasoning_content=reasoning_text or None,
             tool_calls=trace_tool_calls,
-            response_ids=[str(data["id"])] if data.get("id") else [],
+            response_ids=sorted(response_ids),
             metadata={"cache_shape": cache_shape},
         )
         if candidate_artifact_text:

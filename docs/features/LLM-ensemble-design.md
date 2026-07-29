@@ -484,6 +484,14 @@ value exceeds how many proposer slots the tier's template actually produced
 an effective minimum of 2. Both the configured and effective values are
 recorded in `selection_plan` for debugging.
 
+For OpenRouter-compatible calls, the local LLM trace emits an additive
+`llm.response_headers` event when a valid `x-generation-id` response header
+arrives. The event stores only that value in `response_ids`; arbitrary response
+headers are never retained. This preserves a physical attempt's billing
+identity when a request later errors, is cancelled, or ends without a response
+body. It does not change the request payload, prompt, model, tools, retry
+policy, or fallback behavior.
+
 ## 2.8 Configuration surface
 
 ```toml

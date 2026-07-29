@@ -1062,6 +1062,243 @@ def test_openrouter_http_error_names_provider_request(monkeypatch: Any) -> None:
     assert error.message == "OpenRouter chat request failed (HTTP 500): Internal Server Error"
 
 
+def test_openrouter_stream_header_generation_id_is_traced_and_joined_to_response(
+    monkeypatch: Any,
+    tmp_path: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    trace_path = tmp_path / "llm_calls.jsonl"
+    monkeypatch.setenv("OPENSQUILLA_LLM_TRACE_RECORDER", "full")
+    monkeypatch.setenv("OPENSQUILLA_LLM_TRACE_PATH", str(trace_path))
+    _patch_transport_response(
+        monkeypatch,
+        captured,
+        httpx.Response(
+            200,
+            headers={
+                "content-type": "text/event-stream",
+                "x-generation-id": "gen-stream-header-1",
+                "x-debug-secret": "must-not-be-traced",
+            },
+            content=_sse_body("deepseek/deepseek-v4-flash"),
+            request=httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions"),
+        ),
+    )
+    provider = OpenAIProvider(
+        api_key="test",
+        model="deepseek/deepseek-v4-flash",
+        base_url="https://openrouter.ai/api/v1",
+        provider_kind="openrouter",
+    )
+
+    events = _collect_events(provider, ChatConfig())
+
+    assert any(isinstance(event, DoneEvent) for event in events)
+    rows = [
+        json.loads(line)
+        for line in trace_path.read_text(encoding="utf-8").splitlines()
+    ]
+    header_row = next(row for row in rows if row["event"] == "llm.response_headers")
+    assert header_row["response_ids"] == ["gen-stream-header-1"]
+    assert next(row for row in rows if row["event"] == "llm.response")[
+        "response_ids"
+    ] == ["gen-stream-header-1"]
+    assert "x-debug-secret" not in json.dumps(rows, sort_keys=True).lower()
+    assert "must-not-be-traced" not in json.dumps(rows, sort_keys=True)
+
+
+def test_openrouter_http_error_header_generation_id_is_traced_without_other_headers(
+    monkeypatch: Any,
+    tmp_path: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    trace_path = tmp_path / "llm_calls.jsonl"
+    monkeypatch.setenv("OPENSQUILLA_LLM_TRACE_RECORDER", "full")
+    monkeypatch.setenv("OPENSQUILLA_LLM_TRACE_PATH", str(trace_path))
+    _patch_transport_response(
+        monkeypatch,
+        captured,
+        httpx.Response(
+            503,
+            headers={
+                "x-generation-id": "gen-http-error-1",
+                "x-debug-secret": "must-not-be-traced",
+            },
+            content=b"provider unavailable",
+            request=httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions"),
+        ),
+    )
+    provider = OpenAIProvider(
+        api_key="test",
+        model="deepseek/deepseek-v4-flash",
+        base_url="https://openrouter.ai/api/v1",
+        provider_kind="openrouter",
+    )
+
+    events = _collect_events(provider, ChatConfig())
+
+    assert next(event for event in events if isinstance(event, ErrorEvent)).code == "503"
+    rows = [
+        json.loads(line)
+        for line in trace_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [row["event"] for row in rows] == [
+        "llm.request",
+        "llm.response_headers",
+        "llm.error",
+    ]
+    assert rows[1]["response_ids"] == ["gen-http-error-1"]
+    serialized = json.dumps(rows, sort_keys=True)
+    assert "x-debug-secret" not in serialized.lower()
+    assert "must-not-be-traced" not in serialized
+
+
+def test_openrouter_header_generation_id_survives_local_stream_cancellation(
+    monkeypatch: Any,
+    tmp_path: Any,
+) -> None:
+    class BlockingStream(httpx.AsyncByteStream):
+        def __init__(self) -> None:
+            self.started = False
+
+        async def __aiter__(self):
+            self.started = True
+            await asyncio.Future()
+            yield b""  # pragma: no cover - cancellation is the test terminal
+
+        async def aclose(self) -> None:
+            return None
+
+    stream = BlockingStream()
+    trace_path = tmp_path / "llm_calls.jsonl"
+    monkeypatch.setenv("OPENSQUILLA_LLM_TRACE_RECORDER", "full")
+    monkeypatch.setenv("OPENSQUILLA_LLM_TRACE_PATH", str(trace_path))
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={
+                "content-type": "text/event-stream",
+                "x-generation-id": "gen-cancelled-stream-1",
+            },
+            stream=stream,
+        )
+
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+
+    def patched_async_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        kwargs["transport"] = transport
+        return real_async_client(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "opensquilla.provider.openai.httpx.AsyncClient", patched_async_client
+    )
+    provider = OpenAIProvider(
+        api_key="test",
+        model="deepseek/deepseek-v4-flash",
+        base_url="https://openrouter.ai/api/v1",
+        provider_kind="openrouter",
+    )
+
+    async def run_and_cancel() -> None:
+        async def consume() -> None:
+            async for _event in provider.chat(
+                [Message(role="user", content="hi")],
+                config=ChatConfig(timeout=60.0),
+            ):
+                pass
+
+        task = asyncio.create_task(consume())
+        for _ in range(100):
+            if stream.started:
+                break
+            await asyncio.sleep(0.001)
+        assert stream.started
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(run_and_cancel())
+
+    rows = [
+        json.loads(line)
+        for line in trace_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [row["event"] for row in rows] == [
+        "llm.request",
+        "llm.response_headers",
+    ]
+    assert rows[1]["response_ids"] == ["gen-cancelled-stream-1"]
+
+
+def test_openrouter_non_stream_header_generation_id_is_joined_to_response(
+    monkeypatch: Any,
+    tmp_path: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    trace_path = tmp_path / "llm_calls.jsonl"
+    monkeypatch.setenv("OPENSQUILLA_LLM_TRACE_RECORDER", "full")
+    monkeypatch.setenv("OPENSQUILLA_LLM_TRACE_PATH", str(trace_path))
+    _patch_transport_response(
+        monkeypatch,
+        captured,
+        httpx.Response(
+            200,
+            headers={"x-generation-id": "gen-non-stream-1"},
+            json={
+                "model": "deepseek/deepseek-v4-flash",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": "ok"},
+                    }
+                ],
+                "usage": {"prompt_tokens": 2, "completion_tokens": 1},
+            },
+            request=httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions"),
+        ),
+    )
+    provider = OpenAIProvider(
+        api_key="test",
+        model="deepseek/deepseek-v4-flash",
+        base_url="https://openrouter.ai/api/v1",
+        provider_kind="openrouter",
+    )
+
+    async def collect_fallback() -> list[Any]:
+        return [
+            event
+            async for event in provider._complete_non_stream(
+                payload={
+                    "model": "deepseek/deepseek-v4-flash",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                },
+                headers={"Authorization": "Bearer test"},
+                cfg=ChatConfig(timeout=60.0),
+                tools=None,
+                timeout_exc=httpx.ReadTimeout("empty stream"),
+            )
+        ]
+
+    events = asyncio.run(collect_fallback())
+
+    assert any(isinstance(event, DoneEvent) for event in events)
+    rows = [
+        json.loads(line)
+        for line in trace_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [row["event"] for row in rows] == [
+        "llm.request",
+        "llm.response_headers",
+        "llm.response",
+    ]
+    assert rows[1]["response_ids"] == ["gen-non-stream-1"]
+    assert rows[2]["response_ids"] == ["gen-non-stream-1"]
+
+
 def test_openai_compatible_provider_writes_llm_trace(monkeypatch: Any, tmp_path: Any) -> None:
     captured: dict[str, Any] = {}
     trace_path = tmp_path / "llm_calls.jsonl"
