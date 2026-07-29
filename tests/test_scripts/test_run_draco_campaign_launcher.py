@@ -260,10 +260,10 @@ def test_campaign_shape_and_runtime_policy_are_frozen() -> None:
         'readonly DRACO_GROUPS="B0,B1,B2,B4,G1"',
         '--groups "$DRACO_GROUPS"',
         "--max-tasks 10",
-        "--concurrency 5",
+        '--concurrency "$TASK_CONCURRENCY"',
         "--experiment-config-set timeouts.task_seconds=10800",
         "--experiment-config-set runner.agent_max_iterations=20",
-        "--experiment-config-set runner.concurrency=5",
+        '--experiment-config-set "runner.concurrency=$TASK_CONCURRENCY"',
         "--judge-concurrency 6",
         "--experiment-config-set judge.concurrency=6",
         "--experiment-config-set ensemble.aggregator_recovery_mode=experiment",
@@ -284,6 +284,7 @@ def test_campaign_shape_and_runtime_policy_are_frozen() -> None:
         "--local-web-search-provider brave",
         "--local-web-search-api-key-env BRAVE_SEARCH_API_KEY",
         "--require-openrouter-non-byok",
+        '--expected-task-concurrency "$TASK_CONCURRENCY"',
     )
     for fragment in required_fragments:
         assert fragment in script
@@ -313,6 +314,10 @@ def test_exact_input_and_new_main_repo_report_child_are_enforced() -> None:
     assert 'CONFIG="$REFERENCE_REPO/.local-state/config.toml"' in script
     assert "DRACO_CAMPAIGN_REPORT_ROOT" in script
     assert "DRACO_CAMPAIGN_REFERENCE_REPO" in script
+    assert 'TASK_CONCURRENCY="${DRACO_CAMPAIGN_TASK_CONCURRENCY:-5}"' in script
+    assert '[[ ! "$TASK_CONCURRENCY" =~ ^[1-9][0-9]*$ ]]' in script
+    assert "DRACO_CAMPAIGN_TASK_CONCURRENCY must be a positive integer" in script
+    assert "c${TASK_CONCURRENCY}-j6-a3-" in script
     assert (
         'readonly EXPECTED_INPUT_SHA256="'
         "1eb4e618c8df8e7f68bded3d2b6f77a541744aa1072eb338835b776183188a8d"
@@ -742,8 +747,7 @@ def test_terminal_model_budget_exhaustion_is_recorded_before_finalizer() -> None
     assert '.reason_code == "model_attempt_budget_exhausted"' in script
     assert '"$ARCHIVE_DIR/finalization-status.json"' in script
     assert (
-        'RECOVERY_STATUS="$SNAPSHOT_REPO/scripts/experiments/'
-        'recover_draco_finalization.py"'
+        'RECOVERY_STATUS="$SNAPSHOT_REPO/scripts/experiments/recover_draco_finalization.py"'
     ) in script
 
 

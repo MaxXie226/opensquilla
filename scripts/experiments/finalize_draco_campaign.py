@@ -420,9 +420,16 @@ def validate_formal_manifest_command(
     payload: Mapping[str, Any],
     *,
     path: Path,
+    expected_task_concurrency: int = FORMAL_TASK_CONCURRENCY,
 ) -> dict[str, int]:
     """Validate scheduling fields intentionally excluded from compatibility."""
 
+    if (
+        isinstance(expected_task_concurrency, bool)
+        or not isinstance(expected_task_concurrency, int)
+        or expected_task_concurrency < 1
+    ):
+        raise FinalizationError("expected task concurrency must be a positive integer")
     command = payload.get("command")
     parsed_args = command.get("parsed_args") if isinstance(command, Mapping) else None
     require_formal_fields(
@@ -430,7 +437,7 @@ def validate_formal_manifest_command(
         {
             "groups": ",".join(GROUPS),
             "max_tasks": FROZEN_DRACO_MINI_TASK_COUNT,
-            "concurrency": FORMAL_TASK_CONCURRENCY,
+            "concurrency": expected_task_concurrency,
             "judge_concurrency": FORMAL_JUDGE_CONCURRENCY,
             "require_clean_source": True,
             "dry_run": False,
@@ -438,7 +445,7 @@ def validate_formal_manifest_command(
         label=f"{path} command.parsed_args",
     )
     return {
-        "task_concurrency": FORMAL_TASK_CONCURRENCY,
+        "task_concurrency": expected_task_concurrency,
         "judge_concurrency": FORMAL_JUDGE_CONCURRENCY,
     }
 
@@ -677,6 +684,7 @@ def load_manifest_contracts(
     *,
     result_paths: Sequence[Path],
     groups: Sequence[str],
+    expected_task_concurrency: int = FORMAL_TASK_CONCURRENCY,
 ) -> tuple[dict[str, str], dict[str, dict[str, Any]], str, list[dict[str, Any]]]:
     if not paths:
         raise FinalizationError("at least one --manifest source is required")
@@ -706,7 +714,11 @@ def load_manifest_contracts(
         path = require_regular_file(raw_path, owner_only=True)
         result_path = require_regular_file(raw_result_path, owner_only=True)
         payload = load_json(path)
-        execution_scheduling = validate_formal_manifest_command(payload, path=path)
+        execution_scheduling = validate_formal_manifest_command(
+            payload,
+            path=path,
+            expected_task_concurrency=expected_task_concurrency,
+        )
         status = str(payload.get("status") or "")
         if status not in allowed_statuses:
             raise FinalizationError(
@@ -8640,6 +8652,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--groups", default=",".join(GROUPS))
     parser.add_argument("--max-generation-attempts", type=int, default=3)
+    parser.add_argument(
+        "--expected-task-concurrency",
+        type=int,
+        default=FORMAL_TASK_CONCURRENCY,
+        help="Expected generation task concurrency recorded by every source manifest.",
+    )
     return parser
 
 
@@ -8647,6 +8665,17 @@ def run_finalization(args: argparse.Namespace) -> dict[str, Any]:
     groups = normalize_groups(args.groups)
     if args.max_generation_attempts != 3:
         raise FinalizationError("formal campaign generation limit must be exactly 3")
+    expected_task_concurrency = getattr(
+        args,
+        "expected_task_concurrency",
+        FORMAL_TASK_CONCURRENCY,
+    )
+    if (
+        isinstance(expected_task_concurrency, bool)
+        or not isinstance(expected_task_concurrency, int)
+        or expected_task_concurrency < 1
+    ):
+        raise FinalizationError("expected task concurrency must be a positive integer")
     input_path = require_regular_file(args.input, owner_only=False)
     tasks = read_tasks(input_path)
     frozen_input_sha256 = validate_frozen_draco_input(input_path, tasks)
@@ -8684,6 +8713,7 @@ def run_finalization(args: argparse.Namespace) -> dict[str, Any]:
         args.manifest,
         result_paths=args.result,
         groups=groups,
+        expected_task_concurrency=expected_task_concurrency,
     )
     validate_formal_campaign_contracts(contracts)
     validate_physical_generation_routes(source_records, contracts=contracts)

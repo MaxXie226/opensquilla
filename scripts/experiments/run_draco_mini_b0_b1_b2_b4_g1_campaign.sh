@@ -26,12 +26,19 @@ Environment overrides:
   DRACO_CAMPAIGN_REPORT_ROOT       Alternate report root
   DRACO_CAMPAIGN_REFERENCE_REPO   Checkout containing data/draco/mini.jsonl
                                   and .local-state/config.toml
+  DRACO_CAMPAIGN_TASK_CONCURRENCY Generation task concurrency (default: 5)
 EOF
 }
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SNAPSHOT_REPO="${DRACO_CAMPAIGN_SNAPSHOT_REPO:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
-OUTPUT_NAME="${DRACO_CAMPAIGN_OUTPUT_NAME:-draco-mini-b0-b1-b2-b4-g1-c5-j6-a3-$(date +%Y%m%d-%H%M%S)}"
+TASK_CONCURRENCY="${DRACO_CAMPAIGN_TASK_CONCURRENCY:-5}"
+if [[ ! "$TASK_CONCURRENCY" =~ ^[1-9][0-9]*$ ]]; then
+  echo "DRACO_CAMPAIGN_TASK_CONCURRENCY must be a positive integer" >&2
+  exit 2
+fi
+readonly TASK_CONCURRENCY
+OUTPUT_NAME="${DRACO_CAMPAIGN_OUTPUT_NAME:-draco-mini-b0-b1-b2-b4-g1-c${TASK_CONCURRENCY}-j6-a3-$(date +%Y%m%d-%H%M%S)}"
 PRIOR_ACCOUNT_WINDOW_SOURCES=()
 if [[ -n "${DRACO_CAMPAIGN_PRIOR_ACCOUNT_WINDOW_DIR:-}" ]]; then
   PRIOR_ACCOUNT_WINDOW_SOURCES+=("$DRACO_CAMPAIGN_PRIOR_ACCOUNT_WINDOW_DIR")
@@ -247,7 +254,7 @@ COMMON_ARGS=(
   --experiment-config "$EXPERIMENT_CONFIG"
   --groups "$DRACO_GROUPS"
   --max-tasks 10
-  --concurrency 5
+  --concurrency "$TASK_CONCURRENCY"
   --timeout 10800
   --ensemble-proposer-timeout 907.5
   --ensemble-aggregator-timeout 2662.5
@@ -266,7 +273,7 @@ COMMON_ARGS=(
   --contamination-blocked-domains "$BLOCKED_DOMAINS"
   --experiment-config-set timeouts.task_seconds=10800
   --experiment-config-set runner.agent_max_iterations=20
-  --experiment-config-set runner.concurrency=5
+  --experiment-config-set "runner.concurrency=$TASK_CONCURRENCY"
   --experiment-config-set judge.concurrency=6
   --experiment-config-set ensemble.aggregator_recovery_mode=experiment
   --experiment-config-set ensemble.aggregator_recovery_top_k=3
@@ -1209,6 +1216,7 @@ FINALIZER_ARGS=(
   --output-dir "$FINAL_OUTPUT_DIR"
   --groups "$DRACO_GROUPS"
   --max-generation-attempts 3
+  --expected-task-concurrency "$TASK_CONCURRENCY"
 )
 for prior_account_window_dir in "${PRIOR_ACCOUNT_WINDOW_DIRS[@]}"; do
   FINALIZER_ARGS+=(--prior-account-window-dir "$prior_account_window_dir")

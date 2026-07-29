@@ -4496,6 +4496,42 @@ def test_manifest_scheduling_tampering_fails_closed(
     assert f"command.parsed_args.{field} differs from the formal value" in str(error.value)
 
 
+def test_manifest_scheduling_accepts_explicit_task_concurrency(
+    module,
+    tmp_path: Path,
+) -> None:
+    args, _, lock_fd = _campaign(module, tmp_path, with_repair=False)
+    manifest = json.loads(args.manifest[0].read_text())
+    manifest["command"]["parsed_args"]["concurrency"] = 7
+    _owner_json(args.manifest[0], manifest)
+    args.expected_task_concurrency = 7
+    try:
+        payload = module.run_finalization(args)
+    finally:
+        os.close(lock_fd)
+
+    assert payload["source_manifests"][0]["execution_scheduling"] == {
+        "task_concurrency": 7,
+        "judge_concurrency": 6,
+    }
+
+
+def test_finalizer_rejects_nonpositive_expected_task_concurrency(
+    module,
+    tmp_path: Path,
+) -> None:
+    args, _, lock_fd = _campaign(module, tmp_path, with_repair=False)
+    args.expected_task_concurrency = 0
+    try:
+        with pytest.raises(
+            module.FinalizationError,
+            match="expected task concurrency must be a positive integer",
+        ):
+            module.run_finalization(args)
+    finally:
+        os.close(lock_fd)
+
+
 def test_b1_frozen_tier_map_cannot_drift(module, tmp_path: Path) -> None:
     args, _, lock_fd = _campaign(module, tmp_path, with_repair=False)
     manifest = json.loads(args.manifest[0].read_text())
