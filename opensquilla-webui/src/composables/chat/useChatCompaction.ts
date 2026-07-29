@@ -67,6 +67,7 @@ interface ChatCompactMeta {
 const COMPACTION_TERMINAL_STATUSES = new Set([
   'completed',
   'skipped',
+  'stale',
   'failed',
   'error',
   'cancelled',
@@ -250,6 +251,7 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
     if (
       status === 'completed'
       || status === 'skipped'
+      || status === 'stale'
       || status === 'emergency_ephemeral'
       || (status === '' && compactedFlag !== null)
     ) {
@@ -346,6 +348,17 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
     if (status === 'skipped') {
       settleCompactInFlight(payload || {})
       showCompactStatus('skipped', i18n.global.t('chat.compact.withinBudget'), { tone: 'info', dismissMs: 5000 })
+      return
+    }
+    if (status === 'stale') {
+      settleCompactInFlight(payload || {})
+      showCompactStatus('stale', i18n.global.t('chat.compact.cancelled'), {
+        tone: 'warn',
+        detail: typeof payload.detail === 'string'
+          ? payload.detail
+          : typeof payload.reason === 'string' ? payload.reason : '',
+        dismissMs: 8000,
+      })
       return
     }
     if (status === 'failed' || status === 'error') {

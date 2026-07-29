@@ -97,6 +97,46 @@ describe('useChatCompaction replay compatibility', () => {
     }
   })
 
+  it('treats a replayed stale outcome as terminal and resumes the pending drain', () => {
+    const h = createHarness()
+    try {
+      h.api.setCompactInFlight(true, 'agent:main:test')
+      h.api.showCompactStatus('started', 'Compacting…')
+
+      h.api.showCompactionToast({
+        status: 'stale',
+        source: 'manual',
+        key: 'agent:main:test',
+        compaction_id: 'cmp-stale',
+        sequence: 2,
+        reason: 'stale_preimage',
+      }, { replayed: true })
+
+      expect(h.api.isCompactInFlightForCurrentSession()).toBe(false)
+      expect(h.api.compactStatus.value).toMatchObject({
+        visible: true,
+        status: 'stale',
+        tone: 'warn',
+        detail: 'stale_preimage',
+        isBusy: false,
+      })
+      expect(h.schedulePendingDrainAfterTerminal).toHaveBeenCalledOnce()
+      expect(h.popAllPendingIntoComposer).not.toHaveBeenCalled()
+
+      h.api.showCompactionToast({
+        status: 'started',
+        source: 'manual',
+        key: 'agent:main:test',
+        compaction_id: 'cmp-stale',
+      })
+      expect(h.api.compactStatus.value.status).toBe('stale')
+      expect(h.api.isCompactInFlightForCurrentSession()).toBe(false)
+    } finally {
+      h.api.cleanup()
+      h.stop()
+    }
+  })
+
   it('keeps legacy compacted-only terminal payloads replayable', () => {
     const h = createHarness()
     try {

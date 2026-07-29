@@ -1190,6 +1190,7 @@
     "tests/test_gateway/test_config_compaction.py": 0.01,
     "tests/test_provider_active_user_wire_mapping.py": 0.01,
     "tests/test_provider_auxiliary_budget.py": 0.01,
+    "tests/test_provider_auxiliary_consumers.py": 0.01,
     "tests/test_session/test_compaction_execution_plan.py": 0.01,
     "tests/test_session/test_compaction_provider_runtime.py": 0.01,
     "tests/test_session/test_tokenizer.py": 0.01

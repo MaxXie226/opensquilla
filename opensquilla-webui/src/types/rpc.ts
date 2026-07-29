@@ -579,6 +579,7 @@ export interface CompactionPayload extends SessionEventPayload {
     | 'observed'
     | 'completed'
     | 'skipped'
+    | 'stale'
     | 'failed'
     | 'error'
     | 'cancelled'
