@@ -379,6 +379,8 @@ jobs:
     needs: build-control-ui
     runs-on: macos-latest
     timeout-minutes: 150
+    env:
+      UV_MANAGED_PYTHON: "true"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -396,15 +398,18 @@ jobs:
       - name: Hydrate router assets
         run: git lfs pull --include="src/opensquilla/squilla_router/models/**"
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
       - name: Set up uv
         uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
+
+      - name: Install Runtime Python
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv python install 3.12
+          uv run --no-project --python 3.12 python -c \
+            "import sqlite3; assert hasattr(sqlite3.Connection, 'enable_load_extension'); assert hasattr(sqlite3.Connection, 'load_extension')"
 
       - name: Set up Node.js
         uses: actions/setup-node@v4

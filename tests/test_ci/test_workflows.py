@@ -1501,6 +1501,15 @@ def test_release_python_assets_are_independent_from_desktop_webui_artifact() -> 
             "path": "src/opensquilla/gateway/static/dist/",
         }
 
+    mac_job = jobs["build-desktop-macos"]
+    assert mac_job["env"] == {"UV_MANAGED_PYTHON": "true"}
+    mac_runtime_python = next(
+        step for step in mac_job["steps"] if step.get("name") == "Install Runtime Python"
+    )
+    assert "uv python install 3.12" in mac_runtime_python["run"]
+    assert "enable_load_extension" in mac_runtime_python["run"]
+    assert not any(step.get("name") == "Set up Python" for step in mac_job["steps"])
+
     python_job = jobs["build-release-assets"]
     assert "needs" not in python_job
     assert not any(
