@@ -212,6 +212,11 @@ _POLICIES_BY_KIND: dict[str, OpenAICompatPolicy] = {
     "openrouter": OpenAICompatPolicy(
         display_name="OpenRouter",
         official_host="openrouter.ai",
+        # OpenRouter's currently operational Terra endpoints expose the
+        # non-deprecated completion-budget field.  Keeping this in the shared
+        # payload policy also lets formal route evidence freeze the exact wire
+        # surface instead of assuming ``max_tokens`` for every model.
+        max_completion_tokens_model_prefixes=("gpt-5.6-terra",),
         text_tool_profile=TextToolCompatProfile(
             model_rules=(
                 TextToolModelRule(
@@ -233,8 +238,10 @@ _POLICIES_BY_KIND: dict[str, OpenAICompatPolicy] = {
         # With OpenRouter's require_parameters gate, forwarding the field
         # rejects every otherwise-compatible endpoint instead of ignoring it.
         unsupported_temperature_model_prefixes=(
+            "claude-fable-5",
             "claude-opus-4.8",
             "claude-sonnet-5",
+            "gpt-5.3-codex",
             "gpt-5.5",
             "gpt-5.6",
             "kimi-k2.6",
@@ -351,6 +358,18 @@ _POLICIES_BY_KIND: dict[str, OpenAICompatPolicy] = {
 }
 
 _DEFAULT_POLICY = OpenAICompatPolicy()
+
+
+def model_matches_policy_prefix(
+    model: str,
+    prefixes: tuple[str, ...],
+) -> bool:
+    """Match a provider policy prefix against the normalized model basename."""
+
+    if not prefixes:
+        return False
+    basename = model.rsplit("/", 1)[-1].strip().lower()
+    return basename.startswith(prefixes)
 
 
 def compat_policy_for_kind(provider_kind: str) -> OpenAICompatPolicy:

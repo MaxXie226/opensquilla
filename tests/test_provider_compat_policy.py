@@ -131,6 +131,7 @@ def test_openrouter_replay_follows_capability_format() -> None:
 
 def test_max_completion_tokens_requires_official_host() -> None:
     openai_policy = compat_policy_for_kind("openai")
+    openrouter_policy = compat_policy_for_kind("openrouter")
     assert _uses_max_completion_tokens(
         openai_policy, "https://api.openai.com/v1", "gpt-5.5"
     )
@@ -140,6 +141,16 @@ def test_max_completion_tokens_requires_official_host() -> None:
     )
     assert not _uses_max_completion_tokens(
         openai_policy, "https://api.openai.com/v1", "gpt-4o"
+    )
+    assert _uses_max_completion_tokens(
+        openrouter_policy,
+        "https://openrouter.ai/api/v1",
+        "openai/gpt-5.6-terra",
+    )
+    assert not _uses_max_completion_tokens(
+        openrouter_policy,
+        "https://gateway.example/v1",
+        "openai/gpt-5.6-terra",
     )
 
 

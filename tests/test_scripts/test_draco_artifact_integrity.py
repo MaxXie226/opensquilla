@@ -439,6 +439,21 @@ def test_route_preflight_reasoning_requirements_follow_frozen_registry(
     assert "qwen/qwen3-coder-next" in ineligible
     assert "reasoning" not in required["qwen/qwen3-coder-next"]
     assert "reasoning" in required["deepseek/deepseek-v4-pro"]
+    assert required["anthropic/claude-fable-5"] == [
+        "max_tokens",
+        "reasoning",
+        "tools",
+    ]
+    assert required["openai/gpt-5.3-codex"] == [
+        "max_tokens",
+        "reasoning",
+        "tools",
+    ]
+    assert required["openai/gpt-5.6-terra"] == [
+        "max_completion_tokens",
+        "reasoning",
+        "tools",
+    ]
 
 
 @pytest.mark.parametrize(

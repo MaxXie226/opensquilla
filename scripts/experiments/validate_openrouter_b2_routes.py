@@ -17,6 +17,10 @@ from urllib.parse import quote
 import httpx
 
 from opensquilla.eval.draco_experiment_config import load_draco_experiment_config
+from opensquilla.provider.compat_policy import (
+    compat_policy_for_kind,
+    model_matches_policy_prefix,
+)
 
 API_ORIGIN = "https://openrouter.ai"
 ROOT = Path(__file__).resolve().parents[2]
@@ -141,22 +145,48 @@ B2_REQUIRED_PARAMETERS["z-ai/glm-5.2"] |= {
 }
 B2_REQUIRED_PARAMETERS["qwen/qwen3.7-max"].add("temperature")
 B2_REQUIRED_PARAMETERS["google/gemini-3.1-pro-preview"].add("temperature")
+OPENROUTER_COMPAT_POLICY = compat_policy_for_kind("openrouter")
 FORMAL_UNSUPPORTED_TEMPERATURE_MODELS = frozenset(
-    {
-        "anthropic/claude-opus-4.8",
-        "anthropic/claude-sonnet-5",
-        "moonshotai/kimi-k2.7-code",
-        "openai/gpt-5.5",
-    }
+    model
+    for model in FORMAL_EXPECTED_ROUTES
+    if model_matches_policy_prefix(
+        model,
+        OPENROUTER_COMPAT_POLICY.unsupported_temperature_model_prefixes,
+    )
+)
+FORMAL_MAX_COMPLETION_TOKENS_MODELS = frozenset(
+    model
+    for model in FORMAL_EXPECTED_ROUTES
+    if model_matches_policy_prefix(
+        model,
+        OPENROUTER_COMPAT_POLICY.max_completion_tokens_model_prefixes,
+    )
 )
 
 
 def formal_required_parameters(expected_routes: dict[str, str]) -> dict[str, set[str]]:
-    required = {model: {"max_tokens", "tools"} for model in expected_routes}
+    required = {
+        model: {
+            (
+                "max_completion_tokens"
+                if model_matches_policy_prefix(
+                    model,
+                    OPENROUTER_COMPAT_POLICY.max_completion_tokens_model_prefixes,
+                )
+                else "max_tokens"
+            ),
+            "tools",
+        }
+        for model in expected_routes
+    }
     for model in set(expected_routes) - FORMAL_REASONING_INELIGIBLE_MODELS:
         required[model].add("reasoning")
-    for model in set(expected_routes) - FORMAL_UNSUPPORTED_TEMPERATURE_MODELS:
-        required[model].add("temperature")
+    for model in expected_routes:
+        if not model_matches_policy_prefix(
+            model,
+            OPENROUTER_COMPAT_POLICY.unsupported_temperature_model_prefixes,
+        ):
+            required[model].add("temperature")
     return required
 
 

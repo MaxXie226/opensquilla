@@ -40,6 +40,7 @@ from .compat_policy import (
     TEXT_TOOL_DIALECT_QWEN_TAG,
     OpenAICompatPolicy,
     compat_policy_for_kind,
+    model_matches_policy_prefix,
 )
 from .context_capabilities import supports_openrouter_explicit_prompt_cache
 from .error_redaction import (
@@ -616,7 +617,7 @@ def _uses_max_completion_tokens(
         return False
     if not _on_official_host(policy, base_url):
         return False
-    return _model_basename(model).startswith(policy.max_completion_tokens_model_prefixes)
+    return model_matches_policy_prefix(model, policy.max_completion_tokens_model_prefixes)
 
 
 def _should_use_max_completion_tokens(
@@ -677,16 +678,18 @@ def _should_send_temperature(
 ) -> bool:
     if cfg.temperature is None:
         return False
-    model_name = _model_basename(model)
     if (
         policy.unsupported_temperature_model_prefixes
         and _on_official_host(policy, base_url)
-        and model_name.startswith(policy.unsupported_temperature_model_prefixes)
+        and model_matches_policy_prefix(
+            model,
+            policy.unsupported_temperature_model_prefixes,
+        )
     ):
         return False
     if (
         policy.fixed_sampling_model_prefixes
-        and model_name.startswith(policy.fixed_sampling_model_prefixes)
+        and model_matches_policy_prefix(model, policy.fixed_sampling_model_prefixes)
         and cfg.temperature != 1.0
     ):
         return False
@@ -695,7 +698,10 @@ def _should_send_temperature(
         and _on_official_host(policy, base_url)
         and cfg.thinking
         and bool(caps and caps.supports_reasoning)
-        and model_name.startswith(policy.omit_temperature_when_thinking_model_prefixes)
+        and model_matches_policy_prefix(
+            model,
+            policy.omit_temperature_when_thinking_model_prefixes,
+        )
     ):
         return False
     return True
@@ -3764,7 +3770,17 @@ class OpenAIProvider:
                     "strict OpenRouter routing has no upstream provider pin for "
                     f"model {self._model!r}"
                 )
-            if pinned_provider:
+            auto_routing = str(pinned_provider or "").strip().lower() == "auto"
+            if (
+                self._provider_routing_strict
+                and auto_routing
+                and not self._openrouter_require_parameters
+            ):
+                raise ValueError(
+                    "strict OpenRouter auto routing requires parameter "
+                    "compatibility enforcement"
+                )
+            if pinned_provider and not auto_routing:
                 if self._provider_routing_strict:
                     payload["provider"] = {
                         "only": [pinned_provider],

@@ -14,6 +14,10 @@ from pathlib import Path
 from typing import Any
 
 from opensquilla.eval.draco_experiment_config import load_draco_experiment_config
+from opensquilla.provider.compat_policy import (
+    compat_policy_for_kind,
+    model_matches_policy_prefix,
+)
 
 SNAPSHOT_SCHEMA = "opensquilla.draco-b2-artifact-snapshot/v1"
 SUCCESS_SCHEMA = "opensquilla.draco-b2-formal-success/v1"
@@ -40,14 +44,7 @@ EXPECTED_PROVIDER_NAMES = {
     "poolside": "Poolside",
     "tencent": "Tencent",
 }
-FORMAL_UNSUPPORTED_TEMPERATURE_MODELS = frozenset(
-    {
-        "anthropic/claude-opus-4.8",
-        "anthropic/claude-sonnet-5",
-        "moonshotai/kimi-k2.7-code",
-        "openai/gpt-5.5",
-    }
-)
+OPENROUTER_COMPAT_POLICY = compat_policy_for_kind("openrouter")
 
 
 def file_sha256(path: Path) -> str:
@@ -270,11 +267,28 @@ def _formal_required_parameters(
     *,
     reasoning_ineligible_models: set[str] | frozenset[str] = (FORMAL_REASONING_INELIGIBLE_MODELS),
 ) -> dict[str, list[str]]:
-    required = {model: {"max_tokens", "tools"} for model in expected_routes}
+    required = {
+        model: {
+            (
+                "max_completion_tokens"
+                if model_matches_policy_prefix(
+                    model,
+                    OPENROUTER_COMPAT_POLICY.max_completion_tokens_model_prefixes,
+                )
+                else "max_tokens"
+            ),
+            "tools",
+        }
+        for model in expected_routes
+    }
     for model in set(expected_routes) - reasoning_ineligible_models:
         required[model].add("reasoning")
-    for model in set(expected_routes) - FORMAL_UNSUPPORTED_TEMPERATURE_MODELS:
-        required[model].add("temperature")
+    for model in expected_routes:
+        if not model_matches_policy_prefix(
+            model,
+            OPENROUTER_COMPAT_POLICY.unsupported_temperature_model_prefixes,
+        ):
+            required[model].add("temperature")
     return {model: sorted(parameters) for model, parameters in required.items()}
 
 

@@ -7,6 +7,10 @@ from pathlib import Path
 
 from opensquilla.eval.draco_experiment_config import load_draco_experiment_config
 from opensquilla.gateway.llm_runtime import OPENROUTER_DEFAULT_PROVIDER_ROUTING
+from opensquilla.provider.compat_policy import (
+    compat_policy_for_kind,
+    model_matches_policy_prefix,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_PATH = ROOT / "scripts" / "experiments" / "validate_openrouter_b2_routes.py"
@@ -57,18 +61,33 @@ def test_formal_routes_match_runtime_pins_and_capability_contract() -> None:
     experiment = load_draco_experiment_config(validator.DEFAULT_EXPERIMENT_CONFIG_PATH).config
     assert experiment.g1_routing is not None
     candidate_scope = getattr(experiment.g1_routing, "candidate_scope", "exact_routes")
+    policy = compat_policy_for_kind("openrouter")
     for model, provider in validator.FORMAL_EXPECTED_ROUTES.items():
         if candidate_scope == "registry_all":
             assert provider == "auto"
         else:
             assert OPENROUTER_DEFAULT_PROVIDER_ROUTING[model] == provider
         required = validator.FORMAL_REQUIRED_PARAMETERS[model]
-        assert {"max_tokens", "tools"} <= required
+        uses_max_completion_tokens = model_matches_policy_prefix(
+            model,
+            policy.max_completion_tokens_model_prefixes,
+        )
+        expected_token_parameter = (
+            "max_completion_tokens" if uses_max_completion_tokens else "max_tokens"
+        )
+        other_token_parameter = (
+            "max_tokens" if uses_max_completion_tokens else "max_completion_tokens"
+        )
+        assert {expected_token_parameter, "tools"} <= required
+        assert other_token_parameter not in required
         assert ("reasoning" in required) is (
             model not in validator.FORMAL_REASONING_INELIGIBLE_MODELS
         )
         assert ("temperature" in required) is (
-            model not in validator.FORMAL_UNSUPPORTED_TEMPERATURE_MODELS
+            not model_matches_policy_prefix(
+                model,
+                policy.unsupported_temperature_model_prefixes,
+            )
         )
     if candidate_scope == "registry_all":
         payload = json.loads(REGISTRY_PATH.read_text(encoding="utf-8"))
@@ -92,6 +111,21 @@ def test_formal_routes_match_runtime_pins_and_capability_contract() -> None:
         "max_tokens",
         "reasoning",
         "temperature",
+        "tools",
+    }
+    assert validator.FORMAL_REQUIRED_PARAMETERS["anthropic/claude-fable-5"] == {
+        "max_tokens",
+        "reasoning",
+        "tools",
+    }
+    assert validator.FORMAL_REQUIRED_PARAMETERS["openai/gpt-5.3-codex"] == {
+        "max_tokens",
+        "reasoning",
+        "tools",
+    }
+    assert validator.FORMAL_REQUIRED_PARAMETERS["openai/gpt-5.6-terra"] == {
+        "max_completion_tokens",
+        "reasoning",
         "tools",
     }
 

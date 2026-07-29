@@ -9716,6 +9716,23 @@ def _build_router_dynamic_members(
         snapshot,
         inputs.get("registry_allowlist"),
     )
+    if (
+        allowlist_trace is not None
+        and allowlist_trace.get("candidate_scope") == "registry_all"
+    ):
+        # ``auto`` is an explicit, contract-bound routing decision for the
+        # complete registry pool.  It satisfies strict routing without
+        # fabricating an upstream provider pin; OpenAIProvider still requires
+        # the parameter-compatibility gate before honoring the sentinel.
+        provider_routing = dict(inherited_provider_config.provider_routing)
+        for identity in allowlist_trace["expected_identities"]:
+            provider, model = str(identity).split(":", 1)
+            if provider == "openrouter":
+                provider_routing.setdefault(model, "auto")
+        inherited_provider_config = replace(
+            inherited_provider_config,
+            provider_routing=provider_routing,
+        )
 
     # Keep every deployment in the replay snapshot. The ranking hard filter
     # removes deployments that the shared resolver says cannot execute.

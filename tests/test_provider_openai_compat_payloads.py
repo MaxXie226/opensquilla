@@ -3400,8 +3400,10 @@ def test_openrouter_still_sends_temperature(monkeypatch: Any) -> None:
 @pytest.mark.parametrize(
     "model",
     [
+        "anthropic/claude-fable-5",
         "anthropic/claude-opus-4.8",
         "anthropic/claude-sonnet-5",
+        "openai/gpt-5.3-codex",
         "openai/gpt-5.5",
         "openai/gpt-5.6-luna",
         "moonshotai/kimi-k2.6",
@@ -3422,6 +3424,26 @@ def test_openrouter_models_omit_unsupported_temperature_without_capabilities(
     )
     _collect(provider, ChatConfig(temperature=0))
 
+    assert "temperature" not in captured["payload"]
+
+
+def test_openrouter_gpt_5_6_terra_uses_max_completion_tokens(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="test",
+        model="openai/gpt-5.6-terra",
+        base_url="https://openrouter.ai/api/v1",
+        provider_kind="openrouter",
+    )
+    cfg = ChatConfig(temperature=0)
+
+    _collect(provider, cfg)
+
+    assert captured["payload"]["max_completion_tokens"] == cfg.max_tokens
+    assert "max_tokens" not in captured["payload"]
     assert "temperature" not in captured["payload"]
 
 
@@ -5246,6 +5268,51 @@ def test_openrouter_routing_strict_env_rejects_unmapped_model_before_request(
     )
 
     with pytest.raises(ValueError, match="has no upstream provider pin"):
+        _collect_events(provider, ChatConfig())
+
+    assert "payload" not in captured
+
+
+def test_openrouter_routing_strict_auto_uses_parameter_gate_without_pin(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    monkeypatch.setenv("OPENSQUILLA_PROVIDER_ROUTING_STRICT", "enabled")
+    monkeypatch.setenv("OPENSQUILLA_OPENROUTER_REQUIRE_PARAMETERS", "1")
+    provider = OpenAIProvider(
+        api_key="test",
+        model="openai/gpt-5.6-terra",
+        base_url="https://openrouter.ai/api/v1",
+        provider_kind="openrouter",
+        provider_routing={"openai/gpt-5.6-terra": "auto"},
+    )
+
+    _collect(provider, ChatConfig())
+
+    assert captured["payload"]["provider"] == {"require_parameters": True}
+    assert captured["payload"]["max_completion_tokens"] == ChatConfig().max_tokens
+
+
+def test_openrouter_routing_strict_auto_requires_parameter_gate(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    monkeypatch.setenv("OPENSQUILLA_PROVIDER_ROUTING_STRICT", "enabled")
+    monkeypatch.delenv("OPENSQUILLA_OPENROUTER_REQUIRE_PARAMETERS", raising=False)
+    provider = OpenAIProvider(
+        api_key="test",
+        model="openai/gpt-5.6-terra",
+        base_url="https://openrouter.ai/api/v1",
+        provider_kind="openrouter",
+        provider_routing={"openai/gpt-5.6-terra": "auto"},
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="auto routing requires parameter compatibility enforcement",
+    ):
         _collect_events(provider, ChatConfig())
 
     assert "payload" not in captured

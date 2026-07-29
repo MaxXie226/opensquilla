@@ -7901,6 +7901,10 @@ def test_g1_runtime_dynamic_plan_satisfies_frozen_ranking_contract(
         in module._openrouter_supported_thinking_levels(member.provider_config.model)
         for member in [*provider.proposers, provider.aggregator]
     )
+    assert all(
+        member.provider_config.provider_routing.get(member.provider_config.model) == "auto"
+        for member in [*provider.proposers, provider.aggregator]
+    )
 
 
 def _compatibility_for(
