@@ -116,6 +116,10 @@ exclude = [
     # Never discover a checkout's ignored/stale UI bundle implicitly. The
     # explicit embed-ui hook force-includes a caller-selected artifact.
     "src/opensquilla/gateway/static/dist/**",
+    # The hook force-includes a generated replacement carrying immutable
+    # commit/UI-mode metadata. Exclude the source fallback to avoid two files
+    # targeting the same wheel archive path.
+    "src/opensquilla/_build_info.py",
     "src/opensquilla/scheduler/templates/*.md",
     "src/opensquilla/skills/bundled/**/THIRD_PARTY_NOTICES.md",
     "src/opensquilla/skills/bundled/**/README.md",

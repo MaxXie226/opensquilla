@@ -73,6 +73,7 @@ def _build_contract_probe(tmp_path: Path) -> Path:
     build_info.parent.mkdir(parents=True)
     scripts.mkdir()
     (package / "__init__.py").write_text("", encoding="utf-8")
+    (build_info.parent / "__init__.py").write_text("", encoding="utf-8")
     build_info.write_text(
         "BUILD_COMMIT = None\nBUILD_UI_MODE = None\n",
         encoding="utf-8",
@@ -94,8 +95,11 @@ version = "0.0.0"
 requires-python = ">=3.12"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/probe"]
-exclude = ["src/opensquilla/gateway/static/dist/**"]
+packages = ["src/probe", "src/opensquilla"]
+exclude = [
+  "src/opensquilla/gateway/static/dist/**",
+  "src/opensquilla/_build_info.py",
+]
 
 [tool.hatch.build.targets.sdist]
 exclude = ["src/opensquilla/gateway/static/dist/**"]

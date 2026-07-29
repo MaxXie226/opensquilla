@@ -164,6 +164,7 @@ def test_standard_distributions_are_headless_by_default() -> None:
     assert "artifacts" not in hatch["targets"]["wheel"]
     assert "artifacts" not in hatch["targets"]["sdist"]
     assert artifact_rule in hatch["targets"]["wheel"]["exclude"]
+    assert "src/opensquilla/_build_info.py" in hatch["targets"]["wheel"]["exclude"]
     assert artifact_rule in hatch["targets"]["sdist"]["exclude"]
     assert "opensquilla-webui/**" in hatch["targets"]["sdist"]["exclude"]
     assert "OPENSQUILLA_BUILD_UI_MODE" in hook
