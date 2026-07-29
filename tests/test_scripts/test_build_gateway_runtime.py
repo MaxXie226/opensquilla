@@ -76,8 +76,8 @@ def test_pyinstaller_contract_is_public_headless_and_has_explicit_ui_input(
         ui_artifact=None,
     )
     headless_text = "\n".join(map(os.fspath, headless))
-    assert "scripts/gateway_runtime/entry.py" in headless_text
-    assert "scripts/gateway_runtime/ensure_ca_trust.py" in headless_text
+    assert os.fspath(build.ENTRY_PATH) in headless
+    assert os.fspath(build.CA_RUNTIME_HOOK_PATH) in headless
     assert "static/dist" not in headless_text
     assert "--collect-all\nopensquilla" in headless_text
     assert "--collect-all\nsqlite_vec" in headless_text
