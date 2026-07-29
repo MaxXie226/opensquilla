@@ -180,6 +180,26 @@ def test_build_rejects_host_target_mismatch_before_running_pyinstaller(
         )
 
 
+def test_builder_rejects_python_without_loadable_sqlite_extensions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _ConnectionWithoutExtensions:
+        def __enter__(self) -> _ConnectionWithoutExtensions:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    monkeypatch.setattr(
+        build.sqlite3,
+        "connect",
+        lambda *_args, **_kwargs: _ConnectionWithoutExtensions(),
+    )
+
+    with pytest.raises(RuntimeArtifactError, match="loadable SQLite extensions"):
+        build.verify_sqlite_vec_support()
+
+
 def test_runtime_entrypoint_supports_stable_version_flag(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

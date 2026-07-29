@@ -9,6 +9,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -173,6 +174,44 @@ def verify_ui_artifact(ui_artifact: Path) -> Path:
     if manifest is None:
         raise RuntimeArtifactError("Control UI artifact manifest is missing")
     return ui_artifact.resolve(strict=True)
+
+
+def verify_sqlite_vec_support() -> None:
+    """Fail before packaging when the build interpreter cannot load sqlite-vec."""
+
+    try:
+        import sqlite_vec
+    except ImportError as error:
+        raise RuntimeArtifactError(
+            "Gateway Runtime build environment does not contain sqlite-vec"
+        ) from error
+
+    try:
+        with sqlite3.connect(":memory:") as connection:
+            enable_load_extension = getattr(connection, "enable_load_extension", None)
+            load_extension = getattr(connection, "load_extension", None)
+            if not callable(enable_load_extension) or not callable(load_extension):
+                raise RuntimeArtifactError(
+                    "Gateway Runtime build interpreter does not support loadable SQLite "
+                    "extensions required by sqlite-vec; use uv-managed Python 3.12"
+                )
+            enable_load_extension(True)
+            try:
+                load_extension(sqlite_vec.loadable_path())
+            finally:
+                enable_load_extension(False)
+            version = connection.execute("SELECT vec_version()").fetchone()
+            if not version or not isinstance(version[0], str):
+                raise RuntimeArtifactError(
+                    "Gateway Runtime build interpreter could not verify sqlite-vec"
+                )
+    except RuntimeArtifactError:
+        raise
+    except (OSError, sqlite3.Error) as error:
+        raise RuntimeArtifactError(
+            "Gateway Runtime build interpreter could not load sqlite-vec; "
+            "use uv-managed Python 3.12"
+        ) from error
 
 
 def _write_identity_runtime_hook(
@@ -434,6 +473,7 @@ def build_runtime(
             f"build host architecture mismatch: expected {expected_arch}, got {arch}"
         )
 
+    verify_sqlite_vec_support()
     verify_router_assets()
     verified_ui = verify_ui_artifact(ui_artifact) if ui_artifact is not None else None
 

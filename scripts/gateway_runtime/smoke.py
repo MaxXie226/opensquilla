@@ -13,7 +13,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 from websockets.sync.client import connect
 
@@ -115,10 +115,8 @@ def _wait_ready(process: subprocess.Popen[str], port: int, timeout: int) -> None
     health_passed = False
     while time.monotonic() < deadline:
         if process.poll() is not None:
-            stdout, stderr = process.communicate()
             raise RuntimeArtifactError(
-                f"Gateway exited before readiness with {process.returncode}\n"
-                f"{stdout[-4000:]}\n{stderr[-4000:]}"
+                f"Gateway exited before readiness with {process.returncode}"
             )
         try:
             endpoint = "readyz" if health_passed else "healthz"
@@ -212,6 +210,12 @@ def _terminate(process: subprocess.Popen[str]) -> None:
         process.wait(timeout=5)
 
 
+def _log_tail(handle: TextIO) -> str:
+    handle.flush()
+    handle.seek(0)
+    return handle.read()[-4000:]
+
+
 def _lifecycle_smoke(
     binary: Path,
     *,
@@ -223,57 +227,74 @@ def _lifecycle_smoke(
     full: bool,
 ) -> None:
     port = _free_port()
-    process = subprocess.Popen(
-        [
-            os.fspath(binary),
-            "gateway",
-            "run",
-            "--port",
-            str(port),
-            "--bind",
-            "127.0.0.1",
-            "--config",
-            os.fspath(config),
-        ],
-        cwd=binary.parent,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    try:
-        _wait_ready(process, port, timeout)
-        if full:
-            status = _run(
-                binary,
-                [
-                    "gateway",
-                    "status",
-                    "--port",
-                    str(port),
-                    "--bind",
-                    "127.0.0.1",
-                    "--json",
-                    "--config",
-                    os.fspath(config),
-                ],
-                env=env,
-                timeout=30,
-            )
-            if not isinstance(json.loads(status.stdout), dict):
-                raise RuntimeArtifactError("gateway status did not return a JSON object")
-            _websocket_smoke(
-                port,
-                expected_version=expected_version,
-                expected_build_commit=expected_build_commit,
-            )
-            control = _get_text(f"http://127.0.0.1:{port}/control/")
-            if "Gateway is running in headless mode" not in control:
-                raise RuntimeArtifactError("public Runtime unexpectedly served a client bundle")
-            if "/static/dist/" in control:
-                raise RuntimeArtifactError("public Runtime headless page references WebUI assets")
-    finally:
-        _terminate(process)
+    with (
+        tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as stdout_log,
+        tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as stderr_log,
+    ):
+        process = subprocess.Popen(
+            [
+                os.fspath(binary),
+                "gateway",
+                "run",
+                "--port",
+                str(port),
+                "--bind",
+                "127.0.0.1",
+                "--config",
+                os.fspath(config),
+            ],
+            cwd=binary.parent,
+            env=env,
+            stdout=stdout_log,
+            stderr=stderr_log,
+            text=True,
+        )
+        try:
+            _wait_ready(process, port, timeout)
+            if full:
+                status = _run(
+                    binary,
+                    [
+                        "gateway",
+                        "status",
+                        "--port",
+                        str(port),
+                        "--bind",
+                        "127.0.0.1",
+                        "--json",
+                        "--config",
+                        os.fspath(config),
+                    ],
+                    env=env,
+                    timeout=30,
+                )
+                if not isinstance(json.loads(status.stdout), dict):
+                    raise RuntimeArtifactError(
+                        "gateway status did not return a JSON object"
+                    )
+                _websocket_smoke(
+                    port,
+                    expected_version=expected_version,
+                    expected_build_commit=expected_build_commit,
+                )
+                control = _get_text(f"http://127.0.0.1:{port}/control/")
+                if "Gateway is running in headless mode" not in control:
+                    raise RuntimeArtifactError(
+                        "public Runtime unexpectedly served a client bundle"
+                    )
+                if "/static/dist/" in control:
+                    raise RuntimeArtifactError(
+                        "public Runtime headless page references WebUI assets"
+                    )
+        except Exception as error:
+            _terminate(process)
+            raise RuntimeArtifactError(
+                f"{error}\n"
+                f"Gateway stdout:\n{_log_tail(stdout_log)}\n"
+                f"Gateway stderr:\n{_log_tail(stderr_log)}"
+            ) from error
+        finally:
+            _terminate(process)
 
 
 def smoke_runtime(

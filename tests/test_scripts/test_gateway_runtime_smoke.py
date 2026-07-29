@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -12,6 +13,13 @@ from scripts.gateway_runtime import smoke
 class _RunningProcess:
     def poll(self) -> None:
         return None
+
+
+class _ExitedProcess:
+    returncode = 7
+
+    def poll(self) -> int:
+        return self.returncode
 
 
 class _WebSocket:
@@ -58,6 +66,37 @@ def test_wait_ready_uses_health_and_readiness_response_contracts(
         "http://127.0.0.1:18791/healthz",
         "http://127.0.0.1:18791/readyz",
     ]
+
+
+def test_lifecycle_smoke_uses_file_backed_logs_and_reports_tails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def popen(*_args: object, **kwargs: Any) -> _ExitedProcess:
+        captured.update(kwargs)
+        kwargs["stdout"].write("synthetic gateway stdout\n")
+        kwargs["stderr"].write("synthetic gateway stderr\n")
+        return _ExitedProcess()
+
+    monkeypatch.setattr(smoke.subprocess, "Popen", popen)
+
+    with pytest.raises(smoke.RuntimeArtifactError) as raised:
+        smoke._lifecycle_smoke(
+            tmp_path / "opensquilla-gateway",
+            env={},
+            config=tmp_path / "config.toml",
+            timeout=1,
+            expected_version=None,
+            expected_build_commit=None,
+            full=False,
+        )
+
+    assert captured["stdout"] is not smoke.subprocess.PIPE
+    assert captured["stderr"] is not smoke.subprocess.PIPE
+    assert "synthetic gateway stdout" in str(raised.value)
+    assert "synthetic gateway stderr" in str(raised.value)
 
 
 def test_websocket_smoke_completes_challenge_before_rpc(

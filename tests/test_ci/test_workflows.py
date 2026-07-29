@@ -1549,6 +1549,16 @@ def test_release_builds_and_attests_public_gateway_runtime_matrix() -> None:
         "id-token": "write",
         "attestations": "write",
     }
+    assert runtime["env"] == {"UV_MANAGED_PYTHON": "true"}
+    runtime_python = next(
+        step for step in runtime["steps"] if step.get("name") == "Install Runtime Python"
+    )
+    assert "uv python install 3.12" in runtime_python["run"]
+    assert "enable_load_extension" in runtime_python["run"]
+    assert "load_extension" in runtime_python["run"]
+    assert not any(
+        step.get("name") == "Set up Python" for step in runtime["steps"]
+    )
     build = next(
         step for step in runtime["steps"] if step.get("name") == "Build headless Gateway Runtime"
     )
