@@ -1190,6 +1190,9 @@
     "tests/test_gateway/test_artifact_preview.py": 0.01,
     "tests/test_gateway/test_artifact_preview_middleware.py": 0.01,
     "tests/test_gateway/test_root_control_ui_security.py": 0.01,
-    "tests/test_gateway/test_websocket_request_concurrency.py": 0.01
+    "tests/test_gateway/test_websocket_request_concurrency.py": 0.01,
+    "tests/test_cli/test_gateway_client_steer.py": 0.01,
+    "tests/test_engine/test_route_plan.py": 0.01,
+    "tests/test_gateway/test_steer_restart_recovery.py": 0.01
   }
 }
