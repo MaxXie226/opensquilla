@@ -13,11 +13,15 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from opensquilla.eval.draco_experiment_config import load_draco_experiment_config
+
 SNAPSHOT_SCHEMA = "opensquilla.draco-b2-artifact-snapshot/v1"
 SUCCESS_SCHEMA = "opensquilla.draco-b2-formal-success/v1"
 ROUTE_PREFLIGHT_V1_SCHEMA = "opensquilla.openrouter-route-preflight/v1"
 ROUTE_PREFLIGHT_V2_SCHEMA = "opensquilla.openrouter-route-preflight/v2"
 ROUTE_PREFLIGHT_SCHEMAS = frozenset({ROUTE_PREFLIGHT_V1_SCHEMA, ROUTE_PREFLIGHT_V2_SCHEMA})
+ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_EXPERIMENT_CONFIG_PATH = ROOT / "configs" / "benchmarks" / "draco_b2_g12.json"
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 EXPECTED_PROVIDER_NAMES = {
@@ -36,13 +40,6 @@ EXPECTED_PROVIDER_NAMES = {
     "poolside": "Poolside",
     "tencent": "Tencent",
 }
-FORMAL_REASONING_INELIGIBLE_MODELS = frozenset(
-    {
-        "kwaipilot/kat-coder-air-v2.5",
-        "kwaipilot/kat-coder-pro-v2.5",
-        "meta-llama/llama-4-scout",
-    }
-)
 FORMAL_UNSUPPORTED_TEMPERATURE_MODELS = frozenset(
     {
         "anthropic/claude-opus-4.8",
@@ -193,7 +190,7 @@ def _normalized_routes(value: Any, *, label: str) -> dict[str, str]:
             raise ValueError(f"{label} expected_routes must contain string pairs")
         model = raw_model.strip().lower()
         provider = raw_provider.strip().lower()
-        if model != raw_model or provider != raw_provider or "/" not in model:
+        if model != raw_model or provider != raw_provider or "/" not in model or not provider:
             raise ValueError(f"{label} expected_routes are not canonical")
         routes[model] = provider
     if len(routes) != len(value):
@@ -205,11 +202,76 @@ def _positive_int(value: Any) -> bool:
     return not isinstance(value, bool) and isinstance(value, int) and value > 0
 
 
+def _formal_registry_snapshot(contract: Any) -> dict[str, Any]:
+    from opensquilla.provider.ranking_router import (
+        _legacy_registry_snapshot_projection,
+        load_model_registry_snapshot,
+    )
+
+    snapshot = load_model_registry_snapshot()
+    if str(snapshot.get("snapshot_version") or "") != contract.source_registry_snapshot_version:
+        snapshot = _legacy_registry_snapshot_projection(snapshot)
+    if (
+        str(snapshot.get("snapshot_version") or "") != contract.source_registry_snapshot_version
+        or canonical_sha256(snapshot) != contract.expected_source_registry_snapshot_sha256
+    ):
+        raise ValueError("experiment config G1 registry snapshot differs")
+    return snapshot
+
+
+def _resolved_g1_contract(config_path: Path) -> tuple[Any, dict[str, Any]]:
+    experiment = load_draco_experiment_config(config_path).config
+    contract = experiment.g1_routing
+    if contract is None:
+        raise ValueError("experiment config lacks the G1 contract")
+    snapshot = _formal_registry_snapshot(contract)
+    rows = snapshot.get("models")
+    if not isinstance(rows, list):
+        raise ValueError("experiment config G1 registry snapshot is malformed")
+    models: set[str] = set()
+    reasoning_ineligible_models: set[str] = set()
+    for row in rows:
+        facts = row.get("registry_facts") if isinstance(row, dict) else None
+        if not isinstance(facts, dict):
+            raise ValueError("experiment config G1 registry row is malformed")
+        if str(facts.get("provider") or "").strip().lower() != "openrouter":
+            continue
+        model = str(facts.get("model_id") or "").strip().lower()
+        if not model or model in models:
+            raise ValueError("experiment config G1 registry identity is malformed")
+        models.add(model)
+        if facts.get("supports_reasoning") is not True:
+            reasoning_ineligible_models.add(model)
+    if contract.candidate_scope == "exact_routes":
+        assert contract.expected_routes is not None
+        routes = dict(contract.expected_routes)
+        policy = "exact_openrouter_routes"
+    else:
+        routes = {model: "auto" for model in sorted(models)}
+        policy = "all_registry_models"
+    return contract, {
+        "candidate_scope": contract.candidate_scope,
+        "policy": policy,
+        "expected_routes": routes,
+        "expected_candidate_count": len(routes),
+        "expected_routes_sha256": canonical_sha256(routes),
+        "reasoning_ineligible_models": sorted(reasoning_ineligible_models),
+    }
+
+
+_, _DEFAULT_RESOLVED_G1_CONTRACT = _resolved_g1_contract(DEFAULT_EXPERIMENT_CONFIG_PATH)
+FORMAL_REASONING_INELIGIBLE_MODELS = frozenset(
+    _DEFAULT_RESOLVED_G1_CONTRACT["reasoning_ineligible_models"]
+)
+
+
 def _formal_required_parameters(
     expected_routes: dict[str, str],
+    *,
+    reasoning_ineligible_models: set[str] | frozenset[str] = (FORMAL_REASONING_INELIGIBLE_MODELS),
 ) -> dict[str, list[str]]:
     required = {model: {"max_tokens", "tools"} for model in expected_routes}
-    for model in set(expected_routes) - FORMAL_REASONING_INELIGIBLE_MODELS:
+    for model in set(expected_routes) - reasoning_ineligible_models:
         required[model].add("reasoning")
     for model in set(expected_routes) - FORMAL_UNSUPPORTED_TEMPERATURE_MODELS:
         required[model].add("temperature")
@@ -230,8 +292,9 @@ def _recompute_endpoint_counts(
 ) -> tuple[int, int]:
     if not isinstance(endpoints, list) or not endpoints:
         raise ValueError(f"{label} route preflight v2 endpoint evidence is incomplete: {model}")
+    provider_is_auto = expected_provider == "auto"
     expected_provider_name = EXPECTED_PROVIDER_NAMES.get(expected_provider)
-    if not expected_provider_name:
+    if not provider_is_auto and not expected_provider_name:
         raise ValueError(
             f"{label} route preflight v2 provider contract is unknown: {expected_provider}"
         )
@@ -241,9 +304,8 @@ def _recompute_endpoint_counts(
     for endpoint in endpoints:
         if not isinstance(endpoint, dict):
             raise ValueError(f"{label} route preflight v2 endpoint row is invalid: {model}")
-        if not _tag_matches(
-            str(endpoint.get("tag") or ""),
-            expected_provider,
+        if not provider_is_auto and not _tag_matches(
+            str(endpoint.get("tag") or ""), expected_provider
         ):
             raise ValueError(f"{label} route preflight v2 endpoint provider tag differs: {model}")
         status = endpoint.get("status")
@@ -260,7 +322,7 @@ def _recompute_endpoint_counts(
             {str(item) for item in supported} if isinstance(supported, list) else set()
         )
         if (
-            endpoint.get("provider_name") == expected_provider_name
+            (provider_is_auto or endpoint.get("provider_name") == expected_provider_name)
             and endpoint.get("model_id") == model
             and required <= supported_parameters
         ):
@@ -329,42 +391,53 @@ def validate_route_preflight_payload(
     if file_sha256(config_path) != experiment_config_sha256:
         raise ValueError(f"{label} route preflight v2 experiment config changed")
     try:
-        experiment_config = json.loads(config_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        g1_contract, resolved_contract = _resolved_g1_contract(config_path)
+    except (OSError, ValueError) as exc:
         raise ValueError(f"{label} route preflight v2 experiment config is invalid: {exc}") from exc
-    g1_contract = (
-        experiment_config.get("g1_routing") if isinstance(experiment_config, dict) else None
-    )
-    if not isinstance(g1_contract, dict):
-        raise ValueError(f"{label} route preflight v2 lacks the G1 config contract")
-    if g1_contract.get("selection_mode") != "router_dynamic":
+    if g1_contract.selection_mode != "router_dynamic":
         raise ValueError(f"{label} route preflight v2 G1 selection mode differs")
-    candidate_count = g1_contract.get("expected_candidate_count")
+    candidate_scope = str(resolved_contract["candidate_scope"])
+    candidate_policy = str(resolved_contract["policy"])
+    expected_policy = (
+        "all_registry_models" if candidate_scope == "registry_all" else "exact_openrouter_routes"
+    )
+    if candidate_scope not in {"registry_all", "exact_routes"}:
+        raise ValueError(f"{label} route preflight v2 G1 candidate scope differs")
+    if candidate_policy != expected_policy:
+        raise ValueError(f"{label} route preflight v2 G1 candidate policy differs")
+    payload_candidate_scope = str(payload.get("candidate_scope") or "exact_routes")
+    payload_candidate_policy = str(payload.get("candidate_policy") or "exact_openrouter_routes")
+    if payload_candidate_scope != candidate_scope or payload_candidate_policy != candidate_policy:
+        raise ValueError(f"{label} route preflight v2 G1 candidate scope differs")
+    candidate_count = resolved_contract["expected_candidate_count"]
     if not _positive_int(candidate_count) or candidate_count != len(expected_routes):
         raise ValueError(f"{label} route preflight v2 G1 candidate count differs")
     config_routes = _normalized_routes(
-        g1_contract.get("expected_routes"),
+        resolved_contract["expected_routes"],
         label=f"{label} G1 config",
     )
     if config_routes != expected_routes:
         raise ValueError(f"{label} route preflight v2 G1 routes differ")
-    if g1_contract.get("expected_routes_sha256") != expected_routes_sha256:
+    if resolved_contract["expected_routes_sha256"] != expected_routes_sha256:
         raise ValueError(f"{label} route preflight v2 G1 route hash differs")
     profile_id = experiment_evidence.get("g1_routing_profile_id")
     if not isinstance(profile_id, str) or not profile_id.strip():
         raise ValueError(f"{label} route preflight v2 G1 profile is missing")
-    if profile_id != g1_contract.get("profile_id"):
+    if profile_id != g1_contract.profile_id:
         raise ValueError(f"{label} route preflight v2 G1 profile differs")
     source_version = experiment_evidence.get("source_registry_snapshot_version")
     if not isinstance(source_version, str) or not source_version.strip():
         raise ValueError(f"{label} route preflight v2 registry version is missing")
-    if source_version != g1_contract.get("source_registry_snapshot_version"):
+    if source_version != g1_contract.source_registry_snapshot_version:
         raise ValueError(f"{label} route preflight v2 registry version differs")
 
     models = payload.get("models")
     if not isinstance(models, dict) or set(models) != set(expected_routes):
         raise ValueError(f"{label} route preflight v2 model evidence set differs")
-    frozen_required_parameters = _formal_required_parameters(expected_routes)
+    frozen_required_parameters = _formal_required_parameters(
+        expected_routes,
+        reasoning_ineligible_models=set(resolved_contract["reasoning_ineligible_models"]),
+    )
     required_parameters: dict[str, list[str]] = {}
     for model, expected_provider in expected_routes.items():
         row = models.get(model)
@@ -415,6 +488,8 @@ def validate_route_preflight_payload(
     return {
         "schema": schema,
         "scope": "formal",
+        "candidate_scope": candidate_scope,
+        "candidate_policy": candidate_policy,
         "expected_routes_sha256": expected_routes_sha256,
         "expected_candidate_count": candidate_count,
         "experiment_config_sha256": experiment_config_sha256,
@@ -600,6 +675,8 @@ def main() -> int:
                 key: validation[key]
                 for key in (
                     "scope",
+                    "candidate_scope",
+                    "candidate_policy",
                     "expected_routes_sha256",
                     "expected_candidate_count",
                     "experiment_config_sha256",

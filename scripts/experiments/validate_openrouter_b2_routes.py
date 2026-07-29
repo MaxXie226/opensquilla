@@ -30,14 +30,89 @@ B2_EXPECTED_ROUTES = {
 }
 
 
-def formal_expected_routes(experiment_config: Path) -> dict[str, str]:
+def canonical_sha256(value: Any) -> str:
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def formal_registry_snapshot(contract: Any) -> dict[str, Any]:
+    from opensquilla.provider.ranking_router import (
+        _legacy_registry_snapshot_projection,
+        load_model_registry_snapshot,
+    )
+
+    snapshot = load_model_registry_snapshot()
+    if str(snapshot.get("snapshot_version") or "") != contract.source_registry_snapshot_version:
+        snapshot = _legacy_registry_snapshot_projection(snapshot)
+    if str(snapshot.get("snapshot_version") or "") != contract.source_registry_snapshot_version:
+        raise ValueError("formal route preflight registry version differs")
+    if canonical_sha256(snapshot) != contract.expected_source_registry_snapshot_sha256:
+        raise ValueError("formal route preflight registry hash differs")
+    return snapshot
+
+
+def resolved_g1_contract(experiment_config: Path) -> tuple[Any, dict[str, Any]]:
     config = load_draco_experiment_config(experiment_config).config
-    if config.g1_routing is None:
+    contract = config.g1_routing
+    if contract is None:
         raise ValueError("formal route preflight requires g1_routing.expected_routes")
-    return dict(config.g1_routing.expected_routes)
+    if contract.candidate_scope == "exact_routes":
+        assert contract.expected_routes is not None
+        assert contract.expected_candidate_count is not None
+        assert contract.expected_routes_sha256 is not None
+        routes = dict(contract.expected_routes)
+        policy = "exact_openrouter_routes"
+    else:
+        snapshot = formal_registry_snapshot(contract)
+        rows = snapshot.get("models")
+        if not isinstance(rows, list):
+            raise ValueError("formal route preflight registry is malformed")
+        models: set[str] = set()
+        for row in rows:
+            facts = row.get("registry_facts") if isinstance(row, dict) else None
+            if not isinstance(facts, dict):
+                raise ValueError("formal route preflight registry row is malformed")
+            if str(facts.get("provider") or "").strip().lower() != "openrouter":
+                continue
+            model = str(facts.get("model_id") or "").strip().lower()
+            if not model or model in models:
+                raise ValueError("formal route preflight registry identity is malformed")
+            models.add(model)
+        routes = {model: "auto" for model in sorted(models)}
+        policy = "all_registry_models"
+    return config, {
+        **contract.model_dump(mode="json", exclude_none=True),
+        "candidate_scope": contract.candidate_scope,
+        "policy": policy,
+        "expected_candidate_count": len(routes),
+        "expected_routes": routes,
+        "expected_routes_sha256": canonical_sha256(routes),
+    }
+
+
+def formal_expected_routes(experiment_config: Path) -> dict[str, str]:
+    _, contract = resolved_g1_contract(experiment_config)
+    return dict(contract["expected_routes"])
 
 
 FORMAL_EXPECTED_ROUTES = formal_expected_routes(DEFAULT_EXPERIMENT_CONFIG_PATH)
+_FORMAL_CONFIG = load_draco_experiment_config(DEFAULT_EXPERIMENT_CONFIG_PATH).config
+assert _FORMAL_CONFIG.g1_routing is not None
+_FORMAL_REGISTRY_SNAPSHOT = formal_registry_snapshot(_FORMAL_CONFIG.g1_routing)
+FORMAL_REASONING_INELIGIBLE_MODELS = frozenset(
+    str(facts.get("model_id") or "").strip().lower()
+    for row in _FORMAL_REGISTRY_SNAPSHOT.get("models") or []
+    if isinstance(row, dict)
+    and isinstance((facts := row.get("registry_facts")), dict)
+    and str(facts.get("provider") or "").strip().lower() == "openrouter"
+    and facts.get("supports_reasoning") is not True
+)
 EXPECTED_PROVIDER_NAMES = {
     "anthropic": "Anthropic",
     "deepseek": "DeepSeek",
@@ -66,13 +141,6 @@ B2_REQUIRED_PARAMETERS["z-ai/glm-5.2"] |= {
 }
 B2_REQUIRED_PARAMETERS["qwen/qwen3.7-max"].add("temperature")
 B2_REQUIRED_PARAMETERS["google/gemini-3.1-pro-preview"].add("temperature")
-FORMAL_REASONING_INELIGIBLE_MODELS = frozenset(
-    {
-        "kwaipilot/kat-coder-air-v2.5",
-        "kwaipilot/kat-coder-pro-v2.5",
-        "meta-llama/llama-4-scout",
-    }
-)
 FORMAL_UNSUPPORTED_TEMPERATURE_MODELS = frozenset(
     {
         "anthropic/claude-opus-4.8",
@@ -93,17 +161,6 @@ def formal_required_parameters(expected_routes: dict[str, str]) -> dict[str, set
 
 
 FORMAL_REQUIRED_PARAMETERS = formal_required_parameters(FORMAL_EXPECTED_ROUTES)
-
-
-def canonical_sha256(value: Any) -> str:
-    payload = json.dumps(
-        value,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
 
 
 def get_json(client: httpx.Client, path: str) -> tuple[Any, str]:
@@ -144,8 +201,9 @@ def recompute_model_endpoint_compatibility(
     endpoints = evidence.get("matching_endpoints")
     if not isinstance(endpoints, list) or not endpoints:
         raise ValueError(f"endpoint evidence is missing for {model}")
+    provider_is_auto = expected_provider == "auto"
     expected_provider_name = EXPECTED_PROVIDER_NAMES.get(expected_provider)
-    if not expected_provider_name:
+    if not provider_is_auto and not expected_provider_name:
         raise ValueError(f"provider display-name contract is missing for {expected_provider}")
 
     operational_count = 0
@@ -153,7 +211,10 @@ def recompute_model_endpoint_compatibility(
     for endpoint in endpoints:
         if not isinstance(endpoint, dict):
             raise ValueError(f"endpoint evidence row is invalid for {model}")
-        if not tag_matches(str(endpoint.get("tag") or ""), expected_provider):
+        if not provider_is_auto and not tag_matches(
+            str(endpoint.get("tag") or ""),
+            expected_provider,
+        ):
             raise ValueError(f"endpoint tag differs for {model} -> {expected_provider}")
         status = endpoint.get("status")
         operational = isinstance(status, int) and not isinstance(status, bool) and status == 0
@@ -169,7 +230,7 @@ def recompute_model_endpoint_compatibility(
             {str(item) for item in supported} if isinstance(supported, list) else set()
         )
         if (
-            endpoint.get("provider_name") == expected_provider_name
+            (provider_is_auto or endpoint.get("provider_name") == expected_provider_name)
             and endpoint.get("model_id") == model
             and required_parameters <= supported_parameters
         ):
@@ -226,13 +287,26 @@ def main() -> int:
     args = parse_args()
 
     experiment = load_draco_experiment_config(args.experiment_config).config
+    resolved_contract = (
+        resolved_g1_contract(args.experiment_config)[1] if args.scope == "formal" else None
+    )
     expected_routes = (
-        dict(experiment.g1_routing.expected_routes)
-        if args.scope == "formal" and experiment.g1_routing is not None
+        dict(resolved_contract["expected_routes"])
+        if resolved_contract is not None
         else B2_EXPECTED_ROUTES
     )
     if args.scope == "formal" and experiment.g1_routing is None:
         raise SystemExit("formal route preflight requires g1_routing.expected_routes")
+    candidate_scope = (
+        str(resolved_contract["candidate_scope"])
+        if resolved_contract is not None
+        else "exact_routes"
+    )
+    candidate_policy = (
+        str(resolved_contract["policy"])
+        if resolved_contract is not None
+        else "exact_openrouter_routes"
+    )
     required_parameters = (
         formal_required_parameters(expected_routes)
         if args.scope == "formal"
@@ -256,7 +330,7 @@ def main() -> int:
             for row in provider_rows
             if isinstance(row, dict) and row.get("slug")
         }
-        missing_slugs = sorted(set(expected_routes.values()) - provider_slugs)
+        missing_slugs = sorted(set(expected_routes.values()) - {"auto"} - provider_slugs)
         if missing_slugs:
             raise SystemExit(f"OpenRouter provider slug(s) unavailable: {missing_slugs}")
 
@@ -273,11 +347,12 @@ def main() -> int:
                 raise SystemExit(f"OpenRouter endpoint schema invalid for {model}")
             if data.get("id") != model:
                 raise SystemExit(f"OpenRouter endpoint response model differs for {model}")
+            provider_is_auto = expected_provider == "auto"
             matches = [
                 row
                 for row in endpoints
                 if isinstance(row, dict)
-                and tag_matches(str(row.get("tag") or ""), expected_provider)
+                and (provider_is_auto or tag_matches(str(row.get("tag") or ""), expected_provider))
             ]
             operational = [row for row in matches if row.get("status") == 0]
             compatible = [
@@ -285,7 +360,10 @@ def main() -> int:
                 for row in operational
                 if required_parameters[model]
                 <= {str(item) for item in (row.get("supported_parameters") or [])}
-                and row.get("provider_name") == EXPECTED_PROVIDER_NAMES[expected_provider]
+                and (
+                    provider_is_auto
+                    or row.get("provider_name") == EXPECTED_PROVIDER_NAMES[expected_provider]
+                )
                 and row.get("model_id") == model
             ]
             if not matches:
@@ -335,6 +413,8 @@ def main() -> int:
         "scope": args.scope,
         "trust_env": False,
         "providers_response_sha256": providers_sha256,
+        "candidate_scope": candidate_scope,
+        "candidate_policy": candidate_policy,
         "expected_routes": expected_routes,
         "expected_routes_sha256": canonical_sha256(expected_routes),
         "experiment_config": {

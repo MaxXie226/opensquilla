@@ -68,12 +68,27 @@ class DracoG1RoutingConfig(_StrictConfig):
     expected_ranking_config_version: str = Field(min_length=1)
     expected_ranking_config_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     expected_proposer_count_max: int = Field(gt=0)
-    expected_candidate_count: int = Field(gt=0)
-    expected_routes: dict[str, str] = Field(min_length=1)
-    expected_routes_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    expected_candidate_count: int | None = Field(default=None, gt=0)
+    expected_routes: dict[str, str] | None = None
+    expected_routes_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
     @model_validator(mode="after")
     def _validate_expected_routes(self) -> DracoG1RoutingConfig:
+        exact_fields = (
+            self.expected_candidate_count,
+            self.expected_routes,
+            self.expected_routes_sha256,
+        )
+        if all(value is None for value in exact_fields):
+            return self
+        if any(value is None for value in exact_fields):
+            raise ValueError(
+                "g1_routing expected_candidate_count, expected_routes, and "
+                "expected_routes_sha256 must be specified together"
+            )
+        assert self.expected_candidate_count is not None
+        assert self.expected_routes is not None
+        assert self.expected_routes_sha256 is not None
         if self.expected_proposer_count_max > self.expected_candidate_count:
             raise ValueError(
                 "g1_routing.expected_proposer_count_max exceeds expected_candidate_count"
@@ -93,6 +108,12 @@ class DracoG1RoutingConfig(_StrictConfig):
         if actual_hash != self.expected_routes_sha256:
             raise ValueError("g1_routing.expected_routes_sha256 does not match expected_routes")
         return self
+
+    @property
+    def candidate_scope(self) -> Literal["registry_all", "exact_routes"]:
+        """Use every packaged registry model unless an exact route set is supplied."""
+
+        return "exact_routes" if self.expected_routes is not None else "registry_all"
 
 
 ThinkingSetting = Literal[

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import sys
 from pathlib import Path
 
@@ -10,6 +12,7 @@ from opensquilla.gateway.config import GatewayConfig, LlmProviderProfile
 from opensquilla.provider.compat_policy import compat_policy_for_kind
 from opensquilla.provider.ensemble import build_ensemble_provider_from_config
 from opensquilla.provider.openai import _build_openai_wire_messages
+from opensquilla.provider.ranking_router import load_model_registry_snapshot
 from opensquilla.provider.selector import ProviderConfig
 from opensquilla.provider.types import ChatConfig, Message, ModelCapabilities
 
@@ -387,7 +390,7 @@ def test_router_dynamic_uses_structured_candidates_with_source() -> None:
     assert all(candidate["model"] != "disabled/model" for candidate in pool)
 
 
-def test_router_dynamic_exact_registry_allowlist_filters_fully_composed_pool() -> None:
+def test_router_dynamic_registry_all_uses_every_packaged_model_by_default() -> None:
     experiment = load_draco_experiment_config(
         ROOT / "configs" / "benchmarks" / "draco_b2_g12.json"
     ).config
@@ -417,8 +420,11 @@ def test_router_dynamic_exact_registry_allowlist_filters_fully_composed_pool() -
     )
 
     plan = provider.selection_plan
-    expected = {f"openrouter:{model}" for model in experiment.g1_routing.expected_routes}
-    assert plan["candidate_pool_size"] == 20
+    expected = {
+        f"openrouter:{row['registry_facts']['model_id']}"
+        for row in load_model_registry_snapshot()["models"]
+    }
+    assert plan["candidate_pool_size"] == len(expected)
     assert {row["identity"] for row in plan["candidate_pool"]} == expected
     assert set(plan["selected_P"]) <= expected
     assert plan["selected_A"] in expected
@@ -427,12 +433,104 @@ def test_router_dynamic_exact_registry_allowlist_filters_fully_composed_pool() -
     assert plan["aggregator_model"] == plan["selected_A"].partition(":")[2]
     allowlist = plan["candidate_allowlist"]
     assert allowlist["profile_id"] == experiment.g1_routing.profile_id
-    assert allowlist["candidate_count"] == 20
-    assert allowlist["input_candidate_count"] == 80
-    assert allowlist["excluded_candidate_count"] == 60
-    assert allowlist["expected_routes_sha256"] == (experiment.g1_routing.expected_routes_sha256)
+    assert allowlist["policy"] == "all_registry_models"
+    assert allowlist["candidate_scope"] == "registry_all"
+    assert allowlist["candidate_count"] == len(expected)
+    assert allowlist["input_candidate_count"] == len(expected)
+    assert allowlist["excluded_candidate_count"] == 0
+    assert len(allowlist["expected_routes_sha256"]) == 64
     assert allowlist["expected_source_registry_snapshot_sha256"] == (
         experiment.g1_routing.expected_source_registry_snapshot_sha256
+    )
+
+
+def test_router_dynamic_new_registry_contract_requires_explicit_policy() -> None:
+    experiment = load_draco_experiment_config(
+        ROOT / "configs" / "benchmarks" / "draco_b2_g12.json"
+    ).config
+    assert experiment.g1_routing is not None
+    contract = experiment.g1_routing.model_dump(mode="json", exclude_none=True)
+    contract["candidate_scope"] = "registry_all"
+    cfg = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "deepseek/deepseek-v4-pro",
+            "api_key": "fake",
+        },
+        llm_ensemble={"enabled": True, "selection_mode": "router_dynamic"},
+    )
+
+    with pytest.raises(ValueError, match="policy differs from candidate scope"):
+        build_ensemble_provider_from_config(
+            config=cfg,
+            inherited_provider_config=ProviderConfig(
+                provider="openrouter",
+                model="deepseek/deepseek-v4-pro",
+                api_key="fake",
+            ),
+            fallback_provider=None,
+            turn_metadata={"routed_tier": "c1", "routing_confidence": 0.9},
+            ranking_inputs={"registry_allowlist": contract},
+        )
+
+
+def test_router_dynamic_explicit_registry_allowlist_still_filters_pool() -> None:
+    experiment = load_draco_experiment_config(
+        ROOT / "configs" / "benchmarks" / "draco_b2_g12.json"
+    ).config
+    assert experiment.g1_routing is not None
+    routes = {
+        "deepseek/deepseek-v4-pro": "deepseek",
+        "z-ai/glm-5.2": "z-ai",
+    }
+    contract = experiment.g1_routing.model_dump(mode="json", exclude_none=True)
+    contract.update(
+        {
+            "candidate_scope": "exact_routes",
+            "policy": "exact_openrouter_routes",
+            "expected_candidate_count": len(routes),
+            "expected_routes": routes,
+            "expected_routes_sha256": hashlib.sha256(
+                json.dumps(
+                    routes,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+        }
+    )
+    cfg = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "deepseek/deepseek-v4-pro",
+            "api_key": "fake",
+            "base_url": "https://openrouter.example/api/v1",
+        },
+        llm_ensemble={"enabled": True, "selection_mode": "router_dynamic"},
+    )
+    inherited = ProviderConfig(
+        provider="openrouter",
+        model="deepseek/deepseek-v4-pro",
+        api_key="fake",
+        base_url="https://openrouter.example/api/v1",
+    )
+
+    provider = build_ensemble_provider_from_config(
+        config=cfg,
+        inherited_provider_config=inherited,
+        fallback_provider=None,
+        turn_metadata={"routed_tier": "c1", "routing_confidence": 0.9},
+        ranking_inputs={"registry_allowlist": contract},
+    )
+
+    expected = {f"openrouter:{model}" for model in routes}
+    plan = provider.selection_plan
+    assert plan["candidate_pool_size"] == len(routes)
+    assert {row["identity"] for row in plan["candidate_pool"]} == expected
+    assert plan["candidate_allowlist"]["policy"] == "exact_openrouter_routes"
+    assert plan["candidate_allowlist"]["excluded_candidate_count"] == (
+        len(load_model_registry_snapshot()["models"]) - len(routes)
     )
 
 

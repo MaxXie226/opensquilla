@@ -15,6 +15,7 @@ import pytest
 from opensquilla.eval.draco_artifact_integrity import (
     trace_row_from_result as canonical_trace_row_from_result,
 )
+from opensquilla.eval.draco_experiment_config import load_draco_experiment_config
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "experiments" / "finalize_draco_campaign.py"
@@ -36,14 +37,19 @@ def module():
 
 
 def test_formal_model_thinking_levels_match_campaign_config(module) -> None:
-    config = json.loads(
-        (ROOT / "configs" / "benchmarks" / "draco_b2_g12.json").read_text(encoding="utf-8")
-    )
+    config_path = ROOT / "configs" / "benchmarks" / "draco_b2_g12.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
 
     assert module.FORMAL_MODEL_THINKING_LEVELS == config["generation"]["model_thinking_levels"]
     assert module.FORMAL_MODEL_THINKING_LEVELS["moonshotai/kimi-k2.7-code"] == "high"
     assert module.FORMAL_MODEL_THINKING_LEVELS["qwen/qwen3.7-max"] == "high"
-    assert set(config["g1_routing"]["expected_routes"]) <= set(module.FORMAL_MODEL_THINKING_LEVELS)
+    resolved = load_draco_experiment_config(config_path).config.g1_routing
+    assert resolved is not None
+    if getattr(resolved, "candidate_scope", "exact_routes") == "registry_all":
+        assert set(module.formal_registry_all_routes().values()) == {"auto"}
+    else:
+        assert resolved.expected_routes is not None
+        assert set(resolved.expected_routes) <= set(module.FORMAL_MODEL_THINKING_LEVELS)
 
 
 def test_finalizer_version_covers_canonical_usage_evidence(module) -> None:
@@ -101,8 +107,7 @@ def test_counter_only_failed_judge_request_is_canonical_and_route_bound(
     attempt_id = f"{0x5100 + ordinal:032x}"
     run = {
         "error": (
-            "OpenRouter chat request failed (HTTP 503): "
-            "Cloudflare Worker exceeded resource limits"
+            "OpenRouter chat request failed (HTTP 503): Cloudflare Worker exceeded resource limits"
         ),
         "llm_request_count": 1,
         "usage_unknown_count": 1,
@@ -168,9 +173,7 @@ def test_counter_only_failed_judge_request_is_canonical_and_route_bound(
         module.usage_route_reasons(
             canonical["usage"],
             allowed_models={module.JUDGE_MODEL},
-            provider_pins={
-                module.JUDGE_MODEL: module.FORMAL_UPSTREAM_PINS[module.JUDGE_MODEL]
-            },
+            provider_pins={module.JUDGE_MODEL: module.FORMAL_UPSTREAM_PINS[module.JUDGE_MODEL]},
             allow_unknown_judge_attempts=True,
         )
         == []
@@ -235,9 +238,7 @@ def test_unknown_judge_placeholder_cannot_claim_success_or_actual_identity(
         module.usage_route_reasons(
             tampered,
             allowed_models={module.JUDGE_MODEL},
-            provider_pins={
-                module.JUDGE_MODEL: module.FORMAL_UPSTREAM_PINS[module.JUDGE_MODEL]
-            },
+            provider_pins={module.JUDGE_MODEL: module.FORMAL_UPSTREAM_PINS[module.JUDGE_MODEL]},
             allow_unknown_judge_attempts=True,
         )
     ) == {
@@ -419,6 +420,181 @@ def test_frozen_g1_serving_aliases_bind_router_receipts(
             provider_pins={requested_model: upstream_provider},
         )
     )
+
+
+def test_registry_all_contract_resolves_the_complete_packaged_pool(module) -> None:
+    routes = module.formal_registry_all_routes()
+
+    assert len(routes) == module.FORMAL_G1_REGISTRY_ALL_CANDIDATE_COUNT == 80
+    assert set(routes.values()) == {"auto"}
+    assert all(model == model.strip().lower() and "/" in model for model in routes)
+
+
+def test_auto_candidate_provider_accepts_any_successful_upstream_but_role_pin_remains(
+    module,
+) -> None:
+    requested_model = "x-ai/grok-4.5"
+    unit = {
+        "role": "proposer",
+        "provider": "openrouter",
+        "model": requested_model,
+        "requested_provider": "openrouter",
+        "requested_model": requested_model,
+        "provider_usage": {
+            "requested_provider": "openrouter",
+            "requested_model": requested_model,
+            "router_metadata": {
+                "requested_provider": "openrouter",
+                "requested": requested_model,
+                "attempts": [
+                    {
+                        "provider": "some-operational-upstream",
+                        "model": requested_model,
+                        "status": 200,
+                    }
+                ],
+            },
+        },
+    }
+
+    assert (
+        module.usage_route_reasons(
+            {"model_usage_breakdown": [unit]},
+            allowed_models={requested_model},
+            provider_pins={requested_model: "auto"},
+        )
+        == []
+    )
+
+    analyzer = deepcopy(unit)
+    analyzer.update(
+        {
+            "role": "task_analyzer",
+            "model": module.B0_MODEL,
+            "requested_model": module.B0_MODEL,
+        }
+    )
+    analyzer["provider_usage"]["requested_model"] = module.B0_MODEL
+    analyzer["provider_usage"]["router_metadata"]["requested"] = module.B0_MODEL
+    analyzer["provider_usage"]["router_metadata"]["attempts"][0]["model"] = module.B0_MODEL
+    reasons = module.usage_route_reasons(
+        {"model_usage_breakdown": [analyzer]},
+        allowed_models={requested_model},
+        provider_pins={module.B0_MODEL: "auto"},
+        role_model_pins={"task_analyzer": module.B0_MODEL},
+        role_provider_pins={
+            "task_analyzer": module.FORMAL_UPSTREAM_PINS[module.B0_MODEL],
+        },
+    )
+    assert "router_receipt_provider_not_bound_to_formal_route" in reasons
+
+
+def test_registry_all_auto_preserves_concrete_runtime_provider_pins(module) -> None:
+    pinned_model = "x-ai/grok-4.5"
+    unpinned_model = "meta-llama/llama-4-scout"
+    contract = {
+        "resolved_llm_runtime": {
+            "provider_routing": {
+                pinned_model.upper(): "xAI",
+            }
+        },
+        "g1_registry_contract": {
+            "candidate_scope": "registry_all",
+            "expected_routes": {
+                pinned_model: "auto",
+                unpinned_model: "auto",
+            },
+        },
+    }
+
+    assert module.contract_provider_pins(contract) == {
+        pinned_model: "xai",
+        unpinned_model: "auto",
+    }
+
+    unit = {
+        "role": "proposer",
+        "provider": "openrouter",
+        "model": pinned_model,
+        "requested_provider": "openrouter",
+        "requested_model": pinned_model,
+        "provider_usage": {
+            "requested_provider": "openrouter",
+            "requested_model": pinned_model,
+            "router_metadata": {
+                "requested_provider": "openrouter",
+                "requested": pinned_model,
+                "attempts": [
+                    {
+                        "provider": "different-upstream",
+                        "model": pinned_model,
+                        "status": 200,
+                    }
+                ],
+            },
+        },
+    }
+    reasons = module.usage_route_reasons(
+        {"model_usage_breakdown": [unit]},
+        allowed_models={pinned_model},
+        provider_pins=module.contract_provider_pins(contract),
+    )
+    assert "router_receipt_provider_not_bound_to_formal_route" in reasons
+
+
+def test_registry_all_plan_requires_all_registry_models_policy_and_pool(module) -> None:
+    routes = module.formal_registry_all_routes()
+    routes_hash = module.canonical_sha256(routes)
+    profile_id = "test-registry-all"
+    source_version = "curated-openrouter-step2-2026-07-24.3"
+    filtered_version = f"{source_version}+{profile_id}+{routes_hash[:12]}"
+    identities = sorted(f"openrouter:{model}" for model in routes)
+    contract = {
+        "profile_id": profile_id,
+        "selection_mode": "router_dynamic",
+        "candidate_scope": "registry_all",
+        "policy": "all_registry_models",
+        "user_profile_enabled": False,
+        "source_registry_snapshot_version": source_version,
+        "expected_routes": routes,
+        "expected_routes_sha256": routes_hash,
+        "expected_candidate_count": len(routes),
+        "expected_source_registry_snapshot_sha256": (
+            module.FORMAL_G1_SOURCE_REGISTRY_SNAPSHOT_SHA256
+        ),
+        "expected_ranking_config_schema_version": (module.FORMAL_G1_RANKING_CONFIG_SCHEMA_VERSION),
+        "expected_ranking_config_version": module.FORMAL_G1_RANKING_CONFIG_VERSION,
+        "expected_ranking_config_sha256": module.FORMAL_G1_RANKING_CONFIG_SHA256,
+        "expected_proposer_count_max": module.FORMAL_G1_PROPOSER_COUNT_MAX,
+    }
+    plan = {
+        "candidate_allowlist": {
+            "policy": "all_registry_models",
+            "profile_id": profile_id,
+            "source_registry_snapshot_version": source_version,
+            "expected_source_registry_snapshot_sha256": (
+                module.FORMAL_G1_SOURCE_REGISTRY_SNAPSHOT_SHA256
+            ),
+            "filtered_registry_snapshot_version": filtered_version,
+            "expected_routes_sha256": routes_hash,
+            "expected_candidate_count": len(routes),
+            "candidate_count": len(routes),
+            "expected_identities": identities,
+        },
+        "candidate_pool_size": len(routes),
+        "candidate_pool": [{"identity": identity} for identity in identities],
+        "registry_snapshot_version": filtered_version,
+        "registry_snapshot_hash": "d" * 64,
+    }
+
+    reasons, _, _ = module.g1_registry_plan_reasons(plan, contract=contract)
+    assert "invalid_g1_registry_contract" not in reasons
+    assert "wrong_g1_candidate_pool" not in reasons
+    assert not any(reason.startswith("wrong_g1_candidate_allowlist") for reason in reasons)
+
+    plan["candidate_allowlist"]["policy"] = "exact_openrouter_routes"
+    reasons, _, _ = module.g1_registry_plan_reasons(plan, contract=contract)
+    assert "wrong_g1_candidate_allowlist_policy" in reasons
 
 
 def _owner_json(path: Path, value: object) -> None:
@@ -2042,10 +2218,13 @@ def test_agent_call_sequence_hashes_full_segment_when_trace_text_is_clipped(
         },
     ]
 
-    assert module.agent_call_output_sequence_reasons(
-        calls,
-        final_text=first + second,
-    ) == []
+    assert (
+        module.agent_call_output_sequence_reasons(
+            calls,
+            final_text=first + second,
+        )
+        == []
+    )
     calls[1]["assembled_output"]["sha256"] = module.text_sha256(second + "tampered")
     assert module.agent_call_output_sequence_reasons(
         calls,
@@ -3410,9 +3589,7 @@ def test_five_counter_only_failed_judge_attempts_finalize_without_rerun(
         for item in ledger
         if item["cost_precision"] == "unknown"
         and item["scopes"] == ["judge"]
-        and item["group_task_pairs"] == [
-            {"group": row["group"], "task_id": row["task_id"]}
-        ]
+        and item["group_task_pairs"] == [{"group": row["group"], "task_id": row["task_id"]}]
     ]
     assert len(ledger) == 41
     assert len(unknown_judge) == 5

@@ -1077,11 +1077,30 @@ def _apply_strict_generation_policy_candidate_filter(
         model = str(facts.get("model_id") or "").strip()
         if provider != "openrouter" or not model:
             continue
-        requested_thinking = normalized_mapping.get(model.lower(), default_level)
+        configured_thinking = normalized_mapping.get(model.lower())
+        supported_levels_raw = facts.get("supported_thinking_levels")
+        supported_levels = (
+            [str(level).strip().lower() for level in supported_levels_raw if str(level).strip()]
+            if isinstance(supported_levels_raw, Sequence)
+            and not isinstance(supported_levels_raw, (str, bytes))
+            else []
+        )
+        requested_thinking = (
+            configured_thinking
+            if configured_thinking is not None
+            else supported_levels[0]
+            if supported_levels
+            else default_level
+        )
         if requested_thinking in {"", "off", "none", "false"}:
             continue
         capabilities = openrouter_static_capabilities(model)
-        if capabilities is not None and capabilities.supports_reasoning:
+        supports_reasoning = facts.get("supports_reasoning")
+        if supports_reasoning is True or (
+            supports_reasoning is None
+            and capabilities is not None
+            and capabilities.supports_reasoning
+        ):
             continue
 
         raw_reasons = facts.get(_RUNTIME_HARD_FILTER_REASONS_FIELD)
@@ -9407,7 +9426,7 @@ def _apply_router_dynamic_registry_allowlist(
     snapshot: dict[str, Any],
     raw_contract: Any,
 ) -> dict[str, Any] | None:
-    """Restrict a fully composed dynamic snapshot to one exact formal route set."""
+    """Bind a dynamic snapshot to all packaged models or one explicit subset."""
 
     if raw_contract is None:
         return None
@@ -9418,6 +9437,21 @@ def _apply_router_dynamic_registry_allowlist(
     expected_routes_raw = raw_contract.get("expected_routes")
     expected_count_raw = raw_contract.get("expected_candidate_count")
     expected_hash = str(raw_contract.get("expected_routes_sha256") or "").strip()
+    candidate_scope = str(raw_contract.get("candidate_scope") or "").strip().lower()
+    if not candidate_scope:
+        candidate_scope = (
+            "exact_routes" if isinstance(expected_routes_raw, Mapping) else "registry_all"
+        )
+    if candidate_scope not in {"registry_all", "exact_routes"}:
+        raise ValueError("router_dynamic registry allowlist candidate scope is invalid")
+    expected_policy = (
+        "all_registry_models" if candidate_scope == "registry_all" else "exact_openrouter_routes"
+    )
+    declared_policy = str(raw_contract.get("policy") or "").strip()
+    if ("candidate_scope" in raw_contract and not declared_policy) or (
+        declared_policy and declared_policy != expected_policy
+    ):
+        raise ValueError("router_dynamic registry allowlist policy differs from candidate scope")
     expected_source_snapshot_hash = str(
         raw_contract.get("expected_source_registry_snapshot_sha256") or ""
     ).strip()
@@ -9426,15 +9460,46 @@ def _apply_router_dynamic_registry_allowlist(
         or not source_version
         or len(expected_source_snapshot_hash) != 64
         or any(char not in "0123456789abcdef" for char in expected_source_snapshot_hash)
-        or not isinstance(expected_routes_raw, Mapping)
     ):
         raise ValueError("router_dynamic registry allowlist contract is incomplete")
+    actual_source_version = str(snapshot.get("snapshot_version") or "").strip()
+    if actual_source_version != source_version:
+        raise ValueError(
+            "router_dynamic registry snapshot version differs from the formal allowlist contract"
+        )
+
+    rows = snapshot.get("models")
+    if not isinstance(rows, list):
+        raise ValueError("router_dynamic registry snapshot has no model rows")
+    if expected_routes_raw is None and candidate_scope == "registry_all":
+        derived_models: list[str] = []
+        for row in rows:
+            facts = row.get("registry_facts") if isinstance(row, Mapping) else None
+            if not isinstance(facts, Mapping):
+                raise ValueError("router_dynamic registry snapshot row lacks registry facts")
+            provider = str(facts.get("provider") or "").strip().lower()
+            model = str(facts.get("model_id") or "").strip().lower()
+            if provider != "openrouter" or not model:
+                raise ValueError("router_dynamic registry_all requires OpenRouter model identities")
+            derived_models.append(model)
+        if len(set(derived_models)) != len(derived_models):
+            raise ValueError("router_dynamic registry_all contains duplicate model identities")
+        expected_routes = {model: "auto" for model in derived_models}
+    elif isinstance(expected_routes_raw, Mapping):
+        expected_routes = {
+            str(model).strip().lower(): str(provider).strip().lower()
+            for model, provider in expected_routes_raw.items()
+        }
+    else:
+        raise ValueError("router_dynamic exact route contract has no expected routes")
+    if candidate_scope == "registry_all" and any(
+        provider != "auto" for provider in expected_routes.values()
+    ):
+        raise ValueError("router_dynamic registry_all routes must use auto upstream routing")
+    if expected_count_raw is None and candidate_scope == "registry_all":
+        expected_count_raw = len(expected_routes)
     if isinstance(expected_count_raw, bool) or not isinstance(expected_count_raw, int):
         raise ValueError("router_dynamic registry allowlist candidate count is invalid")
-    expected_routes = {
-        str(model).strip().lower(): str(provider).strip().lower()
-        for model, provider in expected_routes_raw.items()
-    }
     if len(expected_routes) != expected_count_raw or expected_count_raw <= 0:
         raise ValueError("router_dynamic registry allowlist candidate count differs")
     actual_hash = hashlib.sha256(
@@ -9446,17 +9511,11 @@ def _apply_router_dynamic_registry_allowlist(
             allow_nan=False,
         ).encode("utf-8")
     ).hexdigest()
+    if not expected_hash and candidate_scope == "registry_all":
+        expected_hash = actual_hash
     if actual_hash != expected_hash:
         raise ValueError("router_dynamic registry allowlist hash differs")
-    actual_source_version = str(snapshot.get("snapshot_version") or "").strip()
-    if actual_source_version != source_version:
-        raise ValueError(
-            "router_dynamic registry snapshot version differs from the formal allowlist contract"
-        )
 
-    rows = snapshot.get("models")
-    if not isinstance(rows, list):
-        raise ValueError("router_dynamic registry snapshot has no model rows")
     expected_identities = {f"openrouter:{model}" for model in expected_routes}
     retained: list[dict[str, Any]] = []
     retained_identities: set[str] = set()
@@ -9491,7 +9550,8 @@ def _apply_router_dynamic_registry_allowlist(
     snapshot["source_snapshot_version"] = actual_source_version
     snapshot["snapshot_version"] = f"{actual_source_version}+{profile_id}+{expected_hash[:12]}"
     return {
-        "policy": "exact_openrouter_routes",
+        "policy": expected_policy,
+        "candidate_scope": candidate_scope,
         "profile_id": profile_id,
         "source_registry_snapshot_version": actual_source_version,
         "filtered_registry_snapshot_version": snapshot["snapshot_version"],

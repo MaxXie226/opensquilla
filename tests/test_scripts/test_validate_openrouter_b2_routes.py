@@ -45,15 +45,23 @@ def test_formal_routes_are_a_valid_subset_of_router_dynamic_registry() -> None:
     assert set(validator.B2_EXPECTED_ROUTES) <= set(validator.FORMAL_EXPECTED_ROUTES)
     experiment = load_draco_experiment_config(validator.DEFAULT_EXPERIMENT_CONFIG_PATH).config
     assert experiment.g1_routing is not None
-    assert validator.FORMAL_EXPECTED_ROUTES == experiment.g1_routing.expected_routes
-    assert validator.canonical_sha256(validator.FORMAL_EXPECTED_ROUTES) == (
-        experiment.g1_routing.expected_routes_sha256
+    _, resolved = validator.resolved_g1_contract(validator.DEFAULT_EXPERIMENT_CONFIG_PATH)
+    assert validator.FORMAL_EXPECTED_ROUTES == resolved["expected_routes"]
+    assert (
+        validator.canonical_sha256(validator.FORMAL_EXPECTED_ROUTES)
+        == (resolved["expected_routes_sha256"])
     )
 
 
 def test_formal_routes_match_runtime_pins_and_capability_contract() -> None:
+    experiment = load_draco_experiment_config(validator.DEFAULT_EXPERIMENT_CONFIG_PATH).config
+    assert experiment.g1_routing is not None
+    candidate_scope = getattr(experiment.g1_routing, "candidate_scope", "exact_routes")
     for model, provider in validator.FORMAL_EXPECTED_ROUTES.items():
-        assert OPENROUTER_DEFAULT_PROVIDER_ROUTING[model] == provider
+        if candidate_scope == "registry_all":
+            assert provider == "auto"
+        else:
+            assert OPENROUTER_DEFAULT_PROVIDER_ROUTING[model] == provider
         required = validator.FORMAL_REQUIRED_PARAMETERS[model]
         assert {"max_tokens", "tools"} <= required
         assert ("reasoning" in required) is (
@@ -62,8 +70,24 @@ def test_formal_routes_match_runtime_pins_and_capability_contract() -> None:
         assert ("temperature" in required) is (
             model not in validator.FORMAL_UNSUPPORTED_TEMPERATURE_MODELS
         )
-    assert validator.FORMAL_EXPECTED_ROUTES["google/gemini-3.5-flash"] == ("google-ai-studio")
-    assert "openai/gpt-5.6-luna" not in validator.FORMAL_EXPECTED_ROUTES
+    if candidate_scope == "registry_all":
+        payload = json.loads(REGISTRY_PATH.read_text(encoding="utf-8"))
+        registry_models = {
+            str(row["registry_facts"]["model_id"])
+            for row in payload["models"]
+            if row["registry_facts"]["provider"] == "openrouter"
+        }
+        assert validator.FORMAL_EXPECTED_ROUTES == dict.fromkeys(registry_models, "auto")
+        assert validator.FORMAL_REASONING_INELIGIBLE_MODELS == {
+            str(row["registry_facts"]["model_id"])
+            for row in payload["models"]
+            if row["registry_facts"]["provider"] == "openrouter"
+            and row["registry_facts"]["supports_reasoning"] is not True
+        }
+        assert len(validator.FORMAL_REASONING_INELIGIBLE_MODELS) == 15
+    else:
+        assert validator.FORMAL_EXPECTED_ROUTES["google/gemini-3.5-flash"] == ("google-ai-studio")
+        assert "openai/gpt-5.6-luna" not in validator.FORMAL_EXPECTED_ROUTES
     assert validator.FORMAL_REQUIRED_PARAMETERS["google/gemini-3.5-flash"] == {
         "max_tokens",
         "reasoning",
@@ -141,3 +165,64 @@ def test_validator_rejects_tampered_precomputed_compatible_count() -> None:
         assert "compatible endpoint count differs" in str(exc)
     else:
         raise AssertionError("tampered compatible count must fail closed")
+
+
+def test_validator_auto_provider_accepts_matching_operational_endpoint() -> None:
+    model = "vendor/model"
+    required = {"max_tokens", "tools"}
+    evidence = {
+        "expected_provider": "auto",
+        "response_model_id": model,
+        "matching_endpoints": [
+            {
+                "tag": "any-upstream",
+                "provider_name": "Any Upstream",
+                "model_id": model,
+                "status": 0,
+                "supported_parameters": sorted(required),
+            }
+        ],
+        "operational_match_count": 1,
+        "compatible_operational_match_count": 1,
+        "required_parameters": sorted(required),
+    }
+
+    assert validator.recompute_model_endpoint_compatibility(
+        model=model,
+        expected_provider="auto",
+        required_parameters=required,
+        evidence=evidence,
+    ) == (1, 1)
+
+
+def test_validator_auto_provider_rejects_wrong_serving_model() -> None:
+    model = "vendor/model"
+    required = {"max_tokens", "tools"}
+    evidence = {
+        "expected_provider": "auto",
+        "response_model_id": model,
+        "matching_endpoints": [
+            {
+                "tag": "any-upstream",
+                "provider_name": "Any Upstream",
+                "model_id": "vendor/other",
+                "status": 0,
+                "supported_parameters": sorted(required),
+            }
+        ],
+        "operational_match_count": 1,
+        "compatible_operational_match_count": 0,
+        "required_parameters": sorted(required),
+    }
+
+    try:
+        validator.recompute_model_endpoint_compatibility(
+            model=model,
+            expected_provider="auto",
+            required_parameters=required,
+            evidence=evidence,
+        )
+    except ValueError as exc:
+        assert "no saved endpoint supports" in str(exc)
+    else:
+        raise AssertionError("auto provider must still bind the serving model")

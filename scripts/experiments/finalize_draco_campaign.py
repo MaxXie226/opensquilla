@@ -72,6 +72,7 @@ FORMAL_G1_RANKING_CONFIG_SCHEMA_VERSION = "step2-ranking-config-v3"
 FORMAL_G1_RANKING_CONFIG_VERSION = "step2-ranking-2026-07-22.1"
 FORMAL_G1_RANKING_CONFIG_SHA256 = "a8addcdefa04349209c20e97ca5851ed0f5ca55646c9d0c5badc5d32dd7ef10c"
 FORMAL_G1_PROPOSER_COUNT_MAX = 5
+FORMAL_G1_REGISTRY_ALL_CANDIDATE_COUNT = 80
 FORMAL_TASK_CONCURRENCY = 5
 FORMAL_JUDGE_CONCURRENCY = 6
 FORMAL_TASK_TIMEOUT_SECONDS = Decimal("10800")
@@ -285,6 +286,38 @@ def canonical_json_bytes(value: Any) -> bytes:
 def canonical_sha256(value: Any, *, prefix: bool = False) -> str:
     digest = hashlib.sha256(canonical_json_bytes(value)).hexdigest()
     return f"sha256:{digest}" if prefix else digest
+
+
+@cache
+def formal_registry_all_routes() -> dict[str, str]:
+    """Return the exact projected packaged OpenRouter pool for ``registry_all``."""
+
+    from opensquilla.provider.ranking_router import (
+        _legacy_registry_snapshot_projection,
+        load_model_registry_snapshot,
+    )
+
+    snapshot = _legacy_registry_snapshot_projection(load_model_registry_snapshot())
+    if canonical_sha256(snapshot) != FORMAL_G1_SOURCE_REGISTRY_SNAPSHOT_SHA256:
+        raise FinalizationError("formal OpenRouter model registry snapshot changed")
+    rows = snapshot.get("models")
+    if not isinstance(rows, list):
+        raise FinalizationError("formal OpenRouter model registry snapshot is malformed")
+    routes: dict[str, str] = {}
+    for row in rows:
+        facts = row.get("registry_facts") if isinstance(row, Mapping) else None
+        if not isinstance(facts, Mapping):
+            raise FinalizationError("formal OpenRouter model registry row is malformed")
+        provider = str(facts.get("provider") or "").strip().casefold()
+        if provider != "openrouter":
+            continue
+        model = str(facts.get("model_id") or "").strip().casefold()
+        if not model or "/" not in model or model in routes:
+            raise FinalizationError("formal OpenRouter model registry identity is malformed")
+        routes[model] = "auto"
+    if len(routes) != FORMAL_G1_REGISTRY_ALL_CANDIDATE_COUNT:
+        raise FinalizationError("formal OpenRouter registry-all candidate count changed")
+    return routes
 
 
 def file_sha256(path: Path) -> str:
@@ -1136,12 +1169,38 @@ def validate_formal_campaign_contracts(
     g1_spec = g1.get("group_spec") if isinstance(g1, Mapping) else None
     registry = g1.get("g1_registry_contract") if isinstance(g1, Mapping) else None
     routes = registry.get("expected_routes") if isinstance(registry, Mapping) else None
+    candidate_scope = (
+        str(registry.get("candidate_scope") or "exact_routes")
+        if isinstance(registry, Mapping)
+        else ""
+    )
+    candidate_policy = (
+        str(registry.get("policy") or "exact_openrouter_routes")
+        if isinstance(registry, Mapping)
+        else ""
+    )
+    expected_candidate_policy = (
+        "all_registry_models" if candidate_scope == "registry_all" else "exact_openrouter_routes"
+    )
+    registry_all_routes_valid = candidate_scope != "registry_all" or (
+        isinstance(routes, Mapping)
+        and dict(routes) == formal_registry_all_routes()
+        and nonnegative_int(registry.get("expected_candidate_count"))
+        == FORMAL_G1_REGISTRY_ALL_CANDIDATE_COUNT
+    )
     if (
         not isinstance(g1_spec, Mapping)
         or g1_spec.get("kind") != "selection_mode"
         or g1_spec.get("selection_mode") != "router_dynamic"
+        or candidate_scope not in {"registry_all", "exact_routes"}
+        or candidate_policy != expected_candidate_policy
         or not isinstance(routes, Mapping)
         or not routes
+        or (
+            candidate_scope == "exact_routes"
+            and any(str(provider).strip().casefold() == "auto" for provider in routes.values())
+        )
+        or not registry_all_routes_valid
         or nonnegative_int(registry.get("expected_candidate_count")) != len(routes)
         or not str(registry.get("profile_id") or "").strip()
         or not str(registry.get("source_registry_snapshot_version") or "").strip()
@@ -1156,7 +1215,9 @@ def validate_formal_campaign_contracts(
         or registry.get("expected_proposer_count_max") != FORMAL_G1_PROPOSER_COUNT_MAX
         or registry.get("user_profile_enabled") is not False
     ):
-        raise FinalizationError("G1 formal contract must use router_dynamic with frozen routes")
+        raise FinalizationError(
+            "G1 formal contract must use router_dynamic with a resolved frozen candidate pool"
+        )
     for group, contract in contracts.items():
         gateway = contract.get("gateway_execution")
         ensemble = gateway.get("llm_ensemble") if isinstance(gateway, Mapping) else None
@@ -1183,13 +1244,21 @@ def validate_formal_campaign_contracts(
             else {*routes, B0_MODEL}
         )
         for model in required_models:
-            expected_pin = (
-                str(routes[model])
-                if group == "G1" and model in routes
-                else FORMAL_UPSTREAM_PINS.get(model)
+            route_pin = (
+                str(routes[model]).strip().casefold() if group == "G1" and model in routes else ""
             )
+            if group == "G1" and route_pin == "auto":
+                # ``registry_all`` deliberately leaves candidate upstream
+                # selection to OpenRouter.  The fixed task analyzer remains
+                # independently pinned below.
+                continue
+            expected_pin = route_pin or FORMAL_UPSTREAM_PINS.get(model)
             if not expected_pin or str(pins.get(model) or "").strip().casefold() != expected_pin:
                 raise FinalizationError(f"{group} upstream provider pin differs for {model}")
+        if group == "G1" and (
+            str(pins.get(B0_MODEL) or "").strip().casefold() != FORMAL_UPSTREAM_PINS[B0_MODEL]
+        ):
+            raise FinalizationError("G1 task analyzer upstream provider pin differs")
 
 
 def usage_generation_contract(value: Any) -> Any:
@@ -1499,11 +1568,32 @@ def selected_usage_models(row: Mapping[str, Any]) -> set[str]:
 def contract_provider_pins(contract: Mapping[str, Any]) -> dict[str, str]:
     runtime = contract.get("resolved_llm_runtime")
     raw = runtime.get("provider_routing") if isinstance(runtime, Mapping) else None
-    return (
-        {str(model): str(provider).strip().casefold() for model, provider in raw.items()}
+    pins = (
+        {
+            str(model).strip().casefold(): str(provider).strip().casefold()
+            for model, provider in raw.items()
+            if str(model).strip() and str(provider).strip()
+        }
         if isinstance(raw, Mapping)
         else {}
     )
+    registry = contract.get("g1_registry_contract")
+    routes = registry.get("expected_routes") if isinstance(registry, Mapping) else None
+    if (
+        isinstance(registry, Mapping)
+        and registry.get("candidate_scope") == "registry_all"
+        and isinstance(routes, Mapping)
+    ):
+        # ``auto`` means the candidate contract does not require an upstream
+        # pin.  It does not cancel a concrete pin already frozen in the
+        # resolved runtime; mirror the runner's audit projection by filling
+        # only candidates that are otherwise unpinned.
+        for model, provider in routes.items():
+            normalized_model = str(model).strip().casefold()
+            normalized_provider = str(provider).strip().casefold()
+            if normalized_model and normalized_provider == "auto":
+                pins.setdefault(normalized_model, "auto")
+    return pins
 
 
 def _is_unknown_task_analyzer_placeholder(unit: Mapping[str, Any]) -> bool:
@@ -1579,8 +1669,7 @@ def _is_unknown_judge_placeholder(unit: Mapping[str, Any]) -> bool:
         and int(unit["physical_request_ordinal"]) >= 1
         and isinstance(provider_usage, Mapping)
         and provider_usage.get("usage_unknown") is True
-        and provider_usage.get("usage_evidence_schema")
-        == "opensquilla.usage-evidence/v1"
+        and provider_usage.get("usage_evidence_schema") == "opensquilla.usage-evidence/v1"
         and provider_usage.get("usage_evidence_id") == evidence_id
         and not response_ids(unit)
         and not _successful_router_bindings(unit)
@@ -1593,6 +1682,7 @@ def usage_route_reasons(
     allowed_models: set[str],
     provider_pins: Mapping[str, str] | None = None,
     role_model_pins: Mapping[str, str] | None = None,
+    role_provider_pins: Mapping[str, str] | None = None,
     allow_unknown_task_analyzer_attempts: bool = False,
     allow_unknown_judge_attempts: bool = False,
 ) -> list[str]:
@@ -1616,12 +1706,27 @@ def usage_route_reasons(
             if role_model_pins is not None and route_role in role_model_pins
             else allowed_models
         )
+
+        def expected_provider_pin(model: str) -> str:
+            role_pin = (
+                str(role_provider_pins.get(route_role) or "").strip().casefold()
+                if role_provider_pins is not None and route_role in role_provider_pins
+                else ""
+            )
+            model_pin = (
+                str(provider_pins.get(model) or "").strip().casefold()
+                if provider_pins is not None
+                else ""
+            )
+            pin = role_pin or model_pin
+            return "" if pin == "auto" else pin
+
         if role in MISSING_USAGE_PLACEHOLDER_ROLES:
             unknown_analyzer_allowed = (
                 allow_unknown_task_analyzer_attempts and _is_unknown_task_analyzer_placeholder(unit)
             )
-            unknown_judge_allowed = (
-                allow_unknown_judge_attempts and _is_unknown_judge_placeholder(unit)
+            unknown_judge_allowed = allow_unknown_judge_attempts and _is_unknown_judge_placeholder(
+                unit
             )
             provider = str(unit.get("provider") or "").strip().casefold()
             requested_provider = str(unit.get("requested_provider") or "").strip().casefold()
@@ -1716,12 +1821,19 @@ def usage_route_reasons(
                     ),
                     "",
                 )
-                expected_pin = str(provider_pins.get(pin_model) or "").strip().casefold()
-                if not expected_pin:
+                expected_pin = expected_provider_pin(pin_model)
+                if (
+                    not expected_pin
+                    and str(provider_pins.get(pin_model) or "").strip().casefold() != "auto"
+                ):
                     reasons.append("missing_formal_upstream_provider_pin")
-                elif successful and any(
-                    upstream_provider != _normalize_openrouter_provider_identity(expected_pin)
-                    for upstream_provider, _ in successful
+                elif (
+                    expected_pin
+                    and successful
+                    and any(
+                        upstream_provider != _normalize_openrouter_provider_identity(expected_pin)
+                        for upstream_provider, _ in successful
+                    )
                 ):
                     reasons.append("router_receipt_provider_not_bound_to_formal_route")
             if unknown_analyzer_allowed:
@@ -1799,12 +1911,23 @@ def usage_route_reasons(
             reasons.append("conflicting_successful_router_receipt")
         if not _formal_openrouter_models_equivalent(router_requested, requested_model):
             reasons.append("router_receipt_request_not_bound_to_formal_route")
-        expected_pin = (
+        expected_pin = expected_provider_pin(requested_model)
+        raw_expected_pin = (
             str(provider_pins.get(requested_model) or "").strip().casefold()
             if provider_pins is not None
             else ""
         )
-        if provider_pins is not None and not expected_pin:
+        role_has_explicit_pin = (
+            role_provider_pins is not None
+            and route_role in role_provider_pins
+            and bool(str(role_provider_pins.get(route_role) or "").strip())
+        )
+        if (
+            provider_pins is not None
+            and not expected_pin
+            and raw_expected_pin != "auto"
+            and not role_has_explicit_pin
+        ):
             reasons.append("missing_formal_upstream_provider_pin")
         elif expected_pin and any(
             upstream_provider != _normalize_openrouter_provider_identity(expected_pin)
@@ -3551,6 +3674,11 @@ def g1_registry_plan_reasons(
     formal_n_max = contract.get("expected_proposer_count_max")
     routes = contract.get("expected_routes")
     expected_count = nonnegative_int(contract.get("expected_candidate_count"))
+    candidate_scope = str(contract.get("candidate_scope") or "exact_routes")
+    candidate_policy = str(contract.get("policy") or "exact_openrouter_routes")
+    expected_candidate_policy = (
+        "all_registry_models" if candidate_scope == "registry_all" else "exact_openrouter_routes"
+    )
     expected_identities = (
         {f"openrouter:{str(model).strip().lower()}" for model in routes}
         if isinstance(routes, Mapping)
@@ -3559,6 +3687,8 @@ def g1_registry_plan_reasons(
     if (
         not profile_id
         or contract.get("selection_mode") != "router_dynamic"
+        or candidate_scope not in {"registry_all", "exact_routes"}
+        or candidate_policy != expected_candidate_policy
         or not source_version
         or not HEX64.fullmatch(routes_hash)
         or canonical_sha256(routes) != routes_hash
@@ -3571,12 +3701,25 @@ def g1_registry_plan_reasons(
         or contract.get("user_profile_enabled") is not False
         or expected_count <= 0
         or len(expected_identities) != expected_count
+        or (
+            candidate_scope == "exact_routes"
+            and isinstance(routes, Mapping)
+            and any(str(provider).strip().casefold() == "auto" for provider in routes.values())
+        )
+        or (
+            candidate_scope == "registry_all"
+            and (
+                not isinstance(routes, Mapping)
+                or dict(routes) != formal_registry_all_routes()
+                or expected_count != FORMAL_G1_REGISTRY_ALL_CANDIDATE_COUNT
+            )
+        )
     ):
         return ["invalid_g1_registry_contract"], (), ""
     filtered_version = f"{source_version}+{profile_id}+{routes_hash[:12]}"
     allowlist = plan.get("candidate_allowlist")
     expected_allowlist = {
-        "policy": "exact_openrouter_routes",
+        "policy": expected_candidate_policy,
         "profile_id": profile_id,
         "source_registry_snapshot_version": source_version,
         "expected_source_registry_snapshot_sha256": (source_registry_snapshot_hash),
@@ -4031,6 +4174,9 @@ def route_reasons(
                     allowed_models=allowed,
                     provider_pins=provider_pins,
                     role_model_pins={"task_analyzer": B0_MODEL},
+                    role_provider_pins={
+                        "task_analyzer": FORMAL_UPSTREAM_PINS[B0_MODEL],
+                    },
                     allow_unknown_task_analyzer_attempts=True,
                 )
             )
@@ -4091,6 +4237,7 @@ def validate_physical_generation_routes(
                 set[str],
                 Mapping[str, str],
                 Mapping[str, str] | None,
+                Mapping[str, str] | None,
             ]
         ],
     ] = defaultdict(list)
@@ -4099,6 +4246,7 @@ def validate_physical_generation_routes(
         contract = contracts.get(group) or {}
         provider_pins: Mapping[str, str] | None = contract_provider_pins(contract)
         role_model_pins: Mapping[str, str] | None = None
+        role_provider_pins: Mapping[str, str] | None = None
         routing = record.row.get("routing_trace")
         routing = routing if isinstance(routing, Mapping) else {}
         if group in {"B0", "B4"}:
@@ -4116,6 +4264,9 @@ def validate_physical_generation_routes(
             if isinstance(routes, Mapping):
                 allowed.update(str(model) for model in routes)
                 role_model_pins = {"task_analyzer": B0_MODEL}
+                role_provider_pins = {
+                    "task_analyzer": FORMAL_UPSTREAM_PINS[B0_MODEL],
+                }
         allowed.discard("")
         execution = record.row.get("execution")
         attempts = (
@@ -4160,6 +4311,7 @@ def validate_physical_generation_routes(
                     allowed,
                     provider_pins,
                     role_model_pins,
+                    role_provider_pins,
                 )
             )
     for attempt_id, versions in attempt_versions.items():
@@ -4168,19 +4320,25 @@ def validate_physical_generation_routes(
             label=f"generation attempt {attempt_id}",
             identity_seed=f"generation-attempt:{attempt_id}",
         )
-        selected_versions = [
-            version for version in versions if version[0] is record
-        ]
+        selected_versions = [version for version in versions if version[0] is record]
         if not selected_versions:
             raise FinalizationError(
                 f"generation attempt {attempt_id} selected an unknown route version"
             )
-        _, _, allowed, provider_pins, role_model_pins = selected_versions[-1]
+        (
+            _,
+            _,
+            allowed,
+            provider_pins,
+            role_model_pins,
+            role_provider_pins,
+        ) = selected_versions[-1]
         reasons = usage_route_reasons(
             run.get("usage"),
             allowed_models=allowed,
             provider_pins=provider_pins,
             role_model_pins=role_model_pins,
+            role_provider_pins=role_provider_pins,
             allow_unknown_task_analyzer_attempts=record.key[0] == "G1",
         )
         roles = {
@@ -4370,11 +4528,7 @@ def judge_reasons(
                 run,
                 attempt_id=attempt_id,
             )
-            reasons.extend(
-                "wrong_judge_model_route"
-                for reason in route_failures
-                if reason
-            )
+            reasons.extend("wrong_judge_model_route" for reason in route_failures if reason)
         final_attempt = attempts[-1] if attempts and isinstance(attempts[-1], Mapping) else {}
         final_run = final_attempt.get("run")
         expected_verdict = (
@@ -5012,8 +5166,7 @@ def proof_only_usage_evidence_reasons(row: Mapping[str, Any]) -> list[str]:
     execution = row.get("execution")
     generation_attempts = (
         execution.get("generation_attempts")
-        if isinstance(execution, Mapping)
-        and isinstance(execution.get("generation_attempts"), list)
+        if isinstance(execution, Mapping) and isinstance(execution.get("generation_attempts"), list)
         else []
     )
     for index, attempt in enumerate(generation_attempts):
@@ -5046,8 +5199,7 @@ def proof_only_usage_evidence_reasons(row: Mapping[str, Any]) -> list[str]:
             reasons.append("candidate_judges/not_list")
         else:
             judge_scopes.extend(
-                (f"candidate_judge/{index}", judge)
-                for index, judge in enumerate(candidate_judges)
+                (f"candidate_judge/{index}", judge) for index, judge in enumerate(candidate_judges)
             )
     for scope, judge in judge_scopes:
         if judge is None:
@@ -5233,9 +5385,7 @@ def build_actual_spend_ledger(
             label=f"generation attempt {attempt_id}",
             identity_seed=f"generation-attempt:{attempt_id}",
         )
-        matching_versions = [
-            version for version in versions if version[0] is record
-        ]
+        matching_versions = [version for version in versions if version[0] is record]
         if not matching_versions:
             raise FinalizationError(
                 f"generation attempt {attempt_id} selected an unknown receipt version"
@@ -5290,9 +5440,7 @@ def build_actual_spend_ledger(
             requested_model=JUDGE_MODEL,
             role="unknown_request",
         )
-        matching_versions = [
-            version for version in versions if version[0] is record
-        ]
+        matching_versions = [version for version in versions if version[0] is record]
         if not matching_versions:
             raise FinalizationError(f"{identity} selected an unknown receipt version")
         _, judge_scope, _, path = matching_versions[-1]

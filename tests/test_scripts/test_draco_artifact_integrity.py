@@ -238,10 +238,12 @@ def _v2_route_preflight(
     config: dict[str, object],
     config_sha256: str,
 ) -> dict[str, object]:
-    g1 = config["g1_routing"]
-    assert isinstance(g1, dict)
-    routes = g1["expected_routes"]
-    assert isinstance(routes, dict)
+    raw_g1 = config["g1_routing"]
+    assert isinstance(raw_g1, dict)
+    resolved, resolved_contract = module._resolved_g1_contract(config_path)
+    routes = dict(resolved_contract["expected_routes"])
+    candidate_scope = str(resolved_contract["candidate_scope"])
+    candidate_policy = str(resolved_contract["policy"])
     required_parameters = module._formal_required_parameters(routes)
     return {
         "schema": module.ROUTE_PREFLIGHT_V2_SCHEMA,
@@ -249,13 +251,15 @@ def _v2_route_preflight(
         "scope": "formal",
         "trust_env": False,
         "providers_response_sha256": "1" * 64,
+        "candidate_scope": candidate_scope,
+        "candidate_policy": candidate_policy,
         "expected_routes": routes,
         "expected_routes_sha256": module.canonical_sha256(routes),
         "experiment_config": {
             "path": str(config_path.resolve()),
             "sha256": config_sha256,
-            "g1_routing_profile_id": g1["profile_id"],
-            "source_registry_snapshot_version": g1["source_registry_snapshot_version"],
+            "g1_routing_profile_id": resolved.profile_id,
+            "source_registry_snapshot_version": resolved.source_registry_snapshot_version,
         },
         "required_parameters_sha256": module.canonical_sha256(required_parameters),
         "models": {
@@ -265,8 +269,12 @@ def _v2_route_preflight(
                 "response_sha256": "2" * 64,
                 "matching_endpoints": [
                     {
-                        "tag": provider,
-                        "provider_name": module.EXPECTED_PROVIDER_NAMES[provider],
+                        "tag": "any-upstream" if provider == "auto" else provider,
+                        "provider_name": (
+                            "Any Upstream"
+                            if provider == "auto"
+                            else module.EXPECTED_PROVIDER_NAMES[provider]
+                        ),
                         "model_id": model,
                         "status": 0,
                         "supported_parameters": list(required_parameters[model]),
@@ -364,8 +372,11 @@ def test_formal_success_accepts_recomputed_v2_route_preflight(
     assert isinstance(evidence, list)
     assert {row["route_preflight_schema"] for row in evidence} == {payload["schema"]}
     contract = evidence[0]["formal_g1_contract"]
-    assert contract["expected_candidate_count"] == 20
-    assert contract["expected_routes_sha256"] == config["g1_routing"]["expected_routes_sha256"]
+    _, resolved_contract = module._resolved_g1_contract(config_path)
+    assert contract["candidate_scope"] == resolved_contract["candidate_scope"]
+    assert contract["candidate_policy"] == resolved_contract["policy"]
+    assert contract["expected_candidate_count"] == resolved_contract["expected_candidate_count"]
+    assert contract["expected_routes_sha256"] == resolved_contract["expected_routes_sha256"]
 
 
 def test_formal_success_rejects_v1_without_endpoint_details(tmp_path: Path) -> None:
@@ -377,6 +388,57 @@ def test_formal_success_rejects_v1_without_endpoint_details(tmp_path: Path) -> N
             experiment_config_sha256="a" * 64,
             label="legacy evidence",
         )
+
+
+def test_route_preflight_auto_provider_still_binds_model_and_parameters() -> None:
+    module = _load(SEAL_ARTIFACTS, "seal_draco_artifacts_auto_provider_test")
+    parameters = ["max_tokens", "tools"]
+    endpoints = [
+        {
+            "tag": "unfrozen-upstream",
+            "provider_name": "Unfrozen Upstream",
+            "model_id": "vendor/model",
+            "status": 0,
+            "supported_parameters": parameters,
+        }
+    ]
+
+    assert module._recompute_endpoint_counts(
+        model="vendor/model",
+        expected_provider="auto",
+        required_parameters=parameters,
+        endpoints=endpoints,
+        label="test",
+    ) == (1, 1)
+
+    endpoints[0]["model_id"] = "vendor/other"
+    with pytest.raises(ValueError, match="no compatible route"):
+        module._recompute_endpoint_counts(
+            model="vendor/model",
+            expected_provider="auto",
+            required_parameters=parameters,
+            endpoints=endpoints,
+            label="test",
+        )
+
+
+def test_route_preflight_reasoning_requirements_follow_frozen_registry(
+    tmp_path: Path,
+) -> None:
+    module = _load(SEAL_ARTIFACTS, "seal_draco_artifacts_reasoning_registry_test")
+    config_path, _, _ = _formal_g1_config(module, tmp_path)
+    _, resolved_contract = module._resolved_g1_contract(config_path)
+    ineligible = set(resolved_contract["reasoning_ineligible_models"])
+    routes = dict(resolved_contract["expected_routes"])
+    required = module._formal_required_parameters(
+        routes,
+        reasoning_ineligible_models=ineligible,
+    )
+
+    assert len(ineligible) == 15
+    assert "qwen/qwen3-coder-next" in ineligible
+    assert "reasoning" not in required["qwen/qwen3-coder-next"]
+    assert "reasoning" in required["deepseek/deepseek-v4-pro"]
 
 
 @pytest.mark.parametrize(
@@ -501,6 +563,19 @@ def test_v2_route_preflight_recomputes_saved_endpoint_compatibility(
                 for route_model in payload["expected_routes"]
             }
         )
+
+    if model_row["expected_provider"] == "auto" and mutation in {
+        "wrong_provider_name",
+        "wrong_tag",
+    }:
+        # ``auto`` authenticates an operational, model-matching, compatible
+        # endpoint without freezing its upstream provider identity.
+        module.validate_route_preflight_payload(
+            payload,
+            experiment_config_sha256=config_sha256,
+            label="unfrozen provider evidence",
+        )
+        return
 
     with pytest.raises(ValueError, match=error_match):
         module.validate_route_preflight_payload(

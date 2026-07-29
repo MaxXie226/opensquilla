@@ -32,9 +32,10 @@ def test_default_b2_config_is_g12_derived_quality_first_profile() -> None:
     assert config.routing.selection_mode == "static_openrouter_b5"
     assert config.routing.skip_single_model_router is True
     assert config.g1_routing is not None
-    assert config.g1_routing.profile_id == "draco_g1_formal_openrouter_20_20260725"
+    assert config.g1_routing.profile_id == "draco_g1_formal_registry_all_20260729"
     assert config.g1_routing.selection_mode == "router_dynamic"
     assert config.g1_routing.user_profile_enabled is False
+    assert config.g1_routing.candidate_scope == "registry_all"
     assert config.g1_routing.expected_source_registry_snapshot_sha256 == (
         "a7cad0eb0b68c97ab82bf21c336107041bc77a14b3e8931b0e672a345610fe9b"
     )
@@ -44,13 +45,9 @@ def test_default_b2_config_is_g12_derived_quality_first_profile() -> None:
         "a8addcdefa04349209c20e97ca5851ed0f5ca55646c9d0c5badc5d32dd7ef10c"
     )
     assert config.g1_routing.expected_proposer_count_max == 5
-    assert config.g1_routing.expected_candidate_count == 20
-    assert len(config.g1_routing.expected_routes) == 20
-    assert config.g1_routing.expected_routes_sha256 == (
-        "48df6de139b2df034fd0d94f26eae3df3023dc3b650f6ad06e54ad7410c40335"
-    )
-    assert config.g1_routing.expected_routes["google/gemini-3.5-flash"] == ("google-ai-studio")
-    assert "openai/gpt-5.6-luna" not in config.g1_routing.expected_routes
+    assert config.g1_routing.expected_candidate_count is None
+    assert config.g1_routing.expected_routes is None
+    assert config.g1_routing.expected_routes_sha256 is None
     assert [member.model for member in config.ensemble.proposers] == [
         "deepseek/deepseek-v4-pro",
         "z-ai/glm-5.2",
@@ -219,27 +216,73 @@ def test_formal_g1_thinking_map_uses_each_registry_models_highest_level() -> Non
         for row in registry["models"]
     }
 
+    configured_registry_models = set(config.generation.model_thinking_levels) & set(
+        highest_by_model
+    )
     assert {
         model: config.generation.model_thinking_levels[model]
-        for model in config.g1_routing.expected_routes
-    } == {model: highest_by_model[model] for model in config.g1_routing.expected_routes}
+        for model in configured_registry_models
+    } == {model: highest_by_model[model] for model in configured_registry_models}
 
 
-def test_g1_expected_routes_hash_and_count_are_fail_closed() -> None:
+def test_g1_registry_all_requires_no_explicit_route_fields(tmp_path: Path) -> None:
+    config = load_draco_experiment_config(DEFAULT_CONFIG).config
+    assert config.g1_routing is not None
+    assert config.g1_routing.candidate_scope == "registry_all"
+
+    for index, partial_contract in enumerate(
+        (
+            {"expected_candidate_count": 20},
+            {"expected_routes": {"deepseek/deepseek-v4-pro": "deepseek"}},
+            {"expected_routes_sha256": "0" * 64},
+        )
+    ):
+        payload = json.loads(DEFAULT_CONFIG.read_text(encoding="utf-8"))
+        payload["g1_routing"].update(partial_contract)
+        partial_config = tmp_path / f"partial-{index}.json"
+        partial_config.write_text(json.dumps(payload), encoding="utf-8")
+        with pytest.raises(ValidationError, match="must be specified together"):
+            load_draco_experiment_config(partial_config)
+
+
+def test_g1_explicit_routes_remain_hash_and_count_fail_closed(tmp_path: Path) -> None:
+    payload = json.loads(DEFAULT_CONFIG.read_text(encoding="utf-8"))
+    routes = {
+        "deepseek/deepseek-v4-pro": "deepseek",
+        "z-ai/glm-5.2": "z-ai",
+    }
+    routes_hash = hashlib.sha256(
+        json.dumps(
+            routes,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    payload["g1_routing"].update(
+        {
+            "expected_proposer_count_max": len(routes),
+            "expected_candidate_count": len(routes),
+            "expected_routes": routes,
+            "expected_routes_sha256": routes_hash,
+        }
+    )
+    explicit_config = tmp_path / "explicit.json"
+    explicit_config.write_text(json.dumps(payload), encoding="utf-8")
+
+    config = load_draco_experiment_config(explicit_config).config
+    assert config.g1_routing is not None
+    assert config.g1_routing.candidate_scope == "exact_routes"
+
     with pytest.raises(ValidationError, match="expected_routes_sha256"):
         load_draco_experiment_config(
-            DEFAULT_CONFIG,
+            explicit_config,
             inline_sets=[f"g1_routing.expected_routes_sha256={'0' * 64}"],
         )
     with pytest.raises(ValidationError, match="expected_candidate_count"):
         load_draco_experiment_config(
-            DEFAULT_CONFIG,
-            inline_sets=["g1_routing.expected_candidate_count=19"],
-        )
-    with pytest.raises(ValidationError, match="expected_proposer_count_max"):
-        load_draco_experiment_config(
-            DEFAULT_CONFIG,
-            inline_sets=["g1_routing.expected_proposer_count_max=21"],
+            explicit_config,
+            inline_sets=["g1_routing.expected_candidate_count=3"],
         )
 
 

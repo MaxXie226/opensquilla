@@ -377,37 +377,62 @@ def validate_g1_registry_contract(
     for row in rows:
         facts = row.get("registry_facts") if isinstance(row, Mapping) else None
         if not isinstance(facts, Mapping):
-            continue
+            raise ValueError("G1 registry snapshot contains a malformed model row")
         if str(facts.get("provider") or "").strip().lower() != "openrouter":
-            continue
+            raise ValueError("G1 formal registry contains a non-OpenRouter model")
         model = str(facts.get("model_id") or "").strip().lower()
-        if model:
-            available.add(model)
-    missing_models = sorted(set(contract.expected_routes) - available)
-    if missing_models:
-        raise ValueError(
-            "G1 expected route model(s) missing from registry: " + ", ".join(missing_models)
-        )
-
-    runtime = resolve_llm_runtime_config(config)
-    pin_mismatches = {
-        model: {
-            "expected": expected_provider,
-            "actual": runtime.provider_routing.get(model),
+        if not model or model in available:
+            raise ValueError("G1 registry snapshot contains a missing or duplicate model id")
+        available.add(model)
+    if contract.candidate_scope == "exact_routes":
+        assert contract.expected_routes is not None
+        assert contract.expected_candidate_count is not None
+        assert contract.expected_routes_sha256 is not None
+        expected_routes = dict(contract.expected_routes)
+        expected_count = contract.expected_candidate_count
+        expected_hash = contract.expected_routes_sha256
+        missing_models = sorted(set(expected_routes) - available)
+        if missing_models:
+            raise ValueError(
+                "G1 expected route model(s) missing from registry: " + ", ".join(missing_models)
+            )
+        runtime = resolve_llm_runtime_config(config)
+        pin_mismatches = {
+            model: {
+                "expected": expected_provider,
+                "actual": runtime.provider_routing.get(model),
+            }
+            for model, expected_provider in expected_routes.items()
+            if runtime.provider_routing.get(model) != expected_provider
         }
-        for model, expected_provider in contract.expected_routes.items()
-        if runtime.provider_routing.get(model) != expected_provider
-    }
-    if pin_mismatches:
-        raise ValueError(
-            "G1 expected route provider pin(s) differ: " + ", ".join(sorted(pin_mismatches))
-        )
+        if pin_mismatches:
+            raise ValueError(
+                "G1 expected route provider pin(s) differ: " + ", ".join(sorted(pin_mismatches))
+            )
+        policy = "exact_openrouter_routes"
+        runtime_pin_policy = "required_exact"
+        runtime_pins_match: bool | None = True
+    else:
+        expected_routes = {model: "auto" for model in sorted(available)}
+        expected_count = len(expected_routes)
+        expected_hash = canonical_json_sha256(expected_routes).removeprefix("sha256:")
+        policy = "all_registry_models"
+        runtime_pin_policy = "optional_auto"
+        runtime_pins_match = None
+    if expected_count < contract.expected_proposer_count_max:
+        raise ValueError("G1 registry has fewer candidates than the proposer maximum")
     return {
-        **contract.model_dump(mode="json"),
-        "policy": "exact_openrouter_routes",
+        **contract.model_dump(mode="json", exclude_none=True),
+        "candidate_scope": contract.candidate_scope,
+        "policy": policy,
+        "expected_candidate_count": expected_count,
+        "expected_routes": expected_routes,
+        "expected_routes_sha256": expected_hash,
+        "expected_identities": sorted(f"openrouter:{model}" for model in expected_routes),
         "validated": True,
         "available_registry_candidate_count": len(available),
-        "runtime_pins_match": True,
+        "runtime_pin_policy": runtime_pin_policy,
+        "runtime_pins_match": runtime_pins_match,
     }
 
 
@@ -2459,6 +2484,7 @@ def validate_strict_openrouter_ensemble_members(
     policy: dict[str, Any],
     *,
     fallback_config: ProviderConfig | None = None,
+    allow_unpinned_openrouter: bool = False,
 ) -> None:
     """Fail before billing when a realized member cannot honor the frozen request."""
 
@@ -2511,7 +2537,11 @@ def validate_strict_openrouter_ensemble_members(
                     f"OpenRouter model {model!r} cannot prove support for "
                     f"frozen thinking={thinking!r}"
                 )
-        if strict_routing_enabled and model not in cfg.provider_routing:
+        if (
+            strict_routing_enabled
+            and not allow_unpinned_openrouter
+            and model not in cfg.provider_routing
+        ):
             raise ValueError(f"OpenRouter model {model!r} has no strict upstream provider pin")
         if strict_routing_enabled and not require_parameters_enabled:
             raise ValueError(
@@ -2998,6 +3028,7 @@ async def build_experiment_provider(
     ensemble_proposer_timeout: float | None,
     ensemble_aggregator_timeout: float | None,
     experiment_config: DracoExperimentConfig | None = None,
+    g1_registry_contract: Mapping[str, Any] | None = None,
     generation_policy: dict[str, Any] | None = None,
 ) -> ProviderBuildResult:
     """Build one DRACO provider through the same routing primitives as runtime.py."""
@@ -3011,6 +3042,13 @@ async def build_experiment_provider(
     )
     if group == "G1" and g1_routing is None:
         raise ValueError("G1 requires a versioned g1_routing experiment contract")
+    resolved_g1_registry_contract = (
+        dict(g1_registry_contract)
+        if isinstance(g1_registry_contract, Mapping)
+        else g1_routing.model_dump(mode="json", exclude_none=True)
+        if g1_routing is not None
+        else None
+    )
     recovery_policy = (
         aggregator_recovery_policy(experiment_config)
         if experiment_config is not None
@@ -3183,7 +3221,7 @@ async def build_experiment_provider(
                     "request_context": request_context,
                     "ranking_config": ranking_config,
                     "generation_policy": dict(generation_policy or {}),
-                    "registry_allowlist": g1_routing.model_dump(mode="json"),
+                    "registry_allowlist": resolved_g1_registry_contract,
                 },
             )
             plan = copy.deepcopy(dry_dynamic_provider.selection_plan)
@@ -3446,7 +3484,7 @@ async def build_experiment_provider(
             "request_context": request_context,
             "ranking_config": ranking_config,
             "generation_policy": dict(generation_policy or {}),
-            "registry_allowlist": g1_routing.model_dump(mode="json"),
+            "registry_allowlist": resolved_g1_registry_contract,
         }
         turn.metadata["router_dynamic_task_profile"] = task_analysis.profile
         turn.metadata["router_dynamic_task_analyzer"] = task_analysis.trace(ranking_config)
@@ -3494,6 +3532,10 @@ async def build_experiment_provider(
                 provider,
                 generation_policy,
                 fallback_config=routed_config,
+                allow_unpinned_openrouter=bool(
+                    isinstance(resolved_g1_registry_contract, Mapping)
+                    and resolved_g1_registry_contract.get("candidate_scope") == "registry_all"
+                ),
             )
         routing_trace.update(
             {
@@ -4975,15 +5017,18 @@ def done_payload(done: DoneEvent | None) -> dict[str, Any]:
         "provider_usage": payload["provider_usage"],
         "usage_missing_count": payload["usage_missing_count"],
     }
-    identity_seed = "done:" + hashlib.sha256(
-        json.dumps(
-            identity_material,
-            ensure_ascii=False,
-            sort_keys=True,
-            default=str,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    ).hexdigest()
+    identity_seed = (
+        "done:"
+        + hashlib.sha256(
+            json.dumps(
+                identity_material,
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+    )
     payload = canonicalize_run_usage(
         evidence_run,
         identity_seed=identity_seed,
@@ -5668,9 +5713,7 @@ def run_result_summary(result: RunResult) -> dict[str, Any]:
     if result.done is not None:
         done_usage = done_payload(result.done)
         trace = (
-            result.done.ensemble_trace
-            if isinstance(result.done.ensemble_trace, Mapping)
-            else {}
+            result.done.ensemble_trace if isinstance(result.done.ensemble_trace, Mapping) else {}
         )
         done_evidence: dict[str, Any] = {
             "usage": done_usage,
@@ -5705,19 +5748,22 @@ def run_result_summary(result: RunResult) -> dict[str, Any]:
             {"model_usage_breakdown": result.setup_usage}
         )
     if llm_request_count:
-        identity_seed = "run-result:" + hashlib.sha256(
-            json.dumps(
-                {
-                    "trace_events": result.trace_events,
-                    "latency_ms": result.latency_ms,
-                    "final_text_sha256": text_sha256(result.final_text),
-                },
-                ensure_ascii=False,
-                sort_keys=True,
-                default=str,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        ).hexdigest()
+        identity_seed = (
+            "run-result:"
+            + hashlib.sha256(
+                json.dumps(
+                    {
+                        "trace_events": result.trace_events,
+                        "latency_ms": result.latency_ms,
+                        "final_text_sha256": text_sha256(result.final_text),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+        )
         usage = canonicalize_run_usage(
             {
                 "usage": usage,
@@ -5849,6 +5895,13 @@ def g1_registry_contract_reasons(
     reasons: list[str] = []
     profile_id = str(contract.get("profile_id") or "").strip()
     selection_mode = str(contract.get("selection_mode") or "").strip()
+    candidate_scope = str(contract.get("candidate_scope") or "").strip()
+    if not candidate_scope:
+        candidate_scope = "exact_routes"
+    expected_policy = (
+        "all_registry_models" if candidate_scope == "registry_all" else "exact_openrouter_routes"
+    )
+    declared_policy = str(contract.get("policy") or "").strip()
     source_version = str(contract.get("source_registry_snapshot_version") or "").strip()
     expected_hash = str(contract.get("expected_routes_sha256") or "").strip()
     expected_source_registry_hash = str(
@@ -5865,6 +5918,12 @@ def g1_registry_contract_reasons(
     if (
         not profile_id
         or selection_mode != "router_dynamic"
+        or candidate_scope not in {"registry_all", "exact_routes"}
+        or (
+            declared_policy != expected_policy
+            if "candidate_scope" in contract
+            else declared_policy not in {"", expected_policy}
+        )
         or contract.get("user_profile_enabled") is not False
         or not source_version
         or len(expected_hash) != 64
@@ -5913,7 +5972,7 @@ def g1_registry_contract_reasons(
         reasons.append("missing_g1_candidate_allowlist")
     else:
         expected_fields = {
-            "policy": "exact_openrouter_routes",
+            "policy": expected_policy,
             "profile_id": profile_id,
             "source_registry_snapshot_version": source_version,
             "filtered_registry_snapshot_version": expected_filtered_version,
@@ -5922,6 +5981,8 @@ def g1_registry_contract_reasons(
             "expected_candidate_count": expected_count,
             "candidate_count": expected_count,
         }
+        if "candidate_scope" in contract:
+            expected_fields["candidate_scope"] = candidate_scope
         for field, expected_value in expected_fields.items():
             if allowlist.get(field) != expected_value:
                 reasons.append(f"wrong_g1_candidate_allowlist_{field}")
@@ -7776,6 +7837,10 @@ async def run_one(
     require_openrouter_non_byok: bool = False,
 ) -> dict[str, Any]:
     spec = GROUP_SPECS[group]
+    audit_provider_routing = _openrouter_audit_provider_routing(
+        inherited.provider_routing,
+        g1_registry_contract if group == "G1" else None,
+    )
     started = time.time()
     if (
         not isinstance(generation_attempt_offset, int)
@@ -7822,6 +7887,7 @@ async def run_one(
             ensemble_proposer_timeout=ensemble_proposer_timeout,
             ensemble_aggregator_timeout=ensemble_aggregator_timeout,
             experiment_config=experiment_config,
+            g1_registry_contract=g1_registry_contract,
             generation_policy=generation_policy,
         )
         effective_prompt = build.prompt
@@ -7968,7 +8034,7 @@ async def run_one(
                 "candidate_judges": [],
                 "tool_policy": tool_policy,
             },
-            provider_routing=inherited.provider_routing,
+            provider_routing=audit_provider_routing,
         )
         if not generation_non_byok_audit["pass"]:
             generation_non_byok_policy_violation = not bool(
@@ -8302,7 +8368,7 @@ async def run_one(
     if require_openrouter_non_byok:
         final_non_byok_audit = openrouter_non_byok_audit(
             row,
-            provider_routing=inherited.provider_routing,
+            provider_routing=audit_provider_routing,
         )
         row["openrouter_non_byok_audit"] = final_non_byok_audit
     judge_reasons = judge_completion_reasons(
@@ -8579,8 +8645,9 @@ def _formal_openrouter_model_aliases() -> dict[str, frozenset[str]]:
             continue
         model = str(facts.get("model_id") or "").strip().casefold()
         version = str(facts.get("version") or "").strip().casefold()
-        if model not in aliases:
+        if not model:
             continue
+        aliases.setdefault(model, {model})
         if version:
             aliases[model].add(version)
     return {model: frozenset(values) for model, values in aliases.items()}
@@ -8637,16 +8704,19 @@ def _openrouter_router_provider_metadata_pin_state(
     }
     if request_identities and request_identities != {router_requested}:
         return "conflict"
-    expected_provider = _normalize_openrouter_provider_identity(routes[router_requested])
+    configured_provider = routes[router_requested].strip().casefold()
+    auto_route = configured_provider == "auto"
+    expected_provider = _normalize_openrouter_provider_identity(configured_provider)
     allowed_models = _formal_openrouter_model_aliases().get(
         router_requested,
         frozenset({router_requested}),
     )
 
     def endpoint_matches(endpoint: Mapping[str, Any]) -> bool:
-        return (
-            _normalize_openrouter_provider_identity(endpoint.get("provider")) == expected_provider
-            and str(endpoint.get("model") or "").strip().casefold() in allowed_models
+        model_matches = str(endpoint.get("model") or "").strip().casefold() in allowed_models
+        provider_identity = _normalize_openrouter_provider_identity(endpoint.get("provider"))
+        return model_matches and (
+            bool(provider_identity) if auto_route else provider_identity == expected_provider
         )
 
     successful_attempts = [
@@ -8677,6 +8747,30 @@ def _openrouter_router_provider_metadata_pin_state(
     if not successful_attempts and not selected:
         return "missing"
     return "exact"
+
+
+def _openrouter_audit_provider_routing(
+    provider_routing: Mapping[str, str],
+    g1_registry_contract: Mapping[str, Any] | None,
+) -> dict[str, str]:
+    """Add auditable auto-route sentinels for unpinned registry-all candidates."""
+
+    routes = {
+        str(model).strip().casefold(): str(provider).strip()
+        for model, provider in provider_routing.items()
+        if str(model).strip() and str(provider).strip()
+    }
+    if (
+        isinstance(g1_registry_contract, Mapping)
+        and g1_registry_contract.get("candidate_scope") == "registry_all"
+    ):
+        expected_routes = g1_registry_contract.get("expected_routes")
+        if isinstance(expected_routes, Mapping):
+            for model, provider in expected_routes.items():
+                normalized_model = str(model).strip().casefold()
+                if normalized_model and str(provider).strip().casefold() == "auto":
+                    routes.setdefault(normalized_model, "auto")
+    return routes
 
 
 def _openrouter_provider_billed_cost_is_exact(unit: Mapping[str, Any]) -> bool:
@@ -9782,8 +9876,7 @@ def row_llm_request_count(row: dict[str, Any]) -> int:
     provider_spec = row.get("provider_spec") or {}
     execution = row.get("execution") or {}
     default_request_count = int(
-        provider_spec.get("kind") == "single"
-        and not execution.get("provider_error")
+        provider_spec.get("kind") == "single" and not execution.get("provider_error")
     )
     usage = row.get("usage")
     if isinstance(usage, Mapping) and isinstance(
@@ -9806,9 +9899,7 @@ def row_llm_request_count(row: dict[str, Any]) -> int:
         default_request_count=default_request_count,
     )
     declared_count = (
-        row_metric_int(row, "llm_request_count")
-        if row.get("llm_request_count") is not None
-        else 0
+        row_metric_int(row, "llm_request_count") if row.get("llm_request_count") is not None else 0
     )
     return max(evidence_count, declared_count)
 
@@ -14017,7 +14108,14 @@ async def amain(args: argparse.Namespace) -> int:
                 preexisting_non_byok_ready = (
                     openrouter_non_byok_audit(
                         row,
-                        provider_routing=inherited.provider_routing,
+                        provider_routing=_openrouter_audit_provider_routing(
+                            inherited.provider_routing,
+                            (
+                                getattr(args, "_g1_registry_contract", None)
+                                if row.get("group") == "G1"
+                                else None
+                            ),
+                        ),
                     ).get("policy_safe_to_continue")
                     is True
                 )
@@ -14080,7 +14178,14 @@ async def amain(args: argparse.Namespace) -> int:
                 prior_audit = row.get("openrouter_non_byok_audit")
                 non_byok_audit = openrouter_non_byok_audit(
                     row,
-                    provider_routing=inherited.provider_routing,
+                    provider_routing=_openrouter_audit_provider_routing(
+                        inherited.provider_routing,
+                        (
+                            getattr(args, "_g1_registry_contract", None)
+                            if row.get("group") == "G1"
+                            else None
+                        ),
+                    ),
                 )
                 row["openrouter_non_byok_audit"] = non_byok_audit
                 metadata_repaired |= prior_audit != non_byok_audit
@@ -14286,7 +14391,14 @@ async def amain(args: argparse.Namespace) -> int:
             ) and not getattr(args, "dry_run", False):
                 audit = openrouter_non_byok_audit(
                     row,
-                    provider_routing=inherited.provider_routing,
+                    provider_routing=_openrouter_audit_provider_routing(
+                        inherited.provider_routing,
+                        (
+                            getattr(args, "_g1_registry_contract", None)
+                            if row.get("group") == "G1"
+                            else None
+                        ),
+                    ),
                 )
                 row["openrouter_non_byok_audit"] = audit
                 if not audit["pass"]:

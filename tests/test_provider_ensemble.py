@@ -3133,7 +3133,7 @@ def test_router_dynamic_rejects_unbounded_candidate_text() -> None:
         )
 
 
-def test_router_dynamic_strict_highest_thinking_filters_unsupported_models(
+def test_router_dynamic_strict_highest_thinking_uses_registry_defaults(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("OPENSQUILLA_PROVIDER_ROUTING_STRICT", "1")
@@ -3174,7 +3174,10 @@ def test_router_dynamic_strict_highest_thinking_filters_unsupported_models(
     expected_excluded_models = {
         row["registry_facts"]["model_id"]
         for row in snapshot["models"]
-        if not row["registry_facts"]["supports_reasoning"]
+        if (
+            row["registry_facts"]["supported_thinking_levels"][0] != "off"
+            and not row["registry_facts"]["supports_reasoning"]
+        )
     }
 
     assert excluded_models == expected_excluded_models
@@ -3190,6 +3193,51 @@ def test_router_dynamic_strict_highest_thinking_filters_unsupported_models(
     by_model = {row["model"]: row for row in plan["hard_filter"]["proposer_results"]}
     for model in excluded_models:
         assert "generation_policy_reasoning_unsupported" in by_model[model]["reasons"]
+
+
+def test_router_dynamic_explicit_reasoning_for_unsupported_model_is_filtered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_PROVIDER_ROUTING_STRICT", "1")
+    snapshot = load_model_registry_snapshot()
+    unsupported_model = next(
+        row["registry_facts"]["model_id"]
+        for row in snapshot["models"]
+        if not row["registry_facts"]["supports_reasoning"]
+    )
+    config = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "deepseek/deepseek-v4-pro",
+            "api_key": "fake",
+        },
+        llm_ensemble={"enabled": True, "selection_mode": "router_dynamic"},
+    )
+
+    provider = build_ensemble_provider_from_config(
+        config=config,
+        inherited_provider_config=ProviderConfig(
+            provider="openrouter",
+            model="deepseek/deepseek-v4-pro",
+            api_key="fake",
+        ),
+        fallback_provider=None,
+        turn_metadata={"routed_tier": "c2"},
+        ranking_inputs={
+            "generation_policy": {
+                "thinking_enabled": True,
+                "default_thinking_level": "xhigh",
+                "model_thinking_levels": {unsupported_model: "xhigh"},
+                "require_highest_thinking": True,
+            }
+        },
+    )
+
+    excluded_models = {
+        row["model"]
+        for row in provider.selection_plan["generation_policy_filter"]["excluded_models"]
+    }
+    assert unsupported_model in excluded_models
 
 
 @pytest.mark.parametrize(

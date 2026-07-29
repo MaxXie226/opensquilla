@@ -463,6 +463,38 @@ def _experiment_config():
     return runner.load_draco_experiment_config(runner.DEFAULT_B2_EXPERIMENT_CONFIG_PATH).config
 
 
+def _resolved_g1_registry_contract(module, experiment, config: GatewayConfig) -> dict[str, object]:
+    contract = module.validate_g1_registry_contract(experiment, config)
+    assert contract["candidate_scope"] == "registry_all"
+    assert contract["policy"] == "all_registry_models"
+    return contract
+
+
+def _experiment_with_exact_g1_routes(module):
+    experiment = module.load_draco_experiment_config(
+        module.DEFAULT_B2_EXPERIMENT_CONFIG_PATH
+    ).config
+    assert experiment.g1_routing is not None
+    routes = {
+        "deepseek/deepseek-v4-pro": "deepseek",
+        "moonshotai/kimi-k2.7-code": "moonshotai",
+        "qwen/qwen3.7-max": "alibaba",
+        "x-ai/grok-4.5": "xai",
+        "z-ai/glm-5.2": "z-ai",
+    }
+    payload = experiment.model_dump(mode="json")
+    g1_payload = experiment.g1_routing.model_dump(mode="json", exclude_none=True)
+    g1_payload.update(
+        {
+            "expected_candidate_count": len(routes),
+            "expected_routes": routes,
+            "expected_routes_sha256": module.canonical_json_sha256(routes).removeprefix("sha256:"),
+        }
+    )
+    payload["g1_routing"] = g1_payload
+    return type(experiment).model_validate(payload)
+
+
 def test_reasoning_tokens_are_not_double_counted_as_total_tokens() -> None:
     usage = {
         "input_tokens": 50,
@@ -1423,6 +1455,7 @@ def test_highest_thinking_uses_registry_level_and_rejects_explicit_drift(module)
     }
 
     assert module.generation_thinking_for_model("qwen/qwen3.7-max", policy) == "high"
+    assert module.generation_thinking_for_model("qwen/qwen3-coder-next", policy) == "off"
 
     policy["model_thinking_levels"] = {"moonshotai/kimi-k2.7-code": "max"}
     with pytest.raises(ValueError, match="registry highest supported level is 'high'"):
@@ -7285,8 +7318,15 @@ def test_g1_registry_contract_is_manifested_and_fingerprinted(
     assert contract["global_experiment_profile"]["g1_routing"] == (
         experiment.g1_routing.model_dump(mode="json")
     )
-    assert contract["g1_registry_contract"]["expected_candidate_count"] == 20
-    assert contract["g1_registry_contract"]["runtime_pins_match"] is True
+    resolved_contract = contract["g1_registry_contract"]
+    expected_count = resolved_contract["expected_candidate_count"]
+    assert expected_count == resolved_contract["available_registry_candidate_count"]
+    assert expected_count == len(resolved_contract["expected_routes"])
+    assert expected_count == len(resolved_contract["expected_identities"])
+    assert resolved_contract["candidate_scope"] == "registry_all"
+    assert resolved_contract["policy"] == "all_registry_models"
+    assert resolved_contract["runtime_pin_policy"] == "optional_auto"
+    assert set(resolved_contract["expected_routes"].values()) == {"auto"}
     assert contract["formal_runtime_freeze"] == {
         "source": "experiment_config",
         "sandbox_enabled": False,
@@ -7319,16 +7359,18 @@ def test_g1_registry_contract_is_manifested_and_fingerprinted(
         tool_policy=policy,
     )
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    assert manifest["g1_registry_contract"]["profile_id"] == (
-        "draco_g1_formal_openrouter_20_20260725"
+    assert manifest["g1_registry_contract"]["profile_id"] == experiment.g1_routing.profile_id
+    assert manifest["g1_registry_contract"]["expected_candidate_count"] == expected_count
+    assert (
+        manifest["g1_registry_contract"]["expected_identities"]
+        == (resolved_contract["expected_identities"])
     )
-    assert manifest["g1_registry_contract"]["expected_candidate_count"] == 20
     assert manifest["formal_runtime_freeze"] == contract["formal_runtime_freeze"]
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("module", [runner, _load_resume_runner()], ids=["main", "resume"])
-async def test_g1_dry_build_records_exact_candidate_allowlist(module) -> None:
+async def test_g1_dry_build_records_registry_all_candidate_allowlist(module) -> None:
     experiment = module.load_draco_experiment_config(
         module.DEFAULT_B2_EXPERIMENT_CONFIG_PATH
     ).config
@@ -7339,6 +7381,7 @@ async def test_g1_dry_build_records_exact_candidate_allowlist(module) -> None:
             "api_key": "fake",
         }
     )
+    contract = _resolved_g1_registry_contract(module, experiment, config)
     result = await module.build_experiment_provider(
         config=config,
         inherited=ProviderConfig(
@@ -7353,17 +7396,25 @@ async def test_g1_dry_build_records_exact_candidate_allowlist(module) -> None:
         ensemble_proposer_timeout=None,
         ensemble_aggregator_timeout=None,
         experiment_config=experiment,
+        g1_registry_contract=contract,
         generation_policy={},
     )
 
     plan = result.routing_trace["selection_plan"]
-    assert plan["candidate_pool_size"] == 20
-    assert len(plan["candidate_pool"]) == 20
-    assert plan["candidate_allowlist"]["candidate_count"] == 20
+    expected_count = contract["expected_candidate_count"]
+    expected_identities = set(contract["expected_identities"])
+    assert plan["candidate_pool_size"] == expected_count
+    assert len(plan["candidate_pool"]) == expected_count
+    assert {row["identity"] for row in plan["candidate_pool"]} == expected_identities
+    assert plan["candidate_allowlist"]["candidate_count"] == expected_count
+    assert plan["candidate_allowlist"]["candidate_scope"] == "registry_all"
+    assert plan["candidate_allowlist"]["policy"] == "all_registry_models"
+    assert plan["candidate_allowlist"]["input_candidate_count"] == expected_count
+    assert plan["candidate_allowlist"]["excluded_candidate_count"] == 0
     assert plan["user_profile_enabled"] is False
-    assert len(plan["candidate_allowlist"]["expected_identities"]) == 20
+    assert set(plan["candidate_allowlist"]["expected_identities"]) == expected_identities
     assert plan["candidate_allowlist"]["filtered_registry_snapshot_version"].startswith(
-        "curated-openrouter-step2-2026-07-24.3+"
+        f"{experiment.g1_routing.source_registry_snapshot_version}+"
     )
     assert len(plan["selected_P"]) == 2
     assert plan["N_min"] == 1
@@ -7396,7 +7447,6 @@ def test_g1_dry_cli_main_exits_zero_with_frozen_registry_contract(
             "provider": "openrouter",
             "model": "deepseek/deepseek-v4-pro",
             "api_key": "fake",
-            "provider_routing": experiment.g1_routing.expected_routes,
         }
     )
     monkeypatch.setattr(runner.GatewayConfig, "load", lambda _path: config)
@@ -7445,7 +7495,13 @@ def test_g1_dry_cli_main_exits_zero_with_frozen_registry_contract(
         is True
     )
     assert "openrouter_non_byok_audit" not in row
-    assert len(plan["candidate_pool"]) == 20
+    contract = manifest["g1_registry_contract"]
+    assert contract["candidate_scope"] == "registry_all"
+    assert contract["policy"] == "all_registry_models"
+    assert len(plan["candidate_pool"]) == contract["expected_candidate_count"]
+    assert {item["identity"] for item in plan["candidate_pool"]} == set(
+        contract["expected_identities"]
+    )
     assert (
         plan["registry_snapshot_version"]
         == (plan["candidate_allowlist"]["filtered_registry_snapshot_version"])
@@ -7455,8 +7511,29 @@ def test_g1_dry_cli_main_exits_zero_with_frozen_registry_contract(
     assert all(char in "0123456789abcdef" for char in registry_hash)
 
 
-def test_g1_registry_contract_rejects_runtime_pin_drift() -> None:
-    experiment = _experiment_config()
+@pytest.mark.parametrize("module", [runner, _load_resume_runner()], ids=["main", "resume"])
+def test_g1_registry_all_contract_does_not_require_runtime_pins(module) -> None:
+    experiment = module.load_draco_experiment_config(
+        module.DEFAULT_B2_EXPERIMENT_CONFIG_PATH
+    ).config
+    config = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "deepseek/deepseek-v4-pro",
+            "api_key": "fake",
+            "provider_routing": {"x-ai/grok-4.5": "wrong-provider"},
+        }
+    )
+
+    contract = _resolved_g1_registry_contract(module, experiment, config)
+
+    assert contract["runtime_pin_policy"] == "optional_auto"
+    assert contract["expected_routes"]["x-ai/grok-4.5"] == "auto"
+
+
+@pytest.mark.parametrize("module", [runner, _load_resume_runner()], ids=["main", "resume"])
+def test_g1_exact_routes_contract_rejects_runtime_pin_drift(module) -> None:
+    experiment = _experiment_with_exact_g1_routes(module)
     config = GatewayConfig(
         llm={
             "provider": "openrouter",
@@ -7467,40 +7544,46 @@ def test_g1_registry_contract_rejects_runtime_pin_drift() -> None:
     )
 
     with pytest.raises(ValueError, match="provider pin"):
-        runner.validate_g1_registry_contract(experiment, config)
+        module.validate_g1_registry_contract(experiment, config)
 
 
 @pytest.mark.parametrize("module", [runner, _load_resume_runner()], ids=["main", "resume"])
 def test_g1_registry_contract_rejects_allowlist_trace_drift(module) -> None:
-    experiment = _experiment_config()
-    contract = experiment.g1_routing.model_dump(mode="json")
+    experiment = module.load_draco_experiment_config(
+        module.DEFAULT_B2_EXPERIMENT_CONFIG_PATH
+    ).config
     config = GatewayConfig(
         llm={
             "provider": "openrouter",
             "model": "deepseek/deepseek-v4-pro",
             "api_key": "fake",
-            "provider_routing": experiment.g1_routing.expected_routes,
         },
         llm_ensemble={"enabled": True, "selection_mode": "router_dynamic"},
     )
+    contract = _resolved_g1_registry_contract(module, experiment, config)
     inherited = ProviderConfig(
         provider="openrouter",
         model="deepseek/deepseek-v4-pro",
         api_key="fake",
-        provider_routing=experiment.g1_routing.expected_routes,
     )
     provider = build_ensemble_provider_from_config(
         config=config,
         inherited_provider_config=inherited,
         fallback_provider=None,
         turn_metadata={"routed_tier": "c1", "routing_confidence": 0.9},
-        ranking_inputs={"registry_allowlist": experiment.g1_routing.model_dump(mode="json")},
+        ranking_inputs={"registry_allowlist": contract},
     )
-    expected_identities = sorted(f"openrouter:{model}" for model in contract["expected_routes"])
+    expected_identities = contract["expected_identities"]
     plan = json.loads(json.dumps(provider.selection_plan))
     trace = {"selection_plan": plan}
 
     assert module.g1_registry_contract_reasons(trace, contract) == []
+
+    missing_policy = dict(contract)
+    missing_policy.pop("policy")
+    assert module.g1_registry_contract_reasons(trace, missing_policy) == [
+        "invalid_g1_registry_contract"
+    ]
 
     missing_allowlist = json.loads(json.dumps(trace))
     missing_allowlist["selection_plan"].pop("candidate_allowlist")
@@ -7519,8 +7602,9 @@ def test_g1_registry_contract_rejects_allowlist_trace_drift(module) -> None:
     )
 
     wrong_count = json.loads(json.dumps(trace))
-    wrong_count["selection_plan"]["candidate_pool_size"] = 19
-    wrong_count["selection_plan"]["candidate_allowlist"]["candidate_count"] = 19
+    wrong_count_value = contract["expected_candidate_count"] - 1
+    wrong_count["selection_plan"]["candidate_pool_size"] = wrong_count_value
+    wrong_count["selection_plan"]["candidate_allowlist"]["candidate_count"] = wrong_count_value
     wrong_count_reasons = module.g1_registry_contract_reasons(
         wrong_count,
         contract,
@@ -7602,28 +7686,26 @@ def test_resume_reuses_g1_plan_and_analyzer_within_one_provider_lifecycle() -> N
     )
 
     experiment = _experiment_config()
-    contract = experiment.g1_routing.model_dump(mode="json")
     config = GatewayConfig(
         llm={
             "provider": "openrouter",
             "model": "deepseek/deepseek-v4-pro",
             "api_key": "fake",
-            "provider_routing": experiment.g1_routing.expected_routes,
         },
         llm_ensemble={"enabled": True, "selection_mode": "router_dynamic"},
     )
+    contract = _resolved_g1_registry_contract(module, experiment, config)
     inherited = ProviderConfig(
         provider="openrouter",
         model="deepseek/deepseek-v4-pro",
         api_key="fake",
-        provider_routing=experiment.g1_routing.expected_routes,
     )
     provider = build_ensemble_provider_from_config(
         config=config,
         inherited_provider_config=inherited,
         fallback_provider=None,
         turn_metadata={"routed_tier": "c1", "routing_confidence": 0.9},
-        ranking_inputs={"registry_allowlist": experiment.g1_routing.model_dump(mode="json")},
+        ranking_inputs={"registry_allowlist": contract},
     )
     plan = deepcopy(provider.selection_plan)
     final_text = "answer"
@@ -7774,15 +7856,14 @@ def test_g1_runtime_dynamic_plan_satisfies_frozen_ranking_contract(
             "provider": "openrouter",
             "model": "deepseek/deepseek-v4-pro",
             "api_key": "fake",
-            "provider_routing": experiment.g1_routing.expected_routes,
         },
         llm_ensemble={"enabled": True, "selection_mode": "router_dynamic"},
     )
+    contract = _resolved_g1_registry_contract(module, experiment, config)
     inherited = ProviderConfig(
         provider="openrouter",
         model="deepseek/deepseek-v4-pro",
         api_key="fake",
-        provider_routing=experiment.g1_routing.expected_routes,
     )
     monkeypatch.setenv("OPENSQUILLA_PROVIDER_ROUTING_STRICT", "1")
     monkeypatch.setenv("OPENSQUILLA_OPENROUTER_REQUIRE_PARAMETERS", "1")
@@ -7793,7 +7874,7 @@ def test_g1_runtime_dynamic_plan_satisfies_frozen_ranking_contract(
         fallback_provider=None,
         turn_metadata={"routed_tier": "c1", "routing_confidence": 0.9},
         ranking_inputs={
-            "registry_allowlist": experiment.g1_routing.model_dump(mode="json"),
+            "registry_allowlist": contract,
             "generation_policy": generation_policy,
         },
     )
@@ -7804,12 +7885,13 @@ def test_g1_runtime_dynamic_plan_satisfies_frozen_ranking_contract(
     module.validate_strict_openrouter_ensemble_members(
         provider,
         generation_policy,
+        allow_unpinned_openrouter=True,
     )
 
     assert (
         module.g1_registry_contract_reasons(
             {"selection_plan": provider.selection_plan},
-            experiment.g1_routing.model_dump(mode="json"),
+            contract,
         )
         == []
     )
