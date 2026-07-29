@@ -13,6 +13,7 @@ from collections.abc import AsyncIterator
 from types import SimpleNamespace
 from typing import Any
 
+from opensquilla.engine.agent_injection import ListPendingInputProvider
 from opensquilla.engine.pipeline import TurnContext
 from opensquilla.engine.runtime import TurnRunner, _SelectorFallbackProvider
 from opensquilla.engine.types import DoneEvent as EngineDoneEvent
@@ -198,6 +199,7 @@ async def _run_turn_events(
     monkeypatch: Any,
     *,
     primary_fails: bool,
+    pending_input_provider: ListPendingInputProvider | None = None,
 ) -> list[Any]:
     monkeypatch.setattr(TurnRunner, "_run_pipeline", _routed_pipeline_fake(PRIMARY_MODEL))
     runner = TurnRunner(provider_selector=_ChainSelector(primary_fails=primary_fails))
@@ -209,33 +211,62 @@ async def _run_turn_events(
             tool_context=ToolContext(is_owner=True, caller_kind=CallerKind.CLI),
             history_has_persisted_user=False,
             no_memory_capture=True,
+            pending_input_provider=pending_input_provider,
         )
     ]
 
 
-async def test_precontent_fallback_emits_corrective_router_decision_before_done(
+async def test_precontent_fallback_keeps_one_route_decision_and_appends_execution_leg(
     monkeypatch: Any,
 ) -> None:
     events = await _run_turn_events(monkeypatch, primary_fails=True)
 
     router_events = [event for event in events if isinstance(event, RouterDecisionEvent)]
-    assert len(router_events) == 2
-
-    initial, corrective = router_events
-    assert initial.model == PRIMARY_MODEL
-    assert initial.source == "router"
-    assert initial.fallback is False
-
-    assert corrective.model == FALLBACK_MODEL
-    assert corrective.source == "fallback"
-    assert corrective.fallback is True
-    assert corrective.savings_pct == 0.0
+    assert len(router_events) == 1
+    assert router_events[0].model == PRIMARY_MODEL
+    assert router_events[0].source == "router"
+    assert router_events[0].fallback is False
 
     done_events = [event for event in events if isinstance(event, EngineDoneEvent)]
     assert len(done_events) == 1
-    assert done_events[0].model == FALLBACK_MODEL
-    assert done_events[0].routed_model == FALLBACK_MODEL
-    assert events.index(corrective) < events.index(done_events[0])
+    done = done_events[0]
+    assert done.model == FALLBACK_MODEL
+    assert done.routed_model == FALLBACK_MODEL
+    assert done.route_plan is not None
+    assert done.route_plan["model"] == PRIMARY_MODEL
+    assert [leg["kind"] for leg in done.execution_legs] == [
+        "primary",
+        "provider_fallback",
+    ]
+    assert [leg["model"] for leg in done.execution_legs] == [
+        PRIMARY_MODEL,
+        FALLBACK_MODEL,
+    ]
+
+
+async def test_same_turn_pending_input_preserves_route_plan_and_model(
+    monkeypatch: Any,
+) -> None:
+    pending = ListPendingInputProvider()
+    pending.append("continue with this constraint")
+
+    events = await _run_turn_events(
+        monkeypatch,
+        primary_fails=False,
+        pending_input_provider=pending,
+    )
+
+    router_events = [event for event in events if isinstance(event, RouterDecisionEvent)]
+    assert len(router_events) == 1
+    assert router_events[0].model == PRIMARY_MODEL
+    done = next(event for event in events if isinstance(event, EngineDoneEvent))
+    assert done.route_plan is not None
+    assert done.route_plan["model"] == PRIMARY_MODEL
+    assert len(done.execution_legs) == 2
+    assert {leg["model"] for leg in done.execution_legs} == {PRIMARY_MODEL}
+    assert {leg["plan_id"] for leg in done.execution_legs} == {
+        done.route_plan["plan_id"]
+    }
 
 
 async def test_turn_without_fallback_hop_emits_exactly_one_router_decision(
