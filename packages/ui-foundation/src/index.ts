@@ -1,7 +1,7 @@
-/**
- * Public entry point for product-neutral UI composition contracts.
- *
- * The package boundary is intentionally empty until its first stable
- * composition contract is extracted from the public WebUI.
- */
-export {}
+export * from './gateway/client.js'
+export * from './gateway/http.js'
+export * from './gateway/query.js'
+export * from './gateway/state.js'
+export * from './gateway/storage.js'
+export * from './gateway/types.js'
+export * from './vue.js'

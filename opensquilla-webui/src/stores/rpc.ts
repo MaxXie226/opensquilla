@@ -1,8 +1,14 @@
 import { ref, computed } from 'vue'
 import { defineStore } from 'pinia'
 import {
+  GatewayDataStore,
+  clearStoragePrefix,
+  createGatewayConnectionStorage,
+  type GatewayHelloInput,
+  type GatewayStateSnapshot,
+} from '@opensquilla/ui-foundation'
+import {
   RpcClient,
-  capabilitiesForMethods,
   type RpcCallOptions,
   type RpcConnectionWaitOptions,
   type RpcContractInfo,
@@ -21,14 +27,14 @@ function getDefaultRpcUrl(): string {
   return `${proto}//${location.host}/ws`
 }
 
-function clearStoragePrefix(storage: Storage, prefix: string): void {
-  try {
-    const keys = Array.from({ length: storage.length }, (_, index) => storage.key(index))
-    for (const key of keys) {
-      if (!key) continue
-      if (key.startsWith(prefix)) storage.removeItem(key)
-    }
-  } catch {}
+function connectionStorage() {
+  return createGatewayConnectionStorage({
+    persistent: localStorage,
+    session: sessionStorage,
+    defaultEndpoint: getDefaultRpcUrl(),
+    endpointKey: WS_URL_KEY,
+    tokenKey: WS_TOKEN_KEY,
+  })
 }
 
 function clearLinkTokenBrowserState(): void {
@@ -66,19 +72,15 @@ function consumeLinkTokenFromUrl(): { url: string; token: string } | null {
 }
 
 function loadConnectionSettings(): { url: string; token: string } {
-  let url = getDefaultRpcUrl()
-  let token = ''
-  try { url = localStorage.getItem(WS_URL_KEY) || url } catch {}
-  try { token = sessionStorage.getItem(WS_TOKEN_KEY) || '' } catch {}
-  return { url, token }
+  const settings = connectionStorage().load()
+  return { url: settings.endpoint, token: settings.token || '' }
 }
 
 function saveConnectionSettings(url: string, token: string): void {
-  try { localStorage.setItem(WS_URL_KEY, url || getDefaultRpcUrl()) } catch {}
-  try {
-    if (token) sessionStorage.setItem(WS_TOKEN_KEY, token)
-    else sessionStorage.removeItem(WS_TOKEN_KEY)
-  } catch {}
+  connectionStorage().save({
+    endpoint: url || getDefaultRpcUrl(),
+    ...(token ? { token } : {}),
+  })
 }
 
 export const useRpcStore = defineStore('rpc', () => {
@@ -96,6 +98,24 @@ export const useRpcStore = defineStore('rpc', () => {
   const extensions = ref<string[]>([])
   const unavailableMethods = ref<Set<string>>(new Set())
   const error = ref<string | null>(null)
+  const gatewayData = new GatewayDataStore()
+
+  function applyGatewaySnapshot(snapshot: GatewayStateSnapshot): void {
+    state.value = snapshot.state
+    policy.value = snapshot.policy ? { ...snapshot.policy } : null
+    auth.value = snapshot.auth ? { ...snapshot.auth } : null
+    methods.value = [...snapshot.methods]
+    contract.value = snapshot.contract
+    contractStatus.value = snapshot.contractStatus
+    runtime.value = snapshot.runtime
+    protocolRange.value = snapshot.protocolRange
+    capabilities.value = [...snapshot.capabilities]
+    capabilitySource.value = snapshot.capabilitySource
+    extensions.value = [...snapshot.extensions]
+    unavailableMethods.value = new Set(snapshot.unavailableMethods)
+  }
+
+  gatewayData.subscribe(applyGatewaySnapshot)
 
   const isConnected = computed(() => state.value === 'connected')
   const isConnecting = computed(() => state.value === 'connecting')
@@ -120,54 +140,20 @@ export const useRpcStore = defineStore('rpc', () => {
     client.value = rpc
 
     rpc.on('_state', (s: 'disconnected' | 'connecting' | 'connected') => {
-      state.value = s
-      if (s !== 'connected') {
-        policy.value = null
-        auth.value = null
-        methods.value = []
-        unavailableMethods.value = new Set()
-      }
+      gatewayData.setConnectionState(s)
     })
 
-    rpc.on('_hello', (data: {
-      policy?: Record<string, unknown>
-      auth?: Record<string, unknown>
-      features?: { methods?: unknown }
-      contract?: RpcContractInfo
-      contractStatus?: 'advertised' | 'legacy-contract'
-      runtime?: RpcRuntimeInfo
-      protocolRange?: RpcProtocolRange
-      capabilities?: unknown
-      capabilitySource?: 'hello' | 'features.methods' | 'none'
-      extensions?: unknown
-    }) => {
-      policy.value = data.policy || null
-      auth.value = data.auth || null
-      methods.value = Array.isArray(data.features?.methods)
-        ? data.features.methods.filter((method): method is string => typeof method === 'string')
-        : []
-      contract.value = data.contract || null
-      contractStatus.value = data.contractStatus || (data.contract ? 'advertised' : 'legacy-contract')
-      runtime.value = data.runtime || null
-      protocolRange.value = data.protocolRange || null
-      capabilities.value = Array.isArray(data.capabilities)
-        ? data.capabilities.filter((item): item is string => typeof item === 'string')
-        : capabilitiesForMethods(methods.value)
-      capabilitySource.value =
-        data.capabilitySource ||
-        (Array.isArray(data.capabilities)
-          ? 'hello'
-          : methods.value.length > 0
-            ? 'features.methods'
-            : 'none')
-      extensions.value = Array.isArray(data.extensions)
-        ? data.extensions.filter((item): item is string => typeof item === 'string')
-        : []
-      unavailableMethods.value = new Set()
+    rpc.on('_hello', (data: GatewayHelloInput) => {
+      gatewayData.applyHello(data)
     })
 
     rpc.on('_gap', (detail: unknown) => {
       console.warn('[RPC] Sequence gap detected:', detail)
+      gatewayData.setDiagnostic(
+        detail instanceof Error
+          ? detail
+          : new Error('Gateway connection diagnostic'),
+      )
     })
 
     // Auto-connect on init. Desktop shells use the local gateway serving this UI.
@@ -191,17 +177,7 @@ export const useRpcStore = defineStore('rpc', () => {
     if (client.value) {
       client.value.disconnect()
       error.value = null
-      policy.value = null
-      auth.value = null
-      methods.value = []
-      contract.value = null
-      contractStatus.value = 'legacy-contract'
-      runtime.value = null
-      protocolRange.value = null
-      capabilities.value = []
-      capabilitySource.value = 'none'
-      extensions.value = []
-      unavailableMethods.value = new Set()
+      gatewayData.reset()
       client.value.connect(settings.url, settings.token)
     }
     return true
@@ -209,18 +185,7 @@ export const useRpcStore = defineStore('rpc', () => {
 
   function disconnect() {
     client.value?.disconnect()
-    state.value = 'disconnected'
-    policy.value = null
-    auth.value = null
-    methods.value = []
-    contract.value = null
-    contractStatus.value = 'legacy-contract'
-    runtime.value = null
-    protocolRange.value = null
-    capabilities.value = []
-    capabilitySource.value = 'none'
-    extensions.value = []
-    unavailableMethods.value = new Set()
+    gatewayData.reset()
   }
 
   function supportsMethod(method: string): boolean {
@@ -232,8 +197,7 @@ export const useRpcStore = defineStore('rpc', () => {
   }
 
   function markMethodUnavailable(method: string): void {
-    if (!method) return
-    unavailableMethods.value = new Set([...unavailableMethods.value, method])
+    gatewayData.markMethodUnavailable(method)
   }
 
   async function call<T = unknown>(

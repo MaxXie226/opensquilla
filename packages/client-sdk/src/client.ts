@@ -8,6 +8,7 @@ import {
   ConnectionClosedError,
   GatewayClientError,
   HandshakeError,
+  RequestAbortError,
   RequestTimeoutError,
   SequenceGapError,
 } from './errors.js'
@@ -23,6 +24,7 @@ const WEB_SOCKET_OPEN = 1
 
 export type GatewayConnectionState = 'disconnected' | 'connecting' | 'connected'
 export type GatewayEventHandler = (frame: EventFrame) => void
+export type GatewayTerminationAction = 'reject' | 'reconnect'
 
 export interface WebSocketMessageLike {
   data: unknown
@@ -47,6 +49,19 @@ export interface ReconnectPolicy {
   factor?: number
 }
 
+export interface GatewayCallOptions {
+  timeoutMs?: number
+  signal?: AbortSignal
+  timeoutAction?: GatewayTerminationAction
+  abortAction?: GatewayTerminationAction
+  onSent?: (connectionGeneration: number) => void
+}
+
+export interface GatewayConnectionWaitOptions {
+  timeoutAction?: GatewayTerminationAction
+  abortAction?: GatewayTerminationAction
+}
+
 export interface GatewayClientOptions {
   endpoint: string
   token?: string
@@ -58,8 +73,14 @@ export interface GatewayClientOptions {
   requestTimeoutMs?: number
   keepAliveIntervalMs?: number
   reconnect?: ReconnectPolicy
+  /**
+   * Compatibility escape hatch for legacy clients that sent RPC requests as
+   * soon as the transport opened. New clients should wait for Hello.
+   */
+  allowCallsDuringHandshake?: boolean
   webSocketFactory?: WebSocketFactory
   onStateChange?: (state: GatewayConnectionState) => void
+  onHello?: (hello: NormalizedHello) => void
   onDiagnostic?: (error: Error) => void
 }
 
@@ -68,6 +89,8 @@ interface PendingRequest {
   resolve(value: unknown): void
   reject(error: Error): void
   timeout: ReturnType<typeof setTimeout> | undefined
+  signal: AbortSignal | undefined
+  abortHandler: (() => void) | undefined
 }
 
 interface ConnectWaiter {
@@ -128,11 +151,13 @@ export class GatewayClient {
   private readonly reconnectMaxDelayMs: number
   private readonly reconnectFactor: number
   private readonly eventHandlers = new Map<string, Set<GatewayEventHandler>>()
+  private readonly stateHandlers = new Set<(state: GatewayConnectionState) => void>()
   private readonly pending = new Map<string, PendingRequest>()
 
   private socket: WebSocketLike | null = null
   private connectionState: GatewayConnectionState = 'disconnected'
   private requestId = 0
+  private connectionGeneration = 0
   private connectRequestId: string | null = null
   private connectWaiter: ConnectWaiter | null = null
   private manualClose = false
@@ -171,6 +196,10 @@ export class GatewayClient {
     return this.connectionState
   }
 
+  get pendingRequestCount(): number {
+    return this.pending.size
+  }
+
   connect(): Promise<NormalizedHello> {
     if (this.connectionState !== 'disconnected') {
       return Promise.reject(new Error(`Gateway client is already ${this.connectionState}`))
@@ -206,33 +235,78 @@ export class GatewayClient {
   call<T = unknown>(
     method: RpcMethod | (string & {}),
     params: Record<string, unknown> = {},
-    timeoutMs = this.requestTimeoutMs,
+    timeoutOrOptions: number | GatewayCallOptions = this.requestTimeoutMs,
   ): Promise<T> {
+    const options: GatewayCallOptions =
+      typeof timeoutOrOptions === 'number'
+        ? { timeoutMs: timeoutOrOptions }
+        : timeoutOrOptions
+    const timeoutMs = options.timeoutMs ?? this.requestTimeoutMs
     const socket = this.socket
-    if (this.connectionState !== 'connected' || !socket || socket.readyState !== WEB_SOCKET_OPEN) {
+    const canSend =
+      this.connectionState === 'connected'
+      || (
+        this.options.allowCallsDuringHandshake === true
+        && this.connectionState === 'connecting'
+      )
+    if (!canSend || !socket || socket.readyState !== WEB_SOCKET_OPEN) {
       return Promise.reject(new ConnectionClosedError('Gateway client is not connected'))
+    }
+    if (options.signal?.aborted) {
+      return Promise.reject(new RequestAbortError(method))
     }
     const id = String(++this.requestId)
     return new Promise<T>((resolve, reject) => {
+      const terminate = (
+        error: Error,
+        action: GatewayTerminationAction,
+      ): void => {
+        if (!this.rejectRequest(id, error)) return
+        if (action === 'reconnect') {
+          this.recycleConnection(
+            new ConnectionClosedError(`Connection recycled after ${method} terminated`),
+          )
+        }
+      }
       const timeout =
         timeoutMs > 0 && Number.isFinite(timeoutMs)
           ? setTimeout(() => {
-              this.pending.delete(id)
-              reject(new RequestTimeoutError(id, method, timeoutMs))
+              terminate(
+                new RequestTimeoutError(id, method, timeoutMs),
+                options.timeoutAction ?? 'reject',
+              )
             }, timeoutMs)
           : undefined
-      this.pending.set(id, {
+      const request: PendingRequest = {
         method,
         resolve: (value) => resolve(value as T),
         reject,
         timeout,
-      })
+        signal: options.signal,
+        abortHandler: undefined,
+      }
+      if (options.signal) {
+        request.abortHandler = () => {
+          terminate(
+            new RequestAbortError(method),
+            options.abortAction ?? 'reject',
+          )
+        }
+        options.signal.addEventListener('abort', request.abortHandler, { once: true })
+      }
+      this.pending.set(id, request)
       try {
         socket.send(JSON.stringify({ type: 'req', id, method, params }))
       } catch (error) {
-        this.pending.delete(id)
-        if (timeout !== undefined) clearTimeout(timeout)
-        reject(error instanceof Error ? error : new Error(`Unable to send ${method}`))
+        const failure = error instanceof Error ? error : new Error(`Unable to send ${method}`)
+        this.rejectRequest(id, failure)
+        this.recycleConnection(failure)
+        return
+      }
+      try {
+        options.onSent?.(this.connectionGeneration)
+      } catch {
+        // Send receipts are observational and must not fail an accepted call.
       }
     })
   }
@@ -247,20 +321,90 @@ export class GatewayClient {
     }
   }
 
+  onState(handler: (state: GatewayConnectionState) => void): () => void {
+    this.stateHandlers.add(handler)
+    return () => this.stateHandlers.delete(handler)
+  }
+
+  waitForConnection(
+    timeoutMs = 30_000,
+    signal?: AbortSignal,
+    actions: GatewayConnectionWaitOptions = {},
+  ): Promise<void> {
+    if (signal?.aborted) {
+      return Promise.reject(new RequestAbortError('waitForConnection'))
+    }
+    if (this.connectionState === 'connected') return Promise.resolve()
+
+    return new Promise((resolve, reject) => {
+      let settled = false
+      let timeout: ReturnType<typeof setTimeout> | undefined
+      let off = (): void => {}
+      const cleanup = (): void => {
+        if (timeout !== undefined) clearTimeout(timeout)
+        off()
+        signal?.removeEventListener('abort', onAbort)
+      }
+      const finish = (
+        error?: Error,
+        action: GatewayTerminationAction = 'reject',
+      ): void => {
+        if (settled) return
+        settled = true
+        cleanup()
+        if (!error) {
+          resolve()
+          return
+        }
+        reject(error)
+        if (action === 'reconnect' && this.connectionState !== 'connected') {
+          this.recycleConnection(
+            new ConnectionClosedError('Connection recycled after waitForConnection terminated'),
+          )
+        }
+      }
+      const onAbort = (): void => {
+        finish(
+          new RequestAbortError('waitForConnection'),
+          actions.abortAction ?? 'reject',
+        )
+      }
+
+      off = this.onState((state) => {
+        if (state === 'connected') finish()
+      })
+      signal?.addEventListener('abort', onAbort, { once: true })
+      if (timeoutMs > 0 && Number.isFinite(timeoutMs)) {
+        timeout = setTimeout(() => {
+          finish(
+            new RequestTimeoutError('', 'waitForConnection', timeoutMs),
+            actions.timeoutAction ?? 'reject',
+          )
+        }, timeoutMs)
+      }
+    })
+  }
+
   private openSocket(): void {
     this.setState('connecting')
     this.lastFrameAt = Date.now()
     this.lastSequence = 0
     this.connectRequestId = null
     this.stopHealthChecks()
+    this.connectionGeneration += 1
+    const generation = this.connectionGeneration
     try {
       const socket = this.webSocketFactory(this.options.endpoint)
       this.socket = socket
       socket.onopen = () => {
-        this.reconnectDelayMs = this.reconnectInitialDelayMs
+        if (this.isCurrentSocket(socket, generation)) {
+          this.reconnectDelayMs = this.reconnectInitialDelayMs
+        }
       }
-      socket.onmessage = (event) => this.handleMessage(event.data)
-      socket.onclose = () => this.handleClose()
+      socket.onmessage = (event) => {
+        if (this.isCurrentSocket(socket, generation)) this.handleMessage(event.data)
+      }
+      socket.onclose = () => this.handleClose(socket, generation)
       socket.onerror = () => {}
       this.startHandshakeTimer()
     } catch (error) {
@@ -348,6 +492,13 @@ export class GatewayClient {
       this.connectRequestId = null
       this.setState('connected')
       this.startHealthChecks(hello)
+      try {
+        this.options.onHello?.(hello)
+      } catch (error) {
+        this.notifyDiagnostic(
+          error instanceof Error ? error : new Error('Gateway Hello observer failed'),
+        )
+      }
       this.connectWaiter?.resolve(hello)
       this.connectWaiter = null
     } catch (error) {
@@ -359,10 +510,8 @@ export class GatewayClient {
 
   private acceptResponse(frame: JsonRecord): void {
     const id = typeof frame.id === 'string' ? frame.id : ''
-    const pending = this.pending.get(id)
+    const pending = this.takeRequest(id)
     if (!pending) return
-    this.pending.delete(id)
-    if (pending.timeout !== undefined) clearTimeout(pending.timeout)
     if (frame.ok === true) {
       pending.resolve(frame.payload)
     } else {
@@ -376,11 +525,11 @@ export class GatewayClient {
     if (typeof frame.seq === 'number' && Number.isInteger(frame.seq)) {
       if (this.lastSequence > 0 && frame.seq !== this.lastSequence + 1) {
         const error = new SequenceGapError(this.lastSequence + 1, frame.seq, event)
-        this.options.onDiagnostic?.(error)
+        this.notifyDiagnostic(error)
         try {
           this.socket?.close(1012, 'event sequence gap')
         } catch {
-          this.handleClose()
+          if (this.socket) this.handleClose(this.socket, this.connectionGeneration)
         }
         return
       }
@@ -389,7 +538,15 @@ export class GatewayClient {
     const typedFrame = frame as unknown as EventFrame
     for (const [subscription, handlers] of this.eventHandlers) {
       if (!eventMatches(subscription, event)) continue
-      for (const handler of handlers) handler(typedFrame)
+      for (const handler of handlers) {
+        try {
+          handler(typedFrame)
+        } catch (error) {
+          this.notifyDiagnostic(
+            error instanceof Error ? error : new Error(`Gateway event observer failed: ${event}`),
+          )
+        }
+      }
     }
   }
 
@@ -405,7 +562,8 @@ export class GatewayClient {
     }
   }
 
-  private handleClose(): void {
+  private handleClose(socket: WebSocketLike, generation: number): void {
+    if (!this.isCurrentSocket(socket, generation)) return
     this.stopHandshakeTimer()
     this.stopHealthChecks()
     this.socket = null
@@ -436,7 +594,7 @@ export class GatewayClient {
         this.socket?.readyState === WEB_SOCKET_OPEN &&
         Date.now() - this.lastFrameAt > idleTimeoutMs
       ) {
-        this.options.onDiagnostic?.(new ConnectionClosedError('Gateway tick timed out'))
+        this.notifyDiagnostic(new ConnectionClosedError('Gateway tick timed out'))
         this.socket.close(1012, 'tick timeout')
       }
     }, Math.min(tickMs, 10_000))
@@ -456,12 +614,12 @@ export class GatewayClient {
       const error = new HandshakeError(
         `Gateway handshake timed out after ${this.connectTimeoutMs}ms`,
       )
-      this.options.onDiagnostic?.(error)
+      this.notifyDiagnostic(error)
       this.rejectConnect(error)
       try {
         this.socket?.close(1002, 'handshake timeout')
       } catch {
-        this.handleClose()
+        if (this.socket) this.handleClose(this.socket, this.connectionGeneration)
       }
     }, this.connectTimeoutMs)
   }
@@ -471,21 +629,46 @@ export class GatewayClient {
     this.handshakeTimer = undefined
   }
 
-  private scheduleReconnect(): void {
+  private scheduleReconnect(immediate = false): void {
     if (this.manualClose || !this.reconnectEnabled || this.reconnectTimer !== undefined) return
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = undefined
       this.openSocket()
-    }, this.reconnectDelayMs)
+    }, immediate ? 0 : this.reconnectDelayMs)
+    if (immediate) return
     this.reconnectDelayMs = Math.min(
       this.reconnectDelayMs * this.reconnectFactor,
       this.reconnectMaxDelayMs,
     )
   }
 
+  private recycleConnection(reason: Error): void {
+    const socket = this.socket
+    if (!socket) {
+      this.setState('disconnected')
+      this.scheduleReconnect(true)
+      return
+    }
+    this.stopHandshakeTimer()
+    this.stopHealthChecks()
+    this.socket = null
+    this.connectRequestId = null
+    this.rejectPending(reason)
+    this.rejectConnect(reason)
+    this.setState('disconnected')
+    try {
+      socket.close(1012, 'client reconnect')
+    } catch {}
+    this.scheduleReconnect(true)
+  }
+
   private clearReconnect(): void {
     if (this.reconnectTimer !== undefined) clearTimeout(this.reconnectTimer)
     this.reconnectTimer = undefined
+  }
+
+  private isCurrentSocket(socket: WebSocketLike, generation: number): boolean {
+    return this.socket === socket && this.connectionGeneration === generation
   }
 
   private rejectConnect(error: Error): void {
@@ -494,16 +677,55 @@ export class GatewayClient {
   }
 
   private rejectPending(error: Error): void {
-    for (const request of this.pending.values()) {
-      if (request.timeout !== undefined) clearTimeout(request.timeout)
-      request.reject(error)
+    for (const id of [...this.pending.keys()]) {
+      this.rejectRequest(id, error)
     }
-    this.pending.clear()
+  }
+
+  private takeRequest(id: string): PendingRequest | undefined {
+    const request = this.pending.get(id)
+    if (!request) return undefined
+    this.pending.delete(id)
+    if (request.timeout !== undefined) clearTimeout(request.timeout)
+    if (request.signal && request.abortHandler) {
+      request.signal.removeEventListener('abort', request.abortHandler)
+    }
+    return request
+  }
+
+  private rejectRequest(id: string, error: Error): boolean {
+    const request = this.takeRequest(id)
+    if (!request) return false
+    request.reject(error)
+    return true
   }
 
   private setState(state: GatewayConnectionState): void {
     if (this.connectionState === state) return
     this.connectionState = state
-    this.options.onStateChange?.(state)
+    try {
+      this.options.onStateChange?.(state)
+    } catch (error) {
+      this.notifyDiagnostic(
+        error instanceof Error ? error : new Error('Gateway state observer failed'),
+      )
+    }
+    for (const handler of this.stateHandlers) {
+      try {
+        handler(state)
+      } catch (error) {
+        this.notifyDiagnostic(
+          error instanceof Error ? error : new Error('Gateway state observer failed'),
+        )
+      }
+    }
+  }
+
+  private notifyDiagnostic(error: Error): void {
+    try {
+      this.options.onDiagnostic?.(error)
+    } catch {
+      // Diagnostics are observational and cannot alter transport lifecycle.
+    }
   }
 }

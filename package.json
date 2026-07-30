@@ -14,13 +14,15 @@
     "packages/ui-foundation"
   ],
   "scripts": {
-    "build:ui-packages": "npm run build --workspaces --if-present",
+    "build:client-sdk": "npm run build --prefix packages/client-sdk",
+    "build:ui-packages": "npm run build:client-sdk && npm run build --workspaces --if-present",
     "test:ui-primitives:browser": "playwright test --config packages/ui-primitives/playwright.config.ts",
     "test:ui-packages": "npm run test --workspaces --if-present",
     "typecheck:ui-packages": "npm run typecheck --workspaces --if-present",
-    "verify:ui-packages": "npm run typecheck:ui-packages && npm run test:ui-packages && npm run build:ui-packages && npm run verify:cross-surface --workspace @opensquilla/ui-tokens && npm run verify:boundaries --workspace @opensquilla/ui-primitives && node scripts/verify_ui_packages.mjs"
+    "verify:ui-packages": "npm run build:client-sdk && npm run typecheck:ui-packages && npm run test:ui-packages && npm run build:ui-packages && npm run verify:cross-surface --workspace @opensquilla/ui-tokens && npm run verify:boundaries --workspace @opensquilla/ui-primitives && npm run verify:boundaries --workspace @opensquilla/ui-foundation && node scripts/verify_ui_packages.mjs"
   },
   "devDependencies": {
+    "@opensquilla/client-sdk": "file:packages/client-sdk",
     "@playwright/test": "^1.60.0",
     "@vitejs/plugin-vue": "^6.0.7",
     "happy-dom": "^20.10.6",

@@ -70,7 +70,7 @@ export default defineConfig({
     // path so peer dependencies such as Vue resolve from this WebUI install,
     // including when the repository root has no node_modules directory.
     preserveSymlinks: true,
-    dedupe: ['vue'],
+    dedupe: ['vue', '@opensquilla/client-sdk', '@opensquilla/ui-foundation'],
     alias: {
       '@': resolve(__dirname, 'src'),
     },
@@ -87,7 +87,11 @@ export default defineConfig({
     // linked ESM bundle to native Node outside the WebUI node_modules tree.
     server: {
       deps: {
-        inline: ['@opensquilla/ui-primitives'],
+        inline: [
+          '@opensquilla/client-sdk',
+          '@opensquilla/ui-foundation',
+          '@opensquilla/ui-primitives',
+        ],
       },
     },
   },

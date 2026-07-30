@@ -59,7 +59,7 @@ function assertPackageMetadata(record, packageJson) {
 function isAllowedPackedFile(record, file) {
   if (['LICENSE', 'README.md', 'package.json'].includes(file)) return true
   if (record.name === '@opensquilla/ui-foundation') {
-    return ['dist/index.d.ts', 'dist/index.js'].includes(file)
+    return /^dist\/(?:[\w.-]+\/)*[\w.-]+\.(?:d\.ts|js)$/.test(file)
   }
   if (record.name === '@opensquilla/ui-tokens') {
     return [
@@ -138,6 +138,7 @@ try {
   )
 
   const packedTarballs = []
+  const dependencyTarballs = []
   for (const record of manifest.packages) {
     const packageRoot = path.join(repositoryRoot, record.path)
     const packageJson = JSON.parse(
@@ -147,6 +148,22 @@ try {
     assert.equal(packageJson.version, record.version)
 
     if (!record.workspace) {
+      if (record.name === '@opensquilla/client-sdk') {
+        const output = npm(
+          [
+            'pack',
+            '--json',
+            '--ignore-scripts',
+            '--pack-destination',
+            temporaryRoot,
+            packageRoot,
+          ],
+          repositoryRoot,
+        )
+        const [packed] = JSON.parse(output)
+        assert.ok(packed.filename, `${record.name}: npm pack did not report a tarball`)
+        dependencyTarballs.push(path.join(temporaryRoot, packed.filename))
+      }
       continue
     }
 
@@ -207,14 +224,20 @@ try {
       'export const createTextVNode = passthrough',
       'export const createVNode = passthrough',
       'export const defineComponent = passthrough',
+      'export const getCurrentScope = () => undefined',
+      'export const getCurrentInstance = () => undefined',
       'export const mergeProps = passthrough',
       'export const nextTick = passthrough',
       'export const normalizeClass = passthrough',
       'export const onBeforeUnmount = passthrough',
+      'export const onMounted = passthrough',
+      'export const onScopeDispose = passthrough',
       'export const openBlock = passthrough',
+      'export const readonly = passthrough',
       'export const ref = passthrough',
       'export const renderSlot = passthrough',
       'export const resolveDynamicComponent = passthrough',
+      'export const shallowRef = passthrough',
       'export const toDisplayString = passthrough',
       'export const unref = passthrough',
       'export const useAttrs = passthrough',
@@ -232,6 +255,15 @@ try {
       'export type ComponentOptionsMixin = Record<string, never>',
       'export type ComponentProvideOptions = Record<PropertyKey, unknown>',
       'export type PublicProps = Record<string, unknown>',
+      'export type DeepReadonly<T> = Readonly<T>',
+      'export interface ComputedRef<T> { readonly value: T }',
+      'export interface ShallowRef<T> { value: T }',
+      'export function getCurrentScope(): unknown',
+      'export function getCurrentInstance(): unknown',
+      'export function onScopeDispose(callback: () => void): void',
+      'export function onMounted(callback: () => void): void',
+      'export function readonly<T>(value: T): DeepReadonly<T>',
+      'export function shallowRef<T>(value: T): ShallowRef<T>',
       'export type DefineComponent<',
       '  A = unknown, B = unknown, C = unknown, D = unknown, E = unknown,',
       '  F = unknown, G = unknown, H = unknown, I = unknown, J = unknown,',
@@ -271,6 +303,7 @@ try {
       '--offline',
       '--no-package-lock',
       vueTarball,
+      ...dependencyTarballs,
       ...packedTarballs.map((record) => record.tarball),
     ],
     consumer,

@@ -15,8 +15,8 @@
     "preview": "vite preview",
     "check:architecture": "node scripts/check-architecture.mjs && node scripts/check-chat-security.mjs && node scripts/check-webui-colors.mjs && node scripts/check-webui-motion.mjs && node scripts/check-webui-radius.mjs && node scripts/check-theme-contract.mjs && node scripts/check-theme-scope.mjs && node scripts/check-i18n.mjs && node scripts/check-channel-catalog-i18n.mjs && node scripts/check-readme-locales.mjs",
     "check:readme-locales": "node scripts/check-readme-locales.mjs",
-    "typecheck": "npm run build:client-sdk && npm run build:ui-foundation && npm run check:architecture && vue-tsc --noEmit",
-    "test:unit": "npm run build:client-sdk && npm run build:ui-foundation && vitest run",
+    "typecheck": "npm run build:ui-foundation && npm run check:architecture && vue-tsc --noEmit",
+    "test:unit": "npm run build:ui-foundation && vitest run",
     "test:unit:watch": "vitest",
     "test:e2e": "playwright test",
     "test:e2e:ui": "playwright test --ui",
@@ -27,6 +27,7 @@
   },
   "dependencies": {
     "@opensquilla/client-sdk": "file:../packages/client-sdk",
+    "@opensquilla/ui-foundation": "file:../packages/ui-foundation",
     "@opensquilla/ui-primitives": "file:../packages/ui-primitives",
     "@opensquilla/ui-tokens": "file:../packages/ui-tokens",
     "@types/dompurify": "^3.0.5",
