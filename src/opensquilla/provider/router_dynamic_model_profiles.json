@@ -1,6 +1,6 @@
 {
   "schema_version": "step2-model-registry-v2",
-  "snapshot_version": "curated-openrouter-step2-2026-07-30.1",
+  "snapshot_version": "curated-openrouter-step2-2026-07-30.2",
   "models": [
     {
       "source": "curated_openrouter_profile",
@@ -59,15 +59,15 @@
       },
       "static_profile": {
         "capability_dist_prior": {
-          "reasoning": 0.64,
-          "code_generation": 0.71,
-          "code_review": 0.62,
-          "tool_use": 0.62,
-          "planning": 0.58,
-          "retrieval": 0.52,
+          "reasoning": 0.71,
+          "code_generation": 0.75,
+          "code_review": 0.66,
+          "tool_use": 0.66,
+          "planning": 0.63,
+          "retrieval": 0.55,
           "summarization": 0.68,
           "writing": 0.62,
-          "math": 0.65,
+          "math": 0.72,
           "data_analysis": 0.6,
           "visual_understanding": 0.05,
           "audio_understanding": 0.05,
@@ -1718,10 +1718,10 @@
       "static_profile": {
         "capability_dist_prior": {
           "reasoning": 0.86,
-          "code_generation": 0.84,
-          "code_review": 0.84,
-          "tool_use": 0.85,
-          "planning": 0.84,
+          "code_generation": 0.89,
+          "code_review": 0.89,
+          "tool_use": 0.9,
+          "planning": 0.9,
           "retrieval": 0.77,
           "summarization": 0.85,
           "writing": 0.85,
@@ -1734,7 +1734,7 @@
           "safety_judgment": 0.79
         },
         "domain_dist_prior": {
-          "software_engineering": 0.86,
+          "software_engineering": 0.9,
           "data_science": 0.83,
           "document_processing": 0.86,
           "business_analysis": 0.84,
@@ -2313,10 +2313,10 @@
       "static_profile": {
         "capability_dist_prior": {
           "reasoning": 0.85,
-          "code_generation": 0.8,
-          "code_review": 0.77,
-          "tool_use": 0.9,
-          "planning": 0.8,
+          "code_generation": 0.94,
+          "code_review": 0.94,
+          "tool_use": 0.96,
+          "planning": 0.95,
           "retrieval": 0.88,
           "summarization": 0.89,
           "writing": 0.83,
@@ -2329,7 +2329,7 @@
           "safety_judgment": 0.76
         },
         "domain_dist_prior": {
-          "software_engineering": 0.82,
+          "software_engineering": 0.95,
           "data_science": 0.83,
           "document_processing": 0.89,
           "business_analysis": 0.86,
@@ -2432,10 +2432,10 @@
       "static_profile": {
         "capability_dist_prior": {
           "reasoning": 0.82,
-          "code_generation": 0.78,
-          "code_review": 0.75,
-          "tool_use": 0.88,
-          "planning": 0.77,
+          "code_generation": 0.93,
+          "code_review": 0.93,
+          "tool_use": 0.95,
+          "planning": 0.94,
           "retrieval": 0.86,
           "summarization": 0.87,
           "writing": 0.81,
@@ -2448,7 +2448,7 @@
           "safety_judgment": 0.74
         },
         "domain_dist_prior": {
-          "software_engineering": 0.8,
+          "software_engineering": 0.94,
           "data_science": 0.8,
           "document_processing": 0.87,
           "business_analysis": 0.84,
@@ -2557,7 +2557,7 @@
           "code_review": 0.98,
           "tool_use": 0.96,
           "planning": 0.98,
-          "retrieval": 0.89,
+          "retrieval": 0.9,
           "summarization": 0.94,
           "writing": 0.94,
           "math": 0.97,
@@ -2578,8 +2578,8 @@
           "research": 0.94,
           "customer_support": 0.94,
           "legal": 0.83,
-          "finance": 0.87,
-          "medical": 0.8,
+          "finance": 0.94,
+          "medical": 0.89,
           "technical_writing": 0.96,
           "general": 0.97
         },
@@ -2674,11 +2674,11 @@
       "static_profile": {
         "capability_dist_prior": {
           "reasoning": 0.93,
-          "code_generation": 0.94,
+          "code_generation": 0.96,
           "code_review": 0.91,
           "tool_use": 0.95,
           "planning": 0.91,
-          "retrieval": 0.85,
+          "retrieval": 0.89,
           "summarization": 0.89,
           "writing": 0.86,
           "math": 0.9,
@@ -2699,8 +2699,8 @@
           "research": 0.91,
           "customer_support": 0.88,
           "legal": 0.79,
-          "finance": 0.81,
-          "medical": 0.75,
+          "finance": 0.93,
+          "medical": 0.88,
           "technical_writing": 0.9,
           "general": 0.91
         },
