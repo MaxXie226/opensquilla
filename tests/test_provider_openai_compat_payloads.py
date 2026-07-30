@@ -690,6 +690,46 @@ def test_openrouter_deepseek_v4_returns_reasoning_content_from_details(
     assert done.reasoning_content == "I considered the request."
 
 
+def test_openrouter_native_effort_payload_strictly_descends_for_frozen_neighbors(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="test",
+        model="vendor/reasoning-model",
+        base_url="https://openrouter.ai/api/v1",
+        provider_kind="openrouter",
+    )
+    capabilities = ModelCapabilities(
+        supports_reasoning=True,
+        supports_tools=True,
+        reasoning_format="openrouter",
+    )
+
+    observed: list[dict[str, Any]] = []
+    for level in (ThinkingLevel.XHIGH, ThinkingLevel.HIGH, ThinkingLevel.MEDIUM):
+        _collect(
+            provider,
+            ChatConfig(
+                max_tokens=16_384,
+                thinking=True,
+                thinking_level=level,
+                thinking_budget_tokens=8_192,
+                thinking_budget_explicit=True,
+                model_capabilities=capabilities,
+            ),
+        )
+        observed.append(dict(captured["payload"]["reasoning"]))
+
+    assert observed == [
+        {"effort": "xhigh"},
+        {"effort": "high"},
+        {"effort": "medium"},
+    ]
+    assert all("max_tokens" not in control for control in observed)
+
+
 def _collect_events(
     provider: OpenAIProvider,
     cfg: ChatConfig,

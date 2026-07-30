@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator
+from copy import deepcopy
 from typing import Any
 
 import pytest
@@ -22,6 +23,7 @@ from opensquilla.provider.ranking_router import (
     THINKING_LEVELS,
     DynamicRankingError,
     TaskAnalysisResult,
+    TaskAnalyzerPhysicalEvidenceError,
     TaskAnalyzerStreamCleanupError,
     analyze_task_with_provider,
     build_model_registry_snapshot,
@@ -35,7 +37,13 @@ from opensquilla.provider.ranking_router import (
     rank_models,
     ranking_trace_replay_reasons,
 )
-from opensquilla.provider.types import ChatConfig, DoneEvent, Message, TextDeltaEvent
+from opensquilla.provider.types import (
+    ChatConfig,
+    DoneEvent,
+    ErrorEvent,
+    Message,
+    TextDeltaEvent,
+)
 
 
 def _task_profile(
@@ -270,13 +278,81 @@ def test_v3_replay_binds_frozen_aggregator_candidate_chain() -> None:
         ranking_thinking_assignment_enabled=True,
     )
     trace = decision.trace
-    assert trace["ranking_version"] == "step2-ranking-v3"
+    assert trace["ranking_version"] == "step2-ranking-v4"
 
     tampered = json.loads(json.dumps(trace))
     tampered["aggregator_candidates"] = list(reversed(tampered["aggregator_candidates"]))
 
     assert "g1_frozen_ranker_replay_mismatch_aggregator_candidates" in ranking_trace_replay_reasons(
         tampered
+    )
+
+
+def test_v3_managed_thinking_trace_requires_explicit_compatibility() -> None:
+    trace = rank_models(
+        task_analysis=_analysis(tier=3),
+        user_profile=None,
+        request_context=_context(),
+        registry_snapshot=_snapshot(
+            _thinking_model(
+                "alpha",
+                provider="provider-a",
+                capability=0.95,
+            ),
+            _thinking_model(
+                "beta",
+                provider="provider-b",
+                capability=0.90,
+            ),
+            _thinking_model(
+                "gamma",
+                provider="provider-c",
+                capability=0.85,
+            ),
+        ),
+        routed_tier="c2",
+        routing_confidence=0.91,
+        decision_id="legacy-managed-thinking-replay",
+        ranking_thinking_assignment_enabled=True,
+    ).trace
+    legacy = deepcopy(trace)
+    legacy["ranking_version"] = (
+        ranking_router.LEGACY_THINKING_RANKING_VERSION
+    )
+    legacy.pop("thinking_physical_evidence_schema")
+    legacy["thinking_assignment_details"].pop(
+        "aggregator_candidates"
+    )
+    legacy["policy_versions"]["ranking"] = (
+        ranking_router.LEGACY_THINKING_RANKING_VERSION
+    )
+
+    assert "g1_frozen_ranker_replay_mismatch_ranking_version" in (
+        ranking_trace_replay_reasons(legacy)
+    )
+    assert ranking_trace_replay_reasons(
+        legacy,
+        allow_legacy_managed_v3=True,
+    ) == []
+
+    tampered = deepcopy(legacy)
+    tampered["policy_versions"]["thinking"] = "tampered"
+    assert (
+        "g1_frozen_ranker_replay_mismatch_policy_versions"
+        in ranking_trace_replay_reasons(
+            tampered,
+            allow_legacy_managed_v3=True,
+        )
+    )
+
+    missing_recovery_chain = deepcopy(legacy)
+    missing_recovery_chain.pop("aggregator_candidates")
+    assert (
+        "g1_frozen_ranker_replay_mismatch_aggregator_candidates"
+        in ranking_trace_replay_reasons(
+            missing_recovery_chain,
+            allow_legacy_managed_v3=True,
+        )
     )
 
 
@@ -1088,6 +1164,37 @@ class _AnalyzerProvider:
         return []
 
 
+class _AnalyzerTerminalProvider:
+    provider_name = "analyzer-test"
+    model = "analyzer-test"
+    accounts_physical_usage = True
+
+    def __init__(self, terminals: list[DoneEvent | ErrorEvent]) -> None:
+        self.terminals = terminals
+        self.calls: list[tuple[list[Message], ChatConfig | None]] = []
+
+    async def _stream(
+        self,
+        terminal: DoneEvent | ErrorEvent,
+    ) -> AsyncIterator[Any]:
+        if isinstance(terminal, DoneEvent):
+            yield TextDeltaEvent(text=json.dumps(_task_profile(tier=2)))
+        yield terminal
+
+    def chat(
+        self,
+        messages: list[Message],
+        tools: list[Any] | None = None,
+        config: ChatConfig | None = None,
+    ) -> AsyncIterator[Any]:
+        self.calls.append((messages, config))
+        index = min(len(self.calls) - 1, len(self.terminals) - 1)
+        return self._stream(self.terminals[index])
+
+    async def list_models(self) -> list[Any]:
+        return []
+
+
 @pytest.mark.asyncio
 async def test_task_analyzer_hanging_stream_close_is_bounded(
     monkeypatch: pytest.MonkeyPatch,
@@ -1465,6 +1572,316 @@ async def test_task_analyzer_preserves_unknown_then_exact_retry_attempts() -> No
     assert attempts[1]["provider_usage"]["response_ids"] == ["analyzer-2"]
     assert attempts[1].get("usage_unknown") is not True
     assert len({row["physical_attempt_id"] for row in attempts}) == 2
+
+
+@pytest.mark.asyncio
+async def test_task_analyzer_explicit_no_request_retry_has_no_physical_gap() -> None:
+    config = load_ranking_config()
+    config["task_analyzer"]["max_retries"] = 1
+    provider = _AnalyzerTerminalProvider(
+        [
+            ErrorEvent(
+                message="local preflight",
+                code="local_preflight",
+                request_started=False,
+                physical_request_count=0,
+            ),
+            DoneEvent(
+                provider="openrouter",
+                model="analyzer-test",
+                input_tokens=11,
+                output_tokens=7,
+                billed_cost=0.012,
+                cost_source="provider_billed",
+                provider_usage={
+                    "response_ids": ["analyzer-2"],
+                    "physical_attempt_id": "e" * 32,
+                },
+            ),
+        ]
+    )
+
+    result = await analyze_task_with_provider(
+        provider=provider,
+        message="hello",
+        user_profile_enabled=False,
+        request_context=_context(),
+        routed_tier="c2",
+        routing_confidence=0.77,
+        ranking_config=config,
+        decision_id="b" * 32,
+    )
+
+    assert len(provider.calls) == 2
+    assert result.usage["attempt_count"] == 1
+    assert [row["attempt"] for row in result.usage["physical_attempts"]] == [1]
+    assert result.usage["physical_attempts"][0]["provider_usage"]["response_ids"] == [
+        "analyzer-2"
+    ]
+    assert (
+        result.usage["physical_attempts"][0]["provider_usage"][
+            "physical_attempt_id"
+        ]
+        == result.usage["physical_attempts"][0]["physical_attempt_id"]
+    )
+    assert result.usage["physical_attempts"][0]["physical_attempt_id"] == "e" * 32
+
+
+@pytest.mark.asyncio
+async def test_task_analyzer_explicit_no_request_fallback_is_zero_usage() -> None:
+    config = load_ranking_config()
+    config["task_analyzer"]["max_retries"] = 0
+
+    result = await analyze_task_with_provider(
+        provider=_AnalyzerTerminalProvider(
+            [
+                ErrorEvent(
+                    message="local preflight",
+                    code="local_preflight",
+                    request_started=False,
+                    physical_request_count=0,
+                )
+            ]
+        ),
+        message="hello",
+        user_profile_enabled=False,
+        request_context=_context(),
+        routed_tier="c2",
+        routing_confidence=0.77,
+        ranking_config=config,
+    )
+
+    assert result.source == "router_fallback"
+    assert result.usage == {"physical_attempts": [], "attempt_count": 0}
+
+
+@pytest.mark.asyncio
+async def test_task_analyzer_error_preserves_known_diagnostic_receipt() -> None:
+    config = load_ranking_config()
+    config["task_analyzer"]["max_retries"] = 0
+    diagnostic = DoneEvent(
+        provider="openrouter",
+        model="analyzer-test",
+        input_tokens=13,
+        output_tokens=5,
+        billed_cost=0.025,
+        cost_source="provider_billed",
+        provider_usage={
+            "response_ids": ["diagnostic-response"],
+            "physical_attempt_id": "c" * 32,
+        },
+    )
+
+    result = await analyze_task_with_provider(
+        provider=_AnalyzerTerminalProvider(
+            [
+                ErrorEvent(
+                    message="response metadata invalid",
+                    code="response_invalid",
+                    diagnostic_done=diagnostic,
+                    request_started=True,
+                    physical_request_count=1,
+                )
+            ]
+        ),
+        message="hello",
+        user_profile_enabled=False,
+        request_context=_context(),
+        routed_tier="c2",
+        routing_confidence=0.77,
+        ranking_config=config,
+    )
+
+    attempt = result.usage["physical_attempts"][0]
+    assert result.source == "router_fallback"
+    assert result.usage["attempt_count"] == 1
+    assert attempt["input_tokens"] == 13
+    assert attempt["billed_cost"] == pytest.approx(0.025)
+    assert attempt["provider_usage"]["response_ids"] == ["diagnostic-response"]
+    assert attempt["physical_attempt_id"] == "c" * 32
+    assert attempt["provider_usage"]["physical_attempt_id"] == "c" * 32
+    assert attempt.get("usage_unknown") is not True
+
+
+@pytest.mark.asyncio
+async def test_task_analyzer_conflicting_receipt_ids_fail_closed() -> None:
+    config = load_ranking_config()
+    config["task_analyzer"]["max_retries"] = 3
+    provider = _AnalyzerTerminalProvider(
+        [
+            ErrorEvent(
+                message="conflicting request identities",
+                code="response_invalid",
+                model_usage_breakdown=[
+                    {
+                        "provider": "openrouter",
+                        "model": "analyzer-test",
+                        "input_tokens": 3,
+                        "output_tokens": 1,
+                        "billed_cost": 0.01,
+                        "cost_source": "provider_billed",
+                        "physical_attempt_id": "c" * 32,
+                        "provider_usage": {
+                            "response_ids": ["paid-response"],
+                            "physical_attempt_id": "d" * 32,
+                        },
+                    }
+                ],
+                diagnostic_done=DoneEvent(
+                    provider="openrouter",
+                    model="analyzer-test",
+                    input_tokens=3,
+                    output_tokens=1,
+                    billed_cost=0.01,
+                    cost_source="provider_billed",
+                    provider_usage={
+                        "response_ids": ["paid-response"],
+                        "physical_attempt_id": "d" * 32,
+                    },
+                ),
+                request_started=True,
+                physical_request_count=1,
+            )
+        ]
+    )
+
+    with pytest.raises(TaskAnalyzerPhysicalEvidenceError):
+        await analyze_task_with_provider(
+            provider=provider,
+            message="hello",
+            user_profile_enabled=False,
+            request_context=_context(),
+            routed_tier="c2",
+            routing_confidence=0.77,
+            ranking_config=config,
+        )
+
+    assert len(provider.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_task_analyzer_contradictory_receipt_fails_closed_with_usage() -> None:
+    config = load_ranking_config()
+    config["task_analyzer"]["max_retries"] = 3
+    provider = _AnalyzerTerminalProvider(
+        [
+            ErrorEvent(
+                message="contradictory adapter evidence",
+                code="response_invalid",
+                diagnostic_done=DoneEvent(
+                    provider="openrouter",
+                    model="analyzer-test",
+                    input_tokens=3,
+                    output_tokens=1,
+                    billed_cost=0.01,
+                    cost_source="provider_billed",
+                    provider_usage={"response_ids": ["paid-response"]},
+                ),
+                request_started=False,
+                physical_request_count=0,
+            )
+        ]
+    )
+
+    with pytest.raises(TaskAnalyzerPhysicalEvidenceError) as caught:
+        await analyze_task_with_provider(
+            provider=provider,
+            message="hello",
+            user_profile_enabled=False,
+            request_context=_context(),
+            routed_tier="c2",
+            routing_confidence=0.77,
+            ranking_config=config,
+        )
+
+    assert len(provider.calls) == 1
+    assert caught.value.usage["attempt_count"] == 1
+    assert caught.value.usage["physical_attempts"][0]["provider_usage"][
+        "response_ids"
+    ] == ["paid-response"]
+    assert (
+        caught.value.usage["physical_attempts"][0]["provider_usage"][
+            "physical_attempt_id"
+        ]
+        == caught.value.usage["physical_attempts"][0]["physical_attempt_id"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_task_analyzer_multiple_physical_requests_fail_closed() -> None:
+    config = load_ranking_config()
+    config["task_analyzer"]["max_retries"] = 3
+
+    with pytest.raises(TaskAnalyzerPhysicalEvidenceError) as caught:
+        await analyze_task_with_provider(
+            provider=_AnalyzerTerminalProvider(
+                [
+                    ErrorEvent(
+                        message="fallback wrapper made two calls",
+                        code="all_routes_failed",
+                        request_started=True,
+                        physical_request_count=2,
+                        usage_missing_count=2,
+                    )
+                ]
+            ),
+            message="hello",
+            user_profile_enabled=False,
+            request_context=_context(),
+            routed_tier="c2",
+            routing_confidence=0.77,
+            ranking_config=config,
+        )
+
+    assert caught.value.usage["attempt_count"] == 2
+    assert [row["attempt"] for row in caught.value.usage["physical_attempts"]] == [
+        1,
+        2,
+    ]
+    assert all(
+        row["usage_unknown"] is True
+        for row in caught.value.usage["physical_attempts"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_task_analyzer_logs_do_not_store_exception_body() -> None:
+    class _ExplodingProvider:
+        provider_name = "analyzer-test"
+        model = "analyzer-test"
+        accounts_physical_usage = True
+
+        def chat(
+            self,
+            messages: list[Message],
+            tools: list[Any] | None = None,
+            config: ChatConfig | None = None,
+        ) -> AsyncIterator[Any]:
+            async def stream() -> AsyncIterator[Any]:
+                raise RuntimeError("sensitive upstream response body")
+                yield  # pragma: no cover
+
+            return stream()
+
+        async def list_models(self) -> list[Any]:
+            return []
+
+    config = load_ranking_config()
+    config["task_analyzer"]["max_retries"] = 0
+    with structlog.testing.capture_logs() as captured:
+        await analyze_task_with_provider(
+            provider=_ExplodingProvider(),
+            message="hello",
+            user_profile_enabled=False,
+            request_context=_context(),
+            routed_tier="c2",
+            routing_confidence=0.77,
+            ranking_config=config,
+        )
+
+    serialized_logs = json.dumps(captured)
+    assert "sensitive upstream response body" not in serialized_logs
+    assert all("details" not in row for row in captured)
 
 
 @pytest.mark.asyncio
@@ -2406,6 +2823,69 @@ def test_disabled_thinking_assignment_preserves_exact_legacy_trace_shape() -> No
     )
 
 
+def test_default_off_ignores_managed_only_request_and_registry_filter_facts() -> None:
+    models = [
+        _thinking_model("alpha", provider="provider-a", capability=0.95),
+        _thinking_model("beta", provider="provider-b", capability=0.90),
+        _thinking_model("gamma", provider="provider-c", capability=0.85),
+    ]
+    models[0]["registry_facts"].update(
+        {
+            "supports_tools": False,
+            "retry_excluded_proposer": True,
+        }
+    )
+    for model in models[1:]:
+        model["registry_facts"]["supports_tools"] = True
+    context = {
+        **_context(),
+        "required_parameters_by_role": {
+            "proposer": ["tools"],
+            "aggregator": ["tools"],
+        },
+    }
+
+    disabled = _decision(
+        *deepcopy(models),
+        analysis=_analysis(tier=3),
+        context=context,
+        thinking_assignment_enabled=False,
+    )
+    enabled = _decision(
+        *deepcopy(models),
+        analysis=_analysis(tier=3),
+        context=context,
+        thinking_assignment_enabled=True,
+    )
+    disabled_alpha = [
+        row
+        for role in ("proposer_results", "aggregator_results")
+        for row in disabled.trace["hard_filter"][role]
+        if row["model"] == "alpha"
+    ]
+    enabled_alpha = [
+        row
+        for role in ("proposer_results", "aggregator_results")
+        for row in enabled.trace["hard_filter"][role]
+        if row["model"] == "alpha"
+    ]
+
+    assert all(
+        "required_parameter_tools_unsupported" not in row["reasons"]
+        and "prior_attempt_reasoning_only_length" not in row["reasons"]
+        for row in disabled_alpha
+    )
+    assert any(
+        "required_parameter_tools_unsupported" in row["reasons"]
+        for row in enabled_alpha
+    )
+    assert any(
+        "prior_attempt_reasoning_only_length" in row["reasons"]
+        for row in enabled_alpha
+        if row["role"] == "proposer"
+    )
+
+
 def test_legacy_v3_ranking_config_remains_usable_only_when_assignment_is_off() -> None:
     legacy = load_ranking_config()
     legacy["schema_version"] = "step2-ranking-config-v3"
@@ -2730,7 +3210,7 @@ def test_enabled_assignment_is_complete_auditable_and_role_specific() -> None:
     assert decision.trace["assignment_reasons"]["proposers"]
     assert decision.trace["assignment_reasons"]["aggregator"]
     assert decision.trace["policy_versions"] == {
-        "ranking": "step2-ranking-v3",
+        "ranking": "step2-ranking-v4",
         "thinking": "thinking-policy-v1",
     }
 

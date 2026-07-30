@@ -14,6 +14,7 @@ import copy
 import hashlib
 import json
 import math
+import re
 from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -24,11 +25,13 @@ from typing import Any
 import structlog
 
 from .protocol import LLMProvider
+from .thinking_execution import THINKING_PHYSICAL_EVIDENCE_SCHEMA
 from .types import ChatConfig, DoneEvent, ErrorEvent, Message, TextDeltaEvent
 
 log = structlog.get_logger(__name__)
 
-RANKING_VERSION = "step2-ranking-v3"
+RANKING_VERSION = "step2-ranking-v4"
+LEGACY_THINKING_RANKING_VERSION = "step2-ranking-v3"
 LEGACY_RANKING_VERSION = "step2-ranking-v2"
 RANKING_CONFIG_SCHEMA_VERSION = "step2-ranking-config-v4"
 LEGACY_RANKING_CONFIG_SCHEMA_VERSION = "step2-ranking-config-v3"
@@ -45,6 +48,7 @@ TASK_PROFILE_SCHEMA_VERSION = "step2-task-profile-v1"
 THINKING_POLICY_VERSION = "thinking-policy-v1"
 GENERATION_POLICY_FILTER_REASON_PREFIX = "generation_policy_"
 _TASK_ANALYZER_STREAM_CLOSE_TIMEOUT_SECONDS = 1.0
+_PHYSICAL_ATTEMPT_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _NATIVE_IMAGE_ATTACHMENT_MIMES = frozenset(
     {
         "image/gif",
@@ -151,6 +155,10 @@ class TaskAnalyzerStreamCleanupError(RuntimeError):
     ) -> None:
         super().__init__(message)
         self.usage = copy.deepcopy(dict(usage or {}))
+
+
+class TaskAnalyzerPhysicalEvidenceError(TaskAnalyzerStreamCleanupError):
+    """Raised when analyzer physical-request evidence is contradictory."""
 
 
 class _ValidatedRankingConfig(dict[str, Any]):
@@ -437,6 +445,132 @@ def _request_context_hash(request_context: Mapping[str, Any]) -> str:
     payload = copy.deepcopy(dict(request_context))
     payload.pop("snapshot_hash", None)
     return _canonical_hash(payload)
+
+
+ROUTER_DYNAMIC_RETRY_ROUTING_SCHEMA = "opensquilla.router-dynamic-retry-routing/v2"
+ROUTER_DYNAMIC_TASK_ANALYSIS_REUSE_SCHEMA = "opensquilla.router-dynamic-task-analysis-reuse/v1"
+ROUTER_DYNAMIC_TASK_ANALYSIS_REUSE_FIELDS = (
+    "task_analyzer",
+    "task_profile",
+    "task_profile_hash",
+    "request_context",
+    "request_context_hash",
+    "routed_tier",
+    "routing_confidence",
+    "user_profile_enabled",
+    "user_profile_version",
+    "user_profile_source",
+)
+
+
+def router_dynamic_task_analysis_reuse_projection(
+    plan: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return the canonical public inputs that a G1 rerank must reuse."""
+
+    return {
+        field: copy.deepcopy(plan.get(field)) for field in ROUTER_DYNAMIC_TASK_ANALYSIS_REUSE_FIELDS
+    }
+
+
+def _router_dynamic_task_analysis_projection_reasons(
+    projection: Mapping[str, Any],
+) -> list[str]:
+    reasons: list[str] = []
+    if set(projection) != set(ROUTER_DYNAMIC_TASK_ANALYSIS_REUSE_FIELDS):
+        reasons.append("g1_retry_task_analysis_projection_fields_mismatch")
+        return reasons
+    task_analyzer = projection.get("task_analyzer")
+    task_profile = projection.get("task_profile")
+    request_context = projection.get("request_context")
+    if not isinstance(task_analyzer, Mapping) or not task_analyzer:
+        reasons.append("invalid_g1_retry_task_analyzer")
+    if not isinstance(task_profile, Mapping) or not task_profile:
+        reasons.append("invalid_g1_retry_task_profile")
+    elif str(projection.get("task_profile_hash") or "") != _canonical_hash(task_profile):
+        reasons.append("invalid_g1_retry_task_profile_hash")
+    if not isinstance(request_context, Mapping) or not request_context:
+        reasons.append("invalid_g1_retry_request_context")
+    else:
+        expected_context_hash = _request_context_hash(request_context)
+        if (
+            str(request_context.get("snapshot_hash") or "") != expected_context_hash
+            or str(projection.get("request_context_hash") or "") != expected_context_hash
+        ):
+            reasons.append("invalid_g1_retry_request_context_hash")
+    if not str(projection.get("routed_tier") or "").strip():
+        reasons.append("invalid_g1_retry_routed_tier")
+    routing_confidence = projection.get("routing_confidence")
+    if (
+        isinstance(routing_confidence, bool)
+        or not isinstance(routing_confidence, int | float)
+        or not math.isfinite(float(routing_confidence))
+        or not 0.0 <= float(routing_confidence) <= 1.0
+    ):
+        reasons.append("invalid_g1_retry_routing_confidence")
+    if not isinstance(projection.get("user_profile_enabled"), bool):
+        reasons.append("invalid_g1_retry_user_profile_enabled")
+    if not isinstance(projection.get("user_profile_version"), str):
+        reasons.append("invalid_g1_retry_user_profile_version")
+    if not isinstance(projection.get("user_profile_source"), str):
+        reasons.append("invalid_g1_retry_user_profile_source")
+    return reasons
+
+
+def build_router_dynamic_task_analysis_reuse_binding(
+    source_plan: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Bind one retry to the exact task-analysis inputs of its source decision."""
+
+    source_decision_id = str(source_plan.get("decision_id") or "").strip()
+    projection = router_dynamic_task_analysis_reuse_projection(source_plan)
+    reasons = _router_dynamic_task_analysis_projection_reasons(projection)
+    if not source_decision_id:
+        reasons.append("missing_g1_retry_task_analysis_source_decision")
+    if reasons:
+        raise DynamicRankingError(
+            "router_dynamic retry task-analysis source is invalid: " + ",".join(reasons)
+        )
+    return {
+        "schema": ROUTER_DYNAMIC_TASK_ANALYSIS_REUSE_SCHEMA,
+        "source_decision_id": source_decision_id,
+        "projection": projection,
+        "projection_sha256": _canonical_hash(projection),
+    }
+
+
+def router_dynamic_task_analysis_reuse_reasons(
+    source_plan: Mapping[str, Any],
+    retry_plan: Mapping[str, Any],
+) -> list[str]:
+    """Validate a retry's task-analysis binding against source and reranked plans."""
+
+    reasons: list[str] = []
+    source_projection = router_dynamic_task_analysis_reuse_projection(source_plan)
+    retry_projection = router_dynamic_task_analysis_reuse_projection(retry_plan)
+    reasons.extend(_router_dynamic_task_analysis_projection_reasons(source_projection))
+    reasons.extend(_router_dynamic_task_analysis_projection_reasons(retry_projection))
+    binding = retry_plan.get("task_analysis_reuse")
+    if not isinstance(binding, Mapping):
+        reasons.append("missing_g1_retry_task_analysis_binding")
+        return list(dict.fromkeys(reasons))
+    if binding.get("schema") != ROUTER_DYNAMIC_TASK_ANALYSIS_REUSE_SCHEMA:
+        reasons.append("wrong_g1_retry_task_analysis_binding_schema")
+    source_decision_id = str(source_plan.get("decision_id") or "").strip()
+    if not source_decision_id or binding.get("source_decision_id") != source_decision_id:
+        reasons.append("wrong_g1_retry_task_analysis_source_decision")
+    bound_projection = binding.get("projection")
+    if not isinstance(bound_projection, Mapping):
+        reasons.append("invalid_g1_retry_task_analysis_projection")
+    else:
+        reasons.extend(_router_dynamic_task_analysis_projection_reasons(bound_projection))
+        if dict(bound_projection) != source_projection:
+            reasons.append("g1_retry_task_analysis_source_projection_mismatch")
+        if dict(bound_projection) != retry_projection:
+            reasons.append("g1_retry_task_analysis_reuse_projection_mismatch")
+        if str(binding.get("projection_sha256") or "") != _canonical_hash(bound_projection):
+            reasons.append("g1_retry_task_analysis_projection_hash_mismatch")
+    return list(dict.fromkeys(reasons))
 
 
 def _ranking_value(config: Mapping[str, Any], *path: str) -> Any:
@@ -1796,6 +1930,115 @@ def _task_analyzer_physical_attempt_id(
     return hashlib.sha256(f"{logical_scope}:task_analyzer:{attempt}".encode()).hexdigest()[:32]
 
 
+def _task_analyzer_physical_attempt_count(
+    usage: Mapping[str, Any] | None,
+) -> int:
+    raw_attempts = (usage or {}).get("physical_attempts")
+    return (
+        len([row for row in raw_attempts if isinstance(row, Mapping)])
+        if isinstance(raw_attempts, list)
+        else 0
+    )
+
+
+def _task_analyzer_zero_request_usage(
+    accumulated: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    usage = copy.deepcopy(dict(accumulated or {}))
+    attempts = usage.get("physical_attempts")
+    usage["physical_attempts"] = (
+        [copy.deepcopy(dict(row)) for row in attempts if isinstance(row, Mapping)]
+        if isinstance(attempts, list)
+        else []
+    )
+    usage["attempt_count"] = len(usage["physical_attempts"])
+    return usage
+
+
+def _task_analyzer_usage_from_done(event: DoneEvent) -> dict[str, Any]:
+    usage = {
+        "provider": str(event.provider or ""),
+        "model": event.model,
+        "requested_provider": str(event.requested_provider or ""),
+        "requested_model": str(event.requested_model or ""),
+        "input_tokens": event.input_tokens,
+        "output_tokens": event.output_tokens,
+        "reasoning_tokens": event.reasoning_tokens,
+        "cached_tokens": event.cached_tokens,
+        "cache_write_tokens": event.cache_write_tokens,
+        "billed_cost": event.billed_cost,
+        "cost_source": event.cost_source,
+        "provider_usage": copy.deepcopy(dict(event.provider_usage)),
+    }
+    if event.billing_receipt is not None:
+        usage["billing_receipt"] = event.billing_receipt
+    return usage
+
+
+def _task_analyzer_usage_from_receipt_row(
+    row: Mapping[str, Any],
+) -> dict[str, Any]:
+    usage = copy.deepcopy(dict(row))
+    usage.pop("role", None)
+    usage.pop("label", None)
+    usage.pop("request_count", None)
+    usage.pop("attempt", None)
+    usage["cached_tokens"] = _as_int(
+        usage.get("cached_tokens", usage.get("cache_read_tokens")),
+        0,
+    )
+    usage.pop("cache_read_tokens", None)
+    provider_usage = usage.get("provider_usage")
+    if isinstance(provider_usage, Mapping):
+        usage["provider_usage"] = copy.deepcopy(dict(provider_usage))
+    else:
+        usage["provider_usage"] = {}
+    return usage
+
+
+def _event_reported_physical_attempt_ids(event: object) -> list[str]:
+    """Read additive physical-request evidence without requiring event fields."""
+
+    raw_ids = [str(getattr(event, "physical_attempt_id", "") or "").strip()]
+    provider_usage = getattr(event, "provider_usage", None)
+    if isinstance(provider_usage, Mapping):
+        raw_ids.append(
+            str(provider_usage.get("physical_attempt_id") or "").strip()
+        )
+    return raw_ids
+
+
+def _task_analyzer_reported_physical_attempt_ids(
+    event: ErrorEvent,
+    receipt_rows: Sequence[Mapping[str, Any]],
+) -> tuple[list[str], bool]:
+    """Return reported IDs and whether any source is invalid or contradictory."""
+
+    raw_ids = _event_reported_physical_attempt_ids(event)
+    diagnostic_done = event.diagnostic_done
+    if isinstance(diagnostic_done, DoneEvent):
+        raw_ids.extend(_event_reported_physical_attempt_ids(diagnostic_done))
+    row_conflict = False
+    for row in receipt_rows:
+        direct = str(row.get("physical_attempt_id") or "").strip()
+        provider_usage = row.get("provider_usage")
+        nested = (
+            str(provider_usage.get("physical_attempt_id") or "").strip()
+            if isinstance(provider_usage, Mapping)
+            else ""
+        )
+        if direct and nested and direct.casefold() != nested.casefold():
+            row_conflict = True
+        raw_ids.extend((direct, nested))
+    nonempty_ids = [value.casefold() for value in raw_ids if value]
+    invalid = any(
+        _PHYSICAL_ATTEMPT_ID_RE.fullmatch(value) is None
+        for value in nonempty_ids
+    )
+    unique_ids = list(dict.fromkeys(nonempty_ids))
+    return unique_ids, bool(invalid or row_conflict or len(unique_ids) > 1)
+
+
 def _task_analyzer_attempt_usage(
     usage: Mapping[str, Any] | None,
     *,
@@ -1816,6 +2059,25 @@ def _task_analyzer_attempt_usage(
     row.setdefault("requested_provider", provider_id)
     row.setdefault("requested_model", model_id)
     if has_usage:
+        raw_provider_usage = row.get("provider_usage")
+        provider_usage = (
+            copy.deepcopy(dict(raw_provider_usage))
+            if isinstance(raw_provider_usage, Mapping)
+            else {}
+        )
+        nested_physical_attempt_id = str(
+            provider_usage.get("physical_attempt_id") or ""
+        ).strip()
+        if (
+            nested_physical_attempt_id
+            and nested_physical_attempt_id.casefold()
+            != physical_attempt_id.casefold()
+        ):
+            raise TaskAnalyzerPhysicalEvidenceError(
+                "task analyzer physical_attempt_id mirror is contradictory"
+            )
+        provider_usage["physical_attempt_id"] = physical_attempt_id
+        row["provider_usage"] = provider_usage
         return row
     return {
         "attempt": attempt,
@@ -1863,6 +2125,90 @@ def _merge_task_analyzer_attempt(
     current["physical_attempts"] = [attempt_row]
     merged = _merge_task_analyzer_usage(accumulated, current)
     merged["attempt_count"] = attempt
+    return merged
+
+
+def _merge_task_analyzer_error_evidence(
+    accumulated: Mapping[str, Any] | None,
+    receipt_rows: Sequence[Mapping[str, Any]],
+    *,
+    physical_request_count: int,
+    reported_physical_attempt_ids: Sequence[str],
+    decision_id: str,
+    request_context: Mapping[str, Any],
+    message: str,
+    provider_id: str,
+    model_id: str,
+    unknown_reason: str,
+) -> dict[str, Any]:
+    """Preserve every proven error request before failing closed."""
+
+    merged = _task_analyzer_zero_request_usage(accumulated)
+    start_ordinal = _task_analyzer_physical_attempt_count(merged)
+    for offset in range(physical_request_count):
+        ordinal = start_ordinal + offset + 1
+        row = (
+            _task_analyzer_usage_from_receipt_row(receipt_rows[offset])
+            if offset < len(receipt_rows)
+            else {}
+        )
+        physical_attempt_id = (
+            str(reported_physical_attempt_ids[offset])
+            if offset < len(reported_physical_attempt_ids)
+            and _PHYSICAL_ATTEMPT_ID_RE.fullmatch(
+                str(reported_physical_attempt_ids[offset])
+            )
+            is not None
+            else _task_analyzer_physical_attempt_id(
+                decision_id=decision_id,
+                request_context=request_context,
+                message=message,
+                attempt=ordinal,
+            )
+        )
+        if row:
+            provider_usage = row.get("provider_usage")
+            nested_id = (
+                str(provider_usage.get("physical_attempt_id") or "").strip()
+                if isinstance(provider_usage, Mapping)
+                else ""
+            )
+            direct_id = str(row.get("physical_attempt_id") or "").strip()
+            conflicting_ids = list(
+                dict.fromkeys(
+                    value.casefold()
+                    for value in (
+                        direct_id,
+                        nested_id,
+                        physical_attempt_id,
+                    )
+                    if value
+                )
+            )
+            if len(conflicting_ids) > 1:
+                normalized_provider_usage = (
+                    copy.deepcopy(dict(provider_usage))
+                    if isinstance(provider_usage, Mapping)
+                    else {}
+                )
+                normalized_provider_usage[
+                    "reported_physical_attempt_ids"
+                ] = conflicting_ids
+                normalized_provider_usage.pop(
+                    "physical_attempt_id",
+                    None,
+                )
+                row["provider_usage"] = normalized_provider_usage
+                row.pop("physical_attempt_id", None)
+        merged = _merge_task_analyzer_attempt(
+            merged,
+            row,
+            attempt=ordinal,
+            physical_attempt_id=physical_attempt_id,
+            provider_id=provider_id,
+            model_id=model_id,
+            unknown_reason=unknown_reason,
+        )
     return merged
 
 
@@ -2740,13 +3086,18 @@ async def analyze_task_with_provider(
         attempt=_attempt,
         max_attempts=analyzer_max_retries + 1,
     )
+    physical_attempt_ordinal = _task_analyzer_physical_attempt_count(
+        _accumulated_usage
+    ) + 1
     physical_attempt_id = _task_analyzer_physical_attempt_id(
         decision_id=decision_id,
         request_context=request_context,
         message=message,
-        attempt=_attempt,
+        attempt=physical_attempt_ordinal,
     )
     usage: dict[str, Any] = {}
+    count_current_request = True
+    accounting_override: dict[str, Any] | None = None
     normalization_issues: list[str] = []
     try:
         analyzer_messages = [
@@ -2766,7 +3117,9 @@ async def analyze_task_with_provider(
         # helper is a pass-through when no scope is bound (CLI/unit tests).
         from opensquilla.engine.usage_accounting import (
             account_provider_stream,
+            has_known_provider_usage_receipt,
             provider_accounts_physical_usage,
+            provider_usage_receipt_rows,
         )
 
         stream = (
@@ -2798,26 +3151,61 @@ async def analyze_task_with_provider(
                     elif isinstance(event, DoneEvent):
                         got_done = True
                         terminal_observed = True
-                        usage = {
-                            "provider": str(event.provider or ""),
-                            "model": event.model,
-                            "requested_provider": str(
-                                event.requested_provider or analyzer_provider_id or ""
-                            ),
-                            "requested_model": str(
-                                event.requested_model or analyzer_model_id or ""
-                            ),
-                            "input_tokens": event.input_tokens,
-                            "output_tokens": event.output_tokens,
-                            "reasoning_tokens": event.reasoning_tokens,
-                            "cached_tokens": event.cached_tokens,
-                            "cache_write_tokens": event.cache_write_tokens,
-                            "billed_cost": event.billed_cost,
-                            "cost_source": event.cost_source,
-                            "provider_usage": dict(event.provider_usage),
-                        }
-                        if event.billing_receipt is not None:
-                            usage["billing_receipt"] = event.billing_receipt
+                        usage = _task_analyzer_usage_from_done(event)
+                        usage["requested_provider"] = str(
+                            event.requested_provider or analyzer_provider_id or ""
+                        )
+                        usage["requested_model"] = str(
+                            event.requested_model or analyzer_model_id or ""
+                        )
+                        done_reported_ids = (
+                            _event_reported_physical_attempt_ids(event)
+                        )
+                        done_nonempty_ids = [
+                            value.casefold()
+                            for value in done_reported_ids
+                            if value
+                        ]
+                        done_unique_ids = list(
+                            dict.fromkeys(done_nonempty_ids)
+                        )
+                        done_id_conflict = bool(
+                            any(
+                                _PHYSICAL_ATTEMPT_ID_RE.fullmatch(value)
+                                is None
+                                for value in done_nonempty_ids
+                            )
+                            or len(done_unique_ids) > 1
+                        )
+                        if done_id_conflict:
+                            provider_usage = copy.deepcopy(
+                                dict(usage["provider_usage"])
+                            )
+                            provider_usage[
+                                "reported_physical_attempt_ids"
+                            ] = done_unique_ids
+                            provider_usage.pop(
+                                "physical_attempt_id",
+                                None,
+                            )
+                            usage["provider_usage"] = provider_usage
+                            accounting_override = _merge_task_analyzer_attempt(
+                                _accumulated_usage,
+                                usage,
+                                attempt=physical_attempt_ordinal,
+                                physical_attempt_id=physical_attempt_id,
+                                provider_id=provider_id,
+                                model_id=model_id,
+                                unknown_reason=(
+                                    "TaskAnalyzerPhysicalEvidenceError"
+                                ),
+                            )
+                            raise TaskAnalyzerPhysicalEvidenceError(
+                                "task analyzer DoneEvent physical-request "
+                                "identity is contradictory"
+                            )
+                        if done_unique_ids:
+                            physical_attempt_id = done_unique_ids[0]
                         if usage_tracker is not None and session_key:
                             try:
                                 usage_tracker.add(
@@ -2844,6 +3232,89 @@ async def analyze_task_with_provider(
                         break
                     elif isinstance(event, ErrorEvent):
                         terminal_observed = True
+                        known_receipt = has_known_provider_usage_receipt(event)
+                        receipt_rows = (
+                            provider_usage_receipt_rows(
+                                event,
+                                default_provider=provider_id,
+                                default_model=model_id,
+                            )
+                            if known_receipt
+                            else []
+                        )
+                        (
+                            reported_physical_attempt_ids,
+                            reported_id_conflict,
+                        ) = _task_analyzer_reported_physical_attempt_ids(
+                            event,
+                            receipt_rows,
+                        )
+                        explicit_count = (
+                            max(0, int(event.physical_request_count))
+                            if isinstance(event.physical_request_count, int)
+                            and not isinstance(event.physical_request_count, bool)
+                            else None
+                        )
+                        trace = (
+                            event.ensemble_trace
+                            if isinstance(event.ensemble_trace, Mapping)
+                            else {}
+                        )
+                        missing_count = max(
+                            _as_int(event.usage_missing_count, 0),
+                            _as_int(trace.get("usage_missing_count"), 0),
+                        )
+                        physical_count = max(
+                            explicit_count or 0,
+                            _as_int(trace.get("physical_request_count"), 0),
+                            _as_int(trace.get("llm_request_count"), 0),
+                            len(receipt_rows) + missing_count,
+                            1 if event.request_started is True else 0,
+                            1 if reported_physical_attempt_ids else 0,
+                        )
+                        explicit_zero = bool(
+                            event.request_started is False or explicit_count == 0
+                        )
+                        evidence_conflict = bool(
+                            (explicit_zero and physical_count > 0)
+                            or physical_count > 1
+                            or len(receipt_rows) > 1
+                            or reported_id_conflict
+                        )
+                        if (
+                            not reported_id_conflict
+                            and len(reported_physical_attempt_ids) == 1
+                            and physical_count == 1
+                        ):
+                            physical_attempt_id = reported_physical_attempt_ids[0]
+                        if evidence_conflict:
+                            accounting_override = _merge_task_analyzer_error_evidence(
+                                _accumulated_usage,
+                                receipt_rows,
+                                physical_request_count=max(
+                                    1,
+                                    physical_count,
+                                    len(receipt_rows),
+                                ),
+                                reported_physical_attempt_ids=(
+                                    reported_physical_attempt_ids
+                                ),
+                                decision_id=decision_id,
+                                request_context=request_context,
+                                message=message,
+                                provider_id=provider_id,
+                                model_id=model_id,
+                                unknown_reason="TaskAnalyzerPhysicalEvidenceError",
+                            )
+                            raise TaskAnalyzerPhysicalEvidenceError(
+                                "task analyzer physical-request evidence is contradictory"
+                            )
+                        if explicit_zero:
+                            count_current_request = False
+                        elif receipt_rows:
+                            usage = _task_analyzer_usage_from_receipt_row(
+                                receipt_rows[0]
+                            )
                         raise RuntimeError(f"provider_error:{event.code or 'unknown'}")
                 else:
                     stream_exhausted = True
@@ -2882,26 +3353,34 @@ async def analyze_task_with_provider(
     except TaskAnalyzerStreamCleanupError as exc:
         # A replacement request must not begin while the previous physical
         # provider stream may still be billed in the background.
-        exc.usage = _merge_task_analyzer_attempt(
-            _accumulated_usage,
-            usage,
-            attempt=_attempt,
-            physical_attempt_id=physical_attempt_id,
-            provider_id=provider_id,
-            model_id=model_id,
-            unknown_reason=type(exc).__name__,
+        exc.usage = (
+            accounting_override
+            if accounting_override is not None
+            else _merge_task_analyzer_attempt(
+                _accumulated_usage,
+                usage,
+                attempt=physical_attempt_ordinal,
+                physical_attempt_id=physical_attempt_id,
+                provider_id=provider_id,
+                model_id=model_id,
+                unknown_reason=type(exc).__name__,
+            )
         )
         raise
     except Exception as exc:  # noqa: BLE001 - analysis must fail open to a safe profile
         reason = type(exc).__name__
-        accumulated_usage = _merge_task_analyzer_attempt(
-            _accumulated_usage,
-            usage,
-            attempt=_attempt,
-            physical_attempt_id=physical_attempt_id,
-            provider_id=provider_id,
-            model_id=model_id,
-            unknown_reason=reason,
+        accumulated_usage = (
+            _task_analyzer_zero_request_usage(_accumulated_usage)
+            if not count_current_request
+            else _merge_task_analyzer_attempt(
+                _accumulated_usage,
+                usage,
+                attempt=physical_attempt_ordinal,
+                physical_attempt_id=physical_attempt_id,
+                provider_id=provider_id,
+                model_id=model_id,
+                unknown_reason=reason,
+            )
         )
         if _attempt <= analyzer_max_retries:
             log.warning(
@@ -2911,7 +3390,6 @@ async def analyze_task_with_provider(
                 reason=reason,
                 provider=provider_id or "unknown",
                 model=model_id,
-                details=str(exc),
                 attempt=_attempt,
                 next_attempt=_attempt + 1,
                 max_attempts=analyzer_max_retries + 1,
@@ -2933,7 +3411,7 @@ async def analyze_task_with_provider(
                 ranking_config=effective_config,
                 decision_id=decision_id,
                 _attempt=_attempt + 1,
-                _retry_feedback=str(exc),
+                _retry_feedback=reason,
                 _accumulated_usage=accumulated_usage,
             )
         log.warning(
@@ -2943,7 +3421,6 @@ async def analyze_task_with_provider(
             reason=reason,
             provider=provider_id or "unknown",
             model=model_id,
-            details=str(exc),
             routed_tier=_router_tier(routed_tier, effective_config),
             user_profile_enabled=user_profile_enabled,
             attempt=_attempt,
@@ -2964,7 +3441,7 @@ async def analyze_task_with_provider(
     usage = _merge_task_analyzer_attempt(
         _accumulated_usage,
         usage,
-        attempt=_attempt,
+        attempt=physical_attempt_ordinal,
         physical_attempt_id=physical_attempt_id,
         provider_id=provider_id,
         model_id=model_id,
@@ -3767,7 +4244,11 @@ def _context_need(
 
 
 def _availability_reasons(
-    model: RankedModel, role: str, ranking_config: Mapping[str, Any]
+    model: RankedModel,
+    role: str,
+    ranking_config: Mapping[str, Any],
+    *,
+    thinking_policy_managed: bool = False,
 ) -> list[str]:
     facts = model.registry_facts
     reasons: list[str] = []
@@ -3809,6 +4290,12 @@ def _availability_reasons(
     runtime_reasons = facts.get("runtime_hard_filter_reasons")
     if isinstance(runtime_reasons, Sequence) and not isinstance(runtime_reasons, (str, bytes)):
         reasons.extend(str(reason).strip() for reason in runtime_reasons if str(reason).strip())
+    if (
+        thinking_policy_managed
+        and role.strip().lower() == "proposer"
+        and facts.get("retry_excluded_proposer") is True
+    ):
+        reasons.append("prior_attempt_reasoning_only_length")
     return reasons
 
 
@@ -3823,7 +4310,12 @@ def _hard_filter_reasons(
     ranking_config: Mapping[str, Any],
     thinking_policy: Mapping[str, Any] | None = None,
 ) -> tuple[list[str], int]:
-    reasons = _availability_reasons(model, role, ranking_config)
+    reasons = _availability_reasons(
+        model,
+        role,
+        ranking_config,
+        thinking_policy_managed=thinking_policy is not None,
+    )
     permission = user_profile.get("permission")
     permission_map = permission if isinstance(permission, Mapping) else {}
     allowed = permission_map.get("allow_models")
@@ -3874,6 +4366,30 @@ def _hard_filter_reasons(
     }
     if not required_modalities.issubset(supported_modalities):
         reasons.append("modality_mismatch")
+    raw_required_by_role = (
+        request_context.get("required_parameters_by_role")
+        if thinking_policy is not None
+        else None
+    )
+    required_by_role = (
+        raw_required_by_role.get(role)
+        if isinstance(raw_required_by_role, Mapping)
+        else None
+    )
+    required_parameters = (
+        {
+            str(value).strip().lower()
+            for value in required_by_role
+            if str(value).strip()
+        }
+        if isinstance(required_by_role, Sequence)
+        and not isinstance(required_by_role, (str, bytes))
+        else set()
+    )
+    if "tools" in required_parameters and not bool(
+        model.registry_facts.get("supports_tools")
+    ):
+        reasons.append("required_parameter_tools_unsupported")
 
     context_need = _context_need(
         role=role,
@@ -5312,8 +5828,11 @@ def rank_models(
             policy=thinking_policy,
         )
         assigned_fallbacks: list[RankedModel] = []
+        aggregator_candidate_details = [
+            copy.deepcopy(thinking_assignment_details["aggregator"])
+        ]
         for fallback in aggregator_candidates[1:]:
-            assigned_fallback, _, _ = _resolve_model_thinking_level(
+            assigned_fallback, fallback_detail, unsupported = _resolve_model_thinking_level(
                 fallback,
                 role="aggregator_fallback",
                 requested_level=aggregator_target,
@@ -5322,9 +5841,19 @@ def rank_models(
                 policy=thinking_policy,
             )
             assigned_fallbacks.append(assigned_fallback)
+            aggregator_candidate_details.append(fallback_detail)
+            if unsupported is not None:
+                thinking_unsupported_fallbacks.append(unsupported)
         assigned_aggregator_candidates = (
             assigned_aggregator,
             *assigned_fallbacks,
+        )
+        # The primary scalar assignment remains the selected_A assignment.
+        # Recovery candidates need their own replay-bound initial/native
+        # levels and ordered provider-rejection chain so an execution receipt
+        # for a secondary aggregator cannot masquerade as a primary mutation.
+        thinking_assignment_details["aggregator_candidates"] = (
+            aggregator_candidate_details
         )
 
     reason_counts: dict[str, int] = {}
@@ -5432,6 +5961,9 @@ def rank_models(
         trace.update(
             {
                 "ranking_thinking_assignment_enabled": True,
+                "thinking_physical_evidence_schema": (
+                    THINKING_PHYSICAL_EVIDENCE_SCHEMA
+                ),
                 "thinking_policy_version": str(thinking_policy["policy_version"]),
                 "thinking_assignment": copy.deepcopy(thinking_assignment),
                 "thinking_assignment_details": copy.deepcopy(thinking_assignment_details),
@@ -5536,6 +6068,7 @@ _RANKING_REPLAY_FIELDS = (
     "routed_tier",
     "routing_confidence",
     "ranking_thinking_assignment_enabled",
+    "thinking_physical_evidence_schema",
     "effective_tier",
     "effective_router_tier",
     "task_profile",
@@ -5579,13 +6112,22 @@ _RANKING_REPLAY_FIELDS = (
 )
 
 
-def ranking_trace_replay_reasons(trace: Mapping[str, Any]) -> list[str]:
+def ranking_trace_replay_reasons(
+    trace: Mapping[str, Any],
+    *,
+    allow_legacy_managed_v3: bool = False,
+) -> list[str]:
     """Replay a frozen G1 ranker trace from embedded public evidence."""
 
     reasons: list[str] = []
     legacy_trace = (
         trace.get("ranking_version") == "step2-ranking-v2"
         and trace.get("ranking_config_schema_version") == LEGACY_RANKING_CONFIG_SCHEMA_VERSION
+    )
+    legacy_thinking_trace = (
+        allow_legacy_managed_v3
+        and trace.get("ranking_version") == LEGACY_THINKING_RANKING_VERSION
+        and trace.get("ranking_thinking_assignment_enabled") is True
     )
     if "ranking_thinking_assignment_enabled" not in trace and not legacy_trace:
         reasons.append("missing_g1_replay_thinking_assignment_switch")
@@ -5680,6 +6222,7 @@ def ranking_trace_replay_reasons(trace: Mapping[str, Any]) -> list[str]:
 
     additive_thinking_fields = {
         "ranking_thinking_assignment_enabled",
+        "thinking_physical_evidence_schema",
         "thinking_policy_version",
         "thinking_assignment",
         "thinking_assignment_details",
@@ -5689,18 +6232,66 @@ def ranking_trace_replay_reasons(trace: Mapping[str, Any]) -> list[str]:
     }
     legacy_disabled_replay = not thinking_assignment_enabled and legacy_trace
     for field_name in _RANKING_REPLAY_FIELDS:
-        if field_name == "ranking_version" and legacy_disabled_replay:
+        if field_name == "ranking_version" and (
+            legacy_disabled_replay or legacy_thinking_trace
+        ):
             continue
-        # ``aggregator_candidates`` became replay-bound evidence in the v3
-        # ranking contract. Historical v2 traces predate that field, so keep
-        # them readable while requiring every newly emitted v3 trace to bind
-        # the complete frozen recovery chain.
-        if field_name == "aggregator_candidates" and field_name not in trace and legacy_trace:
+        # Managed v3 already bound the top-level aggregator recovery chain.
+        # Only unmanaged v2 predates that field.
+        if (
+            field_name == "aggregator_candidates"
+            and field_name not in trace
+            and legacy_trace
+        ):
+            continue
+        if (
+            field_name == "thinking_assignment_details"
+            and legacy_thinking_trace
+            and isinstance(trace.get(field_name), Mapping)
+            and isinstance(replayed.get(field_name), Mapping)
+        ):
+            observed_details = copy.deepcopy(
+                dict(trace[field_name])
+            )
+            replayed_details = copy.deepcopy(
+                dict(replayed[field_name])
+            )
+            if "aggregator_candidates" not in observed_details:
+                replayed_details.pop("aggregator_candidates", None)
+            if observed_details != replayed_details:
+                reasons.append(
+                    "g1_frozen_ranker_replay_mismatch_"
+                    "thinking_assignment_details"
+                )
+            continue
+        if (
+            field_name == "policy_versions"
+            and legacy_thinking_trace
+            and isinstance(trace.get(field_name), Mapping)
+            and isinstance(replayed.get(field_name), Mapping)
+        ):
+            observed_versions = dict(trace[field_name])
+            replayed_versions = dict(replayed[field_name])
+            if (
+                observed_versions.get("ranking")
+                != LEGACY_THINKING_RANKING_VERSION
+            ):
+                reasons.append(
+                    "g1_frozen_ranker_replay_mismatch_policy_versions"
+                )
+                continue
+            observed_versions["ranking"] = replayed_versions.get(
+                "ranking"
+            )
+            if observed_versions != replayed_versions:
+                reasons.append(
+                    "g1_frozen_ranker_replay_mismatch_policy_versions"
+                )
             continue
         if (
             field_name in additive_thinking_fields
             and field_name not in trace
-            and legacy_disabled_replay
+            and (legacy_disabled_replay or legacy_thinking_trace)
         ):
             continue
         if trace.get(field_name) != replayed.get(field_name):

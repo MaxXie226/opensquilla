@@ -53,7 +53,203 @@ def test_formal_model_thinking_levels_match_campaign_config(module) -> None:
 
 
 def test_finalizer_version_covers_canonical_usage_evidence(module) -> None:
-    assert module.FINALIZER_VERSION == 5
+    assert module.FINALIZER_VERSION == 6
+
+
+def test_legacy_managed_v3_source_requires_exact_external_identity(
+    module,
+) -> None:
+    identity = deepcopy(module.LEGACY_MANAGED_V3_SOURCE_IDENTITY)
+    assert module.legacy_managed_v3_source_authenticated(
+        {"source_identity": identity}
+    )
+    assert not module.legacy_managed_v3_source_authenticated(
+        {"source_identity": {**identity, "unexpected": True}}
+    )
+    assert not module.legacy_managed_v3_source_authenticated(
+        {
+            "source_identity": {
+                **identity,
+                "git_head": "0" * 40,
+            }
+        }
+    )
+    assert not module.legacy_managed_v3_source_authenticated(
+        {
+            "source_identity": {
+                **identity,
+                "source_tree_sha256": "0" * 64,
+            }
+        }
+    )
+
+
+def test_g1_thinking_physical_usage_requires_exact_id_multiset(
+    module,
+) -> None:
+    proposer_id = "a" * 32
+    aggregator_id = "b" * 32
+    call = {
+        "selection_plan": {
+            "thinking_physical_evidence_schema": (
+                module.THINKING_PHYSICAL_EVIDENCE_SCHEMA
+            )
+        },
+        "candidates": [
+            {
+                "request_started": True,
+                "execution": {
+                    "physical_attempts": [
+                        {
+                            "request_started": True,
+                            "physical_attempt_id": proposer_id,
+                        }
+                    ]
+                },
+            }
+        ],
+        "aggregator_recovery": {
+            "attempts": [
+                {
+                    "request_started": True,
+                    "physical_attempt_id": aggregator_id,
+                }
+            ]
+        },
+    }
+
+    def usage_unit(
+        attempt_id: str,
+        *,
+        role: str,
+    ) -> dict[str, object]:
+        return {
+            "role": role,
+            "provider": "openrouter",
+            "requested_provider": "openrouter",
+            "model": "test/model",
+            "requested_model": "test/model",
+            "request_count": 1,
+            "physical_attempt_id": attempt_id,
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "reasoning_tokens": 0,
+            "cached_tokens": 0,
+            "cache_write_tokens": 0,
+            "billed_cost": 0.0,
+            "cost_source": "none",
+            "provider_usage": {
+                "physical_attempt_id": attempt_id,
+            },
+        }
+
+    run = {
+        "llm_request_count": 2,
+        "ensemble_trace": call,
+        "usage": {
+            "model_usage_breakdown": [
+                usage_unit(proposer_id, role="proposer"),
+                usage_unit(aggregator_id, role="aggregator"),
+            ]
+        },
+    }
+
+    assert module.g1_thinking_physical_usage_binding_reasons(run) == []
+
+    duplicate_usage = deepcopy(run)
+    duplicate_usage["usage"]["model_usage_breakdown"][1][
+        "physical_attempt_id"
+    ] = proposer_id
+    duplicate_usage["usage"]["model_usage_breakdown"][1][
+        "provider_usage"
+    ]["physical_attempt_id"] = proposer_id
+    assert (
+        "g1_thinking_physical_usage_set_mismatch"
+        in module.g1_thinking_physical_usage_binding_reasons(
+            duplicate_usage
+        )
+    )
+
+    duplicate_ledger = deepcopy(run)
+    duplicate_ledger["ensemble_trace"]["aggregator_recovery"][
+        "attempts"
+    ][0]["physical_attempt_id"] = proposer_id
+    assert (
+        "invalid_g1_thinking_physical_attempt_set"
+        in module.g1_thinking_physical_usage_binding_reasons(
+            duplicate_ledger
+        )
+    )
+
+    cross_role_collision = deepcopy(run)
+    cross_role_collision["setup_usage"] = [
+        usage_unit(proposer_id, role="task_analyzer")
+    ]
+    generation_ids = module._strict_g1_physical_generation_usage_ids(
+        cross_role_collision,
+        identity_seed="cross-role-collision",
+    )
+    assert proposer_id in generation_ids
+    owners: dict[
+        str,
+        tuple[tuple[str, str], str, str],
+    ] = {}
+    assert (
+        module.register_physical_attempt_owners(
+            [proposer_id],
+            owner=(("G1", "task-1"), "1" * 32, "task_analyzer"),
+            owners=owners,
+        )
+        == []
+    )
+    assert module.register_physical_attempt_owners(
+        generation_ids,
+        owner=(("G1", "task-1"), "1" * 32, "managed_generation"),
+        owners=owners,
+    ) == [
+        "physical_attempt_id_reused_across_generation_attempts"
+    ]
+
+
+def test_physical_attempt_ids_are_unique_across_request_owners(
+    module,
+) -> None:
+    attempt_id = "c" * 32
+    owners: dict[
+        str,
+        tuple[tuple[str, str], str, str],
+    ] = {}
+
+    assert (
+        module.register_physical_attempt_owners(
+            [attempt_id],
+            owner=(("G1", "task-1"), "1" * 32, "task_analyzer"),
+            owners=owners,
+        )
+        == []
+    )
+    assert (
+        module.register_physical_attempt_owners(
+            [attempt_id],
+            owner=(("G1", "task-1"), "1" * 32, "task_analyzer"),
+            owners=owners,
+        )
+        == []
+    )
+    assert module.register_physical_attempt_owners(
+        [attempt_id],
+        owner=(("G1", "task-1"), "1" * 32, "managed_generation"),
+        owners=owners,
+    ) == [
+        "physical_attempt_id_reused_across_generation_attempts"
+    ]
+    assert module.register_physical_attempt_owners(
+        [attempt_id],
+        owner=(("G1", "task-2"), "2" * 32, "task_analyzer"),
+        owners=owners,
+    ) == [
+        "physical_attempt_id_reused_across_generation_attempts"
+    ]
 
 
 def test_text_sha256_matches_runner_wire_format(module) -> None:
@@ -2282,10 +2478,18 @@ def test_g1_route_gate_reuses_one_provider_lifecycle_plan_and_analyzer(
         "FORMAL_G1_RANKING_CONFIG_SHA256",
         module.canonical_sha256(_test_ranking_config(module)),
     )
+    legacy_replay_flags: list[bool] = []
+
+    def replay_reasons(_plan, **kwargs):
+        legacy_replay_flags.append(
+            kwargs.get("allow_legacy_managed_v3") is True
+        )
+        return []
+
     monkeypatch.setattr(
         ranking_router,
         "ranking_trace_replay_reasons",
-        lambda _plan: [],
+        replay_reasons,
     )
     task = {
         "id": "task-1",
@@ -2355,6 +2559,19 @@ def test_g1_route_gate_reuses_one_provider_lifecycle_plan_and_analyzer(
     row["ensemble_trace"]["calls"][0]["selection_plan"] = deepcopy(plan)
 
     assert module.route_reasons(row, group="G1", contract=contract) == []
+    assert legacy_replay_flags and not any(legacy_replay_flags)
+
+    legacy_replay_flags.clear()
+    authenticated_contract = deepcopy(contract)
+    authenticated_contract["source_identity"] = deepcopy(
+        module.LEGACY_MANAGED_V3_SOURCE_IDENTITY
+    )
+    assert module.route_reasons(
+        row,
+        group="G1",
+        contract=authenticated_contract,
+    ) == []
+    assert legacy_replay_flags and all(legacy_replay_flags)
 
     conflicting = deepcopy(row)
     conflicting["ensemble_trace"]["calls"][0]["selection_plan"]["decision_id"] = (
@@ -2370,10 +2587,1222 @@ def test_g1_route_gate_reuses_one_provider_lifecycle_plan_and_analyzer(
     missing_analyzer["execution"]["generation_attempts"][0]["run"]["usage"] = {
         "model_usage_breakdown": []
     }
-    assert "missing_g1_task_analyzer_request" in module.route_reasons(
-        missing_analyzer,
-        group="G1",
-        contract=contract,
+    assert "missing_g1_task_analyzer_request" in (
+        module.g1_provider_lifecycle_analyzer_reasons(
+            missing_analyzer,
+            allow_unknown_placeholder=True,
+        )
+    )
+
+
+def test_adaptive_g1_lifecycle_audits_serialized_prior_attempt_trace(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.provider.ranking_router import (
+        ROUTER_DYNAMIC_RETRY_ROUTING_SCHEMA,
+        build_router_dynamic_task_analysis_reuse_binding,
+    )
+
+    failed_identity = "openrouter:openai/gpt-5.6-sol"
+    task_profile = {"task_type": "analysis", "tier_dist": {"2": 1.0}}
+    request_context = {
+        "schema_version": "test-request-context/v1",
+        "task_text": "test prompt",
+    }
+    request_context["snapshot_hash"] = module.canonical_sha256(request_context)
+    analysis_fields = {
+        "task_analyzer": {"source": "test_analyzer", "schema_valid": True},
+        "task_profile": task_profile,
+        "task_profile_hash": module.canonical_sha256(task_profile),
+        "request_context": request_context,
+        "request_context_hash": request_context["snapshot_hash"],
+        "routed_tier": "c2",
+        "routing_confidence": 0.9,
+        "user_profile_enabled": False,
+        "user_profile_version": "",
+        "user_profile_source": "",
+    }
+    plan_1 = {
+        "decision_id": "decision-1",
+        "selected_P": [failed_identity, "openrouter:model-b"],
+        "proposer_models": ["openai/gpt-5.6-sol", "model-b"],
+        "selected_A": "openrouter:model-a",
+        "aggregator_model": "model-a",
+    }
+    plan_1.update(deepcopy(analysis_fields))
+    plan_2 = {
+        "decision_id": "decision-2",
+        "selected_P": ["openrouter:model-b", "openrouter:model-c"],
+        "proposer_models": ["model-b", "model-c"],
+        "selected_A": "openrouter:model-a",
+        "aggregator_model": "model-a",
+        "retry_parent_decision_id": "decision-1",
+        "retry_excluded_proposer_identities": [failed_identity],
+        "task_analysis_reused": True,
+    }
+    plan_2.update(deepcopy(analysis_fields))
+    plan_2.update(
+        {
+            "ranking_thinking_assignment_enabled": True,
+            "aggregator_candidates": ["openrouter:model-a"],
+            "executed_thinking_assignment": {
+                "proposers": {identity: "high" for identity in plan_2["selected_P"]},
+                "aggregator": "high",
+                "thinking_policy_version": "test-thinking-policy/v1",
+            },
+            "thinking_assignment_details": {
+                "proposers": [
+                    {
+                        "identity": identity,
+                        "model_id": identity.partition(":")[2],
+                        "role": "proposer",
+                        "requested_level": "high",
+                        "effective_level": "high",
+                        "provider_level": "high",
+                        "fallback_reason": "",
+                        "reasons": [],
+                        "provider_rejection_fallbacks": [
+                            {
+                                "unified_level": "medium",
+                                "provider_level": "medium",
+                                "reason": "provider_rejection_fallback",
+                            }
+                        ],
+                    }
+                    for identity in plan_2["selected_P"]
+                ],
+                "aggregator": {
+                    "identity": "openrouter:model-a",
+                    "model_id": "model-a",
+                    "role": "aggregator",
+                    "requested_level": "high",
+                    "effective_level": "high",
+                    "provider_level": "high",
+                    "fallback_reason": "",
+                    "reasons": [],
+                    "provider_rejection_fallbacks": [],
+                },
+                "aggregator_candidates": [
+                    {
+                        "identity": "openrouter:model-a",
+                        "model_id": "model-a",
+                        "role": "aggregator",
+                        "requested_level": "high",
+                        "effective_level": "high",
+                        "provider_level": "high",
+                        "fallback_reason": "",
+                        "reasons": [],
+                        "provider_rejection_fallbacks": [],
+                    }
+                ],
+            },
+        }
+    )
+    plan_1.update(
+        {
+            "ranking_thinking_assignment_enabled": True,
+            "aggregator_candidates": ["openrouter:model-a"],
+            "executed_thinking_assignment": {
+                "proposers": {
+                    identity: "high" for identity in plan_1["selected_P"]
+                },
+                "aggregator": "high",
+                "thinking_policy_version": "test-thinking-policy/v1",
+            },
+            "thinking_assignment_details": {
+                **deepcopy(plan_2["thinking_assignment_details"]),
+                "proposers": [
+                    {
+                        **deepcopy(
+                            plan_2["thinking_assignment_details"]["proposers"][0]
+                        ),
+                        "identity": identity,
+                        "model_id": identity.partition(":")[2],
+                    }
+                    for identity in plan_1["selected_P"]
+                ],
+            },
+        }
+    )
+    task_analysis_binding = build_router_dynamic_task_analysis_reuse_binding(plan_1)
+    plan_2.update(
+        {
+            "task_analysis_reuse": task_analysis_binding,
+            "retry_routing": {
+                "schema": ROUTER_DYNAMIC_RETRY_ROUTING_SCHEMA,
+                "reason": "prior_attempt_reasoning_only_length",
+                "parent_decision_id": "decision-1",
+                "excluded_proposer_identities": [failed_identity],
+                "task_analysis_reused": True,
+                "task_analysis_source_decision_id": "decision-1",
+                "task_analysis_reuse_sha256": task_analysis_binding["projection_sha256"],
+            },
+        }
+    )
+    failure_trace = {
+        "candidates": [
+            {
+                "ok": False,
+                "provider": "openrouter",
+                "model": "openai/gpt-5.6-sol",
+                "requested_provider": "openrouter",
+                "requested_model": "openai/gpt-5.6-sol",
+                "request_started": True,
+                "physical_request_count": 1,
+                "stop_reason": "length",
+                "reasoning_tokens": 16_384,
+                "effective_thinking_level": "high",
+                "provider_thinking_level": "high",
+                "execution": {
+                    "role": "proposer",
+                    "requested_provider": "openrouter",
+                    "provider": "openrouter",
+                    "requested_model": "openai/gpt-5.6-sol",
+                    "model": "openai/gpt-5.6-sol",
+                    "assigned_thinking_level": "high",
+                    "effective_thinking_level": "high",
+                    "provider_thinking_level": "high",
+                    "thinking_override": "high",
+                    "effective_thinking": True,
+                    "effective_provider_thinking_level": "high",
+                    "thinking_policy_managed": True,
+                    "thinking_fallback_attempts": [],
+                },
+                "content": {"text": "", "chars": 0},
+            }
+        ]
+    }
+    failure_trace["selection_plan"] = deepcopy(plan_1)
+    failure_record = module._g1_reasoning_only_length_failures({"ensemble_trace": failure_trace})[0]
+    from opensquilla.provider.thinking_execution import (
+        project_thinking_execution_history,
+    )
+
+    projected_plan_2, projection_audit, projection_reason = (
+        project_thinking_execution_history([plan_1], plan_2)
+    )
+    assert projection_reason == ""
+    plan_2 = projected_plan_2
+    row = {
+        "group": "G1",
+        "task_id": "task-1",
+        "final_text_sha256": "selected-answer",
+        "usage": {},
+        "routing_trace": {"selection_plan": deepcopy(plan_2)},
+        "ensemble_trace": {"selection_plan": deepcopy(plan_2)},
+        "execution": {
+            "generation_attempts": [
+                {
+                    "attempt_id": "1" * 32,
+                    "attempt": 1,
+                    "selection_plan": deepcopy(plan_1),
+                    "excluded_proposer_identities": [],
+                    "deterministic_proposer_failures": [failure_record],
+                    "retry_selection_plan": deepcopy(plan_2),
+                    "retry_excluded_proposer_identities": [failed_identity],
+                    "thinking_execution_projection": projection_audit,
+                    "will_retry": True,
+                    "run": {
+                        "final_text_sha256": "discarded-answer",
+                        "llm_request_count": 1,
+                        "setup_usage": [
+                            {
+                                "role": "task_analyzer",
+                                "attempt": 1,
+                                "physical_attempt_id": "a" * 32,
+                                "provider": "openrouter",
+                                "requested_provider": "openrouter",
+                                "model": "anthropic/claude-opus-4.8",
+                                "requested_model": "anthropic/claude-opus-4.8",
+                                "request_count": 1,
+                            }
+                        ],
+                        "usage": {
+                            "model_usage_breakdown": [
+                                {
+                                    "role": "task_analyzer",
+                                    "attempt": 1,
+                                    "physical_attempt_id": "a" * 32,
+                                    "provider": "openrouter",
+                                    "requested_provider": "openrouter",
+                                    "model": "anthropic/claude-opus-4.8",
+                                    "requested_model": "anthropic/claude-opus-4.8",
+                                    "request_count": 1,
+                                }
+                            ]
+                        },
+                        "routing_trace": {"selection_plan": deepcopy(plan_1)},
+                        "ensemble_trace": failure_trace,
+                    },
+                },
+                {
+                    "attempt_id": "2" * 32,
+                    "attempt": 2,
+                    "selection_plan": deepcopy(plan_2),
+                    "excluded_proposer_identities": [failed_identity],
+                    "deterministic_proposer_failures": [],
+                    "will_retry": False,
+                    "run": {
+                        "final_text_sha256": "selected-answer",
+                        "llm_request_count": 1,
+                        "usage": {},
+                        "routing_trace": {"selection_plan": deepcopy(plan_2)},
+                        "ensemble_trace": {
+                            "selection_plan": deepcopy(plan_2),
+                            "candidates": [],
+                        },
+                    },
+                },
+            ]
+        },
+    }
+    serialized = json.loads(json.dumps(row))
+    validated_decisions: list[str] = []
+
+    def fake_plan_reasons(
+        plan,
+        *,
+        contract,
+        allow_legacy_managed_v3=False,
+    ):
+        del contract, allow_legacy_managed_v3
+        decision_id = str(plan.get("decision_id") or "")
+        validated_decisions.append(decision_id)
+        reasons = ["invalid_prior_g1_plan"] if decision_id == "invalid-prior" else []
+        return (
+            reasons,
+            tuple(plan.get("proposer_models") or []),
+            str(plan.get("aggregator_model") or ""),
+        )
+
+    monkeypatch.setattr(module, "g1_registry_plan_reasons", fake_plan_reasons)
+    routing, evidence, reasons = module.effective_g1_lifecycle_routing(
+        serialized,
+        contract={"g1_registry_contract": {}},
+    )
+
+    assert reasons == []
+    assert routing["selection_plan"] == plan_2
+    assert evidence["selected_attempt"] == 2
+    assert evidence["validated_attempt_plan_count"] == 2
+    assert "decision-1" in validated_decisions
+    assert module._g1_reasoning_only_length_failure_identities(
+        serialized["execution"]["generation_attempts"][0]["run"]
+    ) == {failed_identity}
+
+    fallback_success = deepcopy(serialized)
+    physical_fallback_plan = fallback_success["execution"]["generation_attempts"][1]["run"][
+        "ensemble_trace"
+    ]["selection_plan"]
+    fallback_identity = plan_2["selected_P"][0]
+    physical_fallback_plan["executed_thinking_assignment"]["proposers"][fallback_identity] = (
+        "medium"
+    )
+    physical_fallback_plan["thinking_execution_fallbacks"] = [
+        {
+            "trigger_stage": "proposer_execution",
+            "fallback_type": "thinking_level_neighbor",
+            "reason": "provider_rejected_thinking_level",
+            "identity": fallback_identity,
+            "requested_thinking_level": "high",
+            "rejected_unified_level": "high",
+            "rejected_provider_level": "high",
+            "effective_thinking_level": "medium",
+            "effective_provider_level": "medium",
+            "thinking_policy_version": "test-thinking-policy/v1",
+            "fallback_result": "succeeded",
+        }
+    ]
+    fallback_success["execution"]["generation_attempts"][1]["run"]["ensemble_trace"][
+        "candidates"
+    ] = [
+        {
+            "requested_provider": "openrouter",
+            "provider": "openrouter",
+            "requested_model": fallback_identity.partition(":")[2],
+            "model": fallback_identity.partition(":")[2],
+            "ok": True,
+            "request_started": True,
+            "physical_request_count": 2,
+            "effective_thinking_level": "medium",
+            "provider_thinking_level": "medium",
+            "execution": {
+                "role": "proposer",
+                "requested_provider": "openrouter",
+                "provider": "openrouter",
+                "requested_model": fallback_identity.partition(":")[2],
+                "model": fallback_identity.partition(":")[2],
+                "assigned_thinking_level": "medium",
+                "effective_thinking_level": "medium",
+                "provider_thinking_level": "medium",
+                "thinking_override": "medium",
+                "effective_thinking": True,
+                "effective_provider_thinking_level": "medium",
+                "thinking_policy_managed": True,
+                "thinking_fallback_attempts": deepcopy(
+                    physical_fallback_plan["thinking_execution_fallbacks"]
+                ),
+            },
+        }
+    ]
+    assert (
+        module.effective_g1_lifecycle_routing(
+            fallback_success,
+            contract={"g1_registry_contract": {}},
+        )[2]
+        == []
+    )
+
+    cross_attempt_receipt = deepcopy(fallback_success)
+    receipt_attempt = cross_attempt_receipt["execution"]["generation_attempts"][1]
+    receipt_plan = deepcopy(
+        receipt_attempt["run"]["ensemble_trace"]["selection_plan"]
+    )
+    # consume_provider_setup() must snapshot this post-call receipt prefix.
+    receipt_attempt["run"]["routing_trace"]["selection_plan"] = deepcopy(
+        receipt_plan
+    )
+    receipt_attempt["run"]["final_text_sha256"] = "transient-attempt"
+    receipt_attempt["run"]["error"] = "HTTP 429"
+    receipt_attempt["will_retry"] = True
+    final_attempt = deepcopy(receipt_attempt)
+    final_attempt.update(
+        {
+            "attempt_id": "3" * 32,
+            "attempt": 3,
+            "selection_plan": deepcopy(receipt_plan),
+            "deterministic_proposer_failures": [],
+            "will_retry": False,
+        }
+    )
+    final_attempt["run"]["error"] = ""
+    final_attempt["run"]["final_text_sha256"] = "selected-answer"
+    final_attempt["run"]["routing_trace"]["selection_plan"] = deepcopy(
+        receipt_plan
+    )
+    final_candidate = final_attempt["run"]["ensemble_trace"]["candidates"][0]
+    final_candidate["physical_request_count"] = 1
+    final_candidate["execution"]["thinking_fallback_attempts"] = []
+    cross_attempt_receipt["execution"]["generation_attempts"].append(
+        final_attempt
+    )
+    cross_attempt_receipt["routing_trace"]["selection_plan"] = deepcopy(
+        receipt_plan
+    )
+    cross_attempt_receipt["ensemble_trace"] = deepcopy(
+        final_attempt["run"]["ensemble_trace"]
+    )
+    assert (
+        module.effective_g1_lifecycle_routing(
+            cross_attempt_receipt,
+            contract={"g1_registry_contract": {}},
+        )[2]
+        == []
+    )
+
+    stale_cross_attempt_routing = deepcopy(cross_attempt_receipt)
+    stale_cross_attempt_routing["execution"]["generation_attempts"][2][
+        "run"
+    ]["routing_trace"]["selection_plan"] = deepcopy(plan_2)
+    assert (
+        "invalid_g1_thinking_execution_plan_mutation"
+        in module.effective_g1_lifecycle_routing(
+            stale_cross_attempt_routing,
+            contract={"g1_registry_contract": {}},
+        )[2]
+    )
+
+    fallback_tamper = deepcopy(fallback_success)
+    fallback_tamper["execution"]["generation_attempts"][1]["run"]["ensemble_trace"][
+        "selection_plan"
+    ]["thinking_execution_fallbacks"][0]["effective_thinking_level"] = "low"
+    assert (
+        "invalid_g1_thinking_execution_plan_mutation"
+        in module.effective_g1_lifecycle_routing(
+            fallback_tamper,
+            contract={"g1_registry_contract": {}},
+        )[2]
+    )
+
+    missing_trace = deepcopy(serialized)
+    missing_trace["execution"]["generation_attempts"][0]["run"].pop("ensemble_trace")
+    assert (
+        "wrong_g1_deterministic_proposer_failure_evidence"
+        in module.effective_g1_lifecycle_routing(
+            missing_trace,
+            contract={"g1_registry_contract": {}},
+        )[2]
+    )
+
+    invalid_prior = deepcopy(serialized)
+    invalid_prior["execution"]["generation_attempts"][0]["selection_plan"]["decision_id"] = (
+        "invalid-prior"
+    )
+    invalid_prior["execution"]["generation_attempts"][0]["run"]["routing_trace"]["selection_plan"][
+        "decision_id"
+    ] = "invalid-prior"
+    assert (
+        "invalid_prior_g1_plan"
+        in module.effective_g1_lifecycle_routing(
+            invalid_prior,
+            contract={"g1_registry_contract": {}},
+        )[2]
+    )
+
+    physical_plan_tamper = deepcopy(serialized)
+    physical_plan_tamper["execution"]["generation_attempts"][0]["run"]["ensemble_trace"][
+        "selection_plan"
+    ]["decision_id"] = "tampered-physical"
+    assert (
+        "g1_attempt_selection_plan_differs_from_physical_plan"
+        in module.effective_g1_lifecycle_routing(
+            physical_plan_tamper,
+            contract={"g1_registry_contract": {}},
+        )[2]
+    )
+
+    retry_provenance_tamper = deepcopy(serialized)
+    retry_provenance_tamper["execution"]["generation_attempts"][1]["selection_plan"][
+        "retry_routing"
+    ]["schema"] = "tampered"
+    assert (
+        "wrong_g1_retry_routing_schema"
+        in module.effective_g1_lifecycle_routing(
+            retry_provenance_tamper,
+            contract={"g1_registry_contract": {}},
+        )[2]
+    )
+
+    retry_schema_downgrade = deepcopy(serialized)
+    retry_schema_downgrade["execution"]["generation_attempts"][1]["selection_plan"][
+        "retry_routing"
+    ]["schema"] = "opensquilla.router-dynamic-retry-routing/v1"
+    retry_schema_downgrade["execution"]["generation_attempts"][1]["selection_plan"].pop(
+        "task_analysis_reuse"
+    )
+    assert (
+        "wrong_g1_retry_routing_schema"
+        in module.effective_g1_lifecycle_routing(
+            retry_schema_downgrade,
+            contract={"g1_registry_contract": {}},
+        )[2]
+    )
+
+    retry_link_tamper = deepcopy(serialized)
+    retry_link_tamper["execution"]["generation_attempts"][0]["retry_selection_plan"][
+        "decision_id"
+    ] = "unlinked-decision"
+    assert (
+        "g1_retry_selection_plan_not_used_by_next_attempt"
+        in module.effective_g1_lifecycle_routing(
+            retry_link_tamper,
+            contract={"g1_registry_contract": {}},
+        )[2]
+    )
+
+    current_selected_excluded = deepcopy(serialized)
+    current_selected_excluded["execution"]["generation_attempts"][1]["selection_plan"][
+        "selected_P"
+    ].append(failed_identity)
+    assert (
+        "g1_retry_selected_excluded_proposer"
+        in module.effective_g1_lifecycle_routing(
+            current_selected_excluded,
+            contract={"g1_registry_contract": {}},
+        )[2]
+    )
+
+    retry_selection_selected_excluded = deepcopy(serialized)
+    retry_selection_selected_excluded["execution"]["generation_attempts"][0][
+        "retry_selection_plan"
+    ]["selected_P"].append(failed_identity)
+    assert (
+        "g1_retry_selection_selected_excluded_proposer"
+        in module.effective_g1_lifecycle_routing(
+            retry_selection_selected_excluded,
+            contract={"g1_registry_contract": {}},
+        )[2]
+    )
+
+    missing_retry_selection = deepcopy(serialized)
+    missing_retry_selection["execution"]["generation_attempts"][0].pop("retry_selection_plan")
+    missing_retry_selection["execution"]["generation_attempts"][0].pop(
+        "retry_excluded_proposer_identities"
+    )
+    assert (
+        "missing_g1_retry_selection_plan"
+        in module.effective_g1_lifecycle_routing(
+            missing_retry_selection,
+            contract={"g1_registry_contract": {}},
+        )[2]
+    )
+
+    immutable_payload = module.immutable_attempt_payload(
+        serialized["execution"]["generation_attempts"][0]
+    )
+    tampered_attempt = deepcopy(serialized["execution"]["generation_attempts"][0])
+    tampered_attempt["deterministic_proposer_failures"][0]["reasoning_tokens"] += 1
+    assert module.immutable_attempt_payload(tampered_attempt) != immutable_payload
+
+    physical_plan_tampered_attempt = deepcopy(serialized["execution"]["generation_attempts"][0])
+    physical_plan_tampered_attempt["run"]["ensemble_trace"]["selection_plan"]["decision_id"] = (
+        "cross-wave-physical-plan-tamper"
+    )
+    assert module.immutable_attempt_payload(physical_plan_tampered_attempt) != immutable_payload
+
+    source_record = module.SourceRecord(
+        path=Path("wave-1.jsonl"),
+        source_index=0,
+        line=1,
+        row=serialized,
+    )
+    module.validate_g1_paid_attempt_plan_history(
+        [source_record],
+        contracts={"G1": {"g1_registry_contract": {}}},
+    )
+
+    pre_call_guard_then_success = deepcopy(serialized)
+    guarded_attempt = pre_call_guard_then_success["execution"][
+        "generation_attempts"
+    ][0]
+    guarded_attempt["attempt_kind"] = (
+        "provider_build_after_paid_setup"
+    )
+    guarded_attempt["run"]["trace_events"] = [
+        {
+            "kind": "error",
+            "code": "g1_pre_call_guard_failed",
+            "request_started": False,
+            "physical_request_count": 0,
+        }
+    ]
+    with pytest.raises(
+        module.FinalizationError,
+        match="g1_pre_call_guard_failed",
+    ):
+        module.validate_g1_paid_attempt_plan_history(
+            [
+                module.SourceRecord(
+                    path=Path("pre-call-guard-then-success.jsonl"),
+                    source_index=0,
+                    line=1,
+                    row=pre_call_guard_then_success,
+                )
+            ],
+            contracts={"G1": {"g1_registry_contract": {}}},
+        )
+
+    analyzer_retry = deepcopy(serialized)
+    analyzer_retry_run = analyzer_retry["execution"]["generation_attempts"][0][
+        "run"
+    ]
+    analyzer_retry_rows = [
+        {
+            "role": "task_analyzer",
+            "attempt": attempt,
+            "physical_attempt_id": str(attempt) * 32,
+            "provider": "openrouter",
+            "requested_provider": "openrouter",
+            "model": "anthropic/claude-opus-4.8",
+            "requested_model": "anthropic/claude-opus-4.8",
+            "request_count": 1,
+        }
+        for attempt in (1, 2)
+    ]
+    analyzer_retry_run["llm_request_count"] = 2
+    analyzer_retry_run["setup_usage"] = deepcopy(analyzer_retry_rows)
+    analyzer_retry_run["usage"] = {
+        "model_usage_breakdown": deepcopy(analyzer_retry_rows)
+    }
+    module.validate_g1_paid_attempt_plan_history(
+        [
+            module.SourceRecord(
+                path=Path("analyzer-internal-retry.jsonl"),
+                source_index=0,
+                line=1,
+                row=analyzer_retry,
+            )
+        ],
+        contracts={"G1": {"g1_registry_contract": {}}},
+    )
+    reconciled_analyzers = module._canonical_task_analyzer_setup_units(
+        analyzer_retry_run,
+        identity_seed="legal-duplicate-mirror",
+    )
+    assert [
+        row["physical_attempt_id"] for row in reconciled_analyzers
+    ] == ["1" * 32, "2" * 32]
+
+    setup_one_usage_five = deepcopy(analyzer_retry_run)
+    five_analyzers = [
+        {
+            **deepcopy(analyzer_retry_rows[0]),
+            "attempt": attempt,
+            "physical_attempt_id": f"{attempt:x}" * 32,
+        }
+        for attempt in range(1, 6)
+    ]
+    setup_one_usage_five["setup_usage"] = [
+        deepcopy(five_analyzers[0])
+    ]
+    setup_one_usage_five["usage"] = {
+        "model_usage_breakdown": deepcopy(five_analyzers)
+    }
+    reconciled_five = module._canonical_task_analyzer_setup_units(
+        setup_one_usage_five,
+        identity_seed="setup-one-usage-five",
+    )
+    assert {
+        row["physical_attempt_id"] for row in reconciled_five
+    } == {f"{attempt:x}" * 32 for attempt in range(1, 6)}
+
+    usage_only_extra = deepcopy(analyzer_retry_run)
+    usage_only_extra["setup_usage"] = [
+        deepcopy(analyzer_retry_rows[0])
+    ]
+    usage_only_extra["usage"] = {
+        "model_usage_breakdown": [
+            deepcopy(analyzer_retry_rows[0]),
+            deepcopy(analyzer_retry_rows[1]),
+        ]
+    }
+    reconciled_usage_extra = module._canonical_task_analyzer_setup_units(
+        usage_only_extra,
+        identity_seed="usage-only-extra",
+    )
+    assert [
+        row["physical_attempt_id"] for row in reconciled_usage_extra
+    ] == ["1" * 32, "2" * 32]
+
+    analyzer_attempt = analyzer_retry["execution"]["generation_attempts"][0]
+    analyzer_immutable = module.immutable_attempt_payload(analyzer_attempt)
+    changed_analyzer_identity = deepcopy(analyzer_attempt)
+    changed_analyzer_run = changed_analyzer_identity["run"]
+    changed_analyzer_run["setup_usage"][0]["physical_attempt_id"] = "f" * 32
+    changed_analyzer_run["usage"]["model_usage_breakdown"][0][
+        "physical_attempt_id"
+    ] = "f" * 32
+    assert (
+        module.immutable_attempt_payload(changed_analyzer_identity)
+        != analyzer_immutable
+    )
+
+    wave_1 = deepcopy(serialized)
+    wave_1["final_text_sha256"] = "wave-1-not-selected"
+    wave_1["execution"]["generation_attempts"] = [
+        deepcopy(serialized["execution"]["generation_attempts"][0])
+    ]
+    wave_2 = deepcopy(serialized)
+    wave_2["execution"]["generation_attempts"] = [
+        deepcopy(serialized["execution"]["generation_attempts"][1])
+    ]
+    cross_wave_records = [
+        module.SourceRecord(
+            path=Path("wave-1.jsonl"),
+            source_index=0,
+            line=1,
+            row=wave_1,
+        ),
+        module.SourceRecord(
+            path=Path("wave-2.jsonl"),
+            source_index=1,
+            line=1,
+            row=wave_2,
+        ),
+    ]
+    module.validate_g1_paid_attempt_plan_history(
+        cross_wave_records,
+        contracts={"G1": {"g1_registry_contract": {}}},
+    )
+
+    duplicate_analyzer_wave_2 = deepcopy(wave_2)
+    duplicate_analyzer_run = duplicate_analyzer_wave_2["execution"][
+        "generation_attempts"
+    ][0]["run"]
+    duplicate_analyzer_run["setup_usage"] = [
+        {
+            "role": "task_analyzer",
+            "attempt": 1,
+            "physical_attempt_id": "a" * 32,
+            "provider": "openrouter",
+            "requested_provider": "openrouter",
+            "model": "anthropic/claude-opus-4.8",
+            "requested_model": "anthropic/claude-opus-4.8",
+            "request_count": 1,
+        }
+    ]
+    duplicate_analyzer_run["usage"] = {
+        "model_usage_breakdown": deepcopy(
+            duplicate_analyzer_run["setup_usage"]
+        )
+    }
+    with pytest.raises(
+        module.FinalizationError,
+        match="invalid paid G1 attempt",
+    ):
+        module.validate_g1_paid_attempt_plan_history(
+            [
+                cross_wave_records[0],
+                module.SourceRecord(
+                    path=Path("wave-2-duplicate-analyzer.jsonl"),
+                    source_index=1,
+                    line=1,
+                    row=duplicate_analyzer_wave_2,
+                ),
+            ],
+            contracts={"G1": {"g1_registry_contract": {}}},
+        )
+
+    reset_wave_2 = deepcopy(wave_2)
+    reset_attempt = reset_wave_2["execution"]["generation_attempts"][0]
+    reset_plan = deepcopy(plan_1)
+    reset_plan["decision_id"] = "fresh-cross-wave-reset"
+    reset_attempt["selection_plan"] = deepcopy(reset_plan)
+    reset_attempt["excluded_proposer_identities"] = []
+    reset_attempt["run"]["routing_trace"]["selection_plan"] = deepcopy(reset_plan)
+    reset_attempt["run"]["ensemble_trace"]["selection_plan"] = deepcopy(reset_plan)
+    with pytest.raises(
+        module.FinalizationError,
+        match="invalid paid G1 attempt",
+    ):
+        module.validate_g1_paid_attempt_plan_history(
+            [
+                cross_wave_records[0],
+                module.SourceRecord(
+                    path=Path("wave-2-reset.jsonl"),
+                    source_index=1,
+                    line=1,
+                    row=reset_wave_2,
+                ),
+            ],
+            contracts={"G1": {"g1_registry_contract": {}}},
+        )
+
+    paid_then_zero_request = deepcopy(serialized)
+    paid_then_zero_request["final_text_sha256"] = "not-selected-from-this-wave"
+    first_run = paid_then_zero_request["execution"]["generation_attempts"][0]["run"]
+    first_run.pop("llm_request_count")
+    first_run["usage"] = {
+        "model_usage_breakdown": [
+            {
+                "role": "proposer",
+                "provider": "openrouter",
+                "model": "openai/gpt-5.6-sol",
+            }
+        ]
+    }
+    zero_request_run = paid_then_zero_request["execution"]["generation_attempts"][1]["run"]
+    zero_request_run.update(
+        {
+            "llm_request_count": 0,
+            "request_started": False,
+            "final_text_sha256": "",
+        }
+    )
+    zero_request_run.pop("ensemble_trace")
+    module.validate_g1_paid_attempt_plan_history(
+        [
+            module.SourceRecord(
+                path=Path("paid-then-zero-wave.jsonl"),
+                source_index=0,
+                line=1,
+                row=paid_then_zero_request,
+            )
+        ],
+        contracts={"G1": {"g1_registry_contract": {}}},
+    )
+
+    analyzer_only_run = {
+        "llm_request_count": 1,
+        "setup_usage": [
+            {
+                "role": "task_analyzer",
+                "provider": "openrouter",
+                "model": "anthropic/claude-opus-4.8",
+                "request_count": 1,
+            }
+        ],
+        "usage": {
+            "model_usage_breakdown": [
+                {
+                    "role": "task_analyzer",
+                    "provider": "openrouter",
+                    "model": "anthropic/claude-opus-4.8",
+                    "request_count": 1,
+                }
+            ]
+        },
+    }
+    assert module.run_expected_ensemble_request_count(analyzer_only_run) == 0
+
+    unknown_analyzer = {
+        "role": "unknown_request",
+        "label": "task_analyzer",
+        "attempt": 1,
+        "physical_attempt_id": "a" * 32,
+        "provider": "",
+        "model": "",
+        "requested_provider": "openrouter",
+        "requested_model": "anthropic/claude-opus-4.8",
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_tokens": 0,
+        "cached_tokens": 0,
+        "cache_write_tokens": 0,
+        "billed_cost": 0.0,
+        "cost_source": "unavailable",
+        "request_count": 1,
+        "provider_usage": {
+            "usage_unknown": True,
+            "physical_attempt_id": "a" * 32,
+        },
+    }
+    unknown_analyzer_run = {
+        "llm_request_count": 1,
+        "usage_unknown_count": 1,
+        "setup_usage": [deepcopy(unknown_analyzer)],
+        "usage": {
+            "model_usage_breakdown": [deepcopy(unknown_analyzer)]
+        },
+    }
+    assert (
+        module.run_expected_ensemble_request_count(unknown_analyzer_run) == 0
+    )
+    unknown_then_generation = deepcopy(unknown_analyzer_run)
+    unknown_then_generation["llm_request_count"] = 2
+    unknown_then_generation["usage"]["model_usage_breakdown"].append(
+        {
+            "role": "proposer",
+            "provider": "openrouter",
+            "model": "openai/gpt-5.6-sol",
+            "requested_provider": "openrouter",
+            "requested_model": "openai/gpt-5.6-sol",
+            "request_count": 1,
+        }
+    )
+    assert (
+        module.run_expected_ensemble_request_count(
+            unknown_then_generation
+        )
+        == 1
+    )
+
+    paid_history_tamper = deepcopy(serialized)
+    paid_history_tamper["execution"]["generation_attempts"][0]["run"]["ensemble_trace"][
+        "selection_plan"
+    ]["decision_id"] = "tampered-paid-history"
+    with pytest.raises(
+        module.FinalizationError,
+        match="invalid paid G1 attempt",
+    ):
+        module.validate_g1_paid_attempt_plan_history(
+            [
+                module.SourceRecord(
+                    path=Path("failed-wave.jsonl"),
+                    source_index=0,
+                    line=1,
+                    row=paid_history_tamper,
+                )
+            ],
+            contracts={"G1": {"g1_registry_contract": {}}},
+        )
+
+    adaptive_downgrade = deepcopy(serialized)
+    for attempt in adaptive_downgrade["execution"]["generation_attempts"]:
+        for field in (
+            "selection_plan",
+            "excluded_proposer_identities",
+            "deterministic_proposer_failures",
+            "retry_selection_plan",
+            "retry_excluded_proposer_identities",
+        ):
+            attempt.pop(field, None)
+    with pytest.raises(
+        module.FinalizationError,
+        match="invalid paid G1 attempt",
+    ):
+        module.validate_g1_paid_attempt_plan_history(
+            [
+                module.SourceRecord(
+                    path=Path("adaptive-downgrade.jsonl"),
+                    source_index=0,
+                    line=1,
+                    row=adaptive_downgrade,
+                )
+            ],
+            contracts={"G1": {"g1_registry_contract": {}}},
+        )
+
+    v3_downgrade = deepcopy(serialized)
+    for attempt in v3_downgrade["execution"][
+        "generation_attempts"
+    ]:
+        for field in (
+            "selection_plan",
+            "excluded_proposer_identities",
+            "deterministic_proposer_failures",
+            "retry_selection_plan",
+            "retry_excluded_proposer_identities",
+        ):
+            attempt.pop(field, None)
+        run = attempt["run"]
+        runtime_plans = [
+            run["routing_trace"]["selection_plan"],
+            *[
+                call["selection_plan"]
+                for call in module.ensemble_call_trace_sequence(
+                    run["ensemble_trace"]
+                )[0]
+            ],
+        ]
+        for runtime_plan in runtime_plans:
+            runtime_plan["ranking_version"] = (
+                module.LEGACY_THINKING_RANKING_VERSION
+            )
+            runtime_plan.pop(
+                "thinking_physical_evidence_schema",
+                None,
+            )
+    with pytest.raises(
+        module.FinalizationError,
+        match="invalid paid G1 attempt",
+    ):
+        module.validate_g1_paid_attempt_plan_history(
+            [
+                module.SourceRecord(
+                    path=Path("unauthenticated-v3-downgrade.jsonl"),
+                    source_index=0,
+                    line=1,
+                    row=v3_downgrade,
+                )
+            ],
+            contracts={"G1": {"g1_registry_contract": {}}},
+        )
+
+    authenticated_contract = {
+        "source_identity": deepcopy(
+            module.LEGACY_MANAGED_V3_SOURCE_IDENTITY
+        ),
+        "g1_registry_contract": {},
+    }
+    module.validate_g1_paid_attempt_plan_history(
+        [
+            module.SourceRecord(
+                path=Path("authenticated-legacy-v3-managed-history.jsonl"),
+                source_index=0,
+                line=1,
+                row=v3_downgrade,
+            )
+        ],
+        contracts={"G1": authenticated_contract},
+    )
+
+    forged_contract = deepcopy(authenticated_contract)
+    forged_contract["source_identity"]["source_tree_sha256"] = "0" * 64
+    with pytest.raises(
+        module.FinalizationError,
+        match="invalid paid G1 attempt",
+    ):
+        module.validate_g1_paid_attempt_plan_history(
+            [
+                module.SourceRecord(
+                    path=Path("forged-v3-source.jsonl"),
+                    source_index=0,
+                    line=1,
+                    row=v3_downgrade,
+                )
+            ],
+            contracts={"G1": forged_contract},
+        )
+
+    paid_setup_build_failure = deepcopy(serialized)
+    paid_setup_attempt = paid_setup_build_failure["execution"][
+        "generation_attempts"
+    ][0]
+    paid_setup_attempt["attempt_kind"] = (
+        "provider_build_after_paid_setup"
+    )
+    for field in (
+        "selection_plan",
+        "excluded_proposer_identities",
+        "deterministic_proposer_failures",
+        "retry_selection_plan",
+        "retry_excluded_proposer_identities",
+    ):
+        paid_setup_attempt.pop(field, None)
+    paid_setup_attempt["run"].pop("routing_trace", None)
+    paid_setup_attempt["run"].pop("ensemble_trace", None)
+    paid_setup_build_failure["execution"]["generation_attempts"] = [
+        paid_setup_attempt
+    ]
+    with pytest.raises(
+        module.FinalizationError,
+        match="invalid paid G1 attempt",
+    ):
+        module.validate_g1_paid_attempt_plan_history(
+            [
+                module.SourceRecord(
+                    path=Path("paid-setup-build-failure.jsonl"),
+                    source_index=0,
+                    line=1,
+                    row=paid_setup_build_failure,
+                )
+            ],
+            contracts={"G1": {"g1_registry_contract": {}}},
+        )
+
+    early_best = deepcopy(serialized)
+    early_best["final_text_sha256"] = "discarded-answer"
+    early_best["usage"] = deepcopy(
+        early_best["execution"]["generation_attempts"][0]["run"]["usage"]
+    )
+    early_best["routing_trace"]["selection_plan"] = deepcopy(plan_1)
+    early_best["ensemble_trace"]["selection_plan"] = deepcopy(plan_1)
+    early_best["execution"]["generation_attempts"].append(
+        {
+            "attempt_id": "3" * 32,
+            "attempt": 3,
+            "selection_plan": deepcopy(plan_2),
+            "excluded_proposer_identities": [failed_identity],
+            "deterministic_proposer_failures": [],
+            "will_retry": False,
+            "run": {
+                "final_text_sha256": "last-failed-answer",
+                "llm_request_count": 1,
+                "usage": {},
+                "routing_trace": {"selection_plan": deepcopy(plan_2)},
+                "ensemble_trace": {
+                    "selection_plan": deepcopy(plan_2),
+                    "candidates": [],
+                },
+            },
+        }
+    )
+    _, early_evidence, early_reasons = module.effective_g1_lifecycle_routing(
+        early_best,
+        contract={"g1_registry_contract": {}},
+    )
+    assert early_reasons == []
+    assert early_evidence["selected_attempt"] == 1
+    assert early_evidence["validated_attempt_plan_count"] == 3
+
+    tampered_later_attempt = deepcopy(early_best)
+    tampered_later_attempt["execution"]["generation_attempts"][2][
+        "excluded_proposer_identities"
+    ] = []
+    assert (
+        "wrong_g1_retry_exclusion_evolution"
+        in module.effective_g1_lifecycle_routing(
+            tampered_later_attempt,
+            contract={"g1_registry_contract": {}},
+        )[2]
+    )
+
+
+@pytest.mark.parametrize(
+    "tamper_field",
+    [
+        "task_analyzer",
+        "task_profile",
+        "task_profile_hash",
+        "request_context",
+        "request_context_hash",
+        "routed_tier",
+        "routing_confidence",
+        "user_profile_enabled",
+        "user_profile_version",
+        "user_profile_source",
+        "binding_hash",
+        "source_decision",
+    ],
+)
+def test_finalizer_v2_retry_replay_rejects_task_analysis_tamper(
+    module,
+    tamper_field: str,
+) -> None:
+    from opensquilla.provider.ranking_router import (
+        ROUTER_DYNAMIC_RETRY_ROUTING_SCHEMA,
+        build_router_dynamic_task_analysis_reuse_binding,
+    )
+
+    failed_identity = "openrouter:openai/gpt-5.6-sol"
+    task_profile = {"task_type": "analysis", "tier_dist": {"2": 1.0}}
+    request_context = {
+        "schema_version": "test-request-context/v1",
+        "task_text": "test prompt",
+    }
+    request_context["snapshot_hash"] = module.canonical_sha256(request_context)
+    source_plan = {
+        "decision_id": "decision-1",
+        "task_analyzer": {
+            "source": "test_analyzer",
+            "schema_valid": True,
+        },
+        "task_profile": task_profile,
+        "task_profile_hash": module.canonical_sha256(task_profile),
+        "request_context": request_context,
+        "request_context_hash": request_context["snapshot_hash"],
+        "routed_tier": "c2",
+        "routing_confidence": 0.9,
+        "user_profile_enabled": False,
+        "user_profile_version": "",
+        "user_profile_source": "",
+    }
+    retry_plan = deepcopy(source_plan)
+    retry_plan["decision_id"] = "decision-2"
+    binding = build_router_dynamic_task_analysis_reuse_binding(source_plan)
+    retry_plan.update(
+        {
+            "retry_parent_decision_id": "decision-1",
+            "retry_excluded_proposer_identities": [failed_identity],
+            "task_analysis_reused": True,
+            "task_analysis_reuse": binding,
+            "retry_routing": {
+                "schema": ROUTER_DYNAMIC_RETRY_ROUTING_SCHEMA,
+                "reason": "prior_attempt_reasoning_only_length",
+                "parent_decision_id": "decision-1",
+                "excluded_proposer_identities": [failed_identity],
+                "task_analysis_reused": True,
+                "task_analysis_source_decision_id": "decision-1",
+                "task_analysis_reuse_sha256": binding["projection_sha256"],
+            },
+        }
+    )
+    assert (
+        module._g1_retry_plan_provenance_reasons(
+            retry_plan,
+            initial_plan=source_plan,
+            initial_decision_id="decision-1",
+            exclusions={failed_identity},
+        )
+        == []
+    )
+
+    tampered = deepcopy(retry_plan)
+    if tamper_field == "task_analyzer":
+        tampered["task_analyzer"]["source"] = "tampered"
+    elif tamper_field == "task_profile":
+        tampered["task_profile"]["task_type"] = "tampered"
+    elif tamper_field == "request_context":
+        tampered["request_context"]["task_text"] = "tampered"
+    elif tamper_field == "binding_hash":
+        tampered["task_analysis_reuse"]["projection_sha256"] = "0" * 64
+        tampered["retry_routing"]["task_analysis_reuse_sha256"] = "0" * 64
+    elif tamper_field == "source_decision":
+        tampered["task_analysis_reuse"]["source_decision_id"] = "tampered"
+    elif tamper_field == "user_profile_enabled":
+        tampered[tamper_field] = True
+    elif tamper_field == "routing_confidence":
+        tampered[tamper_field] = 0.1
+    else:
+        tampered[tamper_field] = "tampered"
+
+    assert module._g1_retry_plan_provenance_reasons(
+        tampered,
+        initial_plan=source_plan,
+        initial_decision_id="decision-1",
+        exclusions={failed_identity},
     )
 
 
@@ -3137,7 +4566,7 @@ def test_prior_aborted_account_window_is_preserved_without_fake_ledger_rows(
     monkeypatch.setattr(
         ranking_router,
         "ranking_trace_replay_reasons",
-        lambda _plan: [],
+        lambda _plan, **_kwargs: [],
         raising=False,
     )
     args, _, lock_fd = _campaign(module, tmp_path)
@@ -3188,7 +4617,7 @@ def test_current_reconciliation_runtime_file_hash_mismatch_is_rejected(
     monkeypatch.setattr(
         ranking_router,
         "ranking_trace_replay_reasons",
-        lambda _plan: [],
+        lambda _plan, **_kwargs: [],
         raising=False,
     )
     args, _, lock_fd = _campaign(module, tmp_path)
@@ -3210,7 +4639,7 @@ def test_prior_account_window_overlap_is_rejected(
     monkeypatch.setattr(
         ranking_router,
         "ranking_trace_replay_reasons",
-        lambda _plan: [],
+        lambda _plan, **_kwargs: [],
         raising=False,
     )
     args, _, lock_fd = _campaign(module, tmp_path)
@@ -3239,7 +4668,7 @@ def test_prior_account_before_must_precede_first_stable_observation(
     monkeypatch.setattr(
         ranking_router,
         "ranking_trace_replay_reasons",
-        lambda _plan: [],
+        lambda _plan, **_kwargs: [],
         raising=False,
     )
     args, _, lock_fd = _campaign(module, tmp_path)
@@ -3263,7 +4692,7 @@ def test_prior_windows_require_monotonic_cumulative_byok_counter(
     monkeypatch.setattr(
         ranking_router,
         "ranking_trace_replay_reasons",
-        lambda _plan: [],
+        lambda _plan, **_kwargs: [],
         raising=False,
     )
     args, _, lock_fd = _campaign(module, tmp_path)
@@ -3372,7 +4801,7 @@ def test_prior_account_window_delta_is_not_hard_coded(
     monkeypatch.setattr(
         ranking_router,
         "ranking_trace_replay_reasons",
-        lambda _plan: [],
+        lambda _plan, **_kwargs: [],
         raising=False,
     )
     args, _, lock_fd = _campaign(module, tmp_path)
@@ -3596,7 +5025,7 @@ def test_five_counter_only_failed_judge_attempts_finalize_without_rerun(
     assert all(item["recorded_cost_usd"] is None for item in unknown_judge)
 
 
-def test_cleanup_failure_setup_attempt_survives_later_success_end_to_end(
+def test_cleanup_failure_setup_attempt_blocks_unreconstructed_later_success(
     module,
     tmp_path: Path,
 ) -> None:
@@ -3700,27 +5129,14 @@ def test_cleanup_failure_setup_attempt_survives_later_success_end_to_end(
     wave2_manifest["resume_selection"]["model_regenerate_pair_count"] = 1
     _owner_json(args.manifest[1], wave2_manifest)
     try:
-        manifest = module.run_finalization(args)
+        with pytest.raises(
+            module.FinalizationError,
+            match="invalid paid G1 attempt",
+        ):
+            module.run_finalization(args)
     finally:
         os.close(lock_fd)
-
-    assert manifest["status"] == "complete"
-    ledger = [
-        json.loads(line)
-        for line in (args.output_dir / "actual-spend-ledger.jsonl").read_text().splitlines()
-    ]
-    setup_only = [
-        row
-        for row in ledger
-        if row["cost_precision"] == "unknown"
-        and row["roles"] == ["unknown_request"]
-        and {"group": "G1", "task_id": "task-1"} in row["group_task_pairs"]
-    ]
-    assert len(setup_only) == 1
-    assert any(
-        reference.get("attempt_kind") == "provider_build_after_paid_setup"
-        for reference in setup_only[0]["source_references"]
-    )
+    assert not args.output_dir.exists()
 
 
 def test_explicit_byok_is_fatal_even_when_account_delta_is_zero(module, tmp_path: Path) -> None:
@@ -4801,7 +6217,7 @@ def test_b2_rejects_analyzer_and_g1_requires_it(module, tmp_path: Path) -> None:
     rows2[g1_index] = module.seal_result_row(g1)
     args2.result[0].write_text("".join(json.dumps(row) + "\n" for row in rows2))
     try:
-        with pytest.raises(module.FinalizationError, match="physical generation route"):
+        with pytest.raises(module.FinalizationError, match="selected final answer"):
             module.run_finalization(args2)
     finally:
         os.close(lock_fd2)
@@ -5131,6 +6547,80 @@ def _select_g1_retrospective(
         max_attempts=3,
         manifest_sources=manifest_sources,
     )
+
+
+def test_select_results_validates_each_g1_wave_against_only_its_cumulative_prefix(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    attempt_a = {
+        "attempt_id": "a" * 32,
+        "attempt": 1,
+        "attempt_kind": "generation",
+    }
+    attempt_b = {
+        "attempt_id": "b" * 32,
+        "attempt": 2,
+        "attempt_kind": "generation",
+    }
+    rows = [
+        {
+            "group": "G1",
+            "task_id": "task-1",
+            "final_text_sha256": "answer-a",
+            "generation_attempt_budget_used": 1,
+            "execution": {"generation_attempts": [attempt_a]},
+        },
+        {
+            "group": "G1",
+            "task_id": "task-1",
+            "final_text_sha256": "answer-b",
+            "generation_attempt_budget_used": 2,
+            "execution": {"generation_attempts": [attempt_b]},
+        },
+    ]
+    records = [
+        module.SourceRecord(tmp_path / f"wave-{index}.jsonl", index, 1, row)
+        for index, row in enumerate(rows, start=1)
+    ]
+    observed_prefixes: list[list[str]] = []
+
+    def fake_generation_reasons(record, **_kwargs):
+        attempt_ids = [
+            attempt["attempt_id"]
+            for attempt in record.row["execution"]["generation_attempts"]
+        ]
+        observed_prefixes.append(attempt_ids)
+        return [] if attempt_ids == ["a" * 32, "b" * 32] else ["deferred"]
+
+    monkeypatch.setattr(module, "generation_reasons", fake_generation_reasons)
+    monkeypatch.setattr(
+        module,
+        "generation_identity",
+        lambda row: str(row["final_text_sha256"]),
+    )
+    monkeypatch.setattr(
+        module,
+        "generation_attempt_count",
+        lambda row: len(row["execution"]["generation_attempts"]),
+    )
+    monkeypatch.setattr(module, "judge_reasons", lambda *_args, **_kwargs: [])
+
+    selected, _ = module.select_results(
+        records,
+        tasks=[{"id": "task-1"}],
+        groups=["G1"],
+        fingerprints={"G1": "fingerprint"},
+        contracts={"G1": {}},
+        max_attempts=3,
+    )
+
+    assert observed_prefixes == [
+        ["a" * 32],
+        ["a" * 32, "b" * 32],
+    ]
+    assert selected == [records[1]]
 
 
 def test_g1_retrospective_selects_attempt_two_and_keeps_attempt_three_spend(

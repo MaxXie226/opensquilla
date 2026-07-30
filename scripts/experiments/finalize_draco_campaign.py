@@ -32,6 +32,7 @@ from functools import cache
 from pathlib import Path
 from typing import Any
 
+from opensquilla.provider.types import REASONING_ONLY_LENGTH_STOP_REASONS
 from opensquilla.usage_evidence import (
     MISSING_USAGE_PLACEHOLDER_ROLES,
     UsageEvidenceError,
@@ -55,10 +56,20 @@ RESOLUTION_SCHEMA = "opensquilla.draco.openrouter-non-byok-resolution/v1"
 GENERATION_ATTEMPT_EVIDENCE_SCHEMA = "opensquilla.draco-generation-attempt/v1"
 JUDGE_ATTEMPT_EVIDENCE_SCHEMA = "opensquilla.draco-judge-attempt/v1"
 ENSEMBLE_OUTPUT_BINDING_SCHEMA = "opensquilla.ensemble-output-binding/v1"
+THINKING_PHYSICAL_EVIDENCE_SCHEMA = (
+    "opensquilla.router-dynamic-thinking-physical-evidence/v1"
+)
+LEGACY_THINKING_RANKING_VERSION = "step2-ranking-v3"
+LEGACY_MANAGED_V3_SOURCE_IDENTITY = {
+    "git_head": "f39f7d5e529ce42a6149fc8af6be5a7d6e23ea6b",
+    "source_tree_sha256": (
+        "f44c3edc6db511639c6f7e8a411a47d5eff057eb4911ecc3aa6335967b2a993e"
+    ),
+}
 JUDGE_ATTEMPT_BUDGET_SCOPE = "criterion_repeat_campaign"
 JUDGE_ATTEMPT_BUDGET_LIMIT = 3
 JUDGE_ATTEMPT_BUDGET_EXHAUSTED_ERROR = "judge_attempt_budget_exhausted"
-FINALIZER_VERSION = 5
+FINALIZER_VERSION = 6
 FROZEN_DRACO_MINI_TASK_COUNT = 10
 FROZEN_DRACO_MINI_SHA256 = "1eb4e618c8df8e7f68bded3d2b6f77a541744aa1072eb338835b776183188a8d"
 FORMAL_REQUIRED_STABLE_POLL_COUNT = 6
@@ -82,6 +93,7 @@ FORMAL_AGENT_MAX_ITERATIONS = 20
 FORMAL_GENERATION_MAX_ATTEMPTS = 3
 FORMAL_GENERATION_RETRY_BACKOFF_SECONDS = Decimal("2")
 FORMAL_GENERATION_MAX_TOKENS = 16_384
+FORMAL_G1_TASK_ANALYZER_MAX_RETRIES = 3
 FORMAL_AGGREGATOR_RECOVERY_POLICY = {
     "aggregator_recovery_mode": "experiment",
     "aggregator_recovery_top_k": 3,
@@ -1298,6 +1310,8 @@ def usage_generation_identity_contract(value: Any) -> Any:
         return None
     token_keys = USAGE_CONTRACT_KEYS[4:]
     contract = {key: value.get(key) for key in token_keys if key in value}
+    if "physical_attempt_id" in value:
+        contract["physical_attempt_id"] = value.get("physical_attempt_id")
     breakdown = value.get("model_usage_breakdown")
     if isinstance(breakdown, list):
         contract["model_usage_breakdown"] = [
@@ -1350,7 +1364,12 @@ def repair_evidence(row: Mapping[str, Any], execution: Mapping[str, Any]) -> boo
 
 
 def immutable_attempt_payload(attempt: Mapping[str, Any]) -> dict[str, Any]:
-    """Project attempt fields a later receipt repair may not change."""
+    """Project attempt fields a later receipt repair may not change.
+
+    Legacy non-adaptive attempts retain their original v1 projection.  Once an
+    attempt carries G1 adaptive-routing evidence, its complete decision and
+    retry provenance are immutable across waves.
+    """
 
     run = attempt.get("run")
     attempt_id = str(attempt.get("attempt_id") or "")
@@ -1369,7 +1388,7 @@ def immutable_attempt_payload(attempt: Mapping[str, Any]) -> dict[str, Any]:
         if canonical_run is not None
         else None
     )
-    return {
+    payload = {
         "attempt_id": attempt.get("attempt_id"),
         "attempt_kind": attempt.get("attempt_kind"),
         "attempt": attempt.get("attempt"),
@@ -1382,6 +1401,50 @@ def immutable_attempt_payload(attempt: Mapping[str, Any]) -> dict[str, Any]:
         "retry_backoff_s": attempt.get("retry_backoff_s"),
         "run": immutable_run,
     }
+    selection_plan = attempt.get("selection_plan")
+    adaptive_fields = (
+        "selection_plan",
+        "excluded_proposer_identities",
+        "deterministic_proposer_failures",
+        "retry_selection_plan",
+        "retry_excluded_proposer_identities",
+    )
+    adaptive = any(field in attempt for field in adaptive_fields)
+    if adaptive:
+        routing = run.get("routing_trace") if isinstance(run, Mapping) else None
+        routing_plan = routing.get("selection_plan") if isinstance(routing, Mapping) else None
+        ensemble_trace = run.get("ensemble_trace") if isinstance(run, Mapping) else None
+        ensemble_plans: list[Any] = []
+        if isinstance(ensemble_trace, Mapping):
+            calls, _ = ensemble_call_trace_sequence(ensemble_trace)
+            ensemble_plans = [copy.deepcopy(call.get("selection_plan")) for call in calls]
+        payload.update(
+            {
+                "selection_plan": copy.deepcopy(selection_plan),
+                "excluded_proposer_identities": copy.deepcopy(
+                    attempt.get("excluded_proposer_identities")
+                ),
+                "deterministic_proposer_failures": copy.deepcopy(
+                    attempt.get("deterministic_proposer_failures")
+                ),
+                "retry_selection_plan": copy.deepcopy(attempt.get("retry_selection_plan")),
+                "retry_excluded_proposer_identities": copy.deepcopy(
+                    attempt.get("retry_excluded_proposer_identities")
+                ),
+                "run_routing_selection_plan": copy.deepcopy(routing_plan),
+                "run_ensemble_selection_plans": ensemble_plans,
+                # Setup usage and the aggregate usage breakdown are two
+                # mirrors of the same paid analyzer calls.  Bind both source
+                # shapes and their reconciled physical identities so a later
+                # wave cannot hide retries by changing only setup_usage.
+                "run_task_analyzer_setup_usage_evidence": (
+                    _task_analyzer_setup_usage_contract(run)
+                    if isinstance(run, Mapping)
+                    else None
+                ),
+            }
+        )
+    return payload
 
 
 def validate_generation_attempt_evidence(
@@ -1389,7 +1452,7 @@ def validate_generation_attempt_evidence(
     *,
     max_attempts: int,
 ) -> dict[str, Any]:
-    """Validate immutable, cumulative v1 attempt declarations across waves."""
+    """Validate immutable, cumulative attempt declarations across waves."""
 
     seen_payloads: dict[str, str] = {}
     attempt_owner: dict[str, tuple[str, str]] = {}
@@ -1456,6 +1519,7 @@ def validate_generation_attempt_evidence(
                 raise FinalizationError("generation attempt ordinal is invalid")
             if attempt.get("attempt_kind") not in {
                 "generation",
+                "generation_pre_call_guard",
                 "provider_build_after_paid_setup",
             }:
                 raise FinalizationError("generation attempt kind is unsupported")
@@ -1633,6 +1697,261 @@ def _is_unknown_task_analyzer_placeholder(unit: Mapping[str, Any]) -> bool:
         and provider_usage.get("usage_unknown") is True
         and provider_usage.get("physical_attempt_id") == unit.get("physical_attempt_id")
     )
+
+
+def _is_task_analyzer_evidence(unit: Mapping[str, Any]) -> bool:
+    role = str(unit.get("role") or "").strip().casefold()
+    return role == "task_analyzer" or (
+        role == "unknown_request"
+        and str(unit.get("label") or "").strip().casefold()
+        == "task_analyzer"
+    )
+
+
+def _task_analyzer_source_rows(
+    run: Mapping[str, Any],
+    *,
+    source: str,
+) -> list[dict[str, Any]]:
+    if source == "setup":
+        raw_rows = run.get("setup_usage")
+        rows = raw_rows if isinstance(raw_rows, list) else []
+    elif source == "usage":
+        usage = run.get("usage")
+        rows = usage_units(usage)
+    else:  # pragma: no cover - internal caller contract
+        raise ValueError(f"unknown task analyzer evidence source: {source}")
+    return [
+        copy.deepcopy(dict(row))
+        for row in rows
+        if isinstance(row, Mapping) and _is_task_analyzer_evidence(row)
+    ]
+
+
+def _task_analyzer_physical_attempt_id(unit: Mapping[str, Any]) -> str:
+    direct = str(unit.get("physical_attempt_id") or "").strip()
+    provider_usage = unit.get("provider_usage")
+    nested = (
+        str(provider_usage.get("physical_attempt_id") or "").strip()
+        if isinstance(provider_usage, Mapping)
+        else ""
+    )
+    if direct and nested and direct != nested:
+        raise FinalizationError(
+            "task analyzer evidence has conflicting physical_attempt_id fields"
+        )
+    return direct or nested
+
+
+_TASK_ANALYZER_MIRROR_FIELDS = (
+    "role",
+    "label",
+    "attempt",
+    "request_count",
+    "provider",
+    "model",
+    "requested_provider",
+    "requested_model",
+    "input_tokens",
+    "output_tokens",
+    "reasoning_tokens",
+    "cached_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+)
+
+
+def _task_analyzer_present_value(unit: Mapping[str, Any], field: str) -> Any | None:
+    if field not in unit:
+        return None
+    value = unit.get(field)
+    return None if value in (None, "", [], {}) else value
+
+
+def _merge_task_analyzer_mirrors(
+    setup: Mapping[str, Any],
+    usage: Mapping[str, Any],
+) -> dict[str, Any]:
+    for field_name in _TASK_ANALYZER_MIRROR_FIELDS:
+        setup_value = _task_analyzer_present_value(setup, field_name)
+        usage_value = _task_analyzer_present_value(usage, field_name)
+        if (
+            setup_value is not None
+            and usage_value is not None
+            and setup_value != usage_value
+        ):
+            raise FinalizationError(
+                "task analyzer setup/usage evidence conflicts on "
+                f"{field_name}"
+            )
+    setup_ids = response_ids(setup)
+    usage_ids = response_ids(usage)
+    if setup_ids and usage_ids and setup_ids != usage_ids:
+        raise FinalizationError(
+            "task analyzer setup/usage evidence conflicts on response_id"
+        )
+    merged = copy.deepcopy(dict(setup))
+    for key, value in usage.items():
+        if _task_analyzer_present_value(merged, str(key)) is None:
+            merged[str(key)] = copy.deepcopy(value)
+    return merged
+
+
+def _normalized_task_analyzer_source(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    source: str,
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
+    identified: dict[str, dict[str, Any]] = {}
+    unidentified: list[dict[str, Any]] = []
+    for raw in rows:
+        row = copy.deepcopy(dict(raw))
+        request_count = row.get("request_count")
+        if request_count is not None and nonnegative_int(request_count) != 1:
+            raise FinalizationError(
+                f"task analyzer {source} evidence must represent one physical request per row"
+            )
+        physical_id = _task_analyzer_physical_attempt_id(row)
+        if not physical_id:
+            unidentified.append(row)
+            continue
+        row["physical_attempt_id"] = physical_id
+        prior = identified.get(physical_id)
+        if prior is None:
+            identified[physical_id] = row
+        else:
+            identified[physical_id] = _merge_task_analyzer_mirrors(
+                prior,
+                row,
+            )
+    return identified, unidentified
+
+
+def _reconciled_task_analyzer_units(
+    run: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Reconcile setup and aggregate usage as mirrors of physical calls."""
+
+    setup_rows = _task_analyzer_source_rows(run, source="setup")
+    usage_rows = _task_analyzer_source_rows(run, source="usage")
+    setup_by_id, setup_without_id = _normalized_task_analyzer_source(
+        setup_rows,
+        source="setup",
+    )
+    usage_by_id, usage_without_id = _normalized_task_analyzer_source(
+        usage_rows,
+        source="usage",
+    )
+
+    if setup_rows and usage_rows:
+        any_identified = bool(setup_by_id or usage_by_id)
+        any_unidentified = bool(setup_without_id or usage_without_id)
+        if any_identified and any_unidentified:
+            raise FinalizationError(
+                "task analyzer setup/usage evidence cannot mix identified "
+                "and unidentified physical requests"
+            )
+        if any_identified:
+            reconciled = [
+                (
+                    _merge_task_analyzer_mirrors(
+                        setup_by_id[physical_id],
+                        usage_by_id[physical_id],
+                    )
+                    if physical_id in setup_by_id and physical_id in usage_by_id
+                    else copy.deepcopy(
+                        setup_by_id.get(physical_id)
+                        or usage_by_id[physical_id]
+                    )
+                )
+                for physical_id in set(setup_by_id) | set(usage_by_id)
+            ]
+        else:
+            if len(setup_without_id) != len(usage_without_id):
+                raise FinalizationError(
+                    "task analyzer setup/usage evidence has different "
+                    "physical-request multiplicity"
+                )
+            reconciled = [
+                _merge_task_analyzer_mirrors(setup, usage)
+                for setup, usage in zip(
+                    setup_without_id,
+                    usage_without_id,
+                    strict=True,
+                )
+            ]
+    elif setup_rows:
+        reconciled = [*setup_by_id.values(), *setup_without_id]
+    else:
+        reconciled = [*usage_by_id.values(), *usage_without_id]
+
+    reconciled.sort(
+        key=lambda row: (
+            nonnegative_int(row.get("attempt")),
+            _task_analyzer_physical_attempt_id(row),
+            canonical_sha256(row),
+        )
+    )
+    return reconciled, setup_rows, usage_rows
+
+
+def _task_analyzer_immutable_unit(unit: Mapping[str, Any]) -> dict[str, Any]:
+    fields = (
+        "role",
+        "label",
+        "attempt",
+        "physical_attempt_id",
+        "request_count",
+        "requested_provider",
+        "requested_model",
+        "input_tokens",
+        "output_tokens",
+        "reasoning_tokens",
+        "cached_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+    )
+    projected = {
+        field: copy.deepcopy(unit.get(field))
+        for field in fields
+        if field in unit
+    }
+    physical_id = _task_analyzer_physical_attempt_id(unit)
+    if physical_id:
+        projected["physical_attempt_id"] = physical_id
+    return projected
+
+
+def _task_analyzer_setup_usage_contract(
+    run: Mapping[str, Any],
+) -> dict[str, Any]:
+    reconciled, setup_rows, usage_rows = _reconciled_task_analyzer_units(run)
+    return {
+        "setup": [
+            _task_analyzer_immutable_unit(row)
+            for row in setup_rows
+        ],
+        "usage": [
+            _task_analyzer_immutable_unit(row)
+            for row in usage_rows
+        ],
+        "unique_physical": [
+            _task_analyzer_immutable_unit(row)
+            for row in reconciled
+        ],
+    }
+
+
+def _canonical_task_analyzer_setup_units(
+    run: Mapping[str, Any],
+    *,
+    identity_seed: str,
+) -> list[dict[str, Any]]:
+    """Return each unique analyzer request after reconciling both mirrors."""
+
+    del identity_seed  # Physical analyzer identity is carried by the evidence.
+    reconciled, _, _ = _reconciled_task_analyzer_units(run)
+    return reconciled
 
 
 def _is_unknown_judge_placeholder(unit: Mapping[str, Any]) -> bool:
@@ -3167,9 +3486,18 @@ def ensemble_physical_call_reasons(
         reasons.append("proposer_quorum_not_met")
 
     executed_plan = call.get("selection_plan")
+    strict_physical_evidence = False
     if not isinstance(executed_plan, Mapping):
         reasons.append("missing_executed_selection_plan")
     else:
+        physical_schema = executed_plan.get(
+            "thinking_physical_evidence_schema"
+        )
+        if physical_schema is not None:
+            if physical_schema != THINKING_PHYSICAL_EVIDENCE_SCHEMA:
+                reasons.append("unknown_thinking_physical_evidence_schema")
+            else:
+                strict_physical_evidence = True
         raw_models = executed_plan.get("proposer_models")
         models = tuple(str(item) for item in raw_models) if isinstance(raw_models, list) else ()
         if models != tuple(expected_proposers):
@@ -3250,6 +3578,7 @@ def ensemble_physical_call_reasons(
 
     if str(call.get("final_request_role") or "") == "aggregator":
         proposer_physical_count = 0
+        strict_physical_ids: list[str] = []
         if isinstance(candidates, list):
             for candidate in candidates:
                 if not isinstance(candidate, Mapping):
@@ -3268,8 +3597,62 @@ def ensemble_physical_call_reasons(
                         reasons.append("invalid_proposer_physical_request_count")
                     else:
                         proposer_physical_count += physical_count
+                        if strict_physical_evidence:
+                            execution = candidate.get("execution")
+                            attempts = (
+                                execution.get("physical_attempts")
+                                if isinstance(execution, Mapping)
+                                else None
+                            )
+                            if (
+                                not isinstance(attempts, list)
+                                or len(attempts) != physical_count
+                            ):
+                                reasons.append(
+                                    "invalid_proposer_physical_attempt_ledger"
+                                )
+                            else:
+                                for ordinal, attempt in enumerate(
+                                    attempts,
+                                    start=1,
+                                ):
+                                    attempt_id = (
+                                        str(
+                                            attempt.get(
+                                                "physical_attempt_id"
+                                            )
+                                            or ""
+                                        )
+                                        if isinstance(attempt, Mapping)
+                                        else ""
+                                    )
+                                    if (
+                                        not isinstance(attempt, Mapping)
+                                        or attempt.get("attempt") != ordinal
+                                        or attempt.get("request_started")
+                                        is not True
+                                        or HEX32.fullmatch(attempt_id) is None
+                                    ):
+                                        reasons.append(
+                                            "invalid_proposer_physical_attempt"
+                                        )
+                                    else:
+                                        strict_physical_ids.append(
+                                            attempt_id
+                                        )
                 elif physical_count not in {None, 0}:
                     reasons.append("unstarted_proposer_has_physical_request")
+                elif strict_physical_evidence:
+                    execution = candidate.get("execution")
+                    attempts = (
+                        execution.get("physical_attempts")
+                        if isinstance(execution, Mapping)
+                        else []
+                    )
+                    if attempts not in (None, []):
+                        reasons.append(
+                            "unstarted_proposer_has_physical_attempt"
+                        )
         recovery = call.get("aggregator_recovery")
         recovery_attempts = recovery.get("attempts") if isinstance(recovery, Mapping) else []
         aggregator_physical_count = (
@@ -3286,6 +3669,31 @@ def ensemble_physical_call_reasons(
             if isinstance(recovery_attempts, list)
             else 0
         )
+        if strict_physical_evidence and isinstance(
+            recovery_attempts,
+            list,
+        ):
+            for recovery_attempt in recovery_attempts:
+                if not isinstance(recovery_attempt, Mapping):
+                    continue
+                started = recovery_attempt.get("request_started") is True
+                attempt_id = str(
+                    recovery_attempt.get("physical_attempt_id") or ""
+                )
+                if started:
+                    if (
+                        recovery_attempt.get("physical_request_count") != 1
+                        or HEX32.fullmatch(attempt_id) is None
+                    ):
+                        reasons.append(
+                            "invalid_aggregator_physical_attempt_identity"
+                        )
+                    else:
+                        strict_physical_ids.append(attempt_id)
+                elif attempt_id:
+                    reasons.append(
+                        "unstarted_aggregator_attempt_has_physical_identity"
+                    )
         raw_llm_request_count = call.get("llm_request_count")
         raw_physical_request_count = call.get("physical_request_count")
         if (
@@ -3303,11 +3711,73 @@ def ensemble_physical_call_reasons(
         if raw_llm_request_count != raw_physical_request_count:
             reasons.append("ensemble_request_count_mismatch")
         minimum_request_count = proposer_physical_count + aggregator_physical_count
-        if (
-            isinstance(raw_physical_request_count, int)
-            and raw_physical_request_count < minimum_request_count
-        ):
-            reasons.append("ensemble_physical_request_count_undercounted")
+        if isinstance(raw_physical_request_count, int):
+            if (
+                strict_physical_evidence
+                and raw_physical_request_count != minimum_request_count
+            ):
+                reasons.append(
+                    "ensemble_physical_request_count_not_exact"
+                )
+            elif raw_physical_request_count < minimum_request_count:
+                reasons.append("ensemble_physical_request_count_undercounted")
+        if strict_physical_evidence:
+            if len(strict_physical_ids) != len(set(strict_physical_ids)):
+                reasons.append("duplicate_ensemble_physical_attempt_id")
+            if (
+                isinstance(raw_physical_request_count, int)
+                and raw_physical_request_count
+                != len(strict_physical_ids)
+            ):
+                reasons.append(
+                    "ensemble_physical_attempt_set_count_mismatch"
+                )
+            selected_id = ""
+            if isinstance(recovery, Mapping):
+                selected_attempt = recovery.get("selected_attempt")
+                selected_rows = [
+                    row
+                    for row in recovery_attempts
+                    if isinstance(row, Mapping)
+                    and row.get("attempt") == selected_attempt
+                    and row.get("request_started") is True
+                    and row.get("outcome") == "succeeded"
+                ]
+                if len(selected_rows) == 1:
+                    selected_id = str(
+                        selected_rows[0].get("physical_attempt_id") or ""
+                    )
+            final_request = call.get("final_request")
+            final_usage = (
+                final_request.get("usage")
+                if isinstance(final_request, Mapping)
+                else None
+            )
+            final_provider_usage = (
+                final_usage.get("provider_usage")
+                if isinstance(final_usage, Mapping)
+                else None
+            )
+            final_id = (
+                str(final_usage.get("physical_attempt_id") or "")
+                if isinstance(final_usage, Mapping)
+                else ""
+            )
+            nested_final_id = (
+                str(
+                    final_provider_usage.get("physical_attempt_id") or ""
+                )
+                if isinstance(final_provider_usage, Mapping)
+                else ""
+            )
+            if (
+                not selected_id
+                or final_id != selected_id
+                or nested_final_id != selected_id
+            ):
+                reasons.append(
+                    "final_aggregator_physical_attempt_id_mismatch"
+                )
 
     final_request = call.get("final_request")
     if (
@@ -3666,10 +4136,27 @@ def g1_recomputed_proposer_bounds(
     return minimum, maximum, reasons
 
 
+def legacy_managed_v3_source_authenticated(
+    contract: Mapping[str, Any] | None,
+) -> bool:
+    """Authorize the historical managed-v3 shape only for its exact source."""
+
+    source_identity = (
+        contract.get("source_identity")
+        if isinstance(contract, Mapping)
+        else None
+    )
+    return (
+        isinstance(source_identity, Mapping)
+        and dict(source_identity) == LEGACY_MANAGED_V3_SOURCE_IDENTITY
+    )
+
+
 def g1_registry_plan_reasons(
     plan: Any,
     *,
     contract: Mapping[str, Any],
+    allow_legacy_managed_v3: bool = False,
 ) -> tuple[list[str], tuple[str, ...], str]:
     """Bind a G1 physical plan to its frozen registry and exact P/A choice."""
 
@@ -3878,7 +4365,12 @@ def g1_registry_plan_reasons(
             ranking_trace_replay_reasons,
         )
 
-        reasons.extend(ranking_trace_replay_reasons(plan))
+        reasons.extend(
+            ranking_trace_replay_reasons(
+                plan,
+                allow_legacy_managed_v3=allow_legacy_managed_v3,
+            )
+        )
     except Exception:  # noqa: BLE001 - malformed evidence must fail closed
         reasons.append("g1_frozen_ranker_replay_failed")
     return list(dict.fromkeys(reasons)), proposer_models, aggregator_model
@@ -3897,10 +4389,30 @@ _G1_LIFECYCLE_PLAN_MATCH_FIELDS = (
     "aggregator_recovery_top_k",
     "aggregator_max_tokens_cap",
     "aggregator_visible_answer_reserve_tokens",
+    "task_analyzer",
     "task_profile",
+    "task_profile_hash",
+    "request_context",
+    "request_context_hash",
+    "routed_tier",
+    "routing_confidence",
+    "user_profile_enabled",
+    "user_profile_version",
+    "user_profile_source",
     "N_min",
     "N_max",
     "bound_reasons",
+    "retry_parent_decision_id",
+    "retry_excluded_proposer_identities",
+    "task_analysis_reused",
+    "task_analysis_reuse",
+    "retry_routing",
+)
+_G1_EXECUTION_MUTABLE_SELECTION_PLAN_FIELDS = frozenset(
+    {
+        "executed_thinking_assignment",
+        "thinking_execution_fallbacks",
+    }
 )
 
 
@@ -3925,6 +4437,635 @@ def matching_saved_generation_attempts(
     ]
 
 
+def _normalized_g1_retry_identities(raw: Any) -> tuple[set[str], bool]:
+    if raw is None:
+        return set(), True
+    if not isinstance(raw, list):
+        return set(), False
+    normalized = [str(identity or "").strip().lower() for identity in raw]
+    valid = bool(
+        all(
+            identity
+            and identity.partition(":")[1] == ":"
+            and identity.partition(":")[0]
+            and identity.partition(":")[2]
+            for identity in normalized
+        )
+        and len(normalized) == len(set(normalized))
+    )
+    return set(normalized), valid
+
+
+def _g1_reasoning_only_length_failures(
+    run: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    trace = run.get("ensemble_trace")
+    calls, _ = ensemble_call_trace_sequence(trace if isinstance(trace, Mapping) else {})
+    failures: list[dict[str, Any]] = []
+    for call_index, call in enumerate(calls, start=1):
+        candidates = call.get("candidates")
+        if not isinstance(candidates, list):
+            continue
+        for candidate_index, candidate in enumerate(candidates):
+            if not isinstance(candidate, Mapping) or candidate.get("ok") is True:
+                continue
+            stop_reason = str(candidate.get("stop_reason") or "").strip().casefold()
+            if stop_reason not in REASONING_ONLY_LENGTH_STOP_REASONS:
+                continue
+            content = candidate.get("content")
+            content_chars = content.get("chars") if isinstance(content, Mapping) else None
+            visible_chars = (
+                nonnegative_int(content_chars)
+                if isinstance(content_chars, int | float) and not isinstance(content_chars, bool)
+                else len(
+                    str(
+                        (
+                            content.get("text")
+                            if isinstance(content, Mapping)
+                            else candidate.get("text")
+                        )
+                        or ""
+                    )
+                )
+            )
+            reasoning_tokens = nonnegative_int(candidate.get("reasoning_tokens"))
+            output_tokens = nonnegative_int(candidate.get("output_tokens"))
+            if reasoning_tokens <= 0:
+                for field in (
+                    "model_usage_breakdown",
+                    "diagnostic_model_usage_breakdown",
+                ):
+                    breakdown = candidate.get(field)
+                    if isinstance(breakdown, list):
+                        reasoning_tokens += sum(
+                            nonnegative_int(unit.get("reasoning_tokens"))
+                            for unit in breakdown
+                            if isinstance(unit, Mapping)
+                        )
+            if output_tokens <= 0:
+                breakdown = candidate.get("model_usage_breakdown")
+                if isinstance(breakdown, list):
+                    output_tokens = sum(
+                        nonnegative_int(unit.get("output_tokens"))
+                        for unit in breakdown
+                        if isinstance(unit, Mapping)
+                    )
+            provider = (
+                str(candidate.get("requested_provider") or candidate.get("provider") or "")
+                .strip()
+                .lower()
+            )
+            model = (
+                str(candidate.get("requested_model") or candidate.get("model") or "")
+                .strip()
+                .lower()
+            )
+            if (
+                visible_chars == 0
+                and reasoning_tokens > 0
+                and candidate.get("request_started") is True
+                and nonnegative_int(candidate.get("physical_request_count")) > 0
+                and provider
+                and model
+            ):
+                actual_provider = str(candidate.get("provider") or provider).strip().lower()
+                actual_model = str(candidate.get("model") or model).strip().lower()
+                raw_candidate_index = candidate.get("index")
+                normalized_candidate_index = (
+                    raw_candidate_index
+                    if isinstance(raw_candidate_index, int)
+                    and not isinstance(raw_candidate_index, bool)
+                    and raw_candidate_index >= 0
+                    else candidate_index
+                )
+                failures.append(
+                    {
+                        "identity": f"{provider}:{model}",
+                        "reason": "reasoning_only_length",
+                        "call_index": call_index,
+                        "candidate_index": normalized_candidate_index,
+                        "provider": actual_provider,
+                        "model": actual_model,
+                        "requested_provider": provider,
+                        "requested_model": model,
+                        "ok": False,
+                        "request_started": True,
+                        "physical_request_count": nonnegative_int(
+                            candidate.get("physical_request_count")
+                        ),
+                        "usage_reported": candidate.get("usage_reported") is True,
+                        "usage_missing_count": nonnegative_int(
+                            candidate.get("usage_missing_count")
+                        ),
+                        "stop_reason": stop_reason,
+                        "visible_output_chars": visible_chars,
+                        "input_tokens": nonnegative_int(candidate.get("input_tokens")),
+                        "output_tokens": output_tokens,
+                        "reasoning_tokens": reasoning_tokens,
+                        "error": str(candidate.get("error") or ""),
+                        "error_code": str(candidate.get("error_code") or ""),
+                    }
+                )
+    return failures
+
+
+def _g1_reasoning_only_length_failure_identities(run: Mapping[str, Any]) -> set[str]:
+    return {
+        str(failure.get("identity") or "") for failure in _g1_reasoning_only_length_failures(run)
+    }
+
+
+def _g1_plans_match(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+    return all(left.get(field) == right.get(field) for field in _G1_LIFECYCLE_PLAN_MATCH_FIELDS)
+
+
+def _g1_full_plans_match(
+    left: Mapping[str, Any],
+    right: Mapping[str, Any],
+) -> bool:
+    """Compare every immutable field while excluding execution fallback receipts."""
+
+    try:
+        return canonical_sha256(
+            {
+                str(key): copy.deepcopy(value)
+                for key, value in left.items()
+                if str(key) not in _G1_EXECUTION_MUTABLE_SELECTION_PLAN_FIELDS
+            }
+        ) == canonical_sha256(
+            {
+                str(key): copy.deepcopy(value)
+                for key, value in right.items()
+                if str(key) not in _G1_EXECUTION_MUTABLE_SELECTION_PLAN_FIELDS
+            }
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def _g1_execution_plan_mutation_reasons(
+    expected_plan: Mapping[str, Any],
+    observed_plan: Mapping[str, Any],
+) -> list[str]:
+    """Validate provider-execution receipts excluded from decision-plan hashing."""
+
+    from opensquilla.provider.thinking_execution import (
+        validate_thinking_execution_plan_mutation,
+    )
+
+    return (
+        ["invalid_g1_thinking_execution_plan_mutation"]
+        if validate_thinking_execution_plan_mutation(
+            expected_plan,
+            observed_plan,
+        )
+        else []
+    )
+
+def _g1_retry_plan_provenance_reasons(
+    plan: Mapping[str, Any],
+    *,
+    initial_plan: Mapping[str, Any],
+    initial_decision_id: str,
+    exclusions: set[str],
+) -> list[str]:
+    """Require bound-v2 provenance for every adaptive retry plan."""
+
+    reasons: list[str] = []
+    provenance_fields = (
+        "retry_parent_decision_id",
+        "retry_excluded_proposer_identities",
+        "task_analysis_reused",
+        "task_analysis_reuse",
+        "retry_routing",
+    )
+    if not exclusions:
+        if any(field in plan for field in provenance_fields):
+            reasons.append("unexpected_g1_initial_retry_provenance")
+        return reasons
+    expected_exclusions = sorted(exclusions)
+    if plan.get("retry_parent_decision_id") != initial_decision_id:
+        reasons.append("wrong_g1_retry_parent_decision_id")
+    if not str(plan.get("decision_id") or "") or plan.get("decision_id") == initial_decision_id:
+        reasons.append("wrong_g1_retry_decision_id")
+    if plan.get("retry_excluded_proposer_identities") != expected_exclusions:
+        reasons.append("wrong_g1_retry_plan_exclusions")
+    if plan.get("task_analysis_reused") is not True:
+        reasons.append("missing_g1_retry_task_analysis_reuse")
+    retry_routing = plan.get("retry_routing")
+    if not isinstance(retry_routing, Mapping):
+        reasons.append("missing_g1_retry_routing_provenance")
+        return reasons
+    retry_schema = retry_routing.get("schema")
+    if retry_schema != "opensquilla.router-dynamic-retry-routing/v2":
+        reasons.append("wrong_g1_retry_routing_schema")
+    if retry_routing.get("reason") != "prior_attempt_reasoning_only_length":
+        reasons.append("wrong_g1_retry_routing_reason")
+    if retry_routing.get("parent_decision_id") != initial_decision_id:
+        reasons.append("wrong_g1_retry_routing_parent_decision_id")
+    if retry_routing.get("excluded_proposer_identities") != expected_exclusions:
+        reasons.append("wrong_g1_retry_routing_exclusions")
+    if retry_routing.get("task_analysis_reused") is not True:
+        reasons.append("missing_g1_retry_routing_task_analysis_reuse")
+    if retry_schema == "opensquilla.router-dynamic-retry-routing/v2":
+        from opensquilla.provider.ranking_router import (
+            router_dynamic_task_analysis_reuse_reasons,
+        )
+
+        reasons.extend(
+            router_dynamic_task_analysis_reuse_reasons(
+                initial_plan,
+                plan,
+            )
+        )
+        binding = plan.get("task_analysis_reuse")
+        binding_hash = (
+            str(binding.get("projection_sha256") or "") if isinstance(binding, Mapping) else ""
+        )
+        if retry_routing.get("task_analysis_source_decision_id") != initial_decision_id:
+            reasons.append("wrong_g1_retry_routing_task_analysis_source_decision")
+        if retry_routing.get("task_analysis_reuse_sha256") != binding_hash:
+            reasons.append("wrong_g1_retry_routing_task_analysis_reuse_hash")
+    return list(dict.fromkeys(reasons))
+
+
+def _adaptive_g1_lifecycle_routing(
+    row: Mapping[str, Any],
+    *,
+    registry: Mapping[str, Any],
+    physical_plans: Sequence[Mapping[str, Any]],
+    initial_reasons: Sequence[str],
+    allow_legacy_managed_v3: bool = False,
+) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
+    """Validate per-attempt G1 retry plans without requiring identical rosters."""
+
+    reasons = list(initial_reasons)
+    matching = matching_saved_generation_attempts(row)
+    if len(matching) != 1:
+        reasons.append("ambiguous_g1_selected_generation_attempt")
+    selected = matching[0] if len(matching) == 1 else None
+    selected_attempt_id = (
+        str(selected.get("attempt_id") or "") if isinstance(selected, Mapping) else ""
+    )
+    selected_ordinal = (
+        nonnegative_int(selected.get("attempt")) if isinstance(selected, Mapping) else 0
+    )
+    execution = row.get("execution")
+    attempts = (
+        execution.get("generation_attempts")
+        if isinstance(execution, Mapping) and isinstance(execution.get("generation_attempts"), list)
+        else []
+    )
+    expected_exclusions: set[str] = set()
+    selected_plan: Mapping[str, Any] | None = None
+    selected_routing: Mapping[str, Any] | None = None
+    validated_plan_count = 0
+    validated_physical_plan_count = 0
+    previous_ordinal = 0
+    previous_plan: Mapping[str, Any] | None = None
+    pending_retry_plan: Mapping[str, Any] | None = None
+    pending_retry_exclusions: set[str] | None = None
+    initial_plan: Mapping[str, Any] | None = None
+    initial_decision_id = ""
+    thinking_plan_prefix_by_decision: dict[str, Mapping[str, Any]] = {}
+    thinking_execution_history: list[dict[str, Any]] = []
+    for attempt in attempts:
+        if not isinstance(attempt, Mapping):
+            reasons.append("invalid_g1_attempt_evidence")
+            continue
+        ordinal = nonnegative_int(attempt.get("attempt"))
+        if ordinal <= 0:
+            reasons.append("invalid_g1_attempt_ordinal_sequence")
+            continue
+        if ordinal <= previous_ordinal:
+            reasons.append("invalid_g1_attempt_ordinal_sequence")
+        previous_ordinal = ordinal
+        run = attempt.get("run")
+        run_map = run if isinstance(run, Mapping) else {}
+        routing = run_map.get("routing_trace")
+        routing_map = routing if isinstance(routing, Mapping) else {}
+        routed_plan = routing_map.get("selection_plan")
+        declared_plan = attempt.get("selection_plan")
+        if not isinstance(declared_plan, Mapping):
+            reasons.append("missing_g1_attempt_selection_plan")
+            continue
+        plan = declared_plan
+        if not isinstance(routed_plan, Mapping):
+            reasons.append("missing_g1_attempt_routing_plan")
+        validated_plan_count += 1
+        plan_reasons, _, _ = g1_registry_plan_reasons(
+            plan,
+            contract=registry,
+            allow_legacy_managed_v3=allow_legacy_managed_v3,
+        )
+        reasons.extend(plan_reasons)
+        if isinstance(routed_plan, Mapping):
+            routed_reasons, _, _ = g1_registry_plan_reasons(
+                routed_plan,
+                contract=registry,
+                allow_legacy_managed_v3=allow_legacy_managed_v3,
+            )
+            reasons.extend(routed_reasons)
+            if not _g1_full_plans_match(declared_plan, routed_plan):
+                reasons.append("g1_attempt_selection_plan_differs_from_routing")
+            reasons.extend(
+                _g1_execution_plan_mutation_reasons(
+                    declared_plan,
+                    routed_plan,
+                )
+            )
+
+        if not initial_decision_id:
+            initial_decision_id = str(plan.get("decision_id") or "")
+            initial_plan = plan
+
+        exclusion_sources: list[tuple[set[str], bool]] = [
+            _normalized_g1_retry_identities(attempt.get("excluded_proposer_identities"))
+        ]
+        if "retry_excluded_proposer_identities" in plan:
+            exclusion_sources.append(
+                _normalized_g1_retry_identities(plan.get("retry_excluded_proposer_identities"))
+            )
+        retry_routing = plan.get("retry_routing")
+        if isinstance(retry_routing, Mapping):
+            exclusion_sources.append(
+                _normalized_g1_retry_identities(retry_routing.get("excluded_proposer_identities"))
+            )
+        if any(not valid for _, valid in exclusion_sources):
+            reasons.append("invalid_g1_retry_excluded_proposer_identities")
+        current_exclusions = exclusion_sources[0][0]
+        attempt_exclusions_raw = attempt.get("excluded_proposer_identities")
+        if attempt_exclusions_raw != sorted(current_exclusions):
+            reasons.append("noncanonical_g1_attempt_exclusions")
+        if any(values != current_exclusions for values, _ in exclusion_sources[1:]):
+            reasons.append("conflicting_g1_retry_excluded_proposer_identities")
+        if pending_retry_plan is not None:
+            if not _g1_full_plans_match(plan, pending_retry_plan):
+                reasons.append("g1_retry_selection_plan_not_used_by_next_attempt")
+            reasons.extend(
+                _g1_execution_plan_mutation_reasons(
+                    pending_retry_plan,
+                    plan,
+                )
+            )
+            if current_exclusions != (pending_retry_exclusions or set()):
+                reasons.append("g1_retry_exclusions_not_used_by_next_attempt")
+            pending_retry_plan = None
+            pending_retry_exclusions = None
+        elif previous_plan is not None:
+            if not _g1_full_plans_match(plan, previous_plan):
+                reasons.append("g1_attempt_plan_changed_without_retry_selection")
+            reasons.extend(
+                _g1_execution_plan_mutation_reasons(
+                    previous_plan,
+                    plan,
+                )
+            )
+        if not expected_exclusions.issubset(current_exclusions):
+            reasons.append("nonmonotonic_g1_retry_exclusions")
+        if current_exclusions != expected_exclusions:
+            reasons.append("wrong_g1_retry_exclusion_evolution")
+        selected_p = {
+            str(identity or "").strip().lower() for identity in plan.get("selected_P") or []
+        }
+        if selected_p & current_exclusions:
+            reasons.append("g1_retry_selected_excluded_proposer")
+        reasons.extend(
+            _g1_retry_plan_provenance_reasons(
+                plan,
+                initial_plan=initial_plan or plan,
+                initial_decision_id=initial_decision_id,
+                exclusions=current_exclusions,
+            )
+        )
+
+        attempt_trace = run_map.get("ensemble_trace")
+        attempt_calls: list[Mapping[str, Any]] = []
+        if isinstance(attempt_trace, Mapping) and attempt_trace:
+            attempt_calls, attempt_sequence_reasons = ensemble_call_trace_sequence(attempt_trace)
+            reasons.extend(attempt_sequence_reasons)
+            if not attempt_calls:
+                reasons.append("missing_g1_attempt_physical_selection_plan")
+            decision_key = str(plan.get("decision_id") or "")
+            previous_thinking_plan = thinking_plan_prefix_by_decision.get(
+                decision_key
+            )
+            if previous_thinking_plan is None:
+                previous_thinking_plan = plan
+            for call in attempt_calls:
+                physical_plan = call.get("selection_plan")
+                physical_reasons, _, _ = g1_registry_plan_reasons(
+                    physical_plan,
+                    contract=registry,
+                    allow_legacy_managed_v3=allow_legacy_managed_v3,
+                )
+                reasons.extend(physical_reasons)
+                if not isinstance(physical_plan, Mapping):
+                    reasons.append("missing_g1_attempt_physical_selection_plan")
+                    continue
+                validated_physical_plan_count += 1
+                if not _g1_full_plans_match(plan, physical_plan):
+                    reasons.append("g1_attempt_selection_plan_differs_from_physical_plan")
+                reasons.extend(
+                    _g1_execution_plan_mutation_reasons(
+                        plan,
+                        physical_plan,
+                    )
+                )
+                from opensquilla.provider.thinking_execution import (
+                    validate_thinking_execution_call,
+                )
+
+                validated_thinking_plan, execution_reason = (
+                    validate_thinking_execution_call(
+                        previous_thinking_plan,
+                        call,
+                    )
+                )
+                if execution_reason:
+                    reasons.append("invalid_g1_physical_thinking_execution")
+                else:
+                    previous_thinking_plan = validated_thinking_plan
+                if not isinstance(previous_thinking_plan, Mapping):
+                    reasons.append("invalid_g1_physical_thinking_execution")
+                if isinstance(routed_plan, Mapping) and not _g1_full_plans_match(
+                    routed_plan,
+                    physical_plan,
+                ):
+                    reasons.append("g1_attempt_routing_plan_differs_from_physical_plan")
+                if isinstance(routed_plan, Mapping):
+                    reasons.extend(
+                        _g1_execution_plan_mutation_reasons(
+                            routed_plan,
+                            physical_plan,
+                        )
+                    )
+                thinking_execution_history.append(
+                    copy.deepcopy(dict(physical_plan))
+                )
+            thinking_plan_prefix_by_decision[decision_key] = (
+                previous_thinking_plan
+            )
+        elif run_expected_ensemble_request_count(run_map) > 0:
+            reasons.append("missing_g1_attempt_ensemble_trace")
+
+        derived_failure_rows = _g1_reasoning_only_length_failures(run_map)
+        derived_failures = {str(failure.get("identity") or "") for failure in derived_failure_rows}
+        recorded_failures = attempt.get("deterministic_proposer_failures")
+        normalized_recorded_failures = (
+            [dict(failure) for failure in recorded_failures]
+            if isinstance(recorded_failures, list)
+            and all(isinstance(failure, Mapping) for failure in recorded_failures)
+            else None
+        )
+        if normalized_recorded_failures != derived_failure_rows:
+            reasons.append("wrong_g1_deterministic_proposer_failure_evidence")
+        if not derived_failures.issubset(selected_p):
+            reasons.append("g1_retry_failure_outside_attempt_roster")
+        next_exclusions = current_exclusions | derived_failures
+
+        retry_selection_plan = attempt.get("retry_selection_plan")
+        retry_exclusions_raw = attempt.get("retry_excluded_proposer_identities")
+        retry_deferred = attempt.get("retry_deferred_to_next_wave")
+        if retry_deferred is not None and type(retry_deferred) is not bool:
+            reasons.append("invalid_g1_retry_deferred_marker")
+        if isinstance(retry_selection_plan, Mapping):
+            from opensquilla.provider.thinking_execution import (
+                validate_thinking_execution_history_closure,
+            )
+
+            projected_retry_plan, projection_audit, projection_reason = (
+                validate_thinking_execution_history_closure(
+                    thinking_execution_history,
+                    retry_selection_plan,
+                )
+            )
+            if projection_reason:
+                reasons.append(
+                    "invalid_g1_thinking_execution_projection:"
+                    + projection_reason
+                )
+            elif (
+                retry_selection_plan.get("executed_thinking_assignment")
+                != projected_retry_plan.get("executed_thinking_assignment")
+                or retry_selection_plan.get("thinking_execution_fallbacks", [])
+                != projected_retry_plan.get("thinking_execution_fallbacks", [])
+            ):
+                reasons.append("g1_retry_thinking_execution_projection_differs")
+            if attempt.get("thinking_execution_projection") != projection_audit:
+                reasons.append("wrong_g1_thinking_execution_projection_audit")
+            retry_plan_reasons, _, _ = g1_registry_plan_reasons(
+                retry_selection_plan,
+                contract=registry,
+                allow_legacy_managed_v3=allow_legacy_managed_v3,
+            )
+            reasons.extend(retry_plan_reasons)
+            retry_exclusions, retry_exclusions_valid = _normalized_g1_retry_identities(
+                retry_exclusions_raw
+            )
+            if not retry_exclusions_valid:
+                reasons.append("invalid_g1_retry_next_exclusions")
+            if retry_exclusions_raw != sorted(retry_exclusions):
+                reasons.append("invalid_g1_retry_next_exclusions")
+            if retry_exclusions != next_exclusions:
+                reasons.append("wrong_g1_retry_next_exclusion_evolution")
+            retry_selected_p = {
+                str(identity or "").strip().lower()
+                for identity in retry_selection_plan.get("selected_P") or []
+            }
+            if retry_selected_p & retry_exclusions:
+                reasons.append("g1_retry_selection_selected_excluded_proposer")
+            reasons.extend(
+                _g1_retry_plan_provenance_reasons(
+                    retry_selection_plan,
+                    initial_plan=initial_plan or plan,
+                    initial_decision_id=initial_decision_id,
+                    exclusions=retry_exclusions,
+                )
+            )
+            if (
+                (attempt.get("will_retry") is True)
+                == (retry_deferred is True)
+                or not derived_failures
+            ):
+                reasons.append("unexpected_g1_retry_selection_plan")
+            pending_retry_plan = retry_selection_plan
+            pending_retry_exclusions = retry_exclusions
+        elif retry_selection_plan is not None:
+            reasons.append("invalid_g1_retry_selection_plan")
+        elif retry_exclusions_raw not in (None, []):
+            reasons.append("g1_retry_exclusions_without_selection_plan")
+        elif retry_deferred is True:
+            reasons.append("g1_retry_deferred_without_selection_plan")
+        elif attempt.get("will_retry") is True and derived_failures:
+            reasons.append("missing_g1_retry_selection_plan")
+
+        expected_exclusions = next_exclusions
+
+        if selected is not None and str(attempt.get("attempt_id") or "") == selected_attempt_id:
+            selected_plan = plan
+            selected_routing = routing_map
+        previous_plan = plan
+
+    if validated_plan_count <= 0:
+        reasons.append("missing_g1_attempt_selection_plan")
+    if pending_retry_plan is not None:
+        reasons.append("dangling_g1_retry_selection_plan")
+    if selected_plan is None:
+        reasons.append("missing_g1_selected_attempt_selection_plan")
+        return {}, {}, list(dict.fromkeys(reasons))
+    for physical in physical_plans:
+        if not _g1_full_plans_match(selected_plan, physical):
+            reasons.append("g1_selected_attempt_plan_differs_from_physical_plan")
+        reasons.extend(
+            _g1_execution_plan_mutation_reasons(
+                selected_plan,
+                physical,
+            )
+        )
+
+    top_routing = row.get("routing_trace")
+    top_routing_map = top_routing if isinstance(top_routing, Mapping) else {}
+    top_plan = top_routing_map.get("selection_plan")
+    if isinstance(top_plan, Mapping):
+        top_reasons, _, _ = g1_registry_plan_reasons(
+            top_plan,
+            contract=registry,
+            allow_legacy_managed_v3=allow_legacy_managed_v3,
+        )
+        reasons.extend(top_reasons)
+        if not _g1_full_plans_match(selected_plan, top_plan):
+            reasons.append("g1_routing_plan_differs_from_selected_attempt")
+        reasons.extend(
+            _g1_execution_plan_mutation_reasons(
+                selected_plan,
+                top_plan,
+            )
+        )
+        effective_routing = dict(top_routing_map)
+    elif top_routing_map:
+        reasons.append("invalid_g1_top_routing_trace")
+        effective_routing = {}
+    elif isinstance(selected_routing, Mapping) and selected_routing:
+        effective_routing = dict(selected_routing)
+    else:
+        effective_routing = {"selection_plan": dict(selected_plan)}
+
+    evidence = {
+        "schema": "opensquilla.draco.g1-provider-lifecycle-routing-recovery/v1",
+        "source_attempt_id": selected_attempt_id,
+        "source_attempt": selected_ordinal,
+        "selected_attempt_id": selected_attempt_id,
+        "selected_attempt": selected_ordinal,
+        "decision_id": str(selected_plan.get("decision_id") or ""),
+        "registry_snapshot_hash": str(selected_plan.get("registry_snapshot_hash") or ""),
+        "ranking_config_hash": str(selected_plan.get("ranking_config_hash") or ""),
+        "validated_attempt_plan_count": validated_plan_count,
+        "validated_attempt_physical_plan_count": validated_physical_plan_count,
+    }
+    return effective_routing, evidence, list(dict.fromkeys(reasons))
+
+
 def effective_g1_lifecycle_routing(
     row: Mapping[str, Any],
     *,
@@ -3932,6 +5073,9 @@ def effective_g1_lifecycle_routing(
 ) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
     """Resolve one G1 plan from the same row/provider lifecycle."""
 
+    allow_legacy_managed_v3 = (
+        legacy_managed_v3_source_authenticated(contract)
+    )
     registry = contract.get("g1_registry_contract")
     if not isinstance(registry, Mapping):
         return {}, {}, ["invalid_g1_registry_contract"]
@@ -3944,13 +5088,41 @@ def effective_g1_lifecycle_routing(
     physical_plans: list[Mapping[str, Any]] = []
     for call in calls:
         plan = call.get("selection_plan")
-        plan_reasons, _, _ = g1_registry_plan_reasons(plan, contract=registry)
+        plan_reasons, _, _ = g1_registry_plan_reasons(
+            plan,
+            contract=registry,
+            allow_legacy_managed_v3=allow_legacy_managed_v3,
+        )
         reasons.extend(plan_reasons)
         if isinstance(plan, Mapping):
             physical_plans.append(plan)
     if not physical_plans:
         reasons.append("missing_g1_physical_selection_plan")
         return {}, {}, list(dict.fromkeys(reasons))
+    execution = row.get("execution")
+    generation_attempts = (
+        execution.get("generation_attempts")
+        if isinstance(execution, Mapping) and isinstance(execution.get("generation_attempts"), list)
+        else []
+    )
+    if any(
+        isinstance(attempt, Mapping)
+        and (
+            "selection_plan" in attempt
+            or "excluded_proposer_identities" in attempt
+            or "deterministic_proposer_failures" in attempt
+            or "retry_selection_plan" in attempt
+            or "retry_excluded_proposer_identities" in attempt
+        )
+        for attempt in generation_attempts
+    ):
+        return _adaptive_g1_lifecycle_routing(
+            row,
+            registry=registry,
+            physical_plans=physical_plans,
+            initial_reasons=reasons,
+            allow_legacy_managed_v3=allow_legacy_managed_v3,
+        )
     physical = physical_plans[0]
     for plan in physical_plans[1:]:
         if any(plan.get(field) != physical.get(field) for field in _G1_LIFECYCLE_PLAN_MATCH_FIELDS):
@@ -3960,7 +5132,11 @@ def effective_g1_lifecycle_routing(
     top_routing = dict(routing) if isinstance(routing, Mapping) else {}
     top_plan = top_routing.get("selection_plan")
     if isinstance(top_plan, Mapping):
-        top_reasons, _, _ = g1_registry_plan_reasons(top_plan, contract=registry)
+        top_reasons, _, _ = g1_registry_plan_reasons(
+            top_plan,
+            contract=registry,
+            allow_legacy_managed_v3=allow_legacy_managed_v3,
+        )
         reasons.extend(top_reasons)
         if any(
             top_plan.get(field) != physical.get(field) for field in _G1_LIFECYCLE_PLAN_MATCH_FIELDS
@@ -3992,7 +5168,11 @@ def effective_g1_lifecycle_routing(
         plan = (
             attempt_routing.get("selection_plan") if isinstance(attempt_routing, Mapping) else None
         )
-        plan_reasons, _, _ = g1_registry_plan_reasons(plan, contract=registry)
+        plan_reasons, _, _ = g1_registry_plan_reasons(
+            plan,
+            contract=registry,
+            allow_legacy_managed_v3=allow_legacy_managed_v3,
+        )
         if plan_reasons:
             if isinstance(plan, Mapping):
                 reasons.extend(plan_reasons)
@@ -4026,6 +5206,371 @@ def effective_g1_lifecycle_routing(
     return dict(recovered), evidence, list(dict.fromkeys(reasons))
 
 
+def validate_g1_paid_attempt_plan_history(
+    records: Sequence[SourceRecord],
+    *,
+    contracts: Mapping[str, Mapping[str, Any]],
+) -> None:
+    """Make every paid adaptive G1 attempt auditable across all source waves."""
+
+    group_contract = contracts.get("G1")
+    allow_legacy_managed_v3 = (
+        legacy_managed_v3_source_authenticated(group_contract)
+    )
+    registry = (
+        group_contract.get("g1_registry_contract") if isinstance(group_contract, Mapping) else None
+    )
+    if not isinstance(registry, Mapping):
+        raise FinalizationError("G1 paid-attempt audit lacks a registry contract")
+    violations: list[dict[str, Any]] = []
+    selected_only_reasons = {
+        "ambiguous_g1_selected_generation_attempt",
+        "missing_g1_selected_attempt_selection_plan",
+    }
+    task_records: dict[tuple[str, str], list[SourceRecord]] = {}
+    for record in records:
+        if record.key[0] != "G1":
+            continue
+        task_records.setdefault(record.key, []).append(record)
+
+    for task_key, task_history in task_records.items():
+        attempts_by_id: dict[str, dict[str, Any]] = {}
+        attempt_payload_hashes: dict[str, str] = {}
+        attempt_references: dict[str, dict[str, Any]] = {}
+        history_is_adaptive = False
+        duplicate_conflict = False
+        for record in task_history:
+            execution = record.row.get("execution")
+            raw_attempts = (
+                execution.get("generation_attempts")
+                if isinstance(execution, Mapping)
+                and isinstance(execution.get("generation_attempts"), list)
+                else []
+            )
+            for attempt in raw_attempts:
+                if not isinstance(attempt, Mapping):
+                    continue
+                run = attempt.get("run")
+                run_map = run if isinstance(run, Mapping) else {}
+                trace_events = run_map.get("trace_events")
+                routing = run_map.get("routing_trace")
+                if (
+                    any(
+                        isinstance(event, Mapping)
+                        and event.get("code")
+                        == "g1_pre_call_guard_failed"
+                        for event in (
+                            trace_events
+                            if isinstance(trace_events, list)
+                            else []
+                        )
+                    )
+                    or (
+                        isinstance(routing, Mapping)
+                        and isinstance(
+                            routing.get("pre_call_guard"),
+                            Mapping,
+                        )
+                    )
+                ):
+                    violations.append(
+                        record.reference
+                        | {
+                            "group": task_key[0],
+                            "task_id": task_key[1],
+                            "attempt_id": str(
+                                attempt.get("attempt_id") or ""
+                            ),
+                            "reasons": ["g1_pre_call_guard_failed"],
+                        }
+                    )
+                    duplicate_conflict = True
+                    continue
+                routed_plan = (
+                    routing.get("selection_plan")
+                    if isinstance(routing, Mapping)
+                    else None
+                )
+                trace = run_map.get("ensemble_trace")
+                physical_calls, _ = ensemble_call_trace_sequence(
+                    trace if isinstance(trace, Mapping) else {}
+                )
+                paid_analyzer_setup = bool(
+                    attempt.get("attempt_kind")
+                    == "provider_build_after_paid_setup"
+                )
+                managed_runtime_plans = [
+                    plan
+                    for plan in (
+                        routed_plan,
+                        *(
+                            call.get("selection_plan")
+                            for call in physical_calls
+                        ),
+                    )
+                    if isinstance(plan, Mapping)
+                    and plan.get(
+                        "ranking_thinking_assignment_enabled"
+                    )
+                    is True
+                ]
+                current_adaptive_runtime_plans = [
+                    plan
+                    for plan in managed_runtime_plans
+                    if not (
+                        allow_legacy_managed_v3
+                        and plan.get("ranking_version")
+                        == LEGACY_THINKING_RANKING_VERSION
+                        and not plan.get(
+                            "thinking_physical_evidence_schema"
+                        )
+                    )
+                ]
+                runtime_requires_adaptive = bool(
+                    paid_analyzer_setup
+                    or current_adaptive_runtime_plans
+                )
+                adaptive = any(
+                    field in attempt
+                    for field in (
+                        "selection_plan",
+                        "excluded_proposer_identities",
+                        "deterministic_proposer_failures",
+                        "retry_selection_plan",
+                        "retry_excluded_proposer_identities",
+                    )
+                )
+                history_is_adaptive = (
+                    history_is_adaptive
+                    or adaptive
+                    or runtime_requires_adaptive
+                )
+                if runtime_requires_adaptive and not all(
+                    field in attempt
+                    for field in (
+                        "selection_plan",
+                        "excluded_proposer_identities",
+                        "deterministic_proposer_failures",
+                    )
+                ):
+                    violations.append(
+                        record.reference
+                        | {
+                            "group": task_key[0],
+                            "task_id": task_key[1],
+                            "attempt_id": str(attempt.get("attempt_id") or ""),
+                            "reasons": [
+                                "missing_adaptive_g1_attempt_evidence"
+                            ],
+                        }
+                    )
+                    duplicate_conflict = True
+                    continue
+                if not adaptive:
+                    continue
+                attempt_id = str(attempt.get("attempt_id") or "")
+                ordinal = nonnegative_int(attempt.get("attempt"))
+                if not attempt_id or ordinal <= 0:
+                    violations.append(
+                        record.reference
+                        | {
+                            "group": task_key[0],
+                            "task_id": task_key[1],
+                            "reasons": ["invalid_g1_attempt_identity_or_ordinal"],
+                        }
+                    )
+                    duplicate_conflict = True
+                    continue
+                normalized = copy.deepcopy(dict(attempt))
+                payload_hash = canonical_sha256(
+                    immutable_attempt_payload(normalized)
+                )
+                previous_hash = attempt_payload_hashes.get(attempt_id)
+                if previous_hash is not None and previous_hash != payload_hash:
+                    violations.append(
+                        record.reference
+                        | {
+                            "group": task_key[0],
+                            "task_id": task_key[1],
+                            "attempt_id": attempt_id,
+                            "reasons": [
+                                "conflicting_cross_wave_g1_attempt_evidence"
+                            ],
+                        }
+                    )
+                    duplicate_conflict = True
+                    continue
+                attempts_by_id.setdefault(attempt_id, normalized)
+                attempt_payload_hashes[attempt_id] = payload_hash
+                attempt_references.setdefault(attempt_id, record.reference)
+        if duplicate_conflict or not history_is_adaptive or not attempts_by_id:
+            continue
+
+        ordered_attempts = sorted(
+            attempts_by_id.values(),
+            key=lambda attempt: (
+                nonnegative_int(attempt.get("attempt")),
+                str(attempt.get("attempt_id") or ""),
+            ),
+        )
+        ordinals = [nonnegative_int(attempt.get("attempt")) for attempt in ordered_attempts]
+        expected_ordinals = list(range(1, len(ordered_attempts) + 1))
+        if ordinals != expected_ordinals:
+            violations.append(
+                task_history[-1].reference
+                | {
+                    "group": task_key[0],
+                    "task_id": task_key[1],
+                    "attempt_ordinals": ordinals,
+                    "reasons": ["noncontiguous_cross_wave_g1_attempt_history"],
+                }
+            )
+            continue
+
+        paid_attempt_count = sum(
+            1
+            for attempt in ordered_attempts
+            if isinstance(attempt.get("run"), Mapping)
+            and run_expected_request_count(attempt["run"]) > 0
+        )
+        if paid_attempt_count <= 0:
+            continue
+
+        analyzer_occurrences: list[tuple[int, Mapping[str, Any]]] = []
+        for attempt in ordered_attempts:
+            run = attempt.get("run")
+            if not isinstance(run, Mapping) or run_expected_request_count(run) <= 0:
+                continue
+            attempt_id = str(attempt.get("attempt_id") or "")
+            ordinal = nonnegative_int(attempt.get("attempt"))
+            for unit in _canonical_task_analyzer_setup_units(
+                run,
+                identity_seed=f"generation-attempt:{attempt_id}",
+            ):
+                analyzer_occurrences.append((ordinal, unit))
+        analyzer_reasons: list[str] = []
+        if not analyzer_occurrences:
+            analyzer_reasons.append("missing_g1_task_analyzer_request")
+        else:
+            if any(ordinal != 1 for ordinal, _ in analyzer_occurrences):
+                analyzer_reasons.append("g1_task_analyzer_not_in_first_attempt")
+            analyzer_attempts = [
+                nonnegative_int(analyzer.get("attempt"))
+                for _, analyzer in analyzer_occurrences
+            ]
+            if analyzer_attempts != list(
+                range(1, len(analyzer_occurrences) + 1)
+            ):
+                analyzer_reasons.append(
+                    "invalid_g1_task_analyzer_retry_sequence"
+                )
+            if len(analyzer_occurrences) > (
+                FORMAL_G1_TASK_ANALYZER_MAX_RETRIES + 1
+            ):
+                analyzer_reasons.append(
+                    "g1_task_analyzer_retry_budget_exceeded"
+                )
+            physical_attempt_ids = [
+                str(analyzer.get("physical_attempt_id") or "")
+                for _, analyzer in analyzer_occurrences
+            ]
+            if (
+                any(not HEX32.fullmatch(value) for value in physical_attempt_ids)
+                or len(physical_attempt_ids) != len(set(physical_attempt_ids))
+            ):
+                analyzer_reasons.append(
+                    "invalid_g1_task_analyzer_physical_attempt_identity"
+                )
+            requested_routes = {
+                (
+                    str(analyzer.get("requested_provider") or "")
+                    .strip()
+                    .casefold(),
+                    str(analyzer.get("requested_model") or "").strip(),
+                )
+                for _, analyzer in analyzer_occurrences
+            }
+            if (
+                len(requested_routes) != 1
+                or next(iter(requested_routes))[0] != "openrouter"
+                or not _formal_openrouter_models_equivalent(
+                    next(iter(requested_routes))[1],
+                    B0_MODEL,
+                )
+            ):
+                analyzer_reasons.append("wrong_g1_task_analyzer_route")
+            for _, analyzer in analyzer_occurrences:
+                if not _is_unknown_task_analyzer_placeholder(analyzer) and (
+                    str(analyzer.get("provider") or "")
+                    .strip()
+                    .casefold()
+                    != "openrouter"
+                    or not _formal_openrouter_models_equivalent(
+                        analyzer.get("model"),
+                        B0_MODEL,
+                    )
+                ):
+                    analyzer_reasons.append(
+                        "wrong_g1_task_analyzer_route"
+                    )
+                    break
+        if analyzer_reasons:
+            violations.append(
+                task_history[-1].reference
+                | {
+                    "group": task_key[0],
+                    "task_id": task_key[1],
+                    "paid_attempt_count": paid_attempt_count,
+                    "reasons": analyzer_reasons,
+                }
+            )
+
+        # Audit one campaign-wide chain. A failed wave may end immediately
+        # after publishing retry_selection_plan; the next wave consumes that
+        # plan, so validating each SourceRecord independently would either
+        # fabricate a dangling retry or allow the lifecycle to reset.
+        audit_row = copy.deepcopy(task_history[-1].row)
+        audit_execution = (
+            dict(audit_row.get("execution"))
+            if isinstance(audit_row.get("execution"), Mapping)
+            else {}
+        )
+        audit_execution["generation_attempts"] = ordered_attempts
+        audit_row["execution"] = audit_execution
+        audit_row["final_text_sha256"] = (
+            "__campaign_paid_g1_history_has_no_selected_answer__"
+        )
+        _, _, audit_reasons = _adaptive_g1_lifecycle_routing(
+            audit_row,
+            registry=registry,
+            physical_plans=(),
+            initial_reasons=(),
+            allow_legacy_managed_v3=allow_legacy_managed_v3,
+        )
+        fatal_reasons = [
+            reason for reason in audit_reasons if reason not in selected_only_reasons
+        ]
+        if fatal_reasons:
+            violations.append(
+                task_history[-1].reference
+                | {
+                    "group": task_key[0],
+                    "task_id": task_key[1],
+                    "paid_attempt_count": paid_attempt_count,
+                    "attempt_ids": [
+                        str(attempt.get("attempt_id") or "")
+                        for attempt in ordered_attempts
+                    ],
+                    "reasons": fatal_reasons,
+                }
+            )
+    if violations:
+        raise FinalizationError(
+            "campaign source history contains invalid paid G1 attempt "
+            f"plan/provenance evidence: {violations[:5]}"
+        )
+
+
 def g1_provider_lifecycle_analyzer_reasons(
     row: Mapping[str, Any],
     *,
@@ -4049,10 +5594,13 @@ def g1_provider_lifecycle_analyzer_reasons(
     if not request_attempts:
         return ["missing_g1_provider_lifecycle_attempt"]
     first_attempt_id = str(request_attempts[0].get("attempt_id") or "")
-    first_units = canonical_run_usage_units(
-        request_attempts[0]["run"],
-        identity_seed=f"generation-attempt:{first_attempt_id}",
-    )
+    try:
+        first_units = _canonical_task_analyzer_setup_units(
+            request_attempts[0]["run"],
+            identity_seed=f"generation-attempt:{first_attempt_id}",
+        )
+    except FinalizationError:
+        return ["inconsistent_g1_task_analyzer_setup_usage_evidence"]
     analyzers = [
         unit
         for unit in first_units
@@ -4082,10 +5630,13 @@ def g1_provider_lifecycle_analyzer_reasons(
                 return ["wrong_g1_task_analyzer_route"]
     for attempt in request_attempts[1:]:
         attempt_id = str(attempt.get("attempt_id") or "")
-        later_units = canonical_run_usage_units(
-            attempt["run"],
-            identity_seed=f"generation-attempt:{attempt_id}",
-        )
+        try:
+            later_units = _canonical_task_analyzer_setup_units(
+                attempt["run"],
+                identity_seed=f"generation-attempt:{attempt_id}",
+            )
+        except FinalizationError:
+            return ["inconsistent_g1_task_analyzer_setup_usage_evidence"]
         if any(
             str(unit.get("role") or "").strip().casefold() == "task_analyzer"
             or _is_unknown_task_analyzer_placeholder(unit)
@@ -4160,6 +5711,9 @@ def route_reasons(
             )
         )
     elif group == "G1":
+        allow_legacy_managed_v3 = (
+            legacy_managed_v3_source_authenticated(contract)
+        )
         registry = contract.get("g1_registry_contract")
         if not isinstance(registry, Mapping):
             profile = contract.get("global_experiment_profile")
@@ -4178,7 +5732,6 @@ def route_reasons(
         )
         reasons.extend(lifecycle_routing_reasons)
         routing = effective_routing
-        reasons.extend(g1_provider_lifecycle_analyzer_reasons(row))
         if allowed:
             reasons.extend(
                 usage_route_reasons(
@@ -4196,6 +5749,7 @@ def route_reasons(
         plan_reasons, proposers, aggregator = g1_registry_plan_reasons(
             row_plan,
             contract=registry,
+            allow_legacy_managed_v3=allow_legacy_managed_v3,
         )
         reasons.extend(plan_reasons)
         if proposers and aggregator:
@@ -4209,6 +5763,7 @@ def route_reasons(
                 physical_reasons, physical_p, physical_a = g1_registry_plan_reasons(
                     call.get("selection_plan"),
                     contract=registry,
+                    allow_legacy_managed_v3=allow_legacy_managed_v3,
                 )
                 reasons.extend(physical_reasons)
                 if physical_p != proposers or physical_a != aggregator:
@@ -4234,14 +5789,75 @@ def route_reasons(
     return reasons
 
 
+def _strict_g1_physical_generation_usage_ids(
+    run: Mapping[str, Any],
+    *,
+    identity_seed: str,
+) -> list[str]:
+    """Return explicit generation IDs only for the strict thinking schema."""
+
+    trace = run.get("ensemble_trace")
+    calls, _ = ensemble_call_trace_sequence(
+        trace if isinstance(trace, Mapping) else {}
+    )
+    if not any(
+        isinstance(call.get("selection_plan"), Mapping)
+        and call["selection_plan"].get(
+            "thinking_physical_evidence_schema"
+        )
+        == THINKING_PHYSICAL_EVIDENCE_SCHEMA
+        for call in calls
+    ):
+        return []
+    generation_ids = [
+        str(unit.get("physical_attempt_id") or "")
+        for unit in canonical_run_usage_units(
+            run,
+            identity_seed=identity_seed,
+        )
+        if not _is_task_analyzer_evidence(unit)
+    ]
+    return [
+        physical_attempt_id
+        for physical_attempt_id in generation_ids
+        if HEX32.fullmatch(physical_attempt_id) is not None
+    ]
+
+
+def register_physical_attempt_owners(
+    physical_attempt_ids: Sequence[str],
+    *,
+    owner: tuple[tuple[str, str], str, str],
+    owners: dict[str, tuple[tuple[str, str], str, str]],
+) -> list[str]:
+    """Reject one physical request identity owned by two logical request legs."""
+
+    reasons: list[str] = []
+    for physical_attempt_id in dict.fromkeys(
+        physical_attempt_ids
+    ):
+        previous_owner = owners.get(physical_attempt_id)
+        if previous_owner is not None and previous_owner != owner:
+            reasons.append(
+                "physical_attempt_id_reused_across_generation_attempts"
+            )
+            continue
+        owners[physical_attempt_id] = owner
+    return list(dict.fromkeys(reasons))
+
+
 def validate_physical_generation_routes(
     records: Sequence[SourceRecord],
     *,
     contracts: Mapping[str, Mapping[str, Any]],
 ) -> None:
     violations: list[dict[str, Any]] = []
-    attempt_versions: dict[
+    physical_attempt_owners: dict[
         str,
+        tuple[tuple[str, str], str, str],
+    ] = {}
+    attempt_versions: dict[
+        tuple[tuple[str, str], str],
         list[
             tuple[
                 SourceRecord,
@@ -4287,26 +5903,6 @@ def validate_physical_generation_routes(
             and isinstance(execution.get("generation_attempts"), list)
             else []
         )
-        if group == "G1" and any(
-            isinstance(attempt, Mapping)
-            and isinstance(attempt.get("run"), Mapping)
-            and run_expected_request_count(attempt["run"]) > 0
-            for attempt in attempts
-        ):
-            lifecycle_reasons = g1_provider_lifecycle_analyzer_reasons(
-                record.row,
-                allow_unknown_placeholder=True,
-            )
-            if lifecycle_reasons:
-                violations.append(
-                    record.reference
-                    | {
-                        "group": group,
-                        "task_id": record.key[1],
-                        "attempt_id": "provider_lifecycle",
-                        "reasons": lifecycle_reasons,
-                    }
-                )
         for attempt in attempts:
             if not isinstance(attempt, Mapping):
                 continue
@@ -4316,7 +5912,7 @@ def validate_physical_generation_routes(
                 continue
             if run_expected_request_count(run) <= 0:
                 continue
-            attempt_versions[attempt_id].append(
+            attempt_versions[(record.key, attempt_id)].append(
                 (
                     record,
                     run,
@@ -4326,10 +5922,12 @@ def validate_physical_generation_routes(
                     role_provider_pins,
                 )
             )
-    for attempt_id, versions in attempt_versions.items():
+    for (attempt_owner_key, attempt_id), versions in attempt_versions.items():
         record, run = validate_and_select_monotonic_run_version(
             [(version[0], version[1]) for version in versions],
-            label=f"generation attempt {attempt_id}",
+            label=(
+                f"generation attempt {attempt_owner_key}:{attempt_id}"
+            ),
             identity_seed=f"generation-attempt:{attempt_id}",
         )
         selected_versions = [version for version in versions if version[0] is record]
@@ -4353,13 +5951,56 @@ def validate_physical_generation_routes(
             role_provider_pins=role_provider_pins,
             allow_unknown_task_analyzer_attempts=record.key[0] == "G1",
         )
-        roles = {
-            str(unit.get("role") or "").strip().casefold()
-            for unit in canonical_run_usage_units(
+        canonical_units = canonical_run_usage_units(
+            run,
+            identity_seed=f"generation-attempt:{attempt_id}",
+        )
+        if record.key[0] == "G1":
+            reasons.extend(
+                g1_thinking_physical_usage_binding_reasons(run)
+            )
+            analyzer_ids = [
+                _task_analyzer_physical_attempt_id(unit)
+                for unit in _canonical_task_analyzer_setup_units(
+                    run,
+                    identity_seed=f"generation-attempt:{attempt_id}",
+                )
+            ]
+            reasons.extend(
+                register_physical_attempt_owners(
+                    [
+                        physical_attempt_id
+                        for physical_attempt_id in analyzer_ids
+                        if HEX32.fullmatch(physical_attempt_id) is not None
+                    ],
+                    owner=(record.key, attempt_id, "task_analyzer"),
+                    owners=physical_attempt_owners,
+                )
+            )
+            generation_ids = _strict_g1_physical_generation_usage_ids(
                 run,
                 identity_seed=f"generation-attempt:{attempt_id}",
             )
-        }
+            generation_role = "managed_generation"
+        else:
+            generation_ids = [
+                str(unit.get("physical_attempt_id") or "")
+                for unit in canonical_units
+                if not _is_task_analyzer_evidence(unit)
+                and HEX32.fullmatch(
+                    str(unit.get("physical_attempt_id") or "")
+                )
+                is not None
+            ]
+            generation_role = "generation"
+        reasons.extend(
+            register_physical_attempt_owners(
+                generation_ids,
+                owner=(record.key, attempt_id, generation_role),
+                owners=physical_attempt_owners,
+            )
+        )
+        roles = {str(unit.get("role") or "").strip().casefold() for unit in canonical_units}
         if record.key[0] == "B2" and "task_analyzer" in roles:
             reasons.append("unexpected_b2_task_analyzer_request")
         if reasons:
@@ -4821,6 +6462,8 @@ def select_results(
             identity_attempts: dict[str, int] = {}
             invalid_rows: list[dict[str, Any]] = []
             seen_pair_attempt_ids: set[str] = set()
+            g1_generation_attempt_prefix: list[dict[str, Any]] = []
+            g1_generation_attempt_ids: set[str] = set()
             accepted_generation_seen = False
             post_accept_invalid_rows: list[dict[str, Any]] = []
             for record in sorted(candidates, key=lambda item: (item.source_index, item.line)):
@@ -4837,8 +6480,39 @@ def select_results(
                     if isinstance(attempt, Mapping)
                 }
                 new_attempt_ids = row_attempt_ids - seen_pair_attempt_ids
+                validation_record = record
+                if group == "G1":
+                    for attempt in attempts:
+                        if not isinstance(attempt, Mapping):
+                            continue
+                        attempt_id = str(attempt.get("attempt_id") or "")
+                        if attempt_id in g1_generation_attempt_ids:
+                            continue
+                        g1_generation_attempt_ids.add(attempt_id)
+                        g1_generation_attempt_prefix.append(
+                            copy.deepcopy(dict(attempt))
+                        )
+                    validation_row = copy.deepcopy(record.row)
+                    validation_execution = (
+                        dict(validation_row.get("execution"))
+                        if isinstance(
+                            validation_row.get("execution"),
+                            Mapping,
+                        )
+                        else {}
+                    )
+                    validation_execution["generation_attempts"] = (
+                        copy.deepcopy(g1_generation_attempt_prefix)
+                    )
+                    validation_row["execution"] = validation_execution
+                    validation_record = SourceRecord(
+                        path=record.path,
+                        source_index=record.source_index,
+                        line=record.line,
+                        row=validation_row,
+                    )
                 reasons = generation_reasons(
-                    record,
+                    validation_record,
                     task=task,
                     expected_fingerprint=fingerprints[group],
                     contract=contracts[group],
@@ -5129,6 +6803,132 @@ def run_expected_request_count(run: Mapping[str, Any]) -> int:
         return derive_physical_request_count(run)
     except UsageEvidenceError as exc:
         raise FinalizationError(f"invalid physical usage evidence: {exc}") from exc
+
+
+def run_expected_ensemble_request_count(run: Mapping[str, Any]) -> int:
+    """Exclude provable setup-only analyzer calls from ensemble trace demand."""
+
+    total = run_expected_request_count(run)
+    analyzer_count = sum(
+        1
+        for unit in _canonical_task_analyzer_setup_units(
+            run,
+            identity_seed="expected-ensemble-request-count",
+        )
+    )
+    return max(0, total - analyzer_count)
+
+
+def g1_thinking_physical_usage_binding_reasons(
+    run: Mapping[str, Any],
+) -> list[str]:
+    """Bind every v1 managed ensemble request to exactly one usage unit."""
+
+    trace = run.get("ensemble_trace")
+    calls, call_reasons = ensemble_call_trace_sequence(
+        trace if isinstance(trace, Mapping) else {}
+    )
+    strict_calls = [
+        call
+        for call in calls
+        if isinstance(call.get("selection_plan"), Mapping)
+        and call["selection_plan"].get(
+            "thinking_physical_evidence_schema"
+        )
+        == THINKING_PHYSICAL_EVIDENCE_SCHEMA
+    ]
+    if not strict_calls:
+        return []
+    reasons = list(call_reasons)
+    if len(strict_calls) != len(calls):
+        reasons.append("mixed_g1_thinking_physical_evidence_schema")
+
+    ledger_ids: list[str] = []
+    for call in strict_calls:
+        candidates = call.get("candidates")
+        if isinstance(candidates, list):
+            for candidate in candidates:
+                execution = (
+                    candidate.get("execution")
+                    if isinstance(candidate, Mapping)
+                    else None
+                )
+                attempts = (
+                    execution.get("physical_attempts")
+                    if isinstance(execution, Mapping)
+                    else None
+                )
+                if isinstance(attempts, list):
+                    ledger_ids.extend(
+                        str(attempt.get("physical_attempt_id") or "")
+                        for attempt in attempts
+                        if isinstance(attempt, Mapping)
+                        and attempt.get("request_started") is True
+                    )
+        recovery = call.get("aggregator_recovery")
+        attempts = (
+            recovery.get("attempts")
+            if isinstance(recovery, Mapping)
+            else None
+        )
+        if isinstance(attempts, list):
+            ledger_ids.extend(
+                str(attempt.get("physical_attempt_id") or "")
+                for attempt in attempts
+                if isinstance(attempt, Mapping)
+                and attempt.get("request_started") is True
+            )
+
+    if (
+        any(HEX32.fullmatch(attempt_id) is None for attempt_id in ledger_ids)
+        or len(ledger_ids) != len(set(ledger_ids))
+    ):
+        reasons.append("invalid_g1_thinking_physical_attempt_set")
+
+    units = canonical_run_usage_units(
+        run,
+        identity_seed="g1-thinking-physical-usage-binding",
+    )
+    analyzer_ids = {
+        _task_analyzer_physical_attempt_id(unit)
+        for unit in _canonical_task_analyzer_setup_units(
+            run,
+            identity_seed="g1-thinking-physical-usage-binding",
+        )
+    }
+    analyzer_ids.discard("")
+    generation_units = [
+        unit
+        for unit in units
+        if str(unit.get("role") or "").strip().casefold()
+        not in {"task_analyzer", "task_analyzer_attempt"}
+        and str(unit.get("physical_attempt_id") or "") not in analyzer_ids
+    ]
+    usage_ids: list[str] = []
+    for unit in generation_units:
+        attempt_id = str(unit.get("physical_attempt_id") or "")
+        provider_usage = unit.get("provider_usage")
+        nested_id = (
+            str(provider_usage.get("physical_attempt_id") or "")
+            if isinstance(provider_usage, Mapping)
+            else ""
+        )
+        if (
+            HEX32.fullmatch(attempt_id) is None
+            or nested_id != attempt_id
+        ):
+            reasons.append(
+                "invalid_g1_thinking_usage_physical_attempt_id"
+            )
+            continue
+        usage_ids.append(attempt_id)
+
+    if Counter(usage_ids) != Counter(ledger_ids):
+        reasons.append("g1_thinking_physical_usage_set_mismatch")
+    expected = run_expected_ensemble_request_count(run)
+    if len(ledger_ids) != expected or len(generation_units) != expected:
+        reasons.append("g1_thinking_physical_usage_multiplicity_mismatch")
+    return list(dict.fromkeys(reasons))
 
 
 def iter_judge_runs(judge: Any) -> Iterable[tuple[str, Mapping[str, Any]]]:
@@ -8716,7 +10516,14 @@ def run_finalization(args: argparse.Namespace) -> dict[str, Any]:
         expected_task_concurrency=expected_task_concurrency,
     )
     validate_formal_campaign_contracts(contracts)
-    validate_physical_generation_routes(source_records, contracts=contracts)
+    validate_g1_paid_attempt_plan_history(
+        source_records,
+        contracts=contracts,
+    )
+    validate_physical_generation_routes(
+        source_records,
+        contracts=contracts,
+    )
     judge_attempt_evidence_audit = validate_judge_attempt_evidence(source_records)
     selected, pair_audit = select_results(
         source_records,

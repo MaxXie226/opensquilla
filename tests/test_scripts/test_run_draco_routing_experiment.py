@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import hashlib
 import importlib.util
 import inspect
 import json
 import sys
+from collections.abc import Iterator, Mapping
 from copy import deepcopy
 from pathlib import Path
 
@@ -34,6 +36,7 @@ from opensquilla.tools.types import current_tool_context
 
 SCRIPT_PATH = Path(__file__).resolve().parents[2] / "scripts" / "run_draco_routing_experiment.py"
 RESUME_SCRIPT_PATH = SCRIPT_PATH.with_name("run_draco_routing_experiment_resume.py")
+FINALIZER_SCRIPT_PATH = SCRIPT_PATH.parent / "experiments" / "finalize_draco_campaign.py"
 ROOT = SCRIPT_PATH.parent.parent
 
 
@@ -51,6 +54,262 @@ def _load_runner():
 
 
 runner = _load_runner()
+
+
+def _canonical_digest(value: object) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _test_proposer_execution(
+    identity: str,
+    *,
+    level: str = "high",
+    fallback_attempts: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    provider, _, model = identity.partition(":")
+    return {
+        "role": "proposer",
+        "requested_provider": provider,
+        "provider": provider,
+        "requested_model": model,
+        "model": model,
+        "assigned_thinking_level": level,
+        "effective_thinking_level": level,
+        "provider_thinking_level": level,
+        "thinking_override": level,
+        "effective_thinking": True,
+        "effective_provider_thinking_level": level,
+        "thinking_policy_managed": True,
+        "thinking_fallback_attempts": deepcopy(fallback_attempts or []),
+    }
+
+
+def _with_g1_task_analysis_invariants(
+    plan: dict[str, object],
+) -> dict[str, object]:
+    task_profile = {"task_type": "analysis", "tier_dist": {"2": 1.0}}
+    request_context: dict[str, object] = {
+        "schema_version": "test-request-context/v1",
+        "task_text": "test prompt",
+    }
+    request_context["snapshot_hash"] = _canonical_digest(request_context)
+    selected_p = [str(identity) for identity in plan.get("selected_P", [])]
+    selected_a = str(plan.get("selected_A") or "openrouter:model-a")
+    thinking_details = {
+        "proposers": [
+            {
+                "identity": identity,
+                "model_id": identity.partition(":")[2],
+                "role": "proposer",
+                "requested_level": "high",
+                "effective_level": "high",
+                "provider_level": "high",
+                "fallback_reason": "",
+                "reasons": [],
+                "provider_rejection_fallbacks": [],
+            }
+            for identity in selected_p
+        ],
+        "aggregator": {
+            "identity": selected_a,
+            "model_id": selected_a.partition(":")[2],
+            "role": "aggregator",
+            "requested_level": "high",
+            "effective_level": "high",
+            "provider_level": "high",
+            "fallback_reason": "",
+            "reasons": [],
+            "provider_rejection_fallbacks": [],
+        },
+        "aggregator_candidates": [
+            {
+                "identity": selected_a,
+                "model_id": selected_a.partition(":")[2],
+                "role": "aggregator",
+                "requested_level": "high",
+                "effective_level": "high",
+                "provider_level": "high",
+                "fallback_reason": "",
+                "reasons": [],
+                "provider_rejection_fallbacks": [],
+            }
+        ],
+    }
+    return {
+        **plan,
+        "selected_A": selected_a,
+        "aggregator_candidates": [selected_a],
+        "ranking_thinking_assignment_enabled": True,
+        "executed_thinking_assignment": {
+            "proposers": dict.fromkeys(selected_p, "high"),
+            "aggregator": "high",
+            "thinking_policy_version": "test-thinking-policy/v1",
+        },
+        "thinking_assignment_details": thinking_details,
+        "task_analyzer": {
+            "source": "test_analyzer",
+            "schema_valid": True,
+            "confidence": 0.9,
+            "analyzer_version": "test-v1",
+            "provider": "openrouter",
+            "model": "anthropic/claude-opus-4.8",
+            "fallback_reason": "",
+            "usage": {},
+            "normalization_warnings": [],
+        },
+        "task_profile": task_profile,
+        "task_profile_hash": _canonical_digest(task_profile),
+        "request_context": request_context,
+        "request_context_hash": request_context["snapshot_hash"],
+        "routed_tier": "c2",
+        "routing_confidence": 0.9,
+        "user_profile_enabled": False,
+        "user_profile_version": "",
+        "user_profile_source": "",
+    }
+
+
+def _bind_g1_retry_plan(
+    initial_plan: dict[str, object],
+    retry_plan: dict[str, object],
+    *,
+    exclusions: list[str],
+) -> dict[str, object]:
+    from opensquilla.provider.ranking_router import (
+        ROUTER_DYNAMIC_RETRY_ROUTING_SCHEMA,
+        build_router_dynamic_task_analysis_reuse_binding,
+    )
+
+    retry_plan.update(
+        {
+            field: deepcopy(initial_plan[field])
+            for field in (
+                "task_analyzer",
+                "task_profile",
+                "task_profile_hash",
+                "request_context",
+                "request_context_hash",
+                "routed_tier",
+                "routing_confidence",
+                "user_profile_enabled",
+                "user_profile_version",
+                "user_profile_source",
+            )
+        }
+    )
+    if initial_plan.get("ranking_thinking_assignment_enabled") is True:
+        selected_p = [str(identity) for identity in retry_plan.get("selected_P", [])]
+        selected_a = str(
+            retry_plan.get("selected_A")
+            or initial_plan.get("selected_A")
+            or "openrouter:model-a"
+        )
+        initial_details = initial_plan.get("thinking_assignment_details")
+        initial_details = (
+            initial_details if isinstance(initial_details, dict) else {}
+        )
+        initial_proposer_details = {
+            str(detail.get("identity") or ""): deepcopy(detail)
+            for detail in initial_details.get("proposers", [])
+            if isinstance(detail, dict) and str(detail.get("identity") or "")
+        }
+        initial_aggregator_details = {
+            str(detail.get("identity") or ""): deepcopy(detail)
+            for detail in initial_details.get("aggregator_candidates", [])
+            if isinstance(detail, dict) and str(detail.get("identity") or "")
+        }
+        initial_primary_aggregator = initial_details.get("aggregator")
+        if (
+            isinstance(initial_primary_aggregator, dict)
+            and str(initial_primary_aggregator.get("identity") or "")
+        ):
+            initial_aggregator_details.setdefault(
+                str(initial_primary_aggregator["identity"]),
+                deepcopy(initial_primary_aggregator),
+            )
+
+        def retry_detail(identity: str, *, role: str) -> dict[str, object]:
+            inherited = (
+                initial_proposer_details.get(identity)
+                if role == "proposer"
+                else initial_aggregator_details.get(identity)
+            )
+            if inherited is not None:
+                return deepcopy(inherited)
+            return {
+                "identity": identity,
+                "model_id": identity.partition(":")[2],
+                "role": role,
+                "requested_level": "high",
+                "effective_level": "high",
+                "provider_level": "high",
+                "fallback_reason": "",
+                "reasons": [],
+                "provider_rejection_fallbacks": [],
+            }
+
+        proposer_details = [
+            retry_detail(identity, role="proposer")
+            for identity in selected_p
+        ]
+        aggregator_detail = retry_detail(selected_a, role="aggregator")
+        initial_assignment = initial_plan.get("executed_thinking_assignment")
+        policy_version = (
+            str(initial_assignment.get("thinking_policy_version") or "")
+            if isinstance(initial_assignment, dict)
+            else ""
+        ) or "test-thinking-policy/v1"
+        retry_plan.update(
+            {
+                "selected_A": selected_a,
+                "aggregator_candidates": [selected_a],
+                "ranking_thinking_assignment_enabled": True,
+                "executed_thinking_assignment": {
+                    "proposers": {
+                        str(detail["identity"]): str(
+                            detail["effective_level"]
+                        )
+                        for detail in proposer_details
+                    },
+                    "aggregator": str(aggregator_detail["effective_level"]),
+                    "thinking_policy_version": policy_version,
+                },
+                "thinking_execution_fallbacks": [],
+                "thinking_assignment_details": {
+                    "proposers": proposer_details,
+                    "aggregator": aggregator_detail,
+                    "aggregator_candidates": [deepcopy(aggregator_detail)],
+                },
+            }
+        )
+    binding = build_router_dynamic_task_analysis_reuse_binding(initial_plan)
+    parent_decision_id = str(initial_plan["decision_id"])
+    retry_plan.update(
+        {
+            "retry_parent_decision_id": parent_decision_id,
+            "retry_excluded_proposer_identities": exclusions,
+            "task_analysis_reused": True,
+            "task_analysis_reuse": binding,
+            "retry_routing": {
+                "schema": ROUTER_DYNAMIC_RETRY_ROUTING_SCHEMA,
+                "reason": "prior_attempt_reasoning_only_length",
+                "parent_decision_id": parent_decision_id,
+                "excluded_proposer_identities": exclusions,
+                "task_analysis_reused": True,
+                "task_analysis_source_decision_id": parent_decision_id,
+                "task_analysis_reuse_sha256": binding["projection_sha256"],
+            },
+        }
+    )
+    return retry_plan
 
 
 def _openrouter_exact_evidence(
@@ -211,6 +470,19 @@ def _load_resume_runner():
     return module
 
 
+def _load_finalizer():
+    spec = importlib.util.spec_from_file_location(
+        "finalize_draco_campaign_for_runner_test",
+        FINALIZER_SCRIPT_PATH,
+    )
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 resume_runner = _load_resume_runner()
 
 
@@ -362,6 +634,207 @@ async def test_legacy_judge_uses_the_experiment_wide_semaphore(
     [runner, resume_runner],
     ids=["main", "resume"],
 )
+async def test_judge_http_failure_then_success_persists_route_bound_unknown_usage(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    judge_model = "google/gemini-3.1-pro-preview"
+    provider = type(
+        "JudgeProvider",
+        (),
+        {
+            "provider_id": "openrouter",
+            "model": judge_model,
+        },
+    )()
+    calls = 0
+
+    async def fake_collect_run(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return module.RunResult(
+                final_text=json.dumps(
+                    {
+                        "verdict": "MET",
+                        "rationale": "partial response before terminal error",
+                    }
+                ),
+                done=None,
+                error=(
+                    "OpenRouter chat request failed (HTTP 503): "
+                    "Cloudflare Worker exceeded resource limits"
+                ),
+                trace_events=[
+                    {
+                        "kind": "error",
+                        "code": "503",
+                        "request_started": True,
+                        "physical_request_count": 1,
+                    }
+                ],
+            )
+        return module.RunResult(
+            final_text=json.dumps(
+                {
+                    "verdict": "MET",
+                    "rationale": "ok",
+                }
+            ),
+            done=DoneEvent(
+                stop_reason="stop",
+                provider="openrouter",
+                model=judge_model,
+                requested_provider="openrouter",
+                requested_model=judge_model,
+            ),
+        )
+
+    monkeypatch.setattr(module, "collect_run", fake_collect_run)
+    judgment = await module.judge_criterion(
+        judge_provider=provider,
+        task={"id": "task-1", "prompt": "prompt"},
+        answer="answer",
+        criterion={
+            "id": "criterion-1",
+            "weight": 1,
+            "requirement": "x",
+        },
+        max_attempts=2,
+    )
+
+    assert calls == 2
+    assert judgment["met"] is True
+    assert judgment["judge_attempt_count"] == 2
+    failed_run = judgment["judge_attempts"][0]["run"]
+    assert failed_run["llm_request_count"] == 1
+    assert failed_run["usage_unknown_count"] == 1
+    units = failed_run["usage"]["model_usage_breakdown"]
+    assert len(units) == 1
+    assert units[0]["role"] == "unknown_request"
+    assert units[0]["requested_provider"] == "openrouter"
+    assert units[0]["requested_model"] == judge_model
+    assert units[0]["usage_unknown"] is True
+    assert sum(
+        attempt["run"]["llm_request_count"]
+        for attempt in judgment["judge_attempts"]
+    ) == 2
+    assert sum(
+        len(
+            attempt["run"]["usage"].get(
+                "model_usage_breakdown",
+                [],
+            )
+        )
+        for attempt in judgment["judge_attempts"]
+    ) == 2
+
+    finalizer = _load_finalizer()
+    _, route_reasons = finalizer.canonical_judge_run_route_reasons(
+        failed_run,
+        attempt_id=judgment["judge_attempts"][0]["attempt_id"],
+    )
+    assert route_reasons == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "module",
+    [runner, resume_runner],
+    ids=["main", "resume"],
+)
+async def test_legacy_judge_does_not_accept_valid_json_from_failed_request(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    judge_model = "google/gemini-3.1-pro-preview"
+    provider = type(
+        "JudgeProvider",
+        (),
+        {
+            "provider_id": "openrouter",
+            "model": judge_model,
+        },
+    )()
+    calls = 0
+    successful_payload = {
+        "scores": {
+            "accuracy": 5,
+            "completeness": 5,
+            "objectivity": 5,
+            "citation": 5,
+        },
+        "total": 20,
+        "rationale": "ok",
+    }
+
+    async def fake_collect_run(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return module.RunResult(
+                final_text=json.dumps(successful_payload),
+                done=None,
+                error="OpenRouter chat request failed (HTTP 503)",
+                trace_events=[
+                    {
+                        "kind": "error",
+                        "code": "503",
+                        "request_started": True,
+                        "physical_request_count": 1,
+                    }
+                ],
+            )
+        return module.RunResult(
+            final_text=json.dumps(successful_payload),
+            done=DoneEvent(
+                stop_reason="stop",
+                provider="openrouter",
+                model=judge_model,
+                requested_provider="openrouter",
+                requested_model=judge_model,
+            ),
+        )
+
+    monkeypatch.setattr(module, "collect_run", fake_collect_run)
+    judged = await module.judge_text(
+        judge_provider=provider,
+        task={
+            "id": "task-1",
+            "prompt": "prompt",
+            "rubric": "legacy rubric",
+        },
+        answer="answer",
+        dry_run=False,
+        judge_max_attempts=2,
+    )
+
+    assert judged is not None
+    assert calls == 2
+    assert judged["score_status"] == "complete"
+    assert judged["judge_attempt_count"] == 2
+    assert judged["judge_attempts"][0]["schema_valid"] is True
+    failed_run = judged["judge_attempts"][0]["run"]
+    assert failed_run["error"] == "OpenRouter chat request failed (HTTP 503)"
+    failed_unit = failed_run["usage"]["model_usage_breakdown"][0]
+    assert failed_unit["role"] == "unknown_request"
+    assert failed_unit["requested_provider"] == "openrouter"
+    assert failed_unit["requested_model"] == judge_model
+
+    finalizer = _load_finalizer()
+    _, route_reasons = finalizer.canonical_judge_run_route_reasons(
+        failed_run,
+        attempt_id=judged["judge_attempts"][0]["attempt_id"],
+    )
+    assert route_reasons == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "module",
+    [runner, resume_runner],
+    ids=["main", "resume"],
+)
 async def test_judge_attempt_budget_is_cumulative_per_unit_across_waves(
     module,
     monkeypatch: pytest.MonkeyPatch,
@@ -461,6 +934,57 @@ async def test_judge_attempt_budget_is_cumulative_per_unit_across_waves(
 
 def _experiment_config():
     return runner.load_draco_experiment_config(runner.DEFAULT_B2_EXPERIMENT_CONFIG_PATH).config
+
+
+def _experiment_with_current_g1_contract(
+    module,
+    *,
+    thinking_assignment_enabled: bool,
+):
+    from opensquilla.provider.ranking_router import (
+        _legacy_registry_snapshot_projection,
+        load_model_registry_snapshot,
+        ranking_config_snapshot,
+    )
+
+    experiment = _experiment_config()
+    registry = load_model_registry_snapshot()
+    if not thinking_assignment_enabled:
+        registry = _legacy_registry_snapshot_projection(registry)
+    ranking = ranking_config_snapshot(
+        thinking_assignment_enabled=thinking_assignment_enabled,
+    )
+    proposer_count = ranking["proposer_count"]
+    payload = experiment.model_dump(mode="json")
+    payload["g1_routing"].update(
+        {
+            "source_registry_snapshot_version": registry[
+                "snapshot_version"
+            ],
+            "expected_source_registry_snapshot_sha256": (
+                module.canonical_json_sha256(registry).removeprefix(
+                    "sha256:"
+                )
+            ),
+            "expected_ranking_config_schema_version": ranking[
+                "schema_version"
+            ],
+            "expected_ranking_config_version": ranking["config_version"],
+            "expected_ranking_config_sha256": (
+                module.canonical_json_sha256(ranking).removeprefix(
+                    "sha256:"
+                )
+            ),
+            "expected_proposer_count_max": max(
+                *(
+                    int(row["max"])
+                    for row in proposer_count["by_tier"].values()
+                ),
+                int(proposer_count["high_risk"]["max"]),
+            ),
+        }
+    )
+    return type(experiment).model_validate(payload)
 
 
 def _resolved_g1_registry_contract(module, experiment, config: GatewayConfig) -> dict[str, object]:
@@ -661,6 +1185,21 @@ def test_task_analyzer_retry_usage_expands_to_distinct_physical_units(
         "analyzer-2",
     ]
     assert loaded_runner.usage_rows_request_count(rows) == 2
+
+
+@pytest.mark.parametrize("loaded_runner", [runner, resume_runner], ids=["main", "resume"])
+def test_task_analyzer_explicit_zero_request_emits_no_usage_rows(
+    loaded_runner,
+) -> None:
+    rows = loaded_runner.task_analyzer_usage_rows(
+        {"attempt_count": 0, "physical_attempts": []},
+        provider_id="openrouter",
+        model_id="anthropic/claude-opus-4.8",
+        source="router_fallback",
+        fallback_reason="RuntimeError",
+    )
+
+    assert rows == []
 
 
 def _openrouter_config() -> tuple[GatewayConfig, ProviderConfig]:
@@ -987,6 +1526,2912 @@ async def test_generation_attempt_offset_uses_cumulative_ordinal(
     assert len(attempts) == 1
     assert attempts[0]["attempt"] == 3
     assert selected_attempt == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+async def test_g1_thinking_switch_off_preserves_same_provider_retry(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = {
+        "decision_id": "disabled-thinking-decision",
+        "ranking_thinking_assignment_enabled": False,
+        "selected_P": ["openrouter:model-p"],
+        "selected_A": "openrouter:model-a",
+    }
+
+    class Provider:
+        selection_plan = plan
+
+        @staticmethod
+        def _draco_reasoning_only_retry_factory(_exclusions):
+            raise AssertionError("disabled thinking must not rebuild the roster")
+
+    provider = Provider()
+    failed_trace = {
+        "selection_plan": deepcopy(plan),
+        "candidates": [
+            {
+                "index": 0,
+                "provider": "openrouter",
+                "model": "model-p",
+                "requested_provider": "openrouter",
+                "requested_model": "model-p",
+                "ok": False,
+                "request_started": True,
+                "physical_request_count": 1,
+                "stop_reason": "length",
+                "output_tokens": 16_384,
+                "reasoning_tokens": 16_384,
+                "content": {"text": "", "chars": 0, "truncated": False},
+            }
+        ],
+    }
+    results = iter(
+        [
+            module.RunResult(
+                final_text="",
+                done=DoneEvent(ensemble_trace=failed_trace),
+                error="HTTP 503 upstream unavailable",
+                routing_trace={"selection_plan": deepcopy(plan)},
+            ),
+            module.RunResult(
+                final_text="accepted",
+                done=DoneEvent(stop_reason="stop"),
+                routing_trace={"selection_plan": deepcopy(plan)},
+            ),
+        ]
+    )
+    used_providers: list[object] = []
+
+    async def fake_collect_run(active_provider, *_args, **_kwargs):
+        used_providers.append(active_provider)
+        return next(results)
+
+    retry_reasons = iter(["transient_upstream", ""])
+    monkeypatch.setattr(module, "collect_run", fake_collect_run)
+    monkeypatch.setattr(
+        module,
+        "generation_retry_reason",
+        lambda *_args, **_kwargs: next(retry_reasons),
+    )
+
+    result, attempts, selected_attempt = await module.collect_generation_with_retries(
+        provider,
+        "prompt",
+        timeout=30,
+        group="G1",
+        max_attempts=2,
+    )
+
+    assert result.final_text == "accepted"
+    assert selected_attempt == 2
+    assert used_providers == [provider, provider]
+    assert attempts[0]["will_retry"] is True
+    assert attempts[0]["retry_suppressed_reason"] == ""
+    for attempt in attempts:
+        assert "selection_plan" not in attempt
+        assert "deterministic_proposer_failures" not in attempt
+        assert "excluded_proposer_identities" not in attempt
+        assert "retry_selection_plan" not in attempt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+async def test_reasoning_only_length_retry_rebuilds_roster_and_tracks_each_plan(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failed_identity = "openrouter:openai/gpt-5.6-sol"
+    initial_plan = _with_g1_task_analysis_invariants(
+        {
+            "decision_id": "decision-1",
+            "selected_P": [
+                failed_identity,
+                "openrouter:google/gemini-3.1-pro-preview",
+                "openrouter:anthropic/claude-sonnet-5",
+            ],
+            "proposer_sample_count": 3,
+        }
+    )
+    initial_plan.update(
+        {
+            "ranking_thinking_assignment_enabled": True,
+            "selected_A": "openrouter:model-a",
+            "aggregator_candidates": ["openrouter:model-a"],
+                "executed_thinking_assignment": {
+                    "proposers": {identity: "highest" for identity in initial_plan["selected_P"]},
+                    "aggregator": "highest",
+                    "thinking_policy_version": "test-thinking-policy/v1",
+                },
+                "thinking_execution_fallbacks": [],
+                "thinking_assignment_details": {
+                "proposers": [
+                    {
+                        "identity": identity,
+                        "model_id": identity.partition(":")[2],
+                        "role": "proposer",
+                        "requested_level": "highest",
+                        "effective_level": "highest",
+                        "provider_level": "xhigh",
+                        "fallback_reason": "",
+                        "reasons": [],
+                        "provider_rejection_fallbacks": (
+                            [
+                                {
+                                    "unified_level": "high",
+                                    "provider_level": "high",
+                                    "reason": "provider_rejection_fallback",
+                                },
+                                {
+                                    "unified_level": "medium",
+                                    "provider_level": "medium",
+                                    "reason": "provider_rejection_fallback",
+                                },
+                                {
+                                    "unified_level": "low",
+                                    "provider_level": "low",
+                                    "reason": "provider_rejection_fallback",
+                                },
+                            ]
+                            if identity == failed_identity
+                            else []
+                        ),
+                    }
+                    for identity in initial_plan["selected_P"]
+                ],
+                "aggregator": {
+                    "identity": "openrouter:model-a",
+                    "model_id": "model-a",
+                    "role": "aggregator",
+                    "requested_level": "highest",
+                    "effective_level": "highest",
+                    "provider_level": "xhigh",
+                    "fallback_reason": "",
+                    "reasons": [],
+                    "provider_rejection_fallbacks": [],
+                },
+                "aggregator_candidates": [
+                    {
+                        "identity": "openrouter:model-a",
+                        "model_id": "model-a",
+                        "role": "aggregator",
+                        "requested_level": "highest",
+                        "effective_level": "highest",
+                        "provider_level": "xhigh",
+                        "fallback_reason": "",
+                        "reasons": [],
+                        "provider_rejection_fallbacks": [],
+                    }
+                ],
+            },
+        }
+    )
+    retry_plan = _bind_g1_retry_plan(
+        initial_plan,
+        {
+            "decision_id": "decision-2",
+            "selected_P": [
+                "openrouter:google/gemini-3.1-pro-preview",
+                "openrouter:anthropic/claude-sonnet-5",
+                "openrouter:openai/gpt-5.5-pro",
+            ],
+            "proposer_sample_count": 3,
+        },
+        exclusions=[failed_identity],
+    )
+
+    class Provider:
+        def __init__(self, plan: dict[str, object]) -> None:
+            self.selection_plan = plan
+            self.min_successful_proposers = 2
+
+    initial = Provider(initial_plan)
+    replacement = Provider(retry_plan)
+    rebuild_calls: list[list[str]] = []
+
+    def rebuild(exclusions: list[str]):
+        rebuild_calls.append(exclusions)
+        return replacement
+
+    initial._draco_reasoning_only_retry_factory = rebuild
+    physical_initial_plan = deepcopy(initial_plan)
+    physical_initial_plan["executed_thinking_assignment"]["proposers"][failed_identity] = "high"
+    physical_initial_plan["thinking_execution_fallbacks"] = [
+        {
+            "trigger_stage": "proposer_execution",
+            "fallback_type": "thinking_level_neighbor",
+            "reason": "provider_rejected_thinking_level",
+            "identity": failed_identity,
+            "requested_thinking_level": "highest",
+            "rejected_unified_level": "highest",
+            "rejected_provider_level": "xhigh",
+            "effective_thinking_level": "high",
+            "effective_provider_level": "high",
+            "thinking_policy_version": "test-thinking-policy/v1",
+            "fallback_result": "failed",
+        }
+    ]
+    failed_trace = {
+        "selection_plan": physical_initial_plan,
+        "candidates": [
+            {
+                "index": 0,
+                "provider": "openrouter",
+                "model": "openai/gpt-5.6-sol",
+                "requested_provider": "openrouter",
+                "requested_model": "openai/gpt-5.6-sol",
+                "ok": False,
+                "request_started": True,
+                "physical_request_count": 2,
+                "stop_reason": "length",
+                "output_tokens": 16_384,
+                "reasoning_tokens": 16_384,
+                "effective_thinking_level": "high",
+                "provider_thinking_level": "high",
+                "execution": {
+                    "role": "proposer",
+                    "requested_provider": "openrouter",
+                    "provider": "openrouter",
+                    "requested_model": "openai/gpt-5.6-sol",
+                    "model": "openai/gpt-5.6-sol",
+                    "assigned_thinking_level": "high",
+                    "effective_thinking_level": "high",
+                    "provider_thinking_level": "high",
+                    "thinking_override": "high",
+                    "effective_thinking": True,
+                    "effective_provider_thinking_level": "high",
+                    "thinking_policy_managed": True,
+                    "thinking_fallback_attempts": deepcopy(
+                        physical_initial_plan["thinking_execution_fallbacks"]
+                    ),
+                },
+                "content": {"text": "", "chars": 0, "truncated": False},
+            }
+        ],
+    }
+    results = iter(
+        [
+            module.RunResult(
+                final_text="",
+                done=DoneEvent(ensemble_trace=failed_trace),
+                error="llm ensemble had 1 successful proposer(s), requires 2",
+                routing_trace={"selection_plan": deepcopy(initial_plan)},
+            ),
+            module.RunResult(
+                final_text="accepted",
+                done=DoneEvent(
+                    ensemble_trace={
+                        "selection_plan": deepcopy(retry_plan),
+                        "candidates": [],
+                    }
+                ),
+                routing_trace={"selection_plan": deepcopy(retry_plan)},
+            ),
+        ]
+    )
+    used_providers: list[object] = []
+
+    async def fake_collect_run(provider, *_args, **_kwargs):
+        used_providers.append(provider)
+        return next(results)
+
+    validated_plans: list[dict[str, object]] = []
+
+    def fake_retry_reason(*_args, **kwargs):
+        validated_plans.append(dict(kwargs["expected_selection_plan"]))
+        return "ensemble_insufficient_proposers" if len(validated_plans) == 1 else ""
+
+    monkeypatch.setattr(module, "collect_run", fake_collect_run)
+    monkeypatch.setattr(module, "generation_retry_reason", fake_retry_reason)
+
+    result, attempts, selected_attempt = await module.collect_generation_with_retries(
+        initial,
+        "prompt",
+        timeout=30,
+        group="G1",
+        max_attempts=3,
+    )
+
+    assert result.final_text == "accepted"
+    assert selected_attempt == 2
+    assert used_providers == [initial, replacement]
+    assert rebuild_calls == [["openrouter:openai/gpt-5.6-sol"]]
+    assert validated_plans == [initial_plan, retry_plan]
+    assert attempts[0]["selection_plan"] == initial_plan
+    assert attempts[0]["retry_selection_plan"] == retry_plan
+    assert attempts[0]["deterministic_proposer_failures"] == (
+        module._reasoning_only_length_failures_from_trace(failed_trace)
+    )
+    assert attempts[1]["selection_plan"] == retry_plan
+    assert attempts[1]["excluded_proposer_identities"] == ["openrouter:openai/gpt-5.6-sol"]
+    assert json.loads(json.dumps(attempts[0]["run"]))["ensemble_trace"] == failed_trace
+    assert initial._draco_selected_retry_provider is replacement
+    assert replacement.min_successful_proposers == module.legal_proposer_quorum(3)
+
+    tampered_fallback_plan = deepcopy(physical_initial_plan)
+    tampered_fallback_plan["thinking_execution_fallbacks"][0]["effective_thinking_level"] = "medium"
+    assert (
+        module.g1_execution_plan_mutation_reason(
+            initial_plan,
+            tampered_fallback_plan,
+        )
+        == "g1_attempt_thinking_execution_provenance_invalid"
+    )
+
+    upward_expected = deepcopy(initial_plan)
+    failed_detail = next(
+        row
+        for row in upward_expected["thinking_assignment_details"]["proposers"]
+        if row["identity"] == failed_identity
+    )
+    failed_detail["requested_level"] = "high"
+    failed_detail["effective_level"] = "high"
+    failed_detail["provider_level"] = "high"
+    failed_detail["provider_rejection_fallbacks"] = [
+        {
+            "unified_level": "highest",
+            "provider_level": "xhigh",
+            "reason": "provider_rejection_fallback",
+        }
+    ]
+    upward_expected["executed_thinking_assignment"]["proposers"][failed_identity] = "high"
+    upward_fallback_plan = deepcopy(upward_expected)
+    upward_fallback_plan["executed_thinking_assignment"]["proposers"][
+        failed_identity
+    ] = "highest"
+    upward_fallback_plan["thinking_execution_fallbacks"] = [
+        {
+            **physical_initial_plan["thinking_execution_fallbacks"][0],
+            "requested_thinking_level": "high",
+            "rejected_unified_level": "high",
+            "rejected_provider_level": "high",
+            "effective_thinking_level": "highest",
+            "effective_provider_level": "xhigh",
+        }
+    ]
+    assert (
+        module.g1_execution_plan_mutation_reason(
+            upward_expected,
+            upward_fallback_plan,
+        )
+        == ""
+    )
+
+    skipped_upward_plan = deepcopy(upward_fallback_plan)
+    skipped_upward_plan["thinking_execution_fallbacks"][0][
+        "effective_thinking_level"
+    ] = "low"
+    assert (
+        module.g1_execution_plan_mutation_reason(
+            upward_expected,
+            skipped_upward_plan,
+        )
+        == "g1_attempt_thinking_execution_provenance_invalid"
+    )
+
+    arbitrary_reason_plan = deepcopy(physical_initial_plan)
+    arbitrary_reason_plan["thinking_execution_fallbacks"][0]["reason"] = (
+        "forged_reason"
+    )
+    assert (
+        module.g1_execution_plan_mutation_reason(
+            initial_plan,
+            arbitrary_reason_plan,
+        )
+        == "g1_attempt_thinking_execution_provenance_invalid"
+    )
+
+
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+def test_default_off_provider_setup_remains_exactly_one_shot(module) -> None:
+    class Provider:
+        selection_plan = {
+            "decision_id": "legacy-decision",
+            "ranking_thinking_assignment_enabled": False,
+        }
+
+        def selection_plan_execution_snapshot(self):
+            raise AssertionError(
+                "default-off setup must not inspect execution snapshots"
+            )
+
+    provider = Provider()
+    provider._draco_frozen_routing_trace = {"stale": "managed-route"}
+    usage = [{"role": "task_analyzer", "input_tokens": 3}]
+    routing = {
+        "selection_plan": deepcopy(provider.selection_plan),
+        "legacy": True,
+    }
+    module.attach_provider_setup(
+        provider,
+        module.ProviderBuildResult(
+            provider=provider,
+            prompt="prompt",
+            setup_latency_ms=17,
+            setup_usage=usage,
+            routing_trace=routing,
+        ),
+    )
+
+    assert module.consume_provider_setup(provider) == {
+        "latency_ms": 17,
+        "usage": usage,
+        "routing": routing,
+    }
+    assert module.consume_provider_setup(provider) == {}
+    assert provider._draco_frozen_routing_trace is None
+
+
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+def test_managed_provider_setup_keeps_frozen_routing_after_accounting_consumed(
+    module,
+) -> None:
+    class Provider:
+        selection_plan = {
+            "decision_id": "managed-decision",
+            "ranking_thinking_assignment_enabled": True,
+            "executed_thinking_assignment": {"aggregator": "high"},
+        }
+
+        def selection_plan_execution_snapshot(self):
+            return deepcopy(self.selection_plan)
+
+    provider = Provider()
+    module.attach_provider_setup(
+        provider,
+        module.ProviderBuildResult(
+            provider=provider,
+            prompt="prompt",
+            setup_latency_ms=17,
+            setup_usage=[{"role": "task_analyzer", "input_tokens": 3}],
+            routing_trace={"legacy": True},
+        ),
+    )
+
+    first = module.consume_provider_setup(provider)
+    second = module.consume_provider_setup(provider)
+
+    assert first["latency_ms"] == 17
+    assert len(first["usage"]) == 1
+    assert first["routing"]["selection_plan"] == provider.selection_plan
+    assert second == {
+        "latency_ms": 0,
+        "usage": [],
+        "routing": {
+            "legacy": True,
+            "selection_plan": provider.selection_plan,
+        },
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+@pytest.mark.parametrize(
+    "tamper_field",
+    [
+        "task_analyzer",
+        "task_profile",
+        "task_profile_hash",
+        "request_context",
+        "request_context_hash",
+        "routed_tier",
+        "routing_confidence",
+        "user_profile_enabled",
+        "user_profile_version",
+        "user_profile_source",
+        "binding_hash",
+        "source_decision",
+    ],
+)
+async def test_g1_retry_task_analysis_tamper_is_rejected_before_second_paid_call(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+    tamper_field: str,
+) -> None:
+    failed_identity = "openrouter:openai/gpt-5.6-sol"
+    initial_plan = _with_g1_task_analysis_invariants(
+        {
+            "decision_id": "decision-1",
+            "selected_P": [
+                failed_identity,
+                "openrouter:model-b",
+                "openrouter:model-c",
+            ],
+            "proposer_sample_count": 3,
+        }
+    )
+    retry_plan = _bind_g1_retry_plan(
+        initial_plan,
+        {
+            "decision_id": "decision-2",
+            "selected_P": [
+                "openrouter:model-b",
+                "openrouter:model-c",
+                "openrouter:model-d",
+            ],
+            "proposer_sample_count": 3,
+        },
+        exclusions=[failed_identity],
+    )
+    if tamper_field == "task_analyzer":
+        retry_plan["task_analyzer"]["source"] = "tampered"
+    elif tamper_field == "task_profile":
+        retry_plan["task_profile"]["task_type"] = "tampered"
+    elif tamper_field == "request_context":
+        retry_plan["request_context"]["task_text"] = "tampered"
+    elif tamper_field == "binding_hash":
+        retry_plan["task_analysis_reuse"]["projection_sha256"] = "0" * 64
+        retry_plan["retry_routing"]["task_analysis_reuse_sha256"] = "0" * 64
+    elif tamper_field == "source_decision":
+        retry_plan["task_analysis_reuse"]["source_decision_id"] = "tampered"
+    elif tamper_field == "user_profile_enabled":
+        retry_plan[tamper_field] = True
+    elif tamper_field == "routing_confidence":
+        retry_plan[tamper_field] = 0.1
+    else:
+        retry_plan[tamper_field] = "tampered"
+
+    class Provider:
+        def __init__(self, plan: dict[str, object]) -> None:
+            self.selection_plan = plan
+            self.min_successful_proposers = 2
+
+    initial = Provider(initial_plan)
+    replacement = Provider(retry_plan)
+    initial._draco_reasoning_only_retry_factory = lambda _excluded: replacement
+    failed_trace = {
+        "selection_plan": deepcopy(initial_plan),
+        "candidates": [
+            {
+                "provider": "openrouter",
+                "model": "openai/gpt-5.6-sol",
+                "requested_provider": "openrouter",
+                "requested_model": "openai/gpt-5.6-sol",
+                "ok": False,
+                "request_started": True,
+                "physical_request_count": 1,
+                "stop_reason": "length",
+                "reasoning_tokens": 8_192,
+                "effective_thinking_level": "high",
+                "provider_thinking_level": "high",
+                "execution": _test_proposer_execution(failed_identity),
+                "content": {"text": "", "chars": 0},
+            }
+        ],
+    }
+    paid_calls = 0
+
+    async def fake_collect_run(*_args, **_kwargs):
+        nonlocal paid_calls
+        paid_calls += 1
+        if paid_calls > 1:
+            raise AssertionError("tampered retry must be rejected before a paid call")
+        return module.RunResult(
+            final_text="",
+            done=DoneEvent(ensemble_trace=failed_trace),
+            error="ensemble_insufficient_proposers",
+            routing_trace={"selection_plan": deepcopy(initial_plan)},
+        )
+
+    monkeypatch.setattr(module, "collect_run", fake_collect_run)
+    monkeypatch.setattr(
+        module,
+        "generation_retry_reason",
+        lambda *_args, **_kwargs: "ensemble_insufficient_proposers",
+    )
+
+    _, attempts, selected_attempt = await module.collect_generation_with_retries(
+        initial,
+        "prompt",
+        timeout=30,
+        group="G1",
+        max_attempts=2,
+    )
+
+    assert paid_calls == 1
+    assert selected_attempt == 0
+    assert attempts[0]["will_retry"] is False
+    assert attempts[0]["retry_suppressed_reason"] == ("reasoning_only_retry_provenance_invalid")
+
+
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+def test_g1_attempt_full_plan_equality_rejects_unbound_physical_field(module) -> None:
+    plan = _with_g1_task_analysis_invariants(
+        {
+            "decision_id": "decision-1",
+            "selected_P": ["openrouter:model-a"],
+        }
+    )
+    physical = deepcopy(plan)
+    physical["unbound_extra_field"] = "tampered"
+    result = module.RunResult(
+        final_text="",
+        done=DoneEvent(
+            ensemble_trace={
+                "selection_plan": physical,
+                "candidates": [],
+            }
+        ),
+        routing_trace={"selection_plan": deepcopy(plan)},
+    )
+
+    assert module.g1_attempt_plan_consistency_reason(plan, result) == (
+        "g1_attempt_plan_provenance_invalid"
+    )
+
+
+def test_resume_g1_paid_detection_uses_usage_when_request_count_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = {"decision_id": "decision-1", "selected_P": ["openrouter:model-a"]}
+    usage = {
+        "model_usage_breakdown": [
+            {
+                "role": "proposer",
+                "provider": "openrouter",
+                "model": "model-a",
+            }
+        ]
+    }
+    row = {
+        "group": "G1",
+        "task_id": "task-1",
+        "final_text_sha256": "answer",
+        "usage": deepcopy(usage),
+        "routing_trace": {"selection_plan": deepcopy(plan)},
+        "execution": {
+            "generation_attempts": [
+                {
+                    "attempt_id": "1" * 32,
+                    "attempt": 1,
+                    "selection_plan": deepcopy(plan),
+                    "excluded_proposer_identities": [],
+                    "deterministic_proposer_failures": [],
+                    "will_retry": False,
+                    "run": {
+                        "final_text_sha256": "answer",
+                        "usage": deepcopy(usage),
+                        "routing_trace": {"selection_plan": deepcopy(plan)},
+                    },
+                }
+            ]
+        },
+    }
+    monkeypatch.setattr(
+        resume_runner,
+        "g1_registry_contract_reasons",
+        lambda *_args, **_kwargs: [],
+    )
+
+    _, _, reasons = resume_runner._adaptive_g1_provider_lifecycle_routing_evidence(
+        row,
+        g1_contract={},
+        physical_plans=[deepcopy(plan)],
+        initial_reasons=[],
+    )
+
+    assert "missing_g1_attempt_ensemble_trace" in reasons
+
+
+def test_resume_g1_analyzer_only_paid_attempt_does_not_require_ensemble_trace() -> None:
+    run = {
+        "llm_request_count": 1,
+        "setup_usage": [
+            {
+                "role": "task_analyzer",
+                "provider": "openrouter",
+                "model": "anthropic/claude-opus-4.8",
+                "request_count": 1,
+            }
+        ],
+        "usage": {
+            "model_usage_breakdown": [
+                {
+                    "role": "task_analyzer",
+                    "provider": "openrouter",
+                    "model": "anthropic/claude-opus-4.8",
+                    "request_count": 1,
+                }
+            ]
+        },
+    }
+
+    assert resume_runner.g1_run_expected_ensemble_request_count(run) == 0
+
+    unknown_analyzer = {
+        "role": "unknown_request",
+        "label": "task_analyzer",
+        "attempt": 1,
+        "physical_attempt_id": "a" * 32,
+        "provider": "",
+        "model": "",
+        "requested_provider": "openrouter",
+        "requested_model": "anthropic/claude-opus-4.8",
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_tokens": 0,
+        "cached_tokens": 0,
+        "cache_write_tokens": 0,
+        "billed_cost": 0.0,
+        "cost_source": "unavailable",
+        "request_count": 1,
+        "provider_usage": {
+            "usage_unknown": True,
+            "physical_attempt_id": "a" * 32,
+        },
+    }
+    unknown_run = {
+        "llm_request_count": 1,
+        "usage_unknown_count": 1,
+        "setup_usage": [deepcopy(unknown_analyzer)],
+        "usage": {
+            "model_usage_breakdown": [deepcopy(unknown_analyzer)]
+        },
+    }
+    assert (
+        resume_runner.g1_run_expected_ensemble_request_count(unknown_run) == 0
+    )
+    unknown_then_generation = deepcopy(unknown_run)
+    unknown_then_generation["llm_request_count"] = 2
+    unknown_then_generation["usage"]["model_usage_breakdown"].append(
+        {
+            "role": "proposer",
+            "provider": "openrouter",
+            "model": "openai/gpt-5.6-sol",
+            "requested_provider": "openrouter",
+            "requested_model": "openai/gpt-5.6-sol",
+            "request_count": 1,
+        }
+    )
+    assert (
+        resume_runner.g1_run_expected_ensemble_request_count(
+            unknown_then_generation
+        )
+        == 1
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+async def test_reasoning_retry_exhaustion_restores_the_selected_attempt_provider(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failed_identity = "openrouter:openai/gpt-5.6-sol"
+    initial_plan = _with_g1_task_analysis_invariants(
+        {
+            "decision_id": "decision-1",
+            "selected_P": [
+                failed_identity,
+                "openrouter:model-b",
+                "openrouter:model-c",
+            ],
+            "proposer_sample_count": 3,
+        }
+    )
+    retry_plan = _bind_g1_retry_plan(
+        initial_plan,
+        {
+            "decision_id": "decision-2",
+            "selected_P": [
+                "openrouter:model-b",
+                "openrouter:model-c",
+                "openrouter:model-d",
+            ],
+            "proposer_sample_count": 3,
+        },
+        exclusions=[failed_identity],
+    )
+
+    class Provider:
+        def __init__(self, plan: dict[str, object]) -> None:
+            self.selection_plan = plan
+            self.min_successful_proposers = 2
+
+    initial = Provider(initial_plan)
+    replacement = Provider(retry_plan)
+    initial._draco_reasoning_only_retry_factory = lambda _excluded: replacement
+    failed_trace = {
+        "selection_plan": deepcopy(initial_plan),
+        "candidates": [
+            {
+                "provider": "openrouter",
+                "model": "openai/gpt-5.6-sol",
+                "requested_provider": "openrouter",
+                "requested_model": "openai/gpt-5.6-sol",
+                "ok": False,
+                "request_started": True,
+                "physical_request_count": 1,
+                "stop_reason": "length",
+                "reasoning_tokens": 8_192,
+                "effective_thinking_level": "high",
+                "provider_thinking_level": "high",
+                "execution": _test_proposer_execution(failed_identity),
+                "content": {"text": "", "chars": 0},
+            }
+        ],
+    }
+    earlier = module.RunResult(
+        final_text="earlier usable answer",
+        done=DoneEvent(ensemble_trace=failed_trace),
+        routing_trace={"selection_plan": deepcopy(initial_plan)},
+    )
+    results = iter(
+        [
+            earlier,
+            module.RunResult(
+                final_text="",
+                done=DoneEvent(
+                    ensemble_trace={
+                        "selection_plan": deepcopy(retry_plan),
+                        "candidates": [],
+                    }
+                ),
+                error="HTTP 429",
+                routing_trace={"selection_plan": deepcopy(retry_plan)},
+            ),
+            module.RunResult(
+                final_text="",
+                done=DoneEvent(
+                    ensemble_trace={
+                        "selection_plan": deepcopy(retry_plan),
+                        "candidates": [],
+                    }
+                ),
+                error="HTTP 429",
+                routing_trace={"selection_plan": deepcopy(retry_plan)},
+            ),
+        ]
+    )
+    used_providers: list[object] = []
+
+    async def fake_collect_run(active_provider, *_args, **_kwargs):
+        used_providers.append(active_provider)
+        return next(results)
+
+    monkeypatch.setattr(module, "collect_run", fake_collect_run)
+    monkeypatch.setattr(
+        module,
+        "generation_retry_reason",
+        lambda result, **_kwargs: result.error or "ensemble_insufficient_proposers",
+    )
+
+    selected, attempts, selected_attempt = await module.collect_generation_with_retries(
+        initial,
+        "prompt",
+        timeout=30,
+        group="G1",
+        max_attempts=3,
+    )
+
+    assert selected is earlier
+    assert selected_attempt == 0
+    assert used_providers == [initial, replacement, replacement]
+    assert len(attempts) == 3
+    assert initial._draco_selected_retry_provider is initial
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+async def test_b2_reasoning_only_length_retries_same_roster(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Provider:
+        selection_plan = {
+            "selected_P": ["openrouter:model-a", "openrouter:model-b"],
+            "proposer_sample_count": 2,
+        }
+
+    provider = Provider()
+    provider._draco_reasoning_only_retry_factory = lambda _excluded: (_ for _ in ()).throw(
+        AssertionError("B2 must not invoke the G1 roster rebuild factory")
+    )
+    failed_trace = {
+        "selection_plan": deepcopy(provider.selection_plan),
+        "candidates": [
+            {
+                "provider": "openrouter",
+                "model": "model-a",
+                "requested_provider": "openrouter",
+                "requested_model": "model-a",
+                "ok": False,
+                "request_started": True,
+                "physical_request_count": 1,
+                "stop_reason": "max_output_tokens",
+                "reasoning_tokens": 8_192,
+                "content": {"text": "", "chars": 0},
+            }
+        ],
+    }
+    results = iter(
+        [
+            module.RunResult(
+                final_text="",
+                done=DoneEvent(ensemble_trace=deepcopy(failed_trace)),
+            ),
+            module.RunResult(
+                final_text="",
+                done=DoneEvent(ensemble_trace=deepcopy(failed_trace)),
+            ),
+            module.RunResult(final_text="accepted", done=DoneEvent()),
+        ]
+    )
+    used_providers: list[object] = []
+
+    async def fake_collect_run(active_provider, *_args, **_kwargs):
+        used_providers.append(active_provider)
+        return next(results)
+
+    retry_reasons = iter(
+        [
+            "ensemble_insufficient_proposers",
+            "ensemble_insufficient_proposers",
+            "",
+        ]
+    )
+    monkeypatch.setattr(module, "collect_run", fake_collect_run)
+    monkeypatch.setattr(
+        module,
+        "generation_retry_reason",
+        lambda *_args, **_kwargs: next(retry_reasons),
+    )
+
+    result, attempts, selected_attempt = await module.collect_generation_with_retries(
+        provider,
+        "prompt",
+        timeout=30,
+        group="B2",
+        max_attempts=3,
+    )
+
+    assert result.final_text == "accepted"
+    assert selected_attempt == 3
+    assert used_providers == [provider, provider, provider]
+    assert all("retry_selection_plan" not in attempt for attempt in attempts)
+    assert [attempt["will_retry"] for attempt in attempts] == [True, True, False]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+@pytest.mark.parametrize(
+    ("reset_before_third", "immutable_drift_before_third"),
+    [(False, False), (True, False), (False, True)],
+    ids=["prefix-persisted", "prefix-reset", "immutable-drift"],
+)
+async def test_g1_deterministic_then_transient_then_success_reuses_route_not_setup_usage(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+    reset_before_third: bool,
+    immutable_drift_before_third: bool,
+) -> None:
+    failed_identity = "openrouter:openai/gpt-5.6-sol"
+    initial_plan = _with_g1_task_analysis_invariants(
+        {
+            "decision_id": "decision-1",
+            "selected_P": [
+                failed_identity,
+                "openrouter:model-b",
+                "openrouter:model-c",
+            ],
+            "proposer_sample_count": 3,
+        }
+    )
+    initial_plan["thinking_execution_fallbacks"] = []
+    retry_plan = _bind_g1_retry_plan(
+        initial_plan,
+        {
+            "decision_id": "decision-2",
+            "selected_P": [
+                "openrouter:model-b",
+                "openrouter:model-c",
+                "openrouter:model-d",
+            ],
+            "proposer_sample_count": 3,
+        },
+        exclusions=[failed_identity],
+    )
+    retry_plan.update(
+        {
+            "selected_A": "openrouter:model-a",
+            "aggregator_candidates": [
+                "openrouter:model-a",
+                "openrouter:model-a-fallback",
+            ],
+            "ranking_thinking_assignment_enabled": True,
+            "executed_thinking_assignment": {
+                "proposers": {identity: "high" for identity in retry_plan["selected_P"]},
+                "aggregator": "high",
+                "thinking_policy_version": "test-thinking-policy/v1",
+            },
+        }
+    )
+    retry_plan["thinking_assignment_details"]["aggregator_candidates"] = [
+        deepcopy(retry_plan["thinking_assignment_details"]["aggregator"]),
+        {
+            "identity": "openrouter:model-a-fallback",
+            "model_id": "model-a-fallback",
+            "role": "aggregator_fallback",
+            "requested_level": "high",
+            "effective_level": "high",
+            "provider_level": "high",
+            "fallback_reason": "",
+            "reasons": [],
+            "provider_rejection_fallbacks": [
+                {
+                    "unified_level": "medium",
+                    "provider_level": "medium",
+                    "reason": "provider_rejection_fallback",
+                }
+            ],
+        },
+    ]
+    retry_plan_baseline = deepcopy(retry_plan)
+
+    class Provider:
+        def __init__(
+            self,
+            plan: dict[str, object],
+            *,
+            reset_execution_snapshot: bool = False,
+        ) -> None:
+            self.selection_plan = plan
+            self.execution_plan = deepcopy(plan)
+            self.reset_execution_snapshot = reset_execution_snapshot
+            self.min_successful_proposers = 2
+
+        def selection_plan_execution_snapshot(self):
+            return deepcopy(
+                self.selection_plan
+                if self.reset_execution_snapshot
+                else self.execution_plan
+            )
+
+    initial = Provider(initial_plan)
+    replacement = Provider(
+        retry_plan,
+        reset_execution_snapshot=reset_before_third,
+    )
+    analyzer_usage = {
+        "role": "task_analyzer",
+        "provider": "openrouter",
+        "model": "anthropic/claude-opus-4.8",
+        "requested_provider": "openrouter",
+        "requested_model": "anthropic/claude-opus-4.8",
+        "input_tokens": 10,
+        "output_tokens": 2,
+        "billed_cost": 0.25,
+        "cost_source": "provider_billed",
+        "request_count": 1,
+    }
+    module.attach_provider_setup(
+        initial,
+        module.ProviderBuildResult(
+            provider=initial,
+            prompt="prompt",
+            setup_latency_ms=11,
+            setup_usage=[analyzer_usage],
+            routing_trace={"selection_plan": deepcopy(initial_plan)},
+        ),
+    )
+    module.attach_provider_setup(
+        replacement,
+        module.ProviderBuildResult(
+            provider=replacement,
+            prompt="prompt",
+            setup_latency_ms=7,
+            setup_usage=[],
+            routing_trace={"selection_plan": deepcopy(retry_plan)},
+        ),
+    )
+    initial._draco_reasoning_only_retry_factory = lambda _excluded: replacement
+    failed_trace = {
+        "selection_plan": deepcopy(initial_plan),
+        "candidates": [
+            {
+                "provider": "openrouter",
+                "model": "openai/gpt-5.6-sol",
+                "requested_provider": "openrouter",
+                "requested_model": "openai/gpt-5.6-sol",
+                "ok": False,
+                "request_started": True,
+                "physical_request_count": 1,
+                "stop_reason": "length",
+                "reasoning_tokens": 8_192,
+                "effective_thinking_level": "high",
+                "provider_thinking_level": "high",
+                "execution": _test_proposer_execution(failed_identity),
+                "content": {"text": "", "chars": 0},
+            }
+        ],
+    }
+    call_number = 0
+
+    def aggregator_execution(
+        identity: str,
+        level: str,
+    ) -> dict[str, object]:
+        provider, _, model = identity.partition(":")
+        return {
+            "role": "aggregator",
+            "requested_provider": provider,
+            "provider": provider,
+            "requested_model": model,
+            "model": model,
+            "assigned_thinking_level": level,
+            "effective_thinking_level": level,
+            "provider_thinking_level": level,
+            "thinking_override": level,
+            "effective_thinking": True,
+            "effective_provider_thinking_level": level,
+            "thinking_policy_managed": True,
+        }
+
+    async def fake_collect_run(active_provider, *_args, **_kwargs):
+        nonlocal call_number
+        call_number += 1
+        executed_plan = active_provider.selection_plan_execution_snapshot()
+        recovery_attempts: list[dict[str, object]] = []
+        if call_number == 2:
+            executed_plan["thinking_execution_fallbacks"] = [
+                {
+                    "trigger_stage": "aggregator_execution",
+                    "fallback_type": "thinking_level_neighbor",
+                    "reason": "provider_rejected_thinking_level",
+                    "identity": "openrouter:model-a-fallback",
+                    "requested_thinking_level": "high",
+                    "rejected_unified_level": "high",
+                    "rejected_provider_level": "high",
+                    "effective_thinking_level": "medium",
+                    "effective_provider_level": "medium",
+                    "thinking_policy_version": "test-thinking-policy/v1",
+                    "fallback_result": "succeeded",
+                }
+            ]
+            recovery_attempts = [
+                {
+                    "request_started": True,
+                    "requested_provider": "openrouter",
+                    "requested_model": "model-a-fallback",
+                    "outcome": "abandoned",
+                    "execution": aggregator_execution(
+                        "openrouter:model-a-fallback",
+                        "high",
+                    ),
+                },
+                {
+                    "request_started": True,
+                    "requested_provider": "openrouter",
+                    "requested_model": "model-a-fallback",
+                    "outcome": "succeeded",
+                    "execution": aggregator_execution(
+                        "openrouter:model-a-fallback",
+                        "medium",
+                    ),
+                },
+            ]
+            if not reset_before_third:
+                active_provider.execution_plan = deepcopy(executed_plan)
+                if immutable_drift_before_third:
+                    active_provider.execution_plan[
+                        "test_immutable_drift"
+                    ] = True
+        elif call_number == 3:
+            recovery_attempts = [
+                {
+                    "request_started": True,
+                    "requested_provider": "openrouter",
+                    "requested_model": "model-a-fallback",
+                    "outcome": "succeeded",
+                    "execution": aggregator_execution(
+                        "openrouter:model-a-fallback",
+                        "medium",
+                    ),
+                }
+            ]
+        setup = module.consume_provider_setup(active_provider)
+        common = {
+            "setup_latency_ms": setup["latency_ms"],
+            "setup_usage": setup["usage"],
+            "routing_trace": setup["routing"],
+        }
+        if call_number == 1:
+            return module.RunResult(
+                final_text="",
+                done=DoneEvent(ensemble_trace=deepcopy(failed_trace)),
+                **common,
+            )
+        if call_number == 2:
+            return module.RunResult(
+                final_text="",
+                done=DoneEvent(
+                    ensemble_trace={
+                        "selection_plan": executed_plan,
+                        "candidates": [],
+                        "aggregator_recovery": {
+                            "attempts": recovery_attempts
+                        },
+                        "final_request": {
+                            "role": "aggregator",
+                            "request_started": True,
+                            "execution": aggregator_execution(
+                                "openrouter:model-a-fallback",
+                                "medium",
+                            ),
+                        },
+                    }
+                ),
+                error="HTTP 429",
+                **common,
+            )
+        return module.RunResult(
+            final_text="accepted",
+            done=DoneEvent(
+                ensemble_trace={
+                    "selection_plan": executed_plan,
+                    "candidates": [],
+                    "aggregator_recovery": {
+                        "attempts": recovery_attempts
+                    },
+                    "final_request": {
+                        "role": "aggregator",
+                        "request_started": True,
+                        "execution": aggregator_execution(
+                            "openrouter:model-a-fallback",
+                            "medium",
+                        ),
+                    },
+                }
+            ),
+            **common,
+        )
+
+    retry_reasons = iter(["ensemble_insufficient_proposers", "HTTP 429", ""])
+    monkeypatch.setattr(module, "collect_run", fake_collect_run)
+    monkeypatch.setattr(
+        module,
+        "generation_retry_reason",
+        lambda *_args, **_kwargs: next(retry_reasons),
+    )
+
+    result, attempts, selected_attempt = await module.collect_generation_with_retries(
+        initial,
+        "prompt",
+        timeout=30,
+        group="G1",
+        max_attempts=3,
+    )
+
+    if reset_before_third:
+        assert result.error == (
+            "g1_thinking_execution_pre_call_guard_failed:"
+            "thinking_execution_target_prefix_not_closed"
+        )
+        assert selected_attempt == 0
+        assert call_number == 2
+        assert len(attempts) == 3
+        assert attempts[-1]["attempt_kind"] == (
+            "generation_pre_call_guard"
+        )
+        assert attempts[-1]["will_retry"] is False
+        assert (
+            attempts[-1]["retry_suppressed_reason"]
+            == result.error
+        )
+        assert attempts[-1]["run"]["trace_events"][0][
+            "code"
+        ] == "g1_pre_call_guard_failed"
+    elif immutable_drift_before_third:
+        assert result.error == "HTTP 429"
+        assert selected_attempt == 0
+        assert call_number == 2
+        assert len(attempts) == 2
+        assert attempts[-1]["will_retry"] is False
+        assert attempts[-1]["retry_suppressed_reason"] == (
+            "g1_attempt_plan_provenance_invalid"
+        )
+    else:
+        assert result.final_text == "accepted"
+        assert selected_attempt == 3
+        assert call_number == 3
+        assert [attempt["selection_plan"] for attempt in attempts] == [
+            initial_plan,
+            retry_plan_baseline,
+            replacement.execution_plan,
+        ]
+        assert [
+            attempt["run"]["routing_trace"]["selection_plan"]
+            for attempt in attempts
+        ] == [
+            initial_plan,
+            replacement.execution_plan,
+            replacement.execution_plan,
+        ]
+    assert attempts[1]["run"]["ensemble_trace"]["selection_plan"][
+        "thinking_execution_fallbacks"
+    ][0]["fallback_result"] == "succeeded"
+    expected_setup_latencies = (
+        [11, 7, 0]
+        if reset_before_third
+        else [11, 7]
+        if immutable_drift_before_third
+        else [11, 7, 0]
+    )
+    assert [
+        attempt["run"]["setup_latency_ms"]
+        for attempt in attempts
+    ] == expected_setup_latencies
+    analyzer_units = [
+        unit
+        for attempt in attempts
+        for unit in attempt["run"]["usage"].get("model_usage_breakdown", [])
+        if unit.get("role") == "task_analyzer"
+    ]
+    assert analyzer_units == [analyzer_usage]
+    assert sum(
+        float(attempt["run"]["usage"].get("billed_cost") or 0.0) for attempt in attempts
+    ) == pytest.approx(0.25)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+async def test_managed_mode_downgrade_is_blocked_before_first_paid_call(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Provider:
+        selection_plan = {
+            "decision_id": "managed-decision",
+            "ranking_thinking_assignment_enabled": True,
+        }
+
+        def selection_plan_execution_snapshot(self):
+            return {
+                **self.selection_plan,
+                "ranking_thinking_assignment_enabled": False,
+            }
+
+    calls = 0
+
+    async def unexpected_collect_run(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("managed mode drift must stop before a paid call")
+
+    monkeypatch.setattr(module, "collect_run", unexpected_collect_run)
+
+    result, attempts, selected_attempt = (
+        await module.collect_generation_with_retries(
+            Provider(),
+            "prompt",
+            timeout=30,
+            group="G1",
+            max_attempts=2,
+        )
+    )
+
+    assert calls == 0
+    assert selected_attempt == 0
+    assert result.error == (
+        "g1_thinking_execution_managed_mode_changed_before_call"
+    )
+    assert len(attempts) == 1
+    assert attempts[0]["attempt_kind"] == (
+        "generation_pre_call_guard"
+    )
+    assert attempts[0]["attempt"] == 1
+    assert attempts[0]["run"]["llm_request_count"] == 0
+    assert attempts[0]["run"]["trace_events"][0][
+        "code"
+    ] == "g1_pre_call_guard_failed"
+
+
+@pytest.mark.parametrize(
+    "module",
+    [runner, resume_runner],
+    ids=["main", "resume"],
+)
+def test_attach_provider_setup_wraps_paid_snapshot_failure_without_text(
+    module,
+) -> None:
+    plan = _frozen_g1_plan(
+        decision_id="attach-paid-setup-snapshot-error",
+        proposers=["openrouter:model-p"],
+    )
+
+    class Provider:
+        selection_plan = deepcopy(plan)
+
+        def selection_plan_execution_snapshot(self):
+            raise RuntimeError(
+                "private upstream diagnostic must not be persisted"
+            )
+
+    paid_usage = {
+        "role": "task_analyzer",
+        "label": "task_analyzer",
+        "request_count": 1,
+        "physical_attempt_id": "e" * 32,
+        "provider": "openrouter",
+        "model": "anthropic/claude-opus-4.8",
+        "requested_provider": "openrouter",
+        "requested_model": "anthropic/claude-opus-4.8",
+        "input_tokens": 10,
+        "output_tokens": 2,
+        "billed_cost": 0.01,
+        "cost_source": "provider_billed",
+        "provider_usage": {
+            "physical_attempt_id": "e" * 32,
+        },
+    }
+    provider = Provider()
+    with pytest.raises(module.ProviderBuildError) as exc_info:
+        module.attach_provider_setup(
+            provider,
+            module.ProviderBuildResult(
+                provider=provider,
+                prompt="prompt",
+                setup_latency_ms=29,
+                setup_usage=[paid_usage],
+                routing_trace={
+                    "selection_plan": deepcopy(plan)
+                },
+            ),
+        )
+
+    error = exc_info.value
+    assert str(error) == (
+        "provider_build_failed_after_setup:RuntimeError"
+    )
+    assert "private upstream diagnostic" not in str(error)
+    assert error.setup_latency_ms == 29
+    assert error.setup_usage == [paid_usage]
+    assert error.routing_trace == {
+        "selection_plan": plan,
+    }
+
+
+@pytest.mark.parametrize(
+    "module",
+    [runner, resume_runner],
+    ids=["main", "resume"],
+)
+def test_paid_provider_build_post_setup_initialization_is_protected(
+    module,
+) -> None:
+    tree = ast.parse(
+        inspect.getsource(module.build_experiment_provider)
+    )
+    protected = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Try):
+            continue
+        body_source = "\n".join(
+            ast.unparse(statement) for statement in node.body
+        )
+        if (
+            "attach_provider_setup(provider, result)" in body_source
+            and "_draco_reasoning_only_retry_factory" in body_source
+        ):
+            protected.append(node)
+
+    assert len(protected) == 1
+    handlers_source = "\n".join(
+        ast.unparse(handler) for handler in protected[0].handlers
+    )
+    assert "except ProviderBuildError" in handlers_source
+    assert "if setup_usage" in handlers_source
+    assert "raise ProviderBuildError" in handlers_source
+    assert "safe_provider_build_routing_trace" in handlers_source
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+async def test_managed_pre_call_guard_preserves_paid_setup_evidence(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _frozen_g1_plan(
+        decision_id="managed-paid-setup",
+        proposers=["openrouter:model-p"],
+    )
+
+    class Provider:
+        selection_plan = deepcopy(plan)
+        downgraded = False
+
+        def selection_plan_execution_snapshot(self):
+            snapshot = deepcopy(self.selection_plan)
+            if self.downgraded:
+                snapshot["ranking_thinking_assignment_enabled"] = False
+            return snapshot
+
+    paid_usage = {
+        "role": "task_analyzer",
+        "label": "task_analyzer",
+        "request_count": 1,
+        "physical_attempt_id": "a" * 32,
+        "provider": "openrouter",
+        "model": "anthropic/claude-opus-4.8",
+        "requested_provider": "openrouter",
+        "requested_model": "anthropic/claude-opus-4.8",
+        "input_tokens": 10,
+        "output_tokens": 2,
+        "billed_cost": 0.01,
+        "cost_source": "provider_billed",
+        "provider_usage": {"physical_attempt_id": "a" * 32},
+    }
+    provider = Provider()
+    module.attach_provider_setup(
+        provider,
+        module.ProviderBuildResult(
+            provider=provider,
+            prompt="prompt",
+            setup_latency_ms=17,
+            setup_usage=[paid_usage],
+            routing_trace={"selection_plan": deepcopy(plan)},
+        ),
+    )
+    provider.downgraded = True
+    calls = 0
+
+    async def unexpected_collect_run(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("managed mode drift must stop before generation")
+
+    monkeypatch.setattr(module, "collect_run", unexpected_collect_run)
+
+    result, attempts, selected_attempt = (
+        await module.collect_generation_with_retries(
+            provider,
+            "prompt",
+            timeout=30,
+            group="G1",
+            max_attempts=2,
+        )
+    )
+
+    assert calls == 0
+    assert selected_attempt == 0
+    assert result.error == (
+        "g1_thinking_execution_managed_mode_changed_before_call"
+    )
+    assert result.setup_latency_ms == 17
+    assert result.setup_usage == [paid_usage]
+    assert module.consume_provider_setup(provider)["usage"] == []
+    assert len(attempts) == 1
+    assert attempts[0]["attempt_kind"] == "provider_build_after_paid_setup"
+    assert attempts[0]["attempt"] == 1
+    assert attempts[0]["will_retry"] is False
+    assert attempts[0]["retry_suppressed_reason"] == result.error
+    assert attempts[0]["selection_plan"] == plan
+    assert attempts[0]["excluded_proposer_identities"] == []
+    assert attempts[0]["deterministic_proposer_failures"] == []
+    assert attempts[0]["run"]["llm_request_count"] == 1
+    assert attempts[0]["run"]["routing_trace"]["selection_plan"] == plan
+    guard_trace = attempts[0]["run"]["routing_trace"]["pre_call_guard"]
+    assert guard_trace["error"] == result.error
+    assert guard_trace["expected_selection_plan"] == plan
+    assert (
+        guard_trace["observed_selection_plan"][
+            "ranking_thinking_assignment_enabled"
+        ]
+        is False
+    )
+    assert guard_trace["request_started"] is False
+    assert guard_trace["physical_request_count"] == 0
+    assert attempts[0]["run"]["usage"]["model_usage_breakdown"] == [paid_usage]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+async def test_managed_pre_call_guard_snapshot_exception_preserves_paid_setup(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _frozen_g1_plan(
+        decision_id="managed-paid-setup-snapshot-error",
+        proposers=["openrouter:model-p"],
+    )
+
+    class Provider:
+        selection_plan = deepcopy(plan)
+        fail_snapshot = False
+
+        def selection_plan_execution_snapshot(self):
+            if self.fail_snapshot:
+                raise RuntimeError("do not include exception text in evidence")
+            return deepcopy(self.selection_plan)
+
+    paid_usage = {
+        "role": "task_analyzer",
+        "label": "task_analyzer",
+        "request_count": 1,
+        "physical_attempt_id": "b" * 32,
+        "provider": "openrouter",
+        "model": "anthropic/claude-opus-4.8",
+        "requested_provider": "openrouter",
+        "requested_model": "anthropic/claude-opus-4.8",
+        "input_tokens": 10,
+        "output_tokens": 2,
+        "billed_cost": 0.01,
+        "cost_source": "provider_billed",
+        "provider_usage": {"physical_attempt_id": "b" * 32},
+    }
+    provider = Provider()
+    module.attach_provider_setup(
+        provider,
+        module.ProviderBuildResult(
+            provider=provider,
+            prompt="prompt",
+            setup_latency_ms=17,
+            setup_usage=[paid_usage],
+            routing_trace={"selection_plan": deepcopy(plan)},
+        ),
+    )
+    provider.fail_snapshot = True
+    calls = 0
+
+    async def unexpected_collect_run(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("snapshot failure must stop before generation")
+
+    monkeypatch.setattr(module, "collect_run", unexpected_collect_run)
+
+    result, attempts, selected_attempt = (
+        await module.collect_generation_with_retries(
+            provider,
+            "prompt",
+            timeout=30,
+            group="G1",
+            max_attempts=2,
+        )
+    )
+
+    assert calls == 0
+    assert selected_attempt == 0
+    assert result.error == (
+        "g1_thinking_execution_pre_call_guard_exception:"
+        "selection_plan_snapshot:RuntimeError"
+    )
+    assert result.setup_latency_ms == 17
+    assert result.setup_usage == [paid_usage]
+    assert len(attempts) == 1
+    assert attempts[0]["attempt_kind"] == "provider_build_after_paid_setup"
+    assert attempts[0]["selection_plan"] == plan
+    assert attempts[0]["run"]["routing_trace"]["selection_plan"] == plan
+    guard_trace = attempts[0]["run"]["routing_trace"]["pre_call_guard"]
+    assert guard_trace["error"] == result.error
+    assert guard_trace["expected_selection_plan"] == plan
+    assert guard_trace["observed_selection_plan"] is None
+    assert guard_trace["observed_selection_plan_error"] == "RuntimeError"
+    assert "do not include exception text" not in str(guard_trace)
+    assert guard_trace["request_started"] is False
+    assert guard_trace["physical_request_count"] == 0
+    assert attempts[0]["run"]["usage"]["model_usage_breakdown"] == [paid_usage]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+@pytest.mark.parametrize("failure_mode", ["setup_copy", "serializer"])
+async def test_managed_pre_call_guard_capture_failure_preserves_paid_receipt(
+    module,
+    failure_mode: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _frozen_g1_plan(
+        decision_id="managed-paid-setup-copy-error",
+        proposers=["openrouter:model-p"],
+    )
+
+    class Provider:
+        selection_plan = deepcopy(plan)
+        fail_snapshot = False
+
+        def selection_plan_execution_snapshot(self):
+            snapshot = deepcopy(self.selection_plan)
+            if self.fail_snapshot:
+                snapshot["ranking_thinking_assignment_enabled"] = False
+            return snapshot
+
+    paid_usage = {
+        "role": "task_analyzer",
+        "label": "task_analyzer",
+        "request_count": 1,
+        "attempt": 1,
+        "physical_attempt_id": "c" * 32,
+        "provider": "openrouter",
+        "model": "anthropic/claude-opus-4.8",
+        "requested_provider": "openrouter",
+        "requested_model": "anthropic/claude-opus-4.8",
+        "input_tokens": 10,
+        "output_tokens": 2,
+        "billed_cost": 0.01,
+        "cost_source": "provider_billed",
+        "provider_usage": {"physical_attempt_id": "c" * 32},
+    }
+    provider = Provider()
+    module.attach_provider_setup(
+        provider,
+        module.ProviderBuildResult(
+            provider=provider,
+            prompt="prompt",
+            setup_latency_ms=29,
+            setup_usage=[paid_usage],
+            routing_trace={"selection_plan": deepcopy(plan)},
+        ),
+    )
+    provider.fail_snapshot = True
+    setup_metrics = getattr(provider, "_draco_setup_metrics")
+    raw_setup_usage = setup_metrics["usage"]
+    original_deepcopy = module.copy.deepcopy
+    private_detail = f"private paid setup {failure_mode} detail"
+
+    def fail_only_for_setup_usage(value, *args, **kwargs):
+        if value is raw_setup_usage:
+            raise RuntimeError(private_detail)
+        return original_deepcopy(value, *args, **kwargs)
+
+    if failure_mode == "setup_copy":
+        monkeypatch.setattr(
+            module.copy,
+            "deepcopy",
+            fail_only_for_setup_usage,
+        )
+    else:
+        monkeypatch.setattr(
+            module,
+            "json_safe",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError(private_detail)
+            ),
+        )
+    generation_calls = 0
+
+    async def unexpected_collect_run(*_args, **_kwargs):
+        nonlocal generation_calls
+        generation_calls += 1
+        raise AssertionError("setup copy failure must stop before generation")
+
+    monkeypatch.setattr(module, "collect_run", unexpected_collect_run)
+
+    result, attempts, selected_attempt = (
+        await module.collect_generation_with_retries(
+            provider,
+            "prompt",
+            timeout=30,
+            group="G1",
+            max_attempts=2,
+        )
+    )
+
+    assert generation_calls == 0
+    assert selected_attempt == 0
+    assert len(attempts) == 1
+    assert attempts[0]["attempt_kind"] == "provider_build_after_paid_setup"
+    assert result.error == (
+        "g1_thinking_execution_managed_mode_changed_before_call"
+    )
+    assert len(result.setup_usage) == 1
+    receipt = result.setup_usage[0]
+    assert receipt["request_count"] == 1
+    assert receipt["physical_attempt_id"] == "c" * 32
+    assert receipt["billed_cost"] == 0.01
+    guard_trace = attempts[0]["run"]["routing_trace"]["pre_call_guard"]
+    assert guard_trace["setup_snapshot_error"] == (
+        "RuntimeError" if failure_mode == "setup_copy" else ""
+    )
+    if failure_mode == "serializer":
+        assert guard_trace["expected_selection_plan"] == {
+            "capture_failed": True,
+            "exception_type": "RuntimeError",
+        }
+    assert private_detail not in json.dumps(attempts)
+    assert getattr(provider, "_draco_setup_metrics") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+async def test_managed_pre_call_guard_summary_failure_keeps_paid_setup_until_commit(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _frozen_g1_plan(
+        decision_id="managed-paid-setup-summary-error",
+        proposers=["openrouter:model-p"],
+    )
+
+    class Provider:
+        selection_plan = deepcopy(plan)
+        fail_snapshot = False
+
+        def selection_plan_execution_snapshot(self):
+            snapshot = deepcopy(self.selection_plan)
+            if self.fail_snapshot:
+                snapshot["ranking_thinking_assignment_enabled"] = False
+            return snapshot
+
+    paid_usage = {
+        "role": "task_analyzer",
+        "label": "task_analyzer",
+        "request_count": 1,
+        "physical_attempt_id": "f" * 32,
+        "provider": "openrouter",
+        "model": "anthropic/claude-opus-4.8",
+        "requested_provider": "openrouter",
+        "requested_model": "anthropic/claude-opus-4.8",
+        "input_tokens": 10,
+        "output_tokens": 2,
+        "billed_cost": 0.01,
+        "cost_source": "provider_billed",
+        "provider_usage": {"physical_attempt_id": "f" * 32},
+    }
+    provider = Provider()
+    module.attach_provider_setup(
+        provider,
+        module.ProviderBuildResult(
+            provider=provider,
+            prompt="prompt",
+            setup_latency_ms=23,
+            setup_usage=[paid_usage],
+            routing_trace={"selection_plan": deepcopy(plan)},
+        ),
+    )
+    provider.fail_snapshot = True
+    monkeypatch.setattr(
+        module,
+        "run_result_summary",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("private summary detail")
+        ),
+    )
+
+    result, attempts, selected_attempt = (
+        await module.collect_generation_with_retries(
+            provider,
+            "prompt",
+            timeout=30,
+            group="G1",
+            max_attempts=2,
+        )
+    )
+
+    assert selected_attempt == 0
+    assert result.error == (
+        "g1_thinking_execution_managed_mode_changed_before_call"
+    )
+    assert len(attempts) == 1
+    run = attempts[0]["run"]
+    assert run["llm_request_count"] == 1
+    assert run["usage"]["model_usage_breakdown"] == [paid_usage]
+    assert run["generation_postprocessing_failure"][
+        "stage"
+    ] == "g1_pre_call_guard_evidence"
+    assert "private summary detail" not in json.dumps(attempts)
+    assert module.consume_provider_setup(provider)["usage"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+async def test_managed_pre_call_guard_closure_exception_preserves_paid_setup(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _frozen_g1_plan(
+        decision_id="managed-paid-setup-closure-error",
+        proposers=["openrouter:model-p"],
+    )
+
+    class Provider:
+        selection_plan = deepcopy(plan)
+
+        def selection_plan_execution_snapshot(self):
+            return deepcopy(self.selection_plan)
+
+    paid_usage = {
+        "role": "task_analyzer",
+        "label": "task_analyzer",
+        "request_count": 1,
+        "physical_attempt_id": "c" * 32,
+        "provider": "openrouter",
+        "model": "anthropic/claude-opus-4.8",
+        "requested_provider": "openrouter",
+        "requested_model": "anthropic/claude-opus-4.8",
+        "input_tokens": 10,
+        "output_tokens": 2,
+        "billed_cost": 0.01,
+        "cost_source": "provider_billed",
+        "provider_usage": {"physical_attempt_id": "c" * 32},
+    }
+    provider = Provider()
+    module.attach_provider_setup(
+        provider,
+        module.ProviderBuildResult(
+            provider=provider,
+            prompt="prompt",
+            setup_latency_ms=19,
+            setup_usage=[paid_usage],
+            routing_trace={"selection_plan": deepcopy(plan)},
+        ),
+    )
+
+    def fail_closure(*_args, **_kwargs):
+        raise RuntimeError("private closure failure text")
+
+    monkeypatch.setattr(
+        "opensquilla.provider.thinking_execution."
+        "validate_thinking_execution_history_closure",
+        fail_closure,
+    )
+    calls = 0
+
+    async def unexpected_collect_run(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("closure failure must stop before generation")
+
+    monkeypatch.setattr(module, "collect_run", unexpected_collect_run)
+
+    result, attempts, selected_attempt = (
+        await module.collect_generation_with_retries(
+            provider,
+            "prompt",
+            timeout=30,
+            group="G1",
+            max_attempts=2,
+        )
+    )
+
+    assert calls == 0
+    assert selected_attempt == 0
+    assert result.error == (
+        "g1_thinking_execution_pre_call_guard_exception:"
+        "history_closure:RuntimeError"
+    )
+    assert result.setup_usage == [paid_usage]
+    assert len(attempts) == 1
+    assert attempts[0]["attempt_kind"] == (
+        "provider_build_after_paid_setup"
+    )
+    assert "private closure failure text" not in str(attempts)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+async def test_managed_pre_call_guard_hash_exception_preserves_paid_setup(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _frozen_g1_plan(
+        decision_id="managed-paid-setup-hash-error",
+        proposers=["openrouter:model-p"],
+    )
+
+    class Provider:
+        selection_plan = deepcopy(plan)
+
+        def selection_plan_execution_snapshot(self):
+            return deepcopy(self.selection_plan)
+
+    paid_usage = {
+        "role": "task_analyzer",
+        "label": "task_analyzer",
+        "request_count": 1,
+        "physical_attempt_id": "d" * 32,
+        "provider": "openrouter",
+        "model": "anthropic/claude-opus-4.8",
+        "requested_provider": "openrouter",
+        "requested_model": "anthropic/claude-opus-4.8",
+        "input_tokens": 10,
+        "output_tokens": 2,
+        "billed_cost": 0.01,
+        "cost_source": "provider_billed",
+        "provider_usage": {"physical_attempt_id": "d" * 32},
+    }
+    provider = Provider()
+    module.attach_provider_setup(
+        provider,
+        module.ProviderBuildResult(
+            provider=provider,
+            prompt="prompt",
+            setup_latency_ms=23,
+            setup_usage=[paid_usage],
+            routing_trace={"selection_plan": deepcopy(plan)},
+        ),
+    )
+    calls = 0
+
+    async def retrying_collect_run(active_provider, *_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        setup = module.consume_provider_setup(active_provider)
+        return module.RunResult(
+            final_text="",
+            done=DoneEvent(
+                ensemble_trace={
+                    "selection_plan": deepcopy(plan),
+                    "candidates": [],
+                }
+            ),
+            error="transient",
+            setup_latency_ms=module.coerce_metric_int(
+                setup.get("latency_ms")
+            ),
+            setup_usage=deepcopy(setup.get("usage") or []),
+            routing_trace=deepcopy(
+                setup.get("routing")
+                or {"selection_plan": deepcopy(plan)}
+            ),
+        )
+
+    monkeypatch.setattr(module, "collect_run", retrying_collect_run)
+    monkeypatch.setattr(
+        module,
+        "generation_retry_reason",
+        lambda *_args, **_kwargs: "transient",
+    )
+
+    original_hash = module.canonical_json_sha256
+    hash_calls = 0
+
+    def fail_hash(value):
+        nonlocal hash_calls
+        hash_calls += 1
+        if hash_calls == 4:
+            raise RuntimeError("private hash failure text")
+        return original_hash(value)
+
+    monkeypatch.setattr(module, "canonical_json_sha256", fail_hash)
+
+    result, attempts, selected_attempt = (
+        await module.collect_generation_with_retries(
+            provider,
+            "prompt",
+            timeout=30,
+            group="G1",
+            max_attempts=2,
+        )
+    )
+
+    assert calls == 1
+    assert selected_attempt == 0
+    assert result.error == (
+        "g1_thinking_execution_pre_call_guard_exception:"
+        "immutable_hash:RuntimeError"
+    )
+    assert result.setup_usage == []
+    assert [attempt["attempt_kind"] for attempt in attempts] == [
+        "generation",
+        "generation_pre_call_guard",
+    ]
+    assert paid_usage in attempts[0]["run"]["usage"][
+        "model_usage_breakdown"
+    ]
+    assert attempts[1]["attempt"] == 2
+    assert attempts[1]["run"]["llm_request_count"] == 0
+    assert attempts[1]["run"]["routing_trace"]["pre_call_guard"][
+        "error"
+    ] == result.error
+    assert attempts[1]["run"]["trace_events"][0][
+        "code"
+    ] == "g1_pre_call_guard_failed"
+    assert "private hash failure text" not in str(attempts)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+async def test_successful_managed_result_with_tampered_plan_is_not_accepted(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _frozen_g1_plan(
+        decision_id="managed-success",
+        proposers=["openrouter:model-p"],
+    )
+
+    class Provider:
+        selection_plan = deepcopy(plan)
+
+        def selection_plan_execution_snapshot(self):
+            return deepcopy(self.selection_plan)
+
+    tampered = deepcopy(plan)
+    tampered["selected_A"] = "openrouter:tampered"
+    calls = 0
+
+    async def fake_collect_run(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return module.RunResult(
+            final_text="apparently successful",
+            done=DoneEvent(
+                ensemble_trace={
+                    "selection_plan": deepcopy(tampered),
+                    "candidates": [],
+                }
+            ),
+            routing_trace={"selection_plan": deepcopy(tampered)},
+        )
+
+    monkeypatch.setattr(module, "collect_run", fake_collect_run)
+    monkeypatch.setattr(
+        module,
+        "generation_retry_reason",
+        lambda *_args, **_kwargs: "",
+    )
+
+    result, attempts, selected_attempt = (
+        await module.collect_generation_with_retries(
+            Provider(),
+            "prompt",
+            timeout=30,
+            group="G1",
+            max_attempts=2,
+        )
+    )
+
+    assert calls == 1
+    assert selected_attempt == 0
+    assert len(attempts) == 1
+    assert attempts[0]["will_retry"] is False
+    assert attempts[0]["retry_suppressed_reason"] == (
+        "g1_attempt_plan_provenance_invalid"
+    )
+    assert result.error == "g1_attempt_plan_provenance_invalid"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+@pytest.mark.parametrize("switch_value", [None, False], ids=["missing", "false"])
+async def test_transient_generation_failure_retries_same_roster_without_rebuild(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+    switch_value: bool | None,
+) -> None:
+    class Provider:
+        selection_plan = {
+            "selected_P": [
+                "openrouter:model-a",
+                "openrouter:model-b",
+                "openrouter:model-c",
+            ],
+            "proposer_sample_count": 3,
+        }
+        min_successful_proposers = 2
+
+        @property
+        def _draco_reasoning_only_retry_factory(self):
+            raise AssertionError(
+                "default-off retries must not inspect the managed factory"
+            )
+
+        def selection_plan_execution_snapshot(self):
+            raise AssertionError(
+                "default-off retries must use the frozen legacy plan"
+            )
+
+    provider = Provider()
+    if switch_value is not None:
+        provider.selection_plan = {
+            **provider.selection_plan,
+            "ranking_thinking_assignment_enabled": switch_value,
+        }
+
+    provider._draco_prior_excluded_proposer_identities = object()
+    provider._draco_g1_thinking_execution_history = object()
+    calls: list[object] = []
+
+    async def fake_collect_run(active_provider, *_args, **_kwargs):
+        calls.append(active_provider)
+        return module.RunResult(
+            final_text="",
+            done=DoneEvent(
+                ensemble_trace={
+                    "selection_plan": deepcopy(active_provider.selection_plan),
+                    "candidates": [],
+                }
+            ),
+            error="HTTP 429: rate limited",
+            routing_trace={"selection_plan": deepcopy(active_provider.selection_plan)},
+        )
+
+    monkeypatch.setattr(module, "collect_run", fake_collect_run)
+
+    result, attempts, selected_attempt = await module.collect_generation_with_retries(
+        provider,
+        "prompt",
+        timeout=30,
+        group="G1",
+        max_attempts=2,
+    )
+
+    assert result.error == "HTTP 429: rate limited"
+    assert selected_attempt == 0
+    assert calls == [provider, provider]
+    assert len(attempts) == 2
+    assert all(
+        all(
+            field not in attempt
+            for field in (
+                "selection_plan",
+                "deterministic_proposer_failures",
+                "excluded_proposer_identities",
+                "retry_selection_plan",
+            )
+        )
+        for attempt in attempts
+    )
+    assert not hasattr(provider, "_draco_selected_retry_provider")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+async def test_g1_missing_paid_physical_trace_blocks_next_paid_call(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _with_g1_task_analysis_invariants(
+        {
+            "decision_id": "decision-1",
+            "selected_P": [
+                "openrouter:model-a",
+                "openrouter:model-b",
+                "openrouter:model-c",
+            ],
+            "proposer_sample_count": 3,
+        }
+    )
+
+    class Provider:
+        selection_plan = plan
+        min_successful_proposers = 2
+
+    provider = Provider()
+    paid_calls = 0
+
+    async def fake_collect_run(*_args, **_kwargs):
+        nonlocal paid_calls
+        paid_calls += 1
+        if paid_calls > 1:
+            raise AssertionError("missing physical trace must block a second paid call")
+        return module.RunResult(
+            final_text="",
+            done=DoneEvent(),
+            error="HTTP 503",
+            routing_trace={"selection_plan": deepcopy(plan)},
+        )
+
+    monkeypatch.setattr(module, "collect_run", fake_collect_run)
+    monkeypatch.setattr(
+        module,
+        "generation_retry_reason",
+        lambda *_args, **_kwargs: "HTTP 503",
+    )
+
+    _, attempts, selected_attempt = await module.collect_generation_with_retries(
+        provider,
+        "prompt",
+        timeout=30,
+        group="G1",
+        max_attempts=2,
+    )
+
+    assert paid_calls == 1
+    assert selected_attempt == 0
+    assert attempts[0]["will_retry"] is False
+    assert attempts[0]["retry_suppressed_reason"] == ("g1_attempt_plan_provenance_invalid")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+async def test_g1_physical_counter_mismatch_blocks_next_paid_call(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.provider.thinking_execution import (
+        THINKING_PHYSICAL_EVIDENCE_SCHEMA,
+    )
+
+    plan = _with_g1_task_analysis_invariants(
+        {
+            "decision_id": "strict-physical-binding",
+            "selected_P": ["openrouter:model-a"],
+            "proposer_sample_count": 1,
+            "thinking_physical_evidence_schema": (
+                THINKING_PHYSICAL_EVIDENCE_SCHEMA
+            ),
+        }
+    )
+
+    class Provider:
+        selection_plan = plan
+        min_successful_proposers = 1
+
+    paid_calls = 0
+
+    async def fake_collect_run(*_args, **_kwargs):
+        nonlocal paid_calls
+        paid_calls += 1
+        if paid_calls > 1:
+            raise AssertionError(
+                "physical Counter mismatch must block a second paid call"
+            )
+        return module.RunResult(
+            final_text="",
+            done=DoneEvent(
+                model_usage_breakdown=[
+                    {
+                        "role": "proposer",
+                        "physical_attempt_id": "b" * 32,
+                        "provider": "openrouter",
+                        "model": "model-a",
+                        "requested_provider": "openrouter",
+                        "requested_model": "model-a",
+                        "input_tokens": 1,
+                        "output_tokens": 0,
+                        "billed_cost": 0.0,
+                        "cost_source": "none",
+                        "provider_usage": {
+                            "physical_attempt_id": "b" * 32,
+                        },
+                    }
+                ],
+                ensemble_trace={
+                    "selection_plan": deepcopy(plan),
+                    "candidates": [
+                        {
+                            "request_started": True,
+                            "execution": {
+                                "physical_attempts": [
+                                    {
+                                        "request_started": True,
+                                        "physical_attempt_id": "a" * 32,
+                                    }
+                                ]
+                            },
+                        }
+                    ],
+                    "aggregator_recovery": {"attempts": []},
+                },
+            ),
+            error="HTTP 503",
+            routing_trace={"selection_plan": deepcopy(plan)},
+        )
+
+    monkeypatch.setattr(module, "collect_run", fake_collect_run)
+    monkeypatch.setattr(
+        module,
+        "generation_retry_reason",
+        lambda *_args, **_kwargs: "HTTP 503",
+    )
+    monkeypatch.setattr(
+        module,
+        "g1_attempt_plan_consistency_reason",
+        lambda *_args, **_kwargs: "",
+    )
+
+    _, attempts, selected_attempt = await module.collect_generation_with_retries(
+        Provider(),
+        "prompt",
+        timeout=30,
+        group="G1",
+        max_attempts=2,
+    )
+
+    assert paid_calls == 1
+    assert selected_attempt == 0
+    assert attempts[0]["will_retry"] is False
+    assert attempts[0]["retry_suppressed_reason"] == (
+        "g1_physical_usage_binding_failed:"
+        "g1_thinking_physical_usage_set_mismatch"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+@pytest.mark.parametrize(
+    (
+        "managed",
+        "usage_attempt_id",
+        "ledger_attempt_id",
+        "expected_selected",
+    ),
+    [
+        (True, "a" * 32, "b" * 32, 0),
+        (True, "a" * 32, "a" * 32, 1),
+        (False, "", "", 1),
+    ],
+    ids=[
+        "managed-success-mismatch-blocked",
+        "managed-success-matched",
+        "default-off-unchanged",
+    ],
+)
+async def test_managed_g1_audits_success_before_judge_or_acceptance(
+    module,
+    managed: bool,
+    usage_attempt_id: str,
+    ledger_attempt_id: str,
+    expected_selected: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.provider.thinking_execution import (
+        THINKING_PHYSICAL_EVIDENCE_SCHEMA,
+    )
+
+    plan = {
+        "decision_id": "strict-success-audit",
+        "selected_P": ["openrouter:model-a"],
+        "proposer_sample_count": 1,
+        "ranking_thinking_assignment_enabled": managed,
+    }
+    if managed:
+        plan = _with_g1_task_analysis_invariants(
+            {
+                **plan,
+                "thinking_physical_evidence_schema": (
+                    THINKING_PHYSICAL_EVIDENCE_SCHEMA
+                ),
+            }
+        )
+
+    class Provider:
+        selection_plan = plan
+        min_successful_proposers = 1
+
+    async def fake_collect_run(*_args, **_kwargs):
+        if not managed:
+            return module.RunResult(
+                final_text="legacy accepted answer",
+                done=DoneEvent(
+                    ensemble_trace={
+                        "selection_plan": deepcopy(plan),
+                        "candidates": [],
+                    },
+                ),
+                routing_trace={"selection_plan": deepcopy(plan)},
+            )
+        usage_row = {
+            "role": "proposer",
+            "physical_attempt_id": usage_attempt_id,
+            "provider": "openrouter",
+            "model": "model-a",
+            "requested_provider": "openrouter",
+            "requested_model": "model-a",
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "billed_cost": 0.0,
+            "cost_source": "none",
+            "provider_usage": {
+                "physical_attempt_id": usage_attempt_id,
+            },
+        }
+        return module.RunResult(
+            final_text="accepted answer",
+            done=DoneEvent(
+                model_usage_breakdown=[usage_row],
+                ensemble_trace={
+                    "selection_plan": deepcopy(plan),
+                    "candidates": [
+                        {
+                            "request_started": True,
+                            "execution": {
+                                "physical_attempts": [
+                                    {
+                                        "request_started": True,
+                                        "physical_attempt_id": (
+                                            ledger_attempt_id
+                                        ),
+                                    }
+                                ]
+                            },
+                        }
+                    ],
+                    "aggregator_recovery": {"attempts": []},
+                },
+            ),
+            routing_trace={"selection_plan": deepcopy(plan)},
+        )
+
+    monkeypatch.setattr(module, "collect_run", fake_collect_run)
+    monkeypatch.setattr(
+        module,
+        "generation_retry_reason",
+        lambda *_args, **_kwargs: "",
+    )
+    monkeypatch.setattr(
+        module,
+        "g1_attempt_plan_consistency_reason",
+        lambda *_args, **_kwargs: "",
+    )
+
+    result, attempts, selected_attempt = (
+        await module.collect_generation_with_retries(
+            Provider(),
+            "prompt",
+            timeout=30,
+            group="G1",
+            max_attempts=1,
+        )
+    )
+
+    assert selected_attempt == expected_selected
+    assert len(attempts) == 1
+    if managed and usage_attempt_id != ledger_attempt_id:
+        expected_error = (
+            "g1_physical_usage_binding_failed:"
+            "g1_thinking_physical_usage_set_mismatch"
+        )
+        assert result.error == expected_error
+        assert attempts[0]["retry_reason"] == expected_error
+        assert attempts[0]["retry_suppressed_reason"] == expected_error
+        assert attempts[0]["will_retry"] is False
+    else:
+        assert result.error == ""
+        assert attempts[0]["retry_reason"] == ""
+        assert attempts[0]["retry_suppressed_reason"] == ""
+        if not managed:
+            assert "selection_plan" not in attempts[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+async def test_g1_retry_factory_reuses_task_analysis_without_second_request(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.provider.ranking_router import (
+        TaskAnalysisResult,
+        fallback_task_profile,
+        load_model_registry_snapshot,
+        ranking_config_snapshot,
+    )
+
+    experiment = _experiment_config()
+    current_registry = load_model_registry_snapshot()
+    current_ranking = ranking_config_snapshot(
+        thinking_assignment_enabled=True,
+    )
+    experiment_payload = experiment.model_dump(mode="json")
+    experiment_payload["g1_routing"].update(
+        {
+            "source_registry_snapshot_version": current_registry[
+                "snapshot_version"
+            ],
+            "expected_source_registry_snapshot_sha256": (
+                module.canonical_json_sha256(current_registry).removeprefix(
+                    "sha256:"
+                )
+            ),
+            "expected_ranking_config_schema_version": current_ranking[
+                "schema_version"
+            ],
+            "expected_ranking_config_version": current_ranking[
+                "config_version"
+            ],
+            "expected_ranking_config_sha256": (
+                module.canonical_json_sha256(current_ranking).removeprefix(
+                    "sha256:"
+                )
+            ),
+        }
+    )
+    experiment = type(experiment).model_validate(experiment_payload)
+    config = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "deepseek/deepseek-v4-pro",
+            "api_key": "fake",
+        },
+        llm_ensemble={
+            "enabled": True,
+            "selection_mode": "router_dynamic",
+            "ranking_thinking_assignment_enabled": True,
+        },
+    )
+    inherited = ProviderConfig(
+        provider="openrouter",
+        model="deepseek/deepseek-v4-pro",
+        api_key="fake",
+    )
+    contract = _resolved_g1_registry_contract(module, experiment, config)
+    analyzer_calls = 0
+
+    async def fake_run_pipeline(turn, _steps):
+        turn.model = inherited.model
+        turn.metadata.update(
+            {
+                "routed_tier": "c1",
+                "routing_confidence": 0.9,
+                "routing_source": "test",
+                "routing_applied": False,
+            }
+        )
+        return turn
+
+    async def fake_analyze_task_with_provider(**kwargs):
+        nonlocal analyzer_calls
+        analyzer_calls += 1
+        return TaskAnalysisResult(
+            profile=fallback_task_profile(
+                routed_tier=kwargs["routed_tier"],
+                request_context=kwargs["request_context"],
+                ranking_config=kwargs["ranking_config"],
+            ),
+            source="test_analyzer",
+            schema_valid=True,
+            confidence=0.9,
+            usage={
+                "provider": kwargs["analyzer_provider_id"],
+                "model": kwargs["analyzer_model_id"],
+                "requested_provider": kwargs["analyzer_provider_id"],
+                "requested_model": kwargs["analyzer_model_id"],
+                "input_tokens": 5,
+                "output_tokens": 2,
+                "attempt_count": 1,
+            },
+        )
+
+    monkeypatch.setattr(module, "run_pipeline", fake_run_pipeline)
+    monkeypatch.setattr(
+        "opensquilla.provider.ranking_router.analyze_task_with_provider",
+        fake_analyze_task_with_provider,
+    )
+    monkeypatch.setenv("OPENSQUILLA_PROVIDER_ROUTING_STRICT", "1")
+    monkeypatch.setenv("OPENSQUILLA_OPENROUTER_REQUIRE_PARAMETERS", "1")
+
+    build = await module.build_experiment_provider(
+        config=config,
+        inherited=inherited,
+        group="G1",
+        prompt="test prompt",
+        dry_run=False,
+        enable_proposer_tools=False,
+        ensemble_proposer_timeout=None,
+        ensemble_aggregator_timeout=None,
+        experiment_config=experiment,
+        g1_registry_contract=contract,
+        generation_policy={},
+    )
+    failed_identity = build.provider.selection_plan["selected_P"][0]
+    retry_provider = build.provider._draco_reasoning_only_retry_factory([failed_identity])
+
+    assert analyzer_calls == 1
+    assert failed_identity not in retry_provider.selection_plan["selected_P"]
+    assert retry_provider.selection_plan["task_analysis_reused"] is True
+    assert (
+        retry_provider.selection_plan["retry_parent_decision_id"]
+        == (build.provider.selection_plan["decision_id"])
+    )
+    retry_routing = retry_provider.selection_plan["retry_routing"]
+    reuse_binding = retry_provider.selection_plan["task_analysis_reuse"]
+    assert retry_routing == {
+        "schema": "opensquilla.router-dynamic-retry-routing/v2",
+        "reason": "prior_attempt_reasoning_only_length",
+        "parent_decision_id": build.provider.selection_plan["decision_id"],
+        "excluded_proposer_identities": [failed_identity],
+        "task_analysis_reused": True,
+        "task_analysis_source_decision_id": (build.provider.selection_plan["decision_id"]),
+        "task_analysis_reuse_sha256": reuse_binding["projection_sha256"],
+    }
+    assert (
+        module.g1_retry_plan_provenance_reason(
+            build.provider.selection_plan,
+            retry_provider.selection_plan,
+            excluded_proposer_identities={failed_identity},
+        )
+        == ""
+    )
+    assert retry_provider.min_successful_proposers == module.legal_proposer_quorum(
+        len(retry_provider.selection_plan["selected_P"])
+    )
+    retry_setup = module.consume_provider_setup(retry_provider)
+    assert retry_setup["usage"] == []
+    assert retry_setup["routing"]["task_analyzer_reuse"]["physical_request_count"] == 0
+    assert retry_setup["routing"]["task_analyzer_reuse"]["excluded_proposer_identities"] == [
+        failed_identity
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+@pytest.mark.parametrize(
+    "failure_mode",
+    ["trace", "usage_materialization", "usage_mapping"],
+)
+async def test_task_analyzer_post_return_failure_preserves_paid_receipts(
+    module,
+    failure_mode: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.provider.ranking_router import fallback_task_profile
+
+    experiment = _experiment_with_current_g1_contract(
+        module,
+        thinking_assignment_enabled=True,
+    )
+    config = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "deepseek/deepseek-v4-pro",
+            "api_key": "fake",
+        },
+        llm_ensemble={
+            "enabled": True,
+            "selection_mode": "router_dynamic",
+            "ranking_thinking_assignment_enabled": True,
+        },
+    )
+    inherited = ProviderConfig(
+        provider="openrouter",
+        model="deepseek/deepseek-v4-pro",
+        api_key="fake",
+    )
+    contract = _resolved_g1_registry_contract(
+        module,
+        experiment,
+        config,
+    )
+
+    async def fake_run_pipeline(turn, _steps):
+        turn.model = inherited.model
+        turn.metadata.update(
+            {
+                "routed_tier": "c1",
+                "routing_confidence": 0.9,
+                "routing_source": "test",
+                "routing_applied": False,
+            }
+        )
+        return turn
+
+    analyzer_calls = 0
+    private_detail = "private analyzer trace detail"
+
+    class UsageMapping(Mapping[str, object]):
+        def __init__(self, payload: dict[str, object]) -> None:
+            self._payload = payload
+
+        def __getitem__(self, key: str) -> object:
+            return self._payload[key]
+
+        def __iter__(self) -> Iterator[str]:
+            raise RuntimeError(private_detail)
+
+        def __len__(self) -> int:
+            return len(self._payload)
+
+        def get(self, key: str, default=None):
+            return self._payload.get(key, default)
+
+    async def fake_analyze_task_with_provider(**kwargs):
+        nonlocal analyzer_calls
+        analyzer_calls += 1
+        analyzer_provider = kwargs["analyzer_provider_id"]
+        analyzer_model = kwargs["analyzer_model_id"]
+        physical_attempts = [
+            {
+                "attempt": ordinal,
+                "physical_attempt_id": str(ordinal) * 32,
+                "provider": analyzer_provider,
+                "model": analyzer_model,
+                "requested_provider": analyzer_provider,
+                "requested_model": analyzer_model,
+                "input_tokens": ordinal,
+                "output_tokens": 1,
+                "provider_usage": {
+                    "physical_attempt_id": str(ordinal) * 32,
+                },
+            }
+            for ordinal in range(
+                1,
+                4 if failure_mode != "trace" else 2,
+            )
+        ]
+
+        class Analysis:
+            profile = fallback_task_profile(
+                routed_tier=kwargs["routed_tier"],
+                request_context=kwargs["request_context"],
+                ranking_config=kwargs["ranking_config"],
+            )
+            source = "test_analyzer"
+            fallback_reason = ""
+            schema_valid = True
+            confidence = 0.9
+            usage_payload = {
+                "attempt_count": 3,
+                "physical_attempts": physical_attempts,
+            }
+            usage = (
+                UsageMapping(usage_payload)
+                if failure_mode == "usage_mapping"
+                else usage_payload
+                if failure_mode == "usage_materialization"
+                else {
+                    **physical_attempts[0],
+                    "attempt_count": 1,
+                }
+            )
+
+            def trace(self, _ranking_config):
+                if failure_mode == "trace":
+                    raise RuntimeError(private_detail)
+                return {}
+
+        return Analysis()
+
+    monkeypatch.setattr(module, "run_pipeline", fake_run_pipeline)
+    monkeypatch.setattr(
+        "opensquilla.provider.ranking_router."
+        "analyze_task_with_provider",
+        fake_analyze_task_with_provider,
+    )
+    if failure_mode == "usage_materialization":
+        monkeypatch.setattr(
+            module,
+            "task_analyzer_usage_rows",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError(private_detail)
+            ),
+        )
+    monkeypatch.setenv("OPENSQUILLA_PROVIDER_ROUTING_STRICT", "1")
+    monkeypatch.setenv(
+        "OPENSQUILLA_OPENROUTER_REQUIRE_PARAMETERS",
+        "1",
+    )
+
+    with pytest.raises(module.ProviderBuildError) as captured:
+        await module.build_experiment_provider(
+            config=config,
+            inherited=inherited,
+            group="G1",
+            prompt="test prompt",
+            dry_run=False,
+            enable_proposer_tools=False,
+            ensemble_proposer_timeout=None,
+            ensemble_aggregator_timeout=None,
+            experiment_config=experiment,
+            g1_registry_contract=contract,
+            generation_policy={},
+        )
+
+    assert analyzer_calls == 1
+    error = captured.value
+    assert str(error) == (
+        "provider_build_failed_after_setup:RuntimeError"
+    )
+    assert private_detail not in str(error)
+    expected_count = (
+        3 if failure_mode != "trace" else 1
+    )
+    assert len(error.setup_usage) == expected_count
+    assert [usage["attempt"] for usage in error.setup_usage] == list(
+        range(1, expected_count + 1)
+    )
+    assert {
+        usage["physical_attempt_id"]
+        for usage in error.setup_usage
+    } == {
+        str(ordinal) * 32
+        for ordinal in range(1, expected_count + 1)
+    }
+    assert all(
+        usage["role"] == "task_analyzer"
+        and usage["request_count"] == 1
+        and usage["requested_provider"] == "openrouter"
+        and usage["requested_model"]
+        == "anthropic/claude-opus-4.8"
+        for usage in error.setup_usage
+    )
+    assert error.routing_trace["task_analyzer"]["source"] == (
+        "analyzer_postprocess_failed"
+    )
+    assert private_detail not in json.dumps(error.routing_trace)
 
 
 @pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
@@ -1360,6 +4805,83 @@ def _ensemble_member(module, model: str, *, thinking: str = "low"):
         max_tokens=1024,
         thinking=thinking,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+async def test_g1_dry_build_uses_final_generation_policy_for_request_contract(
+    module,
+) -> None:
+    experiment = _experiment_with_current_g1_contract(
+        module,
+        thinking_assignment_enabled=True,
+    )
+    config = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "deepseek/deepseek-v4-pro",
+            "api_key": "fake",
+            "max_tokens": 4_096,
+            "temperature": 0.7,
+        },
+        llm_ensemble={
+            "enabled": True,
+            "selection_mode": "router_dynamic",
+            "ranking_thinking_assignment_enabled": True,
+        },
+    )
+    inherited = ProviderConfig(
+        provider="openrouter",
+        model="deepseek/deepseek-v4-pro",
+        api_key="fake",
+    )
+    contract = _resolved_g1_registry_contract(module, experiment, config)
+    generation_policy = {
+        "temperature": None,
+        "max_tokens": 16_384,
+        "max_tokens_overridden": True,
+    }
+
+    build = await module.build_experiment_provider(
+        config=config,
+        inherited=inherited,
+        group="G1",
+        prompt="test prompt",
+        dry_run=True,
+        enable_proposer_tools=False,
+        ensemble_proposer_timeout=None,
+        ensemble_aggregator_timeout=None,
+        experiment_config=experiment,
+        g1_registry_contract=contract,
+        generation_policy=generation_policy,
+    )
+
+    plan = build.routing_trace["selection_plan"]
+    assert plan["request_context"]["routing_budget"]["aggregator_output_tokens"] == 16_384
+    model_facts = next(
+        row["registry_facts"]
+        for row in plan["registry_snapshot"]["models"]
+        if row["registry_facts"]["model_id"] == "deepseek/deepseek-v4-pro"
+    )
+    assert model_facts["runtime_temperature_parameter_required"] is False
+
+
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+def test_empty_generation_policy_preserves_configured_temperature(module) -> None:
+    config = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "deepseek/deepseek-v4-pro",
+            "api_key": "fake",
+            "max_tokens": 4_096,
+            "temperature": 0.7,
+        }
+    )
+
+    assert module.resolve_effective_generation_request_parameters(
+        llm_config=config.llm,
+        generation_policy={},
+    ) == (4_096, 0.7)
 
 
 @pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
@@ -2643,6 +6165,32 @@ def test_run_result_summary_honors_explicit_physical_request_count(
 
 
 @pytest.mark.parametrize("module", [runner, _load_resume_runner()], ids=["main", "resume"])
+def test_run_result_summary_keeps_ensemble_trace_managed_only(module) -> None:
+    trace = {"llm_request_count": 1, "physical_request_count": 1}
+    unmanaged = module.RunResult(
+        final_text="answer",
+        done=DoneEvent(ensemble_trace=deepcopy(trace)),
+        routing_trace={
+            "selection_plan": {
+                "ranking_thinking_assignment_enabled": False,
+            }
+        },
+    )
+    managed = module.RunResult(
+        final_text="answer",
+        done=DoneEvent(ensemble_trace=deepcopy(trace)),
+        routing_trace={
+            "selection_plan": {
+                "ranking_thinking_assignment_enabled": True,
+            }
+        },
+    )
+
+    assert "ensemble_trace" not in module.run_result_summary(unmanaged)
+    assert module.run_result_summary(managed)["ensemble_trace"] == trace
+
+
+@pytest.mark.parametrize("module", [runner, _load_resume_runner()], ids=["main", "resume"])
 def test_no_done_paid_setup_unknown_usage_is_counted(module) -> None:
     physical_attempt_id = "a" * 32
     unknown_analyzer = {
@@ -2896,6 +6444,40 @@ async def test_collect_run_preserves_partial_receipts_from_terminal_error() -> N
     assert accounting["exact_request_count"] == 1
     assert accounting["unknown_request_count"] == 1
     assert accounting["recorded_cost_usd"] == pytest.approx(0.05)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "module",
+    [runner, resume_runner],
+    ids=["main", "resume"],
+)
+async def test_collect_run_persists_only_stable_exception_type(module) -> None:
+    private_detail = (
+        "private prompt api_key=secret-value "
+        "Bearer private-upstream-token"
+    )
+
+    class ExplodingProvider:
+        def chat(self, *_args, **_kwargs):
+            async def events():
+                if False:
+                    yield None
+                raise RuntimeError(private_detail)
+
+            return events()
+
+    result = await module.collect_run(
+        ExplodingProvider(),
+        "prompt",
+        timeout=1.0,
+    )
+    summary = module.run_result_summary(result)
+
+    assert result.error == "RuntimeError"
+    assert summary["error"] == "RuntimeError"
+    assert summary["trace_events"][-1]["error"] == "RuntimeError"
+    assert private_detail not in json.dumps(summary)
 
 
 @pytest.mark.asyncio
@@ -4552,6 +8134,7 @@ def test_main_and_resume_share_identical_critical_runtime_functions() -> None:
         "admissible_empty_nonterminal_fallback_reasons",
         "agent_call_output_sequence_reasons",
         "ensemble_generation_retry_reason",
+        "deterministic_reasoning_only_length_failures",
         "provider_done_from_agent_done",
         "backfill_result_requested_identity",
         "collect_generation_with_retries",
@@ -4569,6 +8152,7 @@ def test_main_and_resume_share_identical_critical_runtime_functions() -> None:
         "enforce_draco_legal_proposer_quorum",
         "enforce_formal_draco_runtime_config",
         "canonical_json_sha256",
+        "g1_immutable_selection_plan_payload",
         "gateway_execution_contract",
         "validate_strict_openrouter_non_byok_environment",
         "resolved_llm_runtime_contract",
@@ -5786,6 +9370,141 @@ def test_resume_generation_attempt_budget_is_cumulative() -> None:
     assert resume_runner.remaining_generation_attempts(8, 3) == 0
 
 
+def test_resume_paid_adaptive_g1_requires_frozen_lifecycle_reconstruction() -> None:
+    enabled_contract = {
+        "gateway_execution": {
+            "llm_ensemble": {
+                "ranking_thinking_assignment_enabled": True,
+            }
+        }
+    }
+    adaptive_state = {
+        "action": "regenerate",
+        "row": {
+            "execution": {
+                "generation_attempts": [
+                    {
+                        "attempt_id": "a" * 32,
+                        "attempt": 1,
+                        "selection_plan": {
+                            "decision_id": "frozen-decision",
+                            "ranking_thinking_assignment_enabled": True,
+                        },
+                        "excluded_proposer_identities": [],
+                        "deterministic_proposer_failures": [],
+                        "run": {"llm_request_count": 1},
+                    }
+                ]
+            }
+        },
+    }
+
+    assert resume_runner.g1_cross_wave_lifecycle_requires_reconstruction(
+        group="G1",
+        prior_attempts_used=1,
+        state=adaptive_state,
+        current_run_compatibility_contract=enabled_contract,
+    )
+    assert not resume_runner.g1_cross_wave_lifecycle_requires_reconstruction(
+        group="G1",
+        prior_attempts_used=0,
+        state=adaptive_state,
+        current_run_compatibility_contract=enabled_contract,
+    )
+    assert not resume_runner.g1_cross_wave_lifecycle_requires_reconstruction(
+        group="B1",
+        prior_attempts_used=1,
+        state=adaptive_state,
+        current_run_compatibility_contract=enabled_contract,
+    )
+    legacy_state = deepcopy(adaptive_state)
+    legacy_attempt = legacy_state["row"]["execution"]["generation_attempts"][0]
+    for field in (
+        "selection_plan",
+        "excluded_proposer_identities",
+        "deterministic_proposer_failures",
+    ):
+        legacy_attempt.pop(field)
+    assert not resume_runner.g1_cross_wave_lifecycle_requires_reconstruction(
+        group="G1",
+        prior_attempts_used=1,
+        state=legacy_state,
+        current_run_compatibility_contract=enabled_contract,
+    )
+
+    paid_setup_failure = deepcopy(legacy_state)
+    failed_attempt = paid_setup_failure["row"]["execution"][
+        "generation_attempts"
+    ][0]
+    failed_attempt["attempt_kind"] = "provider_build_after_paid_setup"
+    failed_attempt["run"] = {
+        "llm_request_count": 1,
+        "setup_usage": [
+            {
+                "role": "task_analyzer",
+                "provider": "openrouter",
+                "model": "anthropic/claude-opus-4.8",
+                "request_count": 1,
+            }
+        ],
+    }
+    assert resume_runner.g1_cross_wave_lifecycle_requires_reconstruction(
+        group="G1",
+        prior_attempts_used=1,
+        state=paid_setup_failure,
+        current_run_compatibility_contract=enabled_contract,
+    )
+
+
+@pytest.mark.parametrize(
+    "ensemble_contract",
+    [
+        {},
+        {"ranking_thinking_assignment_enabled": False},
+    ],
+    ids=["switch-missing", "switch-false"],
+)
+def test_resume_g1_frozen_lifecycle_default_off_preserves_legacy_analyzer_path(
+    ensemble_contract: dict[str, object],
+) -> None:
+    state = {
+        "action": "regenerate",
+        "row": {
+            "execution": {
+                "generation_attempts": [
+                    {
+                        "attempt_id": "a" * 32,
+                        "attempt": 1,
+                        "run": {
+                            "llm_request_count": 2,
+                            "usage": {
+                                "model_usage_breakdown": [
+                                    {
+                                        "role": "task_analyzer",
+                                        "provider": "openrouter",
+                                        "requested_provider": "openrouter",
+                                        "model": "anthropic/claude-opus-4.8",
+                                        "requested_model": "anthropic/claude-opus-4.8",
+                                    }
+                                ]
+                            },
+                        },
+                    }
+                ]
+            }
+        },
+    }
+
+    assert not resume_runner.g1_cross_wave_lifecycle_requires_reconstruction(
+        group="G1",
+        prior_attempts_used=1,
+        state=state,
+        current_run_compatibility_contract={
+            "gateway_execution": {"llm_ensemble": ensemble_contract}
+        },
+    )
+
+
 def test_resume_generation_attempt_budget_is_cumulative_across_jsonl_waves(
     tmp_path: Path,
 ) -> None:
@@ -5911,6 +9630,1471 @@ def _strict_attempt_resume_row(
     }
 
 
+def _enabled_g1_frozen_lifecycle_contract() -> dict[str, object]:
+    return {
+        "gateway_execution": {
+            "llm_ensemble": {
+                "ranking_thinking_assignment_enabled": True,
+            }
+        },
+        "g1_registry_contract": {},
+    }
+
+
+def test_resume_blocks_automatic_resend_after_paid_postprocessing_failure() -> None:
+    reason = (
+        "generation_postprocessing_failed:"
+        "run_result_summary:RuntimeError"
+    )
+    row = _strict_attempt_resume_row(
+        attempt_id="1" * 32,
+        cumulative_budget=1,
+        generation_completed_at=1.0,
+    )
+    row.update(
+        {
+            "error": reason,
+            "selected_generation_succeeded": False,
+        }
+    )
+    attempt = row["execution"]["generation_attempts"][0]
+    attempt.update(
+        {
+            "retryable": False,
+            "retry_reason": reason,
+            "retry_suppressed_reason": reason,
+            "will_retry": False,
+            "generation_postprocessing_failure": {
+                "stage": "run_result_summary",
+                "exception_type": "RuntimeError",
+            },
+        }
+    )
+    attempt["run"].update(
+        {
+            "error": reason,
+            "llm_request_count": 1,
+            "generation_postprocessing_failure": {
+                "stage": "run_result_summary",
+                "exception_type": "RuntimeError",
+            },
+        }
+    )
+    row = resume_runner.seal_result_row(row)
+
+    state = resume_runner.resume_row_completion_state(
+        row,
+        expected_prompt_sha256=resume_runner.text_sha256(
+            "same prompt"
+        ),
+        expected_task_input_sha256="sha256:task-input",
+        expected_run_compatibility_fingerprint=(
+            "sha256:run-contract"
+        ),
+        judge_required=False,
+    )
+
+    assert state["action"] == "regenerate"
+    assert state["generation_auto_retry_blocked"] is True
+    assert state["generation_postprocessing_terminal"] == {
+        "schema": (
+            "opensquilla.draco."
+            "generation-postprocessing-terminal/v1"
+        ),
+        "reason": reason,
+        "stage": "run_result_summary",
+        "exception_type": "RuntimeError",
+        "attempt_id": "1" * 32,
+        "attempt": 1,
+        "llm_request_count": 1,
+        "automatic_generation_retry_allowed": False,
+    }
+
+    tree = ast.parse(inspect.getsource(resume_runner.amain))
+    guarded = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef)
+        and node.name == "_guarded"
+    )
+    terminal_branch = next(
+        node
+        for node in ast.walk(guarded)
+        if isinstance(node, ast.If)
+        and "generation_auto_retry_blocked" in ast.unparse(node.test)
+    )
+    terminal_return = next(
+        node
+        for node in ast.walk(terminal_branch)
+        if isinstance(node, ast.Return)
+    )
+    model_call = next(
+        node
+        for node in ast.walk(guarded)
+        if isinstance(node, ast.Await)
+        and "run_one" in ast.unparse(node)
+    )
+    assert terminal_return.lineno < model_call.lineno
+
+
+def _task_analyzer_unit(
+    *,
+    attempt: int = 1,
+    physical_attempt_id: str = "a" * 32,
+) -> dict[str, object]:
+    return {
+        "role": "task_analyzer",
+        "attempt": attempt,
+        "physical_attempt_id": physical_attempt_id,
+        "provider": "openrouter",
+        "requested_provider": "openrouter",
+        "model": "anthropic/claude-opus-4.8",
+        "requested_model": "anthropic/claude-opus-4.8",
+        "input_tokens": 10,
+        "output_tokens": 2,
+        "reasoning_tokens": 0,
+        "cached_tokens": 0,
+        "cache_write_tokens": 0,
+        "billed_cost": 0.01,
+        "cost_source": "provider_billed",
+        "request_count": 1,
+        "provider_usage": {
+            "physical_attempt_id": physical_attempt_id,
+        },
+    }
+
+
+def _unknown_task_analyzer_unit(
+    *,
+    attempt: int,
+    physical_attempt_id: str,
+) -> dict[str, object]:
+    return {
+        "role": "unknown_request",
+        "label": "task_analyzer",
+        "attempt": attempt,
+        "physical_attempt_id": physical_attempt_id,
+        "provider": "",
+        "requested_provider": "openrouter",
+        "model": "",
+        "requested_model": "anthropic/claude-opus-4.8",
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_tokens": 0,
+        "cached_tokens": 0,
+        "cache_write_tokens": 0,
+        "billed_cost": 0.0,
+        "cost_source": "none",
+        "request_count": 1,
+        "provider_usage": {
+            "usage_unknown": True,
+            "physical_attempt_id": physical_attempt_id,
+        },
+    }
+
+
+def _frozen_g1_plan(
+    *,
+    decision_id: str,
+    proposers: list[str],
+) -> dict[str, object]:
+    plan = _with_g1_task_analysis_invariants(
+        {
+            "decision_id": decision_id,
+            "selected_P": proposers,
+            "proposer_models": [
+                identity.partition(":")[2] for identity in proposers
+            ],
+            "proposer_sample_count": len(proposers),
+        }
+    )
+    plan["ranking_parameters"] = {
+        "task_analyzer": {"max_retries": 2},
+    }
+    return plan
+
+
+def _frozen_g1_failure_run(
+    module,
+    *,
+    plan: dict[str, object],
+    failed_identity: str | None,
+    analyzer_units: list[dict[str, object]] | None = None,
+) -> tuple[dict[str, object], list[dict[str, object]]]:
+    candidates: list[dict[str, object]] = []
+    if failed_identity is not None:
+        provider, _, model = failed_identity.partition(":")
+        candidates.append(
+            {
+                "index": 0,
+                "provider": provider,
+                "requested_provider": provider,
+                "model": model,
+                "requested_model": model,
+                "ok": False,
+                "request_started": True,
+                "physical_request_count": 1,
+                "stop_reason": "length",
+                "reasoning_tokens": 8_192,
+                "output_tokens": 8_192,
+                "effective_thinking_level": "high",
+                "provider_thinking_level": "high",
+                "execution": _test_proposer_execution(
+                    failed_identity
+                ),
+                "content": {"text": "", "chars": 0},
+            }
+        )
+    trace = {
+        "selection_plan": deepcopy(plan),
+        "candidates": candidates,
+    }
+    units = deepcopy(analyzer_units or [])
+    run = {
+        "llm_request_count": 1 + len(units),
+        "usage": {"model_usage_breakdown": deepcopy(units)},
+        "setup_usage": deepcopy(units),
+        "routing_trace": {"selection_plan": deepcopy(plan)},
+        "ensemble_trace": trace,
+        "error": "generation_failed",
+    }
+    return run, module._g1_reasoning_only_length_failures(run)
+
+
+def _frozen_g1_failure_result(
+    module,
+    *,
+    plan: dict[str, object],
+    failed_identity: str,
+):
+    provider, _, model = failed_identity.partition(":")
+    trace = {
+        "selection_plan": deepcopy(plan),
+        "candidates": [
+            {
+                "index": 0,
+                "provider": provider,
+                "requested_provider": provider,
+                "model": model,
+                "requested_model": model,
+                "ok": False,
+                "request_started": True,
+                "physical_request_count": 1,
+                "stop_reason": "length",
+                "reasoning_tokens": 8_192,
+                "output_tokens": 8_192,
+                "effective_thinking_level": "high",
+                "provider_thinking_level": "high",
+                "execution": _test_proposer_execution(failed_identity),
+                "content": {"text": "", "chars": 0},
+            }
+        ],
+    }
+    return module.RunResult(
+        final_text="",
+        done=DoneEvent(ensemble_trace=trace),
+        error="ensemble_insufficient_proposers",
+        routing_trace={"selection_plan": deepcopy(plan)},
+    )
+
+
+@pytest.mark.asyncio
+async def test_resume_frozen_g1_b_to_c_retry_uses_original_a_parent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failed_a = "openrouter:model-a"
+    failed_b = "openrouter:model-b"
+    plan_a = _frozen_g1_plan(
+        decision_id="decision-a",
+        proposers=[failed_a, failed_b, "openrouter:model-c"],
+    )
+    plan_b = _bind_g1_retry_plan(
+        plan_a,
+        _frozen_g1_plan(
+            decision_id="decision-b",
+            proposers=[failed_b, "openrouter:model-c", "openrouter:model-d"],
+        ),
+        exclusions=[failed_a],
+    )
+    plan_c = _bind_g1_retry_plan(
+        plan_a,
+        _frozen_g1_plan(
+            decision_id="decision-c",
+            proposers=[
+                "openrouter:model-c",
+                "openrouter:model-d",
+                "openrouter:model-e",
+            ],
+        ),
+        exclusions=[failed_a, failed_b],
+    )
+
+    class Provider:
+        def __init__(self, plan: dict[str, object]) -> None:
+            self.selection_plan = plan
+            self.min_successful_proposers = 2
+
+    resumed_b = Provider(plan_b)
+    retry_c = Provider(plan_c)
+    resumed_b._draco_g1_initial_selection_plan = deepcopy(plan_a)
+    resumed_b._draco_prior_excluded_proposer_identities = [failed_a]
+    rebuild_calls: list[list[str]] = []
+
+    def rebuild(exclusions: list[str]):
+        rebuild_calls.append(exclusions)
+        return retry_c
+
+    resumed_b._draco_reasoning_only_retry_factory = rebuild
+    results = iter(
+        [
+            _frozen_g1_failure_result(
+                resume_runner,
+                plan=plan_b,
+                failed_identity=failed_b,
+            ),
+            resume_runner.RunResult(
+                final_text="accepted",
+                done=DoneEvent(
+                    ensemble_trace={
+                        "selection_plan": deepcopy(plan_c),
+                        "candidates": [],
+                    }
+                ),
+                routing_trace={"selection_plan": deepcopy(plan_c)},
+            ),
+        ]
+    )
+    paid_providers: list[object] = []
+
+    async def fake_collect_run(active_provider, *_args, **_kwargs):
+        paid_providers.append(active_provider)
+        return next(results)
+
+    monkeypatch.setattr(resume_runner, "collect_run", fake_collect_run)
+    monkeypatch.setattr(
+        resume_runner,
+        "generation_retry_reason",
+        lambda result, **_kwargs: (
+            "ensemble_insufficient_proposers"
+            if not result.final_text
+            else ""
+        ),
+    )
+
+    result, attempts, selected_attempt = (
+        await resume_runner.collect_generation_with_retries(
+            resumed_b,
+            "prompt",
+            timeout=30,
+            group="G1",
+            max_attempts=2,
+            attempt_offset=1,
+        )
+    )
+
+    assert result.final_text == "accepted"
+    assert selected_attempt == 3
+    assert paid_providers == [resumed_b, retry_c]
+    assert rebuild_calls == [[failed_a, failed_b]]
+    assert attempts[0]["selection_plan"] == plan_b
+    assert attempts[0]["retry_selection_plan"] == plan_c
+    assert attempts[1]["selection_plan"] == plan_c
+    assert attempts[1]["excluded_proposer_identities"] == [
+        failed_a,
+        failed_b,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_resume_frozen_g1_wave_boundary_seals_pending_retry_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failed_a = "openrouter:model-a"
+    failed_b = "openrouter:model-b"
+    plan_a = _frozen_g1_plan(
+        decision_id="decision-a",
+        proposers=[failed_a, failed_b, "openrouter:model-c"],
+    )
+    plan_b = _bind_g1_retry_plan(
+        plan_a,
+        _frozen_g1_plan(
+            decision_id="decision-b",
+            proposers=[failed_b, "openrouter:model-c", "openrouter:model-d"],
+        ),
+        exclusions=[failed_a],
+    )
+    plan_c = _bind_g1_retry_plan(
+        plan_a,
+        _frozen_g1_plan(
+            decision_id="decision-c",
+            proposers=[
+                "openrouter:model-c",
+                "openrouter:model-d",
+                "openrouter:model-e",
+            ],
+        ),
+        exclusions=[failed_a, failed_b],
+    )
+
+    class Provider:
+        def __init__(self, plan: dict[str, object]) -> None:
+            self.selection_plan = plan
+            self.min_successful_proposers = 2
+
+    resumed_b = Provider(plan_b)
+    resumed_b._draco_g1_initial_selection_plan = deepcopy(plan_a)
+    resumed_b._draco_prior_excluded_proposer_identities = [failed_a]
+    resumed_b._draco_reasoning_only_retry_factory = (
+        lambda exclusions: (
+            Provider(plan_c)
+            if exclusions == [failed_a, failed_b]
+            else (_ for _ in ()).throw(AssertionError(exclusions))
+        )
+    )
+    paid_calls = 0
+
+    async def fake_collect_run(*_args, **_kwargs):
+        nonlocal paid_calls
+        paid_calls += 1
+        return _frozen_g1_failure_result(
+            resume_runner,
+            plan=plan_b,
+            failed_identity=failed_b,
+        )
+
+    monkeypatch.setattr(resume_runner, "collect_run", fake_collect_run)
+    monkeypatch.setattr(
+        resume_runner,
+        "generation_retry_reason",
+        lambda *_args, **_kwargs: "ensemble_insufficient_proposers",
+    )
+
+    _, attempts, selected_attempt = (
+        await resume_runner.collect_generation_with_retries(
+            resumed_b,
+            "prompt",
+            timeout=30,
+            group="G1",
+            max_attempts=1,
+            attempt_offset=1,
+        )
+    )
+
+    assert paid_calls == 1
+    assert selected_attempt == 0
+    assert len(attempts) == 1
+    assert attempts[0]["attempt"] == 2
+    assert attempts[0]["will_retry"] is False
+    assert attempts[0]["retry_deferred_to_next_wave"] is True
+    assert attempts[0]["retry_selection_plan"] == plan_c
+    assert attempts[0]["retry_excluded_proposer_identities"] == [
+        failed_a,
+        failed_b,
+    ]
+
+
+def test_resume_restores_only_validated_physical_thinking_prefix() -> None:
+    identity = "openrouter:model-a"
+    target_plan = _frozen_g1_plan(
+        decision_id="decision-a",
+        proposers=[
+            identity,
+            "openrouter:model-b",
+            "openrouter:model-c",
+        ],
+    )
+    target_detail = next(
+        row
+        for row in target_plan["thinking_assignment_details"]["proposers"]
+        if row["identity"] == identity
+    )
+    target_detail["provider_rejection_fallbacks"] = [
+        {
+            "unified_level": "medium",
+            "provider_level": "medium",
+            "reason": "provider_rejection_fallback",
+        },
+        {
+            "unified_level": "low",
+            "provider_level": "low",
+            "reason": "provider_rejection_fallback",
+        },
+    ]
+    frozen_row = {
+        "trigger_stage": "proposer_execution",
+        "fallback_type": "thinking_level_neighbor",
+        "reason": "provider_rejected_thinking_level",
+        "identity": identity,
+        "requested_thinking_level": "high",
+        "rejected_unified_level": "high",
+        "rejected_provider_level": "high",
+        "effective_thinking_level": "medium",
+        "effective_provider_level": "medium",
+        "thinking_policy_version": "test-thinking-policy/v1",
+        "fallback_result": "failed",
+    }
+    physical_prefix = deepcopy(target_plan)
+    physical_prefix["executed_thinking_assignment"]["proposers"][
+        identity
+    ] = "medium"
+    physical_prefix["thinking_execution_fallbacks"] = [deepcopy(frozen_row)]
+    assert (
+        resume_runner.g1_execution_plan_mutation_reason(
+            target_plan,
+            physical_prefix,
+        )
+        == ""
+    )
+
+    class Config:
+        provider = "openrouter"
+        model = "model-a"
+
+    class Member:
+        provider_config = Config()
+        requested_thinking_level = "high"
+        effective_thinking_level = "high"
+        thinking = "high"
+
+    class Provider:
+        def __init__(self) -> None:
+            self.selection_plan = deepcopy(target_plan)
+            self.proposers = [Member()]
+            self.aggregator = None
+            self.aggregator_fallbacks = []
+
+        def selection_plan_execution_snapshot(self):
+            return deepcopy(self.selection_plan)
+
+        def _record_thinking_fallback(
+            self,
+            *,
+            member,
+            role,
+            rejected_unified_level,
+            rejected_provider_level,
+            effective_unified_level,
+            effective_provider_level,
+            fallback_result,
+            reason,
+        ):
+            row = {
+                "trigger_stage": f"{role}_execution",
+                "fallback_type": "thinking_level_neighbor",
+                "reason": reason,
+                "identity": (
+                    f"{member.provider_config.provider}:"
+                    f"{member.provider_config.model}"
+                ),
+                "requested_thinking_level": (
+                    member.requested_thinking_level
+                ),
+                "rejected_unified_level": rejected_unified_level,
+                "rejected_provider_level": rejected_provider_level,
+                "effective_thinking_level": effective_unified_level,
+                "effective_provider_level": effective_provider_level,
+                "thinking_policy_version": (
+                    self.selection_plan["executed_thinking_assignment"][
+                        "thinking_policy_version"
+                    ]
+                ),
+                "fallback_result": fallback_result,
+            }
+            member.effective_thinking_level = effective_unified_level
+            member.thinking = effective_provider_level
+            self.selection_plan["executed_thinking_assignment"][
+                "proposers"
+            ][row["identity"]] = effective_unified_level
+            self.selection_plan.setdefault(
+                "thinking_execution_fallbacks",
+                [],
+            ).append(row)
+            return deepcopy(row)
+
+    provider = Provider()
+    resume_runner.restore_g1_thinking_execution_prefix(
+        provider,
+        target_plan=target_plan,
+        physical_execution_prefix=physical_prefix,
+    )
+
+    assert provider.selection_plan_execution_snapshot() == physical_prefix
+    tampered_prefix = deepcopy(physical_prefix)
+    tampered_prefix["selected_A"] = "openrouter:tampered"
+    with pytest.raises(
+        ValueError,
+        match="thinking execution prefix is incompatible",
+    ):
+        resume_runner.restore_g1_thinking_execution_prefix(
+            Provider(),
+            target_plan=target_plan,
+            physical_execution_prefix=tampered_prefix,
+        )
+
+
+@pytest.mark.asyncio
+async def test_resume_frozen_g1_provider_build_does_not_repeat_analyzer_or_cost(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from opensquilla.provider.ranking_router import (
+        TaskAnalysisResult,
+        fallback_task_profile,
+    )
+
+    experiment = _experiment_with_current_g1_contract(
+        resume_runner,
+        thinking_assignment_enabled=True,
+    )
+    config = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "deepseek/deepseek-v4-pro",
+            "api_key": "fake",
+        },
+        llm_ensemble={
+            "enabled": True,
+            "selection_mode": "router_dynamic",
+            "ranking_thinking_assignment_enabled": True,
+        },
+    )
+    inherited = ProviderConfig(
+        provider="openrouter",
+        model="deepseek/deepseek-v4-pro",
+        api_key="fake",
+    )
+    contract = _resolved_g1_registry_contract(
+        resume_runner,
+        experiment,
+        config,
+    )
+    analyzer_calls = 0
+
+    async def fake_run_pipeline(turn, _steps):
+        turn.model = inherited.model
+        turn.metadata.update(
+            {
+                "routed_tier": "c1",
+                "routing_confidence": 0.9,
+                "routing_source": "test",
+                "routing_applied": False,
+            }
+        )
+        return turn
+
+    async def fake_analyze_task_with_provider(**kwargs):
+        nonlocal analyzer_calls
+        analyzer_calls += 1
+        return TaskAnalysisResult(
+            profile=fallback_task_profile(
+                routed_tier=kwargs["routed_tier"],
+                request_context=kwargs["request_context"],
+                ranking_config=kwargs["ranking_config"],
+            ),
+            source="test_analyzer",
+            schema_valid=True,
+            confidence=0.9,
+            usage={
+                "provider": kwargs["analyzer_provider_id"],
+                "model": kwargs["analyzer_model_id"],
+                "requested_provider": kwargs["analyzer_provider_id"],
+                "requested_model": kwargs["analyzer_model_id"],
+                "input_tokens": 5,
+                "output_tokens": 2,
+                "attempt_count": 1,
+            },
+        )
+
+    monkeypatch.setattr(
+        resume_runner,
+        "run_pipeline",
+        fake_run_pipeline,
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ranking_router.analyze_task_with_provider",
+        fake_analyze_task_with_provider,
+    )
+    monkeypatch.setenv("OPENSQUILLA_PROVIDER_ROUTING_STRICT", "1")
+    monkeypatch.setenv("OPENSQUILLA_OPENROUTER_REQUIRE_PARAMETERS", "1")
+
+    first = await resume_runner.build_experiment_provider(
+        config=config,
+        inherited=inherited,
+        group="G1",
+        prompt="test prompt",
+        dry_run=False,
+        enable_proposer_tools=False,
+        ensemble_proposer_timeout=None,
+        ensemble_aggregator_timeout=None,
+        experiment_config=experiment,
+        g1_registry_contract=contract,
+        generation_policy=None,
+    )
+    initial_plan = deepcopy(first.provider.selection_plan)
+    from opensquilla.provider.thinking_execution import (
+        project_thinking_execution_history,
+    )
+
+    target_execution_prefix, projection_audit, projection_reason = (
+        project_thinking_execution_history([], initial_plan)
+    )
+    assert projection_reason == ""
+    lifecycle = {
+        "schema": (
+            resume_runner.G1_CROSS_WAVE_FROZEN_LIFECYCLE_SCHEMA
+        ),
+        "initial_plan": deepcopy(initial_plan),
+        "target_plan": deepcopy(initial_plan),
+        "cumulative_excluded_proposer_identities": [],
+        "target_execution_prefix": target_execution_prefix,
+        "thinking_execution_projection": projection_audit,
+        "thinking_execution_history": [],
+        "task_analyzer_physical_request_count": 1,
+    }
+
+    resumed = await resume_runner.build_experiment_provider(
+        config=config,
+        inherited=inherited,
+        group="G1",
+        prompt="test prompt",
+        dry_run=False,
+        enable_proposer_tools=False,
+        ensemble_proposer_timeout=None,
+        ensemble_aggregator_timeout=None,
+        experiment_config=experiment,
+        g1_registry_contract=contract,
+        generation_policy=None,
+        frozen_g1_lifecycle=lifecycle,
+    )
+
+    assert analyzer_calls == 1
+    assert resumed.setup_usage == []
+    assert resume_runner.consume_provider_setup(resumed.provider)[
+        "usage"
+    ] == []
+    assert (
+        resumed.provider._draco_g1_initial_selection_plan
+        == initial_plan
+    )
+    assert (
+        resumed.routing_trace["task_analyzer_reuse"][
+            "physical_request_count"
+        ]
+        == 0
+    )
+    assert (
+        resumed.routing_trace["task_analyzer_reuse"][
+            "historical_physical_request_count"
+        ]
+        == 1
+    )
+
+    drifted_lifecycle = deepcopy(lifecycle)
+    drifted_lifecycle["initial_plan"]["ranking_parameters"][
+        "trace"
+    ]["profile_decimal_places"] += 1
+    drifted_lifecycle["target_plan"] = deepcopy(
+        drifted_lifecycle["initial_plan"]
+    )
+    with pytest.raises(
+        ValueError,
+        match="ranker evidence differs from the current registry/config",
+    ):
+        await resume_runner.build_experiment_provider(
+            config=config,
+            inherited=inherited,
+            group="G1",
+            prompt="test prompt",
+            dry_run=False,
+            enable_proposer_tools=False,
+            ensemble_proposer_timeout=None,
+            ensemble_aggregator_timeout=None,
+            experiment_config=experiment,
+            g1_registry_contract=contract,
+            generation_policy=None,
+            frozen_g1_lifecycle=drifted_lifecycle,
+        )
+    assert analyzer_calls == 1
+
+    analyzer_usage = deepcopy(first.setup_usage)
+    selected_member = first.provider.proposers[0]
+    selected_provider = selected_member.provider_config.provider
+    selected_model = selected_member.provider_config.model
+    selected_identity = f"{selected_provider}:{selected_model}"
+    selected_level = selected_member.effective_thinking_level or "off"
+    selected_provider_level = selected_member.thinking or "off"
+    generation_usage = {
+        "role": "proposer",
+        "provider": selected_provider,
+        "requested_provider": selected_provider,
+        "model": selected_model,
+        "requested_model": selected_model,
+        "physical_attempt_id": "f" * 32,
+        "request_count": 1,
+        "input_tokens": 1,
+        "output_tokens": 1,
+        "cost_source": "none",
+        "provider_usage": {
+            "physical_attempt_id": "f" * 32,
+        },
+    }
+    proposer_execution = {
+        "role": "proposer",
+        "requested_provider": selected_provider,
+        "provider": selected_provider,
+        "requested_model": selected_model,
+        "model": selected_model,
+        "assigned_thinking_level": selected_level,
+        "effective_thinking_level": selected_level,
+        "provider_thinking_level": selected_provider_level,
+        "thinking_override": selected_provider_level,
+        "effective_thinking": (
+            selected_provider_level not in {"off", "none", "false"}
+        ),
+        "effective_provider_thinking_level": selected_provider_level,
+        "thinking_policy_managed": True,
+        "thinking_fallback_attempts": [],
+        "physical_attempts": [
+            {
+                "attempt": 1,
+                "physical_attempt_id": "f" * 32,
+                "identity": selected_identity,
+                "request_started": True,
+                "outcome": "succeeded",
+                "effective_thinking_level": selected_level,
+                "provider_thinking_level": selected_provider_level,
+            }
+        ],
+        "thinking_fallback_bindings": [],
+    }
+    historical_attempt = {
+        "attempt_id": "1" * 32,
+        "attempt_kind": "generation",
+        "attempt": 1,
+        "selection_plan": deepcopy(initial_plan),
+        "excluded_proposer_identities": [],
+        "deterministic_proposer_failures": [],
+        "will_retry": False,
+        "run": {
+            "llm_request_count": len(analyzer_usage) + 1,
+            "setup_usage": deepcopy(analyzer_usage),
+            "usage": {
+                "model_usage_breakdown": [
+                    *deepcopy(analyzer_usage),
+                    generation_usage,
+                ],
+            },
+            "routing_trace": {
+                "selection_plan": deepcopy(initial_plan),
+            },
+            "ensemble_trace": {
+                "selection_plan": deepcopy(initial_plan),
+                "candidates": [
+                    {
+                        "requested_provider": selected_provider,
+                        "provider": selected_provider,
+                        "requested_model": selected_model,
+                        "model": selected_model,
+                        "request_started": True,
+                        "physical_request_count": 1,
+                        "effective_thinking_level": selected_level,
+                        "provider_thinking_level": (
+                            selected_provider_level
+                        ),
+                        "execution": proposer_execution,
+                    }
+                ],
+                "aggregator_recovery": {
+                    "attempts": [],
+                    "selected_attempt": None,
+                },
+                "llm_request_count": 1,
+                "physical_request_count": 1,
+            },
+        },
+    }
+    compatibility = {
+        **_enabled_g1_frozen_lifecycle_contract(),
+        "g1_registry_contract": deepcopy(contract),
+    }
+    guarded_attempt = deepcopy(historical_attempt)
+    guarded_attempt["attempt_kind"] = (
+        "provider_build_after_paid_setup"
+    )
+    guarded_attempt["run"]["trace_events"] = [
+        {
+            "kind": "error",
+            "code": "g1_pre_call_guard_failed",
+            "request_started": False,
+            "physical_request_count": 0,
+        }
+    ]
+    with pytest.raises(ValueError, match="g1_pre_call_guard_failed"):
+        resume_runner.reconstruct_g1_cross_wave_frozen_lifecycle(
+            attempts=[guarded_attempt],
+            current_run_compatibility_contract=compatibility,
+        )
+    reconstructed = (
+        resume_runner.reconstruct_g1_cross_wave_frozen_lifecycle(
+            attempts=[historical_attempt],
+            current_run_compatibility_contract=compatibility,
+        )
+    )
+    assert reconstructed["target_plan"] == initial_plan
+    mismatched_physical_usage = deepcopy(historical_attempt)
+    mismatched_usage_unit = mismatched_physical_usage["run"][
+        "usage"
+    ]["model_usage_breakdown"][-1]
+    mismatched_usage_unit["physical_attempt_id"] = "9" * 32
+    mismatched_usage_unit["provider_usage"][
+        "physical_attempt_id"
+    ] = "9" * 32
+    with pytest.raises(
+        ValueError,
+        match="g1_thinking_physical_usage_set_mismatch",
+    ):
+        resume_runner.reconstruct_g1_cross_wave_frozen_lifecycle(
+            attempts=[mismatched_physical_usage],
+            current_run_compatibility_contract=compatibility,
+        )
+
+    duplicate_physical_attempt = deepcopy(historical_attempt)
+    duplicate_physical_attempt["attempt_id"] = "2" * 32
+    duplicate_physical_attempt["attempt"] = 2
+    duplicate_physical_attempt["run"]["setup_usage"] = []
+    duplicate_physical_attempt["run"]["usage"][
+        "model_usage_breakdown"
+    ] = [
+        deepcopy(generation_usage)
+    ]
+    duplicate_physical_attempt["run"]["llm_request_count"] = 1
+    with pytest.raises(
+        ValueError,
+        match=(
+            "duplicate_cross_attempt_g1_thinking_"
+            "physical_attempt_id"
+        ),
+    ):
+        resume_runner.reconstruct_g1_cross_wave_frozen_lifecycle(
+            attempts=[
+                historical_attempt,
+                duplicate_physical_attempt,
+            ],
+            current_run_compatibility_contract=compatibility,
+        )
+    drifted_compatibility = deepcopy(compatibility)
+    drifted_compatibility["g1_registry_contract"][
+        "expected_candidate_count"
+    ] += 1
+    with pytest.raises(ValueError, match="invalid cross-Wave frozen G1"):
+        resume_runner.reconstruct_g1_cross_wave_frozen_lifecycle(
+            attempts=[historical_attempt],
+            current_run_compatibility_contract=drifted_compatibility,
+        )
+
+    source_attempt = deepcopy(historical_attempt)
+    source_attempt.update(
+        {
+            "started_at": 1.0,
+            "completed_at": 2.0,
+            "retryable": True,
+            "retry_reason": "provider_error",
+            "retry_suppressed_reason": "",
+            "retry_backoff_s": 0.0,
+        }
+    )
+    prompt_hash = resume_runner.text_sha256("test prompt")
+    source_row = resume_runner.seal_result_row(
+        {
+            "group": "G1",
+            "provider_spec": dict(resume_runner.GROUP_SPECS["G1"]),
+            "routing_trace": {
+                "selection_plan": deepcopy(initial_plan),
+            },
+            "task_id": "task-1",
+            "prompt_sha256": prompt_hash,
+            "task_input_sha256": "sha256:task-input",
+            "run_compatibility_fingerprint": "sha256:run-contract",
+            "error": "provider_error",
+            "final_text": "",
+            "llm_request_count": source_attempt["run"][
+                "llm_request_count"
+            ],
+            "generation_attempt_count": 1,
+            "generation_attempt_evidence_schema": (
+                resume_runner.GENERATION_ATTEMPT_EVIDENCE_SCHEMA
+            ),
+            "generation_attempt_budget_limit": 3,
+            "generation_attempt_budget_used": 1,
+            "generation_completed_at": 2.0,
+            "actual_spend_metrics": {
+                "generation_attempt_count": 1,
+            },
+            "execution": {
+                "generation_attempts": [source_attempt],
+                "prior_generation_attempts_used": 0,
+                "generation_attempt_budget_remaining": 2,
+            },
+            "usage": deepcopy(source_attempt["run"]["usage"]),
+        }
+    )
+    source_path = tmp_path / "g1-wave.jsonl"
+    source_path.write_text(
+        json.dumps(source_row) + "\n",
+        encoding="utf-8",
+    )
+    states, _ = resume_runner.load_resume_group_task_states(
+        resume_paths=[source_path],
+        selected_keys={("G1", "task-1")},
+        prompt_hashes={"task-1": prompt_hash},
+        task_input_hashes={"task-1": "sha256:task-input"},
+        run_compatibility_fingerprints={
+            "G1": "sha256:run-contract",
+        },
+        run_compatibility_contracts={"G1": compatibility},
+    )
+    state = states[("G1", "task-1")]
+    assert state["action"] == "regenerate"
+    attached_lifecycle = state["g1_frozen_resume_lifecycle"]
+    assert attached_lifecycle["target_plan"] == initial_plan
+
+    attached_build = await resume_runner.build_experiment_provider(
+        config=config,
+        inherited=inherited,
+        group="G1",
+        prompt="test prompt",
+        dry_run=False,
+        enable_proposer_tools=False,
+        ensemble_proposer_timeout=None,
+        ensemble_aggregator_timeout=None,
+        experiment_config=experiment,
+        g1_registry_contract=contract,
+        generation_policy=None,
+        frozen_g1_lifecycle=attached_lifecycle,
+    )
+    assert analyzer_calls == 1
+    assert attached_build.setup_usage == []
+    paid_providers: list[object] = []
+
+    async def fake_collect_run(active_provider, *_args, **_kwargs):
+        paid_providers.append(active_provider)
+        active_plan = deepcopy(active_provider.selection_plan)
+        active_trace = deepcopy(
+            historical_attempt["run"]["ensemble_trace"]
+        )
+        active_trace["selection_plan"] = active_plan
+        active_candidate = active_trace["candidates"][0]
+        active_physical_attempt = active_candidate["execution"][
+            "physical_attempts"
+        ][0]
+        active_physical_attempt["physical_attempt_id"] = "e" * 32
+        active_usage = deepcopy(generation_usage)
+        active_usage["physical_attempt_id"] = "e" * 32
+        active_usage["provider_usage"][
+            "physical_attempt_id"
+        ] = "e" * 32
+        return resume_runner.RunResult(
+            final_text="accepted",
+            done=DoneEvent(
+                model_usage_breakdown=[active_usage],
+                ensemble_trace=active_trace,
+            ),
+            routing_trace={"selection_plan": active_plan},
+        )
+
+    monkeypatch.setattr(
+        resume_runner,
+        "collect_run",
+        fake_collect_run,
+    )
+    monkeypatch.setattr(
+        resume_runner,
+        "generation_retry_reason",
+        lambda *_args, **_kwargs: "",
+    )
+    result, attempts, selected_attempt = (
+        await resume_runner.collect_generation_with_retries(
+            attached_build.provider,
+            "test prompt",
+            timeout=30,
+            group="G1",
+            max_attempts=2,
+            attempt_offset=1,
+        )
+    )
+    assert result.final_text == "accepted"
+    assert selected_attempt == 2
+    assert paid_providers == [attached_build.provider]
+    assert attempts[0]["excluded_proposer_identities"] == []
+
+
+def test_resume_reconstructs_frozen_g1_a_to_b_to_c_pending_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failed_a = "openrouter:model-a"
+    failed_b = "openrouter:model-b"
+    plan_a = _frozen_g1_plan(
+        decision_id="decision-a",
+        proposers=[failed_a, failed_b, "openrouter:model-c"],
+    )
+    plan_b = _bind_g1_retry_plan(
+        plan_a,
+        _frozen_g1_plan(
+            decision_id="decision-b",
+            proposers=[failed_b, "openrouter:model-c", "openrouter:model-d"],
+        ),
+        exclusions=[failed_a],
+    )
+    plan_c = _bind_g1_retry_plan(
+        plan_a,
+        _frozen_g1_plan(
+            decision_id="decision-c",
+            proposers=[
+                "openrouter:model-c",
+                "openrouter:model-d",
+                "openrouter:model-e",
+            ],
+        ),
+        exclusions=[failed_a, failed_b],
+    )
+    analyzer = [_task_analyzer_unit()]
+    run_a, failures_a = _frozen_g1_failure_run(
+        resume_runner,
+        plan=plan_a,
+        failed_identity=failed_a,
+        analyzer_units=analyzer,
+    )
+    from opensquilla.provider.thinking_execution import (
+        project_thinking_execution_history,
+    )
+
+    projected_b, projection_audit_b, projection_reason_b = (
+        project_thinking_execution_history([plan_a], plan_b)
+    )
+    assert projection_reason_b == ""
+    plan_b = projected_b
+    run_b, failures_b = _frozen_g1_failure_run(
+        resume_runner,
+        plan=plan_b,
+        failed_identity=failed_b,
+    )
+    projected_c, projection_audit_c, projection_reason_c = (
+        project_thinking_execution_history([plan_a, plan_b], plan_c)
+    )
+    assert projection_reason_c == ""
+    plan_c = projected_c
+    attempts = [
+        {
+            "attempt_id": "1" * 32,
+            "attempt_kind": "generation",
+            "attempt": 1,
+            "selection_plan": plan_a,
+            "excluded_proposer_identities": [],
+            "deterministic_proposer_failures": failures_a,
+            "retry_selection_plan": plan_b,
+            "retry_excluded_proposer_identities": [failed_a],
+            "thinking_execution_projection": projection_audit_b,
+            "will_retry": True,
+            "run": run_a,
+        },
+        {
+            "attempt_id": "2" * 32,
+            "attempt_kind": "generation",
+            "attempt": 2,
+            "selection_plan": plan_b,
+            "excluded_proposer_identities": [failed_a],
+            "deterministic_proposer_failures": failures_b,
+            "retry_selection_plan": plan_c,
+            "retry_excluded_proposer_identities": [failed_a, failed_b],
+            "thinking_execution_projection": projection_audit_c,
+            "will_retry": False,
+            "retry_deferred_to_next_wave": True,
+            "run": run_b,
+        },
+    ]
+    monkeypatch.setattr(
+        resume_runner,
+        "_g1_frozen_lifecycle_plan_reasons",
+        lambda *_args, **_kwargs: [],
+    )
+
+    lifecycle = resume_runner.reconstruct_g1_cross_wave_frozen_lifecycle(
+        attempts=attempts,
+        current_run_compatibility_contract=(
+            _enabled_g1_frozen_lifecycle_contract()
+        ),
+    )
+
+    assert lifecycle["initial_parent_decision_id"] == "decision-a"
+    assert lifecycle["target_plan"] == plan_c
+    assert lifecycle["target_plan_source"] == "pending_retry_selection_plan"
+    assert lifecycle["cumulative_excluded_proposer_identities"] == [
+        failed_a,
+        failed_b,
+    ]
+    assert lifecycle["target_execution_prefix"] == plan_c
+    assert lifecycle["thinking_execution_projection"] == projection_audit_c
+    assert lifecycle["task_analyzer_physical_request_count"] == 1
+
+    tampered = deepcopy(attempts)
+    tampered[0]["run"]["ensemble_trace"]["candidates"][0]["execution"][
+        "effective_provider_thinking_level"
+    ] = "low"
+    with pytest.raises(
+        ValueError,
+        match="invalid_g1_physical_thinking_execution",
+    ):
+        resume_runner.reconstruct_g1_cross_wave_frozen_lifecycle(
+            attempts=tampered,
+            current_run_compatibility_contract=(
+                _enabled_g1_frozen_lifecycle_contract()
+            ),
+        )
+
+
+@pytest.mark.parametrize("invalid_marker", [0, 1])
+def test_resume_frozen_g1_retry_deferred_marker_is_exact_boolean(
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_marker: int,
+) -> None:
+    failed = "openrouter:model-a"
+    plan_a = _frozen_g1_plan(
+        decision_id="decision-a",
+        proposers=[
+            failed,
+            "openrouter:model-b",
+            "openrouter:model-c",
+        ],
+    )
+    plan_b = _bind_g1_retry_plan(
+        plan_a,
+        _frozen_g1_plan(
+            decision_id="decision-b",
+            proposers=[
+                "openrouter:model-b",
+                "openrouter:model-c",
+                "openrouter:model-d",
+            ],
+        ),
+        exclusions=[failed],
+    )
+    run, failures = _frozen_g1_failure_run(
+        resume_runner,
+        plan=plan_a,
+        failed_identity=failed,
+        analyzer_units=[_task_analyzer_unit()],
+    )
+    monkeypatch.setattr(
+        resume_runner,
+        "_g1_frozen_lifecycle_plan_reasons",
+        lambda *_args, **_kwargs: [],
+    )
+
+    with pytest.raises(ValueError, match="invalid_g1_retry_deferred_marker"):
+        resume_runner.reconstruct_g1_cross_wave_frozen_lifecycle(
+            attempts=[
+                {
+                    "attempt_id": "1" * 32,
+                    "attempt_kind": "generation",
+                    "attempt": 1,
+                    "selection_plan": plan_a,
+                    "excluded_proposer_identities": [],
+                    "deterministic_proposer_failures": failures,
+                    "retry_selection_plan": plan_b,
+                    "retry_excluded_proposer_identities": [failed],
+                    "will_retry": False,
+                    "retry_deferred_to_next_wave": invalid_marker,
+                    "run": run,
+                }
+            ],
+            current_run_compatibility_contract=(
+                _enabled_g1_frozen_lifecycle_contract()
+            ),
+        )
+
+
+def test_resume_frozen_g1_accepts_unknown_then_successful_analyzer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _frozen_g1_plan(
+        decision_id="decision-a",
+        proposers=[
+            "openrouter:model-a",
+            "openrouter:model-b",
+            "openrouter:model-c",
+        ],
+    )
+    analyzer_units = [
+        _unknown_task_analyzer_unit(
+            attempt=1,
+            physical_attempt_id="a" * 32,
+        ),
+        _task_analyzer_unit(
+            attempt=2,
+            physical_attempt_id="b" * 32,
+        ),
+    ]
+    run, failures = _frozen_g1_failure_run(
+        resume_runner,
+        plan=plan,
+        failed_identity=None,
+        analyzer_units=analyzer_units,
+    )
+    monkeypatch.setattr(
+        resume_runner,
+        "_g1_frozen_lifecycle_plan_reasons",
+        lambda *_args, **_kwargs: [],
+    )
+
+    lifecycle = resume_runner.reconstruct_g1_cross_wave_frozen_lifecycle(
+        attempts=[
+            {
+                "attempt_id": "1" * 32,
+                "attempt_kind": "generation",
+                "attempt": 1,
+                "selection_plan": plan,
+                "excluded_proposer_identities": [],
+                "deterministic_proposer_failures": failures,
+                "will_retry": False,
+                "run": run,
+            }
+        ],
+        current_run_compatibility_contract=(
+            _enabled_g1_frozen_lifecycle_contract()
+        ),
+    )
+
+    assert lifecycle["task_analyzer_physical_request_count"] == 2
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_reason"),
+    [
+        ("setup_usage_mismatch", "g1_task_analyzer_setup_usage_mismatch"),
+        ("setup_usage_missing", "missing_g1_task_analyzer_setup_usage"),
+        ("aggregate_usage_missing", "missing_g1_task_analyzer_aggregate_usage"),
+        ("analyzer_ordinal_gap", "invalid_g1_task_analyzer_attempt_sequence"),
+        ("analyzer_duplicate_id", "invalid_g1_task_analyzer_attempt_sequence"),
+        (
+            "analyzer_retry_limit_exceeded",
+            "invalid_g1_task_analyzer_attempt_sequence",
+        ),
+    ],
+)
+def test_resume_frozen_g1_rejects_analyzer_evidence_contradictions(
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    expected_reason: str,
+) -> None:
+    plan = _frozen_g1_plan(
+        decision_id="decision-a",
+        proposers=[
+            "openrouter:model-a",
+            "openrouter:model-b",
+            "openrouter:model-c",
+        ],
+    )
+    units = [
+        _task_analyzer_unit(
+            attempt=1,
+            physical_attempt_id="a" * 32,
+        ),
+        _task_analyzer_unit(
+            attempt=2,
+            physical_attempt_id="b" * 32,
+        ),
+    ]
+    if mutation == "analyzer_retry_limit_exceeded":
+        plan["ranking_parameters"]["task_analyzer"]["max_retries"] = 0
+    run, failures = _frozen_g1_failure_run(
+        resume_runner,
+        plan=plan,
+        failed_identity=None,
+        analyzer_units=units,
+    )
+    if mutation == "setup_usage_mismatch":
+        run["setup_usage"][1]["output_tokens"] = 99
+    elif mutation == "setup_usage_missing":
+        run["setup_usage"] = []
+    elif mutation == "aggregate_usage_missing":
+        run["usage"]["model_usage_breakdown"] = []
+    elif mutation == "analyzer_ordinal_gap":
+        run["usage"]["model_usage_breakdown"][1]["attempt"] = 3
+        run["setup_usage"][1]["attempt"] = 3
+    elif mutation == "analyzer_duplicate_id":
+        run["usage"]["model_usage_breakdown"][1][
+            "physical_attempt_id"
+        ] = "a" * 32
+        run["setup_usage"][1]["physical_attempt_id"] = "a" * 32
+    monkeypatch.setattr(
+        resume_runner,
+        "_g1_frozen_lifecycle_plan_reasons",
+        lambda *_args, **_kwargs: [],
+    )
+
+    with pytest.raises(ValueError, match=expected_reason):
+        resume_runner.reconstruct_g1_cross_wave_frozen_lifecycle(
+            attempts=[
+                {
+                    "attempt_id": "1" * 32,
+                    "attempt_kind": "generation",
+                    "attempt": 1,
+                    "selection_plan": plan,
+                    "excluded_proposer_identities": [],
+                    "deterministic_proposer_failures": failures,
+                    "will_retry": False,
+                    "run": run,
+                }
+            ],
+            current_run_compatibility_contract=(
+                _enabled_g1_frozen_lifecycle_contract()
+            ),
+        )
+
+
+def test_resume_frozen_g1_rejects_tail_deterministic_failure_without_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failed = "openrouter:model-a"
+    plan = _frozen_g1_plan(
+        decision_id="decision-a",
+        proposers=[failed, "openrouter:model-b", "openrouter:model-c"],
+    )
+    run, failures = _frozen_g1_failure_run(
+        resume_runner,
+        plan=plan,
+        failed_identity=failed,
+        analyzer_units=[_task_analyzer_unit()],
+    )
+    monkeypatch.setattr(
+        resume_runner,
+        "_g1_frozen_lifecycle_plan_reasons",
+        lambda *_args, **_kwargs: [],
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="g1_deterministic_failure_lacks_pending_retry_plan",
+    ):
+        resume_runner.reconstruct_g1_cross_wave_frozen_lifecycle(
+            attempts=[
+                {
+                    "attempt_id": "1" * 32,
+                    "attempt_kind": "generation",
+                    "attempt": 1,
+                    "selection_plan": plan,
+                    "excluded_proposer_identities": [],
+                    "deterministic_proposer_failures": failures,
+                    "will_retry": False,
+                    "run": run,
+                }
+            ],
+            current_run_compatibility_contract=(
+                _enabled_g1_frozen_lifecycle_contract()
+            ),
+        )
+
+
 def test_resume_strict_attempt_evidence_reconstructs_cumulative_budget(
     tmp_path: Path,
 ) -> None:
@@ -5939,6 +11123,230 @@ def test_resume_strict_attempt_evidence_reconstructs_cumulative_budget(
     assert state["prior_generation_attempts_used"] == 3
     assert state["observed_unique_generation_attempt_count"] == 3
     assert state["generation_attempt_evidence_mode"] == "strict_v1"
+
+
+@pytest.mark.parametrize(
+    ("terminal_kind", "expected_reason"),
+    [
+        (
+            "generation_pre_call_guard",
+            "g1_pre_call_guard_failed",
+        ),
+        (
+            "provider_build_after_paid_setup",
+            "g1_paid_setup_attempt_lacks_frozen_lifecycle",
+        ),
+    ],
+)
+def test_resume_strict_g1_terminal_history_cannot_be_washed_by_later_complete(
+    tmp_path: Path,
+    terminal_kind: str,
+    expected_reason: str,
+) -> None:
+    compatibility = _enabled_g1_frozen_lifecycle_contract()
+    fingerprint = "sha256:g1-run-contract"
+    terminal = _strict_attempt_resume_row(
+        attempt_id="1" * 32,
+        cumulative_budget=1,
+        generation_completed_at=1.0,
+    )
+    terminal.update(
+        {
+            "group": "G1",
+            "provider_spec": dict(resume_runner.GROUP_SPECS["G1"]),
+            "run_compatibility_fingerprint": fingerprint,
+        }
+    )
+    terminal_attempt = terminal["execution"]["generation_attempts"][0]
+    terminal_attempt["attempt_kind"] = terminal_kind
+    if terminal_kind == "generation_pre_call_guard":
+        terminal_attempt["run"].update(
+            {
+                "llm_request_count": 0,
+                "usage_unknown_count": 0,
+                "trace_events": [
+                    {
+                        "kind": "error",
+                        "code": "g1_pre_call_guard_failed",
+                        "request_started": False,
+                        "physical_request_count": 0,
+                    }
+                ],
+                "routing_trace": {
+                    "pre_call_guard": {
+                        "code": "immutable_plan_hash_drift",
+                    }
+                },
+            }
+        )
+
+    later_complete = _strict_attempt_resume_row(
+        attempt_id="2" * 32,
+        cumulative_budget=2,
+        generation_completed_at=2.0,
+    )
+    later_complete.update(
+        {
+            "group": "G1",
+            "provider_spec": dict(resume_runner.GROUP_SPECS["G1"]),
+            "run_compatibility_fingerprint": fingerprint,
+            "error": None,
+            "final_text": "later successful answer",
+            "quality_total": 80.0,
+            "judge": _complete_legacy_judge(
+                "later-complete-after-terminal-history"
+            ),
+        }
+    )
+    later_attempt = later_complete["execution"][
+        "generation_attempts"
+    ][0]
+    later_attempt.update(
+        {
+            "retryable": False,
+            "retry_reason": "",
+        }
+    )
+    later_attempt["run"].update(
+        {
+            "error": "",
+            "usage_unknown_count": 0,
+        }
+    )
+
+    paths: list[Path] = []
+    for wave, row in enumerate(
+        (terminal, later_complete),
+        start=1,
+    ):
+        path = tmp_path / f"terminal-g1-wave-{wave}.jsonl"
+        path.write_text(
+            json.dumps(resume_runner.seal_result_row(row)) + "\n",
+            encoding="utf-8",
+        )
+        paths.append(path)
+
+    with pytest.raises(ValueError, match=expected_reason):
+        resume_runner.load_resume_group_task_states(
+            resume_paths=paths,
+            selected_keys={("G1", "task-1")},
+            prompt_hashes={
+                "task-1": resume_runner.text_sha256("same prompt")
+            },
+            task_input_hashes={"task-1": "sha256:task-input"},
+            run_compatibility_fingerprints={"G1": fingerprint},
+            run_compatibility_contracts={"G1": compatibility},
+        )
+
+
+def test_resume_legacy_attempt_schema_does_not_use_strict_guard_scan(
+    tmp_path: Path,
+) -> None:
+    row = _strict_attempt_resume_row(
+        attempt_id="1" * 32,
+        cumulative_budget=1,
+        generation_completed_at=1.0,
+    )
+    row.pop("generation_attempt_evidence_schema")
+    row["error"] = "g1_pre_call_guard_failed"
+    path = tmp_path / "legacy-attempt.jsonl"
+    path.write_text(
+        json.dumps(resume_runner.seal_result_row(row)) + "\n",
+        encoding="utf-8",
+    )
+
+    states, _ = resume_runner.load_resume_group_task_states(
+        resume_paths=[path],
+        selected_keys={("B1", "task-1")},
+        prompt_hashes={
+            "task-1": resume_runner.text_sha256("same prompt")
+        },
+        task_input_hashes={"task-1": "sha256:task-input"},
+        run_compatibility_fingerprints={
+            "B1": "sha256:run-contract"
+        },
+    )
+
+    assert states[("B1", "task-1")]["action"] == "regenerate"
+
+
+@pytest.mark.parametrize(
+    ("field_name", "replacement"),
+    [
+        ("prompt_sha256", "sha256:stale-prompt"),
+        ("task_input_sha256", "sha256:stale-task"),
+        (
+            "run_compatibility_fingerprint",
+            "sha256:stale-run-contract",
+        ),
+    ],
+)
+def test_resume_strict_attempt_source_rows_are_bound_before_aggregation(
+    tmp_path: Path,
+    field_name: str,
+    replacement: str,
+) -> None:
+    row = _strict_attempt_resume_row(
+        attempt_id="1" * 32,
+        cumulative_budget=1,
+        generation_completed_at=1.0,
+    )
+    row[field_name] = replacement
+    path = tmp_path / "stale-strict-attempt.jsonl"
+    path.write_text(
+        json.dumps(resume_runner.seal_result_row(row)) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="strict generation attempt source binding differs",
+    ):
+        resume_runner.load_resume_group_task_states(
+            resume_paths=[path],
+            selected_keys={("B1", "task-1")},
+            prompt_hashes={
+                "task-1": resume_runner.text_sha256("same prompt")
+            },
+            task_input_hashes={"task-1": "sha256:task-input"},
+            run_compatibility_fingerprints={
+                "B1": "sha256:run-contract"
+            },
+        )
+
+
+def test_resume_budget_exhaustion_returns_before_provider_construction() -> None:
+    tree = ast.parse(inspect.getsource(resume_runner.amain))
+    guarded = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef)
+        and node.name == "_guarded"
+    )
+    exhausted_branch = next(
+        node
+        for node in guarded.body
+        if isinstance(node, ast.If)
+        and "remaining_attempts <= 0" in ast.unparse(node.test)
+    )
+    exhausted_return = next(
+        node
+        for node in ast.walk(exhausted_branch)
+        if isinstance(node, ast.Return)
+    )
+    run_one_await = next(
+        node
+        for node in ast.walk(guarded)
+        if isinstance(node, ast.Await)
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Name)
+        and node.value.func.id == "run_one"
+    )
+
+    assert "_generation_budget_exhausted_row" in ast.unparse(
+        exhausted_return.value
+    )
+    assert exhausted_return.lineno < run_one_await.lineno
 
 
 def test_resume_strict_attempt_evidence_accepts_monotonic_repair(
@@ -7529,6 +12937,20 @@ def test_g1_registry_all_contract_does_not_require_runtime_pins(module) -> None:
 
     assert contract["runtime_pin_policy"] == "optional_auto"
     assert contract["expected_routes"]["x-ai/grok-4.5"] == "auto"
+    audited = module._openrouter_audit_provider_routing(
+        {
+            "x-ai/grok-4.5": "wrong-provider",
+            "anthropic/claude-opus-4.8": "anthropic",
+        },
+        contract,
+    )
+    assert audited["x-ai/grok-4.5"] == "wrong-provider"
+    missing_model = next(
+        model
+        for model in contract["expected_routes"]
+        if model not in {"x-ai/grok-4.5", "anthropic/claude-opus-4.8"}
+    )
+    assert audited[missing_model] == "auto"
 
 
 @pytest.mark.parametrize("module", [runner, _load_resume_runner()], ids=["main", "resume"])
@@ -7565,6 +12987,10 @@ def test_g1_registry_contract_rejects_allowlist_trace_drift(module) -> None:
         provider="openrouter",
         model="deepseek/deepseek-v4-pro",
         api_key="fake",
+        provider_routing={
+            "deepseek/deepseek-v4-pro": "deepseek",
+            "x-ai/grok-4.5": "wrong-provider",
+        },
     )
     provider = build_ensemble_provider_from_config(
         config=config,
@@ -7864,6 +13290,10 @@ def test_g1_runtime_dynamic_plan_satisfies_frozen_ranking_contract(
         provider="openrouter",
         model="deepseek/deepseek-v4-pro",
         api_key="fake",
+        provider_routing={
+            "deepseek/deepseek-v4-pro": "deepseek",
+            "x-ai/grok-4.5": "wrong-provider",
+        },
     )
     monkeypatch.setenv("OPENSQUILLA_PROVIDER_ROUTING_STRICT", "1")
     monkeypatch.setenv("OPENSQUILLA_OPENROUTER_REQUIRE_PARAMETERS", "1")
@@ -8921,7 +14351,10 @@ async def test_provider_build_failure_preserves_already_billed_setup_receipt(
         require_openrouter_non_byok=True,
     )
 
-    assert row["error"] == "RuntimeError: strict dynamic selection failed"
+    assert row["error"] == (
+        "provider_build_failed_after_setup:RuntimeError"
+    )
+    assert "strict dynamic selection failed" not in row["error"]
     assert row["selected_generation_succeeded"] is False
     assert row["llm_request_count"] == 0
     assert row["actual_spend_metrics"]["llm_request_count"] == 1
@@ -8939,6 +14372,609 @@ async def test_provider_build_failure_preserves_already_billed_setup_receipt(
     assert row["usage"]["model_usage_breakdown"] == [setup_usage]
     assert runner.openrouter_non_byok_audit(row)["pass"] is True
     assert judge_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "module",
+    [runner, resume_runner],
+    ids=["main", "resume"],
+)
+@pytest.mark.parametrize(
+    "failure_stage",
+    ["routing_serialization", "model_capabilities"],
+)
+async def test_run_one_post_build_failure_preserves_paid_setup_and_blocks_generation(
+    module,
+    failure_stage: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, inherited = _openrouter_config()
+    setup_usage = {
+        "provider": "openrouter",
+        "model": "anthropic/claude-opus-4.8",
+        "input_tokens": 12,
+        "output_tokens": 3,
+        "billed_cost": 0.25,
+        "cost_source": "provider_billed",
+        "provider_usage": _openrouter_exact_evidence(
+            0.25,
+            f"post-build-{failure_stage}",
+        ),
+    }
+    routing_trace = {
+        "kind": "selection_mode",
+        "model": "post-build-model",
+    }
+
+    async def fake_build_experiment_provider(**_kwargs):
+        return module.ProviderBuildResult(
+            provider=object(),
+            prompt="built prompt",
+            setup_latency_ms=123,
+            setup_usage=[setup_usage],
+            routing_trace=routing_trace,
+        )
+
+    collector_calls = 0
+
+    async def forbidden_collect_generation(*_args, **_kwargs):
+        nonlocal collector_calls
+        collector_calls += 1
+        raise AssertionError(
+            "post-build failure must block generation"
+        )
+
+    monkeypatch.setattr(
+        module,
+        "build_experiment_provider",
+        fake_build_experiment_provider,
+    )
+    monkeypatch.setattr(
+        module,
+        "collect_generation_with_retries",
+        forbidden_collect_generation,
+    )
+    private_detail = "private post-build diagnostic must not persist"
+    if failure_stage == "routing_serialization":
+        original_json_safe = module.json_safe
+
+        def fail_build_routing_only(value):
+            if value is routing_trace:
+                raise RuntimeError(private_detail)
+            return original_json_safe(value)
+
+        monkeypatch.setattr(module, "json_safe", fail_build_routing_only)
+    else:
+        original_capabilities = (
+            module.with_openrouter_model_capabilities
+        )
+
+        def fail_post_build_capabilities(config_value, model):
+            if model == "post-build-model":
+                raise RuntimeError(private_detail)
+            return original_capabilities(config_value, model)
+
+        monkeypatch.setattr(
+            module,
+            "with_openrouter_model_capabilities",
+            fail_post_build_capabilities,
+        )
+
+    row = await module.run_one(
+        task={"id": "task-1", "prompt": "prompt"},
+        group="B1",
+        config=config,
+        inherited=inherited,
+        dry_run=False,
+        judge_provider=object(),
+        judge_candidates=False,
+        judge_repeats=1,
+        judge_concurrency=1,
+        judge_max_attempts=1,
+        judge_semaphore=None,
+        timeout=10.0,
+        ensemble_proposer_timeout=None,
+        ensemble_aggregator_timeout=None,
+        ensemble_proposer_early_stop_success_count=None,
+        ensemble_proposer_early_stop_after=None,
+        expand_ensemble_timeouts_to_task_timeout=False,
+        tool_policy={
+            "tools_enabled": False,
+            "tool_mode": "provider_only",
+        },
+        generation_policy={},
+    )
+
+    assert collector_calls == 0
+    assert row["execution"]["provider_error"] == (
+        "provider_build_failed_after_setup:RuntimeError"
+    )
+    assert private_detail not in json.dumps(row)
+    assert row["generation_attempt_count"] == 1
+    assert row["generation_attempt_budget_used"] == 1
+    failed_attempt = row["execution"]["generation_attempts"][0]
+    assert (
+        failed_attempt["attempt_kind"]
+        == "provider_build_after_paid_setup"
+    )
+    assert failed_attempt["run"]["usage"][
+        "model_usage_breakdown"
+    ] == [setup_usage]
+    assert row["actual_spend_metrics"]["llm_request_count"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "module",
+    [runner, _load_resume_runner()],
+    ids=["main", "resume"],
+)
+@pytest.mark.parametrize(
+    "failure_stage",
+    [
+        "requested_identity_backfill",
+        "generation_retry_reason",
+        "run_result_summary",
+    ],
+)
+async def test_paid_generation_postprocess_failure_commits_once_and_blocks_more_paid_work(
+    module,
+    failure_stage: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, inherited = _openrouter_config()
+    model = str(module.GROUP_SPECS["B0"]["model"])
+    usage_row = {
+        "provider": "openrouter",
+        "model": model,
+        "requested_provider": "openrouter",
+        "requested_model": model,
+        "input_tokens": 7,
+        "output_tokens": 2,
+        "billed_cost": 0.02,
+        "cost_source": "provider_billed",
+        "physical_attempt_id": "d" * 32,
+        "provider_usage": {
+            **_openrouter_exact_evidence(
+                0.02,
+                f"postprocess-{module.__name__}-{failure_stage}",
+            ),
+            "physical_attempt_id": "d" * 32,
+        },
+    }
+    paid_result = module.RunResult(
+        final_text="answer that must not reach Judge",
+        done=DoneEvent(
+            provider="openrouter",
+            model=model,
+            requested_provider="openrouter",
+            requested_model=model,
+            input_tokens=7,
+            output_tokens=2,
+            billed_cost=0.02,
+            cost_source="provider_billed",
+            model_usage_breakdown=[usage_row],
+        ),
+    )
+
+    async def fake_build_experiment_provider(**_kwargs):
+        return module.ProviderBuildResult(
+            provider=object(),
+            prompt="built prompt",
+            routing_trace={"kind": "single", "model": model},
+        )
+
+    paid_calls = 0
+
+    async def fake_collect_run(*_args, **_kwargs):
+        nonlocal paid_calls
+        paid_calls += 1
+        if paid_calls > 1:
+            raise AssertionError(
+                "postprocessing failure must not trigger another paid call"
+            )
+        return paid_result
+
+    judge_calls = 0
+
+    async def forbidden_judge(**_kwargs):
+        nonlocal judge_calls
+        judge_calls += 1
+        raise AssertionError("postprocessing failure must not reach Judge")
+
+    private_detail = "private paid postprocess diagnostic"
+    monkeypatch.setattr(
+        module,
+        "build_experiment_provider",
+        fake_build_experiment_provider,
+    )
+    monkeypatch.setattr(module, "collect_run", fake_collect_run)
+    monkeypatch.setattr(module, "judge_text", forbidden_judge)
+    if failure_stage == "requested_identity_backfill":
+        monkeypatch.setattr(
+            module,
+            "backfill_result_requested_identity",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError(private_detail)
+            ),
+        )
+    elif failure_stage == "generation_retry_reason":
+        monkeypatch.setattr(
+            module,
+            "generation_retry_reason",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError(private_detail)
+            ),
+        )
+    else:
+        monkeypatch.setattr(
+            module,
+            "run_result_summary",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError(private_detail)
+            ),
+        )
+
+    row = await module.run_one(
+        task={"id": "task-1", "prompt": "prompt"},
+        group="B0",
+        config=config,
+        inherited=inherited,
+        dry_run=False,
+        judge_provider=object(),
+        judge_candidates=False,
+        judge_repeats=1,
+        judge_concurrency=1,
+        judge_max_attempts=1,
+        judge_semaphore=None,
+        timeout=10.0,
+        ensemble_proposer_timeout=None,
+        ensemble_aggregator_timeout=None,
+        ensemble_proposer_early_stop_success_count=None,
+        ensemble_proposer_early_stop_after=None,
+        expand_ensemble_timeouts_to_task_timeout=False,
+        tool_policy={
+            "tools_enabled": False,
+            "tool_mode": "provider_only",
+        },
+        generation_policy={},
+        generation_max_attempts=3,
+    )
+
+    expected_reason = (
+        f"generation_postprocessing_failed:{failure_stage}:RuntimeError"
+    )
+    assert paid_calls == 1
+    assert judge_calls == 0
+    assert row["error"] == expected_reason
+    assert private_detail not in json.dumps(row)
+    assert row["selected_generation_succeeded"] is False
+    assert row["generation_attempt_count"] == 1
+    assert row["selected_attempt_metrics"][
+        "generation_attempt"
+    ] == 0
+    assert row["execution"]["selected_generation_attempt"] == 0
+    attempt = row["execution"]["generation_attempts"][0]
+    assert attempt["attempt"] == 1
+    assert len(attempt["attempt_id"]) == 32
+    assert attempt["retryable"] is False
+    assert attempt["retry_reason"] == expected_reason
+    assert attempt["retry_suppressed_reason"] == expected_reason
+    assert attempt["will_retry"] is False
+    assert attempt["run"]["llm_request_count"] == 1
+    assert len(
+        attempt["run"]["usage"]["model_usage_breakdown"]
+    ) == 1
+    assert attempt["generation_postprocessing_failure"] == {
+        "stage": failure_stage,
+        "exception_type": "RuntimeError",
+    }
+    terminal_evidence = (
+        resume_runner.generation_postprocessing_terminal_evidence(
+            row
+        )
+    )
+    assert terminal_evidence is not None
+    assert terminal_evidence["attempt_id"] == attempt["attempt_id"]
+    assert (
+        terminal_evidence["automatic_generation_retry_allowed"]
+        is False
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "module",
+    [runner, _load_resume_runner()],
+    ids=["main", "resume"],
+)
+async def test_terminal_generation_validation_failure_rewrites_existing_attempt_without_duplication(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, inherited = _openrouter_config()
+    model = str(module.GROUP_SPECS["B0"]["model"])
+    paid_result = module.RunResult(
+        final_text="answer",
+        done=DoneEvent(
+            provider="openrouter",
+            model=model,
+            requested_provider="openrouter",
+            requested_model=model,
+            input_tokens=2,
+            output_tokens=1,
+            model_usage_breakdown=[
+                {
+                    "provider": "openrouter",
+                    "model": model,
+                    "requested_provider": "openrouter",
+                    "requested_model": model,
+                    "input_tokens": 2,
+                    "output_tokens": 1,
+                    "physical_attempt_id": "e" * 32,
+                    "provider_usage": {
+                        "physical_attempt_id": "e" * 32,
+                    },
+                }
+            ],
+        ),
+    )
+
+    async def fake_build_experiment_provider(**_kwargs):
+        return module.ProviderBuildResult(
+            provider=object(),
+            prompt="prompt",
+            routing_trace={"kind": "single", "model": model},
+        )
+
+    paid_calls = 0
+
+    async def fake_collect_run(*_args, **_kwargs):
+        nonlocal paid_calls
+        paid_calls += 1
+        return paid_result
+
+    reason_calls = 0
+
+    def fail_second_validation(*_args, **_kwargs):
+        nonlocal reason_calls
+        reason_calls += 1
+        if reason_calls == 1:
+            return ""
+        raise RuntimeError("private terminal validation detail")
+
+    judge_calls = 0
+
+    async def forbidden_judge(**_kwargs):
+        nonlocal judge_calls
+        judge_calls += 1
+        raise AssertionError("terminal validation failure must block Judge")
+
+    monkeypatch.setattr(
+        module,
+        "build_experiment_provider",
+        fake_build_experiment_provider,
+    )
+    monkeypatch.setattr(module, "collect_run", fake_collect_run)
+    monkeypatch.setattr(
+        module,
+        "generation_retry_reason",
+        fail_second_validation,
+    )
+    monkeypatch.setattr(module, "judge_text", forbidden_judge)
+
+    row = await module.run_one(
+        task={"id": "task-1", "prompt": "prompt"},
+        group="B0",
+        config=config,
+        inherited=inherited,
+        dry_run=False,
+        judge_provider=object(),
+        judge_candidates=False,
+        judge_repeats=1,
+        judge_concurrency=1,
+        judge_max_attempts=1,
+        judge_semaphore=None,
+        timeout=10.0,
+        ensemble_proposer_timeout=None,
+        ensemble_aggregator_timeout=None,
+        ensemble_proposer_early_stop_success_count=None,
+        ensemble_proposer_early_stop_after=None,
+        expand_ensemble_timeouts_to_task_timeout=False,
+        tool_policy={
+            "tools_enabled": False,
+            "tool_mode": "provider_only",
+        },
+        generation_policy={},
+    )
+
+    expected_reason = (
+        "generation_postprocessing_failed:"
+        "terminal_generation_validation:RuntimeError"
+    )
+    assert paid_calls == 1
+    assert judge_calls == 0
+    assert reason_calls == 2
+    assert row["error"] == expected_reason
+    assert row["generation_attempt_count"] == 1
+    attempt = row["execution"]["generation_attempts"][0]
+    assert attempt["retry_reason"] == expected_reason
+    assert attempt["will_retry"] is False
+    assert (
+        attempt["generation_postprocessing_failure"]["stage"]
+        == "terminal_generation_validation"
+    )
+
+
+@pytest.mark.parametrize(
+    "module",
+    [runner, _load_resume_runner()],
+    ids=["main", "resume"],
+)
+def test_emergency_generation_summary_counts_setup_and_generation_once(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary_id = "1" * 32
+    analyzer_id = "2" * 32
+    model = str(module.GROUP_SPECS["B0"]["model"])
+    primary = {
+        "role": "generation",
+        "physical_attempt_id": primary_id,
+        "provider": "openrouter",
+        "model": model,
+        "requested_provider": "openrouter",
+        "requested_model": model,
+        "input_tokens": 2,
+        "output_tokens": 1,
+        "provider_usage": {
+            "physical_attempt_id": primary_id,
+        },
+    }
+    analyzer = {
+        "role": "task_analyzer",
+        "label": "task_analyzer",
+        "request_count": 1,
+        "physical_attempt_id": analyzer_id,
+        "provider": "openrouter",
+        "model": "anthropic/claude-opus-4.8",
+        "requested_provider": "openrouter",
+        "requested_model": "anthropic/claude-opus-4.8",
+        "input_tokens": 3,
+        "output_tokens": 1,
+        "provider_usage": {
+            "physical_attempt_id": analyzer_id,
+        },
+    }
+    result = module.RunResult(
+        final_text="answer",
+        done=DoneEvent(
+            provider="openrouter",
+            model=model,
+            requested_provider="openrouter",
+            requested_model=model,
+            model_usage_breakdown=[primary],
+        ),
+        setup_usage=[analyzer],
+    )
+    monkeypatch.setattr(
+        module,
+        "run_result_summary",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("summary failed")
+        ),
+    )
+
+    summary = module.emergency_generation_run_summary(
+        result,
+        reason=(
+            "generation_postprocessing_failed:"
+            "run_result_summary:RuntimeError"
+        ),
+        stage="run_result_summary",
+        exception_type="RuntimeError",
+        identity_seed="generation-attempt:" + "3" * 32,
+        expected_provider="openrouter",
+        expected_model=model,
+    )
+
+    assert summary["llm_request_count"] == 2
+    units = summary["usage"]["model_usage_breakdown"]
+    assert len(units) == 2
+    assert {
+        str(unit.get("physical_attempt_id") or "")
+        for unit in units
+    } == {primary_id, analyzer_id}
+
+
+@pytest.mark.parametrize(
+    "module",
+    [runner, _load_resume_runner()],
+    ids=["main", "resume"],
+)
+def test_paid_generation_recovery_survives_broken_summary_and_canonicalizer(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = module.RunResult(
+        final_text="",
+        done=None,
+        error="HTTP 503",
+        trace_events=[
+            {
+                "kind": "error",
+                "code": "503",
+                "request_started": True,
+                "physical_request_count": 1,
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        module,
+        "run_result_summary",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("summary boom")
+        ),
+    )
+    monkeypatch.setattr(
+        module,
+        "canonicalize_run_usage",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("canonicalizer boom")
+        ),
+    )
+    monkeypatch.setattr(
+        module,
+        "json_safe",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("serializer boom")
+        ),
+    )
+    pending = {
+        "result": result,
+        "attempts": [],
+        "attempt_id": "4" * 32,
+        "attempt_index": 1,
+        "attempt_started_at": 1.0,
+        "expected_provider": "openrouter",
+        "expected_model": "model-a",
+        "stage": "run_result_summary",
+    }
+
+    recovered, attempts, selected, reason = (
+        module.recover_paid_generation_postprocessing_failure(
+            pending,
+            RuntimeError("outer boom"),
+        )
+    )
+
+    assert recovered is result
+    assert selected == 0
+    assert reason == (
+        "generation_postprocessing_failed:"
+        "run_result_summary:RuntimeError"
+    )
+    assert len(attempts) == 1
+    run = attempts[0]["run"]
+    assert run["llm_request_count"] == 1
+    assert run["usage_unknown_count"] == 1
+    assert run["generation_postprocessing_failure"][
+        "evidence_precision"
+    ] == "unvalidated_raw_plus_primitive_unknown"
+    units = run["usage"]["model_usage_breakdown"]
+    assert len(units) == 1
+    assert units[0]["role"] == "usage_missing"
+    assert units[0]["requested_provider"] == "openrouter"
+    assert units[0]["requested_model"] == "model-a"
+    assert units[0]["usage_unknown"] is True
+    assert run["trace_events"] == [
+        {
+            "kind": "error",
+            "code": "trace_evidence_capture_failed",
+            "exception_type": "RuntimeError",
+        }
+    ]
 
 
 @pytest.mark.asyncio

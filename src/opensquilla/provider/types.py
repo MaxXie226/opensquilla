@@ -11,6 +11,14 @@ from opensquilla.execution_status import ExecutionStatus
 if TYPE_CHECKING:
     from opensquilla.provider.failures import ProviderFailureKind
 
+# Provider APIs use all three literals for the same terminal condition: the
+# completion budget was exhausted before any visible answer was emitted.
+# Keeping the vocabulary here prevents inner-ensemble recovery and outer
+# campaign retry/audit code from drifting apart.
+REASONING_ONLY_LENGTH_STOP_REASONS = frozenset(
+    {"length", "max_tokens", "max_output_tokens"}
+)
+
 # ---------------------------------------------------------------------------
 # Stream event dataclasses
 # ---------------------------------------------------------------------------
@@ -127,7 +135,6 @@ class DoneEvent:
     # with configuration values.
     requested_model: str = ""
     requested_provider: str = ""
-
     @property
     def upstream_cost_usd(self) -> float:
         """Backward-compatible alias for earlier OpenRouter cost consumers."""
@@ -204,7 +211,6 @@ class ErrorEvent:
     # billable request started; fallback wrappers may report counts > 1.
     request_started: bool | None = None
     physical_request_count: int | None = None
-
 
 @dataclass
 class ProviderHeartbeatEvent:

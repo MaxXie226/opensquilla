@@ -19,6 +19,7 @@ import subprocess
 import sys
 import time
 import uuid
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from functools import cache
@@ -94,6 +95,7 @@ from opensquilla.provider.ensemble import (
     EnsembleProvider,
     build_ensemble_provider_from_config,
     openrouter_static_capabilities,
+    resolve_effective_generation_request_parameters,
 )
 from opensquilla.provider.registry import get_provider_spec
 from opensquilla.provider.selector import (
@@ -102,6 +104,7 @@ from opensquilla.provider.selector import (
     SelectorConfig,
 )
 from opensquilla.provider.types import (
+    REASONING_ONLY_LENGTH_STOP_REASONS,
     ChatConfig,
     DoneEvent,
     ErrorEvent,
@@ -123,6 +126,8 @@ from opensquilla.tools.registry import ToolRegistry
 from opensquilla.tools.types import CallerKind, InteractionMode, ToolContext, ToolSpec
 from opensquilla.usage_evidence import (
     MISSING_USAGE_PLACEHOLDER_ROLES,
+    USAGE_EVIDENCE_SCHEMA,
+    canonical_run_usage_units,
     canonicalize_run_usage,
     derive_physical_request_count,
     is_missing_usage_placeholder,
@@ -328,7 +333,9 @@ def validate_g1_registry_contract(
     )
 
     snapshot = load_model_registry_snapshot()
-    thinking_assignment_enabled = bool(config.llm_ensemble.ranking_thinking_assignment_enabled)
+    thinking_assignment_enabled = (
+        config.llm_ensemble.ranking_thinking_assignment_enabled is True
+    )
     if not thinking_assignment_enabled:
         snapshot = _legacy_registry_snapshot_projection(snapshot)
     actual_version = str(snapshot.get("snapshot_version") or "").strip()
@@ -678,33 +685,153 @@ class ProviderBuildError(RuntimeError):
         setup_usage: list[dict[str, Any]],
         routing_trace: dict[str, Any],
     ) -> None:
-        super().__init__(f"{type(cause).__name__}: {cause}")
+        super().__init__(
+            "provider_build_failed_after_setup:"
+            + type(cause).__name__
+        )
         self.setup_latency_ms = setup_latency_ms
         self.setup_usage = list(setup_usage)
         self.routing_trace = dict(routing_trace)
 
 
-def attach_provider_setup(provider: Any, build: ProviderBuildResult) -> Any:
-    """Carry one-time routing/analyzer accounting into the first generation attempt."""
+def safe_provider_build_routing_trace(value: Any) -> dict[str, Any]:
+    """Return only JSON-safe routing evidence for a failed provider build."""
 
-    setattr(
-        provider,
-        "_draco_setup_metrics",
-        {
-            "latency_ms": build.setup_latency_ms,
-            "usage": list(build.setup_usage),
-            "routing": dict(build.routing_trace),
-        },
+    try:
+        normalized = json_safe(value)
+    except Exception:
+        return {}
+    return dict(normalized) if isinstance(normalized, Mapping) else {}
+
+
+def _provider_selection_plan_execution_snapshot(
+    provider: Any,
+) -> Mapping[str, Any] | None:
+    """Read the provider's immutable route plus its persisted receipt prefix."""
+
+    snapshot = getattr(provider, "selection_plan_execution_snapshot", None)
+    plan = (
+        snapshot()
+        if callable(snapshot)
+        else getattr(provider, "selection_plan", None)
     )
-    return provider
+    return plan if isinstance(plan, Mapping) else None
+
+
+def attach_provider_setup(provider: Any, build: ProviderBuildResult) -> Any:
+    """Attach one-shot setup accounting plus a reusable frozen routing receipt."""
+
+    try:
+        selection_plan = getattr(provider, "selection_plan", None)
+        if not (
+            isinstance(selection_plan, Mapping)
+            and selection_plan.get("ranking_thinking_assignment_enabled")
+            is True
+        ):
+            setattr(provider, "_draco_frozen_routing_trace", None)
+            setattr(
+                provider,
+                "_draco_setup_metrics",
+                {
+                    "latency_ms": build.setup_latency_ms,
+                    "usage": list(build.setup_usage),
+                    "routing": dict(build.routing_trace),
+                },
+            )
+            return provider
+        execution_plan = _provider_selection_plan_execution_snapshot(
+            provider
+        )
+        if not (
+            isinstance(execution_plan, Mapping)
+            and execution_plan.get(
+                "ranking_thinking_assignment_enabled"
+            )
+            is True
+        ):
+            raise ValueError(
+                "managed provider selection plan snapshot is invalid"
+            )
+        frozen_routing = json_safe(build.routing_trace)
+        if not isinstance(frozen_routing, Mapping):
+            raise TypeError(
+                "provider routing trace must serialize to an object"
+            )
+        if execution_plan is not None:
+            serialized_plan = json_safe(
+                copy.deepcopy(dict(execution_plan))
+            )
+            if not isinstance(serialized_plan, Mapping):
+                raise TypeError(
+                    "provider selection plan must serialize to an object"
+                )
+            frozen_routing = {
+                **dict(frozen_routing),
+                "selection_plan": copy.deepcopy(
+                    dict(serialized_plan)
+                ),
+            }
+        setattr(
+            provider,
+            "_draco_setup_metrics",
+            {
+                "latency_ms": build.setup_latency_ms,
+                "usage": copy.deepcopy(list(build.setup_usage)),
+            },
+        )
+        setattr(
+            provider,
+            "_draco_frozen_routing_trace",
+            copy.deepcopy(dict(frozen_routing)),
+        )
+        return provider
+    except ProviderBuildError:
+        raise
+    except Exception as exc:
+        if build.setup_usage:
+            raise ProviderBuildError(
+                exc,
+                setup_latency_ms=build.setup_latency_ms,
+                setup_usage=build.setup_usage,
+                routing_trace=safe_provider_build_routing_trace(
+                    build.routing_trace
+                ),
+            ) from exc
+        raise
 
 
 def consume_provider_setup(provider: Any) -> dict[str, Any]:
+    """Consume setup once and bind the frozen route to the executed plan state."""
+
     setup = getattr(provider, "_draco_setup_metrics", None)
-    if not isinstance(setup, dict):
+    routing = getattr(provider, "_draco_frozen_routing_trace", None)
+    if not isinstance(routing, Mapping):
+        if not isinstance(setup, dict):
+            return {}
+        setattr(provider, "_draco_setup_metrics", None)
+        return setup
+    if not isinstance(setup, Mapping) and not isinstance(routing, Mapping):
         return {}
-    setattr(provider, "_draco_setup_metrics", None)
-    return setup
+    if isinstance(setup, Mapping):
+        setattr(provider, "_draco_setup_metrics", None)
+    routing_receipt = copy.deepcopy(dict(routing)) if isinstance(routing, Mapping) else {}
+    executed_plan = _provider_selection_plan_execution_snapshot(provider)
+    if routing_receipt and isinstance(executed_plan, Mapping):
+        serialized_plan = json_safe(copy.deepcopy(dict(executed_plan)))
+        if not isinstance(serialized_plan, Mapping):
+            raise TypeError("provider selection plan must serialize to an object")
+        routing_receipt["selection_plan"] = copy.deepcopy(dict(serialized_plan))
+    return {
+        "latency_ms": coerce_metric_int(
+            setup.get("latency_ms") if isinstance(setup, Mapping) else 0
+        ),
+        "usage": copy.deepcopy(
+            setup.get("usage")
+            if isinstance(setup, Mapping) and isinstance(setup.get("usage"), list)
+            else []
+        ),
+        "routing": routing_receipt,
+    }
 
 
 class DryProvider:
@@ -2965,6 +3092,14 @@ def task_analyzer_usage_rows(
         if isinstance(raw_attempts, list)
         else []
     )
+    raw_declared_count = usage.get("attempt_count")
+    if (
+        not attempts
+        and isinstance(raw_declared_count, int)
+        and not isinstance(raw_declared_count, bool)
+        and raw_declared_count == 0
+    ):
+        return []
     declared_count = max(
         1,
         coerce_metric_int(usage.get("attempt_count")),
@@ -3047,6 +3182,154 @@ def task_analyzer_usage_rows(
     return rows
 
 
+def conservative_task_analyzer_usage_rows(
+    usage: Any,
+    *,
+    provider_id: str,
+    model_id: str,
+    source: str,
+    fallback_reason: str,
+) -> list[dict[str, Any]]:
+    """Recover analyzer retry cardinality and IDs without trusting parsing."""
+
+    def safe_get(value: Any, key: str, default: Any = None) -> Any:
+        try:
+            return value.get(key, default) if isinstance(value, Mapping) else default
+        except Exception:  # noqa: BLE001 - evidence objects may be malformed
+            return default
+
+    def safe_count(value: Any) -> int:
+        if isinstance(value, bool):
+            return 0
+        if isinstance(value, int):
+            return max(0, value)
+        try:
+            return max(0, int(str(value).strip()))
+        except Exception:  # noqa: BLE001 - use observed attempts instead
+            return 0
+
+    raw_attempts = safe_get(usage, "physical_attempts", [])
+    attempts = raw_attempts if isinstance(raw_attempts, list) else []
+    declared_raw = safe_get(usage, "attempt_count")
+    declared_count = safe_count(declared_raw)
+    if (
+        declared_raw == 0
+        and not isinstance(declared_raw, bool)
+        and not attempts
+    ):
+        return []
+    request_count = max(1, declared_count, len(attempts))
+    attempts_by_ordinal: dict[int, Any] = {}
+    for position, attempt in enumerate(attempts, start=1):
+        ordinal = safe_count(safe_get(attempt, "attempt")) or position
+        attempts_by_ordinal.setdefault(ordinal, attempt)
+
+    rows: list[dict[str, Any]] = []
+    for ordinal in range(1, request_count + 1):
+        raw_attempt = attempts_by_ordinal.get(ordinal)
+        if raw_attempt is None and request_count == 1:
+            raw_attempt = usage
+        try:
+            attempt_payload = (
+                dict(raw_attempt)
+                if isinstance(raw_attempt, Mapping)
+                else {}
+            )
+            attempt_payload.pop("physical_attempts", None)
+            attempt_payload.pop("attempt_count", None)
+            attempt_payload.setdefault("attempt", ordinal)
+            row = task_analyzer_usage_row(
+                attempt_payload,
+                provider_id=provider_id,
+                model_id=model_id,
+                source=source,
+                fallback_reason=fallback_reason,
+            )
+        except Exception:  # noqa: BLE001 - build a primitive unknown row
+            try:
+                physical_attempt_id = str(
+                    safe_get(raw_attempt, "physical_attempt_id") or ""
+                ).strip()
+            except Exception:  # noqa: BLE001 - generate a stable-shape ID
+                physical_attempt_id = ""
+            physical_attempt_id = (
+                physical_attempt_id or uuid.uuid4().hex
+            )
+            row = {
+                "role": "unknown_request",
+                "label": "task_analyzer",
+                "request_count": 1,
+                "attempt": ordinal,
+                "physical_attempt_id": physical_attempt_id,
+                "provider": "",
+                "model": "",
+                "requested_provider": str(provider_id or ""),
+                "requested_model": str(model_id or ""),
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "reasoning_tokens": 0,
+                "cached_tokens": 0,
+                "cache_write_tokens": 0,
+                "billed_cost": 0.0,
+                "cost_source": "none",
+                "usage_unknown": True,
+                "provider_usage": {
+                    "physical_attempt_id": physical_attempt_id,
+                    "usage_unknown": True,
+                    "task_analysis_source": source,
+                    "fallback_reason": fallback_reason,
+                    "recovery_source": (
+                        "analyzer_postprocess_primitive_fallback"
+                    ),
+                },
+            }
+        rows.append(row)
+    return rows
+
+
+def _bind_frozen_g1_retry_provenance(
+    plan: dict[str, Any],
+    *,
+    initial_plan: Mapping[str, Any],
+    excluded_proposer_identities: Sequence[str],
+) -> None:
+    """Bind a materialized reroute to the original paid analyzer decision."""
+
+    from opensquilla.provider.ranking_router import (
+        ROUTER_DYNAMIC_RETRY_ROUTING_SCHEMA,
+        build_router_dynamic_task_analysis_reuse_binding,
+    )
+
+    exclusions = sorted(
+        {
+            str(identity or "").strip().lower()
+            for identity in excluded_proposer_identities
+            if str(identity or "").strip()
+        }
+    )
+    initial_decision_id = str(initial_plan.get("decision_id") or "")
+    if not initial_decision_id or not exclusions:
+        raise ValueError("frozen G1 reroute lacks parent decision or exclusions")
+    binding = build_router_dynamic_task_analysis_reuse_binding(initial_plan)
+    plan["retry_parent_decision_id"] = initial_decision_id
+    plan["retry_excluded_proposer_identities"] = exclusions
+    plan["task_analysis_reused"] = True
+    plan["task_analysis_reuse"] = binding
+    retry_routing = dict(plan.get("retry_routing") or {})
+    retry_routing.update(
+        {
+            "schema": ROUTER_DYNAMIC_RETRY_ROUTING_SCHEMA,
+            "reason": "prior_attempt_reasoning_only_length",
+            "parent_decision_id": initial_decision_id,
+            "excluded_proposer_identities": exclusions,
+            "task_analysis_reused": True,
+            "task_analysis_source_decision_id": initial_decision_id,
+            "task_analysis_reuse_sha256": binding["projection_sha256"],
+        }
+    )
+    plan["retry_routing"] = retry_routing
+
+
 async def build_experiment_provider(
     *,
     config: GatewayConfig,
@@ -3060,9 +3343,15 @@ async def build_experiment_provider(
     experiment_config: DracoExperimentConfig | None = None,
     g1_registry_contract: Mapping[str, Any] | None = None,
     generation_policy: dict[str, Any] | None = None,
+    tools: Sequence[ToolDefinition] | None = None,
+    frozen_g1_lifecycle: Mapping[str, Any] | None = None,
 ) -> ProviderBuildResult:
     """Build one DRACO provider through the same routing primitives as runtime.py."""
 
+    if frozen_g1_lifecycle is not None:
+        raise ValueError(
+            "frozen G1 lifecycle provider construction is resume-only"
+        )
     spec = GROUP_SPECS[group]
     started = time.monotonic()
     kind = spec["kind"]
@@ -3198,10 +3487,11 @@ async def build_experiment_provider(
                 ranking_config_snapshot,
             )
 
+            thinking_assignment_enabled = (
+                config.llm_ensemble.ranking_thinking_assignment_enabled is True
+            )
             ranking_config = ranking_config_snapshot(
-                thinking_assignment_enabled=bool(
-                    config.llm_ensemble.ranking_thinking_assignment_enabled
-                ),
+                thinking_assignment_enabled=thinking_assignment_enabled,
             )
             dry_config = config.model_copy(deep=True)
             dry_ensemble = dry_config.llm_ensemble
@@ -3210,7 +3500,17 @@ async def build_experiment_provider(
             dry_ensemble.ranking_user_profile_generation_enabled = False
             dry_ensemble.ranking_user_profile_enabled = False
             apply_aggregator_recovery_policy(dry_ensemble, recovery_policy)
-            configured_output_tokens = int(getattr(dry_config.llm, "max_tokens", 0) or 0)
+            if thinking_assignment_enabled:
+                configured_output_tokens, _ = (
+                    resolve_effective_generation_request_parameters(
+                        llm_config=dry_config.llm,
+                        generation_policy=generation_policy,
+                    )
+                )
+            else:
+                configured_output_tokens = int(
+                    getattr(dry_config.llm, "max_tokens", 0) or 0
+                )
             candidate_output_tokens, aggregator_output_tokens = dynamic_output_token_budgets(
                 configured_output_tokens=configured_output_tokens,
                 candidate_max_chars=int(dry_ensemble.candidate_max_chars or 0),
@@ -3229,6 +3529,29 @@ async def build_experiment_provider(
                 request_context=request_context,
                 ranking_config=ranking_config,
             )
+            dry_ranking_inputs = {
+                "decision_id": ("dry-" + hashlib.sha256(prompt.encode()).hexdigest()[:24]),
+                "task_analysis": TaskAnalysisResult(
+                    profile=task_profile,
+                    source="dry_run_fallback",
+                    schema_valid=False,
+                    confidence=0.0,
+                    fallback_reason="dry_run_no_analyzer_call",
+                ),
+                "user_profile": None,
+                "request_context": request_context,
+                "ranking_config": ranking_config,
+                "generation_policy": (
+                    dict(generation_policy)
+                    if generation_policy is not None
+                    else None
+                    if thinking_assignment_enabled
+                    else {}
+                ),
+                "registry_allowlist": resolved_g1_registry_contract,
+            }
+            if thinking_assignment_enabled:
+                dry_ranking_inputs["request_tools_present"] = bool(tools)
             dry_dynamic_provider = build_ensemble_provider_from_config(
                 config=dry_config,
                 inherited_provider_config=inherited,
@@ -3238,21 +3561,7 @@ async def build_experiment_provider(
                     "routing_confidence": 0.0,
                     "router_dynamic_task_text": prompt,
                 },
-                ranking_inputs={
-                    "decision_id": ("dry-" + hashlib.sha256(prompt.encode()).hexdigest()[:24]),
-                    "task_analysis": TaskAnalysisResult(
-                        profile=task_profile,
-                        source="dry_run_fallback",
-                        schema_valid=False,
-                        confidence=0.0,
-                        fallback_reason="dry_run_no_analyzer_call",
-                    ),
-                    "user_profile": None,
-                    "request_context": request_context,
-                    "ranking_config": ranking_config,
-                    "generation_policy": dict(generation_policy or {}),
-                    "registry_allowlist": resolved_g1_registry_contract,
-                },
+                ranking_inputs=dry_ranking_inputs,
             )
             plan = copy.deepcopy(dry_dynamic_provider.selection_plan)
             proposer_models = list(plan.get("proposer_models") or [])
@@ -3422,10 +3731,11 @@ async def build_experiment_provider(
             ranking_config_snapshot,
         )
 
+        thinking_assignment_enabled = (
+            group_config.llm_ensemble.ranking_thinking_assignment_enabled is True
+        )
         ranking_config = ranking_config_snapshot(
-            thinking_assignment_enabled=bool(
-                group_config.llm_ensemble.ranking_thinking_assignment_enabled
-            ),
+            thinking_assignment_enabled=thinking_assignment_enabled,
         )
         routing_extra = turn.metadata.get("routing_extra")
         routing_extra_map = routing_extra if isinstance(routing_extra, Mapping) else {}
@@ -3439,9 +3749,18 @@ async def build_experiment_provider(
             routing_confidence = float(turn.metadata.get("routing_confidence") or 0.0)
         except (TypeError, ValueError):
             routing_confidence = 0.0
-        configured_output_tokens = int(
-            getattr(getattr(group_config, "llm", None), "max_tokens", 0) or 0
-        )
+        if thinking_assignment_enabled:
+            configured_output_tokens, _ = (
+                resolve_effective_generation_request_parameters(
+                    llm_config=getattr(group_config, "llm", None),
+                    generation_policy=generation_policy,
+                )
+            )
+        else:
+            configured_output_tokens = int(
+                getattr(getattr(group_config, "llm", None), "max_tokens", 0)
+                or 0
+            )
         candidate_output_tokens, aggregator_output_tokens = dynamic_output_token_budgets(
             configured_output_tokens=configured_output_tokens,
             candidate_max_chars=int(ensemble_cfg.candidate_max_chars or 0),
@@ -3505,61 +3824,171 @@ async def build_experiment_provider(
                 exc,
                 setup_latency_ms=int((time.monotonic() - started) * 1000),
                 setup_usage=setup_usage,
-                routing_trace=routing_trace,
+                routing_trace=safe_provider_build_routing_trace(
+                    routing_trace
+                ),
             ) from exc
-        ranking_inputs = {
-            "decision_id": decision_id,
-            "task_analysis": task_analysis,
-            "user_profile": user_profile,
-            "request_context": request_context,
-            "ranking_config": ranking_config,
-            "generation_policy": dict(generation_policy or {}),
-            "registry_allowlist": resolved_g1_registry_contract,
-        }
-        turn.metadata["router_dynamic_task_profile"] = task_analysis.profile
-        turn.metadata["router_dynamic_task_analyzer"] = task_analysis.trace(ranking_config)
-        turn.metadata["router_dynamic_request_context_hash"] = request_context.get("snapshot_hash")
-        analyzer_usage = dict(task_analysis.usage or {})
-        setup_usage.extend(
-            task_analyzer_usage_rows(
-                analyzer_usage,
+        analyzer_postprocess_error: Exception | None = None
+        analyzer_usage_materialization_failed = False
+        raw_analyzer_usage: Any = None
+        try:
+            raw_analyzer_usage = task_analysis.usage
+            analyzer_usage = dict(raw_analyzer_usage or {})
+        except Exception as exc:  # noqa: BLE001 - preserve raw retry evidence
+            analyzer_postprocess_error = exc
+            analyzer_usage_materialization_failed = True
+            analyzer_usage = {
+                "attempt_count": 1,
+                "usage_unknown": True,
+            }
+        try:
+            analyzer_source = str(task_analysis.source or "")
+            analyzer_fallback_reason = str(
+                task_analysis.fallback_reason or ""
+            )
+        except Exception as exc:  # noqa: BLE001 - usage was already captured
+            analyzer_postprocess_error = (
+                analyzer_postprocess_error or exc
+            )
+            analyzer_source = "analyzer_postprocess_failed"
+            analyzer_fallback_reason = type(exc).__name__
+        try:
+            if analyzer_usage_materialization_failed:
+                analyzer_usage_rows = conservative_task_analyzer_usage_rows(
+                    (
+                        raw_analyzer_usage
+                        if isinstance(raw_analyzer_usage, Mapping)
+                        else analyzer_usage
+                    ),
+                    provider_id=TASK_ANALYZER_PROVIDER_ID,
+                    model_id=TASK_ANALYZER_MODEL_ID,
+                    source="analyzer_postprocess_failed",
+                    fallback_reason=type(
+                        analyzer_postprocess_error
+                    ).__name__,
+                )
+            else:
+                analyzer_usage_rows = task_analyzer_usage_rows(
+                    analyzer_usage,
+                    provider_id=TASK_ANALYZER_PROVIDER_ID,
+                    model_id=TASK_ANALYZER_MODEL_ID,
+                    source=analyzer_source,
+                    fallback_reason=analyzer_fallback_reason,
+                )
+        except Exception as exc:  # noqa: BLE001 - retain one unknown receipt
+            analyzer_postprocess_error = (
+                analyzer_postprocess_error or exc
+            )
+            analyzer_usage_rows = conservative_task_analyzer_usage_rows(
+                (
+                    raw_analyzer_usage
+                    if isinstance(raw_analyzer_usage, Mapping)
+                    else analyzer_usage
+                ),
                 provider_id=TASK_ANALYZER_PROVIDER_ID,
                 model_id=TASK_ANALYZER_MODEL_ID,
-                source=task_analysis.source,
-                fallback_reason=task_analysis.fallback_reason,
+                source="analyzer_postprocess_failed",
+                fallback_reason=type(exc).__name__,
             )
-        )
-        routing_trace["task_analyzer"] = {
-            "provider": TASK_ANALYZER_PROVIDER_ID,
-            "model": TASK_ANALYZER_MODEL_ID,
-            "source": task_analysis.source,
-            "schema_valid": task_analysis.schema_valid,
-            "confidence": task_analysis.confidence,
-            "fallback_reason": task_analysis.fallback_reason,
-            "request_context_hash": request_context.get("snapshot_hash"),
-            "user_profile_enabled": user_profile_enabled,
-        }
+        setup_usage.extend(analyzer_usage_rows)
+        if analyzer_postprocess_error is not None:
+            routing_trace["task_analyzer"] = {
+                "provider": TASK_ANALYZER_PROVIDER_ID,
+                "model": TASK_ANALYZER_MODEL_ID,
+                "source": "analyzer_postprocess_failed",
+                "schema_valid": False,
+                "fallback_reason": type(
+                    analyzer_postprocess_error
+                ).__name__,
+                "request_context_hash": request_context.get("snapshot_hash"),
+                "user_profile_enabled": user_profile_enabled,
+            }
+            raise ProviderBuildError(
+                analyzer_postprocess_error,
+                setup_latency_ms=int((time.monotonic() - started) * 1000),
+                setup_usage=setup_usage,
+                routing_trace=safe_provider_build_routing_trace(
+                    routing_trace
+                ),
+            ) from analyzer_postprocess_error
+        try:
+            ranking_inputs = {
+                "decision_id": decision_id,
+                "task_analysis": task_analysis,
+                "user_profile": user_profile,
+                "request_context": request_context,
+                "ranking_config": ranking_config,
+                "generation_policy": (
+                    dict(generation_policy)
+                    if generation_policy is not None
+                    else None
+                    if thinking_assignment_enabled
+                    else {}
+                ),
+                "registry_allowlist": resolved_g1_registry_contract,
+            }
+            if thinking_assignment_enabled:
+                ranking_inputs["request_tools_present"] = bool(tools)
+            turn.metadata["router_dynamic_task_profile"] = task_analysis.profile
+            turn.metadata["router_dynamic_task_analyzer"] = task_analysis.trace(
+                ranking_config
+            )
+            turn.metadata["router_dynamic_request_context_hash"] = (
+                request_context.get("snapshot_hash")
+            )
+            routing_trace["task_analyzer"] = {
+                "provider": TASK_ANALYZER_PROVIDER_ID,
+                "model": TASK_ANALYZER_MODEL_ID,
+                "source": analyzer_source,
+                "schema_valid": task_analysis.schema_valid,
+                "confidence": task_analysis.confidence,
+                "fallback_reason": analyzer_fallback_reason,
+                "request_context_hash": request_context.get("snapshot_hash"),
+                "user_profile_enabled": user_profile_enabled,
+            }
+        except Exception as exc:  # noqa: BLE001 - preserve a paid analyzer call
+            if not setup_usage:
+                raise
+            routing_trace["task_analyzer"] = {
+                "provider": TASK_ANALYZER_PROVIDER_ID,
+                "model": TASK_ANALYZER_MODEL_ID,
+                "source": "analyzer_postprocess_failed",
+                "schema_valid": False,
+                "fallback_reason": type(exc).__name__,
+                "request_context_hash": request_context.get("snapshot_hash"),
+                "user_profile_enabled": user_profile_enabled,
+            }
+            raise ProviderBuildError(
+                exc,
+                setup_latency_ms=int((time.monotonic() - started) * 1000),
+                setup_usage=setup_usage,
+                routing_trace=safe_provider_build_routing_trace(
+                    routing_trace
+                ),
+            ) from exc
 
-    try:
-        provider = build_ensemble_provider_from_config(
+    def materialize_ensemble_provider(
+        active_ranking_inputs: Mapping[str, Any] | None,
+    ) -> Any:
+        materialized = build_ensemble_provider_from_config(
             config=group_config,
             inherited_provider_config=routed_config,
             fallback_provider=routed_provider,
             turn_metadata=turn.metadata,
-            ranking_inputs=ranking_inputs,
+            ranking_inputs=active_ranking_inputs,
         )
         if b2_experiment is not None:
-            provider = align_b2_provider_to_g12(provider, b2_experiment)
+            materialized = align_b2_provider_to_g12(materialized, b2_experiment)
         if g1_routing is not None:
-            provider.selection_plan["user_profile_enabled"] = user_profile_enabled
-        provider = enforce_draco_legal_proposer_quorum(provider)
+            materialized.selection_plan["user_profile_enabled"] = user_profile_enabled
+        materialized = enforce_draco_legal_proposer_quorum(materialized)
         if generation_policy is not None:
-            provider = apply_generation_policy_to_ensemble_provider(
-                provider,
+            materialized = apply_generation_policy_to_ensemble_provider(
+                materialized,
                 generation_policy,
             )
             validate_strict_openrouter_ensemble_members(
-                provider,
+                materialized,
                 generation_policy,
                 fallback_config=routed_config,
                 allow_unpinned_openrouter=bool(
@@ -3567,6 +3996,11 @@ async def build_experiment_provider(
                     and resolved_g1_registry_contract.get("candidate_scope") == "registry_all"
                 ),
             )
+        materialized.seal_managed_thinking_execution_guard()
+        return materialized
+
+    try:
+        provider = materialize_ensemble_provider(ranking_inputs)
         routing_trace.update(
             {
                 "selection_mode": selection_mode,
@@ -3581,18 +4015,119 @@ async def build_experiment_provider(
                 exc,
                 setup_latency_ms=int((time.monotonic() - started) * 1000),
                 setup_usage=setup_usage,
-                routing_trace=routing_trace,
+                routing_trace=safe_provider_build_routing_trace(
+                    routing_trace
+                ),
             ) from exc
         raise
-    result = ProviderBuildResult(
-        provider=provider,
-        prompt=turn.message,
-        setup_latency_ms=int((time.monotonic() - started) * 1000),
-        setup_usage=setup_usage,
-        routing_trace=routing_trace,
-    )
-    attach_provider_setup(provider, result)
-    return result
+    try:
+        result = ProviderBuildResult(
+            provider=provider,
+            prompt=turn.message,
+            setup_latency_ms=int((time.monotonic() - started) * 1000),
+            setup_usage=setup_usage,
+            routing_trace=routing_trace,
+        )
+        attach_provider_setup(provider, result)
+        if g1_routing is not None and isinstance(ranking_inputs, Mapping):
+            frozen_ranking_inputs = dict(ranking_inputs)
+            initial_selection_plan = copy.deepcopy(
+                dict(provider.selection_plan)
+            )
+            initial_decision_id = str(
+                initial_selection_plan.get("decision_id") or ""
+            )
+            initial_task_analysis = frozen_ranking_inputs.get(
+                "task_analysis"
+            )
+            initial_task_analysis_trace = dict(
+                routing_trace.get("task_analyzer") or {}
+            )
+
+            def rebuild_after_reasoning_only_length(
+                excluded_proposer_identities: Sequence[str],
+            ) -> Any:
+                exclusions = sorted(
+                    {
+                        str(identity or "").strip().lower()
+                        for identity in excluded_proposer_identities
+                        if str(identity or "").strip()
+                    }
+                )
+                if not exclusions:
+                    raise ValueError(
+                        "G1 retry rebuild requires at least one proposer exclusion"
+                    )
+                retry_started = time.monotonic()
+                exclusion_hash = hashlib.sha256(
+                    "\n".join(exclusions).encode("utf-8")
+                ).hexdigest()[:16]
+                retry_inputs = dict(frozen_ranking_inputs)
+                retry_inputs.update(
+                    {
+                        "decision_id": (
+                            f"{initial_decision_id}-retry-{exclusion_hash}"
+                        ),
+                        "task_analysis": initial_task_analysis,
+                        "retry_excluded_proposer_identities": exclusions,
+                        "retry_parent_decision_id": initial_decision_id,
+                        "task_analysis_reused": True,
+                    }
+                )
+                retry_provider = materialize_ensemble_provider(retry_inputs)
+                retry_plan = retry_provider.selection_plan
+                _bind_frozen_g1_retry_provenance(
+                    retry_plan,
+                    initial_plan=initial_selection_plan,
+                    excluded_proposer_identities=exclusions,
+                )
+                retry_provider.seal_managed_thinking_execution_guard()
+                retry_routing_trace = {
+                    **dict(routing_trace),
+                    "selection_plan": retry_plan,
+                    "task_analyzer": initial_task_analysis_trace,
+                    "task_analyzer_reuse": {
+                        "schema": (
+                            "opensquilla.draco.task-analysis-reuse/v1"
+                        ),
+                        "source_decision_id": initial_decision_id,
+                        "physical_request_count": 0,
+                        "excluded_proposer_identities": exclusions,
+                    },
+                }
+                retry_build = ProviderBuildResult(
+                    provider=retry_provider,
+                    prompt=turn.message,
+                    setup_latency_ms=int(
+                        (time.monotonic() - retry_started) * 1000
+                    ),
+                    setup_usage=[],
+                    routing_trace=retry_routing_trace,
+                )
+                attach_provider_setup(retry_provider, retry_build)
+                return retry_provider
+
+            setattr(
+                provider,
+                "_draco_reasoning_only_retry_factory",
+                rebuild_after_reasoning_only_length,
+            )
+        return result
+    except ProviderBuildError:
+        raise
+    except Exception as exc:
+        if setup_usage:
+            raise ProviderBuildError(
+                exc,
+                setup_latency_ms=int(
+                    (time.monotonic() - started) * 1000
+                ),
+                setup_usage=setup_usage,
+                routing_trace=safe_provider_build_routing_trace(
+                    routing_trace
+                ),
+            ) from exc
+        raise
 
 
 def build_profile_provider(
@@ -4022,7 +4557,7 @@ async def collect_run(
             error = f"TimeoutError: run timed out after {timeout:g}s"
             _trace("timeout", timeout_s=timeout)
     except Exception as exc:  # noqa: BLE001 - benchmark rows should keep going
-        error = f"{type(exc).__name__}: {exc}"
+        error = type(exc).__name__
         _trace("exception", error=error)
     setup = consume_provider_setup(provider)
     setup_latency_ms = coerce_metric_int(setup.get("latency_ms"))
@@ -4885,7 +5420,7 @@ async def collect_agent_run(
             error = f"TimeoutError: agent run timed out after {timeout:g}s"
             _trace("timeout", timeout_s=timeout)
     except Exception as exc:  # noqa: BLE001 - benchmark rows should keep going
-        error = f"{type(exc).__name__}: {exc}"
+        error = type(exc).__name__
         _trace("exception", error=error)
 
     provider_done = provider_done_from_agent_done(
@@ -5023,6 +5558,11 @@ def done_payload(done: DoneEvent | None) -> dict[str, Any]:
         "thinking_signature_present": bool(done.thinking_signature),
     }
     billing_receipt = getattr(done, "billing_receipt", None)
+    physical_attempt_id = str(
+        getattr(done, "physical_attempt_id", "") or ""
+    )
+    if physical_attempt_id:
+        payload["physical_attempt_id"] = physical_attempt_id
     if billing_receipt is not None:
         payload["billing_receipt"] = billing_receipt
     payload["billed_cost"] = trusted_provider_billed_cost(payload)
@@ -5734,7 +6274,13 @@ def run_result_error_physical_request_count(result: RunResult) -> int | None:
     return None
 
 
-def run_result_summary(result: RunResult) -> dict[str, Any]:
+def run_result_summary(
+    result: RunResult,
+    *,
+    requested_provider: str | None = None,
+    requested_model: str | None = None,
+    missing_usage_role: str | None = None,
+) -> dict[str, Any]:
     usage = run_result_usage_payload(result)
     server_tool_call_count = coerce_metric_int(usage.get("server_tool_call_count"))
     total_tool_call_count = result.tool_call_count + server_tool_call_count
@@ -5801,14 +6347,23 @@ def run_result_summary(result: RunResult) -> dict[str, Any]:
                 "request_started": True,
             },
             identity_seed=identity_seed,
-            requested_provider=str(usage.get("requested_provider") or ""),
-            requested_model=str(usage.get("requested_model") or ""),
+            requested_provider=(
+                str(usage.get("requested_provider") or "")
+                if requested_provider is None
+                else requested_provider
+            ),
+            requested_model=(
+                str(usage.get("requested_model") or "")
+                if requested_model is None
+                else requested_model
+            ),
+            role=missing_usage_role,
         )
         usage_unknown_count = max(
             usage_unknown_count,
             usage_unknown_count_from_usage_payload(usage),
         )
-    return {
+    summary = {
         "latency_ms": result.latency_ms,
         "ttft_ms": result.ttft_ms,
         "tool_call_count": result.tool_call_count,
@@ -5827,6 +6382,419 @@ def run_result_summary(result: RunResult) -> dict[str, Any]:
         "setup_latency_ms": result.setup_latency_ms,
         "routing_trace": result.routing_trace,
     }
+    selection_plan = (
+        result.routing_trace.get("selection_plan")
+        if isinstance(result.routing_trace, Mapping)
+        else None
+    )
+    if (
+        isinstance(selection_plan, Mapping)
+        and selection_plan.get("ranking_thinking_assignment_enabled") is True
+    ):
+        summary["ensemble_trace"] = json_safe(
+            result.done.ensemble_trace
+            if result.done is not None
+            and isinstance(result.done.ensemble_trace, Mapping)
+            else {}
+        )
+    return summary
+
+
+def judge_run_result_summary(
+    result: RunResult,
+    *,
+    judge_provider: Any,
+) -> dict[str, Any]:
+    """Bind missing Judge usage to the frozen requested route at creation."""
+
+    return run_result_summary(
+        result,
+        requested_provider=str(
+            getattr(judge_provider, "provider_id", "") or ""
+        ),
+        requested_model=str(getattr(judge_provider, "model", "") or ""),
+        missing_usage_role="unknown_request",
+    )
+
+
+def generation_postprocessing_failure_reason(
+    stage: str,
+    exc: Exception,
+) -> str:
+    """Return a non-sensitive terminal reason for paid-call postprocessing."""
+
+    return (
+        "generation_postprocessing_failed:"
+        + str(stage or "unknown")
+        + ":"
+        + type(exc).__name__
+    )
+
+
+def primitive_unknown_usage_payload(
+    *,
+    physical_count: int,
+    identity_seed: str,
+    requested_provider: str,
+    requested_model: str,
+    role: str = "usage_missing",
+) -> dict[str, Any]:
+    """Build strict unknown units without depending on canonicalizers."""
+
+    count = (
+        physical_count
+        if isinstance(physical_count, int)
+        and not isinstance(physical_count, bool)
+        and physical_count > 0
+        else 0
+    )
+    units: list[dict[str, Any]] = []
+    for ordinal in range(1, count + 1):
+        canonical = json.dumps(
+            {
+                "identity_seed": str(identity_seed),
+                "ordinal": ordinal,
+                "role": role,
+                "schema": USAGE_EVIDENCE_SCHEMA,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        evidence_id = (
+            "sha256:"
+            + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        )
+        units.append(
+            {
+                "usage_evidence_schema": USAGE_EVIDENCE_SCHEMA,
+                "usage_evidence_id": evidence_id,
+                "usage_evidence_source": (
+                    "emergency_physical_request_counter"
+                ),
+                "role": role,
+                "physical_request_ordinal": ordinal,
+                "provider": "",
+                "model": "",
+                "requested_provider": str(
+                    requested_provider or ""
+                ).strip(),
+                "requested_model": str(
+                    requested_model or ""
+                ).strip(),
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "reasoning_tokens": 0,
+                "cached_tokens": 0,
+                "cache_write_tokens": 0,
+                "billed_cost": 0.0,
+                "cost_source": "none",
+                "usage_unknown": True,
+                "provider_usage": {
+                    "usage_unknown": True,
+                    "usage_evidence_schema": USAGE_EVIDENCE_SCHEMA,
+                    "usage_evidence_id": evidence_id,
+                },
+            }
+        )
+    return {
+        "usage_evidence_schema": USAGE_EVIDENCE_SCHEMA,
+        "model_usage_breakdown": units,
+        "usage_missing_count": count,
+    }
+
+
+def emergency_generation_run_summary(
+    result: RunResult,
+    *,
+    reason: str,
+    stage: str,
+    exception_type: str,
+    identity_seed: str,
+    expected_provider: str = "",
+    expected_model: str = "",
+) -> dict[str, Any]:
+    """Persist conservative physical evidence when normal summarization fails."""
+
+    source_error_present = bool(result.error)
+    primitive_usage_fallback = False
+    try:
+        summary = run_result_summary(
+            result,
+            requested_provider=expected_provider or None,
+            requested_model=expected_model or None,
+        )
+        summary_error_type = ""
+        unvalidated_usage: Any = None
+    except Exception as summary_exc:  # noqa: BLE001 - this is the last evidence boundary
+        summary_error_type = type(summary_exc).__name__
+        try:
+            raw_usage = run_result_usage_payload(result)
+        except Exception:  # noqa: BLE001 - retain a conservative unknown unit
+            raw_usage = {}
+        try:
+            unvalidated_usage = json_safe(raw_usage)
+        except Exception:  # noqa: BLE001 - never persist an unsafe object
+            unvalidated_usage = {
+                "capture_failed": True,
+                "exception_type": summary_error_type,
+            }
+        if not isinstance(unvalidated_usage, Mapping):
+            unvalidated_usage = {}
+        breakdown = unvalidated_usage.get("model_usage_breakdown")
+        represented_units = (
+            len([unit for unit in breakdown if isinstance(unit, Mapping)])
+            if isinstance(breakdown, list)
+            else 0
+        )
+        explicit_count = run_result_error_physical_request_count(result)
+        if explicit_count is not None:
+            primary_count = max(0, explicit_count)
+        elif result.done is not None:
+            try:
+                done_usage = done_payload(result.done)
+                done_evidence: dict[str, Any] = {
+                    "usage": done_usage,
+                    "request_started": True,
+                }
+                if isinstance(result.done.ensemble_trace, Mapping):
+                    done_evidence["ensemble_trace"] = (
+                        result.done.ensemble_trace
+                    )
+                primary_count = derive_physical_request_count(
+                    done_evidence,
+                    default_request_count=1,
+                )
+            except Exception:  # noqa: BLE001 - one completed call is conservative
+                primary_count = 1
+        elif (
+            bool(result.error or result.final_text)
+            and not run_result_was_blocked_before_request(result)
+        ):
+            primary_count = 1
+        else:
+            primary_count = 0
+        try:
+            setup_count = usage_rows_request_count(result.setup_usage)
+        except Exception:  # noqa: BLE001 - one row is at least one request
+            setup_count = len(result.setup_usage)
+        physical_count = max(
+            represented_units,
+            primary_count + setup_count,
+        )
+        try:
+            canonical_usage = canonicalize_run_usage(
+                {
+                    "usage": dict(unvalidated_usage),
+                    "physical_request_count": physical_count,
+                    "request_started": physical_count > 0,
+                },
+                identity_seed=identity_seed,
+                requested_provider=expected_provider,
+                requested_model=expected_model,
+            )
+        except Exception:  # noqa: BLE001 - retry only with safe primitives
+            try:
+                canonical_usage = canonicalize_run_usage(
+                    {
+                        "usage": {},
+                        "physical_request_count": physical_count,
+                        "request_started": physical_count > 0,
+                    },
+                    identity_seed=identity_seed + ":unknown",
+                    requested_provider=expected_provider,
+                    requested_model=expected_model,
+                )
+            except Exception:  # noqa: BLE001 - canonicalizer itself is unavailable
+                primitive_usage_fallback = True
+                canonical_usage = primitive_unknown_usage_payload(
+                    physical_count=physical_count,
+                    identity_seed=identity_seed + ":primitive-unknown",
+                    requested_provider=expected_provider,
+                    requested_model=expected_model,
+                )
+        unknown_count = (
+            physical_count
+            if primitive_usage_fallback
+            else usage_unknown_count_from_usage_payload(
+                canonical_usage
+            )
+        )
+        try:
+            server_tool_use = server_tool_counts_from_usage_payload(
+                canonical_usage
+            )
+        except Exception:  # noqa: BLE001 - tools are secondary evidence
+            server_tool_use = {}
+        server_tool_call_count = sum(server_tool_use.values())
+        total_tool_call_count = (
+            coerce_metric_int(result.tool_call_count)
+            + server_tool_call_count
+        )
+        try:
+            safe_trace_events = json_safe(result.trace_events)
+        except Exception as trace_exc:  # noqa: BLE001 - primitive evidence only
+            safe_trace_events = [
+                {
+                    "kind": "error",
+                    "code": "trace_evidence_capture_failed",
+                    "exception_type": type(trace_exc).__name__,
+                }
+            ]
+        try:
+            safe_routing_trace = safe_provider_build_routing_trace(
+                result.routing_trace
+            )
+        except Exception as routing_exc:  # noqa: BLE001 - primitive evidence only
+            safe_routing_trace = {
+                "capture_failed": True,
+                "exception_type": type(routing_exc).__name__,
+            }
+        summary = {
+            "latency_ms": coerce_metric_int(result.latency_ms),
+            "ttft_ms": result.ttft_ms,
+            "tool_call_count": coerce_metric_int(result.tool_call_count),
+            "stream_tool_call_count": coerce_metric_int(
+                result.tool_call_count
+            ),
+            "server_tool_call_count": server_tool_call_count,
+            "server_tool_use": server_tool_use,
+            "total_tool_call_count": total_tool_call_count,
+            "trajectory_steps": total_tool_call_count + physical_count,
+            "llm_request_count": physical_count,
+            "usage_unknown_count": unknown_count,
+            "error": reason,
+            "final_text_chars": len(result.final_text),
+            "final_text_sha256": text_sha256(result.final_text),
+            "usage": canonical_usage,
+            "trace_events": safe_trace_events,
+            "setup_latency_ms": coerce_metric_int(
+                result.setup_latency_ms
+            ),
+            "routing_trace": safe_routing_trace,
+        }
+    summary["error"] = reason
+    summary["generation_postprocessing_failure"] = {
+        "stage": stage,
+        "exception_type": exception_type,
+        "summary_exception_type": summary_error_type,
+        "source_error_present": source_error_present,
+        "evidence_precision": (
+            "unvalidated_raw_plus_primitive_unknown"
+            if summary_error_type and primitive_usage_fallback
+            else "unvalidated_raw_plus_conservative_unknown"
+            if summary_error_type
+            else "canonical"
+        ),
+    }
+    if unvalidated_usage is not None:
+        summary["unvalidated_usage_evidence"] = unvalidated_usage
+    return summary
+
+
+def recover_paid_generation_postprocessing_failure(
+    pending: Mapping[str, Any],
+    exc: Exception,
+) -> tuple[RunResult, list[dict[str, Any]], int, str]:
+    """Commit one terminal attempt after a paid-call postprocessing exception."""
+
+    result = pending.get("result")
+    if not isinstance(result, RunResult):
+        raise exc
+    stage = str(pending.get("stage") or "unknown")
+    reason = generation_postprocessing_failure_reason(stage, exc)
+    attempt_id = str(pending.get("attempt_id") or "")
+    attempt_index = coerce_metric_int(pending.get("attempt_index"))
+    attempts_value = pending.get("attempts")
+    attempts = (
+        attempts_value
+        if isinstance(attempts_value, list)
+        else []
+    )
+    result.trace_events = [
+        *(
+            list(result.trace_events)
+            if isinstance(result.trace_events, list)
+            else []
+        ),
+        {
+            "kind": "error",
+            "code": "generation_postprocessing_failed",
+            "stage": stage,
+            "exception_type": type(exc).__name__,
+        },
+    ]
+    run_summary = emergency_generation_run_summary(
+        result,
+        reason=reason,
+        stage=stage,
+        exception_type=type(exc).__name__,
+        identity_seed=f"generation-attempt:{attempt_id or 'unknown'}",
+        expected_provider=str(pending.get("expected_provider") or ""),
+        expected_model=str(pending.get("expected_model") or ""),
+    )
+    result.error = reason
+    existing = next(
+        (
+            attempt
+            for attempt in reversed(attempts)
+            if isinstance(attempt, dict)
+            and str(attempt.get("attempt_id") or "") == attempt_id
+        ),
+        None,
+    )
+    if existing is None:
+        existing = {
+            "attempt_id": attempt_id,
+            "attempt_kind": "generation",
+            "attempt": attempt_index,
+            "started_at": pending.get("attempt_started_at"),
+            "completed_at": time.time(),
+        }
+        if pending.get("adaptive_g1") is True:
+            try:
+                safe_plan = json_safe(
+                    copy.deepcopy(
+                        dict(pending.get("selection_plan") or {})
+                    )
+                )
+            except Exception as plan_exc:  # noqa: BLE001 - evidence stays terminal
+                safe_plan = {
+                    "capture_failed": True,
+                    "exception_type": type(plan_exc).__name__,
+                }
+            existing.update(
+                {
+                    "selection_plan": safe_plan,
+                    "deterministic_proposer_failures": [],
+                    "excluded_proposer_identities": sorted(
+                        str(value)
+                        for value in (
+                            pending.get(
+                                "excluded_proposer_identities"
+                            )
+                            or []
+                        )
+                    ),
+                }
+            )
+        attempts.append(existing)
+    existing.update(
+        {
+            "completed_at": time.time(),
+            "retryable": False,
+            "retry_reason": reason,
+            "retry_suppressed_reason": reason,
+            "will_retry": False,
+            "retry_backoff_s": 0.0,
+            "run": run_summary,
+            "generation_postprocessing_failure": {
+                "stage": stage,
+                "exception_type": type(exc).__name__,
+            },
+        }
+    )
+    return result, attempts, 0, reason
 
 
 def usage_rows_request_count(rows: list[dict[str, Any]]) -> int:
@@ -6457,6 +7425,150 @@ def ensemble_call_trace_sequence(
     return call_traces, reasons
 
 
+def g1_retry_physical_usage_binding_reasons(
+    run: Mapping[str, Any],
+    *,
+    identity_seed: str,
+) -> list[str]:
+    """Strictly bind every paid managed-G1 ledger before more paid work."""
+
+    from opensquilla.provider.thinking_execution import (
+        THINKING_PHYSICAL_EVIDENCE_SCHEMA,
+    )
+
+    trace = run.get("ensemble_trace")
+    calls, reasons = ensemble_call_trace_sequence(
+        trace if isinstance(trace, Mapping) else {}
+    )
+    strict_calls = [
+        call
+        for call in calls
+        if isinstance(call.get("selection_plan"), Mapping)
+        and call["selection_plan"].get(
+            "thinking_physical_evidence_schema"
+        )
+        == THINKING_PHYSICAL_EVIDENCE_SCHEMA
+    ]
+    if not strict_calls:
+        return [
+            *reasons,
+            "missing_g1_thinking_physical_evidence_schema",
+        ]
+    if len(strict_calls) != len(calls):
+        reasons.append("mixed_g1_thinking_physical_evidence_schema")
+
+    ledger_ids: list[str] = []
+    for call in strict_calls:
+        candidates = call.get("candidates")
+        for candidate in candidates if isinstance(candidates, list) else []:
+            execution = (
+                candidate.get("execution")
+                if isinstance(candidate, Mapping)
+                else None
+            )
+            physical_attempts = (
+                execution.get("physical_attempts")
+                if isinstance(execution, Mapping)
+                else None
+            )
+            ledger_ids.extend(
+                str(attempt.get("physical_attempt_id") or "")
+                for attempt in (
+                    physical_attempts
+                    if isinstance(physical_attempts, list)
+                    else []
+                )
+                if isinstance(attempt, Mapping)
+                and attempt.get("request_started") is True
+            )
+        recovery = call.get("aggregator_recovery")
+        recovery_attempts = (
+            recovery.get("attempts")
+            if isinstance(recovery, Mapping)
+            else None
+        )
+        ledger_ids.extend(
+            str(attempt.get("physical_attempt_id") or "")
+            for attempt in (
+                recovery_attempts
+                if isinstance(recovery_attempts, list)
+                else []
+            )
+            if isinstance(attempt, Mapping)
+            and attempt.get("request_started") is True
+        )
+
+    def valid_id(value: str) -> bool:
+        return len(value) == 32 and all(
+            character in "0123456789abcdef"
+            for character in value
+        )
+
+    if (
+        any(not valid_id(attempt_id) for attempt_id in ledger_ids)
+        or len(ledger_ids) != len(set(ledger_ids))
+    ):
+        reasons.append("invalid_g1_thinking_physical_attempt_set")
+    try:
+        units = canonical_run_usage_units(
+            run,
+            identity_seed=identity_seed,
+        )
+        total_request_count = derive_physical_request_count(run)
+    except Exception as exc:  # noqa: BLE001 - suppress retry without raw evidence
+        reasons.append(
+            "g1_physical_usage_canonicalization_failed:"
+            + type(exc).__name__
+        )
+        return list(dict.fromkeys(reasons))
+
+    def is_task_analyzer_unit(unit: Mapping[str, Any]) -> bool:
+        role = str(unit.get("role") or "").strip().casefold()
+        return role in {"task_analyzer", "task_analyzer_attempt"} or (
+            role == "unknown_request"
+            and str(unit.get("label") or "").strip().casefold()
+            == "task_analyzer"
+        )
+
+    analyzer_unit_count = sum(
+        1 for unit in units if is_task_analyzer_unit(unit)
+    )
+    generation_units = [
+        unit for unit in units if not is_task_analyzer_unit(unit)
+    ]
+    usage_ids: list[str] = []
+    for unit in generation_units:
+        attempt_id = str(unit.get("physical_attempt_id") or "")
+        provider_usage = unit.get("provider_usage")
+        nested_id = (
+            str(provider_usage.get("physical_attempt_id") or "")
+            if isinstance(provider_usage, Mapping)
+            else ""
+        )
+        if not valid_id(attempt_id) or nested_id != attempt_id:
+            reasons.append(
+                "invalid_g1_thinking_usage_physical_attempt_id"
+            )
+            continue
+        usage_ids.append(attempt_id)
+    if len(usage_ids) != len(set(usage_ids)):
+        reasons.append("invalid_g1_thinking_usage_physical_attempt_set")
+    if Counter(usage_ids) != Counter(ledger_ids):
+        reasons.append("g1_thinking_physical_usage_set_mismatch")
+    expected_generation_requests = max(
+        0,
+        total_request_count - analyzer_unit_count,
+    )
+    if (
+        len(ledger_ids) != expected_generation_requests
+        or len(generation_units) != expected_generation_requests
+    ):
+        reasons.append(
+            "g1_thinking_physical_usage_multiplicity_mismatch"
+        )
+    return list(dict.fromkeys(reasons))
+
+
 _ADMISSIBLE_NONTERMINAL_FALLBACK_CORE_REASONS = frozenset(
     {
         "aggregator_fallback_used_or_unknown",
@@ -6954,6 +8066,318 @@ def selected_generation_attempt(
     return coerce_metric_int(attempts[-1].get("attempt")) if attempts else 0
 
 
+def _reasoning_only_length_failures_from_trace(
+    root_trace: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Normalize deterministic proposer failures from every physical ensemble call."""
+
+    if not isinstance(root_trace, Mapping):
+        return []
+    call_traces, _ = ensemble_call_trace_sequence(root_trace)
+    failures: list[dict[str, Any]] = []
+    for call_index, call_trace in enumerate(call_traces, start=1):
+        candidates = call_trace.get("candidates")
+        if not isinstance(candidates, list):
+            continue
+        for candidate_index, candidate in enumerate(candidates):
+            if not isinstance(candidate, Mapping) or candidate.get("ok") is True:
+                continue
+            stop_reason = str(candidate.get("stop_reason") or "").strip().casefold()
+            if stop_reason not in REASONING_ONLY_LENGTH_STOP_REASONS:
+                continue
+            content = candidate.get("content")
+            content_chars = content.get("chars") if isinstance(content, Mapping) else None
+            visible_chars = (
+                coerce_metric_int(content_chars)
+                if isinstance(content_chars, int | float)
+                and not isinstance(content_chars, bool)
+                else len(
+                    str(
+                        (
+                            content.get("text")
+                            if isinstance(content, Mapping)
+                            else candidate.get("text")
+                        )
+                        or ""
+                    )
+                )
+            )
+            reasoning_tokens = coerce_metric_int(candidate.get("reasoning_tokens"))
+            output_tokens = coerce_metric_int(candidate.get("output_tokens"))
+            if reasoning_tokens <= 0:
+                for field in (
+                    "model_usage_breakdown",
+                    "diagnostic_model_usage_breakdown",
+                ):
+                    breakdown = candidate.get(field)
+                    if isinstance(breakdown, list):
+                        reasoning_tokens += sum(
+                            coerce_metric_int(row.get("reasoning_tokens"))
+                            for row in breakdown
+                            if isinstance(row, Mapping)
+                        )
+            if output_tokens <= 0:
+                breakdown = candidate.get("model_usage_breakdown")
+                if isinstance(breakdown, list):
+                    output_tokens = sum(
+                        coerce_metric_int(row.get("output_tokens"))
+                        for row in breakdown
+                        if isinstance(row, Mapping)
+                    )
+            if (
+                visible_chars != 0
+                or reasoning_tokens <= 0
+                or candidate.get("request_started") is not True
+                or coerce_metric_int(candidate.get("physical_request_count")) <= 0
+            ):
+                continue
+            provider = (
+                str(
+                    candidate.get("requested_provider")
+                    or candidate.get("provider")
+                    or ""
+                )
+                .strip()
+                .lower()
+            )
+            model = (
+                str(
+                    candidate.get("requested_model")
+                    or candidate.get("model")
+                    or ""
+                )
+                .strip()
+                .lower()
+            )
+            if not provider or not model:
+                continue
+            actual_provider = str(
+                candidate.get("provider") or provider
+            ).strip().lower()
+            actual_model = str(
+                candidate.get("model") or model
+            ).strip().lower()
+            raw_candidate_index = candidate.get("index")
+            normalized_candidate_index = (
+                raw_candidate_index
+                if isinstance(raw_candidate_index, int)
+                and not isinstance(raw_candidate_index, bool)
+                and raw_candidate_index >= 0
+                else candidate_index
+            )
+            failures.append(
+                {
+                    "identity": f"{provider}:{model}",
+                    "reason": "reasoning_only_length",
+                    "call_index": call_index,
+                    "candidate_index": normalized_candidate_index,
+                    "provider": actual_provider,
+                    "model": actual_model,
+                    "requested_provider": provider,
+                    "requested_model": model,
+                    "ok": False,
+                    "request_started": True,
+                    "physical_request_count": coerce_metric_int(
+                        candidate.get("physical_request_count")
+                    ),
+                    "usage_reported": candidate.get("usage_reported") is True,
+                    "usage_missing_count": coerce_metric_int(
+                        candidate.get("usage_missing_count")
+                    ),
+                    "stop_reason": stop_reason,
+                    "visible_output_chars": visible_chars,
+                    "input_tokens": coerce_metric_int(candidate.get("input_tokens")),
+                    "output_tokens": output_tokens,
+                    "reasoning_tokens": reasoning_tokens,
+                    "error": str(candidate.get("error") or ""),
+                    "error_code": str(candidate.get("error_code") or ""),
+                }
+            )
+    return failures
+
+
+def deterministic_reasoning_only_length_failures(
+    result: RunResult,
+) -> list[dict[str, Any]]:
+    done = result.done
+    root_trace = done.ensemble_trace if done is not None else None
+    return (
+        _reasoning_only_length_failures_from_trace(root_trace)
+        if isinstance(root_trace, Mapping)
+        else []
+    )
+
+
+def g1_retry_plan_provenance_reason(
+    initial_plan: Mapping[str, Any],
+    retry_plan: Mapping[str, Any],
+    *,
+    excluded_proposer_identities: set[str],
+) -> str:
+    from opensquilla.provider.ranking_router import (
+        ROUTER_DYNAMIC_RETRY_ROUTING_SCHEMA,
+        router_dynamic_task_analysis_reuse_reasons,
+    )
+
+    parent_decision_id = str(initial_plan.get("decision_id") or "")
+    expected_exclusions = sorted(excluded_proposer_identities)
+    retry_routing = retry_plan.get("retry_routing")
+    reuse_binding = retry_plan.get("task_analysis_reuse")
+    reuse_hash = (
+        str(reuse_binding.get("projection_sha256") or "")
+        if isinstance(reuse_binding, Mapping)
+        else ""
+    )
+    if (
+        not parent_decision_id
+        or retry_plan.get("retry_parent_decision_id") != parent_decision_id
+        or retry_plan.get("retry_excluded_proposer_identities")
+        != expected_exclusions
+        or retry_plan.get("task_analysis_reused") is not True
+        or not isinstance(retry_routing, Mapping)
+        or retry_routing.get("schema")
+        != ROUTER_DYNAMIC_RETRY_ROUTING_SCHEMA
+        or retry_routing.get("reason")
+        != "prior_attempt_reasoning_only_length"
+        or retry_routing.get("parent_decision_id") != parent_decision_id
+        or retry_routing.get("excluded_proposer_identities")
+        != expected_exclusions
+        or retry_routing.get("task_analysis_reused") is not True
+        or retry_routing.get("task_analysis_source_decision_id")
+        != parent_decision_id
+        or retry_routing.get("task_analysis_reuse_sha256") != reuse_hash
+        or router_dynamic_task_analysis_reuse_reasons(
+            initial_plan,
+            retry_plan,
+        )
+    ):
+        return "reasoning_only_retry_provenance_invalid"
+    return ""
+
+
+_G1_EXECUTION_MUTABLE_SELECTION_PLAN_FIELDS = frozenset(
+    {"executed_thinking_assignment", "thinking_execution_fallbacks"}
+)
+
+
+def g1_immutable_selection_plan_payload(
+    plan: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        str(key): copy.deepcopy(value)
+        for key, value in plan.items()
+        if str(key) not in _G1_EXECUTION_MUTABLE_SELECTION_PLAN_FIELDS
+    }
+
+
+def g1_execution_plan_mutation_reason(
+    expected_plan: Mapping[str, Any],
+    observed_plan: Mapping[str, Any],
+) -> str:
+    from opensquilla.provider.thinking_execution import (
+        validate_thinking_execution_plan_mutation,
+    )
+
+    return (
+        "g1_attempt_thinking_execution_provenance_invalid"
+        if validate_thinking_execution_plan_mutation(
+            expected_plan,
+            observed_plan,
+        )
+        else ""
+    )
+
+
+def g1_attempt_plan_consistency_reason(
+    expected_plan: Mapping[str, Any],
+    result: RunResult,
+) -> str:
+    if not expected_plan:
+        return "g1_attempt_plan_provenance_invalid"
+    expected_hash = canonical_json_sha256(
+        g1_immutable_selection_plan_payload(expected_plan)
+    )
+    routing = result.routing_trace
+    if not isinstance(routing, Mapping) or not routing:
+        return "g1_attempt_plan_provenance_invalid"
+    routed_plan = routing.get("selection_plan")
+    if (
+        not isinstance(routed_plan, Mapping)
+        or canonical_json_sha256(
+            g1_immutable_selection_plan_payload(routed_plan)
+        )
+        != expected_hash
+        or g1_execution_plan_mutation_reason(expected_plan, routed_plan)
+    ):
+        return "g1_attempt_plan_provenance_invalid"
+    done = result.done
+    trace = done.ensemble_trace if done is not None else None
+    explicit_request_count = run_result_error_physical_request_count(result)
+    has_physical_request_evidence = (
+        done is not None
+        or explicit_request_count is not None
+        and explicit_request_count > 0
+        or explicit_request_count is None
+        and bool(result.error or result.final_text)
+        and not run_result_was_blocked_before_request(result)
+    )
+    if has_physical_request_evidence and (
+        not isinstance(trace, Mapping) or not trace
+    ):
+        return "g1_attempt_plan_provenance_invalid"
+    if isinstance(trace, Mapping) and trace:
+        calls, sequence_reasons = ensemble_call_trace_sequence(trace)
+        if sequence_reasons or not calls:
+            return "g1_attempt_plan_provenance_invalid"
+        previous_physical_plan: Mapping[str, Any] = expected_plan
+        for call in calls:
+            physical_plan = call.get("selection_plan")
+            if (
+                not isinstance(physical_plan, Mapping)
+                or canonical_json_sha256(
+                    g1_immutable_selection_plan_payload(physical_plan)
+                )
+                != expected_hash
+            ):
+                return "g1_attempt_plan_provenance_invalid"
+            from opensquilla.provider.thinking_execution import (
+                validate_thinking_execution_call,
+            )
+
+            validated_plan, execution_reason = validate_thinking_execution_call(
+                previous_physical_plan,
+                call,
+            )
+            if execution_reason:
+                return "g1_attempt_plan_provenance_invalid"
+            previous_physical_plan = validated_plan
+        if g1_execution_plan_mutation_reason(
+            routed_plan,
+            previous_physical_plan,
+        ):
+            return "g1_attempt_plan_provenance_invalid"
+    return ""
+
+
+def _normalized_g1_retry_identities(raw: Any) -> tuple[set[str], bool]:
+    if raw is None:
+        return set(), True
+    if not isinstance(raw, list):
+        return set(), False
+    normalized = [str(identity or "").strip().lower() for identity in raw]
+    valid = bool(
+        all(
+            identity
+            and identity.partition(":")[1] == ":"
+            and identity.partition(":")[0]
+            and identity.partition(":")[2]
+            for identity in normalized
+        )
+        and len(normalized) == len(set(normalized))
+    )
+    return set(normalized), valid
+
+
 async def collect_generation_with_retries(
     provider: Any,
     prompt: str,
@@ -6974,10 +8398,286 @@ async def collect_generation_with_retries(
     expected_model: str = "",
     expected_provider: str = "",
     expected_g1_registry_contract: Mapping[str, Any] | None = None,
+    paid_attempt_sink: dict[str, Any] | None = None,
 ) -> tuple[RunResult, list[dict[str, Any]], int]:
     attempts: list[dict[str, Any]] = []
     best_non_empty: RunResult | None = None
+    best_non_empty_provider: Any | None = None
     last_result: RunResult | None = None
+    last_result_provider: Any | None = None
+    initial_provider = provider
+    if paid_attempt_sink is not None:
+        paid_attempt_sink.clear()
+    current_provider = provider
+    initial_selection_plan = getattr(initial_provider, "selection_plan", None)
+    managed_g1_lifecycle = bool(
+        group == "G1"
+        and isinstance(initial_selection_plan, Mapping)
+        and initial_selection_plan.get(
+            "ranking_thinking_assignment_enabled"
+        )
+        is True
+    )
+    frozen_unmanaged_selection_plan = (
+        copy.deepcopy(dict(initial_selection_plan or {}))
+        if str((GROUP_SPECS.get(group) or {}).get("kind") or "")
+        == "selection_mode"
+        and not managed_g1_lifecycle
+        else {}
+    )
+
+    def remember_selected_provider(selected_provider: Any) -> None:
+        if (
+            selected_provider is not initial_provider
+            or hasattr(initial_provider, "_draco_selected_retry_provider")
+        ):
+            setattr(
+                initial_provider,
+                "_draco_selected_retry_provider",
+                selected_provider,
+            )
+
+    def fail_before_generation_call(
+        guard_error: str,
+        *,
+        attempt_id: str,
+        attempt_index: int,
+        attempt_started_at: float,
+        selection_plan: Mapping[str, Any],
+    ) -> tuple[RunResult, list[dict[str, Any]], int]:
+        """Fail closed without dropping already-paid provider setup evidence."""
+
+        observed_plan: Mapping[str, Any] | None = None
+        observed_plan_error = ""
+        try:
+            observed_plan = _provider_selection_plan_execution_snapshot(
+                current_provider
+            )
+        except Exception as exc:  # noqa: BLE001 - preserve paid setup on guard failure
+            observed_plan_error = type(exc).__name__
+        frozen_routing = getattr(
+            current_provider,
+            "_draco_frozen_routing_trace",
+            None,
+        )
+        raw_setup = getattr(
+            current_provider,
+            "_draco_setup_metrics",
+            None,
+        )
+        setup_snapshot_error = ""
+        raw_setup_usage = (
+            raw_setup.get("usage")
+            if isinstance(raw_setup, Mapping)
+            and isinstance(raw_setup.get("usage"), list)
+            else []
+        )
+        try:
+            setup_usage = copy.deepcopy(raw_setup_usage)
+        except Exception as exc:  # noqa: BLE001 - use primitive analyzer recovery
+            setup_snapshot_error = type(exc).__name__
+            setup_usage = conservative_task_analyzer_usage_rows(
+                {
+                    "attempt_count": len(raw_setup_usage),
+                    "physical_attempts": raw_setup_usage,
+                },
+                provider_id="openrouter",
+                model_id="anthropic/claude-opus-4.8",
+                source="g1_pre_call_guard_setup_recovery",
+                fallback_reason=type(exc).__name__,
+            )
+        try:
+            safe_selection_plan = json_safe(
+                copy.deepcopy(dict(selection_plan))
+            )
+            if not isinstance(safe_selection_plan, Mapping):
+                raise TypeError(
+                    "selection plan did not serialize to an object"
+                )
+            safe_selection_plan = dict(safe_selection_plan)
+        except Exception as exc:  # noqa: BLE001 - preserve setup, not raw data
+            safe_selection_plan = {
+                "capture_failed": True,
+                "exception_type": type(exc).__name__,
+            }
+        safe_observed_plan: dict[str, Any] | None = None
+        if isinstance(observed_plan, Mapping):
+            try:
+                safe_observed_plan = safe_provider_build_routing_trace(
+                    observed_plan
+                )
+            except Exception as exc:  # noqa: BLE001 - diagnostics are secondary
+                observed_plan_error = (
+                    observed_plan_error or type(exc).__name__
+                )
+        raw_setup_routing = (
+            raw_setup.get("routing")
+            if isinstance(raw_setup, Mapping)
+            else None
+        )
+        try:
+            routing_trace = (
+                safe_provider_build_routing_trace(frozen_routing)
+                if isinstance(frozen_routing, Mapping)
+                else safe_provider_build_routing_trace(
+                    raw_setup_routing
+                )
+                if isinstance(raw_setup_routing, Mapping)
+                else {"selection_plan": safe_selection_plan}
+            )
+            if not isinstance(routing_trace, dict):
+                routing_trace = dict(routing_trace)
+        except Exception as exc:  # noqa: BLE001 - preserve paid setup evidence
+            routing_trace = {
+                "selection_plan": safe_selection_plan,
+                "capture_failed": True,
+                "exception_type": type(exc).__name__,
+            }
+        routing_trace["pre_call_guard"] = {
+            "error": guard_error,
+            "expected_selection_plan": safe_selection_plan,
+            "observed_selection_plan": safe_observed_plan,
+            "observed_selection_plan_error": observed_plan_error,
+            "setup_snapshot_error": setup_snapshot_error,
+            "request_started": False,
+            "physical_request_count": 0,
+        }
+        guarded_result = RunResult(
+            final_text="",
+            done=None,
+            error=guard_error,
+            setup_latency_ms=coerce_metric_int(
+                raw_setup.get("latency_ms")
+                if isinstance(raw_setup, Mapping)
+                else 0
+            ),
+            setup_usage=setup_usage,
+            routing_trace=routing_trace,
+            trace_events=[
+                {
+                    "seq": 1,
+                    "elapsed_ms": coerce_metric_int(
+                        raw_setup.get("latency_ms")
+                        if isinstance(raw_setup, Mapping)
+                        else 0
+                    ),
+                    "kind": "error",
+                    "code": "g1_pre_call_guard_failed",
+                    "request_started": False,
+                    "physical_request_count": 0,
+                }
+            ],
+        )
+        try:
+            guard_run_summary = run_result_summary(guarded_result)
+        except Exception as exc:  # noqa: BLE001 - setup evidence must survive
+            guard_run_summary = emergency_generation_run_summary(
+                guarded_result,
+                reason=guard_error,
+                stage="g1_pre_call_guard_evidence",
+                exception_type=type(exc).__name__,
+                identity_seed=f"generation-attempt:{attempt_id}",
+            )
+        attempts.append(
+            {
+                "attempt_id": attempt_id,
+                "attempt_kind": (
+                    "provider_build_after_paid_setup"
+                    if setup_usage
+                    else "generation_pre_call_guard"
+                ),
+                "attempt": attempt_index,
+                "started_at": attempt_started_at,
+                "completed_at": time.time(),
+                "retryable": False,
+                "retry_reason": guard_error,
+                "retry_suppressed_reason": guard_error,
+                "will_retry": False,
+                "retry_backoff_s": 0.0,
+                "selection_plan": safe_selection_plan,
+                "deterministic_proposer_failures": [],
+                "excluded_proposer_identities": sorted(
+                    excluded_proposer_identities
+                ),
+                "run": guard_run_summary,
+            }
+        )
+        if isinstance(raw_setup, Mapping):
+            setattr(current_provider, "_draco_setup_metrics", None)
+        remember_selected_provider(current_provider)
+        return guarded_result, attempts, 0
+
+    retry_provider_factory = (
+        getattr(
+            provider,
+            "_draco_reasoning_only_retry_factory",
+            None,
+        )
+        if managed_g1_lifecycle
+        else None
+    )
+    raw_prior_exclusions = (
+        getattr(
+            provider,
+            "_draco_prior_excluded_proposer_identities",
+            [],
+        )
+        if managed_g1_lifecycle
+        else []
+    )
+    prior_exclusions, prior_exclusions_valid = _normalized_g1_retry_identities(
+        raw_prior_exclusions
+    )
+    if (
+        managed_g1_lifecycle
+        and (
+            not prior_exclusions_valid
+            or raw_prior_exclusions != sorted(prior_exclusions)
+        )
+    ):
+        raise ValueError("frozen G1 prior proposer exclusions are invalid")
+    excluded_proposer_identities = (
+        set(prior_exclusions) if managed_g1_lifecycle else set()
+    )
+    frozen_initial_plan = (
+        getattr(
+            provider,
+            "_draco_g1_initial_selection_plan",
+            None,
+        )
+        if managed_g1_lifecycle
+        else None
+    )
+    g1_retry_provenance_parent = (
+        copy.deepcopy(dict(frozen_initial_plan))
+        if isinstance(frozen_initial_plan, Mapping)
+        else copy.deepcopy(
+            dict(getattr(initial_provider, "selection_plan", {}) or {})
+        )
+    )
+    g1_thinking_plan_prefixes: dict[str, dict[str, Any]] = {}
+    raw_thinking_history = (
+        getattr(
+            provider,
+            "_draco_g1_thinking_execution_history",
+            [],
+        )
+        if managed_g1_lifecycle
+        else []
+    )
+    if (
+        managed_g1_lifecycle
+        and (
+            not isinstance(raw_thinking_history, list)
+            or any(not isinstance(plan, Mapping) for plan in raw_thinking_history)
+        )
+    ):
+        raise ValueError("frozen G1 thinking execution history is invalid")
+    g1_thinking_execution_history = [
+        copy.deepcopy(dict(plan))
+        for plan in raw_thinking_history
+        if isinstance(plan, Mapping)
+    ]
     if (
         not isinstance(attempt_offset, int)
         or isinstance(attempt_offset, bool)
@@ -6988,18 +8688,163 @@ async def collect_generation_with_retries(
         bounded_generation_attempts(max_attempts),
         GENERATION_MAX_ATTEMPTS - attempt_offset,
     )
-    expected_selection_plan = (
-        dict(getattr(provider, "selection_plan", {}) or {})
-        if str((GROUP_SPECS.get(group) or {}).get("kind") or "") == "selection_mode"
-        else {}
-    )
     for local_attempt_index in range(1, attempt_limit + 1):
         attempt_index = attempt_offset + local_attempt_index
         attempt_id = uuid.uuid4().hex
         attempt_started_at = time.time()
+        if managed_g1_lifecycle:
+            selection_plan_snapshot = getattr(
+                current_provider,
+                "selection_plan_execution_snapshot",
+                None,
+            )
+            try:
+                expected_selection_plan = copy.deepcopy(
+                    dict(
+                        selection_plan_snapshot()
+                        if callable(selection_plan_snapshot)
+                        else getattr(current_provider, "selection_plan", {})
+                        or {}
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 - preserve paid setup evidence
+                guard_error = (
+                    "g1_thinking_execution_pre_call_guard_exception:"
+                    "selection_plan_snapshot:"
+                    + type(exc).__name__
+                )
+                return fail_before_generation_call(
+                    guard_error,
+                    attempt_id=attempt_id,
+                    attempt_index=attempt_index,
+                    attempt_started_at=attempt_started_at,
+                    selection_plan=initial_selection_plan,
+                )
+            if (
+                expected_selection_plan.get(
+                    "ranking_thinking_assignment_enabled"
+                )
+                is not True
+            ):
+                guard_error = "g1_thinking_execution_managed_mode_changed_before_call"
+                return fail_before_generation_call(
+                    guard_error,
+                    attempt_id=attempt_id,
+                    attempt_index=attempt_index,
+                    attempt_started_at=attempt_started_at,
+                    selection_plan=initial_selection_plan,
+                )
+            adaptive_g1 = True
+        else:
+            expected_selection_plan = copy.deepcopy(
+                frozen_unmanaged_selection_plan
+            )
+            adaptive_g1 = False
+        if adaptive_g1:
+            from opensquilla.provider.thinking_execution import (
+                THINKING_PHYSICAL_EVIDENCE_SCHEMA,
+                validate_thinking_execution_history_closure,
+            )
+
+            try:
+                (
+                    closed_execution_plan,
+                    _,
+                    closure_reason,
+                ) = validate_thinking_execution_history_closure(
+                    g1_thinking_execution_history,
+                    expected_selection_plan,
+                )
+                expected_selection_plan = copy.deepcopy(
+                    closed_execution_plan
+                )
+            except Exception as exc:  # noqa: BLE001 - preserve paid setup evidence
+                guard_error = (
+                    "g1_thinking_execution_pre_call_guard_exception:"
+                    "history_closure:"
+                    + type(exc).__name__
+                )
+                return fail_before_generation_call(
+                    guard_error,
+                    attempt_id=attempt_id,
+                    attempt_index=attempt_index,
+                    attempt_started_at=attempt_started_at,
+                    selection_plan=expected_selection_plan,
+                )
+            if closure_reason:
+                guard_error = (
+                    "g1_thinking_execution_pre_call_guard_failed:"
+                    + closure_reason
+                )
+                return fail_before_generation_call(
+                    guard_error,
+                    attempt_id=attempt_id,
+                    attempt_index=attempt_index,
+                    attempt_started_at=attempt_started_at,
+                    selection_plan=expected_selection_plan,
+                )
+        strict_g1_physical_binding_required = bool(
+            adaptive_g1
+            and expected_selection_plan.get(
+                "thinking_physical_evidence_schema"
+            )
+            == THINKING_PHYSICAL_EVIDENCE_SCHEMA
+        )
+        decision_id = str(expected_selection_plan.get("decision_id") or "")
+        cached_execution_plan = g1_thinking_plan_prefixes.get(decision_id)
+        if adaptive_g1 and cached_execution_plan is not None:
+            try:
+                cached_immutable_hash = canonical_json_sha256(
+                    g1_immutable_selection_plan_payload(cached_execution_plan)
+                )
+                observed_immutable_hash = canonical_json_sha256(
+                    g1_immutable_selection_plan_payload(
+                        expected_selection_plan
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 - preserve paid setup evidence
+                guard_error = (
+                    "g1_thinking_execution_pre_call_guard_exception:"
+                    "immutable_hash:"
+                    + type(exc).__name__
+                )
+                return fail_before_generation_call(
+                    guard_error,
+                    attempt_id=attempt_id,
+                    attempt_index=attempt_index,
+                    attempt_started_at=attempt_started_at,
+                    selection_plan=expected_selection_plan,
+                )
+            if cached_immutable_hash != observed_immutable_hash:
+                guard_error = "g1_thinking_execution_immutable_plan_changed_before_retry"
+                return fail_before_generation_call(
+                    guard_error,
+                    attempt_id=attempt_id,
+                    attempt_index=attempt_index,
+                    attempt_started_at=attempt_started_at,
+                    selection_plan=expected_selection_plan,
+                )
+            if (
+                expected_selection_plan.get("executed_thinking_assignment")
+                != cached_execution_plan.get("executed_thinking_assignment")
+                or expected_selection_plan.get(
+                    "thinking_execution_fallbacks",
+                    [],
+                )
+                != cached_execution_plan.get("thinking_execution_fallbacks", [])
+            ):
+                guard_error = "g1_thinking_execution_state_reset_before_retry"
+                return fail_before_generation_call(
+                    guard_error,
+                    attempt_id=attempt_id,
+                    attempt_index=attempt_index,
+                    attempt_started_at=attempt_started_at,
+                    selection_plan=expected_selection_plan,
+                )
+            expected_selection_plan = copy.deepcopy(cached_execution_plan)
         if runner_mode == RUNNER_MODE_AGENT_LOOP:
             result = await collect_agent_run(
-                provider,
+                current_provider,
                 prompt,
                 timeout=timeout,
                 config=config,
@@ -7013,25 +8858,49 @@ async def collect_generation_with_retries(
             )
         else:
             result = await collect_run(
-                provider,
+                current_provider,
                 prompt,
                 timeout=timeout,
                 config=config,
                 tools=tools,
             )
+        if paid_attempt_sink is not None:
+            paid_attempt_sink.update(
+                {
+                    "result": result,
+                    "attempts": attempts,
+                    "attempt_id": attempt_id,
+                    "attempt_index": attempt_index,
+                    "attempt_started_at": attempt_started_at,
+                    "selection_plan": expected_selection_plan,
+                    "adaptive_g1": adaptive_g1,
+                    "excluded_proposer_identities": tuple(
+                        sorted(excluded_proposer_identities)
+                    ),
+                    "expected_provider": expected_provider,
+                    "expected_model": expected_model,
+                    "current_provider": current_provider,
+                    "stage": "paid_call_returned",
+                }
+            )
         last_result = result
+        last_result_provider = current_provider
         group_spec = GROUP_SPECS.get(group) or {}
         expected_selection_mode = (
             str(group_spec.get("selection_mode") or "")
             if group_spec.get("kind") == "selection_mode"
             else ""
         )
+        if paid_attempt_sink is not None:
+            paid_attempt_sink["stage"] = "requested_identity_backfill"
         backfill_result_requested_identity(
             result,
             expected_model=expected_model,
             expected_provider=expected_provider,
             expected_selection_plan=expected_selection_plan,
         )
+        if paid_attempt_sink is not None:
+            paid_attempt_sink["stage"] = "generation_retry_reason"
         reason = generation_retry_reason(
             result,
             expected_selection_mode=expected_selection_mode,
@@ -7048,35 +8917,280 @@ async def collect_generation_with_retries(
             and is_agent_hard_timeout(result)
         ):
             retry_suppressed_reason = "agent_hard_timeout"
-        if result.final_text.strip() and best_non_empty is None:
+        if paid_attempt_sink is not None:
+            paid_attempt_sink["stage"] = "g1_attempt_plan_consistency"
+        consistency_reason = (
+            g1_attempt_plan_consistency_reason(
+                expected_selection_plan,
+                result,
+            )
+            if adaptive_g1
+            else ""
+        )
+        if consistency_reason:
+            reason = consistency_reason
+            retry_suppressed_reason = consistency_reason
+            mark_retryable_generation_error(result, consistency_reason)
+        if (
+            not consistency_reason
+            and result.final_text.strip()
+            and best_non_empty is None
+        ):
             best_non_empty = result
+            best_non_empty_provider = current_provider
+        if paid_attempt_sink is not None:
+            paid_attempt_sink["stage"] = "deterministic_failure_extraction"
+        deterministic_failures = (
+            deterministic_reasoning_only_length_failures(result)
+            if adaptive_g1
+            else []
+        )
         will_retry = (
             bool(reason) and not retry_suppressed_reason and local_attempt_index < attempt_limit
         )
+        prepare_deferred_g1_retry = bool(
+            adaptive_g1
+            and reason
+            and not retry_suppressed_reason
+            and deterministic_failures
+            and attempt_index < GENERATION_MAX_ATTEMPTS
+            and not will_retry
+        )
+        if paid_attempt_sink is not None:
+            paid_attempt_sink["stage"] = "run_result_summary"
+        attempt_run_summary = run_result_summary(result)
+        if strict_g1_physical_binding_required:
+            if paid_attempt_sink is not None:
+                paid_attempt_sink["stage"] = "g1_physical_usage_binding"
+            physical_binding_reasons = (
+                g1_retry_physical_usage_binding_reasons(
+                    attempt_run_summary,
+                    identity_seed=f"generation-attempt:{attempt_id}",
+                )
+            )
+            if physical_binding_reasons:
+                physical_binding_failure = (
+                    "g1_physical_usage_binding_failed:"
+                    + physical_binding_reasons[0]
+                )
+                if not reason:
+                    reason = physical_binding_failure
+                    mark_retryable_generation_error(
+                        result,
+                        physical_binding_failure,
+                    )
+                retry_suppressed_reason = physical_binding_failure
+                will_retry = False
+                prepare_deferred_g1_retry = False
+        if adaptive_g1 and (will_retry or prepare_deferred_g1_retry):
+            execute_g1_retry_this_wave = will_retry
+            if retry_suppressed_reason:
+                will_retry = False
+                prepare_deferred_g1_retry = False
+            else:
+                will_retry = execute_g1_retry_this_wave
+            if (
+                (will_retry or prepare_deferred_g1_retry)
+                and result.done is not None
+            ):
+                trace = result.done.ensemble_trace
+                calls, call_reasons = ensemble_call_trace_sequence(
+                    trace if isinstance(trace, Mapping) else {}
+                )
+                if not call_reasons and calls:
+                    for call in calls:
+                        physical_plan = call.get("selection_plan")
+                        if isinstance(physical_plan, Mapping):
+                            g1_thinking_execution_history.append(
+                                copy.deepcopy(dict(physical_plan))
+                            )
+                    last_plan = calls[-1].get("selection_plan")
+                    if isinstance(last_plan, Mapping) and decision_id:
+                        g1_thinking_plan_prefixes[decision_id] = copy.deepcopy(
+                            dict(last_plan)
+                        )
         retry_backoff_s = (
             bounded_generation_retry_backoff(retry_backoff_seconds) * (2 ** (attempt_index - 1))
             if will_retry
             else 0.0
         )
-        attempts.append(
-            {
-                "attempt_id": attempt_id,
-                "attempt_kind": "generation",
-                "attempt": attempt_index,
-                "started_at": attempt_started_at,
-                "completed_at": time.time(),
-                "retryable": bool(reason),
-                "retry_reason": reason,
-                "retry_suppressed_reason": retry_suppressed_reason,
-                "will_retry": will_retry,
-                "retry_backoff_s": retry_backoff_s,
-                "run": run_result_summary(result),
-            }
-        )
+        if paid_attempt_sink is not None:
+            paid_attempt_sink["stage"] = "attempt_serialization"
+        attempt_record = {
+            "attempt_id": attempt_id,
+            "attempt_kind": "generation",
+            "attempt": attempt_index,
+            "started_at": attempt_started_at,
+            "completed_at": time.time(),
+            "retryable": bool(reason),
+            "retry_reason": reason,
+            "retry_suppressed_reason": retry_suppressed_reason,
+            "will_retry": will_retry,
+            "retry_backoff_s": retry_backoff_s,
+            "run": attempt_run_summary,
+        }
+        if adaptive_g1:
+            attempt_record.update(
+                {
+                    "selection_plan": json_safe(expected_selection_plan),
+                    "deterministic_proposer_failures": deterministic_failures,
+                    "excluded_proposer_identities": sorted(
+                        excluded_proposer_identities
+                    ),
+                }
+            )
+        attempts.append(attempt_record)
+        if paid_attempt_sink is not None:
+            paid_attempt_sink["stage"] = "attempt_committed"
+            paid_attempt_sink["attempt_appended"] = True
         if not reason:
+            remember_selected_provider(current_provider)
             return result, attempts, attempt_index
         if retry_suppressed_reason:
+            remember_selected_provider(current_provider)
             return result, attempts, 0
+        if (
+            adaptive_g1
+            and deterministic_failures
+            and (will_retry or prepare_deferred_g1_retry)
+        ):
+            excluded_proposer_identities.update(
+                str(failure["identity"]) for failure in deterministic_failures
+            )
+            if not callable(retry_provider_factory):
+                attempts[-1]["will_retry"] = False
+                attempts[-1]["retry_suppressed_reason"] = (
+                    "reasoning_only_retry_factory_unavailable"
+                )
+                remember_selected_provider(current_provider)
+                return result, attempts, 0
+            if paid_attempt_sink is not None:
+                paid_attempt_sink["stage"] = "retry_provider_build"
+            try:
+                retry_provider = retry_provider_factory(
+                    sorted(excluded_proposer_identities)
+                )
+            except Exception as exc:  # noqa: BLE001 - fail closed before another paid call
+                attempts[-1]["will_retry"] = False
+                attempts[-1]["retry_suppressed_reason"] = (
+                    f"reasoning_only_retry_provider_build_failed:{type(exc).__name__}"
+                )
+                remember_selected_provider(current_provider)
+                return result, attempts, 0
+            if paid_attempt_sink is not None:
+                paid_attempt_sink["stage"] = "retry_plan_validation"
+            retry_plan = dict(getattr(retry_provider, "selection_plan", {}) or {})
+            provenance_reason = g1_retry_plan_provenance_reason(
+                g1_retry_provenance_parent,
+                retry_plan,
+                excluded_proposer_identities=excluded_proposer_identities,
+            )
+            if provenance_reason:
+                attempts[-1]["will_retry"] = False
+                attempts[-1]["retry_suppressed_reason"] = provenance_reason
+                remember_selected_provider(current_provider)
+                return result, attempts, 0
+            prior_selected = list(expected_selection_plan.get("selected_P") or [])
+            retry_selected = list(retry_plan.get("selected_P") or [])
+            if (
+                not retry_selected
+                or retry_selected == prior_selected
+                or any(
+                    str(identity).strip().lower() in excluded_proposer_identities
+                    for identity in retry_selected
+                )
+            ):
+                attempts[-1]["will_retry"] = False
+                attempts[-1]["retry_suppressed_reason"] = (
+                    "reasoning_only_retry_roster_unchanged"
+                )
+                remember_selected_provider(current_provider)
+                return result, attempts, 0
+            expected_quorum = legal_proposer_quorum(len(retry_selected))
+            if (
+                coerce_metric_int(
+                    getattr(retry_provider, "min_successful_proposers", 0)
+                )
+                != expected_quorum
+            ):
+                attempts[-1]["will_retry"] = False
+                attempts[-1]["retry_suppressed_reason"] = (
+                    "reasoning_only_retry_quorum_changed"
+                )
+                remember_selected_provider(current_provider)
+                return result, attempts, 0
+            if paid_attempt_sink is not None:
+                paid_attempt_sink["stage"] = "retry_execution_projection"
+            from opensquilla.provider.thinking_execution import (
+                project_thinking_execution_history,
+                restore_projected_thinking_execution,
+            )
+
+            retry_snapshot = getattr(
+                retry_provider,
+                "selection_plan_execution_snapshot",
+                None,
+            )
+            retry_target_plan = copy.deepcopy(
+                dict(
+                    retry_snapshot()
+                    if callable(retry_snapshot)
+                    else retry_plan
+                )
+            )
+            projected_plan, projection_audit, projection_reason = (
+                project_thinking_execution_history(
+                    g1_thinking_execution_history,
+                    retry_target_plan,
+                )
+            )
+            if projection_reason:
+                attempts[-1]["will_retry"] = False
+                attempts[-1]["retry_suppressed_reason"] = (
+                    "g1_thinking_execution_projection_failed:"
+                    + projection_reason
+                )
+                remember_selected_provider(current_provider)
+                return result, attempts, 0
+            if (
+                retry_target_plan.get("executed_thinking_assignment")
+                != projected_plan.get("executed_thinking_assignment")
+                or retry_target_plan.get("thinking_execution_fallbacks", [])
+                != projected_plan.get("thinking_execution_fallbacks", [])
+            ):
+                try:
+                    restore_projected_thinking_execution(
+                        retry_provider,
+                        target_plan=retry_target_plan,
+                        projected_plan=projected_plan,
+                    )
+                except Exception as exc:  # noqa: BLE001 - fail closed before another paid call
+                    attempts[-1]["will_retry"] = False
+                    attempts[-1]["retry_suppressed_reason"] = (
+                        "g1_thinking_execution_projection_restore_failed:"
+                        + type(exc).__name__
+                    )
+                    remember_selected_provider(current_provider)
+                    return result, attempts, 0
+            retry_plan = copy.deepcopy(
+                dict(retry_snapshot() if callable(retry_snapshot) else projected_plan)
+            )
+            attempts[-1]["thinking_execution_projection"] = json_safe(
+                projection_audit
+            )
+            attempts[-1]["retry_selection_plan"] = json_safe(retry_plan)
+            attempts[-1]["retry_excluded_proposer_identities"] = sorted(
+                excluded_proposer_identities
+            )
+            if prepare_deferred_g1_retry:
+                attempts[-1]["retry_deferred_to_next_wave"] = True
+            else:
+                current_provider = retry_provider
+                setattr(
+                    initial_provider,
+                    "_draco_selected_retry_provider",
+                    retry_provider,
+                )
         if retry_backoff_s > 0:
             await asyncio.sleep(retry_backoff_s)
     selected = (
@@ -7088,6 +9202,14 @@ async def collect_generation_with_retries(
             error=GENERATION_MISSING_DONE_ERROR,
         )
     )
+    selected_provider = (
+        best_non_empty_provider
+        if best_non_empty is not None
+        else last_result_provider
+        if last_result is not None
+        else initial_provider
+    )
+    remember_selected_provider(selected_provider)
     mark_empty_generation_output(selected)
     return selected, attempts, 0
 
@@ -7509,7 +9631,10 @@ async def judge_text(
                 "parsed": parsed is not None,
                 "schema_valid": False,
                 "retry_suppressed_reason": cleanup_failure,
-                "run": run_result_summary(result),
+                "run": judge_run_result_summary(
+                    result,
+                    judge_provider=judge_provider,
+                ),
             }
         )
         if cleanup_failure:
@@ -7517,8 +9642,14 @@ async def judge_text(
         if parsed is not None:
             normalized = normalize_legacy_judge_result(parsed)
             attempts[-1]["schema_valid"] = normalized.get("score_status") == "complete"
-            if normalized.get("score_status") == "complete":
-                normalized["judge_run"] = run_result_summary(result)
+            if (
+                normalized.get("score_status") == "complete"
+                and not result.error
+            ):
+                normalized["judge_run"] = judge_run_result_summary(
+                    result,
+                    judge_provider=judge_provider,
+                )
                 normalized["judge_attempts"] = attempts
                 normalized.update(
                     judge_attempt_budget_fields(
@@ -7540,10 +9671,18 @@ async def judge_text(
         "total": None,
         "error": (
             last_cleanup_failure
+            or (last_result.error if last_result is not None else "")
             or ("judge_json_schema_invalid" if parsed_any else "judge_json_parse_failed")
         ),
         "raw": last_text[:2000],
-        "judge_run": run_result_summary(last_result) if last_result is not None else {},
+        "judge_run": (
+            judge_run_result_summary(
+                last_result,
+                judge_provider=judge_provider,
+            )
+            if last_result is not None
+            else {}
+        ),
         "judge_attempts": attempts,
         **judge_attempt_budget_fields(
             attempts=attempts,
@@ -7610,7 +9749,10 @@ async def judge_criterion(
         parsed = extract_json_object(result.final_text) or {}
         met = parse_verdict(parsed.get("verdict"))
         cleanup_failure = generation_cleanup_failure_reason(result)
-        run_summary = run_result_summary(result)
+        run_summary = judge_run_result_summary(
+            result,
+            judge_provider=judge_provider,
+        )
         attempts.append(
             {
                 "attempt_id": uuid.uuid4().hex,
@@ -7638,7 +9780,7 @@ async def judge_criterion(
                 exhausted=False,
             ),
         }
-        if met is not None and not cleanup_failure:
+        if met is not None and not cleanup_failure and not result.error:
             return row
         row["error"] = result.error or "judge_verdict_parse_failed"
         row["raw"] = result.final_text[:1000]
@@ -7849,6 +9991,7 @@ async def run_one(
     tools: list[ToolDefinition] | None = None,
     run_compatibility_fingerprint: str = "",
     g1_registry_contract: Mapping[str, Any] | None = None,
+    frozen_g1_lifecycle: Mapping[str, Any] | None = None,
     require_openrouter_non_byok: bool = False,
 ) -> dict[str, Any]:
     spec = GROUP_SPECS[group]
@@ -7864,6 +10007,7 @@ async def run_one(
     ):
         raise ValueError("generation attempt offset must be an integer within the formal budget")
     provider = None
+    build: ProviderBuildResult | None = None
     effective_prompt = str(task["prompt"])
     provider_error = ""
     failed_build_setup_latency_ms = 0
@@ -7904,16 +10048,17 @@ async def run_one(
             experiment_config=experiment_config,
             g1_registry_contract=g1_registry_contract,
             generation_policy=generation_policy,
+            tools=tools,
+            frozen_g1_lifecycle=frozen_g1_lifecycle,
         )
-        effective_prompt = build.prompt
+        candidate_prompt = build.prompt
         safe_routing_trace = json_safe(build.routing_trace)
         if not isinstance(safe_routing_trace, Mapping):
             raise TypeError("provider routing trace must serialize to an object")
-        frozen_build_routing_trace = json.loads(
+        candidate_routing_trace = json.loads(
             json.dumps(dict(safe_routing_trace), ensure_ascii=False)
         )
-        provider = build.provider
-        generation_config = with_openrouter_model_capabilities(
+        candidate_generation_config = with_openrouter_model_capabilities(
             generation_config,
             str(
                 build.routing_trace.get("fallback_model")
@@ -7923,14 +10068,31 @@ async def run_one(
                 or ""
             ),
         )
+        effective_prompt = candidate_prompt
+        frozen_build_routing_trace = candidate_routing_trace
+        generation_config = candidate_generation_config
+        provider = build.provider
     except Exception as exc:  # noqa: BLE001 - report config errors per row
+        provider = None
         if isinstance(exc, ProviderBuildError):
             provider_error = str(exc)
             failed_build_setup_latency_ms = exc.setup_latency_ms
             failed_build_setup_usage = list(exc.setup_usage)
             failed_build_routing_trace = dict(exc.routing_trace)
+        elif build is not None and build.setup_usage:
+            provider_error = (
+                "provider_build_failed_after_setup:"
+                + type(exc).__name__
+            )
+            failed_build_setup_latency_ms = build.setup_latency_ms
+            failed_build_setup_usage = list(build.setup_usage)
+            failed_build_routing_trace = (
+                safe_provider_build_routing_trace(build.routing_trace)
+            )
         else:
-            provider_error = f"{type(exc).__name__}: {exc}"
+            provider_error = (
+                "provider_build_failed:" + type(exc).__name__
+            )
     expected_generation_model = ""
     if spec.get("kind") == "single":
         expected_generation_model = str(spec.get("model") or "").strip()
@@ -7945,30 +10107,56 @@ async def run_one(
         if dry_run and spec.get("kind") in {"single", "router_single"}
         else str(inherited.provider or "").strip()
     )
+    terminal_generation_reason_override = ""
     if provider is not None:
-        (
-            run,
-            generation_attempts,
-            selected_generation_attempt_index,
-        ) = await collect_generation_with_retries(
+        paid_attempt_sink: dict[str, Any] = {}
+        try:
+            (
+                run,
+                generation_attempts,
+                selected_generation_attempt_index,
+            ) = await collect_generation_with_retries(
+                provider,
+                effective_prompt,
+                timeout=effective_timeout,
+                config=generation_config,
+                tools=tools,
+                runner_mode=runner_mode,
+                tool_policy=tool_policy,
+                task_id=str(task["id"]),
+                group=group,
+                output_dir=output_dir,
+                agent_max_iterations=agent_max_iterations,
+                finalization_policy=finalization_policy,
+                max_attempts=generation_attempt_limit,
+                attempt_offset=generation_attempt_offset,
+                retry_backoff_seconds=generation_retry_backoff_s,
+                expected_model=expected_generation_model,
+                expected_provider=expected_generation_provider,
+                expected_g1_registry_contract=g1_registry_contract,
+                paid_attempt_sink=paid_attempt_sink,
+            )
+        except Exception as exc:  # noqa: BLE001 - commit a returned paid call
+            if not paid_attempt_sink:
+                raise
+            (
+                run,
+                generation_attempts,
+                selected_generation_attempt_index,
+                terminal_generation_reason_override,
+            ) = recover_paid_generation_postprocessing_failure(
+                paid_attempt_sink,
+                exc,
+            )
+            recovered_provider = paid_attempt_sink.get(
+                "current_provider"
+            )
+            if recovered_provider is not None:
+                provider = recovered_provider
+        provider = getattr(
             provider,
-            effective_prompt,
-            timeout=effective_timeout,
-            config=generation_config,
-            tools=tools,
-            runner_mode=runner_mode,
-            tool_policy=tool_policy,
-            task_id=str(task["id"]),
-            group=group,
-            output_dir=output_dir,
-            agent_max_iterations=agent_max_iterations,
-            finalization_policy=finalization_policy,
-            max_attempts=generation_attempt_limit,
-            attempt_offset=generation_attempt_offset,
-            retry_backoff_seconds=generation_retry_backoff_s,
-            expected_model=expected_generation_model,
-            expected_provider=expected_generation_provider,
-            expected_g1_registry_contract=g1_registry_contract,
+            "_draco_selected_retry_provider",
+            provider,
         )
     else:
         run = RunResult(
@@ -8011,20 +10199,60 @@ async def run_one(
             else []
         )
         selected_generation_attempt_index = 0
-    terminal_generation_reason = generation_retry_reason(
-        run,
-        expected_selection_mode=(
-            str(spec.get("selection_mode") or "") if spec.get("kind") == "selection_mode" else ""
-        ),
-        expected_selection_plan=(
-            dict(getattr(provider, "selection_plan", {}) or {})
-            if provider is not None and spec.get("kind") == "selection_mode"
-            else {}
-        ),
-        expected_g1_registry_contract=g1_registry_contract,
-        expected_model=expected_generation_model,
-        expected_provider=expected_generation_provider,
-    )
+    if terminal_generation_reason_override:
+        terminal_generation_reason = (
+            terminal_generation_reason_override
+        )
+    else:
+        try:
+            terminal_generation_reason = generation_retry_reason(
+                run,
+                expected_selection_mode=(
+                    str(spec.get("selection_mode") or "")
+                    if spec.get("kind") == "selection_mode"
+                    else ""
+                ),
+                expected_selection_plan=(
+                    dict(getattr(provider, "selection_plan", {}) or {})
+                    if provider is not None
+                    and spec.get("kind") == "selection_mode"
+                    else {}
+                ),
+                expected_g1_registry_contract=g1_registry_contract,
+                expected_model=expected_generation_model,
+                expected_provider=expected_generation_provider,
+            )
+        except Exception as exc:  # noqa: BLE001 - the paid attempt is committed
+            pending = {
+                "result": run,
+                "attempts": generation_attempts,
+                "attempt_id": (
+                    generation_attempts[-1].get("attempt_id")
+                    if generation_attempts
+                    and isinstance(generation_attempts[-1], Mapping)
+                    else uuid.uuid4().hex
+                ),
+                "attempt_index": (
+                    generation_attempts[-1].get("attempt")
+                    if generation_attempts
+                    and isinstance(generation_attempts[-1], Mapping)
+                    else generation_attempt_offset + 1
+                ),
+                "attempt_started_at": started,
+                "expected_provider": expected_generation_provider,
+                "expected_model": expected_generation_model,
+                "current_provider": provider,
+                "stage": "terminal_generation_validation",
+            }
+            (
+                run,
+                generation_attempts,
+                selected_generation_attempt_index,
+                terminal_generation_reason,
+            ) = recover_paid_generation_postprocessing_failure(
+                pending,
+                exc,
+            )
     mark_retryable_generation_error(run, terminal_generation_reason)
     generation_accepted = not bool(terminal_generation_reason)
     generation_completed_at = time.time()
