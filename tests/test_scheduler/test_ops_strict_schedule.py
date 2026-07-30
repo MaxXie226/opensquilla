@@ -69,6 +69,34 @@ async def test_ops_add_persists_creator_owner_boundary(tmp_path: Path) -> None:
         await store.close()
 
 
+@pytest.mark.parametrize("legacy_mode", ["standard", "trusted", "managed"])
+async def test_ops_add_decodes_legacy_safe_modes_to_canonical_value(
+    tmp_path: Path,
+    legacy_mode: str,
+) -> None:
+    store, ops = await _open_ops(tmp_path)
+    try:
+        job = await ops.add(
+            name=f"legacy-{legacy_mode}",
+            handler_key="agent_run",
+            payload=make_agent_turn_payload("ping"),
+            session_target=SessionTarget.ISOLATED,
+            schedule_kind=ScheduleKind.CRON,
+            schedule_value="*/5 * * * *",
+            creator_is_owner=True,
+            run_mode=legacy_mode,
+        )
+
+        reloaded = await store.get(job.id)
+
+        assert reloaded is not None
+        assert reloaded.run_mode == "safe"
+        assert reloaded.elevated == ""
+        assert reloaded.execution_target == "sandbox"
+    finally:
+        await store.close()
+
+
 async def test_ops_add_is_atomic_and_idempotent_under_concurrency(tmp_path: Path) -> None:
     store, ops = await _open_ops(tmp_path)
     try:

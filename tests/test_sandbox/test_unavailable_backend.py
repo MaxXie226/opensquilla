@@ -240,7 +240,7 @@ async def test_managed_high_impact_gate_does_not_wait_for_legacy_human_approval(
             session_key="managed-high-impact",
             workspace_dir=str(tmp_path),
             sandbox_run_context=RunContext(
-                run_mode=RunMode.TRUSTED,
+                run_mode=RunMode.SAFE,
                 workspace=str(tmp_path),
             ),
         )

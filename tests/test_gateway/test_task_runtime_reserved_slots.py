@@ -331,7 +331,7 @@ async def test_send_with_envelope_preserves_accepted_run_mode_override() -> None
         subagent_reserved_slots=1,
     )
     accepted_override = AcceptedRunModeOverride(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         run_mode_source="user",
         source="request",
     )
@@ -359,7 +359,7 @@ async def test_reserve_serializes_accepted_run_mode_into_task_details() -> None:
         max_concurrency=1,
     )
     accepted_override = AcceptedRunModeOverride(
-        run_mode=RunMode.TRUSTED,
+        run_mode=RunMode.SAFE,
         run_mode_source="user",
         source="request",
     )

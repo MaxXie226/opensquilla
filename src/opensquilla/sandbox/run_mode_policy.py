@@ -6,8 +6,8 @@ from typing import Any
 
 from opensquilla.sandbox.run_mode import RunMode, normalize_run_mode
 
-_OWNER_ALLOWED_RUN_MODES = (RunMode.STANDARD, RunMode.TRUSTED, RunMode.FULL)
-_NON_OWNER_ALLOWED_RUN_MODES = (RunMode.STANDARD, RunMode.TRUSTED)
+_OWNER_ALLOWED_RUN_MODES = (RunMode.SAFE, RunMode.FULL)
+_NON_OWNER_ALLOWED_RUN_MODES = (RunMode.SAFE,)
 
 
 def principal_is_owner(principal: Any) -> bool:
@@ -21,9 +21,7 @@ def allowed_run_modes_for_principal(principal: Any) -> tuple[RunMode, ...]:
 
 
 def default_run_mode_for_principal(principal: Any) -> RunMode:
-    if principal_is_owner(principal):
-        return RunMode.FULL
-    return RunMode.TRUSTED
+    return RunMode.SAFE
 
 
 def run_mode_allowed_for_principal(mode: Any, principal: Any) -> bool:

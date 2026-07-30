@@ -74,7 +74,7 @@ def _request(tmp_path: Path) -> SandboxRequest:
         action_kind="shell.exec",
         policy=replace(_policy(), file_system=profile),
         env={"PATH": r"C:\Windows\System32"},
-        run_mode=RunMode.TRUSTED.value,
+        run_mode=RunMode.SAFE.value,
     )
 
 
@@ -960,7 +960,7 @@ def test_payload_rehomes_user_state_for_regular_windows_commands(
             "HOMEDRIVE": "C:",
             "HOMEPATH": r"\SandboxUser\me",
         },
-        run_mode=RunMode.TRUSTED.value,
+        run_mode=RunMode.SAFE.value,
     )
     monkeypatch.setattr(mod, "_support_ready", lambda: True)
     monkeypatch.setattr(mod, "_capability_store_path", lambda: tmp_path / "cap_sids.json")
@@ -1503,7 +1503,7 @@ def test_payload_adds_readonly_private_mounts_as_deny_write_paths(
         action_kind="shell.exec",
         policy=policy,
         env={"PATH": r"C:\Windows\System32"},
-        run_mode=RunMode.TRUSTED.value,
+        run_mode=RunMode.SAFE.value,
     )
 
     monkeypatch.setattr(mod, "_support_ready", lambda: True)
@@ -1645,7 +1645,7 @@ def test_trusted_non_sensitive_expansion_auto_grants(
         action_kind=request.action_kind,
         policy=request.policy,
         env={"OPENSQUILLA_WINDOWS_SANDBOX_EXPANSION_ROOTS": str(external)},
-        run_mode=RunMode.TRUSTED.value,
+        run_mode=RunMode.SAFE.value,
     )
     monkeypatch.setattr(mod, "_support_ready", lambda: True)
     monkeypatch.setattr(mod, "_capability_store_path", lambda: tmp_path / "cap_sids.json")
@@ -1670,7 +1670,7 @@ def test_missing_expansion_roots_are_ignored(
         action_kind=request.action_kind,
         policy=request.policy,
         env={"OPENSQUILLA_WINDOWS_SANDBOX_EXPANSION_ROOTS": str(missing)},
-        run_mode=RunMode.TRUSTED.value,
+        run_mode=RunMode.SAFE.value,
     )
     monkeypatch.setattr(mod, "_support_ready", lambda: True)
     monkeypatch.setattr(mod, "_capability_store_path", lambda: tmp_path / "cap_sids.json")
@@ -1696,7 +1696,7 @@ def test_standard_non_sensitive_expansion_requires_approval(
         action_kind=request.action_kind,
         policy=request.policy,
         env={"OPENSQUILLA_WINDOWS_SANDBOX_EXPANSION_ROOTS": str(external)},
-        run_mode=RunMode.STANDARD.value,
+        run_mode=RunMode.SAFE.value,
     )
     monkeypatch.setattr(mod, "_support_ready", lambda: True)
     monkeypatch.setattr(mod, "_capability_store_path", lambda: tmp_path / "cap_sids.json")
@@ -1728,7 +1728,7 @@ def test_windows_filesystem_operation_request_uses_stdin_and_shared_profile(
     operation = SandboxOperation.filesystem(
         kind="write_text",
         workspace=workspace,
-        run_mode=RunMode.TRUSTED.value,
+        run_mode=RunMode.SAFE.value,
         path=target,
         paths=(target,),
         content="hello",
@@ -1793,7 +1793,7 @@ def test_windows_filesystem_operation_request_serializes_logical_profile_path(
     operation = SandboxOperation.filesystem(
         kind="write_text",
         workspace=workspace,
-        run_mode=RunMode.TRUSTED.value,
+        run_mode=RunMode.SAFE.value,
         path=target,
         paths=(target,),
         content="hello",
@@ -1841,7 +1841,7 @@ def test_windows_filesystem_target_checks_logical_path_before_canonicalizing(
     operation = SandboxOperation.filesystem(
         kind="write_text",
         workspace=workspace,
-        run_mode=RunMode.TRUSTED.value,
+        run_mode=RunMode.SAFE.value,
         path=logical_target,
         paths=(canonical_target,),
         content="hello",
@@ -1876,7 +1876,7 @@ def test_windows_relative_filesystem_target_is_based_on_workspace(
     operation = SandboxOperation.filesystem(
         kind="write_text",
         workspace=workspace,
-        run_mode=RunMode.TRUSTED.value,
+        run_mode=RunMode.SAFE.value,
         path=relative_target,
         paths=(relative_target,),
         content="hello",
@@ -1909,7 +1909,7 @@ def test_windows_source_target_maps_execution_workspace_alias(
     operation = SandboxOperation.filesystem(
         kind="create_source",
         workspace=workspace,
-        run_mode=RunMode.TRUSTED.value,
+        run_mode=RunMode.SAFE.value,
         path=target,
         logical_path=Path("/workspace/new.py"),
         paths=(target,),
@@ -1949,7 +1949,7 @@ def test_windows_apply_patch_checks_each_logical_path_relative_to_root(
     operation = SandboxOperation.filesystem(
         kind="apply_patch",
         workspace=workspace,
-        run_mode=RunMode.TRUSTED.value,
+        run_mode=RunMode.SAFE.value,
         paths=(canonical_target,),
         patch=patch,
         root=workspace,
@@ -1994,7 +1994,7 @@ def test_windows_filesystem_operation_request_preserves_minimal_home_environment
     operation = SandboxOperation.filesystem(
         kind="read_file",
         workspace=workspace,
-        run_mode=RunMode.TRUSTED.value,
+        run_mode=RunMode.SAFE.value,
         path=target,
         paths=(target,),
         file_system_profile=FileSystemPermissionProfile(
@@ -2047,7 +2047,7 @@ def test_windows_filesystem_worker_does_not_expand_general_tool_paths(
     operation = SandboxOperation.filesystem(
         kind="read_file",
         workspace=workspace,
-        run_mode=RunMode.STANDARD.value,
+        run_mode=RunMode.SAFE.value,
         path=target,
         paths=(target,),
         file_system_profile=FileSystemPermissionProfile(
@@ -2087,7 +2087,7 @@ def test_windows_filesystem_operation_missing_read_target_fails_before_acl(
     operation = SandboxOperation.filesystem(
         kind="read_file",
         workspace=workspace,
-        run_mode=RunMode.TRUSTED.value,
+        run_mode=RunMode.SAFE.value,
         path=target,
         paths=(target,),
         display_path=str(target),
@@ -2137,7 +2137,7 @@ def test_windows_filesystem_operation_denies_runtime_readonly_target(
     operation = SandboxOperation.filesystem(
         kind="write_text",
         workspace=workspace,
-        run_mode=RunMode.TRUSTED.value,
+        run_mode=RunMode.SAFE.value,
         path=target,
         paths=(target,),
         content="blocked",
@@ -2169,7 +2169,7 @@ async def test_windows_filesystem_operation_rejects_mismatched_paths_without_cac
     operation = SandboxOperation.filesystem(
         kind="write_text",
         workspace=workspace,
-        run_mode=RunMode.TRUSTED.value,
+        run_mode=RunMode.SAFE.value,
         path=actual,
         paths=(declared,),
         content="blocked",

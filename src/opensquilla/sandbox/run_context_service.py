@@ -349,7 +349,7 @@ async def auto_add_trusted_domain_grant(
     )
     if grant in existing.domains:
         return existing
-    trusted_context = replace(existing, run_mode=RunMode.TRUSTED)
+    trusted_context = replace(existing, run_mode=RunMode.SAFE)
     decision = decide_network_access(normalized_host, trusted_context)
     if (
         decision.status != "allow"

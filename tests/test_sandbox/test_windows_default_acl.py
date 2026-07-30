@@ -14,7 +14,7 @@ def test_standard_auto_grants_required_and_asks_for_expansion(tmp_path: Path) ->
     )
 
     plan = plan_acl_refresh(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         required=(AclGrant(tmp_path / "workspace", AclAccess.RWX, AclGrantKind.REQUIRED),),
         policy=(AclGrant(tmp_path / "policy", AclAccess.RWX, AclGrantKind.POLICY),),
         expansion=(
@@ -37,7 +37,7 @@ def test_trusted_auto_grants_non_sensitive_expansion(tmp_path: Path) -> None:
     )
 
     plan = plan_acl_refresh(
-        run_mode=RunMode.TRUSTED,
+        run_mode=RunMode.SAFE,
         required=(),
         policy=(),
         expansion=(AclGrant(tmp_path / "gradle", AclAccess.RWX, AclGrantKind.EXPANSION),),
@@ -58,7 +58,7 @@ def test_sensitive_expansion_is_denied_in_trusted(tmp_path: Path) -> None:
     )
 
     plan = plan_acl_refresh(
-        run_mode=RunMode.TRUSTED,
+        run_mode=RunMode.SAFE,
         required=(),
         policy=(),
         expansion=(AclGrant(tmp_path / ".ssh", AclAccess.RWX, AclGrantKind.EXPANSION),),
@@ -83,7 +83,7 @@ def test_policy_grants_bypass_legacy_marker_but_expansions_do_not(tmp_path: Path
     expansion = AclGrant(tmp_path / "expansion", AclAccess.RWX, AclGrantKind.EXPANSION)
 
     plan = plan_acl_refresh(
-        run_mode=RunMode.TRUSTED,
+        run_mode=RunMode.SAFE,
         required=(),
         policy=(policy,),
         expansion=(expansion,),

@@ -342,7 +342,7 @@ def _trusted_run_mode_hint(ctx: RpcContext, source_hint: dict[str, Any]) -> Any 
         if run_mode_allowed_for_principal(run_mode, ctx.principal):
             return run_mode
         if run_mode == RunMode.FULL and not ctx.principal.is_owner:
-            return RunMode.TRUSTED
+            return RunMode.SAFE
         return None
 
     elevated = source_hint.get("elevated")
@@ -351,7 +351,7 @@ def _trusted_run_mode_hint(ctx: RpcContext, source_hint: dict[str, Any]) -> Any 
     if not ctx.principal.is_owner:
         return None
     if elevated in _TRUSTED_ELEVATED_ALIASES:
-        return RunMode.TRUSTED
+        return RunMode.SAFE
     if elevated == "full":
         return RunMode.FULL
     return None
@@ -2332,7 +2332,7 @@ async def _handle_sessions_send(
         mode = project_default_run_mode(ctx.config)
         mode_source = (
             "project_default"
-            if mode is RunMode.STANDARD and config_run_mode(ctx.config) is RunMode.FULL
+            if mode is RunMode.SAFE and config_run_mode(ctx.config) is RunMode.FULL
             else "operator_default"
         )
         create_kwargs["workspace_id"] = selected_workspace.workspace_id

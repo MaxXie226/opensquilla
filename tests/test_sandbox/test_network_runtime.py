@@ -80,7 +80,7 @@ async def test_cancelled_network_wait_expires_its_orphaned_approval(
         run_mode="standard",
     )
     context = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         workspace=str(tmp_path),
     )
     service = NetworkApprovalService(
@@ -161,7 +161,7 @@ async def test_proxy_runtime_approval_waits_and_forwards_after_allow(
         workspace_dir=str(tmp_path),
         session_key="s1",
         sandbox_run_context=RunContext(
-            run_mode=RunMode.STANDARD,
+            run_mode=RunMode.SAFE,
             workspace=str(tmp_path),
         ),
     )
@@ -194,7 +194,7 @@ async def test_proxy_runtime_approval_waits_and_forwards_after_allow(
         assert params["fingerprint"]
 
         tool_context.sandbox_run_context = RunContext(
-            run_mode=RunMode.STANDARD,
+            run_mode=RunMode.SAFE,
             workspace=str(tmp_path),
             domains=(
                 DomainGrant(
@@ -235,7 +235,7 @@ async def test_trusted_runtime_network_decider_allows_without_approval(
         run_mode="trusted",
     )
     service = NetworkApprovalService(
-        context=RunContext(run_mode=RunMode.TRUSTED),
+        context=RunContext(run_mode=RunMode.SAFE),
         request=request,
         runtime=SimpleNamespace(workspace=tmp_path),
         approval_timeout_seconds=0.01,
@@ -267,7 +267,7 @@ async def test_network_approval_missing_payload_blocks_request(tmp_path: Path) -
         run_mode="standard",
     )
     service = NetworkApprovalService(
-        context=RunContext(run_mode=RunMode.STANDARD),
+        context=RunContext(run_mode=RunMode.SAFE),
         request=request,
         runtime=SimpleNamespace(workspace=tmp_path),
         approval_requester=lambda *_args, **_kwargs: None,
@@ -312,7 +312,7 @@ async def test_standard_network_forces_human_reviewer(
         seen_params.update(params)
         payload = request_sandbox_approval(params, **kwargs)
         ctx.sandbox_run_context = RunContext(
-            run_mode=RunMode.STANDARD,
+            run_mode=RunMode.SAFE,
             workspace=str(tmp_path),
             domains=(
                 DomainGrant(
@@ -335,7 +335,7 @@ async def test_standard_network_forces_human_reviewer(
         workspace_dir=str(tmp_path),
         session_key="network-standard-human",
         run_mode="standard",
-        sandbox_run_context=RunContext(run_mode=RunMode.STANDARD),
+        sandbox_run_context=RunContext(run_mode=RunMode.SAFE),
         on_sandbox_auto_review=_auto_review,
     )
     token = current_tool_context.set(ctx)
@@ -401,7 +401,7 @@ async def test_auto_review_network_request_is_hidden_and_canonical(
         workspace_dir=str(tmp_path),
         session_key="network-auto",
         run_mode="trusted",
-        sandbox_run_context=RunContext(run_mode=RunMode.TRUSTED),
+        sandbox_run_context=RunContext(run_mode=RunMode.SAFE),
     )
     setattr(ctx, "on_sandbox_auto_review", _review)
     service = NetworkApprovalService(
@@ -453,7 +453,7 @@ async def test_auto_review_network_without_reviewer_callback_fails_closed(
         run_mode="trusted",
     )
     service = NetworkApprovalService(
-        context=RunContext(run_mode=RunMode.TRUSTED),
+        context=RunContext(run_mode=RunMode.SAFE),
         request=request,
         runtime=runtime,
         approval_timeout_seconds=0.1,
@@ -514,7 +514,7 @@ async def test_auto_review_network_converted_to_human_stays_pending(
         workspace_dir=str(tmp_path),
         session_key="network-legacy",
         run_mode="standard",
-        sandbox_run_context=RunContext(run_mode=RunMode.STANDARD),
+        sandbox_run_context=RunContext(run_mode=RunMode.SAFE),
         on_sandbox_auto_review=_convert_to_human,
     )
     service = NetworkApprovalService(
@@ -574,7 +574,7 @@ async def test_subprocess_preflight_leaves_explicit_url_approval_to_proxy_runtim
             session_key="s1",
             run_mode="standard",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.STANDARD,
+                run_mode=RunMode.SAFE,
                 workspace=str(tmp_path),
             ),
         )

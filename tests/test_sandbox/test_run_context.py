@@ -48,7 +48,7 @@ def test_run_context_round_trips_mode_source() -> None:
     )
 
     context = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         workspace="/tmp/project",
         run_mode_source="project_default",
     )
@@ -114,7 +114,7 @@ def test_effective_legacy_project_preserves_explicit_full() -> None:
 
 
 @pytest.mark.asyncio
-async def test_default_run_context_is_full_host_access() -> None:
+async def test_default_run_context_is_safe() -> None:
     from opensquilla.sandbox.config import SandboxSettings
     from opensquilla.sandbox.run_context import get_run_context
 
@@ -131,7 +131,7 @@ async def test_default_run_context_is_full_host_access() -> None:
         workspace="/workspace",
     )
 
-    assert context.run_mode is RunMode.FULL
+    assert context.run_mode is RunMode.SAFE
     assert context.source == "default"
 
 
@@ -155,16 +155,16 @@ async def test_sandbox_run_mode_set_persists_user_provenance() -> None:
         config=config,
         workspace="/tmp/ws",
     )
-    assert ctx.run_mode == RunMode.STANDARD
+    assert ctx.run_mode == RunMode.SAFE
     assert ctx.source == "default"
 
-    updated = await set_run_mode(manager, manager.node.session_key, RunMode.TRUSTED, config=config)
-    assert updated.run_mode == RunMode.TRUSTED
+    updated = await set_run_mode(manager, manager.node.session_key, RunMode.SAFE, config=config)
+    assert updated.run_mode == RunMode.SAFE
     restored = run_context_from_origin_payload(
         manager.node.origin["sandbox_run_context"]
     )
     assert restored is not None
-    assert restored.run_mode is RunMode.TRUSTED
+    assert restored.run_mode is RunMode.SAFE
     assert restored.run_mode_source == "user"
 
 
@@ -183,7 +183,7 @@ async def test_set_run_mode_persists_first_workspace_and_preserves_origin_keys()
     updated = await set_run_mode(
         manager,
         manager.node.session_key,
-        RunMode.TRUSTED,
+        RunMode.SAFE,
         config=config,
         workspace="/tmp/ws",
     )
@@ -212,7 +212,7 @@ async def test_saved_restricted_mode_overrides_globally_disabled_sandbox() -> No
         workspace="/tmp/new",
     )
 
-    assert ctx.run_mode == RunMode.STANDARD
+    assert ctx.run_mode == RunMode.SAFE
     assert ctx.workspace == expected_workspace
     assert ctx.source == "saved"
 
@@ -319,7 +319,7 @@ async def test_rpc_run_context_set_allows_owner_full_mode() -> None:
 
 
 @pytest.mark.asyncio
-async def test_rpc_run_context_set_allows_non_owner_trusted_mode(
+async def test_rpc_run_context_set_decodes_non_owner_legacy_trusted_mode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from opensquilla.gateway import rpc_sandbox
@@ -362,13 +362,13 @@ async def test_rpc_run_context_set_allows_non_owner_trusted_mode(
         ctx,
     )
 
-    assert result["runMode"] == "trusted"
-    assert manager.node.origin["sandbox_run_context"]["run_mode"] == "trusted"
+    assert result["runMode"] == "safe"
+    assert manager.node.origin["sandbox_run_context"]["run_mode"] == "safe"
     assert manager.node.origin["sandbox_run_context"]["run_mode_source"] == "user"
 
 
 @pytest.mark.asyncio
-async def test_rpc_run_context_get_coerces_non_owner_default_full_to_trusted() -> None:
+async def test_rpc_run_context_get_coerces_non_owner_default_full_to_safe() -> None:
     from opensquilla.gateway.auth import Principal
     from opensquilla.gateway.rpc import RpcContext
     from opensquilla.gateway.rpc_sandbox import _handle_sandbox_run_context_get
@@ -397,7 +397,7 @@ async def test_rpc_run_context_get_coerces_non_owner_default_full_to_trusted() -
         ctx,
     )
 
-    assert result["runMode"] == "trusted"
+    assert result["runMode"] == "safe"
     assert result["source"] == "default"
     assert manager.node.origin is None
 
@@ -446,9 +446,9 @@ async def test_rpc_run_context_set_creates_owner_new_webchat_session(
         ctx,
     )
 
-    assert result["runMode"] == "trusted"
+    assert result["runMode"] == "safe"
     assert manager.created == [(session_key, "main")]
-    assert manager.sessions[session_key].origin["sandbox_run_context"]["run_mode"] == "trusted"
+    assert manager.sessions[session_key].origin["sandbox_run_context"]["run_mode"] == "safe"
     assert (
         manager.sessions[session_key]
         .origin["sandbox_run_context"]["run_mode_source"]

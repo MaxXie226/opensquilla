@@ -128,7 +128,7 @@ def build_channel_route_envelope(
     # the configured channel-admin mapping.
     metadata.pop("principal_is_owner", None)
     metadata.pop(CHANNEL_ADMIN_VERIFIED_METADATA_KEY, None)
-    metadata.setdefault("run_mode", RunMode.TRUSTED.value)
+    metadata.setdefault("run_mode", RunMode.SAFE.value)
     resolved_agent_id = _agent_id(agent_id, session_key)
     resolved_channel_type = channel_type or session_prefix
     account_id = metadata.get("account_id")
@@ -506,9 +506,9 @@ def tool_context_from_envelope(
         except ValueError:
             run_mode = None
         if run_mode == RunMode.FULL and not is_owner:
-            run_mode = RunMode.TRUSTED
+            run_mode = RunMode.SAFE
     elif legacy_elevated == "on" and is_owner:
-        run_mode = RunMode.TRUSTED
+        run_mode = RunMode.SAFE
     elif legacy_elevated in ("bypass", "full") and is_owner:
         run_mode = RunMode.FULL
     elif default_elevated in ("bypass", "full") and is_owner:
@@ -537,7 +537,7 @@ def tool_context_from_envelope(
         and sandbox_run_context.run_mode == RunMode.FULL
         and not is_owner
     ):
-        sandbox_run_context = replace(sandbox_run_context, run_mode=RunMode.TRUSTED)
+        sandbox_run_context = replace(sandbox_run_context, run_mode=RunMode.SAFE)
     if sandbox_run_context_fresh and sandbox_run_context is not None:
         sandbox_mounts = sandbox_run_context.to_origin_payload()["mounts"]
     else:

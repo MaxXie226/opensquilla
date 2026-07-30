@@ -8,8 +8,7 @@ from typing import Any, Literal
 
 
 class RunMode(StrEnum):
-    STANDARD = "standard"
-    TRUSTED = "trusted"
+    SAFE = "safe"
     FULL = "full"
 
 
@@ -23,23 +22,25 @@ class RunModeConfigPatch:
 
 
 _RUN_MODE_ALIASES = {
-    "on": RunMode.STANDARD,
-    "off": RunMode.STANDARD,
+    "safe": RunMode.SAFE,
+    "on": RunMode.SAFE,
+    "off": RunMode.SAFE,
     "bypass": RunMode.FULL,
-    "standard": RunMode.STANDARD,
-    "standard-sandbox": RunMode.STANDARD,
-    "standard_sandbox": RunMode.STANDARD,
-    "trust": RunMode.TRUSTED,
-    "trusted": RunMode.TRUSTED,
-    "trusted-sandbox": RunMode.TRUSTED,
-    "trusted_sandbox": RunMode.TRUSTED,
+    "standard": RunMode.SAFE,
+    "standard-sandbox": RunMode.SAFE,
+    "standard_sandbox": RunMode.SAFE,
+    "trust": RunMode.SAFE,
+    "trusted": RunMode.SAFE,
+    "trusted-sandbox": RunMode.SAFE,
+    "trusted_sandbox": RunMode.SAFE,
+    "managed": RunMode.SAFE,
     "full": RunMode.FULL,
     "full-host-access": RunMode.FULL,
     "full_host_access": RunMode.FULL,
 }
 
 
-def normalize_run_mode(value: Any, default: RunMode = RunMode.FULL) -> RunMode:
+def normalize_run_mode(value: Any, default: RunMode = RunMode.SAFE) -> RunMode:
     if isinstance(value, RunMode):
         return value
     if value is None or str(value).strip() == "":
@@ -55,10 +56,8 @@ def normalize_run_mode(value: Any, default: RunMode = RunMode.FULL) -> RunMode:
 
 def display_name(mode: Any) -> str:
     normalized = normalize_run_mode(mode)
-    if normalized == RunMode.STANDARD:
-        return "Standard-Sandbox"
-    if normalized == RunMode.TRUSTED:
-        return "Managed Execution"
+    if normalized == RunMode.SAFE:
+        return "Safe"
     return "Full Host Access"
 
 
@@ -66,7 +65,7 @@ def execution_target(mode: Any) -> Literal["sandbox", "host"]:
     return "host" if normalize_run_mode(mode) == RunMode.FULL else "sandbox"
 
 
-def approval_behavior(mode: Any) -> Literal["standard", "trusted", "full"]:
+def approval_behavior(mode: Any) -> Literal["safe", "full"]:
     return normalize_run_mode(mode).value
 
 
@@ -99,20 +98,20 @@ def legacy_state_to_run_mode(
     if permission_mode in {"bypass", "full"}:
         return RunMode.FULL
     if permission_mode in {"off", "on", ""}:
-        return RunMode.TRUSTED
+        return RunMode.SAFE
     if permission_mode in {"standard", "standard-sandbox", "standard_sandbox", "restricted"}:
-        return RunMode.STANDARD
+        return RunMode.SAFE
     if not bool(sandbox_enabled):
-        return RunMode.TRUSTED
+        return RunMode.SAFE
     if bool(sandbox_enabled) and not bool(grading_enabled):
-        return RunMode.STANDARD
-    return RunMode.TRUSTED
+        return RunMode.SAFE
+    return RunMode.SAFE
 
 
 def config_run_mode(config: Any) -> RunMode:
     sandbox = getattr(config, "sandbox", None)
     explicit = getattr(sandbox, "run_mode", None)
-    if explicit is not None:
+    if explicit is not None and _field_was_set(sandbox, "run_mode"):
         return normalize_run_mode(explicit)
 
     permissions = getattr(config, "permissions", None)
@@ -125,7 +124,7 @@ def config_run_mode(config: Any) -> RunMode:
         sandbox,
         "security_grading",
     ):
-        return RunMode.FULL
+        return normalize_run_mode(explicit, default=RunMode.SAFE)
 
     return legacy_state_to_run_mode(
         sandbox_enabled=getattr(sandbox, "sandbox", False),
@@ -163,7 +162,7 @@ def project_default_run_mode(config: Any) -> RunMode:
 def sandbox_runtime_capability_mode(config: Any) -> RunMode:
     configured = config_run_mode(config)
     if configured is RunMode.FULL and not _full_mode_is_explicit(config):
-        return RunMode.STANDARD
+        return RunMode.SAFE
     return configured
 
 

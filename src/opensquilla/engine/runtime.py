@@ -5999,7 +5999,7 @@ class TurnRunner:
                 normalized_run_mode = None
             if normalized_run_mode is not None:
                 lines = [f"Run mode: {display_name(normalized_run_mode)}"]
-                if normalized_run_mode is RunMode.TRUSTED:
+                if normalized_run_mode is RunMode.SAFE:
                     lines.extend(
                         [
                             "Default execution target: sandbox",

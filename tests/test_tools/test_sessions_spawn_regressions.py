@@ -409,7 +409,7 @@ async def test_spawned_child_restart_uses_persisted_inherited_authority_at_boot(
     manager = SessionManager(storage, inject_time_prefix=False)
     parent_key = "agent:main:webchat:spawn-parent-restart"
     parent_context = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         workspace=str(workspace),
         mounts=(
             MountGrant(path=str(mounted), access="rw", scope="chat"),
@@ -566,7 +566,7 @@ async def test_spawned_child_restart_uses_persisted_inherited_authority_at_boot(
             event_emitter=emit,
         )
 
-        assert observations["mode"] is RunMode.STANDARD
+        assert observations["mode"] is RunMode.SAFE
         assert observations["source"] == "route_metadata"
         assert observations["run_mode_source"] == "user"
         assert [(grant.path, grant.access, grant.scope) for grant in observations["mounts"]] == [
@@ -665,7 +665,7 @@ async def test_project_spawned_child_persists_binding_and_revalidates_queued_exe
         },
     )
     authoritative_parent = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         workspace=str(project_path),
         mounts=(MountGrant(path=str(mounted), access="rw", scope="chat"),),
         domains=(
@@ -795,7 +795,7 @@ async def test_project_spawned_child_persists_binding_and_revalidates_queued_exe
         assert child.origin[RUN_CONTEXT_ORIGIN_KEY]["run_mode"] == "standard"
         assert observations == [
             {
-                "mode": RunMode.STANDARD,
+                "mode": RunMode.SAFE,
                 "workspace": str(project_path),
                 "run_mode_source": "project_default",
                 "network": observations[0]["network"],

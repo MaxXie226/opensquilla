@@ -545,7 +545,7 @@ async def test_explicit_named_network_approval_in_standard_requires_human(
             run_mode="standard",
         )
         decision = await NetworkApprovalService(
-            context=RunContext(run_mode=RunMode.STANDARD, workspace=str(tmp_path)),
+            context=RunContext(run_mode=RunMode.SAFE, workspace=str(tmp_path)),
             request=request,
             runtime=type(
                 "Runtime",
@@ -572,7 +572,7 @@ async def test_explicit_named_network_approval_in_standard_requires_human(
         workspace_dir=str(tmp_path),
         session_key="network-agent",
         sandbox_run_context=RunContext(
-            run_mode=RunMode.STANDARD,
+            run_mode=RunMode.SAFE,
             workspace=str(tmp_path),
         ),
     )

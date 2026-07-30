@@ -106,7 +106,7 @@ def _request(
     tmp_path: Path,
     argv: tuple[str, ...],
     *,
-    run_mode: RunMode = RunMode.TRUSTED,
+    run_mode: RunMode = RunMode.SAFE,
 ) -> SandboxRequest:
     return SandboxRequest(
         argv=argv,
@@ -237,7 +237,7 @@ async def test_windows_default_proxy_allowlist_without_proxy_fails_closed(
         action_kind="shell.exec",
         policy=proxy_policy,
         env=dict(os.environ),
-        run_mode=RunMode.TRUSTED.value,
+        run_mode=RunMode.SAFE.value,
     )
 
     result = await WindowsDefaultBackend().run(request)

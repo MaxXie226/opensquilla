@@ -70,7 +70,7 @@ def managed_context(tmp_path: Path) -> Iterator[ToolContext]:
         session_key="s1",
         run_mode="standard",
         sandbox_run_context=RunContext(
-            run_mode=RunMode.STANDARD,
+            run_mode=RunMode.SAFE,
             domains=(DomainGrant(domain="allowed.test"),),
         ),
     )
@@ -110,7 +110,7 @@ def _install_trusted_session_handles(
         session_key="s1",
         agent_id="main",
         origin={
-            "sandbox_run_context": RunContext(run_mode=RunMode.TRUSTED).to_origin_payload(),
+            "sandbox_run_context": RunContext(run_mode=RunMode.SAFE).to_origin_payload(),
         },
     )
 
@@ -413,7 +413,7 @@ async def test_temporary_network_grant_allows_retry_for_explicit_target(
         ),
     )
     managed_context.sandbox_run_context = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         temporary_grants=(
             TemporaryGrant(
                 kind="domain",
@@ -443,7 +443,7 @@ async def test_windows_unready_boundary_blocks_decorated_network_tools(
     runtime = integration_mod.get_runtime()
     assert runtime is not None
     runtime.backend = SimpleNamespace(name="windows_default")
-    managed_context.sandbox_run_context = RunContext(run_mode=RunMode.TRUSTED)
+    managed_context.sandbox_run_context = RunContext(run_mode=RunMode.SAFE)
 
     class _UnexpectedClient:
         def __init__(self, *args: object, **kwargs: object) -> None:
@@ -483,7 +483,7 @@ async def test_windows_unready_boundary_does_not_trigger_elevation_when_not_admi
     runtime = integration_mod.get_runtime()
     assert runtime is not None
     runtime.backend = SimpleNamespace(name="windows_default")
-    managed_context.sandbox_run_context = RunContext(run_mode=RunMode.TRUSTED)
+    managed_context.sandbox_run_context = RunContext(run_mode=RunMode.SAFE)
 
     monkeypatch.setattr(
         integration_mod,
@@ -508,7 +508,7 @@ async def test_windows_unready_boundary_repairs_when_already_admin(
     runtime = integration_mod.get_runtime()
     assert runtime is not None
     runtime.backend = SimpleNamespace(name="windows_default")
-    managed_context.sandbox_run_context = RunContext(run_mode=RunMode.TRUSTED)
+    managed_context.sandbox_run_context = RunContext(run_mode=RunMode.SAFE)
     calls: list[object] = []
 
     monkeypatch.setattr(
@@ -566,7 +566,7 @@ async def test_windows_unready_boundary_blocks_rpc_network_action(
     runtime = integration_mod.get_runtime()
     assert runtime is not None
     runtime.backend = SimpleNamespace(name="windows_default")
-    managed_context.sandbox_run_context = RunContext(run_mode=RunMode.TRUSTED)
+    managed_context.sandbox_run_context = RunContext(run_mode=RunMode.SAFE)
     called = False
 
     async def _callback() -> str:
@@ -689,7 +689,7 @@ async def test_persisted_temporary_grant_from_saved_origin_does_not_allow_after_
         return "ok"
 
     persisted = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         temporary_grants=(
             TemporaryGrant(
                 kind="domain",
@@ -757,7 +757,7 @@ async def test_trusted_explicit_target_does_not_auto_add_before_proxy_upstream(
             workspace_dir=str(workspace),
             session_key="s1",
             run_mode="trusted",
-            sandbox_run_context=RunContext(run_mode=RunMode.TRUSTED, source="route_metadata"),
+            sandbox_run_context=RunContext(run_mode=RunMode.SAFE, source="route_metadata"),
         )
     )
     try:
@@ -814,7 +814,7 @@ async def test_trusted_inprocess_auto_trust_does_not_persist_private_resolution(
             workspace_dir=str(workspace),
             session_key="s1",
             run_mode="trusted",
-            sandbox_run_context=RunContext(run_mode=RunMode.TRUSTED, source="route_metadata"),
+            sandbox_run_context=RunContext(run_mode=RunMode.SAFE, source="route_metadata"),
         )
     )
     try:
@@ -903,7 +903,7 @@ async def test_trusted_inprocess_auto_trust_persists_after_safe_proxy_upstream(
             workspace_dir=str(workspace),
             session_key="s1",
             run_mode="trusted",
-            sandbox_run_context=RunContext(run_mode=RunMode.TRUSTED, source="route_metadata"),
+            sandbox_run_context=RunContext(run_mode=RunMode.SAFE, source="route_metadata"),
         )
     )
     try:
@@ -958,7 +958,7 @@ async def test_trusted_explicit_target_auto_adds_chat_domain_grant_in_production
         session_key="s1",
         agent_id="main",
         origin={
-            "sandbox_run_context": RunContext(run_mode=RunMode.TRUSTED).to_origin_payload(),
+            "sandbox_run_context": RunContext(run_mode=RunMode.SAFE).to_origin_payload(),
         },
     )
 
@@ -1002,7 +1002,7 @@ async def test_trusted_explicit_target_auto_adds_chat_domain_grant_in_production
             workspace_dir=str(workspace),
             session_key="s1",
             run_mode="trusted",
-            sandbox_run_context=RunContext(run_mode=RunMode.TRUSTED, source="route_metadata"),
+            sandbox_run_context=RunContext(run_mode=RunMode.SAFE, source="route_metadata"),
         )
     )
     try:
@@ -1051,7 +1051,7 @@ async def test_standard_explicit_target_does_not_auto_add_recognized_default_hos
         session_key="s1",
         agent_id="main",
         origin={
-            "sandbox_run_context": RunContext(run_mode=RunMode.STANDARD).to_origin_payload(),
+            "sandbox_run_context": RunContext(run_mode=RunMode.SAFE).to_origin_payload(),
         },
     )
 
@@ -1095,7 +1095,7 @@ async def test_standard_explicit_target_does_not_auto_add_recognized_default_hos
             workspace_dir=str(workspace),
             session_key="s1",
             run_mode="standard",
-            sandbox_run_context=RunContext(run_mode=RunMode.STANDARD, source="route_metadata"),
+            sandbox_run_context=RunContext(run_mode=RunMode.SAFE, source="route_metadata"),
         )
     )
     try:
@@ -1175,7 +1175,7 @@ async def test_run_with_managed_network_proxy_honors_temporary_domain_grant(
             session_key="s1",
             run_mode="standard",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.STANDARD,
+                run_mode=RunMode.SAFE,
                 temporary_grants=(
                     TemporaryGrant(
                         kind="domain",
@@ -1208,7 +1208,7 @@ async def test_windows_fixed_proxy_port_subprocesses_are_serialized(
     assert runtime is not None
     runtime.backend = SimpleNamespace(name="windows_default")
     managed_context.sandbox_run_context = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         domains=(DomainGrant(domain="example.com"),),
     )
     monkeypatch.setattr(integration_mod, "_windows_allowed_proxy_ports", lambda _rt: (48123,))
@@ -1359,7 +1359,7 @@ async def test_run_with_managed_network_proxy_does_not_auto_add_before_proxy_ups
             workspace_dir=str(workspace),
             session_key="s1",
             run_mode="trusted",
-            sandbox_run_context=RunContext(run_mode=RunMode.TRUSTED, source="route_metadata"),
+            sandbox_run_context=RunContext(run_mode=RunMode.SAFE, source="route_metadata"),
         )
     )
     try:
@@ -1701,7 +1701,7 @@ async def test_inprocess_network_action_with_network_none_defers_to_proxy_runtim
         workspace_dir=str(tmp_path),
         session_key="s1",
         run_mode="standard",
-        sandbox_run_context=RunContext(run_mode=RunMode.STANDARD),
+        sandbox_run_context=RunContext(run_mode=RunMode.SAFE),
     )
     token = current_tool_context.set(ctx)
     seen: dict[str, object] = {}
@@ -1767,7 +1767,7 @@ async def test_inprocess_network_action_with_network_none_uses_granted_explicit_
         session_key="s1",
         run_mode="standard",
         sandbox_run_context=RunContext(
-            run_mode=RunMode.STANDARD,
+            run_mode=RunMode.SAFE,
             domains=(
                 DomainGrant(
                     domain="example.com",
@@ -1838,7 +1838,7 @@ async def test_trusted_network_none_auto_allows_unknown_explicit_public_target(
         workspace_dir=str(tmp_path),
         session_key="s1",
         run_mode="trusted",
-        sandbox_run_context=RunContext(run_mode=RunMode.TRUSTED),
+        sandbox_run_context=RunContext(run_mode=RunMode.SAFE),
     )
     token = current_tool_context.set(ctx)
     seen: dict[str, object] = {}

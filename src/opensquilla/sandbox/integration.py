@@ -839,13 +839,13 @@ async def gate_action(
     except Exception:  # pragma: no cover - defensive against tool-context cycles
         active_mode = None
     managed_execution = bool(
-        active_mode == RunMode.TRUSTED.value
-        or (run_context is not None and run_context.run_mode == RunMode.TRUSTED)
+        active_mode == RunMode.SAFE.value
+        or (run_context is not None and run_context.run_mode == RunMode.SAFE)
         or (
             active_mode is None
             and run_context is None
             and configured_mode is not None
-            and normalize_run_mode(configured_mode) == RunMode.TRUSTED
+            and normalize_run_mode(configured_mode) == RunMode.SAFE
         )
     )
     if managed_execution and policy.require_approval:
@@ -990,7 +990,7 @@ def _auto_trusted_persistence_callback(
     *,
     context: RunContext,
 ) -> Callable[[NetworkDecision], Awaitable[None]] | None:
-    if context.run_mode != RunMode.TRUSTED:
+    if context.run_mode != RunMode.SAFE:
         return None
     session_manager, config = _current_sandbox_persistence_handles()
     if session_manager is None or config is None:
@@ -1555,7 +1555,7 @@ async def _preflight_request_package_bundle(
     bundle_id = _package_bundle_id_for_request(request)
     if bundle_id is None:
         return None
-    if context.run_mode == RunMode.TRUSTED:
+    if context.run_mode == RunMode.SAFE:
         return None
 
     fingerprint = action_fingerprint(request)
@@ -1588,7 +1588,7 @@ def _context_with_request_package_bundle(
     bundle_id = _package_bundle_id_for_request(request)
     if bundle_id is None or _context_has_enabled_package_bundle(context, bundle_id):
         return context
-    if context.run_mode != RunMode.TRUSTED:
+    if context.run_mode != RunMode.SAFE:
         return context
     grant = PackageBundleGrant(bundle_id=bundle_id, scope="chat", source="auto_trusted")
     return dataclasses.replace(context, bundles=context.bundles + (grant,))
@@ -1941,11 +1941,11 @@ async def escalate_unavailable_backend_in_managed_mode(
         mode = (
             context.run_mode
             if context is not None
-            else normalize_run_mode(request.run_mode, default=RunMode.STANDARD)
+            else normalize_run_mode(request.run_mode, default=RunMode.SAFE)
         )
     except ValueError:
         return None
-    if mode != RunMode.TRUSTED:
+    if mode != RunMode.SAFE:
         return None
     rt = runtime or get_runtime()
     if rt is None or not isinstance(rt.backend, UnavailableBackend):

@@ -672,7 +672,7 @@ async def test_shell_backend_request_preserves_resolved_run_mode(
             session_key="s1",
             run_mode="trusted",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.TRUSTED,
+                run_mode=RunMode.SAFE,
                 workspace=str(tmp_path),
             ),
         )
@@ -762,7 +762,7 @@ async def test_trusted_windows_shell_receives_managed_proxy_without_network_hint
             session_key="s1",
             run_mode="trusted",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.TRUSTED,
+                run_mode=RunMode.SAFE,
                 workspace=str(tmp_path),
             ),
         )
@@ -842,7 +842,7 @@ async def test_trusted_linux_shell_receives_managed_proxy_without_network_hint(
             session_key="s1",
             run_mode="trusted",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.TRUSTED,
+                run_mode=RunMode.SAFE,
                 workspace=str(tmp_path),
             ),
         )
@@ -942,7 +942,7 @@ async def test_trusted_windows_code_exec_receives_managed_proxy_without_network_
             session_key="s1",
             run_mode="trusted",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.TRUSTED,
+                run_mode=RunMode.SAFE,
                 workspace=str(tmp_path),
             ),
         )
@@ -995,7 +995,7 @@ def test_trusted_windows_tools_collapse_host_network_to_managed_proxy(
             workspace_dir=str(tmp_path),
             session_key="s1",
             run_mode="trusted",
-            sandbox_run_context=RunContext(run_mode=RunMode.TRUSTED),
+            sandbox_run_context=RunContext(run_mode=RunMode.SAFE),
         )
     )
     try:
@@ -1359,7 +1359,7 @@ async def test_code_exec_backend_request_preserves_resolved_run_mode(
             session_key="s1",
             run_mode="trusted",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.TRUSTED,
+                run_mode=RunMode.SAFE,
                 workspace=str(tmp_path),
             ),
         )
@@ -1608,7 +1608,7 @@ async def test_shell_unknown_explicit_url_runs_with_managed_proxy(
             workspace_dir=str(managed_runtime),
             session_key="s1",
             run_mode="standard",
-            sandbox_run_context=RunContext(run_mode=RunMode.STANDARD),
+            sandbox_run_context=RunContext(run_mode=RunMode.SAFE),
         )
     )
     try:
@@ -1830,7 +1830,7 @@ async def test_windows_proxy_allowlist_preflight_does_not_repair_during_command(
             session_key="s1",
             run_mode="trusted",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.TRUSTED,
+                run_mode=RunMode.SAFE,
                 workspace=str(tmp_path),
             ),
         )
@@ -1904,7 +1904,7 @@ async def test_windows_ready_proxy_allowlist_preflight_continues_to_proxy_runtim
             session_key="s1",
             run_mode="trusted",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.TRUSTED,
+                run_mode=RunMode.SAFE,
                 workspace=str(tmp_path),
             ),
         )
@@ -1944,7 +1944,7 @@ async def test_shell_package_install_queues_bundle_approval_before_proxy_run(
             workspace_dir=str(managed_runtime),
             session_key="s1",
             run_mode="standard",
-            sandbox_run_context=RunContext(run_mode=RunMode.STANDARD),
+            sandbox_run_context=RunContext(run_mode=RunMode.SAFE),
         )
     )
     try:
@@ -1989,7 +1989,7 @@ async def test_uv_pip_install_queues_bundle_approval_before_proxy_run(
             workspace_dir=str(managed_runtime),
             session_key="s1",
             run_mode="standard",
-            sandbox_run_context=RunContext(run_mode=RunMode.STANDARD),
+            sandbox_run_context=RunContext(run_mode=RunMode.SAFE),
         )
     )
     try:
@@ -2046,7 +2046,7 @@ async def test_poetry_install_queues_python_bundle_before_proxy_run(
             workspace_dir=str(managed_runtime),
             session_key="s1",
             run_mode="standard",
-            sandbox_run_context=RunContext(run_mode=RunMode.STANDARD),
+            sandbox_run_context=RunContext(run_mode=RunMode.SAFE),
         )
     )
     try:
@@ -2104,7 +2104,7 @@ async def test_composer_install_queues_php_bundle_before_proxy_run(
             workspace_dir=str(managed_runtime),
             session_key="s1",
             run_mode="standard",
-            sandbox_run_context=RunContext(run_mode=RunMode.STANDARD),
+            sandbox_run_context=RunContext(run_mode=RunMode.SAFE),
         )
     )
     try:
@@ -2177,7 +2177,7 @@ async def test_trusted_uv_pip_install_receives_managed_proxy_without_prompt(
             session_key="s1",
             run_mode="trusted",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.TRUSTED,
+                run_mode=RunMode.SAFE,
                 workspace=str(managed_runtime),
             ),
         )
@@ -2245,7 +2245,7 @@ async def test_trusted_python_explicit_url_uses_managed_proxy_before_execution(
             session_key="s1",
             run_mode="trusted",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.TRUSTED,
+                run_mode=RunMode.SAFE,
                 workspace=str(managed_runtime),
             ),
         )
@@ -2306,7 +2306,7 @@ async def test_trusted_python_caught_network_error_still_uses_proxy_before_execu
             session_key="s1",
             run_mode="trusted",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.TRUSTED,
+                run_mode=RunMode.SAFE,
                 workspace=str(managed_runtime),
             ),
         )
@@ -2370,7 +2370,7 @@ async def test_trusted_npm_view_uses_managed_proxy_before_execution(
             session_key="s1",
             run_mode="trusted",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.TRUSTED,
+                run_mode=RunMode.SAFE,
                 workspace=str(managed_runtime),
             ),
         )
@@ -2452,7 +2452,7 @@ async def test_trusted_unknown_install_uses_managed_proxy_without_redundant_retr
             session_key="s1",
             run_mode="trusted",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.TRUSTED,
+                run_mode=RunMode.SAFE,
                 workspace=str(managed_runtime),
             ),
         )
@@ -2501,7 +2501,7 @@ async def test_standard_network_failure_does_not_return_package_bundle_recovery_
             workspace_dir=str(standard_runtime_no_preflight),
             session_key="s1",
             run_mode="standard",
-            sandbox_run_context=RunContext(run_mode=RunMode.STANDARD),
+            sandbox_run_context=RunContext(run_mode=RunMode.SAFE),
         )
     )
     try:
@@ -2551,7 +2551,7 @@ async def test_standard_network_failure_does_not_retry_explicit_url(
             workspace_dir=str(standard_runtime_no_preflight),
             session_key="s1",
             run_mode="standard",
-            sandbox_run_context=RunContext(run_mode=RunMode.STANDARD),
+            sandbox_run_context=RunContext(run_mode=RunMode.SAFE),
         )
     )
     try:
@@ -2630,7 +2630,7 @@ async def test_standard_network_failure_does_not_retry_with_approved_bundle(
             session_key="s1",
             run_mode="standard",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.STANDARD,
+                run_mode=RunMode.SAFE,
                 workspace=str(standard_runtime_no_preflight),
                 bundles=(PackageBundleGrant(bundle_id="python-package-install"),),
             ),
@@ -2756,7 +2756,7 @@ async def test_standard_network_failure_does_not_consume_allow_once_grant(
         fingerprint=integration_mod.action_fingerprint(approval_request),
     )
     run_context = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         workspace=str(standard_runtime_no_preflight),
         temporary_grants=(grant,),
     )
@@ -2825,7 +2825,7 @@ async def test_trusted_hostless_private_network_failure_does_not_retry(
             session_key="s1",
             run_mode="trusted",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.TRUSTED,
+                run_mode=RunMode.SAFE,
                 workspace=str(managed_runtime),
             ),
         )
@@ -2885,7 +2885,7 @@ async def test_trusted_metadata_target_is_not_auto_retried(
             session_key="s1",
             run_mode="trusted",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.TRUSTED,
+                run_mode=RunMode.SAFE,
                 workspace=str(managed_runtime),
             ),
         )
@@ -2978,7 +2978,7 @@ async def test_trusted_network_failure_does_not_retry_after_managed_proxy_execut
             session_key="s1",
             run_mode="trusted",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.TRUSTED,
+                run_mode=RunMode.SAFE,
                 workspace=str(managed_runtime),
             ),
         )
@@ -3034,7 +3034,7 @@ async def test_trusted_normal_user_path_denial_requests_broader_retry_review(
             session_key="s1",
             run_mode="trusted",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.TRUSTED,
+                run_mode=RunMode.SAFE,
                 workspace=str(managed_runtime),
             ),
         )
@@ -3089,7 +3089,7 @@ async def test_trusted_read_path_denial_requests_broader_retry_review(
             session_key="s1",
             run_mode="trusted",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.TRUSTED,
+                run_mode=RunMode.SAFE,
                 workspace=str(managed_runtime),
             ),
         )
@@ -3144,7 +3144,7 @@ async def test_trusted_execve_path_denial_requests_broader_retry_review(
             session_key="s1",
             run_mode="trusted",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.TRUSTED,
+                run_mode=RunMode.SAFE,
                 workspace=str(managed_runtime),
             ),
         )
@@ -3224,7 +3224,7 @@ async def test_trusted_managed_network_denial_requests_broader_retry_review(
             session_key="s1",
             run_mode="trusted",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.TRUSTED,
+                run_mode=RunMode.SAFE,
                 workspace=str(managed_runtime),
             ),
         )
@@ -3294,7 +3294,7 @@ async def test_trusted_sensitive_path_denial_does_not_auto_retry(
             session_key="s1",
             run_mode="trusted",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.TRUSTED,
+                run_mode=RunMode.SAFE,
                 workspace=str(managed_runtime),
             ),
         )
@@ -3342,7 +3342,7 @@ async def test_trusted_successful_network_failure_text_does_not_retry(
             session_key="s1",
             run_mode="trusted",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.TRUSTED,
+                run_mode=RunMode.SAFE,
                 workspace=str(managed_runtime),
             ),
         )
@@ -3380,7 +3380,7 @@ async def test_timeout_wrapped_node_install_queues_bundle_approval_before_proxy_
             workspace_dir=str(managed_runtime),
             session_key="s1",
             run_mode="standard",
-            sandbox_run_context=RunContext(run_mode=RunMode.STANDARD),
+            sandbox_run_context=RunContext(run_mode=RunMode.SAFE),
         )
     )
     try:
@@ -3442,7 +3442,7 @@ async def test_subprocess_network_approval_uses_session_workspace_for_external_c
             session_key="s1",
             run_mode="standard",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.STANDARD,
+                run_mode=RunMode.SAFE,
                 workspace=str(managed_runtime),
             ),
         )
@@ -3503,7 +3503,7 @@ async def test_subprocess_network_once_grant_consumes_from_session_workspace(
         session_key="s1",
         run_mode="standard",
         sandbox_run_context=RunContext(
-            run_mode=RunMode.STANDARD,
+            run_mode=RunMode.SAFE,
             workspace=str(managed_runtime),
             temporary_grants=(grant,),
         ),
@@ -3581,7 +3581,7 @@ async def test_background_shell_network_spawn_receives_managed_proxy(
             session_key="s1",
             run_mode="standard",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.STANDARD,
+                run_mode=RunMode.SAFE,
                 domains=(DomainGrant(domain="example.com"),),
             ),
         )
@@ -3662,7 +3662,7 @@ async def test_code_network_subprocess_receives_managed_proxy_env(
             session_key="s1",
             run_mode="standard",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.STANDARD,
+                run_mode=RunMode.SAFE,
                 domains=(DomainGrant(domain="example.com"),),
             ),
         )
@@ -3763,7 +3763,7 @@ async def test_code_exec_prepares_managed_proxy_before_backend_run(
             session_key="s1",
             run_mode="trusted",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.TRUSTED,
+                run_mode=RunMode.SAFE,
                 domains=(DomainGrant(domain="example.com"),),
             ),
         )
@@ -3838,7 +3838,7 @@ async def test_trusted_code_exec_path_denial_escalates_without_retry(
             session_key="s1",
             run_mode="trusted",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.TRUSTED,
+                run_mode=RunMode.SAFE,
                 workspace=str(managed_runtime),
             ),
         )
@@ -3905,7 +3905,7 @@ async def test_code_unknown_explicit_url_runs_with_managed_proxy(
             workspace_dir=str(managed_runtime),
             session_key="s1",
             run_mode="standard",
-            sandbox_run_context=RunContext(run_mode=RunMode.STANDARD),
+            sandbox_run_context=RunContext(run_mode=RunMode.SAFE),
         )
     )
     try:

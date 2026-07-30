@@ -83,7 +83,7 @@ def decide_network_access(host: str, context: RunContext) -> NetworkDecision:
                     source=f"bundle:{bundle_grant.bundle_id}",
                 )
 
-    if context.run_mode == RunMode.TRUSTED and _is_recognized_default_host(
+    if context.run_mode == RunMode.SAFE and _is_recognized_default_host(
         normalized_host,
         disabled_bundle_ids=disabled_bundle_ids,
     ):
@@ -125,7 +125,7 @@ def decide_network_access(host: str, context: RunContext) -> NetworkDecision:
             source=f"public_network:{scope}",
         )
 
-    if context.run_mode == RunMode.TRUSTED:
+    if context.run_mode == RunMode.SAFE:
         return NetworkDecision(
             status="allow",
             normalized_host=normalized_host,

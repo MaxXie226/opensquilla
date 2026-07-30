@@ -38,7 +38,7 @@ class _SessionManager:
 
 def _context(
     *,
-    run_mode: RunMode = RunMode.STANDARD,
+    run_mode: RunMode = RunMode.SAFE,
     domains: tuple[DomainGrant, ...] = (),
     bundles: tuple[PackageBundleGrant, ...] = (),
     public_network: tuple[PublicNetworkGrant, ...] = (),
@@ -91,7 +91,7 @@ def test_decide_network_access_asks_for_unknown_valid_domain() -> None:
 def test_standard_sandbox_unknown_public_host_still_asks() -> None:
     decision = decide_network_access(
         "https://new-public-example.invalid",
-        _context(run_mode=RunMode.STANDARD),
+        _context(run_mode=RunMode.SAFE),
     )
 
     assert decision == NetworkDecision(
@@ -103,7 +103,7 @@ def test_standard_sandbox_unknown_public_host_still_asks() -> None:
 
 
 def test_trusted_sandbox_auto_trusts_unknown_public_host_for_this_chat() -> None:
-    decision = decide_network_access("docs.example.com", _context(run_mode=RunMode.TRUSTED))
+    decision = decide_network_access("docs.example.com", _context(run_mode=RunMode.SAFE))
 
     assert decision == NetworkDecision(
         status="allow",
@@ -116,7 +116,7 @@ def test_trusted_sandbox_auto_trusts_unknown_public_host_for_this_chat() -> None
 def test_trusted_sandbox_unknown_public_host_auto_trusts_for_chat() -> None:
     decision = decide_network_access(
         "https://new-public-example.invalid",
-        _context(run_mode=RunMode.TRUSTED),
+        _context(run_mode=RunMode.SAFE),
     )
 
     assert decision == NetworkDecision(
@@ -344,7 +344,7 @@ def test_full_host_access_bypasses_sandbox_domain_controls() -> None:
 
 
 def test_trusted_sandbox_auto_trusts_low_risk_recognized_hosts_for_this_chat() -> None:
-    context = _context(run_mode=RunMode.TRUSTED)
+    context = _context(run_mode=RunMode.SAFE)
 
     for host in ("api.github.com", "registry.npmjs.org"):
         decision = decide_network_access(host, context)
@@ -495,7 +495,7 @@ async def test_trusted_sandbox_auto_trust_does_not_persist_unsafe_hosts() -> Non
 
 
 def test_trusted_sandbox_does_not_auto_trust_unsafe_hosts() -> None:
-    context = _context(run_mode=RunMode.TRUSTED)
+    context = _context(run_mode=RunMode.SAFE)
 
     for host in (
         "127.0.0.1",

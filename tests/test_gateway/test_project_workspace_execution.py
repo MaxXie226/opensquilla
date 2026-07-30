@@ -255,7 +255,7 @@ async def test_explicit_full_project_uses_operator_default_provenance(
         assert restored.run_mode_source == "operator_default"
 
 
-@pytest.mark.parametrize("mode", [RunMode.STANDARD, RunMode.TRUSTED])
+@pytest.mark.parametrize("mode", [RunMode.SAFE, RunMode.SAFE])
 @pytest.mark.asyncio
 async def test_explicit_standard_and_trusted_project_modes_round_trip(
     tmp_path: Path,
@@ -1655,7 +1655,7 @@ async def test_runtime_send_rehydrates_unbound_session_before_real_enforcement(
         source="saved",
     )
     standard_context = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         workspace=str(workspace),
         run_mode_source="user",
         source="saved",
@@ -1810,7 +1810,7 @@ def test_only_trusted_envelope_freshness_reaches_tool_context() -> None:
         run_mode="standard",
     )
     envelope.metadata["sandbox_run_context"] = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         workspace="/tmp/project",
         source="saved",
     ).to_origin_payload()

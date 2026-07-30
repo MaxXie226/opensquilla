@@ -58,7 +58,7 @@ def test_saved_route_run_mode_wins_over_later_global_full_default() -> None:
         default_elevated="full",
     )
 
-    assert ctx.run_mode == "standard"
+    assert ctx.run_mode == "safe"
     assert ctx.elevated is None
 
 
@@ -130,9 +130,9 @@ def test_channel_route_upgrades_owner_default_to_full_but_keeps_members_trusted(
 
     # Administrator identity widens the tool surface, not the session's
     # execution policy. The same default applies to the WebUI owner.
-    assert user_ctx.run_mode == "trusted"
+    assert user_ctx.run_mode == "safe"
     assert user_ctx.elevated is None
-    assert admin_ctx.run_mode == "trusted"
+    assert admin_ctx.run_mode == "safe"
     assert admin_ctx.elevated is None
 
 
@@ -148,14 +148,14 @@ def test_channel_route_preserves_explicit_trusted_choice_for_owner() -> None:
     # verified channel administrator, just as it does in the WebUI.
     _apply_run_context_route_metadata(
         envelope,
-        RunContext(run_mode=RunMode.TRUSTED, source="saved"),
+        RunContext(run_mode=RunMode.SAFE, source="saved"),
         principal_is_owner=True,
     )
 
     admin_ctx = tool_context_from_envelope(envelope, is_owner=True)
 
     assert envelope.metadata["run_mode_explicit"] is True
-    assert admin_ctx.run_mode == "trusted"
+    assert admin_ctx.run_mode == "safe"
     assert admin_ctx.elevated is None
 
 
@@ -170,17 +170,17 @@ def test_channel_route_default_run_context_matches_sandbox_context_for_owner() -
     # A default (unsaved) run context must not count as an explicit choice.
     _apply_run_context_route_metadata(
         envelope,
-        RunContext(run_mode=RunMode.TRUSTED, source="default"),
+        RunContext(run_mode=RunMode.SAFE, source="default"),
         principal_is_owner=True,
     )
 
     admin_ctx = tool_context_from_envelope(envelope, is_owner=True)
 
     assert envelope.metadata["run_mode_explicit"] is False
-    assert admin_ctx.run_mode == "trusted"
+    assert admin_ctx.run_mode == "safe"
     assert admin_ctx.elevated is None
     assert admin_ctx.sandbox_run_context is not None
-    assert admin_ctx.sandbox_run_context.run_mode == RunMode.TRUSTED
+    assert admin_ctx.sandbox_run_context.run_mode == RunMode.SAFE
 
 
 @pytest.mark.parametrize("run_mode", list(RunMode))
@@ -235,7 +235,7 @@ def test_channel_owner_can_use_explicit_full_route_metadata() -> None:
     _mark_verified_channel_admin(envelope)
     admin_ctx = tool_context_from_envelope(envelope, is_owner=True)
 
-    assert user_ctx.run_mode == "trusted"
+    assert user_ctx.run_mode == "safe"
     assert user_ctx.elevated is None
     assert admin_ctx.run_mode == "full"
     assert admin_ctx.elevated == "full"
@@ -253,7 +253,7 @@ def test_unstamped_channel_owner_context_stays_restricted() -> None:
 
     assert ctx.is_owner is False
     assert ctx.channel_admin_verified is False
-    assert ctx.run_mode == "trusted"
+    assert ctx.run_mode == "safe"
     assert ctx.elevated is None
 
 
@@ -263,7 +263,7 @@ def test_route_metadata_hydrates_full_sandbox_run_context() -> None:
         run_mode="standard",
     )
     run_context = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         domains=(DomainGrant(domain="pypi.org"),),
         bundles=(
             PackageBundleGrant(bundle_id="python-package-install", scope="chat"),
@@ -278,7 +278,7 @@ def test_route_metadata_hydrates_full_sandbox_run_context() -> None:
     )
     ctx = tool_context_from_envelope(envelope, is_owner=True)
 
-    assert envelope.metadata["run_mode"] == "standard"
+    assert envelope.metadata["run_mode"] == "safe"
     assert envelope.metadata["sandbox_mounts"] == []
     assert envelope.metadata["sandbox_run_context"]["domains"] == [
         {"domain": "pypi.org", "scope": "chat", "source": "manual"}
@@ -295,7 +295,7 @@ def test_route_metadata_hydrates_full_sandbox_run_context() -> None:
             "source": "disabled",
         },
     ]
-    assert ctx.run_mode == "standard"
+    assert ctx.run_mode == "safe"
     assert isinstance(ctx.sandbox_run_context, RunContext)
     assert [grant.domain for grant in ctx.sandbox_run_context.domains] == ["pypi.org"]
     assert [
@@ -325,7 +325,7 @@ def test_fresh_route_metadata_preserves_user_scope_grants_for_execution(
         run_mode="standard",
     )
     run_context = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         workspace=str(workspace),
         mounts=(
             MountGrant(path=str(chat_mount), access="ro", scope="chat"),
@@ -442,7 +442,7 @@ def test_policy_mounts_use_live_run_context_when_legacy_mount_metadata_is_stale(
         session_key="agent:main:cli",
         sandbox_mounts=[],
         sandbox_run_context=RunContext(
-            run_mode=RunMode.TRUSTED,
+            run_mode=RunMode.SAFE,
             workspace=str(workspace),
             mounts=(MountGrant(path=str(approved_mount), access="ro", scope="chat"),),
         ),
@@ -479,7 +479,7 @@ def test_policy_mounts_treat_live_empty_run_context_as_authoritative(
         session_key="agent:main:cli",
         sandbox_mounts=[{"path": str(removed_mount), "access": "ro"}],
         sandbox_run_context=RunContext(
-            run_mode=RunMode.STANDARD,
+            run_mode=RunMode.SAFE,
             workspace=str(workspace),
             mounts=(),
         ),
@@ -509,8 +509,8 @@ def test_invalid_route_run_context_metadata_is_ignored() -> None:
 def test_legacy_owner_elevated_aliases_map_to_trusted_run_mode() -> None:
     ctx = _owner_rpc_context(is_owner=True)
 
-    assert _trusted_run_mode_hint(ctx, {"elevated": "on"}) == RunMode.TRUSTED
-    assert _trusted_run_mode_hint(ctx, {"elevated": "bypass"}) == RunMode.TRUSTED
+    assert _trusted_run_mode_hint(ctx, {"elevated": "on"}) == RunMode.SAFE
+    assert _trusted_run_mode_hint(ctx, {"elevated": "bypass"}) == RunMode.SAFE
 
 
 def test_legacy_owner_full_elevated_alias_maps_to_full_run_mode() -> None:

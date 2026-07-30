@@ -27,6 +27,7 @@ from opensquilla.sandbox.permissions import (
 from opensquilla.sandbox.platform_permissions import FileSystemPlatformContext
 from opensquilla.sandbox.run_context import MountGrant, RunContext
 from opensquilla.sandbox.run_mode import RunMode
+from opensquilla.sandbox.run_mode import normalize_run_mode
 from opensquilla.sandbox.types import SandboxBackendError, SandboxRequest
 from opensquilla.tools.builtin import filesystem as fs
 from opensquilla.tools.builtin import patch as patch_tool
@@ -159,7 +160,7 @@ def _install_source_filesystem_worker_backend() -> _SourceFilesystemWorkerBacken
 def tool_context(
     workspace: Path,
     *,
-    run_mode: str | None = "standard",
+    run_mode: str | None = "safe",
     sandbox_mounts: list[dict[str, object]] | None = None,
     workspace_strict: bool = False,
 ) -> Iterator[ToolContext]:
@@ -180,7 +181,7 @@ def tool_context(
         session_key="s1",
         sandbox_mounts=sandbox_mounts or [],
         sandbox_run_context=RunContext(
-            run_mode=RunMode(run_mode or "standard"),
+            run_mode=normalize_run_mode(run_mode),
             workspace=str(workspace),
             mounts=mounts,
             source="saved",
@@ -2756,7 +2757,7 @@ async def test_trusted_run_context_read_path_outside_workspace_needs_no_mount(
 
     with tool_context(workspace, run_mode=None) as ctx:
         ctx.sandbox_run_context = RunContext(
-            run_mode=RunMode.TRUSTED,
+            run_mode=RunMode.SAFE,
             workspace=str(workspace),
         )
         result = await fs.read_file(str(target))

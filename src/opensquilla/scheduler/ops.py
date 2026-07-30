@@ -6,6 +6,12 @@ from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from opensquilla.sandbox.legacy_codec import (
+    LegacyModeContext,
+    LegacyModeDecodeError,
+    decode_legacy_run_mode,
+)
+from opensquilla.sandbox.run_mode import RunMode
 from opensquilla.session.keys import normalize_agent_id
 
 from .delivery import validate_webhook_url
@@ -24,13 +30,6 @@ from .types import (
     ScheduleKind,
     SessionTarget,
 )
-
-_RUN_MODE_ALIASES = {
-    "bypass": "full",
-    "standard-sandbox": "standard",
-    "standard_sandbox": "standard",
-}
-_PERSISTED_RUN_MODES = frozenset({"standard", "trusted", "full"})
 
 
 def _validate_structured_schedule(
@@ -76,14 +75,18 @@ def _persisted_run_mode(value: str, *, creator_is_owner: bool) -> str:
     """Resolve the already-authorized execution mode at the scheduler boundary."""
 
     normalized = str(value or "").strip().lower()
-    normalized = _RUN_MODE_ALIASES.get(normalized, normalized)
     if not normalized:
-        normalized = "full" if creator_is_owner else "trusted"
-    if normalized not in _PERSISTED_RUN_MODES:
-        raise ValueError(f"unsupported cron run_mode: {value!r}")
-    if normalized == "full" and not creator_is_owner:
-        return "trusted"
-    return normalized
+        return RunMode.FULL.value if creator_is_owner else RunMode.SAFE.value
+    try:
+        mode = decode_legacy_run_mode(
+            normalized,
+            context=LegacyModeContext.EXPLICIT,
+        )
+    except LegacyModeDecodeError as exc:
+        raise ValueError(f"unsupported cron run_mode: {value!r}") from exc
+    if mode is RunMode.FULL and not creator_is_owner:
+        return RunMode.SAFE.value
+    return mode.value
 
 
 def _delivery_requested(delivery: DeliveryConfig | None) -> bool:

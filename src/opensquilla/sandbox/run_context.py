@@ -621,11 +621,11 @@ def effective_project_run_mode(context: RunContext, config: Any) -> RunContext:
         context.run_mode is RunMode.FULL
         and context.run_mode_source is None
         and config_run_mode(config) is RunMode.FULL
-        and project_default_run_mode(config) is RunMode.STANDARD
+        and project_default_run_mode(config) is RunMode.SAFE
     ):
         return replace(
             context,
-            run_mode=RunMode.STANDARD,
+            run_mode=RunMode.SAFE,
             run_mode_source="project_default",
         )
     return context

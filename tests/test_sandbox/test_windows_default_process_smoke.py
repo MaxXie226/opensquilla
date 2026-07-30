@@ -56,7 +56,7 @@ def _request(
         policy=_policy(),
         stdin=stdin,
         env=dict(os.environ),
-        run_mode=RunMode.TRUSTED.value,
+        run_mode=RunMode.SAFE.value,
     )
 
 
@@ -186,7 +186,7 @@ async def test_windows_default_runs_shell_host_nested_powershell_env_probe(
                 "NO_PROXY": "localhost,127.0.0.1",
                 "OPENSQUILLA_SANDBOX_NETWORK": "proxy_allowlist",
             },
-            run_mode=RunMode.TRUSTED.value,
+            run_mode=RunMode.SAFE.value,
         )
     )
 
