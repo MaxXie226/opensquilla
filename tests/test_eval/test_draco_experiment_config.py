@@ -94,13 +94,17 @@ def test_default_b2_config_is_g12_derived_quality_first_profile() -> None:
     assert all(member.temperature == 0.0 for member in config.ensemble.proposers)
     assert config.ensemble.aggregator.max_tokens == 16_384
     assert config.ensemble.aggregator.temperature == 0.0
-    assert config.ensemble.min_successful_proposers == 3
+    assert config.ensemble.min_successful_proposers == 2
     assert config.ensemble.all_failed_policy == "fallback_single"
     assert config.ensemble.candidate_max_chars == 24_000
     assert config.ensemble.shuffle_candidates is False
     assert config.ensemble.record_candidates is True
     assert config.ensemble.proposer_tools is False
     assert config.ensemble.aggregator_tools is True
+    assert config.ensemble.proposer_backup_count == 2
+    assert config.ensemble.proposer_recovery_max_additional_calls == 3
+    assert config.ensemble.proposer_max_tokens_cap == 65_536
+    assert config.ensemble.proposer_visible_answer_reserve_tokens == 4_096
     assert config.ensemble.wait_for_all_proposers is True
     assert config.ensemble.quorum_grace_seconds == 0.0
     assert config.tools.web_search.provider == "brave"
@@ -143,6 +147,23 @@ def test_draco_ensemble_rejects_invalid_aggregator_output_budget() -> None:
         load_draco_experiment_config(
             DEFAULT_CONFIG,
             inline_sets=["ensemble.aggregator_max_tokens_cap=8192"],
+        )
+
+
+def test_draco_ensemble_rejects_invalid_proposer_recovery_budget() -> None:
+    with pytest.raises(ValidationError, match="less than or equal to 3"):
+        load_draco_experiment_config(
+            DEFAULT_CONFIG,
+            inline_sets=["ensemble.proposer_recovery_max_additional_calls=4"],
+        )
+
+    with pytest.raises(
+        ValidationError,
+        match="proposer_visible_answer_reserve_tokens must be smaller",
+    ):
+        load_draco_experiment_config(
+            DEFAULT_CONFIG,
+            inline_sets=["ensemble.proposer_max_tokens_cap=4096"],
         )
 
 

@@ -101,7 +101,7 @@
       "thinking": "xhigh",
       "k": 1
     },
-    "min_successful_proposers": 3,
+    "min_successful_proposers": 2,
     "all_failed_policy": "fallback_single",
     "candidate_max_chars": 24000,
     "shuffle_candidates": false,
@@ -112,6 +112,10 @@
     "aggregator_recovery_top_k": 3,
     "aggregator_max_tokens_cap": 65536,
     "aggregator_visible_answer_reserve_tokens": 8192,
+    "proposer_backup_count": 2,
+    "proposer_recovery_max_additional_calls": 3,
+    "proposer_max_tokens_cap": 65536,
+    "proposer_visible_answer_reserve_tokens": 4096,
     "wait_for_all_proposers": true,
     "quorum_grace_seconds": 0.0
   },

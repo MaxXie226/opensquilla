@@ -285,6 +285,19 @@ GENERATION_EMPTY_OUTPUT_ERROR = "empty_generation_output"
 GENERATION_MISSING_DONE_ERROR = "generation_missing_done"
 RUNNER_STREAM_CLEANUP_TIMEOUT_SECONDS = 1.0
 RUN_COMPATIBILITY_SCHEMA = "opensquilla.draco.run-compatibility/v1"
+PROPOSER_RECOVERY_SCHEMA = "opensquilla.router-dynamic-proposer-recovery/v1"
+FORMAL_PROPOSER_RECOVERY_POLICY: dict[str, Any] = {
+    "schema": PROPOSER_RECOVERY_SCHEMA,
+    "configured_backup_count": 2,
+    "effective_backup_count": 2,
+    "max_additional_physical_requests": 3,
+    "quorum_required": 2,
+    "max_tokens_cap": 65_536,
+    "visible_answer_reserve_tokens": 4_096,
+    "thinking_downgrade_order": ["one_strictly_lower"],
+    "transient_same_model_retries": 1,
+    "backup_reasoning_downgrades": 1,
+}
 REPAIR_ONLY_SOURCE_DRIFT_SCHEMA = "opensquilla.draco.repair-only-source-drift/v1"
 
 
@@ -458,6 +471,48 @@ def aggregator_recovery_policy(
     }
 
 
+def proposer_recovery_policy(
+    experiment: DracoExperimentConfig,
+) -> dict[str, Any]:
+    """Return the frozen, provider-owned proposer recovery settings."""
+
+    ensemble = experiment.ensemble
+    return {
+        "proposer_backup_count": ensemble.proposer_backup_count,
+        "proposer_recovery_max_additional_calls": (
+            ensemble.proposer_recovery_max_additional_calls
+        ),
+        "proposer_max_tokens_cap": ensemble.proposer_max_tokens_cap,
+        "proposer_visible_answer_reserve_tokens": (
+            ensemble.proposer_visible_answer_reserve_tokens
+        ),
+    }
+
+
+def proposer_recovery_plan_policy(
+    policy: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project runtime settings into immutable selection-plan evidence."""
+
+    configured_backup_count = int(policy["proposer_backup_count"])
+    return {
+        "schema": PROPOSER_RECOVERY_SCHEMA,
+        "configured_backup_count": configured_backup_count,
+        "effective_backup_count": configured_backup_count,
+        "max_additional_physical_requests": int(
+            policy["proposer_recovery_max_additional_calls"]
+        ),
+        "quorum_required": 2,
+        "max_tokens_cap": int(policy["proposer_max_tokens_cap"]),
+        "visible_answer_reserve_tokens": int(
+            policy["proposer_visible_answer_reserve_tokens"]
+        ),
+        "thinking_downgrade_order": ["one_strictly_lower"],
+        "transient_same_model_retries": 1,
+        "backup_reasoning_downgrades": 1,
+    }
+
+
 def apply_aggregator_recovery_policy(target: Any, policy: Mapping[str, Any]) -> None:
     """Apply one normalized recovery policy to a runtime or dry provider config."""
 
@@ -479,12 +534,24 @@ def enforce_formal_draco_runtime_config(
     config.sandbox.sandbox = False
     config.sandbox.security_grading = False
     recovery_policy = aggregator_recovery_policy(experiment)
+    proposer_policy = proposer_recovery_policy(experiment)
+    if (
+        "G1" in groups
+        and proposer_recovery_plan_policy(proposer_policy)
+        != FORMAL_PROPOSER_RECOVERY_POLICY
+    ):
+        raise ValueError(
+            "formal G1 requires the frozen provider-owned proposer "
+            "recovery policy"
+        )
     apply_aggregator_recovery_policy(config.llm_ensemble, recovery_policy)
+    apply_aggregator_recovery_policy(config.llm_ensemble, proposer_policy)
     freeze: dict[str, Any] = {
         "source": "experiment_config",
         "sandbox_enabled": False,
         "sandbox_security_grading_enabled": False,
         **recovery_policy,
+        **proposer_policy,
     }
     if "G1" in groups:
         g1_routing = experiment.g1_routing
@@ -725,13 +792,14 @@ def attach_provider_setup(provider: Any, build: ProviderBuildResult) -> Any:
 
     try:
         selection_plan = getattr(provider, "selection_plan", None)
-        if not (
+        managed_thinking = bool(
             isinstance(selection_plan, Mapping)
             and selection_plan.get(
                 "ranking_thinking_assignment_enabled"
             )
             is True
-        ):
+        )
+        if not managed_thinking:
             setattr(provider, "_draco_frozen_routing_trace", None)
             setattr(
                 provider,
@@ -886,6 +954,38 @@ class DryEnsembleProvider:
         candidates: list[dict[str, Any]] = []
         selected_p = self.selection_plan.get("selected_P")
         selected_identities = selected_p if isinstance(selected_p, list) else []
+        recovery_policy = self.selection_plan.get(
+            "proposer_recovery_policy"
+        )
+        formal_recovery = (
+            isinstance(recovery_policy, Mapping)
+            and dict(recovery_policy)
+            == FORMAL_PROPOSER_RECOVERY_POLICY
+        )
+        chat_sequence = int(
+            getattr(self, "_draco_dry_chat_sequence", 0)
+        ) + 1
+        self._draco_dry_chat_sequence = chat_sequence
+        recovery_scope_id = str(
+            getattr(self, "_draco_dry_recovery_scope_id", "")
+        )
+        if formal_recovery and not recovery_scope_id:
+            recovery_scope_id = hashlib.sha256(
+                (
+                    f"dry-run-turn:{self.group}:"
+                    f"{self.selection_plan.get('decision_id')}"
+                ).encode()
+            ).hexdigest()[:32]
+            self._draco_dry_recovery_scope_id = recovery_scope_id
+
+        def physical_attempt_id(role: str, index: int, identity: str) -> str:
+            return hashlib.sha256(
+                (
+                    f"{recovery_scope_id}:{chat_sequence}:"
+                    f"{role}:{index}:{identity}"
+                ).encode()
+            ).hexdigest()[:32]
+
         for index, model in enumerate(self.proposer_models):
             sample_index = sample_indexes.get(model, 0)
             sample_indexes[model] = sample_index + 1
@@ -898,38 +998,63 @@ class DryEnsembleProvider:
             provider = provider.strip() if separator else "dry"
             selected_model = selected_model.strip() if separator else model
             candidate_text = f"Candidate {index + 1} for {prompt[:80]}"
-            candidates.append(
-                {
-                    "index": index,
-                    "sample_index": sample_index,
-                    "label": f"proposer_{index + 1}",
-                    "provider": provider,
-                    "requested_provider": provider,
-                    "model": selected_model,
-                    "requested_model": selected_model,
-                    "ok": True,
-                    "request_started": True,
-                    "physical_request_count": 1,
-                    "usage_reported": True,
-                    "stop_reason": "stop",
-                    "content": {
-                        "text": candidate_text,
-                        "chars": len(candidate_text),
-                        "truncated": False,
-                    },
+            candidate = {
+                "index": index,
+                "sample_index": sample_index,
+                "label": f"proposer_{index + 1}",
+                "provider": provider,
+                "requested_provider": provider,
+                "model": selected_model,
+                "requested_model": selected_model,
+                "ok": True,
+                "request_started": True,
+                "physical_request_count": 1,
+                "usage_reported": True,
+                "usage_missing_count": 0,
+                "stop_reason": "stop",
+                "content": {
                     "text": candidate_text,
-                    "input_tokens": 10 + index,
-                    "output_tokens": 8,
-                    "billed_cost": 0.0,
-                    "cost_source": "none",
+                    "chars": len(candidate_text),
+                    "truncated": False,
+                },
+                "text": candidate_text,
+                "input_tokens": 10 + index,
+                "output_tokens": 8,
+                "billed_cost": 0.0,
+                "cost_source": "none",
+            }
+            if formal_recovery:
+                candidate["execution"] = {
+                    "actual_provider": provider,
+                    "actual_model": selected_model,
+                    "requested_provider": provider,
+                    "requested_model": selected_model,
+                    "physical_attempts": [
+                        {
+                            "attempt": 1,
+                            "request_started": True,
+                            "stream_closed": True,
+                            "physical_attempt_id": physical_attempt_id(
+                                "proposer",
+                                index,
+                                identity,
+                            ),
+                            "identity": identity,
+                            "outcome": "succeeded",
+                        }
+                    ],
                 }
-            )
+            candidates.append(candidate)
         text = f"[dry:{self.group}:{self.profile}] fused answer for {prompt[:120]}"
-        proposer_usage = [
-            {
+        proposer_usage = []
+        for candidate in candidates:
+            unit = {
                 "role": "proposer",
                 "provider": candidate["provider"],
                 "model": candidate["model"],
+                "requested_provider": candidate["requested_provider"],
+                "requested_model": candidate["requested_model"],
+                "request_count": 1,
                 "input_tokens": candidate["input_tokens"],
                 "output_tokens": candidate["output_tokens"],
                 "cached_tokens": 0,
@@ -937,8 +1062,15 @@ class DryEnsembleProvider:
                 "billed_cost": 0.0,
                 "cost_source": "none",
             }
-            for candidate in candidates
-        ]
+            if formal_recovery:
+                attempt_id = candidate["execution"][
+                    "physical_attempts"
+                ][0]["physical_attempt_id"]
+                unit["physical_attempt_id"] = attempt_id
+                unit["provider_usage"] = {
+                    "physical_attempt_id": attempt_id,
+                }
+            proposer_usage.append(unit)
         yield TextDeltaEvent(text=text)
         aggregator_provider = (
             str(self.selection_plan.get("selected_A") or "dry:").partition(":")[0].strip() or "dry"
@@ -957,6 +1089,20 @@ class DryEnsembleProvider:
         if not aggregator_candidates or aggregator_candidates[0] != aggregator_identity:
             aggregator_candidates = [aggregator_identity]
         self.selection_plan["aggregator_candidates"] = list(aggregator_candidates)
+        aggregator_attempt_id = physical_attempt_id(
+            "aggregator",
+            0,
+            aggregator_identity,
+        )
+        selection_plan_fingerprint = ""
+        if formal_recovery:
+            from opensquilla.provider.protocol import (
+                provider_retry_roster_fingerprint,
+            )
+
+            selection_plan_fingerprint = (
+                provider_retry_roster_fingerprint(self.selection_plan)
+            )
         yield DoneEvent(
             input_tokens=sum(int(candidate["input_tokens"]) for candidate in candidates) + 21,
             output_tokens=max(1, len(text) // 4),
@@ -968,12 +1114,29 @@ class DryEnsembleProvider:
                     "role": "aggregator",
                     "provider": aggregator_provider,
                     "model": self.model,
+                    "requested_provider": aggregator_provider,
+                    "requested_model": self.model,
+                    "request_count": 1,
                     "input_tokens": 21,
                     "output_tokens": max(1, len(text) // 4),
                     "cached_tokens": 0,
                     "cache_write_tokens": 0,
                     "billed_cost": 0.0,
                     "cost_source": "none",
+                    **(
+                        {
+                            "physical_attempt_id": (
+                                aggregator_attempt_id
+                            ),
+                            "provider_usage": {
+                                "physical_attempt_id": (
+                                    aggregator_attempt_id
+                                ),
+                            },
+                        }
+                        if formal_recovery
+                        else {}
+                    ),
                 },
             ],
             ensemble_trace={
@@ -1024,6 +1187,17 @@ class DryEnsembleProvider:
                             "requested_model": self.model,
                             "actual_provider": aggregator_provider,
                             "actual_model": self.model,
+                            **(
+                                {
+                                    "physical_attempt_id": (
+                                        aggregator_attempt_id
+                                    ),
+                                    "usage_reported": True,
+                                    "usage_missing_count": 0,
+                                }
+                                if formal_recovery
+                                else {}
+                            ),
                         }
                     ],
                     "proposer_reused": True,
@@ -1037,6 +1211,35 @@ class DryEnsembleProvider:
                     "continuation_count": 0,
                     "same_model_recovery_count": 0,
                 },
+                **(
+                    {
+                        "proposer_recovery": {
+                            "schema": PROPOSER_RECOVERY_SCHEMA,
+                            "selection_plan_fingerprint": (
+                                selection_plan_fingerprint
+                            ),
+                            "scope": "run_turn",
+                            "scope_id": recovery_scope_id,
+                            "max_additional_physical_requests": 3,
+                            "external_physical_requests_reserved": 0,
+                            "additional_physical_requests_started": 0,
+                            "remaining_additional_physical_requests": 3,
+                            "quorum_required": 2,
+                            "quorum_reached": len(candidates) >= 2,
+                            "cumulative_excluded_identities": [],
+                            "visited_identities": [],
+                            "executed_proposer_roster_before": list(
+                                selected_identities
+                            ),
+                            "executed_proposer_roster_after": list(
+                                selected_identities
+                            ),
+                            "attempts": [],
+                        }
+                    }
+                    if formal_recovery
+                    else {}
+                ),
                 "executed_A": aggregator_identity,
                 "fallback_reason": "",
                 "run_outcome": "success",
@@ -1059,6 +1262,20 @@ class DryEnsembleProvider:
                         "requested_provider": aggregator_provider,
                         "requested_model": self.model,
                         "stop_reason": "stop",
+                        **(
+                            {
+                                "physical_attempt_id": (
+                                    aggregator_attempt_id
+                                ),
+                                "provider_usage": {
+                                    "physical_attempt_id": (
+                                        aggregator_attempt_id
+                                    ),
+                                },
+                            }
+                            if formal_recovery
+                            else {}
+                        ),
                     },
                     "output": {
                         "text": text,
@@ -2416,7 +2633,9 @@ def align_b2_provider_to_g12(
     provider.proposers = [_member(member) for member in ensemble.proposers]
     provider.aggregator = _member(ensemble.aggregator)
     provider.profile_name = ensemble.profile_name
-    provider.min_successful_proposers = ensemble.min_successful_proposers
+    provider.min_successful_proposers = legal_proposer_quorum(
+        sum(max(1, int(member.k)) for member in ensemble.proposers)
+    )
     provider.proposer_timeout_seconds = experiment.timeouts.proposer_seconds
     provider.aggregator_timeout_seconds = experiment.timeouts.aggregator_seconds
     provider.candidate_max_chars = ensemble.candidate_max_chars
@@ -2513,14 +2732,30 @@ def enforce_draco_legal_proposer_quorum(provider: Any) -> Any:
     proposer_count = sum(max(1, int(getattr(member, "k", 1) or 1)) for member in proposers)
     if proposer_count <= 0:
         return provider
-    required = legal_proposer_quorum(proposer_count)
+    selection_plan = dict(getattr(provider, "selection_plan", {}) or {})
+    provider_native_policy = selection_plan.get(
+        "proposer_recovery_policy"
+    )
+    formal_provider_native = bool(
+        isinstance(provider_native_policy, Mapping)
+        and dict(provider_native_policy)
+        == FORMAL_PROPOSER_RECOVERY_POLICY
+    )
+    required = (
+        2
+        if formal_provider_native
+        else legal_proposer_quorum(proposer_count)
+    )
     configured = int(getattr(provider, "min_successful_proposers", 1) or 1)
     provider.min_successful_proposers = required
-    selection_plan = dict(getattr(provider, "selection_plan", {}) or {})
     selection_plan.setdefault("configured_min_successful_proposers", configured)
     selection_plan["effective_min_successful_proposers"] = required
     selection_plan["legal_min_successful_proposers"] = required
-    selection_plan["legal_quorum_policy"] = "ceil(2*n/3)"
+    selection_plan["legal_quorum_policy"] = (
+        "fixed_2_provider_native"
+        if formal_provider_native
+        else "ceil(2*n/3)"
+    )
     provider.selection_plan = selection_plan
     return provider
 
@@ -3375,6 +3610,22 @@ async def build_experiment_provider(
             ),
         }
     )
+    proposer_policy = (
+        proposer_recovery_policy(experiment_config)
+        if experiment_config is not None
+        else {
+            "proposer_backup_count": config.llm_ensemble.proposer_backup_count,
+            "proposer_recovery_max_additional_calls": (
+                config.llm_ensemble.proposer_recovery_max_additional_calls
+            ),
+            "proposer_max_tokens_cap": (
+                config.llm_ensemble.proposer_max_tokens_cap
+            ),
+            "proposer_visible_answer_reserve_tokens": (
+                config.llm_ensemble.proposer_visible_answer_reserve_tokens
+            ),
+        }
+    )
     if dry_run:
         if kind in {"single", "router_single"}:
             model = spec.get("model") or "dry-routed-single"
@@ -3404,6 +3655,7 @@ async def build_experiment_provider(
                 selection_mode=str(spec.get("selection_mode") or ""),
             )
             apply_aggregator_recovery_policy(dry_provider, recovery_policy)
+            apply_aggregator_recovery_policy(dry_provider, proposer_policy)
             if b2_experiment is not None:
                 dry_provider.min_successful_proposers = legal_proposer_quorum(
                     len(dry_provider.proposer_models)
@@ -3495,6 +3747,10 @@ async def build_experiment_provider(
             dry_ensemble.ranking_user_profile_generation_enabled = False
             dry_ensemble.ranking_user_profile_enabled = False
             apply_aggregator_recovery_policy(dry_ensemble, recovery_policy)
+            apply_aggregator_recovery_policy(dry_ensemble, proposer_policy)
+            dry_ensemble.min_successful_proposers = (
+                FORMAL_PROPOSER_RECOVERY_POLICY["quorum_required"]
+            )
             if thinking_assignment_enabled:
                 configured_output_tokens, _ = (
                     resolve_effective_generation_request_parameters(
@@ -3563,7 +3819,16 @@ async def build_experiment_provider(
             aggregator_model = str(plan.get("aggregator_model") or "")
             dry_provider.proposer_models = proposer_models
             dry_provider.model = aggregator_model
-            dry_provider.min_successful_proposers = legal_proposer_quorum(len(proposer_models))
+            provider_native_policy = plan.get(
+                "proposer_recovery_policy"
+            )
+            dry_provider.min_successful_proposers = (
+                2
+                if isinstance(provider_native_policy, Mapping)
+                and dict(provider_native_policy)
+                == FORMAL_PROPOSER_RECOVERY_POLICY
+                else legal_proposer_quorum(len(proposer_models))
+            )
             dry_routing_trace.update(
                 {
                     "benchmark_alignment": g1_routing.profile_id,
@@ -3574,6 +3839,18 @@ async def build_experiment_provider(
             dry_provider.selection_plan = copy.deepcopy(plan)
         if isinstance(dry_provider, DryEnsembleProvider):
             dry_provider.selection_plan.update(recovery_policy)
+            if g1_routing is not None:
+                expected_proposer_policy = proposer_recovery_plan_policy(
+                    proposer_policy
+                )
+                if (
+                    dry_provider.selection_plan.get("proposer_recovery_policy")
+                    != expected_proposer_policy
+                ):
+                    raise ValueError(
+                        "dry G1 proposer recovery policy differs from the "
+                        "formal experiment contract"
+                    )
             selected_aggregator = str(dry_provider.selection_plan.get("selected_A") or "").strip()
             if selected_aggregator:
                 dry_provider.selection_plan.setdefault(
@@ -3584,6 +3861,15 @@ async def build_experiment_provider(
                 "evidence_kind": "dry_run_policy_only",
                 **dict(recovery_policy),
             }
+            if g1_routing is not None:
+                dry_routing_trace["proposer_recovery_policy"] = {
+                    "evidence_kind": "dry_run_policy_only",
+                    **dict(
+                        dry_provider.selection_plan[
+                            "proposer_recovery_policy"
+                        ]
+                    ),
+                }
             dry_routing_trace["selection_plan"] = copy.deepcopy(dry_provider.selection_plan)
         result = ProviderBuildResult(
             provider=dry_provider,
@@ -3687,6 +3973,10 @@ async def build_experiment_provider(
     ensemble_cfg.selection_mode = selection_mode
     apply_aggregator_recovery_policy(ensemble_cfg, recovery_policy)
     if g1_routing is not None:
+        apply_aggregator_recovery_policy(ensemble_cfg, proposer_policy)
+        ensemble_cfg.min_successful_proposers = (
+            FORMAL_PROPOSER_RECOVERY_POLICY["quorum_required"]
+        )
         ensemble_cfg.ranking_user_profile_generation_enabled = False
         ensemble_cfg.ranking_user_profile_enabled = bool(g1_routing.user_profile_enabled)
     ensemble_cfg.proposer_tools = (
@@ -4307,91 +4597,6 @@ async def build_experiment_provider(
             routing_trace=routing_trace,
         )
         attach_provider_setup(provider, result)
-        if g1_routing is not None and isinstance(ranking_inputs, Mapping):
-            frozen_ranking_inputs = dict(ranking_inputs)
-            initial_selection_plan = copy.deepcopy(
-                dict(frozen_g1_lifecycle["initial_plan"])
-                if frozen_g1_lifecycle is not None
-                else provider.selection_plan
-            )
-            initial_decision_id = str(
-                initial_selection_plan.get("decision_id") or ""
-            )
-            initial_task_analysis = frozen_ranking_inputs.get(
-                "task_analysis"
-            )
-            initial_task_analysis_trace = dict(
-                routing_trace.get("task_analyzer") or {}
-            )
-
-            def rebuild_after_reasoning_only_length(
-                excluded_proposer_identities: Sequence[str],
-            ) -> Any:
-                exclusions = sorted(
-                    {
-                        str(identity or "").strip().lower()
-                        for identity in excluded_proposer_identities
-                        if str(identity or "").strip()
-                    }
-                )
-                if not exclusions:
-                    raise ValueError(
-                        "G1 retry rebuild requires at least one proposer exclusion"
-                    )
-                retry_started = time.monotonic()
-                exclusion_hash = hashlib.sha256(
-                    "\n".join(exclusions).encode("utf-8")
-                ).hexdigest()[:16]
-                retry_inputs = dict(frozen_ranking_inputs)
-                retry_inputs.update(
-                    {
-                        "decision_id": (
-                            f"{initial_decision_id}-retry-{exclusion_hash}"
-                        ),
-                        "task_analysis": initial_task_analysis,
-                        "retry_excluded_proposer_identities": exclusions,
-                        "retry_parent_decision_id": initial_decision_id,
-                        "task_analysis_reused": True,
-                    }
-                )
-                retry_provider = materialize_ensemble_provider(retry_inputs)
-                retry_plan = retry_provider.selection_plan
-                _bind_frozen_g1_retry_provenance(
-                    retry_plan,
-                    initial_plan=initial_selection_plan,
-                    excluded_proposer_identities=exclusions,
-                )
-                retry_provider.seal_managed_thinking_execution_guard()
-                retry_routing_trace = {
-                    **dict(routing_trace),
-                    "selection_plan": retry_plan,
-                    "task_analyzer": initial_task_analysis_trace,
-                    "task_analyzer_reuse": {
-                        "schema": (
-                            "opensquilla.draco.task-analysis-reuse/v1"
-                        ),
-                        "source_decision_id": initial_decision_id,
-                        "physical_request_count": 0,
-                        "excluded_proposer_identities": exclusions,
-                    },
-                }
-                retry_build = ProviderBuildResult(
-                    provider=retry_provider,
-                    prompt=turn.message,
-                    setup_latency_ms=int(
-                        (time.monotonic() - retry_started) * 1000
-                    ),
-                    setup_usage=[],
-                    routing_trace=retry_routing_trace,
-                )
-                attach_provider_setup(retry_provider, retry_build)
-                return retry_provider
-
-            setattr(
-                provider,
-                "_draco_reasoning_only_retry_factory",
-                rebuild_after_reasoning_only_length,
-            )
         return result
     except ProviderBuildError:
         raise
@@ -4956,6 +5161,7 @@ def agent_config_from_chat_config(
         finalization_disable_thinking=bool(policy["finalization_disable_thinking"]),
         metadata={
             "benchmark": "DRACO",
+            "provider_retry_owner": "caller",
             "runner_mode": RUNNER_MODE_AGENT_LOOP,
             "tool_activity_heartbeat_interval": 30.0,
             "agent_finalization_policy": dict(policy),
@@ -6560,6 +6766,7 @@ def run_result_summary(
     requested_provider: str | None = None,
     requested_model: str | None = None,
     missing_usage_role: str | None = None,
+    include_ensemble_trace: bool = False,
 ) -> dict[str, Any]:
     usage = run_result_usage_payload(result)
     server_tool_call_count = coerce_metric_int(usage.get("server_tool_call_count"))
@@ -6668,7 +6875,8 @@ def run_result_summary(
         else None
     )
     if (
-        isinstance(selection_plan, Mapping)
+        include_ensemble_trace
+        or isinstance(selection_plan, Mapping)
         and selection_plan.get("ranking_thinking_assignment_enabled") is True
     ):
         summary["ensemble_trace"] = json_safe(
@@ -7143,6 +7351,8 @@ def g1_cross_wave_lifecycle_requires_reconstruction(
             current_run_compatibility_contract
         )
     ):
+        return False
+    if state.get("generation_auto_retry_blocked") is True:
         return False
     row = state.get("row")
     execution = row.get("execution") if isinstance(row, Mapping) else None
@@ -7837,10 +8047,16 @@ def g1_retry_physical_usage_binding_reasons(
         call
         for call in calls
         if isinstance(call.get("selection_plan"), Mapping)
-        and call["selection_plan"].get(
-            "thinking_physical_evidence_schema"
+        and (
+            call["selection_plan"].get(
+                "thinking_physical_evidence_schema"
+            )
+            == THINKING_PHYSICAL_EVIDENCE_SCHEMA
+            or call["selection_plan"].get(
+                "proposer_recovery_policy"
+            )
+            is not None
         )
-        == THINKING_PHYSICAL_EVIDENCE_SCHEMA
     ]
     if not strict_calls:
         return [
@@ -7988,15 +8204,27 @@ def admissible_empty_nonterminal_fallback_reasons(
         reasons.append("invalid_intermediate_fallback_flag")
     if str(trace.get("final_request_role") or "") != "fallback_single":
         reasons.append("invalid_intermediate_fallback_role")
+    plan = (
+        dict(expected_selection_plan)
+        if isinstance(expected_selection_plan, Mapping)
+        else {}
+    )
     total = trace.get("total_candidates")
     successful = trace.get("successful_proposers")
+    required_quorum = (
+        2
+        if plan.get("proposer_recovery_policy") is not None
+        else legal_proposer_quorum(total)
+        if isinstance(total, int) and not isinstance(total, bool)
+        else 0
+    )
     if (
         not isinstance(total, int)
         or isinstance(total, bool)
         or total <= 0
         or not isinstance(successful, int)
         or isinstance(successful, bool)
-        or not 0 <= successful < legal_proposer_quorum(total)
+        or not 0 <= successful < required_quorum
     ):
         reasons.append("invalid_intermediate_fallback_quorum")
     final_request = trace.get("final_request")
@@ -8046,7 +8274,6 @@ def admissible_empty_nonterminal_fallback_reasons(
         or any(provider != "openrouter" for provider in execution_providers)
     ):
         reasons.append("wrong_intermediate_fallback_provider")
-    plan = dict(expected_selection_plan) if isinstance(expected_selection_plan, Mapping) else {}
     selected_p = plan.get("selected_P")
     allowed_models = (
         [
@@ -8461,17 +8688,59 @@ def selected_generation_attempt(
 
 def _reasoning_only_length_failures_from_trace(
     root_trace: Mapping[str, Any],
+    *,
+    require_coherent_envelope: bool = True,
 ) -> list[dict[str, Any]]:
-    """Normalize deterministic proposer failures from every physical ensemble call."""
+    """Extract only exact, fully receipted reasoning-only length failures."""
 
     if not isinstance(root_trace, Mapping):
         return []
-    call_traces, _ = ensemble_call_trace_sequence(root_trace)
+    call_traces, sequence_reasons = ensemble_call_trace_sequence(root_trace)
+    if sequence_reasons:
+        return []
     failures: list[dict[str, Any]] = []
+    envelope_physical_count = 0
     for call_index, call_trace in enumerate(call_traces, start=1):
         candidates = call_trace.get("candidates")
         if not isinstance(candidates, list):
-            continue
+            return []
+        call_physical_count = 0
+        if require_coherent_envelope:
+            for candidate in candidates:
+                if not isinstance(candidate, Mapping):
+                    return []
+                started = candidate.get("request_started")
+                physical_count = candidate.get("physical_request_count")
+                missing_count = candidate.get("usage_missing_count")
+                if not isinstance(started, bool):
+                    return []
+                if started:
+                    if (
+                        isinstance(physical_count, bool)
+                        or not isinstance(physical_count, int)
+                        or physical_count <= 0
+                        or candidate.get("usage_reported") is not True
+                        or isinstance(missing_count, bool)
+                        or not isinstance(missing_count, int)
+                        or missing_count != 0
+                    ):
+                        return []
+                    call_physical_count += physical_count
+                elif physical_count not in (None, 0):
+                    return []
+            for field, expected in (
+                ("physical_request_count", call_physical_count),
+                ("llm_request_count", call_physical_count),
+                ("usage_missing_count", 0),
+            ):
+                value = call_trace.get(field)
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or value != expected
+                ):
+                    return []
+            envelope_physical_count += call_physical_count
         for candidate_index, candidate in enumerate(candidates):
             if not isinstance(candidate, Mapping) or candidate.get("ok") is True:
                 continue
@@ -8520,7 +8789,25 @@ def _reasoning_only_length_failures_from_trace(
                 visible_chars != 0
                 or reasoning_tokens <= 0
                 or candidate.get("request_started") is not True
-                or coerce_metric_int(candidate.get("physical_request_count")) <= 0
+                or isinstance(candidate.get("physical_request_count"), bool)
+                or not isinstance(candidate.get("physical_request_count"), int)
+                or int(candidate["physical_request_count"]) <= 0
+                or (
+                    require_coherent_envelope
+                    and (
+                        candidate.get("usage_reported") is not True
+                        or isinstance(candidate.get("usage_missing_count"), bool)
+                        or not isinstance(candidate.get("usage_missing_count"), int)
+                        or int(candidate["usage_missing_count"]) != 0
+                    )
+                )
+                or str(candidate.get("error") or "").strip()
+                or str(candidate.get("error_code") or "").strip()
+                or str(candidate.get("text") or "").strip()
+                or (
+                    isinstance(content, Mapping)
+                    and str(content.get("text") or "").strip()
+                )
             ):
                 continue
             provider = (
@@ -8567,23 +8854,65 @@ def _reasoning_only_length_failures_from_trace(
                     "input_tokens": coerce_metric_int(candidate.get("input_tokens")),
                     "output_tokens": output_tokens,
                     "reasoning_tokens": reasoning_tokens,
-                    "error": str(candidate.get("error") or ""),
-                    "error_code": str(candidate.get("error_code") or ""),
+                    "error": "",
+                    "error_code": "",
                 }
             )
+    if require_coherent_envelope:
+        for field, expected in (
+            ("physical_request_count", envelope_physical_count),
+            ("llm_request_count", envelope_physical_count),
+            ("usage_missing_count", 0),
+        ):
+            value = root_trace.get(field)
+            if value is not None and (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value != expected
+            ):
+                return []
     return failures
 
 
 def deterministic_reasoning_only_length_failures(
     result: RunResult,
+    *,
+    require_coherent_envelope: bool = True,
 ) -> list[dict[str, Any]]:
     done = result.done
     root_trace = done.ensemble_trace if done is not None else None
-    return (
-        _reasoning_only_length_failures_from_trace(root_trace)
-        if isinstance(root_trace, Mapping)
-        else []
+    if not isinstance(root_trace, Mapping) or done is None:
+        return []
+    failures = _reasoning_only_length_failures_from_trace(
+        root_trace,
+        require_coherent_envelope=require_coherent_envelope,
     )
+    if not failures:
+        return []
+    if not require_coherent_envelope:
+        return failures
+    if done.usage_missing_count != 0:
+        return []
+    call_traces, sequence_reasons = ensemble_call_trace_sequence(root_trace)
+    if sequence_reasons:
+        return []
+    expected_physical_count = sum(
+        int(call.get("physical_request_count") or 0)
+        for call in call_traces
+        if isinstance(call.get("physical_request_count"), int)
+        and not isinstance(call.get("physical_request_count"), bool)
+    )
+    represented_usage_count = sum(
+        max(1, coerce_metric_int(row.get("request_count")))
+        for row in done.model_usage_breakdown
+        if isinstance(row, Mapping)
+    )
+    if (
+        expected_physical_count <= 0
+        or represented_usage_count != expected_physical_count
+    ):
+        return []
+    return failures
 
 
 def g1_retry_plan_provenance_reason(
@@ -8751,6 +9080,71 @@ def _normalized_g1_retry_identities(raw: Any) -> tuple[set[str], bool]:
     return set(normalized), valid
 
 
+def g1_provider_native_recovery_policy_reason(
+    plan: Mapping[str, Any] | None,
+) -> str:
+    """Validate an explicit provider-owned proposer recovery contract."""
+
+    if not isinstance(plan, Mapping):
+        return ""
+    policy = plan.get("proposer_recovery_policy")
+    if policy is None:
+        return ""
+    if not isinstance(policy, Mapping):
+        return "invalid_g1_proposer_recovery_policy"
+    if dict(policy) != FORMAL_PROPOSER_RECOVERY_POLICY:
+        return "invalid_g1_proposer_recovery_policy"
+    backups = plan.get("backup_P")
+    selected = plan.get("selected_P")
+    aggregator_candidates = plan.get("aggregator_candidates")
+    if (
+        not isinstance(backups, list)
+        or len(backups) != 2
+        or not isinstance(selected, list)
+        or not selected
+        or not isinstance(aggregator_candidates, list)
+        or not aggregator_candidates
+        or any(
+            not isinstance(identity, str)
+            or not identity
+            or identity != identity.strip().casefold()
+            or identity.count(":") != 1
+            for identity in [
+                *selected,
+                *backups,
+                *aggregator_candidates,
+            ]
+        )
+        or len(set(selected)) != len(selected)
+        or len(set(backups)) != len(backups)
+        or bool(set(backups).intersection(selected))
+        or bool(set(backups).intersection(aggregator_candidates))
+        or plan.get("effective_min_successful_proposers") != 2
+    ):
+        return "invalid_g1_proposer_recovery_roster"
+    from opensquilla.provider.protocol import (
+        provider_retry_roster_fingerprint,
+    )
+
+    fingerprint = provider_retry_roster_fingerprint(plan)
+    if (
+        len(fingerprint) != 64
+        or any(character not in "0123456789abcdef" for character in fingerprint)
+    ):
+        return "invalid_g1_proposer_recovery_fingerprint"
+    return ""
+
+
+def g1_provider_native_recovery_enabled(
+    plan: Mapping[str, Any] | None,
+) -> bool:
+    return bool(
+        isinstance(plan, Mapping)
+        and plan.get("proposer_recovery_policy") is not None
+        and not g1_provider_native_recovery_policy_reason(plan)
+    )
+
+
 async def collect_generation_with_retries(
     provider: Any,
     prompt: str,
@@ -8783,6 +9177,17 @@ async def collect_generation_with_retries(
         paid_attempt_sink.clear()
     current_provider = provider
     initial_selection_plan = getattr(initial_provider, "selection_plan", None)
+    native_g1_recovery_reason = (
+        g1_provider_native_recovery_policy_reason(initial_selection_plan)
+        if group == "G1"
+        else ""
+    )
+    if native_g1_recovery_reason:
+        raise ValueError(native_g1_recovery_reason)
+    provider_native_g1_recovery = bool(
+        group == "G1"
+        and g1_provider_native_recovery_enabled(initial_selection_plan)
+    )
     managed_g1_lifecycle = bool(
         group == "G1"
         and isinstance(initial_selection_plan, Mapping)
@@ -8791,11 +9196,38 @@ async def collect_generation_with_retries(
         )
         is True
     )
+    router_dynamic_g1 = bool(
+        group == "G1"
+        and isinstance(initial_selection_plan, Mapping)
+        and initial_selection_plan.get("strategy") == "router_dynamic"
+    )
+    raw_retry_provider_factory = (
+        getattr(
+            provider,
+            "_draco_reasoning_only_retry_factory",
+            None,
+        )
+        if (managed_g1_lifecycle or router_dynamic_g1)
+        and not provider_native_g1_recovery
+        else None
+    )
+    g1_plan_lifecycle = bool(
+        managed_g1_lifecycle
+        or (
+            router_dynamic_g1
+            and callable(raw_retry_provider_factory)
+        )
+        or provider_native_g1_recovery
+    )
+    g1_retry_lifecycle = bool(
+        g1_plan_lifecycle
+        and not provider_native_g1_recovery
+    )
     frozen_unmanaged_selection_plan = (
         copy.deepcopy(dict(initial_selection_plan or {}))
         if str((GROUP_SPECS.get(group) or {}).get("kind") or "")
         == "selection_mode"
-        and not managed_g1_lifecycle
+        and not g1_plan_lifecycle
         else {}
     )
 
@@ -8981,13 +9413,7 @@ async def collect_generation_with_retries(
         return guarded_result, attempts, 0
 
     retry_provider_factory = (
-        getattr(
-            provider,
-            "_draco_reasoning_only_retry_factory",
-            None,
-        )
-        if managed_g1_lifecycle
-        else None
+        raw_retry_provider_factory if g1_retry_lifecycle else None
     )
     raw_prior_exclusions = (
         getattr(
@@ -8995,14 +9421,14 @@ async def collect_generation_with_retries(
             "_draco_prior_excluded_proposer_identities",
             [],
         )
-        if managed_g1_lifecycle
+        if g1_retry_lifecycle
         else []
     )
     prior_exclusions, prior_exclusions_valid = _normalized_g1_retry_identities(
         raw_prior_exclusions
     )
     if (
-        managed_g1_lifecycle
+        g1_retry_lifecycle
         and (
             not prior_exclusions_valid
             or raw_prior_exclusions != sorted(prior_exclusions)
@@ -9010,7 +9436,7 @@ async def collect_generation_with_retries(
     ):
         raise ValueError("frozen G1 prior proposer exclusions are invalid")
     excluded_proposer_identities = (
-        set(prior_exclusions) if managed_g1_lifecycle else set()
+        set(prior_exclusions) if g1_retry_lifecycle else set()
     )
     frozen_initial_plan = (
         getattr(
@@ -9018,7 +9444,7 @@ async def collect_generation_with_retries(
             "_draco_g1_initial_selection_plan",
             None,
         )
-        if managed_g1_lifecycle
+        if g1_retry_lifecycle
         else None
     )
     g1_retry_provenance_parent = (
@@ -9065,7 +9491,7 @@ async def collect_generation_with_retries(
         attempt_index = attempt_offset + local_attempt_index
         attempt_id = uuid.uuid4().hex
         attempt_started_at = time.time()
-        if managed_g1_lifecycle:
+        if g1_plan_lifecycle:
             selection_plan_snapshot = getattr(
                 current_provider,
                 "selection_plan_execution_snapshot",
@@ -9094,7 +9520,8 @@ async def collect_generation_with_retries(
                     selection_plan=initial_selection_plan,
                 )
             if (
-                expected_selection_plan.get(
+                managed_g1_lifecycle
+                and expected_selection_plan.get(
                     "ranking_thinking_assignment_enabled"
                 )
                 is not True
@@ -9107,13 +9534,13 @@ async def collect_generation_with_retries(
                     attempt_started_at=attempt_started_at,
                     selection_plan=initial_selection_plan,
                 )
-            adaptive_g1 = True
+            adaptive_g1 = g1_retry_lifecycle
         else:
             expected_selection_plan = copy.deepcopy(
                 frozen_unmanaged_selection_plan
             )
             adaptive_g1 = False
-        if adaptive_g1:
+        if managed_g1_lifecycle:
             from opensquilla.provider.thinking_execution import (
                 THINKING_PHYSICAL_EVIDENCE_SCHEMA,
                 validate_thinking_execution_history_closure,
@@ -9157,15 +9584,18 @@ async def collect_generation_with_retries(
                     selection_plan=expected_selection_plan,
                 )
         strict_g1_physical_binding_required = bool(
-            adaptive_g1
-            and expected_selection_plan.get(
-                "thinking_physical_evidence_schema"
+            provider_native_g1_recovery
+            or (
+                managed_g1_lifecycle
+                and expected_selection_plan.get(
+                    "thinking_physical_evidence_schema"
+                )
+                == THINKING_PHYSICAL_EVIDENCE_SCHEMA
             )
-            == THINKING_PHYSICAL_EVIDENCE_SCHEMA
         )
         decision_id = str(expected_selection_plan.get("decision_id") or "")
         cached_execution_plan = g1_thinking_plan_prefixes.get(decision_id)
-        if adaptive_g1 and cached_execution_plan is not None:
+        if managed_g1_lifecycle and cached_execution_plan is not None:
             try:
                 cached_immutable_hash = canonical_json_sha256(
                     g1_immutable_selection_plan_payload(cached_execution_plan)
@@ -9285,6 +9715,14 @@ async def collect_generation_with_retries(
         mark_retryable_generation_error(result, reason)
         retry_suppressed_reason = generation_cleanup_failure_reason(result)
         if (
+            provider_native_g1_recovery
+            and reason
+            and not retry_suppressed_reason
+        ):
+            retry_suppressed_reason = (
+                "provider_native_proposer_recovery_terminal"
+            )
+        if (
             not retry_suppressed_reason
             and runner_mode == RUNNER_MODE_AGENT_LOOP
             and is_agent_hard_timeout(result)
@@ -9297,7 +9735,7 @@ async def collect_generation_with_retries(
                 expected_selection_plan,
                 result,
             )
-            if adaptive_g1
+            if adaptive_g1 or provider_native_g1_recovery
             else ""
         )
         if consistency_reason:
@@ -9314,7 +9752,10 @@ async def collect_generation_with_retries(
         if paid_attempt_sink is not None:
             paid_attempt_sink["stage"] = "deterministic_failure_extraction"
         deterministic_failures = (
-            deterministic_reasoning_only_length_failures(result)
+            deterministic_reasoning_only_length_failures(
+                result,
+                require_coherent_envelope=False,
+            )
             if adaptive_g1
             else []
         )
@@ -9331,7 +9772,12 @@ async def collect_generation_with_retries(
         )
         if paid_attempt_sink is not None:
             paid_attempt_sink["stage"] = "run_result_summary"
-        attempt_run_summary = run_result_summary(result)
+        attempt_run_summary = run_result_summary(
+            result,
+            include_ensemble_trace=(
+                adaptive_g1 or provider_native_g1_recovery
+            ),
+        )
         if strict_g1_physical_binding_required:
             if paid_attempt_sink is not None:
                 paid_attempt_sink["stage"] = "g1_physical_usage_binding"
@@ -9355,7 +9801,10 @@ async def collect_generation_with_retries(
                 retry_suppressed_reason = physical_binding_failure
                 will_retry = False
                 prepare_deferred_g1_retry = False
-        if adaptive_g1 and (will_retry or prepare_deferred_g1_retry):
+        if (
+            managed_g1_lifecycle
+            and (will_retry or prepare_deferred_g1_retry)
+        ):
             execute_g1_retry_this_wave = will_retry
             if retry_suppressed_reason:
                 will_retry = False
@@ -9402,11 +9851,17 @@ async def collect_generation_with_retries(
             "retry_backoff_s": retry_backoff_s,
             "run": attempt_run_summary,
         }
-        if adaptive_g1:
+        if provider_native_g1_recovery:
+            attempt_record["proposer_recovery_owner"] = "provider"
+        if adaptive_g1 or provider_native_g1_recovery:
             attempt_record.update(
                 {
                     "selection_plan": json_safe(expected_selection_plan),
-                    "deterministic_proposer_failures": deterministic_failures,
+                    "deterministic_proposer_failures": (
+                        deterministic_failures
+                        if adaptive_g1
+                        else []
+                    ),
                     "excluded_proposer_identities": sorted(
                         excluded_proposer_identities
                     ),
@@ -9494,11 +9949,6 @@ async def collect_generation_with_retries(
                 return result, attempts, 0
             if paid_attempt_sink is not None:
                 paid_attempt_sink["stage"] = "retry_execution_projection"
-            from opensquilla.provider.thinking_execution import (
-                project_thinking_execution_history,
-                restore_projected_thinking_execution,
-            )
-
             retry_snapshot = getattr(
                 retry_provider,
                 "selection_plan_execution_snapshot",
@@ -9511,46 +9961,64 @@ async def collect_generation_with_retries(
                     else retry_plan
                 )
             )
-            projected_plan, projection_audit, projection_reason = (
-                project_thinking_execution_history(
-                    g1_thinking_execution_history,
-                    retry_target_plan,
+            if managed_g1_lifecycle:
+                from opensquilla.provider.thinking_execution import (
+                    project_thinking_execution_history,
+                    restore_projected_thinking_execution,
                 )
-            )
-            if projection_reason:
-                attempts[-1]["will_retry"] = False
-                attempts[-1]["retry_suppressed_reason"] = (
-                    "g1_thinking_execution_projection_failed:"
-                    + projection_reason
-                )
-                remember_selected_provider(current_provider)
-                return result, attempts, 0
-            if (
-                retry_target_plan.get("executed_thinking_assignment")
-                != projected_plan.get("executed_thinking_assignment")
-                or retry_target_plan.get("thinking_execution_fallbacks", [])
-                != projected_plan.get("thinking_execution_fallbacks", [])
-            ):
-                try:
-                    restore_projected_thinking_execution(
-                        retry_provider,
-                        target_plan=retry_target_plan,
-                        projected_plan=projected_plan,
+
+                projected_plan, projection_audit, projection_reason = (
+                    project_thinking_execution_history(
+                        g1_thinking_execution_history,
+                        retry_target_plan,
                     )
-                except Exception as exc:  # noqa: BLE001 - fail closed before another paid call
+                )
+                if projection_reason:
                     attempts[-1]["will_retry"] = False
                     attempts[-1]["retry_suppressed_reason"] = (
-                        "g1_thinking_execution_projection_restore_failed:"
-                        + type(exc).__name__
+                        "g1_thinking_execution_projection_failed:"
+                        + projection_reason
                     )
                     remember_selected_provider(current_provider)
                     return result, attempts, 0
-            retry_plan = copy.deepcopy(
-                dict(retry_snapshot() if callable(retry_snapshot) else projected_plan)
-            )
-            attempts[-1]["thinking_execution_projection"] = json_safe(
-                projection_audit
-            )
+                if (
+                    retry_target_plan.get("executed_thinking_assignment")
+                    != projected_plan.get("executed_thinking_assignment")
+                    or retry_target_plan.get(
+                        "thinking_execution_fallbacks",
+                        [],
+                    )
+                    != projected_plan.get(
+                        "thinking_execution_fallbacks",
+                        [],
+                    )
+                ):
+                    try:
+                        restore_projected_thinking_execution(
+                            retry_provider,
+                            target_plan=retry_target_plan,
+                            projected_plan=projected_plan,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - fail closed before another paid call
+                        attempts[-1]["will_retry"] = False
+                        attempts[-1]["retry_suppressed_reason"] = (
+                            "g1_thinking_execution_projection_restore_failed:"
+                            + type(exc).__name__
+                        )
+                        remember_selected_provider(current_provider)
+                        return result, attempts, 0
+                retry_plan = copy.deepcopy(
+                    dict(
+                        retry_snapshot()
+                        if callable(retry_snapshot)
+                        else projected_plan
+                    )
+                )
+                attempts[-1]["thinking_execution_projection"] = json_safe(
+                    projection_audit
+                )
+            else:
+                retry_plan = retry_target_plan
             attempts[-1]["retry_selection_plan"] = json_safe(retry_plan)
             attempts[-1]["retry_excluded_proposer_identities"] = sorted(
                 excluded_proposer_identities
@@ -16567,6 +17035,346 @@ def generation_postprocessing_terminal_evidence(
     }
 
 
+def provider_native_proposer_recovery_terminal_evidence(
+    row: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Classify explicit provider-owned recovery as terminal across Waves.
+
+    The provider owns every additional proposer request inside one run-turn
+    scope.  Once that scope returns, the DRACO outer attempt must never replay
+    the whole roster.  Malformed or interrupted receipts therefore fail
+    closed as terminal evidence rather than authorizing another paid call.
+    """
+
+    execution = row.get("execution")
+    attempts = (
+        execution.get("generation_attempts")
+        if isinstance(execution, Mapping)
+        and isinstance(execution.get("generation_attempts"), list)
+        else []
+    )
+    generation_attempts = [
+        attempt
+        for attempt in attempts
+        if isinstance(attempt, Mapping)
+        and attempt.get("attempt_kind") == "generation"
+    ]
+    native_attempts = [
+        attempt
+        for attempt in generation_attempts
+        if attempt.get("proposer_recovery_owner") == "provider"
+    ]
+    if not native_attempts:
+        return None
+
+    reasons: list[str] = []
+    if len(generation_attempts) != 1 or len(native_attempts) != 1:
+        reasons.append("provider_native_outer_generation_replayed")
+    attempt = native_attempts[-1]
+    if (
+        attempt.get("will_retry") is not False
+        or str(attempt.get("retry_suppressed_reason") or "")
+        != "provider_native_proposer_recovery_terminal"
+    ):
+        reasons.append("provider_native_outer_retry_not_suppressed")
+    plan = attempt.get("selection_plan")
+    plan_reason = g1_provider_native_recovery_policy_reason(
+        plan if isinstance(plan, Mapping) else None
+    )
+    if not isinstance(plan, Mapping):
+        reasons.append("missing_provider_native_selection_plan")
+    elif plan_reason:
+        reasons.append(plan_reason)
+
+    from opensquilla.provider.protocol import (
+        provider_retry_roster_fingerprint,
+    )
+
+    expected_fingerprint = (
+        provider_retry_roster_fingerprint(plan)
+        if isinstance(plan, Mapping)
+        else ""
+    )
+    run = attempt.get("run")
+    trace = run.get("ensemble_trace") if isinstance(run, Mapping) else None
+    calls, call_reasons = ensemble_call_trace_sequence(
+        trace if isinstance(trace, Mapping) else {}
+    )
+    reasons.extend(call_reasons)
+    if not calls:
+        reasons.append("missing_provider_native_recovery_call")
+
+    prior_receipts: list[dict[str, Any]] = []
+    prior_started = 0
+    scope_id = ""
+    latest_remaining = 3
+    latest_quorum_reached = False
+    for call in calls:
+        call_plan = call.get("selection_plan")
+        call_fingerprint = (
+            provider_retry_roster_fingerprint(call_plan)
+            if isinstance(call_plan, Mapping)
+            else ""
+        )
+        if (
+            not expected_fingerprint
+            or call_fingerprint != expected_fingerprint
+        ):
+            reasons.append("provider_native_recovery_fingerprint_mismatch")
+        receipt = call.get("proposer_recovery")
+        if not isinstance(receipt, Mapping):
+            reasons.append("missing_provider_native_recovery_receipt")
+            continue
+        raw_scope_id = str(receipt.get("scope_id") or "")
+        if (
+            receipt.get("scope") != "run_turn"
+            or not raw_scope_id
+        ):
+            reasons.append("invalid_provider_native_recovery_scope")
+        if scope_id and raw_scope_id != scope_id:
+            reasons.append("provider_native_recovery_scope_changed")
+        scope_id = raw_scope_id
+        started = receipt.get("additional_physical_requests_started")
+        remaining = receipt.get("remaining_additional_physical_requests")
+        receipt_attempts = receipt.get("attempts")
+        if (
+            receipt.get("schema") != PROPOSER_RECOVERY_SCHEMA
+            or receipt.get("selection_plan_fingerprint")
+            != expected_fingerprint
+            or receipt.get("max_additional_physical_requests") != 3
+            or receipt.get("external_physical_requests_reserved") != 0
+            or isinstance(started, bool)
+            or not isinstance(started, int)
+            or not 0 <= started <= 3
+            or isinstance(remaining, bool)
+            or not isinstance(remaining, int)
+            or remaining != 3 - started
+            or receipt.get("quorum_required") != 2
+            or type(receipt.get("quorum_reached")) is not bool
+            or not isinstance(receipt_attempts, list)
+        ):
+            reasons.append("invalid_provider_native_recovery_receipt")
+            continue
+        latest_remaining = remaining
+        latest_quorum_reached = receipt.get("quorum_reached") is True
+        normalized_attempts = [
+            dict(item)
+            for item in receipt_attempts
+            if isinstance(item, Mapping)
+        ]
+        if len(normalized_attempts) != len(receipt_attempts):
+            reasons.append("invalid_provider_native_recovery_attempt")
+            continue
+        if (
+            len(normalized_attempts) < len(prior_receipts)
+            or normalized_attempts[: len(prior_receipts)]
+            != prior_receipts
+        ):
+            reasons.append("provider_native_recovery_receipt_prefix_reset")
+        new_receipts = normalized_attempts[len(prior_receipts) :]
+        receipt_physical_ids: list[str] = []
+        receipt_started = 0
+        for sequence, item in enumerate(normalized_attempts, start=1):
+            request_started = item.get("request_started")
+            physical_count = item.get("physical_request_count")
+            physical_id = str(item.get("physical_attempt_id") or "")
+            if (
+                item.get("sequence") != sequence
+                or item.get("kind")
+                not in {
+                    "thinking_downgrade",
+                    "transient_retry",
+                    "backup_replacement",
+                }
+                or not isinstance(item.get("slot_index"), int)
+                or isinstance(item.get("slot_index"), bool)
+                or not str(item.get("source_identity") or "")
+                or not str(item.get("target_identity") or "")
+                or not str(item.get("failure_kind") or "")
+                or not str(item.get("reason") or "")
+                or type(request_started) is not bool
+            ):
+                reasons.append("invalid_provider_native_recovery_attempt")
+                continue
+            if request_started:
+                receipt_started += coerce_metric_int(physical_count)
+                if (
+                    physical_count != 1
+                    or len(physical_id) != 32
+                    or any(
+                        character not in "0123456789abcdef"
+                        for character in physical_id
+                    )
+                    or item.get("stream_closed") is not True
+                    or item.get("outcome")
+                    not in {
+                        "succeeded",
+                        "failed",
+                        "budget_overrun",
+                        "evidence_unproven",
+                    }
+                ):
+                    reasons.append("invalid_provider_native_recovery_attempt")
+                else:
+                    receipt_physical_ids.append(physical_id)
+            elif (
+                physical_count != 0
+                or physical_id
+                or item.get("outcome") != "not_started"
+            ):
+                reasons.append("invalid_provider_native_unstarted_attempt")
+        if (
+            receipt_started != started
+            or started < prior_started
+            or len(receipt_physical_ids) != len(set(receipt_physical_ids))
+        ):
+            reasons.append("invalid_provider_native_recovery_budget")
+
+        candidates = call.get("candidates")
+        current_candidate_ids: list[str] = []
+        candidate_physical_attempts_by_slot: dict[
+            int,
+            list[Mapping[str, Any]],
+        ] = {}
+        if not isinstance(candidates, list):
+            reasons.append("missing_provider_native_candidates")
+        else:
+            all_call_ids: list[str] = []
+            for slot_index, candidate in enumerate(candidates):
+                physical_attempts = (
+                    candidate.get("execution", {}).get("physical_attempts")
+                    if isinstance(candidate, Mapping)
+                    and isinstance(candidate.get("execution"), Mapping)
+                    else None
+                )
+                physical_count = (
+                    candidate.get("physical_request_count")
+                    if isinstance(candidate, Mapping)
+                    else None
+                )
+                if (
+                    not isinstance(physical_attempts, list)
+                    or not isinstance(physical_count, int)
+                    or isinstance(physical_count, bool)
+                    or len(physical_attempts) != physical_count
+                ):
+                    reasons.append(
+                        "invalid_provider_native_candidate_physical_ledger"
+                    )
+                    continue
+                slot_ids: list[str] = []
+                for ordinal, physical in enumerate(
+                    physical_attempts,
+                    start=1,
+                ):
+                    physical_id = (
+                        str(physical.get("physical_attempt_id") or "")
+                        if isinstance(physical, Mapping)
+                        else ""
+                    )
+                    if (
+                        not isinstance(physical, Mapping)
+                        or physical.get("attempt") != ordinal
+                        or physical.get("request_started") is not True
+                        or len(physical_id) != 32
+                        or any(
+                            character not in "0123456789abcdef"
+                            for character in physical_id
+                        )
+                    ):
+                        reasons.append(
+                            "invalid_provider_native_candidate_physical_attempt"
+                        )
+                        continue
+                    slot_ids.append(physical_id)
+                    all_call_ids.append(physical_id)
+                if (
+                    physical_attempts
+                    and isinstance(physical_attempts[0], Mapping)
+                ):
+                    candidate_physical_attempts_by_slot[slot_index] = [
+                        physical
+                        for physical in physical_attempts
+                        if isinstance(physical, Mapping)
+                    ]
+                current_candidate_ids.extend(slot_ids)
+            if len(all_call_ids) != len(set(all_call_ids)):
+                reasons.append(
+                    "duplicate_provider_native_candidate_physical_attempt_id"
+                )
+
+        new_receipt_ids = [
+            str(item.get("physical_attempt_id") or "")
+            for item in new_receipts
+            if item.get("request_started") is True
+        ]
+        new_receipt_id_set = set(new_receipt_ids)
+        current_recovery_ids = [
+            physical_id
+            for physical_id in current_candidate_ids
+            if physical_id in new_receipt_id_set
+        ]
+        if Counter(new_receipt_ids) != Counter(current_recovery_ids):
+            reasons.append(
+                "provider_native_recovery_candidate_receipt_mismatch"
+            )
+        primary_success_slots = {
+            slot_index
+            for slot_index, physical_attempts in (
+                candidate_physical_attempts_by_slot.items()
+            )
+            if any(
+                str(physical.get("physical_attempt_id") or "")
+                not in new_receipt_id_set
+                and physical.get("outcome") == "succeeded"
+                for physical in physical_attempts
+            )
+        }
+        successful_slots = set(primary_success_slots)
+        for item in new_receipts:
+            if item.get("request_started") is not True:
+                continue
+            if len(successful_slots) >= 2:
+                reasons.append("provider_native_recovery_continued_after_quorum")
+            if item.get("outcome") == "succeeded":
+                successful_slots.add(
+                    coerce_metric_int(item.get("slot_index"))
+                )
+        if latest_quorum_reached != (len(successful_slots) >= 2):
+            reasons.append("provider_native_recovery_quorum_mismatch")
+
+        prior_receipts = normalized_attempts
+        prior_started = started
+
+    attempt_id = str(attempt.get("attempt_id") or "")
+    if (
+        len(attempt_id) != 32
+        or any(character not in "0123456789abcdef" for character in attempt_id)
+    ):
+        reasons.append("invalid_provider_native_generation_attempt_id")
+    status = (
+        "receipt_invalid"
+        if reasons
+        else "budget_exhausted"
+        if latest_remaining == 0 and not latest_quorum_reached
+        else "provider_scope_terminal"
+    )
+    return {
+        "schema": (
+            "opensquilla.draco.provider-native-proposer-recovery-terminal/v1"
+        ),
+        "status": status,
+        "attempt_id": attempt_id,
+        "selection_plan_fingerprint": expected_fingerprint,
+        "additional_physical_requests_started": prior_started,
+        "remaining_additional_physical_requests": latest_remaining,
+        "quorum_reached": latest_quorum_reached,
+        "receipt_valid": not reasons,
+        "receipt_reasons": list(dict.fromkeys(reasons)),
+        "automatic_generation_retry_allowed": False,
+    }
+
+
 def resume_row_completion_state(
     row: dict[str, Any],
     *,
@@ -16633,6 +17441,9 @@ def resume_row_completion_state(
         ]
     postprocessing_terminal = (
         generation_postprocessing_terminal_evidence(row)
+    )
+    provider_recovery_terminal = (
+        provider_native_proposer_recovery_terminal_evidence(row)
     )
     generation_valid = not generation_reasons
 
@@ -16842,8 +17653,12 @@ def resume_row_completion_state(
         ),
         "generation_terminal_reclassification": terminal_reclassification,
         "generation_postprocessing_terminal": postprocessing_terminal,
+        "provider_native_proposer_recovery_terminal": (
+            provider_recovery_terminal
+        ),
         "generation_auto_retry_blocked": (
             postprocessing_terminal is not None
+            or provider_recovery_terminal is not None
         ),
         "action": action,
     }
@@ -18153,7 +18968,12 @@ async def amain(args: argparse.Namespace) -> int:
         prior_used = coerce_metric_int(
             state.get("prior_generation_attempts_used")
         )
-        evidence = state.get("generation_postprocessing_terminal")
+        postprocessing_evidence = state.get(
+            "generation_postprocessing_terminal"
+        )
+        proposer_recovery_evidence = state.get(
+            "provider_native_proposer_recovery_terminal"
+        )
         reason = str(row.get("error") or "")
         row["generation_attempt_budget_limit"] = (
             GENERATION_MAX_ATTEMPTS
@@ -18173,8 +18993,13 @@ async def amain(args: argparse.Namespace) -> int:
                 ),
                 "generation_auto_retry_blocked": True,
                 "generation_postprocessing_terminal": (
-                    dict(evidence)
-                    if isinstance(evidence, Mapping)
+                    dict(postprocessing_evidence)
+                    if isinstance(postprocessing_evidence, Mapping)
+                    else None
+                ),
+                "provider_native_proposer_recovery_terminal": (
+                    dict(proposer_recovery_evidence)
+                    if isinstance(proposer_recovery_evidence, Mapping)
                     else None
                 ),
             }

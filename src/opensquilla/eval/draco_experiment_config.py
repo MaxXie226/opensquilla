@@ -155,6 +155,10 @@ class DracoEnsembleConfig(_StrictConfig):
     aggregator_recovery_top_k: int = Field(default=3, ge=1, le=3)
     aggregator_max_tokens_cap: int = Field(default=65_536, ge=2)
     aggregator_visible_answer_reserve_tokens: int = Field(default=8_192, ge=1)
+    proposer_backup_count: int = Field(default=0, ge=0, le=2)
+    proposer_recovery_max_additional_calls: int = Field(default=0, ge=0, le=3)
+    proposer_max_tokens_cap: int = Field(default=65_536, ge=2)
+    proposer_visible_answer_reserve_tokens: int = Field(default=4_096, ge=1)
     wait_for_all_proposers: bool
     quorum_grace_seconds: float = Field(ge=0.0)
 
@@ -176,6 +180,11 @@ class DracoEnsembleConfig(_StrictConfig):
             raise ValueError(
                 "ensemble.aggregator_visible_answer_reserve_tokens must be smaller than "
                 "ensemble.aggregator_max_tokens_cap"
+            )
+        if self.proposer_visible_answer_reserve_tokens >= self.proposer_max_tokens_cap:
+            raise ValueError(
+                "ensemble.proposer_visible_answer_reserve_tokens must be smaller than "
+                "ensemble.proposer_max_tokens_cap"
             )
         return self
 

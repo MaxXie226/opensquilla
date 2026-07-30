@@ -1444,6 +1444,7 @@ def test_agent_config_threads_finalization_policy(module) -> None:
     for field_name, expected in policy.items():
         assert getattr(agent_config, field_name) == expected
     assert agent_config.metadata["agent_finalization_policy"] == policy
+    assert agent_config.metadata["provider_retry_owner"] == "caller"
 
 
 @pytest.mark.asyncio
@@ -1536,18 +1537,25 @@ async def test_g1_thinking_switch_off_preserves_same_provider_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     plan = {
-        "decision_id": "disabled-thinking-decision",
+        "strategy": "router_dynamic",
+        "decision_id": "default-off-transient-decision",
         "ranking_thinking_assignment_enabled": False,
-        "selected_P": ["openrouter:model-p"],
+        "selected_P": [
+            "openrouter:model-p",
+            "openrouter:model-b",
+            "openrouter:model-c",
+        ],
         "selected_A": "openrouter:model-a",
+        "proposer_sample_count": 3,
     }
 
     class Provider:
         selection_plan = plan
+        min_successful_proposers = 2
 
         @staticmethod
         def _draco_reasoning_only_retry_factory(_exclusions):
-            raise AssertionError("disabled thinking must not rebuild the roster")
+            raise AssertionError("transient failures must not rebuild the roster")
 
     provider = Provider()
     failed_trace = {
@@ -1562,12 +1570,17 @@ async def test_g1_thinking_switch_off_preserves_same_provider_retry(
                 "ok": False,
                 "request_started": True,
                 "physical_request_count": 1,
-                "stop_reason": "length",
-                "output_tokens": 16_384,
-                "reasoning_tokens": 16_384,
+                "stop_reason": "error",
+                "output_tokens": 0,
+                "reasoning_tokens": 0,
+                "error": "HTTP 503 upstream unavailable",
                 "content": {"text": "", "chars": 0, "truncated": False},
             }
         ],
+    }
+    successful_trace = {
+        "selection_plan": deepcopy(plan),
+        "candidates": [],
     }
     results = iter(
         [
@@ -1579,7 +1592,10 @@ async def test_g1_thinking_switch_off_preserves_same_provider_retry(
             ),
             module.RunResult(
                 final_text="accepted",
-                done=DoneEvent(stop_reason="stop"),
+                done=DoneEvent(
+                    stop_reason="stop",
+                    ensemble_trace=successful_trace,
+                ),
                 routing_trace={"selection_plan": deepcopy(plan)},
             ),
         ]
@@ -1611,11 +1627,477 @@ async def test_g1_thinking_switch_off_preserves_same_provider_retry(
     assert used_providers == [provider, provider]
     assert attempts[0]["will_retry"] is True
     assert attempts[0]["retry_suppressed_reason"] == ""
+    assert [attempt["selection_plan"] for attempt in attempts] == [plan, plan]
+    assert [attempt["run"]["ensemble_trace"] for attempt in attempts] == [
+        failed_trace,
+        successful_trace,
+    ]
     for attempt in attempts:
-        assert "selection_plan" not in attempt
-        assert "deterministic_proposer_failures" not in attempt
-        assert "excluded_proposer_identities" not in attempt
+        assert attempt["deterministic_proposer_failures"] == []
+        assert attempt["excluded_proposer_identities"] == []
         assert "retry_selection_plan" not in attempt
+        assert "thinking_execution_projection" not in attempt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+async def test_g1_default_off_reasoning_only_length_rebuilds_router_dynamic_roster(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failed_identities = sorted(
+        [
+            "openrouter:openai/gpt-5.6-sol",
+            "openrouter:anthropic/claude-sonnet-5",
+        ]
+    )
+    managed_fields = (
+        "ranking_thinking_assignment_enabled",
+        "executed_thinking_assignment",
+        "thinking_assignment_details",
+    )
+
+    def default_off_plan(plan: dict[str, object]) -> dict[str, object]:
+        routed = _with_g1_task_analysis_invariants(
+            {
+                "strategy": "router_dynamic",
+                **plan,
+            }
+        )
+        for field in managed_fields:
+            routed.pop(field, None)
+        return routed
+
+    initial_plan = default_off_plan(
+        {
+            "decision_id": "default-off-decision-1",
+            "selected_P": [
+                "openrouter:openai/gpt-5.6-sol",
+                "openrouter:anthropic/claude-sonnet-5",
+                "openrouter:model-b",
+            ],
+            "proposer_sample_count": 3,
+        }
+    )
+    retry_plan = _bind_g1_retry_plan(
+        initial_plan,
+        default_off_plan(
+            {
+                "decision_id": "default-off-decision-2",
+                "selected_P": [
+                    "openrouter:model-b",
+                    "openrouter:model-c",
+                    "openrouter:model-d",
+                ],
+                "proposer_sample_count": 3,
+            }
+        ),
+        exclusions=failed_identities,
+    )
+
+    class Provider:
+        def __init__(self, selection_plan: dict[str, object]) -> None:
+            self.selection_plan = selection_plan
+            self.min_successful_proposers = module.legal_proposer_quorum(3)
+
+    initial = Provider(initial_plan)
+    replacement = Provider(retry_plan)
+    rebuild_calls: list[list[str]] = []
+
+    def rebuild(exclusions: list[str]):
+        rebuild_calls.append(exclusions)
+        return replacement
+
+    initial._draco_reasoning_only_retry_factory = rebuild
+    failed_trace = {
+        "selection_plan": deepcopy(initial_plan),
+        "candidates": [
+            {
+                "index": 0,
+                "provider": "openrouter",
+                "model": "openai/gpt-5.6-sol",
+                "requested_provider": "openrouter",
+                "requested_model": "openai/gpt-5.6-sol",
+                "ok": False,
+                "request_started": True,
+                "physical_request_count": 1,
+                "usage_reported": True,
+                "usage_missing_count": 0,
+                "stop_reason": "length",
+                "output_tokens": 16_384,
+                "reasoning_tokens": 16_384,
+                "content": {"text": "", "chars": 0, "truncated": False},
+            },
+            {
+                "index": 1,
+                "provider": "openrouter",
+                "model": "anthropic/claude-sonnet-5",
+                "requested_provider": "openrouter",
+                "requested_model": "anthropic/claude-sonnet-5",
+                "ok": False,
+                "request_started": True,
+                "physical_request_count": 1,
+                "usage_reported": True,
+                "usage_missing_count": 0,
+                "stop_reason": "length",
+                "output_tokens": 16_384,
+                "reasoning_tokens": 16_384,
+                "content": {"text": "", "chars": 0, "truncated": False},
+            },
+        ],
+        "physical_request_count": 2,
+        "llm_request_count": 2,
+        "usage_missing_count": 0,
+    }
+    successful_trace = {
+        "selection_plan": deepcopy(retry_plan),
+        "candidates": [],
+    }
+    results = iter(
+        [
+            module.RunResult(
+                final_text="",
+                done=DoneEvent(
+                    ensemble_trace=failed_trace,
+                    usage_missing_count=0,
+                    model_usage_breakdown=[
+                        {"request_count": 1},
+                        {"request_count": 1},
+                    ],
+                ),
+                error="llm ensemble had 1 successful proposer(s), requires 2",
+                routing_trace={"selection_plan": deepcopy(initial_plan)},
+            ),
+            module.RunResult(
+                final_text="accepted",
+                done=DoneEvent(
+                    stop_reason="stop",
+                    ensemble_trace=successful_trace,
+                ),
+                routing_trace={"selection_plan": deepcopy(retry_plan)},
+            ),
+        ]
+    )
+    used_providers: list[object] = []
+
+    async def fake_collect_run(active_provider, *_args, **_kwargs):
+        used_providers.append(active_provider)
+        return next(results)
+
+    monkeypatch.setattr(module, "collect_run", fake_collect_run)
+    monkeypatch.setattr(
+        module,
+        "generation_retry_reason",
+        lambda result, **_kwargs: (
+            "ensemble_insufficient_proposers"
+            if not result.final_text
+            else ""
+        ),
+    )
+
+    result, attempts, selected_attempt = await module.collect_generation_with_retries(
+        initial,
+        "prompt",
+        timeout=30,
+        group="G1",
+        max_attempts=2,
+    )
+
+    deterministic_failures = module._reasoning_only_length_failures_from_trace(
+        failed_trace
+    )
+    assert len(deterministic_failures) == 2
+    assert result.final_text == "accepted"
+    assert selected_attempt == 2
+    assert used_providers == [initial, replacement]
+    assert rebuild_calls == [failed_identities]
+    assert not set(failed_identities).intersection(retry_plan["selected_P"])
+    assert len(retry_plan["selected_P"]) == 3
+    assert attempts[0]["selection_plan"] == initial_plan
+    assert attempts[0]["deterministic_proposer_failures"] == deterministic_failures
+    assert attempts[0]["excluded_proposer_identities"] == []
+    assert attempts[0]["retry_excluded_proposer_identities"] == failed_identities
+    assert attempts[0]["retry_selection_plan"] == retry_plan
+    assert attempts[0]["run"]["ensemble_trace"] == failed_trace
+    assert attempts[1]["selection_plan"] == retry_plan
+    assert attempts[1]["deterministic_proposer_failures"] == []
+    assert attempts[1]["excluded_proposer_identities"] == failed_identities
+    assert attempts[1]["run"]["ensemble_trace"] == successful_trace
+    assert initial._draco_selected_retry_provider is replacement
+    assert module.legal_proposer_quorum(3) == 2
+    assert replacement.min_successful_proposers == 2
+    assert all("thinking_execution_projection" not in attempt for attempt in attempts)
+    assert all(
+        field not in plan
+        for plan in (initial_plan, retry_plan)
+        for field in managed_fields
+    )
+
+
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+def test_unmanaged_reasoning_usage_drives_deterministic_g1_roster_retry(module) -> None:
+    failed_identity = "openrouter:openai/gpt-5.6-sol"
+    candidate = ensemble_provider._CandidateResult(
+        index=0,
+        sample_index=0,
+        label="proposer_1",
+        provider="openrouter",
+        model="openai/gpt-5.6-sol",
+        requested_provider="openrouter",
+        requested_model="openai/gpt-5.6-sol",
+        text="",
+        input_tokens=208,
+        output_tokens=16_384,
+        reasoning_tokens=16_384,
+        stop_reason="length",
+        request_started=True,
+        physical_request_count=1,
+        usage_reported=True,
+    )
+
+    trace = {
+        "physical_request_count": 1,
+        "llm_request_count": 1,
+        "usage_missing_count": 0,
+        "candidates": [
+            candidate.trace_row(
+                include_text=True,
+                content_max_chars=8_000,
+            )
+        ]
+    }
+
+    failures = module._reasoning_only_length_failures_from_trace(trace)
+
+    assert len(failures) == 1
+    failure = failures[0]
+    assert failure["identity"] == failed_identity
+    assert failure["reason"] == "reasoning_only_length"
+    assert failure["stop_reason"] == "length"
+    assert failure["visible_output_chars"] == 0
+    assert failure["output_tokens"] == 16_384
+    assert failure["reasoning_tokens"] == 16_384
+    assert failure["request_started"] is True
+    assert failure["physical_request_count"] == 1
+    assert failure["usage_reported"] is True
+
+
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        (("candidates", 0, "ok"), True),
+        (("candidates", 0, "request_started"), False),
+        (("candidates", 0, "physical_request_count"), 0),
+        (("candidates", 0, "usage_reported"), False),
+        (("candidates", 0, "usage_missing_count"), 1),
+        (("candidates", 0, "stop_reason"), "error"),
+        (("candidates", 0, "reasoning_tokens"), 0),
+        (("candidates", 0, "content", "chars"), 1),
+        (("candidates", 0, "error"), "HTTP 429 rate limited"),
+        (("candidates", 0, "error"), "HTTP 503 upstream unavailable"),
+        (("candidates", 0, "error"), "DNS resolution failed"),
+        (("candidates", 0, "error_code"), "invalid_api_key"),
+        (("physical_request_count",), 2),
+        (("llm_request_count",), 2),
+        (("usage_missing_count",), 1),
+    ],
+)
+def test_strict_reasoning_only_extractor_rejects_inexact_or_transient_evidence(
+    module,
+    path: tuple[object, ...],
+    value: object,
+) -> None:
+    trace = {
+        "physical_request_count": 1,
+        "llm_request_count": 1,
+        "usage_missing_count": 0,
+        "candidates": [
+            {
+                "index": 0,
+                "provider": "openrouter",
+                "model": "openai/gpt-5.6-sol",
+                "requested_provider": "openrouter",
+                "requested_model": "openai/gpt-5.6-sol",
+                "ok": False,
+                "request_started": True,
+                "physical_request_count": 1,
+                "usage_reported": True,
+                "usage_missing_count": 0,
+                "stop_reason": "length",
+                "output_tokens": 16_384,
+                "reasoning_tokens": 16_384,
+                "error": "",
+                "error_code": "",
+                "content": {"text": "", "chars": 0, "truncated": False},
+            }
+        ],
+    }
+    target: object = trace
+    for component in path[:-1]:
+        target = target[component]  # type: ignore[index]
+    target[path[-1]] = value  # type: ignore[index]
+
+    assert module._reasoning_only_length_failures_from_trace(trace) == []
+
+
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+def test_strict_reasoning_only_extractor_requires_done_usage_coherence(module) -> None:
+    trace = {
+        "physical_request_count": 1,
+        "llm_request_count": 1,
+        "usage_missing_count": 0,
+        "candidates": [
+            {
+                "index": 0,
+                "provider": "openrouter",
+                "model": "openai/gpt-5.6-sol",
+                "requested_provider": "openrouter",
+                "requested_model": "openai/gpt-5.6-sol",
+                "ok": False,
+                "request_started": True,
+                "physical_request_count": 1,
+                "usage_reported": True,
+                "usage_missing_count": 0,
+                "stop_reason": "max_tokens",
+                "output_tokens": 16_384,
+                "reasoning_tokens": 16_384,
+                "error": "",
+                "error_code": "",
+                "content": {"text": "", "chars": 0, "truncated": False},
+            }
+        ],
+    }
+    exact = module.RunResult(
+        final_text="",
+        done=DoneEvent(
+            usage_missing_count=0,
+            model_usage_breakdown=[
+                {
+                    "role": "proposer",
+                    "provider": "openrouter",
+                    "model": "openai/gpt-5.6-sol",
+                    "request_count": 1,
+                    "reasoning_tokens": 16_384,
+                }
+            ],
+            ensemble_trace=trace,
+        ),
+    )
+    assert len(module.deterministic_reasoning_only_length_failures(exact)) == 1
+
+    missing_usage = deepcopy(exact)
+    assert missing_usage.done is not None
+    missing_usage.done.usage_missing_count = 1
+    assert module.deterministic_reasoning_only_length_failures(missing_usage) == []
+
+    unrepresented_request = deepcopy(exact)
+    assert unrepresented_request.done is not None
+    unrepresented_request.done.model_usage_breakdown = []
+    assert module.deterministic_reasoning_only_length_failures(unrepresented_request) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+async def test_provider_native_g1_recovery_never_enters_outer_generation_retry(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = {
+        "strategy": "router_dynamic",
+        "selection_mode": "router_dynamic",
+        "selected_P": [
+            "openrouter:model-a",
+            "openrouter:model-b",
+            "openrouter:model-c",
+        ],
+        "proposer_models": ["model-a", "model-b", "model-c"],
+        "proposer_sample_count": 3,
+        "effective_min_successful_proposers": 2,
+        "backup_P": [
+            "openrouter:model-d",
+            "openrouter:model-e",
+        ],
+        "configured_proposer_backup_count": 2,
+        "effective_proposer_backup_count": 2,
+        "selected_A": "openrouter:model-f",
+        "aggregator_candidates": [
+            "openrouter:model-f",
+            "openrouter:model-g",
+            "openrouter:model-h",
+        ],
+        "proposer_recovery_policy": {
+            "schema": "opensquilla.router-dynamic-proposer-recovery/v1",
+            "configured_backup_count": 2,
+            "effective_backup_count": 2,
+            "max_additional_physical_requests": 3,
+            "quorum_required": 2,
+            "max_tokens_cap": 65_536,
+            "visible_answer_reserve_tokens": 4_096,
+            "thinking_downgrade_order": ["one_strictly_lower"],
+            "transient_same_model_retries": 1,
+            "backup_reasoning_downgrades": 1,
+        },
+    }
+
+    class Provider:
+        selection_plan = plan
+
+    calls: list[object] = []
+
+    async def fake_collect_run(active_provider, *_args, **_kwargs):
+        calls.append(active_provider)
+        return module.RunResult(
+            final_text="",
+            done=DoneEvent(
+                usage_missing_count=0,
+                ensemble_trace={
+                    "selection_plan": deepcopy(plan),
+                    "proposer_recovery": {
+                        "schema": "opensquilla.router-dynamic-proposer-recovery/v1",
+                        "max_additional_physical_requests": 3,
+                        "additional_physical_requests_started": 3,
+                        "remaining_additional_physical_requests": 0,
+                    },
+                },
+            ),
+            error="ensemble_insufficient_proposers",
+            routing_trace={"selection_plan": deepcopy(plan)},
+        )
+
+    monkeypatch.setattr(module, "collect_run", fake_collect_run)
+    monkeypatch.setattr(
+        module,
+        "generation_retry_reason",
+        lambda *_args, **_kwargs: "ensemble_insufficient_proposers",
+    )
+    monkeypatch.setattr(
+        module,
+        "g1_retry_physical_usage_binding_reasons",
+        lambda *_args, **_kwargs: [],
+    )
+
+    result, attempts, selected_attempt = await module.collect_generation_with_retries(
+        Provider(),
+        "prompt",
+        timeout=30,
+        group="G1",
+        max_attempts=3,
+    )
+
+    assert result.error == "ensemble_insufficient_proposers"
+    assert selected_attempt == 0
+    assert len(calls) == 1
+    assert len(attempts) == 1
+    assert attempts[0]["will_retry"] is False
+    assert attempts[0]["retry_suppressed_reason"] == (
+        "provider_native_proposer_recovery_terminal"
+    )
+    assert attempts[0]["proposer_recovery_owner"] == "provider"
+    assert attempts[0]["selection_plan"] == plan
+    assert attempts[0]["deterministic_proposer_failures"] == []
+    assert attempts[0]["excluded_proposer_identities"] == []
+    assert "ensemble_trace" in attempts[0]["run"]
 
 
 @pytest.mark.asyncio
@@ -1766,6 +2248,8 @@ async def test_reasoning_only_length_retry_rebuilds_roster_and_tracks_each_plan(
                 "ok": False,
                 "request_started": True,
                 "physical_request_count": 2,
+                "usage_reported": True,
+                "usage_missing_count": 0,
                 "stop_reason": "length",
                 "output_tokens": 16_384,
                 "reasoning_tokens": 16_384,
@@ -1791,12 +2275,21 @@ async def test_reasoning_only_length_retry_rebuilds_roster_and_tracks_each_plan(
                 "content": {"text": "", "chars": 0, "truncated": False},
             }
         ],
+        "physical_request_count": 2,
+        "llm_request_count": 2,
+        "usage_missing_count": 0,
     }
     results = iter(
         [
             module.RunResult(
                 final_text="",
-                done=DoneEvent(ensemble_trace=failed_trace),
+                done=DoneEvent(
+                    ensemble_trace=failed_trace,
+                    usage_missing_count=0,
+                    model_usage_breakdown=[
+                        {"request_count": 2},
+                    ],
+                ),
                 error="llm ensemble had 1 successful proposer(s), requires 2",
                 routing_trace={"selection_plan": deepcopy(initial_plan)},
             ),
@@ -3314,10 +3807,7 @@ def test_paid_provider_build_post_setup_initialization_is_protected(
         body_source = "\n".join(
             ast.unparse(statement) for statement in node.body
         )
-        if (
-            "attach_provider_setup(provider, result)" in body_source
-            and "_draco_reasoning_only_retry_factory" in body_source
-        ):
+        if "attach_provider_setup(provider, result)" in body_source:
             protected.append(node)
 
     assert len(protected) == 1
@@ -4383,12 +4873,19 @@ async def test_managed_g1_audits_success_before_judge_or_acceptance(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
-async def test_g1_retry_factory_reuses_task_analysis_without_second_request(
+@pytest.mark.parametrize(
+    "thinking_assignment_enabled",
+    [True, False],
+    ids=["managed", "default-off-missing"],
+)
+async def test_g1_provider_native_recovery_runs_task_analysis_once(
     module,
+    thinking_assignment_enabled: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from opensquilla.provider.ranking_router import (
         TaskAnalysisResult,
+        _legacy_registry_snapshot_projection,
         fallback_task_profile,
         load_model_registry_snapshot,
         ranking_config_snapshot,
@@ -4396,8 +4893,12 @@ async def test_g1_retry_factory_reuses_task_analysis_without_second_request(
 
     experiment = _experiment_config()
     current_registry = load_model_registry_snapshot()
+    if not thinking_assignment_enabled:
+        current_registry = _legacy_registry_snapshot_projection(
+            current_registry
+        )
     current_ranking = ranking_config_snapshot(
-        thinking_assignment_enabled=True,
+        thinking_assignment_enabled=thinking_assignment_enabled,
     )
     experiment_payload = experiment.model_dump(mode="json")
     experiment_payload["g1_routing"].update(
@@ -4424,17 +4925,19 @@ async def test_g1_retry_factory_reuses_task_analysis_without_second_request(
         }
     )
     experiment = type(experiment).model_validate(experiment_payload)
+    ensemble_config: dict[str, object] = {
+        "enabled": True,
+        "selection_mode": "router_dynamic",
+    }
+    if thinking_assignment_enabled:
+        ensemble_config["ranking_thinking_assignment_enabled"] = True
     config = GatewayConfig(
         llm={
             "provider": "openrouter",
             "model": "deepseek/deepseek-v4-pro",
             "api_key": "fake",
         },
-        llm_ensemble={
-            "enabled": True,
-            "selection_mode": "router_dynamic",
-            "ranking_thinking_assignment_enabled": True,
-        },
+        llm_ensemble=ensemble_config,
     )
     inherited = ProviderConfig(
         provider="openrouter",
@@ -4500,44 +5003,42 @@ async def test_g1_retry_factory_reuses_task_analysis_without_second_request(
         g1_registry_contract=contract,
         generation_policy={},
     )
-    failed_identity = build.provider.selection_plan["selected_P"][0]
-    retry_provider = build.provider._draco_reasoning_only_retry_factory([failed_identity])
+    plan = build.provider.selection_plan
+    managed_fields = (
+        "ranking_thinking_assignment_enabled",
+        "thinking_assignment",
+        "thinking_assignment_details",
+        "executed_thinking_assignment",
+        "thinking_execution_fallbacks",
+    )
+    if thinking_assignment_enabled:
+        assert plan["ranking_thinking_assignment_enabled"] is True
+    else:
+        assert all(field not in plan for field in managed_fields)
 
     assert analyzer_calls == 1
-    assert failed_identity not in retry_provider.selection_plan["selected_P"]
-    assert retry_provider.selection_plan["task_analysis_reused"] is True
+    assert not hasattr(
+        build.provider,
+        "_draco_reasoning_only_retry_factory",
+    )
+    assert plan["proposer_recovery_policy"] == (
+        module.FORMAL_PROPOSER_RECOVERY_POLICY
+    )
+    assert len(plan["backup_P"]) == 2
+    assert plan["configured_proposer_backup_count"] == 2
+    assert plan["effective_proposer_backup_count"] == 2
+    assert plan["effective_min_successful_proposers"] == 2
+    assert build.provider.min_successful_proposers == 2
+
+    setup = module.consume_provider_setup(build.provider)
+    assert setup["usage"] == build.setup_usage
     assert (
-        retry_provider.selection_plan["retry_parent_decision_id"]
-        == (build.provider.selection_plan["decision_id"])
+        sum(int(unit.get("request_count") or 0) for unit in setup["usage"])
+        == 1
     )
-    retry_routing = retry_provider.selection_plan["retry_routing"]
-    reuse_binding = retry_provider.selection_plan["task_analysis_reuse"]
-    assert retry_routing == {
-        "schema": "opensquilla.router-dynamic-retry-routing/v2",
-        "reason": "prior_attempt_reasoning_only_length",
-        "parent_decision_id": build.provider.selection_plan["decision_id"],
-        "excluded_proposer_identities": [failed_identity],
-        "task_analysis_reused": True,
-        "task_analysis_source_decision_id": (build.provider.selection_plan["decision_id"]),
-        "task_analysis_reuse_sha256": reuse_binding["projection_sha256"],
-    }
-    assert (
-        module.g1_retry_plan_provenance_reason(
-            build.provider.selection_plan,
-            retry_provider.selection_plan,
-            excluded_proposer_identities={failed_identity},
-        )
-        == ""
-    )
-    assert retry_provider.min_successful_proposers == module.legal_proposer_quorum(
-        len(retry_provider.selection_plan["selected_P"])
-    )
-    retry_setup = module.consume_provider_setup(retry_provider)
-    assert retry_setup["usage"] == []
-    assert retry_setup["routing"]["task_analyzer_reuse"]["physical_request_count"] == 0
-    assert retry_setup["routing"]["task_analyzer_reuse"]["excluded_proposer_identities"] == [
-        failed_identity
-    ]
+    assert module.consume_provider_setup(build.provider).get("usage", []) == []
+    if not thinking_assignment_enabled:
+        assert "thinking_execution_projection" not in setup["routing"]
 
 
 @pytest.mark.asyncio
@@ -10040,6 +10541,328 @@ def test_resume_blocks_automatic_resend_after_paid_postprocessing_failure() -> N
     assert terminal_return.lineno < model_call.lineno
 
 
+def _provider_native_exhausted_resume_row() -> dict[str, object]:
+    plan: dict[str, object] = {
+        "strategy": "router_dynamic",
+        "selection_mode": "router_dynamic",
+        "selected_P": [
+            "openrouter:model-a",
+            "openrouter:model-b",
+            "openrouter:model-c",
+        ],
+        "proposer_models": ["model-a", "model-b", "model-c"],
+        "proposer_sample_count": 3,
+        "effective_min_successful_proposers": 2,
+        "backup_P": [
+            "openrouter:model-d",
+            "openrouter:model-e",
+        ],
+        "configured_proposer_backup_count": 2,
+        "effective_proposer_backup_count": 2,
+        "selected_A": "openrouter:model-f",
+        "aggregator_candidates": [
+            "openrouter:model-f",
+            "openrouter:model-g",
+            "openrouter:model-h",
+        ],
+        "proposer_recovery_policy": deepcopy(
+            resume_runner.FORMAL_PROPOSER_RECOVERY_POLICY
+        ),
+    }
+    from opensquilla.provider.protocol import (
+        provider_retry_roster_fingerprint,
+    )
+
+    fingerprint = provider_retry_roster_fingerprint(plan)
+
+    def physical(
+        ordinal: int,
+        attempt_id: str,
+        identity: str,
+        outcome: str,
+    ) -> dict[str, object]:
+        return {
+            "attempt": ordinal,
+            "physical_attempt_id": attempt_id,
+            "identity": identity,
+            "request_started": True,
+            "stream_closed": True,
+            "outcome": outcome,
+        }
+
+    call = {
+        "selection_plan": deepcopy(plan),
+        "successful_proposers": 1,
+        "candidates": [
+            {
+                "request_started": True,
+                "physical_request_count": 4,
+                "execution": {
+                    "physical_attempts": [
+                        physical(
+                            1,
+                            "a" * 32,
+                            "openrouter:model-a",
+                            "failed",
+                        ),
+                        physical(
+                            2,
+                            "b" * 32,
+                            "openrouter:model-a",
+                            "failed",
+                        ),
+                        physical(
+                            3,
+                            "c" * 32,
+                            "openrouter:model-d",
+                            "failed",
+                        ),
+                        physical(
+                            4,
+                            "d" * 32,
+                            "openrouter:model-e",
+                            "failed",
+                        ),
+                    ]
+                },
+            },
+            {
+                "request_started": True,
+                "physical_request_count": 1,
+                "execution": {
+                    "physical_attempts": [
+                        physical(
+                            1,
+                            "e" * 32,
+                            "openrouter:model-b",
+                            "succeeded",
+                        )
+                    ]
+                },
+            },
+            {
+                "request_started": True,
+                "physical_request_count": 1,
+                "execution": {
+                    "physical_attempts": [
+                        physical(
+                            1,
+                            "f" * 32,
+                            "openrouter:model-c",
+                            "failed",
+                        )
+                    ]
+                },
+            },
+        ],
+        "proposer_recovery": {
+            "schema": resume_runner.PROPOSER_RECOVERY_SCHEMA,
+            "selection_plan_fingerprint": fingerprint,
+            "scope": "run_turn",
+            "scope_id": "scope-1",
+            "max_additional_physical_requests": 3,
+            "external_physical_requests_reserved": 0,
+            "additional_physical_requests_started": 3,
+            "remaining_additional_physical_requests": 0,
+            "quorum_required": 2,
+            "quorum_reached": False,
+            "cumulative_excluded_identities": [
+                "openrouter:model-a",
+                "openrouter:model-d",
+                "openrouter:model-e",
+            ],
+            "visited_identities": [
+                "openrouter:model-d",
+                "openrouter:model-e",
+            ],
+            "executed_proposer_roster_before": list(plan["selected_P"]),
+            "executed_proposer_roster_after": list(plan["selected_P"]),
+            "attempts": [
+                {
+                    "sequence": 1,
+                    "slot_index": 0,
+                    "kind": "thinking_downgrade",
+                    "source_identity": "openrouter:model-a",
+                    "target_identity": "openrouter:model-a",
+                    "failure_kind": "reasoning_only_length",
+                    "reason": "reasoning_only_length",
+                    "thinking_before": "high",
+                    "thinking_after": "medium",
+                    "request_started": True,
+                    "physical_request_count": 1,
+                    "physical_attempt_id": "b" * 32,
+                    "stream_closed": True,
+                    "usage_reported": True,
+                    "usage_missing_count": 0,
+                    "outcome": "failed",
+                },
+                {
+                    "sequence": 2,
+                    "slot_index": 0,
+                    "kind": "backup_replacement",
+                    "source_identity": "openrouter:model-a",
+                    "target_identity": "openrouter:model-d",
+                    "failure_kind": "reasoning_only_length",
+                    "reason": "frozen_backup_order",
+                    "request_started": True,
+                    "physical_request_count": 1,
+                    "physical_attempt_id": "c" * 32,
+                    "stream_closed": True,
+                    "usage_reported": True,
+                    "usage_missing_count": 0,
+                    "outcome": "failed",
+                },
+                {
+                    "sequence": 3,
+                    "slot_index": 0,
+                    "kind": "backup_replacement",
+                    "source_identity": "openrouter:model-a",
+                    "target_identity": "openrouter:model-e",
+                    "failure_kind": "reasoning_only_length",
+                    "reason": "frozen_backup_order",
+                    "request_started": True,
+                    "physical_request_count": 1,
+                    "physical_attempt_id": "d" * 32,
+                    "stream_closed": True,
+                    "usage_reported": True,
+                    "usage_missing_count": 0,
+                    "outcome": "failed",
+                },
+            ],
+        },
+    }
+    return {
+        "group": "G1",
+        "error": "llm ensemble had 1 successful proposer(s), requires 2",
+        "selected_generation_succeeded": False,
+        "execution": {
+            "generation_attempts": [
+                {
+                    "attempt_id": "1" * 32,
+                    "attempt_kind": "generation",
+                    "attempt": 1,
+                    "will_retry": False,
+                    "retry_suppressed_reason": (
+                        "provider_native_proposer_recovery_terminal"
+                    ),
+                    "proposer_recovery_owner": "provider",
+                    "selection_plan": deepcopy(plan),
+                    "run": {
+                        "error": (
+                            "llm ensemble had 1 successful proposer(s), "
+                            "requires 2"
+                        ),
+                        "ensemble_trace": call,
+                    },
+                }
+            ]
+        },
+    }
+
+
+def test_resume_provider_native_exhaustion_is_terminal_across_waves() -> None:
+    row = _provider_native_exhausted_resume_row()
+
+    evidence = (
+        resume_runner.provider_native_proposer_recovery_terminal_evidence(
+            row
+        )
+    )
+
+    assert evidence is not None
+    assert evidence["status"] == "budget_exhausted"
+    assert evidence["receipt_valid"] is True
+    assert evidence["additional_physical_requests_started"] == 3
+    assert evidence["remaining_additional_physical_requests"] == 0
+    state = {
+        "action": "regenerate",
+        "row": row,
+        "generation_auto_retry_blocked": True,
+    }
+    assert (
+        resume_runner.g1_cross_wave_lifecycle_requires_reconstruction(
+            group="G1",
+            prior_attempts_used=1,
+            state=state,
+            current_run_compatibility_contract=(
+                _enabled_g1_frozen_lifecycle_contract()
+            ),
+        )
+        is False
+    )
+
+
+def test_resume_provider_native_malformed_receipt_fails_closed() -> None:
+    row = _provider_native_exhausted_resume_row()
+    attempt = row["execution"]["generation_attempts"][0]
+    receipt = attempt["run"]["ensemble_trace"]["proposer_recovery"]
+    receipt["selection_plan_fingerprint"] = "0" * 64
+
+    evidence = (
+        resume_runner.provider_native_proposer_recovery_terminal_evidence(
+            row
+        )
+    )
+
+    assert evidence is not None
+    assert evidence["status"] == "receipt_invalid"
+    assert evidence["receipt_valid"] is False
+    assert "invalid_provider_native_recovery_receipt" in evidence[
+        "receipt_reasons"
+    ]
+    assert evidence["automatic_generation_retry_allowed"] is False
+
+
+def test_resume_provider_native_external_replay_reservation_fails_closed() -> None:
+    row = _provider_native_exhausted_resume_row()
+    attempt = row["execution"]["generation_attempts"][0]
+    receipt = attempt["run"]["ensemble_trace"]["proposer_recovery"]
+    receipt["external_physical_requests_reserved"] = 1
+
+    evidence = (
+        resume_runner.provider_native_proposer_recovery_terminal_evidence(
+            row
+        )
+    )
+
+    assert evidence is not None
+    assert evidence["status"] == "receipt_invalid"
+    assert evidence["receipt_valid"] is False
+    assert "invalid_provider_native_recovery_receipt" in evidence[
+        "receipt_reasons"
+    ]
+    assert evidence["automatic_generation_retry_allowed"] is False
+
+
+@pytest.mark.parametrize(
+    ("scope", "scope_id"),
+    (("chat", "scope-1"), ("run_turn", "")),
+)
+def test_resume_provider_native_scope_must_be_stable_run_turn(
+    scope: str,
+    scope_id: str,
+) -> None:
+    row = _provider_native_exhausted_resume_row()
+    attempt = row["execution"]["generation_attempts"][0]
+    receipt = attempt["run"]["ensemble_trace"]["proposer_recovery"]
+    receipt["scope"] = scope
+    receipt["scope_id"] = scope_id
+
+    evidence = (
+        resume_runner.provider_native_proposer_recovery_terminal_evidence(
+            row
+        )
+    )
+
+    assert evidence is not None
+    assert evidence["status"] == "receipt_invalid"
+    assert evidence["receipt_valid"] is False
+    assert "invalid_provider_native_recovery_scope" in evidence[
+        "receipt_reasons"
+    ]
+    assert evidence["automatic_generation_retry_allowed"] is False
+
+
 def _task_analyzer_unit(
     *,
     attempt: int = 1,
@@ -10125,8 +10948,26 @@ def _frozen_g1_failure_run(
     analyzer_units: list[dict[str, object]] | None = None,
 ) -> tuple[dict[str, object], list[dict[str, object]]]:
     candidates: list[dict[str, object]] = []
+    generation_units: list[dict[str, object]] = []
     if failed_identity is not None:
         provider, _, model = failed_identity.partition(":")
+        physical_attempt_id = hashlib.sha256(
+            (
+                f"{plan.get('decision_id')}:{failed_identity}:"
+                "reasoning-only-length"
+            ).encode()
+        ).hexdigest()[:32]
+        execution = _test_proposer_execution(failed_identity)
+        execution["physical_attempts"] = [
+            {
+                "attempt": 1,
+                "request_started": True,
+                "stream_closed": True,
+                "physical_attempt_id": physical_attempt_id,
+                "identity": failed_identity,
+                "outcome": "failed",
+            }
+        ]
         candidates.append(
             {
                 "index": 0,
@@ -10137,26 +10978,53 @@ def _frozen_g1_failure_run(
                 "ok": False,
                 "request_started": True,
                 "physical_request_count": 1,
+                "usage_reported": True,
+                "usage_missing_count": 0,
                 "stop_reason": "length",
                 "reasoning_tokens": 8_192,
                 "output_tokens": 8_192,
                 "effective_thinking_level": "high",
                 "provider_thinking_level": "high",
-                "execution": _test_proposer_execution(
-                    failed_identity
-                ),
+                "execution": execution,
                 "content": {"text": "", "chars": 0},
+            }
+        )
+        generation_units.append(
+            {
+                "role": "proposer",
+                "physical_attempt_id": physical_attempt_id,
+                "provider": provider,
+                "requested_provider": provider,
+                "model": model,
+                "requested_model": model,
+                "input_tokens": 1,
+                "output_tokens": 8_192,
+                "reasoning_tokens": 8_192,
+                "cached_tokens": 0,
+                "cache_write_tokens": 0,
+                "billed_cost": 0.0,
+                "cost_source": "none",
+                "request_count": 1,
+                "provider_usage": {
+                    "physical_attempt_id": physical_attempt_id,
+                },
             }
         )
     trace = {
         "selection_plan": deepcopy(plan),
         "candidates": candidates,
+        "physical_request_count": len(generation_units),
+        "llm_request_count": len(generation_units),
+        "usage_missing_count": 0,
     }
-    units = deepcopy(analyzer_units or [])
+    setup_units = deepcopy(analyzer_units or [])
+    units = [*deepcopy(setup_units), *generation_units]
     run = {
-        "llm_request_count": 1 + len(units),
+        "llm_request_count": len(units),
+        "physical_request_count": len(units),
+        "usage_missing_count": 0,
         "usage": {"model_usage_breakdown": deepcopy(units)},
-        "setup_usage": deepcopy(units),
+        "setup_usage": deepcopy(setup_units),
         "routing_trace": {"selection_plan": deepcopy(plan)},
         "ensemble_trace": trace,
         "error": "generation_failed",
@@ -10171,6 +11039,23 @@ def _frozen_g1_failure_result(
     failed_identity: str,
 ):
     provider, _, model = failed_identity.partition(":")
+    physical_attempt_id = hashlib.sha256(
+        (
+            f"{plan.get('decision_id')}:{failed_identity}:"
+            "reasoning-only-length-result"
+        ).encode()
+    ).hexdigest()[:32]
+    execution = _test_proposer_execution(failed_identity)
+    execution["physical_attempts"] = [
+        {
+            "attempt": 1,
+            "request_started": True,
+            "stream_closed": True,
+            "physical_attempt_id": physical_attempt_id,
+            "identity": failed_identity,
+            "outcome": "failed",
+        }
+    ]
     trace = {
         "selection_plan": deepcopy(plan),
         "candidates": [
@@ -10183,19 +11068,48 @@ def _frozen_g1_failure_result(
                 "ok": False,
                 "request_started": True,
                 "physical_request_count": 1,
+                "usage_reported": True,
+                "usage_missing_count": 0,
                 "stop_reason": "length",
                 "reasoning_tokens": 8_192,
                 "output_tokens": 8_192,
                 "effective_thinking_level": "high",
                 "provider_thinking_level": "high",
-                "execution": _test_proposer_execution(failed_identity),
+                "execution": execution,
                 "content": {"text": "", "chars": 0},
             }
         ],
+        "physical_request_count": 1,
+        "llm_request_count": 1,
+        "usage_missing_count": 0,
     }
     return module.RunResult(
         final_text="",
-        done=DoneEvent(ensemble_trace=trace),
+        done=DoneEvent(
+            ensemble_trace=trace,
+            usage_missing_count=0,
+            model_usage_breakdown=[
+                {
+                    "role": "proposer",
+                    "physical_attempt_id": physical_attempt_id,
+                    "provider": provider,
+                    "requested_provider": provider,
+                    "model": model,
+                    "requested_model": model,
+                    "request_count": 1,
+                    "input_tokens": 1,
+                    "output_tokens": 8_192,
+                    "reasoning_tokens": 8_192,
+                    "cached_tokens": 0,
+                    "cache_write_tokens": 0,
+                    "billed_cost": 0.0,
+                    "cost_source": "none",
+                    "provider_usage": {
+                        "physical_attempt_id": physical_attempt_id,
+                    },
+                }
+            ],
+        ),
         error="ensemble_insufficient_proposers",
         routing_trace={"selection_plan": deepcopy(plan)},
     )
@@ -12171,6 +13085,9 @@ def test_resume_verifies_b2_runtime_lineup_against_current_contract() -> None:
     )
     ensemble = experiment["ensemble"]
     expected_models = [member["model"] for member in ensemble["proposers"]]
+    expected_quorum = resume_runner.legal_proposer_quorum(
+        len(expected_models)
+    )
     selection_plan = {
         "strategy": experiment["routing"]["selection_mode"],
         "selection_mode": experiment["routing"]["selection_mode"],
@@ -12182,6 +13099,9 @@ def test_resume_verifies_b2_runtime_lineup_against_current_contract() -> None:
         ],
         "aggregator_model": ensemble["aggregator"]["model"],
         "selected_A": (f"{ensemble['aggregator']['provider']}:{ensemble['aggregator']['model']}"),
+        "configured_min_successful_proposers": expected_quorum,
+        "effective_min_successful_proposers": expected_quorum,
+        "legal_min_successful_proposers": expected_quorum,
     }
     final_answer = "answer"
     final_trace = {
@@ -12189,7 +13109,7 @@ def test_resume_verifies_b2_runtime_lineup_against_current_contract() -> None:
         "request_outcome": "llm_response",
         "selection_strategy": experiment["routing"]["selection_mode"],
         "selection_plan": selection_plan,
-        "successful_proposers": ensemble["min_successful_proposers"],
+        "successful_proposers": expected_quorum,
         "total_candidates": len(expected_models),
         "fallback_used": False,
         "candidates": [
@@ -12198,25 +13118,25 @@ def test_resume_verifies_b2_runtime_lineup_against_current_contract() -> None:
                 "requested_provider": member["provider"],
                 "model": member["model"],
                 "requested_model": member["model"],
-                "ok": index < ensemble["min_successful_proposers"],
+                "ok": index < expected_quorum,
                 "request_started": True,
                 "physical_request_count": 1,
-                "usage_reported": index < ensemble["min_successful_proposers"],
-                "stop_reason": ("stop" if index < ensemble["min_successful_proposers"] else ""),
+                "usage_reported": index < expected_quorum,
+                "stop_reason": ("stop" if index < expected_quorum else ""),
                 "content": {
                     "text": (
-                        f"candidate-{index}" if index < ensemble["min_successful_proposers"] else ""
+                        f"candidate-{index}" if index < expected_quorum else ""
                     ),
                     "chars": (
                         len(f"candidate-{index}")
-                        if index < ensemble["min_successful_proposers"]
+                        if index < expected_quorum
                         else 0
                     ),
                     "truncated": False,
                 },
                 **(
                     {}
-                    if index < ensemble["min_successful_proposers"]
+                    if index < expected_quorum
                     else {"error": "failed", "error_code": "test_failure"}
                 ),
             }
@@ -12738,6 +13658,25 @@ def test_terminal_policy_allows_only_empty_nonterminal_fallback(module) -> None:
         expected_selection_plan=plan,
     ) == ["intermediate_fallback_visible_output"]
 
+    formal_plan = deepcopy(plan)
+    formal_plan["proposer_models"].append("p5")
+    formal_plan["selected_P"].append("openrouter:p5")
+    formal_plan["proposer_sample_count"] = 5
+    formal_plan["proposer_recovery_policy"] = deepcopy(
+        module.FORMAL_PROPOSER_RECOVERY_POLICY
+    )
+    formal_fallback = _terminal_policy_call(
+        index=1,
+        plan=formal_plan,
+        successful=2,
+        fallback=True,
+        output="",
+    )
+    assert module.admissible_empty_nonterminal_fallback_reasons(
+        formal_fallback,
+        expected_selection_plan=formal_plan,
+    ) == ["invalid_intermediate_fallback_quorum"]
+
     assert retry_reason([deepcopy(fallback)], "") == ("aggregator_fallback_used_or_unknown")
 
 
@@ -13002,6 +13941,13 @@ def test_g1_registry_contract_is_manifested_and_fingerprinted(
     assert config.llm_ensemble.aggregator_recovery_top_k == 3
     assert config.llm_ensemble.aggregator_max_tokens_cap == 65_536
     assert config.llm_ensemble.aggregator_visible_answer_reserve_tokens == 8_192
+    assert config.llm_ensemble.proposer_backup_count == 2
+    assert config.llm_ensemble.proposer_recovery_max_additional_calls == 3
+    assert config.llm_ensemble.proposer_max_tokens_cap == 65_536
+    assert (
+        config.llm_ensemble.proposer_visible_answer_reserve_tokens
+        == 4_096
+    )
     assert config.sandbox.sandbox is False
     assert config.sandbox.security_grading is False
     args._g1_registry_contract = module.validate_g1_registry_contract(
@@ -13046,6 +13992,10 @@ def test_g1_registry_contract_is_manifested_and_fingerprinted(
         "aggregator_recovery_top_k": 3,
         "aggregator_max_tokens_cap": 65_536,
         "aggregator_visible_answer_reserve_tokens": 8_192,
+        "proposer_backup_count": 2,
+        "proposer_recovery_max_additional_calls": 3,
+        "proposer_max_tokens_cap": 65_536,
+        "proposer_visible_answer_reserve_tokens": 4_096,
         "g1_user_profile_generation_enabled": False,
         "g1_user_profile_enabled": False,
     }
@@ -15537,6 +16487,67 @@ def test_b2_provider_alignment_pins_effective_member_configuration() -> None:
     assert provider.min_successful_proposers == 3
     assert provider.selection_plan["effective_min_successful_proposers"] == 3
     assert provider.selection_plan["legal_min_successful_proposers"] == 3
+
+
+@pytest.mark.parametrize("module", [runner, _load_resume_runner()], ids=["main", "resume"])
+def test_provider_native_formal_quorum_stays_two_for_five_proposers(
+    module,
+) -> None:
+    class Member:
+        k = 1
+
+    class Provider:
+        proposers = [Member() for _ in range(5)]
+        min_successful_proposers = 4
+        selection_plan = {
+            "proposer_recovery_policy": deepcopy(
+                module.FORMAL_PROPOSER_RECOVERY_POLICY
+            ),
+            "configured_min_successful_proposers": 4,
+        }
+
+    provider = module.enforce_draco_legal_proposer_quorum(Provider())
+
+    assert provider.min_successful_proposers == 2
+    assert provider.selection_plan["effective_min_successful_proposers"] == 2
+    assert provider.selection_plan["legal_min_successful_proposers"] == 2
+    assert (
+        provider.selection_plan["legal_quorum_policy"]
+        == "fixed_2_provider_native"
+    )
+
+    legacy = Provider()
+    legacy.selection_plan = {}
+    legacy.min_successful_proposers = 4
+    legacy = module.enforce_draco_legal_proposer_quorum(legacy)
+    assert legacy.min_successful_proposers == 4
+
+
+@pytest.mark.parametrize("module", [runner, _load_resume_runner()], ids=["main", "resume"])
+def test_formal_g1_rejects_nonfrozen_proposer_recovery_policy(
+    module,
+) -> None:
+    experiment = module.load_draco_experiment_config(
+        module.DEFAULT_B2_EXPERIMENT_CONFIG_PATH,
+        inline_sets=["ensemble.proposer_backup_count=1"],
+    ).config
+    config = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "model-a",
+            "api_key": "fake",
+        }
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="frozen provider-owned proposer recovery policy",
+    ):
+        module.enforce_formal_draco_runtime_config(
+            config,
+            experiment,
+            ["G1"],
+        )
 
 
 def test_b2_provider_alignment_rebuilds_trace_after_lineup_override() -> None:

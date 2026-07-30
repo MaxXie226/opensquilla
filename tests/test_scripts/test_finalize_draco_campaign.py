@@ -857,6 +857,10 @@ def _receipt(
     }
 
 
+def _physical_attempt_id(seed: str) -> str:
+    return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:32]
+
+
 def _ensemble_trace(
     proposers: list[str],
     aggregator: str,
@@ -1062,6 +1066,7 @@ def _nonterminal_fallback_call(
 
 
 def _ranked_aggregator_fallback_call(
+    module,
     plan: dict[str, object],
     *,
     final_text: str,
@@ -1200,7 +1205,848 @@ def _ranked_aggregator_fallback_call(
             "assembled_prefix_sha256": hashlib.sha256(final_text.encode("utf-8")).hexdigest(),
         }
     ]
+    if plan.get("proposer_recovery_policy") is not None:
+        _formalize_provider_native_call(
+            module,
+            call,
+            plan,
+            scope_id=(
+                "ranked-fallback-"
+                f"{fallback_index}-{module.text_sha256(final_text)[:16]}"
+            ),
+        )
     return call
+
+
+def _provider_native_recovery_call(
+    module,
+) -> tuple[dict[str, object], dict[str, object]]:
+    selected = [
+        "openrouter:model-a",
+        "openrouter:model-b",
+        "openrouter:model-c",
+    ]
+    backups = ["openrouter:model-d", "openrouter:model-e"]
+    plan: dict[str, object] = {
+        "strategy": "router_dynamic",
+        "selection_mode": "router_dynamic",
+        "selected_P": selected,
+        "proposer_models": ["model-a", "model-b", "model-c"],
+        "proposer_sample_count": 3,
+        "effective_min_successful_proposers": 2,
+        "backup_P": backups,
+        "configured_proposer_backup_count": 2,
+        "effective_proposer_backup_count": 2,
+        "selected_A": "openrouter:model-f",
+        "aggregator_candidates": [
+            "openrouter:model-f",
+            "openrouter:model-g",
+            "openrouter:model-h",
+        ],
+        "proposer_recovery_policy": deepcopy(
+            module.FORMAL_PROPOSER_RECOVERY_POLICY
+        ),
+    }
+    from opensquilla.provider.protocol import (
+        provider_retry_roster_fingerprint,
+    )
+
+    fingerprint = provider_retry_roster_fingerprint(plan)
+    primary_a, recovered_a, primary_b, primary_c = (
+        "a" * 32,
+        "b" * 32,
+        "c" * 32,
+        "d" * 32,
+    )
+
+    def physical(
+        ordinal: int,
+        attempt_id: str,
+        identity: str,
+        outcome: str,
+    ) -> dict[str, object]:
+        return {
+            "attempt": ordinal,
+            "request_started": True,
+            "stream_closed": True,
+            "physical_attempt_id": attempt_id,
+            "identity": identity,
+            "outcome": outcome,
+        }
+
+    def candidate(
+        *,
+        index: int,
+        model: str,
+        ok: bool,
+        attempts: list[dict[str, object]],
+    ) -> dict[str, object]:
+        text = f"candidate-{index}" if ok else ""
+        return {
+            "index": index,
+            "ok": ok,
+            "request_started": bool(attempts),
+            "physical_request_count": len(attempts),
+            "usage_reported": True,
+            "usage_missing_count": 0,
+            "requested_provider": "openrouter",
+            "requested_model": model,
+            "provider": "openrouter" if ok else "",
+            "model": model if ok else "",
+            "content": {
+                "text": text,
+                "chars": len(text),
+                "truncated": False,
+            },
+            "execution": {"physical_attempts": attempts},
+        }
+
+    call: dict[str, object] = {
+        "selection_plan": plan,
+        "successful_proposers": 2,
+        "candidates": [
+            candidate(
+                index=0,
+                model="model-a",
+                ok=True,
+                attempts=[
+                    physical(
+                        1,
+                        primary_a,
+                        "openrouter:model-a",
+                        "failed",
+                    ),
+                    physical(
+                        2,
+                        recovered_a,
+                        "openrouter:model-a",
+                        "succeeded",
+                    ),
+                ],
+            ),
+            candidate(
+                index=1,
+                model="model-b",
+                ok=True,
+                attempts=[
+                    physical(
+                        1,
+                        primary_b,
+                        "openrouter:model-b",
+                        "succeeded",
+                    )
+                ],
+            ),
+            candidate(
+                index=2,
+                model="model-c",
+                ok=False,
+                attempts=[
+                    physical(
+                        1,
+                        primary_c,
+                        "openrouter:model-c",
+                        "failed",
+                    )
+                ],
+            ),
+        ],
+        "proposer_recovery": {
+            "schema": module.FORMAL_PROPOSER_RECOVERY_SCHEMA,
+            "selection_plan_fingerprint": fingerprint,
+            "scope": "run_turn",
+            "scope_id": "scope-1",
+            "max_additional_physical_requests": 3,
+            "external_physical_requests_reserved": 0,
+            "additional_physical_requests_started": 1,
+            "remaining_additional_physical_requests": 2,
+            "quorum_required": 2,
+            "quorum_reached": True,
+            "cumulative_excluded_identities": [],
+            "visited_identities": [],
+            "executed_proposer_roster_before": list(selected),
+            "executed_proposer_roster_after": list(selected),
+            "attempts": [
+                {
+                    "sequence": 1,
+                    "slot_index": 0,
+                    "kind": "thinking_downgrade",
+                    "source_identity": selected[0],
+                    "target_identity": selected[0],
+                    "failure_kind": "reasoning_only_length",
+                    "reason": "reasoning_only_length",
+                    "thinking_before": "high",
+                    "thinking_after": "medium",
+                    "request_started": True,
+                    "physical_request_count": 1,
+                    "physical_attempt_id": recovered_a,
+                    "stream_closed": True,
+                    "usage_reported": True,
+                    "usage_missing_count": 0,
+                    "outcome": "succeeded",
+                }
+            ],
+        },
+    }
+    return call, plan
+
+
+def test_provider_native_proposer_recovery_binds_receipt_and_fingerprint(
+    module,
+) -> None:
+    call, plan = _provider_native_recovery_call(module)
+
+    final_identities, recovery_ids, reasons = (
+        module.proposer_recovery_execution_reasons(
+            call,
+            executed_plan=plan,
+        )
+    )
+
+    assert reasons == []
+    assert final_identities == {
+        0: "openrouter:model-a",
+        1: "openrouter:model-b",
+        2: "openrouter:model-c",
+    }
+    assert recovery_ids == {"b" * 32}
+
+
+def test_provider_native_backup_roster_is_reused_by_the_next_agent_call(
+    module,
+) -> None:
+    first, plan = _provider_native_recovery_call(module)
+    first_candidate = first["candidates"][0]
+    first_receipt = first["proposer_recovery"]
+    first_attempt = first_receipt["attempts"][0]
+    backup_identity = str(plan["backup_P"][0])
+    backup_model = backup_identity.partition(":")[2]
+    first_candidate.update(
+        {
+            "requested_model": backup_model,
+            "provider": "openrouter",
+            "model": backup_model,
+        }
+    )
+    first_candidate["execution"]["physical_attempts"][1][
+        "identity"
+    ] = backup_identity
+    first_attempt.update(
+        {
+            "kind": "backup_replacement",
+            "target_identity": backup_identity,
+            "reason": "frozen_backup_order",
+        }
+    )
+    first_attempt.pop("thinking_before")
+    first_attempt.pop("thinking_after")
+    first_receipt["visited_identities"] = [backup_identity]
+    first_receipt["executed_proposer_roster_after"][0] = backup_identity
+
+    first_final, _, first_reasons = (
+        module.proposer_recovery_execution_reasons(
+            first,
+            executed_plan=plan,
+        )
+    )
+    assert first_reasons == []
+    assert first_final[0] == backup_identity
+
+    second = deepcopy(first)
+    second_receipt = second["proposer_recovery"]
+    effective_roster = [
+        backup_identity,
+        "openrouter:model-b",
+        "openrouter:model-c",
+    ]
+    second_receipt["executed_proposer_roster_before"] = list(
+        effective_roster
+    )
+    second_receipt["executed_proposer_roster_after"] = list(
+        effective_roster
+    )
+    for candidate, attempt_id, identity, outcome in zip(
+        second["candidates"],
+        ("e" * 32, "f" * 32, "1" * 32),
+        effective_roster,
+        ("succeeded", "succeeded", "failed"),
+        strict=True,
+    ):
+        model = identity.partition(":")[2]
+        candidate.update(
+            {
+                "physical_request_count": 1,
+                "requested_provider": "openrouter",
+                "requested_model": model,
+                "provider": "openrouter" if outcome == "succeeded" else "",
+                "model": model if outcome == "succeeded" else "",
+            }
+        )
+        candidate["execution"]["physical_attempts"] = [
+            {
+                "attempt": 1,
+                "request_started": True,
+                "stream_closed": True,
+                "physical_attempt_id": attempt_id,
+                "identity": identity,
+                "outcome": outcome,
+            }
+        ]
+
+    second_final, second_recovery_ids, second_reasons = (
+        module.proposer_recovery_execution_reasons(
+            second,
+            executed_plan=plan,
+        )
+    )
+    assert second_reasons == []
+    assert second_final[0] == backup_identity
+    assert second_recovery_ids == set()
+
+    first["agent_call_index"] = 1
+    second["agent_call_index"] = 2
+    physical_models = (
+        ("a" * 32, "model-a"),
+        ("b" * 32, backup_model),
+        ("c" * 32, "model-b"),
+        ("d" * 32, "model-c"),
+        ("e" * 32, backup_model),
+        ("f" * 32, "model-b"),
+        ("1" * 32, "model-c"),
+    )
+
+    def usage_unit(
+        physical_attempt_id: str,
+        model: str,
+    ) -> dict[str, object]:
+        return {
+            "role": "proposer",
+            "provider": "openrouter",
+            "requested_provider": "openrouter",
+            "model": model,
+            "requested_model": model,
+            "request_count": 1,
+            "physical_attempt_id": physical_attempt_id,
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "reasoning_tokens": 0,
+            "cached_tokens": 0,
+            "cache_write_tokens": 0,
+            "billed_cost": 0.0,
+            "cost_source": "none",
+            "provider_usage": {
+                "physical_attempt_id": physical_attempt_id,
+            },
+        }
+
+    run = {
+        "llm_request_count": len(physical_models),
+        "physical_request_count": len(physical_models),
+        "ensemble_trace": {
+            "mode": "agent_loop",
+            "agent_llm_call_count": 2,
+            "untraced_agent_llm_call_count": 0,
+            "calls": [first, second],
+        },
+        "usage": {
+            "model_usage_breakdown": [
+                usage_unit(attempt_id, model)
+                for attempt_id, model in physical_models
+            ]
+        },
+    }
+    assert module.g1_thinking_physical_usage_binding_reasons(run) == []
+
+    tampered_continuity = deepcopy(run)
+    tampered_continuity["ensemble_trace"]["calls"][1][
+        "proposer_recovery"
+    ]["executed_proposer_roster_before"] = list(plan["selected_P"])
+    assert (
+        "proposer_recovery_roster_prefix_changed"
+        in module.g1_thinking_physical_usage_binding_reasons(
+            tampered_continuity
+        )
+    )
+
+    tampered_first_prefix = deepcopy(run)
+    tampered_first_prefix["ensemble_trace"]["calls"][0][
+        "proposer_recovery"
+    ]["executed_proposer_roster_before"] = list(effective_roster)
+    assert (
+        "proposer_recovery_roster_prefix_changed"
+        in module.g1_thinking_physical_usage_binding_reasons(
+            tampered_first_prefix
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_reason"),
+    [
+        ("fingerprint", "invalid_proposer_recovery_receipt"),
+        ("budget", "invalid_proposer_recovery_receipt"),
+        ("external_reserved", "invalid_proposer_recovery_receipt"),
+        ("chat_scope", "invalid_proposer_recovery_receipt"),
+        ("empty_scope", "invalid_proposer_recovery_receipt"),
+        ("usage", "invalid_proposer_recovery_attempt"),
+        ("skip_backup", "proposer_recovery_skipped_ordered_backup"),
+        (
+            "continued_after_quorum",
+            "proposer_recovery_continued_after_quorum",
+        ),
+    ],
+)
+def test_provider_native_proposer_recovery_fails_closed(
+    module,
+    mutation: str,
+    expected_reason: str,
+) -> None:
+    call, plan = _provider_native_recovery_call(module)
+    receipt = call["proposer_recovery"]
+    candidates = call["candidates"]
+    assert isinstance(receipt, dict)
+    assert isinstance(candidates, list)
+    attempts = receipt["attempts"]
+    assert isinstance(attempts, list)
+    if mutation == "fingerprint":
+        receipt["selection_plan_fingerprint"] = "0" * 64
+    elif mutation == "budget":
+        receipt["remaining_additional_physical_requests"] = 3
+    elif mutation == "external_reserved":
+        receipt["external_physical_requests_reserved"] = 1
+    elif mutation == "chat_scope":
+        receipt["scope"] = "chat"
+    elif mutation == "empty_scope":
+        receipt["scope_id"] = ""
+    elif mutation == "usage":
+        attempts[0]["usage_missing_count"] = 1
+    elif mutation == "skip_backup":
+        candidate = candidates[0]
+        candidate["requested_model"] = "model-e"
+        candidate["provider"] = "openrouter"
+        candidate["model"] = "model-e"
+        candidate["execution"]["physical_attempts"][1][
+            "identity"
+        ] = "openrouter:model-e"
+        attempts[0].update(
+            {
+                "kind": "backup_replacement",
+                "target_identity": "openrouter:model-e",
+            }
+        )
+        attempts[0].pop("thinking_before")
+        attempts[0].pop("thinking_after")
+        receipt["visited_identities"] = ["openrouter:model-e"]
+        receipt["executed_proposer_roster_after"][0] = (
+            "openrouter:model-e"
+        )
+    else:
+        candidate = candidates[2]
+        physical_rows = candidate["execution"]["physical_attempts"]
+        physical_rows.append(
+            {
+                "attempt": 2,
+                "request_started": True,
+                "stream_closed": True,
+                "physical_attempt_id": "e" * 32,
+                "identity": "openrouter:model-c",
+                "outcome": "failed",
+            }
+        )
+        candidate["physical_request_count"] = 2
+        attempts.append(
+            {
+                "sequence": 2,
+                "slot_index": 2,
+                "kind": "transient_retry",
+                "source_identity": "openrouter:model-c",
+                "target_identity": "openrouter:model-c",
+                "failure_kind": "timeout",
+                "reason": "transient_same_model_retry",
+                "backoff_s": 0.0,
+                "request_started": True,
+                "physical_request_count": 1,
+                "physical_attempt_id": "e" * 32,
+                "stream_closed": True,
+                "usage_reported": True,
+                "usage_missing_count": 0,
+                "outcome": "failed",
+            }
+        )
+        receipt["additional_physical_requests_started"] = 2
+        receipt["remaining_additional_physical_requests"] = 1
+
+    _, _, reasons = module.proposer_recovery_execution_reasons(
+        call,
+        executed_plan=plan,
+    )
+    assert expected_reason in reasons
+
+
+def test_provider_native_recovery_allows_unstarted_primary_then_backup(
+    module,
+) -> None:
+    call, plan = _provider_native_recovery_call(module)
+    candidate = call["candidates"][0]
+    receipt = call["proposer_recovery"]
+    attempt = receipt["attempts"][0]
+    backup_identity = plan["backup_P"][0]
+    candidate.update(
+        {
+            "physical_request_count": 1,
+            "requested_model": backup_identity.partition(":")[2],
+            "provider": "openrouter",
+            "model": backup_identity.partition(":")[2],
+        }
+    )
+    backup_physical = candidate["execution"]["physical_attempts"][1]
+    backup_physical.update(
+        {
+            "attempt": 1,
+            "identity": backup_identity,
+        }
+    )
+    candidate["execution"]["physical_attempts"] = [backup_physical]
+    attempt.update(
+        {
+            "kind": "backup_replacement",
+            "target_identity": backup_identity,
+            "reason": "frozen_backup_order",
+        }
+    )
+    attempt.pop("thinking_before")
+    attempt.pop("thinking_after")
+    receipt["visited_identities"] = [backup_identity]
+    receipt["executed_proposer_roster_after"][0] = backup_identity
+
+    final_identities, recovery_ids, reasons = (
+        module.proposer_recovery_execution_reasons(
+            call,
+            executed_plan=plan,
+        )
+    )
+
+    assert reasons == []
+    assert final_identities[0] == backup_identity
+    assert recovery_ids == {"b" * 32}
+    run = {
+        "llm_request_count": 3,
+        "ensemble_trace": call,
+        "usage": {
+            "model_usage_breakdown": [
+                {
+                    "role": "proposer",
+                    "provider": "openrouter",
+                    "requested_provider": "openrouter",
+                    "model": model,
+                    "requested_model": model,
+                    "request_count": 1,
+                    "physical_attempt_id": attempt_id,
+                    "input_tokens": 1,
+                    "output_tokens": 1,
+                    "reasoning_tokens": 0,
+                    "cached_tokens": 0,
+                    "cache_write_tokens": 0,
+                    "billed_cost": 0.0,
+                    "cost_source": "none",
+                    "provider_usage": {
+                        "physical_attempt_id": attempt_id,
+                    },
+                }
+                for attempt_id, model in (
+                    ("b" * 32, "model-d"),
+                    ("c" * 32, "model-b"),
+                    ("d" * 32, "model-c"),
+                )
+            ]
+        },
+    }
+    assert module.g1_thinking_physical_usage_binding_reasons(run) == []
+
+
+def test_provider_native_formal_quorum_is_two_for_five_proposers(
+    module,
+) -> None:
+    call, plan = _provider_native_recovery_call(module)
+    selected = list(plan["selected_P"]) + [
+        "openrouter:model-i",
+        "openrouter:model-j",
+    ]
+    plan["selected_P"] = selected
+    plan["proposer_models"] = [
+        identity.partition(":")[2] for identity in selected
+    ]
+    plan["proposer_sample_count"] = len(selected)
+    receipt = call["proposer_recovery"]
+    receipt["executed_proposer_roster_before"] = list(selected)
+    receipt["executed_proposer_roster_after"] = list(selected)
+    from opensquilla.provider.protocol import (
+        provider_retry_roster_fingerprint,
+    )
+
+    receipt["selection_plan_fingerprint"] = (
+        provider_retry_roster_fingerprint(plan)
+    )
+    for index, (model, attempt_id) in enumerate(
+        (("model-i", "e" * 32), ("model-j", "f" * 32)),
+        start=3,
+    ):
+        call["candidates"].append(
+            {
+                "index": index,
+                "ok": False,
+                "request_started": True,
+                "physical_request_count": 1,
+                "usage_reported": True,
+                "usage_missing_count": 0,
+                "requested_provider": "openrouter",
+                "requested_model": model,
+                "provider": "",
+                "model": "",
+                "content": {"text": "", "chars": 0, "truncated": False},
+                "execution": {
+                    "physical_attempts": [
+                        {
+                            "attempt": 1,
+                            "request_started": True,
+                            "stream_closed": True,
+                            "physical_attempt_id": attempt_id,
+                            "identity": f"openrouter:{model}",
+                            "outcome": "failed",
+                        }
+                    ]
+                },
+            }
+        )
+    call["total_candidates"] = 5
+
+    reasons = module.ensemble_physical_call_reasons(
+        call,
+        expected_proposers=plan["proposer_models"],
+        expected_aggregator="model-f",
+        final_text="",
+        require_output_binding=False,
+    )
+    assert "proposer_quorum_not_met" not in reasons
+    assert "insufficient_actual_proposer_quorum" not in reasons
+
+    one_success = deepcopy(call)
+    one_success["successful_proposers"] = 1
+    one_success["proposer_recovery"]["quorum_reached"] = False
+    failed_second = one_success["candidates"][1]
+    failed_second.update(
+        {
+            "ok": False,
+            "provider": "",
+            "model": "",
+            "content": {"text": "", "chars": 0, "truncated": False},
+        }
+    )
+    failed_second["execution"]["physical_attempts"][0][
+        "outcome"
+    ] = "failed"
+    one_success_reasons = module.ensemble_physical_call_reasons(
+        one_success,
+        expected_proposers=plan["proposer_models"],
+        expected_aggregator="model-f",
+        final_text="",
+        require_output_binding=False,
+    )
+    assert "proposer_quorum_not_met" in one_success_reasons
+    assert "insufficient_actual_proposer_quorum" in one_success_reasons
+
+
+def test_provider_native_recovery_usage_is_bound_exactly_once(
+    module,
+) -> None:
+    call, _ = _provider_native_recovery_call(module)
+
+    def usage_unit(
+        attempt_id: str,
+        model: str,
+    ) -> dict[str, object]:
+        return {
+            "role": "proposer",
+            "provider": "openrouter",
+            "requested_provider": "openrouter",
+            "model": model,
+            "requested_model": model,
+            "request_count": 1,
+            "physical_attempt_id": attempt_id,
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "reasoning_tokens": 0,
+            "cached_tokens": 0,
+            "cache_write_tokens": 0,
+            "billed_cost": 0.0,
+            "cost_source": "none",
+            "provider_usage": {
+                "physical_attempt_id": attempt_id,
+            },
+        }
+
+    run = {
+        "llm_request_count": 4,
+        "ensemble_trace": call,
+        "usage": {
+            "model_usage_breakdown": [
+                usage_unit("a" * 32, "model-a"),
+                usage_unit("b" * 32, "model-a"),
+                usage_unit("c" * 32, "model-b"),
+                usage_unit("d" * 32, "model-c"),
+            ]
+        },
+    }
+
+    assert module.g1_thinking_physical_usage_binding_reasons(run) == []
+
+    missing_recovery_usage = deepcopy(run)
+    missing_recovery_usage["usage"]["model_usage_breakdown"].pop(1)
+    assert (
+        "g1_thinking_physical_usage_set_mismatch"
+        in module.g1_thinking_physical_usage_binding_reasons(
+            missing_recovery_usage
+        )
+    )
+
+    duplicate_recovery_usage = deepcopy(run)
+    duplicate_recovery_usage["usage"]["model_usage_breakdown"].append(
+        usage_unit("b" * 32, "model-a")
+    )
+    assert (
+        "g1_thinking_physical_usage_set_mismatch"
+        in module.g1_thinking_physical_usage_binding_reasons(
+            duplicate_recovery_usage
+        )
+    )
+
+
+def test_provider_native_lifecycle_forbids_outer_generation_replay(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    call, plan = _provider_native_recovery_call(module)
+
+    def usage_unit(
+        attempt_id: str,
+        model: str,
+    ) -> dict[str, object]:
+        return {
+            "role": "proposer",
+            "provider": "openrouter",
+            "requested_provider": "openrouter",
+            "model": model,
+            "requested_model": model,
+            "request_count": 1,
+            "physical_attempt_id": attempt_id,
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "reasoning_tokens": 0,
+            "cached_tokens": 0,
+            "cache_write_tokens": 0,
+            "billed_cost": 0.0,
+            "cost_source": "none",
+            "provider_usage": {
+                "physical_attempt_id": attempt_id,
+            },
+        }
+
+    usage = {
+        "model_usage_breakdown": [
+            usage_unit("a" * 32, "model-a"),
+            usage_unit("b" * 32, "model-a"),
+            usage_unit("c" * 32, "model-b"),
+            usage_unit("d" * 32, "model-c"),
+        ]
+    }
+    run = {
+        "final_text_sha256": "selected-answer",
+        "llm_request_count": 4,
+        "routing_trace": {"selection_plan": deepcopy(plan)},
+        "ensemble_trace": deepcopy(call),
+        "usage": deepcopy(usage),
+    }
+    attempt = {
+        "attempt_id": "1" * 32,
+        "attempt_kind": "generation",
+        "attempt": 1,
+        "retryable": False,
+        "retry_reason": "",
+        "retry_suppressed_reason": "",
+        "will_retry": False,
+        "retry_backoff_s": 0.0,
+        "proposer_recovery_owner": "provider",
+        "selection_plan": deepcopy(plan),
+        "deterministic_proposer_failures": [],
+        "excluded_proposer_identities": [],
+        "run": run,
+    }
+    row = {
+        "group": "G1",
+        "task_id": "task-1",
+        "final_text_sha256": "selected-answer",
+        "usage": deepcopy(usage),
+        "routing_trace": {"selection_plan": deepcopy(plan)},
+        "ensemble_trace": deepcopy(call),
+        "execution": {"generation_attempts": [attempt]},
+    }
+
+    def fake_plan_reasons(
+        value,
+        *,
+        contract,
+        allow_legacy_managed_v3=False,
+    ):
+        del contract, allow_legacy_managed_v3
+        return (
+            [],
+            tuple(value.get("proposer_models") or []),
+            str(value.get("aggregator_model") or ""),
+        )
+
+    monkeypatch.setattr(
+        module,
+        "g1_registry_plan_reasons",
+        fake_plan_reasons,
+    )
+    _, evidence, reasons = module._adaptive_g1_lifecycle_routing(
+        row,
+        registry={},
+        physical_plans=(plan,),
+        initial_reasons=(),
+    )
+    assert reasons == []
+    assert evidence["validated_provider_native_receipt_count"] == 1
+
+    replayed = deepcopy(row)
+    first_attempt = replayed["execution"]["generation_attempts"][0]
+    first_attempt["run"]["final_text_sha256"] = "discarded-answer"
+    second_attempt = deepcopy(attempt)
+    second_attempt["attempt_id"] = "2" * 32
+    second_attempt["attempt"] = 2
+    replayed["execution"]["generation_attempts"].append(second_attempt)
+    _, _, replay_reasons = module._adaptive_g1_lifecycle_routing(
+        replayed,
+        registry={},
+        physical_plans=(plan,),
+        initial_reasons=(),
+    )
+    assert "g1_provider_native_outer_retry_forbidden" in replay_reasons
+
+
+def _g1_routes() -> dict[str, str]:
+    """Return a small formal pool with room for P, backup_P, and A fallbacks."""
+
+    return {
+        "deepseek/deepseek-v4-pro": "deepseek",
+        "z-ai/glm-5.2": "z-ai",
+        "qwen/qwen3.7-max": "alibaba",
+        "moonshotai/kimi-k2.7-code": "moonshotai",
+        "anthropic/claude-sonnet-5": "anthropic",
+        "openai/gpt-5.5": "openai",
+        "google/gemini-3.1-pro-preview": "google-ai-studio",
+        "deepseek/deepseek-v4-flash": "deepseek",
+    }
 
 
 def _contract(module, group: str, key_hash: str) -> dict[str, object]:
@@ -1293,7 +2139,10 @@ def _contract(module, group: str, key_hash: str) -> dict[str, object]:
             "base_url": "https://openrouter.ai/api/v1",
             "base_url_from_env": False,
             "proxy": "",
-            "provider_routing": dict(module.FORMAL_UPSTREAM_PINS),
+            "provider_routing": {
+                **dict(module.FORMAL_UPSTREAM_PINS),
+                **(_g1_routes() if group == "G1" else {}),
+            },
             "provider_routing_strict": True,
             "stream_error_frames": True,
             "router_metadata_required": True,
@@ -1391,11 +2240,7 @@ def _contract(module, group: str, key_hash: str) -> dict[str, object]:
             }
         }
     if group == "G1":
-        routes = {
-            "deepseek/deepseek-v4-pro": "deepseek",
-            "z-ai/glm-5.2": "z-ai",
-            "qwen/qwen3.7-max": "alibaba",
-        }
+        routes = _g1_routes()
         contract["g1_registry_contract"] = {
             "profile_id": "test-g1",
             "selection_mode": "router_dynamic",
@@ -1502,11 +2347,7 @@ def _g1_plan(module, proposers: list[str], aggregator: str) -> dict[str, object]
         rank_models,
     )
 
-    routes = {
-        "deepseek/deepseek-v4-pro": "deepseek",
-        "z-ai/glm-5.2": "z-ai",
-        "qwen/qwen3.7-max": "alibaba",
-    }
+    routes = _g1_routes()
     routes_hash = module.canonical_sha256(routes)
     identities = [f"openrouter:{model}" for model in routes]
     version = f"test-registry-v1+test-g1+{routes_hash[:12]}"
@@ -1554,6 +2395,11 @@ def _g1_plan(module, proposers: list[str], aggregator: str) -> dict[str, object]
         routing_confidence=0.9,
         ranking_config=ranking_config,
         decision_id="test-g1-decision",
+        proposer_backup_count=2,
+        proposer_recovery_max_additional_calls=3,
+        proposer_max_tokens_cap=65_536,
+        proposer_visible_answer_reserve_tokens=4_096,
+        proposer_recovery_quorum=2,
     )
     plan = deepcopy(decision.trace)
     selected_proposers = [str(identity).partition(":")[2] for identity in plan["selected_P"]]
@@ -1563,6 +2409,9 @@ def _g1_plan(module, proposers: list[str], aggregator: str) -> dict[str, object]
             "selection_mode": "router_dynamic",
             "proposer_models": selected_proposers,
             "proposer_sample_count": len(selected_proposers),
+            "configured_min_successful_proposers": 2,
+            "effective_min_successful_proposers": 2,
+            "legal_min_successful_proposers": 2,
             "aggregator_model": selected_aggregator,
             **module.FORMAL_AGGREGATOR_RECOVERY_POLICY,
             "candidate_allowlist": {
@@ -1574,13 +2423,136 @@ def _g1_plan(module, proposers: list[str], aggregator: str) -> dict[str, object]
                 ),
                 "filtered_registry_snapshot_version": version,
                 "expected_routes_sha256": routes_hash,
-                "expected_candidate_count": 3,
-                "candidate_count": 3,
+                "expected_candidate_count": len(routes),
+                "candidate_count": len(routes),
                 "expected_identities": identities,
             },
         }
     )
     return plan
+
+
+def _formalize_provider_native_call(
+    module,
+    call: dict[str, object],
+    plan: dict[str, object],
+    *,
+    scope_id: str,
+) -> list[tuple[str, str, str]]:
+    """Attach one exact provider-owned recovery and physical usage ledger."""
+
+    from opensquilla.provider.protocol import (
+        provider_retry_roster_fingerprint,
+    )
+
+    call["selection_plan"] = deepcopy(plan)
+    selected = [str(identity) for identity in plan["selected_P"]]
+    candidates = call["candidates"]
+    assert isinstance(candidates, list)
+    assert len(candidates) == len(selected)
+    physical_units: list[tuple[str, str, str]] = []
+    for index, (candidate, identity) in enumerate(
+        zip(candidates, selected, strict=True)
+    ):
+        assert isinstance(candidate, dict)
+        provider, separator, model = identity.partition(":")
+        assert separator and provider and model
+        physical_id = _physical_attempt_id(
+            f"{scope_id}:proposer:{index}:{identity}"
+        )
+        candidate.update(
+            {
+                "index": index,
+                "provider": provider,
+                "model": model,
+                "requested_provider": provider,
+                "requested_model": model,
+                "usage_reported": True,
+                "usage_missing_count": 0,
+                "execution": {
+                    "actual_provider": provider,
+                    "actual_model": model,
+                    "requested_provider": provider,
+                    "requested_model": model,
+                    "physical_attempts": [
+                        {
+                            "attempt": 1,
+                            "request_started": True,
+                            "stream_closed": True,
+                            "physical_attempt_id": physical_id,
+                            "identity": identity,
+                            "outcome": "succeeded",
+                        }
+                    ],
+                },
+            }
+        )
+        physical_units.append((physical_id, model, "proposer"))
+
+    call["proposer_recovery"] = {
+        "schema": module.FORMAL_PROPOSER_RECOVERY_SCHEMA,
+        "selection_plan_fingerprint": provider_retry_roster_fingerprint(plan),
+        "scope": "run_turn",
+        "scope_id": scope_id,
+        "max_additional_physical_requests": 3,
+        "external_physical_requests_reserved": 0,
+        "additional_physical_requests_started": 0,
+        "remaining_additional_physical_requests": 3,
+        "quorum_required": 2,
+        "quorum_reached": call.get("successful_proposers", 0) >= 2,
+        "cumulative_excluded_identities": [],
+        "visited_identities": [],
+        "executed_proposer_roster_before": list(selected),
+        "executed_proposer_roster_after": list(selected),
+        "attempts": [],
+    }
+
+    recovery = call["aggregator_recovery"]
+    assert isinstance(recovery, dict)
+    attempts = recovery["attempts"]
+    assert isinstance(attempts, list)
+    for position, attempt in enumerate(attempts, start=1):
+        assert isinstance(attempt, dict)
+        if attempt.get("request_started") is not True:
+            attempt.pop("physical_attempt_id", None)
+            continue
+        provider = str(attempt["requested_provider"])
+        model = str(attempt["requested_model"])
+        physical_id = _physical_attempt_id(
+            f"{scope_id}:aggregator:{position}:{provider}:{model}"
+        )
+        attempt.update(
+            {
+                "physical_request_count": 1,
+                "physical_attempt_id": physical_id,
+                "stream_closed": True,
+            }
+        )
+        physical_units.append((physical_id, model, "aggregator"))
+
+    selected_attempt = recovery["selected_attempt"]
+    selected_rows = [
+        attempt
+        for attempt in attempts
+        if isinstance(attempt, dict)
+        and attempt.get("attempt") == selected_attempt
+        and attempt.get("request_started") is True
+        and attempt.get("outcome") == "succeeded"
+    ]
+    assert len(selected_rows) == 1
+    selected_id = str(selected_rows[0]["physical_attempt_id"])
+    final_request = call["final_request"]
+    assert isinstance(final_request, dict)
+    final_usage = final_request["usage"]
+    assert isinstance(final_usage, dict)
+    final_usage["physical_attempt_id"] = selected_id
+    final_usage["provider_usage"] = {
+        "physical_attempt_id": selected_id,
+    }
+    started_count = len(physical_units)
+    call["llm_request_count"] = started_count
+    call["physical_request_count"] = started_count
+    return physical_units
 
 
 def _row(
@@ -1607,15 +2579,7 @@ def _row(
     )
     generation_units = [generation_receipt]
     if group == "G1":
-        analyzer_receipt = _receipt(
-            f"{response_prefix}-task-analyzer",
-            module.B0_MODEL,
-            exact=exact,
-        )
-        analyzer_receipt["role"] = "task_analyzer"
-        generation_units.insert(0, analyzer_receipt)
-    generation_request_count = len(generation_units)
-    generation_cost = 0.1 * generation_request_count
+        generation_units = []
     final_text = f"answer for {group}"
     routing_trace: dict[str, object]
     ensemble_trace: dict[str, object]
@@ -1656,22 +2620,73 @@ def _row(
             "z-ai/glm-5.2",
         ]
         plan = _g1_plan(module, proposers, model)
+        selected_proposers = [str(value) for value in plan["proposer_models"]]
+        selected_aggregator = str(plan["aggregator_model"])
         routing_trace = {
             "kind": "selection_mode",
             "selection_mode": "router_dynamic",
             "selection_plan": plan,
         }
         ensemble_trace = _ensemble_trace(
-            proposers,
-            model,
+            selected_proposers,
+            selected_aggregator,
             final_text=final_text,
             selection_mode="router_dynamic",
         )
         call = ensemble_trace["calls"][0]
+        assert isinstance(call, dict)
         call["selection_plan"] = deepcopy(plan)
         recovery = call["aggregator_recovery"]
+        assert isinstance(recovery, dict)
         recovery["candidate_ids"] = list(plan["aggregator_candidates"])
         recovery["candidate_count"] = len(plan["aggregator_candidates"])
+        physical_units = _formalize_provider_native_call(
+            module,
+            call,
+            plan,
+            scope_id=f"{response_prefix}-run-turn",
+        )
+        analyzer_id = _physical_attempt_id(
+            f"{response_prefix}:task-analyzer"
+        )
+        analyzer_receipt = _receipt(
+            f"{response_prefix}-task-analyzer",
+            module.B0_MODEL,
+            exact=exact,
+        )
+        analyzer_receipt.update(
+            {
+                "role": "task_analyzer",
+                "physical_attempt_id": analyzer_id,
+            }
+        )
+        analyzer_provider_usage = analyzer_receipt["provider_usage"]
+        assert isinstance(analyzer_provider_usage, dict)
+        analyzer_provider_usage["physical_attempt_id"] = analyzer_id
+        generation_units.append(analyzer_receipt)
+        for index, (physical_id, physical_model, role) in enumerate(
+            physical_units
+        ):
+            receipt = _receipt(
+                f"{response_prefix}-generation-{index}",
+                physical_model,
+                exact=exact,
+            )
+            receipt.update(
+                {
+                    "role": role,
+                    "physical_attempt_id": physical_id,
+                }
+            )
+            provider_usage = receipt["provider_usage"]
+            assert isinstance(provider_usage, dict)
+            provider_usage["physical_attempt_id"] = physical_id
+            generation_units.append(receipt)
+    generation_request_count = len(generation_units)
+    generation_cost = sum(
+        float(unit.get("billed_cost") or 0.0)
+        for unit in generation_units
+    )
     rubric = task["rubric"]
     criteria = rubric["sections"][0]["criteria"]
     judgments = []
@@ -1911,6 +2926,7 @@ def test_ensemble_gate_allows_only_empty_nonterminal_fallback(module) -> None:
         module.admissible_empty_nonterminal_fallback_reasons(
             boolean_chars["ensemble_trace"]["calls"][0],
             expected_proposers=module.B2_PROPOSERS,
+            executed_plan=terminal["selection_plan"],
         )
     )
 
@@ -1964,6 +2980,42 @@ def test_ensemble_gate_allows_only_empty_nonterminal_fallback(module) -> None:
     )
 
 
+def test_nonterminal_fallback_uses_the_executed_recovery_quorum(
+    module,
+) -> None:
+    proposers = [f"model-{index}" for index in range(5)]
+    terminal = _ensemble_trace(
+        proposers,
+        "model-aggregator",
+        final_text="final answer",
+        selection_mode="router_dynamic",
+    )["calls"][0]
+    fallback = _nonterminal_fallback_call(terminal, successful=2)
+    legacy_plan = terminal["selection_plan"]
+
+    assert (
+        "invalid_intermediate_fallback_quorum"
+        not in module.admissible_empty_nonterminal_fallback_reasons(
+            fallback,
+            expected_proposers=proposers,
+            executed_plan=legacy_plan,
+        )
+    )
+
+    formal_plan = deepcopy(legacy_plan)
+    formal_plan["proposer_recovery_policy"] = deepcopy(
+        module.FORMAL_PROPOSER_RECOVERY_POLICY
+    )
+    assert (
+        "invalid_intermediate_fallback_quorum"
+        in module.admissible_empty_nonterminal_fallback_reasons(
+            fallback,
+            expected_proposers=proposers,
+            executed_plan=formal_plan,
+        )
+    )
+
+
 @pytest.mark.parametrize("fallback_index", [1, 2])
 def test_g1_ensemble_gate_accepts_only_frozen_ranked_aggregator_fallbacks(
     module,
@@ -1986,6 +3038,7 @@ def test_g1_ensemble_gate_accepts_only_frozen_ranked_aggregator_fallbacks(
     )
     final_text = "ranked fallback answer"
     call = _ranked_aggregator_fallback_call(
+        module,
         plan,
         final_text=final_text,
         fallback_index=fallback_index,
@@ -2012,11 +3065,7 @@ def test_g1_ensemble_gate_accepts_only_frozen_ranked_aggregator_fallbacks(
             row,
             expected_proposers=plan["proposer_models"],
             expected_aggregator=primary_model,
-            allowed_models={
-                "deepseek/deepseek-v4-pro",
-                "z-ai/glm-5.2",
-                "qwen/qwen3.7-max",
-            },
+            allowed_models=set(_g1_routes()),
         )
         == []
     )
@@ -2042,6 +3091,7 @@ def test_formal_continuation_fallback_contract(
     )
     final_text = "assembled continuation fallback answer"
     call = _ranked_aggregator_fallback_call(
+        module,
         plan,
         final_text=final_text,
         fallback_index=1,
@@ -2182,8 +3232,16 @@ def test_formal_recovery_request_conservation_allows_nested_physical_usage(modul
         ],
         "z-ai/glm-5.2",
     )
+    for field in (
+        "backup_P",
+        "configured_proposer_backup_count",
+        "effective_proposer_backup_count",
+        "proposer_recovery_policy",
+    ):
+        plan.pop(field, None)
     final_text = "nested provider answer"
     call = _ranked_aggregator_fallback_call(
+        module,
         plan,
         final_text=final_text,
         fallback_index=1,
@@ -2241,6 +3299,7 @@ def test_g1_ensemble_gate_rejects_forged_or_semantic_aggregator_fallback(
     )
     final_text = "ranked fallback answer"
     call = _ranked_aggregator_fallback_call(
+        module,
         plan,
         final_text=final_text,
         fallback_index=2 if mutation == "skip_top2" else 1,
@@ -2890,6 +3949,92 @@ def test_adaptive_g1_lifecycle_audits_serialized_prior_attempt_trace(
     assert module._g1_reasoning_only_length_failure_identities(
         serialized["execution"]["generation_attempts"][0]["run"]
     ) == {failed_identity}
+
+    default_off_retry = deepcopy(serialized)
+
+    def disable_managed_thinking(value):
+        if isinstance(value, dict):
+            if "decision_id" in value and "selected_P" in value:
+                value["ranking_thinking_assignment_enabled"] = False
+                for field in (
+                    "executed_thinking_assignment",
+                    "thinking_execution_fallbacks",
+                    "thinking_assignment_details",
+                ):
+                    value.pop(field, None)
+            for child in value.values():
+                disable_managed_thinking(child)
+        elif isinstance(value, list):
+            for child in value:
+                disable_managed_thinking(child)
+
+    disable_managed_thinking(default_off_retry)
+    default_off_retry["execution"]["generation_attempts"][0].pop(
+        "thinking_execution_projection"
+    )
+    default_off_routing, _, default_off_reasons = (
+        module.effective_g1_lifecycle_routing(
+            default_off_retry,
+            contract={"g1_registry_contract": {}},
+        )
+    )
+    assert default_off_reasons == []
+    assert (
+        default_off_routing["selection_plan"][
+            "ranking_thinking_assignment_enabled"
+        ]
+        is False
+    )
+
+    managed_retry_downgrade = deepcopy(serialized)
+    managed_retry_downgrade["execution"]["generation_attempts"][0][
+        "retry_selection_plan"
+    ]["ranking_thinking_assignment_enabled"] = False
+    assert any(
+        reason.startswith("invalid_g1_thinking_execution_projection:")
+        for reason in module.effective_g1_lifecycle_routing(
+            managed_retry_downgrade,
+            contract={"g1_registry_contract": {}},
+        )[2]
+    )
+
+    default_off_reuse_tamper = deepcopy(default_off_retry)
+    default_off_reuse_tamper["execution"]["generation_attempts"][0][
+        "retry_selection_plan"
+    ].pop("task_analysis_reuse")
+    assert (
+        "missing_g1_retry_task_analysis_binding"
+        in module.effective_g1_lifecycle_routing(
+            default_off_reuse_tamper,
+            contract={"g1_registry_contract": {}},
+        )[2]
+    )
+
+    default_off_exclusion_tamper = deepcopy(default_off_retry)
+    default_off_exclusion_tamper["execution"]["generation_attempts"][1][
+        "excluded_proposer_identities"
+    ] = []
+    assert (
+        "wrong_g1_retry_exclusion_evolution"
+        in module.effective_g1_lifecycle_routing(
+            default_off_exclusion_tamper,
+            contract={"g1_registry_contract": {}},
+        )[2]
+    )
+
+    default_off_physical_plan_tamper = deepcopy(default_off_retry)
+    default_off_physical_plan_tamper["execution"]["generation_attempts"][0][
+        "run"
+    ]["ensemble_trace"]["selection_plan"]["decision_id"] = (
+        "default-off-tampered-physical"
+    )
+    assert (
+        "g1_attempt_selection_plan_differs_from_physical_plan"
+        in module.effective_g1_lifecycle_routing(
+            default_off_physical_plan_tamper,
+            contract={"g1_registry_contract": {}},
+        )[2]
+    )
 
     fallback_success = deepcopy(serialized)
     physical_fallback_plan = fallback_success["execution"]["generation_attempts"][1]["run"][
@@ -4058,7 +5203,7 @@ def _campaign(
             "captured_at": "1970-01-01T00:20:30+00:00",
             "api_key_sha256": key_hash,
             "benchmark_environment_key_verified": True,
-            "usage": "13.6",
+            "usage": "13.9",
             "byok_usage": "0",
             "is_free_tier": False,
         },
@@ -4073,7 +5218,7 @@ def _campaign(
     stable = [
         {
             "captured_at": (f"1970-01-01T00:{17 + offset // 60:02d}:{offset % 60:02d}+00:00"),
-            "usage": "13.6",
+            "usage": "13.9",
             "byok_usage": "0",
         }
         for offset in stable_offsets
@@ -4086,8 +5231,8 @@ def _campaign(
             "settlement_status": "stable",
             "api_key_sha256": key_hash,
             "usage_before_usd": "10",
-            "usage_after_usd": "13.6",
-            "usage_delta_usd": "3.6",
+            "usage_after_usd": "13.9",
+            "usage_delta_usd": "3.9",
             "byok_usage_before_usd": "0",
             "byok_usage_after_usd": "0",
             "byok_usage_delta_usd": "0",
@@ -4155,13 +5300,13 @@ def _g1_only_campaign(
         }
         _owner_json(manifest_path, manifest)
 
-    usage_after = "10.8"
+    usage_after = "11.1"
     after = json.loads(args.account_after.read_text())
     after["usage"] = usage_after
     _owner_json(args.account_after, after)
     reconciliation = json.loads(args.account_reconciliation.read_text())
     reconciliation["usage_after_usd"] = usage_after
-    reconciliation["usage_delta_usd"] = "0.8"
+    reconciliation["usage_delta_usd"] = "1.1"
     for observation in reconciliation["stable_observations"]:
         observation["usage"] = usage_after
     _owner_json(args.account_reconciliation, reconciliation)
@@ -4264,7 +5409,7 @@ def _bind_prior_campaign_window(
         module,
         args,
         tmp_path,
-        before_usage="6.4",
+        before_usage="6.1",
         suffix="prior-campaign",
     )
     prior_reconciliation_path = prior / "openrouter-account-reconciliation.json"
@@ -4357,12 +5502,12 @@ def test_prior_campaign_window_reconciles_physical_first_sources(
         "current",
     ]
     assert proof["result_row_account_window_scope"] == "campaign_windows"
-    assert proof["account"]["campaign_usage_delta_usd"] == "3.6"
+    assert proof["account"]["campaign_usage_delta_usd"] == "3.9"
     assert proof["account"]["campaign_window_count"] == 2
     scope = proof["cost_scope"]
-    assert scope["campaign_bound_account_window_total_usd"] == "3.6"
+    assert scope["campaign_bound_account_window_total_usd"] == "3.9"
     assert scope["campaign_attributable_exact"] is True
-    assert scope["campaign_attributable_cost_usd"] == "3.6"
+    assert scope["campaign_attributable_cost_usd"] == "3.9"
 
     coverage = proof["window"]["source_window_coverage"]
     assert [
@@ -4384,12 +5529,12 @@ def test_prior_campaign_window_reconciles_physical_first_sources(
         "account_window_path": str(prior.resolve()),
         "account_window_kind": "prior_campaign",
         "source_indexes": [0],
-        "physical_request_count": 36,
-        "ledger_recorded_cost_usd": "3.600000000",
-        "ledger_exact_cost_usd": "3.600000000",
+        "physical_request_count": 39,
+        "ledger_recorded_cost_usd": "3.900000000",
+        "ledger_exact_cost_usd": "3.900000000",
         "unknown_cost_request_count": 0,
         "non_exact_cost_request_count": 0,
-        "account_usage_delta_usd": "3.6",
+        "account_usage_delta_usd": "3.9",
         "reconciliation_gap_usd": "0E-9",
         "reconciliation_status": "exact",
     }
@@ -4411,7 +5556,7 @@ def test_prior_campaign_window_reconciles_physical_first_sources(
         json.loads(line)
         for line in (args.output_dir / "actual-spend-ledger.jsonl").read_text().splitlines()
     ]
-    assert len(ledger) == 36
+    assert len(ledger) == 39
     assert {
         (
             row["physical_source"]["source_index"],
@@ -4424,12 +5569,12 @@ def test_prior_campaign_window_reconciles_physical_first_sources(
     }
 
     report = (args.output_dir / "EXPERIMENT_RESULTS.md").read_text()
-    assert "Generation disposition 成本：selected=$0.600000000" in report
-    assert "账本已记录成本：$3.600000000" in report
-    assert "Campaign-bound OpenRouter account delta：$3.6" in report
-    assert "prior_campaign=36 requests/$3.6/exact" in report
+    assert "Generation disposition 成本：selected=$0.900000000" in report
+    assert "账本已记录成本：$3.900000000" in report
+    assert "Campaign-bound OpenRouter account delta：$3.9" in report
+    assert "prior_campaign=39 requests/$3.9/exact" in report
     assert "current=0 requests/$0/exact" in report
-    assert manifest["cost_attribution"]["campaign_bound_account_window_total_usd"] == "3.6"
+    assert manifest["cost_attribution"]["campaign_bound_account_window_total_usd"] == "3.9"
 
 
 @pytest.mark.parametrize(
@@ -4541,11 +5686,11 @@ def test_full_offline_finalization_is_atomic_and_preserves_contracts(
     ledger = [
         json.loads(line) for line in (output / "actual-spend-ledger.jsonl").read_text().splitlines()
     ]
-    # Six physical generation requests (G1 includes its analyzer) plus thirty
+    # Nine physical generation requests (G1 includes its analyzer) plus thirty
     # (2 criteria x 3 repeats)
     # physical Judge requests.
     # The repair wave repeats both but must not double-count them.
-    assert len(ledger) == 36
+    assert len(ledger) == 39
     generation_rows = [row for row in ledger if "generation" in row["scopes"]]
     assert {row["generation_disposition"] for row in generation_rows} == {"selected"}
     audit = json.loads((output / "audit.json").read_text())
@@ -4571,10 +5716,10 @@ def test_full_offline_finalization_is_atomic_and_preserves_contracts(
     assert "修复动作明细" in report
     proof = json.loads((output / "openrouter-non-byok-campaign-proof.json").read_text())
     assert proof["cost_scope"]["campaign_attributable_exact"] is True
-    assert proof["cost_scope"]["campaign_attributable_cost_usd"] == "3.6"
+    assert proof["cost_scope"]["campaign_attributable_cost_usd"] == "3.9"
     assert proof["cost_scope"]["attribution_precision"] == "campaign-attributable-exact"
     assert [window["kind"] for window in proof["account_windows"]] == ["current"]
-    assert proof["account_window_total_usd"] == "3.6"
+    assert proof["account_window_total_usd"] == "3.9"
     assert proof["unallocated_aborted_window_usd"] == "0"
 
 
@@ -4638,7 +5783,7 @@ def test_g1_only_finalization_scopes_all_formal_outputs(
     assert manifest["paired_quality_comparisons"] == []
     assert manifest["openrouter_non_byok_campaign_proof_sha256"] == proof["proof_sha256"]
     assert [row["group"] for row in rows] == ["G1"]
-    assert len(ledger) == 8
+    assert len(ledger) == 11
     assert {
         reference["group"]
         for ledger_row in ledger
@@ -4658,12 +5803,12 @@ def test_g1_only_finalization_scopes_all_formal_outputs(
             "account_window_path": str(tmp_path.resolve()),
             "account_window_kind": "current",
             "source_indexes": [0, 1],
-            "physical_request_count": 8,
-            "ledger_recorded_cost_usd": "0.800000000",
-            "ledger_exact_cost_usd": "0.800000000",
+            "physical_request_count": 11,
+            "ledger_recorded_cost_usd": "1.100000000",
+            "ledger_exact_cost_usd": "1.100000000",
             "unknown_cost_request_count": 0,
             "non_exact_cost_request_count": 0,
-            "account_usage_delta_usd": "0.8",
+            "account_usage_delta_usd": "1.1",
             "reconciliation_gap_usd": "0E-9",
             "reconciliation_status": "exact",
         }
@@ -4755,7 +5900,7 @@ def test_prior_aborted_account_window_is_preserved_without_fake_ledger_rows(
         "prior_aborted",
         "current",
     ]
-    assert scope["account_window_total_usd"] == "8.198438756"
+    assert scope["account_window_total_usd"] == "8.498438756"
     assert scope["unallocated_aborted_window_usd"] == "4.598438756"
     assert (
         scope["attribution_precision"] == "multi-window-counter-exact-campaign-attribution-unproven"
@@ -4767,9 +5912,9 @@ def test_prior_aborted_account_window_is_preserved_without_fake_ledger_rows(
         json.loads(line)
         for line in (args.output_dir / "actual-spend-ledger.jsonl").read_text().splitlines()
     ]
-    assert len(ledger) == 36
+    assert len(ledger) == 39
     assert manifest["cost_attribution"]["account_windows"] == scope["account_windows"]
-    assert manifest["cost_attribution"]["account_window_total_usd"] == "8.198438756"
+    assert manifest["cost_attribution"]["account_window_total_usd"] == "8.498438756"
     audit = json.loads((args.output_dir / "audit.json").read_text())
     assert audit["selected_generation_cost"]["unallocated_aborted_window_usd"] == ("4.598438756")
     report = (args.output_dir / "EXPERIMENT_RESULTS.md").read_text()
@@ -4987,7 +6132,7 @@ def test_prior_account_window_delta_is_not_hard_coded(
         os.close(lock_fd)
     proof = json.loads((args.output_dir / "openrouter-non-byok-campaign-proof.json").read_text())
     assert proof["unallocated_aborted_window_usd"] == "4"
-    assert proof["account_window_total_usd"] == "7.6"
+    assert proof["account_window_total_usd"] == "7.9"
     assert proof["cost_scope"]["campaign_attributable_exact"] is False
 
 
@@ -4999,9 +6144,9 @@ def test_unverified_receipt_is_resolved_only_by_campaign_proof(module, tmp_path:
         os.close(lock_fd)
     proof = json.loads((args.output_dir / "openrouter-non-byok-campaign-proof.json").read_text())
     assert proof["pass"] is True
-    assert proof["local_physical_request_evidence"]["unverified_request_count"] == 36
+    assert proof["local_physical_request_evidence"]["unverified_request_count"] == 39
     assert (
-        proof["local_physical_request_evidence"]["campaign_covered_unverified_request_count"] == 36
+        proof["local_physical_request_evidence"]["campaign_covered_unverified_request_count"] == 39
     )
     assert proof["cost_scope"]["campaign_attributable_exact"] is False
     assert proof["cost_scope"]["campaign_attributable_cost_usd"] is None
@@ -5054,8 +6199,8 @@ def test_unknown_failed_analyzer_attempt_is_preserved_without_rerun(
     run_units = run["usage"]["model_usage_breakdown"]
     top_units.insert(0, deepcopy(unknown_analyzer))
     run_units.insert(0, deepcopy(unknown_analyzer))
-    g1["llm_request_count"] = 3
-    run["llm_request_count"] = 3
+    g1["llm_request_count"] = 6
+    run["llm_request_count"] = 6
     g1["error"] = "openrouter_non_byok_metadata_incomplete"
     g1["completion_status"].update(
         {
@@ -5065,7 +6210,7 @@ def test_unknown_failed_analyzer_attempt_is_preserved_without_rerun(
     )
     g1["cost_accounting"]["selected_generation_attempt"].update(
         {
-            "request_count": 3,
+            "request_count": 6,
             "cost_complete": False,
             "cost_exact": False,
         }
@@ -5091,7 +6236,7 @@ def test_unknown_failed_analyzer_attempt_is_preserved_without_rerun(
         json.loads(line)
         for line in (args.output_dir / "actual-spend-ledger.jsonl").read_text().splitlines()
     ]
-    assert len(ledger) == 37
+    assert len(ledger) == 40
     unknown = [
         row
         for row in ledger
@@ -5193,7 +6338,7 @@ def test_five_counter_only_failed_judge_attempts_finalize_without_rerun(
         and item["scopes"] == ["judge"]
         and item["group_task_pairs"] == [{"group": row["group"], "task_id": row["task_id"]}]
     ]
-    assert len(ledger) == 41
+    assert len(ledger) == 44
     assert len(unknown_judge) == 5
     assert all(item["recorded_cost_usd"] is None for item in unknown_judge)
 
@@ -5633,9 +6778,9 @@ def test_actual_spend_ledger_keeps_failed_replaced_attempt_once(module, tmp_path
         ledger, summary = module.build_actual_spend_ledger(records)
         assert attempt_audit["B0/task-1"]["unique_attempt_count"] == 2
         assert summary["distinct_generation_attempt_count"] == 6
-        assert len(ledger) == 37
+        assert len(ledger) == 40
         ids = {item for row in ledger for item in row["response_id_sha256"]}
-        assert len(ids) == 37
+        assert len(ids) == 40
     finally:
         os.close(lock_fd)
 
@@ -5931,8 +7076,8 @@ def test_non_exact_estimates_may_exceed_exact_account_delta(module, tmp_path: Pa
         os.close(lock_fd)
     assert manifest["status"] == "complete"
     proof = json.loads((args.output_dir / "openrouter-non-byok-campaign-proof.json").read_text())
-    assert proof["account"]["usage_delta_usd"] == "3.6"
-    assert proof["cost_scope"]["ledger_recorded_cost_usd"] == "7.2"
+    assert proof["account"]["usage_delta_usd"] == "3.9"
+    assert proof["cost_scope"]["ledger_recorded_cost_usd"] == "7.8"
     assert proof["cost_scope"]["reconciliation_status"] == "account_exact_per_request_incomplete"
     assert proof["cost_scope"]["campaign_attributable_exact"] is False
     assert proof["cost_scope"]["campaign_attributable_cost_usd"] is None
@@ -6385,7 +7530,7 @@ def test_b2_rejects_analyzer_and_g1_requires_it(module, tmp_path: Path) -> None:
     attempt_run2["usage"]["model_usage_breakdown"] = attempt_run2["usage"]["model_usage_breakdown"][
         1:
     ]
-    attempt_run2["llm_request_count"] = 1
+    attempt_run2["llm_request_count"] = 4
     g1_index = rows2.index(g1)
     rows2[g1_index] = module.seal_result_row(g1)
     args2.result[0].write_text("".join(json.dumps(row) + "\n" for row in rows2))

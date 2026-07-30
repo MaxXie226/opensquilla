@@ -102,6 +102,21 @@ FORMAL_AGGREGATOR_RECOVERY_POLICY = {
     "aggregator_max_tokens_cap": 65_536,
     "aggregator_visible_answer_reserve_tokens": 8_192,
 }
+FORMAL_PROPOSER_RECOVERY_SCHEMA = (
+    "opensquilla.router-dynamic-proposer-recovery/v1"
+)
+FORMAL_PROPOSER_RECOVERY_POLICY = {
+    "schema": FORMAL_PROPOSER_RECOVERY_SCHEMA,
+    "configured_backup_count": 2,
+    "effective_backup_count": 2,
+    "max_additional_physical_requests": 3,
+    "quorum_required": 2,
+    "max_tokens_cap": 65_536,
+    "visible_answer_reserve_tokens": 4_096,
+    "thinking_downgrade_order": ["one_strictly_lower"],
+    "transient_same_model_retries": 1,
+    "backup_reasoning_downgrades": 1,
+}
 FORMAL_JUDGE_MAX_ATTEMPTS = 3
 FORMAL_BLOCKED_DOMAINS = (
     "hf.co",
@@ -3491,6 +3506,502 @@ def aggregator_recovery_execution_reasons(
     return expected_model, list(dict.fromkeys(reasons))
 
 
+def _canonical_proposer_recovery_identity(value: Any) -> str:
+    identity = str(value or "")
+    if (
+        not identity
+        or identity != identity.strip().casefold()
+        or identity.count(":") != 1
+        or any(character.isspace() for character in identity)
+    ):
+        return ""
+    provider, model = identity.split(":", 1)
+    return identity if provider and model else ""
+
+
+def proposer_recovery_execution_reasons(
+    call: Mapping[str, Any],
+    *,
+    executed_plan: Mapping[str, Any],
+) -> tuple[dict[int, str], set[str], list[str]]:
+    """Validate one self-contained provider-owned recovery receipt."""
+
+    policy = executed_plan.get("proposer_recovery_policy")
+    receipt = call.get("proposer_recovery")
+    if policy is None:
+        return (
+            {},
+            set(),
+            ["unexpected_proposer_recovery_receipt"]
+            if receipt is not None
+            else [],
+        )
+
+    reasons: list[str] = []
+    if (
+        not isinstance(policy, Mapping)
+        or dict(policy) != FORMAL_PROPOSER_RECOVERY_POLICY
+    ):
+        reasons.append("invalid_proposer_recovery_policy")
+    selected = executed_plan.get("selected_P")
+    backups = executed_plan.get("backup_P")
+    aggregators = executed_plan.get("aggregator_candidates")
+    selected_identities = (
+        [_canonical_proposer_recovery_identity(value) for value in selected]
+        if isinstance(selected, list)
+        else []
+    )
+    backup_identities = (
+        [_canonical_proposer_recovery_identity(value) for value in backups]
+        if isinstance(backups, list)
+        else []
+    )
+    aggregator_identities = (
+        [
+            _canonical_proposer_recovery_identity(value)
+            for value in aggregators
+        ]
+        if isinstance(aggregators, list)
+        else []
+    )
+    if (
+        not selected_identities
+        or any(not identity for identity in selected_identities)
+        or len(set(selected_identities)) != len(selected_identities)
+        or len(backup_identities) != 2
+        or any(not identity for identity in backup_identities)
+        or len(set(backup_identities)) != 2
+        or bool(set(selected_identities).intersection(backup_identities))
+        or bool(set(aggregator_identities).intersection(backup_identities))
+        or executed_plan.get("effective_min_successful_proposers") != 2
+    ):
+        reasons.append("invalid_proposer_recovery_roster")
+
+    try:
+        from opensquilla.provider.protocol import (
+            provider_retry_roster_fingerprint,
+        )
+
+        expected_fingerprint = provider_retry_roster_fingerprint(
+            executed_plan
+        )
+    except (TypeError, ValueError):
+        expected_fingerprint = ""
+    if HEX64.fullmatch(expected_fingerprint) is None:
+        reasons.append("invalid_proposer_recovery_fingerprint")
+
+    if not isinstance(receipt, Mapping):
+        reasons.append("missing_proposer_recovery_receipt")
+        return {}, set(), list(dict.fromkeys(reasons))
+    started_count = receipt.get("additional_physical_requests_started")
+    remaining_count = receipt.get("remaining_additional_physical_requests")
+    receipt_attempts = receipt.get("attempts")
+    if (
+        receipt.get("schema") != FORMAL_PROPOSER_RECOVERY_SCHEMA
+        or receipt.get("selection_plan_fingerprint")
+        != expected_fingerprint
+        or receipt.get("scope") != "run_turn"
+        or not str(receipt.get("scope_id") or "").strip()
+        or receipt.get("max_additional_physical_requests") != 3
+        or receipt.get("external_physical_requests_reserved") != 0
+        or isinstance(started_count, bool)
+        or not isinstance(started_count, int)
+        or not 0 <= started_count <= 3
+        or isinstance(remaining_count, bool)
+        or not isinstance(remaining_count, int)
+        or remaining_count != 3 - started_count
+        or receipt.get("quorum_required") != 2
+        or type(receipt.get("quorum_reached")) is not bool
+        or not isinstance(receipt_attempts, list)
+    ):
+        reasons.append("invalid_proposer_recovery_receipt")
+        receipt_attempts = (
+            receipt_attempts if isinstance(receipt_attempts, list) else []
+        )
+
+    candidates = call.get("candidates")
+    final_identity_by_slot: dict[int, str] = {}
+    physical_identity_by_id: dict[str, str] = {}
+    all_candidate_ids: list[str] = []
+    candidate_physical_attempts_by_slot: dict[
+        int,
+        list[Mapping[str, Any]],
+    ] = {}
+    if (
+        not isinstance(candidates, list)
+        or len(candidates) != len(selected_identities)
+    ):
+        reasons.append("invalid_proposer_recovery_candidate_slots")
+        candidates = candidates if isinstance(candidates, list) else []
+    for slot_index, candidate in enumerate(candidates):
+        if not isinstance(candidate, Mapping):
+            reasons.append("invalid_proposer_recovery_candidate")
+            continue
+        execution = candidate.get("execution")
+        physical_attempts = (
+            execution.get("physical_attempts")
+            if isinstance(execution, Mapping)
+            else None
+        )
+        physical_count = candidate.get("physical_request_count")
+        request_started = candidate.get("request_started")
+        if (
+            type(request_started) is not bool
+            or isinstance(physical_count, bool)
+            or not isinstance(physical_count, int)
+            or physical_count < 0
+            or not isinstance(physical_attempts, list)
+            or len(physical_attempts) != physical_count
+            or request_started is not bool(physical_count)
+        ):
+            reasons.append("invalid_proposer_recovery_physical_ledger")
+            continue
+        slot_identities: list[str] = []
+        valid_slot_attempts: list[Mapping[str, Any]] = []
+        for ordinal, physical in enumerate(physical_attempts, start=1):
+            physical_id = (
+                str(physical.get("physical_attempt_id") or "")
+                if isinstance(physical, Mapping)
+                else ""
+            )
+            identity = (
+                _canonical_proposer_recovery_identity(
+                    physical.get("identity")
+                )
+                if isinstance(physical, Mapping)
+                else ""
+            )
+            if (
+                not isinstance(physical, Mapping)
+                or physical.get("attempt") != ordinal
+                or physical.get("request_started") is not True
+                or physical.get("stream_closed") is not True
+                or HEX32.fullmatch(physical_id) is None
+                or not identity
+            ):
+                reasons.append("invalid_proposer_recovery_physical_attempt")
+                continue
+            slot_identities.append(identity)
+            all_candidate_ids.append(physical_id)
+            physical_identity_by_id[physical_id] = identity
+            valid_slot_attempts.append(physical)
+        candidate_physical_attempts_by_slot[slot_index] = (
+            valid_slot_attempts
+        )
+        requested_identity = _canonical_proposer_recovery_identity(
+            f"{str(candidate.get('requested_provider') or '')}:"
+            f"{str(candidate.get('requested_model') or '')}"
+        )
+        actual_identity = _canonical_proposer_recovery_identity(
+            f"{str(candidate.get('provider') or '')}:"
+            f"{str(candidate.get('model') or '')}"
+        )
+        allowed_slot_identities = (
+            {
+                selected_identities[slot_index],
+                *backup_identities,
+            }
+            if slot_index < len(selected_identities)
+            else set(backup_identities)
+        )
+        if (
+            not requested_identity
+            or requested_identity not in allowed_slot_identities
+            or (
+                successful_candidate(candidate)
+                and actual_identity != requested_identity
+            )
+            or (
+                slot_identities
+                and slot_identities[-1] != requested_identity
+            )
+        ):
+            reasons.append("wrong_proposer_recovery_final_identity")
+        elif slot_index < len(selected_identities):
+            final_identity_by_slot[slot_index] = requested_identity
+    if (
+        len(all_candidate_ids) != len(set(all_candidate_ids))
+        or len(physical_identity_by_id) != len(all_candidate_ids)
+    ):
+        reasons.append("duplicate_proposer_recovery_physical_attempt_id")
+
+    normalized_attempts: list[Mapping[str, Any]] = []
+    receipt_started_total = 0
+    receipt_physical_ids: list[str] = []
+    backup_targets: list[str] = []
+    for sequence, attempt in enumerate(receipt_attempts, start=1):
+        if not isinstance(attempt, Mapping):
+            reasons.append("invalid_proposer_recovery_attempt")
+            continue
+        normalized_attempts.append(attempt)
+        slot_index = attempt.get("slot_index")
+        kind = str(attempt.get("kind") or "")
+        source_identity = _canonical_proposer_recovery_identity(
+            attempt.get("source_identity")
+        )
+        target_identity = _canonical_proposer_recovery_identity(
+            attempt.get("target_identity")
+        )
+        request_started = attempt.get("request_started")
+        physical_count = attempt.get("physical_request_count")
+        physical_id = str(attempt.get("physical_attempt_id") or "")
+        outcome = str(attempt.get("outcome") or "")
+        if (
+            attempt.get("sequence") != sequence
+            or isinstance(slot_index, bool)
+            or not isinstance(slot_index, int)
+            or not 0 <= slot_index < len(selected_identities)
+            or kind
+            not in {
+                "thinking_downgrade",
+                "transient_retry",
+                "backup_replacement",
+            }
+            or not source_identity
+            or not target_identity
+            or not str(attempt.get("failure_kind") or "").strip()
+            or not str(attempt.get("reason") or "").strip()
+            or type(request_started) is not bool
+        ):
+            reasons.append("invalid_proposer_recovery_attempt")
+            continue
+        if request_started:
+            receipt_started_total += nonnegative_int(physical_count)
+            if (
+                physical_count != 1
+                or HEX32.fullmatch(physical_id) is None
+                or attempt.get("stream_closed") is not True
+                or outcome
+                not in {
+                    "succeeded",
+                    "failed",
+                    "budget_overrun",
+                    "evidence_unproven",
+                }
+                or (
+                    attempt.get("usage_reported") is True
+                    and attempt.get("usage_missing_count") != 0
+                )
+                or (
+                    attempt.get("usage_reported") is not True
+                    and attempt.get("usage_missing_count") != 1
+                )
+            ):
+                reasons.append("invalid_proposer_recovery_attempt")
+            else:
+                receipt_physical_ids.append(physical_id)
+        elif (
+            physical_count != 0
+            or physical_id
+            or outcome != "not_started"
+        ):
+            reasons.append("invalid_proposer_recovery_unstarted_attempt")
+        if kind == "thinking_downgrade":
+            if (
+                target_identity != source_identity
+                or not str(attempt.get("thinking_before") or "")
+                or not str(attempt.get("thinking_after") or "")
+                or attempt.get("thinking_before")
+                == attempt.get("thinking_after")
+            ):
+                reasons.append("invalid_proposer_thinking_downgrade")
+        elif kind == "transient_retry":
+            backoff = attempt.get("backoff_s")
+            if (
+                target_identity != source_identity
+                or isinstance(backoff, bool)
+                or not isinstance(backoff, int | float)
+                or float(backoff) < 0
+            ):
+                reasons.append("invalid_proposer_transient_retry")
+        else:
+            if target_identity not in backup_identities:
+                reasons.append("invalid_proposer_backup_replacement")
+            else:
+                backup_targets.append(target_identity)
+        if (
+            request_started
+            and physical_id in physical_identity_by_id
+            and physical_identity_by_id[physical_id] != target_identity
+        ):
+            reasons.append("proposer_recovery_physical_identity_mismatch")
+
+    if (
+        receipt_started_total != started_count
+        or len(receipt_physical_ids) != len(set(receipt_physical_ids))
+    ):
+        reasons.append("invalid_proposer_recovery_budget")
+
+    receipt_physical_id_set = set(receipt_physical_ids)
+    current_recovery_ids: list[str] = []
+    primary_success_slots: set[int] = set()
+    primary_identity_by_slot: dict[int, str] = {}
+    for slot_index, physical_attempts in (
+        candidate_physical_attempts_by_slot.items()
+    ):
+        candidate_ids = [
+            str(physical.get("physical_attempt_id") or "")
+            for physical in physical_attempts
+        ]
+        candidate_recovery_ids = [
+            physical_id
+            for physical_id in candidate_ids
+            if physical_id in receipt_physical_id_set
+        ]
+        current_recovery_ids.extend(candidate_recovery_ids)
+        primary_rows = [
+            physical
+            for physical in physical_attempts
+            if str(physical.get("physical_attempt_id") or "")
+            not in receipt_physical_id_set
+        ]
+        if (
+            len(primary_rows) > 1
+            or (
+                primary_rows
+                and physical_attempts
+                and primary_rows[0] is not physical_attempts[0]
+            )
+        ):
+            reasons.append(
+                "invalid_proposer_recovery_primary_physical_ledger"
+            )
+        elif primary_rows:
+            primary_identity = _canonical_proposer_recovery_identity(
+                primary_rows[0].get("identity")
+            )
+            primary_identity_by_slot[slot_index] = primary_identity
+            if primary_rows[0].get("outcome") == "succeeded":
+                primary_success_slots.add(slot_index)
+        expected_slot_recovery_ids = [
+            str(attempt.get("physical_attempt_id") or "")
+            for attempt in normalized_attempts
+            if attempt.get("request_started") is True
+            and attempt.get("slot_index") == slot_index
+            and str(attempt.get("physical_attempt_id") or "")
+            in set(candidate_ids)
+        ]
+        if candidate_recovery_ids != expected_slot_recovery_ids:
+            reasons.append(
+                "proposer_recovery_candidate_receipt_order_mismatch"
+            )
+
+    if backup_targets != backup_identities[: len(backup_targets)]:
+        reasons.append("proposer_recovery_skipped_ordered_backup")
+    visited = receipt.get("visited_identities")
+    if (
+        not isinstance(visited, list)
+        or visited != sorted(set(backup_targets))
+    ):
+        reasons.append("wrong_proposer_recovery_visited_identities")
+    exclusions = receipt.get("cumulative_excluded_identities")
+    if (
+        not isinstance(exclusions, list)
+        or exclusions != sorted(set(str(value) for value in exclusions))
+        or any(
+            _canonical_proposer_recovery_identity(value)
+            not in {*selected_identities, *backup_identities}
+            for value in exclusions
+        )
+    ):
+        reasons.append("invalid_proposer_recovery_exclusions")
+
+    before = receipt.get("executed_proposer_roster_before")
+    after = receipt.get("executed_proposer_roster_after")
+    normalized_before = (
+        [_canonical_proposer_recovery_identity(value) for value in before]
+        if isinstance(before, list)
+        else []
+    )
+    normalized_after = (
+        [_canonical_proposer_recovery_identity(value) for value in after]
+        if isinstance(after, list)
+        else []
+    )
+    allowed_identities_by_slot = [
+        {selected_identity, *backup_identities}
+        for selected_identity in selected_identities
+    ]
+
+    def valid_executed_roster(roster: list[str]) -> bool:
+        return (
+            len(roster) == len(selected_identities)
+            and all(roster)
+            and len(set(roster)) == len(roster)
+            and all(
+                identity in allowed_identities_by_slot[slot_index]
+                for slot_index, identity in enumerate(roster)
+            )
+        )
+
+    derived_after = list(normalized_before)
+    current_recovery_set = set(current_recovery_ids)
+    for attempt in normalized_attempts:
+        physical_id = str(attempt.get("physical_attempt_id") or "")
+        slot_index = attempt.get("slot_index")
+        if (
+            attempt.get("request_started") is True
+            and physical_id in current_recovery_set
+            and attempt.get("outcome") == "succeeded"
+            and isinstance(slot_index, int)
+            and not isinstance(slot_index, bool)
+            and 0 <= slot_index < len(derived_after)
+        ):
+            derived_after[slot_index] = (
+                _canonical_proposer_recovery_identity(
+                    attempt.get("target_identity")
+                )
+            )
+    if (
+        not valid_executed_roster(normalized_before)
+        or not valid_executed_roster(normalized_after)
+        or normalized_after != derived_after
+        or any(
+            primary_identity != normalized_before[slot_index]
+            for slot_index, primary_identity in (
+                primary_identity_by_slot.items()
+            )
+            if slot_index < len(normalized_before)
+        )
+    ):
+        reasons.append("invalid_proposer_recovery_executed_roster")
+
+    if any(
+        Counter(receipt_physical_ids)[physical_id]
+        != Counter(current_recovery_ids)[physical_id]
+        for physical_id in current_recovery_ids
+    ):
+        reasons.append("proposer_recovery_candidate_receipt_mismatch")
+    successful_slots = set(primary_success_slots)
+    for attempt in normalized_attempts:
+        physical_id = str(attempt.get("physical_attempt_id") or "")
+        if (
+            attempt.get("request_started") is not True
+            or physical_id not in current_recovery_set
+        ):
+            continue
+        if len(successful_slots) >= 2:
+            reasons.append("proposer_recovery_continued_after_quorum")
+        if attempt.get("outcome") == "succeeded":
+            successful_slots.add(nonnegative_int(attempt.get("slot_index")))
+    actual_successful = (
+        sum(successful_candidate(candidate) for candidate in candidates)
+        if isinstance(candidates, list)
+        else 0
+    )
+    if (
+        call.get("successful_proposers") != actual_successful
+        or receipt.get("quorum_reached") is not (actual_successful >= 2)
+        or len(successful_slots) != actual_successful
+    ):
+        reasons.append("proposer_recovery_success_count_mismatch")
+    return (
+        final_identity_by_slot,
+        set(current_recovery_ids),
+        list(dict.fromkeys(reasons)),
+    )
+
+
 def ensemble_physical_call_reasons(
     call: Mapping[str, Any],
     *,
@@ -3510,18 +4021,26 @@ def ensemble_physical_call_reasons(
     total = call.get("total_candidates")
     successful = call.get("successful_proposers")
     expected_total = len(expected_proposers)
+    executed_plan = call.get("selection_plan")
+    required_successful_proposers = (
+        2
+        if isinstance(executed_plan, Mapping)
+        and executed_plan.get("proposer_recovery_policy") is not None
+        else math.ceil(2 * expected_total / 3)
+    )
     if not isinstance(total, int) or isinstance(total, bool) or total != expected_total:
         reasons.append("wrong_executed_proposer_count")
     if (
         not isinstance(successful, int)
         or isinstance(successful, bool)
         or not 0 <= successful <= expected_total
-        or successful < math.ceil(2 * expected_total / 3)
+        or successful < required_successful_proposers
     ):
         reasons.append("proposer_quorum_not_met")
 
-    executed_plan = call.get("selection_plan")
     strict_physical_evidence = False
+    recovered_identity_by_slot: dict[int, str] = {}
+    recovery_physical_ids: set[str] = set()
     if not isinstance(executed_plan, Mapping):
         reasons.append("missing_executed_selection_plan")
     else:
@@ -3539,6 +4058,19 @@ def ensemble_physical_call_reasons(
             reasons.append("wrong_proposer_models")
         if str(executed_plan.get("aggregator_model") or "") != expected_aggregator:
             reasons.append("wrong_aggregator_model")
+        if executed_plan.get("proposer_recovery_policy") is not None:
+            strict_physical_evidence = True
+            (
+                recovered_identity_by_slot,
+                recovery_physical_ids,
+                proposer_recovery_reasons,
+            ) = proposer_recovery_execution_reasons(
+                call,
+                executed_plan=executed_plan,
+            )
+            reasons.extend(proposer_recovery_reasons)
+        elif call.get("proposer_recovery") is not None:
+            reasons.append("unexpected_proposer_recovery_receipt")
     executed_aggregator, recovery_reasons = aggregator_recovery_execution_reasons(
         call,
         expected_aggregator=expected_aggregator,
@@ -3558,13 +4090,20 @@ def ensemble_physical_call_reasons(
         actual_successful = sum(proven)
         if actual_successful != successful:
             reasons.append("successful_proposer_count_mismatch")
-        if actual_successful < math.ceil(2 * expected_total / 3):
+        if actual_successful < required_successful_proposers:
             reasons.append("insufficient_actual_proposer_quorum")
-        for candidate, expected_model, candidate_proven in zip(
-            candidates, expected_proposers, proven, strict=True
+        for slot_index, (candidate, expected_model, candidate_proven) in enumerate(
+            zip(candidates, expected_proposers, proven, strict=True)
         ):
             if not isinstance(candidate, Mapping):
                 continue
+            expected_identity = recovered_identity_by_slot.get(
+                slot_index,
+                f"openrouter:{expected_model}",
+            )
+            expected_provider, _, expected_candidate_model = (
+                expected_identity.partition(":")
+            )
             execution = candidate.get("execution")
             actual_provider = (
                 str(
@@ -3599,14 +4138,17 @@ def ensemble_physical_call_reasons(
                 or ""
             ).strip()
             if (
-                requested_provider != "openrouter"
-                or (actual_provider and actual_provider != "openrouter")
+                requested_provider != expected_provider
+                or (actual_provider and actual_provider != expected_provider)
                 or (candidate_proven and not actual_provider)
             ):
                 reasons.append("wrong_actual_proposer_provider")
             if (
-                requested_model != expected_model
-                or (actual_model and actual_model != expected_model)
+                requested_model != expected_candidate_model
+                or (
+                    actual_model
+                    and actual_model != expected_candidate_model
+                )
                 or (candidate_proven and not actual_model)
             ):
                 reasons.append("wrong_actual_proposer_model")
@@ -3759,6 +4301,12 @@ def ensemble_physical_call_reasons(
         if strict_physical_evidence:
             if len(strict_physical_ids) != len(set(strict_physical_ids)):
                 reasons.append("duplicate_ensemble_physical_attempt_id")
+            if not recovery_physical_ids.issubset(
+                set(strict_physical_ids)
+            ):
+                reasons.append(
+                    "proposer_recovery_physical_attempt_set_mismatch"
+                )
             if (
                 isinstance(raw_physical_request_count, int)
                 and raw_physical_request_count
@@ -3892,6 +4440,7 @@ def admissible_empty_nonterminal_fallback_reasons(
     call: Mapping[str, Any],
     *,
     expected_proposers: Sequence[str],
+    executed_plan: Mapping[str, Any],
 ) -> list[str]:
     """Validate an outputless nonterminal fallback against frozen routes."""
 
@@ -3905,13 +4454,18 @@ def admissible_empty_nonterminal_fallback_reasons(
     total = call.get("total_candidates")
     successful = call.get("successful_proposers")
     expected_total = len(expected_proposers)
+    required_quorum = (
+        2
+        if executed_plan.get("proposer_recovery_policy") is not None
+        else math.ceil(2 * expected_total / 3)
+    )
     if (
         not isinstance(total, int)
         or isinstance(total, bool)
         or total != expected_total
         or not isinstance(successful, int)
         or isinstance(successful, bool)
-        or not 0 <= successful < math.ceil(2 * expected_total / 3)
+        or not 0 <= successful < required_quorum
     ):
         reasons.append("invalid_intermediate_fallback_quorum")
     candidates = call.get("candidates")
@@ -4096,6 +4650,7 @@ def ensemble_gate(
                 fallback_reasons = admissible_empty_nonterminal_fallback_reasons(
                     call,
                     expected_proposers=proposers,
+                    executed_plan=selection_plan,
                 )
                 reasons.extend(fallback_reasons)
                 if not fallback_reasons:
@@ -4340,6 +4895,50 @@ def g1_registry_plan_reasons(
     aggregator_model = selected_a.partition(":")[2] if selected_a in expected_identities else ""
     if not aggregator_model:
         reasons.append("wrong_g1_selected_aggregator")
+    backup_p = plan.get("backup_P")
+    proposer_recovery_policy = plan.get("proposer_recovery_policy")
+    if backup_p is None and proposer_recovery_policy is None:
+        # Historical plans predate provider-owned proposer recovery.  They
+        # remain auditable under their original frozen contract.
+        pass
+    elif not isinstance(proposer_recovery_policy, Mapping):
+        reasons.append("invalid_g1_proposer_recovery_policy")
+    else:
+        normalized_backups = (
+            [str(identity or "") for identity in backup_p]
+            if isinstance(backup_p, list)
+            else []
+        )
+        aggregator_candidates = plan.get("aggregator_candidates")
+        normalized_aggregators = (
+            [str(identity or "") for identity in aggregator_candidates]
+            if isinstance(aggregator_candidates, list)
+            else []
+        )
+        if dict(proposer_recovery_policy) != FORMAL_PROPOSER_RECOVERY_POLICY:
+            reasons.append("wrong_g1_proposer_recovery_policy")
+        if (
+            not isinstance(backup_p, list)
+            or len(normalized_backups) != 2
+            or len(set(normalized_backups)) != 2
+            or any(identity not in expected_identities for identity in normalized_backups)
+            or bool(set(normalized_backups).intersection(str(value) for value in selected_p or []))
+            or bool(set(normalized_backups).intersection(normalized_aggregators))
+            or plan.get("configured_proposer_backup_count") != 2
+            or plan.get("effective_proposer_backup_count") != 2
+            or plan.get("effective_min_successful_proposers") != 2
+        ):
+            reasons.append("wrong_g1_proposer_recovery_roster")
+        try:
+            from opensquilla.provider.protocol import (
+                provider_retry_roster_fingerprint,
+            )
+
+            fingerprint = provider_retry_roster_fingerprint(plan)
+        except (TypeError, ValueError):
+            fingerprint = ""
+        if HEX64.fullmatch(fingerprint) is None:
+            reasons.append("invalid_g1_proposer_recovery_fingerprint")
     recovery_fields_present = any(
         field in plan
         for field in (
@@ -4416,10 +5015,14 @@ _G1_LIFECYCLE_PLAN_MATCH_FIELDS = (
     "registry_snapshot_hash",
     "ranking_config_hash",
     "selected_P",
+    "backup_P",
     "selected_A",
     "proposer_models",
     "aggregator_model",
     "aggregator_candidates",
+    "configured_proposer_backup_count",
+    "effective_proposer_backup_count",
+    "proposer_recovery_policy",
     "aggregator_recovery_mode",
     "aggregator_recovery_top_k",
     "aggregator_max_tokens_cap",
@@ -4771,6 +5374,8 @@ def _adaptive_g1_lifecycle_routing(
     initial_decision_id = ""
     thinking_plan_prefix_by_decision: dict[str, Mapping[str, Any]] = {}
     thinking_execution_history: list[dict[str, Any]] = []
+    provider_native_terminal_seen = False
+    validated_provider_native_receipt_count = 0
     for attempt in attempts:
         if not isinstance(attempt, Mapping):
             reasons.append("invalid_g1_attempt_evidence")
@@ -4784,6 +5389,14 @@ def _adaptive_g1_lifecycle_routing(
         previous_ordinal = ordinal
         run = attempt.get("run")
         run_map = run if isinstance(run, Mapping) else {}
+        attempt_has_ensemble_requests = (
+            run_expected_ensemble_request_count(run_map) > 0
+        )
+        if (
+            provider_native_terminal_seen
+            and attempt_has_ensemble_requests
+        ):
+            reasons.append("g1_provider_native_outer_retry_forbidden")
         routing = run_map.get("routing_trace")
         routing_map = routing if isinstance(routing, Mapping) else {}
         routed_plan = routing_map.get("selection_plan")
@@ -4816,6 +5429,15 @@ def _adaptive_g1_lifecycle_routing(
                     routed_plan,
                 )
             )
+
+        provider_native_policy = (
+            plan.get("proposer_recovery_policy") is not None
+        )
+        if provider_native_policy:
+            if attempt.get("proposer_recovery_owner") != "provider":
+                reasons.append("missing_g1_provider_native_recovery_owner")
+        elif attempt.get("proposer_recovery_owner") is not None:
+            reasons.append("unexpected_g1_provider_native_recovery_owner")
 
         if not initial_decision_id:
             initial_decision_id = str(plan.get("decision_id") or "")
@@ -4942,14 +5564,82 @@ def _adaptive_g1_lifecycle_routing(
                             physical_plan,
                         )
                     )
+                if provider_native_policy:
+                    _, _, provider_recovery_reasons = (
+                        proposer_recovery_execution_reasons(
+                            call,
+                            executed_plan=physical_plan,
+                        )
+                    )
+                    reasons.extend(provider_recovery_reasons)
+                    validated_provider_native_receipt_count += 1
                 thinking_execution_history.append(
                     copy.deepcopy(dict(physical_plan))
                 )
             thinking_plan_prefix_by_decision[decision_key] = (
                 previous_thinking_plan
             )
-        elif run_expected_ensemble_request_count(run_map) > 0:
+        elif attempt_has_ensemble_requests:
             reasons.append("missing_g1_attempt_ensemble_trace")
+
+        if provider_native_policy:
+            if attempt.get("deterministic_proposer_failures") != []:
+                reasons.append(
+                    "unexpected_g1_provider_native_outer_failure_evidence"
+                )
+            if (
+                attempt.get("excluded_proposer_identities") != []
+                or current_exclusions
+            ):
+                reasons.append(
+                    "unexpected_g1_provider_native_outer_exclusions"
+                )
+            if any(
+                field in attempt
+                for field in (
+                    "retry_selection_plan",
+                    "retry_excluded_proposer_identities",
+                    "retry_deferred_to_next_wave",
+                    "thinking_execution_projection",
+                )
+            ):
+                reasons.append(
+                    "unexpected_g1_provider_native_outer_retry_plan"
+                )
+            retry_backoff = attempt.get("retry_backoff_s")
+            if (
+                attempt.get("will_retry") is not False
+                or isinstance(retry_backoff, bool)
+                or not isinstance(retry_backoff, int | float)
+                or float(retry_backoff) != 0.0
+            ):
+                reasons.append(
+                    "g1_provider_native_outer_retry_not_suppressed"
+                )
+            if (
+                attempt.get("retry_reason")
+                and not str(
+                    attempt.get("retry_suppressed_reason") or ""
+                ).strip()
+            ):
+                reasons.append(
+                    "g1_provider_native_terminal_reason_not_suppressed"
+                )
+            if attempt_has_ensemble_requests:
+                provider_native_terminal_seen = True
+                reasons.extend(
+                    g1_thinking_physical_usage_binding_reasons(run_map)
+                )
+            expected_exclusions = current_exclusions
+            if (
+                selected is not None
+                and str(attempt.get("attempt_id") or "")
+                == selected_attempt_id
+            ):
+                selected_plan = plan
+                selected_routing = routing_map
+            previous_plan = plan
+            continue
 
         derived_failure_rows = _g1_reasoning_only_length_failures(run_map)
         derived_failures = {str(failure.get("identity") or "") for failure in derived_failure_rows}
@@ -4972,30 +5662,40 @@ def _adaptive_g1_lifecycle_routing(
         if retry_deferred is not None and type(retry_deferred) is not bool:
             reasons.append("invalid_g1_retry_deferred_marker")
         if isinstance(retry_selection_plan, Mapping):
-            from opensquilla.provider.thinking_execution import (
-                validate_thinking_execution_history_closure,
-            )
-
-            projected_retry_plan, projection_audit, projection_reason = (
-                validate_thinking_execution_history_closure(
-                    thinking_execution_history,
-                    retry_selection_plan,
+            if (
+                (initial_plan or plan).get(
+                    "ranking_thinking_assignment_enabled"
                 )
-            )
-            if projection_reason:
-                reasons.append(
-                    "invalid_g1_thinking_execution_projection:"
-                    + projection_reason
+                is True
+                or retry_selection_plan.get(
+                    "ranking_thinking_assignment_enabled"
                 )
-            elif (
-                retry_selection_plan.get("executed_thinking_assignment")
-                != projected_retry_plan.get("executed_thinking_assignment")
-                or retry_selection_plan.get("thinking_execution_fallbacks", [])
-                != projected_retry_plan.get("thinking_execution_fallbacks", [])
+                is True
             ):
-                reasons.append("g1_retry_thinking_execution_projection_differs")
-            if attempt.get("thinking_execution_projection") != projection_audit:
-                reasons.append("wrong_g1_thinking_execution_projection_audit")
+                from opensquilla.provider.thinking_execution import (
+                    validate_thinking_execution_history_closure,
+                )
+
+                projected_retry_plan, projection_audit, projection_reason = (
+                    validate_thinking_execution_history_closure(
+                        thinking_execution_history,
+                        retry_selection_plan,
+                    )
+                )
+                if projection_reason:
+                    reasons.append(
+                        "invalid_g1_thinking_execution_projection:"
+                        + projection_reason
+                    )
+                elif (
+                    retry_selection_plan.get("executed_thinking_assignment")
+                    != projected_retry_plan.get("executed_thinking_assignment")
+                    or retry_selection_plan.get("thinking_execution_fallbacks", [])
+                    != projected_retry_plan.get("thinking_execution_fallbacks", [])
+                ):
+                    reasons.append("g1_retry_thinking_execution_projection_differs")
+                if attempt.get("thinking_execution_projection") != projection_audit:
+                    reasons.append("wrong_g1_thinking_execution_projection_audit")
             retry_plan_reasons, _, _ = g1_registry_plan_reasons(
                 retry_selection_plan,
                 contract=registry,
@@ -5104,6 +5804,9 @@ def _adaptive_g1_lifecycle_routing(
         "ranking_config_hash": str(selected_plan.get("ranking_config_hash") or ""),
         "validated_attempt_plan_count": validated_plan_count,
         "validated_attempt_physical_plan_count": validated_physical_plan_count,
+        "validated_provider_native_receipt_count": (
+            validated_provider_native_receipt_count
+        ),
     }
     return effective_routing, evidence, list(dict.fromkeys(reasons))
 
@@ -6860,7 +7563,7 @@ def run_expected_ensemble_request_count(run: Mapping[str, Any]) -> int:
 def g1_thinking_physical_usage_binding_reasons(
     run: Mapping[str, Any],
 ) -> list[str]:
-    """Bind every v1 managed ensemble request to exactly one usage unit."""
+    """Bind every managed/recovered physical request to one usage unit."""
 
     trace = run.get("ensemble_trace")
     calls, call_reasons = ensemble_call_trace_sequence(
@@ -6870,10 +7573,16 @@ def g1_thinking_physical_usage_binding_reasons(
         call
         for call in calls
         if isinstance(call.get("selection_plan"), Mapping)
-        and call["selection_plan"].get(
-            "thinking_physical_evidence_schema"
+        and (
+            call["selection_plan"].get(
+                "thinking_physical_evidence_schema"
+            )
+            == THINKING_PHYSICAL_EVIDENCE_SCHEMA
+            or call["selection_plan"].get(
+                "proposer_recovery_policy"
+            )
+            is not None
         )
-        == THINKING_PHYSICAL_EVIDENCE_SCHEMA
     ]
     if not strict_calls:
         return []
@@ -6882,8 +7591,20 @@ def g1_thinking_physical_usage_binding_reasons(
         reasons.append("mixed_g1_thinking_physical_evidence_schema")
 
     ledger_ids: list[str] = []
+    prior_recovery_attempts: list[dict[str, Any]] = []
+    prior_recovery_started = 0
+    prior_recovery_roster_after: list[str] | None = None
+    recovery_scope_id = ""
+    recovery_fingerprint = ""
     for call in strict_calls:
+        plan = call.get("selection_plan")
+        provider_recovery_policy = (
+            plan.get("proposer_recovery_policy")
+            if isinstance(plan, Mapping)
+            else None
+        )
         candidates = call.get("candidates")
+        current_candidate_ids: list[str] = []
         if isinstance(candidates, list):
             for candidate in candidates:
                 execution = (
@@ -6897,12 +7618,14 @@ def g1_thinking_physical_usage_binding_reasons(
                     else None
                 )
                 if isinstance(attempts, list):
-                    ledger_ids.extend(
+                    candidate_ids = [
                         str(attempt.get("physical_attempt_id") or "")
                         for attempt in attempts
                         if isinstance(attempt, Mapping)
                         and attempt.get("request_started") is True
-                    )
+                    ]
+                    ledger_ids.extend(candidate_ids)
+                    current_candidate_ids.extend(candidate_ids)
         recovery = call.get("aggregator_recovery")
         attempts = (
             recovery.get("attempts")
@@ -6917,16 +7640,122 @@ def g1_thinking_physical_usage_binding_reasons(
                 and attempt.get("request_started") is True
             )
 
+        if provider_recovery_policy is None:
+            if call.get("proposer_recovery") is not None:
+                reasons.append("unexpected_proposer_recovery_receipt")
+            continue
+        receipt = call.get("proposer_recovery")
+        receipt_attempts = (
+            receipt.get("attempts")
+            if isinstance(receipt, Mapping)
+            else None
+        )
+        if not isinstance(receipt, Mapping) or not isinstance(
+            receipt_attempts,
+            list,
+        ):
+            reasons.append("missing_proposer_recovery_receipt")
+            continue
+        normalized_receipts = [
+            dict(attempt)
+            for attempt in receipt_attempts
+            if isinstance(attempt, Mapping)
+        ]
+        if len(normalized_receipts) != len(receipt_attempts):
+            reasons.append("invalid_proposer_recovery_attempt")
+            continue
+        started = receipt.get("additional_physical_requests_started")
+        started_total = sum(
+            nonnegative_int(attempt.get("physical_request_count"))
+            for attempt in normalized_receipts
+            if attempt.get("request_started") is True
+        )
+        if (
+            isinstance(started, bool)
+            or not isinstance(started, int)
+            or started != started_total
+            or started < prior_recovery_started
+            or len(normalized_receipts) < len(prior_recovery_attempts)
+            or normalized_receipts[: len(prior_recovery_attempts)]
+            != prior_recovery_attempts
+        ):
+            reasons.append("proposer_recovery_receipt_prefix_mismatch")
+        new_receipts = normalized_receipts[
+            len(prior_recovery_attempts) :
+        ]
+        new_recovery_ids = [
+            str(attempt.get("physical_attempt_id") or "")
+            for attempt in new_receipts
+            if attempt.get("request_started") is True
+        ]
+        new_recovery_id_set = set(new_recovery_ids)
+        current_recovery_ids = [
+            physical_id
+            for physical_id in current_candidate_ids
+            if physical_id in new_recovery_id_set
+        ]
+        if Counter(new_recovery_ids) != Counter(current_recovery_ids):
+            reasons.append(
+                "proposer_recovery_incremental_physical_set_mismatch"
+            )
+        scope_id = str(receipt.get("scope_id") or "")
+        fingerprint = str(
+            receipt.get("selection_plan_fingerprint") or ""
+        )
+        roster_before = receipt.get("executed_proposer_roster_before")
+        roster_after = receipt.get("executed_proposer_roster_after")
+        normalized_before = (
+            [str(identity or "") for identity in roster_before]
+            if isinstance(roster_before, list)
+            else []
+        )
+        normalized_after = (
+            [str(identity or "") for identity in roster_after]
+            if isinstance(roster_after, list)
+            else []
+        )
+        if recovery_scope_id and scope_id != recovery_scope_id:
+            reasons.append("proposer_recovery_scope_changed")
+        if recovery_fingerprint and fingerprint != recovery_fingerprint:
+            reasons.append("proposer_recovery_fingerprint_changed")
+        if (
+            prior_recovery_roster_after is None
+            and isinstance(plan, Mapping)
+            and isinstance(plan.get("selected_P"), list)
+            and normalized_before
+            != [str(identity or "") for identity in plan["selected_P"]]
+        ):
+            reasons.append("proposer_recovery_roster_prefix_changed")
+        elif (
+            prior_recovery_roster_after is not None
+            and normalized_before != prior_recovery_roster_after
+        ):
+            reasons.append("proposer_recovery_roster_prefix_changed")
+        recovery_scope_id = scope_id
+        recovery_fingerprint = fingerprint
+        prior_recovery_attempts = normalized_receipts
+        prior_recovery_started = nonnegative_int(started)
+        prior_recovery_roster_after = normalized_after
+
     if (
         any(HEX32.fullmatch(attempt_id) is None for attempt_id in ledger_ids)
         or len(ledger_ids) != len(set(ledger_ids))
     ):
         reasons.append("invalid_g1_thinking_physical_attempt_set")
 
-    units = canonical_run_usage_units(
-        run,
-        identity_seed="g1-thinking-physical-usage-binding",
-    )
+    try:
+        units = canonical_run_usage_units(
+            run,
+            identity_seed="g1-thinking-physical-usage-binding",
+        )
+    except (FinalizationError, UsageEvidenceError, TypeError):
+        reasons.extend(
+            (
+                "g1_thinking_physical_usage_set_mismatch",
+                "g1_thinking_physical_usage_multiplicity_mismatch",
+            )
+        )
+        return list(dict.fromkeys(reasons))
     analyzer_ids = {
         _task_analyzer_physical_attempt_id(unit)
         for unit in _canonical_task_analyzer_setup_units(
@@ -6963,7 +7792,13 @@ def g1_thinking_physical_usage_binding_reasons(
 
     if Counter(usage_ids) != Counter(ledger_ids):
         reasons.append("g1_thinking_physical_usage_set_mismatch")
-    expected = run_expected_ensemble_request_count(run)
+    try:
+        expected = run_expected_ensemble_request_count(run)
+    except FinalizationError:
+        reasons.append(
+            "g1_thinking_physical_usage_multiplicity_mismatch"
+        )
+        return list(dict.fromkeys(reasons))
     if len(ledger_ids) != expected or len(generation_units) != expected:
         reasons.append("g1_thinking_physical_usage_multiplicity_mismatch")
     return list(dict.fromkeys(reasons))
@@ -9896,10 +10731,18 @@ def experiment_results_markdown(
         "- 完成标准：Judge 必须 `score_status=complete`、无 Judge error、存在 `quality_total`",
         *(
             [
-                f"- {'/'.join(ensemble_groups)}：proposer 至少达到 `ceil(2N/3)`，"
+                "- B2：proposer 至少达到 `ceil(2N/3)`，最终答案必须由 "
+                "aggregator 请求绑定"
+            ]
+            if "B2" in ensemble_groups
+            else []
+        ),
+        *(
+            [
+                "- G1：正式 provider-native recovery quorum 固定为 2，"
                 "最终答案必须由 aggregator 请求绑定"
             ]
-            if ensemble_groups
+            if "G1" in ensemble_groups
             else []
         ),
         "",
