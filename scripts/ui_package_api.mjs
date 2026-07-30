@@ -166,6 +166,11 @@ function normalizedNodeText(node, sourceFile) {
   return node.getText(sourceFile).replace(/\s+/g, ' ').trim()
 }
 
+export function compareStableText(left, right) {
+  if (left === right) return 0
+  return left < right ? -1 : 1
+}
+
 function declarationKey(node, sourceFile, index) {
   if (node.name && typeof node.name.getText === 'function') {
     return `${ts.SyntaxKind[node.kind]}:${node.name.getText(sourceFile)}`
@@ -207,7 +212,7 @@ async function extractDeclarations(packageRoot) {
       })
     })
   }
-  return signatures.sort((left, right) => left.key.localeCompare(right.key))
+  return signatures.sort((left, right) => compareStableText(left.key, right.key))
 }
 
 function compilerOptions() {

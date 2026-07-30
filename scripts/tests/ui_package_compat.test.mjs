@@ -5,6 +5,7 @@ import {
   compareApiReports,
   parseSemver,
 } from '../check_ui_package_compat.mjs'
+import { compareStableText } from '../ui_package_api.mjs'
 
 function packageReport(overrides = {}) {
   return {
@@ -36,6 +37,21 @@ function report(entry = packageReport()) {
     packages: [entry],
   }
 }
+
+test('API declaration ordering uses locale-independent code points', () => {
+  const entries = [
+    'components/button.d.ts',
+    'components/UiButton.vue.d.ts',
+    'gateway/client.d.ts#z',
+    'gateway/client.d.ts#A',
+  ]
+  assert.deepEqual([...entries].sort(compareStableText), [
+    'components/UiButton.vue.d.ts',
+    'components/button.d.ts',
+    'gateway/client.d.ts#A',
+    'gateway/client.d.ts#z',
+  ])
+})
 
 test('bootstrap is explicit and non-blocking', () => {
   const result = compareApiReports(null, report())

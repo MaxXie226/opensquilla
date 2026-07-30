@@ -539,44 +539,8 @@
         "UiStack",
         "UiSwitch"
       ],
-      "declarationsDigest": "sha256:5bb798d118af8ab1ae48522690aa8d267667873a4539add9b992ce54bdf145dc",
+      "declarationsDigest": "sha256:0ae3010be35bf399b31e6ce7dad6a11d613f6a6a55c4aaa2e711d88a2cb8f110",
       "declarations": [
-        {
-          "key": "components/button.d.ts#TypeAliasDeclaration:UiButtonSize",
-          "signature": "export type UiButtonSize = 'small' | 'medium' | 'large';"
-        },
-        {
-          "key": "components/button.d.ts#TypeAliasDeclaration:UiButtonVariant",
-          "signature": "export type UiButtonVariant = 'primary' | 'secondary' | 'ghost' | 'danger';"
-        },
-        {
-          "key": "components/dialogStack.d.ts#FunctionDeclaration:isTopmostDialog",
-          "signature": "export declare function isTopmostDialog(token: symbol): boolean;"
-        },
-        {
-          "key": "components/dialogStack.d.ts#FunctionDeclaration:registerDialog",
-          "signature": "export declare function registerDialog(token: symbol): void;"
-        },
-        {
-          "key": "components/dialogStack.d.ts#FunctionDeclaration:unregisterDialog",
-          "signature": "export declare function unregisterDialog(token: symbol): boolean;"
-        },
-        {
-          "key": "components/stack.d.ts#TypeAliasDeclaration:UiStackAlign",
-          "signature": "export type UiStackAlign = 'start' | 'center' | 'end' | 'stretch' | 'baseline';"
-        },
-        {
-          "key": "components/stack.d.ts#TypeAliasDeclaration:UiStackDirection",
-          "signature": "export type UiStackDirection = 'row' | 'column';"
-        },
-        {
-          "key": "components/stack.d.ts#TypeAliasDeclaration:UiStackGap",
-          "signature": "export type UiStackGap = 'none' | 'xs' | 'sm' | 'md' | 'lg' | 'xl';"
-        },
-        {
-          "key": "components/stack.d.ts#TypeAliasDeclaration:UiStackJustify",
-          "signature": "export type UiStackJustify = 'start' | 'center' | 'end' | 'between' | 'around' | 'evenly';"
-        },
         {
           "key": "components/UiButton.vue.d.ts#ExportAssignment:default",
           "signature": "export default _default;"
@@ -722,6 +686,50 @@
           "signature": "declare const _default: import(\"vue\").DefineComponent<__VLS_Props, {}, {}, {}, {}, import(\"vue\").ComponentOptionsMixin, import(\"vue\").ComponentOptionsMixin, { change: (args_0: boolean) => any; \"update:checked\": (args_0: boolean) => any; }, string, import(\"vue\").PublicProps, Readonly<__VLS_Props> & Readonly<{ onChange?: (args_0: boolean) => any; \"onUpdate:checked\"?: (args_0: boolean) => any; }>, { disabled: boolean; busy: boolean; checked: boolean; }, {}, {}, {}, string, import(\"vue\").ComponentProvideOptions, false, {}, any>;"
         },
         {
+          "key": "components/button.d.ts#TypeAliasDeclaration:UiButtonSize",
+          "signature": "export type UiButtonSize = 'small' | 'medium' | 'large';"
+        },
+        {
+          "key": "components/button.d.ts#TypeAliasDeclaration:UiButtonVariant",
+          "signature": "export type UiButtonVariant = 'primary' | 'secondary' | 'ghost' | 'danger';"
+        },
+        {
+          "key": "components/dialogStack.d.ts#FunctionDeclaration:isTopmostDialog",
+          "signature": "export declare function isTopmostDialog(token: symbol): boolean;"
+        },
+        {
+          "key": "components/dialogStack.d.ts#FunctionDeclaration:registerDialog",
+          "signature": "export declare function registerDialog(token: symbol): void;"
+        },
+        {
+          "key": "components/dialogStack.d.ts#FunctionDeclaration:unregisterDialog",
+          "signature": "export declare function unregisterDialog(token: symbol): boolean;"
+        },
+        {
+          "key": "components/stack.d.ts#TypeAliasDeclaration:UiStackAlign",
+          "signature": "export type UiStackAlign = 'start' | 'center' | 'end' | 'stretch' | 'baseline';"
+        },
+        {
+          "key": "components/stack.d.ts#TypeAliasDeclaration:UiStackDirection",
+          "signature": "export type UiStackDirection = 'row' | 'column';"
+        },
+        {
+          "key": "components/stack.d.ts#TypeAliasDeclaration:UiStackGap",
+          "signature": "export type UiStackGap = 'none' | 'xs' | 'sm' | 'md' | 'lg' | 'xl';"
+        },
+        {
+          "key": "components/stack.d.ts#TypeAliasDeclaration:UiStackJustify",
+          "signature": "export type UiStackJustify = 'start' | 'center' | 'end' | 'between' | 'around' | 'evenly';"
+        },
+        {
+          "key": "index.d.ts#ExportDeclaration:{ UiButtonSize, UiButtonVariant, }:'./components/button.js'",
+          "signature": "export type { UiButtonSize, UiButtonVariant, } from './components/button.js';"
+        },
+        {
+          "key": "index.d.ts#ExportDeclaration:{ UiStackAlign, UiStackDirection, UiStackGap, UiStackJustify, }:'./components/stack.js'",
+          "signature": "export type { UiStackAlign, UiStackDirection, UiStackGap, UiStackJustify, } from './components/stack.js';"
+        },
+        {
           "key": "index.d.ts#ExportDeclaration:{ default as UiButton }:'./components/UiButton.vue'",
           "signature": "export { default as UiButton } from './components/UiButton.vue';"
         },
@@ -744,14 +752,6 @@
         {
           "key": "index.d.ts#ExportDeclaration:{ default as UiSwitch }:'./components/UiSwitch.vue'",
           "signature": "export { default as UiSwitch } from './components/UiSwitch.vue';"
-        },
-        {
-          "key": "index.d.ts#ExportDeclaration:{ UiButtonSize, UiButtonVariant, }:'./components/button.js'",
-          "signature": "export type { UiButtonSize, UiButtonVariant, } from './components/button.js';"
-        },
-        {
-          "key": "index.d.ts#ExportDeclaration:{ UiStackAlign, UiStackDirection, UiStackGap, UiStackJustify, }:'./components/stack.js'",
-          "signature": "export type { UiStackAlign, UiStackDirection, UiStackGap, UiStackJustify, } from './components/stack.js';"
         }
       ],
       "deprecations": []
@@ -920,7 +920,7 @@
         "useGatewayQuery",
         "useGatewayState"
       ],
-      "declarationsDigest": "sha256:6dfd968b8cf1ec10b7483ea486e241c08fa652f866e43de470fe6feaddac586f",
+      "declarationsDigest": "sha256:5efc2aa468d21aadf90f2952adcd7e3fbce97624441a20682626633e300846d8",
       "declarations": [
         {
           "key": "composition/app.d.ts#FunctionDeclaration:createOpenSquillaApp",
@@ -1143,16 +1143,16 @@
           "signature": "export declare class RpcTimeoutError extends Error implements RpcClientError { readonly method: string; readonly timeoutMs: number; readonly code = \"RPC_TIMEOUT\"; constructor(method: string, timeoutMs: number); }"
         },
         {
-          "key": "gateway/client.d.ts#ExportDeclaration:{ capabilitiesForMethods }:",
-          "signature": "export { capabilitiesForMethods };"
-        },
-        {
           "key": "gateway/client.d.ts#ExportDeclaration:{ ConnectionClosedError, GatewayClientError, GatewayHttpError, HandshakeError, RequestAbortError, RequestTimeoutError, SequenceGapError, }:",
           "signature": "export { ConnectionClosedError, GatewayClientError, GatewayHttpError, HandshakeError, RequestAbortError, RequestTimeoutError, SequenceGapError, };"
         },
         {
           "key": "gateway/client.d.ts#ExportDeclaration:{ EventFrame, GatewayCallOptions, GatewayClientOptions, GatewayConnectionState, GatewayConnectionWaitOptions, GatewayTerminationAction, NormalizedHello, }:",
           "signature": "export type { EventFrame, GatewayCallOptions, GatewayClientOptions, GatewayConnectionState, GatewayConnectionWaitOptions, GatewayTerminationAction, NormalizedHello, };"
+        },
+        {
+          "key": "gateway/client.d.ts#ExportDeclaration:{ capabilitiesForMethods }:",
+          "signature": "export { capabilitiesForMethods };"
         },
         {
           "key": "gateway/client.d.ts#FunctionDeclaration:createGatewayClient",
