@@ -226,12 +226,6 @@ def decide_command(
     tokens = _strip_wrappers(tuple(str(token) for token in argv), platform=target)
     if not tokens:
         return CommandDecision(CommandAction.APPROVAL, "command_parse_failed")
-    if _is_system_tool(tokens, platform=target):
-        system_tools = policy.commands.system_tools
-        if system_tools == "disabled":
-            return CommandDecision(CommandAction.DENY, "system_tool_disabled", tokens)
-        if system_tools == "prompt":
-            return CommandDecision(CommandAction.APPROVAL, "system_tool_prompt", tokens)
     auto = _best_prefix(
         tokens,
         policy.commands.auto_allow_prefixes,
@@ -251,6 +245,12 @@ def decide_command(
             tokens,
             approval,
         )
+    if _is_system_tool(tokens, platform=target):
+        system_tools = policy.commands.system_tools
+        if system_tools == "disabled":
+            return CommandDecision(CommandAction.DENY, "system_tool_disabled", tokens)
+        if system_tools == "prompt":
+            return CommandDecision(CommandAction.APPROVAL, "system_tool_prompt", tokens)
     normalized = normalize_argv(tokens, platform=target)
     if normalized[:2] == ("git", "push"):
         return CommandDecision(CommandAction.APPROVAL, "builtin_git_push", tokens)

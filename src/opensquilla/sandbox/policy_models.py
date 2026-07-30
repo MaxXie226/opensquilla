@@ -33,7 +33,7 @@ class FilePolicySettings(_PolicyModel):
 class CommandPolicySettings(_PolicyModel):
     require_approval_prefixes: list[list[str]] = Field(default_factory=list)
     auto_allow_prefixes: list[list[str]] = Field(default_factory=list)
-    system_tools: Literal["auto", "prompt", "disabled"] = "prompt"
+    system_tools: Literal["auto", "prompt", "disabled"] = "auto"
 
     @field_validator("require_approval_prefixes", "auto_allow_prefixes")
     @classmethod

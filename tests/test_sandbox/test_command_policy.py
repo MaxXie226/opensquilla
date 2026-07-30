@@ -73,14 +73,14 @@ def test_system_tool_tri_state(mode: str, expected: str) -> None:
     assert decide_command(["wsl", "--status"], policy, platform="windows").action == expected
 
 
-def test_system_tool_disabled_cannot_be_overridden_by_auto_prefix() -> None:
+def test_explicit_auto_prefix_overrides_system_tool_default() -> None:
     policy = SandboxPolicy()
     policy.commands.system_tools = "disabled"
     policy.commands.auto_allow_prefixes = [["wsl"]]
 
     assert (
         decide_command(["wsl", "--status"], policy, platform="windows").action
-        is CommandAction.DENY
+        is CommandAction.AUTO
     )
 
 
