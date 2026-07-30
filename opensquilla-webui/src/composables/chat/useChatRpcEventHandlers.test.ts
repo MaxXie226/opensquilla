@@ -967,6 +967,37 @@ describe('useChatRpcEventHandlers ensemble handoff', () => {
 })
 
 describe('useChatRpcEventHandlers ensemble activity', () => {
+  it('removes the transient connection-loss row after reconnect', () => {
+    const { api, messages, stop } = createHarness()
+
+    try {
+      api.handlers.onConnectionState('disconnected')
+      expect(messages.value).toEqual([
+        expect.objectContaining({
+          role: 'system',
+          text: 'Connection lost — trying to reconnect…',
+        }),
+      ])
+
+      api.handlers.onConnectionState('connected')
+      expect(messages.value).toEqual([])
+    } finally {
+      stop()
+    }
+  })
+
+  it('does not duplicate the transient row while disconnected', () => {
+    const { api, messages, stop } = createHarness()
+
+    try {
+      api.handlers.onConnectionState('disconnected')
+      api.handlers.onConnectionState('disconnected')
+      expect(messages.value).toHaveLength(1)
+    } finally {
+      stop()
+    }
+  })
+
   it('treats ensemble progress as a hard-idle liveness event', () => {
     const { api, stream, stop } = createHarness()
 

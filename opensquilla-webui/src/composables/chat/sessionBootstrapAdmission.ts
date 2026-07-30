@@ -12,13 +12,14 @@ let primedRelease: (() => void) | null = null
  */
 export const optionalSessionRpcAllowed = computed(() => activeHolds.value === 0)
 
+export const OPTIONAL_SESSION_RPC_TIMEOUT_MS = 10_000
+
 export const optionalSessionRpcCallOptions: RpcCallOptions = {
-  timeoutMs: 2_000,
-  // These methods still use the Gateway's serial dispatcher. Retire the
-  // connection when one is abandoned so a stuck handler cannot keep later
-  // navigation and control requests trapped behind it.
-  timeoutAction: 'reconnect',
-  abortAction: 'reconnect',
+  timeoutMs: OPTIONAL_SESSION_RPC_TIMEOUT_MS,
+  // Optional metadata must never retire the shared socket carrying a live
+  // model stream. Let the caller degrade the optional surface independently.
+  timeoutAction: 'reject',
+  abortAction: 'reject',
 }
 
 type OptionalSessionRpcClient = {

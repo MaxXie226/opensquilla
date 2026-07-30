@@ -1213,37 +1213,53 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   }
 
   let connectionLostNoted = false
+  let connectionLostNotice: ChatMessage | null = null
   let connectionStateGeneration = 0
+
+  function clearConnectionLostStatus() {
+    connectionLostNoted = false
+    if (!connectionLostNotice) return
+    const noticeIndex = messages.value.indexOf(connectionLostNotice)
+    if (noticeIndex >= 0) messages.value.splice(noticeIndex, 1)
+    connectionLostNotice = null
+  }
+
   function handleRpcConnectionState(state: string) {
     const stateGeneration = ++connectionStateGeneration
     const recovery = options.handleSessionConnectionState(state)
-    if (state === 'connected' && sessionKey.value) {
-      const connectedSessionKey = sessionKey.value
-      connectionLostNoted = false
+    if (state === 'connected') {
+      clearConnectionLostStatus()
       stream.hideThinkingIndicator()
-      // Preserve critical frame ordering after reconnect without waiting for a
-      // potentially slow history response before refreshing independent UI.
-      const criticalRequestsQueued = recovery?.criticalRequestsQueued
-        ?? Promise.resolve()
-      void criticalRequestsQueued.then(() => {
-        if (
-          connectionStateGeneration === stateGeneration
-          && sessionKey.value === connectedSessionKey
-        ) {
-          options.loadCurrentSessionUsage()
-          void options.refreshRunModePreference?.()
-        }
-      })
+      if (sessionKey.value) {
+        const connectedSessionKey = sessionKey.value
+        // Preserve critical frame ordering after reconnect without waiting for a
+        // potentially slow history response before refreshing independent UI.
+        const criticalRequestsQueued = recovery?.criticalRequestsQueued
+          ?? Promise.resolve()
+        void criticalRequestsQueued.then(() => {
+          if (
+            connectionStateGeneration === stateGeneration
+            && sessionKey.value === connectedSessionKey
+          ) {
+            options.loadCurrentSessionUsage()
+            void options.refreshRunModePreference?.()
+          }
+        })
+      }
       if (stream.isStreaming.value) stream.resetStreamIdleTimer()
     }
     if (state === 'disconnected' && stream.isStreaming.value) {
-      // Surface the drop instead of silently freezing the work-card, and keep the
-      // idle watchdog ARMED (do not clear it) so a run whose events never resume
-      // still times out honestly instead of spinning forever on a dead socket.
+      // Keep the idle watchdog armed so a run whose events never resume still
+      // times out honestly. The row is transient and removed after reconnect.
       stream.showThinkingIndicator()
       if (!connectionLostNoted) {
         connectionLostNoted = true
-        messages.value.push({ role: 'system', text: 'Connection lost — trying to reconnect…', ts: new Date().toISOString() })
+        connectionLostNotice = {
+          role: 'system',
+          text: 'Connection lost — trying to reconnect…',
+          ts: new Date().toISOString(),
+        }
+        messages.value.push(connectionLostNotice)
       }
     }
   }
