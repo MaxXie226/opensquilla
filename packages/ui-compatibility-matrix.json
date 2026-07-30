@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "policy": "current-and-previous-minor",
+  "bootstrap": true,
+  "current": {
+    "releaseVersion": "0.1.0",
+    "clientSdkRange": ">=0.1.0 <0.3.0",
+    "packages": {
+      "@opensquilla/client-sdk": "0.1.0",
+      "@opensquilla/ui-foundation": "0.1.0",
+      "@opensquilla/ui-primitives": "0.1.0",
+      "@opensquilla/ui-tokens": "0.1.0"
+    },
+    "gateway": {
+      "protocolMin": 3,
+      "protocolMax": 3,
+      "contractDigest": "sha256:9819d28398fd37609c8c86ae9b5bbf8133d122ae07f06b75817a4d5b3c30a79e"
+    },
+    "featureApi": {
+      "min": 1,
+      "max": 1
+    },
+    "nativeCapabilityApi": {
+      "min": 1,
+      "max": 1
+    }
+  },
+  "previous": null,
+  "failurePolicy": {
+    "protocolNoOverlap": "hard-fail",
+    "missingRequiredCapability": "hard-fail",
+    "missingOptionalCapability": "disable-feature",
+    "unknownNativeCapability": "unsupported"
+  }
+}

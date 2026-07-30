@@ -16,10 +16,16 @@
   "scripts": {
     "build:client-sdk": "npm run build --prefix packages/client-sdk",
     "build:ui-packages": "npm run build:client-sdk && npm run build --workspaces --if-present",
+    "build:ui-package-release": "node scripts/build_ui_package_release.mjs",
+    "check:ui-package-api": "node scripts/ui_package_api.mjs --check",
+    "check:ui-package-compat": "node scripts/check_ui_package_compat.mjs",
+    "install:ui-package-release": "node scripts/install_ui_package_release.mjs",
     "test:ui-primitives:browser": "playwright test --config packages/ui-primitives/playwright.config.ts",
     "test:ui-packages": "npm run test --workspaces --if-present",
+    "test:ui-package-release": "node --test scripts/tests/ui_package_compat.test.mjs",
     "typecheck:ui-packages": "npm run typecheck --workspaces --if-present",
-    "verify:ui-packages": "npm run build:client-sdk && npm run typecheck:ui-packages && npm run test:ui-packages && npm run build:ui-packages && npm run verify:cross-surface --workspace @opensquilla/ui-tokens && npm run verify:boundaries --workspace @opensquilla/ui-primitives && npm run verify:boundaries --workspace @opensquilla/ui-foundation && node scripts/verify_ui_packages.mjs"
+    "verify:ui-package-release": "npm run build:ui-packages && npm run check:ui-package-api && npm run test:ui-package-release && node scripts/verify_ui_package_release.mjs",
+    "verify:ui-packages": "npm run build:client-sdk && npm run typecheck:ui-packages && npm run test:ui-packages && npm run build:ui-packages && npm run verify:cross-surface --workspace @opensquilla/ui-tokens && npm run verify:boundaries --workspace @opensquilla/ui-primitives && npm run verify:boundaries --workspace @opensquilla/ui-foundation && node scripts/verify_ui_packages.mjs && npm run verify:ui-package-release"
   },
   "devDependencies": {
     "@opensquilla/client-sdk": "file:packages/client-sdk",

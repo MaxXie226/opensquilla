@@ -38,6 +38,7 @@ try {
   assert.ok(packed?.filename, 'npm pack did not report a tarball')
   const paths = packed.files.map((entry) => entry.path)
   const allowed = [
+    'CHANGELOG.md',
     'README.md',
     'contract-coverage.json',
     'package.json',

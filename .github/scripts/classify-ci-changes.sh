@@ -118,7 +118,7 @@ while IFS= read -r path || [[ -n "${path}" ]]; do
     opensquilla-webui/*)
       mark_frontend_changed
       ;;
-    package.json | package-lock.json | tsconfig.ui-package.json | packages/ui-package-manifest.json | packages/ui-*/* | scripts/verify_ui_packages.mjs)
+    package.json | package-lock.json | tsconfig.ui-package.json | packages/UI_RELEASE.md | packages/ui-package-manifest.json | packages/ui-compatibility-matrix.json | packages/ui-*/* | contracts/ui-foundation/* | contracts/ui-foundation/*/* | scripts/*ui_package*.mjs | scripts/tests/ui_package*.test.mjs | tests/fixtures/ui-package-consumer/*)
       # Public UI Foundation packages are browser-safe client inputs. They
       # have their own cross-platform pack/install gate and never wake the
       # Python runtime or release-wheel path.
@@ -140,6 +140,11 @@ while IFS= read -r path || [[ -n "${path}" ]]; do
       mark_full_required
       ;;
     .github/workflows/wheelhouse-release.yml)
+      mark_ci_changed
+      mark_release_changed
+      ;;
+    .github/workflows/ui-foundation-release.yml)
+      mark_frontend_changed
       mark_ci_changed
       mark_release_changed
       ;;

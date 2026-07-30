@@ -101,6 +101,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -114,6 +116,20 @@ jobs:
 
       - name: Verify public UI package boundaries
         run: npm run verify:ui-packages
+
+      - name: Enforce UI package semantic-version compatibility
+        shell: bash
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          if [[ -n "${BASE_REF}" ]]; then
+            baseline="origin/${BASE_REF}"
+          else
+            baseline="HEAD^"
+          fi
+          npm run check:ui-package-compat -- \
+            --baseline-ref "${baseline}" \
+            --allow-bootstrap
 
   ui-primitives-browser:
     name: Public UI primitives (browser matrix)
@@ -168,8 +184,12 @@ jobs:
           node-version-file: opensquilla-webui/.node-version
           cache: 'npm'
           cache-dependency-path: |
+            package-lock.json
             packages/client-sdk/package-lock.json
             opensquilla-webui/package-lock.json
+
+      - name: Install public UI release dependencies
+        run: npm ci --ignore-scripts
 
       - name: Install client SDK dependencies
         working-directory: packages/client-sdk
@@ -185,6 +205,21 @@ jobs:
       - name: Install frontend dependencies
         working-directory: opensquilla-webui
         run: npm ci
+
+      - name: Build and verify immutable public UI release assets
+        env:
+          UI_RELEASE_DIR: ${{ runner.temp }}/opensquilla-ui-release
+        run: |
+          npm run build:ui-packages
+          npm run check:ui-package-api
+          npm run build:ui-package-release -- \
+            --output-dir "${UI_RELEASE_DIR}" \
+            --source-ref "${GITHUB_REF_NAME}" \
+            --source-commit "${GITHUB_SHA}"
+          npm run verify:ui-package-release -- \
+            --artifacts-dir "${UI_RELEASE_DIR}"
+          npm run install:ui-package-release -- \
+            --artifacts-dir "${UI_RELEASE_DIR}"
 
       - name: Run frontend unit tests
         if: ${{ needs.classify-changes.outputs.frontend_changed == 'true' || needs.classify-changes.outputs.full_required == 'true' }}
