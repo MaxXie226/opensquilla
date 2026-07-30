@@ -1,10 +1,22 @@
-"""Frozen-aware launch and dispatch for trusted OpenSquilla child roles."""
+"""Frozen-aware launch, dispatch, and packaged developer-runtime discovery."""
 
 from __future__ import annotations
 
+import os
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from enum import StrEnum
+from pathlib import Path
+from typing import Any
+
+from opensquilla.sandbox.policy_models import RuntimePolicySettings
+from opensquilla.sandbox.run_mode import RunMode
+from opensquilla.sandbox.runtime_manifest import (
+    BundledRuntimeResolver,
+    RuntimeManifest,
+    RuntimeManifestError,
+    split_path,
+)
 
 
 class ChildRole(StrEnum):
@@ -26,6 +38,77 @@ _ROLE_MODULES: dict[ChildRole, str] = {
     ChildRole.WINDOWS_DEFAULT_RUNNER: "opensquilla.sandbox.backend.windows_default_runner",
     ChildRole.DIRECTORY_PICKER: "opensquilla.gateway.windows_directory_picker",
 }
+
+_RUNTIME_ROOT_ENV = "OPENSQUILLA_BUNDLED_RUNTIME_ROOT"
+_RUNTIME_MANIFEST_ENV = "OPENSQUILLA_RUNTIME_MANIFEST"
+
+
+def discover_bundled_runtime_layout() -> tuple[Path, Path] | None:
+    """Return ``(manifest, developer-root)`` without downloading anything."""
+
+    explicit_root = os.environ.get(_RUNTIME_ROOT_ENV)
+    explicit_manifest = os.environ.get(_RUNTIME_MANIFEST_ENV)
+    if explicit_root or explicit_manifest:
+        root = Path(explicit_root).expanduser() if explicit_root else None
+        if explicit_manifest:
+            manifest = Path(explicit_manifest).expanduser()
+        elif root is not None:
+            manifest = root.parent / "runtime-manifest.json"
+        else:  # pragma: no cover - guarded by the outer condition
+            return None
+        if root is None:
+            root = manifest.parent / "developer"
+        return manifest.absolute(), root.absolute()
+
+    executable = Path(sys.executable).absolute()
+    candidates = [executable.parent, *executable.parents]
+    for candidate in candidates:
+        manifest = candidate / "runtime-manifest.json"
+        developer_root = candidate / "developer"
+        if manifest.is_file() and developer_root.is_dir():
+            return manifest, developer_root
+        runtime_manifest = candidate / "runtime" / "runtime-manifest.json"
+        runtime_developer = candidate / "runtime" / "developer"
+        if runtime_manifest.is_file() and runtime_developer.is_dir():
+            return runtime_manifest, runtime_developer
+    return None
+
+
+def bundled_runtime_resolver() -> BundledRuntimeResolver | None:
+    layout = discover_bundled_runtime_layout()
+    if layout is None:
+        return None
+    manifest_path, developer_root = layout
+    try:
+        manifest = RuntimeManifest.from_path(manifest_path)
+        return BundledRuntimeResolver(manifest, resource_root=developer_root)
+    except RuntimeManifestError:
+        return None
+
+
+def apply_bundled_runtime_path(
+    environment: Mapping[str, str] | None,
+    *,
+    mode: RunMode | str,
+    policy: RuntimePolicySettings | Mapping[str, Any] | None = None,
+    require_bundled: bool = False,
+) -> dict[str, str]:
+    """Apply Safe/Full PATH precedence to a child environment.
+
+    Safe places enabled packaged tools first; Full keeps host PATH first.
+    ``require_bundled`` is used by guest-safe runs, which must keep their
+    already-isolated PATH rather than inheriting host tools when a package is
+    incomplete.
+    """
+
+    result = dict(environment or {})
+    path_key = next((key for key in result if key.casefold() == "path"), "PATH")
+    resolver = bundled_runtime_resolver()
+    if resolver is None:
+        return result
+    resolved = resolver.path_for(mode, split_path(result.get(path_key)), policy=policy)
+    result[path_key] = os.pathsep.join(str(path) for path in resolved)
+    return result
 
 
 def _coerce_role(role: ChildRole | str) -> ChildRole:

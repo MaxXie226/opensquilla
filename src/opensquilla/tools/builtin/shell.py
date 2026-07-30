@@ -97,6 +97,8 @@ from opensquilla.sandbox.path_validation import (
     trusted_write_auto_grant_allowed,
 )
 from opensquilla.sandbox.policy import LevelHints
+from opensquilla.sandbox.runtime_launcher import apply_bundled_runtime_path
+from opensquilla.sandbox.runtime_manifest import RuntimeManifestError
 from opensquilla.sandbox.types import (
     ApprovedHostExecution,
     DenialResult,
@@ -194,8 +196,27 @@ def _apply_safe_command_policy(
 def _base_shell_environment() -> dict[str, str]:
     ctx = current_tool_context.get()
     if ctx is not None and ctx.guest_safe:
-        return dict(ctx.environment or {})
-    return dict(os.environ)
+        return _runtime_shell_environment(
+            dict(ctx.environment or {}),
+            require_bundled=True,
+        )
+    return _runtime_shell_environment(dict(os.environ))
+
+
+def _runtime_shell_environment(
+    environment: dict[str, str],
+    *,
+    require_bundled: bool = False,
+) -> dict[str, str]:
+    try:
+        return apply_bundled_runtime_path(
+            environment,
+            mode=current_run_mode() or "safe",
+            policy=active_sandbox_policy().runtimes,
+            require_bundled=require_bundled,
+        )
+    except RuntimeManifestError as exc:
+        raise ToolError(str(exc)) from exc
 _SANDBOX_NETWORK_HINT = (
     "Hint: sandboxed shell/code has no direct network. Use sandbox_network approval "
     "or trusted managed-network mode, then retry the shell command through the "
@@ -5313,6 +5334,7 @@ async def _run_full_host_shell_command(
     merged_env = _base_shell_environment()
     if env:
         merged_env.update(env)
+    merged_env = _runtime_shell_environment(merged_env)
     apply_utf8_child_env(merged_env)
     _append_windows_app_alias_path(merged_env, runtime=runtime)
     merged_env = _dedupe_windows_env_keys(_host_shell_env(merged_env))
@@ -5420,8 +5442,6 @@ async def exec_command(
     justification: str = "",
     prefix_rule: list[str] | None = None,
 ) -> str:
-    import os
-
     if full_host_access_active():
         cwd = _effective_workdir(workdir)
         mutation_before = snapshot_current_workspace_mutations()
@@ -5589,9 +5609,10 @@ async def exec_command(
         if deny_block is not None:
             return json.dumps(deny_block, ensure_ascii=False)
 
-    merged_env = os.environ.copy()
+    merged_env = _base_shell_environment()
     if env:
         merged_env.update(env)
+    merged_env = _runtime_shell_environment(merged_env)
     apply_utf8_child_env(merged_env)
     _append_windows_app_alias_path(merged_env, runtime=runtime)
     merged_env = _dedupe_windows_env_keys(merged_env)
@@ -5788,8 +5809,9 @@ async def _start_host_background_process(
     """Start a host background process without sandbox policy or safety preflight."""
 
     session_id = str(uuid.uuid4())[:8]
+    base_env = dict(env) if env is not None else _base_shell_environment()
     host_env = apply_utf8_child_env(
-        _host_shell_env(dict(env) if env is not None else os.environ.copy())
+        _host_shell_env(_runtime_shell_environment(base_env))
     )
     _append_windows_app_alias_path(host_env, runtime=runtime)
     host_env = _dedupe_windows_env_keys(host_env)

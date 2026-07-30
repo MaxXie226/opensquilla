@@ -1,0 +1,59 @@
+{
+  "schemaVersion": 1,
+  "runtimeSet": "2026-07-30",
+  "assets": {
+    "windows-x64": {
+      "python": {
+        "id": "cpython-3.13.14-windows-x64",
+        "version": "3.13.14+20260728",
+        "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260728/cpython-3.13.14%2B20260728-x86_64-pc-windows-msvc-install_only_stripped.tar.gz",
+        "sha256": "a091ab914f2b7d2dbc52e9cf4a225190f72709fc79a64ec44bc61ca4d2908a64",
+        "archiveType": "tar.gz",
+        "installDir": "python",
+        "stripComponents": 1,
+        "binDirs": [
+          ".",
+          "Scripts"
+        ],
+        "executables": {
+          "python": "python.exe"
+        }
+      },
+      "node": {
+        "id": "node-24.18.1-windows-x64",
+        "version": "24.18.1",
+        "url": "https://nodejs.org/dist/v24.18.1/node-v24.18.1-win-x64.zip",
+        "sha256": "ec56b84a7551893ab2324ebdfdc4ab974a63b4781162600b68a1293cc3e53765",
+        "archiveType": "zip",
+        "installDir": "node",
+        "stripComponents": 1,
+        "binDirs": [
+          "."
+        ],
+        "executables": {
+          "node": "node.exe",
+          "npm": "npm.cmd",
+          "npx": "npx.cmd"
+        }
+      },
+      "gitBash": {
+        "id": "git-for-windows-2.55.0.3-x64",
+        "version": "2.55.0.windows.3",
+        "url": "https://github.com/git-for-windows/git/releases/download/v2.55.0.windows.3/PortableGit-2.55.0.3-64-bit.7z.exe",
+        "sha256": "ab00566336b5472120f9a52d34f2e79c5406535792acb0548001ffd0bd090e5d",
+        "archiveType": "7z-sfx",
+        "installDir": "git-bash",
+        "stripComponents": 0,
+        "binDirs": [
+          "cmd",
+          "bin",
+          "usr/bin"
+        ],
+        "executables": {
+          "git": "cmd/git.exe",
+          "bash": "bin/bash.exe"
+        }
+      }
+    }
+  }
+}

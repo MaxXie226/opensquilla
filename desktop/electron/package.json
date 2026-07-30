@@ -12,6 +12,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "build:gateway": "node scripts/build-gateway.mjs",
+    "fetch:runtimes": "node scripts/fetch-bundled-runtimes.mjs",
     "build:web": "cd ../../opensquilla-webui && npm ci && npm run build",
     "dev": "npm run build && electron .",
     "dist:local": "npm run build:web && npm run build:gateway && npm run dist",
@@ -19,6 +20,7 @@
     "verify:icons": "node scripts/verify-icon-config.mjs",
     "verify:package": "npm run verify:icons && node scripts/verify-package.mjs",
     "verify:gateway-smoke": "node scripts/smoke-gateway.mjs",
+    "test:bundled-runtimes": "node scripts/test-bundled-runtimes.mjs",
     "test:packaged-session-recovery": "node scripts/test-packaged-session-recovery.mjs",
     "test:cli-invocation": "npm run build && node scripts/test-cli-invocation.mjs",
     "test:secret-storage": "npm run build && node scripts/test-secret-storage-policy.mjs",

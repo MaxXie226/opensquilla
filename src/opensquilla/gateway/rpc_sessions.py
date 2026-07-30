@@ -365,7 +365,11 @@ def _trusted_run_mode_hint(ctx: RpcContext, source_hint: dict[str, Any]) -> Any 
 def _guest_profile_for_principal(principal: Any, task_id: str):
     has_capability = getattr(principal, "has", lambda _capability: False)
     if has_capability("guest.safe") and not principal_has_host_execute(principal):
-        return GuestProfileFactory.create(task_id)
+        from opensquilla.sandbox.runtime_launcher import bundled_runtime_resolver
+
+        resolver = bundled_runtime_resolver()
+        runtime_roots = resolver.runtime_roots() if resolver is not None else ()
+        return GuestProfileFactory.create(task_id, runtime_roots=runtime_roots)
     return None
 
 
