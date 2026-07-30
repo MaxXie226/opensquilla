@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -133,8 +134,152 @@ def _obligation_label(obligation: CompactionObligation) -> str:
     return f"{obligation.kind}: {obligation.value}"
 
 
+_OBLIGATION_CONTINUITY_PRIORITY: dict[str, int] = {
+    "user_goal": 0,
+    "user_constraint_or_preference": 1,
+    "pending_tool_or_approval_id": 2,
+    "current_plan_or_next_action": 3,
+    "failed_command_or_error": 4,
+    "do_not_repeat_action": 5,
+    "unresolved_question": 6,
+    "decision_or_rationale": 7,
+    "command": 8,
+    "tool_result_fact": 9,
+    "tool_result_id": 10,
+    "important_identifier": 11,
+    "artifact_path_or_name": 12,
+    "file_path": 13,
+}
+_DEFAULT_OBLIGATION_CONTINUITY_PRIORITY = 14
+
+
+@dataclass(slots=True)
+class _RankedObligation:
+    obligation: CompactionObligation
+    last_seen_order: int
+
+
+class _BoundedObligationBuffer:
+    """Collect bounded per-kind candidates and reserve critical continuity categories."""
+
+    def __init__(self, max_obligations: int) -> None:
+        self._max_obligations = max(0, max_obligations)
+        self._candidates: dict[tuple[str, str], _RankedObligation] = {}
+        self._next_seen_order = 0
+
+    @staticmethod
+    def _rank(candidate: _RankedObligation) -> tuple[int, int, str, str]:
+        obligation = candidate.obligation
+        return (
+            _OBLIGATION_CONTINUITY_PRIORITY.get(
+                obligation.kind,
+                _DEFAULT_OBLIGATION_CONTINUITY_PRIORITY,
+            ),
+            -candidate.last_seen_order,
+            obligation.kind,
+            obligation.value.casefold(),
+        )
+
+    def add(
+        self,
+        *,
+        key: tuple[str, str],
+        obligation: CompactionObligation,
+        seen: set[tuple[str, str]],
+    ) -> None:
+        self._next_seen_order += 1
+        if self._max_obligations == 0:
+            return
+
+        candidate = _RankedObligation(
+            obligation=obligation,
+            last_seen_order=self._next_seen_order,
+        )
+        if key in self._candidates:
+            # A repeated fact belongs to its freshest source so current task state
+            # wins over an identical mention in an older checkpoint.
+            self._candidates[key] = candidate
+            return
+
+        self._candidates[key] = candidate
+        seen.add(key)
+        same_kind = [
+            candidate_key
+            for candidate_key, ranked in self._candidates.items()
+            if ranked.obligation.kind == obligation.kind
+        ]
+        if len(same_kind) <= self._max_obligations:
+            return
+
+        evicted_key = max(
+            same_kind,
+            key=lambda candidate_key: self._rank(self._candidates[candidate_key]),
+        )
+        del self._candidates[evicted_key]
+        seen.discard(evicted_key)
+
+    def values(self) -> list[CompactionObligation]:
+        selected: dict[tuple[str, str], _RankedObligation] = {}
+
+        def _select(candidate: _RankedObligation) -> None:
+            if len(selected) >= self._max_obligations:
+                return
+            obligation = candidate.obligation
+            selected[(obligation.kind, obligation.value.casefold())] = candidate
+
+        ranked_candidates = sorted(self._candidates.values(), key=self._rank)
+        for reserved_kind in (
+            "user_goal",
+            "user_constraint_or_preference",
+        ):
+            candidate = next(
+                (
+                    item
+                    for item in ranked_candidates
+                    if item.obligation.kind == reserved_kind
+                ),
+                None,
+            )
+            if candidate is not None:
+                _select(candidate)
+
+        # Pending operations are structural continuity, not optional historical
+        # detail. Keep every pending ID that fits after the current task anchors.
+        for candidate in ranked_candidates:
+            if candidate.obligation.kind == "pending_tool_or_approval_id":
+                _select(candidate)
+
+        # Preserve balanced kind coverage before repeated facts of any one kind
+        # consume the remaining capacity.
+        represented_kinds = sorted(
+            {candidate.obligation.kind for candidate in ranked_candidates},
+            key=lambda kind: (
+                _OBLIGATION_CONTINUITY_PRIORITY.get(
+                    kind,
+                    _DEFAULT_OBLIGATION_CONTINUITY_PRIORITY,
+                ),
+                kind,
+            ),
+        )
+        for kind in represented_kinds:
+            candidate = next(
+                (item for item in ranked_candidates if item.obligation.kind == kind),
+                None,
+            )
+            if candidate is not None:
+                _select(candidate)
+
+        for candidate in ranked_candidates:
+            _select(candidate)
+
+        return [
+            candidate.obligation
+            for candidate in sorted(selected.values(), key=self._rank)
+        ]
+
+
 def _add_obligation(
-    obligations: list[CompactionObligation],
+    obligations: _BoundedObligationBuffer,
     seen: set[tuple[str, str]],
     *,
     kind: str,
@@ -143,22 +288,21 @@ def _add_obligation(
     source_entry_id: int | None,
     max_obligations: int,
 ) -> None:
-    if len(obligations) >= max_obligations:
+    if max_obligations <= 0:
         return
     cleaned = _clean_obligation_text(value)
     if not cleaned:
         return
     key = (kind, cleaned.casefold())
-    if key in seen:
-        return
-    seen.add(key)
-    obligations.append(
-        CompactionObligation(
+    obligations.add(
+        key=key,
+        obligation=CompactionObligation(
             kind=kind,
             value=cleaned,
             source_role=source_role,
             source_entry_id=source_entry_id,
-        )
+        ),
+        seen=seen,
     )
 
 
@@ -182,7 +326,7 @@ _STRUCTURED_SECTION_KINDS: dict[str, str] = {
 def _extract_rendered_structured_obligations(
     content: str,
     *,
-    obligations: list[CompactionObligation],
+    obligations: _BoundedObligationBuffer,
     seen: set[tuple[str, str]],
     source_role: str | None,
     source_entry_id: int | None,
@@ -260,10 +404,11 @@ def extract_compaction_obligations(
 ) -> list[CompactionObligation]:
     """Extract bounded high-signal continuity facts before entries are removed."""
 
-    obligations: list[CompactionObligation] = []
+    obligations = _BoundedObligationBuffer(max_obligations)
     seen: set[tuple[str, str]] = set()
-    issued_tool_call_ids: set[str] = set()
+    issued_tool_call_ids: dict[str, int] = {}
     completed_tool_call_ids: set[str] = set()
+    tool_call_order = 0
     for entry in entries:
         role = _string_value(_entry_value(entry, "role")) or None
         entry_id = _entry_value(entry, "id")
@@ -437,10 +582,11 @@ def extract_compaction_obligations(
                         or (is_result and not status_name and not pending_result)
                     )
                     if cleaned_call_id:
+                        tool_call_order += 1
                         if is_result and terminal_result:
                             completed_tool_call_ids.add(cleaned_call_id)
                         else:
-                            issued_tool_call_ids.add(cleaned_call_id)
+                            issued_tool_call_ids[cleaned_call_id] = tool_call_order
                     _add_obligation(
                         obligations,
                         seen,
@@ -551,7 +697,11 @@ def extract_compaction_obligations(
                 source_entry_id=source_entry_id,
                 max_obligations=max_obligations,
             )
-    for pending_id in sorted(issued_tool_call_ids - completed_tool_call_ids):
+    pending_ids = issued_tool_call_ids.keys() - completed_tool_call_ids
+    for pending_id in sorted(
+        pending_ids,
+        key=lambda candidate_id: (issued_tool_call_ids[candidate_id], candidate_id),
+    ):
         _add_obligation(
             obligations,
             seen,
@@ -561,7 +711,7 @@ def extract_compaction_obligations(
             source_entry_id=None,
             max_obligations=max_obligations,
         )
-    return obligations
+    return obligations.values()
 
 
 def verify_summary_coverage(

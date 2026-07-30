@@ -235,6 +235,102 @@ def test_extract_compaction_obligations_prioritizes_goals_when_bounded() -> None
     ]
 
 
+def test_extract_compaction_obligations_keeps_current_workset_after_old_noise() -> None:
+    entries = [
+        {
+            "role": "user",
+            "content": (
+                ("Goal: superseded migration goal.\nConstraint: superseded compatibility rule.\n")
+                if index == 0
+                else ""
+            )
+            + f"Touch src/legacy/noise_{index}.py.",
+        }
+        for index in range(64)
+    ]
+    entries.extend(
+        [
+            {
+                "role": "user",
+                "content": (
+                    "Goal: ship the current compaction fix.\n"
+                    "Constraint: preserve pending operation continuity."
+                ),
+            },
+            {
+                "role": "assistant",
+                "content": "Waiting for the current operations.",
+                "tool_calls": [
+                    {"id": "call_pending_tool", "type": "function"},
+                    {"id": "approval_pending_current", "type": "function"},
+                ],
+            },
+        ]
+    )
+
+    obligations = extract_compaction_obligations(entries, max_obligations=64)
+    summary, _coverage = build_structured_summary_from_text(
+        "The current task remains in progress.",
+        obligations,
+    )
+
+    assert len(obligations) == 64
+    assert summary.user_goal == "ship the current compaction fix."
+    assert summary.constraints_and_preferences[0] == (
+        "preserve pending operation continuity."
+    )
+    assert summary.pending_tool_and_approval_ids == [
+        "approval_pending_current",
+        "call_pending_tool",
+    ]
+    assert not any(
+        item.kind == "file_path" and item.value == "src/legacy/noise_0.py"
+        for item in obligations
+    )
+
+
+def test_extract_compaction_obligations_reserves_current_workset_after_goal_noise() -> None:
+    entries = [
+        {
+            "role": "user",
+            "content": f"Goal: superseded historical objective {index}.",
+        }
+        for index in range(70)
+    ]
+    entries.extend(
+        [
+            {
+                "role": "user",
+                "content": (
+                    "Goal: complete the active bounded selection repair.\n"
+                    "Constraint: retain the active pending operation."
+                ),
+            },
+            {
+                "role": "assistant",
+                "content": "The active tool operation is still pending.",
+                "tool_calls": [{"id": "call_active_pending", "type": "function"}],
+            },
+        ]
+    )
+
+    obligations = extract_compaction_obligations(entries, max_obligations=64)
+    summary, _coverage = build_structured_summary_from_text(
+        "The active repair is still underway.",
+        obligations,
+    )
+
+    assert len(obligations) == 64
+    assert summary.user_goal == "complete the active bounded selection repair."
+    assert summary.constraints_and_preferences[0] == (
+        "retain the active pending operation."
+    )
+    assert summary.pending_tool_and_approval_ids == ["call_active_pending"]
+    assert all(
+        item.value != "superseded historical objective 0." for item in obligations
+    )
+
+
 def test_structured_summary_backfills_missing_obligations_without_blocking() -> None:
     obligations = extract_compaction_obligations(
         [
