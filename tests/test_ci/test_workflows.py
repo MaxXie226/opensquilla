@@ -980,6 +980,7 @@ def test_default_ci_uses_layered_job_conditions() -> None:
     assert "tui_changed == 'true'" in jobs["tui-check"]["if"]
     assert "desktop_changed == 'true'" in jobs["desktop-check"]["if"]
     assert "python_changed == 'true'" in jobs["ubuntu-quality"]["if"]
+    assert "docs_only != 'true'" in jobs["client-contract-compat"]["if"]
     assert "full_required == 'true'" in jobs["ubuntu-full"]["if"]
     assert "platform_sensitive_changed == 'true'" in jobs["windows-compat"]["if"]
     assert "windows_full_required == 'true'" in jobs["windows-full"]["if"]
@@ -997,6 +998,7 @@ def test_default_ci_uses_layered_job_conditions() -> None:
     assert "ubuntu-full" in jobs["ci-result"]["needs"]
     assert "macos-recovery" in jobs["ci-result"]["needs"]
     assert "desktop-recovery-e2e" in jobs["ci-result"]["needs"]
+    assert "client-contract-compat" in jobs["ci-result"]["needs"]
 
     frontend_steps = jobs["frontend-check"]["steps"]
     sdk_step = next(
@@ -1012,6 +1014,37 @@ def test_default_ci_uses_layered_job_conditions() -> None:
         step for step in quality_steps if step.get("name") == "Verify generated client contracts"
     )
     assert "generate_client_contracts.py --check" in contract_step["run"]
+    contract_tests = next(
+        step for step in quality_steps if step.get("name") == "Test client contract generation"
+    )
+    assert "tests/test_contracts" in contract_tests["run"]
+    assert "test_build_client_contract_release.py" in contract_tests["run"]
+
+
+def test_client_contract_compatibility_job_is_fork_safe_and_fail_closed() -> None:
+    job = _workflow("ci.yml")["jobs"]["client-contract-compat"]
+    steps = job["steps"]
+    checkout = next(
+        step for step in steps if step.get("name") == "Check out repository history"
+    )
+    compare = next(
+        step for step in steps if step.get("name") == "Compare public client contract"
+    )
+    upload = next(
+        step for step in steps if step.get("name") == "Upload compatibility report"
+    )
+
+    assert checkout["with"] == {
+        "fetch-depth": 0,
+        "lfs": False,
+        "persist-credentials": False,
+    }
+    assert "--baseline-ref" in compare["run"]
+    assert "--allow-missing-baseline" in compare["run"]
+    assert "--output client-contract-compatibility.json" in compare["run"]
+    assert upload["if"] == "always()"
+    assert upload["with"]["if-no-files-found"] == "error"
+    assert "secrets." not in json.dumps(job)
 
 
 def test_ci_result_gate_covers_every_conditional_job_and_classifier_flag() -> None:
@@ -1033,6 +1066,7 @@ def test_ci_result_gate_covers_every_conditional_job_and_classifier_flag() -> No
         "tui-check",
         "desktop-check",
         "ubuntu-quality",
+        "client-contract-compat",
         "ubuntu-full",
         "windows-compat",
         "windows-full",
@@ -1042,6 +1076,9 @@ def test_ci_result_gate_covers_every_conditional_job_and_classifier_flag() -> No
     }
     assert gate_step["run"] == "python .github/scripts/check_ci_results.py"
     assert gate_step["env"]["RESULT_UBUNTU_FULL"] == "${{ needs.ubuntu-full.result }}"
+    assert gate_step["env"]["RESULT_CLIENT_CONTRACT"] == (
+        "${{ needs.client-contract-compat.result }}"
+    )
     assert gate_step["env"]["RESULT_MACOS_RECOVERY"] == (
         "${{ needs.macos-recovery.result }}"
     )
@@ -1460,6 +1497,33 @@ def test_wheelhouse_release_publishes_only_recommended_router_profile() -> None:
     assert "opensquilla-release-assets-${{ env.RELEASE_PROFILE }}" in text
     assert "--profile \"${RELEASE_PROFILE}\"" not in text
     assert "- core" not in text
+
+
+def test_release_publishes_versioned_client_contract_metadata() -> None:
+    workflow = _workflow("wheelhouse-release.yml")
+    publish = workflow["jobs"]["publish-release"]
+    steps = publish["steps"]
+    checkout = next(step for step in steps if step.get("name") == "Checkout release metadata")
+    build = next(
+        step
+        for step in steps
+        if step.get("name") == "Build public client contract release metadata"
+    )
+    checksums = next(
+        step for step in steps if step.get("name") == "Regenerate release checksums"
+    )
+    verify = next(step for step in steps if step.get("name") == "Verify release asset set")
+
+    assert checkout["with"]["fetch-depth"] == 0
+    assert checkout["with"]["lfs"] is False
+    assert "git tag --merged HEAD --sort=-version:refname" in build["run"]
+    assert "contracts/client/v3/contract.json" in build["run"]
+    assert "--allow-bootstrap" in build["run"]
+    assert "--baseline-ref" in build["run"]
+    assert "scripts.build_client_contract_release" in build["run"]
+    assert "scripts.build_client_contract_release" in checksums["run"]
+    assert "scripts.build_client_contract_release" in verify["run"]
+    assert "secrets." not in json.dumps(build)
 
 
 def test_release_python_assets_are_independent_from_desktop_webui_artifact() -> None:

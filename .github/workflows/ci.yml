@@ -374,13 +374,20 @@ jobs:
         run: |
           uv run pytest \
             tests/test_contracts \
+            tests/test_scripts/test_build_client_contract_release.py \
             tests/test_scripts/test_export_gateway_client_contract.py \
             tests/test_scripts/test_generate_client_contracts.py \
             -q
 
       - name: Lint
         shell: bash
-        run: uv run ruff check src tests scripts/generate_client_contracts.py
+        run: |
+          uv run ruff check \
+            src \
+            tests \
+            scripts/generate_client_contracts.py \
+            scripts/check_client_contract_compat.py \
+            scripts/build_client_contract_release.py
 
       - name: Type check
         shell: bash
@@ -427,6 +434,67 @@ jobs:
         shell: bash
         run: |
           uv run python -m pytest tests/test_gateway/test_task_runtime_terminal_cleanup.py::test_no_leak_under_load -v
+
+  client-contract-compat:
+    name: Client contract compatibility
+    needs: classify-changes
+    if: ${{ needs.classify-changes.outputs.docs_only != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: false
+          persist-credentials: false
+
+      - name: Select compatibility baseline
+        shell: bash
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          case "${GITHUB_EVENT_NAME}" in
+            pull_request)
+              baseline="${PR_BASE_SHA}"
+              ;;
+            push)
+              if [[ -n "${PUSH_BEFORE_SHA}" \
+                 && "${PUSH_BEFORE_SHA}" != "0000000000000000000000000000000000000000" ]]; then
+                baseline="${PUSH_BEFORE_SHA}"
+              else
+                baseline="$(git rev-parse HEAD^)"
+              fi
+              ;;
+            *)
+              baseline="$(git rev-parse HEAD^)"
+              ;;
+          esac
+          if [[ -z "${baseline}" ]]; then
+            echo "Unable to select a client contract compatibility baseline" >&2
+            exit 1
+          fi
+          printf 'CLIENT_CONTRACT_BASELINE=%s\n' "${baseline}" >> "${GITHUB_ENV}"
+
+      - name: Compare public client contract
+        shell: bash
+        run: |
+          python scripts/check_client_contract_compat.py \
+            --baseline-ref "${CLIENT_CONTRACT_BASELINE}" \
+            --allow-missing-baseline \
+            --candidate contracts/client/v3 \
+            --output client-contract-compatibility.json
+
+      - name: Upload compatibility report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: opensquilla-client-contract-compatibility
+          path: client-contract-compatibility.json
+          if-no-files-found: error
+          overwrite: true
 
   ubuntu-full:
     name: Full offline tests (ubuntu-latest, ${{ matrix.shard }})
@@ -1125,6 +1193,7 @@ jobs:
       - tui-check
       - desktop-check
       - ubuntu-quality
+      - client-contract-compat
       - ubuntu-full
       - windows-compat
       - windows-full
@@ -1170,6 +1239,7 @@ jobs:
           RESULT_TUI: ${{ needs.tui-check.result }}
           RESULT_DESKTOP: ${{ needs.desktop-check.result }}
           RESULT_UBUNTU: ${{ needs.ubuntu-quality.result }}
+          RESULT_CLIENT_CONTRACT: ${{ needs.client-contract-compat.result }}
           RESULT_UBUNTU_FULL: ${{ needs.ubuntu-full.result }}
           RESULT_WINDOWS_SMOKE: ${{ needs.windows-compat.result }}
           RESULT_WINDOWS_FULL: ${{ needs.windows-full.result }}

@@ -120,6 +120,11 @@ def check_ci_results(env: Mapping[str, str]) -> list[str]:
             "Release packaging contracts",
             flags["release_changed"] or flags["build_wheel_required"] or full,
         ),
+        (
+            "RESULT_CLIENT_CONTRACT",
+            "Client contract compatibility",
+            not flags["docs_only"],
+        ),
     )
     for variable, label, required in conditional_results:
         _require_result(env, errors, variable, label, required=required)

@@ -586,6 +586,8 @@ jobs:
       - name: Checkout release metadata
         uses: actions/checkout@v4
         with:
+          fetch-depth: 0
+          lfs: false
           persist-credentials: false
           ref: ${{ env.RELEASE_TAG != '' && env.RELEASE_TAG || github.ref }}
 
@@ -614,6 +616,46 @@ jobs:
           pattern: opensquilla-gateway-runtime-*
           path: dist
           merge-multiple: true
+
+      - name: Build public client contract release metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(python - <<'PY'
+          import tomllib
+          from pathlib import Path
+
+          project = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+          print(project["project"]["version"])
+          PY
+          )"
+          source_commit="$(git rev-parse HEAD)"
+          source_ref="${RELEASE_TAG:-${GITHUB_REF_NAME}}"
+          baseline_ref=""
+          while IFS= read -r tag; do
+            [[ -z "${tag}" ]] && continue
+            if [[ "$(git rev-parse "${tag}^{commit}")" == "${source_commit}" ]]; then
+              continue
+            fi
+            if git cat-file -e "${tag}:contracts/client/v3/contract.json" 2>/dev/null; then
+              baseline_ref="${tag}"
+              break
+            fi
+          done < <(git tag --merged HEAD --sort=-version:refname)
+
+          args=(
+            --version "${version}"
+            --contract-dir contracts/client/v3
+            --output-dir dist
+            --source-ref "${source_ref}"
+            --source-commit "${source_commit}"
+          )
+          if [[ -n "${baseline_ref}" ]]; then
+            args+=(--baseline-ref "${baseline_ref}")
+          else
+            args+=(--allow-bootstrap)
+          fi
+          python -m scripts.build_client_contract_release "${args[@]}"
 
       - name: Regenerate release checksums
         shell: bash
@@ -647,6 +689,17 @@ jobs:
               ],
               text=True,
           ).splitlines()
+          client_contract_asset_names = subprocess.check_output(
+              [
+                  sys.executable,
+                  "-m",
+                  "scripts.build_client_contract_release",
+                  "--version",
+                  version,
+                  "--list-assets",
+              ],
+              text=True,
+          ).splitlines()
           asset_names = [
               f"OpenSquilla-{desktop_version}-mac-arm64.dmg",
               f"OpenSquilla-{desktop_version}-mac-arm64.zip",
@@ -658,6 +711,7 @@ jobs:
               "latest.yml",
               f"opensquilla-{version}-py3-none-any.whl",
               *runtime_asset_names,
+              *client_contract_asset_names,
           ]
           lines = []
           for name in asset_names:
@@ -699,6 +753,17 @@ jobs:
               ],
               text=True,
           ).splitlines()
+          client_contract_asset_names = subprocess.check_output(
+              [
+                  sys.executable,
+                  "-m",
+                  "scripts.build_client_contract_release",
+                  "--version",
+                  version,
+                  "--list-assets",
+              ],
+              text=True,
+          ).splitlines()
           sha256s = dist / "SHA256SUMS"
           asset_names = [
               f"OpenSquilla-{desktop_version}-mac-arm64.dmg",
@@ -711,6 +776,7 @@ jobs:
               "latest.yml",
               f"opensquilla-{version}-py3-none-any.whl",
               *runtime_asset_names,
+              *client_contract_asset_names,
           ]
           assets = [dist / name for name in asset_names]
           assert sha256s.is_file(), "missing SHA256SUMS"
@@ -904,6 +970,17 @@ jobs:
               ],
               text=True,
           ).splitlines()
+          client_contract_asset_names = subprocess.check_output(
+              [
+                  sys.executable,
+                  "-m",
+                  "scripts.build_client_contract_release",
+                  "--version",
+                  version,
+                  "--list-assets",
+              ],
+              text=True,
+          ).splitlines()
           expected = {
               f"OpenSquilla-{desktop_version}-mac-arm64.dmg",
               f"OpenSquilla-{desktop_version}-mac-arm64.zip",
@@ -915,6 +992,7 @@ jobs:
               "latest.yml",
               f"opensquilla-{version}-py3-none-any.whl",
               *runtime_asset_names,
+              *client_contract_asset_names,
               "SHA256SUMS",
           }
           raw = subprocess.check_output(
