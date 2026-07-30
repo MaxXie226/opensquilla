@@ -24,7 +24,7 @@ describe('ChatComposer control hierarchy', () => {
     expect(composerSource).toContain('setRunMode: [mode: SandboxRunMode]')
 
     expect(viewSource).toContain(':run-mode="runMode"')
-    expect(viewSource).toContain(':allowed-run-modes="allowedRunModes"')
+    expect(viewSource).toContain(':allowed-run-modes="composerAllowedRunModes"')
     expect(viewSource).toContain('@set-run-mode="setComposerRunMode"')
     expect(viewSource).toContain('useChatRunModePreference')
     expect(viewSource).toContain('setGlobalRunMode')
