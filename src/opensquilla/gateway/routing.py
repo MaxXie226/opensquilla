@@ -552,6 +552,15 @@ def tool_context_from_envelope(
         subagent_depth=int(envelope.metadata.get("spawn_depth") or 0),
         agent_id=envelope.agent_id,
         workspace_dir=effective_workspace_dir,
+        guest_safe=bool(envelope.metadata.get("guest_safe")),
+        environment=(
+            {
+                str(key): str(value)
+                for key, value in envelope.metadata.get("guest_environment", {}).items()
+            }
+            if isinstance(envelope.metadata.get("guest_environment"), dict)
+            else None
+        ),
         workspace_strict=workspace_strict,
         run_mode=run_mode.value if run_mode is not None else None,
         sandbox_mounts=sandbox_mounts,

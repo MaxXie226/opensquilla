@@ -82,6 +82,7 @@ from opensquilla.provider.types import (
     ProviderRequestCorrelation,
     derive_provider_request_correlation,
 )
+from opensquilla.sandbox.guest_profile import GuestProfileFactory
 from opensquilla.sandbox.run_context import (
     RUN_CONTEXT_ORIGIN_KEY,
     RunContext,
@@ -95,6 +96,7 @@ from opensquilla.sandbox.run_mode import (
 )
 from opensquilla.sandbox.run_mode_policy import (
     coerce_run_mode_for_principal,
+    principal_has_host_execute,
     run_mode_allowed_for_principal,
 )
 from opensquilla.session.compaction import (
@@ -339,10 +341,13 @@ def _trusted_run_mode_hint(ctx: RpcContext, source_hint: dict[str, Any]) -> Any 
             run_mode = normalize_run_mode(value)
         except ValueError:
             return None
+        if run_mode == RunMode.FULL and not principal_has_host_execute(ctx.principal):
+            raise RpcHandlerError(
+                "HOST_CAPABILITY_REQUIRED",
+                "Full access requires a valid token with host execution permission.",
+            )
         if run_mode_allowed_for_principal(run_mode, ctx.principal):
             return run_mode
-        if run_mode == RunMode.FULL and not ctx.principal.is_owner:
-            return RunMode.SAFE
         return None
 
     elevated = source_hint.get("elevated")
@@ -354,6 +359,13 @@ def _trusted_run_mode_hint(ctx: RpcContext, source_hint: dict[str, Any]) -> Any 
         return RunMode.SAFE
     if elevated == "full":
         return RunMode.FULL
+    return None
+
+
+def _guest_profile_for_principal(principal: Any, task_id: str):
+    has_capability = getattr(principal, "has", lambda _capability: False)
+    if has_capability("guest.safe") and not principal_has_host_execute(principal):
+        return GuestProfileFactory.create(task_id)
     return None
 
 
@@ -2652,17 +2664,23 @@ async def _handle_sessions_send(
     workspace_path = resolve_agent_workspace_dir(agent_id, ctx.config)
     configured_workspace_dir = str(workspace_path) if workspace_path is not None else None
     workspace_dir = configured_workspace_dir
+    turn_id = uuid.uuid4().hex
     run_mode_hint = _trusted_run_mode_hint(ctx, source_hint)
-    try:
-        run_context, authoritative_guard = await authoritative_project_run_context(
-            storage=storage,
-            session_manager=ctx.session_manager,
-            session=session,
-            config=ctx.config,
-            default_workspace=workspace_dir,
-        )
-    except ProjectWorkspaceStateError as exc:
-        raise _project_workspace_error(exc) from exc
+    guest_profile = _guest_profile_for_principal(ctx.principal, turn_id)
+    if guest_profile is not None:
+        run_context = guest_profile.run_context()
+        authoritative_guard = None
+    else:
+        try:
+            run_context, authoritative_guard = await authoritative_project_run_context(
+                storage=storage,
+                session_manager=ctx.session_manager,
+                session=session,
+                config=ctx.config,
+                default_workspace=workspace_dir,
+            )
+        except ProjectWorkspaceStateError as exc:
+            raise _project_workspace_error(exc) from exc
     if authoritative_guard is not None:
         workspace_guard = authoritative_guard
     run_context = replace(
@@ -2722,6 +2740,11 @@ async def _handle_sessions_send(
         run_context,
         principal_is_owner=ctx.principal.is_owner,
     )
+    if guest_profile is not None:
+        route_envelope.metadata["guest_safe"] = True
+        route_envelope.metadata["guest_environment"] = dict(
+            guest_profile.environment
+        )
     elevated_hint = _trusted_elevated_hint(ctx, source_hint)
     if elevated_hint is not None:
         route_envelope.metadata["elevated"] = elevated_hint
@@ -2744,7 +2767,6 @@ async def _handle_sessions_send(
     # Allocate the durable causal identity before persistence.  The same id is
     # handed to TaskRuntime, live events, bootstrap history, and every transcript
     # row produced by this turn.
-    turn_id = uuid.uuid4().hex
     client_message_id = requested_client_message_id or uuid.uuid4().hex
     surface_id = (
         requested_surface_id
@@ -2872,16 +2894,20 @@ async def _handle_sessions_send(
             execution_session = await storage.get_session(key)
             if execution_session is None:
                 raise KeyError(f"Session not found: {key}")
-            (
-                execution_run_context,
-                _execution_workspace_guard,
-            ) = await authoritative_project_run_context(
-                storage=storage,
-                session_manager=ctx.session_manager,
-                session=execution_session,
-                config=ctx.config,
-                default_workspace=configured_workspace_dir,
-            )
+            if guest_profile is not None:
+                execution_run_context = guest_profile.run_context()
+                _execution_workspace_guard = None
+            else:
+                (
+                    execution_run_context,
+                    _execution_workspace_guard,
+                ) = await authoritative_project_run_context(
+                    storage=storage,
+                    session_manager=ctx.session_manager,
+                    session=execution_session,
+                    config=ctx.config,
+                    default_workspace=configured_workspace_dir,
+                )
             execution_run_context = apply_accepted_run_mode_override(
                 execution_run_context,
                 accepted_run_mode_override,
@@ -3016,6 +3042,8 @@ async def _handle_sessions_send(
                 {"message": error_message, "code": event_code},
             )
         finally:
+            if guest_profile is not None:
+                guest_profile.cleanup()
             if "turn_scope" in locals():
                 turn_scope.__exit__(None, None, None)
             if not _terminal_emitted:

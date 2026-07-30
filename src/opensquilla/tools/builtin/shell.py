@@ -189,6 +189,13 @@ def _apply_safe_command_policy(
             else ""
         ),
     )
+
+
+def _base_shell_environment() -> dict[str, str]:
+    ctx = current_tool_context.get()
+    if ctx is not None and ctx.guest_safe:
+        return dict(ctx.environment or {})
+    return dict(os.environ)
 _SANDBOX_NETWORK_HINT = (
     "Hint: sandboxed shell/code has no direct network. Use sandbox_network approval "
     "or trusted managed-network mode, then retry the shell command through the "
@@ -5303,7 +5310,7 @@ async def _run_full_host_shell_command(
     """Execute directly on the host without sandbox policy or safety preflight."""
 
     runtime = get_runtime()
-    merged_env = os.environ.copy()
+    merged_env = _base_shell_environment()
     if env:
         merged_env.update(env)
     apply_utf8_child_env(merged_env)
@@ -6026,7 +6033,7 @@ async def background_process(
     effective_timeout = _resolve_background_timeout(timeout)
 
     if runtime is not None and runtime.effective.sandbox_enabled and not host_execution:
-        merged_env = dict(os.environ)
+        merged_env = _base_shell_environment()
         apply_utf8_child_env(merged_env)
         _append_windows_app_alias_path(merged_env, runtime=runtime)
         merged_env = _dedupe_windows_env_keys(merged_env)

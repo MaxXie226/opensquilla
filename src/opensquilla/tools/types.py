@@ -52,6 +52,8 @@ class ToolContext:
     subagent_depth: int = 0
     agent_id: str = "main"
     workspace_dir: str | None = None
+    guest_safe: bool = False
+    environment: dict[str, str] | None = None
     memory_source_dir: str | None = None
     workspace_strict: bool = False
     scratch_dir: str | None = None
