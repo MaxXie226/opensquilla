@@ -23,6 +23,49 @@ from opensquilla.session.models import SessionContextState, SessionSummary
 _ANTHROPIC_COMPACTION_STATE_KIND = "anthropic_compaction_block"
 _COMPACTION_SUMMARY_CONTEXT_HEADER = "[Compacted Session Summaries]"
 _COMPACTION_SUMMARY_CONTEXT_MAX_CHARS = 16_000
+_STRUCTURED_COMPACTION_SUMMARY_HEADER = "[Structured Compaction Summary]"
+_STRUCTURED_SUMMARY_SECTION_ORDER = (
+    "Goal",
+    "Current Status",
+    "Next Action",
+    "Completed Steps",
+    "Open Steps",
+    "Files and Artifacts",
+    "Tool Results To Remember",
+    "Decisions and Rationale",
+    "Known Failures",
+    "Executed Commands and Tests",
+    "Pending Tool and Approval IDs",
+    "Important Identifiers",
+    "Constraints and Preferences",
+    "Do Not Repeat",
+    "Unresolved Questions",
+    "Critical Carry Forward",
+)
+_STRUCTURED_SUMMARY_SECTION_PRIORITY = (
+    "Goal",
+    "Next Action",
+    "Pending Tool and Approval IDs",
+    "Critical Carry Forward",
+    "Constraints and Preferences",
+    "Current Status",
+    "Open Steps",
+    "Known Failures",
+    "Unresolved Questions",
+    "Important Identifiers",
+    "Decisions and Rationale",
+    "Tool Results To Remember",
+    "Files and Artifacts",
+    "Do Not Repeat",
+    "Completed Steps",
+    "Executed Commands and Tests",
+)
+_COMPACTION_SECTION_OMISSION_MARKER = (
+    "[Omitted from request replay to fit the context budget.]"
+)
+_LEGACY_SUMMARY_MIDDLE_OMISSION_MARKER = (
+    "[Legacy compaction summary text omitted in the middle to fit the context budget.]"
+)
 
 
 @dataclass(frozen=True)
@@ -37,6 +80,190 @@ class CompactionContextItem:
     compaction_id: str | None
     source: str
     covered_through_id: int
+
+
+@dataclass(frozen=True)
+class _StructuredSummarySection:
+    title: str
+    text: str
+
+
+def _split_structured_summary_sections(
+    text: str,
+) -> list[_StructuredSummarySection] | None:
+    """Split renderer-owned structured text without cutting section values."""
+
+    lines = text.splitlines()
+    if not lines or lines[0] != _STRUCTURED_COMPACTION_SUMMARY_HEADER:
+        return None
+
+    title_order = {
+        title: index for index, title in enumerate(_STRUCTURED_SUMMARY_SECTION_ORDER)
+    }
+    starts: list[tuple[int, str]] = []
+    seen: set[str] = set()
+    previous_order = -1
+    for line_index, line in enumerate(lines[1:], start=1):
+        if not line.endswith(":"):
+            continue
+        title = line[:-1]
+        order = title_order.get(title)
+        if order is None:
+            continue
+        # Renderer-owned section headers are separated from the previous
+        # section by a blank line. Requiring that boundary avoids treating
+        # ordinary one-line values as headers.
+        if line_index > 1 and lines[line_index - 1].strip():
+            continue
+        if title in seen or order <= previous_order:
+            # Ambiguous text is safer as one atomic summary than as guessed
+            # sections that could be split in the middle of a field.
+            return None
+        seen.add(title)
+        previous_order = order
+        starts.append((line_index, title))
+
+    if not starts:
+        return [] if not any(line.strip() for line in lines[1:]) else None
+    if any(line.strip() for line in lines[1 : starts[0][0]]):
+        return None
+
+    sections: list[_StructuredSummarySection] = []
+    for index, (start, title) in enumerate(starts):
+        end = starts[index + 1][0] if index + 1 < len(starts) else len(lines)
+        block = "\n".join(lines[start:end]).rstrip()
+        if not block:
+            return None
+        sections.append(_StructuredSummarySection(title=title, text=block))
+    return sections
+
+
+def _render_structured_sections(
+    sections: Sequence[_StructuredSummarySection],
+) -> str:
+    body = "\n\n".join(section.text for section in sections)
+    if not body:
+        return _STRUCTURED_COMPACTION_SUMMARY_HEADER
+    return f"{_STRUCTURED_COMPACTION_SUMMARY_HEADER}\n\n{body}"
+
+
+def _pack_structured_summary_sections(text: str, *, max_chars: int) -> str | None:
+    """Pack complete structured sections, explicitly marking every omission."""
+
+    sections = _split_structured_summary_sections(text)
+    if sections is None:
+        return None
+
+    packed_by_title = {
+        section.title: _StructuredSummarySection(
+            title=section.title,
+            text=f"{section.title}:\n{_COMPACTION_SECTION_OMISSION_MARKER}",
+        )
+        for section in sections
+    }
+
+    def _render_current() -> str:
+        return _render_structured_sections(
+            [packed_by_title[section.title] for section in sections]
+        )
+
+    packed = _render_current()
+    if len(packed) > max_chars:
+        return None
+
+    source_by_title = {section.title: section for section in sections}
+    for title in _STRUCTURED_SUMMARY_SECTION_PRIORITY:
+        source = source_by_title.get(title)
+        if source is None:
+            continue
+        omitted = packed_by_title[title]
+        packed_by_title[title] = source
+        candidate = _render_current()
+        if len(candidate) <= max_chars:
+            packed = candidate
+        else:
+            packed_by_title[title] = omitted
+    return packed
+
+
+def _bounded_legacy_fragment(text: str, *, max_chars: int, from_end: bool) -> str:
+    """Keep a readable word/line-bounded edge of otherwise opaque legacy text."""
+
+    if max_chars <= 0:
+        return ""
+    if len(text) <= max_chars:
+        return text
+
+    candidate = text[-max_chars:] if from_end else text[:max_chars]
+    if from_end:
+        newline = candidate.find("\n")
+        whitespace = candidate.find(" ")
+        boundaries = [value for value in (newline, whitespace) if value >= 0]
+        boundary = min(boundaries, default=-1)
+        if 0 <= boundary < max_chars // 2:
+            candidate = candidate[boundary + 1 :]
+        return candidate.lstrip()
+
+    newline = candidate.rfind("\n")
+    whitespace = candidate.rfind(" ")
+    boundary = max(newline, whitespace)
+    if boundary >= max_chars // 2:
+        candidate = candidate[:boundary]
+    return candidate.rstrip()
+
+
+def _pack_legacy_summary_text(text: str, *, max_chars: int) -> str | None:
+    """Preserve both continuity edges of an oversized pre-structured summary."""
+
+    cleaned = text.strip()
+    if not cleaned:
+        return None
+    if len(cleaned) <= max_chars:
+        return cleaned
+
+    separator = f"\n{_LEGACY_SUMMARY_MIDDLE_OMISSION_MARKER}\n"
+    content_budget = max_chars - len(separator)
+    if content_budget < 2:
+        return None
+
+    # Goals and original framing tend to live at the start, while the latest
+    # status and next action tend to live at the end. Reserve both explicitly.
+    head_budget = max(1, content_budget // 3)
+    tail_budget = max(1, content_budget - head_budget)
+    head = _bounded_legacy_fragment(
+        cleaned,
+        max_chars=head_budget,
+        from_end=False,
+    )
+    tail = _bounded_legacy_fragment(
+        cleaned,
+        max_chars=tail_budget,
+        from_end=True,
+    )
+    if not head and not tail:
+        return None
+    packed = f"{head}{separator}{tail}"
+    return packed if len(packed) <= max_chars else None
+
+
+def _summary_omission_marker(count: int) -> str:
+    noun = "summary" if count == 1 else "summaries"
+    return (
+        f"[Omitted {count} earlier compaction {noun} "
+        "from request replay to fit the context budget.]"
+    )
+
+
+def _render_summary_context_blocks(
+    blocks: Sequence[tuple[int, str]],
+    *,
+    omitted_earlier: int,
+) -> str:
+    body: list[str] = []
+    if omitted_earlier:
+        body.append(_summary_omission_marker(omitted_earlier))
+    body.extend(block for _, block in sorted(blocks))
+    return f"{_COMPACTION_SUMMARY_CONTEXT_HEADER}\n" + "\n\n".join(body)
 
 
 def format_compaction_summary_context(summary_texts: Sequence[str]) -> str | None:
@@ -63,16 +290,64 @@ def format_compaction_summary_context(summary_texts: Sequence[str]) -> str | Non
     )
     if len(rendered) <= _COMPACTION_SUMMARY_CONTEXT_MAX_CHARS:
         return rendered
-    tail_budget = (
-        _COMPACTION_SUMMARY_CONTEXT_MAX_CHARS
-        - len(_COMPACTION_SUMMARY_CONTEXT_HEADER)
-        - 80
-    )
-    tail_budget = max(1000, tail_budget)
-    return (
-        f"{_COMPACTION_SUMMARY_CONTEXT_HEADER}\n"
-        "[Earlier compaction summary context truncated to fit request budget.]\n"
-        f"{rendered[-tail_budget:]}"
+
+    # Budget from newest to oldest, but retain the original chronological
+    # rendering order. Structured summaries keep complete sections; opaque
+    # legacy summaries keep explicitly delimited head/tail continuity so old
+    # installations do not lose the entire checkpoint.
+    selected: list[tuple[int, str]] = []
+    omitted_earlier = 0
+    for index in range(len(deduped) - 1, -1, -1):
+        summary_number = index + 1
+        full_block = f"[Summary {summary_number}]\n{deduped[index]}"
+        full_candidate = _render_summary_context_blocks(
+            [*selected, (summary_number, full_block)],
+            omitted_earlier=index,
+        )
+        if len(full_candidate) <= _COMPACTION_SUMMARY_CONTEXT_MAX_CHARS:
+            selected.append((summary_number, full_block))
+            continue
+
+        block_prefix = f"[Summary {summary_number}]\n"
+        prefix_candidate = _render_summary_context_blocks(
+            [*selected, (summary_number, block_prefix)],
+            omitted_earlier=index,
+        )
+        section_budget = (
+            _COMPACTION_SUMMARY_CONTEXT_MAX_CHARS - len(prefix_candidate)
+        )
+        packed = _pack_structured_summary_sections(
+            deduped[index],
+            max_chars=section_budget,
+        )
+        if (
+            packed is None
+            and not deduped[index].lstrip().startswith(
+                _STRUCTURED_COMPACTION_SUMMARY_HEADER
+            )
+        ):
+            packed = _pack_legacy_summary_text(
+                deduped[index],
+                max_chars=section_budget,
+            )
+        if packed is not None:
+            packed_block = f"{block_prefix}{packed}"
+            packed_candidate = _render_summary_context_blocks(
+                [*selected, (summary_number, packed_block)],
+                omitted_earlier=index,
+            )
+            if len(packed_candidate) <= _COMPACTION_SUMMARY_CONTEXT_MAX_CHARS:
+                selected.append((summary_number, packed_block))
+                continue
+
+        omitted_earlier = index + 1
+        break
+    else:
+        omitted_earlier = 0
+
+    return _render_summary_context_blocks(
+        selected,
+        omitted_earlier=omitted_earlier,
     )
 
 
