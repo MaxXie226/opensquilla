@@ -26,6 +26,7 @@ from opensquilla.usage_evidence import (
     is_missing_usage_placeholder,
 )
 
+from .anthropic import uses_adaptive_thinking
 from .deployment import (
     CredentialPoolAcquirer,
     ProviderDeploymentResolution,
@@ -37,8 +38,11 @@ from .model_catalog import resolve_effective_context_window, shared_catalog
 from .protocol import (
     LLMProvider,
     ProviderMetadata,
+    ProviderRetryTransition,
     project_provider_message_count,
+    provider_retry_roster_fingerprint,
 )
+from .registry import UnknownProviderError, get_provider_spec
 from .selector import ModelSelector, ProviderConfig, SelectorConfig
 from .types import (
     REASONING_ONLY_LENGTH_STOP_REASONS,
@@ -80,6 +84,14 @@ _AGGREGATOR_RETRYABLE_FAILURE_KINDS = frozenset(
         ProviderFailureKind.TRANSPORT_TRANSIENT,
     }
 )
+_PROPOSER_TRANSIENT_FAILURE_KINDS = frozenset(
+    {
+        ProviderFailureKind.RATE_LIMITED,
+        ProviderFailureKind.PROVIDER_OVERLOADED,
+        ProviderFailureKind.TRANSPORT_TRANSIENT,
+    }
+)
+_PROPOSER_TRANSIENT_RETRY_BACKOFF_SECONDS = 1.0
 ENSEMBLE_MULTIMODAL_UNSUPPORTED_CODE = "ensemble_multimodal_unsupported"
 ENSEMBLE_MULTIMODAL_UNSUPPORTED_MESSAGE = (
     "Ensemble does not support image input yet. "
@@ -698,6 +710,42 @@ class _MemberRequestBudgetBinding:
     rederive: bool
 
 
+RouterDynamicRetryFactory = Callable[
+    [Mapping[str, Any]],
+    "EnsembleProvider | None",
+]
+
+
+@dataclass(frozen=True)
+class _RouterDynamicRetryContext:
+    """Frozen, request-free inputs for one chain of roster replacements."""
+
+    root_selection_plan: dict[str, Any]
+    frozen_ranking_inputs: dict[str, Any]
+    retry_factory: RouterDynamicRetryFactory
+    cumulative_excluded_identities: tuple[str, ...] = ()
+    thinking_execution_history: tuple[dict[str, Any], ...] = ()
+    pending_execution_plan: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class _ProposerRecoveryScopeState:
+    """Run-turn-scoped proposer recovery state.
+
+    ``effective_members`` changes only execution state. The immutable ranking
+    plan keeps ``selected_P`` and ``backup_P`` unchanged for replay.
+    """
+
+    scope_id: str
+    max_additional_physical_requests: int
+    additional_physical_requests_started: int = 0
+    external_physical_requests_reserved: int = 0
+    effective_members: dict[int, EnsembleMemberConfig] = field(default_factory=dict)
+    failed_identities: set[str] = field(default_factory=set)
+    visited_identities: set[str] = field(default_factory=set)
+    receipts: list[dict[str, Any]] = field(default_factory=list)
+
+
 @dataclass
 class _CandidateResult:
     index: int
@@ -730,6 +778,7 @@ class _CandidateResult:
     execution: dict[str, Any] = field(default_factory=dict)
     usage_reported: bool = False
     request_started: bool = False
+    stream_closed: bool = False
     physical_request_count: int = 0
     usage_missing_count: int = 0
     provider_usage: dict[str, Any] = field(default_factory=dict)
@@ -807,13 +856,13 @@ class _CandidateResult:
             "ttft_ms": self.ttft_ms,
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
+            "reasoning_tokens": self.reasoning_tokens,
             "billed_cost": self.billed_cost,
             "cost_source": self.cost_source,
         }
         if self.thinking_policy_managed:
             row.update(
                 {
-                    "reasoning_tokens": self.reasoning_tokens,
                     "requested_thinking_level": self.requested_thinking_level,
                     "effective_thinking_level": self.effective_thinking_level,
                     "provider_thinking_level": self.provider_thinking_level,
@@ -860,6 +909,158 @@ def _candidate_result_snapshot(candidate: _CandidateResult) -> _CandidateResult:
         ],
         model_usage_breakdown=[dict(row) for row in candidate.model_usage_breakdown],
     )
+
+
+def _candidate_physical_attempt_id(candidate: _CandidateResult) -> str:
+    attempts = candidate.execution.get("physical_attempts")
+    if not isinstance(attempts, list):
+        return ""
+    for attempt in reversed(attempts):
+        if not isinstance(attempt, Mapping):
+            continue
+        physical_attempt_id = str(
+            attempt.get("physical_attempt_id") or ""
+        ).strip()
+        if (
+            len(physical_attempt_id) == 32
+            and all(character in "0123456789abcdef" for character in physical_attempt_id)
+        ):
+            return physical_attempt_id
+    return ""
+
+
+def _merge_candidate_attempt_evidence(
+    original: _CandidateResult,
+    attempt: _CandidateResult,
+) -> _CandidateResult:
+    """Replace one slot's outcome while retaining every physical usage unit."""
+
+    merged = _candidate_result_snapshot(attempt)
+    merged.index = original.index
+    merged.sample_index = original.sample_index
+    merged.label = original.label
+    merged.input_tokens += original.input_tokens
+    merged.output_tokens += original.output_tokens
+    merged.reasoning_tokens += original.reasoning_tokens
+    merged.cached_tokens += original.cached_tokens
+    merged.cache_write_tokens += original.cache_write_tokens
+    merged.billed_cost += original.billed_cost
+    merged.elapsed_ms += original.elapsed_ms
+    merged.request_started = bool(
+        original.request_started or attempt.request_started
+    )
+    merged.stream_closed = bool(
+        original.stream_closed and attempt.stream_closed
+    )
+    merged.physical_request_count = (
+        original.physical_request_count + attempt.physical_request_count
+    )
+    merged.usage_missing_count = (
+        original.usage_missing_count + attempt.usage_missing_count
+    )
+    merged.usage_reported = bool(
+        original.usage_reported or attempt.usage_reported
+    )
+    merged.model_usage_breakdown = [
+        *[dict(row) for row in original.model_usage_breakdown],
+        *[dict(row) for row in attempt.model_usage_breakdown],
+    ]
+    merged.diagnostic_model_usage_breakdown = [
+        *[dict(row) for row in original.diagnostic_model_usage_breakdown],
+        *[dict(row) for row in attempt.diagnostic_model_usage_breakdown],
+    ]
+    original_attempts = original.execution.get("physical_attempts")
+    attempt_attempts = attempt.execution.get("physical_attempts")
+    if isinstance(original_attempts, list) or isinstance(attempt_attempts, list):
+        merged.execution["physical_attempts"] = [
+            *(
+                deepcopy(original_attempts)
+                if isinstance(original_attempts, list)
+                else []
+            ),
+            *(
+                deepcopy(attempt_attempts)
+                if isinstance(attempt_attempts, list)
+                else []
+            ),
+        ]
+    return merged
+
+
+def _normalized_provider_model_identity(
+    provider: object,
+    model: object,
+) -> str:
+    provider_id = str(provider or "").strip().casefold()
+    model_id = str(model or "").strip().casefold()
+    return f"{provider_id}:{model_id}" if provider_id and model_id else ""
+
+
+def _exact_reasoning_only_length_failures_from_trace(
+    trace: Mapping[str, Any],
+    *,
+    current_roster: frozenset[str],
+) -> tuple[str, ...]:
+    """Extract only fully receipted, invisible reasoning-length failures."""
+
+    candidates = trace.get("candidates")
+    if not isinstance(candidates, list):
+        return ()
+    failed: set[str] = set()
+    for candidate in candidates:
+        if not isinstance(candidate, Mapping):
+            continue
+        content = candidate.get("content")
+        if (
+            candidate.get("ok") is True
+            or candidate.get("request_started") is not True
+            or not isinstance(content, Mapping)
+            or isinstance(content.get("chars"), bool)
+            or content.get("chars") != 0
+            or str(candidate.get("text") or "").strip()
+            or str(candidate.get("error") or "").strip()
+            or str(candidate.get("error_code") or "").strip()
+            or str(candidate.get("stop_reason") or "").strip().casefold()
+            not in REASONING_ONLY_LENGTH_STOP_REASONS
+            or isinstance(candidate.get("physical_request_count"), bool)
+            or not isinstance(candidate.get("physical_request_count"), int)
+            or int(candidate["physical_request_count"]) <= 0
+            or candidate.get("usage_reported") is not True
+            or isinstance(candidate.get("usage_missing_count"), bool)
+            or not isinstance(candidate.get("usage_missing_count"), int)
+            or int(candidate["usage_missing_count"]) != 0
+        ):
+            continue
+        identity = _normalized_provider_model_identity(
+            candidate.get("requested_provider"),
+            candidate.get("requested_model"),
+        )
+        if not identity or identity not in current_roster:
+            continue
+        reasoning_tokens = candidate.get("reasoning_tokens")
+        exact_reasoning_tokens = (
+            int(reasoning_tokens)
+            if isinstance(reasoning_tokens, int)
+            and not isinstance(reasoning_tokens, bool)
+            else 0
+        )
+        for breakdown_key in (
+            "model_usage_breakdown",
+            "diagnostic_model_usage_breakdown",
+        ):
+            rows = candidate.get(breakdown_key)
+            if not isinstance(rows, list):
+                continue
+            exact_reasoning_tokens += sum(
+                int(row.get("reasoning_tokens") or 0)
+                for row in rows
+                if isinstance(row, Mapping)
+                and isinstance(row.get("reasoning_tokens"), int)
+                and not isinstance(row.get("reasoning_tokens"), bool)
+            )
+        if exact_reasoning_tokens > 0:
+            failed.add(identity)
+    return tuple(sorted(failed))
 
 
 def _publish_candidate_attempt_snapshot(
@@ -1486,6 +1687,136 @@ def _aggregator_chat_config(
         ),
     )
     return effective
+
+
+def _proposer_chat_config(
+    base: ChatConfig | None,
+    member: EnsembleMemberConfig,
+    *,
+    max_tokens_cap: int,
+    visible_answer_reserve_tokens: int,
+    max_tokens_cap_explicit: bool,
+    request_budget_binding: _MemberRequestBudgetBinding | None = None,
+) -> tuple[ChatConfig, dict[str, Any]]:
+    """Resolve a proposer output budget without inventing model capacity."""
+
+    configured_max = max(1, int(_member_max_tokens(member)))
+    cap = max(2, int(max_tokens_cap))
+    reserve = max(1, int(visible_answer_reserve_tokens))
+    capability_max = configured_max
+    capability_source = "configured_unknown"
+    trusted_ceiling = False
+    try:
+        resolved_max, resolved_source = shared_catalog().resolve_max_tokens_with_source(
+            member.provider_config.model,
+            user_override=0,
+            provider=member.provider_config.provider,
+        )
+        if resolved_source in {"catalog", "override"} and int(resolved_max or 0) > 0:
+            capability_max = int(resolved_max)
+            capability_source = str(resolved_source)
+            trusted_ceiling = True
+    except Exception:  # noqa: BLE001 - unknown capacity stays conservative
+        pass
+    if trusted_ceiling:
+        ceiling = min(cap, capability_max)
+    elif max_tokens_cap_explicit:
+        ceiling = cap
+        capability_source = "operator_explicit_unverified"
+    else:
+        ceiling = min(cap, configured_max)
+
+    capabilities = _member_model_capabilities(member)
+    dialect = str(capabilities.reasoning_format or "").strip().casefold()
+    try:
+        anthropic_backend = (
+            get_provider_spec(str(member.provider_config.provider).strip().lower()).backend
+            == "anthropic"
+        )
+    except UnknownProviderError:
+        anthropic_backend = False
+    adaptive_anthropic = anthropic_backend and uses_adaptive_thinking(member.provider_config.model)
+    explicit_budget_dialect = dialect in {
+        "anthropic",
+        "dashscope",
+        "thinking_budget",
+        "token_budget",
+    } or (anthropic_backend and not adaptive_anthropic)
+    normalized_thinking, normalized_level = _normalize_thinking(member.thinking)
+    thinking_enabled = (
+        bool(getattr(base, "thinking", False))
+        if normalized_thinking is None
+        else bool(normalized_thinking)
+    )
+    thinking_budget = (
+        _policy_thinking_budget_tokens(str(normalized_level))
+        if member.thinking_policy_managed and normalized_level is not None
+        else max(0, int(getattr(base, "thinking_budget_tokens", 0) or 0))
+        if thinking_enabled
+        else 0
+    )
+    desired = configured_max
+    if thinking_enabled and explicit_budget_dialect:
+        desired = max(desired, thinking_budget + reserve)
+    elif thinking_enabled:
+        # Effort-only APIs do not expose a separable reasoning partition.
+        # Use the entire trusted/operator-authorized ceiling so a 16k routed
+        # default does not strand a model that can emit 64k. The visible
+        # partition remains best-effort because effort APIs expose no numeric
+        # reasoning budget.
+        desired = max(desired, ceiling)
+    effective_max = min(max(1, desired), max(1, ceiling))
+    effective_reserve = min(reserve, max(1, effective_max - 1))
+    effective_member = replace(member, max_tokens=effective_max)
+    effective = _member_chat_config(
+        base,
+        effective_member,
+        request_budget_binding=request_budget_binding,
+        role="proposer",
+    )
+    guarantee = "best_effort"
+    if thinking_enabled and explicit_budget_dialect:
+        bounded_thinking_budget = min(
+            thinking_budget,
+            max(0, effective_max - effective_reserve),
+        )
+        if bounded_thinking_budget > 0:
+            effective = effective.model_copy(
+                update={
+                    "thinking_budget_tokens": bounded_thinking_budget,
+                    "thinking_budget_explicit": True,
+                }
+            )
+            if bounded_thinking_budget + effective_reserve <= effective_max:
+                guarantee = "hard"
+        else:
+            effective = effective.model_copy(
+                update={
+                    "thinking": False,
+                    "thinking_level": None,
+                    "thinking_budget_tokens": 0,
+                    "thinking_budget_explicit": False,
+                }
+            )
+    budget_trace = {
+        "configured_max_tokens": configured_max,
+        "configured_max_tokens_cap": cap,
+        "max_tokens_cap_explicit": bool(max_tokens_cap_explicit),
+        "capability_max_tokens": capability_max,
+        "capability_source": capability_source,
+        "trusted_catalog_ceiling": trusted_ceiling,
+        "effective_max_tokens": effective.max_tokens,
+        "configured_visible_answer_reserve_tokens": reserve,
+        "effective_visible_answer_reserve_tokens": effective_reserve,
+        "reasoning_dialect": dialect or "unknown",
+        "visible_answer_reserve_guarantee": guarantee,
+        "effective_thinking_budget_tokens": (
+            int(effective.thinking_budget_tokens or 0)
+            if effective.thinking
+            else 0
+        ),
+    }
+    return effective, budget_trace
 
 
 def _build_provider(cfg: ProviderConfig) -> LLMProvider:
@@ -2570,8 +2901,14 @@ class EnsembleProvider:
         aggregator_recovery_top_k: int = 3,
         aggregator_max_tokens_cap: int = 65_536,
         aggregator_visible_answer_reserve_tokens: int = 8_192,
+        proposer_backups: Sequence[EnsembleMemberConfig] = (),
+        proposer_recovery_max_additional_calls: int = 3,
+        proposer_max_tokens_cap: int = 65_536,
+        proposer_visible_answer_reserve_tokens: int = 4_096,
+        proposer_max_tokens_cap_explicit: bool = False,
         quorum_grace_seconds: float = 0.0,
         selection_plan: Mapping[str, Any] | None = None,
+        _router_dynamic_retry_context: _RouterDynamicRetryContext | None = None,
         _member_request_budget_bindings: Mapping[tuple[str, str, str], _MemberRequestBudgetBinding]
         | None = None,
         _credential_pool_failure_reporter: CredentialPoolFailureReporter | None = None,
@@ -2615,6 +2952,32 @@ class EnsembleProvider:
         self.aggregator_visible_answer_reserve_tokens = int(
             aggregator_visible_answer_reserve_tokens or 0
         )
+        self.proposer_backups = list(proposer_backups)
+        self.proposer_recovery_max_additional_calls = int(
+            proposer_recovery_max_additional_calls or 0
+        )
+        self.proposer_max_tokens_cap = int(proposer_max_tokens_cap or 0)
+        self.proposer_visible_answer_reserve_tokens = int(
+            proposer_visible_answer_reserve_tokens or 0
+        )
+        self.proposer_max_tokens_cap_explicit = bool(
+            proposer_max_tokens_cap_explicit
+        )
+        if self.proposer_recovery_max_additional_calls < 0:
+            raise ValueError(
+                "proposer_recovery_max_additional_calls must be non-negative"
+            )
+        if self.proposer_max_tokens_cap < 2:
+            raise ValueError("proposer_max_tokens_cap must be at least 2")
+        if not (
+            1
+            <= self.proposer_visible_answer_reserve_tokens
+            < self.proposer_max_tokens_cap
+        ):
+            raise ValueError(
+                "proposer_visible_answer_reserve_tokens must be between 1 "
+                "and proposer_max_tokens_cap - 1"
+            )
         if self.aggregator_max_tokens_cap < 2:
             raise ValueError("aggregator_max_tokens_cap must be at least 2")
         if not (
@@ -2626,9 +2989,51 @@ class EnsembleProvider:
             )
         self.quorum_grace_seconds = max(0.0, float(quorum_grace_seconds or 0.0))
         self.selection_plan = dict(selection_plan or {})
+        recovery_policy = self.selection_plan.get("proposer_recovery_policy")
+        if isinstance(recovery_policy, Mapping):
+            if not provider_retry_roster_fingerprint(self.selection_plan):
+                raise ValueError(
+                    "router_dynamic proposer recovery selection plan is invalid"
+                )
+            runtime_primary_ids = [
+                self._member_identity(member) for member in self.proposers
+            ]
+            runtime_backup_ids = [
+                self._member_identity(member) for member in self.proposer_backups
+            ]
+            if list(self.selection_plan.get("selected_P") or []) != runtime_primary_ids:
+                raise ValueError(
+                    "router_dynamic proposer recovery primary roster does not "
+                    "match the frozen selection plan"
+                )
+            if list(self.selection_plan.get("backup_P") or []) != runtime_backup_ids:
+                raise ValueError(
+                    "router_dynamic proposer recovery backup roster does not "
+                    "match the frozen selection plan"
+                )
+            runtime_policy = {
+                "max_additional_physical_requests": (
+                    self.proposer_recovery_max_additional_calls
+                ),
+                "quorum_required": self.min_successful_proposers,
+                "max_tokens_cap": self.proposer_max_tokens_cap,
+                "visible_answer_reserve_tokens": (
+                    self.proposer_visible_answer_reserve_tokens
+                ),
+            }
+            for field_name, runtime_value in runtime_policy.items():
+                if recovery_policy.get(field_name) != runtime_value:
+                    raise ValueError(
+                        "router_dynamic proposer recovery "
+                        f"{field_name} does not match the frozen selection plan"
+                    )
+        self._router_dynamic_retry_context = _router_dynamic_retry_context
+        self._retry_transition_prepared = False
         self._member_request_budget_bindings = dict(_member_request_budget_bindings or {})
         self._credential_pool_failure_reporter = _credential_pool_failure_reporter
         self._active_chat = False
+        self._proposer_retry_scope: _ProposerRecoveryScopeState | None = None
+        self._current_proposer_recovery_trace: dict[str, Any] | None = None
         self._pending_cleanup_tasks: set[asyncio.Future[Any]] = set()
         self._pending_cleanup_phases: dict[asyncio.Future[Any], str] = {}
         self._cleanup_poisoned_reason = ""
@@ -2846,7 +3251,10 @@ class EnsembleProvider:
     def enforces_routed_thinking_policy(self) -> bool:
         """Whether outer wrappers must not hop to an unmanaged provider."""
 
-        return self._thinking_policy_active()
+        return bool(
+            self._thinking_policy_active()
+            or self._router_dynamic_proposer_recovery_enabled()
+        )
 
     def _reset_usage_accounting_snapshot(
         self,
@@ -3073,6 +3481,332 @@ class EnsembleProvider:
             pending_count=len(self._pending_cleanup_tasks),
         )
 
+    @property
+    def prepare_retry_after_failure(
+        self,
+    ) -> Callable[[ErrorEvent], ProviderRetryTransition | None] | None:
+        """Expose legacy roster replacement only for archived plans."""
+
+        if isinstance(
+            self.selection_plan.get("proposer_recovery_policy"),
+            Mapping,
+        ):
+            return None
+        return self._prepare_legacy_retry_after_failure
+
+    def _prepare_legacy_retry_after_failure(
+        self,
+        event: ErrorEvent,
+    ) -> ProviderRetryTransition | None:
+        """Do not replay an ensemble after proposer failure.
+
+        Router-dynamic recovery is now internal and slot-local so successful
+        primaries are retained. The legacy whole-roster transition remains
+        below only for read compatibility with historical traces; it is
+        intentionally unreachable.
+        """
+
+        context = self._router_dynamic_retry_context
+        if context is None or self._retry_transition_prepared:
+            return None
+        # A provider instance owns at most one preparation attempt.  A rejected
+        # event or factory cannot be retried into a different local outcome.
+        self._retry_transition_prepared = True
+        if (
+            not isinstance(event, ErrorEvent)
+            or event.code != "ensemble_insufficient_proposers"
+            or self._active_chat
+            or self._cleanup_is_pending()
+            or str(self.selection_plan.get("strategy") or "") != "router_dynamic"
+            or str(self.selection_plan.get("selection_mode") or "")
+            != "router_dynamic"
+        ):
+            return None
+        trace = event.ensemble_trace
+        if not isinstance(trace, Mapping):
+            return None
+        final_request = trace.get("final_request")
+        if (
+            trace.get("fallback_used") is not False
+            or trace.get("final_request_role") != "none"
+            or not isinstance(final_request, Mapping)
+            or final_request.get("role") != "none"
+            or final_request.get("request_started") is not False
+        ):
+            return None
+
+        source_plan = trace.get("selection_plan")
+        if not isinstance(source_plan, Mapping):
+            return None
+        source_plan = deepcopy(dict(source_plan))
+        source_fingerprint = provider_retry_roster_fingerprint(source_plan)
+        if (
+            not source_fingerprint
+            or source_fingerprint
+            != provider_retry_roster_fingerprint(self.selection_plan)
+        ):
+            return None
+        raw_selected = source_plan.get("selected_P")
+        if not isinstance(raw_selected, list):
+            return None
+        selected_identities = tuple(
+            str(identity or "").strip().casefold()
+            for identity in raw_selected
+        )
+        actual_identities = tuple(
+            self._member_identity(member).strip().casefold()
+            for member in self.proposers
+        )
+        if (
+            not selected_identities
+            or any(not identity for identity in selected_identities)
+            or selected_identities != actual_identities
+        ):
+            return None
+
+        candidates = trace.get("candidates")
+        if not isinstance(candidates, list):
+            return None
+        candidate_physical_count = sum(
+            int(candidate.get("physical_request_count") or 0)
+            for candidate in candidates
+            if isinstance(candidate, Mapping)
+            and candidate.get("request_started") is True
+            and isinstance(candidate.get("physical_request_count"), int)
+            and not isinstance(candidate.get("physical_request_count"), bool)
+        )
+        candidate_missing_count = sum(
+            int(candidate.get("usage_missing_count") or 0)
+            for candidate in candidates
+            if isinstance(candidate, Mapping)
+            and isinstance(candidate.get("usage_missing_count"), int)
+            and not isinstance(candidate.get("usage_missing_count"), bool)
+        )
+        trace_physical_count = trace.get("physical_request_count")
+        trace_missing_count = trace.get("usage_missing_count")
+        event_physical_count = event.physical_request_count
+        if (
+            candidate_physical_count <= 0
+            or candidate_missing_count != 0
+            or isinstance(trace_physical_count, bool)
+            or not isinstance(trace_physical_count, int)
+            or trace_physical_count != candidate_physical_count
+            or isinstance(event_physical_count, bool)
+            or not isinstance(event_physical_count, int)
+            or event_physical_count != candidate_physical_count
+            or event.request_started is not True
+            or isinstance(trace_missing_count, bool)
+            or not isinstance(trace_missing_count, int)
+            or trace_missing_count != candidate_missing_count
+            or int(event.usage_missing_count or 0) != candidate_missing_count
+        ):
+            return None
+        successful_count = trace.get("successful_proposers")
+        if (
+            isinstance(successful_count, bool)
+            or not isinstance(successful_count, int)
+            or successful_count >= self.min_successful_proposers
+        ):
+            return None
+
+        current_roster = frozenset(selected_identities)
+        newly_failed = _exact_reasoning_only_length_failures_from_trace(
+            trace,
+            current_roster=current_roster,
+        )
+        if not newly_failed:
+            return None
+        cumulative_exclusions = tuple(
+            sorted(
+                {
+                    *context.cumulative_excluded_identities,
+                    *newly_failed,
+                }
+            )
+        )
+        if set(cumulative_exclusions) == set(
+            context.cumulative_excluded_identities
+        ):
+            return None
+
+        from .ranking_router import (
+            ROUTER_DYNAMIC_RETRY_ROUTING_SCHEMA,
+            build_router_dynamic_task_analysis_reuse_binding,
+            router_dynamic_task_analysis_reuse_reasons,
+        )
+
+        root_plan = deepcopy(context.root_selection_plan)
+        root_decision_id = str(root_plan.get("decision_id") or "").strip()
+        if not root_decision_id:
+            return None
+        try:
+            reuse_binding = build_router_dynamic_task_analysis_reuse_binding(
+                root_plan
+            )
+        except Exception:  # noqa: BLE001 - invalid provenance fails closed
+            return None
+        decision_suffix = hashlib.sha256(
+            json.dumps(
+                {
+                    "root_decision_id": root_decision_id,
+                    "excluded_proposer_identities": cumulative_exclusions,
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()[:16]
+        retry_inputs = deepcopy(context.frozen_ranking_inputs)
+        retry_inputs.update(
+            {
+                "decision_id": (
+                    f"{root_decision_id}-replacement-{decision_suffix}"
+                ),
+                "retry_excluded_proposer_identities": list(
+                    cumulative_exclusions
+                ),
+                "retry_parent_decision_id": root_decision_id,
+                "task_analysis_reused": True,
+                "task_analysis_reuse": deepcopy(reuse_binding),
+            }
+        )
+        try:
+            replacement = context.retry_factory(retry_inputs)
+        except Exception:  # noqa: BLE001 - factory is a local optional boundary
+            return None
+        if (
+            not isinstance(replacement, EnsembleProvider)
+            or replacement is self
+            or replacement._active_chat
+            or replacement._cleanup_is_pending()
+            or replacement._accounting_state.physical_request_count != 0
+            or replacement._accounting_state.usage_missing_count != 0
+            or replacement._accounting_state.usage_rows
+        ):
+            return None
+
+        target_plan = replacement.selection_plan_execution_snapshot()
+        target_plan["retry_parent_decision_id"] = root_decision_id
+        target_plan["retry_excluded_proposer_identities"] = list(
+            cumulative_exclusions
+        )
+        target_plan["task_analysis_reused"] = True
+        target_plan["task_analysis_reuse"] = deepcopy(reuse_binding)
+        target_plan["retry_routing"] = {
+            "schema": ROUTER_DYNAMIC_RETRY_ROUTING_SCHEMA,
+            "reason": "prior_attempt_reasoning_only_length",
+            "parent_decision_id": root_decision_id,
+            "excluded_proposer_identities": list(cumulative_exclusions),
+            "task_analysis_reused": True,
+            "task_analysis_source_decision_id": root_decision_id,
+            "task_analysis_reuse_sha256": reuse_binding[
+                "projection_sha256"
+            ],
+        }
+        if router_dynamic_task_analysis_reuse_reasons(root_plan, target_plan):
+            return None
+        target_selected = target_plan.get("selected_P")
+        target_quorum = target_plan.get(
+            "effective_min_successful_proposers"
+        )
+        target_sample_count = target_plan.get("proposer_sample_count")
+        if (
+            not isinstance(target_selected, list)
+            or not target_selected
+            or any(
+                not isinstance(identity, str) or not identity.strip()
+                for identity in target_selected
+            )
+            or set(
+                str(identity).strip().casefold()
+                for identity in target_selected
+            ).intersection(cumulative_exclusions)
+            or isinstance(target_quorum, bool)
+            or not isinstance(target_quorum, int)
+            or isinstance(target_sample_count, bool)
+            or not isinstance(target_sample_count, int)
+            or target_quorum != replacement.min_successful_proposers
+            or not 1 <= target_quorum <= target_sample_count
+            or tuple(
+                self._member_identity(member).strip().casefold()
+                for member in replacement.proposers
+            )
+            != tuple(
+                str(identity).strip().casefold()
+                for identity in target_selected
+            )
+        ):
+            return None
+
+        replacement.selection_plan = deepcopy(target_plan)
+        history = list(context.thinking_execution_history)
+        pending_plan = deepcopy(target_plan)
+        if self._thinking_policy_active():
+            from .thinking_execution import (
+                project_thinking_execution_history,
+                restore_projected_thinking_execution,
+                validate_thinking_execution_call,
+            )
+
+            validated_source, validation_reason = (
+                validate_thinking_execution_call(
+                    context.pending_execution_plan,
+                    trace,
+                )
+            )
+            if validation_reason:
+                return None
+            history.append(deepcopy(validated_source))
+            replacement.seal_managed_thinking_execution_guard()
+            projected, _, projection_reason = (
+                project_thinking_execution_history(
+                    history,
+                    target_plan,
+                )
+            )
+            if projection_reason:
+                return None
+            try:
+                restore_projected_thinking_execution(
+                    replacement,
+                    target_plan=target_plan,
+                    projected_plan=projected,
+                )
+            except (TypeError, ValueError, RuntimeError):
+                return None
+            pending_plan = replacement.selection_plan_execution_snapshot()
+        elif replacement._thinking_policy_active():
+            return None
+
+        target_plan = replacement.selection_plan_execution_snapshot()
+        target_fingerprint = provider_retry_roster_fingerprint(target_plan)
+        if not target_fingerprint or target_fingerprint == source_fingerprint:
+            return None
+        replacement._router_dynamic_retry_context = (
+            _RouterDynamicRetryContext(
+                root_selection_plan=deepcopy(root_plan),
+                frozen_ranking_inputs=deepcopy(
+                    context.frozen_ranking_inputs
+                ),
+                retry_factory=context.retry_factory,
+                cumulative_excluded_identities=cumulative_exclusions,
+                thinking_execution_history=tuple(
+                    deepcopy(history)
+                ),
+                pending_execution_plan=deepcopy(pending_plan),
+            )
+        )
+        return ProviderRetryTransition(
+            replacement_provider=replacement,
+            reason="reasoning_only_length",
+            source_roster_fingerprint=source_fingerprint,
+            target_roster_fingerprint=target_fingerprint,
+            excluded_identities=cumulative_exclusions,
+            source_plan=source_plan,
+            target_plan=deepcopy(target_plan),
+            setup_physical_request_count=0,
+        )
+
     def _report_member_credential_failure(
         self,
         member: EnsembleMemberConfig,
@@ -3281,6 +4015,132 @@ class EnsembleProvider:
             provider_kind="ensemble",
             model=f"ensemble/{self.profile_name}",
             base_url="",
+        )
+
+    def begin_provider_retry_scope(
+        self,
+        scope_id: str,
+        *,
+        max_additional_physical_requests: int = 3,
+    ) -> bool:
+        """Bind proposer recovery state to one outer ``run_turn``."""
+
+        if (
+            not isinstance(scope_id, str)
+            or not scope_id
+            or scope_id != scope_id.strip()
+        ):
+            raise ValueError("provider retry scope_id must be non-empty")
+        if (
+            isinstance(max_additional_physical_requests, bool)
+            or not isinstance(max_additional_physical_requests, int)
+            or max_additional_physical_requests < 0
+        ):
+            raise ValueError(
+                "max_additional_physical_requests must be a non-negative integer"
+            )
+        if self._active_chat or self._proposer_retry_scope is not None:
+            raise RuntimeError("ensemble proposer retry scope is already active")
+        effective_max = min(
+            max_additional_physical_requests,
+            self.proposer_recovery_max_additional_calls,
+        )
+        self._proposer_retry_scope = _ProposerRecoveryScopeState(
+            scope_id=scope_id,
+            max_additional_physical_requests=effective_max,
+            effective_members=self._expanded_primary_members(),
+        )
+        return True
+
+    def end_provider_retry_scope(self, scope_id: str) -> bool:
+        """Release all run-turn-local proposer substitutions and receipts."""
+
+        if (
+            not isinstance(scope_id, str)
+            or not scope_id
+            or scope_id != scope_id.strip()
+        ):
+            raise ValueError("provider retry scope_id must be non-empty")
+        state = self._proposer_retry_scope
+        if state is None or state.scope_id != scope_id:
+            raise RuntimeError("ensemble proposer retry scope does not match")
+        if self._active_chat:
+            raise RuntimeError("cannot end provider retry scope during chat")
+        self._proposer_retry_scope = None
+        self._current_proposer_recovery_trace = None
+        return True
+
+    def reserve_provider_retry_physical_request(
+        self,
+        scope_id: str,
+        *,
+        physical_request_count: int = 1,
+    ) -> bool:
+        """Atomically reserve outer retry calls from this run-turn ledger."""
+
+        if (
+            not isinstance(scope_id, str)
+            or not scope_id
+            or scope_id != scope_id.strip()
+        ):
+            raise ValueError("provider retry scope_id must be non-empty")
+        if (
+            isinstance(physical_request_count, bool)
+            or not isinstance(physical_request_count, int)
+            or physical_request_count <= 0
+        ):
+            raise ValueError(
+                "physical_request_count must be a positive integer"
+            )
+        state = self._proposer_retry_scope
+        if state is None or state.scope_id != scope_id:
+            return False
+        remaining = (
+            state.max_additional_physical_requests
+            - state.additional_physical_requests_started
+        )
+        if physical_request_count > remaining:
+            return False
+        # This method is synchronous: no task switch can split the
+        # check-and-increment pair on the asyncio event loop.
+        state.additional_physical_requests_started += physical_request_count
+        state.external_physical_requests_reserved += physical_request_count
+        return True
+
+    def _router_dynamic_selection(self) -> bool:
+        policy = self.selection_plan.get("proposer_recovery_policy")
+        return bool(
+            self.selection_plan.get("strategy") == "router_dynamic"
+            and self.selection_plan.get("selection_mode") == "router_dynamic"
+            and isinstance(policy, Mapping)
+            and policy.get("schema")
+            == "opensquilla.router-dynamic-proposer-recovery/v1"
+        )
+
+    def _router_dynamic_proposer_recovery_enabled(self) -> bool:
+        return bool(
+            self._router_dynamic_selection()
+            and self.proposer_recovery_max_additional_calls > 0
+        )
+
+    def _expanded_primary_members(self) -> dict[int, EnsembleMemberConfig]:
+        expanded: dict[int, EnsembleMemberConfig] = {}
+        slot_index = 0
+        for member in self.proposers:
+            for _ in range(max(1, int(member.k or 1))):
+                expanded[slot_index] = member
+                slot_index += 1
+        return expanded
+
+    def _chat_proposer_recovery_state(self) -> _ProposerRecoveryScopeState:
+        if self._proposer_retry_scope is not None:
+            return self._proposer_retry_scope
+        return _ProposerRecoveryScopeState(
+            scope_id="",
+            max_additional_physical_requests=(
+                self.proposer_recovery_max_additional_calls
+            ),
+            effective_members=self._expanded_primary_members(),
         )
 
     def validate_chat_request(self, messages: list[Message]) -> ErrorEvent | None:
@@ -3552,6 +4412,7 @@ class EnsembleProvider:
             )
             return
         self._reset_usage_accounting_snapshot(accounting_state)
+        self._current_proposer_recovery_trace = None
         self._active_chat = True
         try:
             async with _closing_async_iterator(
@@ -3812,6 +4673,7 @@ class EnsembleProvider:
         # looks stalled. Drain a progress queue: a real delta -> yield immediately,
         # a heartbeat-interval gap -> yield a keep-alive, the sentinel -> done.
         progress_queue: asyncio.Queue[EnsembleProgressEvent | None] = asyncio.Queue()
+        proposer_recovery_state = self._chat_proposer_recovery_state()
 
         async def _drain_proposers() -> list[_CandidateResult]:
             try:
@@ -3822,6 +4684,7 @@ class EnsembleProvider:
                     progress=progress_queue.put_nowait,
                     soft_deadline=soft_deadline,
                     soft_deadline_triggered=soft_deadline_triggered,
+                    recovery_state=proposer_recovery_state,
                 )
             finally:
                 progress_queue.put_nowait(None)  # sentinel: proposers finished
@@ -3888,6 +4751,19 @@ class EnsembleProvider:
                 close_trace,
             )
             return
+        if isinstance(
+            self.selection_plan.get("proposer_recovery_policy"),
+            Mapping,
+        ):
+            candidates = await self._recover_proposers_serially(
+                candidates,
+                state=proposer_recovery_state,
+                messages=messages,
+                tools=tools,
+                config=config,
+                soft_deadline=soft_deadline,
+                soft_deadline_triggered=soft_deadline_triggered,
+            )
         # Reaching the boundary is sufficient even when every proposer already
         # completed. The outer consumer may spend time rendering progress
         # events before aggregation resumes; in that case no pending task was
@@ -4818,6 +5694,783 @@ class EnsembleProvider:
             async for event in child_stream:
                 yield event
 
+    @staticmethod
+    def _proposer_failure_kind(
+        result: _CandidateResult,
+        member: EnsembleMemberConfig,
+    ) -> ProviderFailureKind:
+        raw_code = str(result.error_code or "")
+        return classify_provider_error(
+            provider_name=member.provider_config.provider,
+            status_code=int(raw_code) if raw_code.isdigit() else None,
+            raw_code=raw_code,
+            message=result.error,
+        )
+
+    @staticmethod
+    def _exact_reasoning_only_candidate(
+        result: _CandidateResult,
+    ) -> bool:
+        attempts = result.execution.get("physical_attempts")
+        if (
+            not isinstance(attempts, list)
+            or len(attempts) != 1
+            or not isinstance(attempts[0], Mapping)
+        ):
+            return False
+        attempt = attempts[0]
+        physical_attempt_id = str(
+            attempt.get("physical_attempt_id") or ""
+        ).strip()
+        if (
+            len(physical_attempt_id) != 32
+            or any(
+                character not in "0123456789abcdef"
+                for character in physical_attempt_id
+            )
+            or attempt.get("request_started") is not True
+            or attempt.get("stream_closed") is not True
+        ):
+            return False
+        usage_rows = [
+            row
+            for row in result.model_usage_breakdown
+            if isinstance(row, Mapping)
+            and not _is_missing_request_placeholder(row)
+        ]
+        if len(usage_rows) != 1:
+            return False
+        usage_row = usage_rows[0]
+        usage_reasoning_tokens = usage_row.get("reasoning_tokens")
+        provider_usage = usage_row.get("provider_usage")
+        usage_physical_attempt_id = str(
+            usage_row.get("physical_attempt_id")
+            or (
+                provider_usage.get("physical_attempt_id")
+                if isinstance(provider_usage, Mapping)
+                else ""
+            )
+            or ""
+        ).strip()
+        return bool(
+            result.request_started
+            and result.stream_closed
+            and result.usage_reported
+            and result.usage_missing_count == 0
+            and result.physical_request_count == 1
+            and not result.error
+            and not result.error_code
+            and not result.text.strip()
+            and isinstance(result.reasoning_tokens, int)
+            and not isinstance(result.reasoning_tokens, bool)
+            and result.reasoning_tokens > 0
+            and isinstance(usage_reasoning_tokens, int)
+            and not isinstance(usage_reasoning_tokens, bool)
+            and usage_reasoning_tokens > 0
+            and usage_reasoning_tokens == result.reasoning_tokens
+            and str(result.stop_reason or "").strip().casefold()
+            in REASONING_ONLY_LENGTH_STOP_REASONS
+            and usage_physical_attempt_id == physical_attempt_id
+        )
+
+    @staticmethod
+    def _persist_unknown_request_usage(
+        result: _CandidateResult,
+    ) -> bool:
+        """Make a closed, unreceipted request explicit before continuing."""
+
+        if not result.request_started or result.usage_reported:
+            return True
+        attempts = result.execution.get("physical_attempts")
+        if (
+            not result.stream_closed
+            or result.physical_request_count != 1
+            or result.usage_missing_count != 1
+            or not isinstance(attempts, list)
+            or len(attempts) != 1
+            or not isinstance(attempts[0], Mapping)
+        ):
+            return False
+        attempt = attempts[0]
+        physical_attempt_id = str(
+            attempt.get("physical_attempt_id") or ""
+        ).strip()
+        if (
+            len(physical_attempt_id) != 32
+            or any(
+                character not in "0123456789abcdef"
+                for character in physical_attempt_id
+            )
+            or attempt.get("request_started") is not True
+            or attempt.get("stream_closed") is not True
+        ):
+            return False
+        placeholders = [
+            row
+            for row in result.model_usage_breakdown
+            if isinstance(row, dict)
+            and _is_missing_request_placeholder(row)
+        ]
+        if len(placeholders) != 1 or len(result.model_usage_breakdown) != 1:
+            return False
+        row = placeholders[0]
+        provider_usage = row.get("provider_usage")
+        row_physical_attempt_id = str(
+            row.get("physical_attempt_id")
+            or (
+                provider_usage.get("physical_attempt_id")
+                if isinstance(provider_usage, Mapping)
+                else ""
+            )
+            or ""
+        ).strip()
+        if row_physical_attempt_id != physical_attempt_id:
+            return False
+        row["role"] = "unknown_request"
+        row["usage_unknown"] = True
+        row["usage_evidence_source"] = "closed_physical_request_unknown_usage"
+        if isinstance(provider_usage, dict):
+            provider_usage["usage_unknown"] = True
+        result.usage_missing_count = 1
+        return True
+
+    def _new_proposer_recovery_trace(
+        self,
+        state: _ProposerRecoveryScopeState,
+    ) -> dict[str, Any]:
+        quorum = self.min_successful_proposers
+        return {
+            "schema": "opensquilla.router-dynamic-proposer-recovery/v1",
+            "selection_plan_fingerprint": provider_retry_roster_fingerprint(
+                self.selection_plan
+            ),
+            "scope_id": state.scope_id,
+            "scope": "run_turn" if state.scope_id else "chat",
+            "max_additional_physical_requests": (
+                state.max_additional_physical_requests
+            ),
+            "additional_physical_requests_started": (
+                state.additional_physical_requests_started
+            ),
+            "external_physical_requests_reserved": (
+                state.external_physical_requests_reserved
+            ),
+            "remaining_additional_physical_requests": max(
+                0,
+                state.max_additional_physical_requests
+                - state.additional_physical_requests_started,
+            ),
+            "quorum_required": quorum,
+            "quorum_reached": False,
+            "cumulative_excluded_identities": sorted(
+                state.failed_identities
+            ),
+            "visited_identities": sorted(state.visited_identities),
+            "executed_proposer_roster_before": [
+                self._member_identity(state.effective_members[index])
+                for index in sorted(state.effective_members)
+            ],
+            "executed_proposer_roster_after": [],
+            "attempts": deepcopy(state.receipts),
+        }
+
+    def _refresh_proposer_recovery_trace(
+        self,
+        trace: dict[str, Any],
+        state: _ProposerRecoveryScopeState,
+        candidates: Sequence[_CandidateResult],
+    ) -> None:
+        trace["additional_physical_requests_started"] = (
+            state.additional_physical_requests_started
+        )
+        trace["external_physical_requests_reserved"] = (
+            state.external_physical_requests_reserved
+        )
+        trace["remaining_additional_physical_requests"] = max(
+            0,
+            state.max_additional_physical_requests
+            - state.additional_physical_requests_started,
+        )
+        trace["quorum_reached"] = (
+            sum(1 for candidate in candidates if candidate.ok)
+            >= self.min_successful_proposers
+        )
+        trace["cumulative_excluded_identities"] = sorted(
+            state.failed_identities
+        )
+        trace["visited_identities"] = sorted(state.visited_identities)
+        trace["executed_proposer_roster_after"] = [
+            self._member_identity(state.effective_members[index])
+            for index in sorted(state.effective_members)
+        ]
+
+    async def _run_one_proposer_recovery_attempt(
+        self,
+        *,
+        state: _ProposerRecoveryScopeState,
+        trace: dict[str, Any],
+        slot_index: int,
+        member: EnsembleMemberConfig,
+        source_identity: str,
+        kind: Literal[
+            "thinking_downgrade",
+            "transient_retry",
+            "backup_replacement",
+        ],
+        failure_kind: str,
+        reason: str,
+        messages: list[Message],
+        tools: list[ToolDefinition] | None,
+        config: ChatConfig | None,
+        backoff_s: float = 0.0,
+        thinking_before: str = "",
+        thinking_after: str = "",
+        soft_deadline: float | None = None,
+        soft_deadline_triggered: asyncio.Event | None = None,
+    ) -> _CandidateResult | None:
+        remaining = (
+            state.max_additional_physical_requests
+            - state.additional_physical_requests_started
+        )
+        if remaining <= 0:
+            return None
+
+        target_identity = self._member_identity(member)
+
+        def deadline_reached() -> bool:
+            return soft_deadline is not None and (
+                (
+                    soft_deadline_triggered is not None
+                    and soft_deadline_triggered.is_set()
+                )
+                or time.monotonic() >= soft_deadline
+            )
+
+        def record_deadline_not_started(phase: str) -> None:
+            if soft_deadline_triggered is not None:
+                soft_deadline_triggered.set()
+            trace["terminal_reason"] = "soft_deadline"
+            if any(
+                attempt.get("terminal_reason") == "soft_deadline"
+                for attempt in trace["attempts"]
+                if isinstance(attempt, Mapping)
+            ):
+                return
+            receipt: dict[str, Any] = {
+                "sequence": len(trace["attempts"]) + 1,
+                "slot_index": slot_index,
+                "kind": kind,
+                "source_identity": source_identity,
+                "target_identity": target_identity,
+                "failure_kind": failure_kind,
+                "reason": reason,
+                "request_started": False,
+                "physical_request_count": 0,
+                "physical_attempt_id": "",
+                "stream_closed": True,
+                "usage_reported": False,
+                "usage_missing_count": 0,
+                "outcome": "not_started",
+                "terminal_reason": "soft_deadline",
+                "deadline_phase": phase,
+            }
+            if kind == "thinking_downgrade":
+                receipt["thinking_before"] = thinking_before
+                receipt["thinking_after"] = thinking_after
+            if kind == "transient_retry":
+                receipt["backoff_s"] = backoff_s
+            trace["attempts"].append(receipt)
+            state.receipts.append(deepcopy(receipt))
+
+        if deadline_reached():
+            record_deadline_not_started("before_backoff")
+            return None
+        if backoff_s > 0:
+            sleep_seconds = backoff_s
+            if soft_deadline is not None:
+                sleep_seconds = min(
+                    sleep_seconds,
+                    max(0.0, soft_deadline - time.monotonic()),
+                )
+            if sleep_seconds > 0:
+                await asyncio.sleep(sleep_seconds)
+            if deadline_reached():
+                record_deadline_not_started("after_backoff")
+                return None
+        # Keep this check immediately adjacent to dispatch. The caller can
+        # spend time constructing a replacement member or emitting trace
+        # evidence between its scheduling decision and this physical request.
+        if deadline_reached():
+            record_deadline_not_started("before_dispatch")
+            return None
+        attempt = await self._collect_candidate(
+            index=slot_index,
+            sample_index=0,
+            member=replace(member, k=1),
+            messages=messages,
+            tools=tools if self.proposer_tools else None,
+            config=config,
+            progress=None,
+        )
+        actual_physical_count = (
+            max(0, int(attempt.physical_request_count))
+            if attempt.request_started
+            else 0
+        )
+        state.additional_physical_requests_started += actual_physical_count
+        physical_attempt_id = _candidate_physical_attempt_id(attempt)
+        evidence_valid = bool(
+            not attempt.request_started
+            or (
+                attempt.stream_closed
+                and actual_physical_count == 1
+                and physical_attempt_id
+            )
+        )
+        budget_overrun = (
+            actual_physical_count > remaining
+            or state.additional_physical_requests_started
+            > state.max_additional_physical_requests
+        )
+        if attempt.request_started and not attempt.usage_reported:
+            evidence_valid = bool(
+                evidence_valid
+                and self._persist_unknown_request_usage(attempt)
+            )
+        if budget_overrun:
+            attempt.error = (
+                "proposer recovery exceeded the frozen additional physical "
+                "request budget"
+            )
+            attempt.error_code = "proposer_recovery_budget_overrun"
+        elif not evidence_valid:
+            attempt.error = (
+                "proposer recovery physical request evidence is incomplete"
+            )
+            attempt.error_code = "proposer_recovery_evidence_unproven"
+        receipt: dict[str, Any] = {
+            "sequence": len(trace["attempts"]) + 1,
+            "slot_index": slot_index,
+            "kind": kind,
+            "source_identity": source_identity,
+            "target_identity": target_identity,
+            "failure_kind": failure_kind,
+            "reason": reason,
+            "request_started": attempt.request_started,
+            "physical_request_count": actual_physical_count,
+            "physical_attempt_id": physical_attempt_id,
+            "stream_closed": attempt.stream_closed,
+            "usage_reported": attempt.usage_reported,
+            "usage_missing_count": attempt.usage_missing_count,
+            "outcome": (
+                "budget_overrun"
+                if budget_overrun
+                else "evidence_unproven"
+                if not evidence_valid
+                else "succeeded"
+                if attempt.ok
+                else "failed"
+                if attempt.request_started
+                else "not_started"
+            ),
+        }
+        if kind == "thinking_downgrade":
+            receipt["thinking_before"] = thinking_before
+            receipt["thinking_after"] = thinking_after
+        if kind == "transient_retry":
+            receipt["backoff_s"] = backoff_s
+        trace["attempts"].append(receipt)
+        state.receipts.append(deepcopy(receipt))
+        return attempt
+
+    async def _recover_proposers_serially(
+        self,
+        candidates: Sequence[_CandidateResult],
+        *,
+        state: _ProposerRecoveryScopeState,
+        messages: list[Message],
+        tools: list[ToolDefinition] | None,
+        config: ChatConfig | None,
+        soft_deadline: float | None = None,
+        soft_deadline_triggered: asyncio.Event | None = None,
+    ) -> list[_CandidateResult]:
+        """Recover failed slots serially without replaying successful primaries."""
+
+        recovered = sorted(
+            [_candidate_result_snapshot(candidate) for candidate in candidates],
+            key=lambda candidate: candidate.index,
+        )
+        trace = self._new_proposer_recovery_trace(state)
+        self._current_proposer_recovery_trace = trace
+        # A terminally failed effective identity is excluded for the remainder
+        # of this run-turn scope, even when the current chat already reached
+        # quorum and therefore needs no immediate replacement. Otherwise a
+        # later tool-loop chat could replay A after A (or its backup) failed,
+        # bypassing the frozen additional-request budget.
+        for failed in recovered:
+            if failed.ok:
+                continue
+            failed_member = state.effective_members.get(failed.index)
+            if failed_member is not None:
+                state.failed_identities.add(
+                    self._member_identity(failed_member)
+                )
+        if not self._router_dynamic_proposer_recovery_enabled():
+            self._refresh_proposer_recovery_trace(trace, state, recovered)
+            return recovered
+        if sum(1 for candidate in recovered if candidate.ok) >= self.min_successful_proposers:
+            self._refresh_proposer_recovery_trace(trace, state, recovered)
+            return recovered
+
+        backup_cursor = 0
+
+        def next_backup() -> EnsembleMemberConfig | None:
+            nonlocal backup_cursor
+            while backup_cursor < len(self.proposer_backups):
+                backup = self.proposer_backups[backup_cursor]
+                backup_cursor += 1
+                identity = self._member_identity(backup)
+                if (
+                    identity in state.visited_identities
+                    or identity in state.failed_identities
+                ):
+                    continue
+                state.visited_identities.add(identity)
+                return backup
+            return None
+
+        for position, failed in enumerate(list(recovered)):
+            if failed.ok:
+                continue
+            if (
+                sum(1 for candidate in recovered if candidate.ok)
+                >= self.min_successful_proposers
+                or state.additional_physical_requests_started
+                >= state.max_additional_physical_requests
+            ):
+                break
+            slot_index = failed.index
+            member = state.effective_members.get(slot_index)
+            if member is None:
+                continue
+            source_identity = self._member_identity(member)
+            current = failed
+            if current.request_started and not current.stream_closed:
+                state.failed_identities.add(source_identity)
+                continue
+            failure_kind = self._proposer_failure_kind(current, member)
+            exact_reasoning = self._exact_reasoning_only_candidate(current)
+            if (
+                current.request_started
+                and not current.usage_reported
+                and not self._persist_unknown_request_usage(current)
+            ):
+                state.failed_identities.add(source_identity)
+                continue
+            thinking_rejection = bool(
+                failure_kind not in _PROPOSER_TRANSIENT_FAILURE_KINDS
+                and failure_kind
+                not in {
+                    ProviderFailureKind.AUTH_INVALID,
+                    ProviderFailureKind.MODEL_NOT_FOUND,
+                    ProviderFailureKind.INSUFFICIENT_CREDITS,
+                }
+                and _is_thinking_parameter_rejection(
+                    message=current.error,
+                    code=current.error_code,
+                )
+            )
+            lower = _strictly_lower_thinking_fallback(member)
+            if (exact_reasoning or thinking_rejection) and lower is not None:
+                (lower_unified, lower_provider), _ = lower
+                lower_member = replace(
+                    member,
+                    thinking=lower_provider,
+                    effective_thinking_level=lower_unified,
+                    thinking_fallback_reason=(
+                        "reasoning_only_length"
+                        if exact_reasoning
+                        else "provider_rejected_thinking_level"
+                    ),
+                    # One downgrade per candidate. No recursive exhaustion.
+                    thinking_fallbacks=(),
+                )
+                if (
+                    exact_reasoning
+                    or self._persist_unknown_request_usage(current)
+                ):
+                    attempt = await self._run_one_proposer_recovery_attempt(
+                        state=state,
+                        trace=trace,
+                        slot_index=slot_index,
+                        member=lower_member,
+                        source_identity=source_identity,
+                        kind="thinking_downgrade",
+                        failure_kind=(
+                            "reasoning_only_length"
+                            if exact_reasoning
+                            else str(failure_kind)
+                        ),
+                        reason=(
+                            "reasoning_only_length"
+                            if exact_reasoning
+                            else "provider_rejected_thinking_level"
+                        ),
+                        messages=messages,
+                        tools=tools,
+                        config=config,
+                        thinking_before=str(
+                            member.effective_thinking_level or ""
+                        ),
+                        thinking_after=lower_unified,
+                        soft_deadline=soft_deadline,
+                        soft_deadline_triggered=soft_deadline_triggered,
+                    )
+                    if trace.get("terminal_reason") == "soft_deadline":
+                        break
+                    if attempt is not None:
+                        current = _merge_candidate_attempt_evidence(
+                            current,
+                            attempt,
+                        )
+                        recovered[position] = current
+                        if current.ok:
+                            state.effective_members[slot_index] = lower_member
+                        elif current.error_code in {
+                            "proposer_recovery_budget_overrun",
+                            "proposer_recovery_evidence_unproven",
+                        }:
+                            state.failed_identities.add(source_identity)
+                            continue
+            elif failure_kind in _PROPOSER_TRANSIENT_FAILURE_KINDS:
+                if self._persist_unknown_request_usage(current):
+                    attempt = await self._run_one_proposer_recovery_attempt(
+                        state=state,
+                        trace=trace,
+                        slot_index=slot_index,
+                        member=member,
+                        source_identity=source_identity,
+                        kind="transient_retry",
+                        failure_kind=str(failure_kind),
+                        reason="transient_same_model_retry",
+                        messages=messages,
+                        tools=tools,
+                        config=config,
+                        backoff_s=(
+                            _PROPOSER_TRANSIENT_RETRY_BACKOFF_SECONDS
+                        ),
+                        soft_deadline=soft_deadline,
+                        soft_deadline_triggered=soft_deadline_triggered,
+                    )
+                    if trace.get("terminal_reason") == "soft_deadline":
+                        break
+                    if attempt is not None:
+                        current = _merge_candidate_attempt_evidence(
+                            current,
+                            attempt,
+                        )
+                        recovered[position] = current
+                        if current.error_code in {
+                            "proposer_recovery_budget_overrun",
+                            "proposer_recovery_evidence_unproven",
+                        }:
+                            state.failed_identities.add(source_identity)
+                            continue
+
+            if current.ok:
+                effective_member = state.effective_members.get(
+                    slot_index,
+                    member,
+                )
+                state.failed_identities.discard(
+                    self._member_identity(effective_member)
+                )
+                if (
+                    sum(1 for candidate in recovered if candidate.ok)
+                    >= self.min_successful_proposers
+                ):
+                    break
+                continue
+            state.failed_identities.add(source_identity)
+
+            while (
+                not current.ok
+                and state.additional_physical_requests_started
+                < state.max_additional_physical_requests
+            ):
+                backup = next_backup()
+                if backup is None:
+                    break
+                backup_identity = self._member_identity(backup)
+                slot_backup = replace(backup, label=member.label)
+                attempt = await self._run_one_proposer_recovery_attempt(
+                    state=state,
+                    trace=trace,
+                    slot_index=slot_index,
+                    member=slot_backup,
+                    source_identity=source_identity,
+                    kind="backup_replacement",
+                    failure_kind=str(failure_kind),
+                    reason="frozen_backup_order",
+                    messages=messages,
+                    tools=tools,
+                    config=config,
+                    soft_deadline=soft_deadline,
+                    soft_deadline_triggered=soft_deadline_triggered,
+                )
+                if trace.get("terminal_reason") == "soft_deadline":
+                    break
+                if attempt is None:
+                    break
+                current = _merge_candidate_attempt_evidence(current, attempt)
+                recovered[position] = current
+                if current.error_code in {
+                    "proposer_recovery_budget_overrun",
+                    "proposer_recovery_evidence_unproven",
+                }:
+                    state.failed_identities.add(backup_identity)
+                    break
+                if current.ok:
+                    state.effective_members[slot_index] = slot_backup
+                    break
+
+                backup_failure_kind = self._proposer_failure_kind(
+                    attempt,
+                    slot_backup,
+                )
+                backup_exact_reasoning = self._exact_reasoning_only_candidate(
+                    attempt
+                )
+                backup_thinking_rejection = bool(
+                    backup_failure_kind
+                    not in _PROPOSER_TRANSIENT_FAILURE_KINDS
+                    and _is_thinking_parameter_rejection(
+                        message=attempt.error,
+                        code=attempt.error_code,
+                    )
+                )
+                backup_lower = _strictly_lower_thinking_fallback(slot_backup)
+                if (
+                    (backup_exact_reasoning or backup_thinking_rejection)
+                    and backup_lower is not None
+                    and state.additional_physical_requests_started
+                    < state.max_additional_physical_requests
+                    and (
+                        backup_exact_reasoning
+                        or self._persist_unknown_request_usage(attempt)
+                    )
+                ):
+                    (lower_unified, lower_provider), _ = backup_lower
+                    lower_backup = replace(
+                        slot_backup,
+                        thinking=lower_provider,
+                        effective_thinking_level=lower_unified,
+                        thinking_fallback_reason=(
+                            "reasoning_only_length"
+                            if backup_exact_reasoning
+                            else "provider_rejected_thinking_level"
+                        ),
+                        thinking_fallbacks=(),
+                    )
+                    downgraded = await self._run_one_proposer_recovery_attempt(
+                        state=state,
+                        trace=trace,
+                        slot_index=slot_index,
+                        member=lower_backup,
+                        source_identity=backup_identity,
+                        kind="thinking_downgrade",
+                        failure_kind=(
+                            "reasoning_only_length"
+                            if backup_exact_reasoning
+                            else str(backup_failure_kind)
+                        ),
+                        reason=(
+                            "reasoning_only_length"
+                            if backup_exact_reasoning
+                            else "provider_rejected_thinking_level"
+                        ),
+                        messages=messages,
+                        tools=tools,
+                        config=config,
+                        thinking_before=str(
+                            backup.effective_thinking_level or ""
+                        ),
+                        thinking_after=lower_unified,
+                        soft_deadline=soft_deadline,
+                        soft_deadline_triggered=soft_deadline_triggered,
+                    )
+                    if trace.get("terminal_reason") == "soft_deadline":
+                        break
+                    if downgraded is not None:
+                        current = _merge_candidate_attempt_evidence(
+                            current,
+                            downgraded,
+                        )
+                        recovered[position] = current
+                        if current.ok:
+                            state.effective_members[slot_index] = lower_backup
+                            break
+                        backup_failure_kind = (
+                            self._proposer_failure_kind(
+                                downgraded,
+                                lower_backup,
+                            )
+                        )
+                elif (
+                    backup_failure_kind in _PROPOSER_TRANSIENT_FAILURE_KINDS
+                    and state.additional_physical_requests_started
+                    < state.max_additional_physical_requests
+                    and self._persist_unknown_request_usage(attempt)
+                ):
+                    retried = await self._run_one_proposer_recovery_attempt(
+                        state=state,
+                        trace=trace,
+                        slot_index=slot_index,
+                        member=slot_backup,
+                        source_identity=backup_identity,
+                        kind="transient_retry",
+                        failure_kind=str(backup_failure_kind),
+                        reason="transient_same_model_retry",
+                        messages=messages,
+                        tools=tools,
+                        config=config,
+                        backoff_s=(
+                            _PROPOSER_TRANSIENT_RETRY_BACKOFF_SECONDS
+                        ),
+                        soft_deadline=soft_deadline,
+                        soft_deadline_triggered=soft_deadline_triggered,
+                    )
+                    if trace.get("terminal_reason") == "soft_deadline":
+                        break
+                    if retried is not None:
+                        current = _merge_candidate_attempt_evidence(
+                            current,
+                            retried,
+                        )
+                        recovered[position] = current
+                        if current.ok:
+                            state.effective_members[slot_index] = slot_backup
+                            break
+                        backup_failure_kind = (
+                            self._proposer_failure_kind(
+                                retried,
+                                slot_backup,
+                            )
+                        )
+                state.failed_identities.add(backup_identity)
+                source_identity = backup_identity
+                failure_kind = backup_failure_kind
+            if trace.get("terminal_reason") == "soft_deadline":
+                break
+            if (
+                sum(1 for candidate in recovered if candidate.ok)
+                >= self.min_successful_proposers
+            ):
+                break
+
+        self._refresh_proposer_recovery_trace(trace, state, recovered)
+        return recovered
+
     async def _run_proposers(
         self,
         messages: list[Message],
@@ -4827,16 +6480,83 @@ class EnsembleProvider:
         progress: Callable[[EnsembleProgressEvent], None] | None = None,
         soft_deadline: float | None = None,
         soft_deadline_triggered: asyncio.Event | None = None,
+        recovery_state: _ProposerRecoveryScopeState | None = None,
     ) -> list[_CandidateResult]:
         tasks: list[asyncio.Task[_CandidateResult]] = []
         task_meta: dict[
             asyncio.Task[_CandidateResult],
             tuple[int, int, EnsembleMemberConfig],
         ] = {}
+        results: list[_CandidateResult] = []
         index = 0
-        for member in self.proposers:
-            k = max(1, int(member.k or 1))
+        for configured_member in self.proposers:
+            k = max(1, int(configured_member.k or 1))
             for sample_index in range(k):
+                member = (
+                    recovery_state.effective_members.get(
+                        index,
+                        configured_member,
+                    )
+                    if recovery_state is not None
+                    else configured_member
+                )
+                identity = self._member_identity(member)
+                if (
+                    recovery_state is not None
+                    and identity in recovery_state.failed_identities
+                ):
+                    results.append(
+                        _CandidateResult(
+                            index=index,
+                            sample_index=sample_index,
+                            label=(
+                                configured_member.label
+                                or member.label
+                                or f"proposer_{index + 1}"
+                            ),
+                            provider="",
+                            model="",
+                            requested_provider=(
+                                member.provider_config.provider
+                            ),
+                            requested_model=member.provider_config.model,
+                            requested_thinking_level=(
+                                member.requested_thinking_level
+                            ),
+                            effective_thinking_level=(
+                                member.effective_thinking_level
+                            ),
+                            provider_thinking_level=member.thinking,
+                            thinking_fallback_reason=(
+                                member.thinking_fallback_reason
+                            ),
+                            thinking_policy_version=(
+                                member.thinking_policy_version
+                            ),
+                            error=(
+                                "proposer identity was excluded after an "
+                                "earlier failure in this retry scope"
+                            ),
+                            error_code=(
+                                "proposer_recovery_identity_excluded"
+                            ),
+                            request_started=False,
+                            stream_closed=True,
+                            physical_request_count=0,
+                            usage_reported=False,
+                            usage_missing_count=0,
+                            execution={
+                                "request_started": False,
+                                "stream_closed": True,
+                                "blocked_reason": (
+                                    "scope_failed_identity"
+                                ),
+                                "blocked_identity": identity,
+                            },
+                        )
+                    )
+                    index += 1
+                    continue
                 task = asyncio.create_task(
                     self._collect_candidate(
                         index=index,
@@ -4852,14 +6572,16 @@ class EnsembleProvider:
                 task_meta[task] = (index, sample_index, member)
                 index += 1
         if not tasks:
-            return []
+            return sorted(results, key=lambda result: result.index)
 
-        results: list[_CandidateResult] = []
         pending: set[asyncio.Task[_CandidateResult]] = set(tasks)
         cancel_code = ""
         cancel_message = ""
         try:
-            if len(pending) < self.min_successful_proposers:
+            if (
+                len(pending) < self.min_successful_proposers
+                and not self._router_dynamic_proposer_recovery_enabled()
+            ):
                 cancel_code = "quorum_unreachable"
                 cancel_message = (
                     "proposer cancelled because ensemble quorum is unreachable: "
@@ -4907,7 +6629,11 @@ class EnsembleProvider:
                     if soft_deadline_triggered is not None:
                         soft_deadline_triggered.set()
                     break
-                if successful_count + len(pending) < self.min_successful_proposers:
+                if (
+                    successful_count + len(pending)
+                    < self.min_successful_proposers
+                    and not self._router_dynamic_proposer_recovery_enabled()
+                ):
                     cancel_code = "quorum_unreachable"
                     cancel_message = (
                         "proposer cancelled because ensemble quorum became unreachable: "
@@ -5278,7 +7004,10 @@ class EnsembleProvider:
             )
         try:
             request_task = asyncio.current_task()
-            if request_task is not None and member.thinking_policy_managed:
+            if request_task is not None and (
+                member.thinking_policy_managed
+                or self._router_dynamic_selection()
+            ):
                 setattr(
                     request_task,
                     "_opensquilla_ensemble_physical_attempts",
@@ -5394,9 +7123,15 @@ class EnsembleProvider:
                 api_key=cfg.api_key,
             )
         finally:
-            if member.thinking_policy_managed:
+            if (
+                member.thinking_policy_managed
+                or self._router_dynamic_selection()
+            ):
                 result.request_started = bool(physical_attempts)
-                result.physical_request_count = len(physical_attempts)
+                result.physical_request_count = max(
+                    result.physical_request_count,
+                    len(physical_attempts),
+                )
                 result.execution.setdefault(
                     "physical_attempts",
                     deepcopy(physical_attempts),
@@ -5422,7 +7157,10 @@ class EnsembleProvider:
                         error=result.error,
                     )
                 )
-            if member.thinking_policy_managed:
+            if (
+                member.thinking_policy_managed
+                or self._router_dynamic_selection()
+            ):
                 log.info(
                     "llm_ensemble.routing.model_execution_recorded",
                     role="proposer",
@@ -5458,18 +7196,38 @@ class EnsembleProvider:
         physical_attempts: list[dict[str, Any]],
         thinking_fallback_bindings: list[dict[str, Any]],
     ) -> _CandidateResult:
-        chat_cfg = _member_chat_config(
-            config,
-            member,
-            request_budget_binding=self._member_request_budget_binding(member),
-            role="proposer",
-        )
+        if self._router_dynamic_selection():
+            chat_cfg, proposer_output_budget = _proposer_chat_config(
+                config,
+                member,
+                max_tokens_cap=self.proposer_max_tokens_cap,
+                visible_answer_reserve_tokens=(
+                    self.proposer_visible_answer_reserve_tokens
+                ),
+                max_tokens_cap_explicit=self.proposer_max_tokens_cap_explicit,
+                request_budget_binding=self._member_request_budget_binding(
+                    member
+                ),
+            )
+        else:
+            chat_cfg = _member_chat_config(
+                config,
+                member,
+                request_budget_binding=self._member_request_budget_binding(
+                    member
+                ),
+                role="proposer",
+            )
+            proposer_output_budget = {}
         proposer_updates: dict[str, Any] = {
             "candidate_output_mode": "inert_artifact",
         }
         if not tools:
             proposer_updates["tool_choice"] = None
-        if member.thinking_policy_managed:
+        if (
+            member.thinking_policy_managed
+            or self._router_dynamic_selection()
+        ):
             proposer_updates["allow_provider_stream_fallback"] = False
         chat_cfg = chat_cfg.model_copy(update=proposer_updates)
         if self.proposer_timeout_seconds > 0:
@@ -5482,7 +7240,12 @@ class EnsembleProvider:
             timeout_seconds=self.proposer_timeout_seconds,
             request_budget_binding=self._member_request_budget_binding(member),
         )
-        if member.thinking_policy_managed:
+        if proposer_output_budget:
+            result.execution["output_budget"] = proposer_output_budget
+        if (
+            member.thinking_policy_managed
+            or self._router_dynamic_selection()
+        ):
             result.execution["physical_attempts"] = physical_attempts
             result.execution["thinking_fallback_bindings"] = (
                 thinking_fallback_bindings
@@ -5519,7 +7282,11 @@ class EnsembleProvider:
             nonlocal current_physical_attempt
             result.request_started = True
             result.physical_request_count = 1
-            physical_attempt_id = uuid.uuid4().hex if member.thinking_policy_managed else ""
+            track_physical_attempt = bool(
+                member.thinking_policy_managed
+                or self._router_dynamic_selection()
+            )
+            physical_attempt_id = uuid.uuid4().hex if track_physical_attempt else ""
             if physical_attempt_id:
                 current_physical_attempt = {
                     "attempt": len(physical_attempts) + 1,
@@ -5529,6 +7296,7 @@ class EnsembleProvider:
                         f"{member.provider_config.model}"
                     ),
                     "request_started": True,
+                    "stream_closed": False,
                     "outcome": "interrupted",
                     "effective_thinking_level": (
                         member.effective_thinking_level or ""
@@ -5566,7 +7334,10 @@ class EnsembleProvider:
                     request_count,
                 )
 
-        if member.thinking_policy_managed:
+        if (
+            member.thinking_policy_managed
+            or self._router_dynamic_selection()
+        ):
             raw_stream = _provider_events_with_error_boundary(
                 provider_config=member.provider_config,
                 messages=messages,
@@ -5635,7 +7406,10 @@ class EnsembleProvider:
                     result.provider = _done_event_actual_provider(event)
                     result.model = str(event.model or "").strip()
                     result.provider_usage = dict(event.provider_usage)
-                    if member.thinking_policy_managed:
+                    if (
+                        member.thinking_policy_managed
+                        or self._router_dynamic_selection()
+                    ):
                         if current_physical_attempt is None:
                             raise ValueError(
                                 "managed proposer completion has no physical attempt"
@@ -5800,10 +7574,7 @@ class EnsembleProvider:
                             for item in diagnostic_done.model_usage_breakdown
                             if isinstance(item, Mapping)
                         ]
-                    if (
-                        member.thinking_policy_managed
-                        and current_physical_attempt is not None
-                    ):
+                    if current_physical_attempt is not None:
                         (
                             result.model_usage_breakdown,
                             managed_missing_count,
@@ -5842,6 +7613,9 @@ class EnsembleProvider:
                         result,
                     )
                     break
+        result.stream_closed = True
+        if current_physical_attempt is not None:
+            current_physical_attempt["stream_closed"] = True
         candidate_text = "".join(text_parts)
         rejected_thinking_level = (
             result.error
@@ -5878,7 +7652,10 @@ class EnsembleProvider:
             )
             result.error_code = "thinking_fallback_without_physical_request"
             fallback_trigger = ""
-        if fallback_trigger:
+        # Proposer recovery is owned by the serial post-primary scheduler.
+        # Never recurse here: concurrent primary tasks must remain one
+        # physical request each and cannot race beyond quorum.
+        if fallback_trigger and not self._router_dynamic_selection():
             assert current_physical_attempt is not None
             current_physical_attempt["outcome"] = fallback_trigger
             if fallback_trigger == "reasoning_only_length":
@@ -6235,6 +8012,10 @@ class EnsembleProvider:
         if self.selection_plan:
             trace["selection_plan"] = _json_safe(
                 self._selection_plan_execution_snapshot()
+            )
+        if self._current_proposer_recovery_trace is not None:
+            trace["proposer_recovery"] = _json_safe(
+                self._current_proposer_recovery_trace
             )
         if self._thinking_policy_active():
             trace["thinking_execution_fallbacks"] = _json_safe(
@@ -10743,7 +12524,9 @@ def _build_router_dynamic_members(
     credential_pool_acquirer: CredentialPoolAcquirer | None = None,
     session_key: str = "",
     aggregator_fallbacks_out: list[EnsembleMemberConfig] | None = None,
+    proposer_backups_out: list[EnsembleMemberConfig] | None = None,
     aggregator_fallback_limit: int = 2,
+    retry_context_inputs_out: dict[str, Any] | None = None,
 ) -> tuple[str, list[EnsembleMemberConfig], EnsembleMemberConfig, dict[str, Any]]:
     """Build members from the profile-driven Step2 ranking decision."""
 
@@ -10975,7 +12758,7 @@ def _build_router_dynamic_members(
 
     raw_retry_exclusions = inputs.get("retry_excluded_proposer_identities")
     retry_exclusions: set[str] = set()
-    if thinking_assignment_enabled and raw_retry_exclusions is not None:
+    if raw_retry_exclusions is not None:
         if not isinstance(raw_retry_exclusions, Sequence) or isinstance(
             raw_retry_exclusions,
             (str, bytes),
@@ -11050,7 +12833,7 @@ def _build_router_dynamic_members(
                 sends_temperature = False
             facts["runtime_temperature_parameter_required"] = sends_temperature
         identity = f"{provider_id}:{model_id}".strip().lower()
-        if thinking_assignment_enabled and identity in retry_exclusions:
+        if identity in retry_exclusions:
             matched_retry_exclusions.add(identity)
             facts["retry_excluded_proposer"] = True
         try:
@@ -11084,6 +12867,37 @@ def _build_router_dynamic_members(
         ranking_config=ranking_config,
         decision_id=decision_id,
         ranking_thinking_assignment_enabled=thinking_assignment_enabled,
+        proposer_backup_count=int(
+            getattr(ensemble_cfg, "proposer_backup_count", 2) or 0
+        ),
+        proposer_recovery_max_additional_calls=int(
+            getattr(
+                ensemble_cfg,
+                "proposer_recovery_max_additional_calls",
+                3,
+            )
+            or 0
+        ),
+        proposer_max_tokens_cap=int(
+            getattr(ensemble_cfg, "proposer_max_tokens_cap", 65_536)
+            or 65_536
+        ),
+        proposer_visible_answer_reserve_tokens=int(
+            getattr(
+                ensemble_cfg,
+                "proposer_visible_answer_reserve_tokens",
+                4_096,
+            )
+            or 4_096
+        ),
+        proposer_recovery_quorum=(
+            int(getattr(ensemble_cfg, "min_successful_proposers", 1) or 1)
+            if int(
+                getattr(ensemble_cfg, "min_successful_proposers", 1) or 1
+            )
+            != _LEGACY_ENSEMBLE_MIN_SUCCESSFUL_PROPOSERS
+            else None
+        ),
     )
     if generation_filter_trace is not None:
         decision.trace["generation_policy_filter"] = generation_filter_trace
@@ -11224,6 +13038,22 @@ def _build_router_dynamic_members(
         )
         for index, model in enumerate(decision.proposers)
     ]
+    proposer_backups = [
+        _member_from_ref(
+            ranked_ref(model, role="proposer"),
+            config=config,
+            inherited=inherited_provider_config,
+            label=f"proposer_backup_{index}",
+            credential_pool_acquirer=credential_pool_acquirer,
+            session_key=session_key,
+        )
+        for index, model in enumerate(
+            decision.backup_proposers,
+            start=1,
+        )
+    ]
+    if proposer_backups_out is not None:
+        proposer_backups_out.extend(proposer_backups)
     aggregator = _member_from_ref(
         ranked_ref(decision.aggregator, role="aggregator"),
         config=config,
@@ -11248,6 +13078,33 @@ def _build_router_dynamic_members(
     ]
     if aggregator_fallbacks_out is not None:
         aggregator_fallbacks_out.extend(aggregator_fallbacks)
+    if retry_context_inputs_out is not None:
+        retry_context_inputs_out.update(deepcopy(inputs))
+        retry_context_inputs_out.update(
+            {
+                "task_analysis": deepcopy(task_analysis),
+                "request_context": deepcopy(dict(request_context)),
+                "ranking_config": deepcopy(dict(ranking_config)),
+            }
+        )
+        if user_profile is not None:
+            retry_context_inputs_out["user_profile"] = deepcopy(
+                dict(user_profile)
+            )
+        else:
+            retry_context_inputs_out.pop("user_profile", None)
+        if generation_policy is not None:
+            retry_context_inputs_out["generation_policy"] = deepcopy(
+                dict(generation_policy)
+            )
+        else:
+            retry_context_inputs_out.pop("generation_policy", None)
+        if registry_allowlist is not None:
+            retry_context_inputs_out["registry_allowlist"] = deepcopy(
+                registry_allowlist
+            )
+        else:
+            retry_context_inputs_out.pop("registry_allowlist", None)
     profile_tier = f"c{decision.effective_tier - 1}"
     return f"router_dynamic/{profile_tier}", proposers, aggregator, decision.trace
 
@@ -11761,6 +13618,61 @@ def _normalize_aggregator_recovery_policy(
     return normalized_mode, normalized_top_k
 
 
+@dataclass(frozen=True)
+class _DefaultRouterDynamicRetryFactory:
+    """Pure-local builder closure used by typed roster transitions."""
+
+    config: Any = field(repr=False)
+    inherited_provider_config: ProviderConfig = field(repr=False)
+    fallback_provider: LLMProvider | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    turn_metadata: dict[str, Any] = field(default_factory=dict, repr=False)
+    enable_member_request_budget_rebinding: bool = False
+    model_catalog: Any | None = field(default=None, repr=False, compare=False)
+    context_overflow_threshold: float = 0.85
+    credential_pool_acquirer: CredentialPoolAcquirer | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    credential_pool_failure_reporter: CredentialPoolFailureReporter | None = (
+        field(default=None, repr=False, compare=False)
+    )
+    session_key: str = ""
+    fallback_selector: Any | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+
+    def __call__(
+        self,
+        ranking_inputs: Mapping[str, Any],
+    ) -> EnsembleProvider:
+        return build_ensemble_provider_from_config(
+            config=self.config,
+            inherited_provider_config=self.inherited_provider_config,
+            fallback_provider=self.fallback_provider,
+            turn_metadata=self.turn_metadata,
+            ranking_inputs=ranking_inputs,
+            router_dynamic_retry_factory=self,
+            _enable_member_request_budget_rebinding=(
+                self.enable_member_request_budget_rebinding
+            ),
+            _model_catalog=self.model_catalog,
+            _context_overflow_threshold=self.context_overflow_threshold,
+            _credential_pool_acquirer=self.credential_pool_acquirer,
+            _credential_pool_failure_reporter=(
+                self.credential_pool_failure_reporter
+            ),
+            _session_key=self.session_key,
+            _fallback_selector=self.fallback_selector,
+        )
+
+
 def build_ensemble_provider_from_config(
     *,
     config: Any,
@@ -11768,6 +13680,7 @@ def build_ensemble_provider_from_config(
     fallback_provider: LLMProvider | None,
     turn_metadata: Mapping[str, Any] | None = None,
     ranking_inputs: Mapping[str, Any] | None = None,
+    router_dynamic_retry_factory: RouterDynamicRetryFactory | None = None,
     _enable_member_request_budget_rebinding: bool = False,
     _model_catalog: Any | None = None,
     _context_overflow_threshold: float = 0.85,
@@ -11785,6 +13698,8 @@ def build_ensemble_provider_from_config(
         getattr(ensemble_cfg, "aggregator_recovery_top_k", 3),
     )
     aggregator_fallbacks: list[EnsembleMemberConfig] = []
+    proposer_backups: list[EnsembleMemberConfig] = []
+    materialized_retry_inputs: dict[str, Any] = {}
     static_profile = static_b5_profile(selection_mode)
     if static_profile is not None:
         profile_name, proposers, aggregator, selection_plan = _build_static_b5_members(
@@ -11818,7 +13733,9 @@ def build_ensemble_provider_from_config(
             credential_pool_acquirer=_credential_pool_acquirer,
             session_key=_session_key,
             aggregator_fallbacks_out=aggregator_fallbacks,
+            proposer_backups_out=proposer_backups,
             aggregator_fallback_limit=recovery_top_k - 1,
+            retry_context_inputs_out=materialized_retry_inputs,
         )
     else:
         raise ValueError(f"unknown llm_ensemble.selection_mode {selection_mode!r}")
@@ -11899,6 +13816,29 @@ def build_ensemble_provider_from_config(
         )
         or 8_192
     )
+    ensemble_fields_set = set(
+        getattr(ensemble_cfg, "model_fields_set", set()) or set()
+    )
+    proposer_max_tokens_cap = int(
+        getattr(ensemble_cfg, "proposer_max_tokens_cap", 65_536)
+        or 65_536
+    )
+    proposer_visible_answer_reserve_tokens = int(
+        getattr(
+            ensemble_cfg,
+            "proposer_visible_answer_reserve_tokens",
+            4_096,
+        )
+        or 4_096
+    )
+    proposer_recovery_max_additional_calls = int(
+        getattr(
+            ensemble_cfg,
+            "proposer_recovery_max_additional_calls",
+            3,
+        )
+        or 0
+    )
     selection_plan.setdefault(
         "selected_P",
         [
@@ -11922,9 +13862,44 @@ def build_ensemble_provider_from_config(
         ]
         selection_plan["proposer_sample_count"] = len(selection_plan["proposer_models"])
         selection_plan["aggregator_model"] = aggregator.provider_config.model
+        selection_plan["backup_P"] = [
+            f"{member.provider_config.provider}:{member.provider_config.model}"
+            for member in proposer_backups
+        ]
+        recovery_policy = dict(
+            selection_plan.get("proposer_recovery_policy") or {}
+        )
+        recovery_policy.update(
+            {
+                "schema": (
+                    "opensquilla.router-dynamic-proposer-recovery/v1"
+                ),
+                "configured_backup_count": int(
+                    getattr(ensemble_cfg, "proposer_backup_count", 2) or 0
+                ),
+                "effective_backup_count": len(proposer_backups),
+                "max_additional_physical_requests": (
+                    proposer_recovery_max_additional_calls
+                ),
+                "quorum_required": min_successful_proposers,
+                "max_tokens_cap": proposer_max_tokens_cap,
+                "visible_answer_reserve_tokens": (
+                    proposer_visible_answer_reserve_tokens
+                ),
+                "thinking_downgrade_order": ["one_strictly_lower"],
+                "transient_same_model_retries": 1,
+                "backup_reasoning_downgrades": 1,
+            }
+        )
+        selection_plan["proposer_recovery_policy"] = recovery_policy
     inherited_provider = str(inherited_provider_config.provider or "").strip().lower()
     inherited_model = str(inherited_provider_config.model or "").strip().lower()
-    lineup_members = [*proposers, aggregator, *aggregator_fallbacks]
+    lineup_members = [
+        *proposers,
+        *proposer_backups,
+        aggregator,
+        *aggregator_fallbacks,
+    ]
     cross_provider_lineup = any(
         member.provider_config.provider.strip().lower() != inherited_provider
         for member in lineup_members
@@ -11955,6 +13930,9 @@ def build_ensemble_provider_from_config(
             )
 
         proposers = [without_private_replay(member) for member in proposers]
+        proposer_backups = [
+            without_private_replay(member) for member in proposer_backups
+        ]
         aggregator = without_private_replay(aggregator)
         aggregator_fallbacks = [without_private_replay(member) for member in aggregator_fallbacks]
         disable_fallback_replay = getattr(
@@ -11982,14 +13960,19 @@ def build_ensemble_provider_from_config(
     request_budget_bindings = (
         _runtime_member_request_budget_bindings(
             config=config,
-            members=[*proposers, aggregator, *aggregator_fallbacks],
+            members=[
+                *proposers,
+                *proposer_backups,
+                aggregator,
+                *aggregator_fallbacks,
+            ],
             model_catalog=_model_catalog,
             context_overflow_threshold=_context_overflow_threshold,
         )
         if _enable_member_request_budget_rebinding
         else {}
     )
-    return EnsembleProvider(
+    provider = EnsembleProvider(
         profile_name=profile_name,
         proposers=proposers,
         aggregator=aggregator,
@@ -12023,8 +14006,67 @@ def build_ensemble_provider_from_config(
             )
             or 8_192
         ),
+        proposer_backups=proposer_backups,
+        proposer_recovery_max_additional_calls=(
+            proposer_recovery_max_additional_calls
+        ),
+        proposer_max_tokens_cap=proposer_max_tokens_cap,
+        proposer_visible_answer_reserve_tokens=(
+            proposer_visible_answer_reserve_tokens
+        ),
+        proposer_max_tokens_cap_explicit=(
+            "proposer_max_tokens_cap" in ensemble_fields_set
+        ),
         quorum_grace_seconds=quorum_grace_seconds,
         selection_plan=selection_plan,
         _member_request_budget_bindings=request_budget_bindings,
         _credential_pool_failure_reporter=_credential_pool_failure_reporter,
     )
+    if selection_mode == "router_dynamic":
+        if router_dynamic_retry_factory is None:
+            config_copy = (
+                config.model_copy(deep=True)
+                if callable(getattr(config, "model_copy", None))
+                else deepcopy(config)
+            )
+            inherited_copy = replace(
+                inherited_provider_config,
+                provider_routing=dict(
+                    inherited_provider_config.provider_routing
+                ),
+            )
+            router_dynamic_retry_factory = (
+                _DefaultRouterDynamicRetryFactory(
+                    config=config_copy,
+                    inherited_provider_config=inherited_copy,
+                    fallback_provider=fallback_provider,
+                    turn_metadata=deepcopy(dict(turn_metadata or {})),
+                    enable_member_request_budget_rebinding=(
+                        _enable_member_request_budget_rebinding
+                    ),
+                    model_catalog=_model_catalog,
+                    context_overflow_threshold=(
+                        _context_overflow_threshold
+                    ),
+                    credential_pool_acquirer=(
+                        _credential_pool_acquirer
+                    ),
+                    credential_pool_failure_reporter=(
+                        _credential_pool_failure_reporter
+                    ),
+                    session_key=_session_key,
+                    fallback_selector=_fallback_selector,
+                )
+            )
+        initial_plan = provider.selection_plan_execution_snapshot()
+        provider._router_dynamic_retry_context = (
+            _RouterDynamicRetryContext(
+                root_selection_plan=deepcopy(initial_plan),
+                frozen_ranking_inputs=deepcopy(
+                    materialized_retry_inputs
+                ),
+                retry_factory=router_dynamic_retry_factory,
+                pending_execution_plan=deepcopy(initial_plan),
+            )
+        )
+    return provider

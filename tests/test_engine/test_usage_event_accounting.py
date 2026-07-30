@@ -26,7 +26,13 @@ from opensquilla.engine.usage_accounting import (
     provider_usage_receipt_rows,
     usd_to_nanos,
 )
-from opensquilla.provider import ChatConfig, Message, ModelCapabilities
+from opensquilla.provider import (
+    ChatConfig,
+    Message,
+    ModelCapabilities,
+    ProviderRetryTransition,
+    provider_retry_roster_fingerprint,
+)
 from opensquilla.provider import DoneEvent as ProviderDone
 from opensquilla.provider import ErrorEvent as ProviderError
 from opensquilla.provider import TextDeltaEvent as ProviderText
@@ -211,6 +217,49 @@ class _SequenceProvider:
     async def _stream(self, events: list[Any]) -> AsyncIterator[Any]:
         for event in events:
             yield event
+
+
+class _RetryTransitionProvider(_SequenceProvider):
+    provider_name = "ensemble"
+    retry_failed_call_safe = False
+
+    def __init__(self, streams: list[list[Any]]) -> None:
+        super().__init__(streams)
+        self.transition: ProviderRetryTransition | None = None
+
+    def prepare_retry_after_failure(
+        self,
+        event: ProviderError,
+    ) -> ProviderRetryTransition | None:
+        del event
+        return self.transition
+
+
+def _retry_transition_plan(model: str) -> dict[str, Any]:
+    aggregator = "openrouter:aggregator"
+    return {
+        "strategy": "router_dynamic",
+        "selection_mode": "router_dynamic",
+        "selected_P": [f"openrouter:{model}"],
+        "backup_P": [],
+        "proposer_recovery_policy": {
+            "schema": "opensquilla.router-dynamic-proposer-recovery/v1",
+            "configured_backup_count": 0,
+            "effective_backup_count": 0,
+            "max_additional_physical_requests": 3,
+            "quorum_required": 1,
+            "max_tokens_cap": 16_384,
+            "visible_answer_reserve_tokens": 4_096,
+            "thinking_downgrade_order": ["one_strictly_lower"],
+            "transient_same_model_retries": 1,
+            "backup_reasoning_downgrades": 1,
+        },
+        "proposer_models": [model],
+        "selected_A": aggregator,
+        "aggregator_candidates": [aggregator],
+        "effective_min_successful_proposers": 1,
+        "proposer_sample_count": 1,
+    }
 
 
 class _PhysicalLegProvider(_SequenceProvider):
@@ -912,6 +961,236 @@ async def test_retried_done_calls_get_monotonic_distinct_identities() -> None:
         call.event_id for call in sink.started
     ]
     assert sink.unknown == []
+
+
+@pytest.mark.asyncio
+async def test_provider_retry_transition_accounts_source_and_replacement_once_each() -> None:
+    sink = _RecordingSink()
+    source = _RetryTransitionProvider(
+        [
+            [
+                ProviderError(
+                    message="source roster failed",
+                    code="503",
+                    model_usage_breakdown=[
+                        {
+                            "provider": "openrouter",
+                            "model": "source-model",
+                            "input_tokens": 4,
+                            "output_tokens": 2,
+                            "billed_cost": 0.1,
+                            "cost_source": "provider_billed",
+                        }
+                    ],
+                    request_started=True,
+                    physical_request_count=1,
+                )
+            ]
+        ]
+    )
+    replacement = _SequenceProvider(
+        [
+            [
+                ProviderText(text="ok"),
+                ProviderDone(
+                    input_tokens=7,
+                    output_tokens=3,
+                    billed_cost=0.2,
+                    cost_source="provider_billed",
+                    provider="openrouter",
+                    model="target-model",
+                ),
+            ]
+        ]
+    )
+    source_plan = _retry_transition_plan("source-model")
+    target_plan = _retry_transition_plan("target-model")
+    source.transition = ProviderRetryTransition(
+        replacement_provider=replacement,
+        reason="exclude_failed_roster_member",
+        source_roster_fingerprint=provider_retry_roster_fingerprint(source_plan),
+        target_roster_fingerprint=provider_retry_roster_fingerprint(target_plan),
+        excluded_identities=("openrouter:source-model",),
+        source_plan=source_plan,
+        target_plan=target_plan,
+    )
+    agent = Agent(
+        provider=source,
+        config=AgentConfig(
+            max_iterations=1,
+            max_provider_retries=1,
+            retry_base_backoff_ms=0,
+            retry_max_backoff_ms=0,
+            provider_id="ensemble",
+            model_id="ensemble",
+        ),
+        usage_event_sink=sink,
+        usage_execution_context=_context(),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    assert source.calls == 1
+    assert replacement.calls == 1
+    assert any(isinstance(event, AgentDone) for event in events)
+    assert [call.call_index for call in sink.started] == [1, 2]
+    assert len({call.event_id for call in sink.started}) == 2
+    assert [call.event_id for call, _result in sink.finalized] == [
+        call.event_id for call in sink.started
+    ]
+    assert sink.unknown == []
+    assert [
+        (
+            result.input_tokens,
+            result.output_tokens,
+            result.billed_cost_nanos,
+        )
+        for _call, result in sink.finalized
+    ] == [
+        (4, 2, 100_000_000),
+        (7, 3, 200_000_000),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_selector_wrapper_retry_transition_accounts_each_leg_once() -> None:
+    sink = _RecordingSink()
+    source_receipt = ProviderBillingReceipt(
+        currency="USD",
+        status="confirmed",
+        amount_nanos=100_000_000,
+        usd_equivalent_nanos=100_000_000,
+        fx_native_per_usd_nanos=1_000_000_000,
+    )
+    target_receipt = ProviderBillingReceipt(
+        currency="USD",
+        status="confirmed",
+        amount_nanos=200_000_000,
+        usd_equivalent_nanos=200_000_000,
+        fx_native_per_usd_nanos=1_000_000_000,
+    )
+    source_decision_id = "source-decision"
+    target_decision_id = "target-decision"
+    exclusions = ["openrouter:source-model"]
+    source_plan = {
+        **_retry_transition_plan("source-model"),
+        "decision_id": source_decision_id,
+        "session": {"escalation_level": 0},
+    }
+    target_plan = {
+        **_retry_transition_plan("target-model"),
+        "decision_id": target_decision_id,
+        "session": {"escalation_level": 0},
+        "retry_parent_decision_id": source_decision_id,
+        "retry_excluded_proposer_identities": exclusions,
+        "task_analysis_reused": True,
+        "task_analysis_reuse": {
+            "source_decision_id": source_decision_id,
+            "reused": True,
+        },
+        "retry_routing": {
+            "schema": "opensquilla.router-dynamic-retry-routing/v2",
+            "parent_decision_id": source_decision_id,
+            "task_analysis_reused": True,
+            "excluded_proposer_identities": exclusions,
+        },
+    }
+    source = _RetryTransitionProvider(
+        [
+            [
+                ProviderError(
+                    message="source roster lost deterministic quorum",
+                    code="ensemble_insufficient_proposers",
+                    model_usage_breakdown=[
+                        {
+                            "provider": "openrouter",
+                            "model": "source-model",
+                            "input_tokens": 4,
+                            "output_tokens": 2,
+                            "billed_cost": 0.1,
+                            "cost_source": "provider_billed",
+                            "billing_receipt": source_receipt,
+                        }
+                    ],
+                    request_started=True,
+                    physical_request_count=1,
+                )
+            ]
+        ]
+    )
+    replacement = _SequenceProvider(
+        [
+            [
+                ProviderText(text="ok"),
+                ProviderDone(
+                    input_tokens=7,
+                    output_tokens=3,
+                    billed_cost=0.2,
+                    cost_source="provider_billed",
+                    provider="openrouter",
+                    model="target-model",
+                    billing_receipt=target_receipt,
+                ),
+            ]
+        ]
+    )
+    source.transition = ProviderRetryTransition(
+        replacement_provider=replacement,
+        reason="reasoning_only_length",
+        source_roster_fingerprint=provider_retry_roster_fingerprint(source_plan),
+        target_roster_fingerprint=provider_retry_roster_fingerprint(target_plan),
+        excluded_identities=tuple(exclusions),
+        source_plan=source_plan,
+        target_plan=target_plan,
+    )
+    turn_metadata: dict[str, Any] = {
+        "router_dynamic_pending_route_plan": source_plan,
+        "ensemble_decision_id": source_decision_id,
+        "router_fallback_hops": 3,
+    }
+    selector = _FallbackSelector(replacement)
+    wrapper = _SelectorFallbackProvider(source, selector, turn_metadata)
+    agent = Agent(
+        provider=wrapper,
+        config=AgentConfig(
+            max_iterations=1,
+            max_provider_retries=1,
+            retry_base_backoff_ms=0,
+            retry_max_backoff_ms=0,
+            provider_id="openrouter",
+            model_id="ensemble",
+            metadata=turn_metadata,
+        ),
+        usage_event_sink=sink,
+        usage_execution_context=_context(),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    assert source.calls == 1
+    assert replacement.calls == 1
+    assert any(isinstance(event, AgentDone) for event in events)
+    assert isinstance(agent.provider, _SelectorFallbackProvider)
+    assert agent.provider.primary is replacement
+    assert len(sink.started) == 2
+    assert len(sink.finalized) == 2
+    assert [call.call_index for call in sink.started] == [1, 2]
+    assert len({call.event_id for call in sink.started}) == 2
+    assert [call.event_id for call, _result in sink.finalized] == [
+        call.event_id for call in sink.started
+    ]
+    assert [
+        result.billed_cost_nanos
+        for _call, result in sink.finalized
+    ] == [100_000_000, 200_000_000]
+    assert sink.unknown == []
+    assert turn_metadata["router_dynamic_pending_route_plan"] == target_plan
+    assert turn_metadata["router_dynamic_decision"]["decision_id"] == (
+        target_decision_id
+    )
+    assert turn_metadata["ensemble_decision_id"] == target_decision_id
+    assert turn_metadata["router_fallback_hops"] == 3
+    assert "router_fallback_reason" not in turn_metadata
 
 
 @pytest.mark.asyncio
@@ -2531,7 +2810,7 @@ async def test_direct_meta_llm_helper_records_usage_with_parent_attribution() ->
 
 
 @pytest.mark.asyncio
-async def test_selector_fallback_accounts_each_physical_leg_without_outer_duplicate() -> None:
+async def test_selector_budget_zero_accounts_only_primary_physical_leg() -> None:
     sink = _RecordingSink()
     fallback = _PhysicalLegProvider(
         "anthropic",
@@ -2570,18 +2849,16 @@ async def test_selector_fallback_accounts_each_physical_leg_without_outer_duplic
         pass
 
     assert primary.calls == 1
-    assert fallback.calls == 1
+    assert fallback.calls == 0
     assert [(call.call_index, call.provider, call.model) for call in sink.started] == [
         (1, "openai", "primary-model"),
-        (2, "anthropic", "fallback-model"),
     ]
     assert [(call.call_index, reason) for call, reason in sink.unknown] == [
         (1, "provider_error:429")
     ]
-    assert [call.call_index for call, _ in sink.finalized] == [2]
-    assert len(sink.started) == 2  # no Agent-level wrapper envelope
-    assert tracker.rows[0][1]["provider"] == "anthropic"
-    assert tracker.rows[0][1]["model_id"] == "fallback-model"
+    assert sink.finalized == []
+    assert len(sink.started) == 1  # no fallback or Agent wrapper envelope
+    assert all(row[1].get("provider") != "anthropic" for row in tracker.rows)
 
 
 @pytest.mark.asyncio

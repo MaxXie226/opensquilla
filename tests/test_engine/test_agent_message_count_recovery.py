@@ -492,7 +492,7 @@ async def test_message_limit_recovery_retries_once_below_headroom_without_rewrit
     agent = Agent(
         provider=provider,
         config=AgentConfig(
-            max_provider_retries=0,
+            max_provider_retries=1,
             request_context_prompt="request-scoped evidence",
             flush_enabled=False,
         ),
@@ -541,7 +541,7 @@ async def test_message_limit_cut_never_splits_parallel_tool_group(
     provider = _ExactMessageLimitProvider([100, None])
     agent = Agent(
         provider=provider,
-        config=AgentConfig(max_provider_retries=0, flush_enabled=False),
+        config=AgentConfig(max_provider_retries=1, flush_enabled=False),
     )
     agent.set_history(_history_with_parallel_tool_group())
 
@@ -662,7 +662,7 @@ async def test_reasoning_scaffold_cleanup_preserves_recovered_tool_pairing(
                 reasoning_format="openrouter",
             ),
             reasoning_prefill_recovery_mode="recover",
-            max_provider_retries=0,
+            max_provider_retries=2,
             flush_enabled=False,
         ),
         tool_definitions=[
@@ -727,7 +727,7 @@ async def test_assistant_tail_loop_perturbation_uses_actual_count_for_recovery(
             ),
             reasoning_prefill_recovery_mode="recover",
             identical_request_loop_break_threshold=1,
-            max_provider_retries=0,
+            max_provider_retries=2,
             flush_enabled=False,
         ),
     )
@@ -830,7 +830,7 @@ def test_message_limit_safe_cuts_keep_consecutive_user_side_history_together() -
 
 
 @pytest.mark.asyncio
-async def test_member_budget_rebinding_and_exact_count_recovery_compose_once(
+async def test_ensemble_message_limit_recovery_does_not_replay_roster(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     compact_requests: list[Any] = []
@@ -872,7 +872,7 @@ async def test_member_budget_rebinding_and_exact_count_recovery_compose_once(
         config=AgentConfig(
             max_tokens=128_000,
             context_window_tokens=256_000,
-            max_provider_retries=0,
+            max_provider_retries=1,
             flush_enabled=False,
         ),
     )
@@ -880,22 +880,27 @@ async def test_member_budget_rebinding_and_exact_count_recovery_compose_once(
 
     events = [event async for event in agent.run_turn("current user request")]
 
-    assert len(compact_requests) == 1
+    assert compact_requests == []
     assert sum(call["wire_messages"] > 100 for call in member_calls) == 4
-    assert sum(call["wire_messages"] <= 90 for call in member_calls) == 5
-    assert sum(call["aggregator"] for call in member_calls) == 1
+    assert not any(call["wire_messages"] <= 90 for call in member_calls)
+    assert not any(call["aggregator"] for call in member_calls)
     assert any(
         call["model"] == "kimi-k2.7-code" and call["request_cap"] == 367_200
         for call in member_calls
     )
     assert any(
-        call["model"] == "glm-5.2" and call["request_cap"] == 2_896_800
+        call["model"] == "glm-5.2" and call["request_cap"] > 367_200
         for call in member_calls
     )
-    assert any(getattr(event, "kind", None) == "done" for event in events)
-    assert not any(
+    assert any(
         isinstance(event, ErrorEvent)
-        and event.code == "provider_request_message_limit_exhausted"
+        and event.code == "400"
+        for event in events
+    )
+    assert not any(getattr(event, "kind", None) == "done" for event in events)
+    assert not any(
+        isinstance(event, WarningEvent)
+        and event.code == "provider_request_message_limit_recovery_success"
         for event in events
     )
 

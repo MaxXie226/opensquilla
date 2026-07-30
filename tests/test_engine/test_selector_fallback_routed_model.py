@@ -9,15 +9,25 @@ computed for the abandoned model no longer apply.
 
 from __future__ import annotations
 
+import copy
 from collections.abc import AsyncIterator
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
+from opensquilla.engine import Agent, AgentConfig, ThinkingLevel
 from opensquilla.engine.pipeline import TurnContext
 from opensquilla.engine.runtime import TurnRunner, _SelectorFallbackProvider
 from opensquilla.engine.types import DoneEvent as EngineDoneEvent
 from opensquilla.engine.types import RouterDecisionEvent
-from opensquilla.provider import DoneEvent, ErrorEvent, TextDeltaEvent
+from opensquilla.provider import (
+    DoneEvent,
+    ErrorEvent,
+    ProviderRetryTransition,
+    TextDeltaEvent,
+    provider_retry_roster_fingerprint,
+)
 from opensquilla.tools.types import CallerKind, ToolContext
 
 
@@ -31,6 +41,120 @@ class _StubSelector:
     @property
     def current_config(self) -> SimpleNamespace:
         return SimpleNamespace(provider="fallback-provider", model=self._fallback_model)
+
+
+def _router_dynamic_retry_plan(
+    decision_id: str,
+    proposer: str,
+) -> dict[str, Any]:
+    return {
+        "strategy": "router_dynamic",
+        "selection_mode": "router_dynamic",
+        "decision_id": decision_id,
+        "ranking_version": "test-ranking-v1",
+        "registry_snapshot_version": "test-registry-v1",
+        "registry_snapshot_hash": "a" * 64,
+        "selected_P": [f"openrouter:{proposer}"],
+        "backup_P": [],
+        "proposer_recovery_policy": {
+            "schema": "opensquilla.router-dynamic-proposer-recovery/v1",
+            "configured_backup_count": 0,
+            "effective_backup_count": 0,
+            "max_additional_physical_requests": 3,
+            "quorum_required": 1,
+            "max_tokens_cap": 16_384,
+            "visible_answer_reserve_tokens": 4_096,
+            "thinking_downgrade_order": ["one_strictly_lower"],
+            "transient_same_model_retries": 1,
+            "backup_reasoning_downgrades": 1,
+        },
+        "proposer_models": [proposer],
+        "selected_A": "openrouter:aggregator-model",
+        "aggregator_candidates": ["openrouter:aggregator-model"],
+        "effective_min_successful_proposers": 1,
+        "proposer_sample_count": 1,
+        "effective_tier": "c1",
+        "session": {"escalation_level": 1},
+    }
+
+
+def _retry_transition(
+    source_plan: dict[str, Any],
+    target_plan: dict[str, Any],
+    replacement_provider: object,
+) -> ProviderRetryTransition:
+    return ProviderRetryTransition(
+        replacement_provider=replacement_provider,
+        reason="reasoning_only_length",
+        source_roster_fingerprint=provider_retry_roster_fingerprint(source_plan),
+        target_roster_fingerprint=provider_retry_roster_fingerprint(target_plan),
+        excluded_identities=("openrouter:source-proposer",),
+        source_plan=source_plan,
+        target_plan=target_plan,
+    )
+
+
+class _RetryPrimary:
+    provider_name = "ensemble"
+    retry_failed_call_safe = False
+
+    def __init__(
+        self,
+        transition: ProviderRetryTransition | None,
+    ) -> None:
+        self.transition = transition
+        self.events: list[ErrorEvent] = []
+
+    def prepare_retry_after_failure(
+        self,
+        event: ErrorEvent,
+    ) -> ProviderRetryTransition | None:
+        self.events.append(event)
+        return self.transition
+
+
+class _RetryReplacement:
+    provider_name = "ensemble"
+    retry_failed_call_safe = False
+
+    def chat(
+        self,
+        messages: list[Any],
+        tools: Any = None,
+        config: Any = None,
+    ) -> AsyncIterator[Any]:
+        del messages, tools, config
+        return self._stream()
+
+    async def _stream(self) -> AsyncIterator[Any]:
+        yield DoneEvent(stop_reason="stop")
+
+
+def _valid_retry_plans() -> tuple[dict[str, Any], dict[str, Any]]:
+    source = _router_dynamic_retry_plan(
+        "source-decision",
+        "source-proposer",
+    )
+    target = _router_dynamic_retry_plan(
+        "target-decision",
+        "target-proposer",
+    )
+    target.update(
+        {
+            "retry_parent_decision_id": source["decision_id"],
+            "retry_excluded_proposer_identities": ["openrouter:source-proposer"],
+            "task_analysis_reused": True,
+            "task_analysis_reuse": {
+                "source_decision_id": source["decision_id"],
+            },
+            "retry_routing": {
+                "parent_decision_id": source["decision_id"],
+                "task_analysis_reused": True,
+                "excluded_proposer_identities": ["openrouter:source-proposer"],
+            },
+        }
+    )
+    return source, target
 
 
 def test_fallback_realigns_routed_model_and_drops_savings() -> None:
@@ -74,6 +198,151 @@ def test_fallback_to_same_model_keeps_savings() -> None:
 def test_fallback_without_metadata_is_noop() -> None:
     wrapper = _SelectorFallbackProvider(object(), _StubSelector("any/model"))
     assert wrapper.fallback_after_invalid_response("upstream 503") is True
+
+
+@pytest.mark.asyncio
+async def test_retry_transition_rewraps_provider_and_retargets_route_audit() -> None:
+    source, target = _valid_retry_plans()
+    raw_replacement = _RetryReplacement()
+    primary = _RetryPrimary(_retry_transition(source, target, raw_replacement))
+    selector = _StubSelector("same-selector")
+    health_ledger = object()
+    metadata: dict[str, Any] = {
+        "router_dynamic_pending_route_plan": copy.deepcopy(source),
+        "router_dynamic_decision": {"decision_id": source["decision_id"]},
+        "ensemble_decision_id": source["decision_id"],
+        "router_fallback_hops": 2,
+    }
+    source_metadata = copy.deepcopy(metadata)
+    wrapper = _SelectorFallbackProvider(
+        primary,
+        selector,
+        turn_metadata=metadata,
+        health_ledger=health_ledger,  # type: ignore[arg-type]
+    )
+    event = ErrorEvent(
+        message="not enough proposers",
+        code="ensemble_insufficient_proposers",
+    )
+
+    transition = wrapper.prepare_retry_after_failure(event)
+
+    assert transition is not None
+    assert transition is not primary.transition
+    assert primary.events == [event]
+    replacement = transition.replacement_provider
+    assert isinstance(replacement, _SelectorFallbackProvider)
+    assert replacement.primary is raw_replacement
+    assert replacement._selector is selector
+    assert replacement._turn_metadata is metadata
+    assert replacement._health_ledger is health_ledger
+    assert replacement.accounts_physical_usage is True
+    assert replacement.retry_failed_call_safe is False
+    assert metadata == source_metadata
+
+    retry_stream = replacement.chat([])
+    assert metadata == source_metadata
+
+    first_event = await anext(retry_stream)
+    assert isinstance(first_event, DoneEvent)
+
+    assert metadata["router_fallback_hops"] == 2
+    assert metadata["router_dynamic_pending_route_plan"] == target
+    assert metadata["router_dynamic_pending_route_plan"] is not target
+    assert metadata["ensemble_decision_id"] == target["decision_id"]
+    audit = metadata["router_dynamic_decision"]
+    assert audit["decision_id"] == target["decision_id"]
+    assert audit["selected_P"] == target["selected_P"]
+    assert audit["selected_A"] == target["selected_A"]
+    assert audit["retry_parent_decision_id"] == source["decision_id"]
+    assert audit["retry_routing"] == target["retry_routing"]
+    assert audit["task_analysis_reused"] is True
+    assert audit["task_analysis_reuse"] == target["task_analysis_reuse"]
+    await retry_stream.aclose()
+
+
+def test_retry_transition_none_leaves_wrapper_and_metadata_unchanged() -> None:
+    source, _ = _valid_retry_plans()
+    primary = _RetryPrimary(None)
+    metadata: dict[str, Any] = {
+        "router_dynamic_pending_route_plan": copy.deepcopy(source),
+        "router_dynamic_decision": {"decision_id": source["decision_id"]},
+        "ensemble_decision_id": source["decision_id"],
+        "router_fallback_hops": 0,
+    }
+    before = copy.deepcopy(metadata)
+    wrapper = _SelectorFallbackProvider(
+        primary,
+        _StubSelector("same-selector"),
+        turn_metadata=metadata,
+    )
+
+    assert (
+        wrapper.prepare_retry_after_failure(ErrorEvent(message="ordinary failure", code="500"))
+        is None
+    )
+    assert wrapper.primary is primary
+    assert metadata == before
+
+
+def test_invalid_retry_audit_projection_fails_closed_without_metadata_update() -> None:
+    source, target = _valid_retry_plans()
+    target["decision_id"] = ""
+    primary = _RetryPrimary(_retry_transition(source, target, _RetryReplacement()))
+    metadata: dict[str, Any] = {
+        "router_dynamic_pending_route_plan": copy.deepcopy(source),
+        "router_dynamic_decision": {"decision_id": source["decision_id"]},
+        "ensemble_decision_id": source["decision_id"],
+        "router_fallback_hops": 1,
+    }
+    before = copy.deepcopy(metadata)
+    wrapper = _SelectorFallbackProvider(
+        primary,
+        _StubSelector("same-selector"),
+        turn_metadata=metadata,
+    )
+
+    assert (
+        wrapper.prepare_retry_after_failure(
+            ErrorEvent(
+                message="not enough proposers",
+                code="ensemble_insufficient_proposers",
+            )
+        )
+        is None
+    )
+    assert wrapper.primary is primary
+    assert metadata == before
+
+
+def test_retry_transition_exclusion_mismatch_fails_closed() -> None:
+    source, target = _valid_retry_plans()
+    target["retry_routing"]["excluded_proposer_identities"] = ["openrouter:unrelated-proposer"]
+    primary = _RetryPrimary(_retry_transition(source, target, _RetryReplacement()))
+    metadata: dict[str, Any] = {
+        "router_dynamic_pending_route_plan": copy.deepcopy(source),
+        "router_dynamic_decision": {"decision_id": source["decision_id"]},
+        "ensemble_decision_id": source["decision_id"],
+        "router_fallback_hops": 1,
+    }
+    before = copy.deepcopy(metadata)
+    wrapper = _SelectorFallbackProvider(
+        primary,
+        _StubSelector("same-selector"),
+        turn_metadata=metadata,
+    )
+
+    assert (
+        wrapper.prepare_retry_after_failure(
+            ErrorEvent(
+                message="not enough proposers",
+                code="ensemble_insufficient_proposers",
+            )
+        )
+        is None
+    )
+    assert wrapper.primary is primary
+    assert metadata == before
 
 
 PRIMARY_MODEL = "routed-primary"
@@ -124,6 +393,114 @@ class _ChainSelector:
     def next_fallback_after_failure(self, exc: Exception) -> _ChainProvider:
         self.current_config = SimpleNamespace(model=FALLBACK_MODEL)
         return _ChainProvider(FALLBACK_MODEL, fail=False)
+
+
+class _FailingFallbackSelector(_ChainSelector):
+    def next_fallback_after_failure(self, exc: Exception) -> _ChainProvider:
+        del exc
+        raise RuntimeError("selector resolution failed")
+
+
+class _CloseFailingStream:
+    def __init__(self) -> None:
+        self._emitted = False
+
+    def __aiter__(self) -> _CloseFailingStream:
+        return self
+
+    async def __anext__(self) -> Any:
+        if self._emitted:
+            raise StopAsyncIteration
+        self._emitted = True
+        return ErrorEvent(
+            message="HTTP 404: model not found",
+            code="404",
+        )
+
+    async def aclose(self) -> None:
+        raise RuntimeError("primary close failed")
+
+
+class _CloseFailingProvider:
+    provider_name = "openrouter"
+
+    def chat(
+        self,
+        messages: list[Any],
+        tools: Any = None,
+        config: Any = None,
+    ) -> AsyncIterator[Any]:
+        del messages, tools, config
+        return _CloseFailingStream()
+
+    async def list_models(self) -> list[Any]:
+        return []
+
+
+def _exact_reasoning_length_done() -> DoneEvent:
+    done = DoneEvent(
+        stop_reason="length",
+        output_tokens=16_384,
+        reasoning_tokens=16_384,
+        reasoning_content="internal",
+        provider_usage={"test_usage_receipt": True},
+    )
+    done.request_started = True
+    done.physical_request_count = 1
+    return done
+
+
+class _BudgetScriptProvider:
+    provider_name = "openrouter"
+
+    def __init__(self, model: str, streams: list[list[Any]]) -> None:
+        self.model = model
+        self.streams = streams
+        self.calls: list[Any] = []
+
+    def chat(
+        self,
+        messages: list[Any],
+        tools: Any = None,
+        config: Any = None,
+    ) -> AsyncIterator[Any]:
+        del messages, tools
+        index = len(self.calls)
+        self.calls.append(config)
+        events = self.streams[index] if index < len(self.streams) else self.streams[-1]
+        return self._stream(events)
+
+    async def _stream(self, events: list[Any]) -> AsyncIterator[Any]:
+        for event in events:
+            yield event
+
+    async def list_models(self) -> list[Any]:
+        return []
+
+
+class _BudgetChainSelector:
+    active_provider_id = "openrouter"
+
+    def __init__(self, providers: list[_BudgetScriptProvider]) -> None:
+        self.providers = providers
+        self.index = 0
+        self.current_config = SimpleNamespace(
+            provider="openrouter",
+            model=providers[0].model,
+        )
+
+    def next_fallback_after_failure(
+        self,
+        exc: Exception,
+    ) -> _BudgetScriptProvider:
+        del exc
+        self.index += 1
+        provider = self.providers[self.index]
+        self.current_config = SimpleNamespace(
+            provider="openrouter",
+            model=provider.model,
+        )
+        return provider
 
 
 def _routed_pipeline_fake(routed_model: str) -> Any:
@@ -297,3 +674,142 @@ async def test_blocked_cross_provider_route_passes_primary_model_to_agent_reques
     [done_event] = [event for event in events if isinstance(event, EngineDoneEvent)]
     assert done_event.model == PRIMARY_MODEL
     assert done_event.routed_model == foreign_model
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("budget", "fallback_expected"),
+    [
+        (0, False),
+        (1, True),
+    ],
+)
+async def test_selector_fallback_uses_no_hook_provider_scope_budget(
+    budget: int,
+    fallback_expected: bool,
+) -> None:
+    selector = _ChainSelector(primary_fails=True)
+    primary = selector.resolve()
+    wrapper = _SelectorFallbackProvider(primary, selector)
+
+    assert wrapper.begin_provider_retry_scope(
+        "selector-budget",
+        max_additional_physical_requests=budget,
+    )
+    events = [event async for event in wrapper.chat([])]
+
+    if fallback_expected:
+        assert any(
+            isinstance(event, TextDeltaEvent) and event.text == f"answer-from:{FALLBACK_MODEL}"
+            for event in events
+        )
+        assert wrapper.primary is not primary
+    else:
+        assert any(isinstance(event, ErrorEvent) for event in events)
+        assert not any(isinstance(event, TextDeltaEvent) for event in events)
+        assert wrapper.primary is primary
+    assert wrapper._retry_scope_local_remaining["selector-budget"] == 0
+    assert wrapper.end_provider_retry_scope("selector-budget")
+
+
+@pytest.mark.asyncio
+async def test_selector_resolution_failure_does_not_debit_retry_scope() -> None:
+    selector = _FailingFallbackSelector(primary_fails=True)
+    primary = selector.resolve()
+    wrapper = _SelectorFallbackProvider(primary, selector)
+    assert wrapper.begin_provider_retry_scope(
+        "selector-resolution-failure",
+        max_additional_physical_requests=1,
+    )
+
+    events = [event async for event in wrapper.chat([])]
+
+    assert any(isinstance(event, ErrorEvent) for event in events)
+    assert wrapper.primary is primary
+    assert wrapper._retry_scope_local_remaining["selector-resolution-failure"] == 1
+    assert wrapper.end_provider_retry_scope("selector-resolution-failure")
+
+
+@pytest.mark.asyncio
+async def test_primary_close_failure_does_not_debit_retry_scope() -> None:
+    selector = _ChainSelector(primary_fails=True)
+    primary = _CloseFailingProvider()
+    wrapper = _SelectorFallbackProvider(primary, selector)
+    assert wrapper.begin_provider_retry_scope(
+        "primary-close-failure",
+        max_additional_physical_requests=1,
+    )
+
+    with pytest.raises(RuntimeError, match="primary close failed"):
+        async for _ in wrapper.chat([]):
+            pass
+
+    assert wrapper.primary is primary
+    assert wrapper._retry_scope_local_remaining["primary-close-failure"] == 1
+    assert wrapper.end_provider_retry_scope("primary-close-failure")
+
+
+@pytest.mark.asyncio
+async def test_selector_and_agent_retries_share_three_request_budget() -> None:
+    primary = _BudgetScriptProvider(
+        "model-a",
+        [
+            [
+                ErrorEvent(
+                    message="HTTP 404: model not found",
+                    code="404",
+                    request_started=True,
+                    physical_request_count=1,
+                    usage_missing_count=1,
+                )
+            ]
+        ],
+    )
+    first_fallback = _BudgetScriptProvider(
+        "model-b",
+        [
+            [_exact_reasoning_length_done()],
+            [_exact_reasoning_length_done()],
+        ],
+    )
+    second_fallback = _BudgetScriptProvider(
+        "model-c",
+        [
+            [_exact_reasoning_length_done()],
+            [
+                TextDeltaEvent(text="must-not-run"),
+                DoneEvent(
+                    stop_reason="stop",
+                    input_tokens=1,
+                    output_tokens=1,
+                ),
+            ],
+        ],
+    )
+    selector = _BudgetChainSelector([primary, first_fallback, second_fallback])
+    wrapper = _SelectorFallbackProvider(primary, selector)
+    agent = Agent(
+        provider=wrapper,
+        config=AgentConfig(
+            thinking=ThinkingLevel.MEDIUM,
+            max_provider_retries=3,
+            retry_base_backoff_ms=0,
+            retry_max_backoff_ms=0,
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    # One selector fallback plus two later Agent dispatches exhaust the
+    # run-turn cap. The attempted fourth recovery request never reaches C.
+    assert len(primary.calls) == 1
+    assert len(first_fallback.calls) == 2
+    assert len(second_fallback.calls) == 1
+    assert first_fallback.calls[0].allow_provider_stream_fallback is False
+    assert first_fallback.calls[1].allow_provider_stream_fallback is False
+    assert second_fallback.calls[0].allow_provider_stream_fallback is False
+    assert not any(event.kind == "text_delta" and event.text == "must-not-run" for event in events)
+    assert any(
+        event.kind == "error" and event.code == "provider_retry_budget_exhausted"
+        for event in events
+    )

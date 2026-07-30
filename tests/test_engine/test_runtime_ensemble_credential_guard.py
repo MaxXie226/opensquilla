@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 import structlog.testing
 
+from opensquilla.engine.pipeline import TurnContext
 from opensquilla.engine.runtime import TurnRunner
 from opensquilla.engine.types import DoneEvent
 from opensquilla.gateway.config import GatewayConfig, SquillaRouterConfig
@@ -72,6 +73,38 @@ def _static_b5_config(**ensemble_overrides: Any) -> GatewayConfig:
     )
 
 
+def _router_dynamic_plan(
+    decision_id: str,
+    *,
+    proposer: str,
+    aggregator: str,
+) -> dict[str, Any]:
+    return {
+        "strategy": "router_dynamic",
+        "selection_mode": "router_dynamic",
+        "decision_id": decision_id,
+        "selected_P": [proposer],
+        "selected_A": aggregator,
+        "session": {},
+    }
+
+
+def _turn_with_pending_route(
+    session_key: str,
+    pending: dict[str, Any],
+) -> TurnContext:
+    return TurnContext(
+        message="test",
+        session_key=session_key,
+        config=None,
+        provider=None,
+        model="test",
+        tool_defs=[],
+        system_prompt="test",
+        metadata={"router_dynamic_pending_route_plan": pending},
+    )
+
+
 def test_router_dynamic_route_memory_preserves_thinking_assignment() -> None:
     runner = TurnRunner(
         provider_selector=None,
@@ -109,6 +142,163 @@ def test_router_dynamic_route_memory_preserves_thinking_assignment() -> None:
     )
     assert remembered is not None
     assert remembered["thinking_assignment"] == executed_assignment
+
+
+@pytest.mark.parametrize(
+    "retry_decision",
+    [False, True],
+    ids=["same-decision", "valid-retry-lineage"],
+)
+def test_router_dynamic_route_memory_prefers_valid_effective_selection_plan(
+    retry_decision: bool,
+) -> None:
+    runner = TurnRunner(
+        provider_selector=None,
+        config=_static_b5_config(selection_mode="router_dynamic"),
+    )
+    session_key = "agent:main:effective-route"
+    pending = _router_dynamic_plan(
+        "initial-decision",
+        proposer="openrouter:initial-proposer",
+        aggregator="openrouter:initial-aggregator",
+    )
+    effective = _router_dynamic_plan(
+        "retry-decision" if retry_decision else pending["decision_id"],
+        proposer=(
+            "openrouter:replacement-proposer"
+            if retry_decision
+            else "openrouter:initial-proposer"
+        ),
+        aggregator=(
+            "openrouter:replacement-aggregator"
+            if retry_decision
+            else "openrouter:initial-aggregator"
+        ),
+    )
+    if retry_decision:
+        effective.update(
+            {
+                "retry_parent_decision_id": pending["decision_id"],
+                "task_analysis_reused": True,
+                "retry_routing": {
+                    "parent_decision_id": pending["decision_id"],
+                },
+            }
+        )
+    else:
+        effective["session"] = {"escalation_level": 2}
+    turn = _turn_with_pending_route(session_key, pending)
+
+    assert runner._commit_pending_router_dynamic_route(
+        turn,
+        DoneEvent(
+            ensemble_trace={
+                "fallback_used": False,
+                "effective_selection_plan": effective,
+            }
+        ),
+    )
+
+    remembered = runner._previous_router_dynamic_route(session_key)
+    assert remembered is not None
+    assert remembered["selected_P"] == effective["selected_P"]
+    assert remembered["selected_A"] == effective["selected_A"]
+    if not retry_decision:
+        assert remembered["escalation_level"] == 2
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"strategy": "static_openrouter_b5"},
+        {"selection_mode": "static_openrouter_b5"},
+        {"decision_id": ""},
+        {"selected_P": []},
+        {"selected_P": ["replacement-without-provider"]},
+        {"selected_P": ["openrouter:"]},
+        {
+            "selected_P": [
+                "openrouter:replacement-proposer",
+                "openrouter:replacement-proposer",
+            ]
+        },
+        {"selected_A": " "},
+        {"selected_A": "replacement-without-provider"},
+        {"selected_A": ":replacement-aggregator"},
+        {"retry_parent_decision_id": "unrelated-decision"},
+        {"task_analysis_reused": False},
+        {"retry_routing": None},
+        {"retry_routing": {"parent_decision_id": "unrelated-decision"}},
+        {
+            "decision_id": "initial-decision",
+            "selected_A": "openrouter:initial-aggregator",
+        },
+        {
+            "decision_id": "initial-decision",
+            "selected_P": ["openrouter:initial-proposer"],
+        },
+    ],
+    ids=[
+        "wrong-strategy",
+        "wrong-selection-mode",
+        "empty-decision-id",
+        "empty-proposer-list",
+        "malformed-proposer-identity",
+        "empty-proposer-model",
+        "duplicate-proposer-identity",
+        "blank-aggregator",
+        "malformed-aggregator-identity",
+        "empty-aggregator-provider",
+        "wrong-retry-parent",
+        "task-analysis-not-reused",
+        "missing-retry-routing",
+        "wrong-retry-routing-parent",
+        "same-decision-changed-proposer",
+        "same-decision-changed-aggregator",
+    ],
+)
+def test_router_dynamic_route_memory_rejects_invalid_effective_selection_plan(
+    override: dict[str, Any],
+) -> None:
+    runner = TurnRunner(
+        provider_selector=None,
+        config=_static_b5_config(selection_mode="router_dynamic"),
+    )
+    session_key = "agent:main:invalid-effective-route"
+    pending = _router_dynamic_plan(
+        "initial-decision",
+        proposer="openrouter:initial-proposer",
+        aggregator="openrouter:initial-aggregator",
+    )
+    effective = {
+        **_router_dynamic_plan(
+            "retry-decision",
+            proposer="openrouter:replacement-proposer",
+            aggregator="openrouter:replacement-aggregator",
+        ),
+        "retry_parent_decision_id": pending["decision_id"],
+        "task_analysis_reused": True,
+        "retry_routing": {
+            "parent_decision_id": pending["decision_id"],
+        },
+        **override,
+    }
+    turn = _turn_with_pending_route(session_key, pending)
+
+    assert runner._commit_pending_router_dynamic_route(
+        turn,
+        DoneEvent(
+            ensemble_trace={
+                "fallback_used": False,
+                "effective_selection_plan": effective,
+            }
+        ),
+    )
+
+    remembered = runner._previous_router_dynamic_route(session_key)
+    assert remembered is not None
+    assert remembered["selected_P"] == pending["selected_P"]
+    assert remembered["selected_A"] == pending["selected_A"]
 
 
 async def test_static_b5_wrap_skipped_without_openrouter_credential(

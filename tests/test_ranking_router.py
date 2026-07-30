@@ -2823,7 +2823,7 @@ def test_disabled_thinking_assignment_preserves_exact_legacy_trace_shape() -> No
     )
 
 
-def test_default_off_ignores_managed_only_request_and_registry_filter_facts() -> None:
+def test_default_off_keeps_request_filters_off_but_honors_retry_exclusions() -> None:
     models = [
         _thinking_model("alpha", provider="provider-a", capability=0.95),
         _thinking_model("beta", provider="provider-b", capability=0.90),
@@ -2872,8 +2872,17 @@ def test_default_off_ignores_managed_only_request_and_registry_filter_facts() ->
 
     assert all(
         "required_parameter_tools_unsupported" not in row["reasons"]
-        and "prior_attempt_reasoning_only_length" not in row["reasons"]
         for row in disabled_alpha
+    )
+    assert any(
+        "prior_attempt_reasoning_only_length" in row["reasons"]
+        for row in disabled_alpha
+        if row["role"] == "proposer"
+    )
+    assert all(
+        "prior_attempt_reasoning_only_length" not in row["reasons"]
+        for row in disabled_alpha
+        if row["role"] == "aggregator"
     )
     assert any(
         "required_parameter_tools_unsupported" in row["reasons"]
@@ -3237,6 +3246,100 @@ def test_enabled_thinking_assignment_is_replayable_and_tamper_evident() -> None:
     tampered["thinking_assignment"]["aggregator"] = "low"
     assert "g1_frozen_ranker_replay_mismatch_thinking_assignment" in ranking_trace_replay_reasons(
         tampered
+    )
+
+
+def test_ranker_freezes_ordered_disjoint_proposer_backups_and_replays_exactly() -> None:
+    models = [
+        _thinking_model(
+            f"model-{index}",
+            provider=f"provider-{index}",
+            capability=0.95,
+        )
+        for index in range(9)
+    ]
+    decision = rank_models(
+        task_analysis=_analysis(tier=3),
+        user_profile=None,
+        request_context=_context(),
+        registry_snapshot=_snapshot(*models),
+        routed_tier="c2",
+        routing_confidence=0.91,
+        decision_id="backup-replay-decision",
+        ranking_thinking_assignment_enabled=True,
+        proposer_backup_count=2,
+        proposer_recovery_max_additional_calls=3,
+        proposer_max_tokens_cap=65_536,
+        proposer_visible_answer_reserve_tokens=4_096,
+        proposer_recovery_quorum=2,
+    )
+
+    selected = {model.identity for model in decision.proposers}
+    aggregators = {
+        model.identity for model in decision.aggregator_candidates
+    }
+    backups = [model.identity for model in decision.backup_proposers]
+    assert len(backups) == 2
+    assert len(set(backups)) == 2
+    assert not selected.intersection(backups)
+    assert not aggregators.intersection(backups)
+    assert decision.trace["backup_P"] == backups
+    assert decision.trace["proposer_recovery_policy"] == {
+        "schema": "opensquilla.router-dynamic-proposer-recovery/v1",
+        "configured_backup_count": 2,
+        "effective_backup_count": 2,
+        "max_additional_physical_requests": 3,
+        "quorum_required": 2,
+        "max_tokens_cap": 65_536,
+        "visible_answer_reserve_tokens": 4_096,
+        "thinking_downgrade_order": ["one_strictly_lower"],
+        "transient_same_model_retries": 1,
+        "backup_reasoning_downgrades": 1,
+    }
+    assert ranking_trace_replay_reasons(decision.trace) == []
+
+    tampered = deepcopy(decision.trace)
+    tampered["proposer_recovery_policy"]["configured_backup_count"] = 1
+    assert (
+        "g1_frozen_ranker_replay_mismatch_proposer_recovery_policy"
+        in ranking_trace_replay_reasons(tampered)
+    )
+
+
+def test_ranker_legacy_replay_allows_no_recovery_projection_but_rejects_partial() -> None:
+    decision = rank_models(
+        task_analysis=_analysis(tier=3),
+        user_profile=None,
+        request_context=_context(),
+        registry_snapshot=_snapshot(
+            *[
+                _thinking_model(
+                    f"legacy-{index}",
+                    provider=f"provider-{index}",
+                    capability=0.99 - index * 0.04,
+                )
+                for index in range(8)
+            ]
+        ),
+        routed_tier="c2",
+        routing_confidence=0.91,
+        decision_id="legacy-backup-replay",
+        ranking_thinking_assignment_enabled=True,
+    )
+    legacy = deepcopy(decision.trace)
+    for field_name in (
+        "backup_P",
+        "configured_proposer_backup_count",
+        "effective_proposer_backup_count",
+        "proposer_recovery_policy",
+    ):
+        legacy.pop(field_name, None)
+    assert ranking_trace_replay_reasons(legacy) == []
+
+    partial = deepcopy(legacy)
+    partial["backup_P"] = []
+    assert "incomplete_g1_replay_proposer_recovery_policy" in (
+        ranking_trace_replay_reasons(partial)
     )
 
 

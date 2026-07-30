@@ -199,11 +199,17 @@ from opensquilla.provider import (
 from opensquilla.provider import (
     ProviderHeartbeatEvent,
     ProviderRecoveryAction,
+    ProviderRetryTransition,
     classify_provider_error,
     decide_recovery_action,
+    prepare_provider_retry_after_failure,
 )
 from opensquilla.provider.model_catalog import resolve_effective_context_window
-from opensquilla.provider.protocol import validate_provider_chat_request
+from opensquilla.provider.protocol import (
+    ProviderRetryScopeError,
+    reserve_provider_retry_physical_request,
+    validate_provider_chat_request,
+)
 from opensquilla.provider.types import (
     EnsembleProgressEvent as ProviderEnsembleProgressEvent,
 )
@@ -1454,6 +1460,95 @@ def _drop_unpaired_tool_use_segments(segments: list[dict[str, Any]]) -> list[dic
     ]
 
 
+def _valid_router_dynamic_route_identity(value: object) -> bool:
+    if not isinstance(value, str) or value != value.strip():
+        return False
+    provider, separator, model = value.partition(":")
+    return (
+        separator == ":"
+        and provider == provider.strip()
+        and model == model.strip()
+        and bool(provider)
+        and bool(model)
+    )
+
+
+def _router_dynamic_decision_projection(
+    selection_plan: object,
+) -> dict[str, Any] | None:
+    """Build the public runtime audit projection for one dynamic route."""
+
+    if not isinstance(selection_plan, Mapping):
+        return None
+    decision_id = selection_plan.get("decision_id")
+    selected_proposers = selection_plan.get("selected_P")
+    selected_aggregator = selection_plan.get("selected_A")
+    session = selection_plan.get("session")
+    if (
+        selection_plan.get("strategy") != "router_dynamic"
+        or selection_plan.get("selection_mode") != "router_dynamic"
+        or not isinstance(decision_id, str)
+        or not decision_id.strip()
+        or decision_id != decision_id.strip()
+        or not isinstance(selected_proposers, list)
+        or not selected_proposers
+        or any(
+            not _valid_router_dynamic_route_identity(identity) for identity in selected_proposers
+        )
+        or len(set(selected_proposers)) != len(selected_proposers)
+        or not _valid_router_dynamic_route_identity(selected_aggregator)
+        or not isinstance(session, Mapping)
+    ):
+        return None
+
+    projection = {
+        "decision_id": decision_id,
+        "ranking_version": selection_plan.get("ranking_version"),
+        "registry_snapshot_version": selection_plan.get("registry_snapshot_version"),
+        "registry_snapshot_hash": selection_plan.get("registry_snapshot_hash"),
+        "selected_P": list(selected_proposers),
+        "selected_A": selected_aggregator,
+        "effective_tier": selection_plan.get("effective_tier"),
+        "session": copy.deepcopy(dict(session)),
+    }
+    thinking_assignment = selection_plan.get("thinking_assignment")
+    if isinstance(thinking_assignment, Mapping):
+        executed_assignment = selection_plan.get("executed_thinking_assignment")
+        unsupported_fallbacks = selection_plan.get("unsupported_level_fallbacks")
+        policy_versions = selection_plan.get("policy_versions")
+        if (
+            unsupported_fallbacks is not None
+            and (
+                not isinstance(unsupported_fallbacks, Sequence)
+                or isinstance(unsupported_fallbacks, (str, bytes, bytearray))
+            )
+        ) or (policy_versions is not None and not isinstance(policy_versions, Mapping)):
+            return None
+        projection.update(
+            {
+                "thinking_assignment": copy.deepcopy(dict(thinking_assignment)),
+                "executed_thinking_assignment": (
+                    copy.deepcopy(dict(executed_assignment))
+                    if isinstance(executed_assignment, Mapping)
+                    else None
+                ),
+                "assignment_reasons": copy.deepcopy(selection_plan.get("assignment_reasons")),
+                "unsupported_level_fallbacks": copy.deepcopy(list(unsupported_fallbacks or [])),
+                "policy_versions": copy.deepcopy(dict(policy_versions or {})),
+            }
+        )
+    for audit_field in (
+        "retry_parent_decision_id",
+        "retry_excluded_proposer_identities",
+        "task_analysis_reused",
+        "task_analysis_reuse",
+        "retry_routing",
+    ):
+        if audit_field in selection_plan:
+            projection[audit_field] = copy.deepcopy(selection_plan[audit_field])
+    return projection
+
+
 class _SelectorFallbackProvider:
     """Provider wrapper that switches to selector fallback on pre-content errors."""
 
@@ -1472,9 +1567,145 @@ class _SelectorFallbackProvider:
         # the default everywhere today — makes every ledger hook below a
         # no-op, keeping the default fallback path byte-identical.
         self._health_ledger = health_ledger
+        self._pending_retry_metadata_update: dict[str, Any] | None = None
+        self._retry_scope_provider_bindings: dict[str, Any | None] = {}
+        self._retry_scope_local_remaining: dict[str, int | None] = {}
+        self._retry_scope_handoff_sources: dict[str, object] = {}
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._provider, name)
+
+    def begin_provider_retry_scope(
+        self,
+        scope_id: str,
+        *,
+        max_additional_physical_requests: int = 3,
+    ) -> bool:
+        """Bind the wrapper scope to the provider instance active at begin."""
+
+        if (
+            isinstance(max_additional_physical_requests, bool)
+            or not isinstance(max_additional_physical_requests, int)
+            or max_additional_physical_requests < 0
+        ):
+            raise ValueError("max_additional_physical_requests must be a non-negative integer")
+
+        if scope_id in self._retry_scope_provider_bindings:
+            return False
+        handoff_source = self._retry_scope_handoff_sources.get(scope_id)
+        handoff_remaining = self._retry_scope_local_remaining.get(scope_id)
+        handoff_active = (
+            handoff_source is not None
+            and isinstance(handoff_remaining, int)
+            and not isinstance(handoff_remaining, bool)
+            and handoff_remaining >= 0
+        )
+        effective_max = (
+            min(max_additional_physical_requests, handoff_remaining)
+            if handoff_active
+            else max_additional_physical_requests
+        )
+        provider = self.primary
+        begin = getattr(provider, "begin_provider_retry_scope", None)
+        if callable(begin):
+            result = begin(
+                scope_id,
+                max_additional_physical_requests=effective_max,
+            )
+            if result is False or result not in (None, True):
+                return result
+            self._retry_scope_provider_bindings[scope_id] = provider
+        else:
+            self._retry_scope_provider_bindings[scope_id] = None
+        # This mirror is the one wrapper-level ledger used by both selector
+        # fallback and Agent retries. Native providers remain authoritative
+        # for their internal recoveries, so a delegated reservation must pass
+        # both this mirror and the bound provider's own scope.
+        self._retry_scope_local_remaining[scope_id] = effective_max
+        self._retry_scope_handoff_sources.pop(scope_id, None)
+        return True
+
+    def end_provider_retry_scope(self, scope_id: str) -> bool:
+        """End the scope on the exact primary instance that accepted it."""
+
+        if scope_id not in self._retry_scope_provider_bindings:
+            return False
+        self._retry_scope_local_remaining.pop(scope_id, None)
+        provider = self._retry_scope_provider_bindings.pop(scope_id)
+        if provider is None:
+            return True
+        end = getattr(provider, "end_provider_retry_scope", None)
+        if not callable(end):
+            return True
+        return end(scope_id)
+
+    def reserve_provider_retry_physical_request(
+        self,
+        scope_id: str,
+        *,
+        physical_request_count: int = 1,
+    ) -> bool:
+        """Reserve from the one ledger shared by fallback and Agent retries."""
+
+        if (
+            isinstance(physical_request_count, bool)
+            or not isinstance(physical_request_count, int)
+            or physical_request_count <= 0
+        ):
+            raise ValueError("physical_request_count must be a positive integer")
+        if scope_id not in self._retry_scope_provider_bindings:
+            return False
+        remaining = self._retry_scope_local_remaining.get(scope_id)
+        if (
+            not isinstance(remaining, int)
+            or isinstance(remaining, bool)
+            or remaining < physical_request_count
+        ):
+            return False
+        provider = self._retry_scope_provider_bindings[scope_id]
+        if provider is not None:
+            reserve = getattr(
+                provider,
+                "reserve_provider_retry_physical_request",
+                None,
+            )
+            if not callable(reserve):
+                # A native scope without a reservation hook may recover only
+                # inside that provider. Starting another physical request at
+                # this wrapper would create an independent second ledger.
+                return False
+            if (
+                reserve(
+                    scope_id,
+                    physical_request_count=physical_request_count,
+                )
+                is not True
+            ):
+                return False
+        self._retry_scope_local_remaining[scope_id] = remaining - physical_request_count
+        return True
+
+    def can_handoff_provider_retry_scope_to(
+        self,
+        replacement_provider: object,
+        scope_id: str,
+    ) -> bool:
+        """Prove a legacy wrapper transition retains the exact same ledger."""
+
+        return bool(
+            isinstance(replacement_provider, _SelectorFallbackProvider)
+            and scope_id in self._retry_scope_provider_bindings
+            and self._retry_scope_provider_bindings[scope_id] is None
+            and replacement_provider._retry_scope_handoff_sources.get(scope_id) is self
+            and replacement_provider._retry_scope_local_remaining
+            is self._retry_scope_local_remaining
+        )
+
+    @property
+    def primary(self) -> Any:
+        """Provider currently owned by this selector/accounting wrapper."""
+
+        return self._provider
 
     @property
     def accounts_physical_usage(self) -> bool:
@@ -1489,6 +1720,126 @@ class _SelectorFallbackProvider:
         return getattr(self._provider, "retry_failed_call_safe", True) is not False
 
     @property
+    def prepare_retry_after_failure(
+        self,
+    ) -> Callable[[ProviderErrorEvent], ProviderRetryTransition | None] | None:
+        """Expose retry replacement only while the active provider supports it."""
+
+        prepare = getattr(self.primary, "prepare_retry_after_failure", None)
+        return self._prepare_retry_after_failure if callable(prepare) else None
+
+    def _prepare_retry_after_failure(
+        self,
+        event: ProviderErrorEvent,
+    ) -> ProviderRetryTransition | None:
+        """Delegate a zero-request roster replacement without dropping wrappers."""
+
+        transition = prepare_provider_retry_after_failure(
+            self.primary,
+            event,
+        )
+        if transition is None:
+            return None
+
+        if not isinstance(transition.source_plan, Mapping) or not isinstance(
+            transition.target_plan,
+            Mapping,
+        ):
+            return None
+        source_plan = copy.deepcopy(dict(transition.source_plan))
+        target_plan = copy.deepcopy(dict(transition.target_plan))
+        source_audit = _router_dynamic_decision_projection(source_plan)
+        target_audit = _router_dynamic_decision_projection(target_plan)
+        if source_audit is None or target_audit is None:
+            return None
+        source_decision_id = source_audit["decision_id"]
+        target_decision_id = target_audit["decision_id"]
+        source_parent_decision_id = source_plan.get("retry_parent_decision_id")
+        if "retry_parent_decision_id" in source_plan:
+            expected_parent_decision_id = source_parent_decision_id
+        else:
+            expected_parent_decision_id = source_decision_id
+        target_parent_decision_id = target_plan.get("retry_parent_decision_id")
+        target_exclusions = target_plan.get("retry_excluded_proposer_identities")
+        target_retry_routing = target_plan.get("retry_routing")
+        transition_exclusions = list(transition.excluded_identities)
+        if (
+            not isinstance(expected_parent_decision_id, str)
+            or not expected_parent_decision_id.strip()
+            or expected_parent_decision_id != expected_parent_decision_id.strip()
+            or target_decision_id == source_decision_id
+            or target_parent_decision_id != expected_parent_decision_id
+            or not isinstance(target_exclusions, list)
+            or not target_exclusions
+            or target_exclusions != transition_exclusions
+            or any(
+                not _valid_router_dynamic_route_identity(identity) for identity in target_exclusions
+            )
+            or len(set(target_exclusions)) != len(target_exclusions)
+            or target_plan.get("task_analysis_reused") is not True
+            or not isinstance(target_plan.get("task_analysis_reuse"), Mapping)
+            or not isinstance(target_retry_routing, Mapping)
+            or target_retry_routing.get("parent_decision_id") != target_parent_decision_id
+            or target_retry_routing.get("task_analysis_reused") is not True
+            or target_retry_routing.get("excluded_proposer_identities") != transition_exclusions
+        ):
+            return None
+
+        metadata = self._turn_metadata
+        if metadata is not None:
+            pending = metadata.get("router_dynamic_pending_route_plan")
+            if isinstance(pending, Mapping) and pending.get("decision_id") != source_decision_id:
+                return None
+
+        replacement = _SelectorFallbackProvider(
+            transition.replacement_provider,
+            self._selector,
+            self._turn_metadata,
+            health_ledger=self._health_ledger,
+        )
+        transferable_scope_ids = {
+            scope_id
+            for scope_id, provider in self._retry_scope_provider_bindings.items()
+            if provider is None
+            and isinstance(
+                self._retry_scope_local_remaining.get(scope_id),
+                int,
+            )
+        }
+        if transferable_scope_ids:
+            replacement._retry_scope_local_remaining = self._retry_scope_local_remaining
+            replacement._retry_scope_handoff_sources = {
+                scope_id: self for scope_id in transferable_scope_ids
+            }
+        wrapped_transition = ProviderRetryTransition(
+            replacement_provider=replacement,
+            reason=transition.reason,
+            source_roster_fingerprint=(transition.source_roster_fingerprint),
+            target_roster_fingerprint=(transition.target_roster_fingerprint),
+            excluded_identities=tuple(transition.excluded_identities),
+            source_plan=source_plan,
+            target_plan=target_plan,
+            setup_physical_request_count=(transition.setup_physical_request_count),
+        )
+        if metadata is not None:
+            replacement._pending_retry_metadata_update = copy.deepcopy(
+                {
+                    "router_dynamic_pending_route_plan": target_plan,
+                    "router_dynamic_decision": target_audit,
+                    "ensemble_decision_id": target_decision_id,
+                }
+            )
+        return wrapped_transition
+
+    def _activate_pending_retry_metadata(self) -> None:
+        update = self._pending_retry_metadata_update
+        if update is None:
+            return
+        self._pending_retry_metadata_update = None
+        if self._turn_metadata is not None:
+            self._turn_metadata.update(copy.deepcopy(update))
+
+    @property
     def provider_name(self) -> str:
         return getattr(self._provider, "provider_name", "")
 
@@ -1498,6 +1849,13 @@ class _SelectorFallbackProvider:
         return str(
             getattr(self._selector, "active_provider_id", "") or self.provider_name
         )
+
+    @property
+    def active_model_id(self) -> str:
+        """Configured model identity of the selector's active chain link."""
+
+        current_config = getattr(self._selector, "current_config", None)
+        return str(getattr(current_config, "model", "") or "")
 
     def disable_provider_state_replay(self) -> None:
         """Rebuild the active fallback chain without provider-private replay."""
@@ -1668,6 +2026,12 @@ class _SelectorFallbackProvider:
             yield validation_error
             return
 
+        # A prepared retry route is only observable once this replacement is
+        # actually committed to a physical provider call. Merely obtaining an
+        # async iterator (or failing local request validation) must leave the
+        # source route metadata intact.
+        self._activate_pending_retry_metadata()
+
         emitted_user_visible_content = False
         pre_text_buffer: list[Any] = []
 
@@ -1722,7 +2086,7 @@ class _SelectorFallbackProvider:
                         return
                     self._record_health_failure(event)
                     try:
-                        self._provider = self._selector.next_fallback_after_failure(
+                        fallback_provider = self._selector.next_fallback_after_failure(
                             RuntimeError(event.message)
                         )
                     except Exception:
@@ -1730,13 +2094,33 @@ class _SelectorFallbackProvider:
                             yield buffered_event
                         yield event
                         return
+                    # Prove the failed physical leg closed before reserving or
+                    # dispatching another potentially billable request.
+                    await primary_stream.aclose()
+                    active_scope_ids = tuple(self._retry_scope_provider_bindings)
+                    if len(active_scope_ids) > 1:
+                        for buffered_event in drain_pre_text_buffer():
+                            yield buffered_event
+                        yield event
+                        return
+                    if active_scope_ids:
+                        try:
+                            reserve_provider_retry_physical_request(
+                                self,
+                                active_scope_ids[0],
+                            )
+                        except ProviderRetryScopeError:
+                            for buffered_event in drain_pre_text_buffer():
+                                yield buffered_event
+                            yield event
+                            return
+                    # Reservation success is the commit point for this route.
+                    # Failed close/resolution/reservation leaves `_provider`
+                    # and externally visible route metadata on the source.
+                    self._provider = fallback_provider
                     self._note_fallback_hop()
                     self._skip_benched_fallbacks()
                     self._realign_routed_model_after_fallback()
-                    # Close the failed physical leg before reserving the next
-                    # one; otherwise an early-consumer break can defer unknown
-                    # coverage until async-generator GC.
-                    await primary_stream.aclose()
                     fallback_provider = self._provider
                     fallback_provider_id, fallback_model = self._active_deployment()
                     fallback_usage_snapshot = getattr(
@@ -1744,11 +2128,17 @@ class _SelectorFallbackProvider:
                         "usage_accounting_snapshot",
                         None,
                     )
+                    fallback_config = config
+                    model_copy = getattr(config, "model_copy", None)
+                    if callable(model_copy):
+                        fallback_config = model_copy(
+                            update={"allow_provider_stream_fallback": False}
+                        )
                     fallback_stream = account_provider_stream(
                         lambda: fallback_provider.chat(
                             messages,
                             tools=tools,
-                            config=config,
+                            config=fallback_config,
                         ),
                         provider=fallback_provider_id,
                         model=fallback_model,
@@ -3010,8 +3400,64 @@ class TurnRunner:
             return False
         if ensemble_trace.get("fallback_used") is not False:
             return False
+        effective = ensemble_trace.get("effective_selection_plan")
+        selection_plan = pending
+        if isinstance(effective, Mapping):
+            decision_id = effective.get("decision_id")
+            selected_proposers = effective.get("selected_P")
+            selected_aggregator = effective.get("selected_A")
+            pending_decision_id = pending.get("decision_id")
+            pending_selected_proposers = pending.get("selected_P")
+            pending_selected_aggregator = pending.get("selected_A")
+            retry_routing = effective.get("retry_routing")
+
+            same_decision = decision_id == pending_decision_id
+            same_decision_same_roster = (
+                same_decision
+                and isinstance(selected_proposers, Sequence)
+                and not isinstance(
+                    selected_proposers,
+                    (str, bytes, bytearray),
+                )
+                and isinstance(pending_selected_proposers, Sequence)
+                and not isinstance(
+                    pending_selected_proposers,
+                    (str, bytes, bytearray),
+                )
+                and tuple(selected_proposers) == tuple(pending_selected_proposers)
+                and selected_aggregator == pending_selected_aggregator
+            )
+            valid_route_lineage = same_decision_same_roster or (
+                not same_decision
+                and isinstance(pending_decision_id, str)
+                and bool(pending_decision_id.strip())
+                and effective.get("retry_parent_decision_id") == pending_decision_id
+                and effective.get("task_analysis_reused") is True
+                and isinstance(retry_routing, Mapping)
+                and retry_routing.get("parent_decision_id") == pending_decision_id
+            )
+            if (
+                effective.get("strategy") == "router_dynamic"
+                and effective.get("selection_mode") == "router_dynamic"
+                and isinstance(decision_id, str)
+                and bool(decision_id.strip())
+                and isinstance(selected_proposers, Sequence)
+                and not isinstance(
+                    selected_proposers,
+                    (str, bytes, bytearray),
+                )
+                and bool(selected_proposers)
+                and all(
+                    _valid_router_dynamic_route_identity(identity)
+                    for identity in selected_proposers
+                )
+                and len(set(selected_proposers)) == len(selected_proposers)
+                and _valid_router_dynamic_route_identity(selected_aggregator)
+                and valid_route_lineage
+            ):
+                selection_plan = effective
         try:
-            self._remember_router_dynamic_route(turn.session_key, pending)
+            self._remember_router_dynamic_route(turn.session_key, selection_plan)
         except Exception:  # noqa: BLE001 - continuity memory must not fail the turn
             log.warning(
                 "llm_ensemble.router_dynamic.route_memory_failed",
@@ -6424,53 +6870,11 @@ class TurnRunner:
                     )
                     if selection_mode == "router_dynamic":
                         turn.metadata["router_dynamic_pending_route_plan"] = plan
-                        router_dynamic_decision = {
-                            "decision_id": ensemble_decision_id,
-                            "ranking_version": plan.get("ranking_version"),
-                            "registry_snapshot_version": plan.get(
-                                "registry_snapshot_version"
-                            ),
-                            "registry_snapshot_hash": plan.get(
-                                "registry_snapshot_hash"
-                            ),
-                            "selected_P": list(plan.get("selected_P") or []),
-                            "selected_A": plan.get("selected_A"),
-                            "effective_tier": plan.get("effective_tier"),
-                            "session": dict(plan.get("session") or {}),
-                        }
-                        if isinstance(plan.get("thinking_assignment"), Mapping):
-                            router_dynamic_decision.update(
-                                {
-                                    "thinking_assignment": copy.deepcopy(
-                                        dict(plan["thinking_assignment"])
-                                    ),
-                                    "executed_thinking_assignment": (
-                                        copy.deepcopy(
-                                            dict(plan["executed_thinking_assignment"])
-                                        )
-                                        if isinstance(
-                                            plan.get(
-                                                "executed_thinking_assignment"
-                                            ),
-                                            Mapping,
-                                        )
-                                        else None
-                                    ),
-                                    "assignment_reasons": copy.deepcopy(
-                                        plan.get("assignment_reasons")
-                                    ),
-                                    "unsupported_level_fallbacks": copy.deepcopy(
-                                        list(
-                                            plan.get(
-                                                "unsupported_level_fallbacks"
-                                            )
-                                            or []
-                                        )
-                                    ),
-                                    "policy_versions": copy.deepcopy(
-                                        dict(plan.get("policy_versions") or {})
-                                    ),
-                                }
+                        router_dynamic_decision = _router_dynamic_decision_projection(plan)
+                        if router_dynamic_decision is None:
+                            raise ValueError(
+                                "router_dynamic selection plan cannot be "
+                                "projected into runtime audit metadata"
                             )
                         turn.metadata["router_dynamic_decision"] = (
                             router_dynamic_decision

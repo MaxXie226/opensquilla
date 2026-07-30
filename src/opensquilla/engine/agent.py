@@ -145,10 +145,16 @@ from opensquilla.provider import (
 )
 from opensquilla.provider.failures import ProviderFailureKind, classify_provider_error
 from opensquilla.provider.protocol import (
+    ProviderRetryScopeError,
+    begin_provider_retry_scope,
+    end_provider_retry_scope,
+    prepare_provider_retry_after_failure,
     project_provider_message_count,
+    reserve_provider_retry_physical_request,
     validate_provider_chat_request,
 )
 from opensquilla.provider.types import (
+    REASONING_ONLY_LENGTH_STOP_REASONS,
     ContentBlockImage,
     FailureInjector,
     ProviderMessageCountProjection,
@@ -202,6 +208,7 @@ from .context import ContextAssembly
 from .subagent import SubagentManager, SubagentSpec
 from .types import (
     _THINKING_BUDGET_DEFAULT,
+    THINKING_BUDGETS,
     AgentConfig,
     AgentEvent,
     AgentState,
@@ -1775,7 +1782,12 @@ def _classify_provider_attempt(
             stop_reason=stop_reason,
             user_visible_emitted=user_visible_emitted,
         )
-    if (stop_reason or "").lower() == "length" and not visible_text and not tool_calls:
+    normalized_stop_reason = (stop_reason or "").strip().casefold()
+    if (
+        normalized_stop_reason in REASONING_ONLY_LENGTH_STOP_REASONS
+        and not visible_text
+        and not tool_calls
+    ):
         if (reasoning_content and reasoning_content.strip()) or reasoning_tokens > 0:
             return _ProviderAttemptClassification(
                 _ProviderAttemptKind.REASONING_ONLY,
@@ -1787,7 +1799,7 @@ def _classify_provider_attempt(
             stop_reason=stop_reason,
             user_visible_emitted=user_visible_emitted,
         )
-    if (stop_reason or "").lower() == "length":
+    if normalized_stop_reason in REASONING_ONLY_LENGTH_STOP_REASONS:
         return _ProviderAttemptClassification(
             _ProviderAttemptKind.LENGTH_CAPPED,
             stop_reason=stop_reason,
@@ -1812,30 +1824,187 @@ def _classify_provider_attempt(
     )
 
 
+_REASONING_LENGTH_RETRY_LEVELS = (
+    ThinkingLevel.MAX,
+    ThinkingLevel.XHIGH,
+    ThinkingLevel.HIGH,
+    ThinkingLevel.MEDIUM,
+    ThinkingLevel.LOW,
+    ThinkingLevel.MINIMAL,
+)
+
+
+def _thinking_request_fingerprint(chat_cfg: ChatConfig) -> tuple[bool, str, int, bool | None]:
+    level = getattr(chat_cfg.thinking_level, "value", chat_cfg.thinking_level)
+    return (
+        bool(chat_cfg.thinking),
+        str(level or "").strip().casefold(),
+        max(0, int(chat_cfg.thinking_budget_tokens or 0)),
+        chat_cfg.thinking_budget_explicit,
+    )
+
+
 def _chat_config_with_thinking_disabled(chat_cfg: ChatConfig) -> ChatConfig:
-    return ChatConfig(
-        max_tokens=chat_cfg.max_tokens,
-        temperature=chat_cfg.temperature,
-        top_p=chat_cfg.top_p,
-        system=chat_cfg.system,
-        thinking=False,
-        thinking_budget_tokens=0,
-        thinking_budget_explicit=False,
-        timeout=chat_cfg.timeout,
-        stop_sequences=chat_cfg.stop_sequences,
-        cache_breakpoints=chat_cfg.cache_breakpoints,
-        cache_mode=chat_cfg.cache_mode,
-        output_json_schema=chat_cfg.output_json_schema,
-        output_json_schema_strict=chat_cfg.output_json_schema_strict,
-        model_capabilities=chat_cfg.model_capabilities,
-        thinking_level=None,
-        provider_request_max_chars=chat_cfg.provider_request_max_chars,
-        tool_choice=chat_cfg.tool_choice,
-        candidate_output_mode=chat_cfg.candidate_output_mode,
-        ensemble_execution_mode=chat_cfg.ensemble_execution_mode,
-        ensemble_soft_deadline_seconds=chat_cfg.ensemble_soft_deadline_seconds,
-        ensemble_soft_deadline_disable_tools=(chat_cfg.ensemble_soft_deadline_disable_tools),
-        ensemble_soft_deadline_disable_thinking=(chat_cfg.ensemble_soft_deadline_disable_thinking),
+    return chat_cfg.model_copy(
+        update={
+            "thinking": False,
+            "thinking_budget_tokens": 0,
+            "thinking_budget_explicit": True,
+            "thinking_level": None,
+        }
+    )
+
+
+def _chat_config_with_strictly_lower_thinking(
+    chat_cfg: ChatConfig,
+) -> ChatConfig | None:
+    """Return the nearest lower thinking request, or ``None`` at the floor."""
+
+    if not chat_cfg.thinking:
+        return None
+    raw_level = getattr(chat_cfg.thinking_level, "value", chat_cfg.thinking_level)
+    normalized_level = str(raw_level or "").strip().casefold()
+    try:
+        current_level = ThinkingLevel(normalized_level)
+    except ValueError:
+        current_level = None
+
+    target_level: ThinkingLevel | None = None
+    if current_level in _REASONING_LENGTH_RETRY_LEVELS:
+        current_index = _REASONING_LENGTH_RETRY_LEVELS.index(current_level)
+        if current_index + 1 < len(_REASONING_LENGTH_RETRY_LEVELS):
+            target_level = _REASONING_LENGTH_RETRY_LEVELS[current_index + 1]
+    else:
+        current_budget = max(0, int(chat_cfg.thinking_budget_tokens or 0))
+        for candidate in reversed(_REASONING_LENGTH_RETRY_LEVELS):
+            if THINKING_BUDGETS[candidate] < current_budget:
+                target_level = candidate
+                break
+
+    lowered = (
+        _chat_config_with_thinking_disabled(chat_cfg)
+        if target_level is None
+        else chat_cfg.model_copy(
+            update={
+                "thinking": True,
+                "thinking_budget_tokens": THINKING_BUDGETS[target_level],
+                "thinking_budget_explicit": True,
+                "thinking_level": target_level,
+            }
+        )
+    )
+    if _thinking_request_fingerprint(lowered) == _thinking_request_fingerprint(chat_cfg):
+        return None
+    return lowered
+
+
+_THINKING_REJECTION_SUBJECTS = (
+    "thinking",
+    "reasoning",
+    "reasoning_effort",
+    "budget_tokens",
+)
+_THINKING_REJECTION_TERMS = (
+    "invalid",
+    "unsupported",
+    "not support",
+    "not allowed",
+    "unknown",
+    "unrecognized",
+    "reject",
+    "must be",
+    "should be one of",
+    "expected one of",
+    "valid values",
+    "allowed values",
+)
+_THINKING_LEVEL_PARAMETER_MARKERS = (
+    "reasoning_effort",
+    "thinking_level",
+    "thinking level",
+    "reasoning level",
+    "budget_tokens",
+    "budget tokens",
+    "thinking budget",
+    "reasoning budget",
+)
+
+
+def _is_thinking_parameter_rejection(*, message: str, code: str) -> bool:
+    evidence = f"{code} {message}".strip().casefold()
+    if "signature" in evidence:
+        return False
+    has_subject = any(subject in evidence for subject in _THINKING_REJECTION_SUBJECTS)
+    has_parameter = any(marker in evidence for marker in _THINKING_LEVEL_PARAMETER_MARKERS) or (
+        ("thinking" in evidence or "reasoning" in evidence) and " value" in evidence
+    )
+    return (
+        has_subject
+        and has_parameter
+        and any(term in evidence for term in _THINKING_REJECTION_TERMS)
+    )
+
+
+def _provider_done_has_explicit_usage_evidence(done: ProviderDoneEvent) -> bool:
+    """Reject a zero-filled Done envelope that does not prove usage reporting."""
+
+    breakdown = getattr(done, "model_usage_breakdown", None)
+    if isinstance(breakdown, list) and any(
+        isinstance(row, Mapping) and bool(row) for row in breakdown
+    ):
+        return True
+    provider_usage = getattr(done, "provider_usage", None)
+    if isinstance(provider_usage, Mapping) and bool(provider_usage):
+        return True
+    if getattr(done, "billing_receipt", None) is not None:
+        return True
+    return any(
+        isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0
+        for value in (
+            getattr(done, "input_tokens", 0),
+            getattr(done, "output_tokens", 0),
+            getattr(done, "reasoning_tokens", 0),
+            getattr(done, "cached_tokens", 0),
+            getattr(done, "cache_write_tokens", 0),
+            getattr(done, "billed_cost", 0.0),
+        )
+    )
+
+
+def _reasoning_length_retry_evidence_is_exact(
+    done: ProviderDoneEvent | None,
+    *,
+    provider_stream_closed: bool,
+    provider_error: ProviderErrorEvent | None,
+) -> bool:
+    """Require explicit single-attempt completion evidence before lowering."""
+
+    if (
+        done is None
+        or not provider_stream_closed
+        or provider_error is not None
+        or getattr(done, "request_started", None) is not True
+    ):
+        return False
+    physical_request_count = getattr(done, "physical_request_count", None)
+    if (
+        isinstance(physical_request_count, bool)
+        or not isinstance(physical_request_count, int)
+        or physical_request_count != 1
+    ):
+        return False
+    usage_missing_count = getattr(done, "usage_missing_count", None)
+    if (
+        isinstance(usage_missing_count, bool)
+        or not isinstance(usage_missing_count, int)
+        or usage_missing_count != 0
+    ):
+        return False
+    if not _provider_done_has_explicit_usage_evidence(done):
+        return False
+    return (
+        not str(getattr(done, "error", "") or "").strip()
+        and not str(getattr(done, "code", "") or "").strip()
     )
 
 
@@ -4379,6 +4548,8 @@ class Agent:
             return "owned_cleanup_in_progress"
         return ""
 
+    _PROVIDER_RETRY_SCOPE_MAX_ADDITIONAL_PHYSICAL_REQUESTS = 3
+
     async def run_turn(
         self,
         message: str,
@@ -4404,18 +4575,65 @@ class Agent:
             )
             return
         self._active_turn = True
+        provider_retry_scope_id = f"agent-run-turn:{uuid.uuid4().hex}"
+        provider_retry_scope_bound_providers: list[Any] = []
         try:
+            configured_retry_budget = max(
+                0,
+                int(getattr(self.config, "max_provider_retries", 0) or 0),
+            )
+            effective_retry_budget = min(
+                self._PROVIDER_RETRY_SCOPE_MAX_ADDITIONAL_PHYSICAL_REQUESTS,
+                configured_retry_budget,
+            )
+            try:
+                if begin_provider_retry_scope(
+                    self.provider,
+                    provider_retry_scope_id,
+                    max_additional_physical_requests=effective_retry_budget,
+                ):
+                    provider_retry_scope_bound_providers.append(self.provider)
+            except (ProviderRetryScopeError, ValueError) as exc:
+                logger.error(
+                    "provider.retry_scope_begin_failed",
+                    error_type=type(exc).__name__,
+                )
+                yield ErrorEvent(
+                    message=(
+                        "Provider retry scope setup failed before a physical request was started."
+                    ),
+                    code="provider_retry_scope_begin_failed",
+                    request_started=False,
+                    physical_request_count=0,
+                )
+                return
             async with contextlib.aclosing(
                 self._run_turn_owned(
                     message,
                     extra_messages,
                     semantic_message,
                     pending_input_provider=pending_input_provider,
+                    provider_retry_scope_id=provider_retry_scope_id,
+                    provider_retry_scope_bound_providers=(provider_retry_scope_bound_providers),
                 )
             ) as owned_turn:
                 async for event in owned_turn:
                     yield event
         finally:
+            for bound_provider in reversed(provider_retry_scope_bound_providers):
+                try:
+                    end_provider_retry_scope(
+                        bound_provider,
+                        provider_retry_scope_id,
+                    )
+                except (ProviderRetryScopeError, ValueError) as exc:
+                    # Scope cleanup happens after the owned turn has already
+                    # selected its terminal event. Keep that result intact,
+                    # while making the provider cleanup failure observable.
+                    logger.error(
+                        "provider.retry_scope_end_failed",
+                        error_type=type(exc).__name__,
+                    )
             # Early terminal paths (notably meta resume/launch) bypass the
             # ordinary bottom-of-turn reset.  The ownership gate above still
             # blocks unresolved cleanup, while the public state accurately
@@ -4430,6 +4648,8 @@ class Agent:
         semantic_message: str | None = None,
         *,
         pending_input_provider: PendingInputProvider | None = None,
+        provider_retry_scope_id: str = "",
+        provider_retry_scope_bound_providers: list[Any] | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """Run one agent turn, yielding AgentEvents.
 
@@ -4466,6 +4686,8 @@ class Agent:
                     extra_messages,
                     semantic_message,
                     pending_input_provider=pending_input_provider,
+                    provider_retry_scope_id=provider_retry_scope_id,
+                    provider_retry_scope_bound_providers=(provider_retry_scope_bound_providers),
                 )
             ) as turn_events:
                 async for event in turn_events:
@@ -4478,8 +4700,25 @@ class Agent:
         semantic_message: str | None = None,
         *,
         pending_input_provider: PendingInputProvider | None = None,
+        provider_retry_scope_id: str = "",
+        provider_retry_scope_bound_providers: list[Any] | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """Async generator that drives the state machine."""
+        if provider_retry_scope_bound_providers is None:
+            provider_retry_scope_bound_providers = []
+        agent_retry_budget = min(
+            self._PROVIDER_RETRY_SCOPE_MAX_ADDITIONAL_PHYSICAL_REQUESTS,
+            max(0, int(getattr(self.config, "max_provider_retries", 0) or 0)),
+        )
+        agent_retry_additional_calls_used = 0
+        visited_provider_retry_rosters: set[str] = set()
+        visited_provider_retry_request_fingerprints: set[
+            tuple[
+                tuple[str, str],
+                tuple[bool, str, int, bool | None],
+            ]
+        ] = set()
+        reasoning_downgraded_provider_identities: set[tuple[str, str]] = set()
         self._provider_tool_result_overrides = {}
         self._projected_diagnostic_evidence = {}
         self._focused_retrieved_tool_result_handles = set()
@@ -4679,8 +4918,20 @@ class Agent:
             provider_request_max_chars=self._provider_request_proof_max_chars(),
             tool_choice=None,
         )
+        provider_retry_thinking_config: ChatConfig | None = None
         _thinking_fallback_done = False
         _disable_thinking_for_next_provider_call = False
+        provider_retry_owner_value = self.config.metadata.get(
+            "provider_retry_owner",
+            getattr(self.provider, "provider_retry_owner", "agent"),
+        )
+        provider_retry_owner = str(provider_retry_owner_value).strip().casefold()
+        provider_retry_owner_valid = provider_retry_owner in {
+            "agent",
+            "caller",
+        }
+        if not provider_retry_owner_valid:
+            provider_retry_owner = "caller"
 
         def _provider_allows_failed_call_retry() -> bool:
             return (
@@ -4690,7 +4941,8 @@ class Agent:
 
         def _provider_allows_thinking_disable_retry() -> bool:
             return bool(
-                _provider_allows_failed_call_retry()
+                provider_retry_owner == "agent"
+                and _provider_allows_failed_call_retry()
                 and not bool(
                     getattr(
                         self.provider,
@@ -4699,6 +4951,32 @@ class Agent:
                     )
                 )
             )
+
+        def _provider_reasoning_retry_identity(
+            *,
+            actual_provider: str = "",
+            actual_model: str = "",
+        ) -> tuple[str, str]:
+            provider_identity = str(actual_provider or "").strip()
+            if not provider_identity:
+                provider_identity = str(
+                    getattr(self.provider, "active_provider_id", "")
+                    or getattr(self.provider, "provider_name", "")
+                    or type(self.provider).__name__
+                ).strip()
+            model_identity = str(actual_model or "").strip()
+            if not model_identity:
+                model_identity = str(
+                    getattr(self.provider, "active_model_id", "")
+                    or getattr(
+                        getattr(self.provider, "provider_config", None),
+                        "model",
+                        "",
+                    )
+                    or self.config.model_id
+                    or ""
+                ).strip()
+            return provider_identity, model_identity
 
         _reasoning_stream_char_cap = max(
             0, int(getattr(self.config, "reasoning_stream_char_cap", 0) or 0)
@@ -5634,6 +5912,20 @@ class Agent:
                             update={"tool_choice": forced_tool_choice}
                         )
                     _attempt_thinking_disabled = False
+                    if provider_retry_thinking_config is not None:
+                        call_chat_cfg = call_chat_cfg.model_copy(
+                            update={
+                                "thinking": provider_retry_thinking_config.thinking,
+                                "thinking_budget_tokens": (
+                                    provider_retry_thinking_config.thinking_budget_tokens
+                                ),
+                                "thinking_budget_explicit": (
+                                    provider_retry_thinking_config.thinking_budget_explicit
+                                ),
+                                "thinking_level": (provider_retry_thinking_config.thinking_level),
+                            }
+                        )
+                        _attempt_thinking_disabled = not call_chat_cfg.thinking
                     if _disable_thinking_for_next_provider_call:
                         call_chat_cfg = _chat_config_with_thinking_disabled(call_chat_cfg)
                         _disable_thinking_for_next_provider_call = False
@@ -5715,6 +6007,80 @@ class Agent:
                                 ),
                             }
                         )
+
+                    if _call_attempt > 0:
+                        call_chat_cfg = call_chat_cfg.model_copy(
+                            update={"allow_provider_stream_fallback": False}
+                        )
+                        if agent_retry_additional_calls_used >= agent_retry_budget:
+                            terminal_error = ErrorEvent(
+                                message=(
+                                    "Provider retry stopped because this turn "
+                                    "exhausted its shared additional-call budget "
+                                    f"({agent_retry_budget})."
+                                ),
+                                code="provider_retry_budget_exhausted",
+                                request_started=False,
+                                physical_request_count=0,
+                            )
+                            self._write_turn_call_log(
+                                "provider_retry_budget",
+                                action="stop",
+                                budget=agent_retry_budget,
+                                used=agent_retry_additional_calls_used,
+                                iteration=iterations,
+                                attempt=_call_attempt,
+                            )
+                            yield self._transition(AgentState.ERROR)
+                            yield terminal_error
+                            break
+                        try:
+                            provider_scope_reserved = reserve_provider_retry_physical_request(
+                                self.provider,
+                                provider_retry_scope_id,
+                            )
+                        except ProviderRetryScopeError:
+                            terminal_error = ErrorEvent(
+                                message=(
+                                    "Provider retry stopped because this turn "
+                                    "exhausted its shared physical-request "
+                                    f"budget ({agent_retry_budget})."
+                                ),
+                                code="provider_retry_budget_exhausted",
+                                request_started=False,
+                                physical_request_count=0,
+                            )
+                            self._write_turn_call_log(
+                                "provider_retry_budget",
+                                action="stop",
+                                reason="provider_scope_reservation_refused",
+                                budget=agent_retry_budget,
+                                used=agent_retry_additional_calls_used,
+                                iteration=iterations,
+                                attempt=_call_attempt,
+                            )
+                            yield self._transition(AgentState.ERROR)
+                            yield terminal_error
+                            break
+                        # False means the provider has no native/shared hook;
+                        # Agent's turn-wide local ledger remains authoritative.
+                        del provider_scope_reserved
+                        agent_retry_additional_calls_used += 1
+                        self._write_turn_call_log(
+                            "provider_retry_budget",
+                            action="reserve",
+                            budget=agent_retry_budget,
+                            used=agent_retry_additional_calls_used,
+                            iteration=iterations,
+                            attempt=_call_attempt,
+                        )
+
+                    visited_provider_retry_request_fingerprints.add(
+                        (
+                            _provider_reasoning_retry_identity(),
+                            _thinking_request_fingerprint(call_chat_cfg),
+                        )
+                    )
 
                     # The final engine Done identity describes this physical
                     # attempt, not any earlier Agent-loop request.  Reset at the
@@ -6922,18 +7288,57 @@ class Agent:
                                         normalized_usage=normalized_error_usage,
                                     )
                                     cost_receipt_counted = True
-                                # One-shot thinking/reasoning fallback
-                                _err_lower = raw_ev.message.lower()
+                                # A provider parameter rejection may safely
+                                # lower reasoning, but transient/auth/network
+                                # failures that merely mention reasoning must
+                                # keep their original classification.
+                                physical_request_count = raw_ev.physical_request_count
+                                reasoning_retry_identity = _provider_reasoning_retry_identity(
+                                    actual_provider=str(getattr(raw_ev, "provider", "") or ""),
+                                    actual_model=str(getattr(raw_ev, "model", "") or ""),
+                                )
                                 if (
-                                    thinking_enabled
-                                    and not _thinking_fallback_done
-                                    and _provider_allows_thinking_disable_retry()
-                                    and ("thinking" in _err_lower or "reasoning" in _err_lower)
+                                    _provider_allows_thinking_disable_retry()
+                                    and raw_ev.request_started is True
+                                    and isinstance(
+                                        physical_request_count,
+                                        int,
+                                    )
+                                    and not isinstance(
+                                        physical_request_count,
+                                        bool,
+                                    )
+                                    and physical_request_count > 0
+                                    and _is_thinking_parameter_rejection(
+                                        message=raw_ev.message,
+                                        code=raw_ev.code,
+                                    )
+                                    and reasoning_retry_identity
+                                    not in (reasoning_downgraded_provider_identities)
+                                    and (agent_retry_additional_calls_used < agent_retry_budget)
                                 ):
-                                    _thinking_fallback_done = True
-                                    _disable_thinking_for_next_provider_call = True
-                                    _got_error = True
-                                    break  # break stream, retry
+                                    lowered_config = _chat_config_with_strictly_lower_thinking(
+                                        call_chat_cfg
+                                    )
+                                    if lowered_config is not None and (
+                                        reasoning_retry_identity,
+                                        _thinking_request_fingerprint(lowered_config),
+                                    ) not in (visited_provider_retry_request_fingerprints):
+                                        provider_retry_thinking_config = lowered_config
+                                        reasoning_downgraded_provider_identities.add(
+                                            reasoning_retry_identity
+                                        )
+                                        yield WarningEvent(
+                                            code="provider_thinking_level_retry",
+                                            message=(
+                                                "The provider rejected the "
+                                                "requested thinking parameter; "
+                                                "retrying at a lower thinking "
+                                                "level."
+                                            ),
+                                        )
+                                        _got_error = True
+                                        break  # close stream, then retry
 
                                 provider_error = raw_ev
                                 _got_error = True
@@ -7335,6 +7740,57 @@ class Agent:
                             input_tokens=iter_input_tokens,
                             output_tokens=iter_output_tokens,
                         )
+                    reasoning_only_length = (
+                        attempt_classification.kind == _ProviderAttemptKind.REASONING_ONLY
+                        and str(attempt_classification.stop_reason or "").strip().casefold()
+                        in REASONING_ONLY_LENGTH_STOP_REASONS
+                    )
+                    reasoning_retry_identity = _provider_reasoning_retry_identity(
+                        actual_provider=last_actual_provider,
+                        actual_model=last_actual_model,
+                    )
+                    if (
+                        not _got_error
+                        and reasoning_only_length
+                        and _provider_allows_thinking_disable_retry()
+                        and agent_retry_additional_calls_used < agent_retry_budget
+                        and _reasoning_length_retry_evidence_is_exact(
+                            provider_done_for_log,
+                            provider_stream_closed=provider_stream_closed,
+                            provider_error=provider_error_for_log,
+                        )
+                        and reasoning_retry_identity
+                        not in (reasoning_downgraded_provider_identities)
+                    ):
+                        lowered_reasoning_config = _chat_config_with_strictly_lower_thinking(
+                            call_chat_cfg
+                        )
+                        if lowered_reasoning_config is not None and (
+                            reasoning_retry_identity,
+                            _thinking_request_fingerprint(lowered_reasoning_config),
+                        ) not in (visited_provider_retry_request_fingerprints):
+                            provider_retry_thinking_config = lowered_reasoning_config
+                            reasoning_downgraded_provider_identities.add(reasoning_retry_identity)
+                            self._write_turn_call_log(
+                                "provider_reasoning_length_retry",
+                                action="lower_thinking",
+                                iteration=iterations,
+                                attempt=_call_attempt,
+                                source_fingerprint=(_thinking_request_fingerprint(call_chat_cfg)),
+                                target_fingerprint=(
+                                    _thinking_request_fingerprint(lowered_reasoning_config)
+                                ),
+                            )
+                            yield WarningEvent(
+                                code="provider_reasoning_only_retry",
+                                message=(
+                                    "The provider exhausted its output in "
+                                    "reasoning without visible content; "
+                                    "retrying at a lower thinking level."
+                                ),
+                            )
+                            _call_attempt += 1
+                            continue
                     if not _got_error and attempt_classification.kind != _ProviderAttemptKind.OK:
                         logger.warning(
                             "provider.invalid_response",
@@ -7573,10 +8029,12 @@ class Agent:
                         if large_context_invalid:
                             if (
                                 not _invalid_response_fallback_done
+                                and agent_retry_additional_calls_used < agent_retry_budget
                                 and self._switch_to_invalid_response_fallback(
                                     attempt_classification.kind.value
                                 )
                             ):
+                                provider_retry_thinking_config = None
                                 _invalid_response_fallback_done = True
                                 yield WarningEvent(
                                     code="provider_large_context_fallback",
@@ -7590,7 +8048,9 @@ class Agent:
 
                             if (
                                 attempt_classification.kind == _ProviderAttemptKind.REASONING_ONLY
+                                and not reasoning_only_length
                                 and thinking_enabled
+                                and not _attempt_thinking_disabled
                                 and _provider_allows_thinking_disable_retry()
                                 and _retry_policy.can_retry_attempt(
                                     _ProviderAttemptKind.REASONING_ONLY,
@@ -7645,7 +8105,9 @@ class Agent:
 
                         if (
                             attempt_classification.kind == _ProviderAttemptKind.REASONING_ONLY
+                            and not reasoning_only_length
                             and thinking_enabled
+                            and not _attempt_thinking_disabled
                             and _provider_allows_thinking_disable_retry()
                             and _retry_policy.can_retry_attempt(
                                 _ProviderAttemptKind.REASONING_ONLY,
@@ -7653,7 +8115,11 @@ class Agent:
                             )
                         ):
                             _attempt_retries_used[_ProviderAttemptKind.REASONING_ONLY] += 1
-                            if getattr(self.config, "reasoning_only_thinking_fallback", False):
+                            if getattr(
+                                self.config,
+                                "reasoning_only_thinking_fallback",
+                                False,
+                            ):
                                 _thinking_fallback_done = True
                                 _disable_thinking_for_next_provider_call = True
                                 yield WarningEvent(
@@ -7751,6 +8217,7 @@ class Agent:
 
                         if (
                             attempt_classification.kind == _ProviderAttemptKind.LENGTH_CAPPED
+                            and _provider_allows_failed_call_retry()
                             and _retry_policy.can_retry_attempt(
                                 _ProviderAttemptKind.LENGTH_CAPPED,
                                 _attempt_retries_used,
@@ -7801,10 +8268,12 @@ class Agent:
                                 _ProviderAttemptKind.MALFORMED_EMPTY,
                             }
                             and not _invalid_response_fallback_done
+                            and agent_retry_additional_calls_used < agent_retry_budget
                             and self._switch_to_invalid_response_fallback(
                                 attempt_classification.kind.value
                             )
                         ):
+                            provider_retry_thinking_config = None
                             _invalid_response_fallback_done = True
                             yield WarningEvent(
                                 code="provider_empty_retry",
@@ -7932,6 +8401,27 @@ class Agent:
                         break  # stream OK, exit retry loop
 
                     if provider_error is None:
+                        if not _provider_allows_failed_call_retry():
+                            _log.warning(
+                                "provider.retry_suppressed",
+                                reason="composite_provider",
+                                kind="policy_preempt",
+                                provider=getattr(
+                                    self.provider,
+                                    "provider_name",
+                                    "",
+                                ),
+                            )
+                            yield self._transition(AgentState.ERROR)
+                            terminal_error = ErrorEvent(
+                                message=(
+                                    "The provider call was stopped by policy, but this "
+                                    "composite provider cannot be safely replayed."
+                                ),
+                                code="provider_retry_unsafe",
+                            )
+                            yield terminal_error
+                            break
                         _call_attempt += 1
                         continue
 
@@ -7973,6 +8463,28 @@ class Agent:
                                 "provider_request_message_limit_detected",
                                 **proof_log,
                             )
+                            if not _provider_allows_failed_call_retry():
+                                _log.warning(
+                                    "provider.retry_suppressed",
+                                    reason="composite_provider",
+                                    kind="message_limit_recovery",
+                                    provider=getattr(
+                                        self.provider,
+                                        "provider_name",
+                                        "",
+                                    ),
+                                )
+                                yield self._transition(AgentState.ERROR)
+                                terminal_error = ErrorEvent(
+                                    message=provider_error.message,
+                                    code=provider_error.code,
+                                    request_started=provider_error.request_started,
+                                    physical_request_count=(
+                                        provider_error.physical_request_count
+                                    ),
+                                )
+                                yield terminal_error
+                                break
                             if _message_limit_recovery_done:
                                 _log.warning(
                                     "provider_request_message_limit_recovery_repeated",
@@ -8083,9 +8595,12 @@ class Agent:
                         if forced_finalization_for_call:
                             finalization_reason = forced_finalization_reason or "deadline_wrapup"
                             if finalization_reason != "max_iterations":
-                                should_retry_finalization = _fallback.should_retry(
-                                    kind,
-                                    _retry_attempt,
+                                should_retry_finalization = (
+                                    _provider_allows_failed_call_retry()
+                                    and _fallback.should_retry(
+                                        kind,
+                                        _retry_attempt,
+                                    )
                                 )
                                 retry_delay = 0.0
                                 if should_retry_finalization:
@@ -8190,6 +8705,7 @@ class Agent:
                             break
                         if (
                             failure_kind == ProviderFailureKind.EMPTY_RESPONSE
+                            and _provider_allows_failed_call_retry()
                             and _retry_policy.can_retry_provider_failure(
                                 failure_kind,
                                 post_tool_turn=post_tool_turn,
@@ -8244,6 +8760,28 @@ class Agent:
                             _call_attempt += 1
                             continue
                         if failure_kind == ProviderFailureKind.CONTEXT_OVERFLOW:
+                            if not _provider_allows_failed_call_retry():
+                                _log.warning(
+                                    "provider.retry_suppressed",
+                                    reason="composite_provider",
+                                    kind="context_overflow_recovery",
+                                    provider=getattr(
+                                        self.provider,
+                                        "provider_name",
+                                        "",
+                                    ),
+                                )
+                                yield self._transition(AgentState.ERROR)
+                                terminal_error = ErrorEvent(
+                                    message=provider_error.message,
+                                    code=provider_error.code,
+                                    request_started=provider_error.request_started,
+                                    physical_request_count=(
+                                        provider_error.physical_request_count
+                                    ),
+                                )
+                                yield terminal_error
+                                break
                             self._record_provider_context_overflow_reason(provider_error)
                             provider_compaction_window_tokens = (
                                 self._provider_budget_compaction_window_tokens(provider_error)
@@ -8345,7 +8883,209 @@ class Agent:
                             )
                             _call_attempt += 1
                             continue
+                        retry_transition_prepare = getattr(
+                            self.provider,
+                            "prepare_retry_after_failure",
+                            None,
+                        )
+                        retry_transition_attempted = False
+                        if (
+                            callable(retry_transition_prepare)
+                            and provider_retry_owner == "agent"
+                            and _retry_attempt < _fallback.max_retries
+                            and provider_stream_closed
+                            and not attempt_user_visible_emitted
+                            and not tool_calls
+                            and not pending_tools
+                            and _provider_retry_deadline_error() is None
+                            and (agent_retry_additional_calls_used < agent_retry_budget)
+                        ):
+                            retry_transition_attempted = True
+                            source_provider = self.provider
+                            retry_transition = prepare_provider_retry_after_failure(
+                                source_provider,
+                                provider_error,
+                            )
+                            transition_rejection_reason = ""
+                            if retry_transition is None:
+                                transition_rejection_reason = "invalid_or_declined_transition"
+                            else:
+                                source_fingerprint = str(
+                                    retry_transition.source_roster_fingerprint or ""
+                                ).strip()
+                                target_fingerprint = str(
+                                    retry_transition.target_roster_fingerprint or ""
+                                ).strip()
+                                setup_request_count = retry_transition.setup_physical_request_count
+                                if (
+                                    retry_transition.replacement_provider is None
+                                    or retry_transition.replacement_provider is source_provider
+                                ):
+                                    transition_rejection_reason = "invalid_replacement_provider"
+                                elif (
+                                    getattr(
+                                        retry_transition.replacement_provider,
+                                        "retry_failed_call_safe",
+                                        True,
+                                    )
+                                    is False
+                                ):
+                                    transition_rejection_reason = "composite_replacement_provider"
+                                elif (
+                                    not isinstance(setup_request_count, int)
+                                    or isinstance(setup_request_count, bool)
+                                    or setup_request_count != 0
+                                ):
+                                    transition_rejection_reason = (
+                                        "setup_physical_request_count_nonzero"
+                                    )
+                                elif (
+                                    not source_fingerprint
+                                    or not target_fingerprint
+                                    or source_fingerprint == target_fingerprint
+                                ):
+                                    transition_rejection_reason = "invalid_roster_fingerprint"
+                                elif target_fingerprint in visited_provider_retry_rosters:
+                                    transition_rejection_reason = "target_roster_already_visited"
+                                elif callable(
+                                    getattr(
+                                        source_provider,
+                                        "reserve_provider_retry_physical_request",
+                                        None,
+                                    )
+                                ):
+                                    handoff = getattr(
+                                        source_provider,
+                                        "can_handoff_provider_retry_scope_to",
+                                        None,
+                                    )
+                                    if (
+                                        not callable(handoff)
+                                        or handoff(
+                                            retry_transition.replacement_provider,
+                                            provider_retry_scope_id,
+                                        )
+                                        is not True
+                                    ):
+                                        transition_rejection_reason = (
+                                            "native_retry_scope_handoff_unproven"
+                                        )
+
+                            replacement_provider = (
+                                retry_transition.replacement_provider
+                                if retry_transition is not None
+                                else None
+                            )
+                            replacement_already_bound = any(
+                                bound_provider is replacement_provider
+                                for bound_provider in provider_retry_scope_bound_providers
+                            )
+                            if (
+                                not transition_rejection_reason
+                                and replacement_provider is not None
+                                and not replacement_already_bound
+                            ):
+                                replacement_has_scope_hook = callable(
+                                    getattr(
+                                        replacement_provider,
+                                        "begin_provider_retry_scope",
+                                        None,
+                                    )
+                                )
+                                if replacement_has_scope_hook:
+                                    # Register before begin so a hook that
+                                    # partially initializes and then raises is
+                                    # still offered a matching end in run_turn's
+                                    # cleanup path.
+                                    provider_retry_scope_bound_providers.append(
+                                        replacement_provider
+                                    )
+                                try:
+                                    replacement_retry_budget = max(
+                                        0,
+                                        agent_retry_budget - agent_retry_additional_calls_used,
+                                    )
+                                    begin_provider_retry_scope(
+                                        replacement_provider,
+                                        provider_retry_scope_id,
+                                        max_additional_physical_requests=(replacement_retry_budget),
+                                    )
+                                except (ProviderRetryScopeError, ValueError):
+                                    transition_rejection_reason = "retry_scope_bind_failed"
+
+                            if not transition_rejection_reason:
+                                # All validation precedes this single assignment:
+                                # a failed/invalid transition cannot leave a
+                                # half-installed provider behind.
+                                transition_audit = {
+                                    "action": "apply",
+                                    "reason": retry_transition.reason,
+                                    "attempt": _retry_attempt + 1,
+                                    "source_roster_fingerprint": source_fingerprint,
+                                    "target_roster_fingerprint": target_fingerprint,
+                                    "excluded_identities": list(
+                                        retry_transition.excluded_identities
+                                    ),
+                                    "target_plan": dict(retry_transition.target_plan),
+                                    "setup_physical_request_count": setup_request_count,
+                                }
+                                self.provider = retry_transition.replacement_provider
+                                visited_provider_retry_rosters.update(
+                                    {
+                                        source_fingerprint,
+                                        target_fingerprint,
+                                    }
+                                )
+                                _log.warning(
+                                    "provider.retry_transition",
+                                    **transition_audit,
+                                )
+                                self._write_turn_call_log(
+                                    "provider_retry_transition",
+                                    **transition_audit,
+                                )
+                                yield WarningEvent(
+                                    code="provider_retry_transition",
+                                    message=(
+                                        "The provider failed before producing output; "
+                                        "retrying with a rebuilt provider roster."
+                                    ),
+                                )
+                                _retry_attempt += 1
+                                _call_attempt += 1
+                                continue
+
+                            _log.warning(
+                                "provider.retry_transition_rejected",
+                                reason=transition_rejection_reason,
+                                attempt=_retry_attempt + 1,
+                                provider=getattr(
+                                    source_provider,
+                                    "provider_name",
+                                    "",
+                                ),
+                            )
+                            self._write_turn_call_log(
+                                "provider_retry_transition",
+                                action="reject",
+                                reason=transition_rejection_reason,
+                                attempt=_retry_attempt + 1,
+                            )
+                        elif callable(retry_transition_prepare) and not (
+                            provider_retry_owner_valid
+                        ):
+                            self._write_turn_call_log(
+                                "provider_retry_transition",
+                                action="skip",
+                                reason="invalid_provider_retry_owner",
+                            )
+
                         should_retry = _fallback.should_retry(kind, _retry_attempt)
+                        if retry_transition_attempted:
+                            # The provider exposed a typed transition contract,
+                            # but did not return one that passed validation. Never
+                            # fall back to replaying that exact failed instance.
+                            should_retry = False
                         retry_failed_call_safe = (
                             getattr(
                                 self.provider,

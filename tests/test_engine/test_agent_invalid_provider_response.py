@@ -20,6 +20,7 @@ from opensquilla.provider import (
     ToolInputSchema,
 )
 from opensquilla.provider import DoneEvent as ProviderDone
+from opensquilla.provider import ErrorEvent as ProviderError
 from opensquilla.provider import TextDeltaEvent as ProviderText
 from opensquilla.provider import ToolUseDeltaEvent as ProviderToolUseDelta
 from opensquilla.provider import ToolUseEndEvent as ProviderToolUseEnd
@@ -65,6 +66,24 @@ class _FallbackSequenceProvider(_SequenceProvider):
     def fallback_after_invalid_response(self, reason: str) -> bool:
         self.fallback_reasons.append(reason)
         return True
+
+
+class _ModelSwitchingFallbackSequenceProvider(_FallbackSequenceProvider):
+    active_model_id = "model-a"
+
+    def fallback_after_invalid_response(self, reason: str) -> bool:
+        switched = super().fallback_after_invalid_response(reason)
+        if switched:
+            self.active_model_id = "model-b"
+        return switched
+
+
+def _evidenced_done(**kwargs: Any) -> ProviderDone:
+    kwargs.setdefault("provider_usage", {"test_usage_receipt": True})
+    done = ProviderDone(**kwargs)
+    done.request_started = True
+    done.physical_request_count = 1
+    return done
 
 
 def _large_reasoning_only_done() -> ProviderDone:
@@ -212,6 +231,342 @@ async def test_reasoning_only_first_turn_retries_without_disabling_thinking() ->
     assert len(assistant_messages) == 1
     assert assistant_messages[0].content[0].text == "ok"
     assert assistant_messages[0].reasoning_content is None
+
+
+@pytest.mark.parametrize(
+    "stop_reason",
+    ["length", "max_tokens", "max_output_tokens"],
+)
+@pytest.mark.asyncio
+async def test_reasoning_only_length_family_forces_changed_retry(
+    stop_reason: str,
+) -> None:
+    provider = _SequenceProvider(
+        [
+            [
+                _evidenced_done(
+                    stop_reason=stop_reason,
+                    input_tokens=10,
+                    output_tokens=16_384,
+                    reasoning_tokens=16_384,
+                    reasoning_content="internal reasoning",
+                    model="openrouter/test-reasoning",
+                )
+            ],
+            [
+                ProviderText(text="ok"),
+                ProviderDone(
+                    stop_reason="stop",
+                    input_tokens=11,
+                    output_tokens=1,
+                    model="openrouter/test-reasoning",
+                ),
+            ],
+        ]
+    )
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            thinking=ThinkingLevel.MEDIUM,
+            reasoning_only_thinking_fallback=False,
+            retry_base_backoff_ms=0,
+            retry_max_backoff_ms=0,
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    assert len(provider.calls) == 2
+    assert provider.calls[0]["config"].thinking is True
+    assert provider.calls[1]["config"].thinking is True
+    assert provider.calls[1]["config"].thinking_level == ThinkingLevel.LOW
+    assert (
+        provider.calls[1]["config"].thinking_budget_tokens
+        < provider.calls[0]["config"].thinking_budget_tokens
+    )
+    warning = next(
+        event
+        for event in events
+        if event.kind == "warning" and event.code == "provider_reasoning_only_retry"
+    )
+    assert "lower thinking level" in warning.message
+    assert any(event.kind == "done" and event.text == "ok" for event in events)
+    assert not any(event.kind == "error" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_reasoning_only_length_lowers_same_model_only_once() -> None:
+    provider = _SequenceProvider(
+        [
+            [
+                _evidenced_done(
+                    stop_reason="length",
+                    output_tokens=16_384,
+                    reasoning_tokens=16_384,
+                    reasoning_content="internal",
+                )
+            ],
+            [
+                _evidenced_done(
+                    stop_reason="length",
+                    output_tokens=16_384,
+                    reasoning_tokens=16_384,
+                    reasoning_content="internal",
+                )
+            ],
+            [ProviderText(text="should-not-run"), _evidenced_done(stop_reason="stop")],
+        ]
+    )
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            thinking=ThinkingLevel.HIGH,
+            max_provider_retries=3,
+            retry_base_backoff_ms=0,
+            retry_max_backoff_ms=0,
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    assert len(provider.calls) == 2
+    assert [call["config"].thinking_level for call in provider.calls] == [
+        ThinkingLevel.HIGH,
+        ThinkingLevel.MEDIUM,
+    ]
+    assert any(event.kind == "error" and event.code == "empty_response" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_backup_model_can_lower_to_level_already_used_by_source() -> None:
+    provider = _ModelSwitchingFallbackSequenceProvider(
+        [
+            [
+                _evidenced_done(
+                    stop_reason="length",
+                    output_tokens=16_384,
+                    reasoning_tokens=16_384,
+                    reasoning_content="source reasoning",
+                )
+            ],
+            [
+                _evidenced_done(
+                    stop_reason="length",
+                    output_tokens=16_384,
+                    reasoning_tokens=16_384,
+                    reasoning_content="source reasoning again",
+                )
+            ],
+            [
+                _evidenced_done(
+                    stop_reason="length",
+                    output_tokens=16_384,
+                    reasoning_tokens=16_384,
+                    reasoning_content="backup reasoning",
+                )
+            ],
+            [
+                ProviderText(text="ok"),
+                _evidenced_done(stop_reason="stop"),
+            ],
+        ]
+    )
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            thinking=ThinkingLevel.MEDIUM,
+            max_provider_retries=3,
+            retry_base_backoff_ms=0,
+            retry_max_backoff_ms=0,
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    assert provider.fallback_reasons == ["reasoning_only"]
+    assert len(provider.calls) == 4
+    assert [call["config"].thinking_level for call in provider.calls] == [
+        ThinkingLevel.MEDIUM,
+        ThinkingLevel.LOW,
+        ThinkingLevel.MEDIUM,
+        ThinkingLevel.LOW,
+    ]
+    assert (
+        sum(
+            event.kind == "warning" and event.code == "provider_reasoning_only_retry"
+            for event in events
+        )
+        == 2
+    )
+    assert any(event.kind == "done" and event.text == "ok" for event in events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    (
+        "request_started",
+        "physical_request_count",
+        "usage_missing_count",
+        "usage_reported",
+    ),
+    [
+        (None, 1, 0, True),
+        (True, 0, 0, True),
+        (True, 2, 0, True),
+        (True, 1, 1, True),
+        (True, 1, 0, False),
+    ],
+)
+async def test_reasoning_length_retry_requires_exact_done_evidence(
+    request_started: bool | None,
+    physical_request_count: int,
+    usage_missing_count: int,
+    usage_reported: bool,
+) -> None:
+    done = ProviderDone(
+        stop_reason="length",
+        reasoning_content="internal",
+        usage_missing_count=usage_missing_count,
+        provider_usage=({"test_usage_receipt": True} if usage_reported else {}),
+    )
+    done.request_started = request_started
+    done.physical_request_count = physical_request_count
+    provider = _SequenceProvider(
+        [
+            [done],
+            [ProviderText(text="should-not-run"), _evidenced_done()],
+        ]
+    )
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            thinking=ThinkingLevel.MEDIUM,
+            max_provider_retries=3,
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    assert len(provider.calls) == 1
+    assert any(event.kind == "error" and event.code == "empty_response" for event in events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("code", "message"),
+    [
+        ("429", "reasoning service is temporarily rate limited"),
+        ("503", "upstream reasoning backend unavailable"),
+        ("dns_error", "DNS failure resolving reasoning endpoint"),
+        ("401", "unauthorized to access reasoning model"),
+        ("403", "forbidden from accessing reasoning model"),
+    ],
+)
+async def test_transient_or_auth_reasoning_errors_do_not_lower_thinking(
+    code: str,
+    message: str,
+) -> None:
+    provider = _SequenceProvider(
+        [
+            [
+                ProviderError(
+                    message=message,
+                    code=code,
+                    request_started=True,
+                    physical_request_count=1,
+                    usage_missing_count=1,
+                )
+            ],
+            [ProviderText(text="ok"), _evidenced_done(stop_reason="stop")],
+        ]
+    )
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            thinking=ThinkingLevel.MEDIUM,
+            max_provider_retries=1,
+            retry_base_backoff_ms=0,
+            retry_max_backoff_ms=0,
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    assert all(call["config"].thinking_level == ThinkingLevel.MEDIUM for call in provider.calls)
+    assert not any(
+        event.kind == "warning" and event.code == "provider_thinking_level_retry"
+        for event in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_exact_thinking_parameter_rejection_lowers_once() -> None:
+    provider = _SequenceProvider(
+        [
+            [
+                ProviderError(
+                    message=(
+                        "Unsupported value for reasoning_effort: max; expected one of medium, low"
+                    ),
+                    code="400",
+                    request_started=True,
+                    physical_request_count=1,
+                    usage_missing_count=1,
+                )
+            ],
+            [ProviderText(text="ok"), _evidenced_done(stop_reason="stop")],
+        ]
+    )
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            thinking=ThinkingLevel.MEDIUM,
+            max_provider_retries=1,
+            retry_base_backoff_ms=0,
+            retry_max_backoff_ms=0,
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    assert len(provider.calls) == 2
+    assert provider.calls[0]["config"].thinking_level == ThinkingLevel.MEDIUM
+    assert provider.calls[1]["config"].thinking_level == ThinkingLevel.LOW
+    assert any(
+        event.kind == "warning" and event.code == "provider_thinking_level_retry"
+        for event in events
+    )
+    assert any(event.kind == "done" and event.text == "ok" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_reasoning_length_retry_owner_caller_does_not_lower() -> None:
+    provider = _SequenceProvider(
+        [
+            [
+                _evidenced_done(
+                    stop_reason="length",
+                    output_tokens=16_384,
+                    reasoning_tokens=16_384,
+                    reasoning_content="internal",
+                )
+            ],
+            [ProviderText(text="should-not-run"), _evidenced_done()],
+        ]
+    )
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            thinking=ThinkingLevel.MEDIUM,
+            max_provider_retries=3,
+            metadata={"provider_retry_owner": "caller"},
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    assert len(provider.calls) == 1
+    assert any(event.kind == "error" and event.code == "empty_response" for event in events)
 
 
 @pytest.mark.asyncio
@@ -885,10 +1240,10 @@ async def test_clean_empty_done_can_switch_to_selector_fallback() -> None:
 
     events = [event async for event in agent.run_turn("hello")]
 
-    assert provider.fallback_reasons == ["malformed_empty"]
-    assert len(provider.calls) == 2
-    assert any(event.kind == "done" and event.text == "ok" for event in events)
-    assert not any(event.kind == "error" for event in events)
+    assert provider.fallback_reasons == []
+    assert len(provider.calls) == 1
+    assert any(event.kind == "error" and event.code == "empty_response" for event in events)
+    assert not any(event.kind == "done" and event.text == "ok" for event in events)
 
 
 @pytest.mark.asyncio

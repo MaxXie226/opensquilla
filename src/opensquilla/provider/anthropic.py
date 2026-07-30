@@ -224,7 +224,7 @@ def _build_system_payload(cfg: ChatConfig) -> str | list[dict[str, Any]] | None:
     return blocks or cfg.system
 
 
-def _uses_adaptive_thinking(model: str) -> bool:
+def uses_adaptive_thinking(model: str) -> bool:
     model_lower = model.lower()
     return "claude-sonnet-4-6" in model_lower or "claude-opus-4-6" in model_lower
 
@@ -348,7 +348,7 @@ class AnthropicProvider:
         max_tokens = max(1, cfg.max_tokens)
         thinking_payload: dict[str, Any] | None = None
         if cfg.thinking:
-            if _uses_adaptive_thinking(self._model):
+            if uses_adaptive_thinking(self._model):
                 thinking_payload = {"type": "adaptive"}
             else:
                 budget_tokens = max(1, cfg.thinking_budget_tokens)

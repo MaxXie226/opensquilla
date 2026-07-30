@@ -33,6 +33,10 @@ def test_llm_ensemble_defaults_to_disabled_for_model_router_first_install() -> N
     assert ensemble.proposer_tools is False
     assert ensemble.aggregator_tools is True
     assert ensemble.min_successful_proposers == 1
+    assert ensemble.proposer_backup_count == 2
+    assert ensemble.proposer_recovery_max_additional_calls == 3
+    assert ensemble.proposer_max_tokens_cap == 65_536
+    assert ensemble.proposer_visible_answer_reserve_tokens == 4_096
     assert ensemble.model_options == []
     assert ensemble.candidates == []
     assert ensemble.candidate_max_chars == 24_000
@@ -69,6 +73,26 @@ def test_llm_ensemble_defaults_to_disabled_for_model_router_first_install() -> N
     assert provider.aggregator_serving_chain_timeout_seconds == 120.0
     assert provider.shuffle_candidates is False
     assert provider.quorum_grace_seconds == 10.0
+
+
+def test_llm_ensemble_proposer_recovery_can_be_explicitly_disabled() -> None:
+    cfg = GatewayConfig(
+        llm_ensemble={
+            "proposer_recovery_max_additional_calls": 0,
+        }
+    )
+
+    assert cfg.llm_ensemble.proposer_recovery_max_additional_calls == 0
+
+
+def test_llm_ensemble_rejects_proposer_reserve_at_or_above_cap() -> None:
+    with pytest.raises(ValueError, match="proposer_visible_answer_reserve_tokens"):
+        GatewayConfig(
+            llm_ensemble={
+                "proposer_max_tokens_cap": 4_096,
+                "proposer_visible_answer_reserve_tokens": 4_096,
+            }
+        )
 
 
 def test_llm_ensemble_user_profile_switches_are_independent() -> None:

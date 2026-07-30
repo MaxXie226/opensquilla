@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+from collections import Counter
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from .types import (
     ChatConfig,
@@ -237,6 +240,444 @@ class LLMProvider(Protocol):
     async def list_models(self) -> list[ModelInfo]:
         """Return all models available from this provider."""
         ...
+
+
+@dataclass(frozen=True)
+class ProviderRetryTransition:
+    """A zero-request transition to a materially different provider roster.
+
+    The failed provider remains the owner of its terminal usage evidence.  A
+    transition only describes a newly constructed provider; it never carries
+    usage rows forward or authorizes replay of the failed provider instance.
+    """
+
+    replacement_provider: LLMProvider = field(repr=False, compare=False)
+    reason: str
+    source_roster_fingerprint: str
+    target_roster_fingerprint: str
+    excluded_identities: tuple[str, ...] = ()
+    source_plan: dict[str, Any] = field(default_factory=dict, repr=False)
+    target_plan: dict[str, Any] = field(default_factory=dict, repr=False)
+    setup_physical_request_count: int = 0
+
+
+class ProviderRetryScopeError(RuntimeError):
+    """An optional provider retry-scope hook failed closed."""
+
+
+def _validated_provider_retry_scope_id(scope_id: object) -> str:
+    if (
+        not isinstance(scope_id, str)
+        or not scope_id
+        or scope_id != scope_id.strip()
+    ):
+        raise ValueError("provider retry scope_id must be a non-empty stripped string")
+    return scope_id
+
+
+def begin_provider_retry_scope(
+    provider: object | None,
+    scope_id: str,
+    *,
+    max_additional_physical_requests: int = 3,
+) -> bool:
+    """Begin an optional run-turn retry ledger on ``provider``.
+
+    Providers without the hook remain compatible. Once a hook exists, an
+    explicit refusal or exception is a correctness failure: silently falling
+    back to a per-chat budget would reset a run-turn physical-call cap.
+    """
+
+    validated_scope_id = _validated_provider_retry_scope_id(scope_id)
+    if (
+        isinstance(max_additional_physical_requests, bool)
+        or not isinstance(max_additional_physical_requests, int)
+        or max_additional_physical_requests < 0
+    ):
+        raise ValueError(
+            "max_additional_physical_requests must be a non-negative integer"
+        )
+    if provider is None:
+        return False
+    begin = getattr(provider, "begin_provider_retry_scope", None)
+    if not callable(begin):
+        return False
+    try:
+        result = begin(
+            validated_scope_id,
+            max_additional_physical_requests=max_additional_physical_requests,
+        )
+    except Exception as exc:  # noqa: BLE001 - optional hook must fail closed
+        raise ProviderRetryScopeError(
+            "provider begin_provider_retry_scope hook failed"
+        ) from exc
+    if result is False:
+        raise ProviderRetryScopeError(
+            "provider begin_provider_retry_scope hook refused the scope"
+        )
+    if result not in {None, True}:
+        raise ProviderRetryScopeError(
+            "provider begin_provider_retry_scope hook returned an invalid result"
+        )
+    return True
+
+
+def reserve_provider_retry_physical_request(
+    provider: object | None,
+    scope_id: str,
+    *,
+    physical_request_count: int = 1,
+) -> bool:
+    """Reserve physical-call budget from an optional run-turn retry ledger.
+
+    A provider without this capability remains compatible and returns
+    ``False``. Once the hook exists, every refusal, invalid result, or
+    exception fails closed so a caller cannot issue an unaccounted request
+    after the shared retry budget is exhausted.
+    """
+
+    validated_scope_id = _validated_provider_retry_scope_id(scope_id)
+    if (
+        isinstance(physical_request_count, bool)
+        or not isinstance(physical_request_count, int)
+        or physical_request_count <= 0
+    ):
+        raise ValueError("physical_request_count must be a positive integer")
+    if provider is None:
+        return False
+    reserve = getattr(
+        provider,
+        "reserve_provider_retry_physical_request",
+        None,
+    )
+    if not callable(reserve):
+        return False
+    try:
+        result = reserve(
+            validated_scope_id,
+            physical_request_count=physical_request_count,
+        )
+    except Exception as exc:  # noqa: BLE001 - optional hook must fail closed
+        raise ProviderRetryScopeError(
+            "provider reserve_provider_retry_physical_request hook failed"
+        ) from exc
+    if result is False:
+        raise ProviderRetryScopeError(
+            "provider retry physical-request budget is exhausted"
+        )
+    if result is not True:
+        raise ProviderRetryScopeError(
+            "provider reserve_provider_retry_physical_request hook returned "
+            "an invalid result"
+        )
+    return True
+
+
+def end_provider_retry_scope(
+    provider: object | None,
+    scope_id: str,
+) -> bool:
+    """End an optional run-turn retry ledger on ``provider``."""
+
+    validated_scope_id = _validated_provider_retry_scope_id(scope_id)
+    if provider is None:
+        return False
+    end = getattr(provider, "end_provider_retry_scope", None)
+    if not callable(end):
+        return False
+    try:
+        result = end(validated_scope_id)
+    except Exception as exc:  # noqa: BLE001 - optional hook must fail closed
+        raise ProviderRetryScopeError(
+            "provider end_provider_retry_scope hook failed"
+        ) from exc
+    if result is False:
+        raise ProviderRetryScopeError(
+            "provider end_provider_retry_scope hook refused the scope"
+        )
+    if result not in {None, True}:
+        raise ProviderRetryScopeError(
+            "provider end_provider_retry_scope hook returned an invalid result"
+        )
+    return True
+
+
+def _canonical_provider_model_identity(
+    value: object,
+) -> tuple[str, str] | None:
+    """Return the two canonical identity components or reject the value."""
+
+    if (
+        not isinstance(value, str)
+        or value != value.strip()
+        or value != value.casefold()
+        or value.count(":") != 1
+        or any(character.isspace() for character in value)
+    ):
+        return None
+    provider, model = value.split(":", 1)
+    if not provider or not model:
+        return None
+    return provider, model
+
+
+def provider_retry_roster_fingerprint(plan: object) -> str:
+    """Hash the physical ensemble roster and quorum encoded by a route plan.
+
+    Decision IDs are deliberately excluded: changing an ID does not prove that
+    a retry will invoke different physical models.
+    """
+
+    if not isinstance(plan, dict):
+        try:
+            plan = dict(plan)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return ""
+    strategy = _string_value(plan.get("strategy")).casefold()
+    selection_mode = _string_value(plan.get("selection_mode")).casefold()
+    selected_p = plan.get("selected_P")
+    backup_p = plan.get("backup_P")
+    proposer_recovery_policy = plan.get("proposer_recovery_policy")
+    proposer_models = plan.get("proposer_models")
+    selected_a = plan.get("selected_A")
+    aggregator_candidates = plan.get("aggregator_candidates")
+    quorum = plan.get("effective_min_successful_proposers")
+    sample_count = plan.get("proposer_sample_count")
+    selected_p_parts = (
+        [
+            _canonical_provider_model_identity(identity)
+            for identity in selected_p
+        ]
+        if isinstance(selected_p, list)
+        else []
+    )
+    selected_a_parts = _canonical_provider_model_identity(selected_a)
+    backup_p_parts = (
+        [
+            _canonical_provider_model_identity(identity)
+            for identity in backup_p
+        ]
+        if isinstance(backup_p, list)
+        else []
+    )
+    aggregator_parts = (
+        [
+            _canonical_provider_model_identity(identity)
+            for identity in aggregator_candidates
+        ]
+        if isinstance(aggregator_candidates, list)
+        else []
+    )
+    normalized_proposer_models = (
+        list(proposer_models)
+        if isinstance(proposer_models, list)
+        and all(
+            isinstance(model, str)
+            and model
+            and model == model.strip()
+            and model == model.casefold()
+            and not any(character.isspace() for character in model)
+            for model in proposer_models
+        )
+        else []
+    )
+    selected_p_strings = (
+        [identity for identity in selected_p if isinstance(identity, str)]
+        if isinstance(selected_p, list)
+        else []
+    )
+    backup_p_strings = (
+        [identity for identity in backup_p if isinstance(identity, str)]
+        if isinstance(backup_p, list)
+        else []
+    )
+    aggregator_strings = (
+        [
+            identity
+            for identity in aggregator_candidates
+            if isinstance(identity, str)
+        ]
+        if isinstance(aggregator_candidates, list)
+        else []
+    )
+    selected_model_counts = Counter(
+        parts[1]
+        for parts in selected_p_parts
+        if parts is not None
+    )
+    proposer_model_counts = Counter(normalized_proposer_models)
+    backup_aggregator_overlap = bool(
+        isinstance(aggregator_candidates, list)
+        and isinstance(backup_p, list)
+        and any(candidate in backup_p for candidate in aggregator_candidates)
+    )
+    valid_recovery_policy = False
+    if isinstance(proposer_recovery_policy, dict):
+        configured_backup_count = proposer_recovery_policy.get(
+            "configured_backup_count"
+        )
+        effective_backup_count = proposer_recovery_policy.get(
+            "effective_backup_count"
+        )
+        max_additional = proposer_recovery_policy.get(
+            "max_additional_physical_requests"
+        )
+        policy_quorum = proposer_recovery_policy.get("quorum_required")
+        proposer_cap = proposer_recovery_policy.get("max_tokens_cap")
+        proposer_reserve = proposer_recovery_policy.get(
+            "visible_answer_reserve_tokens"
+        )
+        downgrade_order = proposer_recovery_policy.get(
+            "thinking_downgrade_order"
+        )
+        transient_retries = proposer_recovery_policy.get(
+            "transient_same_model_retries"
+        )
+        backup_downgrades = proposer_recovery_policy.get(
+            "backup_reasoning_downgrades"
+        )
+        integer_values = (
+            configured_backup_count,
+            effective_backup_count,
+            max_additional,
+            policy_quorum,
+            proposer_cap,
+            proposer_reserve,
+            transient_retries,
+            backup_downgrades,
+        )
+        valid_recovery_policy = bool(
+            proposer_recovery_policy.get("schema")
+            == "opensquilla.router-dynamic-proposer-recovery/v1"
+            and all(
+                isinstance(value, int) and not isinstance(value, bool)
+                for value in integer_values
+            )
+            and configured_backup_count >= 0
+            and effective_backup_count == len(backup_p_parts)
+            and effective_backup_count <= configured_backup_count
+            and 0 <= max_additional <= 3
+            and policy_quorum == quorum
+            and proposer_cap >= 2
+            and 1 <= proposer_reserve < proposer_cap
+            and downgrade_order == ["one_strictly_lower"]
+            and transient_retries == 1
+            and backup_downgrades == 1
+        )
+    if (
+        strategy != "router_dynamic"
+        or selection_mode != "router_dynamic"
+        or not isinstance(selected_p, list)
+        or not selected_p
+        or any(parts is None for parts in selected_p_parts)
+        or len(selected_p_strings) != len(selected_p)
+        or len(set(selected_p_strings)) != len(selected_p_strings)
+        or not isinstance(backup_p, list)
+        or any(parts is None for parts in backup_p_parts)
+        or len(backup_p_strings) != len(backup_p)
+        or len(set(backup_p_strings)) != len(backup_p_strings)
+        or bool(set(selected_p_strings).intersection(backup_p_strings))
+        or backup_aggregator_overlap
+        or not valid_recovery_policy
+        or not isinstance(proposer_models, list)
+        or not proposer_models
+        or not normalized_proposer_models
+        or set(proposer_model_counts) != set(selected_model_counts)
+        or any(
+            proposer_model_counts[model] < selected_count
+            for model, selected_count in selected_model_counts.items()
+        )
+        or selected_a_parts is None
+        or not isinstance(aggregator_candidates, list)
+        or not aggregator_candidates
+        or any(parts is None for parts in aggregator_parts)
+        or len(aggregator_strings) != len(aggregator_candidates)
+        or len(set(aggregator_strings)) != len(aggregator_strings)
+        or aggregator_candidates[0] != selected_a
+        or isinstance(quorum, bool)
+        or not isinstance(quorum, int)
+        or quorum <= 0
+        or isinstance(sample_count, bool)
+        or not isinstance(sample_count, int)
+        or sample_count != len(proposer_models)
+        or quorum > sample_count
+    ):
+        return ""
+    payload = {
+        "strategy": strategy,
+        "selection_mode": selection_mode,
+        "selected_P": selected_p,
+        "backup_P": backup_p,
+        "proposer_recovery_policy": proposer_recovery_policy,
+        "proposer_models": normalized_proposer_models,
+        "selected_A": selected_a,
+        "aggregator_candidates": aggregator_candidates,
+        "effective_min_successful_proposers": quorum,
+        "proposer_sample_count": sample_count,
+    }
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def prepare_provider_retry_after_failure(
+    provider: object | None,
+    event: ErrorEvent,
+) -> ProviderRetryTransition | None:
+    """Invoke an optional typed replacement hook and validate it fail-closed."""
+
+    if provider is None or not isinstance(event, ErrorEvent):
+        return None
+    prepare = getattr(provider, "prepare_retry_after_failure", None)
+    if not callable(prepare):
+        return None
+    try:
+        transition = prepare(event)
+    except Exception:  # noqa: BLE001 - optional replacement must fail closed
+        return None
+    if not isinstance(transition, ProviderRetryTransition):
+        return None
+    source_fingerprint = provider_retry_roster_fingerprint(
+        transition.source_plan
+    )
+    target_fingerprint = provider_retry_roster_fingerprint(
+        transition.target_plan
+    )
+    exclusions = transition.excluded_identities
+    source_proposers = transition.source_plan.get("selected_P")
+    target_proposers = transition.target_plan.get("selected_P")
+    canonical_exclusions = (
+        isinstance(exclusions, tuple)
+        and bool(exclusions)
+        and all(
+            _canonical_provider_model_identity(identity) is not None
+            for identity in exclusions
+        )
+        and len(set(exclusions)) == len(exclusions)
+    )
+    if (
+        transition.replacement_provider is None
+        or transition.replacement_provider is provider
+        or not _string_value(transition.reason)
+        or transition.setup_physical_request_count != 0
+        or not source_fingerprint
+        or not target_fingerprint
+        or source_fingerprint == target_fingerprint
+        or transition.source_roster_fingerprint != source_fingerprint
+        or transition.target_roster_fingerprint != target_fingerprint
+        or not canonical_exclusions
+        or not isinstance(source_proposers, list)
+        or not set(exclusions).issubset(source_proposers)
+        or not isinstance(target_proposers, list)
+        or bool(set(exclusions).intersection(target_proposers))
+    ):
+        return None
+    return transition
 
 
 class ProviderFailure(Exception):  # noqa: N818 - public compatibility name

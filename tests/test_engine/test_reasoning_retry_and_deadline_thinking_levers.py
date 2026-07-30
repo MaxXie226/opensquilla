@@ -431,8 +431,8 @@ async def test_reasoning_stream_char_cap_skips_streams_in_tool_call_phase() -> N
 
 @pytest.mark.asyncio
 async def test_reasoning_stream_char_cap_preempt_keeps_provider_retry_budget() -> None:
-    # The preempt is an engine choice, not a provider failure: with a provider
-    # retry budget of zero, the preempted attempt's retry must still run.
+    # Engine preemption starts one additional physical request and therefore
+    # requires one unit from the turn-wide provider retry budget.
     provider = _SequenceProvider(
         [
             [
@@ -448,7 +448,7 @@ async def test_reasoning_stream_char_cap_preempt_keeps_provider_retry_budget() -
         config=AgentConfig(
             thinking=ThinkingLevel.MEDIUM,
             reasoning_stream_char_cap=500,
-            max_provider_retries=0,
+            max_provider_retries=1,
             retry_base_backoff_ms=0,
             retry_max_backoff_ms=0,
         ),

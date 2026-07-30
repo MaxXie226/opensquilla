@@ -3766,7 +3766,7 @@ async def test_context_overflow_effective_compaction_allows_single_retry(
     agent = Agent(
         provider=provider,
         config=AgentConfig(
-            max_provider_retries=0,
+            max_provider_retries=1,
             max_overflow_retries=2,
             flush_enabled=False,
         ),
@@ -4043,7 +4043,7 @@ async def test_provider_request_budget_exhausted_compacts_warns_and_retries(
     agent = Agent(
         provider=provider,
         config=AgentConfig(
-            max_provider_retries=0,
+            max_provider_retries=1,
             max_overflow_retries=2,
             flush_enabled=False,
         ),
@@ -4109,7 +4109,7 @@ async def test_provider_request_budget_uses_provider_window_for_compaction(
         provider=provider,
         config=AgentConfig(
             context_window_tokens=1_048_576,
-            max_provider_retries=0,
+            max_provider_retries=1,
             max_overflow_retries=2,
             flush_enabled=False,
         ),
@@ -4144,7 +4144,7 @@ async def test_provider_request_budget_retry_payload_is_rechecked_against_budget
         provider=provider,
         config=AgentConfig(
             context_window_tokens=1_048_576,
-            max_provider_retries=0,
+            max_provider_retries=1,
             max_overflow_retries=2,
             flush_enabled=False,
         ),
@@ -4194,7 +4194,7 @@ async def test_provider_budget_retry_uses_effective_proof_budget(
         provider=provider,
         config=AgentConfig(
             context_window_tokens=1_048_576,
-            max_provider_retries=0,
+            max_provider_retries=1,
             max_overflow_retries=2,
             flush_enabled=False,
         ),
@@ -4273,7 +4273,7 @@ async def test_provider_request_budget_recent_tail_exhaustion_is_reported_as_con
     agent = Agent(
         provider=provider,
         config=AgentConfig(
-            max_provider_retries=0,
+            max_provider_retries=1,
             max_overflow_retries=1,
             flush_enabled=False,
         ),
@@ -4311,7 +4311,7 @@ async def test_context_overflow_degraded_flush_still_runs_live_compaction_by_def
     provider = _ContextOverflowProvider(success_after=1)
     agent = Agent(
         provider=provider,
-        config=AgentConfig(max_provider_retries=0, max_overflow_retries=2),
+        config=AgentConfig(max_provider_retries=1, max_overflow_retries=2),
     )
 
     events = [event async for event in agent.run_turn("x" * 4000)]
@@ -4346,7 +4346,7 @@ async def test_context_overflow_flush_timeout_records_backoff_and_retries(
     agent = Agent(
         provider=provider,
         config=AgentConfig(
-            max_provider_retries=0,
+            max_provider_retries=1,
             max_overflow_retries=2,
             flush_enabled=True,
             flush_pre_compaction=True,

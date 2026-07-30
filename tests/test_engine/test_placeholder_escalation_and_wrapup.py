@@ -815,6 +815,49 @@ async def test_deadline_wrapup_preempts_ensemble_progress_into_finalization() ->
 
 
 @pytest.mark.asyncio
+async def test_deadline_wrapup_preempt_does_not_replay_unsafe_composite() -> None:
+    provider = _SequenceProvider(
+        [
+            [
+                ProviderHeartbeatEvent(
+                    phase="ensemble_proposers_wait",
+                    message="still running proposers",
+                ),
+                1.05,
+                ProviderHeartbeatEvent(
+                    phase="ensemble_proposers_wait",
+                    message="soft deadline crossed",
+                ),
+            ],
+            _final_text(),
+        ]
+    )
+    provider.provider_name = "ensemble"
+    provider.retry_failed_call_safe = False
+    agent = _echo_agent(
+        provider,
+        AgentConfig(
+            timeout=2.0,
+            deadline_wrapup_margin_seconds=1,
+            deadline_wrapup_disable_tools=True,
+            finalization_aggregator_only=True,
+            max_provider_retries=3,
+            retry_base_backoff_ms=0,
+            retry_max_backoff_ms=0,
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("fix the bug")]
+
+    assert len(provider.calls) == 1
+    assert any(
+        event.kind == "error" and event.code == "provider_retry_unsafe"
+        for event in events
+    )
+    assert not any(event.kind == "done" for event in events)
+
+
+@pytest.mark.asyncio
 async def test_deadline_wrapup_does_not_preempt_aggregator_finish() -> None:
     provider = _SequenceProvider(
         [

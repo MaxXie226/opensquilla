@@ -491,6 +491,10 @@ class LlmEnsembleConfig(BaseSettings):
     proposer_tools: bool = False
     aggregator_tools: bool = True
     min_successful_proposers: int = Field(default=1, ge=1)
+    proposer_backup_count: int = Field(default=2, ge=0)
+    proposer_recovery_max_additional_calls: int = Field(default=3, ge=0, le=3)
+    proposer_max_tokens_cap: int = Field(default=65_536, ge=2)
+    proposer_visible_answer_reserve_tokens: int = Field(default=4_096, ge=1)
     all_failed_policy: Literal["fallback_single", "error"] = "fallback_single"
     model_options: list[str] = Field(default_factory=_default_llm_ensemble_model_options)
     candidates: list[LlmEnsembleCandidateConfig] = Field(default_factory=list)
@@ -530,6 +534,15 @@ class LlmEnsembleConfig(BaseSettings):
             raise ValueError(
                 "llm_ensemble.aggregator_visible_answer_reserve_tokens must be "
                 "smaller than llm_ensemble.aggregator_max_tokens_cap"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_proposer_output_budget(self) -> LlmEnsembleConfig:
+        if self.proposer_visible_answer_reserve_tokens >= self.proposer_max_tokens_cap:
+            raise ValueError(
+                "llm_ensemble.proposer_visible_answer_reserve_tokens must be "
+                "smaller than llm_ensemble.proposer_max_tokens_cap"
             )
         return self
 

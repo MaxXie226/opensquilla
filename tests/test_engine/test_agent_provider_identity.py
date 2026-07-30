@@ -1,12 +1,10 @@
-"""Pin the configured-provider-id propagation into usage tracking.
+"""Pin actual-vs-requested provider identity separation in usage tracking.
 
 Local runtimes (vLLM, LM Studio, Ollama, …) are free, but the openai_compat
 adapter class names itself ``"openai"`` for every deployment it serves. The
-Agent used to forward that adapter class name into the usage tracker, so a
-vLLM deployment was billed with the cloud OpenAI default estimate. The fix
-threads the *configured* provider id (``AgentConfig.provider_id``) into both
-tracker-add branches, ahead of the adapter class name, so ``SessionUsage``
-prices a local runtime as free.
+configured provider and adapter name are request context, not physical
+response evidence.  When a Done event omits its provider, the legacy tracker
+must preserve a blank actual provider rather than promote either value.
 """
 
 from __future__ import annotations
@@ -82,10 +80,8 @@ def _run_single_turn(
     return tracker
 
 
-def test_fallback_branch_records_configured_provider_id() -> None:
-    """A vLLM-configured agent records ``provider="vllm"`` so the session
-    prices the turn as free, even though the adapter class name is
-    ``"openai"``."""
+def test_fallback_branch_does_not_promote_configured_provider_to_actual() -> None:
+    """Configured vLLM identity is not physical response evidence."""
     session_key = "agent:test:webchat:vllm"
     tracker = _run_single_turn(
         AgentConfig(max_iterations=2, provider_id="vllm"),
@@ -96,16 +92,11 @@ def test_fallback_branch_records_configured_provider_id() -> None:
     assert usage is not None
     assert usage._per_model is not None
     mu = usage._per_model["qwen3-coder:30b"]
-    assert mu.provider == "vllm"
-    # local_free short-circuit in resolve_model_price -> zero cost
-    assert mu.cost == 0.0
+    assert mu.provider == ""
 
 
-def test_fallback_branch_without_provider_id_uses_adapter_name() -> None:
-    """Backward-compatible default: with no configured provider id the
-    adapter class name still flows through (and prices as cloud), so the
-    fix is opt-in via ``AgentConfig.provider_id`` rather than a silent
-    behavior change for callers that don't set it."""
+def test_fallback_branch_does_not_promote_adapter_name_to_actual() -> None:
+    """A generic adapter name is not physical response evidence either."""
     session_key = "agent:test:webchat:default"
     tracker = _run_single_turn(
         AgentConfig(max_iterations=2),
@@ -116,13 +107,12 @@ def test_fallback_branch_without_provider_id_uses_adapter_name() -> None:
     assert usage is not None
     assert usage._per_model is not None
     mu = usage._per_model["qwen3-coder:30b"]
-    assert mu.provider == "openai"
-    # "openai" is not a local-free provider -> cloud default estimate applies
+    assert mu.provider == ""
     assert mu.cost > 0.0
 
 
-def test_routed_turn_records_selectors_actual_provider_id() -> None:
-    """Cross-provider routing must not attribute usage to the primary provider."""
+def test_routed_turn_does_not_promote_selector_config_to_actual_provider() -> None:
+    """Selector configuration remains non-physical without a response receipt."""
 
     class _Selector:
         active_provider_id = "deepseek"
@@ -137,14 +127,14 @@ def test_routed_turn_records_selectors_actual_provider_id() -> None:
     usage = tracker.get(session_key)
     assert usage is not None
     [deployment] = usage.deployment_breakdown
-    assert deployment["provider"] == "deepseek"
+    assert deployment["provider"] == ""
     assert deployment["model"] == "qwen3-coder:30b"
 
 
-def test_routed_turn_cost_budget_prices_the_actual_provider(
+def test_routed_turn_cost_budget_uses_requested_provider_as_pricing_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The live cost gate must not price a routed model as the primary provider."""
+    """Requested provider may price a call without becoming actual identity."""
     from opensquilla.engine import pricing
 
     class _Selector:
@@ -168,5 +158,5 @@ def test_routed_turn_cost_budget_prices_the_actual_provider(
         provider=_SelectorFallbackProvider(_LocalCompatProvider(), _Selector()),
     )
 
-    assert ("qwen3-coder:30b", "deepseek") in calls
-    assert ("qwen3-coder:30b", "openrouter") not in calls
+    assert ("qwen3-coder:30b", "openrouter") in calls
+    assert ("qwen3-coder:30b", "deepseek") not in calls

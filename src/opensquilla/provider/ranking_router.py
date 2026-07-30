@@ -311,6 +311,9 @@ class RankingDecision:
     # Item zero is always the selected primary. The remaining items are
     # frozen recovery candidates from the same hard-filtered ranking.
     aggregator_candidates: tuple[RankedModel, ...] = field(default_factory=tuple)
+    # Ordered, unselected proposer replacements from the same hard-filtered
+    # and scored registry snapshot.
+    backup_proposers: tuple[RankedModel, ...] = field(default_factory=tuple)
 
 
 def _as_float(value: Any, default: float = 0.0) -> float:
@@ -4291,8 +4294,7 @@ def _availability_reasons(
     if isinstance(runtime_reasons, Sequence) and not isinstance(runtime_reasons, (str, bytes)):
         reasons.extend(str(reason).strip() for reason in runtime_reasons if str(reason).strip())
     if (
-        thinking_policy_managed
-        and role.strip().lower() == "proposer"
+        role.strip().lower() == "proposer"
         and facts.get("retry_excluded_proposer") is True
     ):
         reasons.append("prior_attempt_reasoning_only_length")
@@ -5367,12 +5369,59 @@ def rank_models(
     ranking_config: Mapping[str, Any] | None = None,
     decision_id: str = "",
     ranking_thinking_assignment_enabled: bool = False,
+    proposer_backup_count: int = 2,
+    proposer_recovery_max_additional_calls: int = 3,
+    proposer_max_tokens_cap: int = 65_536,
+    proposer_visible_answer_reserve_tokens: int = 4_096,
+    proposer_recovery_quorum: int | None = None,
 ) -> RankingDecision:
     """Select ``(P, A)`` using the Step2 chapter-6 ranking pipeline."""
 
     if not isinstance(ranking_thinking_assignment_enabled, bool):
         raise DynamicRankingError(
             "router_dynamic ranking_thinking_assignment_enabled must be a boolean"
+        )
+    if (
+        isinstance(proposer_backup_count, bool)
+        or not isinstance(proposer_backup_count, int)
+        or proposer_backup_count < 0
+    ):
+        raise DynamicRankingError(
+            "router_dynamic proposer_backup_count must be a non-negative integer"
+        )
+    if (
+        isinstance(proposer_recovery_max_additional_calls, bool)
+        or not isinstance(proposer_recovery_max_additional_calls, int)
+        or not 0 <= proposer_recovery_max_additional_calls <= 3
+    ):
+        raise DynamicRankingError(
+            "router_dynamic proposer recovery max additional calls must be "
+            "an integer between zero and three"
+        )
+    if (
+        isinstance(proposer_max_tokens_cap, bool)
+        or not isinstance(proposer_max_tokens_cap, int)
+        or proposer_max_tokens_cap < 2
+        or isinstance(proposer_visible_answer_reserve_tokens, bool)
+        or not isinstance(proposer_visible_answer_reserve_tokens, int)
+        or not 1
+        <= proposer_visible_answer_reserve_tokens
+        < proposer_max_tokens_cap
+    ):
+        raise DynamicRankingError(
+            "router_dynamic proposer visible reserve must be positive and "
+            "smaller than proposer max tokens cap"
+        )
+    if (
+        proposer_recovery_quorum is not None
+        and (
+            isinstance(proposer_recovery_quorum, bool)
+            or not isinstance(proposer_recovery_quorum, int)
+            or proposer_recovery_quorum <= 0
+        )
+    ):
+        raise DynamicRankingError(
+            "router_dynamic proposer recovery quorum must be a positive integer"
         )
     if ranking_thinking_assignment_enabled:
         effective_ranking_config = _resolve_ranking_config(ranking_config)
@@ -5778,6 +5827,20 @@ def rank_models(
     aggregator_row = aggregator_candidate_rows[0]
     aggregator = aggregator_row["model"]
     aggregator_candidates = tuple(row["model"] for row in aggregator_candidate_rows)
+    aggregator_candidate_identities = {
+        model.identity for model in aggregator_candidates
+    }
+    backup_rows = [
+        row
+        for row in quality_candidate_rows
+        if row["model"] not in selected
+        and row["model"].identity not in aggregator_candidate_identities
+    ][:proposer_backup_count]
+    backup_proposers = tuple(row["model"] for row in backup_rows)
+    recovery_quorum = min(
+        proposer_recovery_quorum or minimum,
+        len(selected),
+    )
     coverage_shortfall = len(selected) < minimum
     session_adjusted_ids = sorted(
         {
@@ -5794,6 +5857,7 @@ def rank_models(
     assigned_proposers = tuple(selected)
     assigned_aggregator = aggregator
     assigned_aggregator_candidates = aggregator_candidates
+    assigned_backup_proposers = backup_proposers
     thinking_assignment: dict[str, Any] = {}
     thinking_assignment_details: dict[str, Any] = {}
     thinking_assignment_reasons: dict[str, Any] = {}
@@ -5855,6 +5919,41 @@ def rank_models(
         thinking_assignment_details["aggregator_candidates"] = (
             aggregator_candidate_details
         )
+        (
+            proposer_target,
+            proposer_reasons,
+            proposer_risk_floor,
+        ) = _thinking_target_for_role(
+            role="proposer",
+            effective_tier=effective_tier,
+            task_profile=task_profile,
+            session_trace=session_trace,
+            policy=thinking_policy,
+        )
+        assigned_backups: list[RankedModel] = []
+        backup_details: list[dict[str, Any]] = []
+        for backup in backup_proposers:
+            assigned_backup, backup_detail, unsupported = (
+                _resolve_model_thinking_level(
+                    backup,
+                    role="proposer_backup",
+                    requested_level=proposer_target,
+                    reasons=proposer_reasons,
+                    risk_floor=proposer_risk_floor,
+                    policy=thinking_policy,
+                )
+            )
+            assigned_backups.append(assigned_backup)
+            backup_details.append(backup_detail)
+            if unsupported is not None:
+                thinking_unsupported_fallbacks.append(unsupported)
+        assigned_backup_proposers = tuple(assigned_backups)
+        if assigned_backup_proposers:
+            thinking_assignment["backup_proposers"] = {
+                model.identity: model.effective_thinking_level
+                for model in assigned_backup_proposers
+            }
+            thinking_assignment_details["backup_proposers"] = backup_details
 
     reason_counts: dict[str, int] = {}
     for filter_row in [*proposer_filters, *aggregator_filters]:
@@ -5938,6 +6037,25 @@ def rank_models(
         "selection_steps": selection_steps,
         "aggregator_feasibility": aggregator_feasibility,
         "selected_P": selected_ids,
+        "backup_P": [model.identity for model in assigned_backup_proposers],
+        "configured_proposer_backup_count": proposer_backup_count,
+        "effective_proposer_backup_count": len(assigned_backup_proposers),
+        "proposer_recovery_policy": {
+            "schema": "opensquilla.router-dynamic-proposer-recovery/v1",
+            "configured_backup_count": proposer_backup_count,
+            "effective_backup_count": len(assigned_backup_proposers),
+            "max_additional_physical_requests": (
+                proposer_recovery_max_additional_calls
+            ),
+            "quorum_required": recovery_quorum,
+            "max_tokens_cap": proposer_max_tokens_cap,
+            "visible_answer_reserve_tokens": (
+                proposer_visible_answer_reserve_tokens
+            ),
+            "thinking_downgrade_order": ["one_strictly_lower"],
+            "transient_same_model_retries": 1,
+            "backup_reasoning_downgrades": 1,
+        },
         "selected_A": aggregator.identity,
         "aggregator_candidates": [model.identity for model in assigned_aggregator_candidates],
         "exploration": copy.deepcopy(
@@ -6046,6 +6164,7 @@ def rank_models(
     )
     return RankingDecision(
         proposers=assigned_proposers,
+        backup_proposers=assigned_backup_proposers,
         aggregator=assigned_aggregator,
         aggregator_candidates=assigned_aggregator_candidates,
         effective_tier=effective_tier,
@@ -6095,6 +6214,10 @@ _RANKING_REPLAY_FIELDS = (
     "selection_steps",
     "aggregator_feasibility",
     "selected_P",
+    "backup_P",
+    "configured_proposer_backup_count",
+    "effective_proposer_backup_count",
+    "proposer_recovery_policy",
     "selected_A",
     "aggregator_candidates",
     "thinking_policy_version",
@@ -6138,6 +6261,21 @@ def ranking_trace_replay_reasons(
     if not isinstance(raw_thinking_assignment_enabled, bool):
         reasons.append("invalid_g1_replay_thinking_assignment_switch")
     thinking_assignment_enabled = raw_thinking_assignment_enabled is True
+    proposer_recovery_fields = {
+        "backup_P",
+        "configured_proposer_backup_count",
+        "effective_proposer_backup_count",
+        "proposer_recovery_policy",
+    }
+    present_proposer_recovery_fields = {
+        field_name
+        for field_name in proposer_recovery_fields
+        if field_name in trace
+    }
+    if present_proposer_recovery_fields and (
+        present_proposer_recovery_fields != proposer_recovery_fields
+    ):
+        reasons.append("incomplete_g1_replay_proposer_recovery_policy")
     if trace.get("user_profile_enabled") is not False:
         reasons.append("g1_ranking_replay_requires_disabled_user_profile")
     registry_snapshot = trace.get("registry_snapshot")
@@ -6216,6 +6354,72 @@ def ranking_trace_replay_reasons(
             ranking_config=copy.deepcopy(dict(ranking_parameters)),
             decision_id=str(trace.get("decision_id") or ""),
             ranking_thinking_assignment_enabled=thinking_assignment_enabled,
+            proposer_backup_count=(
+                int(trace.get("configured_proposer_backup_count"))
+                if isinstance(trace.get("configured_proposer_backup_count"), int)
+                and not isinstance(trace.get("configured_proposer_backup_count"), bool)
+                else 0
+            ),
+            proposer_recovery_max_additional_calls=(
+                int(
+                    (trace.get("proposer_recovery_policy") or {}).get(
+                        "max_additional_physical_requests"
+                    )
+                )
+                if isinstance(trace.get("proposer_recovery_policy"), Mapping)
+                and isinstance(
+                    (trace.get("proposer_recovery_policy") or {}).get(
+                        "max_additional_physical_requests"
+                    ),
+                    int,
+                )
+                else 0
+            ),
+            proposer_max_tokens_cap=(
+                int(
+                    (trace.get("proposer_recovery_policy") or {}).get(
+                        "max_tokens_cap"
+                    )
+                )
+                if isinstance(trace.get("proposer_recovery_policy"), Mapping)
+                and isinstance(
+                    (trace.get("proposer_recovery_policy") or {}).get(
+                        "max_tokens_cap"
+                    ),
+                    int,
+                )
+                else 65_536
+            ),
+            proposer_visible_answer_reserve_tokens=(
+                int(
+                    (trace.get("proposer_recovery_policy") or {}).get(
+                        "visible_answer_reserve_tokens"
+                    )
+                )
+                if isinstance(trace.get("proposer_recovery_policy"), Mapping)
+                and isinstance(
+                    (trace.get("proposer_recovery_policy") or {}).get(
+                        "visible_answer_reserve_tokens"
+                    ),
+                    int,
+                )
+                else 4_096
+            ),
+            proposer_recovery_quorum=(
+                int(
+                    (trace.get("proposer_recovery_policy") or {}).get(
+                        "quorum_required"
+                    )
+                )
+                if isinstance(trace.get("proposer_recovery_policy"), Mapping)
+                and isinstance(
+                    (trace.get("proposer_recovery_policy") or {}).get(
+                        "quorum_required"
+                    ),
+                    int,
+                )
+                else None
+            ),
         ).trace
     except Exception:  # noqa: BLE001 - malformed replay evidence fails closed
         return ["g1_frozen_ranker_replay_failed"]
@@ -6232,6 +6436,13 @@ def ranking_trace_replay_reasons(
     }
     legacy_disabled_replay = not thinking_assignment_enabled and legacy_trace
     for field_name in _RANKING_REPLAY_FIELDS:
+        if (
+            field_name in proposer_recovery_fields
+            and not present_proposer_recovery_fields
+        ):
+            # Pre-recovery frozen traces remain replayable as legacy evidence,
+            # but cannot acquire a partial/new policy projection.
+            continue
         if field_name == "ranking_version" and (
             legacy_disabled_replay or legacy_thinking_trace
         ):

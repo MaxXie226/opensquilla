@@ -232,7 +232,7 @@ async def test_selector_fallback_restores_single_provider_retry_safety() -> None
         provider=wrapper,
         config=AgentConfig(
             max_iterations=2,
-            max_provider_retries=1,
+            max_provider_retries=2,
             retry_base_backoff_ms=0,
             retry_max_backoff_ms=0,
         ),
