@@ -13,10 +13,8 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 HOOK_PATH = (
     ROOT
-    / "desktop"
-    / "electron"
     / "scripts"
-    / "pyinstaller_runtime_hooks"
+    / "gateway_runtime"
     / "ensure_ca_trust.py"
 )
 _CA_ENV_VARS = ("SSL_CERT_FILE", "SSL_CERT_DIR")
@@ -49,7 +47,7 @@ def restore_ca_environment() -> Iterator[None]:
 @pytest.fixture
 def ca_hook(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
     monkeypatch.delattr(sys, "frozen", raising=False)
-    spec = importlib.util.spec_from_file_location("opensquilla_desktop_ca_hook_test", HOOK_PATH)
+    spec = importlib.util.spec_from_file_location("opensquilla_runtime_ca_hook_test", HOOK_PATH)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -212,7 +210,7 @@ def test_missing_certifi_bundle_fails_with_redacted_action(
         ca_hook.ensure_frozen_default_ca_trust()
 
     message = str(exc_info.value)
-    assert "Reinstall OpenSquilla Desktop" in message
+    assert "Reinstall the Runtime" in message
     assert str(secret_path) not in message
 
 
@@ -249,10 +247,13 @@ def test_invalid_certifi_bundle_fails_post_fallback_validation(
 
 
 def test_desktop_build_and_smoke_wire_the_ca_contract() -> None:
-    build_source = (ROOT / "desktop/electron/scripts/build-gateway.mjs").read_text(
+    build_source = (ROOT / "scripts/gateway_runtime/build.py").read_text(
         encoding="utf-8"
     )
-    entry_source = (ROOT / "desktop/electron/scripts/gateway-entry.py").read_text(
+    desktop_adapter = (ROOT / "desktop/electron/scripts/build-gateway.mjs").read_text(
+        encoding="utf-8"
+    )
+    entry_source = (ROOT / "scripts/gateway_runtime/entry.py").read_text(
         encoding="utf-8"
     )
     smoke_source = (ROOT / "desktop/electron/scripts/smoke-gateway.mjs").read_text(
@@ -260,11 +261,15 @@ def test_desktop_build_and_smoke_wire_the_ca_contract() -> None:
     )
     project_source = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
 
-    assert "'--runtime-hook',\n  caRuntimeHookPath," in build_source
-    assert "'--collect-data',\n  'certifi'," in build_source
-    assert "'--hidden-import',\n  'certifi'," in build_source
+    assert '"--runtime-hook",' in build_source
+    assert "CA_RUNTIME_HOOK_PATH" in build_source
+    assert '"--collect-data",' in build_source
+    assert '"certifi",' in build_source
+    assert '"--hidden-import",' in build_source
     assert '"certifi>=2024.7.4"' in project_source
+    assert "scripts.gateway_runtime.build" in desktop_adapter
     assert "--_desktop-ca-probe" in entry_source
+    assert "--_runtime-ca-probe" in entry_source
     assert "--_sandbox-filesystem-worker" in entry_source
     assert "--elevated-helper" in entry_source
     assert "x509_ca={ca_certificate_count}" in entry_source

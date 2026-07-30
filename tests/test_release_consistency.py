@@ -77,7 +77,29 @@ def test_release_workflow_builds_desktop_installers() -> None:
     assert "latest.yml" in workflow
     assert 'NOTES_FILE="docs/releases/${TAG#v}.md"' in workflow
     assert '--notes-file "${NOTES_FILE}"' in workflow
-    assert 'gh release upload "${TAG}" dist/* --clobber' in workflow
+    assert 'gh release upload "${TAG}" "${path}" --clobber' in workflow
+
+
+def test_release_workflow_publishes_public_gateway_runtime_assets() -> None:
+    workflow = Path(".github/workflows/wheelhouse-release.yml").read_text(encoding="utf-8")
+
+    assert "build-gateway-runtime:" in workflow
+    assert "gateway-runtime-${version}-darwin-arm64" not in workflow
+    assert "scripts.gateway_runtime.build" in workflow
+    assert "scripts.gateway_runtime.verify" in workflow
+    assert "scripts.gateway_runtime.smoke" in workflow
+    assert "actions/attest-build-provenance@v2" in workflow
+    assert "opensquilla-gateway-runtime-${{ matrix.platform }}-${{ matrix.arch }}" in workflow
+    assert "pattern: opensquilla-gateway-runtime-*" in workflow
+    assert "scripts/gateway_runtime/release_assets.py" in workflow
+    assert "Gateway Runtime assets are write-once" in workflow
+    assert "cmp -s" in workflow
+
+    mirror = Path(".github/workflows/mirror-release-to-oss.yml").read_text(encoding="utf-8")
+    assert "sha256sum --strict -c SHA256SUMS" in mirror
+    assert "CHECKSUMMED_ASSETS" in mirror
+    assert "put_immutable_asset" in mirror
+    assert "--forbid-overwrite true" in mirror
 
 
 def test_release_workflow_runs_legacy_windows_upgrade_checks_on_server_2022() -> None:
@@ -126,15 +148,38 @@ def _run_release_upload_with_fake_gh(
     tag: str,
     draft: bool,
     prerelease: bool,
+    runtime_assets: dict[str, tuple[bytes, bytes]] | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], str]:
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir(parents=True)
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "release-test.txt").write_text("mutable", encoding="utf-8")
+    remote_assets = tmp_path / "remote-assets"
+    remote_assets.mkdir()
+    runtime_assets = runtime_assets or {}
+    for name, (local_payload, remote_payload) in runtime_assets.items():
+        (dist / name).write_bytes(local_payload)
+        (remote_assets / name).write_bytes(remote_payload)
     call_log = tmp_path / "gh-calls.log"
     fake_gh = fake_bin / "gh"
     fake_gh.write_text(
         """#!/usr/bin/env bash
 set -euo pipefail
 printf '%s\\n' "$*" >> "$FAKE_GH_LOG"
+if [[ "${1:-} ${2:-}" == "release download" ]]; then
+  pattern=""
+  destination=""
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      --pattern) pattern="$2"; shift 2 ;;
+      --dir) destination="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  cp "$FAKE_REMOTE_ASSETS/$pattern" "$destination/$pattern"
+  exit 0
+fi
 if [[ "$*" == *"--json"* ]]; then
   printf '%s\\n' "$FAKE_RELEASE_STATE"
 fi
@@ -147,8 +192,13 @@ fi
         {
             "FAKE_GH_LOG": str(call_log),
             "FAKE_RELEASE_STATE": json.dumps(
-                {"assets": [], "isDraft": draft, "isPrerelease": prerelease}
+                {
+                    "assets": [{"name": name} for name in runtime_assets],
+                    "isDraft": draft,
+                    "isPrerelease": prerelease,
+                }
             ),
+            "FAKE_REMOTE_ASSETS": str(remote_assets),
             "GH_REPO": "opensquilla/opensquilla",
             "GH_TOKEN": "synthetic-test-token",
             "PATH": (
@@ -159,7 +209,7 @@ fi
     )
     result = subprocess.run(
         ["bash", "-c", _release_upload_script()],
-        cwd=Path.cwd(),
+        cwd=tmp_path,
         env=env,
         capture_output=True,
         text=True,
@@ -214,6 +264,27 @@ def test_release_upload_derives_preview_state_from_each_tag(tmp_path: Path) -> N
     assert preview_result.returncode == 0, preview_result.stderr
     assert "release upload v9.9.9" in stable_calls
     assert "release upload v9.9.9rc7" in preview_calls
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="The release upload Bash step runs in the required Ubuntu packaging job.",
+)
+def test_release_upload_refuses_to_replace_changed_gateway_runtime_asset(
+    tmp_path: Path,
+) -> None:
+    name = "gateway-runtime-9.9.9-linux-x64.tar.gz"
+    result, calls = _run_release_upload_with_fake_gh(
+        tmp_path,
+        tag="v9.9.9",
+        draft=True,
+        prerelease=False,
+        runtime_assets={name: (b"new-runtime", b"published-runtime")},
+    )
+
+    assert result.returncode != 0
+    assert f"byte mismatch for {name}" in result.stderr
+    assert "release upload" not in calls
 
 
 def test_release_profile_preservation_probe_covers_identity_config_and_chat_db(

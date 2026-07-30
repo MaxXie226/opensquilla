@@ -1,0 +1,148 @@
+{
+  "$id": "https://opensquilla.ai/contracts/gateway-runtime-manifest.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "arch": {
+      "enum": [
+        "arm64",
+        "x64"
+      ]
+    },
+    "archive": {
+      "$ref": "#/$defs/archive"
+    },
+    "buildCommit": {
+      "pattern": "^[0-9a-f]{7,64}$",
+      "type": "string"
+    },
+    "capabilities": {
+      "const": [
+        "gateway.rpc",
+        "gateway.sessions",
+        "gateway.artifacts"
+      ]
+    },
+    "contractDigest": {
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "coreVersion": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "createdAt": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "createdBy": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "entrypoint": {
+      "enum": [
+        "opensquilla-gateway",
+        "opensquilla-gateway.exe"
+      ]
+    },
+    "platform": {
+      "enum": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    "protocol": {
+      "additionalProperties": false,
+      "properties": {
+        "max": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "min": {
+          "const": 1
+        }
+      },
+      "required": [
+        "min",
+        "max"
+      ],
+      "type": "object"
+    },
+    "provenance": {
+      "$ref": "#/$defs/file"
+    },
+    "runtimeVersion": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "sbom": {
+      "$ref": "#/$defs/file"
+    },
+    "schemaVersion": {
+      "const": 1
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "runtimeVersion",
+    "coreVersion",
+    "buildCommit",
+    "protocol",
+    "contractDigest",
+    "platform",
+    "arch",
+    "entrypoint",
+    "archive",
+    "sbom",
+    "provenance",
+    "capabilities",
+    "createdAt",
+    "createdBy"
+  ],
+  "title": "OpenSquilla Gateway Runtime Manifest",
+  "type": "object",
+  "$defs": {
+    "archive": {
+      "additionalProperties": false,
+      "properties": {
+        "filename": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "size": {
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "filename",
+        "size",
+        "sha256"
+      ],
+      "type": "object"
+    },
+    "file": {
+      "additionalProperties": false,
+      "properties": {
+        "filename": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "filename",
+        "sha256"
+      ],
+      "type": "object"
+    }
+  }
+}
