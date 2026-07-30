@@ -4332,6 +4332,238 @@ async def test_empty_and_length_only_attempts_retry_without_losing_usage(
 
 
 @pytest.mark.asyncio
+async def test_visible_error_finish_retries_and_only_final_candidate_reaches_aggregator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    receipts = [
+        ProviderBillingReceipt(
+            currency="USD",
+            status="confirmed",
+            amount_nanos=index,
+            usd_equivalent_nanos=index,
+            fx_native_per_usd_nanos=1_000_000_000,
+        )
+        for index in (10_000_000, 20_000_000)
+    ]
+    registry = _AttemptRegistry(
+        {
+            "kimi": [
+                _FakePlan(
+                    [
+                        TextDeltaEvent(text="discard partial"),
+                        DoneEvent(
+                            input_tokens=10,
+                            output_tokens=15,
+                            reasoning_tokens=2,
+                            stop_reason="error",
+                            model="kimi",
+                            billed_cost=0.01,
+                            cost_source="provider_billed",
+                            billing_receipt=receipts[0],
+                        ),
+                    ]
+                ),
+                _FakePlan(
+                    [
+                        TextDeltaEvent(text="usable final draft"),
+                        DoneEvent(
+                            input_tokens=20,
+                            output_tokens=25,
+                            reasoning_tokens=3,
+                            stop_reason="stop",
+                            model="kimi",
+                            billed_cost=0.02,
+                            cost_source="provider_billed",
+                            billing_receipt=receipts[1],
+                        ),
+                    ]
+                ),
+            ],
+            "agg": [
+                _FakePlan(
+                    [
+                        TextDeltaEvent(text="final"),
+                        DoneEvent(
+                            input_tokens=5,
+                            output_tokens=6,
+                            model="agg",
+                        ),
+                    ]
+                )
+            ],
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._ENSEMBLE_PROPOSER_RETRY_BACKOFF_SECONDS",
+        (),
+    )
+    provider = EnsembleProvider(
+        profile_name="score-max",
+        proposers=[_member("kimi")],
+        aggregator=_member("agg"),
+        min_successful_proposers=1,
+        target_successful_proposers=1,
+        proposer_max_retries=2,
+        proposer_timeout_seconds=1,
+        aggregator_timeout_seconds=1,
+        all_failed_policy="error",
+        shuffle_candidates=False,
+    )
+
+    events = await _collect(provider)
+
+    assert [call["model"] for call in registry.calls] == ["kimi", "kimi", "agg"]
+    aggregator_prompt = str(registry.calls[-1]["messages"][-1].content)
+    assert "usable final draft" in aggregator_prompt
+    assert "discard partial" not in aggregator_prompt
+
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert done.input_tokens == 35
+    assert done.output_tokens == 46
+    assert done.reasoning_tokens == 5
+    assert done.billed_cost == pytest.approx(0.03)
+    assert done.usage_missing_count == 0
+    assert done.ensemble_trace is not None
+    assert done.ensemble_trace["llm_request_count"] == 3
+    kimi_trace = done.ensemble_trace["candidates"][0]
+    assert kimi_trace["ok"] is True
+    assert kimi_trace["content"]["text"] == "usable final draft"
+    assert kimi_trace["attempt_count"] == 2
+    assert [attempt["ok"] for attempt in kimi_trace["attempts"]] == [False, True]
+    assert [attempt["stop_reason"] for attempt in kimi_trace["attempts"]] == [
+        "error",
+        "stop",
+    ]
+    assert [attempt["error_code"] for attempt in kimi_trace["attempts"]] == [
+        "candidate_error_finish_reason",
+        "",
+    ]
+    assert [attempt["retry_reason"] for attempt in kimi_trace["attempts"]] == [
+        "error_finish_reason",
+        "",
+    ]
+
+    proposer_rows = [
+        row
+        for row in done.model_usage_breakdown
+        if row["role"] == "proposer"
+    ]
+    assert [row["attempt_index"] for row in proposer_rows] == [1, 2]
+    assert [row["input_tokens"] for row in proposer_rows] == [10, 20]
+    assert [row["output_tokens"] for row in proposer_rows] == [15, 25]
+    assert [row["billed_cost"] for row in proposer_rows] == pytest.approx(
+        [0.01, 0.02]
+    )
+    assert [row["billing_receipt"] for row in proposer_rows] == receipts
+    assert [row["attempt_ok"] for row in proposer_rows] == [False, True]
+    assert [row["error_code"] for row in proposer_rows] == [
+        "candidate_error_finish_reason",
+        "",
+    ]
+    assert [row["retry_reason"] for row in proposer_rows] == [
+        "error_finish_reason",
+        "",
+    ]
+    assert all(row["usage_receipt_missing"] is False for row in proposer_rows)
+
+
+@pytest.mark.asyncio
+async def test_visible_error_finish_exhaustion_blocks_strict_floor_and_preserves_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    receipts = [
+        ProviderBillingReceipt(
+            currency="USD",
+            status="confirmed",
+            amount_nanos=index,
+            usd_equivalent_nanos=index,
+            fx_native_per_usd_nanos=1_000_000_000,
+        )
+        for index in (10_000_000, 20_000_000, 30_000_000)
+    ]
+    registry = _AttemptRegistry(
+        {
+            "p1": [
+                _FakePlan(
+                    [
+                        TextDeltaEvent(text=f"discard partial {attempt}"),
+                        DoneEvent(
+                            input_tokens=10 + attempt,
+                            output_tokens=20 + attempt,
+                            reasoning_tokens=attempt,
+                            stop_reason="error",
+                            model="p1",
+                            billed_cost=attempt / 100,
+                            cost_source="provider_billed",
+                            billing_receipt=receipts[attempt - 1],
+                        ),
+                    ]
+                )
+                for attempt in range(1, 4)
+            ],
+            "p2": [_FakePlan([TextDeltaEvent(text="d2"), DoneEvent(model="p2")])],
+            "p3": [_FakePlan([TextDeltaEvent(text="d3"), DoneEvent(model="p3")])],
+            "p4": [_FakePlan([TextDeltaEvent(text="d4"), DoneEvent(model="p4")])],
+            "agg": [_FakePlan([TextDeltaEvent(text="unused"), DoneEvent(model="agg")])],
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._ENSEMBLE_PROPOSER_RETRY_BACKOFF_SECONDS",
+        (),
+    )
+    provider = EnsembleProvider(
+        profile_name="score-max",
+        proposers=[_member("p1"), _member("p2"), _member("p3"), _member("p4")],
+        aggregator=_member("agg"),
+        min_successful_proposers=4,
+        target_successful_proposers=4,
+        proposer_max_retries=2,
+        proposer_timeout_seconds=1,
+        aggregator_timeout_seconds=1,
+        all_failed_policy="error",
+        shuffle_candidates=False,
+    )
+
+    events = await _collect(provider)
+
+    terminal = next(event for event in events if isinstance(event, ErrorEvent))
+    assert terminal.code == "ensemble_insufficient_proposers"
+    assert "requires 4" in terminal.message
+    assert not any(isinstance(event, DoneEvent) for event in events)
+    assert [call["model"] for call in registry.calls].count("p1") == 3
+    assert "agg" not in [call["model"] for call in registry.calls]
+    assert terminal.usage_missing_count == 0
+
+    p1_rows = [
+        row
+        for row in terminal.model_usage_breakdown
+        if row["role"] == "proposer" and row["model"] == "p1"
+    ]
+    assert [row["attempt_index"] for row in p1_rows] == [1, 2, 3]
+    assert [row["input_tokens"] for row in p1_rows] == [11, 12, 13]
+    assert [row["output_tokens"] for row in p1_rows] == [21, 22, 23]
+    assert [row["billed_cost"] for row in p1_rows] == pytest.approx(
+        [0.01, 0.02, 0.03]
+    )
+    assert [row["billing_receipt"] for row in p1_rows] == receipts
+    assert [row["attempt_ok"] for row in p1_rows] == [False, False, False]
+    assert [row["stop_reason"] for row in p1_rows] == ["error", "error", "error"]
+    assert [row["error_code"] for row in p1_rows] == [
+        "candidate_error_finish_reason",
+        "candidate_error_finish_reason",
+        "candidate_error_finish_reason",
+    ]
+    assert [row["retry_reason"] for row in p1_rows] == [
+        "error_finish_reason",
+        "error_finish_reason",
+        "error_finish_reason",
+    ]
+    assert all(row["usage_receipt_missing"] is False for row in p1_rows)
+
+
+@pytest.mark.asyncio
 async def test_floor_not_met_errors_without_single_model_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

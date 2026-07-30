@@ -340,7 +340,11 @@ class _CandidateResult:
 
     @property
     def ok(self) -> bool:
-        return not self.error and bool(self.text.strip())
+        return (
+            not self.error
+            and str(self.stop_reason or "").strip().lower() != "error"
+            and bool(self.text.strip())
+        )
 
     @property
     def request_count(self) -> int:
@@ -2116,6 +2120,8 @@ class EnsembleProvider:
         if result.ok:
             return ""
         if result.error:
+            if result.error_code == "candidate_error_finish_reason":
+                return "error_finish_reason"
             if result.error_code in {"stream_incomplete", "timeout"}:
                 return "transient_transport"
             if self._member_error_is_retryable(
@@ -2261,6 +2267,9 @@ class EnsembleProvider:
                 result.billing_receipt = event.billing_receipt
                 result.stop_reason = event.stop_reason
                 result.model = event.model or result.model
+                if str(event.stop_reason or "").strip().lower() == "error":
+                    result.error = "proposer terminated with error finish reason"
+                    result.error_code = "candidate_error_finish_reason"
             elif isinstance(event, ErrorEvent):
                 result.error = redact_upstream_error_text(
                     event.message,
