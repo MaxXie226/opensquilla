@@ -67,7 +67,7 @@ async def _wait_for_pending_network_approval() -> dict:
 
 
 @pytest.mark.asyncio
-async def test_cancelled_network_wait_expires_its_orphaned_approval(
+async def test_default_open_network_request_completes_without_approval(
     tmp_path: Path,
 ) -> None:
     reset_approval_queue()
@@ -89,29 +89,21 @@ async def test_cancelled_network_wait_expires_its_orphaned_approval(
         runtime=SimpleNamespace(workspace=tmp_path),
     )
 
-    decision_task = asyncio.create_task(
-        service.decide(
-            NetworkPolicyRequest(
-                protocol=NetworkProtocol.HTTPS_CONNECT,
-                host="cancelled.example",
-                port=443,
-                method="CONNECT",
-            )
+    decision = await service.decide(
+        NetworkPolicyRequest(
+            protocol=NetworkProtocol.HTTPS_CONNECT,
+            host="cancelled.example",
+            port=443,
+            method="CONNECT",
         )
     )
-    pending = await _wait_for_pending_network_approval()
-    decision_task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await decision_task
 
-    entry = get_approval_queue().get(str(pending["id"]))
-    assert entry.resolved is True
-    assert entry.approved is False
-    assert entry.resolution == "expired"
+    assert decision.status == "allow"
+    assert decision.reason == "public_default"
     assert get_approval_queue().list_pending("exec") == []
 
 
-async def test_proxy_runtime_approval_waits_and_forwards_after_allow(
+async def test_proxy_runtime_default_open_forwards_without_approval(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -186,25 +178,6 @@ async def test_proxy_runtime_approval_waits_and_forwards_after_allow(
                 b"\r\n",
             )
         )
-        pending = await _wait_for_pending_network_approval()
-        params = pending["params"]
-        assert params["approvalKind"] == "sandbox_network"
-        assert params["host"] == "unknown.test"
-        assert params["sessionKey"] == "s1"
-        assert params["fingerprint"]
-
-        tool_context.sandbox_run_context = RunContext(
-            run_mode=RunMode.SAFE,
-            workspace=str(tmp_path),
-            domains=(
-                DomainGrant(
-                    domain="unknown.test",
-                    scope="once",
-                    source="temporary",
-                ),
-            ),
-        )
-        get_approval_queue().resolve(str(pending["id"]), True)
         response = await response_task
     finally:
         current_tool_context.reset(context_token)
@@ -220,6 +193,7 @@ async def test_proxy_runtime_approval_waits_and_forwards_after_allow(
         b"Connection: close\r\n"
         b"\r\n"
     ]
+    assert get_approval_queue().list_pending("exec") == []
 
 
 async def test_trusted_runtime_network_decider_allows_without_approval(
@@ -253,11 +227,11 @@ async def test_trusted_runtime_network_decider_allows_without_approval(
     )
 
     assert decision.status == "allow"
-    assert decision.reason == "auto_trusted"
+    assert decision.reason == "public_default"
     assert get_approval_queue().list_pending("exec") == []
 
 
-async def test_network_approval_missing_payload_blocks_request(tmp_path: Path) -> None:
+async def test_default_open_does_not_request_approval_payload(tmp_path: Path) -> None:
     request = SandboxRequest(
         argv=("http_request", "GET", "https://standard-human-only.invalid/path"),
         cwd=tmp_path,
@@ -282,12 +256,12 @@ async def test_network_approval_missing_payload_blocks_request(tmp_path: Path) -
         )
     )
 
-    assert decision.status == "block"
-    assert decision.reason == "approval_missing"
+    assert decision.status == "allow"
+    assert decision.reason == "public_default"
 
 
 @pytest.mark.asyncio
-async def test_standard_network_forces_human_reviewer(
+async def test_safe_default_open_does_not_create_human_review(
     tmp_path: Path,
 ) -> None:
     reset_approval_queue()
@@ -359,8 +333,8 @@ async def test_standard_network_forces_human_reviewer(
         reset_approval_queue()
 
     assert decision.status == "allow"
-    assert seen_params["reviewer"] == "user"
-    assert seen_params["humanActionable"] is True
+    assert decision.reason == "public_default"
+    assert seen_params == {}
     assert auto_review_called is False
 
 

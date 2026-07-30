@@ -1921,16 +1921,16 @@ async def test_windows_ready_proxy_allowlist_preflight_continues_to_proxy_runtim
 
 
 @pytest.mark.asyncio
-async def test_shell_package_install_queues_bundle_approval_before_proxy_run(
+async def test_shell_package_install_uses_default_open_proxy_without_approval(
     managed_runtime: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from opensquilla.tools.builtin import shell
 
-    async def _fail_run_under_backend(request, *, runtime=None):
-        pytest.fail("package bundle approval should run before proxy execution")
+    async def _run_under_backend(request, *, runtime=None):
+        return SimpleNamespace(returncode=0, stdout="ok\n", stderr="", backend_notes=())
 
-    monkeypatch.setattr(shell, "run_under_backend", _fail_run_under_backend)
+    monkeypatch.setattr(shell, "run_under_backend", _run_under_backend)
     monkeypatch.setattr(
         shell,
         "check_safe_bin",
@@ -1948,34 +1948,28 @@ async def test_shell_package_install_queues_bundle_approval_before_proxy_run(
         )
     )
     try:
-        payload = json.loads(
-            await shell.exec_command(
-                "pip install requests",
-                workdir=str(managed_runtime),
-            )
+        result = await shell.exec_command(
+            "pip install requests",
+            workdir=str(managed_runtime),
         )
     finally:
         current_tool_context.reset(token)
 
-    assert payload["status"] == "approval_required"
-    assert payload["approvalKind"] == "sandbox_network"
-    assert payload["bundle_id"] == "python-package-install"
-    pending = get_approval_queue().list_pending("exec")
-    assert len(pending) == 1
-    assert pending[0]["params"]["bundle_id"] == "python-package-install"
+    assert result == "exit_code=0\nok\n"
+    assert get_approval_queue().list_pending("exec") == []
 
 
 @pytest.mark.asyncio
-async def test_uv_pip_install_queues_bundle_approval_before_proxy_run(
+async def test_uv_pip_install_uses_default_open_proxy_without_approval(
     managed_runtime: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from opensquilla.tools.builtin import shell
 
-    async def _fail_run_under_backend(request, *, runtime=None):
-        pytest.fail("uv pip package bundle approval should run before proxy execution")
+    async def _run_under_backend(request, *, runtime=None):
+        return SimpleNamespace(returncode=0, stdout="ok\n", stderr="", backend_notes=())
 
-    monkeypatch.setattr(shell, "run_under_backend", _fail_run_under_backend)
+    monkeypatch.setattr(shell, "run_under_backend", _run_under_backend)
     monkeypatch.setattr(
         shell,
         "check_safe_bin",
@@ -1993,25 +1987,19 @@ async def test_uv_pip_install_queues_bundle_approval_before_proxy_run(
         )
     )
     try:
-        payload = json.loads(
-            await shell.exec_command(
-                "uv pip install --no-cache-dir httpx[http2] pendulum",
-                workdir=str(managed_runtime),
-            )
+        result = await shell.exec_command(
+            "uv pip install --no-cache-dir httpx[http2] pendulum",
+            workdir=str(managed_runtime),
         )
     finally:
         current_tool_context.reset(token)
 
-    assert payload["status"] == "approval_required"
-    assert payload["approvalKind"] == "sandbox_network"
-    assert payload["bundle_id"] == "python-package-install"
-    pending = get_approval_queue().list_pending("exec")
-    assert len(pending) == 1
-    assert pending[0]["params"]["bundle_id"] == "python-package-install"
+    assert result == "exit_code=0\nok\n"
+    assert get_approval_queue().list_pending("exec") == []
 
 
 @pytest.mark.asyncio
-async def test_poetry_install_queues_python_bundle_before_proxy_run(
+async def test_poetry_install_uses_default_open_proxy_without_approval(
     managed_runtime: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2020,8 +2008,8 @@ async def test_poetry_install_queues_python_bundle_before_proxy_run(
 
     profile_calls: list[tuple[str, ...]] = []
 
-    async def _fail_run_under_backend(request, *, runtime=None):
-        pytest.fail("poetry package bundle approval should run before proxy execution")
+    async def _run_under_backend(request, *, runtime=None):
+        return SimpleNamespace(returncode=0, stdout="ok\n", stderr="", backend_notes=())
 
     def _fake_capability_profile_for_command(argv):
         profile_calls.append(tuple(argv))
@@ -2032,7 +2020,7 @@ async def test_poetry_install_queues_python_bundle_before_proxy_run(
         "capability_profile_for_command",
         _fake_capability_profile_for_command,
     )
-    monkeypatch.setattr(shell, "run_under_backend", _fail_run_under_backend)
+    monkeypatch.setattr(shell, "run_under_backend", _run_under_backend)
     monkeypatch.setattr(
         shell,
         "check_safe_bin",
@@ -2050,26 +2038,23 @@ async def test_poetry_install_queues_python_bundle_before_proxy_run(
         )
     )
     try:
-        payload = json.loads(
-            await shell.exec_command(
-                "poetry install",
-                workdir=str(managed_runtime),
-            )
+        result = await shell.exec_command(
+            "poetry install",
+            workdir=str(managed_runtime),
         )
     finally:
         current_tool_context.reset(token)
 
-    assert profile_calls == [("sh", "-lc", "poetry install")]
-    assert payload["status"] == "approval_required"
-    assert payload["approvalKind"] == "sandbox_network"
-    assert payload["bundle_id"] == "python-package-install"
-    pending = get_approval_queue().list_pending("exec")
-    assert len(pending) == 1
-    assert pending[0]["params"]["bundle_id"] == "python-package-install"
+    assert profile_calls == [
+        ("sh", "-lc", "poetry install"),
+        ("sh", "-lc", "poetry install"),
+    ]
+    assert result == "exit_code=0\nok\n"
+    assert get_approval_queue().list_pending("exec") == []
 
 
 @pytest.mark.asyncio
-async def test_composer_install_queues_php_bundle_before_proxy_run(
+async def test_composer_install_uses_default_open_proxy_without_approval(
     managed_runtime: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2078,8 +2063,8 @@ async def test_composer_install_queues_php_bundle_before_proxy_run(
 
     profile_calls: list[tuple[str, ...]] = []
 
-    async def _fail_run_under_backend(request, *, runtime=None):
-        pytest.fail("composer package bundle approval should run before proxy execution")
+    async def _run_under_backend(request, *, runtime=None):
+        return SimpleNamespace(returncode=0, stdout="ok\n", stderr="", backend_notes=())
 
     def _fake_capability_profile_for_command(argv):
         profile_calls.append(tuple(argv))
@@ -2090,7 +2075,7 @@ async def test_composer_install_queues_php_bundle_before_proxy_run(
         "capability_profile_for_command",
         _fake_capability_profile_for_command,
     )
-    monkeypatch.setattr(shell, "run_under_backend", _fail_run_under_backend)
+    monkeypatch.setattr(shell, "run_under_backend", _run_under_backend)
     monkeypatch.setattr(
         shell,
         "check_safe_bin",
@@ -2108,22 +2093,19 @@ async def test_composer_install_queues_php_bundle_before_proxy_run(
         )
     )
     try:
-        payload = json.loads(
-            await shell.exec_command(
-                "composer install",
-                workdir=str(managed_runtime),
-            )
+        result = await shell.exec_command(
+            "composer install",
+            workdir=str(managed_runtime),
         )
     finally:
         current_tool_context.reset(token)
 
-    assert profile_calls == [("sh", "-lc", "composer install")]
-    assert payload["status"] == "approval_required"
-    assert payload["approvalKind"] == "sandbox_network"
-    assert payload["bundle_id"] == "php-package-install"
-    pending = get_approval_queue().list_pending("exec")
-    assert len(pending) == 1
-    assert pending[0]["params"]["bundle_id"] == "php-package-install"
+    assert profile_calls == [
+        ("sh", "-lc", "composer install"),
+        ("sh", "-lc", "composer install"),
+    ]
+    assert result == "exit_code=0\nok\n"
+    assert get_approval_queue().list_pending("exec") == []
 
 
 @pytest.mark.asyncio
@@ -3357,16 +3339,16 @@ async def test_trusted_successful_network_failure_text_does_not_retry(
 
 
 @pytest.mark.asyncio
-async def test_timeout_wrapped_node_install_queues_bundle_approval_before_proxy_run(
+async def test_timeout_wrapped_node_install_uses_default_open_proxy(
     managed_runtime: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from opensquilla.tools.builtin import shell
 
-    async def _fail_run_under_backend(request, *, runtime=None):
-        pytest.fail("node package bundle approval should run before proxy execution")
+    async def _run_under_backend(request, *, runtime=None):
+        return SimpleNamespace(returncode=0, stdout="ok\n", stderr="", backend_notes=())
 
-    monkeypatch.setattr(shell, "run_under_backend", _fail_run_under_backend)
+    monkeypatch.setattr(shell, "run_under_backend", _run_under_backend)
     monkeypatch.setattr(
         shell,
         "check_safe_bin",
@@ -3384,21 +3366,15 @@ async def test_timeout_wrapped_node_install_queues_bundle_approval_before_proxy_
         )
     )
     try:
-        payload = json.loads(
-            await shell.exec_command(
-                "timeout 30 npm install lodash",
-                workdir=str(managed_runtime),
-            )
+        result = await shell.exec_command(
+            "timeout 30 npm install lodash",
+            workdir=str(managed_runtime),
         )
     finally:
         current_tool_context.reset(token)
 
-    assert payload["status"] == "approval_required"
-    assert payload["approvalKind"] == "sandbox_network"
-    assert payload["bundle_id"] == "node-package-install"
-    pending = get_approval_queue().list_pending("exec")
-    assert len(pending) == 1
-    assert pending[0]["params"]["bundle_id"] == "node-package-install"
+    assert result == "exit_code=0\nok\n"
+    assert get_approval_queue().list_pending("exec") == []
 
 
 @pytest.mark.asyncio

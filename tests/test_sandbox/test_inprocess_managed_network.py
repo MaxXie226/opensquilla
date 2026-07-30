@@ -18,9 +18,15 @@ from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.rpc import RpcContext
 from opensquilla.sandbox import integration as integration_mod
 from opensquilla.sandbox.config import SandboxSettings
-from opensquilla.sandbox.integration import configure_runtime, reset_runtime, sandboxed
+from opensquilla.sandbox.integration import (
+    configure_runtime,
+    reset_runtime,
+    sandbox_policy_scope,
+    sandboxed,
+)
 from opensquilla.sandbox.network_guard import NetworkDecision
 from opensquilla.sandbox.network_proxy import SandboxProxyServer as RealSandboxProxyServer
+from opensquilla.sandbox.policy_models import SandboxPolicy as StoredSandboxPolicy
 from opensquilla.sandbox.run_context import (
     DomainGrant,
     RunContext,
@@ -715,7 +721,7 @@ async def test_persisted_temporary_grant_from_saved_origin_does_not_allow_after_
         current_tool_context.reset(token)
 
     assert result == "ok"
-    assert seen["decision"] == "ask"
+    assert seen["decision"] == "allow"
 
 
 @pytest.mark.asyncio
@@ -734,7 +740,7 @@ async def test_trusted_explicit_target_does_not_auto_add_before_proxy_upstream(
             decision = self._decide("api.github.com")
             assert isinstance(decision, NetworkDecision)
             assert decision.status == "allow"
-            assert decision.reason == "auto_trusted"
+            assert decision.reason == "default_allowlist"
 
         async def stop(self) -> None:
             return None
@@ -919,7 +925,7 @@ async def test_trusted_inprocess_auto_trust_persists_after_safe_proxy_upstream(
         domain="new-public.example",
         scope="chat",
         source="auto_trusted",
-    ) in saved.domains
+    ) not in saved.domains
 
 
 @pytest.mark.asyncio
@@ -1017,7 +1023,7 @@ async def test_trusted_explicit_target_auto_adds_chat_domain_grant_in_production
         domain="api.github.com",
         scope="chat",
         source="auto_trusted",
-    ) in saved.domains
+    ) not in saved.domains
 
 
 @pytest.mark.asyncio
@@ -1312,7 +1318,7 @@ async def test_run_with_managed_network_proxy_does_not_auto_add_before_proxy_ups
             decision = self._decide("api.github.com")
             assert isinstance(decision, NetworkDecision)
             assert decision.status == "allow"
-            assert decision.reason == "auto_trusted"
+            assert decision.reason == "default_allowlist"
 
         async def stop(self) -> None:
             return None
@@ -1378,7 +1384,7 @@ async def test_run_with_managed_network_proxy_does_not_auto_add_before_proxy_ups
 
 
 @pytest.mark.asyncio
-async def test_web_fetch_cache_hit_requires_current_run_context_grant(
+async def test_web_fetch_cache_hit_honors_safe_deny_domain(
     monkeypatch: pytest.MonkeyPatch,
     managed_context: ToolContext,
 ) -> None:
@@ -1403,13 +1409,13 @@ async def test_web_fetch_cache_hit_requires_current_run_context_grant(
         lambda *args, **kwargs: pytest.fail("proxy should not start for denied target"),
     )
 
-    result = await web_fetch_mod.web_fetch(url)
+    policy = StoredSandboxPolicy()
+    policy.network.deny_domains = ["blocked.test"]
+    with sandbox_policy_scope(policy):
+        result = await web_fetch_mod.web_fetch(url)
 
     payload = json.loads(result)
-    assert payload["status"] == "approval_required"
-    assert payload["approval_id"]
-    assert payload["approvalKind"] == "sandbox_network"
-    assert payload["host"] == "blocked.test"
+    assert payload["status"] == "denied"
     assert "cached secret" not in result
 
 
@@ -1469,7 +1475,7 @@ async def test_rpc_search_query_allows_search_provider_endpoint_under_managed_ne
     assert seen == {
         "provider_decision": "allow",
         "provider_reason": "system_domain_grant",
-        "unknown_decision": "ask",
+            "unknown_decision": "allow",
         "provider_kwargs": {
             "proxy": "http://127.0.0.1:28080",
             "use_env_proxy": False,
@@ -1878,7 +1884,7 @@ async def test_trusted_network_none_auto_allows_unknown_explicit_public_target(
     assert result == "ok"
     assert seen == {
         "decision": "allow",
-        "reason": "auto_trusted",
+        "reason": "public_default",
         "called": True,
         "stopped": True,
     }

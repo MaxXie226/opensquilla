@@ -1124,6 +1124,7 @@ async def prepare_subprocess_managed_network_proxy(
         context=context,
         request=request,
         runtime=rt,
+        policy=active_sandbox_policy(),
         session_key_override=_resolve_session_id(rt, None),
         workspace_override=grant_workspace,
     )
@@ -1525,7 +1526,7 @@ async def _preflight_cached_network_artifact_access(
     fingerprint: str,
 ) -> DenialResult | dict[str, object] | None:
     for host in _cached_network_artifact_hosts(request):
-        decision = decide_network_access(host, context)
+        decision = decide_network_access(host, context, active_sandbox_policy())
         if decision.status == "allow":
             continue
         if decision.status == "ask":
@@ -1667,6 +1668,7 @@ async def _run_in_process_with_managed_network(
         context=context,
         request=request,
         runtime=runtime,
+        policy=active_sandbox_policy(),
         session_key_override=_resolve_session_id(runtime, None),
         workspace_override=_network_grant_workspace(request, runtime),
     )

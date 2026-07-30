@@ -180,8 +180,8 @@ def _apply_safe_command_policy(
     decision = decide_shell_command(command, active_sandbox_policy())
     if decision.action is CommandAction.DENY:
         raise ToolError(f"command denied by Safe policy: {decision.code}")
-    return dataclasses.replace(
-        result,
+    return SafeBinPolicyResult(
+        allowed=bool(result.allowed),
         needs_approval=decision.action is CommandAction.APPROVAL,
         reason=(
             f"command requires Safe approval: {decision.code}"
