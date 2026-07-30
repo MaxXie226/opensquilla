@@ -189,6 +189,13 @@ class SandboxUpgradeCoordinator:
             raise
 
     def run(self) -> UpgradeMigrationReport:
+        from opensquilla.recovery.locking import acquire_profile_locks
+
+        self.home.mkdir(parents=True, exist_ok=True)
+        with acquire_profile_locks(self.home, timeout=30.0):
+            return self._run_locked()
+
+    def _run_locked(self) -> UpgradeMigrationReport:
         self.home.mkdir(parents=True, exist_ok=True)
         stores = inventory_sandbox_stores(self.home)
         store_names = tuple(path.relative_to(self.home).as_posix() for path in stores)
