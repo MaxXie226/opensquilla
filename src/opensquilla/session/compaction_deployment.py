@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
+import json
+import secrets
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any
@@ -23,6 +26,8 @@ from opensquilla.provider.selector import ProviderConfig, build_provider_from_co
 MAX_COMPACTION_LLM_CALLS = 2
 DEFAULT_COMPACTION_OUTPUT_TOKENS = 1024
 _COMPACTION_CONTEXT_THRESHOLD = 0.85
+# Fingerprints reach telemetry, so make credential guesses unverifiable off-process.
+_DEPLOYMENT_FINGERPRINT_KEY = secrets.token_bytes(32)
 
 
 def _default_deployment_fingerprint(provider_id: str, model: str) -> str:
@@ -33,14 +38,32 @@ def _default_deployment_fingerprint(provider_id: str, model: str) -> str:
 
 
 def _provider_config_fingerprint(config: ProviderConfig) -> str:
-    safe_identity = "\0".join(
-        (
-            str(config.provider or "").strip().lower(),
-            str(config.model or "").strip(),
-            str(config.base_url or "").strip().lower(),
-        )
+    """Return a process-local opaque identity for one physical deployment."""
+
+    identity = {
+        "provider": str(config.provider or "").strip().lower(),
+        "model": str(config.model or "").strip(),
+        "api_key": str(config.api_key or ""),
+        "base_url": str(config.base_url or "").strip(),
+        "org_id": str(config.org_id or "").strip(),
+        "proxy": str(config.proxy or "").strip(),
+        "provider_routing": sorted(
+            (str(key), str(value))
+            for key, value in config.provider_routing.items()
+        ),
+        "replay_provider_state": bool(config.replay_provider_state),
+    }
+    canonical = json.dumps(
+        identity,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
     )
-    return hashlib.sha256(safe_identity.encode("utf-8")).hexdigest()[:24]
+    return hmac.new(
+        _DEPLOYMENT_FINGERPRINT_KEY,
+        canonical.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()[:24]
 
 
 @dataclass(frozen=True, slots=True)

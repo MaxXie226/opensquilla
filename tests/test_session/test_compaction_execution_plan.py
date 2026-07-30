@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -241,6 +241,63 @@ def test_router_current_previous_and_fallback_chain_is_frozen_in_order(
     ]
     assert plan.primary.context_window_tokens == 64_000
     assert all(config.replay_provider_state is False for config in built_configs)
+
+
+def test_replay_isolated_targets_dedupe_but_distinct_credentials_remain(
+    built_configs: list[ProviderConfig],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    current = ProviderConfig(
+        provider="openai",
+        model="shared-model",
+        api_key="primary-secret",
+        base_url="https://api.example.test/v1",
+        org_id="shared-org",
+        proxy="https://proxy.example.test",
+        provider_routing={"order": "latency"},
+    )
+    duplicate = replace(
+        current,
+        provider_routing=dict(current.provider_routing),
+        replay_provider_state=False,
+    )
+    credential_fallback = replace(
+        current,
+        api_key="fallback-secret",
+        provider_routing=dict(current.provider_routing),
+    )
+
+    plan = resolve_compaction_execution_plan(
+        app_config=None,
+        active_provider=None,
+        active_provider_config=current,
+        fallback_provider_configs=(duplicate, credential_fallback),
+    )
+
+    assert plan is not None
+    assert len(plan.candidates) == 2
+    assert [config.api_key for config in built_configs] == [
+        "primary-secret",
+        "primary-secret",
+        "fallback-secret",
+    ]
+    assert all(config.replay_provider_state is False for config in built_configs)
+    providers = [target.provider for target in plan.candidates]
+    assert all(isinstance(provider, _BuiltProvider) for provider in providers)
+    assert [
+        provider.config.api_key
+        for provider in providers
+        if isinstance(provider, _BuiltProvider)
+    ] == ["primary-secret", "fallback-secret"]
+    assert (
+        plan.candidates[0].deployment_fingerprint
+        != plan.candidates[1].deployment_fingerprint
+    )
+    rendered = repr(plan)
+    assert "primary-secret" not in rendered
+    assert "fallback-secret" not in rendered
+    assert "primary-secret" not in caplog.text
+    assert "fallback-secret" not in caplog.text
 
 
 def test_previous_session_identity_re_resolves_rotated_credentials_per_operation(
