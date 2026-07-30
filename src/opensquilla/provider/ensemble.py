@@ -2424,6 +2424,8 @@ class EnsembleProvider:
     ) -> AsyncIterator[StreamEvent]:
         final_text_parts: list[str] = []
         aggregator_started = time.monotonic()
+        retry_rows: list[dict[str, Any]] = []
+        retry_missing_count = 0
 
         def aggregator_progress(
             event_type: str,
@@ -2451,9 +2453,16 @@ class EnsembleProvider:
                 error=error,
             )
 
-        def ensemble_done(event: DoneEvent, *, aggregator_elapsed_ms: int) -> DoneEvent:
-            output_text = "".join(final_text_parts)
-            _attach_final_request_output(trace, event=event, output_text=output_text)
+        def aggregator_usage_row(
+            event: DoneEvent,
+            *,
+            aggregator_elapsed_ms: int,
+            attempt_index: int,
+            attempt_ok: bool,
+            retryable: bool = False,
+            error_code: str = "",
+            retry_reason: str = "",
+        ) -> dict[str, Any]:
             acc = _AggregatorAccumulator(
                 input_tokens=event.input_tokens,
                 output_tokens=event.output_tokens,
@@ -2465,15 +2474,42 @@ class EnsembleProvider:
                 billing_receipt=event.billing_receipt,
                 model=event.model or self.aggregator.provider_config.model,
             )
+            row = acc.usage_row(
+                profile=self.profile_name,
+                member=self.aggregator,
+                role="aggregator",
+                label="aggregator",
+                elapsed_ms=aggregator_elapsed_ms,
+            )
+            if not attempt_ok or attempt_index > 1:
+                row.update(
+                    {
+                        "attempt_index": attempt_index,
+                        "attempt_ok": attempt_ok,
+                        "request_started": True,
+                        "usage_reported": True,
+                        "usage_receipt_missing": False,
+                        "stop_reason": event.stop_reason,
+                        "error_code": error_code,
+                        "retryable": retryable,
+                        "retry_reason": retry_reason,
+                    }
+                )
+            return row
+
+        def ensemble_done(event: DoneEvent, *, aggregator_elapsed_ms: int) -> DoneEvent:
+            output_text = "".join(final_text_parts)
+            _attach_final_request_output(trace, event=event, output_text=output_text)
+            success_row = aggregator_usage_row(
+                event,
+                aggregator_elapsed_ms=aggregator_elapsed_ms,
+                attempt_index=attempt + 1,
+                attempt_ok=True,
+            )
             rows = [
                 *prior_rows,
-                acc.usage_row(
-                    profile=self.profile_name,
-                    member=self.aggregator,
-                    role="aggregator",
-                    label="aggregator",
-                    elapsed_ms=aggregator_elapsed_ms,
-                ),
+                *retry_rows,
+                success_row,
             ]
             return replace(
                 event,
@@ -2483,22 +2519,22 @@ class EnsembleProvider:
                 cached_tokens=_summed_int(rows, "cached_tokens"),
                 cache_write_tokens=_summed_int(rows, "cache_write_tokens"),
                 billed_cost=_summed_float(rows, "billed_cost"),
-                model=acc.model,
+                model=str(success_row.get("model") or event.model),
                 provider=self.aggregator.provider_config.provider,
                 cost_source=_rollup_cost_source(rows),
                 model_usage_breakdown=rows,
                 ensemble_trace=trace,
-                # Each retried aggregator attempt started a request that never
-                # produced a usage receipt.
-                usage_missing_count=prior_missing_count + attempt,
+                usage_missing_count=prior_missing_count + retry_missing_count,
                 billing_receipt=None,
             )
 
         def partial_error(event: ErrorEvent) -> ErrorEvent:
             return replace(
                 event,
-                model_usage_breakdown=list(prior_rows),
-                usage_missing_count=prior_missing_count + attempt + 1,
+                model_usage_breakdown=[*prior_rows, *retry_rows],
+                usage_missing_count=(
+                    prior_missing_count + retry_missing_count + 1
+                ),
             )
 
         yield aggregator_progress("aggregator_start")
@@ -2506,6 +2542,7 @@ class EnsembleProvider:
         while True:
             content_streamed = False
             retry_error: ErrorEvent | None = None
+            retry_usage_reported = False
             heartbeat_stream: AsyncIterator[StreamEvent] | None = None
             try:
                 _mark_final_request_started(trace)
@@ -2526,6 +2563,57 @@ class EnsembleProvider:
                         aggregator_elapsed_ms = int(
                             (time.monotonic() - aggregator_started) * 1000
                         )
+                        if str(event.stop_reason or "").strip().lower() == "error":
+                            _attach_final_request_output(
+                                trace,
+                                event=event,
+                                output_text="".join(final_text_parts),
+                            )
+                            can_retry = (
+                                not content_streamed
+                                and attempt < _ENSEMBLE_AGGREGATOR_MAX_RETRIES
+                            )
+                            failed_row = aggregator_usage_row(
+                                event,
+                                aggregator_elapsed_ms=aggregator_elapsed_ms,
+                                attempt_index=attempt + 1,
+                                attempt_ok=False,
+                                retryable=can_retry,
+                                error_code="aggregator_error_finish_reason",
+                                retry_reason=(
+                                    "error_finish_reason" if can_retry else ""
+                                ),
+                            )
+                            error = ErrorEvent(
+                                message=(
+                                    "ensemble aggregator terminated with error "
+                                    "finish reason"
+                                ),
+                                code="ensemble_aggregator_error_finish_reason",
+                            )
+                            if can_retry:
+                                retry_rows.append(failed_row)
+                                retry_usage_reported = True
+                                retry_error = error
+                                break
+                            terminal_rows = [
+                                *prior_rows,
+                                *retry_rows,
+                                failed_row,
+                            ]
+                            yield aggregator_progress(
+                                "aggregator_finish",
+                                usage=failed_row,
+                                error=error.message,
+                            )
+                            yield replace(
+                                error,
+                                model_usage_breakdown=terminal_rows,
+                                usage_missing_count=(
+                                    prior_missing_count + retry_missing_count
+                                ),
+                            )
+                            return
                         done_event = ensemble_done(
                             event,
                             aggregator_elapsed_ms=aggregator_elapsed_ms,
@@ -2649,6 +2737,8 @@ class EnsembleProvider:
                     yield aggregator_progress("aggregator_finish", error=error.message)
                     yield partial_error(error)
                     return
+            if not retry_usage_reported:
+                retry_missing_count += 1
             close_stream = getattr(heartbeat_stream, "aclose", None)
             if callable(close_stream):
                 with contextlib.suppress(Exception):

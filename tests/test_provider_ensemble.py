@@ -3458,6 +3458,32 @@ def _retry_test_provider() -> EnsembleProvider:
     )
 
 
+def _aggregator_done_with_receipt(
+    *,
+    scale: int,
+    stop_reason: str,
+) -> DoneEvent:
+    receipt = ProviderBillingReceipt(
+        currency="USD",
+        status="confirmed",
+        amount_nanos=scale * 10_000_000,
+        usd_equivalent_nanos=scale * 10_000_000,
+        fx_native_per_usd_nanos=1_000_000_000,
+    )
+    return DoneEvent(
+        input_tokens=scale * 10,
+        output_tokens=scale * 20,
+        reasoning_tokens=scale * 3,
+        cached_tokens=scale * 4,
+        cache_write_tokens=scale,
+        billed_cost=scale / 100,
+        cost_source="provider_billed",
+        billing_receipt=receipt,
+        stop_reason=stop_reason,
+        model="agg",
+    )
+
+
 @pytest.mark.asyncio
 async def test_aggregator_transient_error_is_retried_in_place(
     monkeypatch: pytest.MonkeyPatch,
@@ -3500,6 +3526,137 @@ async def test_aggregator_transient_error_is_retried_in_place(
     ]
     assert len(finishes) == 1
     assert not finishes[0].error
+
+
+@pytest.mark.asyncio
+async def test_aggregator_error_finish_before_content_retries_and_preserves_receipts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failed = _aggregator_done_with_receipt(scale=1, stop_reason="error")
+    succeeded = _aggregator_done_with_receipt(scale=2, stop_reason="stop")
+    _, call_count = _flaky_aggregator_harness(
+        monkeypatch,
+        [
+            [failed],
+            [TextDeltaEvent(text="final"), succeeded],
+        ],
+    )
+
+    events = await _collect(_retry_test_provider())
+
+    assert call_count[0] == 2
+    assert [event.text for event in events if isinstance(event, TextDeltaEvent)] == [
+        "final"
+    ]
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    aggregator_rows = [
+        row
+        for row in done.model_usage_breakdown
+        if row["role"] == "aggregator"
+    ]
+    assert [row["attempt_index"] for row in aggregator_rows] == [1, 2]
+    assert [row["stop_reason"] for row in aggregator_rows] == ["error", "stop"]
+    assert [row["input_tokens"] for row in aggregator_rows] == [10, 20]
+    assert [row["output_tokens"] for row in aggregator_rows] == [20, 40]
+    assert [row["billed_cost"] for row in aggregator_rows] == pytest.approx(
+        [0.01, 0.02]
+    )
+    assert [row["billing_receipt"] for row in aggregator_rows] == [
+        failed.billing_receipt,
+        succeeded.billing_receipt,
+    ]
+    assert done.input_tokens == 30
+    assert done.output_tokens == 60
+    assert done.reasoning_tokens == 9
+    assert done.cached_tokens == 12
+    assert done.cache_write_tokens == 3
+    assert done.billed_cost == pytest.approx(0.03)
+    assert done.usage_missing_count == 0
+    assert done.ensemble_trace is not None
+    assert done.ensemble_trace["final_request"]["retry_count"] == 1
+    assert done.ensemble_trace["llm_request_count"] == 3
+
+
+@pytest.mark.asyncio
+async def test_aggregator_error_finish_after_visible_content_is_terminal_without_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failed = _aggregator_done_with_receipt(scale=1, stop_reason="error")
+    _, call_count = _flaky_aggregator_harness(
+        monkeypatch,
+        [
+            [TextDeltaEvent(text="partial answer"), failed],
+            [
+                TextDeltaEvent(text="must not be replayed"),
+                _aggregator_done_with_receipt(scale=2, stop_reason="stop"),
+            ],
+        ],
+    )
+
+    events = await _collect(_retry_test_provider())
+
+    assert call_count[0] == 1
+    assert [event.text for event in events if isinstance(event, TextDeltaEvent)] == [
+        "partial answer"
+    ]
+    assert not any(isinstance(event, DoneEvent) for event in events)
+    terminal = next(event for event in events if isinstance(event, ErrorEvent))
+    aggregator_rows = [
+        row
+        for row in terminal.model_usage_breakdown
+        if row["role"] == "aggregator"
+    ]
+    assert [row["attempt_index"] for row in aggregator_rows] == [1]
+    assert [row["stop_reason"] for row in aggregator_rows] == ["error"]
+    assert [row["input_tokens"] for row in aggregator_rows] == [10]
+    assert [row["output_tokens"] for row in aggregator_rows] == [20]
+    assert [row["billed_cost"] for row in aggregator_rows] == pytest.approx([0.01])
+    assert [row["billing_receipt"] for row in aggregator_rows] == [
+        failed.billing_receipt
+    ]
+    assert terminal.usage_missing_count == 0
+
+
+@pytest.mark.asyncio
+async def test_aggregator_error_finish_retry_exhaustion_preserves_all_receipts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failed_attempts = [
+        _aggregator_done_with_receipt(scale=scale, stop_reason="error")
+        for scale in range(1, 4)
+    ]
+    _, call_count = _flaky_aggregator_harness(
+        monkeypatch,
+        [[event] for event in failed_attempts],
+    )
+
+    events = await _collect(_retry_test_provider())
+
+    assert call_count[0] == 3
+    assert not any(isinstance(event, TextDeltaEvent) for event in events)
+    assert not any(isinstance(event, DoneEvent) for event in events)
+    terminal = next(event for event in events if isinstance(event, ErrorEvent))
+    aggregator_rows = [
+        row
+        for row in terminal.model_usage_breakdown
+        if row["role"] == "aggregator"
+    ]
+    assert [row["attempt_index"] for row in aggregator_rows] == [1, 2, 3]
+    assert [row["stop_reason"] for row in aggregator_rows] == [
+        "error",
+        "error",
+        "error",
+    ]
+    assert [row["input_tokens"] for row in aggregator_rows] == [10, 20, 30]
+    assert [row["output_tokens"] for row in aggregator_rows] == [20, 40, 60]
+    assert [row["billed_cost"] for row in aggregator_rows] == pytest.approx(
+        [0.01, 0.02, 0.03]
+    )
+    assert [row["billing_receipt"] for row in aggregator_rows] == [
+        event.billing_receipt for event in failed_attempts
+    ]
+    assert terminal.usage_missing_count == 0
 
 
 @pytest.mark.asyncio
