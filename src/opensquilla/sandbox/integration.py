@@ -30,6 +30,7 @@ host.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import contextvars
 import dataclasses
 import functools
@@ -84,6 +85,7 @@ from opensquilla.sandbox.path_validation import (
 )
 from opensquilla.sandbox.permissions import FileSystemPermissionProfile
 from opensquilla.sandbox.policy import LevelHints, build_policy, select_level
+from opensquilla.sandbox.policy_models import SandboxPolicy as StoredSandboxPolicy
 from opensquilla.sandbox.run_context import DomainGrant, PackageBundleGrant, RunContext
 from opensquilla.sandbox.run_context_service import auto_add_trusted_domain_grant
 from opensquilla.sandbox.run_mode import RunMode, normalize_run_mode
@@ -110,6 +112,12 @@ _MANAGED_NETWORK_PROXY_URL: contextvars.ContextVar[str | None] = contextvars.Con
     "opensquilla_managed_network_proxy_url",
     default=None,
 )
+_ACTIVE_SANDBOX_POLICY: contextvars.ContextVar[StoredSandboxPolicy | None] = (
+    contextvars.ContextVar(
+        "opensquilla_active_sandbox_policy",
+        default=None,
+    )
+)
 _MANAGED_PROXY_ENV_NAMES_UPPER = managed_proxy_env_names_upper(
     include_windows_git=True,
 )
@@ -125,6 +133,22 @@ _SEARCH_PROVIDER_SYSTEM_DOMAINS: dict[str, tuple[str, ...]] = {
     "iqs": ("cloud-iqs.aliyuncs.com",),
     "tavily": ("api.tavily.com",),
 }
+
+
+def active_sandbox_policy() -> StoredSandboxPolicy:
+    """Return the immutable policy snapshot for the current Safe run."""
+    policy = _ACTIVE_SANDBOX_POLICY.get()
+    return policy.model_copy(deep=True) if policy is not None else StoredSandboxPolicy()
+
+
+@contextlib.contextmanager
+def sandbox_policy_scope(policy: StoredSandboxPolicy):
+    """Bind one policy version for an entire task/run boundary."""
+    token = _ACTIVE_SANDBOX_POLICY.set(policy.model_copy(deep=True))
+    try:
+        yield
+    finally:
+        _ACTIVE_SANDBOX_POLICY.reset(token)
 
 
 # ─── Approval queue / context protocols ──────────────────────────────────
@@ -2055,6 +2079,7 @@ def _runtime_is_full_host_access(runtime: SandboxRuntime) -> bool:
 
 __all__ = [
     "SandboxRuntime",
+    "active_sandbox_policy",
     "active_file_system_profile",
     "action_fingerprint",
     "build_request",
@@ -2077,4 +2102,5 @@ __all__ = [
     "run_in_process_network_action",
     "run_under_backend",
     "sandboxed",
+    "sandbox_policy_scope",
 ]

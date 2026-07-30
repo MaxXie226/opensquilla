@@ -54,6 +54,7 @@ from opensquilla.sandbox.backend.seatbelt import (
     seatbelt_env_for_policy,
 )
 from opensquilla.sandbox.backend.unavailable import UnavailableBackend
+from opensquilla.sandbox.command_policy import CommandAction, decide_shell_command
 from opensquilla.sandbox.denial_attribution import is_likely_sandbox_denied
 from opensquilla.sandbox.elevation import ElevationAction, gate_elevated_action
 from opensquilla.sandbox.escalation import (
@@ -65,6 +66,7 @@ from opensquilla.sandbox.escalation import (
 from opensquilla.sandbox.integration import (
     SandboxRuntime,
     active_file_system_profile,
+    active_sandbox_policy,
     consume_backend_denial_retry,
     escalate_backend_denial,
     escalate_unavailable_backend_in_managed_mode,
@@ -108,6 +110,7 @@ from opensquilla.sandbox.types import (
     sandbox_path_text,
 )
 from opensquilla.subprocess_encoding import apply_utf8_child_env, decode_subprocess_output
+from opensquilla.tools.builtin.shell_policy import PolicyResult as SafeBinPolicyResult
 from opensquilla.tools.builtin.shell_policy import check_safe_bin
 from opensquilla.tools.path_policy import reject_foreign_host_path
 from opensquilla.tools.registry import tool
@@ -166,6 +169,26 @@ _WINDOWS_ENV_CANONICAL_KEYS = {
     "USERPROFILE": "USERPROFILE",
     "WINDIR": "WINDIR",
 }
+
+
+def _apply_safe_command_policy(
+    command: str,
+    result: SafeBinPolicyResult,
+) -> SafeBinPolicyResult:
+    if full_host_access_active():
+        return result
+    decision = decide_shell_command(command, active_sandbox_policy())
+    if decision.action is CommandAction.DENY:
+        raise ToolError(f"command denied by Safe policy: {decision.code}")
+    return dataclasses.replace(
+        result,
+        needs_approval=decision.action is CommandAction.APPROVAL,
+        reason=(
+            f"command requires Safe approval: {decision.code}"
+            if decision.action is CommandAction.APPROVAL
+            else ""
+        ),
+    )
 _SANDBOX_NETWORK_HINT = (
     "Hint: sandboxed shell/code has no direct network. Use sandbox_network approval "
     "or trusted managed-network mode, then retry the shell command through the "
@@ -5451,6 +5474,7 @@ async def exec_command(
     # Denylist: hard-block, never bypassable
     if not result.allowed:
         raise ToolError(result.reason)
+    result = _apply_safe_command_policy(command, result)
 
     sensitive_block = _sensitive_external_transfer_block(
         "exec_command", command, workdir=cwd, stdin=stdin
@@ -5902,6 +5926,7 @@ async def background_process(
     profile = original_profile
     if not result.allowed:
         raise ToolError(result.reason)
+    result = _apply_safe_command_policy(command, result)
     sensitive_block = _sensitive_external_transfer_block("background_process", command, workdir=cwd)
     if sensitive_block is None:
         sensitive_block = _sensitive_shell_block("background_process", command, workdir=cwd)
