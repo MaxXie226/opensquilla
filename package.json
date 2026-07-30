@@ -1,0 +1,25 @@
+{
+  "name": "opensquilla-ui-package-workspace",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Build workspace for the public OpenSquilla UI Foundation packages",
+  "type": "module",
+  "packageManager": "npm@10.9.0",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "workspaces": [
+    "packages/ui-tokens",
+    "packages/ui-primitives",
+    "packages/ui-foundation"
+  ],
+  "scripts": {
+    "build:ui-packages": "npm run build --workspaces --if-present",
+    "typecheck:ui-packages": "npm run typecheck --workspaces --if-present",
+    "verify:ui-packages": "npm run typecheck:ui-packages && npm run build:ui-packages && node scripts/verify_ui_packages.mjs"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.5"
+  },
+  "license": "Apache-2.0"
+}

@@ -118,6 +118,12 @@ while IFS= read -r path || [[ -n "${path}" ]]; do
     opensquilla-webui/*)
       mark_frontend_changed
       ;;
+    package.json | package-lock.json | tsconfig.ui-package.json | packages/ui-package-manifest.json | packages/ui-*/* | scripts/verify_ui_packages.mjs)
+      # Public UI Foundation packages are browser-safe client inputs. They
+      # have their own cross-platform pack/install gate and never wake the
+      # Python runtime or release-wheel path.
+      mark_frontend_changed
+      ;;
     contracts/client/* | packages/client-sdk/*)
       mark_client_contract_changed
       ;;

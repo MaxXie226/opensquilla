@@ -84,11 +84,15 @@ crontab-*
 tests/functional/reports/
 
 # Frontend build artifacts
+/node_modules/
 opensquilla-webui/node_modules/
 opensquilla-webui/dist/
 packages/client-sdk/node_modules/
 packages/client-sdk/dist/
 packages/client-sdk/*.tgz
+packages/ui-*/node_modules/
+packages/ui-*/dist/
+packages/ui-*/*.tgz
 src/opensquilla/gateway/static/dist/
 
 # Local-only release-hygiene tests that reference legacy artifact names

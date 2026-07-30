@@ -610,6 +610,26 @@ def test_ci_change_classifier_routes_client_sdk_to_python_and_frontend(
     )
 
 
+def test_ci_change_classifier_routes_public_ui_packages_to_frontend_only(
+    tmp_path: Path,
+) -> None:
+    outputs = _classify_changed_files(
+        tmp_path,
+        [
+            "package.json",
+            "package-lock.json",
+            "tsconfig.ui-package.json",
+            "packages/ui-package-manifest.json",
+            "packages/ui-tokens/src/index.ts",
+            "packages/ui-primitives/package.json",
+            "packages/ui-foundation/README.md",
+            "scripts/verify_ui_packages.mjs",
+        ],
+    )
+
+    assert outputs == _expected_classifier_outputs(frontend_changed="true")
+
+
 def test_ci_change_classifier_tracks_ci_dependency_and_release_changes(tmp_path: Path) -> None:
     outputs = _classify_changed_files(
         tmp_path,
@@ -974,6 +994,7 @@ def test_default_ci_uses_layered_job_conditions() -> None:
     jobs = data["jobs"]
 
     assert "tui-check" in jobs
+    assert "frontend_changed == 'true'" in jobs["ui-packages-check"]["if"]
     assert "frontend_changed == 'true'" in jobs["frontend-check"]["if"]
     assert "full_required == 'true'" in jobs["frontend-check"]["if"]
     assert "build_wheel_required == 'true'" not in jobs["frontend-check"]["if"]
@@ -993,6 +1014,7 @@ def test_default_ci_uses_layered_job_conditions() -> None:
     assert "release_changed == 'true'" in jobs["release-packaging"]["if"]
     assert "build_wheel_required == 'true'" in jobs["release-packaging"]["if"]
     assert "tui-check" in jobs["ci-result"]["needs"]
+    assert "ui-packages-check" in jobs["ci-result"]["needs"]
     assert "webui-chat-recovery" in jobs["ci-result"]["needs"]
     assert "desktop-check" in jobs["ci-result"]["needs"]
     assert "ubuntu-full" in jobs["ci-result"]["needs"]
@@ -1061,6 +1083,7 @@ def test_ci_result_gate_covers_every_conditional_job_and_classifier_flag() -> No
         "classify-changes",
         "workflow-lint",
         "readme-locale-check",
+        "ui-packages-check",
         "frontend-check",
         "webui-chat-recovery",
         "tui-check",
@@ -1078,6 +1101,9 @@ def test_ci_result_gate_covers_every_conditional_job_and_classifier_flag() -> No
     assert gate_step["env"]["RESULT_UBUNTU_FULL"] == "${{ needs.ubuntu-full.result }}"
     assert gate_step["env"]["RESULT_CLIENT_CONTRACT"] == (
         "${{ needs.client-contract-compat.result }}"
+    )
+    assert gate_step["env"]["RESULT_UI_PACKAGES"] == (
+        "${{ needs.ui-packages-check.result }}"
     )
     assert gate_step["env"]["RESULT_MACOS_RECOVERY"] == (
         "${{ needs.macos-recovery.result }}"
@@ -1101,6 +1127,33 @@ def test_ci_result_gate_covers_every_conditional_job_and_classifier_flag() -> No
         "FLAG_BUILD_WHEEL_REQUIRED",
         "FLAG_FULL_REQUIRED",
     }
+
+
+def test_public_ui_package_gate_runs_pack_install_smoke_on_all_platforms() -> None:
+    job = _workflow("ci.yml")["jobs"]["ui-packages-check"]
+    steps = job["steps"]
+
+    assert job["strategy"]["fail-fast"] is False
+    assert job["strategy"]["matrix"]["os"] == [
+        "ubuntu-latest",
+        "macos-latest",
+        "windows-latest",
+    ]
+    setup_node = next(step for step in steps if step.get("name") == "Set up Node.js")
+    install = next(
+        step for step in steps
+        if step.get("name") == "Install public UI package dependencies"
+    )
+    verify = next(
+        step for step in steps
+        if step.get("name") == "Verify public UI package boundaries"
+    )
+
+    assert setup_node["with"]["node-version-file"] == "opensquilla-webui/.node-version"
+    assert setup_node["with"]["cache-dependency-path"] == "package-lock.json"
+    assert install["run"] == "npm ci --ignore-scripts"
+    assert verify["run"] == "npm run verify:ui-packages"
+    assert "secrets." not in json.dumps(job)
 
 
 def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> None:
