@@ -111,6 +111,10 @@ Use the session selector to switch between existing sessions. Copy the session
 key when reporting a bug or asking another OpenSquilla surface to inspect the
 same session.
 
+Slash command suggestions complete before they run. `Tab` always completes the
+active candidate, while `Enter` completes a partial match and runs only an
+exact command. Unknown commands remain in the composer with a recovery hint.
+
 Coding mode can be enabled from chat when you want code modifications routed
 through `opensquilla code-task`. With Coding mode on, code changes use the
 guarded host workflow described in [`cli.md`](cli.md#coding-mode-and-code-task)

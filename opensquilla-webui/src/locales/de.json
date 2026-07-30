@@ -3304,6 +3304,9 @@
       "sendReply": "Antwort senden",
       "sendingContinuing": "Antwort wird gesendet · Ausführung wird fortgesetzt…"
     },
+    "slashCommands": {
+      "unknown": "Unbekannter Befehl {command}. Bearbeite ihn weiter oder verwende //, um ihn als Text zu senden."
+    },
     "codingMode": {
       "enabled": "Coding mode für alle Chats aktiviert.",
       "disabled": "Coding mode deaktiviert.",

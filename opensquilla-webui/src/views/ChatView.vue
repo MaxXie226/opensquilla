@@ -449,7 +449,7 @@
         :key="cmd.cmd"
         class="chat-slash-item"
         :class="{ 'chat-slash-item--active': i === slashIdx }"
-        @click="selectSlashCmd(cmd)"
+        @click="completeSlashCmd(cmd)"
       >
         <span class="chat-slash-cmd">{{ cmd.cmd }}</span>
         <span class="chat-slash-desc" :title="cmd.desc">{{ cmd.desc }}</span>
@@ -1768,7 +1768,8 @@ const {
   loadSlashCommands,
   handleSlashInput,
   closeSlashMenu,
-  selectSlashCmd,
+  completeSlashCmd,
+  activateSlashCmd,
   executeSlashCommand,
 } = chatSlashCommands
 
@@ -1785,7 +1786,8 @@ const chatComposerShortcuts = useChatComposerShortcuts({
   autoResizeTextarea,
   handleSlashInput,
   closeSlashMenu,
-  selectSlashCmd,
+  completeSlashCmd,
+  activateSlashCmd,
   popPendingTail,
   enqueuePendingInput,
   sendCurrentInput: () => sendCurrentInput(),

@@ -67,6 +67,13 @@ describe('ChatComposer control hierarchy', () => {
     expect(viewSource).toContain('setCodingModeEnabled,')
     expect(viewSource).toContain('@set-coding-mode-enabled="setComposerCodingModeEnabled"')
   })
+
+  it('completes Slash candidates without executing them from the suggestion menu', () => {
+    expect(viewSource).toContain('@click="completeSlashCmd(cmd)"')
+    expect(viewSource).not.toContain('@click="selectSlashCmd(cmd)"')
+    expect(slashSource).toContain('function completeSlashCmd')
+    expect(slashSource).toContain('function activateSlashCmd')
+  })
 })
 
 describe('ChatComposer model routing contract', () => {

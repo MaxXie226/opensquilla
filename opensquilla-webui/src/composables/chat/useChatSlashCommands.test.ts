@@ -31,6 +31,7 @@ function harness(
   })
   const dispatchHidden = vi.fn()
   const dispatchPlanPrompt = vi.fn()
+  const notify = vi.fn()
   const api = useChatSlashCommands({
     rpc,
     catalogCallOptions,
@@ -41,7 +42,7 @@ function harness(
     resetCurrentSession: vi.fn(),
     setCompactInFlight: vi.fn(),
     showCompactStatus: vi.fn(),
-    notify: vi.fn(),
+    notify,
     dispatchHidden,
     dispatchPlanPrompt,
     activatePlanMode,
@@ -56,6 +57,7 @@ function harness(
     dispatchHidden,
     dispatchPlanPrompt,
     inputText,
+    notify,
     rpc,
     setCodingModeEnabled,
   }
@@ -260,5 +262,58 @@ describe('useChatSlashCommands Coding mode', () => {
     codingModeEnabled.value = true
     api.handleSlashInput()
     expect(api.filteredSlashCmds.value[0].desc).toBe('Disable Coding mode.')
+  })
+
+  it('completes a partial /coding candidate without toggling the mode', async () => {
+    const {
+      api,
+      inputText,
+      setCodingModeEnabled,
+    } = harness(false, [codingCommand])
+    await api.loadSlashCommands()
+    inputText.value = '/co'
+    api.handleSlashInput()
+    const candidate = api.filteredSlashCmds.value[0]
+
+    api.activateSlashCmd(candidate)
+
+    expect(inputText.value).toBe('/coding')
+    expect(setCodingModeEnabled).not.toHaveBeenCalled()
+    expect(api.slashOpen.value).toBe(false)
+  })
+
+  it('executes an exact /coding candidate only after completion', async () => {
+    const {
+      api,
+      inputText,
+      setCodingModeEnabled,
+    } = harness(false, [codingCommand])
+    await api.loadSlashCommands()
+    inputText.value = '/coding'
+    api.handleSlashInput()
+
+    api.activateSlashCmd(api.filteredSlashCmds.value[0])
+    await Promise.resolve()
+
+    expect(setCodingModeEnabled).toHaveBeenCalledWith(true)
+    expect(inputText.value).toBe('')
+  })
+})
+
+describe('useChatSlashCommands recovery', () => {
+  it('keeps an unknown slash command in the composer and shows a visible hint', async () => {
+    const {
+      api,
+      inputText,
+      notify,
+    } = harness(false)
+    inputText.value = '/codng'
+
+    const handled = await api.executeSlashCommand(inputText.value)
+
+    expect(handled).toBe(true)
+    expect(inputText.value).toBe('/codng')
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining('/codng'))
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining('//'))
   })
 })

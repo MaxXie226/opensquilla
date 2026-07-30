@@ -3304,6 +3304,9 @@
       "sendReply": "Envoyer la réponse",
       "sendingContinuing": "Envoi de la réponse · poursuite de l'exécution…"
     },
+    "slashCommands": {
+      "unknown": "Commande inconnue {command}. Continuez à la modifier ou utilisez // pour l’envoyer comme texte."
+    },
     "codingMode": {
       "enabled": "Coding mode activé pour toutes les discussions.",
       "disabled": "Coding mode désactivé.",

@@ -3304,6 +3304,9 @@
       "sendReply": "发送回复",
       "sendingContinuing": "正在发送回复 · 继续运行…"
     },
+    "slashCommands": {
+      "unknown": "未知命令 {command}。请继续编辑，或使用 // 将其作为普通文本发送。"
+    },
     "codingMode": {
       "enabled": "Coding mode 已为所有聊天开启。",
       "disabled": "Coding mode 已关闭。",

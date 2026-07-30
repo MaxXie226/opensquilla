@@ -3304,6 +3304,9 @@
       "sendReply": "返信を送信",
       "sendingContinuing": "返信を送信中 · 実行を継続中…"
     },
+    "slashCommands": {
+      "unknown": "不明なコマンド {command} です。編集を続けるか、// を使用してテキストとして送信してください。"
+    },
     "codingMode": {
       "enabled": "すべてのチャットで Coding mode を有効にしました。",
       "disabled": "Coding mode を無効にしました。",
