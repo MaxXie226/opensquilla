@@ -6,6 +6,7 @@
     "moduleResolution": "Bundler",
     "outDir": "../packages/ui-foundation/dist",
     "paths": {
+      "@opensquilla/client-sdk": ["node_modules/@opensquilla/client-sdk"],
       "vue": ["node_modules/vue"],
       "vue/*": ["node_modules/vue/*"]
     },
