@@ -5,7 +5,10 @@ import {
   compareApiReports,
   parseSemver,
 } from '../check_ui_package_compat.mjs'
-import { compareStableText } from '../ui_package_api.mjs'
+import {
+  canonicalJsonText,
+  compareStableText,
+} from '../ui_package_api.mjs'
 
 function packageReport(overrides = {}) {
   return {
@@ -51,6 +54,13 @@ test('API declaration ordering uses locale-independent code points', () => {
     'gateway/client.d.ts#A',
     'gateway/client.d.ts#z',
   ])
+})
+
+test('API report comparison ignores checkout line-ending conversion', () => {
+  assert.equal(
+    canonicalJsonText('{\r\n  "schemaVersion": 1\r\n}\r\n'),
+    '{\n  "schemaVersion": 1\n}\n',
+  )
 })
 
 test('bootstrap is explicit and non-blocking', () => {

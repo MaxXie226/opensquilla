@@ -30,6 +30,10 @@ export function stableJson(value) {
   return `${JSON.stringify(value, null, 2)}\n`
 }
 
+export function canonicalJsonText(source) {
+  return stableJson(JSON.parse(source))
+}
+
 function semver(value, label) {
   const match = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/.exec(value)
   if (!match) throw new Error(`${label} must use a valid semantic version`)
@@ -323,7 +327,7 @@ export async function main(argv = process.argv.slice(2)) {
   const options = parseArgs(argv)
   const generated = stableJson(await generateApiReport())
   if (options.check) {
-    const checkedIn = await readFile(options.output, 'utf8')
+    const checkedIn = canonicalJsonText(await readFile(options.output, 'utf8'))
     if (checkedIn !== generated) {
       throw new Error(
         `UI package API report is stale; run node scripts/ui_package_api.mjs --write`,
