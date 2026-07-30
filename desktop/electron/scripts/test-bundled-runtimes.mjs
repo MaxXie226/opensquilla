@@ -6,13 +6,44 @@ import { pathToFileURL } from 'node:url'
 
 import {
   assertRuntimeSetReady,
+  defaultManifestPath,
   downloadVerifiedAsset,
+  loadRuntimeManifest,
   validateRuntimeManifest,
 } from './fetch-bundled-runtimes.mjs'
 
 const root = await mkdtemp(join(tmpdir(), 'opensquilla-runtime-test-'))
 
 try {
+  const releaseManifest = await loadRuntimeManifest(defaultManifestPath)
+  const requiredTargets = [
+    'darwin-arm64',
+    'darwin-x64',
+    'linux-arm64',
+    'linux-x64',
+    'windows-arm64',
+    'windows-x64',
+  ]
+  assert.deepEqual(Object.keys(releaseManifest.assets).sort(), requiredTargets)
+  const releaseAssetIds = new Set()
+  for (const [target, assets] of Object.entries(releaseManifest.assets)) {
+    assert.deepEqual(
+      Object.keys(assets).sort(),
+      target.startsWith('windows-')
+        ? ['gitBash', 'node', 'python']
+        : ['node', 'python'],
+    )
+    assert.equal(assets.node.version, '24.18.1')
+    assert.equal(assets.python.version, '3.13.14+20260728')
+    if (target.startsWith('windows-')) {
+      assert.equal(assets.gitBash.version, '2.55.0.windows.3')
+    }
+    for (const asset of Object.values(assets)) {
+      assert.equal(releaseAssetIds.has(asset.id), false, `duplicate runtime asset id: ${asset.id}`)
+      releaseAssetIds.add(asset.id)
+    }
+  }
+
   const source = join(root, 'source.bin')
   const destination = join(root, 'download.bin')
   await writeFile(source, 'pinned runtime fixture')

@@ -1960,38 +1960,14 @@ async def escalate_unavailable_backend_in_managed_mode(
     runtime: SandboxRuntime | None = None,
     review_action: ElevationAction | None = None,
 ) -> DenialResult | ElevationGateResult | None:
-    """Turn a missing sandbox backend into one exact Managed host retry."""
+    """Never replay a started Safe action with host permissions.
 
-    context = current_tool_run_context()
-    try:
-        mode = (
-            context.run_mode
-            if context is not None
-            else normalize_run_mode(request.run_mode, default=RunMode.SAFE)
-        )
-    except ValueError:
-        return None
-    if mode != RunMode.SAFE:
-        return None
-    rt = runtime or get_runtime()
-    if rt is None or not isinstance(rt.backend, UnavailableBackend):
-        return None
-    reason = str(error) or "sandbox backend unavailable"
-    return await escalate_backend_denial(
-        SandboxResult(
-            returncode=-1,
-            stdout="",
-            stderr=reason,
-            wall_time_s=0.0,
-            timed_out=False,
-            backend_used=rt.backend.name,
-            backend_notes=("backend_unavailable", reason),
-        ),
-        request,
-        policy,
-        runtime=rt,
-        review_action=review_action,
-    )
+    Capability fallback is decided before task execution by ``ModeResolver``.
+    Reaching this path means Safe execution already started, so replaying the
+    action could duplicate partial side effects.
+    """
+
+    return None
 
 
 def consume_backend_denial_retry(
@@ -2076,7 +2052,13 @@ def _runtime_is_full_host_access(runtime: SandboxRuntime) -> bool:
     context = current_tool_run_context()
     if context is not None:
         return context.run_mode == RunMode.FULL
-    return runtime.default_run_mode == RunMode.FULL
+    configured = getattr(runtime, "default_run_mode", None)
+    if configured is None:
+        configured = getattr(getattr(runtime, "settings", None), "run_mode", None)
+    try:
+        return normalize_run_mode(configured) == RunMode.FULL
+    except ValueError:
+        return False
 
 
 __all__ = [

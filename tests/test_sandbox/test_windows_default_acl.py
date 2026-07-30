@@ -23,8 +23,12 @@ def test_standard_auto_grants_required_and_asks_for_expansion(tmp_path: Path) ->
         sensitive_marker=lambda path: None,
     )
 
-    assert [item.path.name for item in plan.auto_grants] == ["workspace", "policy"]
-    assert [item.path.name for item in plan.approval_required] == ["external-cache"]
+    assert [item.path.name for item in plan.auto_grants] == [
+        "workspace",
+        "policy",
+        "external-cache",
+    ]
+    assert plan.approval_required == ()
     assert plan.denied == ()
 
 

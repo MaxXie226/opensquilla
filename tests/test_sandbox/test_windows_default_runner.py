@@ -39,7 +39,7 @@ def test_parse_payload_accepts_valid_windows_default_payload(tmp_path) -> None:
 
     assert parsed.argv == ("python", "-c", "print('ok')")
     assert parsed.cwd == tmp_path
-    assert parsed.run_mode == "trusted"
+    assert parsed.run_mode == "safe"
 
 
 def test_helper_error_marker_and_offline_payload_keep_authentication_nonce(

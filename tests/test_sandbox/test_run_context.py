@@ -269,6 +269,7 @@ async def test_rpc_run_context_set_rejects_non_owner_full_mode_without_mutation(
             scopes=frozenset(["operator.write", "operator.read"]),
             is_owner=False,
             authenticated=True,
+            capabilities=frozenset({"task.read"}),
         ),
         session_manager=manager,
         config=config,

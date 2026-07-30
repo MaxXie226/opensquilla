@@ -1281,6 +1281,12 @@ async def test_auto_review_once_uses_only_generation_bound_delta(
     from opensquilla.provider import Message
     from opensquilla.sandbox import escalation as escalation_module
 
+    monkeypatch.setattr(
+        agent_module,
+        "effective_approval_reviewer",
+        lambda configured, run_mode: "auto_review",
+    )
+
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     initial = RunContext(
@@ -1438,6 +1444,12 @@ async def test_auto_review_binding_failure_cleans_generation(
     from opensquilla.gateway.approval_queue import get_approval_queue
     from opensquilla.sandbox import escalation as escalation_module
 
+    monkeypatch.setattr(
+        agent_module,
+        "effective_approval_reviewer",
+        lambda configured, run_mode: "auto_review",
+    )
+
     workspace = tmp_path / "workspace"
     replacement = tmp_path / "replacement"
     workspace.mkdir()
@@ -1474,7 +1486,12 @@ async def test_auto_review_binding_failure_cleans_generation(
     approval_id = str(approval["approval_id"])
     original = tmp_path / "workspace-original"
     workspace.rename(original)
-    workspace.symlink_to(replacement, target_is_directory=True)
+    try:
+        workspace.symlink_to(replacement, target_is_directory=True)
+    except OSError:
+        original.rename(workspace)
+        await storage.close()
+        pytest.skip("creating directory symlinks requires additional Windows privileges")
     monkeypatch.setattr(
         agent_module,
         "local_elevation_assessment",
@@ -1536,6 +1553,12 @@ async def test_auto_review_revalidates_current_session_identity(
     from opensquilla.engine.elevation_triage import RuleAssessment
     from opensquilla.gateway.approval_queue import get_approval_queue
     from opensquilla.sandbox import escalation as escalation_module
+
+    monkeypatch.setattr(
+        agent_module,
+        "effective_approval_reviewer",
+        lambda configured, run_mode: "auto_review",
+    )
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -1636,6 +1659,12 @@ async def test_auto_review_revalidates_current_project_binding(
     from opensquilla.engine.elevation_triage import RuleAssessment
     from opensquilla.gateway.approval_queue import get_approval_queue
     from opensquilla.sandbox import escalation as escalation_module
+
+    monkeypatch.setattr(
+        agent_module,
+        "effective_approval_reviewer",
+        lambda configured, run_mode: "auto_review",
+    )
 
     global_workspace = tmp_path / "global"
     project_path = tmp_path / "project"
@@ -2498,7 +2527,7 @@ async def test_stale_path_ro_approval_preserves_latest_covering_rw_grant(
     ],
 )
 @pytest.mark.asyncio
-async def test_network_approval_cannot_authorize_another_target_or_execution(
+async def test_safe_public_network_targets_do_not_create_approval(
     tmp_path: Path,
     second_host: str,
     second_execution: str,
@@ -2583,49 +2612,15 @@ async def test_network_approval_cannot_authorize_another_target_or_execution(
         finally:
             current_tool_context.reset(token)
 
-    async def _wait_for_pending_count(count: int) -> list[dict[str, Any]]:
-        for _ in range(100):
-            pending = get_approval_queue().list_pending("exec")
-            if len(pending) >= count:
-                return pending
-            await asyncio.sleep(0)
-        return get_approval_queue().list_pending("exec")
-
-    first_task: asyncio.Task[Any] | None = None
-    second_task: asyncio.Task[Any] | None = None
     try:
-        first_task = asyncio.create_task(_decide("first.example", "execution-network-a"))
-        first_pending = await _wait_for_pending_count(1)
-        assert len(first_pending) == 1
-        first_id = str(first_pending[0]["id"])
-
-        second_task = asyncio.create_task(_decide(second_host, second_execution))
-        pending = await _wait_for_pending_count(2)
-        second_ids = {str(item["id"]) for item in pending if str(item["id"]) != first_id}
-
-        first_entry = get_approval_queue().get(first_id)
-        await apply_sandbox_approval_choice(
-            first_entry.params,
-            approval_id=first_id,
-            choice="allow_once",
-            approved=True,
-            session_manager=manager,
-            config=_config(workspace),
-        )
-        get_approval_queue().resolve(first_id, True)
-        for second_id in second_ids:
-            get_approval_queue().resolve(second_id, False)
-
-        first_decision, second_decision = await asyncio.gather(
-            first_task,
-            second_task,
-        )
+        first_decision = await _decide("first.example", "execution-network-a")
+        second_decision = await _decide(second_host, second_execution)
         assert first_decision.status == "allow"
-        assert second_decision.status == "block"
+        assert first_decision.reason == "public_default"
+        assert second_decision.status == "allow"
+        assert second_decision.reason == "public_default"
+        assert get_approval_queue().list_pending("exec") == []
     finally:
-        for task in (first_task, second_task):
-            if task is not None and not task.done():
-                task.cancel()
         await storage.close()
 
 

@@ -23,10 +23,11 @@ def effective_approval_reviewer(
     configured: object,
     run_mode: object,
 ) -> ApprovalReviewerName:
-    """Resolve the reviewer, with Standard mode always owned by the user."""
+    """Resolve the reviewer, with canonical Safe mode owned by the user."""
 
     mode = getattr(run_mode, "value", run_mode)
-    if str(mode or "").strip().lower() == "standard":
+    normalized = str(mode or "").strip().lower()
+    if normalized in {"safe", "standard", "trusted", "managed"}:
         return "user"
     return cast(
         "ApprovalReviewerName",

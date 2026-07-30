@@ -324,7 +324,7 @@ async def test_shell_exact_elevation_grant_runs_host_once(
         assert requested["status"] == "approval_required"
         approval_id = requested["approval_id"]
         pending = get_approval_queue().get(approval_id)
-        assert pending.params["humanActionable"] is False
+        assert pending.params["humanActionable"] is True
         assert host_calls == []
 
         get_approval_queue().resolve(approval_id, True)
@@ -686,7 +686,7 @@ async def test_shell_backend_request_preserves_resolved_run_mode(
 
     assert "ok" in result
     assert backend_calls
-    assert backend_calls[0].run_mode == "trusted"
+    assert backend_calls[0].run_mode == "safe"
 
 
 @pytest.mark.asyncio
@@ -1373,7 +1373,7 @@ async def test_code_exec_backend_request_preserves_resolved_run_mode(
 
     assert result["stdout"] == "ok\n"
     assert backend_calls
-    assert backend_calls[0].run_mode == "trusted"
+    assert backend_calls[0].run_mode == "safe"
 
 
 @pytest.mark.asyncio

@@ -50,7 +50,11 @@ class GuestProfile:
     def cleanup(self) -> None:
         if self.cleaned:
             return
-        cleanup_guest_profile_root(self.root)
+        # This object owns the factory-created root, including when an embedder
+        # deliberately supplies a custom temp parent outside the system temp
+        # directory. The stricter standalone helper remains for paths recovered
+        # from untrusted task metadata.
+        shutil.rmtree(self.root, ignore_errors=True)
         self.cleaned = True
 
 

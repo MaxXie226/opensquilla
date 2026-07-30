@@ -1056,6 +1056,18 @@ def _workspace_strict_read_block(
 
     candidate = resolved.expanduser().resolve(strict=False)
     profile = active_file_system_profile(_workspace_root())
+    ctx = current_tool_context.get()
+    authenticated_safe_read = bool(
+        trusted_sandbox_active()
+        and ctx is not None
+        and not ctx.guest_safe
+    )
+    if (
+        authenticated_safe_read
+        and profile is not None
+        and not profile.is_explicitly_denied(candidate)
+    ):
+        return _cross_session_read_block(tool_name, candidate, original_path)
     if profile is not None and profile.resolve(candidate) is not FileSystemAccess.DENY:
         return _cross_session_read_block(tool_name, candidate, original_path)
     roots = _strict_read_roots()
@@ -1111,6 +1123,21 @@ def _workspace_strict_candidate_marker(
         else candidate.expanduser().resolve(strict=False)
     )
     profile = active_file_system_profile(_workspace_root())
+    ctx = current_tool_context.get()
+    if (
+        trusted_sandbox_active()
+        and ctx is not None
+        and not ctx.guest_safe
+        and profile is not None
+        and not profile.is_explicitly_denied(resolved)
+    ):
+        if _cross_session_read_block(
+            tool_name,
+            resolved,
+            original_path or str(candidate),
+        ):
+            return f"[blocked] {candidate}: another session's private material"
+        return None
     if profile is not None and profile.resolve(resolved) is not FileSystemAccess.DENY:
         if _cross_session_read_block(
             tool_name,

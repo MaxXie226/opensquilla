@@ -1043,118 +1043,23 @@ async def test_shell_reads_dot_credential_names_inside_sandbox(
 
 
 @pytest.mark.asyncio
-async def test_denied_sandbox_path_request_does_not_create_repeated_prompt(
+async def test_authenticated_safe_reads_outside_workspace_without_prompt(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _disable_global_root_readonly()
-    from types import SimpleNamespace
-
-    from opensquilla.gateway.rpc_approvals import _handle_exec_approval_resolve
 
     workspace = tmp_path / "workspace"
     workspace.mkdir(exist_ok=True)
     outside = tmp_path / "outside"
     outside.mkdir()
+    (outside / "notes.txt").write_text("readable\n", encoding="utf-8")
     monkeypatch.setattr(fs.asyncio, "get_event_loop", lambda: _InlineExecutorLoop())
 
     with tool_context(workspace):
-        first = json.loads(await fs.list_dir(str(outside)))
+        result = await fs.list_dir(str(outside))
 
-    assert first["status"] == "approval_required"
-    assert first["approvalKind"] == "sandbox_path"
-    approval_id = first["approval_id"]
-    assert len(get_approval_queue().list_pending("exec")) == 1
-
-    await _handle_exec_approval_resolve(
-        {"id": approval_id, "approved": False, "choice": "deny"},
-        SimpleNamespace(session_manager=None, config=None),
-    )
-
-    with tool_context(workspace):
-        second = json.loads(await fs.list_dir(str(outside)))
-
-    assert second["status"] == "approval_denied"
-    assert second["approval_id"] == approval_id
-    assert "user denied" in second["message"].lower()
-    assert "do not ask" in second["message"].lower()
-    assert "Add the requested path" not in second["message"]
-    assert get_approval_queue().list_pending("exec") == []
-
-
-@pytest.mark.asyncio
-async def test_denied_sandbox_path_request_can_be_requested_again_next_turn(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _disable_global_root_readonly()
-    from types import SimpleNamespace
-
-    from opensquilla.gateway.rpc_approvals import _handle_exec_approval_resolve
-    from opensquilla.sandbox.escalation import clear_sandbox_approval_denials
-
-    workspace = tmp_path / "workspace"
-    workspace.mkdir(exist_ok=True)
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    monkeypatch.setattr(fs.asyncio, "get_event_loop", lambda: _InlineExecutorLoop())
-
-    with tool_context(workspace):
-        first = json.loads(await fs.list_dir(str(outside)))
-
-    assert first["status"] == "approval_required"
-    approval_id = first["approval_id"]
-
-    await _handle_exec_approval_resolve(
-        {"id": approval_id, "approved": False, "choice": "deny"},
-        SimpleNamespace(session_manager=None, config=None),
-    )
-
-    with tool_context(workspace):
-        same_turn = json.loads(await fs.list_dir(str(outside)))
-
-    assert same_turn["status"] == "approval_denied"
-    assert same_turn["approval_id"] == approval_id
-
-    clear_sandbox_approval_denials("s1")
-
-    with tool_context(workspace):
-        next_turn = json.loads(await fs.list_dir(str(outside)))
-
-    assert next_turn["status"] == "approval_required"
-    assert next_turn["approval_id"] != approval_id
-
-
-@pytest.mark.asyncio
-async def test_denied_sandbox_path_request_clears_duplicate_pending_prompts(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _disable_global_root_readonly()
-    from types import SimpleNamespace
-
-    from opensquilla.gateway.rpc_approvals import _handle_exec_approval_resolve
-
-    workspace = tmp_path / "workspace"
-    workspace.mkdir(exist_ok=True)
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    monkeypatch.setattr(fs.asyncio, "get_event_loop", lambda: _InlineExecutorLoop())
-
-    with tool_context(workspace):
-        first = json.loads(await fs.list_dir(str(outside)))
-        second = json.loads(await fs.list_dir(str(outside)))
-
-    assert first["status"] == "approval_required"
-    assert second["status"] == "approval_pending"
-    assert second["approval_id"] == first["approval_id"]
-    assert len(get_approval_queue().list_pending("exec")) == 1
-
-    await _handle_exec_approval_resolve(
-        {"id": first["approval_id"], "approved": False, "choice": "deny"},
-        SimpleNamespace(session_manager=None, config=None),
-    )
-
+    assert "notes.txt" in result
     assert get_approval_queue().list_pending("exec") == []
 
 
