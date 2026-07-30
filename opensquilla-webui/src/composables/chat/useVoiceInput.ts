@@ -3,6 +3,7 @@ import { ref } from 'vue'
 import i18n from '@/i18n'
 import { useToasts } from '@/composables/useToasts'
 import { detectPlatformId } from '@/platform/capabilities'
+import { getPlatform } from '@/platform'
 
 interface TranscriptionResponse {
   text?: string
@@ -34,10 +35,6 @@ function recordingFailureKey(err: unknown): string {
     return 'chat.toast.voiceMicMissing'
   }
   return 'chat.toast.voiceRecordFailed'
-}
-
-interface DesktopWindowVisibilityBridge {
-  onWindowHidden?: (callback: () => void) => void | (() => void)
 }
 
 function authToken(): string {
@@ -259,10 +256,9 @@ export function useVoiceInput() {
   }
 
   if (typeof window !== 'undefined') {
-    const desktop = (window as unknown as {
-      opensquillaDesktop?: DesktopWindowVisibilityBridge
-    }).opensquillaDesktop
-    const unsubscribe = desktop?.onWindowHidden?.(() => cancelRecording({ notify: true }))
+    const unsubscribe = getPlatform().lifecycle.onWindowHidden?.(
+      () => cancelRecording({ notify: true }),
+    )
     if (typeof unsubscribe === 'function') unsubscribeWindowHidden = unsubscribe
   }
   if (typeof document !== 'undefined') {

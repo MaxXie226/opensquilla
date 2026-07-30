@@ -1,10 +1,14 @@
 import { createApp } from 'vue'
 import { createPinia } from 'pinia'
 import App from './App.vue'
-import { router } from './router'
+import { createPublicWebUiRouter } from './router'
 import i18n from './i18n'
-import { useAppStore } from './stores/app'
-import { useRpcStore } from './stores/rpc'
+import { getPlatform } from './platform'
+import {
+  PUBLIC_WEB_UI_COMPOSITION_KEY,
+  createPublicWebUiComposition,
+  getPublicWebUiRuntimeState,
+} from './composition/root'
 import 'katex/dist/katex.min.css'
 import './assets/fonts.css'
 import '@opensquilla/ui-tokens/foundation.css'
@@ -17,23 +21,46 @@ import './styles/chat-markdown.css'
 import './styles/chat-shared.css'
 import './styles/apple-modern.css'
 
-const app = createApp(App)
-app.use(createPinia())
-app.use(router)
-app.use(i18n)
+async function bootstrap(): Promise<void> {
+  const app = createApp(App)
+  const pinia = createPinia()
+  const platform = getPlatform()
+  app.use(pinia)
+  app.use(i18n)
 
-const appStore = useAppStore()
-appStore.initTheme()
+  const composition = await createPublicWebUiComposition({ pinia, platform })
+  const router = createPublicWebUiRouter(composition, platform)
+  const { appStore, rpcStore } = getPublicWebUiRuntimeState(composition)
+  app.provide(PUBLIC_WEB_UI_COMPOSITION_KEY, composition)
+  app.use(router)
 
-const rpcStore = useRpcStore()
-rpcStore.init()
-router.afterEach(() => {
-  rpcStore.applyLinkTokenFromUrl()
-})
+  appStore.initTheme()
+  rpcStore.init()
+  router.afterEach(() => {
+    rpcStore.applyLinkTokenFromUrl()
+  })
 
-// Resolve + load the active locale before mounting so the first paint is
-// already in the right language (no English flash). initLocale never rejects
-// (it falls back to en internally); finally() guarantees the app still mounts.
-appStore.initLocale().finally(() => {
-  app.mount('#app')
+  // Resolve + load the active locale before mounting so the first paint is
+  // already in the right language (no English flash). Preserve the historical
+  // mount-on-locale-failure behavior: locale loading is not allowed to turn a
+  // usable community console into a blank startup error.
+  try {
+    await appStore.initLocale()
+  } finally {
+    app.mount('#app')
+  }
+
+  if (import.meta.hot) {
+    import.meta.hot.dispose(() => {
+      void composition.dispose()
+    })
+  }
+}
+
+void bootstrap().catch((error: unknown) => {
+  console.error('OpenSquilla WebUI composition failed to start', error)
+  const root = document.getElementById('app')
+  if (!root) return
+  root.textContent = 'OpenSquilla could not start. Reload the page or update the client.'
+  root.setAttribute('role', 'alert')
 })

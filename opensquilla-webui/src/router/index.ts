@@ -1,10 +1,14 @@
 import { createRouter, createWebHistory } from 'vue-router'
-import type { RouteRecordRaw, RouteLocationNormalized } from 'vue-router'
-import { getPlatform } from '@/platform'
+import type {
+  RouteComponent,
+  RouteLocationNormalized,
+  RouteRecordRaw,
+  Router,
+} from 'vue-router'
+import type { OpenSquillaAppComposition } from '@opensquilla/ui-foundation'
+import { getPlatform, type Platform } from '@/platform'
+import { createPublicWebUiRedirectRoutes } from '@/composition/catalog'
 import i18n from '@/i18n'
-import { desktopRoutes } from './desktopRoutes'
-import { sharedRoutes } from './sharedRoutes'
-import { webRoutes } from './webRoutes'
 import { captureContentScroll, contentScrollBehavior } from './scrollMemory'
 import { saveLastRoute } from './lastRoute'
 import { legacyChannelHashRedirect } from './legacyRedirects'
@@ -13,27 +17,63 @@ import {
   primeSessionBootstrapAdmission,
 } from '@/composables/chat/sessionBootstrapAdmission'
 
-const basePath = (() => {
+function basePath(): string {
   const el = document.getElementById('opensquilla-data')
   const raw = el?.dataset.basePath || '/control'
   return raw.endsWith('/') ? raw : raw + '/'
-})()
+}
 
-const platform = getPlatform()
-const NotFoundView = () => import('@/views/NotFoundView.vue')
+function webUiOrder(metadata: Readonly<Record<string, unknown>> | undefined): number {
+  return typeof metadata?.webUiOrder === 'number' ? metadata.webUiOrder : 500
+}
 
-export const routes: RouteRecordRaw[] = [
-  ...sharedRoutes,
-  ...(platform.capabilities.hasWebConfig ? webRoutes : []),
-  ...(platform.capabilities.hasDesktopOnboarding ? desktopRoutes : []),
-  { path: '/:pathMatch(.*)*', name: 'not-found', component: NotFoundView, meta: { title: 'Not Found', platforms: ['web', 'desktop'] } },
-]
+export function createPublicWebUiRoutes(
+  composition: OpenSquillaAppComposition,
+  platform: Platform = getPlatform(),
+): RouteRecordRaw[] {
+  const pageLoaders = new Map<string, () => Promise<RouteComponent>>()
+  const registeredRoutes = composition.registry.routes
+    .filter(({ contribution }) => composition.availability(
+      contribution.requirements,
+    ).available)
+    .map(({ contribution }) => {
+      let component = pageLoaders.get(contribution.pageId)
+      if (!component) {
+        component = () => composition.loadPage<RouteComponent>(contribution.pageId)
+        pageLoaders.set(contribution.pageId, component)
+      }
+      const { webUiOrder: _webUiOrder, ...meta } = contribution.metadata ?? {}
+      return {
+        order: webUiOrder(contribution.metadata),
+        record: {
+          path: contribution.path,
+          name: contribution.name,
+          component,
+          meta,
+        } satisfies RouteRecordRaw,
+      }
+    })
+  const redirects = createPublicWebUiRedirectRoutes(platform).map(({ record, order }) => ({
+    order,
+    record,
+  }))
+  return [...registeredRoutes, ...redirects]
+    .sort((left, right) => left.order - right.order)
+    .map(({ record }) => record)
+}
 
-export const router = createRouter({
-  history: createWebHistory(basePath),
-  routes,
-  scrollBehavior: contentScrollBehavior,
-})
+export function createPublicWebUiRouter(
+  composition: OpenSquillaAppComposition,
+  platform: Platform = getPlatform(),
+): Router {
+  const router = createRouter({
+    history: createWebHistory(basePath()),
+    routes: createPublicWebUiRoutes(composition, platform),
+    scrollBehavior: contentScrollBehavior,
+  })
+  installRouterLifecycle(router)
+  return router
+}
 
 function isChatRoutePath(path: string): boolean {
   return path === '/chat' || path === '/chat/new'
@@ -44,22 +84,37 @@ function isChatRoutePath(path: string): boolean {
 // lazy route so optional shell RPCs cannot enter the Gateway's serialized
 // dispatcher ahead of session subscribe/snapshot/history. Query-only chat
 // navigation reuses the mounted view and owns its hold through the coordinator.
-router.beforeEach((to, from) => {
-  const enteringChat = isChatRoutePath(to.path) && !isChatRoutePath(from.path)
-  if (enteringChat) {
-    primeSessionBootstrapAdmission()
-  } else if (!isChatRoutePath(to.path)) {
+function installRouterLifecycle(router: Router): void {
+  router.beforeEach((to, from) => {
+    const enteringChat = isChatRoutePath(to.path) && !isChatRoutePath(from.path)
+    if (enteringChat) {
+      primeSessionBootstrapAdmission()
+    } else if (!isChatRoutePath(to.path)) {
+      clearPrimedSessionBootstrapAdmission()
+    }
+  })
+
+  // Capture the leaving route's content scroll offset so back/forward can restore it.
+  router.beforeEach((_to, from) => {
+    captureContentScroll(from)
+  })
+
+  // Stale channel-setup bookmarks (#channel-… hashes) land on the workspace.
+  router.beforeEach((to) => legacyChannelHashRedirect(to) ?? true)
+
+  router.afterEach((to, _from, failure) => {
+    if (failure || !isChatRoutePath(to.path)) {
+      clearPrimedSessionBootstrapAdmission()
+    }
+    document.title = `${routeTitle(to)} — OpenSquilla`
+    // Remember the current view (path only) so the next launch reopens here.
+    saveLastRoute(to.path)
+  })
+
+  router.onError(() => {
     clearPrimedSessionBootstrapAdmission()
-  }
-})
-
-// Capture the leaving route's content scroll offset so back/forward can restore it.
-router.beforeEach((_to, from) => {
-  captureContentScroll(from)
-})
-
-// Stale channel-setup bookmarks (#channel-… hashes) land on the workspace.
-router.beforeEach((to) => legacyChannelHashRedirect(to) ?? true)
+  })
+}
 
 // Localize the document title from the route name token (e.g. `nav.sessions`),
 // falling back to the English meta.title. `applyRouteTitle` is also re-run when
@@ -79,16 +134,3 @@ export function routeTitle(route: RouteLocationNormalized): string {
   }
   return (route.meta?.title as string) || 'OpenSquilla'
 }
-
-router.afterEach((to, _from, failure) => {
-  if (failure || !isChatRoutePath(to.path)) {
-    clearPrimedSessionBootstrapAdmission()
-  }
-  document.title = `${routeTitle(to)} — OpenSquilla`
-  // Remember the current view (path only) so the next launch reopens here.
-  saveLastRoute(to.path)
-})
-
-router.onError(() => {
-  clearPrimedSessionBootstrapAdmission()
-})

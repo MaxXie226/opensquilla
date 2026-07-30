@@ -166,6 +166,100 @@ function desktopNativeWorkbenchApi(api: OpenSquillaDesktopApi): NativeWorkbenchA
   }
 }
 
+function desktopMigrationApi(api: OpenSquillaDesktopApi): Readonly<Record<string, unknown>> {
+  return Object.freeze({
+    ...(typeof api.getRecoveryState === 'function'
+      ? { getRecoveryState: () => requireDesktopApi().getRecoveryState!() }
+      : {}),
+    ...(typeof api.retryProfileConsolidation === 'function'
+      ? { retryProfileConsolidation: () => requireDesktopApi().retryProfileConsolidation!() }
+      : {}),
+    ...(typeof api.chooseLegacyAgentDataLocation === 'function'
+      ? {
+          chooseLegacyAgentDataLocation: (payload?: Record<string, never>) => (
+            requireDesktopApi().chooseLegacyAgentDataLocation!(payload)
+          ),
+        }
+      : {}),
+    ...(typeof api.migrationSummary === 'function'
+      ? {
+          migrationSummary: (payload?: { source?: string }) => (
+            requireDesktopApi().migrationSummary!(payload)
+          ),
+        }
+      : {}),
+    ...(typeof api.migrationRun === 'function'
+      ? {
+          migrationRun: (payload: { overwrite?: boolean; previewId: string }) => (
+            requireDesktopApi().migrationRun!(payload)
+          ),
+        }
+      : {}),
+    ...(typeof api.migrationBrowseSource === 'function'
+      ? {
+          migrationBrowseSource: (payload: { kind: string }) => (
+            requireDesktopApi().migrationBrowseSource!(payload as never)
+          ),
+        }
+      : {}),
+    ...(typeof api.migrationTakeLastResult === 'function'
+      ? { migrationTakeLastResult: () => requireDesktopApi().migrationTakeLastResult!() }
+      : {}),
+    ...(typeof api.migrationPeekLastResult === 'function'
+      ? { migrationPeekLastResult: () => requireDesktopApi().migrationPeekLastResult!() }
+      : {}),
+    ...(typeof api.migrationDismissLastResult === 'function'
+      ? { migrationDismissLastResult: () => requireDesktopApi().migrationDismissLastResult!() }
+      : {}),
+    ...(typeof api.revealRecoveryPath === 'function'
+      ? {
+          revealRecoveryPath: (payload: { target: 'backups' }) => (
+            requireDesktopApi().revealRecoveryPath!(payload)
+          ),
+        }
+      : {}),
+    ...(typeof api.onMigrationProgress === 'function'
+      ? {
+          onMigrationProgress: (callback: (state: { phase: string; detail?: string }) => void) => (
+            requireDesktopApi().onMigrationProgress!((payload: unknown) => {
+              if (!payload || typeof payload !== 'object') return
+              const state = payload as { phase?: unknown; detail?: unknown }
+              if (typeof state.phase !== 'string') return
+              callback({
+                phase: state.phase,
+                ...(typeof state.detail === 'string' ? { detail: state.detail } : {}),
+              })
+            })
+          ),
+        }
+      : {}),
+    ...(typeof api.inspectDesktopCleanup === 'function'
+      ? {
+          inspectDesktopCleanup: (payload: unknown) => (
+            requireDesktopApi().inspectDesktopCleanup!(payload as never)
+          ),
+        }
+      : {}),
+    ...(typeof api.discardDesktopCleanup === 'function'
+      ? {
+          discardDesktopCleanup: (payload: { previewId: string }) => (
+            requireDesktopApi().discardDesktopCleanup!(payload)
+          ),
+        }
+      : {}),
+    ...(typeof api.applyDesktopCleanup === 'function'
+      ? {
+          applyDesktopCleanup: (payload: unknown) => (
+            requireDesktopApi().applyDesktopCleanup!(payload as never)
+          ),
+        }
+      : {}),
+    ...(typeof api.revealDesktopUserData === 'function'
+      ? { revealDesktopUserData: () => requireDesktopApi().revealDesktopUserData!() }
+      : {}),
+  })
+}
+
 function idleUpdateState(canNativeInstall: boolean, managed = canNativeInstall): DesktopUpdateState {
   return {
     status: 'idle',
@@ -353,6 +447,16 @@ export function createDesktopPlatform(): Platform {
     workbench: {
       ...(nativeWorkbench ? { native: nativeWorkbench } : {}),
     },
+    lifecycle: {
+      ...(typeof desktopApi.onWindowHidden === 'function'
+        ? {
+            onWindowHidden: (callback: () => void) => (
+              requireDesktopApi().onWindowHidden!(callback)
+            ),
+          }
+        : {}),
+    },
+    migration: desktopMigrationApi(desktopApi),
     updates: {
       async getState() {
         const api = requireDesktopApi()

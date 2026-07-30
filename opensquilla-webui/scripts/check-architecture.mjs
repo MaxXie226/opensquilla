@@ -16,12 +16,18 @@ const bannedPatterns = [
     allow: allowedDesktopGlobal,
     message: 'Electron preload access must stay behind src/platform/.',
   },
+  {
+    pattern: 'opensquillaDesktop',
+    allow: allowedDesktopGlobal,
+    message: 'Desktop preload capabilities must be consumed through src/platform/.',
+  },
 ]
 const stalePlatformPatterns = [
   'activeProfile',
   'cloudUrl',
   'getDesktopRpcConnection',
   'desktop:rpc-connection',
+  'export const workbenchPanelRegistry',
 ]
 
 // live-turn fold fence: the append-only turn log and its pure reducer are an internal
@@ -66,6 +72,20 @@ for (const file of walkFiles(srcRoot, /\.(ts|vue)$/, { skipFile: isTestFile })) 
       if (body.includes(moduleId)) {
         failures.push(`${rel}: live-turn log "${moduleId}" must stay within src/composables/chat/ or views/ChatView.vue.`)
       }
+    }
+  }
+}
+
+const requiredCompositionMarkers = new Map([
+  ['src/main.ts', ['createPublicWebUiComposition', 'createPublicWebUiRouter']],
+  ['src/router/index.ts', ['composition.registry.routes', 'composition.loadPage']],
+  ['src/router/nav.ts', ['createPublicWebUiRegistry', 'registry.navigation']],
+])
+for (const [rel, markers] of requiredCompositionMarkers) {
+  const body = readFileSync(join(root, rel), 'utf8')
+  for (const marker of markers) {
+    if (!body.includes(marker)) {
+      failures.push(`${rel}: public WebUI composition marker is missing: "${marker}".`)
     }
   }
 }

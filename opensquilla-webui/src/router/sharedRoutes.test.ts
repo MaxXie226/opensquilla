@@ -1,12 +1,22 @@
 // @vitest-environment happy-dom
-import { beforeEach, describe, expect, it, vi } from 'vitest'
-import type { RouteLocationNormalized } from 'vue-router'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { createPinia } from 'pinia'
+import type {
+  RouteLocationNormalized,
+  RouteRecordRaw,
+} from 'vue-router'
+import type { OpenSquillaAppComposition } from '@opensquilla/ui-foundation'
 import i18n, { loadLocaleMessages } from '@/i18n'
+import { getPlatform } from '@/platform'
+import { createPublicWebUiComposition } from '@/composition/root'
 import { LAST_ROUTE_KEY } from './lastRoute'
 import { defaultRootRedirect } from './sharedRoutes'
-import { routeTitle, routes } from './index'
+import { createPublicWebUiRoutes, routeTitle } from './index'
 
-beforeEach(() => {
+let composition: OpenSquillaAppComposition
+let routes: RouteRecordRaw[]
+
+beforeEach(async () => {
   localStorage.clear()
   i18n.global.locale.value = 'en'
   delete window.opensquillaDesktop
@@ -20,6 +30,16 @@ beforeEach(() => {
     removeListener: vi.fn(),
     dispatchEvent: vi.fn(),
   }))
+  const platform = getPlatform()
+  composition = await createPublicWebUiComposition({
+    pinia: createPinia(),
+    platform,
+  })
+  routes = createPublicWebUiRoutes(composition, platform)
+})
+
+afterEach(async () => {
+  await composition.dispose()
 })
 
 describe('defaultRootRedirect', () => {

@@ -208,9 +208,7 @@ const { confirm } = useConfirm()
 const { pushToast } = useToasts()
 const platform = usePlatform()
 const rpc = useRpcStore()
-const desktopBridge = (globalThis as unknown as {
-  opensquillaDesktop?: DesktopMigrationBridge
-}).opensquillaDesktop
+const desktopBridge = platform.migration as unknown as DesktopMigrationBridge
 const hasDesktopMigrationBridge = computed(() => Boolean(
   platform.capabilities.isDesktop
   && desktopBridge?.migrationSummary
