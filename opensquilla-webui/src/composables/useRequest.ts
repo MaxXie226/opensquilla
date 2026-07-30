@@ -1,4 +1,12 @@
-import { ref, onMounted, type Ref } from 'vue'
+import {
+  createGatewayQuery,
+} from '@opensquilla/ui-foundation'
+import {
+  onMounted,
+  onScopeDispose,
+  ref,
+  type Ref,
+} from 'vue'
 import { useRpcStore } from '@/stores/rpc'
 import { useErrorSink } from '@/composables/useErrorSink'
 
@@ -42,35 +50,32 @@ export function useRequest<T = unknown>(
   const loading = ref(false)
   const error = ref<string | null>(null)
 
-  function resolveParams(): Record<string, unknown> | undefined {
-    return typeof params === 'function' ? params() : params
-  }
-
-  async function run(silent: boolean): Promise<T | null> {
-    if (!silent) loading.value = true
-    error.value = null
-    try {
-      await rpc.waitForConnection()
-      const result = await rpc.call<T>(method, resolveParams())
-      data.value = result
-      return result
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : String(e)
-      error.value = msg
+  const query = createGatewayQuery<T>({
+    client: rpc,
+    method,
+    ...(params === undefined ? {} : { params }),
+    onError: (requestError) => {
+      const msg = requestError.message
       if (toastOnError) {
         reportError(errorLabel ? `${errorLabel}: ${msg}` : msg, errorLabel || method)
       }
-      return null
-    } finally {
-      if (!silent) loading.value = false
-    }
-  }
+    },
+  })
+  const unsubscribe = query.subscribe((snapshot) => {
+    data.value = snapshot.data
+    error.value = snapshot.error?.message ?? null
+    loading.value = snapshot.loading
+  })
 
-  const execute = () => run(false)
-  const refresh = () => run(true)
+  const execute = () => query.execute()
+  const refresh = () => query.refresh()
 
   onMounted(() => {
     if (immediate) void execute()
+  })
+  onScopeDispose(() => {
+    unsubscribe()
+    query.dispose()
   })
 
   return { data, error, loading, execute, refresh }

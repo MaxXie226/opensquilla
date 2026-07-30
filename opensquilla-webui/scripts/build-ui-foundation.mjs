@@ -28,6 +28,16 @@ function run(label, command, args) {
   }
 }
 
+run(
+  'client-sdk',
+  process.execPath,
+  [
+    path.join(webuiRoot, 'node_modules', 'typescript', 'bin', 'tsc'),
+    '-p',
+    path.join(repositoryRoot, 'packages', 'client-sdk', 'tsconfig.json'),
+  ],
+)
+
 const tokenPackageRoot = path.join(repositoryRoot, 'packages', 'ui-tokens')
 run(
   'ui-tokens',
@@ -58,5 +68,14 @@ run(
     path.join(webuiRoot, 'tsconfig.ui-primitives.json'),
     '--declaration',
     '--emitDeclarationOnly',
+  ],
+)
+run(
+  'ui-foundation',
+  process.execPath,
+  [
+    path.join(webuiRoot, 'node_modules', 'typescript', 'bin', 'tsc'),
+    '-p',
+    path.join(webuiRoot, 'tsconfig.ui-foundation.json'),
   ],
 )

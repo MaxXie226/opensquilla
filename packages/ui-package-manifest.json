@@ -60,7 +60,31 @@
       "publicExports": [
         "."
       ],
-      "runtimeExports": []
+      "runtimeExports": [
+        "ConnectionClosedError",
+        "GatewayDataStore",
+        "GatewayClientError",
+        "GatewayHttpClient",
+        "GatewayHttpError",
+        "GatewayQuery",
+        "HandshakeError",
+        "RequestAbortError",
+        "RequestTimeoutError",
+        "RpcAbortError",
+        "RpcClient",
+        "RpcTimeoutError",
+        "SequenceGapError",
+        "capabilitiesForMethods",
+        "clearStoragePrefix",
+        "createFoundationStores",
+        "createGatewayClient",
+        "createGatewayConnectionStorage",
+        "createGatewayHttpClient",
+        "createGatewayQuery",
+        "normalizeHelloFrame",
+        "useGatewayQuery",
+        "useGatewayState"
+      ]
     }
   ]
 }

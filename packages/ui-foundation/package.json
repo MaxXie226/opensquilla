@@ -18,7 +18,15 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "test": "vitest run --config vitest.config.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "verify:boundaries": "node scripts/check-boundaries.mjs"
+  },
+  "dependencies": {
+    "@opensquilla/client-sdk": "0.1.0"
+  },
+  "peerDependencies": {
+    "vue": "^3.5.0"
   },
   "engines": {
     "node": ">=22.12.0"

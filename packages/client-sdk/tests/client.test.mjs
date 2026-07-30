@@ -4,6 +4,7 @@ import test from 'node:test'
 import {
   GatewayClient,
   GatewayClientError,
+  RequestAbortError,
   RequestTimeoutError,
   SequenceGapError,
 } from '../dist/index.js'
@@ -246,5 +247,121 @@ test('reconnects with bounded backoff after an unexpected close', async () => {
   await new Promise((resolve) => setTimeout(resolve, 10))
   assert.equal(sockets.length, 2)
   assert.equal(client.state, 'connecting')
+  client.disconnect()
+})
+
+test('aborts a request without retaining pending state', async () => {
+  const { client, socket } = await connectFixture()
+  const controller = new AbortController()
+  const response = client.call(
+    'sessions.list',
+    {},
+    { signal: controller.signal },
+  )
+  controller.abort()
+
+  await assert.rejects(
+    response,
+    (error) => error instanceof RequestAbortError && error.method === 'sessions.list',
+  )
+  assert.equal(client.pendingRequestCount, 0)
+
+  const request = JSON.parse(socket.sent.at(-1))
+  socket.receive({ type: 'res', id: request.id, ok: true, payload: 'late' })
+  assert.equal(client.pendingRequestCount, 0)
+  client.disconnect()
+})
+
+test('reconnect actions retire only the current transport and deliver the next Hello', async () => {
+  const hellos = []
+  const { client, socket, sockets } = await connectFixture({
+    onHello: (hello) => hellos.push(hello),
+    reconnect: { enabled: true, initialDelayMs: 500, maxDelayMs: 500 },
+  })
+  const staleClose = socket.onclose
+  const controller = new AbortController()
+  const response = client.call(
+    'sessions.list',
+    {},
+    { signal: controller.signal, abortAction: 'reconnect' },
+  )
+  controller.abort()
+
+  await assert.rejects(response, RequestAbortError)
+  await new Promise((resolve) => setTimeout(resolve, 5))
+  assert.equal(sockets.length, 2, 'explicit reconnect actions must not wait for backoff')
+
+  const replacement = sockets[1]
+  replacement.open()
+  replacement.receive({ type: 'event', event: 'connect.challenge' })
+  const connectRequest = JSON.parse(replacement.sent[0])
+  replacement.receive({
+    type: 'hello-ok',
+    id: connectRequest.id,
+    protocol: 3,
+    policy: { tick_interval_ms: 60_000 },
+    features: { methods: ['sessions.list'] },
+  })
+  assert.equal(client.state, 'connected')
+  assert.equal(hellos.length, 2)
+
+  staleClose?.()
+  assert.equal(client.state, 'connected', 'a retired transport cannot close its replacement')
+  client.disconnect()
+})
+
+test('removes state listeners after disposal', async () => {
+  const states = []
+  const { client, sockets } = fixture()
+  const off = client.onState((state) => states.push(state))
+  const connected = client.connect()
+  assert.deepEqual(states, ['connecting'])
+  off()
+
+  const socket = sockets[0]
+  socket.open()
+  socket.receive({ type: 'event', event: 'connect.challenge' })
+  const request = JSON.parse(socket.sent[0])
+  socket.receive({ type: 'hello-ok', id: request.id, protocol: 3 })
+  await connected
+
+  assert.deepEqual(states, ['connecting'])
+  client.disconnect()
+})
+
+test('isolates observer failures from connection and event delivery', async () => {
+  const diagnostics = []
+  const delivered = []
+  const { client, socket } = await connectFixture({
+    onStateChange: (state) => {
+      if (state === 'connecting') throw new Error('synthetic state observer failure')
+    },
+    onHello: () => {
+      throw new Error('synthetic Hello observer failure')
+    },
+    onDiagnostic: (error) => diagnostics.push(error),
+  })
+  client.on('session.message', () => {
+    throw new Error('synthetic event observer failure')
+  })
+  client.on('session.message', (frame) => delivered.push(frame))
+
+  socket.receive({
+    type: 'event',
+    event: 'session.message',
+    seq: 1,
+    payload: { text: 'still delivered' },
+  })
+
+  assert.equal(client.state, 'connected')
+  assert.equal(delivered.length, 1)
+  assert.deepEqual(
+    diagnostics.map((error) => error.message),
+    [
+      'synthetic state observer failure',
+      'synthetic Hello observer failure',
+      'synthetic event observer failure',
+    ],
+  )
   client.disconnect()
 })

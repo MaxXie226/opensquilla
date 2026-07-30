@@ -47,16 +47,41 @@ export class ConnectionClosedError extends Error {
 }
 
 export class RequestTimeoutError extends Error {
+  readonly code = 'RPC_TIMEOUT'
   readonly requestId: string
   readonly method: string
   readonly timeoutMs: number
 
-  constructor(requestId: string, method: string, timeoutMs: number) {
+  constructor(method: string, timeoutMs: number)
+  constructor(requestId: string, method: string, timeoutMs: number)
+  constructor(
+    requestIdOrMethod: string,
+    methodOrTimeout: string | number,
+    optionalTimeout?: number,
+  ) {
+    const requestId = optionalTimeout === undefined ? '' : requestIdOrMethod
+    const method = optionalTimeout === undefined
+      ? requestIdOrMethod
+      : methodOrTimeout as string
+    const timeoutMs = optionalTimeout === undefined
+      ? methodOrTimeout as number
+      : optionalTimeout
     super(`Gateway request ${method} timed out after ${timeoutMs}ms`)
     this.name = 'RequestTimeoutError'
     this.requestId = requestId
     this.method = method
     this.timeoutMs = timeoutMs
+  }
+}
+
+export class RequestAbortError extends Error {
+  readonly code = 'RPC_ABORTED'
+  readonly method: string
+
+  constructor(method: string) {
+    super(`${method} was aborted`)
+    this.name = 'RequestAbortError'
+    this.method = method
   }
 }
 

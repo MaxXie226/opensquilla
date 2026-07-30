@@ -1,0 +1,19 @@
+{
+  "extends": "../tsconfig.ui-package.json",
+  "compilerOptions": {
+    "baseUrl": ".",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "outDir": "../packages/ui-foundation/dist",
+    "paths": {
+      "@opensquilla/client-sdk": ["node_modules/@opensquilla/client-sdk"],
+      "vue": ["node_modules/vue"],
+      "vue/*": ["node_modules/vue/*"]
+    },
+    "rootDir": "../packages/ui-foundation/src",
+    "verbatimModuleSyntax": false
+  },
+  "include": [
+    "../packages/ui-foundation/src/**/*.ts"
+  ]
+}
