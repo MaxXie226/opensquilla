@@ -1,11 +1,12 @@
 import { getPlatform } from '@/platform'
 import type { PlatformId } from '@/platform'
-import type { RouteRecordRaw } from 'vue-router'
 import type { IconName } from '@/utils/icons'
 import i18n from '@/i18n'
-import { desktopRoutes } from './desktopRoutes'
-import { sharedRoutes } from './sharedRoutes'
-import { webRoutes } from './webRoutes'
+import { createPublicWebUiRegistry } from '@/composition/catalog'
+import type {
+  ContributionRegistrySnapshot,
+  OpenSquillaAppComposition,
+} from '@opensquilla/ui-foundation'
 
 type NavigationSlot = 'primary' | 'bottom'
 
@@ -14,12 +15,6 @@ export interface NavigationItem {
   title: string
   icon: IconName
 }
-
-const navRoutes = [
-  ...sharedRoutes,
-  ...webRoutes,
-  ...desktopRoutes,
-]
 
 function routePlatforms(platforms: unknown): PlatformId[] {
   if (!Array.isArray(platforms)) return ['web', 'desktop']
@@ -30,44 +25,89 @@ function routePlatforms(platforms: unknown): PlatformId[] {
 // falling back to the English meta.title literal when no key exists. Called
 // inside the useNavigation() computeds, so reading the reactive i18n locale here
 // makes the rail/drawer/palette re-render on a language switch.
-function navTitle(route: RouteRecordRaw): string {
-  const explicitKey = route.meta?.navLabelKey
+function navTitle(
+  name: string,
+  label: string,
+  metadata: Readonly<Record<string, unknown>> | undefined,
+): string {
+  const explicitKey = metadata?.navLabelKey
   if (explicitKey) {
-    const translated = i18n.global.t(explicitKey)
+    const translated = i18n.global.t(String(explicitKey))
     if (translated !== explicitKey) return translated
   }
-  const name = typeof route.name === 'string' ? route.name : ''
   if (name) {
     const key = `nav.${name}`
     const translated = i18n.global.t(key)
     if (translated !== key) return translated
   }
-  return String(route.meta?.title || route.name || route.path)
+  return label
 }
 
-export function getNavigationItems(slot: NavigationSlot): NavigationItem[] {
+function navigationRegistry(
+  composition: OpenSquillaAppComposition | undefined,
+): ContributionRegistrySnapshot {
+  return composition?.registry ?? createPublicWebUiRegistry(getPlatform())
+}
+
+export function getNavigationItems(
+  slot: NavigationSlot,
+  composition?: OpenSquillaAppComposition,
+): NavigationItem[] {
   const platform = getPlatform()
-  return navRoutes
-    .filter((route) => route.meta?.nav === slot)
-    .filter((route) => routePlatforms(route.meta?.platforms).includes(platform.id))
-    .sort((a, b) => Number(a.meta?.navOrder || 0) - Number(b.meta?.navOrder || 0))
-    .map((route) => ({
-      path: route.path,
-      title: navTitle(route),
-      icon: (route.meta?.icon || 'home') as IconName,
-    }))
+  const registry = navigationRegistry(composition)
+  const routes = new Map(
+    registry.routes.map(({ contribution }) => [contribution.id, contribution]),
+  )
+  const foundationSlot = slot === 'bottom' ? 'footer' : 'primary'
+  return registry.navigation
+    .filter(({ contribution }) => contribution.slot === foundationSlot)
+    .filter(({ contribution }) => (
+      routePlatforms(contribution.metadata?.platforms).includes(platform.id)
+    ))
+    .sort((left, right) => (
+      Number(left.contribution.order ?? 0) - Number(right.contribution.order ?? 0)
+    ))
+    .map(({ contribution }) => {
+      const route = routes.get(contribution.routeId)
+      if (!route) {
+        throw new Error(`Navigation "${contribution.id}" references an unknown route`)
+      }
+      return {
+        path: route.path,
+        title: navTitle(route.name, contribution.label, contribution.metadata),
+        icon: (contribution.metadata?.icon || 'home') as IconName,
+        group: String(contribution.metadata?.group || 'Operate'),
+      }
+    })
+    .map(({ group: _group, ...item }) => item)
 }
 
 // The flat, always-visible destinations shared by the desktop rail, mobile
 // drawer, and command palette. Chat is excluded because the dedicated New-chat
 // action owns that destination.
-export function getWorkNavigationSection(): NavigationItem[] {
-  const groupOf = new Map(
-    navRoutes
-      .filter((route) => route.meta?.nav === 'primary')
-      .map((route) => [route.path, route.meta?.group ?? 'Operate']),
+export function getWorkNavigationSection(
+  composition?: OpenSquillaAppComposition,
+): NavigationItem[] {
+  const registry = navigationRegistry(composition)
+  const routes = new Map(
+    registry.routes.map(({ contribution }) => [contribution.id, contribution]),
   )
-  return getNavigationItems('primary').filter(
-    (item) => groupOf.get(item.path) === 'Work' && item.path !== '/chat',
-  )
+  return registry.navigation
+    .filter(({ contribution }) => contribution.slot === 'primary')
+    .filter(({ contribution }) => contribution.metadata?.group === 'Work')
+    .sort((left, right) => (
+      Number(left.contribution.order ?? 0) - Number(right.contribution.order ?? 0)
+    ))
+    .map(({ contribution }) => {
+      const route = routes.get(contribution.routeId)
+      if (!route) {
+        throw new Error(`Navigation "${contribution.id}" references an unknown route`)
+      }
+      return {
+        path: route.path,
+        title: navTitle(route.name, contribution.label, contribution.metadata),
+        icon: (contribution.metadata?.icon || 'home') as IconName,
+      }
+    })
+    .filter((item) => item.path !== '/chat')
 }

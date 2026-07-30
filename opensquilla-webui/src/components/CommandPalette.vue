@@ -88,7 +88,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
+import { computed, inject, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
 import Icon from './Icon.vue'
@@ -100,6 +100,7 @@ import { highlightFtsSnippet } from '@/utils/searchSnippet'
 import type { SidebarSection } from '@/composables/useSessions'
 import type { IconName } from '@/utils/icons'
 import type { MessageSearchHit, SessionSearchHit, SessionsSearchResponse } from '@/types/rpc'
+import { PUBLIC_WEB_UI_COMPOSITION_KEY } from '@/composition/root'
 
 const props = defineProps<{
   open: boolean
@@ -123,6 +124,7 @@ const emit = defineEmits<{
 const { t } = useI18n()
 const router = useRouter()
 const rpcStore = useRpcStore()
+const composition = inject(PUBLIC_WEB_UI_COMPOSITION_KEY, undefined)
 const { enabled: bgmEnabled, setEnabled: setBgmEnabled } = useBgm()
 
 const dialogRef = ref<HTMLElement | null>(null)
@@ -189,7 +191,7 @@ const allCommands = computed<Command[]>(() => {
   // Work: the pinned rail destinations, from the single Work-band helper so the
   // palette tracks the route taxonomy instead of a hardcoded path list (which
   // silently dropped promoted routes and double-listed demoted ones).
-  for (const item of getWorkNavigationSection()) {
+  for (const item of getWorkNavigationSection(composition)) {
     const searchAliases = item.path === '/usage' ? ' usage 用量' : ''
     out.push({
       id: `nav:${item.path}`,

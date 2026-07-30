@@ -141,6 +141,7 @@
 <script setup lang="ts">
 import {
   computed,
+  inject,
   nextTick,
   onBeforeUnmount,
   onMounted,
@@ -155,7 +156,10 @@ import { useToasts } from '@/composables/useToasts'
 import { usePlatform } from '@/platform'
 import type { NativeWorkbenchSurfaceEvent } from '@/platform/types'
 import type { ArtifactPayload } from '@/types/rpc'
-import { workbenchPanelRegistry } from '@/workbench/registry'
+import {
+  PUBLIC_WEB_UI_COMPOSITION_KEY,
+  getPublicWebUiRuntimeState,
+} from '@/composition/root'
 import {
   artifactWorkbenchItemId,
   createArtifactPreviewWorkbenchItem,
@@ -181,6 +185,7 @@ import {
   attachWorkbenchRuntime,
   WorkbenchRuntimeManager,
 } from '@/workbench/runtime'
+import { createWorkbenchPanelRegistry } from '@/workbench/registry'
 import { useWorkbenchStore } from '@/workbench/store'
 import type {
   NativeSurfaceRect,
@@ -211,7 +216,12 @@ const { t } = useI18n()
 const { confirm } = useConfirm()
 const { pushToast } = useToasts()
 const platform = usePlatform()
-const store = useWorkbenchStore()
+const composition = inject(PUBLIC_WEB_UI_COMPOSITION_KEY, null)
+const workbench = composition
+  ? getPublicWebUiRuntimeState(composition).workbench
+  : null
+const store = workbench?.store ?? useWorkbenchStore()
+const workbenchPanelRegistry = workbench?.registry ?? createWorkbenchPanelRegistry()
 const artifactImageLightbox = useArtifactImageLightbox()
 const nativeSurfaceOccluded = useNativeSurfaceOcclusionState()
 const surfaceBlocked = computed(() => props.modalBlocked || nativeSurfaceOccluded.value)

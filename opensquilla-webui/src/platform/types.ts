@@ -377,6 +377,11 @@ export interface PlatformUpdatesApi {
   onState(callback: (state: DesktopUpdateState) => void): () => void
 }
 
+export interface PlatformLifecycleApi {
+  /** Subscribe to a host-level window hide event. Undefined in browsers. */
+  onWindowHidden?: (callback: () => void) => void | (() => void)
+}
+
 export interface Platform {
   id: PlatformId
   capabilities: PlatformCapabilities
@@ -386,6 +391,14 @@ export interface Platform {
   files: PlatformFilesApi
   workbench: PlatformWorkbenchApi
   updates: PlatformUpdatesApi
+  lifecycle: PlatformLifecycleApi
+  /**
+   * Legacy profile migration operations exposed by the desktop host. The
+   * settings feature owns their domain-specific payload validation; keeping
+   * the object here prevents feature code from reaching into the preload
+   * global directly.
+   */
+  migration: Readonly<Record<string, unknown>>
   /**
    * The host OS locale (BCP-47), used only to seed the initial UI language on
    * first run. Desktop reads it from Electron's app.getLocale(); web returns

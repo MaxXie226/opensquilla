@@ -42,6 +42,7 @@ export type {
   PlatformFilesApi,
   PlatformGatewayApi,
   PlatformId,
+  PlatformLifecycleApi,
   PlatformOnboardingApi,
   PlatformUpdatesApi,
   PlatformSettingsApi,
