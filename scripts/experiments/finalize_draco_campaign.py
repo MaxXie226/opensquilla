@@ -42,8 +42,10 @@ from opensquilla.usage_evidence import (
     usage_units,
 )
 
-GROUPS = ("B0", "B1", "B2", "B4", "G1")
-GROUP_SET = frozenset(GROUPS)
+SUPPORTED_GROUPS = ("B0", "B1", "B2", "B4", "G1")
+# Backwards-compatible public name used by existing callers and fixtures.
+GROUPS = SUPPORTED_GROUPS
+GROUP_SET = frozenset(SUPPORTED_GROUPS)
 RESULT_EVIDENCE_SCHEMA = "opensquilla.draco.result-evidence/v1"
 RESULT_EVIDENCE_SHA256_FIELD = "result_evidence_sha256"
 RUNTIME_SCHEMA = "opensquilla.draco-runtime-environment/v1"
@@ -432,6 +434,7 @@ def validate_formal_manifest_command(
     payload: Mapping[str, Any],
     *,
     path: Path,
+    groups: Sequence[str] = GROUPS,
     expected_task_concurrency: int = FORMAL_TASK_CONCURRENCY,
 ) -> dict[str, int]:
     """Validate scheduling fields intentionally excluded from compatibility."""
@@ -447,7 +450,7 @@ def validate_formal_manifest_command(
     require_formal_fields(
         parsed_args,
         {
-            "groups": ",".join(GROUPS),
+            "groups": ",".join(groups),
             "max_tasks": FROZEN_DRACO_MINI_TASK_COUNT,
             "concurrency": expected_task_concurrency,
             "judge_concurrency": FORMAL_JUDGE_CONCURRENCY,
@@ -485,12 +488,19 @@ def parse_iso(value: Any, *, label: str) -> datetime:
 
 
 def normalize_groups(value: str) -> tuple[str, ...]:
-    groups = tuple(item.strip() for item in value.split(",") if item.strip())
-    if groups != GROUPS:
+    raw_groups = tuple(item.strip() for item in value.split(","))
+    if (
+        not raw_groups
+        or any(not group for group in raw_groups)
+        or len(set(raw_groups)) != len(raw_groups)
+        or any(group not in GROUP_SET for group in raw_groups)
+        or raw_groups != tuple(group for group in SUPPORTED_GROUPS if group in raw_groups)
+    ):
         raise FinalizationError(
-            f"formal finalization requires exactly {','.join(GROUPS)} in that order"
+            "formal finalization groups must be a non-empty, duplicate-free "
+            f"canonical-order subset of {','.join(SUPPORTED_GROUPS)}"
         )
-    return groups
+    return raw_groups
 
 
 def require_regular_file(path: Path, *, owner_only: bool = True) -> Path:
@@ -729,6 +739,7 @@ def load_manifest_contracts(
         execution_scheduling = validate_formal_manifest_command(
             payload,
             path=path,
+            groups=groups,
             expected_task_concurrency=expected_task_concurrency,
         )
         status = str(payload.get("status") or "")
@@ -830,6 +841,7 @@ def load_manifest_contracts(
         manifest_task_ids = payload.get("task_ids")
         if (
             not isinstance(manifest_groups, list)
+            or manifest_groups != list(groups)
             or not isinstance(manifest_task_ids, list)
             or any(
                 str(row.get("group") or "") not in manifest_groups
@@ -934,6 +946,10 @@ def load_manifest_contracts(
         raw_contracts = compatibility.get("contracts")
         if not isinstance(raw_fingerprints, dict) or not isinstance(raw_contracts, dict):
             raise FinalizationError(f"manifest compatibility contract is incomplete: {path}")
+        if set(raw_fingerprints) != set(groups) or set(raw_contracts) != set(groups):
+            raise FinalizationError(
+                f"manifest compatibility scope differs from active groups: {path}"
+            )
         fingerprints: dict[str, str] = {}
         contracts: dict[str, dict[str, Any]] = {}
         for group in groups:
@@ -1002,11 +1018,22 @@ def load_manifest_contracts(
 
 def validate_formal_campaign_contracts(
     contracts: Mapping[str, Mapping[str, Any]],
+    *,
+    groups: Sequence[str] = GROUPS,
 ) -> None:
     """Pin the formal group definitions independently of source manifests."""
 
-    if set(contracts) != GROUP_SET:
-        raise FinalizationError("formal compatibility contracts must cover exactly B0/B1/B2/B4/G1")
+    active_groups = tuple(groups)
+    if (
+        not active_groups
+        or active_groups
+        != tuple(group for group in SUPPORTED_GROUPS if group in active_groups)
+        or set(contracts) != set(active_groups)
+    ):
+        raise FinalizationError(
+            "formal compatibility contracts must cover exactly the active groups "
+            f"{','.join(active_groups)}"
+        )
     expected_timeouts = {
         "task_seconds": FORMAL_TASK_TIMEOUT_SECONDS,
         "proposer_seconds": FORMAL_PROPOSER_TIMEOUT_SECONDS,
@@ -1040,7 +1067,7 @@ def validate_formal_campaign_contracts(
         "max_attempts": FORMAL_JUDGE_MAX_ATTEMPTS,
         "judge_candidates": False,
     }
-    for group in GROUPS:
+    for group in active_groups:
         contract = contracts[group]
         require_formal_fields(
             contract,
@@ -1156,6 +1183,8 @@ def validate_formal_campaign_contracts(
         )
 
     for group, expected_model in (("B0", B0_MODEL), ("B4", B4_MODEL)):
+        if group not in active_groups:
+            continue
         contract = contracts.get(group)
         spec = contract.get("group_spec") if isinstance(contract, Mapping) else None
         if (
@@ -1164,84 +1193,90 @@ def validate_formal_campaign_contracts(
             or spec.get("model") != expected_model
         ):
             raise FinalizationError(f"{group} formal contract must use openrouter/{expected_model}")
-    b1 = contracts.get("B1")
-    b1_spec = b1.get("group_spec") if isinstance(b1, Mapping) else None
-    gateway = b1.get("gateway_execution") if isinstance(b1, Mapping) else None
-    router = gateway.get("squilla_router") if isinstance(gateway, Mapping) else None
-    tiers = router.get("tiers") if isinstance(router, Mapping) else None
-    if not isinstance(b1_spec, Mapping) or b1_spec.get("kind") != "router_single":
-        raise FinalizationError("B1 formal contract must be router_single")
-    if not isinstance(tiers, Mapping) or set(tiers) != set(B1_TIER_MODELS):
-        raise FinalizationError("B1 formal tier set differs from c0/c1/c2/c3/image_model")
-    for tier, expected_model in B1_TIER_MODELS.items():
-        value = tiers.get(tier)
+    if "B1" in active_groups:
+        b1 = contracts.get("B1")
+        b1_spec = b1.get("group_spec") if isinstance(b1, Mapping) else None
+        gateway = b1.get("gateway_execution") if isinstance(b1, Mapping) else None
+        router = gateway.get("squilla_router") if isinstance(gateway, Mapping) else None
+        tiers = router.get("tiers") if isinstance(router, Mapping) else None
+        if not isinstance(b1_spec, Mapping) or b1_spec.get("kind") != "router_single":
+            raise FinalizationError("B1 formal contract must be router_single")
+        if not isinstance(tiers, Mapping) or set(tiers) != set(B1_TIER_MODELS):
+            raise FinalizationError("B1 formal tier set differs from c0/c1/c2/c3/image_model")
+        for tier, expected_model in B1_TIER_MODELS.items():
+            value = tiers.get(tier)
+            if (
+                not isinstance(value, Mapping)
+                or str(value.get("provider") or "").casefold() != "openrouter"
+                or value.get("model") != expected_model
+            ):
+                raise FinalizationError(f"B1 {tier} must use openrouter/{expected_model}")
+    if "B2" in active_groups:
+        b2 = contracts.get("B2")
+        b2_spec = b2.get("group_spec") if isinstance(b2, Mapping) else None
         if (
-            not isinstance(value, Mapping)
-            or str(value.get("provider") or "").casefold() != "openrouter"
-            or value.get("model") != expected_model
+            not isinstance(b2_spec, Mapping)
+            or b2_spec.get("kind") != "selection_mode"
+            or b2_spec.get("selection_mode") != "static_openrouter_b5"
         ):
-            raise FinalizationError(f"B1 {tier} must use openrouter/{expected_model}")
-    b2 = contracts.get("B2")
-    b2_spec = b2.get("group_spec") if isinstance(b2, Mapping) else None
-    if (
-        not isinstance(b2_spec, Mapping)
-        or b2_spec.get("kind") != "selection_mode"
-        or b2_spec.get("selection_mode") != "static_openrouter_b5"
-    ):
-        raise FinalizationError("B2 formal contract must use static_openrouter_b5")
-    g1 = contracts.get("G1")
-    g1_spec = g1.get("group_spec") if isinstance(g1, Mapping) else None
-    registry = g1.get("g1_registry_contract") if isinstance(g1, Mapping) else None
-    routes = registry.get("expected_routes") if isinstance(registry, Mapping) else None
-    candidate_scope = (
-        str(registry.get("candidate_scope") or "exact_routes")
-        if isinstance(registry, Mapping)
-        else ""
-    )
-    candidate_policy = (
-        str(registry.get("policy") or "exact_openrouter_routes")
-        if isinstance(registry, Mapping)
-        else ""
-    )
-    expected_candidate_policy = (
-        "all_registry_models" if candidate_scope == "registry_all" else "exact_openrouter_routes"
-    )
-    registry_all_routes_valid = candidate_scope != "registry_all" or (
-        isinstance(routes, Mapping)
-        and dict(routes) == formal_registry_all_routes()
-        and nonnegative_int(registry.get("expected_candidate_count"))
-        == FORMAL_G1_REGISTRY_ALL_CANDIDATE_COUNT
-    )
-    if (
-        not isinstance(g1_spec, Mapping)
-        or g1_spec.get("kind") != "selection_mode"
-        or g1_spec.get("selection_mode") != "router_dynamic"
-        or candidate_scope not in {"registry_all", "exact_routes"}
-        or candidate_policy != expected_candidate_policy
-        or not isinstance(routes, Mapping)
-        or not routes
-        or (
-            candidate_scope == "exact_routes"
-            and any(str(provider).strip().casefold() == "auto" for provider in routes.values())
+            raise FinalizationError("B2 formal contract must use static_openrouter_b5")
+    routes: Mapping[str, Any] = {}
+    if "G1" in active_groups:
+        g1 = contracts.get("G1")
+        g1_spec = g1.get("group_spec") if isinstance(g1, Mapping) else None
+        registry = g1.get("g1_registry_contract") if isinstance(g1, Mapping) else None
+        routes = registry.get("expected_routes") if isinstance(registry, Mapping) else None
+        candidate_scope = (
+            str(registry.get("candidate_scope") or "exact_routes")
+            if isinstance(registry, Mapping)
+            else ""
         )
-        or not registry_all_routes_valid
-        or nonnegative_int(registry.get("expected_candidate_count")) != len(routes)
-        or not str(registry.get("profile_id") or "").strip()
-        or not str(registry.get("source_registry_snapshot_version") or "").strip()
-        or not HEX64.fullmatch(str(registry.get("expected_routes_sha256") or ""))
-        or canonical_sha256(routes) != str(registry.get("expected_routes_sha256") or "")
-        or registry.get("expected_source_registry_snapshot_sha256")
-        != FORMAL_G1_SOURCE_REGISTRY_SNAPSHOT_SHA256
-        or registry.get("expected_ranking_config_schema_version")
-        != FORMAL_G1_RANKING_CONFIG_SCHEMA_VERSION
-        or registry.get("expected_ranking_config_version") != FORMAL_G1_RANKING_CONFIG_VERSION
-        or registry.get("expected_ranking_config_sha256") != FORMAL_G1_RANKING_CONFIG_SHA256
-        or registry.get("expected_proposer_count_max") != FORMAL_G1_PROPOSER_COUNT_MAX
-        or registry.get("user_profile_enabled") is not False
-    ):
-        raise FinalizationError(
-            "G1 formal contract must use router_dynamic with a resolved frozen candidate pool"
+        candidate_policy = (
+            str(registry.get("policy") or "exact_openrouter_routes")
+            if isinstance(registry, Mapping)
+            else ""
         )
+        expected_candidate_policy = (
+            "all_registry_models"
+            if candidate_scope == "registry_all"
+            else "exact_openrouter_routes"
+        )
+        registry_all_routes_valid = candidate_scope != "registry_all" or (
+            isinstance(routes, Mapping)
+            and dict(routes) == formal_registry_all_routes()
+            and nonnegative_int(registry.get("expected_candidate_count"))
+            == FORMAL_G1_REGISTRY_ALL_CANDIDATE_COUNT
+        )
+        if (
+            not isinstance(g1_spec, Mapping)
+            or g1_spec.get("kind") != "selection_mode"
+            or g1_spec.get("selection_mode") != "router_dynamic"
+            or candidate_scope not in {"registry_all", "exact_routes"}
+            or candidate_policy != expected_candidate_policy
+            or not isinstance(routes, Mapping)
+            or not routes
+            or (
+                candidate_scope == "exact_routes"
+                and any(str(provider).strip().casefold() == "auto" for provider in routes.values())
+            )
+            or not registry_all_routes_valid
+            or nonnegative_int(registry.get("expected_candidate_count")) != len(routes)
+            or not str(registry.get("profile_id") or "").strip()
+            or not str(registry.get("source_registry_snapshot_version") or "").strip()
+            or not HEX64.fullmatch(str(registry.get("expected_routes_sha256") or ""))
+            or canonical_sha256(routes) != str(registry.get("expected_routes_sha256") or "")
+            or registry.get("expected_source_registry_snapshot_sha256")
+            != FORMAL_G1_SOURCE_REGISTRY_SNAPSHOT_SHA256
+            or registry.get("expected_ranking_config_schema_version")
+            != FORMAL_G1_RANKING_CONFIG_SCHEMA_VERSION
+            or registry.get("expected_ranking_config_version") != FORMAL_G1_RANKING_CONFIG_VERSION
+            or registry.get("expected_ranking_config_sha256") != FORMAL_G1_RANKING_CONFIG_SHA256
+            or registry.get("expected_proposer_count_max") != FORMAL_G1_PROPOSER_COUNT_MAX
+            or registry.get("user_profile_enabled") is not False
+        ):
+            raise FinalizationError(
+                "G1 formal contract must use router_dynamic with a resolved frozen candidate pool"
+            )
     for group, contract in contracts.items():
         gateway = contract.get("gateway_execution")
         ensemble = gateway.get("llm_ensemble") if isinstance(gateway, Mapping) else None
@@ -9296,12 +9331,13 @@ def group_metrics(
     rows: Sequence[Mapping[str, Any]],
     *,
     selected_costs_by_pair: Mapping[str, Mapping[str, Any]] | None = None,
+    groups: Sequence[str] = GROUPS,
 ) -> list[dict[str, Any]]:
     grouped: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
     for row in rows:
         grouped[str(row.get("group") or "")].append(row)
     metrics: list[dict[str, Any]] = []
-    for group in GROUPS:
+    for group in groups:
         values = grouped[group]
         qualities = [Decimal(str(row["quality_total"])) for row in values]
         pass_rates = [row_pass_rate(row) for row in values]
@@ -9442,6 +9478,7 @@ def finalize_rows(
     tasks: Sequence[Mapping[str, Any]],
     proof: Mapping[str, Any],
     pair_audit: Mapping[str, Any],
+    groups: Sequence[str] = GROUPS,
 ) -> list[dict[str, Any]]:
     selected_by_key = {record.key: record for record in selected}
     proof_sha = str(proof.get("proof_sha256") or "")
@@ -9449,7 +9486,7 @@ def finalize_rows(
     row_index = 0
     for task in tasks:
         task_id = str(task["id"])
-        for group in GROUPS:
+        for group in groups:
             row_index += 1
             record = selected_by_key[(group, task_id)]
             original = record.row
@@ -9565,6 +9602,7 @@ def paired_quality_comparisons(
     rows: Sequence[Mapping[str, Any]],
     *,
     bootstrap_samples: int = 20_000,
+    groups: Sequence[str] = GROUPS,
 ) -> list[dict[str, Any]]:
     by_group: dict[str, dict[str, Decimal]] = defaultdict(dict)
     for row in rows:
@@ -9572,8 +9610,8 @@ def paired_quality_comparisons(
             str(row.get("quality_total"))
         )
     comparisons: list[dict[str, Any]] = []
-    for group in GROUPS:
-        for baseline in ("B0", "B1"):
+    for group in groups:
+        for baseline in (baseline for baseline in ("B0", "B1") if baseline in groups):
             common = sorted(set(by_group[group]) & set(by_group[baseline]))
             differences = [
                 by_group[group][task_id] - by_group[baseline][task_id] for task_id in common
@@ -9729,6 +9767,7 @@ def repair_action_details(
 def experiment_results_markdown(
     *,
     task_count: int,
+    groups: Sequence[str] = GROUPS,
     final_rows: Sequence[Mapping[str, Any]],
     metrics: Sequence[Mapping[str, Any]],
     ledger_summary: Mapping[str, Any],
@@ -9816,12 +9855,21 @@ def experiment_results_markdown(
         )
         if isinstance(recovery, Mapping):
             retrospective_recoveries.append((row, recovery))
+    active_groups = tuple(groups)
+    group_config_rows = {
+        "B0": f"| B0 | single | `{B0_MODEL}` |",
+        "B1": "| B1 | router_single | frozen `c0/c1/c2/c3` tiers |",
+        "B2": "| B2 | selection_mode | `static_openrouter_b5` |",
+        "B4": f"| B4 | single | `{B4_MODEL}` |",
+        "G1": "| G1 | selection_mode | frozen-registry `router_dynamic` |",
+    }
+    ensemble_groups = [group for group in active_groups if group in {"B2", "G1"}]
     lines = [
-        "# DRACO Mini B0/B1/B2/B4/G1 实验结果",
+        f"# DRACO Mini {'/'.join(active_groups)} 实验结果",
         "",
         "## 实验结论",
         "",
-        f"- 严格完成 {len(final_rows)}/{task_count * len(GROUPS)} 个 "
+        f"- 严格完成 {len(final_rows)}/{task_count * len(active_groups)} 个 "
         "group×task；无缺失、无重复、无失败。",
         "- 质量、成本、Token、工具、Agent Loop、路由、Judge 与修复证据"
         "均由最终 JSONL 和全 campaign 物理请求账本离线重建。",
@@ -9829,8 +9877,9 @@ def experiment_results_markdown(
         "## 实验配置",
         "",
         f"- 任务集：DRACO Mini（{task_count} 题）",
-        "- 实验组：B0、B1、B2、B4、G1",
-        "- 执行：Agent Loop，单任务超时 10800 秒，最多 12 轮；任务并发 5",
+        f"- 实验组：{'、'.join(active_groups)}",
+        f"- 执行：Agent Loop，单任务超时 10800 秒，最多 "
+        f"{FORMAL_AGENT_MAX_ITERATIONS} 轮；任务并发 5",
         "- 生成：temperature=0，max_tokens=16384；每个 `(group, task)` "
         "最多 3 次 generation attempt",
         f"- Judge：`{JUDGE_MODEL}`，3 repeats，Judge 并发 6，单 criterion/repeat 最多 3 次 attempt",
@@ -9842,23 +9891,26 @@ def experiment_results_markdown(
         "必需、response cache 关闭、campaign key 独占",
         "- 结果选择：最后一个严格有效 generation，并采用该 generation 的最新兼容修复行",
         "- 完成标准：Judge 必须 `score_status=complete`、无 Judge error、存在 `quality_total`",
-        "- B2/G1：proposer 至少达到 `ceil(2N/3)`，最终答案必须由 aggregator 请求绑定",
+        *(
+            [
+                f"- {'/'.join(ensemble_groups)}：proposer 至少达到 `ceil(2N/3)`，"
+                "最终答案必须由 aggregator 请求绑定"
+            ]
+            if ensemble_groups
+            else []
+        ),
         "",
         "| Group | Kind | Declared model / selection mode |",
         "|---|---|---|",
-        f"| B0 | single | `{B0_MODEL}` |",
-        "| B1 | router_single | frozen `c0/c1/c2/c3` tiers |",
-        "| B2 | selection_mode | `static_openrouter_b5` |",
-        f"| B4 | single | `{B4_MODEL}` |",
-        "| G1 | selection_mode | frozen-registry `router_dynamic` |",
+        *(group_config_rows[group] for group in active_groups),
         "",
         "## 覆盖与完整性",
         "",
-        f"- 最终结果：{len(final_rows)}/{task_count * len(GROUPS)}",
+        f"- 最终结果：{len(final_rows)}/{task_count * len(active_groups)}",
         "- 每组任务数："
         + "、".join(
             f"{group}={sum(1 for row in final_rows if row.get('group') == group)}"
-            for group in GROUPS
+            for group in active_groups
         ),
         "- 最终 JSONL 无缺失 pair、无重复 pair；每行已重新 seal，trace 由最终行确定性重建。",
         "",
@@ -9941,7 +9993,7 @@ def experiment_results_markdown(
         ): metric
         for metric in rubric_metrics
     }
-    for group in GROUPS:
+    for group in active_groups:
         values = [
             Decimal(str(rubric_by_key[(group, title)]["avg_normalized_score"])).quantize(
                 Decimal("0.01")
@@ -10008,19 +10060,21 @@ def experiment_results_markdown(
     else:
         lines.append("- 无“有效 generation 后仍启动新 attempt”的历史协议偏差。")
     lines.extend(["", "### 同题 Domain 矩阵", ""])
-    lines.append("| Domain | Task | " + " | ".join(GROUPS) + " |")
-    lines.append("|---|---|" + "---:|" * len(GROUPS))
+    lines.append("| Domain | Task | " + " | ".join(active_groups) + " |")
+    lines.append("|---|---|" + "---:|" * len(active_groups))
     by_task_group = {
         (str(row.get("task_id") or ""), str(row.get("group") or "")): row for row in final_rows
     }
     for task_id in sorted({key[0] for key in by_task_group}):
         exemplar = next(
-            by_task_group[(task_id, group)] for group in GROUPS if (task_id, group) in by_task_group
+            by_task_group[(task_id, group)]
+            for group in active_groups
+            if (task_id, group) in by_task_group
         )
         domain = str(exemplar.get("domain") or "Unknown")
         values = [
             Decimal(str(by_task_group[(task_id, group)]["quality_total"])).quantize(Decimal("0.01"))
-            for group in GROUPS
+            for group in active_groups
         ]
         lines.append(
             f"| {domain} | `{task_id[:8]}…` | " + " | ".join(str(value) for value in values) + " |"
@@ -10034,20 +10088,29 @@ def experiment_results_markdown(
             "|---|---|---:|---|---|",
         ]
     )
-    for comparison in comparisons:
-        lines.append(
-            "| {group} | {baseline} | {pairs} | {delta:+.2f} "
-            "[{low:+.2f}, {high:+.2f}] | {wins}/{ties}/{losses} |".format(
-                group=comparison["group"],
-                baseline=comparison["baseline"],
-                pairs=comparison["pair_count"],
-                delta=float(comparison["delta_quality"]),
-                low=float(comparison["ci95_low"]),
-                high=float(comparison["ci95_high"]),
-                wins=comparison["wins"],
-                ties=comparison["ties"],
-                losses=comparison["losses"],
+    if comparisons:
+        for comparison in comparisons:
+            lines.append(
+                "| {group} | {baseline} | {pairs} | {delta:+.2f} "
+                "[{low:+.2f}, {high:+.2f}] | {wins}/{ties}/{losses} |".format(
+                    group=comparison["group"],
+                    baseline=comparison["baseline"],
+                    pairs=comparison["pair_count"],
+                    delta=float(comparison["delta_quality"]),
+                    low=float(comparison["ci95_low"]),
+                    high=float(comparison["ci95_high"]),
+                    wins=comparison["wins"],
+                    ties=comparison["ties"],
+                    losses=comparison["losses"],
+                )
             )
+    else:
+        lines.append("| — | — | 0 | N/A | — |")
+        lines.extend(
+            [
+                "",
+                "- 本次活动组不包含 B0/B1 基线，无法进行同题配对比较。",
+            ]
         )
     lines.extend(
         [
@@ -10279,6 +10342,7 @@ def publish_atomically(
 def final_audit(
     *,
     tasks: Sequence[Mapping[str, Any]],
+    groups: Sequence[str] = GROUPS,
     rows: Sequence[Mapping[str, Any]],
     traces: Sequence[Mapping[str, Any]],
     ledger_summary: Mapping[str, Any],
@@ -10295,7 +10359,7 @@ def final_audit(
     judge_attempt_evidence_audit: Mapping[str, Any],
     max_attempts: int,
 ) -> dict[str, Any]:
-    expected = {(group, str(task["id"])) for task in tasks for group in GROUPS}
+    expected = {(group, str(task["id"])) for task in tasks for group in groups}
     observed = [(str(row.get("group") or ""), str(row.get("task_id") or "")) for row in rows]
     duplicate_count = len(observed) - len(set(observed))
     seal_failures = sum(not verify_result_row_evidence(row) for row in rows)
@@ -10334,7 +10398,7 @@ def final_audit(
         "schema": AUDIT_SCHEMA,
         "pass": passed,
         "created_at": utc_now(),
-        "groups": list(GROUPS),
+        "groups": list(groups),
         "task_count": len(tasks),
         "expected_result_count": len(expected),
         "result_count": len(rows),
@@ -10480,6 +10544,18 @@ def run_finalization(args: argparse.Namespace) -> dict[str, Any]:
     tasks = read_tasks(input_path)
     frozen_input_sha256 = validate_frozen_draco_input(input_path, tasks)
     source_records, source_snapshots = read_source_rows(args.result)
+    unexpected_source_groups = sorted(
+        {
+            record.key[0]
+            for record in source_records
+            if record.key[0] not in set(groups)
+        }
+    )
+    if unexpected_source_groups:
+        raise FinalizationError(
+            "result sources contain groups outside the active finalization scope: "
+            f"{unexpected_source_groups}"
+        )
     validate_source_policy_history(source_records)
     critical_source_snapshots = dict(source_snapshots)
     for raw_path in (
@@ -10515,11 +10591,12 @@ def run_finalization(args: argparse.Namespace) -> dict[str, Any]:
         groups=groups,
         expected_task_concurrency=expected_task_concurrency,
     )
-    validate_formal_campaign_contracts(contracts)
-    validate_g1_paid_attempt_plan_history(
-        source_records,
-        contracts=contracts,
-    )
+    validate_formal_campaign_contracts(contracts, groups=groups)
+    if "G1" in groups:
+        validate_g1_paid_attempt_plan_history(
+            source_records,
+            contracts=contracts,
+        )
     validate_physical_generation_routes(
         source_records,
         contracts=contracts,
@@ -10571,6 +10648,7 @@ def run_finalization(args: argparse.Namespace) -> dict[str, Any]:
         tasks=tasks,
         proof=proof,
         pair_audit=pair_audit,
+        groups=groups,
     )
     traces = [trace_row_from_result(row) for row in final_rows]
     selected_costs, selected_cost_reconciliation = selected_generation_costs_from_ledger(
@@ -10579,12 +10657,14 @@ def run_finalization(args: argparse.Namespace) -> dict[str, Any]:
     metrics = group_metrics(
         final_rows,
         selected_costs_by_pair=selected_costs,
+        groups=groups,
     )
-    comparisons = paired_quality_comparisons(final_rows)
+    comparisons = paired_quality_comparisons(final_rows, groups=groups)
     rubric_metrics = rubric_section_metrics(final_rows)
     repair_details = repair_action_details(final_rows)
     audit = final_audit(
         tasks=tasks,
+        groups=groups,
         rows=final_rows,
         traces=traces,
         ledger_summary=ledger_summary,
@@ -10612,6 +10692,7 @@ def run_finalization(args: argparse.Namespace) -> dict[str, Any]:
     verify_source_snapshots(critical_source_snapshots)
     report = experiment_results_markdown(
         task_count=len(tasks),
+        groups=groups,
         final_rows=final_rows,
         metrics=metrics,
         ledger_summary=ledger_summary,

@@ -4,7 +4,8 @@ set -Eeuo pipefail
 umask 077
 
 readonly EXPECTED_INPUT_SHA256="1eb4e618c8df8e7f68bded3d2b6f77a541744aa1072eb338835b776183188a8d"
-readonly DRACO_GROUPS="B0,B1,B2,B4,G1"
+readonly SUPPORTED_DRACO_GROUPS="B0,B1,B2,B4,G1"
+readonly DEFAULT_DRACO_GROUPS="$SUPPORTED_DRACO_GROUPS"
 readonly BLOCKED_DOMAINS="hf.co,huggingface.co,datasets-server.huggingface.co,github.com,raw.githubusercontent.com,openrouter.ai,perplexity.ai,research.perplexity.ai"
 readonly ACCOUNT_SETTLEMENT_MIN_SECONDS=180
 readonly ACCOUNT_SETTLEMENT_STABLE_POLLS=6
@@ -18,16 +19,59 @@ Usage:
     [--snapshot-repo CLEAN_GIT_SNAPSHOT]
     [--output-name NEW_DIRECTORY_NAME]
     [--prior-account-window-dir ABORTED_CAMPAIGN_ACCOUNT_DIR]
+    [--groups CANONICAL_GROUP_SUBSET]
 
 By default, output is a new direct child of:
   SNAPSHOT_REPO/reports/draco
+The default group set is B0,B1,B2,B4,G1. --groups accepts only a non-empty,
+non-duplicated subset in that canonical order.
 
 Environment overrides:
   DRACO_CAMPAIGN_REPORT_ROOT       Alternate report root
   DRACO_CAMPAIGN_REFERENCE_REPO   Checkout containing data/draco/mini.jsonl
                                   and .local-state/config.toml
+  DRACO_CAMPAIGN_PYTHON           Python executable (default:
+                                  SNAPSHOT_REPO/.venv/bin/python)
   DRACO_CAMPAIGN_TASK_CONCURRENCY Generation task concurrency (default: 5)
 EOF
+}
+
+validate_draco_groups() {
+  local requested="$1"
+  local reconstructed=""
+  local group
+  local group_index=-1
+  local previous_index=-1
+  local -a requested_groups=()
+
+  if [[ -z "$requested" ]]; then
+    echo "--groups must contain at least one experiment group" >&2
+    return 2
+  fi
+  IFS=',' read -r -a requested_groups <<<"$requested"
+  for group in "${requested_groups[@]}"; do
+    case "$group" in
+      B0) group_index=0 ;;
+      B1) group_index=1 ;;
+      B2) group_index=2 ;;
+      B4) group_index=3 ;;
+      G1) group_index=4 ;;
+      *)
+        echo "--groups must be a canonical-order subset of $SUPPORTED_DRACO_GROUPS" >&2
+        return 2
+        ;;
+    esac
+    if (( group_index <= previous_index )); then
+      echo "--groups must be non-duplicated and in canonical order: $SUPPORTED_DRACO_GROUPS" >&2
+      return 2
+    fi
+    previous_index="$group_index"
+    reconstructed+="${reconstructed:+,}$group"
+  done
+  if [[ "$reconstructed" != "$requested" ]]; then
+    echo "--groups must be a canonical-order subset of $SUPPORTED_DRACO_GROUPS" >&2
+    return 2
+  fi
 }
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -38,7 +82,8 @@ if [[ ! "$TASK_CONCURRENCY" =~ ^[1-9][0-9]*$ ]]; then
   exit 2
 fi
 readonly TASK_CONCURRENCY
-OUTPUT_NAME="${DRACO_CAMPAIGN_OUTPUT_NAME:-draco-mini-b0-b1-b2-b4-g1-c${TASK_CONCURRENCY}-j6-a3-$(date +%Y%m%d-%H%M%S)}"
+DRACO_GROUPS="$DEFAULT_DRACO_GROUPS"
+OUTPUT_NAME="${DRACO_CAMPAIGN_OUTPUT_NAME:-}"
 PRIOR_ACCOUNT_WINDOW_SOURCES=()
 if [[ -n "${DRACO_CAMPAIGN_PRIOR_ACCOUNT_WINDOW_DIR:-}" ]]; then
   PRIOR_ACCOUNT_WINDOW_SOURCES+=("$DRACO_CAMPAIGN_PRIOR_ACCOUNT_WINDOW_DIR")
@@ -61,6 +106,11 @@ while [[ "$#" -gt 0 ]]; do
       PRIOR_ACCOUNT_WINDOW_SOURCES+=("$2")
       shift 2
       ;;
+    --groups)
+      [[ "$#" -ge 2 ]] || { usage; exit 2; }
+      DRACO_GROUPS="$2"
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -72,6 +122,15 @@ while [[ "$#" -gt 0 ]]; do
       ;;
   esac
 done
+
+validate_draco_groups "$DRACO_GROUPS" || exit 2
+readonly DRACO_GROUPS
+DRACO_GROUP_SLUG="${DRACO_GROUPS,,}"
+DRACO_GROUP_SLUG="${DRACO_GROUP_SLUG//,/-}"
+readonly DRACO_GROUP_SLUG
+if [[ -z "$OUTPUT_NAME" ]]; then
+  OUTPUT_NAME="draco-mini-${DRACO_GROUP_SLUG}-c${TASK_CONCURRENCY}-j6-a3-$(date +%Y%m%d-%H%M%S)"
+fi
 
 if [[ ! "$OUTPUT_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
   echo "--output-name must be one safe path component" >&2
@@ -90,7 +149,7 @@ OUTPUT_DIR="$REPORT_ROOT/$OUTPUT_NAME"
 ARCHIVE_DIR="$OUTPUT_DIR/archive"
 FINAL_OUTPUT_DIR="$OUTPUT_DIR/.formal-results"
 EXPERIMENT_CONFIG="$SNAPSHOT_REPO/configs/benchmarks/draco_b2_g12.json"
-PYTHON="$SNAPSHOT_REPO/.venv/bin/python"
+PYTHON="${DRACO_CAMPAIGN_PYTHON:-$SNAPSHOT_REPO/.venv/bin/python}"
 MAIN_RUNNER="$SNAPSHOT_REPO/scripts/run_draco_routing_experiment.py"
 RESUME_RUNNER="$SNAPSHOT_REPO/scripts/run_draco_routing_experiment_resume.py"
 FINALIZER="$SNAPSHOT_REPO/scripts/experiments/finalize_draco_campaign.py"
@@ -119,6 +178,11 @@ for required_path in \
     exit 2
   fi
 done
+
+if [[ ! -f "$PYTHON" || ! -x "$PYTHON" ]]; then
+  echo "Campaign Python must be an executable file: $PYTHON" >&2
+  exit 2
+fi
 
 if [[ "$(git -C "$SNAPSHOT_REPO" rev-parse --show-toplevel)" != "$SNAPSHOT_REPO" ]]; then
   echo "--snapshot-repo must be the root of a Git worktree" >&2
@@ -914,6 +978,7 @@ write_actionable_keys() {
     "$COMPATIBILITY_MANIFEST" \
     "$output" \
     "$summary" \
+    "$DRACO_GROUPS" \
     "$@" <<'PY'
 from __future__ import annotations
 
@@ -929,7 +994,8 @@ input_path = Path(sys.argv[3])
 manifest_path = Path(sys.argv[4])
 output_path = Path(sys.argv[5])
 summary_path = Path(sys.argv[6])
-result_paths = [Path(value) for value in sys.argv[7:]]
+groups_raw = sys.argv[7]
+result_paths = [Path(value) for value in sys.argv[8:]]
 
 spec = importlib.util.spec_from_file_location("draco_campaign_resume_gate", runner_path)
 if spec is None or spec.loader is None:
@@ -948,7 +1014,15 @@ finalizer = importlib.util.module_from_spec(finalizer_spec)
 sys.modules[finalizer_spec.name] = finalizer
 finalizer_spec.loader.exec_module(finalizer)
 
-groups = ("B0", "B1", "B2", "B4", "G1")
+supported_groups = ("B0", "B1", "B2", "B4", "G1")
+groups = tuple(groups_raw.split(","))
+if (
+    not groups
+    or any(group not in supported_groups for group in groups)
+    or len(set(groups)) != len(groups)
+    or tuple(group for group in supported_groups if group in groups) != groups
+):
+    raise SystemExit("unsafe or non-canonical campaign group selection")
 tasks = module.load_tasks(input_path, max_tasks=0)
 selected = {(group, str(task["id"])) for task in tasks for group in groups}
 prompt_hashes = {
@@ -1043,6 +1117,8 @@ os.replace(temporary, output_path)
 
 summary_payload = {
     "schema": "opensquilla.draco-campaign-wave-gate/v1",
+    "groups": list(groups),
+    "selected_pair_count": len(selected),
     "actionable_pair_count": len(actionable),
     "campaign_proof_only_pair_count": len(campaign_proof_only),
     "generation_budget_exhausted_pair_count": len(budget_exhausted),

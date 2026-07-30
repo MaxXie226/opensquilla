@@ -4125,6 +4125,50 @@ def _campaign(
     return args, rows, lock_fd
 
 
+def _g1_only_campaign(
+    module,
+    tmp_path: Path,
+) -> tuple[argparse.Namespace, list[dict[str, object]], int]:
+    args, rows, lock_fd = _campaign(module, tmp_path)
+    active_groups = ("G1",)
+    for result_path in args.result:
+        source_rows = [
+            row
+            for row in (
+                json.loads(line) for line in result_path.read_text().splitlines()
+            )
+            if row["group"] == "G1"
+        ]
+        result_path.write_text("".join(json.dumps(row) + "\n" for row in source_rows))
+        result_path.chmod(0o600)
+    for manifest_path in args.manifest:
+        manifest = json.loads(manifest_path.read_text())
+        manifest["groups"] = list(active_groups)
+        manifest["rows_written"] = 1
+        manifest["command"]["parsed_args"]["groups"] = "G1"
+        compatibility = manifest["run_compatibility"]
+        compatibility["fingerprints"] = {
+            "G1": compatibility["fingerprints"]["G1"],
+        }
+        compatibility["contracts"] = {
+            "G1": compatibility["contracts"]["G1"],
+        }
+        _owner_json(manifest_path, manifest)
+
+    usage_after = "10.8"
+    after = json.loads(args.account_after.read_text())
+    after["usage"] = usage_after
+    _owner_json(args.account_after, after)
+    reconciliation = json.loads(args.account_reconciliation.read_text())
+    reconciliation["usage_after_usd"] = usage_after
+    reconciliation["usage_delta_usd"] = "0.8"
+    for observation in reconciliation["stable_observations"]:
+        observation["usage"] = usage_after
+    _owner_json(args.account_reconciliation, reconciliation)
+    args.groups = "G1"
+    return args, [row for row in rows if row["group"] == "G1"], lock_fd
+
+
 def _prior_account_window(
     module,
     args: argparse.Namespace,
@@ -4516,7 +4560,7 @@ def test_full_offline_finalization_is_atomic_and_preserves_contracts(
     assert audit["selected_generation_cost_reconciliation"]["pair_count"] == 5
     report = (output / "EXPERIMENT_RESULTS.md").read_text()
     assert "Brave" in report
-    assert "单任务超时 10800 秒，最多 12 轮；任务并发 5" in report
+    assert "单任务超时 10800 秒，最多 20 轮；任务并发 5" in report
     assert "temperature=0，max_tokens=16384" in report
     assert "`google/gemini-3.1-pro-preview`，3 repeats，Judge 并发 6" in report
     assert "最多 3 次 attempt" in report
@@ -4532,6 +4576,135 @@ def test_full_offline_finalization_is_atomic_and_preserves_contracts(
     assert [window["kind"] for window in proof["account_windows"]] == ["current"]
     assert proof["account_window_total_usd"] == "3.6"
     assert proof["unallocated_aborted_window_usd"] == "0"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("B0,B1,B2,B4,G1", ("B0", "B1", "B2", "B4", "G1")),
+        ("G1", ("G1",)),
+        ("B0,B2,G1", ("B0", "B2", "G1")),
+    ],
+)
+def test_normalize_groups_accepts_canonical_nonempty_subsets(
+    module,
+    raw: str,
+    expected: tuple[str, ...],
+) -> None:
+    assert module.normalize_groups(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "",
+        ",",
+        "G1,G1",
+        "G1,B0",
+        "B0,G2",
+        "B0,,G1",
+        " B0, G1,",
+    ],
+)
+def test_normalize_groups_rejects_invalid_subsets(module, raw: str) -> None:
+    with pytest.raises(module.FinalizationError, match="canonical-order subset"):
+        module.normalize_groups(raw)
+
+
+def test_g1_only_finalization_scopes_all_formal_outputs(
+    module,
+    tmp_path: Path,
+) -> None:
+    args, _, lock_fd = _g1_only_campaign(module, tmp_path)
+    try:
+        manifest = module.run_finalization(args)
+    finally:
+        os.close(lock_fd)
+
+    output = args.output_dir
+    rows = [json.loads(line) for line in (output / "results.jsonl").read_text().splitlines()]
+    ledger = [
+        json.loads(line)
+        for line in (output / "actual-spend-ledger.jsonl").read_text().splitlines()
+    ]
+    audit = json.loads((output / "audit.json").read_text())
+    proof = json.loads((output / "openrouter-non-byok-campaign-proof.json").read_text())
+    report = (output / "EXPERIMENT_RESULTS.md").read_text()
+
+    assert manifest["groups"] == ["G1"]
+    assert manifest["result_count"] == 1
+    assert set(manifest["run_compatibility_fingerprints"]) == {"G1"}
+    assert [metric["group"] for metric in manifest["group_metrics"]] == ["G1"]
+    assert manifest["paired_quality_comparisons"] == []
+    assert manifest["openrouter_non_byok_campaign_proof_sha256"] == proof["proof_sha256"]
+    assert [row["group"] for row in rows] == ["G1"]
+    assert len(ledger) == 8
+    assert {
+        reference["group"]
+        for ledger_row in ledger
+        for reference in ledger_row["source_references"]
+    } == {"G1"}
+    assert audit["pass"] is True
+    assert audit["groups"] == ["G1"]
+    assert audit["expected_result_count"] == 1
+    assert audit["result_count"] == 1
+    assert set(audit["pair_selection"]) == {"G1/task-1"}
+    assert [metric["group"] for metric in audit["selected_generation_cost"]["groups"]] == ["G1"]
+    assert audit["paired_quality_comparisons"] == []
+    assert proof["pass"] is True
+    assert proof["account"]["campaign_byok_usage_delta_usd"] == "0"
+    assert proof["cost_scope"]["ledger_window_reconciliation"] == [
+        {
+            "account_window_path": str(tmp_path.resolve()),
+            "account_window_kind": "current",
+            "source_indexes": [0, 1],
+            "physical_request_count": 8,
+            "ledger_recorded_cost_usd": "0.800000000",
+            "ledger_exact_cost_usd": "0.800000000",
+            "unknown_cost_request_count": 0,
+            "non_exact_cost_request_count": 0,
+            "account_usage_delta_usd": "0.8",
+            "reconciliation_gap_usd": "0E-9",
+            "reconciliation_status": "exact",
+        }
+    ]
+    assert "# DRACO Mini G1 实验结果" in report
+    assert "- 实验组：G1" in report
+    assert "- 严格完成 1/1 个 group×task" in report
+    assert "| G1 | selection_mode | frozen-registry `router_dynamic` |" in report
+    assert "| B0 | single |" not in report
+    assert "本次活动组不包含 B0/B1 基线，无法进行同题配对比较" in report
+
+
+@pytest.mark.parametrize("tamper", ["manifest_groups", "contract_scope"])
+def test_g1_only_manifest_rejects_extra_group_scope(
+    module,
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    args, _, lock_fd = _g1_only_campaign(module, tmp_path)
+    manifest = json.loads(args.manifest[0].read_text())
+    if tamper == "manifest_groups":
+        manifest["groups"] = ["B0", "G1"]
+        error_pattern = "groups/task_ids do not cover"
+    else:
+        b0_contract = _contract(module, "B0", "a" * 64)
+        compatibility = manifest["run_compatibility"]
+        compatibility["contracts"]["B0"] = b0_contract
+        compatibility["fingerprints"]["B0"] = module.canonical_sha256(
+            b0_contract,
+            prefix=True,
+        )
+        error_pattern = "compatibility scope differs from active groups"
+    _owner_json(args.manifest[0], manifest)
+    try:
+        with pytest.raises(
+            module.FinalizationError,
+            match=error_pattern,
+        ):
+            module.run_finalization(args)
+    finally:
+        os.close(lock_fd)
 
 
 def test_metadata_only_wave_may_replay_identical_judge_snapshot_declarations(

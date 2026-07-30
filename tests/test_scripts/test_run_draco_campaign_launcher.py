@@ -257,7 +257,9 @@ def test_reconciliation_rejects_short_or_mismatched_settlement(
 def test_campaign_shape_and_runtime_policy_are_frozen() -> None:
     script = _script()
     required_fragments = (
-        'readonly DRACO_GROUPS="B0,B1,B2,B4,G1"',
+        'readonly SUPPORTED_DRACO_GROUPS="B0,B1,B2,B4,G1"',
+        'readonly DEFAULT_DRACO_GROUPS="$SUPPORTED_DRACO_GROUPS"',
+        'DRACO_GROUPS="$DEFAULT_DRACO_GROUPS"',
         '--groups "$DRACO_GROUPS"',
         "--max-tasks 10",
         '--concurrency "$TASK_CONCURRENCY"',
@@ -291,15 +293,178 @@ def test_campaign_shape_and_runtime_policy_are_frozen() -> None:
     # Static compatibility, wave 1, and resume waves must fingerprint the
     # same strict non-BYOK policy.
     assert script.count("--require-openrouter-non-byok") == 3
-    frozen_groups = re.search(
-        r'readonly DRACO_GROUPS="([^"]+)"',
+    supported_groups = re.search(
+        r'readonly SUPPORTED_DRACO_GROUPS="([^"]+)"',
         script,
     )
-    assert frozen_groups is not None
-    assert "B3" not in frozen_groups.group(1).split(",")
+    assert supported_groups is not None
+    assert supported_groups.group(1).split(",") == ["B0", "B1", "B2", "B4", "G1"]
     # GROUPS is a Bash special readonly array containing the process group IDs.
     # Reusing it silently turns --groups into values such as "1000".
     assert "readonly GROUPS=" not in script
+
+
+def test_campaign_groups_are_a_strict_canonical_nonempty_subset() -> None:
+    validator = _bash_function("validate_draco_groups")
+    harness = (
+        "set -Eeuo pipefail\n"
+        'readonly SUPPORTED_DRACO_GROUPS="B0,B1,B2,B4,G1"\n'
+        + validator
+        + """
+for accepted in B0 B1 B2 B4 G1 B0,B2,G1 B0,B1,B2,B4,G1; do
+  validate_draco_groups "$accepted"
+done
+for rejected in '' B3 G1,B0 B0,B0 B0,,G1 B0,G1, 'B0, G1'; do
+  if validate_draco_groups "$rejected" >/dev/null 2>&1; then
+    exit 3
+  fi
+done
+"""
+    )
+    completed = subprocess.run(
+        ["bash", "-c", harness],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_group_subset_drives_default_slug_runner_gate_and_finalizer() -> None:
+    script = _script()
+    assert "[--groups CANONICAL_GROUP_SUBSET]" in script
+    assert 'DRACO_GROUP_SLUG="${DRACO_GROUPS,,}"' in script
+    assert 'DRACO_GROUP_SLUG="${DRACO_GROUP_SLUG//,/-}"' in script
+    assert (
+        'OUTPUT_NAME="draco-mini-${DRACO_GROUP_SLUG}-c${TASK_CONCURRENCY}'
+        '-j6-a3-$(date +%Y%m%d-%H%M%S)"'
+    ) in script
+    assert '--groups "$DRACO_GROUPS"' in script
+    assert script.count('--groups "$DRACO_GROUPS"') == 2
+    assert (
+        '"$summary" \\\n'
+        '    "$DRACO_GROUPS" \\\n'
+        '    "$@" <<\'PY\''
+    ) in script
+    assert "groups_raw = sys.argv[7]" in script
+    assert "result_paths = [Path(value) for value in sys.argv[8:]]" in script
+    assert re.search(r'(?m)^groups = \("B0", "B1", "B2", "B4", "G1"\)$', script) is None
+    assert '"groups": list(groups)' in script
+    assert '"selected_pair_count": len(selected)' in script
+
+
+def test_g1_only_selects_ten_resume_gate_pairs() -> None:
+    script = _script()
+    assert "tasks = module.load_tasks(input_path, max_tasks=0)" in script
+    assert (
+        'selected = {(group, str(task["id"])) for task in tasks for group in groups}'
+        in script
+    )
+    # The frozen input preflight proves exactly ten unique tasks. With the gate
+    # consuming the validated one-element ("G1",) subset, the target is 10.
+    assert "length == 10" in script
+    assert "unique | length == 10" in script
+    groups = ("G1",)
+    task_ids = tuple(f"task-{index}" for index in range(10))
+    selected = {(group, task_id) for task_id in task_ids for group in groups}
+    assert len(selected) == 10
+
+
+def test_g1_only_resume_gate_emits_exactly_ten_actionable_pairs(
+    tmp_path: Path,
+) -> None:
+    gate_block = _embedded_python_blocks()[3]
+    runner_path = tmp_path / "resume_runner.py"
+    finalizer_path = tmp_path / "finalizer.py"
+    input_path = tmp_path / "mini.jsonl"
+    manifest_path = tmp_path / "manifest.json"
+    output_path = tmp_path / "actionable.jsonl"
+    summary_path = tmp_path / "summary.json"
+
+    runner_path.write_text(
+        """
+import hashlib
+import json
+
+def load_tasks(path, *, max_tasks):
+    assert max_tasks == 0
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+def text_sha256(value):
+    return hashlib.sha256(value.encode()).hexdigest()
+
+def canonical_json_sha256(value):
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True).encode()
+    ).hexdigest()
+
+def load_resume_group_task_states(*, selected_keys, **kwargs):
+    assert len(selected_keys) == 10
+    assert {group for group, _ in selected_keys} == {"G1"}
+    return {}, {"selected_pair_count": len(selected_keys)}
+
+def coerce_metric_int(value):
+    return int(value or 0)
+""".lstrip(),
+        encoding="utf-8",
+    )
+    finalizer_path.write_text(
+        "def proof_only_usage_evidence_reasons(row):\n    return []\n",
+        encoding="utf-8",
+    )
+    input_path.write_text(
+        "".join(
+            json.dumps({"id": f"task-{index}", "prompt": f"prompt-{index}"}) + "\n"
+            for index in range(10)
+        ),
+        encoding="utf-8",
+    )
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "run_compatibility": {
+                    "fingerprints": {"fixture": "fingerprint"},
+                    "contracts": {"fixture": "contract"},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            gate_block,
+            str(runner_path),
+            str(finalizer_path),
+            str(input_path),
+            str(manifest_path),
+            str(output_path),
+            str(summary_path),
+            "G1",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    actionable = [
+        json.loads(line)
+        for line in output_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(actionable) == 10
+    assert {row["group"] for row in actionable} == {"G1"}
+    assert {row["action"] for row in actionable} == {"regenerate"}
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary["groups"] == ["G1"]
+    assert summary["selected_pair_count"] == 10
+    assert summary["actionable_pair_count"] == 10
 
 
 def test_exact_input_and_new_main_repo_report_child_are_enforced() -> None:
@@ -318,6 +483,7 @@ def test_exact_input_and_new_main_repo_report_child_are_enforced() -> None:
     assert '[[ ! "$TASK_CONCURRENCY" =~ ^[1-9][0-9]*$ ]]' in script
     assert "DRACO_CAMPAIGN_TASK_CONCURRENCY must be a positive integer" in script
     assert "c${TASK_CONCURRENCY}-j6-a3-" in script
+    assert "draco-mini-${DRACO_GROUP_SLUG}-c${TASK_CONCURRENCY}-j6-a3-" in script
     assert (
         'readonly EXPECTED_INPUT_SHA256="'
         "1eb4e618c8df8e7f68bded3d2b6f77a541744aa1072eb338835b776183188a8d"
@@ -340,6 +506,19 @@ def test_snapshot_is_parameterized_and_must_be_clean() -> None:
     assert 'git -C "$SNAPSHOT_REPO" status --porcelain=v1 --untracked-files=all' in script
     assert "Formal campaign requires a completely clean source snapshot" in script
     assert script.count("--require-clean-source") == 3
+
+
+def test_campaign_python_can_reuse_an_external_executable() -> None:
+    script = _script()
+    assert (
+        'PYTHON="${DRACO_CAMPAIGN_PYTHON:-$SNAPSHOT_REPO/.venv/bin/python}"'
+        in script
+    )
+    assert '[[ ! -f "$PYTHON" || ! -x "$PYTHON" ]]' in script
+    assert "Campaign Python must be an executable file" in script
+    python_check = script.index('if [[ ! -f "$PYTHON" || ! -x "$PYTHON" ]]')
+    first_python_execution = script.index('"$PYTHON" - "$LOCK_FILE"')
+    assert python_check < first_python_execution
 
 
 def test_secrets_are_loaded_from_safe_files_and_never_embedded() -> None:
