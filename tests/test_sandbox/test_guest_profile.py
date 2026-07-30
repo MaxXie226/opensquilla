@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from opensquilla.sandbox.guest_profile import GuestProfileFactory
+from opensquilla.sandbox.guest_profile import (
+    GuestProfileFactory,
+    cleanup_guest_profile_root,
+)
 from opensquilla.sandbox.run_mode import RunMode
 
 
@@ -53,3 +56,11 @@ def test_guest_cleanup_removes_entire_task_root(tmp_path: Path) -> None:
     profile.cleanup()
 
     assert not root.exists()
+
+
+def test_guest_cleanup_rejects_non_guest_directory(tmp_path: Path) -> None:
+    ordinary = tmp_path / "ordinary"
+    ordinary.mkdir()
+
+    assert cleanup_guest_profile_root(ordinary) is False
+    assert ordinary.exists()

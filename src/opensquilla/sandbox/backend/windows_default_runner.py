@@ -216,8 +216,15 @@ def _parse_payload(args: Sequence[str]) -> HelperPayload:
         raise SystemExit("invalid windows_default payload: policy is required")
 
     run_mode = raw.get("runMode")
-    if run_mode not in {"standard", "trusted"}:
-        raise SystemExit("invalid windows_default payload: runMode must be standard or trusted")
+    from opensquilla.sandbox.run_mode import RunMode, normalize_run_mode
+
+    try:
+        normalized_run_mode = normalize_run_mode(run_mode)
+    except ValueError as exc:
+        raise SystemExit("invalid windows_default payload: runMode must be safe") from exc
+    if normalized_run_mode is not RunMode.SAFE:
+        raise SystemExit("invalid windows_default payload: runMode must be safe")
+    run_mode = normalized_run_mode.value
 
     timeout = raw.get("timeout")
     if not isinstance(timeout, int | float) or timeout <= 0:

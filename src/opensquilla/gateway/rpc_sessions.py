@@ -83,6 +83,7 @@ from opensquilla.provider.types import (
     derive_provider_request_correlation,
 )
 from opensquilla.sandbox.guest_profile import GuestProfileFactory
+from opensquilla.sandbox.mode_resolver import ModeResolutionError, ResolvedMode, resolve_mode
 from opensquilla.sandbox.run_context import (
     RUN_CONTEXT_ORIGIN_KEY,
     RunContext,
@@ -99,6 +100,7 @@ from opensquilla.sandbox.run_mode_policy import (
     principal_has_host_execute,
     run_mode_allowed_for_principal,
 )
+from opensquilla.sandbox.setup_runtime import current_sandbox_capability_report
 from opensquilla.session.compaction import (
     arm_compaction_deadline,
     await_compaction_phase,
@@ -2670,8 +2672,23 @@ async def _handle_sessions_send(
     workspace_dir = configured_workspace_dir
     turn_id = uuid.uuid4().hex
     run_mode_hint = _trusted_run_mode_hint(ctx, source_hint)
-    guest_profile = _guest_profile_for_principal(ctx.principal, turn_id)
-    if guest_profile is not None:
+    guest_profile = None
+    guest_safe = bool(
+        getattr(ctx.principal, "has", lambda _capability: False)("guest.safe")
+        and not principal_has_host_execute(ctx.principal)
+    )
+    capability_report = None
+    if guest_safe:
+        capability_report = await current_sandbox_capability_report(ctx.config)
+        try:
+            resolve_mode(RunMode.SAFE, ctx.principal, capability_report)
+        except ModeResolutionError as exc:
+            raise RpcHandlerError(
+                "SANDBOX_UNAVAILABLE",
+                "Safe mode is unavailable for this unauthenticated request.",
+                details={"reason": exc.code, **capability_report.to_payload()},
+            ) from exc
+        guest_profile = _guest_profile_for_principal(ctx.principal, turn_id)
         run_context = guest_profile.run_context()
         authoritative_guard = None
     else:
@@ -2715,6 +2732,36 @@ async def _handle_sessions_send(
                     key,
                     origin=accepted_run_mode_origin,
                 )
+    if run_context.run_mode is RunMode.FULL:
+        mode_resolution = ResolvedMode(
+            desired_mode=RunMode.FULL,
+            effective_mode=RunMode.FULL,
+        )
+    else:
+        if capability_report is None:
+            capability_report = await current_sandbox_capability_report(ctx.config)
+        try:
+            mode_resolution = resolve_mode(
+                run_context.run_mode,
+                ctx.principal,
+                capability_report,
+            )
+        except ModeResolutionError as exc:
+            raise RpcHandlerError(
+                "SANDBOX_MODE_UNAVAILABLE",
+                "The requested execution mode is unavailable.",
+                details={"reason": exc.code, **capability_report.to_payload()},
+            ) from exc
+    if mode_resolution.effective_mode is not run_context.run_mode:
+        accepted_run_mode_override = AcceptedRunModeOverride(
+            run_mode=mode_resolution.effective_mode,
+            run_mode_source=run_context.run_mode_source,
+            source="capability_fallback",
+        )
+        run_context = apply_accepted_run_mode_override(
+            run_context,
+            accepted_run_mode_override,
+        )
     workspace_dir = run_context.workspace or workspace_dir
     if source_hint.get("caller_kind") == "cli" or source_hint.get("channel_kind") == "cli":
         route_envelope = build_cli_route_envelope(
@@ -2744,8 +2791,10 @@ async def _handle_sessions_send(
         run_context,
         principal_is_owner=ctx.principal.is_owner,
     )
+    route_envelope.metadata["sandbox_mode_resolution"] = mode_resolution.to_payload()
     if guest_profile is not None:
         route_envelope.metadata["guest_safe"] = True
+        route_envelope.metadata["guest_profile_root"] = str(guest_profile.root)
         route_envelope.metadata["guest_environment"] = dict(
             guest_profile.environment
         )
@@ -2825,6 +2874,7 @@ async def _handle_sessions_send(
         "intent": "send",
         "disposition": "queued" if getattr(ctx, "task_runtime", None) is not None else "applied",
         "revision": 1,
+        "sandbox_mode_resolution": mode_resolution.to_payload(),
     }
     fresh_user_session = False
     user_message_id: str | None = None

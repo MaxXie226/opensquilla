@@ -241,7 +241,7 @@ def configure_runtime(
             backend = UnavailableBackend(str(exc))
             log.warning(
                 "sandbox.backend_unavailable: backend=auto reason=%s; "
-                "Managed Execution will request an exact reviewed host retry; "
+                "Safe mode will request an exact reviewed host retry; "
                 "Standard mode remains fail closed",
                 exc,
             )
@@ -873,7 +873,7 @@ async def gate_action(
         )
     )
     if managed_execution and policy.require_approval:
-        # Managed Execution reviews only an exact host escape. Waiting on the
+        # Safe mode reviews only an exact host escape. Waiting on the
         # legacy policy approval gate here can block a sandboxed tool for five
         # minutes before it ever reaches the deterministic elevation rules.
         policy = dataclasses.replace(policy, require_approval=False)

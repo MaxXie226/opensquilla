@@ -1228,6 +1228,13 @@ class TaskRuntime:
                     reservation.overflow_victim.task_id
                 )
             reservation.aborted = True
+        guest_profile_root = reservation.runtime_task.envelope.metadata.get(
+            "guest_profile_root"
+        )
+        if isinstance(guest_profile_root, str) and guest_profile_root:
+            from opensquilla.sandbox.guest_profile import cleanup_guest_profile_root
+
+            cleanup_guest_profile_root(guest_profile_root)
 
     async def _emit_queued_activation(
         self,
@@ -2648,6 +2655,11 @@ class TaskRuntime:
         finally:
             self._user_input_broker.cancel_task(task.task_id)
             await self._settle_attached_plan_run(task)
+            guest_profile_root = task.envelope.metadata.get("guest_profile_root")
+            if isinstance(guest_profile_root, str) and guest_profile_root:
+                from opensquilla.sandbox.guest_profile import cleanup_guest_profile_root
+
+                cleanup_guest_profile_root(guest_profile_root)
 
     async def _freeze_collaboration_context(self, task: _RuntimeTask) -> None:
         """Snapshot session collaboration state at the actual turn boundary.

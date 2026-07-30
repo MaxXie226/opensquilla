@@ -92,7 +92,7 @@ _WINDOWS_DOS_DEVICE_NAMES = frozenset(
 
 
 class WindowsDefaultBackend(Backend):
-    """Windows backend used by Standard-Sandbox and Managed Execution."""
+    """Windows backend used by Safe mode."""
 
     name = "windows_default"
 

@@ -19031,11 +19031,18 @@ class Agent:
             run_context_mode = getattr(parent_run_context, "run_mode", None)
             parent_run_mode = getattr(run_context_mode, "value", run_context_mode)
         parent_elevated = getattr(parent_ctx, "elevated", None)
-        if parent_run_mode not in {"standard", "trusted", "full"}:
+        if parent_run_mode is not None:
+            from opensquilla.sandbox.run_mode import normalize_run_mode
+
+            try:
+                parent_run_mode = normalize_run_mode(parent_run_mode).value
+            except ValueError:
+                parent_run_mode = None
+        if parent_run_mode is None:
             if parent_elevated == "full":
                 parent_run_mode = "full"
             elif parent_elevated in {"on", "bypass"}:
-                parent_run_mode = "trusted"
+                parent_run_mode = "safe"
             else:
                 parent_run_mode = None
 

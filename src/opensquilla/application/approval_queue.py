@@ -19,7 +19,7 @@ from opensquilla.paths import state_dir
 
 VALID_APPROVAL_MODES = frozenset({"auto-approve", "auto-deny", "prompt"})
 VALID_ELEVATED_MODES = frozenset({"on", "bypass", "full"})
-VALID_RUN_MODES = frozenset({"standard", "trusted", "full"})
+VALID_RUN_MODES = frozenset({"safe", "full"})
 
 
 def _native_db_path(path: str | Path) -> str:
@@ -981,7 +981,7 @@ class ApprovalQueue:
             return
         if mode not in VALID_ELEVATED_MODES:
             raise ValueError("mode must be one of: on, bypass, full, off")
-        self.set_run_mode(key, "full" if mode == "full" else "trusted")
+        self.set_run_mode(key, "full" if mode == "full" else "safe")
 
     def get_elevated_mode(self, session_key: str | None) -> str | None:
         """Legacy compatibility wrapper returning only full host access."""
@@ -995,9 +995,13 @@ class ApprovalQueue:
         if mode in (None, "", "off"):
             self._session_run_modes.pop(key, None)
             return
-        if mode not in VALID_RUN_MODES:
-            raise ValueError("mode must be one of: full, standard, trusted, off")
-        self._session_run_modes[key] = mode
+        from opensquilla.sandbox.run_mode import normalize_run_mode
+
+        try:
+            normalized = normalize_run_mode(mode).value
+        except ValueError as exc:
+            raise ValueError("mode must be one of: safe, full, off") from exc
+        self._session_run_modes[key] = normalized
 
     def get_run_mode(self, session_key: str | None) -> str | None:
         key = (session_key or "").strip()

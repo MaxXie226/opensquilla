@@ -50,7 +50,7 @@ class GuestProfile:
     def cleanup(self) -> None:
         if self.cleaned:
             return
-        shutil.rmtree(self.root, ignore_errors=True)
+        cleanup_guest_profile_root(self.root)
         self.cleaned = True
 
 
@@ -130,7 +130,27 @@ class GuestProfileFactory:
         )
 
 
+def cleanup_guest_profile_root(value: str | Path) -> bool:
+    """Remove only a factory-shaped guest root below the system temp directory."""
+
+    root = Path(value).expanduser().absolute()
+    temp_root = Path(tempfile.gettempdir()).expanduser().resolve(strict=False)
+    canonical_root = root.resolve(strict=False)
+    try:
+        canonical_root.relative_to(temp_root)
+    except ValueError:
+        return False
+    if (
+        not root.name.startswith("opensquilla-guest-")
+        or canonical_root.name != root.name
+    ):
+        return False
+    shutil.rmtree(root, ignore_errors=True)
+    return not root.exists()
+
+
 __all__ = [
+    "cleanup_guest_profile_root",
     "GuestMount",
     "GuestProfile",
     "GuestProfileFactory",

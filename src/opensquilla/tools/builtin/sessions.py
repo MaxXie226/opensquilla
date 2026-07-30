@@ -936,7 +936,9 @@ async def session_status() -> str:
             "runtime_ms": getattr(current, "runtime_ms", 0),
         }
         if ctx is not None:
-            run_mode = getattr(ctx, "run_mode", "trusted")
+            from opensquilla.sandbox.run_mode import normalize_run_mode
+
+            run_mode = normalize_run_mode(getattr(ctx, "run_mode", None)).value
             data["run_mode"] = run_mode
             data["sandbox_enabled"] = run_mode != "full"
         return json.dumps(data)
@@ -947,10 +949,11 @@ async def session_status() -> str:
 
 
 def _run_mode_label(run_mode: str | None) -> str | None:
-    if run_mode == "full":
-        return "Full Host Access"
-    if run_mode == "trusted":
-        return "Managed Execution"
-    if run_mode == "standard":
-        return "Standard"
-    return None
+    if run_mode is None:
+        return None
+    from opensquilla.sandbox.run_mode import display_name
+
+    try:
+        return display_name(run_mode)
+    except ValueError:
+        return None

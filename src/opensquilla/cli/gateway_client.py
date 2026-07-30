@@ -1105,7 +1105,7 @@ class GatewayClient:
         """Send message and yield session events until done.
 
         ``elevated`` is a legacy surface kept for older clients. ``off``
-        clears the override, ``on``/``bypass`` map to Managed Execution, and
+        clears the override, ``on``/``bypass`` map to Safe mode, and
         ``full`` maps to Full Host Access.
         """
         # Register the local queue before send. Replay/live frames are broadcast

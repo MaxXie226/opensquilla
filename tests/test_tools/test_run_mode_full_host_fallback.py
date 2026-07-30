@@ -64,7 +64,7 @@ def bypass_context(tmp_path: Path):
 def test_disabled_sandbox_grants_full_host_by_default(
     disabled_sandbox_runtime, bypass_context
 ):
-    assert current_run_mode() == "trusted"
+    assert current_run_mode() == "safe"
     assert full_host_access_active() is True
     assert full_host_access_for_context(bypass_context) is True
 
@@ -73,7 +73,7 @@ def test_opt_out_keeps_context_run_mode_semantics(
     monkeypatch: pytest.MonkeyPatch, disabled_sandbox_runtime, bypass_context
 ):
     monkeypatch.setenv(_ENV, "off")
-    assert current_run_mode() == "trusted"
+    assert current_run_mode() == "safe"
     assert full_host_access_active() is False
     assert full_host_access_for_context(bypass_context) is False
     assert trusted_sandbox_active() is True

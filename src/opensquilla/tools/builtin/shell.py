@@ -219,7 +219,7 @@ def _runtime_shell_environment(
         raise ToolError(str(exc)) from exc
 _SANDBOX_NETWORK_HINT = (
     "Hint: sandboxed shell/code has no direct network. Use sandbox_network approval "
-    "or trusted managed-network mode, then retry the shell command through the "
+    "or Safe mode network access, then retry the shell command through the "
     "managed proxy. Do not switch to separate web download tools for package "
     "installs unless the user explicitly asks for an offline workaround."
 )
@@ -4163,7 +4163,7 @@ def _runtime_readonly_shell_block(
                 f"{tool_name} blocked by sandbox runtime read-only policy: "
                 f"{operation} would modify the OpenSquilla runtime environment under {root}. "
                 "Create a project virtual environment in a writable workspace path, or install "
-                "runtime dependencies outside Managed Execution."
+                "runtime dependencies outside Safe mode."
             ),
             "retryable": False,
         }

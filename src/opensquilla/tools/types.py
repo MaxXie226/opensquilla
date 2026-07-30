@@ -97,7 +97,7 @@ class ToolContext:
     on_bootstrap_source_write: Callable[[str, str], None] | None = None
     on_runtime_event: Callable[[dict[str, Any]], None] | None = None
     # Legacy elevated mode compatibility. New code should treat only "full" as
-    # host execution; standard/trusted run modes stay sandboxed.
+    # host execution; Safe mode stays sandboxed.
     elevated: str | None = None
     # Additive per-call tool surface overrides (surfaced tools are made visible even
     # when exposed_by_default=False). Does NOT relax allowed_tools strict denylist.

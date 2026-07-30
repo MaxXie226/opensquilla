@@ -672,7 +672,7 @@ def _sandbox_path_access_envelope(
     if decision.status == "blocked":
         return _path_access_blocked_envelope(decision)
     if not write and trusted_sandbox_active():
-        # Managed Execution treats local reads as host-readable. Sensitive data
+        # Safe mode treats local reads as host-readable. Sensitive data
         # exfiltration remains blocked at the action/network review boundary.
         return None
     if trusted_sandbox_active() and trusted_write_auto_grant_allowed(
@@ -725,7 +725,7 @@ def _active_filesystem_run_mode() -> str:
     context = current_tool_run_context()
     if context is not None:
         return context.run_mode.value
-    return current_run_mode() or "standard"
+    return current_run_mode() or "safe"
 
 
 async def _run_sandbox_operation_if_required(

@@ -39,6 +39,7 @@ from opensquilla.gateway.websocket import SubscriptionManager, WsConnection, get
 from opensquilla.project_workspaces import ProjectWorkspaceStateError
 from opensquilla.provider.selector import ProviderConfig
 from opensquilla.provider.types import ProviderRequestCorrelation
+from opensquilla.sandbox.capability_service import CapabilityReport
 from opensquilla.sandbox.run_context import RUN_CONTEXT_ORIGIN_KEY
 from opensquilla.session import storage as session_storage
 from opensquilla.session.compaction import CompactionConfig
@@ -1608,6 +1609,119 @@ class TestSessionsSend:
         assert ctx_with_sessions.session_manager.applied_intents == [
             (session.session_key, "continue")
         ]
+
+    @pytest.mark.asyncio
+    async def test_safe_send_soft_lands_to_full_when_host_sandbox_is_unavailable(
+        self,
+        dispatcher,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        unavailable = CapabilityReport(
+            available=False,
+            backend="windows_default",
+            platform="win32",
+            code="backend_unavailable",
+            reason="not available",
+            setup_supported=True,
+            restart_required=False,
+            probe_version=1,
+            capabilities=frozenset(),
+        )
+
+        async def report(_config):
+            return unavailable
+
+        monkeypatch.setattr(rpc_sessions, "current_sandbox_capability_report", report)
+        session = FakeSession(
+            session_key="agent:main:webchat:safe-fallback",
+            origin={
+                "sandbox_run_context": {
+                    "run_mode": "safe",
+                    "workspace": "/workspace",
+                }
+            },
+        )
+
+        class RecordingTaskRuntime:
+            def __init__(self) -> None:
+                self.enqueue_calls: list[dict[str, Any]] = []
+
+            async def enqueue(self, envelope, message: str, **kwargs: Any):
+                self.enqueue_calls.append({"envelope": envelope, "message": message, **kwargs})
+                return SimpleNamespace(
+                    task_id="task-safe-fallback",
+                    session_key=envelope.session_key,
+                    status="queued",
+                )
+
+        runtime = RecordingTaskRuntime()
+        ctx = make_ctx(
+            session_manager=FakeSessionManager([session]),
+            task_runtime=runtime,
+        )
+        res = await dispatcher.dispatch(
+            "r-safe-fallback",
+            "sessions.send",
+            {"key": session.session_key, "message": "hello"},
+            ctx,
+        )
+
+        assert res.ok is True
+        envelope = runtime.enqueue_calls[0]["envelope"]
+        assert envelope.metadata["run_mode"] == "full"
+        assert envelope.metadata["sandbox_mode_resolution"] == {
+            "desiredMode": "safe",
+            "effectiveMode": "full",
+            "fallbackReason": "backend_unavailable",
+            "confirmationRequired": True,
+        }
+        assert session.origin["sandbox_run_context"]["run_mode"] == "safe"
+
+    @pytest.mark.asyncio
+    async def test_guest_safe_send_never_soft_lands_to_host(
+        self,
+        dispatcher,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        unavailable = CapabilityReport(
+            available=False,
+            backend="windows_default",
+            platform="win32",
+            code="backend_unavailable",
+            reason="not available",
+            setup_supported=True,
+            restart_required=False,
+            probe_version=1,
+            capabilities=frozenset(),
+        )
+
+        async def report(_config):
+            return unavailable
+
+        monkeypatch.setattr(rpc_sessions, "current_sandbox_capability_report", report)
+        session = FakeSession(session_key="agent:main:webchat:guest-no-fallback")
+        guest = Principal(
+            role="operator",
+            scopes=frozenset(["operator.read", "operator.write"]),
+            is_owner=False,
+            authenticated=False,
+            auth_state="guest",
+        )
+        ctx = make_ctx(
+            session_manager=FakeSessionManager([session]),
+            task_runtime=None,
+            principal=guest,
+        )
+
+        res = await dispatcher.dispatch(
+            "r-guest-no-fallback",
+            "sessions.send",
+            {"key": session.session_key, "message": "hello"},
+            ctx,
+        )
+
+        assert res.ok is False
+        assert res.error.code == "SANDBOX_UNAVAILABLE"
 
     @pytest.mark.asyncio
     async def test_legacy_direct_send_holds_registry_admission_through_register(
