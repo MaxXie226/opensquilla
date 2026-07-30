@@ -1,0 +1,130 @@
+name: Public UI Foundation Release
+
+"on":
+  push:
+    tags:
+      - "ui-foundation-v*"
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: UI Foundation release version from packages/ui-compatibility-matrix.json
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ui-foundation-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    name: Build immutable public UI release
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: opensquilla-webui/.node-version
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            opensquilla-webui/package-lock.json
+
+      - name: Install public UI release dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Resolve and validate release version
+        id: version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.release_version }}
+          REF_NAME: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          manifest_version="$(
+            node -p "require('./packages/ui-compatibility-matrix.json').current.releaseVersion"
+          )"
+          if [[ "${EVENT_NAME}" == "push" ]]; then
+            requested="${REF_NAME#ui-foundation-v}"
+            if [[ "${requested}" == "${REF_NAME}" ]]; then
+              echo "ERROR: release tag must use ui-foundation-v<semver>" >&2
+              exit 1
+            fi
+          else
+            requested="${INPUT_VERSION}"
+          fi
+          if [[ "${requested}" != "${manifest_version}" ]]; then
+            echo "ERROR: requested ${requested} but manifest declares ${manifest_version}" >&2
+            exit 1
+          fi
+          echo "version=${requested}" >> "${GITHUB_OUTPUT}"
+
+      - name: Verify package, API, and external-consumer gates
+        run: npm run verify:ui-packages
+
+      - name: Build immutable release assets
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+          UI_RELEASE_DIR: ${{ runner.temp }}/opensquilla-ui-release
+        run: |
+          npm run build:ui-package-release -- \
+            --output-dir "${UI_RELEASE_DIR}" \
+            --release-version "${RELEASE_VERSION}" \
+            --source-ref "${GITHUB_REF_NAME}" \
+            --source-commit "${GITHUB_SHA}"
+          npm run verify:ui-package-release -- \
+            --artifacts-dir "${UI_RELEASE_DIR}"
+
+      - name: Install release tarballs into the complete public WebUI
+        run: |
+          npm ci --prefix opensquilla-webui
+          npm run install:ui-package-release -- \
+            --artifacts-dir "${RUNNER_TEMP}/opensquilla-ui-release"
+
+      - name: Build the complete public WebUI from release tarballs
+        run: npm run build --prefix opensquilla-webui
+
+      - name: Upload release-candidate evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: opensquilla-ui-foundation-${{ steps.version.outputs.version }}
+          path: ${{ runner.temp }}/opensquilla-ui-release/
+          if-no-files-found: error
+          retention-days: 31
+
+  publish:
+    name: Publish write-once GitHub Release
+    if: ${{ github.event_name == 'push' }}
+    needs: build-and-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: opensquilla-ui-foundation-${{ needs.build-and-release.outputs.version }}
+          path: ${{ runner.temp }}/opensquilla-ui-release
+
+      - name: Publish write-once GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.build-and-release.outputs.version }}
+        shell: bash
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            "${RUNNER_TEMP}"/opensquilla-ui-release/* \
+            --verify-tag \
+            --title "OpenSquilla UI Foundation ${RELEASE_VERSION}" \
+            --notes "Versioned public UI Foundation packages, API report, compatibility report, checksums, SPDX SBOM, and provenance. Assets are write-once; fixes require a new patch release."

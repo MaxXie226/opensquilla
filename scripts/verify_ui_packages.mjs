@@ -57,7 +57,7 @@ function assertPackageMetadata(record, packageJson) {
 }
 
 function isAllowedPackedFile(record, file) {
-  if (['LICENSE', 'README.md', 'package.json'].includes(file)) return true
+  if (['CHANGELOG.md', 'LICENSE', 'README.md', 'package.json'].includes(file)) return true
   if (record.name === '@opensquilla/ui-foundation') {
     return /^dist\/(?:[\w.-]+\/)*[\w.-]+\.(?:d\.ts|js)$/.test(file)
   }
@@ -120,9 +120,10 @@ function assertCleanArtifactText(record, text) {
 
 try {
   const manifest = JSON.parse(await readFile(manifestPath, 'utf8'))
-  assert.equal(manifest.schemaVersion, 1)
+  assert.equal(manifest.schemaVersion, 2)
   assert.equal(manifest.releaseTrain, 'public-ui-foundation')
-  assert.equal(manifest.versionPolicy, 'independent')
+  assert.equal(manifest.versionPolicy, 'release-groups')
+  assert.equal(manifest.compatibilityPolicy, 'current-and-previous-minor')
 
   const rootPackage = JSON.parse(
     await readFile(path.join(repositoryRoot, 'package.json'), 'utf8'),

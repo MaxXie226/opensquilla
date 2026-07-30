@@ -1,0 +1,1457 @@
+{
+  "schemaVersion": 1,
+  "generatedBy": "scripts/ui_package_api.mjs",
+  "releaseTrain": "public-ui-foundation",
+  "versionPolicy": "release-groups",
+  "compatibilityPolicy": "current-and-previous-minor",
+  "packages": [
+    {
+      "name": "@opensquilla/client-sdk",
+      "version": "0.1.0",
+      "releaseGroup": "client-sdk",
+      "publicExports": [
+        ".",
+        "./contract-coverage.json"
+      ],
+      "apiExports": [
+        "CLIENT_CONTRACT_DIGEST",
+        "CLIENT_CONTRACT_SCHEMA_VERSION",
+        "CLIENT_MAX_PROTOCOL",
+        "CLIENT_MIN_PROTOCOL",
+        "CapabilitySource",
+        "ClientFrame",
+        "ClientProtocolRange",
+        "ConnectParams",
+        "ConnectRequest",
+        "ConnectionClosedError",
+        "ContractInfo",
+        "ContractStatus",
+        "DECLARED_ERROR_CODES",
+        "DECLARED_EVENTS",
+        "DeclaredErrorCode",
+        "DeclaredEvent",
+        "EVENT_PATTERNS",
+        "ErrorShape",
+        "EventFrame",
+        "EventPattern",
+        "FeaturesInfo",
+        "FetchLike",
+        "Frame",
+        "GatewayCallOptions",
+        "GatewayClient",
+        "GatewayClientError",
+        "GatewayClientOptions",
+        "GatewayConnectionState",
+        "GatewayConnectionWaitOptions",
+        "GatewayEventHandler",
+        "GatewayHttpClient",
+        "GatewayHttpClientOptions",
+        "GatewayHttpError",
+        "GatewayTerminationAction",
+        "HandshakeError",
+        "HelloOk",
+        "Integer",
+        "KnownEvent",
+        "NormalizedHello",
+        "NormalizedRuntimeInfo",
+        "OBSERVED_CLIENT_EVENTS",
+        "ObservedClientEvent",
+        "PingFrame",
+        "PolicyInfo",
+        "PongFrame",
+        "ProtocolRangeInfo",
+        "RPC_METHOD_SCOPES",
+        "ReconnectPolicy",
+        "ReqFrame",
+        "RequestAbortError",
+        "RequestTimeoutError",
+        "ResFrame",
+        "RpcMethod",
+        "RpcScope",
+        "RuntimeInfo",
+        "SequenceGapError",
+        "ServerFrame",
+        "ServerInfo",
+        "SnapshotInfo",
+        "StateVersion",
+        "WebSocketFactory",
+        "WebSocketLike",
+        "WebSocketMessageLike",
+        "capabilitiesForMethods",
+        "normalizeHelloFrame"
+      ],
+      "runtimeExports": [
+        "CLIENT_CONTRACT_DIGEST",
+        "CLIENT_CONTRACT_SCHEMA_VERSION",
+        "CLIENT_MAX_PROTOCOL",
+        "CLIENT_MIN_PROTOCOL",
+        "ConnectionClosedError",
+        "DECLARED_ERROR_CODES",
+        "DECLARED_EVENTS",
+        "EVENT_PATTERNS",
+        "GatewayClient",
+        "GatewayClientError",
+        "GatewayHttpClient",
+        "GatewayHttpError",
+        "HandshakeError",
+        "OBSERVED_CLIENT_EVENTS",
+        "RPC_METHOD_SCOPES",
+        "RequestAbortError",
+        "RequestTimeoutError",
+        "SequenceGapError",
+        "capabilitiesForMethods",
+        "normalizeHelloFrame"
+      ],
+      "declarationsDigest": "sha256:092bafd923c4a3f4943e9a5e2175accb090ec5e30886df9df19d5635fbbaa4b3",
+      "declarations": [
+        {
+          "key": "client.d.ts#ClassDeclaration:GatewayClient",
+          "signature": "export declare class GatewayClient { private readonly options; private readonly webSocketFactory; private readonly protocolRange; private readonly connectTimeoutMs; private readonly requestTimeoutMs; private readonly reconnectEnabled; private readonly reconnectInitialDelayMs; private readonly reconnectMaxDelayMs; private readonly reconnectFactor; private readonly eventHandlers; private readonly stateHandlers; private readonly pending; private socket; private connectionState; private requestId; private connectionGeneration; private connectRequestId; private connectWaiter; private manualClose; private reconnectDelayMs; private reconnectTimer; private handshakeTimer; private pingTimer; private idleTimer; private lastFrameAt; private lastSequence; constructor(options: GatewayClientOptions); get state(): GatewayConnectionState; get pendingRequestCount(): number; connect(): Promise<NormalizedHello>; disconnect(): void; call<T = unknown>(method: RpcMethod | (string & {}), params?: Record<string, unknown>, timeoutOrOptions?: number | GatewayCallOptions): Promise<T>; on(eventOrPattern: string, handler: GatewayEventHandler): () => void; onState(handler: (state: GatewayConnectionState) => void): () => void; waitForConnection(timeoutMs?: number, signal?: AbortSignal, actions?: GatewayConnectionWaitOptions): Promise<void>; private openSocket; private handleMessage; private sendConnect; private acceptHello; private acceptResponse; private acceptEvent; private failHandshake; private handleClose; private startHealthChecks; private stopHealthChecks; private startHandshakeTimer; private stopHandshakeTimer; private scheduleReconnect; private recycleConnection; private clearReconnect; private isCurrentSocket; private rejectConnect; private rejectPending; private takeRequest; private rejectRequest; private setState; private notifyDiagnostic; }"
+        },
+        {
+          "key": "client.d.ts#ImportDeclaration:0",
+          "signature": "import type { EventFrame, RpcMethod } from './generated.js';"
+        },
+        {
+          "key": "client.d.ts#ImportDeclaration:1",
+          "signature": "import { type ClientProtocolRange, type NormalizedHello } from './hello.js';"
+        },
+        {
+          "key": "client.d.ts#InterfaceDeclaration:GatewayCallOptions",
+          "signature": "export interface GatewayCallOptions { timeoutMs?: number; signal?: AbortSignal; timeoutAction?: GatewayTerminationAction; abortAction?: GatewayTerminationAction; onSent?: (connectionGeneration: number) => void; }"
+        },
+        {
+          "key": "client.d.ts#InterfaceDeclaration:GatewayClientOptions",
+          "signature": "export interface GatewayClientOptions { endpoint: string; token?: string; auth?: Record<string, unknown>; client?: Record<string, unknown>; scopes?: string[]; protocolRange?: ClientProtocolRange; connectTimeoutMs?: number; requestTimeoutMs?: number; keepAliveIntervalMs?: number; reconnect?: ReconnectPolicy; /** * Compatibility escape hatch for legacy clients that sent RPC requests as * soon as the transport opened. New clients should wait for Hello. */ allowCallsDuringHandshake?: boolean; webSocketFactory?: WebSocketFactory; onStateChange?: (state: GatewayConnectionState) => void; onHello?: (hello: NormalizedHello) => void; onDiagnostic?: (error: Error) => void; }"
+        },
+        {
+          "key": "client.d.ts#InterfaceDeclaration:GatewayConnectionWaitOptions",
+          "signature": "export interface GatewayConnectionWaitOptions { timeoutAction?: GatewayTerminationAction; abortAction?: GatewayTerminationAction; }"
+        },
+        {
+          "key": "client.d.ts#InterfaceDeclaration:ReconnectPolicy",
+          "signature": "export interface ReconnectPolicy { enabled?: boolean; initialDelayMs?: number; maxDelayMs?: number; factor?: number; }"
+        },
+        {
+          "key": "client.d.ts#InterfaceDeclaration:WebSocketLike",
+          "signature": "export interface WebSocketLike { readonly readyState: number; onopen: (() => void) | null; onmessage: ((event: WebSocketMessageLike) => void) | null; onclose: (() => void) | null; onerror: (() => void) | null; send(data: string): void; close(code?: number, reason?: string): void; }"
+        },
+        {
+          "key": "client.d.ts#InterfaceDeclaration:WebSocketMessageLike",
+          "signature": "export interface WebSocketMessageLike { data: unknown; }"
+        },
+        {
+          "key": "client.d.ts#TypeAliasDeclaration:GatewayConnectionState",
+          "signature": "export type GatewayConnectionState = 'disconnected' | 'connecting' | 'connected';"
+        },
+        {
+          "key": "client.d.ts#TypeAliasDeclaration:GatewayEventHandler",
+          "signature": "export type GatewayEventHandler = (frame: EventFrame) => void;"
+        },
+        {
+          "key": "client.d.ts#TypeAliasDeclaration:GatewayTerminationAction",
+          "signature": "export type GatewayTerminationAction = 'reject' | 'reconnect';"
+        },
+        {
+          "key": "client.d.ts#TypeAliasDeclaration:WebSocketFactory",
+          "signature": "export type WebSocketFactory = (url: string) => WebSocketLike;"
+        },
+        {
+          "key": "errors.d.ts#ClassDeclaration:ConnectionClosedError",
+          "signature": "export declare class ConnectionClosedError extends Error { constructor(message?: string, options?: ErrorOptions); }"
+        },
+        {
+          "key": "errors.d.ts#ClassDeclaration:GatewayClientError",
+          "signature": "export declare class GatewayClientError extends Error { readonly code?: string; readonly details?: unknown; readonly retryable?: boolean; readonly retryAfterMs?: number; readonly accepted?: boolean; constructor(error: Partial<ErrorShape> | string | null | undefined, options?: ErrorOptions); }"
+        },
+        {
+          "key": "errors.d.ts#ClassDeclaration:GatewayHttpError",
+          "signature": "export declare class GatewayHttpError extends GatewayClientError { readonly status: number; readonly responseBody: unknown; constructor(status: number, responseBody: unknown, fallbackMessage: string); }"
+        },
+        {
+          "key": "errors.d.ts#ClassDeclaration:HandshakeError",
+          "signature": "export declare class HandshakeError extends Error { constructor(message: string, options?: ErrorOptions); }"
+        },
+        {
+          "key": "errors.d.ts#ClassDeclaration:RequestAbortError",
+          "signature": "export declare class RequestAbortError extends Error { readonly code = \"RPC_ABORTED\"; readonly method: string; constructor(method: string); }"
+        },
+        {
+          "key": "errors.d.ts#ClassDeclaration:RequestTimeoutError",
+          "signature": "export declare class RequestTimeoutError extends Error { readonly code = \"RPC_TIMEOUT\"; readonly requestId: string; readonly method: string; readonly timeoutMs: number; constructor(method: string, timeoutMs: number); constructor(requestId: string, method: string, timeoutMs: number); }"
+        },
+        {
+          "key": "errors.d.ts#ClassDeclaration:SequenceGapError",
+          "signature": "export declare class SequenceGapError extends Error { readonly expected: number; readonly actual: number; readonly event?: string; constructor(expected: number, actual: number, event?: string); }"
+        },
+        {
+          "key": "errors.d.ts#ImportDeclaration:0",
+          "signature": "import type { ErrorShape } from './generated.js';"
+        },
+        {
+          "key": "generated.d.ts#InterfaceDeclaration:ConnectParams",
+          "signature": "export interface ConnectParams { auth?: Record<string, unknown>; caps?: unknown | null; client?: unknown | null; commands?: unknown | null; locale?: unknown | null; maxProtocol?: Integer; minProtocol?: Integer; path_env?: unknown | null; permissions?: unknown | null; role?: string; scopes?: unknown | null; user_agent?: unknown | null; [key: string]: unknown; }"
+        },
+        {
+          "key": "generated.d.ts#InterfaceDeclaration:ContractInfo",
+          "signature": "export interface ContractInfo { digest: string; generatedFrom: string; schemaVersion: Integer; }"
+        },
+        {
+          "key": "generated.d.ts#InterfaceDeclaration:ErrorShape",
+          "signature": "export interface ErrorShape { accepted?: boolean | null; code: string; details?: unknown | null; message: string; retry_after_ms?: Integer | null; retryable?: boolean | null; }"
+        },
+        {
+          "key": "generated.d.ts#InterfaceDeclaration:EventFrame",
+          "signature": "export interface EventFrame { event: string; meta?: Record<string, unknown> | null; payload?: unknown | null; seq?: Integer | null; state_version?: StateVersion | null; type: \"event\"; }"
+        },
+        {
+          "key": "generated.d.ts#InterfaceDeclaration:FeaturesInfo",
+          "signature": "export interface FeaturesInfo { events: Array<string>; methods: Array<string>; }"
+        },
+        {
+          "key": "generated.d.ts#InterfaceDeclaration:HelloOk",
+          "signature": "export interface HelloOk { auth?: Record<string, unknown> | null; capabilities?: Array<string> | null; contract?: ContractInfo | null; extensions?: Array<string> | null; features: FeaturesInfo; id?: string | null; policy: PolicyInfo; protocol: Integer; protocolRange?: ProtocolRangeInfo | null; runtime?: RuntimeInfo | null; server: ServerInfo; snapshot: SnapshotInfo; type: \"hello-ok\"; }"
+        },
+        {
+          "key": "generated.d.ts#InterfaceDeclaration:PingFrame",
+          "signature": "export interface PingFrame { type: \"ping\"; }"
+        },
+        {
+          "key": "generated.d.ts#InterfaceDeclaration:PolicyInfo",
+          "signature": "export interface PolicyInfo { agent_stream_heartbeat_interval_ms?: Integer; agent_stream_idle_timeout_ms?: Integer; client_ws_keepalive_timeout_ms?: Integer; concurrent_history_reads?: boolean; max_buffered_bytes?: Integer; max_payload?: Integer; tick_interval_ms?: Integer; webui_stream_idle_grace_ms?: Integer; }"
+        },
+        {
+          "key": "generated.d.ts#InterfaceDeclaration:PongFrame",
+          "signature": "export interface PongFrame { type: \"pong\"; }"
+        },
+        {
+          "key": "generated.d.ts#InterfaceDeclaration:ProtocolRangeInfo",
+          "signature": "export interface ProtocolRangeInfo { max: Integer; min: Integer; }"
+        },
+        {
+          "key": "generated.d.ts#InterfaceDeclaration:ReqFrame",
+          "signature": "export interface ReqFrame { id: string; method: string; params?: unknown | null; type: \"req\"; }"
+        },
+        {
+          "key": "generated.d.ts#InterfaceDeclaration:ResFrame",
+          "signature": "export interface ResFrame { error?: ErrorShape | null; id: string; ok: boolean; payload?: unknown | null; type: \"res\"; }"
+        },
+        {
+          "key": "generated.d.ts#InterfaceDeclaration:RuntimeInfo",
+          "signature": "export interface RuntimeInfo { arch: string; buildCommit?: string | null; coreVersion: string; platform: string; }"
+        },
+        {
+          "key": "generated.d.ts#InterfaceDeclaration:ServerInfo",
+          "signature": "export interface ServerInfo { conn_id: string; version: string; }"
+        },
+        {
+          "key": "generated.d.ts#InterfaceDeclaration:SnapshotInfo",
+          "signature": "export interface SnapshotInfo { auth_mode?: string | null; config_path?: string | null; health?: unknown; presence?: Array<unknown>; state_dir?: string | null; state_version?: StateVersion; uptime_ms?: Integer; }"
+        },
+        {
+          "key": "generated.d.ts#InterfaceDeclaration:StateVersion",
+          "signature": "export interface StateVersion { health?: Integer; presence?: Integer; }"
+        },
+        {
+          "key": "generated.d.ts#TypeAliasDeclaration:ClientFrame",
+          "signature": "export type ClientFrame = ReqFrame | PingFrame | PongFrame;"
+        },
+        {
+          "key": "generated.d.ts#TypeAliasDeclaration:ConnectRequest",
+          "signature": "export type ConnectRequest = { id: string; method: \"connect\"; params: { auth?: Record<string, unknown>; client?: Record<string, unknown>; maxProtocol?: Integer; minProtocol?: Integer; role?: string; scopes?: Array<string>; [key: string]: unknown; }; type: \"req\"; [key: string]: unknown; };"
+        },
+        {
+          "key": "generated.d.ts#TypeAliasDeclaration:DeclaredErrorCode",
+          "signature": "export type DeclaredErrorCode = (typeof DECLARED_ERROR_CODES)[number];"
+        },
+        {
+          "key": "generated.d.ts#TypeAliasDeclaration:DeclaredEvent",
+          "signature": "export type DeclaredEvent = (typeof DECLARED_EVENTS)[number];"
+        },
+        {
+          "key": "generated.d.ts#TypeAliasDeclaration:EventPattern",
+          "signature": "export type EventPattern = (typeof EVENT_PATTERNS)[number];"
+        },
+        {
+          "key": "generated.d.ts#TypeAliasDeclaration:Frame",
+          "signature": "export type Frame = ReqFrame | ResFrame | EventFrame | HelloOk | PingFrame | PongFrame;"
+        },
+        {
+          "key": "generated.d.ts#TypeAliasDeclaration:Integer",
+          "signature": "export type Integer = number;"
+        },
+        {
+          "key": "generated.d.ts#TypeAliasDeclaration:KnownEvent",
+          "signature": "export type KnownEvent = DeclaredEvent | ObservedClientEvent;"
+        },
+        {
+          "key": "generated.d.ts#TypeAliasDeclaration:ObservedClientEvent",
+          "signature": "export type ObservedClientEvent = (typeof OBSERVED_CLIENT_EVENTS)[number];"
+        },
+        {
+          "key": "generated.d.ts#TypeAliasDeclaration:RpcMethod",
+          "signature": "export type RpcMethod = keyof typeof RPC_METHOD_SCOPES;"
+        },
+        {
+          "key": "generated.d.ts#TypeAliasDeclaration:RpcScope",
+          "signature": "export type RpcScope = (typeof RPC_METHOD_SCOPES)[RpcMethod];"
+        },
+        {
+          "key": "generated.d.ts#TypeAliasDeclaration:ServerFrame",
+          "signature": "export type ServerFrame = ResFrame | EventFrame | HelloOk | PingFrame | PongFrame;"
+        },
+        {
+          "key": "generated.d.ts#VariableStatement:CLIENT_CONTRACT_DIGEST",
+          "signature": "export declare const CLIENT_CONTRACT_DIGEST: \"sha256:9819d28398fd37609c8c86ae9b5bbf8133d122ae07f06b75817a4d5b3c30a79e\";"
+        },
+        {
+          "key": "generated.d.ts#VariableStatement:CLIENT_CONTRACT_SCHEMA_VERSION",
+          "signature": "export declare const CLIENT_CONTRACT_SCHEMA_VERSION: 1;"
+        },
+        {
+          "key": "generated.d.ts#VariableStatement:DECLARED_ERROR_CODES",
+          "signature": "export declare const DECLARED_ERROR_CODES: readonly [\"AGENT_TIMEOUT\", \"APPROVAL_NOT_FOUND\", \"INVALID_REQUEST\", \"METHOD_NOT_FOUND\", \"NOT_FOUND\", \"NOT_LINKED\", \"NOT_PAIRED\", \"UNAUTHORIZED\", \"UNAVAILABLE\"];"
+        },
+        {
+          "key": "generated.d.ts#VariableStatement:DECLARED_EVENTS",
+          "signature": "export declare const DECLARED_EVENTS: readonly [\"connect.challenge\", \"agent\", \"session.message\", \"sessions.changed\", \"presence\", \"tick\", \"shutdown\", \"health\", \"heartbeat\", \"cron\"];"
+        },
+        {
+          "key": "generated.d.ts#VariableStatement:EVENT_PATTERNS",
+          "signature": "export declare const EVENT_PATTERNS: readonly [\"session.event.*\", \"task.*\"];"
+        },
+        {
+          "key": "generated.d.ts#VariableStatement:OBSERVED_CLIENT_EVENTS",
+          "signature": "export declare const OBSERVED_CLIENT_EVENTS: readonly [\"channel.status\", \"collaboration_mode\", \"cron.run.finished\", \"exec.approval.requested\", \"exec.approval.resolved\", \"exec.approval.updated\", \"models.routing.changed\", \"plan_revision\", \"plan_run\", \"plugin.approval.requested\", \"plugin.approval.resolved\", \"plugin.approval.updated\", \"sandbox.run_mode.preference.changed\", \"session.epoch_changed\", \"session.event.artifact\", \"session.event.collaboration_mode\", \"session.event.compaction\", \"session.event.cron_result\", \"session.event.ensemble_progress\", \"session.event.input_disposition\", \"session.event.meta_preflight\", \"session.event.meta_run_announced\", \"session.event.meta_run_completed\", \"session.event.meta_step_state\", \"session.event.plan_revision\", \"session.event.plan_run\", \"session.event.router_control_replay\", \"session.event.router_decision\", \"session.event.run_heartbeat\", \"session.event.state_change\", \"session.event.subagent_completion\", \"session.event.task_group.done\", \"session.event.task_group.failed\", \"session.event.task_group.synthesizing\", \"session.event.task_group.waiting\", \"session.event.text_delta\", \"session.event.tool_result\", \"session.event.tool_use_delta\", \"session.event.tool_use_start\", \"session.event.warning\", \"sessions.changed\", \"task.queued\", \"task.running\"];"
+        },
+        {
+          "key": "generated.d.ts#VariableStatement:RPC_METHOD_SCOPES",
+          "signature": "export declare const RPC_METHOD_SCOPES: { readonly agent: \"operator.write\"; readonly \"agent.identity.get\": \"operator.read\"; readonly \"agent.wait\": \"operator.write\"; readonly \"agents.create\": \"operator.admin\"; readonly \"agents.delete\": \"operator.admin\"; readonly \"agents.files.get\": \"operator.read\"; readonly \"agents.files.list\": \"operator.read\"; readonly \"agents.files.set\": \"operator.admin\"; readonly \"agents.list\": \"operator.read\"; readonly \"agents.update\": \"operator.admin\"; readonly \"channels.admin.set\": \"operator.pairing\"; readonly \"channels.get\": \"operator.admin\"; readonly \"channels.logout\": \"operator.admin\"; readonly \"channels.pairing.approve\": \"operator.pairing\"; readonly \"channels.pairing.revoke\": \"operator.pairing\"; readonly \"channels.pairings\": \"operator.pairing\"; readonly \"channels.probe\": \"operator.admin\"; readonly \"channels.restart\": \"operator.admin\"; readonly \"channels.status\": \"operator.read\"; readonly \"chat.abort\": \"operator.write\"; readonly \"chat.clarify_submit\": \"operator.write\"; readonly \"chat.history\": \"operator.read\"; readonly \"chat.inject\": \"operator.admin\"; readonly \"chat.send\": \"operator.write\"; readonly \"commands.list_for_surface\": \"operator.read\"; readonly \"config.apply\": \"operator.admin\"; readonly \"config.effective\": \"operator.read\"; readonly \"config.get\": \"operator.read\"; readonly \"config.patch\": \"operator.admin\"; readonly \"config.patch.safe\": \"operator.write\"; readonly \"config.reload\": \"operator.admin\"; readonly \"config.schema\": \"operator.admin\"; readonly \"config.schema.lookup\": \"operator.read\"; readonly \"config.set\": \"operator.admin\"; readonly \"cron.add\": \"operator.admin\"; readonly \"cron.create\": \"operator.admin\"; readonly \"cron.list\": \"operator.read\"; readonly \"cron.remove\": \"operator.admin\"; readonly \"cron.run\": \"operator.admin\"; readonly \"cron.runs\": \"operator.read\"; readonly \"cron.status\": \"operator.read\"; readonly \"cron.subscribe\": \"operator.read\"; readonly \"cron.unsubscribe\": \"operator.read\"; readonly \"cron.update\": \"operator.admin\"; readonly \"diagnostics.set\": \"operator.admin\"; readonly \"diagnostics.status\": \"operator.read\"; readonly \"doctor.memory.status\": \"operator.read\"; readonly \"doctor.status\": \"operator.read\"; readonly \"exec.approval.extend\": \"operator.approvals\"; readonly \"exec.approval.forget\": \"operator.approvals\"; readonly \"exec.approval.request\": \"operator.approvals\"; readonly \"exec.approval.resolve\": \"operator.approvals\"; readonly \"exec.approval.snapshot\": \"operator.approvals\"; readonly \"exec.approval.status\": \"operator.approvals\"; readonly \"exec.approval.waitDecision\": \"operator.approvals\"; readonly \"exec.approvals.get\": \"operator.approvals\"; readonly \"exec.approvals.node.get\": \"operator.admin\"; readonly \"exec.approvals.node.set\": \"operator.admin\"; readonly \"exec.approvals.set\": \"operator.approvals\"; readonly \"exec.proposals.accept\": \"operator.admin\"; readonly \"exec.proposals.auto_enabled.disable\": \"operator.admin\"; readonly \"exec.proposals.auto_enabled.list\": \"operator.proposals\"; readonly \"exec.proposals.list\": \"operator.proposals\"; readonly \"exec.proposals.pending_count\": \"operator.proposals\"; readonly \"exec.proposals.reject\": \"operator.admin\"; readonly \"exec.proposals.settings.get\": \"operator.proposals\"; readonly \"exec.proposals.settings.set\": \"operator.admin\"; readonly \"exec.proposals.show\": \"operator.proposals\"; readonly \"gateway.identity.get\": \"operator.read\"; readonly health: \"operator.read\"; readonly \"last-heartbeat\": \"operator.read\"; readonly \"logs.status\": \"operator.read\"; readonly \"logs.tail\": \"operator.read\"; readonly \"logs.trace\": \"operator.read\"; readonly \"memory.import.apply\": \"operator.admin\"; readonly \"memory.import.cancel\": \"operator.admin\"; readonly \"memory.import.discard\": \"operator.admin\"; readonly \"memory.import.info\": \"operator.read\"; readonly \"memory.import.preview\": \"operator.admin\"; readonly \"memory.import.retry\": \"operator.admin\"; readonly \"memory.import.start\": \"operator.admin\"; readonly \"memory.import.status\": \"operator.admin\"; readonly \"memory.import.undo\": \"operator.admin\"; readonly \"memory.index\": \"operator.admin\"; readonly \"memory.list\": \"operator.read\"; readonly \"memory.raw_fallbacks.list\": \"operator.admin\"; readonly \"memory.raw_fallbacks.show\": \"operator.admin\"; readonly \"memory.repair.list\": \"operator.admin\"; readonly \"memory.repair.run\": \"operator.admin\"; readonly \"memory.repair.show\": \"operator.admin\"; readonly \"memory.search\": \"operator.read\"; readonly \"memory.show\": \"operator.read\"; readonly \"meta.list\": \"operator.read\"; readonly \"meta.run\": \"operator.write\"; readonly \"meta.runs.confirm_preflight\": \"operator.admin\"; readonly \"meta.runs.cost\": \"operator.read\"; readonly \"meta.runs.diff\": \"operator.admin\"; readonly \"meta.runs.draft\": \"operator.admin\"; readonly \"meta.runs.eval_baseline\": \"operator.admin\"; readonly \"meta.runs.failures\": \"operator.read\"; readonly \"meta.runs.list\": \"operator.read\"; readonly \"meta.runs.replay\": \"operator.admin\"; readonly \"meta.runs.show\": \"operator.admin\"; readonly \"meta.runs.validate\": \"operator.admin\"; readonly \"migration.sources.list\": \"operator.admin\"; readonly \"migration.sources.preview\": \"operator.admin\"; readonly \"models.list\": \"operator.read\"; readonly \"models.routing.get\": \"operator.read\"; readonly \"models.routing.set\": \"operator.write\"; readonly \"onboarding.audio.configure\": \"operator.admin\"; readonly \"onboarding.catalog\": \"operator.read\"; readonly \"onboarding.channel.disable\": \"operator.admin\"; readonly \"onboarding.channel.enable\": \"operator.admin\"; readonly \"onboarding.channel.probe\": \"operator.admin\"; readonly \"onboarding.channel.remove\": \"operator.admin\"; readonly \"onboarding.channel.upsert\": \"operator.admin\"; readonly \"onboarding.ensemble.configure\": \"operator.admin\"; readonly \"onboarding.imageGeneration.configure\": \"operator.admin\"; readonly \"onboarding.llmProfile.activate\": \"operator.admin\"; readonly \"onboarding.llmProfile.active.remove\": \"operator.admin\"; readonly \"onboarding.llmProfile.credential.clear\": \"operator.admin\"; readonly \"onboarding.llmProfile.draft.models.discover\": \"operator.admin\"; readonly \"onboarding.llmProfile.draft.probe\": \"operator.admin\"; readonly \"onboarding.llmProfile.models.discover\": \"operator.admin\"; readonly \"onboarding.llmProfile.probe\": \"operator.admin\"; readonly \"onboarding.llmProfile.remove\": \"operator.admin\"; readonly \"onboarding.llmProfile.upsert\": \"operator.admin\"; readonly \"onboarding.memory_embedding.configure\": \"operator.admin\"; readonly \"onboarding.models.discover\": \"operator.admin\"; readonly \"onboarding.provider.configure\": \"operator.admin\"; readonly \"onboarding.provider.credential.clear\": \"operator.admin\"; readonly \"onboarding.provider.credential.reveal\": \"operator.admin\"; readonly \"onboarding.provider.probe\": \"operator.admin\"; readonly \"onboarding.router.catalog\": \"operator.read\"; readonly \"onboarding.router.configure\": \"operator.admin\"; readonly \"onboarding.search.configure\": \"operator.admin\"; readonly \"onboarding.status\": \"operator.read\"; readonly \"plans.cancelRun\": \"operator.write\"; readonly \"plans.capabilities\": \"operator.read\"; readonly \"plans.implement\": \"operator.write\"; readonly \"plans.revise\": \"operator.write\"; readonly \"plans.setMode\": \"operator.write\"; readonly \"plugin.approval.extend\": \"operator.approvals\"; readonly \"plugin.approval.request\": \"operator.approvals\"; readonly \"plugin.approval.resolve\": \"operator.approvals\"; readonly \"plugin.approval.status\": \"operator.approvals\"; readonly \"plugin.approval.waitDecision\": \"operator.approvals\"; readonly \"providers.status\": \"operator.read\"; readonly \"router.decisions.list\": \"operator.read\"; readonly \"router.feedback.submit\": \"operator.write\"; readonly \"router.selflearning.status\": \"operator.read\"; readonly \"routing.hold.clear\": \"operator.admin\"; readonly \"routing.hold.get\": \"operator.read\"; readonly \"routing.hold.set\": \"operator.admin\"; readonly \"sandbox.bundle.disable\": \"operator.write\"; readonly \"sandbox.bundle.enable\": \"operator.write\"; readonly \"sandbox.domain.add\": \"operator.write\"; readonly \"sandbox.domain.remove\": \"operator.write\"; readonly \"sandbox.explain\": \"operator.read\"; readonly \"sandbox.mount.add\": \"operator.write\"; readonly \"sandbox.mount.remove\": \"operator.write\"; readonly \"sandbox.path.create-directory\": \"operator.write\"; readonly \"sandbox.path.list\": \"operator.read\"; readonly \"sandbox.path.pick\": \"operator.write\"; readonly \"sandbox.resume\": \"operator.write\"; readonly \"sandbox.run_context.get\": \"operator.read\"; readonly \"sandbox.run_context.set\": \"operator.write\"; readonly \"sandbox.run_mode.preference.get\": \"operator.read\"; readonly \"sandbox.run_mode.preference.set\": \"operator.write\"; readonly \"sandbox.setup.ensure\": \"operator.write\"; readonly \"sandbox.setup.status\": \"operator.read\"; readonly \"sandbox.status\": \"operator.read\"; readonly \"sandbox.workspace.set\": \"operator.write\"; readonly \"search.query\": \"operator.write\"; readonly \"search.status\": \"operator.read\"; readonly \"secrets.reload\": \"operator.admin\"; readonly \"secrets.resolve\": \"operator.admin\"; readonly send: \"operator.write\"; readonly \"sessions.abort\": \"operator.write\"; readonly \"sessions.bootstrap\": \"operator.read\"; readonly \"sessions.compact\": \"operator.write\"; readonly \"sessions.contextCompact\": \"operator.write\"; readonly \"sessions.create\": \"operator.write\"; readonly \"sessions.delete\": \"operator.write\"; readonly \"sessions.fork\": \"operator.write\"; readonly \"sessions.get\": \"operator.read\"; readonly \"sessions.list\": \"operator.read\"; readonly \"sessions.messages.hydrate\": \"operator.read\"; readonly \"sessions.messages.snapshot\": \"operator.read\"; readonly \"sessions.messages.subscribe\": \"operator.read\"; readonly \"sessions.messages.unsubscribe\": \"operator.read\"; readonly \"sessions.patch\": \"operator.admin\"; readonly \"sessions.preview\": \"operator.read\"; readonly \"sessions.reset\": \"operator.write\"; readonly \"sessions.resolve\": \"operator.read\"; readonly \"sessions.search\": \"operator.read\"; readonly \"sessions.send\": \"operator.write\"; readonly \"sessions.steer\": \"operator.write\"; readonly \"sessions.steer.v2\": \"operator.write\"; readonly \"sessions.subscribe\": \"operator.read\"; readonly \"sessions.truncate\": \"operator.write\"; readonly \"sessions.unsubscribe\": \"operator.read\"; readonly \"set-heartbeats\": \"operator.admin\"; readonly \"skills.bins\": \"node\"; readonly \"skills.deps.install\": \"operator.admin\"; readonly \"skills.get\": \"operator.read\"; readonly \"skills.install\": \"operator.admin\"; readonly \"skills.list\": \"operator.read\"; readonly \"skills.reload\": \"operator.admin\"; readonly \"skills.search\": \"operator.read\"; readonly \"skills.status\": \"operator.read\"; readonly \"skills.uninstall\": \"operator.admin\"; readonly \"skills.update\": \"operator.admin\"; readonly status: \"operator.read\"; readonly \"system-event\": \"operator.admin\"; readonly \"system-presence\": \"operator.read\"; readonly \"tools.catalog\": \"operator.read\"; readonly \"tools.effective\": \"operator.read\"; readonly \"tools.search_provider\": \"operator.read\"; readonly \"usage.cost\": \"operator.read\"; readonly \"usage.query\": \"operator.read\"; readonly \"usage.status\": \"operator.read\"; readonly wake: \"operator.write\"; readonly \"wizard.cancel\": \"operator.admin\"; readonly \"wizard.next\": \"operator.admin\"; readonly \"wizard.start\": \"operator.admin\"; readonly \"wizard.status\": \"operator.admin\"; readonly \"workspaces.history.delete\": \"operator.write\"; readonly \"workspaces.list\": \"operator.read\"; readonly \"workspaces.open\": \"operator.write\"; readonly \"workspaces.pin\": \"operator.write\"; readonly \"workspaces.remove\": \"operator.write\"; readonly \"workspaces.update\": \"operator.write\"; };"
+        },
+        {
+          "key": "hello.d.ts#FunctionDeclaration:capabilitiesForMethods",
+          "signature": "export declare function capabilitiesForMethods(methods: readonly string[]): string[];"
+        },
+        {
+          "key": "hello.d.ts#FunctionDeclaration:normalizeHelloFrame",
+          "signature": "export declare function normalizeHelloFrame(input: unknown, requestId: string, clientRange?: ClientProtocolRange): NormalizedHello;"
+        },
+        {
+          "key": "hello.d.ts#ImportDeclaration:0",
+          "signature": "import type { ContractInfo, PolicyInfo, ProtocolRangeInfo, RuntimeInfo } from './generated.js';"
+        },
+        {
+          "key": "hello.d.ts#InterfaceDeclaration:ClientProtocolRange",
+          "signature": "export interface ClientProtocolRange { min: number; max: number; }"
+        },
+        {
+          "key": "hello.d.ts#InterfaceDeclaration:NormalizedHello",
+          "signature": "export interface NormalizedHello { type: 'hello-ok'; id?: string; protocol: number; policy: PolicyInfo & Record<string, unknown>; features: { methods: string[]; events: string[]; }; server: { version: string; conn_id?: string; }; auth?: Record<string, unknown>; contract?: ContractInfo; contractStatus: ContractStatus; runtime: NormalizedRuntimeInfo; protocolRange: ProtocolRangeInfo; capabilities: string[]; capabilitySource: CapabilitySource; extensions: string[]; [key: string]: unknown; }"
+        },
+        {
+          "key": "hello.d.ts#InterfaceDeclaration:NormalizedRuntimeInfo",
+          "signature": "export interface NormalizedRuntimeInfo extends Omit<RuntimeInfo, 'arch' | 'platform'> { arch?: string; platform?: string; }"
+        },
+        {
+          "key": "hello.d.ts#TypeAliasDeclaration:CapabilitySource",
+          "signature": "export type CapabilitySource = 'hello' | 'features.methods' | 'none';"
+        },
+        {
+          "key": "hello.d.ts#TypeAliasDeclaration:ContractStatus",
+          "signature": "export type ContractStatus = 'advertised' | 'legacy-contract';"
+        },
+        {
+          "key": "hello.d.ts#VariableStatement:CLIENT_MAX_PROTOCOL",
+          "signature": "export declare const CLIENT_MAX_PROTOCOL: 3;"
+        },
+        {
+          "key": "hello.d.ts#VariableStatement:CLIENT_MIN_PROTOCOL",
+          "signature": "export declare const CLIENT_MIN_PROTOCOL: 3;"
+        },
+        {
+          "key": "http.d.ts#ClassDeclaration:GatewayHttpClient",
+          "signature": "export declare class GatewayHttpClient { private readonly baseUrl; private readonly fetcher; private readonly headers; constructor(options: GatewayHttpClientOptions); request<T>(path: string, init?: RequestInit): Promise<T>; get<T>(path: string, init?: Omit<RequestInit, 'method'>): Promise<T>; post<T>(path: string, body: unknown, init?: Omit<RequestInit, 'body' | 'method'>): Promise<T>; }"
+        },
+        {
+          "key": "http.d.ts#InterfaceDeclaration:GatewayHttpClientOptions",
+          "signature": "export interface GatewayHttpClientOptions { baseUrl: string; fetch?: FetchLike; headers?: HeadersInit; }"
+        },
+        {
+          "key": "http.d.ts#TypeAliasDeclaration:FetchLike",
+          "signature": "export type FetchLike = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;"
+        },
+        {
+          "key": "index.d.ts#ExportDeclaration:*:'./client.js'",
+          "signature": "export * from './client.js';"
+        },
+        {
+          "key": "index.d.ts#ExportDeclaration:*:'./errors.js'",
+          "signature": "export * from './errors.js';"
+        },
+        {
+          "key": "index.d.ts#ExportDeclaration:*:'./generated.js'",
+          "signature": "export * from './generated.js';"
+        },
+        {
+          "key": "index.d.ts#ExportDeclaration:*:'./hello.js'",
+          "signature": "export * from './hello.js';"
+        },
+        {
+          "key": "index.d.ts#ExportDeclaration:*:'./http.js'",
+          "signature": "export * from './http.js';"
+        }
+      ],
+      "deprecations": []
+    },
+    {
+      "name": "@opensquilla/ui-tokens",
+      "version": "0.1.0",
+      "releaseGroup": "ui-foundation",
+      "publicExports": [
+        ".",
+        "./foundation.css",
+        "./themes.css",
+        "./theme-contract.json",
+        "./themes/*"
+      ],
+      "apiExports": [
+        "DERIVED_THEME_TOKEN_NAMES",
+        "DerivedThemeTokenName",
+        "PUBLIC_THEME_IDS",
+        "PublicThemeId",
+        "REQUIRED_THEME_TOKEN_NAMES",
+        "RequiredThemeTokenName",
+        "ResolvedThemeTokenValues",
+        "THEME_TOKEN_NAMES",
+        "ThemeCssVariableName",
+        "ThemeTokenDiagnostic",
+        "ThemeTokenDiagnosticCode",
+        "ThemeTokenDiagnosticReporter",
+        "ThemeTokenName",
+        "ThemeTokenValues",
+        "resolveThemeTokens",
+        "themeTokensToCssVariables"
+      ],
+      "runtimeExports": [
+        "DERIVED_THEME_TOKEN_NAMES",
+        "PUBLIC_THEME_IDS",
+        "REQUIRED_THEME_TOKEN_NAMES",
+        "THEME_TOKEN_NAMES",
+        "resolveThemeTokens",
+        "themeTokensToCssVariables"
+      ],
+      "declarationsDigest": "sha256:da9f3ef79a61b621ff241a3404d4a0cfa5daf1b79b7ab7813c22abcca1fd508a",
+      "declarations": [
+        {
+          "key": "index.d.ts#FunctionDeclaration:resolveThemeTokens",
+          "signature": "export declare function resolveThemeTokens(candidate: Readonly<Record<string, string | undefined>>, fallback: Readonly<Record<ThemeTokenName, string>>, report?: ThemeTokenDiagnosticReporter): ResolvedThemeTokenValues;"
+        },
+        {
+          "key": "index.d.ts#FunctionDeclaration:themeTokensToCssVariables",
+          "signature": "export declare function themeTokensToCssVariables(tokens: Readonly<ResolvedThemeTokenValues>): Record<ThemeCssVariableName, string>;"
+        },
+        {
+          "key": "index.d.ts#InterfaceDeclaration:ThemeTokenDiagnostic",
+          "signature": "export interface ThemeTokenDiagnostic { code: ThemeTokenDiagnosticCode; token: string; message: string; fallback?: string; }"
+        },
+        {
+          "key": "index.d.ts#TypeAliasDeclaration:DerivedThemeTokenName",
+          "signature": "export type DerivedThemeTokenName = (typeof DERIVED_THEME_TOKEN_NAMES)[number];"
+        },
+        {
+          "key": "index.d.ts#TypeAliasDeclaration:PublicThemeId",
+          "signature": "export type PublicThemeId = (typeof PUBLIC_THEME_IDS)[number];"
+        },
+        {
+          "key": "index.d.ts#TypeAliasDeclaration:RequiredThemeTokenName",
+          "signature": "export type RequiredThemeTokenName = (typeof REQUIRED_THEME_TOKEN_NAMES)[number];"
+        },
+        {
+          "key": "index.d.ts#TypeAliasDeclaration:ResolvedThemeTokenValues",
+          "signature": "export type ResolvedThemeTokenValues = Record<ThemeTokenName, string>;"
+        },
+        {
+          "key": "index.d.ts#TypeAliasDeclaration:ThemeCssVariableName",
+          "signature": "export type ThemeCssVariableName = `--${ThemeTokenName}`;"
+        },
+        {
+          "key": "index.d.ts#TypeAliasDeclaration:ThemeTokenDiagnosticCode",
+          "signature": "export type ThemeTokenDiagnosticCode = 'missing-required-token' | 'unknown-token';"
+        },
+        {
+          "key": "index.d.ts#TypeAliasDeclaration:ThemeTokenDiagnosticReporter",
+          "signature": "export type ThemeTokenDiagnosticReporter = (diagnostic: ThemeTokenDiagnostic) => void;"
+        },
+        {
+          "key": "index.d.ts#TypeAliasDeclaration:ThemeTokenName",
+          "signature": "export type ThemeTokenName = (typeof THEME_TOKEN_NAMES)[number];"
+        },
+        {
+          "key": "index.d.ts#TypeAliasDeclaration:ThemeTokenValues",
+          "signature": "export type ThemeTokenValues = Partial<Record<ThemeTokenName, string>>;"
+        },
+        {
+          "key": "index.d.ts#VariableStatement:DERIVED_THEME_TOKEN_NAMES",
+          "signature": "export declare const DERIVED_THEME_TOKEN_NAMES: readonly [\"elev-highlight\", \"elev-1\", \"elev-1-hover\", \"elev-2\", \"elev-3\", \"ok-fill\", \"warn-fill\", \"danger-fill\", \"info-fill\", \"queued-fill\", \"chart-2\", \"shadow\", \"shadow-color\", \"scrim\", \"grain-opacity\", \"msg-bubble\", \"msg-obj-border\", \"surface-2\", \"surface-3\", \"color-green\", \"color-red\", \"color-blue\", \"text-secondary\", \"sidebar-bg\", \"sidebar-control-bg\", \"sidebar-control-hover\", \"sidebar-item-hover\", \"sidebar-item-active\", \"sidebar-text-strong\", \"sidebar-text\", \"sidebar-text-soft\", \"sidebar-border\"];"
+        },
+        {
+          "key": "index.d.ts#VariableStatement:PUBLIC_THEME_IDS",
+          "signature": "export declare const PUBLIC_THEME_IDS: readonly [\"arctic\", \"crt-green\", \"dark\", \"ember\", \"light\", \"miami\", \"synthwave\", \"terminal\", \"vapor\"];"
+        },
+        {
+          "key": "index.d.ts#VariableStatement:REQUIRED_THEME_TOKEN_NAMES",
+          "signature": "export declare const REQUIRED_THEME_TOKEN_NAMES: readonly [\"bg\", \"bg-surface\", \"bg-surface-2\", \"bg-elevated\", \"bg-hover\", \"text\", \"text-muted\", \"text-dim\", \"border\", \"border-strong\", \"border-focus\", \"card\", \"hairline\", \"accent\", \"accent-hover\", \"accent-deep\", \"accent-secondary\", \"accent-foreground\", \"ok\", \"warn\", \"danger\", \"info\", \"queued\", \"syntax-comment\", \"syntax-keyword\", \"syntax-string\", \"syntax-literal\", \"syntax-title\", \"syntax-attr\"];"
+        },
+        {
+          "key": "index.d.ts#VariableStatement:THEME_TOKEN_NAMES",
+          "signature": "export declare const THEME_TOKEN_NAMES: readonly [\"bg\", \"bg-surface\", \"bg-surface-2\", \"bg-elevated\", \"bg-hover\", \"text\", \"text-muted\", \"text-dim\", \"border\", \"border-strong\", \"border-focus\", \"card\", \"hairline\", \"accent\", \"accent-hover\", \"accent-deep\", \"accent-secondary\", \"accent-foreground\", \"ok\", \"warn\", \"danger\", \"info\", \"queued\", \"syntax-comment\", \"syntax-keyword\", \"syntax-string\", \"syntax-literal\", \"syntax-title\", \"syntax-attr\", \"elev-highlight\", \"elev-1\", \"elev-1-hover\", \"elev-2\", \"elev-3\", \"ok-fill\", \"warn-fill\", \"danger-fill\", \"info-fill\", \"queued-fill\", \"chart-2\", \"shadow\", \"shadow-color\", \"scrim\", \"grain-opacity\", \"msg-bubble\", \"msg-obj-border\", \"surface-2\", \"surface-3\", \"color-green\", \"color-red\", \"color-blue\", \"text-secondary\", \"sidebar-bg\", \"sidebar-control-bg\", \"sidebar-control-hover\", \"sidebar-item-hover\", \"sidebar-item-active\", \"sidebar-text-strong\", \"sidebar-text\", \"sidebar-text-soft\", \"sidebar-border\"];"
+        }
+      ],
+      "deprecations": []
+    },
+    {
+      "name": "@opensquilla/ui-primitives",
+      "version": "0.1.0",
+      "releaseGroup": "ui-foundation",
+      "publicExports": [
+        ".",
+        "./styles.css"
+      ],
+      "apiExports": [
+        "UiButton",
+        "UiButtonSize",
+        "UiButtonVariant",
+        "UiCard",
+        "UiDialog",
+        "UiInput",
+        "UiStack",
+        "UiStackAlign",
+        "UiStackDirection",
+        "UiStackGap",
+        "UiStackJustify",
+        "UiSwitch"
+      ],
+      "runtimeExports": [
+        "UiButton",
+        "UiCard",
+        "UiDialog",
+        "UiInput",
+        "UiStack",
+        "UiSwitch"
+      ],
+      "declarationsDigest": "sha256:0ae3010be35bf399b31e6ce7dad6a11d613f6a6a55c4aaa2e711d88a2cb8f110",
+      "declarations": [
+        {
+          "key": "components/UiButton.vue.d.ts#ExportAssignment:default",
+          "signature": "export default _default;"
+        },
+        {
+          "key": "components/UiButton.vue.d.ts#ImportDeclaration:0",
+          "signature": "import type { UiButtonSize, UiButtonVariant } from './button.js';"
+        },
+        {
+          "key": "components/UiButton.vue.d.ts#TypeAliasDeclaration:__VLS_Props",
+          "signature": "type __VLS_Props = { variant?: UiButtonVariant; size?: UiButtonSize; type?: 'button' | 'submit' | 'reset'; disabled?: boolean; busy?: boolean; block?: boolean; };"
+        },
+        {
+          "key": "components/UiButton.vue.d.ts#TypeAliasDeclaration:__VLS_Slots",
+          "signature": "type __VLS_Slots = {} & { default?: (props: typeof __VLS_1) => any; };"
+        },
+        {
+          "key": "components/UiButton.vue.d.ts#TypeAliasDeclaration:__VLS_WithSlots",
+          "signature": "type __VLS_WithSlots<T, S> = T & { new (): { $slots: S; }; };"
+        },
+        {
+          "key": "components/UiButton.vue.d.ts#VariableStatement:__VLS_1",
+          "signature": "declare var __VLS_1: {};"
+        },
+        {
+          "key": "components/UiButton.vue.d.ts#VariableStatement:__VLS_component",
+          "signature": "declare const __VLS_component: import(\"vue\").DefineComponent<__VLS_Props, {}, {}, {}, {}, import(\"vue\").ComponentOptionsMixin, import(\"vue\").ComponentOptionsMixin, {}, string, import(\"vue\").PublicProps, Readonly<__VLS_Props> & Readonly<{}>, { variant: UiButtonVariant; size: UiButtonSize; type: \"button\" | \"submit\" | \"reset\"; disabled: boolean; busy: boolean; block: boolean; }, {}, {}, {}, string, import(\"vue\").ComponentProvideOptions, false, {}, any>;"
+        },
+        {
+          "key": "components/UiButton.vue.d.ts#VariableStatement:_default",
+          "signature": "declare const _default: __VLS_WithSlots<typeof __VLS_component, __VLS_Slots>;"
+        },
+        {
+          "key": "components/UiCard.vue.d.ts#ExportAssignment:default",
+          "signature": "export default _default;"
+        },
+        {
+          "key": "components/UiCard.vue.d.ts#TypeAliasDeclaration:__VLS_Props",
+          "signature": "type __VLS_Props = { as?: string; interactive?: boolean; padded?: boolean; };"
+        },
+        {
+          "key": "components/UiCard.vue.d.ts#TypeAliasDeclaration:__VLS_Slots",
+          "signature": "type __VLS_Slots = {} & { header?: (props: typeof __VLS_6) => any; } & { default?: (props: typeof __VLS_8) => any; } & { footer?: (props: typeof __VLS_10) => any; };"
+        },
+        {
+          "key": "components/UiCard.vue.d.ts#TypeAliasDeclaration:__VLS_WithSlots",
+          "signature": "type __VLS_WithSlots<T, S> = T & { new (): { $slots: S; }; };"
+        },
+        {
+          "key": "components/UiCard.vue.d.ts#VariableStatement:__VLS_6,__VLS_8,__VLS_10",
+          "signature": "declare var __VLS_6: {}, __VLS_8: {}, __VLS_10: {};"
+        },
+        {
+          "key": "components/UiCard.vue.d.ts#VariableStatement:__VLS_component",
+          "signature": "declare const __VLS_component: import(\"vue\").DefineComponent<__VLS_Props, {}, {}, {}, {}, import(\"vue\").ComponentOptionsMixin, import(\"vue\").ComponentOptionsMixin, {}, string, import(\"vue\").PublicProps, Readonly<__VLS_Props> & Readonly<{}>, { as: string; interactive: boolean; padded: boolean; }, {}, {}, {}, string, import(\"vue\").ComponentProvideOptions, false, {}, any>;"
+        },
+        {
+          "key": "components/UiCard.vue.d.ts#VariableStatement:_default",
+          "signature": "declare const _default: __VLS_WithSlots<typeof __VLS_component, __VLS_Slots>;"
+        },
+        {
+          "key": "components/UiDialog.vue.d.ts#ExportAssignment:default",
+          "signature": "export default _default;"
+        },
+        {
+          "key": "components/UiDialog.vue.d.ts#TypeAliasDeclaration:__VLS_Props",
+          "signature": "type __VLS_Props = { open: boolean; title?: string; description?: string; closeOnBackdrop?: boolean; closeOnEscape?: boolean; initialFocus?: 'first' | 'dialog'; teleportTo?: string; };"
+        },
+        {
+          "key": "components/UiDialog.vue.d.ts#TypeAliasDeclaration:__VLS_Slots",
+          "signature": "type __VLS_Slots = {} & { title?: (props: typeof __VLS_9) => any; } & { default?: (props: typeof __VLS_11) => any; } & { footer?: (props: typeof __VLS_13) => any; };"
+        },
+        {
+          "key": "components/UiDialog.vue.d.ts#TypeAliasDeclaration:__VLS_WithSlots",
+          "signature": "type __VLS_WithSlots<T, S> = T & { new (): { $slots: S; }; };"
+        },
+        {
+          "key": "components/UiDialog.vue.d.ts#VariableStatement:__VLS_9,__VLS_11,__VLS_13",
+          "signature": "declare var __VLS_9: {}, __VLS_11: {}, __VLS_13: {};"
+        },
+        {
+          "key": "components/UiDialog.vue.d.ts#VariableStatement:__VLS_component",
+          "signature": "declare const __VLS_component: import(\"vue\").DefineComponent<__VLS_Props, {}, {}, {}, {}, import(\"vue\").ComponentOptionsMixin, import(\"vue\").ComponentOptionsMixin, { close: () => any; }, string, import(\"vue\").PublicProps, Readonly<__VLS_Props> & Readonly<{ onClose?: () => any; }>, { closeOnBackdrop: boolean; closeOnEscape: boolean; initialFocus: \"first\" | \"dialog\"; teleportTo: string; }, {}, {}, {}, string, import(\"vue\").ComponentProvideOptions, false, {}, any>;"
+        },
+        {
+          "key": "components/UiDialog.vue.d.ts#VariableStatement:_default",
+          "signature": "declare const _default: __VLS_WithSlots<typeof __VLS_component, __VLS_Slots>;"
+        },
+        {
+          "key": "components/UiInput.vue.d.ts#ExportAssignment:default",
+          "signature": "export default _default;"
+        },
+        {
+          "key": "components/UiInput.vue.d.ts#TypeAliasDeclaration:__VLS_Props",
+          "signature": "type __VLS_Props = { modelValue?: string | number; id?: string; label?: string; description?: string; error?: string; type?: 'text' | 'email' | 'password' | 'number' | 'search' | 'url'; disabled?: boolean; required?: boolean; };"
+        },
+        {
+          "key": "components/UiInput.vue.d.ts#VariableStatement:_default",
+          "signature": "declare const _default: import(\"vue\").DefineComponent<__VLS_Props, {}, {}, {}, {}, import(\"vue\").ComponentOptionsMixin, import(\"vue\").ComponentOptionsMixin, { change: (args_0: Event) => any; \"update:modelValue\": (args_0: string | number) => any; }, string, import(\"vue\").PublicProps, Readonly<__VLS_Props> & Readonly<{ onChange?: (args_0: Event) => any; \"onUpdate:modelValue\"?: (args_0: string | number) => any; }>, { type: \"text\" | \"email\" | \"password\" | \"number\" | \"search\" | \"url\"; disabled: boolean; required: boolean; modelValue: string | number; }, {}, {}, {}, string, import(\"vue\").ComponentProvideOptions, false, {}, any>;"
+        },
+        {
+          "key": "components/UiStack.vue.d.ts#ExportAssignment:default",
+          "signature": "export default _default;"
+        },
+        {
+          "key": "components/UiStack.vue.d.ts#ImportDeclaration:0",
+          "signature": "import type { UiStackAlign, UiStackDirection, UiStackGap, UiStackJustify } from './stack.js';"
+        },
+        {
+          "key": "components/UiStack.vue.d.ts#TypeAliasDeclaration:__VLS_Props",
+          "signature": "type __VLS_Props = { as?: string; direction?: UiStackDirection; gap?: UiStackGap; align?: UiStackAlign; justify?: UiStackJustify; wrap?: boolean; };"
+        },
+        {
+          "key": "components/UiStack.vue.d.ts#TypeAliasDeclaration:__VLS_Slots",
+          "signature": "type __VLS_Slots = {} & { default?: (props: typeof __VLS_6) => any; };"
+        },
+        {
+          "key": "components/UiStack.vue.d.ts#TypeAliasDeclaration:__VLS_WithSlots",
+          "signature": "type __VLS_WithSlots<T, S> = T & { new (): { $slots: S; }; };"
+        },
+        {
+          "key": "components/UiStack.vue.d.ts#VariableStatement:__VLS_6",
+          "signature": "declare var __VLS_6: {};"
+        },
+        {
+          "key": "components/UiStack.vue.d.ts#VariableStatement:__VLS_component",
+          "signature": "declare const __VLS_component: import(\"vue\").DefineComponent<__VLS_Props, {}, {}, {}, {}, import(\"vue\").ComponentOptionsMixin, import(\"vue\").ComponentOptionsMixin, {}, string, import(\"vue\").PublicProps, Readonly<__VLS_Props> & Readonly<{}>, { as: string; direction: UiStackDirection; gap: UiStackGap; align: UiStackAlign; justify: UiStackJustify; wrap: boolean; }, {}, {}, {}, string, import(\"vue\").ComponentProvideOptions, false, {}, any>;"
+        },
+        {
+          "key": "components/UiStack.vue.d.ts#VariableStatement:_default",
+          "signature": "declare const _default: __VLS_WithSlots<typeof __VLS_component, __VLS_Slots>;"
+        },
+        {
+          "key": "components/UiSwitch.vue.d.ts#ExportAssignment:default",
+          "signature": "export default _default;"
+        },
+        {
+          "key": "components/UiSwitch.vue.d.ts#TypeAliasDeclaration:__VLS_Props",
+          "signature": "type __VLS_Props = { checked?: boolean; disabled?: boolean; busy?: boolean; label?: string; caption?: string; ariaLabel?: string; name?: string; id?: string; };"
+        },
+        {
+          "key": "components/UiSwitch.vue.d.ts#VariableStatement:_default",
+          "signature": "declare const _default: import(\"vue\").DefineComponent<__VLS_Props, {}, {}, {}, {}, import(\"vue\").ComponentOptionsMixin, import(\"vue\").ComponentOptionsMixin, { change: (args_0: boolean) => any; \"update:checked\": (args_0: boolean) => any; }, string, import(\"vue\").PublicProps, Readonly<__VLS_Props> & Readonly<{ onChange?: (args_0: boolean) => any; \"onUpdate:checked\"?: (args_0: boolean) => any; }>, { disabled: boolean; busy: boolean; checked: boolean; }, {}, {}, {}, string, import(\"vue\").ComponentProvideOptions, false, {}, any>;"
+        },
+        {
+          "key": "components/button.d.ts#TypeAliasDeclaration:UiButtonSize",
+          "signature": "export type UiButtonSize = 'small' | 'medium' | 'large';"
+        },
+        {
+          "key": "components/button.d.ts#TypeAliasDeclaration:UiButtonVariant",
+          "signature": "export type UiButtonVariant = 'primary' | 'secondary' | 'ghost' | 'danger';"
+        },
+        {
+          "key": "components/dialogStack.d.ts#FunctionDeclaration:isTopmostDialog",
+          "signature": "export declare function isTopmostDialog(token: symbol): boolean;"
+        },
+        {
+          "key": "components/dialogStack.d.ts#FunctionDeclaration:registerDialog",
+          "signature": "export declare function registerDialog(token: symbol): void;"
+        },
+        {
+          "key": "components/dialogStack.d.ts#FunctionDeclaration:unregisterDialog",
+          "signature": "export declare function unregisterDialog(token: symbol): boolean;"
+        },
+        {
+          "key": "components/stack.d.ts#TypeAliasDeclaration:UiStackAlign",
+          "signature": "export type UiStackAlign = 'start' | 'center' | 'end' | 'stretch' | 'baseline';"
+        },
+        {
+          "key": "components/stack.d.ts#TypeAliasDeclaration:UiStackDirection",
+          "signature": "export type UiStackDirection = 'row' | 'column';"
+        },
+        {
+          "key": "components/stack.d.ts#TypeAliasDeclaration:UiStackGap",
+          "signature": "export type UiStackGap = 'none' | 'xs' | 'sm' | 'md' | 'lg' | 'xl';"
+        },
+        {
+          "key": "components/stack.d.ts#TypeAliasDeclaration:UiStackJustify",
+          "signature": "export type UiStackJustify = 'start' | 'center' | 'end' | 'between' | 'around' | 'evenly';"
+        },
+        {
+          "key": "index.d.ts#ExportDeclaration:{ UiButtonSize, UiButtonVariant, }:'./components/button.js'",
+          "signature": "export type { UiButtonSize, UiButtonVariant, } from './components/button.js';"
+        },
+        {
+          "key": "index.d.ts#ExportDeclaration:{ UiStackAlign, UiStackDirection, UiStackGap, UiStackJustify, }:'./components/stack.js'",
+          "signature": "export type { UiStackAlign, UiStackDirection, UiStackGap, UiStackJustify, } from './components/stack.js';"
+        },
+        {
+          "key": "index.d.ts#ExportDeclaration:{ default as UiButton }:'./components/UiButton.vue'",
+          "signature": "export { default as UiButton } from './components/UiButton.vue';"
+        },
+        {
+          "key": "index.d.ts#ExportDeclaration:{ default as UiCard }:'./components/UiCard.vue'",
+          "signature": "export { default as UiCard } from './components/UiCard.vue';"
+        },
+        {
+          "key": "index.d.ts#ExportDeclaration:{ default as UiDialog }:'./components/UiDialog.vue'",
+          "signature": "export { default as UiDialog } from './components/UiDialog.vue';"
+        },
+        {
+          "key": "index.d.ts#ExportDeclaration:{ default as UiInput }:'./components/UiInput.vue'",
+          "signature": "export { default as UiInput } from './components/UiInput.vue';"
+        },
+        {
+          "key": "index.d.ts#ExportDeclaration:{ default as UiStack }:'./components/UiStack.vue'",
+          "signature": "export { default as UiStack } from './components/UiStack.vue';"
+        },
+        {
+          "key": "index.d.ts#ExportDeclaration:{ default as UiSwitch }:'./components/UiSwitch.vue'",
+          "signature": "export { default as UiSwitch } from './components/UiSwitch.vue';"
+        }
+      ],
+      "deprecations": []
+    },
+    {
+      "name": "@opensquilla/ui-foundation",
+      "version": "0.1.0",
+      "releaseGroup": "ui-foundation",
+      "publicExports": [
+        "."
+      ],
+      "apiExports": [
+        "Awaitable",
+        "CapabilityId",
+        "CompositionContractError",
+        "CompositionContractErrorCode",
+        "ConnectionClosedError",
+        "ConnectionState",
+        "ContributionId",
+        "ContributionOwner",
+        "ContributionRegistrar",
+        "ContributionRegistrySnapshot",
+        "ContributionRequirements",
+        "CreateGatewayClientOptions",
+        "CreateNativeCapabilityAdapterOptions",
+        "CreateOpenSquillaAppOptions",
+        "EventFrame",
+        "FeatureCapabilityStatus",
+        "FeatureContributions",
+        "FeatureId",
+        "FeatureModuleContract",
+        "FinalizeContributionRegistryOptions",
+        "FoundationStoreContext",
+        "GatewayCallOptions",
+        "GatewayClientBindings",
+        "GatewayClientError",
+        "GatewayClientOptions",
+        "GatewayConnectionSettings",
+        "GatewayConnectionState",
+        "GatewayConnectionStorage",
+        "GatewayConnectionStorageOptions",
+        "GatewayConnectionWaitOptions",
+        "GatewayDataStore",
+        "GatewayHelloInput",
+        "GatewayHttpClient",
+        "GatewayHttpClientOptions",
+        "GatewayHttpError",
+        "GatewayQuery",
+        "GatewayQueryListener",
+        "GatewayQueryOptions",
+        "GatewayQueryRefs",
+        "GatewayQuerySnapshot",
+        "GatewayRequestClient",
+        "GatewayStateListener",
+        "GatewayStateRef",
+        "GatewayStateSnapshot",
+        "GatewayStateSource",
+        "GatewayTerminationAction",
+        "GatewayUiCallOptions",
+        "GatewayUiCapabilitySource",
+        "GatewayUiClient",
+        "GatewayUiConnectionState",
+        "GatewayUiConnectionWaitOptions",
+        "GatewayUiContract",
+        "GatewayUiContractStatus",
+        "GatewayUiEventHandler",
+        "GatewayUiProtocolRange",
+        "GatewayUiRuntime",
+        "HandshakeError",
+        "NATIVE_CAPABILITY_API_VERSION",
+        "NativeCapabilityAdapter",
+        "NativeCapabilityApiVersion",
+        "NativeCapabilityErrorCode",
+        "NativeCapabilityFailure",
+        "NativeCapabilityInvocation",
+        "NativeCapabilityResult",
+        "NavigationContribution",
+        "NavigationSlot",
+        "NormalizedHello",
+        "OpenSquillaAppComposition",
+        "PageContribution",
+        "PageLoadContext",
+        "PageLoader",
+        "PresentationAvailability",
+        "PresentationEnvironment",
+        "PresentationUnavailableReason",
+        "RegisteredNavigation",
+        "RegisteredPage",
+        "RegisteredRoute",
+        "RegisteredState",
+        "RequestAbortError",
+        "RequestTimeoutError",
+        "RouteContribution",
+        "RpcAbortError",
+        "RpcCallOptions",
+        "RpcClient",
+        "RpcClientError",
+        "RpcConnectionWaitOptions",
+        "RpcContractInfo",
+        "RpcErrorDetail",
+        "RpcEventHandler",
+        "RpcFrame",
+        "RpcProtocolRange",
+        "RpcRuntimeInfo",
+        "RpcTerminationAction",
+        "RpcTimeoutError",
+        "ScopedStateInstance",
+        "SequenceGapError",
+        "StateContribution",
+        "StateFactoryContext",
+        "StorageLike",
+        "UI_COMPOSITION_API_VERSION",
+        "UiCompositionApiVersion",
+        "UseGatewayQueryOptions",
+        "assertCapabilityId",
+        "capabilitiesForMethods",
+        "clearStoragePrefix",
+        "createContributionRegistrar",
+        "createFoundationStores",
+        "createGatewayClient",
+        "createGatewayConnectionStorage",
+        "createGatewayHttpClient",
+        "createGatewayQuery",
+        "createNativeCapabilityAdapter",
+        "createOpenSquillaApp",
+        "createWebNativeCapabilityAdapter",
+        "evaluatePresentationAvailability",
+        "normalizeCapabilities",
+        "normalizeHelloFrame",
+        "useGatewayQuery",
+        "useGatewayState"
+      ],
+      "runtimeExports": [
+        "CompositionContractError",
+        "ConnectionClosedError",
+        "ContributionRegistrar",
+        "GatewayClientError",
+        "GatewayDataStore",
+        "GatewayHttpClient",
+        "GatewayHttpError",
+        "GatewayQuery",
+        "HandshakeError",
+        "NATIVE_CAPABILITY_API_VERSION",
+        "RequestAbortError",
+        "RequestTimeoutError",
+        "RpcAbortError",
+        "RpcClient",
+        "RpcTimeoutError",
+        "SequenceGapError",
+        "UI_COMPOSITION_API_VERSION",
+        "assertCapabilityId",
+        "capabilitiesForMethods",
+        "clearStoragePrefix",
+        "createContributionRegistrar",
+        "createFoundationStores",
+        "createGatewayClient",
+        "createGatewayConnectionStorage",
+        "createGatewayHttpClient",
+        "createGatewayQuery",
+        "createNativeCapabilityAdapter",
+        "createOpenSquillaApp",
+        "createWebNativeCapabilityAdapter",
+        "evaluatePresentationAvailability",
+        "normalizeCapabilities",
+        "normalizeHelloFrame",
+        "useGatewayQuery",
+        "useGatewayState"
+      ],
+      "declarationsDigest": "sha256:5efc2aa468d21aadf90f2952adcd7e3fbce97624441a20682626633e300846d8",
+      "declarations": [
+        {
+          "key": "composition/app.d.ts#FunctionDeclaration:createOpenSquillaApp",
+          "signature": "export declare function createOpenSquillaApp(options: CreateOpenSquillaAppOptions): Promise<OpenSquillaAppComposition>;"
+        },
+        {
+          "key": "composition/app.d.ts#ImportDeclaration:0",
+          "signature": "import { type CreateOpenSquillaAppOptions, type OpenSquillaAppComposition } from './types.js';"
+        },
+        {
+          "key": "composition/capabilities.d.ts#FunctionDeclaration:assertCapabilityId",
+          "signature": "export declare function assertCapabilityId(capability: CapabilityId): void;"
+        },
+        {
+          "key": "composition/capabilities.d.ts#FunctionDeclaration:createNativeCapabilityAdapter",
+          "signature": "export declare function createNativeCapabilityAdapter(options: CreateNativeCapabilityAdapterOptions): NativeCapabilityAdapter;"
+        },
+        {
+          "key": "composition/capabilities.d.ts#FunctionDeclaration:createWebNativeCapabilityAdapter",
+          "signature": "export declare function createWebNativeCapabilityAdapter(): NativeCapabilityAdapter;"
+        },
+        {
+          "key": "composition/capabilities.d.ts#FunctionDeclaration:evaluatePresentationAvailability",
+          "signature": "export declare function evaluatePresentationAvailability(requirements: ContributionRequirements | undefined, environment: PresentationEnvironment): PresentationAvailability;"
+        },
+        {
+          "key": "composition/capabilities.d.ts#FunctionDeclaration:normalizeCapabilities",
+          "signature": "export declare function normalizeCapabilities(capabilities: Iterable<CapabilityId>): readonly CapabilityId[];"
+        },
+        {
+          "key": "composition/capabilities.d.ts#ImportDeclaration:0",
+          "signature": "import { type CapabilityId, type ContributionRequirements, type NativeCapabilityAdapter, type NativeCapabilityInvocation, type NativeCapabilityResult, type PresentationAvailability, type PresentationEnvironment } from './types.js';"
+        },
+        {
+          "key": "composition/capabilities.d.ts#InterfaceDeclaration:CreateNativeCapabilityAdapterOptions",
+          "signature": "export interface CreateNativeCapabilityAdapterOptions { readonly bridgeVersion: string; readonly capabilities: readonly CapabilityId[]; invoke<T = unknown>(invocation: NativeCapabilityInvocation): Promise<NativeCapabilityResult<T>>; }"
+        },
+        {
+          "key": "composition/errors.d.ts#ClassDeclaration:CompositionContractError",
+          "signature": "export declare class CompositionContractError extends Error { readonly code: CompositionContractErrorCode; readonly details: Readonly<Record<string, unknown>>; constructor(code: CompositionContractErrorCode, message: string, details?: Readonly<Record<string, unknown>>, options?: ErrorOptions); }"
+        },
+        {
+          "key": "composition/errors.d.ts#TypeAliasDeclaration:CompositionContractErrorCode",
+          "signature": "export type CompositionContractErrorCode = 'invalid_feature_id' | 'duplicate_feature_id' | 'unsupported_feature_api_version' | 'unknown_feature_dependency' | 'feature_dependency_cycle' | 'invalid_contribution_id' | 'duplicate_contribution_id' | 'invalid_route' | 'duplicate_route_path' | 'duplicate_route_name' | 'unknown_page' | 'unknown_route' | 'undeclared_feature_reference' | 'invalid_state_namespace' | 'duplicate_state_namespace' | 'invalid_capability' | 'unknown_capability' | 'missing_required_capability' | 'unsupported_native_adapter_version' | 'state_initialization_failed' | 'unknown_state_namespace' | 'unknown_page_id' | 'composition_disposed';"
+        },
+        {
+          "key": "composition/registrar.d.ts#ClassDeclaration:ContributionRegistrar",
+          "signature": "export declare class ContributionRegistrar { #private; register(feature: FeatureModuleContract): this; registerMany(features: readonly FeatureModuleContract[]): this; finalize(options?: FinalizeContributionRegistryOptions): ContributionRegistrySnapshot; }"
+        },
+        {
+          "key": "composition/registrar.d.ts#FunctionDeclaration:createContributionRegistrar",
+          "signature": "export declare function createContributionRegistrar(features?: readonly FeatureModuleContract[]): ContributionRegistrar;"
+        },
+        {
+          "key": "composition/registrar.d.ts#ImportDeclaration:0",
+          "signature": "import { type CapabilityId, type ContributionRegistrySnapshot, type FeatureModuleContract } from './types.js';"
+        },
+        {
+          "key": "composition/registrar.d.ts#InterfaceDeclaration:FinalizeContributionRegistryOptions",
+          "signature": "export interface FinalizeContributionRegistryOptions { readonly knownCapabilities?: readonly CapabilityId[]; readonly capabilities?: readonly CapabilityId[]; }"
+        },
+        {
+          "key": "composition/types.d.ts#InterfaceDeclaration:ContributionOwner",
+          "signature": "export interface ContributionOwner { readonly featureId: FeatureId; readonly contributionId: ContributionId; }"
+        },
+        {
+          "key": "composition/types.d.ts#InterfaceDeclaration:ContributionRegistrySnapshot",
+          "signature": "export interface ContributionRegistrySnapshot { readonly apiVersion: UiCompositionApiVersion; readonly features: readonly FeatureModuleContract[]; readonly pages: readonly RegisteredPage[]; readonly routes: readonly RegisteredRoute[]; readonly navigation: readonly RegisteredNavigation[]; readonly state: readonly RegisteredState[]; readonly featureCapabilities: readonly FeatureCapabilityStatus[]; }"
+        },
+        {
+          "key": "composition/types.d.ts#InterfaceDeclaration:ContributionRequirements",
+          "signature": "export interface ContributionRequirements { /** * Presentation requirement only. Gateway authorization remains authoritative * even when the host reports every scope in this list. */ readonly gatewayScopes?: readonly string[]; readonly capabilities?: readonly CapabilityId[]; }"
+        },
+        {
+          "key": "composition/types.d.ts#InterfaceDeclaration:CreateOpenSquillaAppOptions",
+          "signature": "export interface CreateOpenSquillaAppOptions { readonly features: readonly FeatureModuleContract[]; readonly knownCapabilities?: readonly CapabilityId[]; readonly capabilities?: readonly CapabilityId[]; readonly gatewayScopes?: readonly string[]; readonly native?: NativeCapabilityAdapter; readonly services?: Readonly<Record<string, unknown>>; }"
+        },
+        {
+          "key": "composition/types.d.ts#InterfaceDeclaration:FeatureCapabilityStatus",
+          "signature": "export interface FeatureCapabilityStatus { readonly featureId: FeatureId; readonly missingOptionalCapabilities: readonly CapabilityId[]; }"
+        },
+        {
+          "key": "composition/types.d.ts#InterfaceDeclaration:FeatureContributions",
+          "signature": "export interface FeatureContributions { readonly pages?: readonly PageContribution[]; readonly routes?: readonly RouteContribution[]; readonly navigation?: readonly NavigationContribution[]; readonly state?: readonly StateContribution[]; }"
+        },
+        {
+          "key": "composition/types.d.ts#InterfaceDeclaration:FeatureModuleContract",
+          "signature": "export interface FeatureModuleContract { readonly id: FeatureId; readonly apiVersion: UiCompositionApiVersion; readonly dependsOn?: readonly FeatureId[]; readonly requiredCapabilities?: readonly CapabilityId[]; readonly optionalCapabilities?: readonly CapabilityId[]; readonly order?: number; readonly contributions?: FeatureContributions; }"
+        },
+        {
+          "key": "composition/types.d.ts#InterfaceDeclaration:NativeCapabilityAdapter",
+          "signature": "export interface NativeCapabilityAdapter { readonly apiVersion: NativeCapabilityApiVersion; readonly bridgeVersion: string | null; readonly capabilities: readonly CapabilityId[]; invoke<T = unknown>(invocation: NativeCapabilityInvocation): Promise<NativeCapabilityResult<T>>; }"
+        },
+        {
+          "key": "composition/types.d.ts#InterfaceDeclaration:NativeCapabilityFailure",
+          "signature": "export interface NativeCapabilityFailure { readonly code: NativeCapabilityErrorCode; readonly capability: CapabilityId; readonly message: string; }"
+        },
+        {
+          "key": "composition/types.d.ts#InterfaceDeclaration:NativeCapabilityInvocation",
+          "signature": "export interface NativeCapabilityInvocation { readonly capability: CapabilityId; readonly request?: unknown; readonly signal?: AbortSignal; }"
+        },
+        {
+          "key": "composition/types.d.ts#InterfaceDeclaration:NavigationContribution",
+          "signature": "export interface NavigationContribution { readonly id: ContributionId; readonly routeId: ContributionId; readonly slot: NavigationSlot; readonly label: string; readonly order?: number; readonly requirements?: ContributionRequirements; readonly metadata?: Readonly<Record<string, unknown>>; }"
+        },
+        {
+          "key": "composition/types.d.ts#InterfaceDeclaration:OpenSquillaAppComposition",
+          "signature": "export interface OpenSquillaAppComposition { readonly registry: ContributionRegistrySnapshot; readonly capabilities: ReadonlySet<CapabilityId>; readonly gatewayScopes: ReadonlySet<string>; readonly native: NativeCapabilityAdapter; readonly disposed: boolean; getState<T = unknown>(namespace: string): T; loadPage<TPage = unknown>(pageId: ContributionId): Promise<TPage>; availability(requirements?: ContributionRequirements): PresentationAvailability; dispose(): Promise<void>; }"
+        },
+        {
+          "key": "composition/types.d.ts#InterfaceDeclaration:PageContribution",
+          "signature": "export interface PageContribution<TPage = unknown> { readonly id: ContributionId; readonly load: PageLoader<TPage>; readonly order?: number; }"
+        },
+        {
+          "key": "composition/types.d.ts#InterfaceDeclaration:PageLoadContext",
+          "signature": "export interface PageLoadContext { readonly featureId: FeatureId; readonly capabilities: ReadonlySet<CapabilityId>; readonly native: NativeCapabilityAdapter; getOwnState<T = unknown>(namespace: string): T; getService<T = unknown>(id: string): T | undefined; }"
+        },
+        {
+          "key": "composition/types.d.ts#InterfaceDeclaration:PresentationAvailability",
+          "signature": "export interface PresentationAvailability { readonly available: boolean; readonly reasons: readonly PresentationUnavailableReason[]; readonly missingCapabilities: readonly CapabilityId[]; readonly missingGatewayScopes: readonly string[]; }"
+        },
+        {
+          "key": "composition/types.d.ts#InterfaceDeclaration:PresentationEnvironment",
+          "signature": "export interface PresentationEnvironment { readonly capabilities: ReadonlySet<CapabilityId>; readonly gatewayScopes?: ReadonlySet<string>; }"
+        },
+        {
+          "key": "composition/types.d.ts#InterfaceDeclaration:RegisteredNavigation",
+          "signature": "export interface RegisteredNavigation extends ContributionOwner { readonly contribution: NavigationContribution; }"
+        },
+        {
+          "key": "composition/types.d.ts#InterfaceDeclaration:RegisteredPage",
+          "signature": "export interface RegisteredPage extends ContributionOwner { readonly contribution: PageContribution; }"
+        },
+        {
+          "key": "composition/types.d.ts#InterfaceDeclaration:RegisteredRoute",
+          "signature": "export interface RegisteredRoute extends ContributionOwner { readonly contribution: RouteContribution; }"
+        },
+        {
+          "key": "composition/types.d.ts#InterfaceDeclaration:RegisteredState",
+          "signature": "export interface RegisteredState extends ContributionOwner { readonly contribution: StateContribution; }"
+        },
+        {
+          "key": "composition/types.d.ts#InterfaceDeclaration:RouteContribution",
+          "signature": "export interface RouteContribution { readonly id: ContributionId; readonly path: string; readonly name: string; readonly pageId: ContributionId; readonly order?: number; readonly requirements?: ContributionRequirements; readonly metadata?: Readonly<Record<string, unknown>>; }"
+        },
+        {
+          "key": "composition/types.d.ts#InterfaceDeclaration:ScopedStateInstance",
+          "signature": "export interface ScopedStateInstance<TState = unknown> { readonly value: TState; dispose?(): Awaitable<void>; }"
+        },
+        {
+          "key": "composition/types.d.ts#InterfaceDeclaration:StateContribution",
+          "signature": "export interface StateContribution<TState = unknown> { readonly id: ContributionId; readonly namespace: string; readonly order?: number; create(context: StateFactoryContext): Awaitable<ScopedStateInstance<TState>>; }"
+        },
+        {
+          "key": "composition/types.d.ts#InterfaceDeclaration:StateFactoryContext",
+          "signature": "export interface StateFactoryContext { readonly featureId: FeatureId; readonly namespace: string; readonly capabilities: ReadonlySet<CapabilityId>; readonly native: NativeCapabilityAdapter; getService<T = unknown>(id: string): T | undefined; }"
+        },
+        {
+          "key": "composition/types.d.ts#TypeAliasDeclaration:Awaitable",
+          "signature": "export type Awaitable<T> = T | Promise<T>;"
+        },
+        {
+          "key": "composition/types.d.ts#TypeAliasDeclaration:CapabilityId",
+          "signature": "export type CapabilityId = string;"
+        },
+        {
+          "key": "composition/types.d.ts#TypeAliasDeclaration:ContributionId",
+          "signature": "export type ContributionId = string;"
+        },
+        {
+          "key": "composition/types.d.ts#TypeAliasDeclaration:FeatureId",
+          "signature": "export type FeatureId = string;"
+        },
+        {
+          "key": "composition/types.d.ts#TypeAliasDeclaration:NativeCapabilityApiVersion",
+          "signature": "export type NativeCapabilityApiVersion = typeof NATIVE_CAPABILITY_API_VERSION;"
+        },
+        {
+          "key": "composition/types.d.ts#TypeAliasDeclaration:NativeCapabilityErrorCode",
+          "signature": "export type NativeCapabilityErrorCode = 'unsupported' | 'unavailable' | 'invalid_request' | 'denied' | 'failed';"
+        },
+        {
+          "key": "composition/types.d.ts#TypeAliasDeclaration:NativeCapabilityResult",
+          "signature": "export type NativeCapabilityResult<T = unknown> = { readonly ok: true; readonly value: T; } | { readonly ok: false; readonly error: NativeCapabilityFailure; };"
+        },
+        {
+          "key": "composition/types.d.ts#TypeAliasDeclaration:NavigationSlot",
+          "signature": "export type NavigationSlot = 'primary' | 'secondary' | 'footer';"
+        },
+        {
+          "key": "composition/types.d.ts#TypeAliasDeclaration:PageLoader",
+          "signature": "export type PageLoader<TPage = unknown> = (context: PageLoadContext) => Awaitable<TPage>;"
+        },
+        {
+          "key": "composition/types.d.ts#TypeAliasDeclaration:PresentationUnavailableReason",
+          "signature": "export type PresentationUnavailableReason = 'missing_capability' | 'missing_gateway_scope';"
+        },
+        {
+          "key": "composition/types.d.ts#TypeAliasDeclaration:UiCompositionApiVersion",
+          "signature": "export type UiCompositionApiVersion = typeof UI_COMPOSITION_API_VERSION;"
+        },
+        {
+          "key": "composition/types.d.ts#VariableStatement:NATIVE_CAPABILITY_API_VERSION",
+          "signature": "export declare const NATIVE_CAPABILITY_API_VERSION: 1;"
+        },
+        {
+          "key": "composition/types.d.ts#VariableStatement:UI_COMPOSITION_API_VERSION",
+          "signature": "export declare const UI_COMPOSITION_API_VERSION: 1;"
+        },
+        {
+          "key": "gateway/client.d.ts#ClassDeclaration:RpcAbortError",
+          "signature": "export declare class RpcAbortError extends Error implements RpcClientError { readonly method: string; readonly code = \"RPC_ABORTED\"; constructor(method: string); }"
+        },
+        {
+          "key": "gateway/client.d.ts#ClassDeclaration:RpcClient",
+          "signature": "export declare class RpcClient implements GatewayUiClient { private client; private readonly listeners; private connectionState; private currentPolicy; get state(): GatewayConnectionState; get policy(): Record<string, unknown>; get _pending(): { readonly size: number; }; connect(endpoint: string, token?: string): void; disconnect(): void; call<T = unknown>(method: string, params?: Record<string, unknown>, options?: GatewayCallOptions): Promise<T>; on(event: string, handler: GatewayUiEventHandler): () => void; waitForConnection(timeoutMs?: number, signal?: AbortSignal, actions?: GatewayConnectionWaitOptions): Promise<void>; private emit; }"
+        },
+        {
+          "key": "gateway/client.d.ts#ClassDeclaration:RpcTimeoutError",
+          "signature": "export declare class RpcTimeoutError extends Error implements RpcClientError { readonly method: string; readonly timeoutMs: number; readonly code = \"RPC_TIMEOUT\"; constructor(method: string, timeoutMs: number); }"
+        },
+        {
+          "key": "gateway/client.d.ts#ExportDeclaration:{ ConnectionClosedError, GatewayClientError, GatewayHttpError, HandshakeError, RequestAbortError, RequestTimeoutError, SequenceGapError, }:",
+          "signature": "export { ConnectionClosedError, GatewayClientError, GatewayHttpError, HandshakeError, RequestAbortError, RequestTimeoutError, SequenceGapError, };"
+        },
+        {
+          "key": "gateway/client.d.ts#ExportDeclaration:{ EventFrame, GatewayCallOptions, GatewayClientOptions, GatewayConnectionState, GatewayConnectionWaitOptions, GatewayTerminationAction, NormalizedHello, }:",
+          "signature": "export type { EventFrame, GatewayCallOptions, GatewayClientOptions, GatewayConnectionState, GatewayConnectionWaitOptions, GatewayTerminationAction, NormalizedHello, };"
+        },
+        {
+          "key": "gateway/client.d.ts#ExportDeclaration:{ capabilitiesForMethods }:",
+          "signature": "export { capabilitiesForMethods };"
+        },
+        {
+          "key": "gateway/client.d.ts#FunctionDeclaration:createGatewayClient",
+          "signature": "export declare function createGatewayClient(options: CreateGatewayClientOptions): GatewayClient;"
+        },
+        {
+          "key": "gateway/client.d.ts#FunctionDeclaration:normalizeHelloFrame",
+          "signature": "export declare function normalizeHelloFrame(data: RpcFrame, requestId: string): RpcFrame;"
+        },
+        {
+          "key": "gateway/client.d.ts#ImportDeclaration:0",
+          "signature": "import { capabilitiesForMethods, ConnectionClosedError, GatewayClient, GatewayClientError, GatewayHttpError, HandshakeError, RequestAbortError, RequestTimeoutError, SequenceGapError, type ContractInfo, type ErrorShape, type EventFrame, type GatewayCallOptions, type GatewayClientOptions, type GatewayConnectionWaitOptions, type GatewayConnectionState, type GatewayTerminationAction, type NormalizedHello, type NormalizedRuntimeInfo, type ProtocolRangeInfo } from '@opensquilla/client-sdk';"
+        },
+        {
+          "key": "gateway/client.d.ts#ImportDeclaration:1",
+          "signature": "import type { GatewayClientBindings, GatewayUiClient, GatewayUiEventHandler } from './types.js';"
+        },
+        {
+          "key": "gateway/client.d.ts#InterfaceDeclaration:CreateGatewayClientOptions",
+          "signature": "export interface CreateGatewayClientOptions extends Omit<GatewayClientOptions, 'endpoint' | 'onDiagnostic' | 'onHello' | 'onStateChange' | 'token'> { endpoint: string; token?: string; bindings?: Partial<GatewayClientBindings>; }"
+        },
+        {
+          "key": "gateway/client.d.ts#InterfaceDeclaration:RpcClientError",
+          "signature": "export interface RpcClientError extends Error { code?: string; details?: unknown; retryable?: boolean; retry_after_ms?: number; accepted?: boolean; }"
+        },
+        {
+          "key": "gateway/client.d.ts#InterfaceDeclaration:RpcFrame",
+          "signature": "export interface RpcFrame extends Record<string, unknown> { type?: string; id?: string; method?: string; params?: Record<string, unknown>; event?: string; payload?: unknown; meta?: Record<string, unknown>; ok?: boolean; error?: string | RpcErrorDetail; protocol?: number; policy?: Record<string, unknown>; features?: { methods?: string[]; events?: string[]; }; server?: { version?: string; conn_id?: string; }; auth?: Record<string, unknown>; contract?: Partial<RpcContractInfo>; runtime?: Partial<RpcRuntimeInfo>; protocolRange?: Partial<RpcProtocolRange>; capabilities?: string[]; extensions?: string[]; contractStatus?: 'advertised' | 'legacy-contract'; capabilitySource?: 'hello' | 'features.methods' | 'none'; seq?: number; }"
+        },
+        {
+          "key": "gateway/client.d.ts#TypeAliasDeclaration:ConnectionState",
+          "signature": "export type ConnectionState = GatewayConnectionState;"
+        },
+        {
+          "key": "gateway/client.d.ts#TypeAliasDeclaration:RpcCallOptions",
+          "signature": "export type RpcCallOptions = GatewayCallOptions;"
+        },
+        {
+          "key": "gateway/client.d.ts#TypeAliasDeclaration:RpcConnectionWaitOptions",
+          "signature": "export type RpcConnectionWaitOptions = GatewayConnectionWaitOptions;"
+        },
+        {
+          "key": "gateway/client.d.ts#TypeAliasDeclaration:RpcContractInfo",
+          "signature": "export type RpcContractInfo = ContractInfo;"
+        },
+        {
+          "key": "gateway/client.d.ts#TypeAliasDeclaration:RpcErrorDetail",
+          "signature": "export type RpcErrorDetail = Partial<ErrorShape>;"
+        },
+        {
+          "key": "gateway/client.d.ts#TypeAliasDeclaration:RpcEventHandler",
+          "signature": "export type RpcEventHandler = GatewayUiEventHandler;"
+        },
+        {
+          "key": "gateway/client.d.ts#TypeAliasDeclaration:RpcProtocolRange",
+          "signature": "export type RpcProtocolRange = ProtocolRangeInfo;"
+        },
+        {
+          "key": "gateway/client.d.ts#TypeAliasDeclaration:RpcRuntimeInfo",
+          "signature": "export type RpcRuntimeInfo = NormalizedRuntimeInfo;"
+        },
+        {
+          "key": "gateway/client.d.ts#TypeAliasDeclaration:RpcTerminationAction",
+          "signature": "export type RpcTerminationAction = GatewayTerminationAction;"
+        },
+        {
+          "key": "gateway/http.d.ts#ExportDeclaration:{ GatewayHttpClient }:",
+          "signature": "export { GatewayHttpClient };"
+        },
+        {
+          "key": "gateway/http.d.ts#ExportDeclaration:{ GatewayHttpClientOptions }:",
+          "signature": "export type { GatewayHttpClientOptions };"
+        },
+        {
+          "key": "gateway/http.d.ts#FunctionDeclaration:createGatewayHttpClient",
+          "signature": "export declare function createGatewayHttpClient(options: GatewayHttpClientOptions): GatewayHttpClient;"
+        },
+        {
+          "key": "gateway/http.d.ts#ImportDeclaration:0",
+          "signature": "import { GatewayHttpClient, type GatewayHttpClientOptions } from '@opensquilla/client-sdk';"
+        },
+        {
+          "key": "gateway/query.d.ts#ClassDeclaration:GatewayQuery",
+          "signature": "export declare class GatewayQuery<T> { private readonly options; private value; private readonly listeners; private runGeneration; private disposed; private activeAbort; constructor(options: GatewayQueryOptions<T>); get snapshot(): GatewayQuerySnapshot<T>; subscribe(listener: GatewayQueryListener<T>, emitCurrent?: boolean): () => void; execute(): Promise<T | null>; refresh(): Promise<T | null>; reset(): void; dispose(): void; private run; private publish; }"
+        },
+        {
+          "key": "gateway/query.d.ts#FunctionDeclaration:createGatewayQuery",
+          "signature": "export declare function createGatewayQuery<T>(options: GatewayQueryOptions<T>): GatewayQuery<T>;"
+        },
+        {
+          "key": "gateway/query.d.ts#ImportDeclaration:0",
+          "signature": "import type { GatewayUiCallOptions, GatewayUiConnectionWaitOptions } from './types.js';"
+        },
+        {
+          "key": "gateway/query.d.ts#InterfaceDeclaration:GatewayQueryOptions",
+          "signature": "export interface GatewayQueryOptions<T> { client: GatewayRequestClient; method: string; params?: (Record<string, unknown> | (() => Record<string, unknown> | undefined)); callOptions?: GatewayUiCallOptions | (() => GatewayUiCallOptions | undefined); waitTimeoutMs?: number; waitActions?: GatewayUiConnectionWaitOptions; onError?: (error: Error) => void; onSuccess?: (data: T) => void; }"
+        },
+        {
+          "key": "gateway/query.d.ts#InterfaceDeclaration:GatewayQuerySnapshot",
+          "signature": "export interface GatewayQuerySnapshot<T> { readonly data: T | null; readonly error: Error | null; readonly loading: boolean; }"
+        },
+        {
+          "key": "gateway/query.d.ts#InterfaceDeclaration:GatewayRequestClient",
+          "signature": "export interface GatewayRequestClient { call<T = unknown>(method: string, params?: Record<string, unknown>, options?: GatewayUiCallOptions): Promise<T>; waitForConnection(timeoutMs?: number, signal?: AbortSignal, actions?: GatewayUiConnectionWaitOptions): Promise<void>; }"
+        },
+        {
+          "key": "gateway/query.d.ts#TypeAliasDeclaration:GatewayQueryListener",
+          "signature": "export type GatewayQueryListener<T> = (snapshot: GatewayQuerySnapshot<T>) => void;"
+        },
+        {
+          "key": "gateway/state.d.ts#ClassDeclaration:GatewayDataStore",
+          "signature": "export declare class GatewayDataStore implements GatewayStateSource { private value; private readonly listeners; get snapshot(): GatewayStateSnapshot; subscribe(listener: GatewayStateListener, emitCurrent?: boolean): () => void; setConnectionState(state: GatewayUiConnectionState): void; applyHello(input: GatewayHelloInput): void; setDiagnostic(diagnostic: Error): void; markMethodUnavailable(method: string): void; supportsMethod(method: string): boolean; supportsCapability(capability: string): boolean; reset(): void; dispose(): void; private publish; }"
+        },
+        {
+          "key": "gateway/state.d.ts#FunctionDeclaration:createFoundationStores",
+          "signature": "export declare function createFoundationStores(context?: FoundationStoreContext): { gateway: GatewayDataStore; };"
+        },
+        {
+          "key": "gateway/state.d.ts#ImportDeclaration:0",
+          "signature": "import type { GatewayHelloInput, GatewayStateListener, GatewayStateSnapshot, GatewayStateSource, GatewayUiConnectionState } from './types.js';"
+        },
+        {
+          "key": "gateway/state.d.ts#InterfaceDeclaration:FoundationStoreContext",
+          "signature": "export interface FoundationStoreContext { gateway?: GatewayDataStore; }"
+        },
+        {
+          "key": "gateway/storage.d.ts#FunctionDeclaration:clearStoragePrefix",
+          "signature": "export declare function clearStoragePrefix(storage: StorageLike, prefix: string): void;"
+        },
+        {
+          "key": "gateway/storage.d.ts#FunctionDeclaration:createGatewayConnectionStorage",
+          "signature": "export declare function createGatewayConnectionStorage(options: GatewayConnectionStorageOptions): GatewayConnectionStorage;"
+        },
+        {
+          "key": "gateway/storage.d.ts#ImportDeclaration:0",
+          "signature": "import type { GatewayConnectionSettings } from './types.js';"
+        },
+        {
+          "key": "gateway/storage.d.ts#InterfaceDeclaration:GatewayConnectionStorage",
+          "signature": "export interface GatewayConnectionStorage { load(): GatewayConnectionSettings; save(settings: GatewayConnectionSettings): void; clear(): void; }"
+        },
+        {
+          "key": "gateway/storage.d.ts#InterfaceDeclaration:GatewayConnectionStorageOptions",
+          "signature": "export interface GatewayConnectionStorageOptions { persistent: StorageLike; session: StorageLike; defaultEndpoint: string; endpointKey?: string; tokenKey?: string; }"
+        },
+        {
+          "key": "gateway/storage.d.ts#InterfaceDeclaration:StorageLike",
+          "signature": "export interface StorageLike { readonly length: number; getItem(key: string): string | null; key(index: number): string | null; removeItem(key: string): void; setItem(key: string, value: string): void; }"
+        },
+        {
+          "key": "gateway/types.d.ts#ImportDeclaration:0",
+          "signature": "import type { CapabilitySource, ContractInfo, ContractStatus, GatewayCallOptions, GatewayConnectionState, GatewayConnectionWaitOptions, NormalizedHello, NormalizedRuntimeInfo, ProtocolRangeInfo } from '@opensquilla/client-sdk';"
+        },
+        {
+          "key": "gateway/types.d.ts#InterfaceDeclaration:GatewayClientBindings",
+          "signature": "export interface GatewayClientBindings { onStateChange(state: GatewayUiConnectionState): void; onHello(hello: NormalizedHello): void; onDiagnostic(error: Error): void; }"
+        },
+        {
+          "key": "gateway/types.d.ts#InterfaceDeclaration:GatewayConnectionSettings",
+          "signature": "export interface GatewayConnectionSettings { endpoint: string; token?: string; }"
+        },
+        {
+          "key": "gateway/types.d.ts#InterfaceDeclaration:GatewayHelloInput",
+          "signature": "export interface GatewayHelloInput { policy?: unknown; auth?: unknown; features?: { methods?: unknown; }; contract?: GatewayUiContract | null; contractStatus?: GatewayUiContractStatus; runtime?: GatewayUiRuntime | null; protocolRange?: GatewayUiProtocolRange | null; capabilities?: unknown; capabilitySource?: GatewayUiCapabilitySource; extensions?: unknown; }"
+        },
+        {
+          "key": "gateway/types.d.ts#InterfaceDeclaration:GatewayStateSnapshot",
+          "signature": "export interface GatewayStateSnapshot { readonly state: GatewayUiConnectionState; readonly policy: Readonly<Record<string, unknown>> | null; readonly auth: Readonly<Record<string, unknown>> | null; readonly methods: readonly string[]; readonly contract: GatewayUiContract | null; readonly contractStatus: GatewayUiContractStatus; readonly runtime: GatewayUiRuntime | null; readonly protocolRange: GatewayUiProtocolRange | null; readonly capabilities: readonly string[]; readonly capabilitySource: GatewayUiCapabilitySource; readonly extensions: readonly string[]; readonly unavailableMethods: ReadonlySet<string>; readonly diagnostic: Error | null; }"
+        },
+        {
+          "key": "gateway/types.d.ts#InterfaceDeclaration:GatewayStateSource",
+          "signature": "export interface GatewayStateSource { readonly snapshot: GatewayStateSnapshot; subscribe(listener: GatewayStateListener, emitCurrent?: boolean): () => void; }"
+        },
+        {
+          "key": "gateway/types.d.ts#InterfaceDeclaration:GatewayUiClient",
+          "signature": "export interface GatewayUiClient { readonly state: GatewayUiConnectionState; readonly policy: Record<string, unknown>; connect(endpoint: string, token?: string): void; disconnect(): void; call<T = unknown>(method: string, params?: Record<string, unknown>, options?: GatewayUiCallOptions): Promise<T>; on(event: string, handler: GatewayUiEventHandler): () => void; waitForConnection(timeoutMs?: number, signal?: AbortSignal, actions?: GatewayUiConnectionWaitOptions): Promise<void>; }"
+        },
+        {
+          "key": "gateway/types.d.ts#TypeAliasDeclaration:GatewayStateListener",
+          "signature": "export type GatewayStateListener = (snapshot: GatewayStateSnapshot) => void;"
+        },
+        {
+          "key": "gateway/types.d.ts#TypeAliasDeclaration:GatewayUiCallOptions",
+          "signature": "export type GatewayUiCallOptions = GatewayCallOptions;"
+        },
+        {
+          "key": "gateway/types.d.ts#TypeAliasDeclaration:GatewayUiCapabilitySource",
+          "signature": "export type GatewayUiCapabilitySource = CapabilitySource;"
+        },
+        {
+          "key": "gateway/types.d.ts#TypeAliasDeclaration:GatewayUiConnectionState",
+          "signature": "export type GatewayUiConnectionState = GatewayConnectionState;"
+        },
+        {
+          "key": "gateway/types.d.ts#TypeAliasDeclaration:GatewayUiConnectionWaitOptions",
+          "signature": "export type GatewayUiConnectionWaitOptions = GatewayConnectionWaitOptions;"
+        },
+        {
+          "key": "gateway/types.d.ts#TypeAliasDeclaration:GatewayUiContract",
+          "signature": "export type GatewayUiContract = ContractInfo;"
+        },
+        {
+          "key": "gateway/types.d.ts#TypeAliasDeclaration:GatewayUiContractStatus",
+          "signature": "export type GatewayUiContractStatus = ContractStatus;"
+        },
+        {
+          "key": "gateway/types.d.ts#TypeAliasDeclaration:GatewayUiEventHandler",
+          "signature": "export type GatewayUiEventHandler = { bivarianceHack(...args: unknown[]): void; }['bivarianceHack'];"
+        },
+        {
+          "key": "gateway/types.d.ts#TypeAliasDeclaration:GatewayUiProtocolRange",
+          "signature": "export type GatewayUiProtocolRange = ProtocolRangeInfo;"
+        },
+        {
+          "key": "gateway/types.d.ts#TypeAliasDeclaration:GatewayUiRuntime",
+          "signature": "export type GatewayUiRuntime = NormalizedRuntimeInfo;"
+        },
+        {
+          "key": "index.d.ts#ExportDeclaration:*:'./composition/app.js'",
+          "signature": "export * from './composition/app.js';"
+        },
+        {
+          "key": "index.d.ts#ExportDeclaration:*:'./composition/capabilities.js'",
+          "signature": "export * from './composition/capabilities.js';"
+        },
+        {
+          "key": "index.d.ts#ExportDeclaration:*:'./composition/errors.js'",
+          "signature": "export * from './composition/errors.js';"
+        },
+        {
+          "key": "index.d.ts#ExportDeclaration:*:'./composition/registrar.js'",
+          "signature": "export * from './composition/registrar.js';"
+        },
+        {
+          "key": "index.d.ts#ExportDeclaration:*:'./composition/types.js'",
+          "signature": "export * from './composition/types.js';"
+        },
+        {
+          "key": "index.d.ts#ExportDeclaration:*:'./gateway/client.js'",
+          "signature": "export * from './gateway/client.js';"
+        },
+        {
+          "key": "index.d.ts#ExportDeclaration:*:'./gateway/http.js'",
+          "signature": "export * from './gateway/http.js';"
+        },
+        {
+          "key": "index.d.ts#ExportDeclaration:*:'./gateway/query.js'",
+          "signature": "export * from './gateway/query.js';"
+        },
+        {
+          "key": "index.d.ts#ExportDeclaration:*:'./gateway/state.js'",
+          "signature": "export * from './gateway/state.js';"
+        },
+        {
+          "key": "index.d.ts#ExportDeclaration:*:'./gateway/storage.js'",
+          "signature": "export * from './gateway/storage.js';"
+        },
+        {
+          "key": "index.d.ts#ExportDeclaration:*:'./gateway/types.js'",
+          "signature": "export * from './gateway/types.js';"
+        },
+        {
+          "key": "index.d.ts#ExportDeclaration:*:'./vue.js'",
+          "signature": "export * from './vue.js';"
+        },
+        {
+          "key": "vue.d.ts#FunctionDeclaration:useGatewayQuery",
+          "signature": "export declare function useGatewayQuery<T>(client: GatewayQueryOptions<T>['client'], method: string, params?: GatewayQueryOptions<T>['params'], options?: UseGatewayQueryOptions<T>): GatewayQueryRefs<T>;"
+        },
+        {
+          "key": "vue.d.ts#FunctionDeclaration:useGatewayState",
+          "signature": "export declare function useGatewayState(source: GatewayStateSource): GatewayStateRef;"
+        },
+        {
+          "key": "vue.d.ts#ImportDeclaration:0",
+          "signature": "import { type ComputedRef, type DeepReadonly, type ShallowRef } from 'vue';"
+        },
+        {
+          "key": "vue.d.ts#ImportDeclaration:1",
+          "signature": "import { type GatewayQueryOptions } from './gateway/query.js';"
+        },
+        {
+          "key": "vue.d.ts#ImportDeclaration:2",
+          "signature": "import type { GatewayStateSnapshot, GatewayStateSource } from './gateway/types.js';"
+        },
+        {
+          "key": "vue.d.ts#InterfaceDeclaration:GatewayQueryRefs",
+          "signature": "export interface GatewayQueryRefs<T> { readonly data: ComputedRef<T | null>; readonly error: ComputedRef<Error | null>; readonly loading: ComputedRef<boolean>; execute(): Promise<T | null>; refresh(): Promise<T | null>; }"
+        },
+        {
+          "key": "vue.d.ts#InterfaceDeclaration:UseGatewayQueryOptions",
+          "signature": "export interface UseGatewayQueryOptions<T> extends Omit<GatewayQueryOptions<T>, 'client' | 'method' | 'params'> { immediate?: boolean; }"
+        },
+        {
+          "key": "vue.d.ts#TypeAliasDeclaration:GatewayStateRef",
+          "signature": "export type GatewayStateRef = DeepReadonly<ShallowRef<GatewayStateSnapshot>>;"
+        }
+      ],
+      "deprecations": []
+    }
+  ]
+}

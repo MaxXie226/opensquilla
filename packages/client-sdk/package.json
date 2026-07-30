@@ -16,6 +16,7 @@
   "files": [
     "dist",
     "contract-coverage.json",
+    "CHANGELOG.md",
     "README.md"
   ],
   "scripts": {
@@ -29,6 +30,15 @@
   },
   "devDependencies": {
     "typescript": "^5.4.5"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/opensquilla/opensquilla.git",
+    "directory": "packages/client-sdk"
   },
   "license": "Apache-2.0"
 }

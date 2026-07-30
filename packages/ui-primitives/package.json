@@ -15,6 +15,7 @@
   },
   "files": [
     "dist",
+    "CHANGELOG.md",
     "README.md"
   ],
   "scripts": {

@@ -1,14 +1,39 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "releaseTrain": "public-ui-foundation",
-  "versionPolicy": "independent",
+  "versionPolicy": "release-groups",
+  "compatibilityPolicy": "current-and-previous-minor",
+  "releaseGroups": [
+    {
+      "id": "client-sdk",
+      "versionPolicy": "independent",
+      "packages": [
+        "@opensquilla/client-sdk"
+      ]
+    },
+    {
+      "id": "ui-foundation",
+      "versionPolicy": "fixed",
+      "packages": [
+        "@opensquilla/ui-tokens",
+        "@opensquilla/ui-primitives",
+        "@opensquilla/ui-foundation"
+      ]
+    }
+  ],
   "packages": [
     {
       "name": "@opensquilla/client-sdk",
       "path": "packages/client-sdk",
       "version": "0.1.0",
       "role": "gateway-client-sdk",
-      "workspace": false
+      "workspace": false,
+      "releaseGroup": "client-sdk",
+      "publicExports": [
+        ".",
+        "./contract-coverage.json"
+      ],
+      "deprecations": []
     },
     {
       "name": "@opensquilla/ui-tokens",
@@ -16,6 +41,7 @@
       "version": "0.1.0",
       "role": "design-contracts",
       "workspace": true,
+      "releaseGroup": "ui-foundation",
       "publicExports": [
         ".",
         "./foundation.css",
@@ -30,7 +56,8 @@
         "THEME_TOKEN_NAMES",
         "resolveThemeTokens",
         "themeTokensToCssVariables"
-      ]
+      ],
+      "deprecations": []
     },
     {
       "name": "@opensquilla/ui-primitives",
@@ -38,6 +65,7 @@
       "version": "0.1.0",
       "role": "browser-safe-primitives",
       "workspace": true,
+      "releaseGroup": "ui-foundation",
       "publicExports": [
         ".",
         "./styles.css"
@@ -49,7 +77,8 @@
         "UiInput",
         "UiStack",
         "UiSwitch"
-      ]
+      ],
+      "deprecations": []
     },
     {
       "name": "@opensquilla/ui-foundation",
@@ -57,6 +86,7 @@
       "version": "0.1.0",
       "role": "product-neutral-composition",
       "workspace": true,
+      "releaseGroup": "ui-foundation",
       "publicExports": [
         "."
       ],
@@ -95,7 +125,8 @@
         "normalizeCapabilities",
         "useGatewayQuery",
         "useGatewayState"
-      ]
+      ],
+      "deprecations": []
     }
   ]
 }

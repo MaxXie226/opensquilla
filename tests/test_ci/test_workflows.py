@@ -623,6 +623,13 @@ def test_ci_change_classifier_routes_public_ui_packages_to_frontend_only(
             "packages/ui-tokens/src/index.ts",
             "packages/ui-primitives/package.json",
             "packages/ui-foundation/README.md",
+            "packages/ui-compatibility-matrix.json",
+            "packages/UI_RELEASE.md",
+            "contracts/ui-foundation/v1/api-report.json",
+            "scripts/build_ui_package_release.mjs",
+            "scripts/check_ui_package_compat.mjs",
+            "scripts/tests/ui_package_compat.test.mjs",
+            "tests/fixtures/ui-package-consumer/smoke.ts",
             "scripts/verify_ui_packages.mjs",
         ],
     )
@@ -1032,6 +1039,20 @@ def test_default_ci_uses_layered_job_conditions() -> None:
     )
     assert "npm run typecheck" in sdk_step["run"]
     assert "npm run verify:package" in sdk_step["run"]
+    release_step = next(
+        step
+        for step in frontend_steps
+        if step.get("name") == "Build and verify immutable public UI release assets"
+    )
+    assert "build:ui-package-release" in release_step["run"]
+    assert "verify:ui-package-release" in release_step["run"]
+    assert "install:ui-package-release" in release_step["run"]
+    unit_step_index = next(
+        index
+        for index, step in enumerate(frontend_steps)
+        if step.get("name") == "Run frontend unit tests"
+    )
+    assert frontend_steps.index(release_step) < unit_step_index
 
     quality_steps = jobs["ubuntu-quality"]["steps"]
     contract_step = next(
@@ -1154,12 +1175,53 @@ def test_public_ui_package_gate_runs_pack_install_smoke_on_all_platforms() -> No
         step for step in steps
         if step.get("name") == "Verify public UI package boundaries"
     )
+    compatibility = next(
+        step for step in steps
+        if step.get("name") == "Enforce UI package semantic-version compatibility"
+    )
+    checkout = next(
+        step for step in steps
+        if step.get("name") == "Check out repository"
+    )
 
+    assert checkout["with"]["fetch-depth"] == 0
     assert setup_node["with"]["node-version-file"] == "opensquilla-webui/.node-version"
     assert setup_node["with"]["cache-dependency-path"] == "package-lock.json"
     assert install["run"] == "npm ci --ignore-scripts"
     assert verify["run"] == "npm run verify:ui-packages"
+    assert "--baseline-ref" in compatibility["run"]
+    assert "--allow-bootstrap" in compatibility["run"]
     assert "secrets." not in json.dumps(job)
+
+
+def test_public_ui_release_workflow_is_write_once_and_private_repo_free() -> None:
+    workflow = _workflow("ui-foundation-release.yml")
+    text = Path(".github/workflows/ui-foundation-release.yml").read_text(
+        encoding="utf-8",
+    )
+    build_job = workflow["jobs"]["build-and-release"]
+    publish_job = workflow["jobs"]["publish"]
+    steps = build_job["steps"]
+
+    assert workflow["on"]["push"]["tags"] == ["ui-foundation-v*"]
+    assert workflow["on"]["workflow_dispatch"]["inputs"]["release_version"]["required"]
+    assert "permissions" not in build_job
+    assert publish_job["permissions"] == {"contents": "write"}
+    assert publish_job["needs"] == "build-and-release"
+    assert "github.event_name == 'push'" in publish_job["if"]
+    assert any(
+        step.get("name") == "Build the complete public WebUI from release tarballs"
+        for step in steps
+    )
+    publish = next(
+        step for step in publish_job["steps"]
+        if step.get("name") == "Publish write-once GitHub Release"
+    )
+    assert "gh release create" in publish["run"]
+    assert "--verify-tag" in publish["run"]
+    assert "--clobber" not in text
+    assert "secrets." not in text
+    assert "private" not in text.lower()
 
 
 def test_public_ui_primitive_browser_gate_covers_all_engines() -> None:
