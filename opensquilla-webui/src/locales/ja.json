@@ -3305,10 +3305,14 @@
       "sendingContinuing": "返信を送信中 · 実行を継続中…"
     },
     "codingMode": {
-      "enabled": "Coding mode を有効にしました。",
+      "enabled": "すべてのチャットで Coding mode を有効にしました。",
       "disabled": "Coding mode を無効にしました。",
-      "usage": "/coding、/coding on、/coding off、または /coding status を使用してください。",
-      "updateFailed": "Coding mode を更新できませんでした。"
+      "usage": "切り替えるには /coding、明示的に操作するには /coding on、/coding off、/coding status を使用してください。",
+      "updateFailed": "Coding mode を更新できませんでした。",
+      "commandEnable": "Coding mode を有効にする。",
+      "commandDisable": "Coding mode を無効にする。",
+      "activeLabel": "Coding 有効",
+      "disableLabel": "Coding mode を無効にする"
     },
     "composer": {
       "executionMode": "実行モード",

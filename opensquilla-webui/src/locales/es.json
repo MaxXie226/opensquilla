@@ -3305,10 +3305,14 @@
       "sendingContinuing": "Enviando respuesta · continuando la ejecución…"
     },
     "codingMode": {
-      "enabled": "Coding mode activado.",
+      "enabled": "Coding mode activado para todos los chats.",
       "disabled": "Coding mode desactivado.",
-      "usage": "Usa /coding, /coding on, /coding off o /coding status.",
-      "updateFailed": "No se pudo actualizar Coding mode."
+      "usage": "Usa /coding para alternar, o /coding on, /coding off o /coding status.",
+      "updateFailed": "No se pudo actualizar Coding mode.",
+      "commandEnable": "Activar Coding mode.",
+      "commandDisable": "Desactivar Coding mode.",
+      "activeLabel": "Coding ACTIVO",
+      "disableLabel": "Desactivar Coding mode"
     },
     "composer": {
       "executionMode": "Modo de ejecución",

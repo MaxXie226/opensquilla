@@ -3305,10 +3305,14 @@
       "sendingContinuing": "正在发送回复 · 继续运行…"
     },
     "codingMode": {
-      "enabled": "Coding mode 已开启。",
+      "enabled": "Coding mode 已为所有聊天开启。",
       "disabled": "Coding mode 已关闭。",
-      "usage": "请使用 /coding、/coding on、/coding off 或 /coding status。",
-      "updateFailed": "无法更新 Coding mode。"
+      "usage": "使用 /coding 切换，或使用 /coding on、/coding off、/coding status。",
+      "updateFailed": "无法更新 Coding mode。",
+      "commandEnable": "开启 Coding mode。",
+      "commandDisable": "关闭 Coding mode。",
+      "activeLabel": "Coding 已开启",
+      "disableLabel": "关闭 Coding mode"
     },
     "composer": {
       "executionMode": "执行模式",

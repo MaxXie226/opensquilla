@@ -114,7 +114,10 @@ same session.
 Coding mode can be enabled from chat when you want code modifications routed
 through `opensquilla code-task`. With Coding mode on, code changes use the
 guarded host workflow described in [`cli.md`](cli.md#coding-mode-and-code-task)
-instead of ordinary in-session editing.
+instead of ordinary in-session editing. Enter `/coding` to toggle the mode.
+While it is enabled, the composer shows a `Coding ON` status control that can
+also turn the mode off. The explicit `/coding on`, `/coding off`, and
+`/coding status` forms remain available for compatibility.
 
 ## Manual Compaction
 
