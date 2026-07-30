@@ -362,6 +362,17 @@ describe('useChatRpcEventHandlers durable out-of-band messages', () => {
       api.handlers.onWarning({
         session_key: 'agent:main:test',
         stream_seq: 2,
+        code: 'provider_request_message_limit_recovery_success',
+        message: 'Older history was summarized for this provider request; retrying once.',
+      })
+      api.handlers.onWarning({
+        session_key: 'agent:main:test',
+        stream_seq: 2,
+        message: 'replayed compaction warning',
+      })
+      api.handlers.onWarning({
+        session_key: 'agent:main:test',
+        stream_seq: 3,
         message: 'Provider is degraded',
       })
 

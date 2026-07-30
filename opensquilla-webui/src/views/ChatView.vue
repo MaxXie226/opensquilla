@@ -375,26 +375,52 @@
     </div>
 
     <!-- Compaction maintenance card -->
-    <div v-if="compactStatus.visible" class="chat-compact-status" :class="`chat-compact-status--${compactStatus.tone}`" role="status" aria-live="polite">
-      <div class="chat-compact-status__head">
-        <span class="chat-compact-status__dot" :class="{ 'chat-compact-status__dot--pulsing': compactStatus.isBusy }" aria-hidden="true" />
+    <div
+      v-if="compactStatus.visible"
+      class="chat-compact-status"
+      :class="`chat-compact-status--${compactStatus.tone}`"
+      role="status"
+      aria-live="polite"
+      aria-atomic="true"
+    >
+      <span
+        class="chat-compact-status__indicator"
+        :class="{ 'chat-compact-status__indicator--busy': compactStatus.isBusy }"
+        aria-hidden="true"
+      >
+        <Icon v-if="compactStatus.status === 'completed'" name="check" :size="12" />
+        <span v-else class="chat-compact-status__dot" />
+      </span>
+      <div class="chat-compact-status__copy">
         <span class="chat-compact-status__title">{{ compactStatus.message }}</span>
-        <span v-if="compactElapsed" class="chat-compact-status__elapsed">{{ compactElapsed }}</span>
+        <span v-if="compactStatus.detail" class="chat-compact-status__detail">{{ compactStatus.detail }}</span>
+        <span
+          v-if="compactStatus.occupancyPercent !== null"
+          class="chat-compact-status__legend"
+        >
+          <span>context {{ compactStatus.occupancyPercent }}%</span>
+          <span v-if="compactStatus.contextWindowLabel">{{ compactStatus.contextWindowLabel }}</span>
+        </span>
       </div>
-      <p v-if="compactStatus.detail" class="chat-compact-status__detail">{{ compactStatus.detail }}</p>
-      <div v-if="compactGaugeVisible" class="chat-compact-status__gauge" aria-hidden="true">
+      <span v-if="compactElapsed" class="chat-compact-status__elapsed" aria-hidden="true">{{ compactElapsed }}</span>
+      <div
+        v-if="compactGaugeVisible"
+        class="chat-compact-status__gauge"
+        role="progressbar"
+        :aria-label="compactStatus.message"
+        aria-valuemin="0"
+        aria-valuemax="100"
+        :aria-valuenow="compactStatus.status === 'completed' ? 100 : undefined"
+        :aria-busy="compactStatus.isBusy ? 'true' : undefined"
+      >
         <span
           class="chat-compact-status__gauge-fill"
           :class="{
-            'chat-compact-status__gauge-fill--breathing': compactStatus.isBusy,
+            'chat-compact-status__gauge-fill--indeterminate': compactStatus.isBusy,
             'chat-compact-status__gauge-fill--done': compactStatus.status === 'completed',
           }"
-          :style="compactStatus.occupancyPercent !== null ? { width: `${compactStatus.occupancyPercent}%` } : undefined"
+          aria-hidden="true"
         />
-      </div>
-      <div v-if="compactGaugeVisible && compactStatus.occupancyPercent !== null" class="chat-compact-status__legend">
-        <span>context {{ compactStatus.occupancyPercent }}%</span>
-        <span v-if="compactStatus.contextWindowLabel">{{ compactStatus.contextWindowLabel }}</span>
       </div>
     </div>
 

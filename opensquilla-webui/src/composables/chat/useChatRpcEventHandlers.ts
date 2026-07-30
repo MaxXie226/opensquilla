@@ -736,7 +736,10 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     // Silent compatibility warnings still own their stream sequence. Consuming
     // it before the display filter prevents a later replay from being accepted.
     if (!acceptStreamSeq(payload)) return
-    if (payload.code === 'provider_reasoning_only_retry') return
+    if (
+      payload.code === 'provider_reasoning_only_retry'
+      || payload.code === 'provider_request_message_limit_recovery_success'
+    ) return
     // Let the view provide the locale-specific fallback when older gateways
     // omit a warning message.
     options.showWarningToast(String(payload.message || ''))
