@@ -141,6 +141,15 @@ jobs:
       - name: Run visual and accessibility browser contracts
         run: npm run test:ui-primitives:browser
 
+      - name: Upload browser regression diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-primitives-browser-diagnostics
+          path: packages/ui-primitives/test-results/
+          if-no-files-found: ignore
+          retention-days: 7
+
   frontend-check:
     name: Frontend build, tests, and artifact
     needs: classify-changes

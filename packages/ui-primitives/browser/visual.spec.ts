@@ -7,10 +7,15 @@ test.beforeEach(async ({ page }) => {
 test('keeps the public primitive visual contract', async ({ page }) => {
   const fixture = page.locator('#fixture')
   await expect(fixture).toBeVisible()
+  await expect(fixture).toHaveCSS('width', '720px')
+  await expect(fixture).toHaveCSS('height', '400px')
   await expect(fixture).toHaveScreenshot('public-primitives.png', {
     animations: 'disabled',
     caret: 'hide',
-    maxDiffPixelRatio: 0.005,
+    // Native font rasterization differs across macOS and Linux. The fixed
+    // canvas plus exact semantic style assertions below keep layout and token
+    // regressions strict while allowing platform antialiasing differences.
+    maxDiffPixelRatio: 0.05,
   })
 
   const primary = page.locator('#primary')

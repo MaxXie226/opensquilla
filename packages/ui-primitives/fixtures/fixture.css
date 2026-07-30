@@ -12,8 +12,10 @@ body {
 }
 
 #fixture {
+  height: 400px;
   margin: 0 auto;
   max-width: 720px;
+  width: 720px;
 }
 
 #fixture h1,
