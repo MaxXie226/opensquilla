@@ -173,16 +173,95 @@ try {
 
   const consumer = path.join(temporaryRoot, 'consumer')
   await mkdir(consumer)
-  const installedVue = JSON.parse(
+  const installedVuePackage = JSON.parse(
     await readFile(path.join(repositoryRoot, 'node_modules', 'vue', 'package.json'), 'utf8'),
   )
+  const vuePeerRoot = path.join(temporaryRoot, 'vue-peer')
+  await mkdir(vuePeerRoot)
+  await writeFile(
+    path.join(vuePeerRoot, 'package.json'),
+    JSON.stringify({
+      name: 'vue',
+      version: installedVuePackage.version,
+      type: 'module',
+      exports: {
+        '.': {
+          types: './index.d.ts',
+          import: './index.js',
+        },
+      },
+      files: ['index.d.ts', 'index.js'],
+    }),
+  )
+  await writeFile(
+    path.join(vuePeerRoot, 'index.js'),
+    [
+      'const passthrough = (...values) => values[0] ?? {}',
+      'export const Teleport = {}',
+      'export const Transition = {}',
+      'export const computed = passthrough',
+      'export const createBlock = passthrough',
+      'export const createCommentVNode = passthrough',
+      'export const createElementBlock = passthrough',
+      'export const createElementVNode = passthrough',
+      'export const createTextVNode = passthrough',
+      'export const createVNode = passthrough',
+      'export const defineComponent = passthrough',
+      'export const mergeProps = passthrough',
+      'export const nextTick = passthrough',
+      'export const normalizeClass = passthrough',
+      'export const onBeforeUnmount = passthrough',
+      'export const openBlock = passthrough',
+      'export const ref = passthrough',
+      'export const renderSlot = passthrough',
+      'export const resolveDynamicComponent = passthrough',
+      'export const toDisplayString = passthrough',
+      'export const unref = passthrough',
+      'export const useAttrs = passthrough',
+      'export const useId = passthrough',
+      'export const watch = passthrough',
+      'export const withCtx = passthrough',
+      'export const withKeys = passthrough',
+      'export const withModifiers = passthrough',
+      '',
+    ].join('\n'),
+  )
+  await writeFile(
+    path.join(vuePeerRoot, 'index.d.ts'),
+    [
+      'export type ComponentOptionsMixin = Record<string, never>',
+      'export type ComponentProvideOptions = Record<PropertyKey, unknown>',
+      'export type PublicProps = Record<string, unknown>',
+      'export type DefineComponent<',
+      '  A = unknown, B = unknown, C = unknown, D = unknown, E = unknown,',
+      '  F = unknown, G = unknown, H = unknown, I = unknown, J = unknown,',
+      '  K = unknown, L = unknown, M = unknown, N = unknown, O = unknown,',
+      '  P = unknown, Q = unknown, R = unknown, S = unknown, T = unknown,',
+      '> = unknown',
+      '',
+    ].join('\n'),
+  )
+  const [packedVue] = JSON.parse(
+    npm(
+      [
+        'pack',
+        '--json',
+        '--ignore-scripts',
+        '--pack-destination',
+        temporaryRoot,
+        vuePeerRoot,
+      ],
+      repositoryRoot,
+    ),
+  )
+  assert.ok(packedVue.filename, 'Vue peer tarball is missing')
+  const vueTarball = path.join(temporaryRoot, packedVue.filename)
   await writeFile(
     path.join(consumer, 'package.json'),
     JSON.stringify({
       name: 'external-ui-package-smoke',
       private: true,
       type: 'module',
-      dependencies: { vue: installedVue.version },
     }),
   )
   npm(
@@ -191,6 +270,7 @@ try {
       '--ignore-scripts',
       '--offline',
       '--no-package-lock',
+      vueTarball,
       ...packedTarballs.map((record) => record.tarball),
     ],
     consumer,
