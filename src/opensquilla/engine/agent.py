@@ -7582,6 +7582,17 @@ class Agent:
                                     wrapup_margin_seconds > 0
                                     and _total_deadline is not None
                                     and not deadline_wrapup_armed
+                                    # A policy preempt retries the provider call.
+                                    # Composite providers mark that unsafe because
+                                    # replaying the call repeats every child request.
+                                    and (
+                                        getattr(
+                                            self.provider,
+                                            "retry_failed_call_safe",
+                                            True,
+                                        )
+                                        is not False
+                                    )
                                     and not attempt_user_visible_emitted
                                     and not pending_tools
                                     and not tool_calls
