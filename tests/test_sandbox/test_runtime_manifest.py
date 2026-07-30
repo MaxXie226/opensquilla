@@ -155,3 +155,27 @@ def test_unknown_platform_fails_closed(tmp_path: Path) -> None:
     )
     with pytest.raises(RuntimeManifestError, match="linux-arm64"):
         resolver.path_for(RunMode.SAFE, ())
+
+
+def test_unix_target_requires_python_and_node_without_windows_git_bash(
+    tmp_path: Path,
+) -> None:
+    windows_assets = _manifest_payload()["assets"]["windows-x64"]
+    payload = {
+        "schemaVersion": 1,
+        "runtimeSet": "portable",
+        "assets": {
+            "linux-x64": {
+                "python": windows_assets["python"],
+                "node": windows_assets["node"],
+            }
+        },
+    }
+    resolver = BundledRuntimeResolver(
+        RuntimeManifest.model_validate(payload),
+        resource_root=tmp_path,
+        platform="linux",
+        arch="x64",
+    )
+
+    assert set(resolver.executable_paths()) == {"python", "node"}

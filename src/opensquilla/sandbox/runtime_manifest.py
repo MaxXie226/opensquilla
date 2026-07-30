@@ -17,6 +17,7 @@ from opensquilla.sandbox.run_mode import RunMode, normalize_run_mode
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _RUNTIME_KEYS = ("python", "node", "gitBash")
+_PORTABLE_RUNTIME_KEYS = ("python", "node")
 _PLATFORM_NAMES = {
     "win32": "windows",
     "windows": "windows",
@@ -152,7 +153,12 @@ class RuntimeManifest:
         for target, raw_target_assets in raw_assets.items():
             target_name = _required_text(target, "asset target")
             target_assets = _mapping(raw_target_assets, f"assets.{target_name}")
-            missing = [key for key in _RUNTIME_KEYS if key not in target_assets]
+            required_keys = (
+                _RUNTIME_KEYS
+                if target_name.startswith("windows-")
+                else _PORTABLE_RUNTIME_KEYS
+            )
+            missing = [key for key in required_keys if key not in target_assets]
             if missing:
                 raise RuntimeManifestError(
                     f"assets.{target_name} is missing: {', '.join(missing)}"
@@ -163,6 +169,7 @@ class RuntimeManifest:
                     field=f"assets.{target_name}.{key}",
                 )
                 for key in _RUNTIME_KEYS
+                if key in target_assets
             }
         return cls(
             schema_version=1,
@@ -272,7 +279,7 @@ class BundledRuntimeResolver:
         return tuple(
             self.target_root() / assets[key].install_dir
             for key, is_enabled in enabled
-            if is_enabled
+            if is_enabled and key in assets
         )
 
     def bundled_path(
@@ -291,7 +298,7 @@ class BundledRuntimeResolver:
         paths = (
             self.target_root() / assets[key].install_dir / bin_dir
             for key, is_enabled in enabled
-            if is_enabled
+            if is_enabled and key in assets
             for bin_dir in assets[key].bin_dirs
         )
         return _dedupe_paths(paths, windows=self.target.startswith("windows-"))

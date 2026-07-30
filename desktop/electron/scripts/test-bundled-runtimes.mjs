@@ -34,6 +34,19 @@ try {
     runtimeSet: 'test',
     assets: { 'windows-x64': { python: asset, node: asset, gitBash: asset } },
   })
+  validateRuntimeManifest({
+    schemaVersion: 1,
+    runtimeSet: 'portable-test',
+    assets: { 'linux-x64': { python: asset, node: asset } },
+  })
+  assert.throws(
+    () => validateRuntimeManifest({
+      schemaVersion: 1,
+      runtimeSet: 'windows-incomplete',
+      assets: { 'windows-x64': { python: asset, node: asset } },
+    }),
+    /gitBash/,
+  )
 
   await downloadVerifiedAsset(asset, destination)
   assert.equal(await readFile(destination, 'utf8'), 'pinned runtime fixture')

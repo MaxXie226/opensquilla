@@ -19,6 +19,7 @@ export const defaultManifestPath = join(packageRoot, 'runtime', 'runtime-manifes
 export const defaultRuntimeRoot = join(packageRoot, 'runtime', 'developer')
 const allowedArchiveTypes = new Set(['zip', 'tar.gz', 'tar.xz', '7z-sfx'])
 const runtimeKeys = ['python', 'node', 'gitBash']
+const portableRuntimeKeys = ['python', 'node']
 const maxInstalledBytes = 2 * 1024 * 1024 * 1024
 
 function requiredText(value, field) {
@@ -94,7 +95,8 @@ export function validateRuntimeManifest(manifest) {
     if (!assets || typeof assets !== 'object' || Array.isArray(assets)) {
       throw new Error(`assets.${target} must be an object`)
     }
-    for (const key of runtimeKeys) {
+    const requiredKeys = target.startsWith('windows-') ? runtimeKeys : portableRuntimeKeys
+    for (const key of requiredKeys) {
       if (!(key in assets)) throw new Error(`assets.${target} is missing ${key}`)
       validateAsset(assets[key], `assets.${target}.${key}`)
     }
@@ -197,7 +199,7 @@ export async function fetchRuntimeSet({
   await mkdir(cacheRoot, { recursive: true })
   await mkdir(targetRoot, { recursive: true })
 
-  for (const key of runtimeKeys) {
+  for (const key of runtimeKeys.filter(key => key in assets)) {
     const asset = assets[key]
     const archiveName = `${asset.id}.${asset.archiveType === '7z-sfx' ? 'exe' : asset.archiveType}`
     const archive = join(cacheRoot, archiveName)
@@ -242,7 +244,7 @@ export async function assertRuntimeSetReady({
   const targetRoot = join(runtimeRoot, target)
   const smokeCommands = {}
   let installedBytes = 0
-  for (const key of runtimeKeys) {
+  for (const key of runtimeKeys.filter(key => key in assets)) {
     const asset = assets[key]
     const installRoot = join(targetRoot, asset.installDir)
     const rootInfo = await stat(installRoot).catch(() => null)
@@ -261,8 +263,8 @@ export async function assertRuntimeSetReady({
   if (executeCommands) {
     smoke(smokeCommands.python, ['--version'])
     smoke(smokeCommands.node, ['--version'])
-    smoke(smokeCommands.git, ['--version'])
-    smoke(smokeCommands.bash, ['--version'])
+    if (smokeCommands.git) smoke(smokeCommands.git, ['--version'])
+    if (smokeCommands.bash) smoke(smokeCommands.bash, ['--version'])
   }
   return { installedBytes, executables: smokeCommands }
 }
