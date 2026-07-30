@@ -42,6 +42,7 @@ from opensquilla.provider.ensemble import (
     _done_event_with_physical_attempt_id,
     _error_event_physical_request_count,
     _is_thinking_parameter_rejection,
+    _json_safe,
     _member_chat_config,
     _member_execution_trace,
     _member_from_ref,
@@ -114,6 +115,27 @@ def test_terminal_event_wire_shape_matches_f39_baseline() -> None:
         assert tuple(item.name for item in fields(event)) == expected_fields
         assert tuple(asdict(event)) == expected_fields
         assert "physical_attempt_id" not in asdict(event)
+
+
+def test_json_safe_serializes_provider_billing_receipt_as_object() -> None:
+    receipt = ProviderBillingReceipt(
+        currency="USD",
+        status="confirmed",
+        amount_nanos=10_000_000,
+        usd_equivalent_nanos=10_000_000,
+        fx_native_per_usd_nanos=1_000_000_000,
+    )
+
+    assert _json_safe({"billing_receipt": receipt}) == {
+        "billing_receipt": {
+            "currency": "USD",
+            "status": "confirmed",
+            "amount_nanos": 10_000_000,
+            "usd_equivalent_nanos": 10_000_000,
+            "fx_native_per_usd_nanos": 1_000_000_000,
+            "schema_version": 1,
+        }
+    }
 
 
 def test_managed_completion_keeps_physical_id_in_usage_evidence() -> None:

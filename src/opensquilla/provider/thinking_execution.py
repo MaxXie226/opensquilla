@@ -57,11 +57,44 @@ PHYSICAL_ATTEMPT_OUTCOMES = frozenset(
 )
 
 
+def _without_billing_receipts(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            key: _without_billing_receipts(item)
+            for key, item in value.items()
+            if key != "billing_receipt"
+        }
+    if isinstance(value, list):
+        return [_without_billing_receipts(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_without_billing_receipts(item) for item in value)
+    return deepcopy(value)
+
+
+def immutable_task_analyzer_payload(value: Any) -> Any:
+    """Project analyzer evidence while ignoring only native receipt representation."""
+
+    if not isinstance(value, Mapping):
+        return deepcopy(value)
+    return {
+        key: (
+            _without_billing_receipts(item)
+            if key == "usage"
+            else deepcopy(item)
+        )
+        for key, item in value.items()
+    }
+
+
 def immutable_selection_plan_payload(plan: Mapping[str, Any]) -> dict[str, Any]:
     """Project a plan without provider-execution state and receipts."""
 
     return {
-        str(key): deepcopy(value)
+        str(key): (
+            immutable_task_analyzer_payload(value)
+            if str(key) == "task_analyzer"
+            else deepcopy(value)
+        )
         for key, value in plan.items()
         if str(key) not in EXECUTION_MUTABLE_SELECTION_PLAN_FIELDS
     }

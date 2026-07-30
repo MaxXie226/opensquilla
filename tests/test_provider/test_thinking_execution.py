@@ -7,10 +7,12 @@ import pytest
 
 from opensquilla.provider.thinking_execution import (
     THINKING_PHYSICAL_EVIDENCE_SCHEMA,
+    immutable_selection_plan_payload,
     project_thinking_execution_history,
     restore_projected_thinking_execution,
     validate_thinking_execution_call,
     validate_thinking_execution_history_closure,
+    validate_thinking_execution_plan_mutation,
 )
 
 
@@ -66,6 +68,51 @@ def _receipt(
         "thinking_policy_version": policy,
         "fallback_result": result,
     }
+
+
+def test_immutable_plan_ignores_only_recursive_analyzer_billing_receipts() -> None:
+    routing_plan = {
+        "decision_id": "decision-a",
+        "task_analyzer": {
+            "source": "remote",
+            "usage": {
+                "input_tokens": 11,
+                "physical_attempt_id": "a" * 32,
+                "billing_receipt": {"status": "confirmed"},
+                "physical_attempts": [
+                    {
+                        "input_tokens": 11,
+                        "physical_attempt_id": "a" * 32,
+                        "billing_receipt": {"status": "confirmed"},
+                    }
+                ],
+            },
+        },
+    }
+    physical_plan = deepcopy(routing_plan)
+    physical_plan["task_analyzer"]["usage"]["billing_receipt"] = (
+        "ProviderBillingReceipt(status='confirmed')"
+    )
+    physical_plan["task_analyzer"]["usage"]["physical_attempts"][0][
+        "billing_receipt"
+    ] = "ProviderBillingReceipt(status='confirmed')"
+
+    assert immutable_selection_plan_payload(
+        routing_plan
+    ) == immutable_selection_plan_payload(physical_plan)
+    assert validate_thinking_execution_plan_mutation(
+        routing_plan,
+        physical_plan,
+    ) == ""
+
+    physical_plan["task_analyzer"]["usage"]["input_tokens"] += 1
+    assert immutable_selection_plan_payload(
+        routing_plan
+    ) != immutable_selection_plan_payload(physical_plan)
+    assert validate_thinking_execution_plan_mutation(
+        routing_plan,
+        physical_plan,
+    ) == "thinking_execution_immutable_plan_mismatch"
 
 
 def _plan(

@@ -16,6 +16,7 @@ import pytest
 from opensquilla.engine.types import DoneEvent as AgentDoneEvent
 from opensquilla.engine.types import ThinkingLevel
 from opensquilla.gateway.config import GatewayConfig
+from opensquilla.provider import ensemble as ensemble_provider
 from opensquilla.provider.ensemble import (
     _member_chat_config,
     build_ensemble_provider_from_config,
@@ -2159,6 +2160,308 @@ def test_g1_attempt_full_plan_equality_rejects_unbound_physical_field(module) ->
 
     assert module.g1_attempt_plan_consistency_reason(plan, result) == (
         "g1_attempt_plan_provenance_invalid"
+    )
+
+
+def _g1_lifecycle_receipt_serialization_plans() -> tuple[
+    dict[str, object],
+    dict[str, object],
+]:
+    receipt = ProviderBillingReceipt(
+        currency="USD",
+        status="confirmed",
+        amount_nanos=10_000_000,
+        usd_equivalent_nanos=10_000_000,
+        fx_native_per_usd_nanos=1_000_000_000,
+    )
+    plan = _with_g1_task_analysis_invariants(
+        {
+            "decision_id": "decision-1",
+            "selected_P": ["openrouter:model-a"],
+        }
+    )
+    plan["task_analyzer"]["usage"] = {
+        "provider": "openrouter",
+        "model": "anthropic/claude-opus-4.8",
+        "input_tokens": 11,
+        "output_tokens": 3,
+        "billing_receipt": receipt,
+        "provider_usage": {
+            "physical_attempt_id": "a" * 32,
+            "response_ids": ["analyzer-response-1"],
+        },
+        "physical_attempts": [
+            {
+                "attempt": 1,
+                "physical_attempt_id": "a" * 32,
+                "provider": "openrouter",
+                "model": "anthropic/claude-opus-4.8",
+                "input_tokens": 11,
+                "output_tokens": 3,
+                "billing_receipt": receipt,
+            }
+        ],
+    }
+    routing_plan = resume_runner.json_safe(deepcopy(plan))
+    physical_plan = ensemble_provider._json_safe(deepcopy(plan))
+    assert isinstance(routing_plan, dict)
+    assert isinstance(physical_plan, dict)
+    physical_plan["task_analyzer"]["usage"]["billing_receipt"] = str(receipt)
+    physical_plan["task_analyzer"]["usage"]["physical_attempts"][0][
+        "billing_receipt"
+    ] = str(receipt)
+    return routing_plan, physical_plan
+
+
+def _g1_lifecycle_plan_reasons(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    routing_plan: dict[str, object],
+    physical_plan: dict[str, object],
+    full_attempt_history: bool = False,
+) -> list[str]:
+    monkeypatch.setattr(
+        module,
+        "ensemble_call_trace_sequence",
+        lambda _trace: ([{"selection_plan": physical_plan}], []),
+    )
+    row = {
+        "group": "G1",
+        "routing_trace": {"selection_plan": routing_plan},
+        "ensemble_trace": {},
+        "execution": {"generation_attempts": []},
+    }
+    if full_attempt_history:
+        if hasattr(module, "effective_g1_lifecycle_routing"):
+            from opensquilla.provider import thinking_execution
+
+            monkeypatch.setattr(
+                thinking_execution,
+                "validate_thinking_execution_call",
+                lambda _prior, call: (call["selection_plan"], ""),
+            )
+        row.update(
+            {
+                "final_text_sha256": "selected-answer",
+                "usage": {},
+                "execution": {
+                    "generation_attempts": [
+                        {
+                            "attempt_id": "1" * 32,
+                            "attempt": 1,
+                            "selection_plan": routing_plan,
+                            "excluded_proposer_identities": [],
+                            "deterministic_proposer_failures": [],
+                            "will_retry": False,
+                            "run": {
+                                "final_text_sha256": "selected-answer",
+                                "usage": {},
+                                "routing_trace": {
+                                    "selection_plan": routing_plan,
+                                },
+                                "ensemble_trace": {
+                                    "selection_plan": physical_plan,
+                                },
+                            },
+                        }
+                    ]
+                },
+            }
+        )
+    if hasattr(module, "effective_g1_lifecycle_routing"):
+        monkeypatch.setattr(
+            module,
+            "g1_registry_plan_reasons",
+            lambda *_args, **_kwargs: ([], (), ""),
+        )
+        return module.effective_g1_lifecycle_routing(
+            row,
+            contract={"g1_registry_contract": {}},
+        )[2]
+    monkeypatch.setattr(
+        module,
+        "g1_registry_contract_reasons",
+        lambda *_args, **_kwargs: [],
+    )
+    return module.g1_provider_lifecycle_routing_evidence(
+        row,
+        contract={"g1_registry_contract": {}},
+    )[2]
+
+
+def test_g1_lifecycle_plan_projection_is_synced_with_finalizer() -> None:
+    finalizer = _load_finalizer()
+
+    for name in (
+        "_g1_task_analyzer_decision_projection",
+        "_g1_lifecycle_plan_field",
+        "_g1_plans_match",
+    ):
+        assert inspect.getsource(getattr(finalizer, name)) == inspect.getsource(
+            getattr(resume_runner, name)
+        )
+
+
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+def test_g1_attempt_consistency_ignores_only_analyzer_receipt_serialization(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.provider import thinking_execution
+
+    routing_plan, physical_plan = _g1_lifecycle_receipt_serialization_plans()
+    monkeypatch.setattr(
+        module,
+        "ensemble_call_trace_sequence",
+        lambda _trace: ([{"selection_plan": physical_plan}], []),
+    )
+    monkeypatch.setattr(
+        thinking_execution,
+        "validate_thinking_execution_call",
+        lambda _prior, call: (call["selection_plan"], ""),
+    )
+    result = module.RunResult(
+        final_text="",
+        done=DoneEvent(
+            ensemble_trace={"selection_plan": physical_plan},
+        ),
+        routing_trace={"selection_plan": routing_plan},
+    )
+
+    assert module.g1_attempt_plan_consistency_reason(routing_plan, result) == ""
+
+    tampered_physical = deepcopy(physical_plan)
+    tampered_physical["task_analyzer"]["usage"]["input_tokens"] += 1
+    monkeypatch.setattr(
+        module,
+        "ensemble_call_trace_sequence",
+        lambda _trace: ([{"selection_plan": tampered_physical}], []),
+    )
+    result.done.ensemble_trace = {"selection_plan": tampered_physical}
+    assert module.g1_attempt_plan_consistency_reason(
+        routing_plan,
+        result,
+    ) == "g1_attempt_plan_provenance_invalid"
+
+
+@pytest.mark.parametrize("implementation", ["finalizer", "resume"])
+def test_g1_lifecycle_plan_ignores_real_analyzer_receipt_serialization(
+    implementation: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_finalizer() if implementation == "finalizer" else resume_runner
+    routing_plan, physical_plan = _g1_lifecycle_receipt_serialization_plans()
+    routing_usage = routing_plan["task_analyzer"]["usage"]
+    physical_usage = physical_plan["task_analyzer"]["usage"]
+
+    assert isinstance(routing_usage["billing_receipt"], dict)
+    assert isinstance(physical_usage["billing_receipt"], str)
+    assert isinstance(routing_usage["physical_attempts"][0]["billing_receipt"], dict)
+    assert isinstance(physical_usage["physical_attempts"][0]["billing_receipt"], str)
+    assert module._g1_plans_match(routing_plan, physical_plan)
+    assert module._g1_full_plans_match(routing_plan, physical_plan)
+    assert module._g1_execution_plan_mutation_reasons(
+        routing_plan,
+        physical_plan,
+    ) == []
+    assert (
+        _g1_lifecycle_plan_reasons(
+            module,
+            monkeypatch,
+            routing_plan=routing_plan,
+            physical_plan=physical_plan,
+        )
+        == []
+    )
+
+
+@pytest.mark.parametrize("implementation", ["finalizer", "resume"])
+def test_g1_full_attempt_history_ignores_only_analyzer_receipt_serialization(
+    implementation: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_finalizer() if implementation == "finalizer" else resume_runner
+    routing_plan, physical_plan = _g1_lifecycle_receipt_serialization_plans()
+
+    assert (
+        _g1_lifecycle_plan_reasons(
+            module,
+            monkeypatch,
+            routing_plan=routing_plan,
+            physical_plan=physical_plan,
+            full_attempt_history=True,
+        )
+        == []
+    )
+
+
+@pytest.mark.parametrize("implementation", ["finalizer", "resume"])
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "source",
+        "model",
+        "confidence",
+        "task_profile_hash",
+        "request_context_hash",
+        "request_context",
+        "analysis_content",
+        "usage_tokens",
+        "usage_route",
+        "usage_physical_id",
+        "usage_response_id",
+        "usage_physical_tokens",
+    ],
+)
+def test_g1_lifecycle_plan_rejects_analyzer_decision_binding_tamper(
+    implementation: str,
+    tamper: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_finalizer() if implementation == "finalizer" else resume_runner
+    routing_plan, physical_plan = _g1_lifecycle_receipt_serialization_plans()
+    if tamper in {"source", "model", "confidence"}:
+        routing_plan["task_analyzer"][tamper] = (
+            0.1 if tamper == "confidence" else f"tampered-{tamper}"
+        )
+    elif tamper == "request_context":
+        routing_plan["request_context"]["task_text"] = "tampered prompt"
+    elif tamper == "analysis_content":
+        routing_plan["task_profile"]["task_type"] = "tampered"
+    elif tamper == "usage_tokens":
+        routing_plan["task_analyzer"]["usage"]["input_tokens"] += 1
+    elif tamper == "usage_route":
+        routing_plan["task_analyzer"]["usage"]["model"] = "tampered/model"
+    elif tamper == "usage_physical_id":
+        routing_plan["task_analyzer"]["usage"]["physical_attempts"][0][
+            "physical_attempt_id"
+        ] = "b" * 32
+    elif tamper == "usage_response_id":
+        routing_plan["task_analyzer"]["usage"]["provider_usage"]["response_ids"] = [
+            "tampered-response"
+        ]
+    elif tamper == "usage_physical_tokens":
+        routing_plan["task_analyzer"]["usage"]["physical_attempts"][0][
+            "input_tokens"
+        ] += 1
+    else:
+        routing_plan[tamper] = "0" * 64
+
+    assert not module._g1_plans_match(routing_plan, physical_plan)
+    assert not module._g1_full_plans_match(routing_plan, physical_plan)
+    assert module._g1_execution_plan_mutation_reasons(
+        routing_plan,
+        physical_plan,
+    )
+    assert "g1_attempt_selection_plan_differs_from_physical_plan" in (
+        _g1_lifecycle_plan_reasons(
+            module,
+            monkeypatch,
+            routing_plan=routing_plan,
+            physical_plan=physical_plan,
+            full_attempt_history=True,
+        )
     )
 
 

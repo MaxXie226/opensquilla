@@ -4443,14 +4443,6 @@ _G1_LIFECYCLE_PLAN_MATCH_FIELDS = (
     "task_analysis_reuse",
     "retry_routing",
 )
-_G1_EXECUTION_MUTABLE_SELECTION_PLAN_FIELDS = frozenset(
-    {
-        "executed_thinking_assignment",
-        "thinking_execution_fallbacks",
-    }
-)
-
-
 def matching_saved_generation_attempts(
     row: Mapping[str, Any],
 ) -> list[Mapping[str, Any]]:
@@ -4610,8 +4602,29 @@ def _g1_reasoning_only_length_failure_identities(run: Mapping[str, Any]) -> set[
     }
 
 
+def _g1_task_analyzer_decision_projection(value: Any) -> Any:
+    """Normalize receipt representation while retaining analyzer usage evidence."""
+
+    from opensquilla.provider.thinking_execution import (
+        immutable_task_analyzer_payload,
+    )
+
+    return immutable_task_analyzer_payload(value)
+
+
+def _g1_lifecycle_plan_field(plan: Mapping[str, Any], field: str) -> Any:
+    value = plan.get(field)
+    if field == "task_analyzer":
+        return _g1_task_analyzer_decision_projection(value)
+    return value
+
+
 def _g1_plans_match(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
-    return all(left.get(field) == right.get(field) for field in _G1_LIFECYCLE_PLAN_MATCH_FIELDS)
+    return all(
+        _g1_lifecycle_plan_field(left, field)
+        == _g1_lifecycle_plan_field(right, field)
+        for field in _G1_LIFECYCLE_PLAN_MATCH_FIELDS
+    )
 
 
 def _g1_full_plans_match(
@@ -4621,19 +4634,13 @@ def _g1_full_plans_match(
     """Compare every immutable field while excluding execution fallback receipts."""
 
     try:
-        return canonical_sha256(
-            {
-                str(key): copy.deepcopy(value)
-                for key, value in left.items()
-                if str(key) not in _G1_EXECUTION_MUTABLE_SELECTION_PLAN_FIELDS
-            }
-        ) == canonical_sha256(
-            {
-                str(key): copy.deepcopy(value)
-                for key, value in right.items()
-                if str(key) not in _G1_EXECUTION_MUTABLE_SELECTION_PLAN_FIELDS
-            }
+        from opensquilla.provider.thinking_execution import (
+            immutable_selection_plan_payload,
         )
+
+        return canonical_sha256(
+            immutable_selection_plan_payload(left)
+        ) == canonical_sha256(immutable_selection_plan_payload(right))
     except (TypeError, ValueError):
         return False
 
@@ -5160,7 +5167,7 @@ def effective_g1_lifecycle_routing(
         )
     physical = physical_plans[0]
     for plan in physical_plans[1:]:
-        if any(plan.get(field) != physical.get(field) for field in _G1_LIFECYCLE_PLAN_MATCH_FIELDS):
+        if not _g1_plans_match(plan, physical):
             reasons.append("conflicting_g1_physical_selection_plans")
 
     routing = row.get("routing_trace")
@@ -5173,9 +5180,7 @@ def effective_g1_lifecycle_routing(
             allow_legacy_managed_v3=allow_legacy_managed_v3,
         )
         reasons.extend(top_reasons)
-        if any(
-            top_plan.get(field) != physical.get(field) for field in _G1_LIFECYCLE_PLAN_MATCH_FIELDS
-        ):
+        if not _g1_plans_match(top_plan, physical):
             reasons.append("g1_routing_plan_differs_from_physical_plan")
         return top_routing, {}, list(dict.fromkeys(reasons))
     if top_routing:
@@ -5212,9 +5217,7 @@ def effective_g1_lifecycle_routing(
             if isinstance(plan, Mapping):
                 reasons.extend(plan_reasons)
             continue
-        if not isinstance(plan, Mapping) or any(
-            plan.get(field) != physical.get(field) for field in _G1_LIFECYCLE_PLAN_MATCH_FIELDS
-        ):
+        if not isinstance(plan, Mapping) or not _g1_plans_match(plan, physical):
             reasons.append("g1_lifecycle_plan_differs_from_physical_plan")
             continue
         if nonnegative_int(attempt.get("attempt")) > selected_ordinal:

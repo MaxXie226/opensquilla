@@ -8255,19 +8255,14 @@ def g1_retry_plan_provenance_reason(
     return ""
 
 
-_G1_EXECUTION_MUTABLE_SELECTION_PLAN_FIELDS = frozenset(
-    {"executed_thinking_assignment", "thinking_execution_fallbacks"}
-)
-
-
 def g1_immutable_selection_plan_payload(
     plan: Mapping[str, Any],
 ) -> dict[str, Any]:
-    return {
-        str(key): copy.deepcopy(value)
-        for key, value in plan.items()
-        if str(key) not in _G1_EXECUTION_MUTABLE_SELECTION_PLAN_FIELDS
-    }
+    from opensquilla.provider.thinking_execution import (
+        immutable_selection_plan_payload,
+    )
+
+    return immutable_selection_plan_payload(plan)
 
 
 def g1_execution_plan_mutation_reason(

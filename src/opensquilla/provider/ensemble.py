@@ -13,7 +13,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from copy import deepcopy
-from dataclasses import dataclass, field, fields, replace
+from dataclasses import asdict, dataclass, field, fields, replace
 from functools import cache
 from typing import Any, Literal
 
@@ -9629,6 +9629,8 @@ def _attach_final_request_output(
 def _json_safe(value: Any) -> Any:
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
+    if isinstance(value, ProviderBillingReceipt):
+        return _json_safe(asdict(value))
     if isinstance(value, list):
         return [_json_safe(item) for item in value]
     if isinstance(value, tuple):

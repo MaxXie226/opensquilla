@@ -8633,22 +8633,14 @@ def g1_retry_plan_provenance_reason(
     return ""
 
 
-_G1_EXECUTION_MUTABLE_SELECTION_PLAN_FIELDS = frozenset(
-    {
-        "executed_thinking_assignment",
-        "thinking_execution_fallbacks",
-    }
-)
-
-
 def g1_immutable_selection_plan_payload(
     plan: Mapping[str, Any],
 ) -> dict[str, Any]:
-    return {
-        str(key): copy.deepcopy(value)
-        for key, value in plan.items()
-        if str(key) not in _G1_EXECUTION_MUTABLE_SELECTION_PLAN_FIELDS
-    }
+    from opensquilla.provider.thinking_execution import (
+        immutable_selection_plan_payload,
+    )
+
+    return immutable_selection_plan_payload(plan)
 
 
 def g1_execution_plan_mutation_reason(
@@ -14166,8 +14158,29 @@ def g1_run_expected_ensemble_request_count(run: Mapping[str, Any]) -> int:
     return max(0, total - analyzer_count)
 
 
+def _g1_task_analyzer_decision_projection(value: Any) -> Any:
+    """Normalize receipt representation while retaining analyzer usage evidence."""
+
+    from opensquilla.provider.thinking_execution import (
+        immutable_task_analyzer_payload,
+    )
+
+    return immutable_task_analyzer_payload(value)
+
+
+def _g1_lifecycle_plan_field(plan: Mapping[str, Any], field: str) -> Any:
+    value = plan.get(field)
+    if field == "task_analyzer":
+        return _g1_task_analyzer_decision_projection(value)
+    return value
+
+
 def _g1_plans_match(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
-    return all(left.get(field) == right.get(field) for field in _G1_LIFECYCLE_PLAN_MATCH_FIELDS)
+    return all(
+        _g1_lifecycle_plan_field(left, field)
+        == _g1_lifecycle_plan_field(right, field)
+        for field in _G1_LIFECYCLE_PLAN_MATCH_FIELDS
+    )
 
 
 def _g1_full_plans_match(
@@ -14626,10 +14639,7 @@ def g1_provider_lifecycle_routing_evidence(
         )
     first_physical = physical_plans[0]
     for plan in physical_plans[1:]:
-        if any(
-            plan.get(field) != first_physical.get(field)
-            for field in _G1_LIFECYCLE_PLAN_MATCH_FIELDS
-        ):
+        if not _g1_plans_match(plan, first_physical):
             reasons.append("conflicting_g1_physical_selection_plans")
 
     routing = row.get("routing_trace")
@@ -14642,10 +14652,7 @@ def g1_provider_lifecycle_routing_evidence(
                 g1_contract,
             )
         )
-        if any(
-            top_plan.get(field) != first_physical.get(field)
-            for field in _G1_LIFECYCLE_PLAN_MATCH_FIELDS
-        ):
+        if not _g1_plans_match(top_plan, first_physical):
             reasons.append("g1_routing_plan_differs_from_physical_plan")
         return top_routing, {}, list(dict.fromkeys(reasons))
     if top_routing:
@@ -14682,10 +14689,7 @@ def g1_provider_lifecycle_routing_evidence(
         if plan_reasons:
             reasons.extend(plan_reasons)
             continue
-        if any(
-            plan.get(field) != first_physical.get(field)
-            for field in _G1_LIFECYCLE_PLAN_MATCH_FIELDS
-        ):
+        if not _g1_plans_match(plan, first_physical):
             reasons.append("g1_lifecycle_plan_differs_from_physical_plan")
             continue
         if coerce_metric_int(attempt.get("attempt")) > selected_ordinal:
