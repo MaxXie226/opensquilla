@@ -15915,6 +15915,33 @@ class Agent:
             return repr(value)
         return value
 
+    def _estimate_live_request_tokens(
+        self,
+        messages: list[Message],
+        *,
+        tools: list[ToolDefinition] | None = None,
+        config: ChatConfig | None = None,
+    ) -> int:
+        """Estimate the current provider request size without lifetime usage."""
+
+        payload: dict[str, Any] = {
+            "messages": [self._live_request_jsonable(message) for message in messages],
+        }
+        if tools:
+            payload["tools"] = [self._live_request_jsonable(tool) for tool in tools]
+        if config is not None:
+            if config.system:
+                payload["system"] = config.system
+            config_payload = config.model_dump(
+                mode="json",
+                exclude_none=True,
+                exclude={"system", "model_capabilities"},
+            )
+            payload.update(config_payload)
+
+        estimated_chars = len(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str))
+        return max(1, estimated_chars // 4)
+
     async def _check_context_overflow(
         self,
         messages: list[Message],
