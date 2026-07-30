@@ -363,17 +363,23 @@ def create_gateway_app(
     def _make_ctx(request: Request | None = None, role_claim: str = "operator") -> RpcContext:
         from opensquilla.gateway.auth import Principal, resolve_auth
 
-        auth_params: dict[str, str] = {}
-        token = extract_http_token(request)
-        if token:
-            auth_params["token"] = token
-        peer_ip = request.client.host if request is not None and request.client else None
-        principal = resolve_auth(
-            config,
-            auth_params=auth_params,
-            role_claim=role_claim,
-            peer_ip=peer_ip,
+        principal = (
+            getattr(request.state, "principal", None)
+            if request is not None
+            else None
         )
+        if principal is None:
+            auth_params: dict[str, str] = {}
+            token = extract_http_token(request)
+            if token:
+                auth_params["token"] = token
+            peer_ip = request.client.host if request is not None and request.client else None
+            principal = resolve_auth(
+                config,
+                auth_params=auth_params,
+                role_claim=role_claim,
+                peer_ip=peer_ip,
+            )
         if principal is None:
             principal = Principal(
                 role=role_claim,

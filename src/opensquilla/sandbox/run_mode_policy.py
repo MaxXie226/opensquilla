@@ -14,8 +14,13 @@ def principal_is_owner(principal: Any) -> bool:
     return getattr(principal, "is_owner", False) is True
 
 
+def principal_has_host_execute(principal: Any) -> bool:
+    capabilities = getattr(principal, "capabilities", ())
+    return "host.execute" in capabilities
+
+
 def allowed_run_modes_for_principal(principal: Any) -> tuple[RunMode, ...]:
-    if principal_is_owner(principal):
+    if principal_has_host_execute(principal):
         return _OWNER_ALLOWED_RUN_MODES
     return _NON_OWNER_ALLOWED_RUN_MODES
 
@@ -45,11 +50,15 @@ def coerce_run_mode_for_principal(mode: Any, principal: Any) -> RunMode:
 
 def principal_payload(principal: Any) -> dict[str, Any]:
     scopes = getattr(principal, "scopes", ())
+    capabilities = getattr(principal, "capabilities", ())
     return {
         "role": getattr(principal, "role", None),
         "scopes": sorted(str(scope) for scope in scopes),
+        "capabilities": sorted(str(capability) for capability in capabilities),
         "isOwner": principal_is_owner(principal),
         "authenticated": bool(getattr(principal, "authenticated", False)),
+        "authState": getattr(principal, "auth_state", None),
+        "tokenPublicId": getattr(principal, "token_public_id", None),
     }
 
 
@@ -58,7 +67,9 @@ def run_mode_policy_payload(principal: Any) -> dict[str, Any]:
     return {
         "allowedRunModes": [mode.value for mode in allowed],
         "defaultRunMode": default_run_mode_for_principal(principal).value,
-        "fullHostAccessDisabledReason": None if principal_is_owner(principal) else "owner_required",
+        "fullHostAccessDisabledReason": (
+            None if principal_has_host_execute(principal) else "host_capability_required"
+        ),
     }
 
 
@@ -74,6 +85,7 @@ __all__ = [
     "coerce_run_mode_for_principal",
     "default_run_mode_for_principal",
     "hello_auth_payload",
+    "principal_has_host_execute",
     "principal_is_owner",
     "principal_payload",
     "run_mode_allowed_for_principal",

@@ -14,12 +14,23 @@ from opensquilla.sandbox.run_mode_policy import (
 )
 
 
-def _principal(is_owner: bool, authenticated: bool = True) -> SimpleNamespace:
+def _principal(
+    is_owner: bool,
+    authenticated: bool = True,
+    capabilities: frozenset[str] | None = None,
+) -> SimpleNamespace:
     return SimpleNamespace(
         role="operator",
         scopes=frozenset({"operator.read", "operator.write"}),
         is_owner=is_owner,
         authenticated=authenticated,
+        capabilities=(
+            frozenset({"host.execute"})
+            if capabilities is None and is_owner
+            else capabilities or frozenset()
+        ),
+        auth_state="authenticated" if authenticated else "guest",
+        token_public_id=None,
     )
 
 
@@ -40,18 +51,21 @@ def test_owner_can_choose_full_but_defaults_to_safe() -> None:
     }
 
 
-def test_authenticated_non_owner_cannot_use_full_host_access() -> None:
-    principal = _principal(is_owner=False)
+def test_authenticated_non_owner_with_host_capability_can_use_full_host_access() -> None:
+    principal = _principal(
+        is_owner=False,
+        capabilities=frozenset({"host.execute"}),
+    )
 
-    assert allowed_run_modes_for_principal(principal) == (RunMode.SAFE,)
+    assert allowed_run_modes_for_principal(principal) == (RunMode.SAFE, RunMode.FULL)
     assert default_run_mode_for_principal(principal) == RunMode.SAFE
     assert run_mode_allowed_for_principal(RunMode.SAFE, principal) is True
-    assert run_mode_allowed_for_principal(RunMode.FULL, principal) is False
-    assert coerce_run_mode_for_principal(RunMode.FULL, principal) == RunMode.SAFE
+    assert run_mode_allowed_for_principal(RunMode.FULL, principal) is True
+    assert coerce_run_mode_for_principal(RunMode.FULL, principal) == RunMode.FULL
     assert run_mode_policy_payload(principal) == {
-        "allowedRunModes": ["safe"],
+        "allowedRunModes": ["safe", "full"],
         "defaultRunMode": "safe",
-        "fullHostAccessDisabledReason": "owner_required",
+        "fullHostAccessDisabledReason": None,
     }
 
 
@@ -67,20 +81,26 @@ def test_unauthenticated_non_owner_uses_safe_policy() -> None:
     assert principal_payload(principal) == {
         "role": "operator",
         "scopes": ["operator.read", "operator.write"],
+        "capabilities": [],
         "isOwner": False,
         "authenticated": False,
+        "authState": "guest",
+        "tokenPublicId": None,
     }
     assert hello_auth_payload(principal) == {
         "principal": {
             "role": "operator",
             "scopes": ["operator.read", "operator.write"],
+            "capabilities": [],
             "isOwner": False,
             "authenticated": False,
+            "authState": "guest",
+            "tokenPublicId": None,
         },
         "runModePolicy": {
             "allowedRunModes": ["safe"],
             "defaultRunMode": "safe",
-            "fullHostAccessDisabledReason": "owner_required",
+            "fullHostAccessDisabledReason": "host_capability_required",
         },
     }
 
@@ -96,7 +116,7 @@ def test_truthy_non_boolean_owner_flag_does_not_grant_owner_policy() -> None:
     assert run_mode_policy_payload(principal) == {
         "allowedRunModes": ["safe"],
         "defaultRunMode": "safe",
-        "fullHostAccessDisabledReason": "owner_required",
+        "fullHostAccessDisabledReason": "host_capability_required",
     }
 
 

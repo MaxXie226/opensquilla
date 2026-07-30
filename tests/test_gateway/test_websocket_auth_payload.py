@@ -16,12 +16,15 @@ def test_owner_hello_auth_payload_allows_full_by_default() -> None:
         "principal": {
             "role": "operator",
             "scopes": ["operator.read", "operator.write"],
+            "capabilities": ["host.execute", "host.read", "task.read", "task.submit"],
             "isOwner": True,
             "authenticated": True,
+            "authState": "authenticated",
+            "tokenPublicId": None,
         },
         "runModePolicy": {
-            "allowedRunModes": ["standard", "trusted", "full"],
-            "defaultRunMode": "full",
+            "allowedRunModes": ["safe", "full"],
+            "defaultRunMode": "safe",
             "fullHostAccessDisabledReason": None,
         },
     }
@@ -39,12 +42,15 @@ def test_unauthenticated_non_owner_hello_auth_payload_disables_full() -> None:
         "principal": {
             "role": "operator",
             "scopes": ["operator.read"],
+            "capabilities": ["guest.safe"],
             "isOwner": False,
             "authenticated": False,
+            "authState": "guest",
+            "tokenPublicId": None,
         },
         "runModePolicy": {
-            "allowedRunModes": ["standard", "trusted"],
-            "defaultRunMode": "trusted",
-            "fullHostAccessDisabledReason": "owner_required",
+            "allowedRunModes": ["safe"],
+            "defaultRunMode": "safe",
+            "fullHostAccessDisabledReason": "host_capability_required",
         },
     }

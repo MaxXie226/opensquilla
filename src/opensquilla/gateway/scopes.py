@@ -38,6 +38,30 @@ NODE_SCOPE = "node"
 
 OPERATOR_SCOPE_NAMESPACE = "operator."
 
+# Execution capabilities are intentionally separate from RPC scopes.
+GUEST_SAFE_CAPABILITY = "guest.safe"
+HOST_EXECUTE_CAPABILITY = "host.execute"
+HOST_READ_CAPABILITY = "host.read"
+TASK_READ_CAPABILITY = "task.read"
+TASK_SUBMIT_CAPABILITY = "task.submit"
+LOCAL_OWNER_CAPABILITIES: frozenset[str] = frozenset(
+    {
+        HOST_EXECUTE_CAPABILITY,
+        HOST_READ_CAPABILITY,
+        TASK_READ_CAPABILITY,
+        TASK_SUBMIT_CAPABILITY,
+    }
+)
+HUMAN_TOKEN_CAPABILITIES: frozenset[str] = frozenset(
+    {
+        HOST_EXECUTE_CAPABILITY,
+        HOST_READ_CAPABILITY,
+        TASK_READ_CAPABILITY,
+        TASK_SUBMIT_CAPABILITY,
+    }
+)
+GUEST_SAFE_CAPABILITIES: frozenset[str] = frozenset({GUEST_SAFE_CAPABILITY})
+
 # Default scope set for a locally-proven operator: same machine, loopback
 # transport. Mirrors what the desktop CLI declares on connect.
 CLI_DEFAULT_OPERATOR_SCOPES: frozenset[str] = frozenset(

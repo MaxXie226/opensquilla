@@ -862,6 +862,19 @@ async def handle_ws_connection(
         await conn.send_res(make_error_res(req_id, "UNAUTHORIZED", "Authentication failed"))
         await conn.close()
         return
+    if principal.auth_state == "invalid":
+        from opensquilla.gateway.token_store import default_auth_failure_limiter
+
+        await default_auth_failure_limiter().wait_after_failure(
+            peer_ip,
+            principal.token_public_id,
+        )
+        log.warning(
+            "ws.auth_invalid_guest_only",
+            conn_id=conn_id,
+            peer_ip=peer_ip,
+            token_public_id=principal.token_public_id,
+        )
 
     from opensquilla.sandbox.run_mode_policy import hello_auth_payload
 
