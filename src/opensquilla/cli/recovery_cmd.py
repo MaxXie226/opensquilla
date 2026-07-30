@@ -20,6 +20,7 @@ from opensquilla.recovery import (
     choose_workspace,
     consolidate_recovery_profiles,
     inspect_profile,
+    inspect_sandbox_upgrade,
     reconcile_profile,
 )
 from opensquilla.recovery.cleanup import (
@@ -54,6 +55,25 @@ _LOCK_TIMEOUT_OPTION = typer.Option(
     min=0.0,
     help="Seconds to wait for a busy profile writer before failing with profile_lock_busy.",
 )
+
+
+@recovery_app.command("sandbox-upgrade-status")
+def sandbox_upgrade_status(
+    home: Path = typer.Option(..., "--home", exists=True, file_okay=False),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Inspect the retained sandbox-upgrade journal without changing it."""
+    report = inspect_sandbox_upgrade(home)
+    if json_output:
+        typer.echo(json.dumps(report.to_dict(), ensure_ascii=False, sort_keys=True))
+    else:
+        typer.echo(f"{report.status}: {'ready' if report.ok else 'recovery required'}")
+        typer.echo(f"journal: {report.journal_path}")
+        typer.echo(f"snapshot: {report.snapshot_path or '-'}")
+        if report.error:
+            typer.echo(report.error, err=True)
+    if not report.ok:
+        raise typer.Exit(code=2)
 
 
 def _emit(report: RecoveryReport, *, json_output: bool) -> None:

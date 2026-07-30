@@ -2485,6 +2485,22 @@ async def build_services(
 
     configure_trusted_fake_ip_cidrs(config.tools.trusted_fake_ip_cidrs)
 
+    # Canonicalize released sandbox state before opening any persistent store.
+    # A failed prepared journal is intentionally left for explicit recovery;
+    # startup never guesses or rolls the profile back automatically.
+    config_path = Path(str(getattr(config, "config_path", "") or ""))
+    if config_path.is_file():
+        from opensquilla.sandbox.upgrade_migration import (
+            ensure_sandbox_upgrade_migrated,
+        )
+
+        upgrade_report = ensure_sandbox_upgrade_migrated(config_path.parent)
+        if not upgrade_report.ok:
+            raise RuntimeError(
+                "migration_failed_manual_recovery_required: "
+                f"{upgrade_report.error or upgrade_report.status}"
+            )
+
     # ── Sandbox runtime ─────────────────────────────────────────────
     # validate_combination emits structured warnings; configure_runtime
     # assembles the backend + gate + ledger so tool handlers can call

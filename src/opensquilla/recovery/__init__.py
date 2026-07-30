@@ -70,6 +70,7 @@ from opensquilla.recovery.settings_transaction import (
     settings_transaction_exists,
 )
 from opensquilla.recovery.transaction import recover_profile_transaction
+from opensquilla.sandbox.upgrade_migration import inspect_sandbox_upgrade
 
 __all__ = [
     "AtomicStateUnknownError",
@@ -108,6 +109,7 @@ __all__ = [
     "guard_desktop_profile",
     "guarded_desktop_profile",
     "inspect_profile",
+    "inspect_sandbox_upgrade",
     "effective_state_roots",
     "native_move_no_replace",
     "move_profile_no_replace",
