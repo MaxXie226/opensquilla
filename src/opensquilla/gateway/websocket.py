@@ -34,6 +34,7 @@ from opensquilla.gateway.protocol import (
     make_event,
 )
 from opensquilla.gateway.rpc import RpcContext, RpcDispatcher
+from opensquilla.sandbox.legacy_codec import encode_payload_for_protocol
 
 log = structlog.get_logger(__name__)
 
@@ -102,6 +103,7 @@ class WsConnection:
 
     conn_id: str
     ws: WebSocket
+    protocol: int = PROTOCOL_VERSION
     principal: Principal = field(
         default_factory=lambda: Principal(
             role="operator",
@@ -300,7 +302,12 @@ class WsConnection:
         # Legacy direct-send path (pre-auth, kill-switch off, or post-stop).
         async with self._send_lock:
             if not self._closing and self.ws.client_state == WebSocketState.CONNECTED:
-                wire = make_event(event, payload, seq=self.next_seq(), meta=meta)
+                wire = make_event(
+                    event,
+                    encode_payload_for_protocol(payload, protocol=self.protocol),
+                    seq=self.next_seq(),
+                    meta=meta,
+                )
                 await self._send_direct_text(wire.model_dump_json())
 
     async def send_res(self, frame: ResFrame) -> None:
@@ -325,7 +332,15 @@ class WsConnection:
             return
         async with self._send_lock:
             if not self._closing and self.ws.client_state == WebSocketState.CONNECTED:
-                await self._send_direct_text(frame.model_dump_json())
+                encoded = frame.model_copy(
+                    update={
+                        "payload": encode_payload_for_protocol(
+                            frame.payload,
+                            protocol=self.protocol,
+                        )
+                    }
+                )
+                await self._send_direct_text(encoded.model_dump_json())
 
     async def send_raw_text(self, text: str) -> None:
         """Send a protocol-level raw frame through the connection writer."""
@@ -487,13 +502,24 @@ class WsConnection:
                     if item.event_name is not None:
                         wire = make_event(
                             item.event_name,
-                            item.payload,
+                            encode_payload_for_protocol(
+                                item.payload,
+                                protocol=self.protocol,
+                            ),
                             seq=self.next_seq(),
                             meta=item.meta,
                         )
                         text = wire.model_dump_json()
                     elif item.res_frame is not None:
-                        text = item.res_frame.model_dump_json()
+                        encoded = item.res_frame.model_copy(
+                            update={
+                                "payload": encode_payload_for_protocol(
+                                    item.res_frame.payload,
+                                    protocol=self.protocol,
+                                )
+                            }
+                        )
+                        text = encoded.model_dump_json()
                     elif item.raw_text is not None:
                         text = item.raw_text
                     else:
@@ -902,6 +928,7 @@ async def handle_ws_connection(
 
     # Assign principal
     conn.principal = principal
+    conn.protocol = negotiated
 
     # Step 6: Send HelloOk
     hello = HelloOk(
@@ -1124,6 +1151,8 @@ async def _message_loop(
             ctx = RpcContext(
                 conn_id=conn.conn_id,
                 principal=conn.principal,
+                protocol=conn.protocol,
+                sandbox_schema_version=2 if conn.protocol >= 4 else 1,
                 session_manager=session_manager,
                 config=config,
                 provider_selector=provider_selector,

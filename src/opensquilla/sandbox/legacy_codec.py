@@ -8,7 +8,7 @@ Standard/Trusted/Managed spellings and the old boolean truth table.
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Final
+from typing import Any, Final
 
 from opensquilla.sandbox.run_mode import RunMode
 
@@ -117,10 +117,68 @@ def encode_run_mode_for_protocol(mode: RunMode, *, protocol: int) -> str:
     return canonical.value
 
 
+_MODE_FIELDS: Final[frozenset[str]] = frozenset(
+    {
+        "runMode",
+        "run_mode",
+        "desiredMode",
+        "desired_mode",
+        "effectiveMode",
+        "effective_mode",
+        "defaultRunMode",
+        "default_run_mode",
+    }
+)
+_MODE_LIST_FIELDS: Final[frozenset[str]] = frozenset(
+    {"allowedRunModes", "allowed_run_modes"}
+)
+
+
+def encode_payload_for_protocol(payload: Any, *, protocol: int) -> Any:
+    """Recursively encode canonical mode fields immediately before a wire send."""
+    if isinstance(payload, list | tuple):
+        return [
+            encode_payload_for_protocol(value, protocol=protocol)
+            for value in payload
+        ]
+    if not isinstance(payload, dict):
+        return payload
+    encoded: dict[Any, Any] = {}
+    for key, value in payload.items():
+        if key in _MODE_FIELDS and isinstance(value, str):
+            try:
+                mode = decode_legacy_run_mode(
+                    value,
+                    context=LegacyModeContext.WIRE_V1,
+                )
+            except LegacyModeDecodeError:
+                encoded[key] = value
+            else:
+                encoded[key] = encode_run_mode_for_protocol(mode, protocol=protocol)
+            continue
+        if key in _MODE_LIST_FIELDS and isinstance(value, list):
+            encoded[key] = [
+                encode_run_mode_for_protocol(
+                    decode_legacy_run_mode(
+                        item,
+                        context=LegacyModeContext.WIRE_V1,
+                    ),
+                    protocol=protocol,
+                )
+                if isinstance(item, str)
+                else item
+                for item in value
+            ]
+            continue
+        encoded[key] = encode_payload_for_protocol(value, protocol=protocol)
+    return encoded
+
+
 __all__ = [
     "LegacyModeContext",
     "LegacyModeDecodeError",
     "decode_legacy_config_mode",
     "decode_legacy_run_mode",
+    "encode_payload_for_protocol",
     "encode_run_mode_for_protocol",
 ]
