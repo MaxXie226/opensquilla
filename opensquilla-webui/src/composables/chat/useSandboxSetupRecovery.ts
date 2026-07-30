@@ -16,6 +16,9 @@ export interface UseSandboxSetupRecoveryOptions {
   connectionState: Ref<string>
   runMode: Ref<SandboxRunMode>
   autoRefresh?: boolean
+  onUnavailable?: (
+    status: SandboxSetupStatusPayload & { state: 'failed' | 'unavailable' },
+  ) => void | Promise<void>
 }
 
 function normalizeStatus(payload: unknown): SandboxSetupStatusPayload | null {
@@ -41,11 +44,15 @@ export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions)
   let requestGeneration = 0
   let pollTimer: ReturnType<typeof setTimeout> | null = null
   let lastState = ''
+  let lastUnavailableFingerprint = ''
 
-  const active = computed(() =>
-    options.connectionState.value === 'connected' && options.runMode.value !== 'full')
+  const active = computed(() => options.connectionState.value === 'connected')
   const visible = computed(() =>
-    active.value && !dismissed.value && status.value !== null && status.value.state !== 'ready')
+    active.value
+    && options.runMode.value !== 'full'
+    && !dismissed.value
+    && status.value !== null
+    && status.value.state !== 'ready')
   const isWindows = computed(() => status.value?.platform.toLowerCase().startsWith('win') === true)
   const canSetup = computed(() =>
     isWindows.value && (status.value?.state === 'not_setup' || status.value?.state === 'failed'))
@@ -66,6 +73,23 @@ export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions)
     lastState = next.state
     status.value = next
     if (next.state !== 'failed') error.value = ''
+    if (next.state === 'ready') {
+      lastUnavailableFingerprint = ''
+    } else if (next.state === 'failed' || next.state === 'unavailable') {
+      const fingerprint = `${next.state}\0${next.message}\0${next.detail || ''}`
+      if (fingerprint !== lastUnavailableFingerprint) {
+        lastUnavailableFingerprint = fingerprint
+        void Promise.resolve(options.onUnavailable?.({
+          ...next,
+          state: next.state,
+        })).catch((cause) => {
+          console.warn(
+            'Failed to report unavailable sandbox:',
+            cause instanceof Error ? cause.message : String(cause),
+          )
+        })
+      }
+    }
     schedulePoll()
   }
 
@@ -124,27 +148,29 @@ export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions)
   }
 
   watch(
-    () => [options.connectionState.value, options.runMode.value] as const,
-    ([connection, mode], previous) => {
-      const changedMode = previous && previous[1] !== mode
-      if (changedMode) dismissed.value = false
+    () => options.connectionState.value,
+    (connection) => {
       requestGeneration++
       clearPoll()
-      if (
-        options.autoRefresh !== false
-        && connection === 'connected'
-        && mode !== 'full'
-      ) {
+      if (options.autoRefresh !== false && connection === 'connected') {
         void refresh()
       }
       else {
         status.value = null
         lastState = ''
+        lastUnavailableFingerprint = ''
         loading.value = false
         ensuring.value = false
       }
     },
     { immediate: true },
+  )
+
+  watch(
+    () => options.runMode.value,
+    () => {
+      dismissed.value = false
+    },
   )
 
   onScopeDispose(() => {

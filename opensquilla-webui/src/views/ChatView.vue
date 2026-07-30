@@ -401,16 +401,6 @@
       </div>
     </div>
 
-    <SandboxSetupBanner
-      v-if="sandboxSetupVisible"
-      :status="sandboxSetupStatus"
-      :can-setup="sandboxSetupCanSetup"
-      :ensuring="sandboxSetupEnsuring"
-      :error="sandboxSetupError"
-      @setup="ensureSandboxSetup"
-      @dismiss="dismissSandboxSetup"
-    />
-
     <!-- Composer dock: positioning context so the slash menu anchors directly
          above the composer in any layout. The new-chat landing centers the
          composer instead of pinning it to the bottom, so the menu must not
@@ -500,7 +490,7 @@
       :send-blocked-message="composerSendBlockedMessage"
       :input-disabled="Boolean(dockedPlanQuestionnaire)"
       :run-mode="runMode"
-      :allowed-run-modes="allowedRunModes"
+      :allowed-run-modes="composerAllowedRunModes"
       :run-mode-locked="runModeLocked"
       :run-mode-lock-message="t('chat.composer.runModeLocked')"
       :model-routing-mode="modelRoutingMode"
@@ -624,7 +614,6 @@ import PendingQueue from '@/components/chat/PendingQueue.vue'
 import PlanCard from '@/components/chat/PlanCard.vue'
 import PlanRunRibbon from '@/components/chat/PlanRunRibbon.vue'
 import RouterFxStrip from '@/components/chat/RouterFxStrip.vue'
-import SandboxSetupBanner from '@/components/chat/SandboxSetupBanner.vue'
 import SharePreviewModal from '@/components/chat/SharePreviewModal.vue'
 import ToolResultModal from '@/components/chat/ToolResultModal.vue'
 import Icon from '@/components/Icon.vue'
@@ -947,16 +936,26 @@ const sandboxSetupRecovery = useSandboxSetupRecovery({
   connectionState: computed(() => rpc.state),
   runMode,
   autoRefresh: false,
+  onUnavailable: async (status) => {
+    await platform.settings.reportSandboxUnavailable?.({
+      state: status.state,
+      ...(status.message ? { message: status.message } : {}),
+    })
+  },
 })
 const {
   status: sandboxSetupStatus,
-  ensuring: sandboxSetupEnsuring,
-  error: sandboxSetupError,
-  visible: sandboxSetupVisible,
-  canSetup: sandboxSetupCanSetup,
-  ensureSetup: ensureSandboxSetup,
-  dismiss: dismissSandboxSetup,
 } = sandboxSetupRecovery
+const composerAllowedRunModes = computed<SandboxRunMode[]>(() => {
+  const status = sandboxSetupStatus.value
+  if (
+    status !== null
+    && (status.state === 'failed' || status.state === 'unavailable')
+  ) {
+    return allowedRunModes.value.filter((mode) => mode !== 'safe')
+  }
+  return allowedRunModes.value
+})
 
 async function refreshPostBootstrapMetadata() {
   await refreshRunModePreference()

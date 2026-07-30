@@ -149,9 +149,9 @@ describe('useSandboxSetupRecovery', () => {
     scope.stop()
   })
 
-  it.each(['disconnected', 'full'] as const)(
-    'does not let a late failed poll schedule work after becoming %s',
-    async (inactiveBy) => {
+  it(
+    'does not let a late failed poll schedule work after disconnecting',
+    async () => {
       vi.useFakeTimers()
       let rejectPending: (cause: Error) => void = () => {}
       const pending = new Promise<unknown>((_resolve, reject) => { rejectPending = reject })
@@ -169,8 +169,7 @@ describe('useSandboxSetupRecovery', () => {
 
       await vi.advanceTimersByTimeAsync(2000)
       expect(rpc.call).toHaveBeenCalledTimes(2)
-      if (inactiveBy === 'disconnected') connectionState.value = 'disconnected'
-      else runMode.value = 'full'
+      connectionState.value = 'disconnected'
       await nextTick()
       rejectPending(new Error('late status failure'))
       await Promise.resolve()
@@ -234,7 +233,7 @@ describe('useSandboxSetupRecovery', () => {
     scope.stop()
   })
 
-  it('shows unavailable as explanation-only and resets dismissal on state/mode change', async () => {
+  it('keeps authoritative availability while Full Access is selected', async () => {
     const runMode = ref<'safe' | 'full'>('safe')
     const connectionState = ref('connected')
     const rpc = { call: vi.fn(async () => payload('unavailable', 'darwin')) }
@@ -246,10 +245,33 @@ describe('useSandboxSetupRecovery', () => {
     recovery.dismiss()
     expect(recovery.visible.value).toBe(false)
     runMode.value = 'full'
-    await vi.waitFor(() => expect(recovery.status.value).toBeNull())
+    await nextTick()
+    expect(recovery.status.value?.state).toBe('unavailable')
+    expect(recovery.visible.value).toBe(false)
     runMode.value = 'safe'
-    await vi.waitFor(() => expect(recovery.visible.value).toBe(true))
+    await nextTick()
+    expect(recovery.visible.value).toBe(true)
     expect(runMode.value).toBe('safe')
+    scope.stop()
+  })
+
+  it('reports each terminal unavailable state once, including in Full Access', async () => {
+    const onUnavailable = vi.fn()
+    const rpc = { call: vi.fn(async () => payload('failed')) }
+    const scope = effectScope()
+    const recovery = scope.run(() => useSandboxSetupRecovery({
+      rpc,
+      connectionState: ref('connected'),
+      runMode: ref('full'),
+      onUnavailable,
+    }))!
+
+    await vi.waitFor(() => expect(onUnavailable).toHaveBeenCalledOnce())
+    expect(recovery.status.value?.state).toBe('failed')
+    expect(recovery.visible.value).toBe(false)
+
+    await recovery.refresh()
+    expect(onUnavailable).toHaveBeenCalledOnce()
     scope.stop()
   })
 })
