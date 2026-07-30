@@ -274,6 +274,17 @@ class _HangingRetryAfterOverflowProvider(_ContextOverflowProvider):
         yield ProviderText(text="unreachable")
 
 
+class _TextThenDelayedSuccessAfterOverflowProvider(_ContextOverflowProvider):
+    async def _stream(self, call_number: int) -> AsyncIterator[Any]:
+        if call_number == 1:
+            yield ProviderError(message="context length exceeded", code="400")
+            return
+        yield ProviderText(text="partial ")
+        await asyncio.sleep(2.1)
+        yield ProviderText(text="ok")
+        yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
+
+
 class _ProviderRequestBudgetExceededProvider:
     provider_name = "openrouter"
 
@@ -5299,6 +5310,25 @@ async def test_inline_compaction_candidate_gets_terminal_when_retry_never_admits
 async def test_inline_compaction_install_wait_obeys_absolute_deadline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    real_wait = asyncio.wait
+    deadline_limited_waits = 0
+
+    async def _wake_deadline_limited_wait_early(
+        futures: set[asyncio.Future[Any]],
+        *,
+        timeout: float | None = None,
+        return_when: str = asyncio.ALL_COMPLETED,
+    ) -> tuple[set[asyncio.Future[Any]], set[asyncio.Future[Any]]]:
+        nonlocal deadline_limited_waits
+        if timeout is not None and timeout < 1.0:
+            deadline_limited_waits += 1
+            return set(), futures
+        return await real_wait(
+            futures,
+            timeout=timeout,
+            return_when=return_when,
+        )
+
     async def _effective_compact(request: Any) -> CompactionResult:
         protected = int(request.config.protected_recent_messages or 0)
         cut = max(0, len(request.entries) - protected)
@@ -5316,6 +5346,7 @@ async def test_inline_compaction_install_wait_obeys_absolute_deadline(
         "opensquilla.engine.agent.notify_compaction",
         lambda _session_key, **payload: notifications.append(payload),
     )
+    monkeypatch.setattr(asyncio, "wait", _wake_deadline_limited_wait_early)
     provider = _HangingRetryAfterOverflowProvider()
     agent = Agent(
         provider=provider,
@@ -5325,7 +5356,7 @@ async def test_inline_compaction_install_wait_obeys_absolute_deadline(
             max_overflow_retries=1,
             iteration_timeout=5.0,
             timeout=5.0,
-            compaction_total_timeout_seconds=0.05,
+            compaction_total_timeout_seconds=0.5,
             flush_enabled=False,
         ),
     )
@@ -5341,6 +5372,7 @@ async def test_inline_compaction_install_wait_obeys_absolute_deadline(
     elapsed = asyncio.get_running_loop().time() - started
 
     assert elapsed < 1.0
+    assert deadline_limited_waits == 1
     assert any(
         isinstance(event, ErrorEvent)
         and event.code == "compaction_deadline_exceeded"
@@ -5355,6 +5387,53 @@ async def test_inline_compaction_install_wait_obeys_absolute_deadline(
     assert len(terminal) == 1
     assert terminal[0]["status"] == "timed_out"
     assert terminal[0]["reason"] == "compaction_deadline_exceeded"
+
+
+@pytest.mark.asyncio
+async def test_inline_compaction_install_deadline_stops_limiting_accepted_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _effective_compact(request: Any) -> CompactionResult:
+        protected = int(request.config.protected_recent_messages or 0)
+        cut = max(0, len(request.entries) - protected)
+        return CompactionResult(
+            summary="short summary",
+            kept_entries=request.entries[cut:],
+            removed_count=cut,
+            kept_start_index=cut,
+            chunks_processed=1,
+        )
+
+    monkeypatch.setattr("opensquilla.engine.agent.compact_context", _effective_compact)
+    provider = _TextThenDelayedSuccessAfterOverflowProvider()
+    agent = Agent(
+        provider=provider,
+        session_key="agent:main:installed-deadline",
+        config=AgentConfig(
+            max_provider_retries=0,
+            max_overflow_retries=1,
+            iteration_timeout=5.0,
+            timeout=5.0,
+            compaction_total_timeout_seconds=2.0,
+            flush_enabled=False,
+        ),
+    )
+    agent.set_history(
+        [
+            Message(role="user", content="old question " + ("q" * 5000)),
+            Message(role="assistant", content="old answer " + ("a" * 5000)),
+        ]
+    )
+
+    events = [event async for event in agent.run_turn("x" * 4000)]
+
+    assert len(provider.calls) == 2
+    assert sum(isinstance(event, CompactionEvent) for event in events) == 1
+    assert any(
+        isinstance(event, DoneEvent) and event.text == "partial ok"
+        for event in events
+    )
+    assert not any(isinstance(event, ErrorEvent) for event in events)
 
 
 @pytest.mark.asyncio

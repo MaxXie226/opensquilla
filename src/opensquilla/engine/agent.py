@@ -2161,6 +2161,21 @@ class _IterationStreamTimeoutError(TimeoutError):
     """Raised when provider streaming exceeds the active Agent iteration budget."""
 
 
+_STREAM_DEADLINE_ATTRIBUTE = "_opensquilla_stream_deadline_at_monotonic"
+
+
+def _provider_stream_deadline_timeout(
+    *,
+    timeout_seconds: float,
+    deadline_at_monotonic: float,
+) -> TimeoutError:
+    """Tag a plain TimeoutError with the deadline enforced by the stream wrapper."""
+
+    error = TimeoutError(f"Agent total timeout after {timeout_seconds}s")
+    setattr(error, _STREAM_DEADLINE_ATTRIBUTE, deadline_at_monotonic)
+    return error
+
+
 def _is_large_context_invalid_response(
     kind: _ProviderAttemptKind,
     *,
@@ -7301,17 +7316,20 @@ class Agent:
                             if self._pending_durable_compaction_event is not None
                             else None
                         )
-                        provider_stream_deadline = _total_deadline
-                        if pending_install_deadline is not None:
-                            provider_stream_deadline = (
-                                min(_total_deadline, pending_install_deadline)
-                                if _total_deadline is not None
-                                else pending_install_deadline
+
+                        def _pending_install_stream_deadline() -> float | None:
+                            pending_event = self._pending_durable_compaction_event
+                            return (
+                                pending_event.compaction_deadline_at_monotonic
+                                if pending_event is not None
+                                else None
                             )
+
                         async for raw_ev in self._stream_provider_events_with_deadline(
                             raw_stream,
                             loop=_loop,
-                            total_deadline=provider_stream_deadline,
+                            total_deadline=_total_deadline,
+                            deadline_provider=_pending_install_stream_deadline,
                         ):
                             if not isinstance(raw_ev, ProviderErrorEvent):
                                 # Provider.chat commonly returns an async
@@ -8034,11 +8052,25 @@ class Agent:
                     except asyncio.CancelledError:
                         usage_unknown_reason = "cancelled"
                         raise
-                    except TimeoutError:
+                    except TimeoutError as exc:
+                        enforced_stream_deadline = getattr(
+                            exc,
+                            _STREAM_DEADLINE_ATTRIBUTE,
+                            None,
+                        )
+                        pending_install_timeout = (
+                            enforced_stream_deadline
+                            == pending_install_deadline
+                            if enforced_stream_deadline is not None
+                            else (
+                                pending_install_deadline is not None
+                                and _loop.time() >= pending_install_deadline
+                            )
+                        )
                         if (
                             pending_install_deadline is not None
-                            and _loop.time() >= pending_install_deadline
                             and self._pending_durable_compaction_event is not None
+                            and pending_install_timeout
                         ):
                             usage_unknown_reason = "compaction_install_timeout"
                             _notify_call_outcome(
@@ -14736,16 +14768,32 @@ class Agent:
         *,
         loop: asyncio.AbstractEventLoop,
         total_deadline: float | None,
+        deadline_provider: Callable[[], float | None] | None = None,
     ) -> AsyncIterator[Any]:
         stream_iter = stream.__aiter__()
         while True:
+            dynamic_deadline = (
+                deadline_provider()
+                if deadline_provider is not None
+                else None
+            )
+            active_deadline = total_deadline
+            if dynamic_deadline is not None:
+                active_deadline = (
+                    min(active_deadline, dynamic_deadline)
+                    if active_deadline is not None
+                    else dynamic_deadline
+                )
             wait_budget = max(0.001, self.config.iteration_timeout)
             total_deadline_limits_wait = False
-            if total_deadline is not None:
-                remaining_total = total_deadline - loop.time()
+            if active_deadline is not None:
+                remaining_total = active_deadline - loop.time()
                 if remaining_total <= 0:
                     await self._close_provider_stream(stream_iter)
-                    raise TimeoutError(f"Agent total timeout after {self.config.timeout}s")
+                    raise _provider_stream_deadline_timeout(
+                        timeout_seconds=self.config.timeout,
+                        deadline_at_monotonic=active_deadline,
+                    )
                 if remaining_total <= wait_budget:
                     wait_budget = remaining_total
                     total_deadline_limits_wait = True
@@ -14763,9 +14811,14 @@ class Agent:
                 with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration):
                     await next_event
                 if total_deadline_limits_wait or (
-                    total_deadline is not None and loop.time() >= total_deadline
+                    active_deadline is not None
+                    and loop.time() >= active_deadline
                 ):
-                    raise TimeoutError(f"Agent total timeout after {self.config.timeout}s")
+                    assert active_deadline is not None
+                    raise _provider_stream_deadline_timeout(
+                        timeout_seconds=self.config.timeout,
+                        deadline_at_monotonic=active_deadline,
+                    )
                 raise _IterationStreamTimeoutError
             try:
                 yield next_event.result()
