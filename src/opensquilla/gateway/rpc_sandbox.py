@@ -39,6 +39,10 @@ from opensquilla.sandbox.path_validation import (
     normalize_mount_access,
     normalize_path,
 )
+from opensquilla.sandbox.policy_store import (
+    PolicyVersionConflict,
+    SandboxPolicyStore,
+)
 from opensquilla.sandbox.run_context import (
     RUN_CONTEXT_ORIGIN_KEY,
     RunContext,
@@ -89,6 +93,13 @@ def _require_params(params: dict | None) -> dict[str, Any]:
     if not isinstance(params, dict):
         raise ValueError("params must be an object")
     return params
+
+
+def _sandbox_policy_store(ctx: RpcContext) -> SandboxPolicyStore:
+    state_dir = getattr(ctx.config, "state_dir", None)
+    if not state_dir:
+        raise RpcUnavailableError("Sandbox policy storage is unavailable.")
+    return SandboxPolicyStore(Path(str(state_dir)) / "sessions.db")
 
 
 def _require_session_key(params: dict[str, Any]) -> str:
@@ -678,6 +689,34 @@ async def _handle_sandbox_capability_status(params: dict | None, ctx: RpcContext
         raise ValueError("params must be an object")
     report = await current_sandbox_capability_report(ctx.config)
     return report.to_payload()
+
+
+@_d.method("sandbox.policy.get", scope="operator.read")
+async def _handle_sandbox_policy_get(params: dict | None, ctx: RpcContext) -> dict:
+    if params is not None and not isinstance(params, dict):
+        raise ValueError("params must be an object")
+    return _sandbox_policy_store(ctx).read().to_public_dict()
+
+
+@_d.method("sandbox.policy.update", scope="operator.write")
+async def _handle_sandbox_policy_update(params: dict | None, ctx: RpcContext) -> dict:
+    _require_owner(ctx, "sandbox.policy.update")
+    values = _require_params(params)
+    base_version = values.get("basePolicyVersion")
+    if not isinstance(base_version, int) or isinstance(base_version, bool):
+        raise ValueError("params.basePolicyVersion must be an integer")
+    policy = values.get("policy")
+    if not isinstance(policy, dict):
+        raise ValueError("params.policy must be an object")
+    try:
+        saved = _sandbox_policy_store(ctx).compare_and_swap(base_version, policy)
+    except PolicyVersionConflict as exc:
+        raise RpcHandlerError(
+            "POLICY_VERSION_CONFLICT",
+            "The sandbox policy changed in another client.",
+            details={"currentPolicy": exc.current_policy.to_public_dict()},
+        ) from exc
+    return saved.to_public_dict()
 
 
 @_d.method("sandbox.setup.ensure", scope="operator.write")

@@ -155,6 +155,7 @@ METHOD_SCOPES: dict[str, str] = {
     "sandbox.status": READ_SCOPE,  # OpenSquilla-only; sandbox posture summary.
     "sandbox.setup.status": READ_SCOPE,  # OpenSquilla-only; setup readiness.
     "sandbox.capability.status": READ_SCOPE,  # OpenSquilla-only; real Safe capability.
+    "sandbox.policy.get": READ_SCOPE,  # OpenSquilla-only; versioned Safe settings.
     "sandbox.explain": READ_SCOPE,  # OpenSquilla-only; deterministic sandbox explanation.
     "sandbox.run_context.get": READ_SCOPE,  # OpenSquilla-only; session sandbox mode.
     "sandbox.run_mode.preference.get": READ_SCOPE,  # OpenSquilla-only; global picker default.
@@ -239,6 +240,7 @@ METHOD_SCOPES: dict[str, str] = {
     "sandbox.bundle.enable": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded handler.
     "sandbox.bundle.disable": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded handler.
     "sandbox.setup.ensure": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded setup.
+    "sandbox.policy.update": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded settings.
     "sandbox.resume": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded denial-pause clear.
     "sandbox.run_context.set": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded handler.
     "sandbox.run_mode.preference.set": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded default.

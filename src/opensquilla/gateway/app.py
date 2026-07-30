@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import json
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -360,6 +361,45 @@ def create_gateway_app(
         msg = result.error.message if result.error else "error"
         return JSONResponse({"error": msg}, status_code=_rpc_status_code(result))
 
+    async def api_sandbox_policy_get(request: Request) -> JSONResponse:
+        result = await dispatcher.dispatch(
+            "_http",
+            "sandbox.policy.get",
+            {},
+            _make_ctx(request),
+        )
+        if result.ok:
+            return JSONResponse(result.payload or {})
+        message = result.error.message if result.error else "error"
+        return JSONResponse({"error": message}, status_code=_rpc_status_code(result))
+
+    async def api_sandbox_policy_update(request: Request) -> JSONResponse:
+        try:
+            params = await request.json()
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+        result = await dispatcher.dispatch(
+            "_http",
+            "sandbox.policy.update",
+            params if isinstance(params, dict) else None,
+            _make_ctx(request),
+        )
+        if result.ok:
+            return JSONResponse(result.payload or {})
+        error = result.error
+        status = (
+            409
+            if error and error.code == "POLICY_VERSION_CONFLICT"
+            else _rpc_status_code(result)
+        )
+        payload: dict[str, Any] = {
+            "error": error.message if error else "error",
+            "code": error.code if error else "INTERNAL",
+        }
+        if error is not None and error.details is not None:
+            payload["details"] = error.details
+        return JSONResponse(payload, status_code=status)
+
     def _make_ctx(request: Request | None = None, role_claim: str = "operator") -> RpcContext:
         from opensquilla.gateway.auth import Principal, resolve_auth
 
@@ -695,6 +735,12 @@ def create_gateway_app(
         Route("/api/desktop/identity", _same_origin(api_desktop_identity), methods=["POST"]),
         Route("/api/desktop/shutdown", _same_origin(api_desktop_shutdown), methods=["POST"]),
         Route("/api/usage", api_usage, methods=["GET"]),
+        Route("/api/v2/sandbox/policy", api_sandbox_policy_get, methods=["GET"]),
+        Route(
+            "/api/v2/sandbox/policy",
+            _same_origin(api_sandbox_policy_update),
+            methods=["PUT"],
+        ),
         Route("/api/channels/status", api_channels_status, methods=["GET"]),
         Route("/api/channels/logout", _same_origin(api_channels_logout), methods=["POST"]),
         Route("/api/channels/pairings", api_channel_pairings, methods=["GET"]),
