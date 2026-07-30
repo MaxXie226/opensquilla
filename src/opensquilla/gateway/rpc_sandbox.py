@@ -68,6 +68,7 @@ from opensquilla.sandbox.run_mode_policy import (
 )
 from opensquilla.sandbox.runtime_launcher import ChildRole, internal_child_argv
 from opensquilla.sandbox.setup_runtime import (
+    current_sandbox_capability_report,
     current_sandbox_setup_runtime_status,
     ensure_sandbox_setup_auto,
 )
@@ -669,6 +670,14 @@ async def _handle_sandbox_status(params: dict | None, ctx: RpcContext) -> dict:
 async def _handle_sandbox_setup_status(params: dict | None, ctx: RpcContext) -> dict:
     result = await current_sandbox_setup_runtime_status(ctx.config)
     return result.to_payload()
+
+
+@_d.method("sandbox.capability.status", scope="operator.read")
+async def _handle_sandbox_capability_status(params: dict | None, ctx: RpcContext) -> dict:
+    if params is not None and not isinstance(params, dict):
+        raise ValueError("params must be an object")
+    report = await current_sandbox_capability_report(ctx.config)
+    return report.to_payload()
 
 
 @_d.method("sandbox.setup.ensure", scope="operator.write")

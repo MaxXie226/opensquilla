@@ -5,6 +5,10 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+from opensquilla.sandbox.capability_service import (
+    CapabilityReport,
+    capability_report_from_setup,
+)
 from opensquilla.sandbox.setup_state import (
     SandboxSetupState,
     SetupResult,
@@ -28,6 +32,20 @@ async def current_sandbox_setup_runtime_status(config: Any) -> SetupResult:
     if _LAST_RESULT is not None and _LAST_RESULT.state is SandboxSetupState.FAILED:
         return _LAST_RESULT
     return await current_sandbox_setup_status(config)
+
+
+async def current_sandbox_capability_report(config: Any) -> CapabilityReport:
+    setup = await current_sandbox_setup_runtime_status(config)
+    backend = str(getattr(getattr(config, "sandbox", None), "backend", "auto"))
+    if backend == "auto":
+        try:
+            from opensquilla.sandbox.integration import get_runtime
+
+            runtime = get_runtime()
+            backend = str(getattr(getattr(runtime, "backend", None), "name", "auto"))
+        except Exception:  # pragma: no cover - defensive import boundary
+            backend = "auto"
+    return capability_report_from_setup(setup, backend=backend)
 
 
 async def ensure_sandbox_setup_auto(config: Any) -> SetupResult:
@@ -74,6 +92,7 @@ def reset_sandbox_setup_runtime_state() -> None:
 
 
 __all__ = [
+    "current_sandbox_capability_report",
     "current_sandbox_setup_runtime_status",
     "ensure_sandbox_setup_auto",
     "reset_sandbox_setup_runtime_state",

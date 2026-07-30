@@ -163,3 +163,27 @@ async def test_reset_setup_runtime_state_delegates_to_current_probe_again(monkey
 
     assert status.state is SandboxSetupState.NOT_SETUP
     assert status.message == "Sandbox setup has not been completed."
+
+
+@pytest.mark.asyncio
+async def test_capability_report_uses_live_setup_and_configured_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.sandbox import setup_runtime
+
+    config = SimpleNamespace(sandbox=SimpleNamespace(backend="windows_default"))
+
+    async def current_probe(_config: object) -> SetupResult:
+        return SetupResult(
+            state=SandboxSetupState.READY,
+            platform="win32",
+            message="ready",
+        )
+
+    monkeypatch.setattr(setup_runtime, "current_sandbox_setup_status", current_probe)
+
+    report = await setup_runtime.current_sandbox_capability_report(config)
+
+    assert report.available is True
+    assert report.backend == "windows_default"
+    assert report.code == "ready"
