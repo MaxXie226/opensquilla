@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "releaseTrain": "public-ui-foundation",
+  "versionPolicy": "independent",
+  "packages": [
+    {
+      "name": "@opensquilla/client-sdk",
+      "path": "packages/client-sdk",
+      "version": "0.1.0",
+      "role": "gateway-client-sdk",
+      "workspace": false
+    },
+    {
+      "name": "@opensquilla/ui-tokens",
+      "path": "packages/ui-tokens",
+      "version": "0.1.0",
+      "role": "design-contracts",
+      "workspace": true
+    },
+    {
+      "name": "@opensquilla/ui-primitives",
+      "path": "packages/ui-primitives",
+      "version": "0.1.0",
+      "role": "browser-safe-primitives",
+      "workspace": true
+    },
+    {
+      "name": "@opensquilla/ui-foundation",
+      "path": "packages/ui-foundation",
+      "version": "0.1.0",
+      "role": "product-neutral-composition",
+      "workspace": true
+    }
+  ]
+}

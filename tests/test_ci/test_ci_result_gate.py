@@ -19,6 +19,7 @@ def _base_env() -> dict[str, str]:
         "RESULT_CLASSIFY": "success",
         "RESULT_WORKFLOW_LINT": "success",
         "RESULT_README_LOCALE": "success",
+        "RESULT_UI_PACKAGES": "skipped",
         "RESULT_FRONTEND": "skipped",
         "RESULT_TUI": "skipped",
         "RESULT_DESKTOP": "skipped",
@@ -204,6 +205,21 @@ def test_ci_result_gate_requires_desktop_recovery_e2e_for_frontend_changes() -> 
     errors = check_ci_results(env)
 
     assert any("Desktop recovery E2E matrix" in error and "skipped" in error for error in errors)
+
+
+def test_ci_result_gate_requires_public_ui_packages_for_frontend_changes() -> None:
+    env = _base_env()
+    env[_flag_env("docs_only")] = "false"
+    env[_flag_env("frontend_changed")] = "true"
+    env["RESULT_FRONTEND"] = "success"
+    env["RESULT_DESKTOP_RECOVERY_E2E"] = "success"
+    env["RESULT_CLIENT_CONTRACT"] = "success"
+
+    errors = check_ci_results(env)
+
+    assert any("Public UI package matrix" in error and "skipped" in error for error in errors)
+    env["RESULT_UI_PACKAGES"] = "success"
+    assert check_ci_results(env) == []
 
 
 def test_ci_result_gate_rejects_failed_or_missing_desktop_recovery_e2e() -> None:

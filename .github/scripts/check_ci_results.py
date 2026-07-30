@@ -84,6 +84,11 @@ def check_ci_results(env: Mapping[str, str]) -> list[str]:
             or flags["desktop_changed"]
             or full,
         ),
+        (
+            "RESULT_UI_PACKAGES",
+            "Public UI package matrix",
+            flags["frontend_changed"] or full,
+        ),
         ("RESULT_TUI", "OpenTUI package tests", flags["tui_changed"] or full),
         ("RESULT_DESKTOP", "Desktop Electron unit tests", flags["desktop_changed"] or full),
         ("RESULT_UBUNTU", "Ubuntu quality gate", flags["python_changed"] or full),
