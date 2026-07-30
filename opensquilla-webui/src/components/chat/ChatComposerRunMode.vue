@@ -34,7 +34,6 @@
       </button>
     </div>
 
-    <span v-if="fullDisabled" class="composer-run-mode__hint">{{ t('chat.composer.runModeFullUnavailable') }}</span>
   </section>
 </template>
 
@@ -59,14 +58,9 @@ const emit = defineEmits<{
 
 const runModeOptions = computed(() => [
   {
-    value: 'standard',
-    label: t('chat.composer.runModeStandard'),
-    description: t('chat.composer.runModeStandardDesc'),
-  },
-  {
-    value: 'trusted',
-    label: t('chat.composer.runModeTrusted'),
-    description: t('chat.composer.runModeTrustedDesc'),
+    value: 'safe',
+    label: t('chat.composer.runModeSafe'),
+    description: t('chat.composer.runModeSafeDesc'),
   },
   {
     value: 'full',
@@ -81,8 +75,6 @@ const allowedRunModes = computed(() => {
   const allowed = props.allowedRunModes.filter(mode => SANDBOX_RUN_MODES.includes(mode))
   return allowed.length > 0 ? allowed : [...SANDBOX_RUN_MODES]
 })
-
-const fullDisabled = computed(() => !allowedRunModes.value.includes('full'))
 
 function isDisabled(mode: SandboxRunMode): boolean {
   return !allowedRunModes.value.includes(mode)
@@ -197,14 +189,6 @@ onMounted(() => rootRef.value?.focus())
 
 .composer-run-mode__option-desc {
   color: var(--text-muted);
-  font-size: 0.75rem;
-  line-height: 1.35;
-}
-
-.composer-run-mode__hint {
-  display: block;
-  margin-top: 0.625rem;
-  color: var(--warn);
   font-size: 0.75rem;
   line-height: 1.35;
 }

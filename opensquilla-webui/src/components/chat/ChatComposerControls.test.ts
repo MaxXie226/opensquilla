@@ -21,7 +21,7 @@ describe('ChatComposer control hierarchy', () => {
     expect(composerSource).toContain('chat-run-mode-btn--${runMode}')
     expect(composerSource).toContain(':run-mode="runMode"')
     expect(composerSource).toContain('@set-run-mode="emit(\'setRunMode\', $event)"')
-    expect(composerSource).toContain("setRunMode: [mode: 'standard' | 'trusted' | 'full']")
+    expect(composerSource).toContain('setRunMode: [mode: SandboxRunMode]')
 
     expect(viewSource).toContain(':run-mode="runMode"')
     expect(viewSource).toContain(':allowed-run-modes="allowedRunModes"')
@@ -39,14 +39,15 @@ describe('ChatComposer control hierarchy', () => {
     expect(zhHans.chat.composer.runModeLocked).toBe('运行中，当前会话无法修改')
   })
 
-  it('offers exactly the three sandbox run modes from the shield popover', () => {
-    expect(runModeSource).toContain("value: 'standard'")
-    expect(runModeSource).toContain("value: 'trusted'")
+  it('offers exactly Safe and Full from the shield popover', () => {
+    expect(runModeSource).toContain("value: 'safe'")
     expect(runModeSource).toContain("value: 'full'")
+    expect(runModeSource).not.toContain("value: 'standard'")
+    expect(runModeSource).not.toContain("value: 'trusted'")
     expect(runModeSource).not.toContain("value: 'on'")
     expect(runModeSource).not.toContain("value: 'bypass'")
-    expect(zhHans.chat.composer.runModeStandardDesc)
-      .toBe('访问项目外文件、网络或更改系统时会询问你。')
+    expect(zhHans.chat.composer.runModeSafeDesc)
+      .toBe('使用沙箱，并遵循你配置的文件、命令与网络安全规则。')
   })
 
   it('moves visual effects to Appearance settings', () => {

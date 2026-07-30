@@ -41,6 +41,23 @@ def test_named_token_revoke_prevents_future_verification(tmp_path) -> None:
     assert store.verify(issued.token) is None
 
 
+def test_named_token_list_never_returns_secret_material(tmp_path) -> None:
+    store = TokenStore(tmp_path / "sessions.db")
+    issued = store.create(
+        name="Desktop",
+        roles={"operator"},
+        scopes={"operator.read"},
+        capabilities={"task.read", "host.execute"},
+    )
+
+    records = store.list_active()
+
+    assert records == (issued.record,)
+    assert issued.token not in repr(records)
+    assert store.revoke(issued.record.public_id) is True
+    assert store.list_active() == ()
+
+
 def test_wrong_secret_and_unknown_public_id_are_indistinguishable(tmp_path) -> None:
     store = TokenStore(tmp_path / "sessions.db")
     issued = store.create(

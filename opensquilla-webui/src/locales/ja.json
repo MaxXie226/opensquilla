@@ -448,6 +448,38 @@
         "default": "OpenSquilla はこのリクエストを完了できませんでした。未確認のプロフィール変更は適用されていません。"
       }
     },
+    "sandbox": {
+      "eyebrow": "セキュリティ",
+      "title": "サンドボックス",
+      "subtitle": "安全モードのファイル、コマンド、ネットワーク、同梱ランタイム、LAN トークンを設定します。",
+      "available": "安全モード利用可能",
+      "unavailable": "安全モード利用不可",
+      "builtin": "組み込み",
+      "actions": { "add": "追加", "remove": "削除", "retry": "再試行", "copy": "コピー", "saving": "保存中…" },
+      "files": {
+        "title": "ファイル保護", "description": "通常のファイルは読み取り可能です。保護パスの変更には承認が必要です。", "readsAllowed": "読み取り許可",
+        "customPath": "カスタム保護パス", "pathPlaceholder": "保護パスを追加", "backupTitle": "再帰削除の前にバックアップ",
+        "backupDescription": "復元可能なコピーを保持し、上限到達時は古いものから削除します。", "quota": "バックアップ容量上限",
+        "recursiveWarning": "再帰削除は元に戻せません。OpenSquilla は専用の警告を表示し、既定でキャンセルを選びます。"
+      },
+      "commands": {
+        "title": "コマンド保護", "description": "コマンドは原則自動実行され、git push など影響の大きい操作だけ承認を求めます。",
+        "systemTools": "システムツール", "systemToolsAuto": "自動許可", "systemToolsPrompt": "事前確認", "systemToolsDisabled": "無効",
+        "approvalPrefixes": "承認が必要なコマンド接頭辞", "autoPrefixes": "常に自動許可する接頭辞", "prefixPlaceholder": "例: git push"
+      },
+      "network": {
+        "title": "ネットワーク保護", "description": "公開ネットワークは既定で許可し、SSRF とメタデータ保護を維持します。",
+        "blockAll": "すべてのネットワークを遮断", "blockAllDescription": "許可ドメインだけを例外にします。", "allowDomains": "許可ドメイン", "denyDomains": "拒否ドメイン"
+      },
+      "runtimes": { "title": "同梱ランタイム", "description": "安全モードは同梱ツールを優先し、フルアクセスはホストツールを優先します。" },
+      "lan": {
+        "title": "LAN アクセスと名前付きトークン", "description": "トークンがホスト権限を決めます。この LAN モードでは HTTPS は必須ではありません。",
+        "guest": "トークンなし・誤り:", "guestDescription": " ゲスト安全モードのみで、ホスト HOME、プロジェクト、秘密環境にはアクセスできません。",
+        "authenticated": "有効なトークン:", "authenticatedDescription": " 権限に応じて安全またはフルアクセスを利用できます。",
+        "tokenName": "トークン名（例: Laptop）", "hostExecute": "ホスト実行 / フルアクセスを許可", "createToken": "トークンを作成",
+        "copyNow": "今すぐコピーしてください。再表示されません。", "fullCapable": "安全とフルアクセス", "safeOnly": "安全のみ", "revoke": "無効化"
+      }
+    },
     "dialog": {
       "title": "設定",
       "actionNeeded": "対応が必要 ({count})",
@@ -483,6 +515,7 @@
       "modelStrategy": "モデルルーティング",
       "behavior": "動作",
       "privacy": "プライバシー",
+      "sandbox": "サンドボックス",
       "memory": "メモリとプロフィール",
       "router": "ルーター",
       "ensemble": "アンサンブル",
@@ -3452,10 +3485,8 @@
       "modelRoutingEnsemble": "AI搭載アンサンブルルーター",
       "modelRoutingEnsembleDesc": "AI が複数のモデルを連携させ、複雑なタスクでの能力向上を優先します。",
       "runMode": "実行モード",
-      "runModeStandard": "毎回確認",
-      "runModeStandardDesc": "プロジェクト外のファイル、ネットワーク、システム変更の前に毎回確認します。",
-      "runModeTrusted": "おまかせ実行",
-      "runModeTrustedDesc": "操作のリスクを自動で判断するため、通常は毎回の確認が不要です。",
+      "runModeSafe": "安全モード",
+      "runModeSafeDesc": "サンドボックスと設定したファイル、コマンド、ネットワーク規則を使用します。",
       "runModeFull": "フルアクセス",
       "runModeFullDesc": "ファイル、ネットワーク、システムへ毎回確認せず直接アクセスできます。",
       "runModeFullUnavailable": "フルアクセスはセッションの所有者のみ利用できます。",

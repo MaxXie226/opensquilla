@@ -448,6 +448,38 @@
         "default": "OpenSquilla konnte diese Anfrage nicht abschließen. Es wurden keine unbestätigten Profiländerungen angewendet."
       }
     },
+    "sandbox": {
+      "eyebrow": "Sicherheit",
+      "title": "Sandbox",
+      "subtitle": "Datei-, Befehls-, Netzwerk-, Laufzeit- und LAN-Token-Regeln für den sicheren Modus.",
+      "available": "Sicherer Modus verfügbar",
+      "unavailable": "Sicherer Modus nicht verfügbar",
+      "builtin": "Integriert",
+      "actions": { "add": "Hinzufügen", "remove": "Entfernen", "retry": "Erneut versuchen", "copy": "Kopieren", "saving": "Speichern…" },
+      "files": {
+        "title": "Dateisicherheit", "description": "Normale Dateien sind lesbar. Änderungen an geschützten Pfaden erfordern eine Freigabe.", "readsAllowed": "Lesen erlaubt",
+        "customPath": "Eigener geschützter Pfad", "pathPlaceholder": "Geschützten Pfad hinzufügen", "backupTitle": "Vor rekursivem Löschen sichern",
+        "backupDescription": "Wiederherstellbare Kopien behalten und bei Erreichen des Limits die ältesten löschen.", "quota": "Backup-Speicherlimit",
+        "recursiveWarning": "Rekursives Löschen ist nicht rückgängig zu machen. OpenSquilla warnt gesondert und wählt standardmäßig Abbrechen."
+      },
+      "commands": {
+        "title": "Befehlssicherheit", "description": "Befehle laufen standardmäßig automatisch. Riskante Aktionen wie git push brauchen eine Freigabe.",
+        "systemTools": "Systemwerkzeuge", "systemToolsAuto": "Automatisch erlauben", "systemToolsPrompt": "Vorher fragen", "systemToolsDisabled": "Deaktiviert",
+        "approvalPrefixes": "Befehlspräfixe mit Freigabe", "autoPrefixes": "Immer automatisch erlaubte Präfixe", "prefixPlaceholder": "Zum Beispiel: git push"
+      },
+      "network": {
+        "title": "Netzwerksicherheit", "description": "Öffentlicher Netzwerkzugriff ist standardmäßig erlaubt; SSRF- und Metadatenschutz bleiben aktiv.",
+        "blockAll": "Gesamten Netzwerkzugriff sperren", "blockAllDescription": "Erlaubte Domains bleiben Ausnahmen.", "allowDomains": "Erlaubte Domains", "denyDomains": "Gesperrte Domains"
+      },
+      "runtimes": { "title": "Mitgelieferte Laufzeiten", "description": "Sicher nutzt zuerst mitgelieferte Werkzeuge; Vollzugriff zuerst Host-Werkzeuge." },
+      "lan": {
+        "title": "LAN-Zugriff und benannte Tokens", "description": "Tokens steuern Host-Rechte; für diesen LAN-Modus ist HTTPS nicht erforderlich.",
+        "guest": "Kein oder ungültiges Token:", "guestDescription": " nur Gast-Sicherheitsmodus ohne Host-HOME, Projekt oder geheime Umgebung.",
+        "authenticated": "Gültiges Token:", "authenticatedDescription": " je nach Berechtigung Sicher oder Vollzugriff.",
+        "tokenName": "Token-Name, z. B. Laptop", "hostExecute": "Host-Ausführung / Vollzugriff erlauben", "createToken": "Token erstellen",
+        "copyNow": "Jetzt kopieren. Das Token wird nicht erneut angezeigt.", "fullCapable": "Sicher und Vollzugriff", "safeOnly": "Nur Sicher", "revoke": "Widerrufen"
+      }
+    },
     "dialog": {
       "title": "Einstellungen",
       "actionNeeded": "Aktion erforderlich ({count})",
@@ -483,6 +515,7 @@
       "modelStrategy": "Modellrouting",
       "behavior": "Verhalten",
       "privacy": "Datenschutz",
+      "sandbox": "Sandbox",
       "memory": "Gedächtnis und Profil",
       "router": "Router",
       "ensemble": "Ensemble",
@@ -3452,10 +3485,8 @@
       "modelRoutingEnsemble": "AI-gestützter Ensemble-Router",
       "modelRoutingEnsembleDesc": "AI koordiniert mehrere Modelle, um die Leistungsfähigkeit bei komplexen Aufgaben zu erhöhen.",
       "runMode": "Ausführungsmodus",
-      "runModeStandard": "Jedes Mal fragen",
-      "runModeStandardDesc": "Fragt vor Zugriffen auf Dateien außerhalb des Projekts, das Netzwerk oder Systemeinstellungen.",
-      "runModeTrusted": "Verwaltete Ausführung",
-      "runModeTrustedDesc": "Bewertet Risiken automatisch, sodass Sie Aktionen meist nicht einzeln bestätigen müssen.",
+      "runModeSafe": "Sicher",
+      "runModeSafeDesc": "Verwendet die Sandbox und Ihre Datei-, Befehls- und Netzwerkregeln.",
       "runModeFull": "Vollzugriff",
       "runModeFullDesc": "Greift ohne einzelne Rückfragen direkt auf Dateien, Netzwerk und System zu.",
       "runModeFullUnavailable": "Vollzugriff ist nur für den Eigentümer der Sitzung verfügbar.",

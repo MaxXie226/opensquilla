@@ -448,6 +448,70 @@
         "default": "OpenSquilla 无法完成此请求，未应用任何未经确认的画像更改。"
       }
     },
+    "sandbox": {
+      "eyebrow": "安全",
+      "title": "沙箱",
+      "subtitle": "配置安全模式下的文件、命令、网络、随包运行时和内网 Token 行为。",
+      "available": "安全模式可用",
+      "unavailable": "安全模式不可用",
+      "builtin": "内置",
+      "actions": {
+        "add": "添加",
+        "remove": "删除",
+        "retry": "重试",
+        "copy": "复制",
+        "saving": "正在保存…"
+      },
+      "files": {
+        "title": "文件安全",
+        "description": "普通文件全部可读；修改、删除或移动下列受保护路径时必须询问。",
+        "readsAllowed": "读取不拦截",
+        "customPath": "自定义受保护路径",
+        "pathPlaceholder": "添加受保护路径",
+        "backupTitle": "递归删除前先备份",
+        "backupDescription": "保留可恢复副本，达到空间上限后自动清理最旧的备份。",
+        "quota": "备份空间上限",
+        "recursiveWarning": "递归删除不可撤回。OpenSquilla 执行前会显示专门的强提醒，并默认选择取消。"
+      },
+      "commands": {
+        "title": "命令安全",
+        "description": "命令默认自动执行；git push 等影响较大且难以撤回的操作才需要审批。",
+        "systemTools": "系统级工具",
+        "systemToolsAuto": "自动放行",
+        "systemToolsPrompt": "每次询问",
+        "systemToolsDisabled": "禁用",
+        "approvalPrefixes": "需要审批的命令前缀",
+        "autoPrefixes": "始终自动放行的命令前缀",
+        "prefixPlaceholder": "例如：git push"
+      },
+      "network": {
+        "title": "网络安全",
+        "description": "默认允许公网访问，同时保留本机元数据与 SSRF 等基础防护。",
+        "blockAll": "阻断所有网络访问",
+        "blockAllDescription": "开启后仅把允许域名作为例外放行。",
+        "allowDomains": "允许域名",
+        "denyDomains": "拒绝域名"
+      },
+      "runtimes": {
+        "title": "随包运行时",
+        "description": "安全模式优先使用随包工具；完全访问优先使用宿主机工具。"
+      },
+      "lan": {
+        "title": "内网访问与具名 Token",
+        "description": "内网连接只信任真实套接字来源。此局域网模式暂不要求 HTTPS，Token 决定宿主机权限。",
+        "guest": "无 Token 或 Token 错误：",
+        "guestDescription": "只能使用访客安全模式，无法读取宿主机 HOME、项目和敏感环境变量。",
+        "authenticated": "有效具名 Token：",
+        "authenticatedDescription": "根据 Token 能力使用安全模式或完全访问。",
+        "tokenName": "Token 名称，例如：笔记本",
+        "hostExecute": "允许宿主机执行 / 完全访问",
+        "createToken": "创建 Token",
+        "copyNow": "请立即复制，此 Token 之后不会再次显示。",
+        "fullCapable": "安全模式和完全访问",
+        "safeOnly": "仅安全模式",
+        "revoke": "撤销"
+      }
+    },
     "dialog": {
       "title": "设置",
       "actionNeeded": "需要处理（{count}）",
@@ -483,6 +547,7 @@
       "modelStrategy": "模型路由",
       "behavior": "行为",
       "privacy": "隐私",
+      "sandbox": "沙箱",
       "memory": "记忆与画像",
       "router": "路由",
       "ensemble": "模型融合",
@@ -3452,10 +3517,8 @@
       "modelRoutingEnsemble": "AI 智能融合路由",
       "modelRoutingEnsembleDesc": "由 AI 协调多个模型协同生成，优先提升复杂任务能力。",
       "runMode": "执行模式",
-      "runModeStandard": "每次询问",
-      "runModeStandardDesc": "访问项目外文件、网络或更改系统时会询问你。",
-      "runModeTrusted": "托管执行",
-      "runModeTrustedDesc": "自动判断操作风险，通常无需你逐次确认。",
+      "runModeSafe": "安全模式",
+      "runModeSafeDesc": "使用沙箱，并遵循你配置的文件、命令与网络安全规则。",
       "runModeFull": "完全访问",
       "runModeFullDesc": "允许直接访问文件、网络和系统，不再逐次询问。",
       "runModeFullUnavailable": "完全访问仅供会话所有者使用。",

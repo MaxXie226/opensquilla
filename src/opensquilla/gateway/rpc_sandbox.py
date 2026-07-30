@@ -27,12 +27,14 @@ from opensquilla.gateway.rpc import (
     get_dispatcher,
 )
 from opensquilla.gateway.session_services import get_session_storage
+from opensquilla.gateway.token_store import TokenRecord, TokenStore
 from opensquilla.project_workspaces import (
     ProjectWorkspaceGuard,
     ProjectWorkspaceStateError,
 )
 from opensquilla.sandbox.domain_validation import validate_domain_pattern
 from opensquilla.sandbox.escalation import remember_resolved_run_context
+from opensquilla.sandbox.file_policy import builtin_deny_write_paths
 from opensquilla.sandbox.package_bundles import expand_package_bundle
 from opensquilla.sandbox.path_validation import (
     decide_path_access,
@@ -100,6 +102,24 @@ def _sandbox_policy_store(ctx: RpcContext) -> SandboxPolicyStore:
     if not state_dir:
         raise RpcUnavailableError("Sandbox policy storage is unavailable.")
     return SandboxPolicyStore(Path(str(state_dir)) / "sessions.db")
+
+
+def _sandbox_token_store(ctx: RpcContext) -> TokenStore:
+    state_dir = getattr(ctx.config, "state_dir", None)
+    if not state_dir:
+        raise RpcUnavailableError("Sandbox token storage is unavailable.")
+    return TokenStore(Path(str(state_dir)) / "sessions.db")
+
+
+def _sandbox_token_payload(record: TokenRecord) -> dict[str, Any]:
+    return {
+        "publicId": record.public_id,
+        "name": record.name,
+        "capabilities": sorted(record.capabilities),
+        "createdAt": record.created_at,
+        "lastUsedAt": record.last_used_at,
+        "lastPeer": record.last_peer,
+    }
 
 
 def _require_session_key(params: dict[str, Any]) -> str:
@@ -698,6 +718,17 @@ async def _handle_sandbox_policy_get(params: dict | None, ctx: RpcContext) -> di
     return _sandbox_policy_store(ctx).read().to_public_dict()
 
 
+@_d.method("sandbox.policy.defaults", scope="operator.read")
+async def _handle_sandbox_policy_defaults(params: dict | None, ctx: RpcContext) -> dict:
+    if params is not None and not isinstance(params, dict):
+        raise ValueError("params must be an object")
+    return {
+        "builtinDenyWritePaths": [
+            str(path) for path in builtin_deny_write_paths()
+        ],
+    }
+
+
 @_d.method("sandbox.policy.update", scope="operator.write")
 async def _handle_sandbox_policy_update(params: dict | None, ctx: RpcContext) -> dict:
     _require_owner(ctx, "sandbox.policy.update")
@@ -717,6 +748,57 @@ async def _handle_sandbox_policy_update(params: dict | None, ctx: RpcContext) ->
             details={"currentPolicy": exc.current_policy.to_public_dict()},
         ) from exc
     return saved.to_public_dict()
+
+
+@_d.method("sandbox.tokens.list", scope="operator.read")
+async def _handle_sandbox_token_list(params: dict | None, ctx: RpcContext) -> dict:
+    _require_owner(ctx, "sandbox.tokens.list")
+    if params is not None and not isinstance(params, dict):
+        raise ValueError("params must be an object")
+    return {
+        "tokens": [
+            _sandbox_token_payload(record)
+            for record in _sandbox_token_store(ctx).list_active()
+        ]
+    }
+
+
+@_d.method("sandbox.tokens.create", scope="operator.write")
+async def _handle_sandbox_token_create(params: dict | None, ctx: RpcContext) -> dict:
+    _require_owner(ctx, "sandbox.tokens.create")
+    values = _require_params(params)
+    name = values.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("params.name must be a non-empty string")
+    host_execute = values.get("hostExecute", True)
+    if not isinstance(host_execute, bool):
+        raise ValueError("params.hostExecute must be a boolean")
+    capabilities = {"task.read", "task.submit"}
+    if host_execute:
+        capabilities.add("host.execute")
+    issued = _sandbox_token_store(ctx).create(
+        name=name.strip(),
+        roles={"operator"},
+        scopes={"operator.read", "operator.write"},
+        capabilities=capabilities,
+    )
+    return {
+        "token": issued.token,
+        "record": _sandbox_token_payload(issued.record),
+    }
+
+
+@_d.method("sandbox.tokens.revoke", scope="operator.write")
+async def _handle_sandbox_token_revoke(params: dict | None, ctx: RpcContext) -> dict:
+    _require_owner(ctx, "sandbox.tokens.revoke")
+    values = _require_params(params)
+    public_id = values.get("publicId")
+    if not isinstance(public_id, str) or not public_id.strip():
+        raise ValueError("params.publicId must be a non-empty string")
+    return {
+        "publicId": public_id.strip(),
+        "revoked": _sandbox_token_store(ctx).revoke(public_id.strip()),
+    }
 
 
 @_d.method("sandbox.setup.ensure", scope="operator.write")

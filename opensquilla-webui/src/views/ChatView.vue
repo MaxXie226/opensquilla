@@ -715,7 +715,11 @@ import type {
   SessionMessagesSnapshotResponse,
 } from '@/types/rpc'
 import type { ModelRoutingMode } from '@/types/modelRouting'
-import { isSandboxRunMode, type SandboxRunMode } from '@/types/sandbox'
+import {
+  isRecognizedSandboxRunMode,
+  normalizeSandboxRunMode,
+  type SandboxRunMode,
+} from '@/types/sandbox'
 import type { ChatPart, InterruptViewState } from '@/types/parts'
 import type {
   CollaborationMode,
@@ -1535,8 +1539,8 @@ const chatSessionSubscription = useChatSessionSubscription({
   },
   onRunModeLock: lock => {
     if (lock.locked === false) return
-    if (isSandboxRunMode(lock.runMode)) {
-      activeRunModeLock.value = lock.runMode
+    if (isRecognizedSandboxRunMode(lock.runMode)) {
+      activeRunModeLock.value = normalizeSandboxRunMode(lock.runMode)
     } else if (activeRunModeLock.value === null) {
       activeRunModeLock.value = globalRunMode.value
     }

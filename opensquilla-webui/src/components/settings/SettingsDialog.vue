@@ -88,6 +88,8 @@
                readiness catalog loading is unavailable. -->
           <SettingsMemoryPanel v-else-if="section === 'memory'" />
 
+          <SandboxSettingsPanel v-else-if="section === 'sandbox'" />
+
           <!-- Optional cross-installation discovery is deliberately mounted
                only when the user opens this section. It never runs at app or
                Settings-dialog startup. -->
@@ -237,6 +239,7 @@ import SettingsAppearancePanel from '@/components/settings/SettingsAppearancePan
 import SettingsKeyboardPanel from '@/components/settings/SettingsKeyboardPanel.vue'
 import SettingsAdvancedPanel from '@/components/settings/SettingsAdvancedPanel.vue'
 import SettingsMemoryPanel from '@/components/settings/SettingsMemoryPanel.vue'
+import SandboxSettingsPanel from '@/components/settings/SandboxSettingsPanel.vue'
 import DesktopRuntimePanel from '@/components/settings/DesktopRuntimePanel.vue'
 import DataMigrationPanel from '@/components/settings/DataMigrationPanel.vue'
 import { useSetupCatalog, SETTINGS_SECTIONS } from '@/composables/setup/useSetupCatalog'

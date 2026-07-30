@@ -448,6 +448,38 @@
         "default": "OpenSquilla no pudo completar esta solicitud. No se aplicaron cambios de perfil sin confirmar."
       }
     },
+    "sandbox": {
+      "eyebrow": "Seguridad",
+      "title": "Sandbox",
+      "subtitle": "Configura archivos, comandos, red, runtimes y tokens LAN del modo seguro.",
+      "available": "Modo seguro disponible",
+      "unavailable": "Modo seguro no disponible",
+      "builtin": "Integrado",
+      "actions": { "add": "Añadir", "remove": "Quitar", "retry": "Reintentar", "copy": "Copiar", "saving": "Guardando…" },
+      "files": {
+        "title": "Seguridad de archivos", "description": "Los archivos normales son legibles. Los cambios en rutas protegidas requieren aprobación.", "readsAllowed": "Lectura permitida",
+        "customPath": "Ruta protegida personalizada", "pathPlaceholder": "Añadir ruta protegida", "backupTitle": "Crear copia antes del borrado recursivo",
+        "backupDescription": "Conserva copias recuperables y elimina las más antiguas al alcanzar el límite.", "quota": "Límite de copias",
+        "recursiveWarning": "El borrado recursivo es irreversible. OpenSquilla mostrará un aviso específico y elegirá Cancelar por defecto."
+      },
+      "commands": {
+        "title": "Seguridad de comandos", "description": "Los comandos se ejecutan automáticamente; operaciones como git push requieren aprobación.",
+        "systemTools": "Herramientas del sistema", "systemToolsAuto": "Permitir automáticamente", "systemToolsPrompt": "Preguntar antes", "systemToolsDisabled": "Desactivado",
+        "approvalPrefixes": "Prefijos que requieren aprobación", "autoPrefixes": "Prefijos siempre permitidos", "prefixPlaceholder": "Por ejemplo: git push"
+      },
+      "network": {
+        "title": "Seguridad de red", "description": "La red pública se permite por defecto y se mantienen las protecciones SSRF y de metadatos.",
+        "blockAll": "Bloquear toda la red", "blockAllDescription": "Los dominios permitidos siguen siendo excepciones.", "allowDomains": "Dominios permitidos", "denyDomains": "Dominios rechazados"
+      },
+      "runtimes": { "title": "Runtimes incluidos", "description": "Seguro prioriza las herramientas incluidas; Acceso completo prioriza las del host." },
+      "lan": {
+        "title": "Acceso LAN y tokens con nombre", "description": "Los tokens controlan los permisos del host; este modo LAN no exige HTTPS.",
+        "guest": "Sin token o token incorrecto:", "guestDescription": " solo modo seguro invitado, sin HOME, proyecto ni secretos del host.",
+        "authenticated": "Token válido:", "authenticatedDescription": " puede usar Seguro o Acceso completo según sus capacidades.",
+        "tokenName": "Nombre del token, por ejemplo Portátil", "hostExecute": "Permitir host / Acceso completo", "createToken": "Crear token",
+        "copyNow": "Cópialo ahora. No volverá a mostrarse.", "fullCapable": "Seguro y Acceso completo", "safeOnly": "Solo Seguro", "revoke": "Revocar"
+      }
+    },
     "dialog": {
       "title": "Ajustes",
       "actionNeeded": "Acción necesaria ({count})",
@@ -483,6 +515,7 @@
       "modelStrategy": "Enrutamiento de modelos",
       "behavior": "Comportamiento",
       "privacy": "Privacidad",
+      "sandbox": "Sandbox",
       "memory": "Memoria y perfil",
       "router": "Enrutador",
       "ensemble": "Conjunto",
@@ -3452,10 +3485,8 @@
       "modelRoutingEnsemble": "Enrutador de conjunto con IA",
       "modelRoutingEnsembleDesc": "La IA coordina varios modelos para mejorar la capacidad en tareas complejas.",
       "runMode": "Modo de ejecución",
-      "runModeStandard": "Preguntar siempre",
-      "runModeStandardDesc": "Pregunta antes de acceder a archivos fuera del proyecto, la red o ajustes del sistema.",
-      "runModeTrusted": "Ejecución gestionada",
-      "runModeTrustedDesc": "Evalúa el riesgo automáticamente, por lo que normalmente no necesitas confirmar cada acción.",
+      "runModeSafe": "Seguro",
+      "runModeSafeDesc": "Usa el sandbox y tus reglas de archivos, comandos y red.",
       "runModeFull": "Acceso completo",
       "runModeFullDesc": "Accede directamente a archivos, la red y el sistema sin preguntar cada vez.",
       "runModeFullUnavailable": "El acceso completo solo está disponible para el propietario de la sesión.",

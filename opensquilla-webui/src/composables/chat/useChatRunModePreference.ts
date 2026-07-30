@@ -4,7 +4,12 @@ import {
   waitForSessionRpcConnection,
 } from '@/composables/chat/sessionBootstrapAdmission'
 import type { RpcCallOptions, RpcConnectionWaitOptions } from '@/lib/rpc'
-import { SANDBOX_RUN_MODES, isSandboxRunMode, type SandboxRunMode } from '@/types/sandbox'
+import {
+  SANDBOX_RUN_MODES,
+  isRecognizedSandboxRunMode,
+  normalizeSandboxRunMode,
+  type SandboxRunMode,
+} from '@/types/sandbox'
 
 export const RUN_MODE_STORAGE_KEY = 'opensquilla.chat.runMode'
 
@@ -72,7 +77,10 @@ function availableStorage(): Storage | null {
 function readStoredRunMode(): SandboxRunMode | null {
   try {
     const value = availableStorage()?.getItem(RUN_MODE_STORAGE_KEY)
-    return isSandboxRunMode(value) ? value : null
+    if (!isRecognizedSandboxRunMode(value)) return null
+    const normalized = normalizeSandboxRunMode(value)
+    if (value !== normalized) availableStorage()?.setItem(RUN_MODE_STORAGE_KEY, normalized)
+    return normalized
   } catch {
     return null
   }
@@ -99,16 +107,13 @@ function preferredRunMode(
   preferred: SandboxRunMode,
 ): SandboxRunMode {
   if (modes.includes(preferred)) return preferred
-  if (modes.includes('trusted')) return 'trusted'
-  return modes[0] ?? 'trusted'
+  if (modes.includes('safe')) return 'safe'
+  return modes[0] ?? 'safe'
 }
 
 export function useChatRunModePreference(options: UseChatRunModePreferenceOptions) {
-  // Default to full host access. For the local owner the backend policy already
-  // reports 'full'; this seeds it before the policy loads (no trusted flicker).
-  // Remote non-owners still get 'trusted' from their policy, and the backend
-  // coerces disallowed modes, so this does not weaken the sandbox boundary.
-  const runMode = ref<SandboxRunMode>('full')
+  // Start fail-safe until the principal-specific backend policy arrives.
+  const runMode = ref<SandboxRunMode>('safe')
   const runModeUserSelected = ref(false)
   const runModeHydrated = ref(false)
 
@@ -119,15 +124,16 @@ export function useChatRunModePreference(options: UseChatRunModePreferenceOption
 
   const runModePolicyDefault = computed<SandboxRunMode>(() => {
     const raw = currentRunModePolicy.value?.defaultRunMode
-    // Fall back to 'full' only when the policy omits a default; the backend
-    // always supplies 'trusted' for non-owner principals, so they are unaffected.
-    return isSandboxRunMode(raw) ? raw : 'full'
+    return isRecognizedSandboxRunMode(raw) ? normalizeSandboxRunMode(raw) : 'safe'
   })
 
   const allowedRunModes = computed<SandboxRunMode[]>(() => {
     const raw = currentRunModePolicy.value?.allowedRunModes
     if (!Array.isArray(raw)) return [...SANDBOX_RUN_MODES]
-    const allowed = raw.filter(isSandboxRunMode)
+    const allowed = raw
+      .filter(isRecognizedSandboxRunMode)
+      .map(value => normalizeSandboxRunMode(value))
+      .filter((value, index, values) => values.indexOf(value) === index)
     return allowed.length > 0 ? allowed : [...SANDBOX_RUN_MODES]
   })
 
@@ -153,7 +159,9 @@ export function useChatRunModePreference(options: UseChatRunModePreferenceOption
   }, { immediate: true })
 
   function normalizePreference(mode: unknown): SandboxRunMode {
-    const candidate = isSandboxRunMode(mode) ? mode : runModePolicyDefault.value
+    const candidate = isRecognizedSandboxRunMode(mode)
+      ? normalizeSandboxRunMode(mode)
+      : runModePolicyDefault.value
     return modesSafeIncludes(allowedRunModes.value, candidate)
       ? candidate
       : preferredRunMode(allowedRunModes.value, runModePolicyDefault.value)

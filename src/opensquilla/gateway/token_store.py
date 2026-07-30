@@ -193,6 +193,16 @@ class TokenStore:
             )
         return cursor.rowcount == 1
 
+    def list_active(self) -> tuple[TokenRecord, ...]:
+        """List active token metadata without ever loading or returning secrets."""
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM sandbox_tokens WHERE revoked_at IS NULL "
+                "ORDER BY created_at DESC, public_id ASC"
+            ).fetchall()
+        return tuple(self._record_from_row(row) for row in rows)
+
     @staticmethod
     def _record_from_row(row: sqlite3.Row) -> TokenRecord:
         return TokenRecord(

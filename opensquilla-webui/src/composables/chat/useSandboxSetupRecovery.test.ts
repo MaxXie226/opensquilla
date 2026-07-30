@@ -17,7 +17,7 @@ describe('useSandboxSetupRecovery', () => {
     const recovery = scope.run(() => useSandboxSetupRecovery({
       rpc,
       connectionState: ref('connected'),
-      runMode: ref('standard'),
+      runMode: ref('safe'),
       autoRefresh: false,
     }))!
 
@@ -29,7 +29,7 @@ describe('useSandboxSetupRecovery', () => {
   })
 
   it('hides ready status and never changes the selected run mode', async () => {
-    const runMode = ref<'standard' | 'trusted' | 'full'>('trusted')
+    const runMode = ref<'safe' | 'full'>('safe')
     const rpc = { call: vi.fn(async () => payload('ready')) }
     const scope = effectScope()
     const recovery = scope.run(() => useSandboxSetupRecovery({
@@ -41,7 +41,7 @@ describe('useSandboxSetupRecovery', () => {
     await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledWith('sandbox.setup.status'))
     expect(recovery.status.value?.state).toBe('ready')
     expect(recovery.visible.value).toBe(false)
-    expect(runMode.value).toBe('trusted')
+    expect(runMode.value).toBe('safe')
     scope.stop()
   })
 
@@ -56,7 +56,7 @@ describe('useSandboxSetupRecovery', () => {
     const recovery = scope.run(() => useSandboxSetupRecovery({
       rpc,
       connectionState: ref('connected'),
-      runMode: ref('standard'),
+      runMode: ref('safe'),
     }))!
     await vi.runAllTicks()
     await Promise.resolve()
@@ -81,7 +81,7 @@ describe('useSandboxSetupRecovery', () => {
     const recovery = scope.run(() => useSandboxSetupRecovery({
       rpc,
       connectionState: ref('connected'),
-      runMode: ref('standard'),
+      runMode: ref('safe'),
     }))!
     await vi.runAllTicks()
     await Promise.resolve()
@@ -114,7 +114,7 @@ describe('useSandboxSetupRecovery', () => {
     const recovery = scope.run(() => useSandboxSetupRecovery({
       rpc,
       connectionState: ref('connected'),
-      runMode: ref('standard'),
+      runMode: ref('safe'),
     }))!
     await vi.runAllTicks()
     await Promise.resolve()
@@ -136,7 +136,7 @@ describe('useSandboxSetupRecovery', () => {
     const recovery = scope.run(() => useSandboxSetupRecovery({
       rpc,
       connectionState: ref('connected'),
-      runMode: ref('standard'),
+      runMode: ref('safe'),
     }))!
     await vi.runAllTicks()
     await Promise.resolve()
@@ -161,7 +161,7 @@ describe('useSandboxSetupRecovery', () => {
           .mockReturnValueOnce(pending),
       }
       const connectionState = ref('connected')
-      const runMode = ref<'standard' | 'full'>('standard')
+      const runMode = ref<'safe' | 'full'>('safe')
       const scope = effectScope()
       const recovery = scope.run(() => useSandboxSetupRecovery({ rpc, connectionState, runMode }))!
       await vi.runAllTicks()
@@ -197,7 +197,7 @@ describe('useSandboxSetupRecovery', () => {
     const recovery = scope.run(() => useSandboxSetupRecovery({
       rpc,
       connectionState: ref('connected'),
-      runMode: ref('standard'),
+      runMode: ref('safe'),
     }))!
     await vi.runAllTicks()
     await Promise.resolve()
@@ -223,7 +223,7 @@ describe('useSandboxSetupRecovery', () => {
     const recovery = scope.run(() => useSandboxSetupRecovery({
       rpc,
       connectionState: ref('connected'),
-      runMode: ref('standard'),
+      runMode: ref('safe'),
     }))!
     await vi.waitFor(() => expect(recovery.canSetup.value).toBe(true))
 
@@ -235,7 +235,7 @@ describe('useSandboxSetupRecovery', () => {
   })
 
   it('shows unavailable as explanation-only and resets dismissal on state/mode change', async () => {
-    const runMode = ref<'standard' | 'trusted' | 'full'>('trusted')
+    const runMode = ref<'safe' | 'full'>('safe')
     const connectionState = ref('connected')
     const rpc = { call: vi.fn(async () => payload('unavailable', 'darwin')) }
     const scope = effectScope()
@@ -245,9 +245,11 @@ describe('useSandboxSetupRecovery', () => {
 
     recovery.dismiss()
     expect(recovery.visible.value).toBe(false)
-    runMode.value = 'standard'
+    runMode.value = 'full'
+    await vi.waitFor(() => expect(recovery.status.value).toBeNull())
+    runMode.value = 'safe'
     await vi.waitFor(() => expect(recovery.visible.value).toBe(true))
-    expect(runMode.value).toBe('standard')
+    expect(runMode.value).toBe('safe')
     scope.stop()
   })
 })
