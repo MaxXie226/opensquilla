@@ -266,7 +266,7 @@ def decide_shell_command(
     target = _platform_name(platform)
     try:
         segments = parse_shell_segments(command, platform=target)
-    except (ValueError, shlex.Error):
+    except ValueError:
         return CommandDecision(CommandAction.APPROVAL, "command_parse_failed")
     decisions = [
         decide_command(segment.argv, policy, platform=target) for segment in segments

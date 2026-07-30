@@ -183,6 +183,16 @@ _MAX_ATTACHMENTS = _attachment_ingest.MAX_ATTACHMENTS
 _SESSION_SUBSCRIBE_REPLAY_BUDGET_SECONDS = 2.0
 
 
+def _coerce_positive_int(value: object, *, default: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
 def _accepts_keyword_arg(func: Any, name: str) -> bool:
     try:
         params = inspect.signature(func).parameters
@@ -3303,7 +3313,11 @@ async def _handle_sessions_send(
                         "target_turn_id": handle.task_id,
                         "revision": max(
                             2,
-                            int(ingress_turn_context.get("revision", 1)) + 1,
+                            _coerce_positive_int(
+                                ingress_turn_context.get("revision"),
+                                default=1,
+                            )
+                            + 1,
                         ),
                     }
                     persisted_entry.turn_context = collected_context
@@ -4126,7 +4140,14 @@ async def _handle_sessions_send(
                 **ingress_turn_context,
                 "turn_id": turn_id,
                 "target_turn_id": turn_id,
-                "revision": max(2, int(ingress_turn_context.get("revision", 1)) + 1),
+                "revision": max(
+                    2,
+                    _coerce_positive_int(
+                        ingress_turn_context.get("revision"),
+                        default=1,
+                    )
+                    + 1,
+                ),
             }
         # Eviction hook: turn was accepted into the runtime,
         # post-resolution + post-engine-acceptance. Evict consumed uuids

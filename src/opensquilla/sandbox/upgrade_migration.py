@@ -266,7 +266,7 @@ class SandboxUpgradeCoordinator:
                 journal_path=self.journal_path,
                 snapshot_path=self.snapshot_path if self.snapshot_path.exists() else None,
                 stores=store_names,
-                error=failed["error"],
+                error=str(failed["error"]),
             )
 
 

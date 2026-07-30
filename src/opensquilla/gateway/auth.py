@@ -164,7 +164,7 @@ class TokenScopeResolver:
 
         if role_claim == "node":
             scopes = NODE_DEFAULT_SCOPES
-            capabilities = frozenset()
+            capabilities: frozenset[str] = frozenset()
             is_owner = False
         else:
             scopes = normalize_operator_scopes(config.auth.token_scopes)

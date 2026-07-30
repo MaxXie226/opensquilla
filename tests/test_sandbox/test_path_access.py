@@ -26,8 +26,7 @@ from opensquilla.sandbox.permissions import (
 )
 from opensquilla.sandbox.platform_permissions import FileSystemPlatformContext
 from opensquilla.sandbox.run_context import MountGrant, RunContext
-from opensquilla.sandbox.run_mode import RunMode
-from opensquilla.sandbox.run_mode import normalize_run_mode
+from opensquilla.sandbox.run_mode import RunMode, normalize_run_mode
 from opensquilla.sandbox.types import SandboxBackendError, SandboxRequest
 from opensquilla.tools.builtin import filesystem as fs
 from opensquilla.tools.builtin import patch as patch_tool
