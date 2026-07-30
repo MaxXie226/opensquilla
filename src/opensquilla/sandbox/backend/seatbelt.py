@@ -46,6 +46,7 @@ from opensquilla.sandbox.permissions import (
     logical_absolute_path,
 )
 from opensquilla.sandbox.run_mode import normalize_run_mode
+from opensquilla.sandbox.runtime_launcher import ChildRole, internal_child_argv
 from opensquilla.sandbox.types import (
     NetworkMode,
     NetworkProxySpec,
@@ -59,8 +60,6 @@ log = logging.getLogger(__name__)
 
 _SANDBOX_EXEC_NAME = "sandbox-exec"
 _SANDBOX_EXEC_SYSTEM_PATH = Path("/usr/bin/sandbox-exec")
-_FILESYSTEM_WORKER_MODULE = "opensquilla.sandbox.filesystem_worker"
-_FROZEN_FILESYSTEM_WORKER_ARG = "--_sandbox-filesystem-worker"
 _FILESYSTEM_PATH_OPERATION_KINDS = frozenset(
     {
         "read_file",
@@ -1011,15 +1010,7 @@ def _python_executable() -> Path:
 
 
 def _filesystem_worker_argv() -> tuple[str, ...]:
-    if bool(getattr(sys, "frozen", False)):
-        return (str(_python_executable()), _FROZEN_FILESYSTEM_WORKER_ARG)
-    return (
-        str(_python_executable()),
-        "-B",
-        "-m",
-        _FILESYSTEM_WORKER_MODULE,
-        "-",
-    )
+    return internal_child_argv(ChildRole.FILESYSTEM_WORKER, args=("-",))
 
 
 def _filesystem_worker_env() -> dict[str, str]:

@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path, PureWindowsPath
 
@@ -863,7 +864,7 @@ def test_payload_contains_cache_env_and_run_mode(
     payload = mod._payload_for_request(_request(tmp_path))
 
     assert payload["backend"] == "windows_default"
-    assert payload["runMode"] == "trusted"
+    assert payload["runMode"] == "safe"
     assert payload["cwd"] == str(tmp_path)
     assert payload["env"]["TEMP"] == str(tmp_path / ".opensquilla-cache" / "temp")
     assert payload["env"]["PIP_CACHE_DIR"] == str(tmp_path / ".opensquilla-cache" / "pip")
@@ -1270,6 +1271,41 @@ async def test_backend_returns_helper_result(
     assert "--payload-env" in captured["argv"]
     payload_env = captured["env"]["OPENSQUILLA_WINDOWS_DEFAULT_PAYLOAD"]
     assert '"argv":["python","-c","print(\'ok\')"]' in payload_env
+
+
+@pytest.mark.asyncio
+async def test_frozen_backend_uses_internal_child_role(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default as mod
+    from opensquilla.sandbox.backend.windows_default import WindowsDefaultBackend
+
+    class _Proc:
+        returncode = 0
+
+        async def communicate(self):
+            return b"", b""
+
+    captured: dict[str, object] = {}
+
+    async def fake_exec(*argv, stdout=None, stderr=None, env=None):
+        captured["argv"] = argv
+        return _Proc()
+
+    monkeypatch.setattr(mod, "_support_ready", lambda: True)
+    monkeypatch.setattr(mod, "_capability_store_path", lambda: tmp_path / "cap_sids.json")
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    await WindowsDefaultBackend().run(_request(tmp_path))
+
+    assert captured["argv"] == (
+        sys.executable,
+        "--internal-child",
+        "windows-default-runner",
+        "--payload-env",
+    )
 
 
 @pytest.mark.asyncio
@@ -1681,7 +1717,7 @@ def test_missing_expansion_roots_are_ignored(
     assert str(missing) not in paths
 
 
-def test_standard_non_sensitive_expansion_requires_approval(
+def test_safe_non_sensitive_expansion_is_automatically_granted(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1701,8 +1737,10 @@ def test_standard_non_sensitive_expansion_requires_approval(
     monkeypatch.setattr(mod, "_support_ready", lambda: True)
     monkeypatch.setattr(mod, "_capability_store_path", lambda: tmp_path / "cap_sids.json")
 
-    with pytest.raises(SandboxBackendError, match="ACL approval is required"):
-        mod._payload_for_request(request)
+    payload = mod._payload_for_request(request)
+
+    auto_grants = payload["policy"]["windowsAclPlan"]["autoGrants"]
+    assert str(external) in {grant["path"] for grant in auto_grants}
 
 
 def test_windows_filesystem_operation_request_uses_stdin_and_shared_profile(
@@ -1724,6 +1762,7 @@ def test_windows_filesystem_operation_request_uses_stdin_and_shared_profile(
 
     monkeypatch.setattr(mod, "_python_executable", lambda: python_exe)
     monkeypatch.setattr(mod, "_opensquilla_import_roots", lambda: (source_root,))
+    monkeypatch.setattr(sys, "executable", str(python_exe))
 
     operation = SandboxOperation.filesystem(
         kind="write_text",
@@ -1740,7 +1779,7 @@ def test_windows_filesystem_operation_request_uses_stdin_and_shared_profile(
     request = mod._filesystem_operation_request(operation)
 
     assert request.cwd == workspace
-    assert request.run_mode == "trusted"
+    assert request.run_mode == "safe"
     mounts = {str(mount.host_path): mount.mode for mount in request.policy.mounts}
     assert mounts[str(runtime_scripts)] == "ro"
     assert mounts[str(runtime_scripts.parent)] == "ro"
@@ -1753,7 +1792,6 @@ def test_windows_filesystem_operation_request_uses_stdin_and_shared_profile(
     assert request.policy.tmp_writable is False
     assert request.argv == (
         str(python_exe),
-        "-B",
         "-m",
         "opensquilla.sandbox.filesystem_worker",
         "-",

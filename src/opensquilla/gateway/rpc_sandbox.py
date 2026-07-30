@@ -66,6 +66,7 @@ from opensquilla.sandbox.run_mode_policy import (
     coerce_run_mode_for_principal,
     run_mode_allowed_for_principal,
 )
+from opensquilla.sandbox.runtime_launcher import ChildRole, internal_child_argv
 from opensquilla.sandbox.setup_runtime import (
     current_sandbox_setup_runtime_status,
     ensure_sandbox_setup_auto,
@@ -321,13 +322,10 @@ def _pick_directory_path(initial_dir: str | None = None) -> str | None:
 
 
 async def _pick_directory_path_windows(initial_dir: str | None = None) -> str | None:
-    command = [
-        sys.executable,
-        "-m",
-        "opensquilla.gateway.windows_directory_picker",
-    ]
+    arguments: list[str] = []
     if initial_dir:
-        command.append(initial_dir)
+        arguments.append(initial_dir)
+    command = internal_child_argv(ChildRole.DIRECTORY_PICKER, args=arguments)
 
     process = await asyncio.create_subprocess_exec(
         *command,

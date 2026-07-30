@@ -1085,7 +1085,6 @@ def test_filesystem_worker_argv_uses_python_module_outside_frozen_runtime(
 
     assert seatbelt_mod._filesystem_worker_argv() == (
         str(seatbelt_mod._python_executable()),
-        "-B",
         "-m",
         "opensquilla.sandbox.filesystem_worker",
         "-",
@@ -1099,7 +1098,9 @@ def test_filesystem_worker_argv_uses_internal_entrypoint_when_frozen(
 
     assert seatbelt_mod._filesystem_worker_argv() == (
         str(seatbelt_mod._python_executable()),
-        "--_sandbox-filesystem-worker",
+        "--internal-child",
+        "filesystem-worker",
+        "-",
     )
 
 

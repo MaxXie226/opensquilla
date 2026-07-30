@@ -57,11 +57,10 @@ from opensquilla.sandbox.permissions import (
     logical_absolute_path,
 )
 from opensquilla.sandbox.run_mode import normalize_run_mode
+from opensquilla.sandbox.runtime_launcher import ChildRole, internal_child_argv
 from opensquilla.sandbox.types import SandboxBackendError, SandboxRequest, SandboxResult
 from opensquilla.subprocess_encoding import decode_subprocess_output
 
-_HELPER_MODULE = "opensquilla.sandbox.backend.windows_default_runner"
-_FILESYSTEM_WORKER_MODULE = "opensquilla.sandbox.filesystem_worker"
 _OUTPUT_BYTE_CAP = 1_048_576
 _HELPER_PAYLOAD_ENV = "OPENSQUILLA_WINDOWS_DEFAULT_PAYLOAD"
 _HELPER_ERROR_PREFIX = "OPENSQUILLA_WINDOWS_DEFAULT_HELPER_ERROR "
@@ -166,7 +165,10 @@ class WindowsDefaultBackend(Backend):
             separators=(",", ":"),
             sort_keys=True,
         )
-        helper_argv = (sys.executable, "-m", _HELPER_MODULE, "--payload-env")
+        helper_argv = internal_child_argv(
+            ChildRole.WINDOWS_DEFAULT_RUNNER,
+            args=("--payload-env",),
+        )
         wall = request.policy.limits.wall_timeout_s
         helper_wall = _helper_supervision_timeout(wall)
         started = time.monotonic()
@@ -394,13 +396,7 @@ def _filesystem_operation_request(
         },
     }
     return SandboxRequest(
-        argv=(
-            str(_python_executable()),
-            "-B",
-            "-m",
-            _FILESYSTEM_WORKER_MODULE,
-            "-",
-        ),
+        argv=internal_child_argv(ChildRole.FILESYSTEM_WORKER, args=("-",)),
         cwd=workspace,
         action_kind=f"fs.worker.{operation.kind}",
         policy=policy,
