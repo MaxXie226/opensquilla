@@ -15,11 +15,20 @@
   ],
   "scripts": {
     "build:ui-packages": "npm run build --workspaces --if-present",
+    "test:ui-primitives:browser": "playwright test --config packages/ui-primitives/playwright.config.ts",
+    "test:ui-packages": "npm run test --workspaces --if-present",
     "typecheck:ui-packages": "npm run typecheck --workspaces --if-present",
-    "verify:ui-packages": "npm run typecheck:ui-packages && npm run build:ui-packages && node scripts/verify_ui_packages.mjs"
+    "verify:ui-packages": "npm run typecheck:ui-packages && npm run test:ui-packages && npm run build:ui-packages && npm run verify:cross-surface --workspace @opensquilla/ui-tokens && npm run verify:boundaries --workspace @opensquilla/ui-primitives && node scripts/verify_ui_packages.mjs"
   },
   "devDependencies": {
-    "typescript": "^5.4.5"
+    "@playwright/test": "^1.60.0",
+    "@vitejs/plugin-vue": "^6.0.7",
+    "happy-dom": "^20.10.6",
+    "typescript": "^5.4.5",
+    "vite": "^8.0.16",
+    "vitest": "^4.1.9",
+    "vue": "^3.5.0",
+    "vue-tsc": "^2.0.11"
   },
   "license": "Apache-2.0"
 }

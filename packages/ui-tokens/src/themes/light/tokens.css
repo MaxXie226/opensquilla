@@ -1,4 +1,4 @@
-/* Theme: light (value) — L1 token block. See src/themes/light/manifest.ts. */
+/* Theme: light (value) — L1 token block. */
 /* Light theme — Feishu/Lark structural logic with a warm-orange brand.
    Neutrals, text hierarchy, and borders follow Lark's published design language
    (open.feishu.cn/document/design-specification/design-language/color): a
@@ -35,7 +35,7 @@
   --hairline: #EFEFF1;
 
   /* Brand orange — the canonical strike accent (the family
-     check-cross-surface-tokens.mjs pins for desktop boot). Following Lark's
+     package cross-surface guard pins for desktop boot). Following Lark's
      logic the brand carries the primary call-to-action, so the former ink-black
      pill is now orange; every AA floor still clears (accent 4.67:1 on the
      field, white-on-accent 5.05:1). */

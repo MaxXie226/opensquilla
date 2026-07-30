@@ -15,21 +15,52 @@
       "path": "packages/ui-tokens",
       "version": "0.1.0",
       "role": "design-contracts",
-      "workspace": true
+      "workspace": true,
+      "publicExports": [
+        ".",
+        "./foundation.css",
+        "./themes.css",
+        "./theme-contract.json",
+        "./themes/*"
+      ],
+      "runtimeExports": [
+        "DERIVED_THEME_TOKEN_NAMES",
+        "PUBLIC_THEME_IDS",
+        "REQUIRED_THEME_TOKEN_NAMES",
+        "THEME_TOKEN_NAMES",
+        "resolveThemeTokens",
+        "themeTokensToCssVariables"
+      ]
     },
     {
       "name": "@opensquilla/ui-primitives",
       "path": "packages/ui-primitives",
       "version": "0.1.0",
       "role": "browser-safe-primitives",
-      "workspace": true
+      "workspace": true,
+      "publicExports": [
+        ".",
+        "./styles.css"
+      ],
+      "runtimeExports": [
+        "UiButton",
+        "UiCard",
+        "UiDialog",
+        "UiInput",
+        "UiStack",
+        "UiSwitch"
+      ]
     },
     {
       "name": "@opensquilla/ui-foundation",
       "path": "packages/ui-foundation",
       "version": "0.1.0",
       "role": "product-neutral-composition",
-      "workspace": true
+      "workspace": true,
+      "publicExports": [
+        "."
+      ],
+      "runtimeExports": []
     }
   ]
 }

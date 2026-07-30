@@ -1,7 +1,7 @@
 import type { ThemeManifest } from '../types'
 
-// Value theme "light". Applied token VALUES live in ./tokens.css (single source
-// of truth, validated by check-theme-contract.mjs).
+// Value theme "light". Applied token values live in @opensquilla/ui-tokens
+// (single source of truth, validated by check-theme-contract.mjs).
 const light: ThemeManifest = {
   id: 'light',
   name: 'theme.light',

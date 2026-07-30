@@ -66,6 +66,11 @@ export default defineConfig({
     },
   },
   resolve: {
+    // Local public packages are file: dependencies. Preserve their consumer
+    // path so peer dependencies such as Vue resolve from this WebUI install,
+    // including when the repository root has no node_modules directory.
+    preserveSymlinks: true,
+    dedupe: ['vue'],
     alias: {
       '@': resolve(__dirname, 'src'),
     },
@@ -77,5 +82,13 @@ export default defineConfig({
     environment: 'node',
     include: ['src/**/*.{test,spec}.ts'],
     exclude: ['e2e/**', 'node_modules/**'],
+    // The local file: package resolves to its workspace source path. Inline it
+    // so Vitest applies Vite peer-dependency resolution instead of handing the
+    // linked ESM bundle to native Node outside the WebUI node_modules tree.
+    server: {
+      deps: {
+        inline: ['@opensquilla/ui-primitives'],
+      },
+    },
   },
 })

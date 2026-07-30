@@ -1,8 +1,10 @@
 # OpenSquilla UI Primitives
 
-Public, browser-safe UI primitives for OpenSquilla clients. The initial package
-establishes a versioned distribution boundary; stable primitives will be added
-only after their product-neutral contracts are defined.
+Public, browser-safe Vue primitives for OpenSquilla clients. The initial stable
+surface includes Button, Input, Dialog, Stack, Card, and Switch. Components use
+semantic tokens from `@opensquilla/ui-tokens` and contain no product routing,
+state, Gateway, or native-bridge behavior.
 
-Only the package root is public. Imports from `src/` or other internal paths
-are unsupported.
+Import components from `@opensquilla/ui-primitives` and load
+`@opensquilla/ui-primitives/styles.css` once in the application composition
+root. Imports from `src/` or other undeclared paths are unsupported.

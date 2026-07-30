@@ -995,6 +995,7 @@ def test_default_ci_uses_layered_job_conditions() -> None:
 
     assert "tui-check" in jobs
     assert "frontend_changed == 'true'" in jobs["ui-packages-check"]["if"]
+    assert "frontend_changed == 'true'" in jobs["ui-primitives-browser"]["if"]
     assert "frontend_changed == 'true'" in jobs["frontend-check"]["if"]
     assert "full_required == 'true'" in jobs["frontend-check"]["if"]
     assert "build_wheel_required == 'true'" not in jobs["frontend-check"]["if"]
@@ -1015,6 +1016,7 @@ def test_default_ci_uses_layered_job_conditions() -> None:
     assert "build_wheel_required == 'true'" in jobs["release-packaging"]["if"]
     assert "tui-check" in jobs["ci-result"]["needs"]
     assert "ui-packages-check" in jobs["ci-result"]["needs"]
+    assert "ui-primitives-browser" in jobs["ci-result"]["needs"]
     assert "webui-chat-recovery" in jobs["ci-result"]["needs"]
     assert "desktop-check" in jobs["ci-result"]["needs"]
     assert "ubuntu-full" in jobs["ci-result"]["needs"]
@@ -1084,6 +1086,7 @@ def test_ci_result_gate_covers_every_conditional_job_and_classifier_flag() -> No
         "workflow-lint",
         "readme-locale-check",
         "ui-packages-check",
+        "ui-primitives-browser",
         "frontend-check",
         "webui-chat-recovery",
         "tui-check",
@@ -1104,6 +1107,9 @@ def test_ci_result_gate_covers_every_conditional_job_and_classifier_flag() -> No
     )
     assert gate_step["env"]["RESULT_UI_PACKAGES"] == (
         "${{ needs.ui-packages-check.result }}"
+    )
+    assert gate_step["env"]["RESULT_UI_PRIMITIVES_BROWSER"] == (
+        "${{ needs.ui-primitives-browser.result }}"
     )
     assert gate_step["env"]["RESULT_MACOS_RECOVERY"] == (
         "${{ needs.macos-recovery.result }}"
@@ -1153,6 +1159,34 @@ def test_public_ui_package_gate_runs_pack_install_smoke_on_all_platforms() -> No
     assert setup_node["with"]["cache-dependency-path"] == "package-lock.json"
     assert install["run"] == "npm ci --ignore-scripts"
     assert verify["run"] == "npm run verify:ui-packages"
+    assert "secrets." not in json.dumps(job)
+
+
+def test_public_ui_primitive_browser_gate_covers_all_engines() -> None:
+    job = _workflow("ci.yml")["jobs"]["ui-primitives-browser"]
+    steps = job["steps"]
+
+    assert job["runs-on"] == "ubuntu-latest"
+    assert job["timeout-minutes"] == 20
+    setup_node = next(step for step in steps if step.get("name") == "Set up Node.js")
+    install = next(
+        step for step in steps
+        if step.get("name") == "Install public UI package dependencies"
+    )
+    browsers = next(
+        step for step in steps if step.get("name") == "Install UI primitive browsers"
+    )
+    verify = next(
+        step for step in steps
+        if step.get("name") == "Run visual and accessibility browser contracts"
+    )
+
+    assert setup_node["with"]["cache-dependency-path"] == "package-lock.json"
+    assert install["run"] == "npm ci --ignore-scripts"
+    assert browsers["run"] == (
+        "npx playwright install --with-deps chromium firefox webkit"
+    )
+    assert verify["run"] == "npm run test:ui-primitives:browser"
     assert "secrets." not in json.dumps(job)
 
 

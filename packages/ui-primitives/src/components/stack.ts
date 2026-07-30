@@ -1,0 +1,10 @@
+export type UiStackDirection = 'row' | 'column'
+export type UiStackGap = 'none' | 'xs' | 'sm' | 'md' | 'lg' | 'xl'
+export type UiStackAlign = 'start' | 'center' | 'end' | 'stretch' | 'baseline'
+export type UiStackJustify =
+  | 'start'
+  | 'center'
+  | 'end'
+  | 'between'
+  | 'around'
+  | 'evenly'

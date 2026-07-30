@@ -21,7 +21,6 @@ function run(command, args, cwd, extraEnv = {}) {
     env: {
       ...process.env,
       npm_config_audit: 'false',
-      npm_config_cache: path.join(temporaryRoot, 'npm-cache'),
       npm_config_fund: 'false',
       ...extraEnv,
     },
@@ -48,7 +47,7 @@ function assertPackageMetadata(record, packageJson) {
   assert.equal(packageJson.private, undefined, `${record.name} must remain publishable`)
   assert.equal(packageJson.license, 'Apache-2.0')
   assert.equal(packageJson.sideEffects, false)
-  assert.deepEqual(Object.keys(packageJson.exports), ['.'])
+  assert.deepEqual(Object.keys(packageJson.exports), record.publicExports)
   assert.equal(packageJson.exports['.'].types, './dist/index.d.ts')
   assert.equal(packageJson.exports['.'].import, './dist/index.js')
   assert.equal(packageJson.publishConfig.access, 'public')
@@ -57,21 +56,41 @@ function assertPackageMetadata(record, packageJson) {
   assert.match(packageJson.version, /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/)
 }
 
+function isAllowedPackedFile(record, file) {
+  if (['LICENSE', 'README.md', 'package.json'].includes(file)) return true
+  if (record.name === '@opensquilla/ui-foundation') {
+    return ['dist/index.d.ts', 'dist/index.js'].includes(file)
+  }
+  if (record.name === '@opensquilla/ui-tokens') {
+    return [
+      'dist/index.d.ts',
+      'dist/index.js',
+      'dist/foundation.css',
+      'dist/themes.css',
+      'dist/theme-contract.json',
+    ].includes(file) || /^dist\/themes\/[^/]+\/tokens\.css$/.test(file)
+  }
+  if (record.name === '@opensquilla/ui-primitives') {
+    return [
+      'dist/index.d.ts',
+      'dist/index.js',
+      'dist/styles.css',
+    ].includes(file) || /^dist\/components\/[\w.-]+\.d\.ts$/.test(file)
+  }
+  return false
+}
+
 function assertPackedFiles(record, packed) {
   assert.ok(packed.filename, `${record.name}: npm pack did not report a tarball`)
   assert.match(packed.integrity, /^sha512-/)
   assert.match(packed.shasum, /^[0-9a-f]{40}$/)
 
-  const allowed = new Set([
-    'LICENSE',
-    'README.md',
-    'dist/index.d.ts',
-    'dist/index.js',
-    'package.json',
-  ])
   const paths = packed.files.map((entry) => entry.path).sort()
   for (const entry of paths) {
-    assert.ok(allowed.has(entry), `${record.name}: unexpected packaged file ${entry}`)
+    assert.ok(
+      isAllowedPackedFile(record, entry),
+      `${record.name}: unexpected packaged file ${entry}`,
+    )
     assert.ok(!entry.startsWith('src/'), `${record.name}: source directory leaked into package`)
     assert.ok(!entry.endsWith('.map'), `${record.name}: source map leaked into package`)
   }
@@ -147,15 +166,103 @@ try {
     assertPackedFiles(record, packed)
     packedTarballs.push({
       ...record,
+      packedFiles: packed.files.map((entry) => entry.path),
       tarball: path.join(temporaryRoot, packed.filename),
     })
   }
 
   const consumer = path.join(temporaryRoot, 'consumer')
   await mkdir(consumer)
+  const installedVuePackage = JSON.parse(
+    await readFile(path.join(repositoryRoot, 'node_modules', 'vue', 'package.json'), 'utf8'),
+  )
+  const vuePeerRoot = path.join(temporaryRoot, 'vue-peer')
+  await mkdir(vuePeerRoot)
+  await writeFile(
+    path.join(vuePeerRoot, 'package.json'),
+    JSON.stringify({
+      name: 'vue',
+      version: installedVuePackage.version,
+      type: 'module',
+      exports: {
+        '.': {
+          types: './index.d.ts',
+          import: './index.js',
+        },
+      },
+      files: ['index.d.ts', 'index.js'],
+    }),
+  )
+  await writeFile(
+    path.join(vuePeerRoot, 'index.js'),
+    [
+      'const passthrough = (...values) => values[0] ?? {}',
+      'export const Teleport = {}',
+      'export const Transition = {}',
+      'export const computed = passthrough',
+      'export const createBlock = passthrough',
+      'export const createCommentVNode = passthrough',
+      'export const createElementBlock = passthrough',
+      'export const createElementVNode = passthrough',
+      'export const createTextVNode = passthrough',
+      'export const createVNode = passthrough',
+      'export const defineComponent = passthrough',
+      'export const mergeProps = passthrough',
+      'export const nextTick = passthrough',
+      'export const normalizeClass = passthrough',
+      'export const onBeforeUnmount = passthrough',
+      'export const openBlock = passthrough',
+      'export const ref = passthrough',
+      'export const renderSlot = passthrough',
+      'export const resolveDynamicComponent = passthrough',
+      'export const toDisplayString = passthrough',
+      'export const unref = passthrough',
+      'export const useAttrs = passthrough',
+      'export const useId = passthrough',
+      'export const watch = passthrough',
+      'export const withCtx = passthrough',
+      'export const withKeys = passthrough',
+      'export const withModifiers = passthrough',
+      '',
+    ].join('\n'),
+  )
+  await writeFile(
+    path.join(vuePeerRoot, 'index.d.ts'),
+    [
+      'export type ComponentOptionsMixin = Record<string, never>',
+      'export type ComponentProvideOptions = Record<PropertyKey, unknown>',
+      'export type PublicProps = Record<string, unknown>',
+      'export type DefineComponent<',
+      '  A = unknown, B = unknown, C = unknown, D = unknown, E = unknown,',
+      '  F = unknown, G = unknown, H = unknown, I = unknown, J = unknown,',
+      '  K = unknown, L = unknown, M = unknown, N = unknown, O = unknown,',
+      '  P = unknown, Q = unknown, R = unknown, S = unknown, T = unknown,',
+      '> = unknown',
+      '',
+    ].join('\n'),
+  )
+  const [packedVue] = JSON.parse(
+    npm(
+      [
+        'pack',
+        '--json',
+        '--ignore-scripts',
+        '--pack-destination',
+        temporaryRoot,
+        vuePeerRoot,
+      ],
+      repositoryRoot,
+    ),
+  )
+  assert.ok(packedVue.filename, 'Vue peer tarball is missing')
+  const vueTarball = path.join(temporaryRoot, packedVue.filename)
   await writeFile(
     path.join(consumer, 'package.json'),
-    JSON.stringify({ name: 'external-ui-package-smoke', private: true, type: 'module' }),
+    JSON.stringify({
+      name: 'external-ui-package-smoke',
+      private: true,
+      type: 'module',
+    }),
   )
   npm(
     [
@@ -163,6 +270,7 @@ try {
       '--ignore-scripts',
       '--offline',
       '--no-package-lock',
+      vueTarball,
       ...packedTarballs.map((record) => record.tarball),
     ],
     consumer,
@@ -182,8 +290,8 @@ try {
       {
         compilerOptions: {
           exactOptionalPropertyTypes: true,
-          module: 'NodeNext',
-          moduleResolution: 'NodeNext',
+          module: 'ESNext',
+          moduleResolution: 'Bundler',
           noEmit: true,
           strict: true,
           target: 'ES2022',
@@ -205,9 +313,18 @@ try {
     [
       "import assert from 'node:assert/strict'",
       `const packageNames = ${JSON.stringify(packedTarballs.map((record) => record.name))}`,
+      `const expectedExports = ${JSON.stringify(
+        Object.fromEntries(
+          packedTarballs.map((record) => [record.name, record.runtimeExports]),
+        ),
+      )}`,
       'for (const packageName of packageNames) {',
       '  const publicEntry = await import(packageName)',
-      "  assert.deepEqual(Object.keys(publicEntry), [], `${packageName}: initial boundary is not empty`)",
+      '  assert.deepEqual(',
+      '    Object.keys(publicEntry).sort(),',
+      '    [...expectedExports[packageName]].sort(),',
+      "    `${packageName}: runtime exports differ from the public API report`,",
+      '  )',
       '  await assert.rejects(',
       "    import(`${packageName}/src/index.js`),",
       "    error => error?.code === 'ERR_PACKAGE_PATH_NOT_EXPORTED',",
@@ -226,9 +343,9 @@ try {
     )
     const artifactText = (
       await Promise.all(
-        ['README.md', 'dist/index.d.ts', 'dist/index.js', 'package.json'].map((entry) =>
-          readFile(path.join(installedRoot, entry), 'utf8'),
-        ),
+        record.packedFiles
+          .filter((entry) => /\.(?:css|d\.ts|js|json|md)$/.test(entry))
+          .map((entry) => readFile(path.join(installedRoot, entry), 'utf8')),
       )
     ).join('\n')
     assertCleanArtifactText(record, artifactText)

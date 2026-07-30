@@ -20,6 +20,7 @@ def _base_env() -> dict[str, str]:
         "RESULT_WORKFLOW_LINT": "success",
         "RESULT_README_LOCALE": "success",
         "RESULT_UI_PACKAGES": "skipped",
+        "RESULT_UI_PRIMITIVES_BROWSER": "skipped",
         "RESULT_FRONTEND": "skipped",
         "RESULT_TUI": "skipped",
         "RESULT_DESKTOP": "skipped",
@@ -219,6 +220,11 @@ def test_ci_result_gate_requires_public_ui_packages_for_frontend_changes() -> No
 
     assert any("Public UI package matrix" in error and "skipped" in error for error in errors)
     env["RESULT_UI_PACKAGES"] = "success"
+    assert any(
+        "Public UI primitive browser matrix" in error and "skipped" in error
+        for error in check_ci_results(env)
+    )
+    env["RESULT_UI_PRIMITIVES_BROWSER"] = "success"
     assert check_ci_results(env) == []
 
 

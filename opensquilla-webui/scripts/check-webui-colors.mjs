@@ -17,6 +17,7 @@ import { hexToRgb, parseTokenDefinitions } from './lib/css-utils.mjs'
 // (e.g. a hardcoded near-black border that vanishes on dark) sneaks in.
 const root = fileURLToPath(new URL('..', import.meta.url))
 const srcDir = join(root, 'src')
+const tokenSrcDir = join(root, '..', 'packages', 'ui-tokens', 'src')
 
 // Token-definition sources. Raw color literals are allowed only inside
 // custom-property definitions in these files: the base.css component file plus
@@ -26,8 +27,8 @@ function isTokenSource(f) {
   const r = f.replace(/\\/g, '/')
   return (
     r.endsWith('/src/assets/base.css') ||
-    r.endsWith('/src/assets/foundation.css') ||
-    /\/src\/themes\/[^/]+\/tokens\.css$/.test(r) ||
+    r.endsWith('/packages/ui-tokens/src/foundation.css') ||
+    /\/packages\/ui-tokens\/src\/themes\/[^/]+\/tokens\.css$/.test(r) ||
     // a skin's scoped stylesheet defines its own token pack; structural rules in
     // it still may not use raw literals (only custom-prop lines are exempt).
     /\/src\/themes\/[^/]+\/skin\.css$/.test(r)
@@ -44,7 +45,10 @@ const neutralColor =
   /\brgba?\(\s*(?:0\s*,\s*0\s*,\s*0|255\s*,\s*255\s*,\s*255)\b[^)]*\)|#(?:000000|ffffff|000|fff)\b/gi
 const customProp = /^\s*--[\w-]+\s*:/
 
-const files = walkFiles(srcDir, /\.(vue|css)$/)
+const files = [
+  ...walkFiles(srcDir, /\.(vue|css)$/),
+  ...walkFiles(tokenSrcDir, /\.css$/),
+]
 
 // ---------------------------------------------------------------------------
 // Pass 1 — raw color literals
@@ -130,8 +134,8 @@ const undefinedTokens = bareUsages.filter(
 //     for the old bug where these were floored at 3.0 against --bg only (or, for
 //     accent, not checked at all), which green-lit sub-AA coloured text.
 //   • The matching --*-fill tokens are marks, never text → 3:1 on --bg.
-const foundationFile = join(srcDir, 'assets', 'foundation.css')
-const themesRoot = join(srcDir, 'themes')
+const foundationFile = join(tokenSrcDir, 'foundation.css')
+const themesRoot = join(tokenSrcDir, 'themes')
 const valueThemeFiles = existsSync(themesRoot)
   ? readdirSync(themesRoot, { withFileTypes: true })
       .filter((d) => d.isDirectory() && existsSync(join(themesRoot, d.name, 'tokens.css')))

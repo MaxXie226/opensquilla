@@ -894,65 +894,6 @@ summary.control-row--divider:focus-visible {
   color: var(--danger);
 }
 
-/* Canonical toggle switch.
-   A native <input type="checkbox"> styled as a switch: it keeps real form
-   semantics (name, :checked), native keyboard support (Space), and stays a
-   first-class actionable element for tests, while reading as the same control
-   as the chat composer's role=switch toggle. Apply `class="control-switch"`
-   to any boolean checkbox in the control UI instead of leaving it raw. */
-.control-switch {
-  appearance: none;
-  -webkit-appearance: none;
-  position: relative;
-  flex-shrink: 0;
-  width: 36px;
-  height: 20px;
-  margin: 0;
-  border: none;
-  border-radius: 999px;
-  background: var(--bg-hover);
-  cursor: pointer;
-  transition: background var(--dur-base) var(--ease-standard);
-}
-
-.control-switch::before {
-  content: '';
-  position: absolute;
-  top: 3px;
-  left: 3px;
-  width: 14px;
-  height: 14px;
-  border-radius: 999px;
-  background: var(--bg-surface);
-  box-shadow: 0 1px 3px var(--shadow-color);
-  transition: transform var(--dur-base) var(--ease-standard);
-}
-
-.control-switch:checked {
-  background: var(--accent);
-}
-
-.control-switch:checked::before {
-  transform: translateX(16px);
-}
-
-.control-switch:disabled {
-  cursor: not-allowed;
-  opacity: 0.55;
-}
-
-.control-switch:focus-visible {
-  outline: 2px solid color-mix(in srgb, var(--accent) 45%, transparent);
-  outline-offset: 2px;
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .control-switch,
-  .control-switch::before {
-    transition: none;
-  }
-}
-
 /* Below ~560px the two-column control-row would crush the control; stack it
    so channel-composer and edit fields stay usable on phones. */
 @media (max-width: 560px) {
