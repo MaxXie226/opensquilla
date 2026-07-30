@@ -3467,14 +3467,22 @@ def test_openrouter_models_omit_unsupported_temperature_without_capabilities(
     assert "temperature" not in captured["payload"]
 
 
-def test_openrouter_gpt_5_6_terra_uses_max_completion_tokens(
+@pytest.mark.parametrize(
+    "model",
+    [
+        "openai/gpt-5.6-sol",
+        "openai/gpt-5.6-terra",
+    ],
+)
+def test_openrouter_gpt_5_6_models_use_max_completion_tokens(
     monkeypatch: Any,
+    model: str,
 ) -> None:
     captured: dict[str, Any] = {}
     _patch_transport(monkeypatch, captured)
     provider = OpenAIProvider(
         api_key="test",
-        model="openai/gpt-5.6-terra",
+        model=model,
         base_url="https://openrouter.ai/api/v1",
         provider_kind="openrouter",
     )

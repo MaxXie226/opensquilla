@@ -216,7 +216,10 @@ _POLICIES_BY_KIND: dict[str, OpenAICompatPolicy] = {
         # non-deprecated completion-budget field.  Keeping this in the shared
         # payload policy also lets formal route evidence freeze the exact wire
         # surface instead of assuming ``max_tokens`` for every model.
-        max_completion_tokens_model_prefixes=("gpt-5.6-terra",),
+        max_completion_tokens_model_prefixes=(
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+        ),
         text_tool_profile=TextToolCompatProfile(
             model_rules=(
                 TextToolModelRule(

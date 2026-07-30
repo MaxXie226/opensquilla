@@ -128,6 +128,11 @@ def test_formal_routes_match_runtime_pins_and_capability_contract() -> None:
         "reasoning",
         "tools",
     }
+    assert validator.FORMAL_REQUIRED_PARAMETERS["openai/gpt-5.6-sol"] == {
+        "max_completion_tokens",
+        "reasoning",
+        "tools",
+    }
 
 
 def _saved_endpoint_evidence(

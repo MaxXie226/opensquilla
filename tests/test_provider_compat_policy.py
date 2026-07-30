@@ -147,6 +147,11 @@ def test_max_completion_tokens_requires_official_host() -> None:
         "https://openrouter.ai/api/v1",
         "openai/gpt-5.6-terra",
     )
+    assert _uses_max_completion_tokens(
+        openrouter_policy,
+        "https://openrouter.ai/api/v1",
+        "openai/gpt-5.6-sol",
+    )
     assert not _uses_max_completion_tokens(
         openrouter_policy,
         "https://gateway.example/v1",
