@@ -102,6 +102,18 @@ def test_release_workflow_publishes_public_gateway_runtime_assets() -> None:
     assert "--forbid-overwrite true" in mirror
 
 
+def test_release_workflow_publishes_public_client_contract_notice() -> None:
+    workflow = Path(".github/workflows/wheelhouse-release.yml").read_text(encoding="utf-8")
+
+    assert "Build public client contract release metadata" in workflow
+    assert "scripts.build_client_contract_release" in workflow
+    assert "opensquilla-client-contract-v3-" in Path(
+        "scripts/build_client_contract_release.py"
+    ).read_text(encoding="utf-8")
+    assert workflow.count("client_contract_asset_names") == 6
+    assert "client_contract_asset_names" in workflow
+
+
 def test_release_workflow_runs_legacy_windows_upgrade_checks_on_server_2022() -> None:
     workflow = yaml.safe_load(
         Path(".github/workflows/wheelhouse-release.yml").read_text(encoding="utf-8")

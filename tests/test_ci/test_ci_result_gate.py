@@ -29,6 +29,7 @@ def _base_env() -> dict[str, str]:
         "RESULT_MACOS_RECOVERY": "skipped",
         "RESULT_DESKTOP_RECOVERY_E2E": "skipped",
         "RESULT_RELEASE": "skipped",
+        "RESULT_CLIENT_CONTRACT": "skipped",
     }
     env.update({_flag_env(name): "false" for name in BOOLEAN_FLAGS})
     env[_flag_env("docs_only")] = "true"
@@ -88,6 +89,7 @@ def test_ci_result_gate_requires_ubuntu_full_matrix_only_for_full_ci() -> None:
     targeted["RESULT_UBUNTU"] = "success"
     targeted["RESULT_WINDOWS_SMOKE"] = "success"
     targeted["RESULT_RELEASE"] = "success"
+    targeted["RESULT_CLIENT_CONTRACT"] = "success"
     assert check_ci_results(targeted) == []
 
     for result in ("skipped", "failure", "cancelled", ""):
@@ -112,6 +114,17 @@ def test_ci_result_gate_requires_headless_packaging_for_wheel_builds() -> None:
 
     assert any("Release packaging contracts" in error for error in errors)
     assert not any("Frontend build, tests, and artifact" in error for error in errors)
+
+
+def test_ci_result_gate_requires_contract_compatibility_for_non_docs_changes() -> None:
+    env = _base_env()
+    env[_flag_env("docs_only")] = "false"
+
+    errors = check_ci_results(env)
+
+    assert any("Client contract compatibility" in error for error in errors)
+    env["RESULT_CLIENT_CONTRACT"] = "success"
+    assert check_ci_results(env) == []
 
 
 def test_ci_result_gate_rejects_failure_cancellation_and_missing_results() -> None:
