@@ -2186,17 +2186,35 @@ class TestSessionsSend:
     @pytest.mark.parametrize(
         ("requested_run_mode", "expected_run_mode"),
         [
-            ("full", "trusted"),
-            ("trusted", "trusted"),
-            ("standard", "standard"),
+            ("full", "full"),
+            ("trusted", "full"),
+            ("standard", "full"),
         ],
     )
-    async def test_send_non_owner_source_run_mode_is_principal_scoped_without_persisting(
+    async def test_send_host_capable_token_run_mode_is_resolved_without_persisting(
         self,
         dispatcher,
         requested_run_mode: str,
         expected_run_mode: str,
+        monkeypatch: pytest.MonkeyPatch,
     ):
+        unavailable = CapabilityReport(
+            available=False,
+            backend="test",
+            platform="test",
+            code="backend_unavailable",
+            reason="not available",
+            setup_supported=False,
+            restart_required=False,
+            probe_version=1,
+            capabilities=frozenset(),
+        )
+
+        async def report(_config):
+            return unavailable
+
+        monkeypatch.setattr(rpc_sessions, "current_sandbox_capability_report", report)
+
         class RecordingTaskRuntime:
             def __init__(self) -> None:
                 self.enqueue_calls: list[dict[str, Any]] = []
@@ -2290,7 +2308,9 @@ class TestSessionsSend:
         assert chat_session.origin["sandbox_run_context"]["run_mode"] == "standard"
 
     @pytest.mark.asyncio
-    async def test_chat_send_non_owner_full_source_run_mode_downgrades_to_trusted(self, dispatcher):
+    async def test_chat_send_host_capable_token_keeps_full_without_owner_authority(
+        self, dispatcher
+    ):
         chat_session = FakeSession(
             session_key="agent:main:webchat:chat-non-owner-full-source",
             session_id="chat-non-owner-full-source",
@@ -2330,8 +2350,10 @@ class TestSessionsSend:
         chat_task = get_agent_task_registry().get(chat_session.session_key)
         if chat_task is not None:
             await chat_task
-        assert chat_runner.run_calls[0]["tool_context"].run_mode == "trusted"
-        assert chat_runner.run_calls[0]["tool_context"].elevated != "full"
+        tool_context = chat_runner.run_calls[0]["tool_context"]
+        assert tool_context.run_mode == "full"
+        assert tool_context.elevated == "full"
+        assert tool_context.is_owner is False
         assert chat_session.origin["sandbox_run_context"]["run_mode"] == "standard"
 
     @pytest.mark.asyncio
@@ -7081,7 +7103,7 @@ class TestSessionsMessagesSubscribe:
         assert res.ok is True
         assert res.payload["run_mode_lock"] == {
             "locked": True,
-            "runMode": "standard",
+            "runMode": "safe",
             "source": "task",
         }
         assert manager._storage.list_agent_tasks_calls == [key]
@@ -7122,7 +7144,7 @@ class TestSessionsMessagesSubscribe:
         assert res.ok is True
         assert res.payload["run_mode_lock"] == {
             "locked": True,
-            "runMode": "trusted",
+            "runMode": "safe",
             "source": "background",
         }
         assert background_called is True

@@ -40,6 +40,9 @@ class SourceKind(StrEnum):
     SYSTEM = "system"
 
 
+PRINCIPAL_HOST_EXECUTE_METADATA_KEY = "principal_host_execute"
+
+
 @dataclass(frozen=True)
 class ReplyTarget:
     """External or subscriber target that can receive a reply/announce."""
@@ -90,6 +93,7 @@ class RouteEnvelope:
         self,
         *,
         is_owner: bool = False,
+        host_execute_allowed: bool = False,
         workspace_dir: str | None = None,
         workspace_strict: bool = False,
         default_elevated: str | None = None,
@@ -98,6 +102,7 @@ class RouteEnvelope:
         return tool_context_from_envelope(
             self,
             is_owner=is_owner,
+            host_execute_allowed=host_execute_allowed,
             workspace_dir=workspace_dir,
             workspace_strict=workspace_strict,
             default_elevated=default_elevated,
@@ -127,6 +132,7 @@ def build_channel_route_envelope(
     # ``channel_dispatch`` stamps this after authenticating the sender against
     # the configured channel-admin mapping.
     metadata.pop("principal_is_owner", None)
+    metadata.pop(PRINCIPAL_HOST_EXECUTE_METADATA_KEY, None)
     metadata.pop(CHANNEL_ADMIN_VERIFIED_METADATA_KEY, None)
     metadata.setdefault("run_mode", RunMode.SAFE.value)
     resolved_agent_id = _agent_id(agent_id, session_key)
@@ -179,6 +185,7 @@ def build_cli_route_envelope(
     sender_id: str | None = None,
     session_id: str | None = None,
     principal_is_owner: bool | None = None,
+    principal_host_execute: bool | None = None,
     interaction_mode: InteractionMode | str = InteractionMode.INTERACTIVE,
     elevated: str | None = None,
     run_mode: str | None = None,
@@ -188,6 +195,8 @@ def build_cli_route_envelope(
     metadata: dict[str, Any] = {}
     if principal_is_owner is not None:
         metadata["principal_is_owner"] = principal_is_owner
+    if principal_host_execute is not None:
+        metadata[PRINCIPAL_HOST_EXECUTE_METADATA_KEY] = bool(principal_host_execute)
     if elevated in ("on", "bypass", "full"):
         metadata["elevated"] = elevated
     try:
@@ -223,6 +232,7 @@ def build_web_route_envelope(
     session_id: str | None = None,
     tool_source_kind: str | None = None,
     principal_is_owner: bool | None = None,
+    principal_host_execute: bool | None = None,
 ) -> RouteEnvelope:
     """Build a route for Web/RPC-originated input."""
     resolved_channel_id = channel_id or (f"web:{conn_id}" if conn_id else "web")
@@ -232,6 +242,8 @@ def build_web_route_envelope(
         metadata["tool_source_kind"] = tool_source_kind
     if principal_is_owner is not None:
         metadata["principal_is_owner"] = principal_is_owner
+    if principal_host_execute is not None:
+        metadata[PRINCIPAL_HOST_EXECUTE_METADATA_KEY] = bool(principal_host_execute)
     return RouteEnvelope(
         source_kind=SourceKind.WEB,
         source_name=source_name,
@@ -338,6 +350,7 @@ def build_subagent_route_envelope(
     spawn_depth: int = 0,
     origin: str = "sessions_spawn",
     principal_is_owner: bool | None = None,
+    principal_host_execute: bool | None = None,
     elevated: str | None = None,
     run_mode: str | RunMode | None = None,
     sandbox_run_context: Any | None = None,
@@ -353,6 +366,8 @@ def build_subagent_route_envelope(
     }
     if principal_is_owner is not None:
         metadata["principal_is_owner"] = bool(principal_is_owner)
+    if principal_host_execute is not None:
+        metadata[PRINCIPAL_HOST_EXECUTE_METADATA_KEY] = bool(principal_host_execute)
     if elevated in ("on", "bypass", "full"):
         metadata["elevated"] = elevated
     normalized_run_mode: RunMode | None = None
@@ -464,6 +479,7 @@ def tool_context_from_envelope(
     envelope: RouteEnvelope,
     *,
     is_owner: bool = False,
+    host_execute_allowed: bool = False,
     workspace_dir: str | None = None,
     workspace_strict: bool = False,
     default_elevated: str | None = None,
@@ -481,6 +497,8 @@ def tool_context_from_envelope(
         # resolution so a generic ``is_owner=True`` cannot widen a Channel
         # context if a future caller forgets the ingress boundary.
         is_owner = channel_admin_verified
+        host_execute_allowed = channel_admin_verified
+    full_access_allowed = is_owner or host_execute_allowed
     allowed_tools: set[str] | None = None
     denied_tools: set[str] = set()
     interaction_mode = _interaction_mode(envelope.interaction_mode)
@@ -505,17 +523,17 @@ def tool_context_from_envelope(
             run_mode = normalize_run_mode(run_mode_value)
         except ValueError:
             run_mode = None
-        if run_mode == RunMode.FULL and not is_owner:
+        if run_mode == RunMode.FULL and not full_access_allowed:
             run_mode = RunMode.SAFE
     elif legacy_elevated == "on" and is_owner:
         run_mode = RunMode.SAFE
-    elif legacy_elevated in ("bypass", "full") and is_owner:
+    elif legacy_elevated in ("bypass", "full") and full_access_allowed:
         run_mode = RunMode.FULL
-    elif default_elevated in ("bypass", "full") and is_owner:
+    elif default_elevated in ("bypass", "full") and full_access_allowed:
         run_mode = RunMode.FULL
     else:
         run_mode = None
-    if run_mode == RunMode.FULL and is_owner:
+    if run_mode == RunMode.FULL and full_access_allowed:
         elevated = "full"
     elif legacy_elevated == "on" and is_owner:
         elevated = legacy_elevated
@@ -535,7 +553,7 @@ def tool_context_from_envelope(
     if (
         sandbox_run_context is not None
         and sandbox_run_context.run_mode == RunMode.FULL
-        and not is_owner
+        and not full_access_allowed
     ):
         sandbox_run_context = replace(sandbox_run_context, run_mode=RunMode.SAFE)
     if sandbox_run_context_fresh and sandbox_run_context is not None:

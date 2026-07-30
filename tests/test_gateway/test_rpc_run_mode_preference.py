@@ -94,7 +94,7 @@ async def test_run_mode_preference_set_persists_before_broadcast(
 
 
 @pytest.mark.asyncio
-async def test_run_mode_preference_get_coerces_full_for_non_owner() -> None:
+async def test_run_mode_preference_get_keeps_full_for_host_capable_token() -> None:
     from opensquilla.gateway import rpc_sandbox
 
     storage = SessionStorage(":memory:")
@@ -108,7 +108,7 @@ async def test_run_mode_preference_get_coerces_full_for_non_owner() -> None:
     finally:
         await storage.close()
 
-    assert payload == {"runMode": "trusted", "source": "preference"}
+    assert payload == {"runMode": "full", "source": "preference"}
 
 
 @pytest.mark.asyncio

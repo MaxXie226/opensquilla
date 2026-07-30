@@ -589,7 +589,7 @@ async def test_task_runtime_turn_uses_authenticated_channel_admin_boundary(
     tool_context = runner.calls[0]["tool_context"]
     assert tool_context.is_owner is expected_owner
     assert tool_context.channel_admin_verified is expected_owner
-    assert tool_context.run_mode == "trusted"
+    assert tool_context.run_mode == "safe"
 
 
 @pytest.mark.parametrize(
@@ -1021,7 +1021,7 @@ async def test_service_container_close_cancels_profile_import_maintenance() -> N
 
 
 @pytest.mark.asyncio
-async def test_bare_full_default_boots_standard_capability(
+async def test_bare_full_default_boots_safe_capability(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1057,11 +1057,11 @@ async def test_bare_full_default_boots_standard_capability(
     )
     try:
         settings, default_mode = captured[0]
-        assert settings.run_mode == "standard"
+        assert settings.run_mode == "safe"
         assert settings.sandbox is True
         assert settings.security_grading is True
         assert settings.network_default == "proxy_allowlist"
-        assert default_mode is RunMode.FULL
+        assert default_mode is RunMode.SAFE
     finally:
         await services.close()
 
@@ -2923,6 +2923,6 @@ async def test_task_runtime_turn_uses_owner_boundary_for_owner_cron_job() -> Non
 def test_default_bypass_keeps_sandbox_capability_for_explicit_restricted_calls() -> None:
     settings = _sandbox_settings_for_runtime(GatewayConfig())
 
-    assert settings.run_mode == "standard"
+    assert settings.run_mode == "safe"
     assert settings.sandbox is True
     assert settings.security_grading is True

@@ -2778,6 +2778,7 @@ async def _handle_sessions_send(
             accepted_run_mode_override,
         )
     workspace_dir = run_context.workspace or workspace_dir
+    host_execute_allowed = principal_has_host_execute(ctx.principal)
     if source_hint.get("caller_kind") == "cli" or source_hint.get("channel_kind") == "cli":
         route_envelope = build_cli_route_envelope(
             session_key=key,
@@ -2787,6 +2788,7 @@ async def _handle_sessions_send(
             sender_id=source_hint.get("sender_id"),
             session_id=getattr(session, "session_id", None),
             principal_is_owner=ctx.principal.is_owner,
+            principal_host_execute=host_execute_allowed,
             run_mode=run_context.run_mode.value,
         )
     else:
@@ -2800,6 +2802,7 @@ async def _handle_sessions_send(
             tool_source_kind=source_hint.get("source_kind"),
             session_id=getattr(session, "session_id", None),
             principal_is_owner=ctx.principal.is_owner,
+            principal_host_execute=host_execute_allowed,
         )
     _apply_run_context_route_metadata(
         route_envelope,
@@ -2995,6 +2998,7 @@ async def _handle_sessions_send(
             tool_ctx = tool_context_from_envelope(
                 route_envelope,
                 is_owner=ctx.principal.is_owner,
+                host_execute_allowed=host_execute_allowed,
                 workspace_dir=execution_workspace_dir,
                 workspace_strict=workspace_strict,
                 default_elevated=configured_default_elevated(ctx.config),

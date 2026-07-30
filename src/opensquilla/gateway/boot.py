@@ -1202,6 +1202,23 @@ def _task_runtime_envelope_owner(envelope: Any) -> bool:
     return getattr(envelope, "source_kind", None) == SourceKind.CLI
 
 
+def _task_runtime_envelope_host_execute(envelope: Any) -> bool:
+    """Resolve host-execution authority without widening owner privileges."""
+    from opensquilla.gateway.routing import (
+        PRINCIPAL_HOST_EXECUTE_METADATA_KEY,
+        SourceKind,
+    )
+
+    if getattr(envelope, "source_kind", None) == SourceKind.CHANNEL:
+        return _task_runtime_envelope_owner(envelope)
+    principal_host_execute = getattr(envelope, "metadata", {}).get(
+        PRINCIPAL_HOST_EXECUTE_METADATA_KEY
+    )
+    if isinstance(principal_host_execute, bool):
+        return principal_host_execute
+    return _task_runtime_envelope_owner(envelope)
+
+
 async def dispatch_task_runtime_turn(
     run: Any,
     *,
@@ -1279,6 +1296,7 @@ async def dispatch_task_runtime_turn(
     tool_context = tool_context_from_envelope(
         run.envelope,
         is_owner=is_owner,
+        host_execute_allowed=_task_runtime_envelope_host_execute(run.envelope),
         workspace_dir=(str(workspace_dir) if workspace_dir is not None else None),
         workspace_strict=workspace_strict,
         default_elevated=configured_default_elevated(config),

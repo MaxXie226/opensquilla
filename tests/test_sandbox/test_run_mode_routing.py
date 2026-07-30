@@ -62,6 +62,31 @@ def test_saved_route_run_mode_wins_over_later_global_full_default() -> None:
     assert ctx.elevated is None
 
 
+def test_host_execute_capability_preserves_full_without_owner_authority() -> None:
+    envelope = build_web_route_envelope(
+        session_key="agent:main:webchat:host-token",
+        principal_is_owner=False,
+    )
+    _apply_run_context_route_metadata(
+        envelope,
+        RunContext(run_mode=RunMode.FULL, source="user"),
+        principal_is_owner=False,
+    )
+
+    ctx = tool_context_from_envelope(
+        envelope,
+        is_owner=False,
+        host_execute_allowed=True,
+    )
+
+    assert ctx.run_mode == "full"
+    assert ctx.elevated == "full"
+    assert ctx.is_owner is False
+    assert ctx.channel_admin_verified is False
+    assert ctx.sandbox_run_context is not None
+    assert ctx.sandbox_run_context.run_mode == RunMode.FULL
+
+
 def test_disabled_runtime_makes_stale_standard_context_resolve_to_full(monkeypatch) -> None:
     from opensquilla.sandbox import integration
 

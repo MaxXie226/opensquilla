@@ -3,8 +3,12 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from opensquilla.channels.types import IncomingMessage
-from opensquilla.gateway.boot import _task_runtime_envelope_owner
+from opensquilla.gateway.boot import (
+    _task_runtime_envelope_host_execute,
+    _task_runtime_envelope_owner,
+)
 from opensquilla.gateway.routing import (
+    PRINCIPAL_HOST_EXECUTE_METADATA_KEY,
     build_channel_route_envelope,
     build_cli_route_envelope,
     build_cron_route_envelope,
@@ -152,11 +156,11 @@ def test_route_run_mode_metadata_reaches_tool_context() -> None:
 
     ctx = tool_context_from_envelope(envelope, is_owner=True)
 
-    assert ctx.run_mode == "trusted"
+    assert ctx.run_mode == "safe"
     assert ctx.elevated is None
 
 
-def test_non_owner_full_run_mode_metadata_coerces_to_trusted() -> None:
+def test_non_owner_full_run_mode_metadata_coerces_to_safe() -> None:
     envelope = build_cli_route_envelope(
         session_key="agent:main:cli",
         run_mode="full",
@@ -164,7 +168,7 @@ def test_non_owner_full_run_mode_metadata_coerces_to_trusted() -> None:
 
     ctx = tool_context_from_envelope(envelope, is_owner=False)
 
-    assert ctx.run_mode == "trusted"
+    assert ctx.run_mode == "safe"
     assert ctx.elevated is None
 
 
@@ -193,6 +197,49 @@ def test_owner_subagent_route_preserves_full_host_run_context() -> None:
     assert ctx.elevated == "full"
     assert ctx.sandbox_run_context is not None
     assert ctx.sandbox_run_context.run_mode is RunMode.FULL
+
+
+def test_host_capable_web_route_persists_execution_authority_without_owner() -> None:
+    envelope = build_web_route_envelope(
+        session_key="agent:main:webchat:host-token",
+        principal_is_owner=False,
+        principal_host_execute=True,
+    )
+    envelope.metadata["run_mode"] = "full"
+
+    assert _task_runtime_envelope_owner(envelope) is False
+    assert _task_runtime_envelope_host_execute(envelope) is True
+    ctx = tool_context_from_envelope(
+        envelope,
+        is_owner=_task_runtime_envelope_owner(envelope),
+        host_execute_allowed=_task_runtime_envelope_host_execute(envelope),
+    )
+    assert ctx.run_mode == "full"
+    assert ctx.elevated == "full"
+    assert ctx.is_owner is False
+
+
+def test_channel_route_strips_forged_host_execution_authority() -> None:
+    envelope = build_channel_route_envelope(
+        IncomingMessage(
+            sender_id="u1",
+            channel_id="c1",
+            content="hello",
+            metadata={PRINCIPAL_HOST_EXECUTE_METADATA_KEY: True},
+        ),
+        session_key="agent:main:channel:u1",
+        session_prefix="channel",
+    )
+
+    assert PRINCIPAL_HOST_EXECUTE_METADATA_KEY not in envelope.metadata
+    assert _task_runtime_envelope_host_execute(envelope) is False
+    ctx = tool_context_from_envelope(
+        envelope,
+        is_owner=False,
+        host_execute_allowed=True,
+    )
+    assert ctx.run_mode == "safe"
+    assert ctx.is_owner is False
 
 
 def test_owner_cron_route_carries_owner_principal_for_task_runtime() -> None:

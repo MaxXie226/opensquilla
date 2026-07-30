@@ -23,7 +23,7 @@ from opensquilla.provider.types import derive_provider_request_correlation
 from opensquilla.sandbox.run_context import RUN_CONTEXT_ORIGIN_KEY
 from opensquilla.session.keys import build_subagent_session_key, parse_agent_id
 from opensquilla.tools.registry import tool
-from opensquilla.tools.run_mode import current_run_mode
+from opensquilla.tools.run_mode import current_run_mode, full_host_access_for_context
 from opensquilla.tools.types import PlanAccess, SafeToolError, ToolError, current_tool_context
 
 _log = structlog.get_logger("opensquilla.tools.sessions")
@@ -518,6 +518,9 @@ async def sessions_spawn(
             parent_task_id=parent_task_id,
             spawn_depth=spawn_depth,
             principal_is_owner=getattr(ctx, "is_owner", None) if ctx is not None else None,
+            principal_host_execute=(
+                full_host_access_for_context(ctx) if ctx is not None else None
+            ),
             elevated=getattr(ctx, "elevated", None) if ctx is not None else None,
             run_mode=current_run_mode(),
             sandbox_run_context=(

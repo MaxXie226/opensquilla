@@ -371,7 +371,7 @@ async def test_reserve_serializes_accepted_run_mode_into_task_details() -> None:
     )
     try:
         assert reservation.task_record.details["accepted_run_mode"] == {
-            "run_mode": "trusted",
+            "run_mode": "safe",
             "run_mode_source": "user",
         }
         assert reservation.runtime_task.accepted_run_mode_override is accepted_override

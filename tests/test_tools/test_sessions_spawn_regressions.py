@@ -573,8 +573,8 @@ async def test_spawned_child_restart_uses_persisted_inherited_authority_at_boot(
             (str(mounted), "rw", "chat")
         ]
         assert observations["granted_network"].reason == "domain_grant"
-        assert observations["unknown_network"].status == "ask"
-        assert observations["unknown_network"].reason == "unknown_domain"
+        assert observations["unknown_network"].status == "allow"
+        assert observations["unknown_network"].reason == "public_default"
         assert observations["caller_kind"] is CallerKind.SUBAGENT
         assert observations["subagent_depth"] == 1
         assert len(backend_operations) == 1
@@ -586,7 +586,7 @@ async def test_spawned_child_restart_uses_persisted_inherited_authority_at_boot(
         assert child.parent_session_key == parent_key
         assert child.origin is not None
         assert child.origin["parent_task_id"] == "parent-task-restart"
-        assert child.origin[RUN_CONTEXT_ORIGIN_KEY]["run_mode"] == "standard"
+        assert child.origin[RUN_CONTEXT_ORIGIN_KEY]["run_mode"] == "safe"
         assert child.origin[RUN_CONTEXT_ORIGIN_KEY]["run_mode_source"] == "user"
         assert child.origin[RUN_CONTEXT_ORIGIN_KEY]["mounts"] == [
             {"path": str(mounted), "access": "rw", "scope": "chat"}
@@ -792,7 +792,7 @@ async def test_project_spawned_child_persists_binding_and_revalidates_queued_exe
         assert child.workspace_id == project.workspace_id
         assert child.origin is not None
         assert child.origin[RUN_CONTEXT_ORIGIN_KEY]["workspace"] == str(project_path)
-        assert child.origin[RUN_CONTEXT_ORIGIN_KEY]["run_mode"] == "standard"
+        assert child.origin[RUN_CONTEXT_ORIGIN_KEY]["run_mode"] == "safe"
         assert observations == [
             {
                 "mode": RunMode.SAFE,
