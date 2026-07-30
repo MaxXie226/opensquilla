@@ -37,7 +37,7 @@ def test_default_b2_config_is_g12_derived_quality_first_profile() -> None:
     assert config.g1_routing.user_profile_enabled is False
     assert config.g1_routing.candidate_scope == "registry_all"
     assert config.g1_routing.expected_source_registry_snapshot_sha256 == (
-        "a7cad0eb0b68c97ab82bf21c336107041bc77a14b3e8931b0e672a345610fe9b"
+        "bd2e6632ad09e84619cf497eb266c45faaa8716eff4d870ba930c3f4eae4b473"
     )
     assert config.g1_routing.expected_ranking_config_schema_version == "step2-ranking-config-v3"
     assert config.g1_routing.expected_ranking_config_version == "step2-ranking-2026-07-22.1"
