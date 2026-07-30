@@ -103,7 +103,7 @@ The chat UI supports:
 - pending message queue behavior while compaction or runtime work is in flight;
 - manual `/compact`;
 - per-turn usage and savings metadata when available;
-- copyable session keys;
+- copyable session IDs;
 - mobile tabs that keep chat, sessions, and operational views reachable on
   narrow screens.
 
