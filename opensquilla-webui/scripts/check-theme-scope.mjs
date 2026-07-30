@@ -13,6 +13,14 @@ import { stripCssComments } from './lib/css-utils.mjs'
 const root = fileURLToPath(new URL('..', import.meta.url))
 const srcDir = join(root, 'src')
 const themesDir = join(srcDir, 'themes')
+const tokenFoundation = join(
+  root,
+  '..',
+  'packages',
+  'ui-tokens',
+  'src',
+  'foundation.css',
+)
 const rel = (p) => relative(root, p).replace(/\\/g, '/')
 
 // Operational L2 surfaces a skin must never target (belt-and-suspenders: the
@@ -137,7 +145,7 @@ const l2Files = [
   // surfaces too — imported app-wide from main.ts.
   ...walkFiles(join(srcDir, 'styles'), styleFiles),
   join(srcDir, 'assets', 'base.css'),
-  join(srcDir, 'assets', 'foundation.css'),
+  tokenFoundation,
 ]
 const xLeak = /var\(\s*--x-[\w-]+/
 for (const f of l2Files) {

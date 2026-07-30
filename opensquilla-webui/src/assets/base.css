@@ -1,12 +1,7 @@
 /* OpenSquilla Web UI — component & layout styles.
    Design tokens are layered and imported first so the built cascade order is
-   identical to the previous single-file base.css: foundation (L0, theme-
-   invariant) then the per-theme L1 blocks (dark default on :root, then light).
-   Adding a theme = a folder under src/themes/; see the theme architecture spec. */
-@import "./foundation.css";
-/* Value-theme L1 token blocks ([data-theme=<id>]) are bundled eagerly by
-   src/themes/tokens.ts (import.meta.glob) so every theme folder loads
-   automatically — see main.ts. */
+   identical to the previous single-file base.css: the public UI token package
+   provides foundation (L0) and value-theme L1 blocks before this file. */
 
 .hidden { display: none !important; }
 
@@ -1745,10 +1740,6 @@ pre {
      already gets, and give the switch an adequate hit area. */
   .control-input,
   .control-segmented__btn { min-height: 44px; }
-  .control-switch { width: 44px; height: 26px; }
-  .control-switch::before { width: 20px; height: 20px; }
-  .control-switch:checked::before { transform: translateX(18px); }
-
   .content {
     padding-top: calc(40px + var(--sp-3));
     padding-right: var(--sp-3);

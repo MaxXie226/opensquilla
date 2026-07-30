@@ -372,8 +372,8 @@ def test_boot_error_and_recovery_states_pause_all_indeterminate_motion() -> None
 def test_boot_and_native_window_backgrounds_match_control_ui_theme_tokens() -> None:
     boot_html = _read("desktop/electron/src/boot.html")
     main_ts = _read("desktop/electron/src/main.ts")
-    light_tokens = _read("opensquilla-webui/src/themes/light/tokens.css")
-    dark_tokens = _read("opensquilla-webui/src/themes/dark/tokens.css")
+    light_tokens = _read("packages/ui-tokens/src/themes/light/tokens.css")
+    dark_tokens = _read("packages/ui-tokens/src/themes/dark/tokens.css")
 
     assert "--bg: #F7F7F8;" in light_tokens
     assert "--bg: #18181A;" in dark_tokens

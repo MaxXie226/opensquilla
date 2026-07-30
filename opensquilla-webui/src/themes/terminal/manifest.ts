@@ -1,8 +1,8 @@
 import type { ThemeManifest } from '../types'
 
 // A full aesthetic WORLD (not just a palette): an amber CRT terminal identity
-// applied globally when selected. The palette lives in ./tokens.css (eager,
-// contract + contrast checked); the world layer (mono type, hard frames,
+// applied globally when selected. The palette lives in @opensquilla/ui-tokens
+// (eager, contract + contrast checked); the world layer (mono type, hard frames,
 // amber glow, scanlines, blinking cursor) is ./world.css, loaded lazily on
 // activation so other-theme users download none of it. Reuses the bundled
 // IBM Plex Mono, so it ships no extra fonts.

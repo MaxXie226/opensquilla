@@ -10,15 +10,24 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
-    }
+    },
+    "./styles.css": "./dist/styles.css"
   },
   "files": [
     "dist",
     "README.md"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "build": "vite build && vue-tsc -p tsconfig.json --declaration --emitDeclarationOnly",
+    "test": "vitest run --config vitest.config.ts",
+    "typecheck": "vue-tsc -p tsconfig.json --noEmit",
+    "verify:boundaries": "node scripts/check-boundaries.mjs"
+  },
+  "dependencies": {
+    "@opensquilla/ui-tokens": "0.1.0"
+  },
+  "peerDependencies": {
+    "vue": "^3.5.0"
   },
   "engines": {
     "node": ">=22.12.0"

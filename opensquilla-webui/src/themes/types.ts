@@ -2,8 +2,8 @@
 //
 // Two axes (see the theme architecture spec):
 //   • value theme  — a global L1 value re-skin applied via `data-theme` on <html>,
-//     with its token block in a co-located tokens.css (validated by
-//     check-theme-contract.mjs) and an optional global "world" layer.
+//     with its palette supplied by @opensquilla/ui-tokens (validated by
+//     check-theme-contract.mjs) and an optional app-owned "world" layer.
 //   • expressive skin — a route-scoped skin applied via `data-skin`, with its
 //     token pack + structural rules in a co-located skin.css.
 // Deliberately minimal: a field earns its place here when something reads it.

@@ -1,0 +1,19 @@
+{
+  "extends": "../tsconfig.ui-package.json",
+  "compilerOptions": {
+    "baseUrl": ".",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "outDir": "../packages/ui-primitives/dist",
+    "paths": {
+      "vue": ["node_modules/vue"],
+      "vue/*": ["node_modules/vue/*"]
+    },
+    "rootDir": "../packages/ui-primitives/src",
+    "verbatimModuleSyntax": false
+  },
+  "include": [
+    "../packages/ui-primitives/src/**/*.ts",
+    "../packages/ui-primitives/src/**/*.vue"
+  ]
+}

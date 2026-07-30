@@ -6,7 +6,7 @@
    theme. Defines the full L1 contract for [data-theme="arctic"]; values tuned so
    the per-theme WCAG contrast guard passes (danger lightened from the source
    palette's muted #BF616A, which is < 3:1 on the ground). See
-   src/themes/arctic/manifest.ts. */
+   opensquilla-webui/src/themes/arctic/manifest.ts. */
 [data-theme="arctic"] {
   --bg: #2E3440;
   --bg-surface: #333B49;

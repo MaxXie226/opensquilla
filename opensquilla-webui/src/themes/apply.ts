@@ -1,9 +1,9 @@
 import { getManifest } from './registry'
 
-// Theme-asset runtime: lazily load a value theme's global "world" layer or an
-// expressive skin's assets. A theme/skin's token pack + structural CSS live in
-// co-located css files (tokens.css / skin.css / world.css) — the single source
-// of truth the CI guards validate — so this module only orchestrates loading.
+// Theme-asset runtime: lazily load a value theme's app-owned "world" layer or an
+// expressive skin's assets. Public value palettes come from
+// @opensquilla/ui-tokens; skin/world structural CSS remains co-located with the
+// WebUI manifests. This module only orchestrates loading.
 
 const worldLoaded = new Set<string>()
 

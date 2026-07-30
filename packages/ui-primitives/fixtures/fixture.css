@@ -1,0 +1,30 @@
+html,
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: Arial, sans-serif;
+  margin: 0;
+  min-height: 100%;
+}
+
+body {
+  padding: 32px;
+}
+
+#fixture {
+  margin: 0 auto;
+  max-width: 720px;
+}
+
+#fixture h1,
+#fixture p {
+  margin: 0;
+}
+
+*,
+*::before,
+*::after {
+  animation-duration: 0s !important;
+  caret-color: transparent !important;
+  transition-duration: 0s !important;
+}

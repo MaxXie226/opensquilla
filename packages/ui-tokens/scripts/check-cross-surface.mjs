@@ -1,6 +1,23 @@
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
-import { hexToRgb, stripAllComments } from './lib/css-utils.mjs'
+
+function hexToRgb(raw) {
+  const hex = raw.slice(1)
+  if (hex.length === 3) {
+    return [...hex].map((value) => Number.parseInt(value + value, 16))
+  }
+  return [
+    Number.parseInt(hex.slice(0, 2), 16),
+    Number.parseInt(hex.slice(2, 4), 16),
+    Number.parseInt(hex.slice(4, 6), 16),
+  ]
+}
+
+function stripAllComments(text) {
+  return text
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^\s*\/\/.*$/gm, '')
+}
 
 // Cross-surface brand-accent guard.
 //
@@ -19,7 +36,7 @@ import { hexToRgb, stripAllComments } from './lib/css-utils.mjs'
 //
 // The gateway serves the generated Vue bundle from static/dist; its source
 // tokens are covered by check-webui-colors.mjs and therefore are not rescanned.
-const repoRoot = fileURLToPath(new URL('../../', import.meta.url))
+const repoRoot = fileURLToPath(new URL('../../../', import.meta.url))
 
 // The canonical "strike" family — the Instrument accent and its documented
 // hover / deep / secondary / light-theme siblings. Stored as normalized

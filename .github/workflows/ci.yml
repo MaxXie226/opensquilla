@@ -115,6 +115,32 @@ jobs:
       - name: Verify public UI package boundaries
         run: npm run verify:ui-packages
 
+  ui-primitives-browser:
+    name: Public UI primitives (browser matrix)
+    needs: classify-changes
+    if: ${{ needs.classify-changes.outputs.frontend_changed == 'true' || needs.classify-changes.outputs.full_required == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: opensquilla-webui/.node-version
+          cache: 'npm'
+          cache-dependency-path: package-lock.json
+
+      - name: Install public UI package dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Install UI primitive browsers
+        run: npx playwright install --with-deps chromium firefox webkit
+
+      - name: Run visual and accessibility browser contracts
+        run: npm run test:ui-primitives:browser
+
   frontend-check:
     name: Frontend build, tests, and artifact
     needs: classify-changes
@@ -1216,6 +1242,7 @@ jobs:
       - workflow-lint
       - readme-locale-check
       - ui-packages-check
+      - ui-primitives-browser
       - frontend-check
       - webui-chat-recovery
       - tui-check
@@ -1264,6 +1291,7 @@ jobs:
           RESULT_WORKFLOW_LINT: ${{ needs.workflow-lint.result }}
           RESULT_README_LOCALE: ${{ needs.readme-locale-check.result }}
           RESULT_UI_PACKAGES: ${{ needs.ui-packages-check.result }}
+          RESULT_UI_PRIMITIVES_BROWSER: ${{ needs.ui-primitives-browser.result }}
           RESULT_FRONTEND: ${{ needs.frontend-check.result }}
           RESULT_TUI: ${{ needs.tui-check.result }}
           RESULT_DESKTOP: ${{ needs.desktop-check.result }}

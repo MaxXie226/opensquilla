@@ -1,10 +1,14 @@
 {
   "extends": "../../tsconfig.ui-package.json",
   "compilerOptions": {
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
     "outDir": "dist",
-    "rootDir": "src"
+    "rootDir": "src",
+    "verbatimModuleSyntax": false
   },
   "include": [
-    "src/**/*.ts"
+    "src/**/*.ts",
+    "src/**/*.vue"
   ]
 }

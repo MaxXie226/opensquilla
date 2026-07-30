@@ -1,7 +1,7 @@
 import type { ThemeManifest } from "../types"
 
 // Value theme "miami" -- Miami daylight -- a warm peachy off-white ground lit by hot flamingo pink, aqua-teal, coral and violet neon accents, with deep plum ink.
-// Applied token values live in ./tokens.css (contract + contrast guards).
+// Applied token values live in @opensquilla/ui-tokens (contract + contrast guards).
 const miami: ThemeManifest = {
   id: "miami",
   name: "Miami",

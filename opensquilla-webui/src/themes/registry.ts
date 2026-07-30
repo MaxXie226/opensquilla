@@ -1,10 +1,11 @@
 import type { ThemeManifest } from './types'
 import type { IconName } from '@/utils/icons'
 
-// Drop-a-folder registration: every `src/themes/<id>/manifest.ts` is picked up
-// automatically — adding a theme is a new folder, never an edit here. A
-// manifest.ts must hold metadata + lazy thunks only (no heavy static imports),
-// so eager-globbing the manifests never pulls fonts/CSS into the entry chunk.
+// Manifest registration: every `src/themes/<id>/manifest.ts` is picked up
+// automatically. A public value theme also needs a matching palette in
+// @opensquilla/ui-tokens; check-theme-contract.mjs keeps the two registries in
+// lockstep. A manifest holds metadata + lazy thunks only (no heavy static
+// imports), so eager-globbing never pulls fonts/CSS into the entry chunk.
 const modules = import.meta.glob<{ default: ThemeManifest }>('./*/manifest.ts', {
   eager: true,
 })

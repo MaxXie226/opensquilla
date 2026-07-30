@@ -10,15 +10,21 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
-    }
+    },
+    "./foundation.css": "./dist/foundation.css",
+    "./themes.css": "./dist/themes.css",
+    "./theme-contract.json": "./dist/theme-contract.json",
+    "./themes/*": "./dist/themes/*/tokens.css"
   },
   "files": [
     "dist",
     "README.md"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "build": "node scripts/build-assets.mjs && tsc -p tsconfig.json",
+    "test": "vitest run tests",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "verify:cross-surface": "node scripts/check-cross-surface.mjs"
   },
   "engines": {
     "node": ">=22.12.0"

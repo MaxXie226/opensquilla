@@ -3,7 +3,7 @@ import type { ThemeManifest } from "../types"
 // Value theme "crt-green" -- a green-screen CRT terminal look -- a faintly
 // green-tinted near-black ground lit by one vivid electric-green accent, a
 // cyan-teal secondary, and bright terminal status colours.
-// Applied token values live in ./tokens.css (contract + contrast guards).
+// Applied token values live in @opensquilla/ui-tokens (contract + contrast guards).
 const crtGreen: ThemeManifest = {
   id: "crt-green",
   name: "CRT Green",

@@ -66,6 +66,10 @@ export default defineConfig({
     },
   },
   resolve: {
+    // Local public packages are file: dependencies. Preserve their consumer
+    // path so peer dependencies such as Vue resolve from this WebUI install,
+    // including when the repository root has no node_modules directory.
+    preserveSymlinks: true,
     alias: {
       '@': resolve(__dirname, 'src'),
     },
