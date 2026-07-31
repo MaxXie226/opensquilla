@@ -51,14 +51,18 @@ def formal_registry_snapshot(contract: Any) -> dict[str, Any]:
         load_model_registry_snapshot,
     )
 
-    snapshot = load_model_registry_snapshot()
-    if str(snapshot.get("snapshot_version") or "") != contract.source_registry_snapshot_version:
-        snapshot = _legacy_registry_snapshot_projection(snapshot)
-    if str(snapshot.get("snapshot_version") or "") != contract.source_registry_snapshot_version:
+    raw_snapshot = load_model_registry_snapshot()
+    candidates = (raw_snapshot, _legacy_registry_snapshot_projection(raw_snapshot))
+    version_matches: list[dict[str, Any]] = []
+    for snapshot in candidates:
+        if str(snapshot.get("snapshot_version") or "") != contract.source_registry_snapshot_version:
+            continue
+        version_matches.append(snapshot)
+        if canonical_sha256(snapshot) == contract.expected_source_registry_snapshot_sha256:
+            return snapshot
+    if not version_matches:
         raise ValueError("formal route preflight registry version differs")
-    if canonical_sha256(snapshot) != contract.expected_source_registry_snapshot_sha256:
-        raise ValueError("formal route preflight registry hash differs")
-    return snapshot
+    raise ValueError("formal route preflight registry hash differs")
 
 
 def resolved_g1_contract(experiment_config: Path) -> tuple[Any, dict[str, Any]]:

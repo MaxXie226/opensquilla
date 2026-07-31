@@ -4,9 +4,13 @@ import importlib.util
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from opensquilla.eval.draco_experiment_config import load_draco_experiment_config
 from opensquilla.gateway.llm_runtime import OPENROUTER_DEFAULT_PROVIDER_ROUTING
+from opensquilla.provider import ranking_router
 from opensquilla.provider.compat_policy import (
     compat_policy_for_kind,
     model_matches_policy_prefix,
@@ -31,6 +35,63 @@ def _load_validator():
 
 
 validator = _load_validator()
+
+
+def _registry_contract(snapshot: dict[str, object]) -> SimpleNamespace:
+    return SimpleNamespace(
+        source_registry_snapshot_version=snapshot["snapshot_version"],
+        expected_source_registry_snapshot_sha256=validator.canonical_sha256(snapshot),
+    )
+
+
+def test_formal_registry_snapshot_selects_by_version_and_hash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = {
+        "schema_version": "raw",
+        "snapshot_version": "same-version",
+        "models": [{"raw": True}],
+    }
+    legacy = {
+        "schema_version": "legacy",
+        "snapshot_version": "same-version",
+        "models": [{"raw": False}],
+    }
+    monkeypatch.setattr(ranking_router, "load_model_registry_snapshot", lambda: raw)
+    monkeypatch.setattr(
+        ranking_router,
+        "_legacy_registry_snapshot_projection",
+        lambda snapshot: legacy,
+    )
+
+    assert validator.formal_registry_snapshot(_registry_contract(raw)) is raw
+    assert validator.formal_registry_snapshot(_registry_contract(legacy)) is legacy
+
+
+def test_formal_registry_snapshot_fails_closed_without_exact_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = {"snapshot_version": "same-version", "models": [{"raw": True}]}
+    legacy = {"snapshot_version": "same-version", "models": [{"raw": False}]}
+    monkeypatch.setattr(ranking_router, "load_model_registry_snapshot", lambda: raw)
+    monkeypatch.setattr(
+        ranking_router,
+        "_legacy_registry_snapshot_projection",
+        lambda snapshot: legacy,
+    )
+    wrong_hash = SimpleNamespace(
+        source_registry_snapshot_version="same-version",
+        expected_source_registry_snapshot_sha256="0" * 64,
+    )
+    wrong_version = SimpleNamespace(
+        source_registry_snapshot_version="other-version",
+        expected_source_registry_snapshot_sha256=validator.canonical_sha256(raw),
+    )
+
+    with pytest.raises(ValueError, match="hash differs"):
+        validator.formal_registry_snapshot(wrong_hash)
+    with pytest.raises(ValueError, match="version differs"):
+        validator.formal_registry_snapshot(wrong_version)
 
 
 def test_formal_scope_is_default(tmp_path: Path) -> None:

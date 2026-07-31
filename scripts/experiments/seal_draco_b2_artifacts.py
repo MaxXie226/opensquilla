@@ -205,15 +205,18 @@ def _formal_registry_snapshot(contract: Any) -> dict[str, Any]:
         load_model_registry_snapshot,
     )
 
-    snapshot = load_model_registry_snapshot()
-    if str(snapshot.get("snapshot_version") or "") != contract.source_registry_snapshot_version:
-        snapshot = _legacy_registry_snapshot_projection(snapshot)
-    if (
-        str(snapshot.get("snapshot_version") or "") != contract.source_registry_snapshot_version
-        or canonical_sha256(snapshot) != contract.expected_source_registry_snapshot_sha256
-    ):
-        raise ValueError("experiment config G1 registry snapshot differs")
-    return snapshot
+    raw_snapshot = load_model_registry_snapshot()
+    candidates = (raw_snapshot, _legacy_registry_snapshot_projection(raw_snapshot))
+    version_matches: list[dict[str, Any]] = []
+    for snapshot in candidates:
+        if str(snapshot.get("snapshot_version") or "") != contract.source_registry_snapshot_version:
+            continue
+        version_matches.append(snapshot)
+        if canonical_sha256(snapshot) == contract.expected_source_registry_snapshot_sha256:
+            return snapshot
+    if not version_matches:
+        raise ValueError("experiment config G1 registry snapshot version differs")
+    raise ValueError("experiment config G1 registry snapshot hash differs")
 
 
 def _resolved_g1_contract(config_path: Path) -> tuple[Any, dict[str, Any]]:

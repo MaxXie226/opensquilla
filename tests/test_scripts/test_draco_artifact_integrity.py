@@ -6,6 +6,7 @@ import os
 import shutil
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -14,6 +15,7 @@ from opensquilla.eval.draco_artifact_integrity import (
     trace_row_from_result,
     verify_result_row_evidence,
 )
+from opensquilla.provider import ranking_router
 
 ROOT = Path(__file__).resolve().parents[2]
 PREPARE_CANARY = ROOT / "scripts" / "experiments" / "prepare_draco_b2_canary.py"
@@ -28,6 +30,66 @@ def _load(path: Path, name: str):
     sys.modules[name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def test_sealer_registry_snapshot_selects_by_version_and_hash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load(SEAL_ARTIFACTS, "seal_draco_artifacts_registry_select_test")
+    raw = {
+        "schema_version": "raw",
+        "snapshot_version": "same-version",
+        "models": [{"raw": True}],
+    }
+    legacy = {
+        "schema_version": "legacy",
+        "snapshot_version": "same-version",
+        "models": [{"raw": False}],
+    }
+    monkeypatch.setattr(ranking_router, "load_model_registry_snapshot", lambda: raw)
+    monkeypatch.setattr(
+        ranking_router,
+        "_legacy_registry_snapshot_projection",
+        lambda snapshot: legacy,
+    )
+    raw_contract = SimpleNamespace(
+        source_registry_snapshot_version="same-version",
+        expected_source_registry_snapshot_sha256=module.canonical_sha256(raw),
+    )
+    legacy_contract = SimpleNamespace(
+        source_registry_snapshot_version="same-version",
+        expected_source_registry_snapshot_sha256=module.canonical_sha256(legacy),
+    )
+
+    assert module._formal_registry_snapshot(raw_contract) is raw
+    assert module._formal_registry_snapshot(legacy_contract) is legacy
+
+
+def test_sealer_registry_snapshot_fails_closed_without_exact_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load(SEAL_ARTIFACTS, "seal_draco_artifacts_registry_reject_test")
+    raw = {"snapshot_version": "same-version", "models": [{"raw": True}]}
+    legacy = {"snapshot_version": "same-version", "models": [{"raw": False}]}
+    monkeypatch.setattr(ranking_router, "load_model_registry_snapshot", lambda: raw)
+    monkeypatch.setattr(
+        ranking_router,
+        "_legacy_registry_snapshot_projection",
+        lambda snapshot: legacy,
+    )
+    wrong_hash = SimpleNamespace(
+        source_registry_snapshot_version="same-version",
+        expected_source_registry_snapshot_sha256="0" * 64,
+    )
+    wrong_version = SimpleNamespace(
+        source_registry_snapshot_version="other-version",
+        expected_source_registry_snapshot_sha256=module.canonical_sha256(raw),
+    )
+
+    with pytest.raises(ValueError, match="hash differs"):
+        module._formal_registry_snapshot(wrong_hash)
+    with pytest.raises(ValueError, match="version differs"):
+        module._formal_registry_snapshot(wrong_version)
 
 
 def test_full_result_hash_and_exact_trace_projection_fail_on_mutation() -> None:
