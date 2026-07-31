@@ -352,6 +352,11 @@ hard-blocked ranges, fix the DNS or proxy setup instead of bypassing the guard.
 
 ## Gateway Binding
 
+The desktop application always owns a loopback-only child Gateway bound to
+`127.0.0.1`. Desktop settings do not change its listener address or expose it
+to the LAN. The settings below apply to a separately launched standalone
+Gateway.
+
 Foreground:
 
 ```sh

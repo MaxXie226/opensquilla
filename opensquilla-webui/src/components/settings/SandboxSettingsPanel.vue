@@ -255,35 +255,6 @@
           <p><strong>{{ t('settings.sandbox.lan.guest') }}</strong>{{ t('settings.sandbox.lan.guestDescription') }}</p>
           <p><strong>{{ t('settings.sandbox.lan.authenticated') }}</strong>{{ t('settings.sandbox.lan.authenticatedDescription') }}</p>
         </div>
-        <template v-if="lanDraft">
-          <div class="sandbox-option">
-            <div>
-              <strong>{{ t('settings.sandbox.lan.listen') }}</strong>
-              <p>{{ t('settings.sandbox.lan.listenDescription') }}</p>
-            </div>
-            <label class="sandbox-switch">
-              <input v-model="lanDraft.listenOnLan" type="checkbox" data-testid="sandbox-listen-lan" />
-              <span aria-hidden="true"></span>
-            </label>
-          </div>
-          <TextRuleEditor
-            v-model="allowedCidr"
-            :title="t('settings.sandbox.lan.allowedCidrs')"
-            placeholder="192.168.1.0/24"
-            :rules="lanDraft.allowedClientCidrs"
-            @add="addTextRule(lanDraft.allowedClientCidrs, allowedCidr, value => { allowedCidr = value })"
-            @remove="removeAt(lanDraft.allowedClientCidrs, $event)"
-          />
-          <p class="sandbox-detail">{{ t('settings.sandbox.lan.cidrDescription') }}</p>
-          <p v-if="lanRestartRequired" class="sandbox-detail">{{ t('settings.sandbox.lan.restartRequired') }}</p>
-          <SectionActions
-            :dirty="lanDirty()"
-            :pending="lanPending"
-            :error="lanError"
-            @save="void saveLan()"
-            @discard="discardLan"
-          />
-        </template>
         <div class="sandbox-token-create">
           <input v-model="tokenName" :placeholder="t('settings.sandbox.lan.tokenName')" />
           <label>
@@ -342,10 +313,6 @@ const {
   defaultRunModeBaseline,
   defaultRunModePending,
   defaultRunModeError,
-  lanDraft,
-  lanPending,
-  lanError,
-  lanRestartRequired,
   sandboxWarningSuppressed,
   desktopWarningPreferenceAvailable,
   desktopPreferencePending,
@@ -360,9 +327,6 @@ const {
   refreshCapability,
   saveDefaultRunMode,
   discardDefaultRunMode,
-  lanDirty,
-  saveLan,
-  discardLan,
   resetSandboxUnavailableWarning,
   saveSection,
   discardSection,
@@ -375,7 +339,6 @@ const approvalPrefix = ref('')
 const autoPrefix = ref('')
 const allowDomain = ref('')
 const denyDomain = ref('')
-const allowedCidr = ref('')
 const tokenName = ref('')
 const tokenHostExecute = ref(true)
 

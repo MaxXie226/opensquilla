@@ -4,7 +4,6 @@ import { usePlatform } from '@/platform'
 import { useRpcStore } from '@/stores/rpc'
 import type {
   SandboxCapabilityReport,
-  SandboxLanSettings,
   SandboxPolicy,
   SandboxPolicyDefaults,
   SandboxRunMode,
@@ -36,11 +35,6 @@ export function useSandboxSettings() {
   const defaultRunMode = ref<SandboxRunMode>('safe')
   const defaultRunModePending = ref(false)
   const defaultRunModeError = ref('')
-  const lanBaseline = ref<SandboxLanSettings | null>(null)
-  const lanDraft = ref<SandboxLanSettings | null>(null)
-  const lanPending = ref(false)
-  const lanError = ref('')
-  const lanRestartRequired = ref(false)
   const sandboxWarningSuppressed = ref(false)
   const desktopWarningPreferenceAvailable = ref(false)
   const desktopPreferencePending = ref(false)
@@ -74,13 +68,12 @@ export function useSandboxSettings() {
     loadError.value = ''
     try {
       await rpc.waitForConnection()
-      const [capabilityPayload, policyPayload, defaultsPayload, tokenPayload, runModePayload, configPayload] = await Promise.all([
+      const [capabilityPayload, policyPayload, defaultsPayload, tokenPayload, runModePayload] = await Promise.all([
         rpc.call<SandboxCapabilityReport>('sandbox.capability.status'),
         rpc.call<SandboxPolicy>('sandbox.policy.get'),
         rpc.call<Partial<SandboxPolicyDefaults>>('sandbox.policy.defaults'),
         rpc.call<{ tokens?: unknown }>('sandbox.tokens.list'),
         rpc.call<{ runMode?: unknown }>('sandbox.run_mode.preference.get'),
-        rpc.call<Record<string, unknown>>('config.get'),
       ])
       capability.value = capabilityPayload
       baseline.value = clonePolicy(policyPayload)
@@ -95,19 +88,6 @@ export function useSandboxSettings() {
       const loadedRunMode: SandboxRunMode = runModePayload.runMode === 'full' ? 'full' : 'safe'
       defaultRunModeBaseline.value = loadedRunMode
       defaultRunMode.value = loadedRunMode
-      const auth = configPayload.auth && typeof configPayload.auth === 'object'
-        ? configPayload.auth as Record<string, unknown>
-        : {}
-      const lan: SandboxLanSettings = {
-        listenOnLan: String(configPayload.host ?? '127.0.0.1') !== '127.0.0.1'
-          && String(configPayload.host ?? '') !== '::1'
-          && String(configPayload.host ?? '').toLowerCase() !== 'localhost',
-        allowedClientCidrs: Array.isArray(auth.allowed_client_cidrs)
-          ? auth.allowed_client_cidrs.map(String)
-          : [],
-      }
-      lanBaseline.value = JSON.parse(JSON.stringify(lan))
-      lanDraft.value = JSON.parse(JSON.stringify(lan))
       tokens.value = Array.isArray(tokenPayload.tokens)
         ? tokenPayload.tokens as SandboxTokenRecord[]
         : []
@@ -160,39 +140,6 @@ export function useSandboxSettings() {
   function discardDefaultRunMode(): void {
     defaultRunMode.value = defaultRunModeBaseline.value
     defaultRunModeError.value = ''
-  }
-
-  function lanDirty(): boolean {
-    return JSON.stringify(lanBaseline.value) !== JSON.stringify(lanDraft.value)
-  }
-
-  async function saveLan(): Promise<void> {
-    if (!lanDraft.value || !lanDirty()) return
-    lanPending.value = true
-    lanError.value = ''
-    try {
-      const payload = await rpc.call<{ restartRequired?: boolean }>('config.patch', {
-        patch: {
-          host: lanDraft.value.listenOnLan ? '0.0.0.0' : '127.0.0.1',
-          auth: {
-            allowed_client_cidrs: lanDraft.value.allowedClientCidrs,
-          },
-        },
-      })
-      lanBaseline.value = JSON.parse(JSON.stringify(lanDraft.value))
-      lanRestartRequired.value = Boolean(payload.restartRequired)
-    } catch (error) {
-      lanError.value = errorMessage(error)
-      throw error
-    } finally {
-      lanPending.value = false
-    }
-  }
-
-  function discardLan(): void {
-    if (!lanBaseline.value) return
-    lanDraft.value = JSON.parse(JSON.stringify(lanBaseline.value))
-    lanError.value = ''
   }
 
   async function resetSandboxUnavailableWarning(): Promise<void> {
@@ -305,10 +252,6 @@ export function useSandboxSettings() {
     defaultRunModeBaseline,
     defaultRunModePending,
     defaultRunModeError,
-    lanDraft,
-    lanPending,
-    lanError,
-    lanRestartRequired,
     sandboxWarningSuppressed,
     desktopWarningPreferenceAvailable,
     desktopPreferencePending,
@@ -323,9 +266,6 @@ export function useSandboxSettings() {
     refreshCapability,
     saveDefaultRunMode,
     discardDefaultRunMode,
-    lanDirty,
-    saveLan,
-    discardLan,
     resetSandboxUnavailableWarning,
     saveSection,
     discardSection,

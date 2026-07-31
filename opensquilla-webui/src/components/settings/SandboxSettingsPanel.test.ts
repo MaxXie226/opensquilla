@@ -194,23 +194,11 @@ describe('SandboxSettingsPanel', () => {
       .toContain('osq_public_secret-once')
   })
 
-  it('saves LAN binding and CIDRs through the restart-aware config boundary', async () => {
+  it('does not expose desktop listener or CIDR configuration', async () => {
     const { el, call } = await mountPanel()
-    el.querySelector<HTMLInputElement>('[data-testid="sandbox-listen-lan"]')!.click()
-    const cidr = el.querySelector<HTMLInputElement>('input[placeholder="192.168.1.0/24"]')!
-    cidr.value = '192.168.50.0/24'
-    cidr.dispatchEvent(new Event('input', { bubbles: true }))
-    cidr.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
-    await settle()
-    const saves = [...el.querySelectorAll<HTMLButtonElement>('[data-testid="save-sandbox-section"]')]
-    saves.find(button => !button.disabled)!.click()
-    await settle()
 
-    expect(call).toHaveBeenCalledWith('config.patch', {
-      patch: {
-        host: '0.0.0.0',
-        auth: { allowed_client_cidrs: ['192.168.50.0/24'] },
-      },
-    })
+    expect(el.querySelector('[data-testid="sandbox-listen-lan"]')).toBeNull()
+    expect(el.querySelector('input[placeholder="192.168.1.0/24"]')).toBeNull()
+    expect(call.mock.calls.some(([method]) => String(method).startsWith('config.'))).toBe(false)
   })
 })

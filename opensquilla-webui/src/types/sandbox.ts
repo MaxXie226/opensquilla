@@ -94,8 +94,3 @@ export interface SandboxPolicyDefaults {
   runtimeTarget: string | null
   runtimeVersions: Partial<Record<'python' | 'node' | 'gitBash', SandboxRuntimeVersion>>
 }
-
-export interface SandboxLanSettings {
-  listenOnLan: boolean
-  allowedClientCidrs: string[]
-}

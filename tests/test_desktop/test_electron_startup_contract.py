@@ -72,6 +72,20 @@ def test_desktop_opens_directly_on_the_new_task_route() -> None:
     assert "const url = `${gatewayUrl}/control/chat`" not in load_control
 
 
+def test_desktop_owned_gateway_is_unconditionally_loopback_bound() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    start_gateway = _section(
+        main_ts,
+        "async function startGateway(): Promise<GatewayState>",
+        "async function startGatewayWithPortRecovery",
+    )
+
+    assert "'--bind', '127.0.0.1'" in start_gateway
+    assert "OPENSQUILLA_GATEWAY_HOST" not in start_gateway
+    assert "OPENSQUILLA_LISTEN" not in start_gateway
+    assert "'0.0.0.0'" not in start_gateway
+
+
 def test_desktop_activation_and_second_instance_share_safe_reveal_helper() -> None:
     main_ts = _read("desktop/electron/src/main.ts")
 
