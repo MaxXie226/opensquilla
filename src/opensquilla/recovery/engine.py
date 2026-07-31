@@ -22,6 +22,7 @@ from opensquilla.recovery.atomic import (
     PathIdentity,
     _chmod_open_file,
     _native_io_path,
+    is_path_redirecting_stat,
     native_move_no_replace,
 )
 from opensquilla.recovery.config_patch import (
@@ -45,6 +46,7 @@ from opensquilla.recovery.locking import (
     ProfileOperationLock,
     acquire_profile_locks,
     replacement_history_lock_scope,
+    resolve_home_link,
 )
 from opensquilla.recovery.models import RecoveryOutcome, RecoveryReport, WorkspaceCandidate
 
@@ -447,8 +449,7 @@ def _workspace_status(path: Path, *, explicitly_configured: bool) -> WorkspaceCa
             configured=explicitly_configured,
         )
 
-    attributes = int(getattr(own_stat, "st_file_attributes", 0))
-    is_link = stat.S_ISLNK(own_stat.st_mode) or bool(attributes & 0x400)
+    is_link = is_path_redirecting_stat(own_stat)
     try:
         target_stat = _native_stat(path) if is_link and explicitly_configured else own_stat
         valid = stat.S_ISDIR(target_stat.st_mode) and _native_access(path, os.R_OK | os.X_OK)
@@ -583,10 +584,8 @@ def _regular_source_stat(path: Path) -> os.stat_result | None:
             "runtime database bundle cannot be inspected",
             stable_code="state_database_unreadable",
         ) from exc
-    attributes = int(getattr(value, "st_file_attributes", 0))
     if (
-        stat.S_ISLNK(value.st_mode)
-        or attributes & 0x400
+        is_path_redirecting_stat(value)
         or not stat.S_ISREG(value.st_mode)
         or value.st_nlink != 1
     ):
@@ -847,8 +846,7 @@ def _profile_top_level_entries(home: Path) -> tuple[str, ...] | None:
         return ()
     except OSError:
         return None
-    attributes = int(getattr(before, "st_file_attributes", 0))
-    if stat.S_ISLNK(before.st_mode) or attributes & 0x400 or not stat.S_ISDIR(before.st_mode):
+    if is_path_redirecting_stat(before) or not stat.S_ISDIR(before.st_mode):
         return None
     try:
         entries = tuple(sorted(entry.name for entry in os.scandir(_native_io_path(home))))
@@ -869,10 +867,7 @@ def _home_is_unsafe(path: Path) -> bool:
         return False
     except OSError:
         return True
-    attributes = int(getattr(value, "st_file_attributes", 0))
-    return (
-        stat.S_ISLNK(value.st_mode) or bool(attributes & 0x400) or not stat.S_ISDIR(value.st_mode)
-    )
+    return is_path_redirecting_stat(value) or not stat.S_ISDIR(value.st_mode)
 
 
 def _legacy_layout_is_proven(home: Path, config: _ConfigView) -> bool:
@@ -910,8 +905,7 @@ def _plain_role_source(path: Path, expected_type: str) -> bool:
         value = _native_lstat(path)
     except OSError:
         return False
-    attributes = int(getattr(value, "st_file_attributes", 0))
-    if stat.S_ISLNK(value.st_mode) or attributes & 0x400:
+    if is_path_redirecting_stat(value):
         return False
     if expected_type == "directory":
         return stat.S_ISDIR(value.st_mode)
@@ -1702,12 +1696,7 @@ def _plain_canonical_directory(path: Path) -> bool:
         return True
     except OSError:
         return False
-    attributes = int(getattr(value, "st_file_attributes", 0))
-    return (
-        not stat.S_ISLNK(value.st_mode)
-        and not attributes & 0x400
-        and stat.S_ISDIR(value.st_mode)
-    )
+    return not is_path_redirecting_stat(value) and stat.S_ISDIR(value.st_mode)
 
 
 def _recovery_profile_isolation_code(home: Path, config: _ConfigView) -> str | None:
@@ -1866,6 +1855,16 @@ def _report(
     )
 
 
+def _resolved_home_path(home: str | Path | None) -> Path:
+    if home is None:
+        from opensquilla.paths import default_opensquilla_home
+
+        home_path = default_opensquilla_home().expanduser().absolute()
+    else:
+        home_path = _absolute(home)
+    return resolve_home_link(home_path)
+
+
 def inspect_profile(
     home: str | Path | None = None,
     *,
@@ -1875,12 +1874,7 @@ def inspect_profile(
 ) -> RecoveryReport:
     """Inspect a Desktop profile without creating or modifying any path."""
 
-    if home is None:
-        from opensquilla.paths import default_opensquilla_home
-
-        home_path = default_opensquilla_home().expanduser().absolute()
-    else:
-        home_path = _absolute(home)
+    home_path = _resolved_home_path(home)
     kind = _profile_kind(profile_kind, home=home_path)
     if _home_is_unsafe(home_path):
         config = _ConfigView(
@@ -2241,7 +2235,7 @@ def reconcile_profile(
 ) -> RecoveryReport:
     """Reconcile each uniquely proven, no-conflict legacy role independently."""
 
-    home_path = _absolute(home)
+    home_path = resolve_home_link(_absolute(home))
     resolved_kind = _profile_kind(profile_kind, home=home_path)
     with acquire_profile_locks(
         home_path,
@@ -2376,7 +2370,7 @@ def choose_workspace(
 ) -> RecoveryReport:
     """CAS-patch the configured workspace after explicit user selection."""
 
-    home_path = _absolute(home)
+    home_path = resolve_home_link(_absolute(home))
     workspace_path = _absolute(workspace, relative_to=home_path)
     resolved_kind = _profile_kind(profile_kind, home=home_path)
     with ProfileOperationLock(home_path, timeout=lock_timeout):
@@ -2426,12 +2420,7 @@ def guard_desktop_profile(home: str | Path | None = None) -> RecoveryReport | No
     runtime entry points.
     """
 
-    if home is None:
-        from opensquilla.paths import default_opensquilla_home
-
-        home_path = default_opensquilla_home().expanduser().absolute()
-    else:
-        home_path = _absolute(home)
+    home_path = _resolved_home_path(home)
     kind = _profile_kind(None, home=home_path)
     if kind not in _DESKTOP_PROFILE_KINDS:
         return None
@@ -2457,12 +2446,7 @@ def guarded_desktop_profile(
     same-process acquisition is intentionally reentrant.
     """
 
-    if home is None:
-        from opensquilla.paths import default_opensquilla_home
-
-        home_path = default_opensquilla_home().expanduser().absolute()
-    else:
-        home_path = _absolute(home)
+    home_path = _resolved_home_path(home)
     with ProfileOperationLock(home_path, timeout=lock_timeout):
         kind = _profile_kind(None, home=home_path)
         report: RecoveryReport | None = None

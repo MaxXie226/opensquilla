@@ -1030,7 +1030,7 @@ def test_workspace_choice_is_blocked_when_config_mutation_is_not_safe(
     assert (home / "config.toml").read_bytes() == config_before
 
 
-def test_workspace_choice_never_follows_unsafe_profile_home(tmp_path: Path) -> None:
+def test_workspace_choice_resolves_linked_profile_home(tmp_path: Path) -> None:
     real_home = tmp_path / "real-home"
     selected = _workspace(tmp_path / "selected")
     _workspace(real_home / "workspace")
@@ -1040,19 +1040,22 @@ def test_workspace_choice_never_follows_unsafe_profile_home(tmp_path: Path) -> N
         linked_home.symlink_to(real_home, target_is_directory=True)
     except OSError:
         pytest.skip("symlink creation is unavailable")
-    config_before = (real_home / "config.toml").read_bytes()
     report = inspect_profile(linked_home)
 
-    assert report.stable_code == "profile_unsafe_path"
-    assert "choose-workspace" not in report.allowed_actions
-    with pytest.raises(InvalidWorkspaceError):
-        choose_workspace(
-            linked_home,
-            transaction_id=report.transaction_id,
-            expected_revision=report.revision,
-            workspace=selected,
-        )
-    assert (real_home / "config.toml").read_bytes() == config_before
+    direct = inspect_profile(real_home)
+    assert report.outcome == direct.outcome
+    assert report.stable_code == direct.stable_code
+    assert Path(report.primary_home) == real_home
+    assert "choose-workspace" in report.allowed_actions
+    choose_workspace(
+        linked_home,
+        transaction_id=report.transaction_id,
+        expected_revision=report.revision,
+        workspace=selected,
+    )
+    assert linked_home.is_symlink()
+    config_after = (real_home / "config.toml").read_text(encoding="utf-8")
+    assert str(selected) in config_after
 
 
 @pytest.mark.parametrize(
@@ -1147,22 +1150,39 @@ def test_legacy_import_journal_prevents_missing_target_from_looking_fresh(
     assert journal.read_bytes() == before
 
 
-@pytest.mark.parametrize("as_file", [False, True])
-def test_profile_root_link_or_special_path_fails_closed(
-    tmp_path: Path,
-    as_file: bool,
-) -> None:
+def test_profile_root_special_path_fails_closed(tmp_path: Path) -> None:
     profile = tmp_path / "opensquilla"
-    if as_file:
-        profile.write_text("not a profile directory\n", encoding="utf-8")
-    else:
-        real = tmp_path / "real-profile"
-        _workspace(real / "workspace")
-        _desktop_config(real)
-        try:
-            profile.symlink_to(real, target_is_directory=True)
-        except OSError:
-            pytest.skip("symlink creation is unavailable")
+    profile.write_text("not a profile directory\n", encoding="utf-8")
+
+    report = inspect_profile(profile)
+
+    assert report.outcome == "recovery_required"
+    assert report.stable_code == "profile_unsafe_path"
+    assert report.candidates == ()
+
+
+def test_profile_root_link_resolves_to_target(tmp_path: Path) -> None:
+    real = tmp_path / "real-profile"
+    _workspace(real / "workspace")
+    _desktop_config(real)
+    profile = tmp_path / "opensquilla"
+    try:
+        profile.symlink_to(real, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlink creation is unavailable")
+
+    report = inspect_profile(profile)
+
+    assert report.outcome == "ready"
+    assert Path(report.primary_home) == real
+
+
+def test_profile_root_dangling_link_fails_closed(tmp_path: Path) -> None:
+    profile = tmp_path / "opensquilla"
+    try:
+        profile.symlink_to(tmp_path / "does-not-exist", target_is_directory=True)
+    except OSError:
+        pytest.skip("symlink creation is unavailable")
 
     report = inspect_profile(profile)
 
