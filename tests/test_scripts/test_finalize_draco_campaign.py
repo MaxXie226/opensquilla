@@ -7409,6 +7409,7 @@ def test_explicit_byok_fails_policy_but_preserves_execution(module, tmp_path: Pa
     assert manifest["execution_pass"] is True
     assert manifest["policy_pass"] is False
     assert proof["pass"] is False
+    assert proof["publication_eligible"] is True
     assert proof["policy_pass"] is False
     assert proof["local_physical_request_evidence"]["explicit_byok_request_count"] == 1
     assert audit["execution_pass"] is True

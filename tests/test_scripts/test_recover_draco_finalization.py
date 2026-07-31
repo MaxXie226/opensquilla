@@ -108,11 +108,44 @@ def _fake_finalizer(module, plan, _lock_fd: int) -> dict[str, Any]:
     _write_text(formal / "results.jsonl", '{"group":"B0","task_id":"task-1"}\n')
     _write_text(formal / "trace.jsonl", '{"group":"B0","task_id":"task-1"}\n')
     _write_text(formal / "actual-spend-ledger.jsonl", "")
+    reconciliation = {
+        "pass": True,
+        "status": "exact",
+        "gap_usd": "0",
+        "tolerance_usd": "0.000001",
+    }
     _write_json(
         formal / "openrouter-non-byok-campaign-proof.json",
-        {"pass": True},
+        {
+            "pass": True,
+            "publication_eligible": True,
+            "execution_pass": True,
+            "policy_pass": True,
+            "reconciliation": reconciliation,
+            "status": "passed",
+            "cost_scope": {
+                "ledger_window_reconciliation": [
+                    {
+                        "reconciliation_status": "exact",
+                        "reconciliation_gap_usd": "0",
+                        "unknown_cost_request_count": 0,
+                        "non_exact_cost_request_count": 0,
+                    }
+                ]
+            },
+        },
     )
-    _write_json(formal / "audit.json", {"pass": True})
+    _write_json(
+        formal / "audit.json",
+        {
+            "pass": True,
+            "status": "passed",
+            "execution_pass": True,
+            "policy_pass": True,
+            "reconciliation": reconciliation,
+            "warnings": [],
+        },
+    )
     _write_text(formal / "EXPERIMENT_RESULTS.md", "# Complete\n")
 
     current_sources = [
@@ -124,6 +157,12 @@ def _fake_finalizer(module, plan, _lock_fd: int) -> dict[str, Any]:
     manifest: dict[str, Any] = {
         "schema": module.MANIFEST_SCHEMA,
         "status": "complete",
+        "execution_pass": True,
+        "policy_pass": True,
+        "reconciliation": reconciliation,
+        "audit_pass": True,
+        "audit_status": "passed",
+        "warnings": [],
         "finalizer_version": 5,
         "groups": ["B0"],
         "task_count": 1,
@@ -167,6 +206,82 @@ def _fake_finalizer(module, plan, _lock_fd: int) -> dict[str, Any]:
     manifest["manifest_sha256"] = module._canonical_sha256(manifest)
     _write_json(formal / "manifest.json", manifest)
     return manifest
+
+
+def _rewrite_formal_states(
+    module,
+    formal: Path,
+    *,
+    audit_pass: bool,
+    policy_pass: bool,
+    proof_pass: bool,
+    publication_eligible: bool,
+    reconciliation: dict[str, Any],
+    warnings: list[str],
+) -> None:
+    audit_status = "passed" if audit_pass else "complete_with_warnings"
+    audit = json.loads((formal / "audit.json").read_text(encoding="utf-8"))
+    audit.update(
+        {
+            "pass": audit_pass,
+            "status": audit_status,
+            "execution_pass": True,
+            "policy_pass": policy_pass,
+            "reconciliation": reconciliation,
+            "warnings": warnings,
+        }
+    )
+    proof = json.loads(
+        (formal / "openrouter-non-byok-campaign-proof.json").read_text(encoding="utf-8")
+    )
+    proof.update(
+        {
+            "pass": proof_pass,
+            "publication_eligible": publication_eligible,
+            "execution_pass": True,
+            "policy_pass": policy_pass,
+            "reconciliation": reconciliation,
+            "status": (
+                "policy_failed"
+                if not policy_pass
+                else "passed"
+                if reconciliation.get("pass") is True
+                else "reconciliation_incomplete"
+            ),
+            "cost_scope": {
+                "ledger_window_reconciliation": [
+                    {
+                        "reconciliation_status": reconciliation["status"],
+                        "reconciliation_gap_usd": reconciliation["gap_usd"],
+                        "unknown_cost_request_count": (
+                            0 if reconciliation.get("pass") is True else 1
+                        ),
+                        "non_exact_cost_request_count": 0,
+                    }
+                ]
+            },
+        }
+    )
+    _write_json(formal / "audit.json", audit)
+    _write_json(formal / "openrouter-non-byok-campaign-proof.json", proof)
+
+    manifest = json.loads((formal / "manifest.json").read_text(encoding="utf-8"))
+    manifest.update(
+        {
+            "execution_pass": True,
+            "policy_pass": policy_pass,
+            "reconciliation": reconciliation,
+            "audit_pass": audit_pass,
+            "audit_status": audit_status,
+            "warnings": warnings,
+        }
+    )
+    manifest["artifacts"] = {
+        name: _artifact_record(module, formal / name) for name in module.ARTIFACT_NAMES
+    }
+    manifest.pop("manifest_sha256", None)
+    manifest["manifest_sha256"] = module._canonical_sha256(manifest)
+    _write_json(formal / "manifest.json", manifest)
 
 
 def test_status_reports_ready_without_writing_campaign(module, tmp_path: Path) -> None:
@@ -284,6 +399,132 @@ def test_valid_staging_resumes_publication_without_rerunning_finalizer(
     )
     assert status["state"] == "complete"
     assert (campaign / "manifest.json").is_file()
+
+
+def test_recovery_publishes_execution_complete_with_reconciliation_warning(
+    module,
+    tmp_path: Path,
+) -> None:
+    campaign, _ = _campaign_fixture(module, tmp_path)
+    plan = module.discover_plan(campaign)
+    _fake_finalizer(module, plan, -1)
+    reconciliation = {
+        "pass": False,
+        "status": "account_exact_per_request_incomplete",
+        "gap_usd": "0E-9",
+        "tolerance_usd": "0.000001",
+    }
+    _rewrite_formal_states(
+        module,
+        plan.formal_dir,
+        audit_pass=False,
+        policy_pass=True,
+        proof_pass=True,
+        publication_eligible=False,
+        reconciliation=reconciliation,
+        warnings=["per-request cost evidence is incomplete"],
+    )
+
+    inspected = module.inspect_campaign(campaign)
+    assert inspected["state"] == "publish_ready"
+    assert inspected["execution_pass"] is True
+    assert inspected["audit_pass"] is False
+    assert inspected["audit_status"] == "complete_with_warnings"
+    assert inspected["policy_pass"] is True
+    assert inspected["reconciliation"] == reconciliation
+
+    def must_not_run(_plan, _lock_fd):
+        raise AssertionError("coherent warning-only staging must not rerun the finalizer")
+
+    status = module.recover_campaign(
+        campaign,
+        finalizer_path=SCRIPT.with_name("finalize_draco_campaign.py"),
+        _runner=must_not_run,
+    )
+    assert status["state"] == "complete"
+    assert status["execution_pass"] is True
+    assert status["audit_pass"] is False
+    assert (campaign / "manifest.json").is_file()
+
+
+def test_recovery_publishes_explicitly_eligible_policy_warning(
+    module,
+    tmp_path: Path,
+) -> None:
+    campaign, _ = _campaign_fixture(module, tmp_path)
+    plan = module.discover_plan(campaign)
+    _fake_finalizer(module, plan, -1)
+    reconciliation = {
+        "pass": True,
+        "status": "exact",
+        "gap_usd": "0",
+        "tolerance_usd": "0.000001",
+    }
+    _rewrite_formal_states(
+        module,
+        plan.formal_dir,
+        audit_pass=False,
+        policy_pass=False,
+        proof_pass=False,
+        publication_eligible=True,
+        reconciliation=reconciliation,
+        warnings=["explicit BYOK evidence is preserved as a policy warning"],
+    )
+
+    status = module.recover_campaign(
+        campaign,
+        finalizer_path=SCRIPT.with_name("finalize_draco_campaign.py"),
+        _runner=lambda _plan, _lock_fd: (_ for _ in ()).throw(
+            AssertionError("eligible policy warning must not rerun the finalizer")
+        ),
+    )
+    assert status["state"] == "complete"
+    assert status["execution_pass"] is True
+    assert status["audit_pass"] is False
+    assert status["policy_pass"] is False
+
+
+def test_recovery_rejects_incoherent_publication_states(module, tmp_path: Path) -> None:
+    campaign, _ = _campaign_fixture(module, tmp_path)
+    plan = module.discover_plan(campaign)
+    _fake_finalizer(module, plan, -1)
+    manifest_path = plan.formal_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["policy_pass"] = False
+    manifest.pop("manifest_sha256", None)
+    manifest["manifest_sha256"] = module._canonical_sha256(manifest)
+    _write_json(manifest_path, manifest)
+
+    status = module.inspect_campaign(campaign)
+    assert status["state"] == "blocked"
+    assert status["reason_code"] == "policy_state_mismatch"
+    assert not (campaign / "manifest.json").exists()
+
+
+def test_recovery_rejects_warning_only_account_gap(module, tmp_path: Path) -> None:
+    campaign, _ = _campaign_fixture(module, tmp_path)
+    plan = module.discover_plan(campaign)
+    _fake_finalizer(module, plan, -1)
+    _rewrite_formal_states(
+        module,
+        plan.formal_dir,
+        audit_pass=False,
+        policy_pass=True,
+        proof_pass=True,
+        publication_eligible=False,
+        reconciliation={
+            "pass": False,
+            "status": "account_exact_per_request_incomplete",
+            "gap_usd": "0.01",
+            "tolerance_usd": "0.000001",
+        },
+        warnings=["per-request cost evidence is incomplete"],
+    )
+
+    status = module.inspect_campaign(campaign)
+    assert status["state"] == "blocked"
+    assert status["reason_code"] == "unsafe_incomplete_reconciliation"
+    assert not (campaign / "manifest.json").exists()
 
 
 def test_staging_bound_to_an_older_wave_set_is_blocked(module, tmp_path: Path) -> None:

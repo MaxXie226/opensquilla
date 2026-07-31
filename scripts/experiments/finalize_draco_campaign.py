@@ -10903,6 +10903,7 @@ def validate_account_proof(
     proof = {
         "schema": PROOF_SCHEMA,
         "pass": policy_pass,
+        "publication_eligible": True,
         "execution_pass": True,
         "policy_pass": policy_pass,
         "reconciliation": {

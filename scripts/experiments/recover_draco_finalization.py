@@ -380,6 +380,195 @@ def _require_archived_source(
         raise RecoveryError("source_hash_mismatch", f"{label} hash differs")
 
 
+def _validate_publication_state_bindings(
+    *,
+    manifest: Mapping[str, Any],
+    audit: Mapping[str, Any],
+    proof: Mapping[str, Any],
+) -> None:
+    """Keep execution publication independent from policy/cost audit status."""
+
+    if not all(
+        value is True
+        for value in (
+            manifest.get("execution_pass"),
+            audit.get("execution_pass"),
+            proof.get("execution_pass"),
+        )
+    ):
+        raise RecoveryError(
+            "execution_audit_failed",
+            "formal artifacts do not agree on a successful execution",
+        )
+
+    policy_values = (
+        manifest.get("policy_pass"),
+        audit.get("policy_pass"),
+        proof.get("policy_pass"),
+    )
+    if (
+        any(not isinstance(value, bool) for value in policy_values)
+        or len(set(policy_values)) != 1
+        or proof.get("pass") is not policy_values[0]
+    ):
+        raise RecoveryError(
+            "policy_state_mismatch",
+            "formal manifest, audit, and account proof policy states differ",
+        )
+
+    reconciliations = (
+        manifest.get("reconciliation"),
+        audit.get("reconciliation"),
+        proof.get("reconciliation"),
+    )
+    if (
+        any(not isinstance(value, Mapping) for value in reconciliations)
+        or not (reconciliations[0] == reconciliations[1] == reconciliations[2])
+    ):
+        raise RecoveryError(
+            "reconciliation_state_mismatch",
+            "formal manifest, audit, and account proof reconciliation states differ",
+        )
+
+    audit_pass = audit.get("pass")
+    audit_status = audit.get("status")
+    if (
+        not isinstance(audit_pass, bool)
+        or manifest.get("audit_pass") is not audit_pass
+        or manifest.get("audit_status") != audit_status
+        or audit_status
+        != ("passed" if audit_pass else "complete_with_warnings")
+    ):
+        raise RecoveryError(
+            "audit_state_mismatch",
+            "formal manifest and audit publication states differ",
+        )
+    audit_warnings = audit.get("warnings")
+    if (
+        not isinstance(audit_warnings, list)
+        or manifest.get("warnings") != audit_warnings
+        or (not audit_pass and not audit_warnings)
+    ):
+        raise RecoveryError(
+            "audit_warning_mismatch",
+            "formal manifest and audit warnings differ",
+        )
+
+    if audit_pass:
+        if policy_values[0] is not True or reconciliations[0].get("pass") is not True:
+            raise RecoveryError(
+                "invalid_passing_audit",
+                "a passing formal audit has failed policy or reconciliation",
+            )
+        return
+
+    proof_publication_eligible = proof.get("publication_eligible") is True
+    reconciliation = reconciliations[0]
+    reconciliation_warning_only = (
+        policy_values[0] is True
+        and proof.get("pass") is True
+        and reconciliation.get("pass") is False
+        and reconciliation.get("status") == "account_exact_per_request_incomplete"
+    )
+    if reconciliation_warning_only:
+        try:
+            gap = Decimal(str(reconciliation.get("gap_usd")))
+            tolerance = Decimal(str(reconciliation.get("tolerance_usd")))
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise RecoveryError(
+                "invalid_incomplete_reconciliation",
+                "warning-only reconciliation has invalid numeric evidence",
+            ) from exc
+        if (
+            not gap.is_finite()
+            or not tolerance.is_finite()
+            or tolerance < 0
+            or tolerance > Decimal("0.000001")
+            or abs(gap) > tolerance
+        ):
+            raise RecoveryError(
+                "unsafe_incomplete_reconciliation",
+                "warning-only reconciliation is outside the exact account tolerance",
+            )
+        cost_scope = proof.get("cost_scope")
+        windows = (
+            cost_scope.get("ledger_window_reconciliation")
+            if isinstance(cost_scope, Mapping)
+            else None
+        )
+        if not isinstance(windows, list) or not windows:
+            raise RecoveryError(
+                "missing_window_reconciliation",
+                "warning-only reconciliation lacks account-window ledger evidence",
+            )
+        incomplete_windows = 0
+        for window in windows:
+            if not isinstance(window, Mapping):
+                raise RecoveryError(
+                    "invalid_window_reconciliation",
+                    "account-window reconciliation is not an object",
+                )
+            status = window.get("reconciliation_status")
+            unknown = window.get("unknown_cost_request_count")
+            non_exact = window.get("non_exact_cost_request_count")
+            try:
+                window_gap = Decimal(str(window.get("reconciliation_gap_usd")))
+            except (InvalidOperation, TypeError, ValueError) as exc:
+                raise RecoveryError(
+                    "invalid_window_reconciliation",
+                    "account-window reconciliation has an invalid gap",
+                ) from exc
+            if (
+                not window_gap.is_finite()
+                or abs(window_gap) > tolerance
+                or isinstance(unknown, bool)
+                or not isinstance(unknown, int)
+                or unknown < 0
+                or isinstance(non_exact, bool)
+                or not isinstance(non_exact, int)
+                or non_exact < 0
+            ):
+                raise RecoveryError(
+                    "unsafe_window_reconciliation",
+                    "account-window reconciliation is outside the publication contract",
+                )
+            incomplete_count = unknown + non_exact
+            if status == "exact":
+                if incomplete_count:
+                    raise RecoveryError(
+                        "unsafe_window_reconciliation",
+                        "an exact account window contains incomplete requests",
+                    )
+            elif status == "account_exact_per_request_incomplete":
+                if incomplete_count <= 0:
+                    raise RecoveryError(
+                        "unsafe_window_reconciliation",
+                        "an incomplete account window lacks incomplete requests",
+                    )
+                incomplete_windows += 1
+            else:
+                raise RecoveryError(
+                    "unsafe_window_reconciliation",
+                    "account-window reconciliation has a conflicting status",
+                )
+        if incomplete_windows <= 0:
+            raise RecoveryError(
+                "missing_incomplete_window",
+                "warning-only reconciliation lacks an incomplete account window",
+            )
+    if proof_publication_eligible and proof.get("pass") is not True:
+        if proof.get("status") not in {"policy_failed", "audit_conflict"}:
+            raise RecoveryError(
+                "invalid_publication_eligibility",
+                "failed account proof lacks an allowed audit-only status",
+            )
+    if not (proof_publication_eligible or reconciliation_warning_only):
+        raise RecoveryError(
+            "audit_failed",
+            "formal audit failure is not explicitly publication eligible",
+        )
+
+
 def _validate_manifest_and_artifacts(
     *,
     campaign_dir: Path,
@@ -613,10 +802,11 @@ def _validate_manifest_and_artifacts(
         container / "openrouter-non-byok-campaign-proof.json",
         label="formal non-BYOK proof",
     )
-    if audit.get("pass") is not True:
-        raise RecoveryError("audit_failed", "formal audit does not pass")
-    if proof.get("pass") is not True:
-        raise RecoveryError("account_proof_failed", "formal account proof does not pass")
+    _validate_publication_state_bindings(
+        manifest=manifest,
+        audit=audit,
+        proof=proof,
+    )
 
     raw_result_count = manifest.get("result_count")
     raw_task_count = manifest.get("task_count")
@@ -761,6 +951,11 @@ def _status_payload(
                 "result_count": manifest.get("result_count"),
                 "manifest_sha256": manifest.get("manifest_sha256"),
                 "finalizer_version": manifest.get("finalizer_version"),
+                "execution_pass": manifest.get("execution_pass"),
+                "audit_pass": manifest.get("audit_pass"),
+                "audit_status": manifest.get("audit_status"),
+                "policy_pass": manifest.get("policy_pass"),
+                "reconciliation": manifest.get("reconciliation"),
             }
         )
     if error is not None:
@@ -804,7 +999,7 @@ def inspect_campaign(campaign_dir: Path) -> dict[str, Any]:
             )
         plan = discover_plan(campaign)
         if plan.formal_dir.exists() or plan.formal_dir.is_symlink():
-            _validate_manifest_and_artifacts(
+            manifest = _validate_manifest_and_artifacts(
                 campaign_dir=campaign,
                 container=plan.formal_dir,
                 staged=True,
@@ -815,6 +1010,7 @@ def inspect_campaign(campaign_dir: Path) -> dict[str, Any]:
                 state="publish_ready",
                 reason_code="valid_formal_staging_present",
                 plan=plan,
+                manifest=manifest,
             )
         generation_exhausted, judge_exhausted = _terminal_gate_budget_exhaustion(
             plan.archive_dir
