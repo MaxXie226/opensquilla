@@ -72,11 +72,11 @@ def test_settings_exposes_all_sandbox_sections() -> None:
         "requireApprovalPrefixes",
         "blockAllNetwork",
         "runtimeVersions",
-        "sandbox-listen-lan",
-        "allowedClientCidrs",
         "create-sandbox-token",
     ):
         assert marker in panel
+    assert 'data-testid="sandbox-listen-lan"' not in panel
+    assert "allowedClientCidrs" not in panel
 
 
 def test_formal_runtime_targets_are_pinned_and_windows_bundles_git_bash() -> None:

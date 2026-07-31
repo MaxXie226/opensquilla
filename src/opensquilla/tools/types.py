@@ -129,10 +129,6 @@ class ToolContext:
     execution_id: str | None = None
     sandbox_session_manager: Any | None = None
     sandbox_gateway_config: Any | None = None
-    # Immutable Safe policy snapshot pinned at the start of this turn.  The
-    # settings RPC may publish a newer version concurrently, but tools in an
-    # already-running turn must keep evaluating one coherent policy.
-    sandbox_policy: Any | None = field(default=None, repr=False)
     # Resolved per turn by the engine (see tools.description_overrides).
     # Keys name a tool or a "tool.param" parameter; values replace the
     # matching model-facing description verbatim. None = mechanism off.
@@ -148,6 +144,10 @@ class ToolContext:
     # guidance pointing at <scratch_dir>/verify-mirror/<workspace-relative-path>.
     scratch_verify_mirror_active: bool = False
 
+    # Immutable Safe policy snapshot pinned at the start of this turn. New
+    # runtime fields stay after the legacy positional tail so embedded callers
+    # that still construct ToolContext positionally keep their field mapping.
+    sandbox_policy: Any | None = field(default=None, repr=False)
     # Set only by the authenticated channel ingress boundary. Keeping this
     # separate from ``is_owner`` prevents a generic owner-context leak from
     # promoting a channel caller through the admin-only tool matrix.
