@@ -3151,3 +3151,29 @@ def test_blocked_consolidation_defers_only_after_primary_is_bootable() -> None:
     assert "inspection.allowed_actions.includes('recover-config')" in startup
     assert "'recover-config', '--home', active.home, '--json'," in startup
     assert "'config_auto_recovery_failed'" in startup
+
+
+def test_recovery_protocol_detail_reaches_the_blocking_panel() -> None:
+    """The engine's sanitized diagnosis travels intact from CLI JSON to boot UI."""
+
+    main_ts = _read("desktop/electron/src/main.ts")
+    boot_html = _read("desktop/electron/src/boot.html")
+    parse = _section(
+        main_ts,
+        "function parseRecoveryProtocol",
+        "function parseDesktopProfileConsolidationProtocol",
+    )
+    render_recovery = _section(
+        boot_html,
+        "function renderRecoveryState(state, moveFocus = true)",
+        "async function runRecoveryAction",
+    )
+
+    assert "detail: string | null" in main_ts
+    # Older CLIs omit the key entirely; both absence and null render nothing.
+    assert "typeof record.detail === 'string' ? record.detail : null" in parse
+    assert "detail: null," in main_ts
+    assert 'id="recoveryDetail"' in boot_html
+    assert "typeof inspection.detail === 'string'" in render_recovery
+    assert "recoveryDetail.textContent = detail" in render_recovery
+    assert "recoveryDetail.hidden = !detail" in render_recovery

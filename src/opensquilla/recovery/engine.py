@@ -189,6 +189,7 @@ class _ConfigView:
     state_explicit: bool = False
     state_from_env: bool = False
     error_code: str | None = None
+    error_detail: str | None = None
 
 
 @dataclass(frozen=True)
@@ -252,6 +253,7 @@ def _read_config(home: Path) -> _ConfigView:
             workspace_from_env=True,
             state_dir=None,
             error_code=exc.stable_code,
+            error_detail=str(exc),
         )
     try:
         state_env = state_override(home)
@@ -266,6 +268,7 @@ def _read_config(home: Path) -> _ConfigView:
             state_dir=None,
             state_from_env=True,
             error_code=exc.stable_code,
+            error_detail=str(exc),
         )
     try:
         snapshot = ConfigSnapshot.capture(config_path)
@@ -281,6 +284,7 @@ def _read_config(home: Path) -> _ConfigView:
             error_code=(
                 "config_unsafe_path" if exc.stable_code == "unsafe_path" else "config_unreadable"
             ),
+            error_detail=str(exc),
         )
     exists = snapshot.identity is not None
     if not exists:
@@ -288,7 +292,7 @@ def _read_config(home: Path) -> _ConfigView:
     else:
         try:
             payload = tomllib.loads(snapshot.data.decode("utf-8"))
-        except (UnicodeDecodeError, tomllib.TOMLDecodeError):
+        except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
             return _ConfigView(
                 path=config_path,
                 exists=True,
@@ -298,6 +302,7 @@ def _read_config(home: Path) -> _ConfigView:
                 workspace_from_env=workspace_env is not None,
                 state_dir=None,
                 error_code="config_invalid",
+                error_detail=f"config.toml is not valid TOML: {exc}",
             )
 
     assert payload is not None
@@ -312,6 +317,7 @@ def _read_config(home: Path) -> _ConfigView:
             workspace_from_env=workspace_env is not None,
             state_dir=None,
             error_code="config_invalid",
+            error_detail="config_version must be an integer",
         )
     if config_version > SUPPORTED_CONFIG_VERSION:
         return _ConfigView(
@@ -323,6 +329,10 @@ def _read_config(home: Path) -> _ConfigView:
             workspace_from_env=workspace_env is not None,
             state_dir=None,
             error_code="config_schema_too_new",
+            error_detail=(
+                f"config_version {config_version} is newer than this build supports "
+                f"({SUPPORTED_CONFIG_VERSION}); upgrade OpenSquilla instead of editing"
+            ),
         )
 
     state_raw = payload.get("state_dir")
@@ -336,6 +346,7 @@ def _read_config(home: Path) -> _ConfigView:
             workspace_from_env=workspace_env is not None,
             state_dir=None,
             error_code="config_invalid",
+            error_detail="state_dir must be a path string",
         )
     if state_env is not None:
         _state_name, state_value = state_env
@@ -364,6 +375,7 @@ def _read_config(home: Path) -> _ConfigView:
             state_explicit=state_explicit,
             state_from_env=state_from_env,
             error_code="config_invalid",
+            error_detail="workspace_dir must be a path string",
         )
     if workspace_env is None or state_env is None:
         legacy_probe = _ConfigView(
@@ -387,6 +399,7 @@ def _read_config(home: Path) -> _ConfigView:
                         payload=None,
                         workspace_from_env=True,
                         error_code=exc.stable_code,
+                        error_detail=str(exc),
                     )
             if state_env is None:
                 try:
@@ -397,6 +410,7 @@ def _read_config(home: Path) -> _ConfigView:
                         payload=None,
                         state_from_env=True,
                         error_code=exc.stable_code,
+                        error_detail=str(exc),
                     )
                 if state_env is not None:
                     _state_name, state_value = state_env
@@ -1871,6 +1885,18 @@ def _revision(
     return int.from_bytes(digest[:8], "big") & ((1 << 53) - 1)
 
 
+def _sanitize_detail(detail: str | None, home: Path) -> str | None:
+    """Spell the profile home as ``<HOME>`` before a detail enters the protocol.
+
+    Desktop diagnostics redact the same prefix, so a detail string never
+    widens what the fixed JSON protocol reveals about the local filesystem.
+    """
+
+    if detail is None:
+        return None
+    return detail.replace(str(home), "<HOME>")
+
+
 def _report(
     *,
     home: Path,
@@ -1881,6 +1907,7 @@ def _report(
     effective_workspace: Path | None,
     allowed_actions: tuple[str, ...],
     cleanup_journal: Path | None = None,
+    detail: str | None = None,
 ) -> RecoveryReport:
     transaction_id = str(uuid.uuid5(_TRANSACTION_NAMESPACE, _path_key(home)))
     return RecoveryReport(
@@ -1898,6 +1925,7 @@ def _report(
             stable_code,
             cleanup_journal=cleanup_journal,
         ),
+        detail=_sanitize_detail(detail, home),
     )
 
 
@@ -1947,6 +1975,7 @@ def inspect_profile(
             stable_code="profile_unsafe_path",
             effective_workspace=None,
             allowed_actions=_RECOVERY_ACTIONS,
+            detail=f"{home_path} is a link or is not a plain directory",
         )
     config = _read_config(home_path)
     candidates = _candidate_set(home_path, config)
@@ -2034,6 +2063,7 @@ def inspect_profile(
             stable_code=config.error_code,
             effective_workspace=None,
             allowed_actions=actions,
+            detail=config.error_detail,
         )
     if kind == "desktop-recovery":
         isolation_code = _recovery_profile_isolation_code(home_path, config)

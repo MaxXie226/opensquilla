@@ -282,6 +282,7 @@ interface RecoveryProtocolResult {
   allowed_actions: string[]
   transaction_id: string | null
   revision: number
+  detail: string | null
 }
 
 type DesktopProfileConsolidationOutcome = 'noop' | 'consolidated' | 'blocked'
@@ -6485,6 +6486,14 @@ function parseRecoveryProtocol(value: unknown): RecoveryProtocolResult {
   if (!Number.isSafeInteger(record.revision) || Number(record.revision) < 0) {
     throw new Error('Recovery command returned an invalid revision.')
   }
+  // Older CLIs omit detail; absence and null both mean "no diagnosis".
+  if (
+    record.detail !== undefined
+    && record.detail !== null
+    && typeof record.detail !== 'string'
+  ) {
+    throw new Error('Recovery command returned an invalid detail.')
+  }
   return {
     schema_version: RECOVERY_PROTOCOL_SCHEMA_VERSION,
     outcome,
@@ -6495,6 +6504,7 @@ function parseRecoveryProtocol(value: unknown): RecoveryProtocolResult {
     allowed_actions: allowedActions,
     transaction_id: record.transaction_id as string | null,
     revision: Number(record.revision),
+    detail: typeof record.detail === 'string' ? record.detail : null,
   }
 }
 
@@ -6889,6 +6899,7 @@ function recoveryFailureResult(home: string, stableCode: string): RecoveryProtoc
     ],
     transaction_id: null,
     revision: 0,
+    detail: null,
   }
 }
 

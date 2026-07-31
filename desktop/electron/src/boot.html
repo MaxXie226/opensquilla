@@ -314,6 +314,18 @@
       overflow-wrap: anywhere;
     }
 
+    .recovery-detail {
+      color: var(--dim);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 11px;
+      overflow-wrap: anywhere;
+      margin-top: 2px;
+    }
+
+    .recovery-detail[hidden] {
+      display: none;
+    }
+
     .recovery-group {
       display: grid;
       gap: 8px;
@@ -538,6 +550,7 @@
           <p id="recoveryIntro" data-i18n="recoveryIntro">OpenSquilla paused the primary gateway because it could not prove that writing is safe. Primary data and any completed consolidation backups remain preserved.</p>
         </div>
         <div class="recovery-code" id="recoveryCode"></div>
+        <div class="recovery-detail" id="recoveryDetail" hidden></div>
 
         <div class="recovery-group" id="workspaceGroup">
           <label for="workspaceCandidates" data-i18n="workspaceLabel">Choose a verified workspace</label>
@@ -723,6 +736,7 @@
     const recoveryTitle = document.getElementById('recoveryTitle');
     const recoveryIntro = document.getElementById('recoveryIntro');
     const recoveryCode = document.getElementById('recoveryCode');
+    const recoveryDetail = document.getElementById('recoveryDetail');
     const recoveryStatus = document.getElementById('recoveryStatus');
     const workspaceCandidates = document.getElementById('workspaceCandidates');
     let currentRecoveryState = null;
@@ -819,6 +833,9 @@
       recoveryPanel.classList.add('visible');
       if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
       recoveryCode.textContent = String(inspection.stable_code || 'recovery_required');
+      const detail = typeof inspection.detail === 'string' ? inspection.detail : '';
+      recoveryDetail.textContent = detail;
+      recoveryDetail.hidden = !detail;
       const cleanupInterrupted = inspection.stable_code === 'cleanup_transaction_incomplete';
       recoveryTitle.textContent = cleanupInterrupted
         ? msg.cleanupRecoveryTitle

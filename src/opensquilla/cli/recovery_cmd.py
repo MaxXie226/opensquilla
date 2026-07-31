@@ -74,17 +74,24 @@ def _failure_report(
         # can still fail below pathlib itself. Keep stdout protocol-valid.
         from opensquilla.recovery.models import RecoveryReport as Report
 
+        home_path = home.expanduser().absolute()
         return Report(
             outcome="recovery_required",
             stable_code=error.stable_code,
-            primary_home=home.expanduser().absolute(),
+            primary_home=home_path,
             effective_workspace=None,
             candidates=(),
             allowed_actions=("copy-diagnostics",),
             transaction_id="",
             revision=0,
+            detail=str(error).replace(str(home_path), "<HOME>"),
         )
-    return replace(base, outcome="recovery_required", stable_code=error.stable_code)
+    return replace(
+        base,
+        outcome="recovery_required",
+        stable_code=error.stable_code,
+        detail=str(error).replace(str(base.primary_home), "<HOME>"),
+    )
 
 
 def _run(

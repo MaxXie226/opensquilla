@@ -1083,6 +1083,32 @@ def test_invalid_or_future_config_requires_recovery(
     assert report.stable_code == stable_code
 
 
+def test_invalid_config_report_carries_sanitized_detail(tmp_path: Path) -> None:
+    home = tmp_path / "opensquilla"
+    home.mkdir()
+    (home / "config.toml").write_text('workspace_dir = "unterminated\n', encoding="utf-8")
+
+    report = inspect_profile(home)
+
+    assert report.stable_code == "config_invalid"
+    assert report.detail is not None
+    assert "TOML" in report.detail
+    assert str(home) not in report.detail
+    assert report.as_dict()["detail"] == report.detail
+
+
+def test_unsafe_home_report_names_the_home_as_placeholder(tmp_path: Path) -> None:
+    real_home = tmp_path / "real-home"
+    real_home.write_text("not a directory", encoding="utf-8")
+
+    report = inspect_profile(real_home)
+
+    assert report.stable_code == "profile_unsafe_path"
+    assert report.detail is not None
+    assert "<HOME>" in report.detail
+    assert str(real_home) not in report.detail
+
+
 def test_replacement_journal_symlink_is_never_followed(tmp_path: Path) -> None:
     home = tmp_path / "opensquilla"
     _workspace(home / "workspace")

@@ -136,6 +136,7 @@ def test_inspect_command_emits_fixed_json_protocol(tmp_path: Path) -> None:
         "allowed_actions",
         "transaction_id",
         "revision",
+        "detail",
     }
     assert payload["outcome"] == "ready"
     assert payload["effective_workspace"] == str(workspace)
