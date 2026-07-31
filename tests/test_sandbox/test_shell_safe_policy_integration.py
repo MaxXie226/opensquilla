@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -157,9 +158,23 @@ def test_guest_safe_profile_keeps_workspace_boundary_and_protected_carveouts(
         write=True,
         profile=profile,
     )
+    sensitive_read = decide_path_access(
+        Path.home() / ".ssh" / "id_ed25519",
+        workspace=workspace,
+        write=False,
+        profile=profile,
+    )
+    ordinary_read = decide_path_access(
+        tmp_path / "ordinary-host-file.txt",
+        workspace=workspace,
+        write=False,
+        profile=profile,
+    )
     assert protected_write.status != "allowed"
     assert ordinary_write.status == "allowed"
     assert outside_write.status != "allowed"
+    assert sensitive_read.status == "blocked"
+    assert ordinary_read.status == "allowed"
 
 
 @pytest.mark.asyncio

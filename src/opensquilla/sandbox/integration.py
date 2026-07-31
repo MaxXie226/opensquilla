@@ -360,6 +360,7 @@ def active_file_system_profile(
         from opensquilla.sandbox.file_policy import (
             authority_roots_for_state,
             compile_safe_file_profile,
+            compile_web_guest_file_profile,
         )
 
         config = getattr(tool_context, "sandbox_gateway_config", None)
@@ -375,8 +376,18 @@ def active_file_system_profile(
             )
         )
         guest_safe = bool(getattr(tool_context, "guest_safe", False))
+        if guest_safe:
+            if effective_workspace is None:
+                raise ValueError(
+                    "GUEST_DEFAULT_WORKSPACE_UNSAFE: guest workspace is unavailable"
+                )
+            return compile_web_guest_file_profile(
+                stored_policy,
+                workspace=effective_workspace,
+                authority_roots=authority_roots,
+            )
         writable_roots: tuple[Path, ...] = ()
-        if effective_workspace is not None and not guest_safe:
+        if effective_workspace is not None:
             writable_roots = (
                 effective_workspace,
                 *(
@@ -390,9 +401,7 @@ def active_file_system_profile(
             authority_roots=authority_roots,
             writable_roots=writable_roots,
         )
-        if not guest_safe:
-            return safe_profile
-        safe_profile = safe_profile.as_read_only()
+        return safe_profile
 
     runtime = get_runtime()
     if runtime is None or not runtime.effective.sandbox_enabled:

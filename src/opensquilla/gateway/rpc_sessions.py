@@ -2713,6 +2713,22 @@ async def _handle_sessions_send(
                 "Safe mode is unavailable for this unauthenticated request.",
                 details={"reason": exc.code, **capability_report.to_payload()},
             ) from exc
+        from opensquilla.sandbox.file_policy import (
+            GuestWorkspacePolicyError,
+            authority_roots_for_state,
+            validate_web_guest_workspace,
+        )
+
+        try:
+            validate_web_guest_workspace(
+                workspace_path,
+                authority_roots=authority_roots_for_state(ctx.config.state_dir),
+            )
+        except GuestWorkspacePolicyError as exc:
+            raise RpcHandlerError(
+                exc.code,
+                "The configured default workspace is not safe for a Web guest.",
+            ) from exc
         guest_profile = _guest_profile_for_principal(
             ctx.principal,
             turn_id,

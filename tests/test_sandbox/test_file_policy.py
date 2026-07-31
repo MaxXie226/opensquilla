@@ -1,11 +1,16 @@
 from __future__ import annotations
 
-from pathlib import Path, PureWindowsPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
+
+import pytest
 
 from opensquilla.sandbox.file_policy import (
+    GuestWorkspacePolicyError,
     builtin_deny_write_paths,
     compile_safe_file_profile,
+    compile_web_guest_file_profile,
     decide_file_access,
+    validate_web_guest_workspace,
 )
 from opensquilla.sandbox.permissions import FileSystemAccess
 from opensquilla.sandbox.policy_models import SandboxPolicy
@@ -116,3 +121,71 @@ def test_safe_profile_compiles_write_baseline_and_read_only_carveouts(
     assert profile.resolve(home / ".ssh" / "config") is FileSystemAccess.READ
     assert profile.resolve(custom / "credential") is FileSystemAccess.READ
     assert profile.resolve(authority / "sessions.db") is FileSystemAccess.DENY
+
+
+def test_windows_web_guest_profile_denies_credentials_and_writes_only_workspace() -> None:
+    home = PureWindowsPath(r"C:\Users\alice")
+    workspace = PureWindowsPath(r"D:\OpenSquilla\workspace")
+    authority = PureWindowsPath(r"C:\Users\alice\.opensquilla\state")
+    custom = PureWindowsPath(r"C:\Company\protected")
+    profile = compile_web_guest_file_profile(
+        SandboxPolicy.model_validate(
+            {"files": {"customDenyWritePaths": [rf"{custom}\**"]}}
+        ),
+        workspace=workspace,
+        authority_roots=(authority,),
+        platform="win32",
+        home=home,
+        env={
+            "USERPROFILE": str(home),
+            "APPDATA": r"C:\Users\alice\AppData\Roaming",
+            "LOCALAPPDATA": r"C:\Users\alice\AppData\Local",
+        },
+    )
+
+    assert profile.default_access is FileSystemAccess.READ
+    assert profile.resolve(home / "Documents" / "ordinary.txt") is FileSystemAccess.READ
+    assert profile.resolve(workspace / "nested" / "new.txt") is FileSystemAccess.WRITE
+    assert profile.resolve(PureWindowsPath(r"D:\outside.txt")) is FileSystemAccess.READ
+    assert profile.resolve(home / ".ssh" / "id_ed25519") is FileSystemAccess.DENY
+    assert profile.resolve(authority / "sessions.db") is FileSystemAccess.DENY
+    assert profile.resolve(custom / "file.txt") is FileSystemAccess.READ
+
+
+def test_posix_web_guest_profile_denies_credentials_and_writes_only_workspace(
+) -> None:
+    home = PurePosixPath("/home/alice")
+    workspace = PurePosixPath("/srv/opensquilla/workspace")
+    authority = PurePosixPath("/srv/opensquilla/state")
+    custom = PurePosixPath("/srv/company/protected")
+    profile = compile_web_guest_file_profile(
+        SandboxPolicy.model_validate(
+            {"files": {"customDenyWritePaths": [f"{custom}/**"]}}
+        ),
+        workspace=workspace,
+        authority_roots=(authority,),
+        platform="linux",
+        home=home,
+        env={"HOME": str(home)},
+    )
+
+    assert profile.resolve(home / "Documents" / "ordinary.txt") is FileSystemAccess.READ
+    assert profile.resolve(workspace / "nested" / "new.txt") is FileSystemAccess.WRITE
+    assert profile.resolve(PurePosixPath("/srv/outside.txt")) is FileSystemAccess.READ
+    assert profile.resolve(home / ".ssh" / "id_ed25519") is FileSystemAccess.DENY
+    assert profile.resolve(authority / "sessions.db") is FileSystemAccess.DENY
+    assert profile.resolve(custom / "file.txt") is FileSystemAccess.READ
+
+
+def test_web_guest_workspace_beneath_sensitive_root_is_rejected(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+
+    with pytest.raises(GuestWorkspacePolicyError) as raised:
+        validate_web_guest_workspace(
+            home / ".ssh" / "project",
+            platform="linux",
+            home=home,
+            env={"HOME": str(home)},
+        )
+
+    assert raised.value.code == "GUEST_DEFAULT_WORKSPACE_UNSAFE"

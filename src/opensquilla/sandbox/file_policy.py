@@ -102,6 +102,10 @@ class FileDecision:
     rule_source: Literal["authority", "builtin", "custom"] | None = None
 
 
+class GuestWorkspacePolicyError(ValueError):
+    code = "GUEST_DEFAULT_WORKSPACE_UNSAFE"
+
+
 def _platform_name(platform: str | None) -> Literal["windows", "macos", "linux"]:
     value = str(platform or sys.platform).lower()
     if value.startswith("win"):
@@ -340,7 +344,6 @@ def compile_safe_file_profile(
         FileSystemPermissionEntry,
         FileSystemPermissionProfile,
     )
-
     target_platform = _platform_name(platform)
     environment = dict(os.environ if env is None else env)
     if home is None:
@@ -411,10 +414,145 @@ def compile_safe_file_profile(
     )
 
 
+def validate_web_guest_workspace(
+    workspace: str | os.PathLike[str] | PurePath,
+    *,
+    authority_roots: Sequence[str | os.PathLike[str] | PurePath] = (),
+    platform: str | None = None,
+    env: Mapping[str, str] | None = None,
+    home: str | PurePath | None = None,
+) -> PurePath:
+    """Return the workspace path or reject a root nested under protected data."""
+
+    target_platform = _platform_name(platform)
+    environment = dict(os.environ if env is None else env)
+    if home is None:
+        home = (
+            environment.get("USERPROFILE")
+            if target_platform == "windows"
+            else environment.get("HOME")
+        ) or str(Path.home())
+    pure_home = _pure_path(str(home), platform=target_platform)
+    candidate = _normalized_text(workspace, platform=target_platform)
+
+    builtin = _matched_rule(
+        workspace,
+        _patterns_for_platform(target_platform),
+        platform=target_platform,
+        env=environment,
+        home=pure_home,
+    )
+    if builtin is not None:
+        raise GuestWorkspacePolicyError(
+            f"{GuestWorkspacePolicyError.code}: default workspace is inside {builtin}"
+        )
+    for root in authority_roots:
+        normalized_root = _normalized_text(root, platform=target_platform)
+        if candidate == normalized_root or candidate.startswith(f"{normalized_root}/"):
+            raise GuestWorkspacePolicyError(
+                f"{GuestWorkspacePolicyError.code}: default workspace is inside authority data"
+            )
+    return _pure_path(str(workspace), platform=target_platform)
+
+
+def compile_web_guest_file_profile(
+    policy: SandboxPolicy,
+    *,
+    workspace: str | os.PathLike[str] | PurePath,
+    authority_roots: Sequence[str | os.PathLike[str] | PurePath] = (),
+    platform: str | None = None,
+    env: Mapping[str, str] | None = None,
+    home: str | PurePath | None = None,
+) -> FileSystemPermissionProfile:
+    """Compile remote Web guest access: host-readable, one write root."""
+
+    from opensquilla.sandbox.permissions import (
+        FileSystemAccess,
+        FileSystemPermissionEntry,
+        FileSystemPermissionProfile,
+    )
+    from opensquilla.sandbox.platform_permissions import FileSystemPlatformContext
+
+    target_platform = _platform_name(platform)
+    environment = dict(os.environ if env is None else env)
+    if home is None:
+        home = (
+            environment.get("USERPROFILE")
+            if target_platform == "windows"
+            else environment.get("HOME")
+        ) or str(Path.home())
+    pure_home = _pure_path(str(home), platform=target_platform)
+    workspace_path = validate_web_guest_workspace(
+        workspace,
+        authority_roots=authority_roots,
+        platform=target_platform,
+        env=environment,
+        home=pure_home,
+    )
+
+    custom_roots: list[PurePath] = []
+    for raw in policy.files.custom_deny_write_paths:
+        expanded = _expand_pattern(
+            raw,
+            platform=target_platform,
+            env=environment,
+            home=pure_home,
+        )
+        custom_roots.append(
+            _pure_path(_pattern_root(expanded), platform=target_platform)
+        )
+
+    sensitive_roots = builtin_deny_write_paths(
+        target_platform,
+        env=environment,
+        home=pure_home,
+    )
+    denied_roots = tuple(
+        dict.fromkeys(
+            (
+                *sensitive_roots,
+                *(
+                    _pure_path(str(root), platform=target_platform)
+                    for root in authority_roots
+                ),
+            )
+        )
+    )
+    base = FileSystemPermissionProfile.workspace(
+        workspace=workspace_path,
+        denied_read_roots=denied_roots,
+        host_root_readonly=True,
+        tmp_writable=False,
+        tmpdir_env_writable=False,
+        platform_context=FileSystemPlatformContext(
+            platform=target_platform,
+            cwd=workspace_path,
+            home=pure_home,
+            writable_roots=(workspace_path,),
+            user_profile_children=(),
+            env=environment,
+        ),
+    )
+    return FileSystemPermissionProfile(
+        entries=(
+            *base.entries,
+            *(
+                FileSystemPermissionEntry(root, FileSystemAccess.READ)
+                for root in dict.fromkeys(custom_roots)
+            ),
+        ),
+        denied_read_globs=base.denied_read_globs,
+        default_access=base.default_access,
+    )
+
+
 __all__ = [
     "FileDecision",
+    "GuestWorkspacePolicyError",
     "authority_roots_for_state",
     "builtin_deny_write_paths",
     "compile_safe_file_profile",
+    "compile_web_guest_file_profile",
     "decide_file_access",
+    "validate_web_guest_workspace",
 ]
