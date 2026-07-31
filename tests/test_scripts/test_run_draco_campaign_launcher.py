@@ -405,7 +405,7 @@ def test_group_subset_drives_default_slug_runner_gate_and_finalizer() -> None:
         '-j6-a3-$(date +%Y%m%d-%H%M%S)"'
     ) in script
     assert '--groups "$DRACO_GROUPS"' in script
-    assert script.count('--groups "$DRACO_GROUPS"') == 2
+    assert script.count('--groups "$DRACO_GROUPS"') == 3
     assert (
         '"$summary" \\\n'
         '    "$DRACO_GROUPS" \\\n'

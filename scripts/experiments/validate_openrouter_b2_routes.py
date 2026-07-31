@@ -25,6 +25,13 @@ from opensquilla.provider.compat_policy import (
 API_ORIGIN = "https://openrouter.ai"
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_EXPERIMENT_CONFIG_PATH = ROOT / "configs" / "benchmarks" / "draco_b2_g12.json"
+ROUTE_PREFLIGHT_SCHEMA = "opensquilla.openrouter-route-preflight/v3"
+FORMAL_GROUP_ORDER = ("B0", "B1", "B2", "B4", "G1")
+TASK_ANALYZER_MODEL = "anthropic/claude-opus-4.8"
+FIXED_GROUP_ROUTES = {
+    "B0": {TASK_ANALYZER_MODEL: "anthropic"},
+    "B4": {"openai/gpt-5.5": "openai"},
+}
 B2_EXPECTED_ROUTES = {
     "deepseek/deepseek-v4-pro": "deepseek",
     "z-ai/glm-5.2": "z-ai",
@@ -168,7 +175,11 @@ FORMAL_MAX_COMPLETION_TOKENS_MODELS = frozenset(
 )
 
 
-def formal_required_parameters(expected_routes: dict[str, str]) -> dict[str, set[str]]:
+def _formal_role_required_parameters(
+    expected_routes: dict[str, str],
+    *,
+    include_tools: bool,
+) -> dict[str, set[str]]:
     required = {
         model: {
             (
@@ -179,10 +190,12 @@ def formal_required_parameters(expected_routes: dict[str, str]) -> dict[str, set
                 )
                 else "max_tokens"
             ),
-            "tools",
         }
         for model in expected_routes
     }
+    if include_tools:
+        for parameters in required.values():
+            parameters.add("tools")
     for model in set(expected_routes) - FORMAL_REASONING_INELIGIBLE_MODELS:
         required[model].add("reasoning")
     for model in expected_routes:
@@ -194,10 +207,27 @@ def formal_required_parameters(expected_routes: dict[str, str]) -> dict[str, set
     return required
 
 
+def formal_proposer_required_parameters(
+    expected_routes: dict[str, str],
+) -> dict[str, set[str]]:
+    return _formal_role_required_parameters(expected_routes, include_tools=False)
+
+
+def formal_required_parameters(expected_routes: dict[str, str]) -> dict[str, set[str]]:
+    """Return the stricter aggregator request surface kept by the v2 contract."""
+
+    return _formal_role_required_parameters(expected_routes, include_tools=True)
+
+
 FORMAL_REQUIRED_PARAMETERS = formal_required_parameters(FORMAL_EXPECTED_ROUTES)
 
 
-def get_json(client: httpx.Client, path: str) -> tuple[Any, str]:
+def get_json(
+    client: httpx.Client,
+    path: str,
+    *,
+    allow_model_not_found: bool = False,
+) -> tuple[Any | None, str, int, str]:
     url = f"{API_ORIGIN}{path}"
     last_error: Exception | None = None
     for attempt in range(1, 4):
@@ -205,9 +235,11 @@ def get_json(client: httpx.Client, path: str) -> tuple[Any, str]:
             response = client.get(url)
             if response.is_redirect:
                 raise RuntimeError(f"redirect refused for {path}")
+            if response.status_code == 404 and allow_model_not_found:
+                return None, hashlib.sha256(response.content).hexdigest(), 404, "raw_body"
             response.raise_for_status()
             payload = response.json()
-            return payload, canonical_sha256(payload)
+            return payload, canonical_sha256(payload), response.status_code, "canonical_json"
         except (httpx.HTTPError, ValueError, RuntimeError) as exc:
             last_error = exc
             if attempt < 3:
@@ -217,6 +249,175 @@ def get_json(client: httpx.Client, path: str) -> tuple[Any, str]:
 
 def tag_matches(tag: str, expected: str) -> bool:
     return tag == expected or tag.startswith(f"{expected}/")
+
+
+def parse_formal_groups(value: str) -> tuple[str, ...]:
+    groups = tuple(value.split(","))
+    if not groups:
+        raise ValueError("formal route preflight requires at least one group")
+    indexes: list[int] = []
+    for group in groups:
+        try:
+            indexes.append(FORMAL_GROUP_ORDER.index(group))
+        except ValueError as exc:
+            raise ValueError(
+                "formal route preflight groups must be a canonical subset of "
+                + ",".join(FORMAL_GROUP_ORDER)
+            ) from exc
+    if indexes != sorted(set(indexes)):
+        raise ValueError("formal route preflight groups must be non-duplicated and canonical")
+    return groups
+
+
+def required_fixed_route_specs(
+    *,
+    experiment: Any,
+    groups: tuple[str, ...],
+    proposer_required_parameters: dict[str, set[str]],
+) -> tuple[dict[str, str], dict[str, set[str]]]:
+    routes: dict[str, str] = {}
+    parameters: dict[str, set[str]] = {}
+
+    def add(model: str, provider: str, required: set[str]) -> None:
+        existing = routes.get(model)
+        if existing is not None and existing != provider:
+            raise ValueError(f"conflicting fixed providers for {model}: {existing}, {provider}")
+        routes[model] = provider
+        parameters.setdefault(model, set()).update(required)
+
+    for group in groups:
+        for model, provider in FIXED_GROUP_ROUTES.get(group, {}).items():
+            if model not in proposer_required_parameters:
+                raise ValueError(f"fixed route is absent from the frozen registry: {model}")
+            add(model, provider, proposer_required_parameters[model])
+    if "B2" in groups:
+        for model, provider in B2_EXPECTED_ROUTES.items():
+            add(model, provider, set(B2_REQUIRED_PARAMETERS[model]))
+    if "G1" in groups:
+        judge_model = str(experiment.judge.model).strip().lower()
+        for model, provider in {
+            TASK_ANALYZER_MODEL: "anthropic",
+            judge_model: "google-ai-studio",
+        }.items():
+            if model not in proposer_required_parameters:
+                raise ValueError(f"G1 fixed route is absent from the frozen registry: {model}")
+            add(model, provider, proposer_required_parameters[model])
+    return dict(sorted(routes.items())), {model: parameters[model] for model in sorted(parameters)}
+
+
+def required_role_capacity(experiment: Any, groups: tuple[str, ...]) -> tuple[int, int]:
+    if "G1" not in groups:
+        return 0, 0
+    g1 = experiment.g1_routing
+    if g1 is None:
+        raise ValueError("formal route preflight requires a G1 routing contract")
+    proposer_count = (
+        int(g1.expected_proposer_count_max)
+        + int(experiment.ensemble.proposer_backup_count)
+        + int(experiment.ensemble.aggregator_recovery_top_k)
+    )
+    return proposer_count, int(experiment.ensemble.aggregator_recovery_top_k)
+
+
+def recompute_model_endpoint_availability(
+    *,
+    model: str,
+    expected_provider: str,
+    proposer_required_parameters: set[str],
+    aggregator_required_parameters: set[str],
+    evidence: dict[str, Any],
+) -> tuple[int, int, int, str]:
+    """Recompute v3 role-aware availability, including explicit 0/0 rows."""
+
+    if evidence.get("expected_provider") != expected_provider:
+        raise ValueError(f"endpoint evidence provider differs for {model}")
+    if evidence.get("requested_model_id") != model:
+        raise ValueError(f"endpoint requested model differs for {model}")
+    fetch_outcome = evidence.get("endpoint_fetch_outcome")
+    response_status = evidence.get("endpoint_http_status")
+    response_hash_kind = evidence.get("response_sha256_kind")
+    if fetch_outcome == "ok":
+        if response_status != 200 or response_hash_kind != "canonical_json":
+            raise ValueError(f"endpoint fetch evidence differs for {model}")
+        if evidence.get("response_model_id") != model:
+            raise ValueError(f"endpoint response model differs for {model}")
+    elif fetch_outcome == "model_not_found":
+        if (
+            response_status != 404
+            or response_hash_kind != "raw_body"
+            or evidence.get("response_model_id") is not None
+        ):
+            raise ValueError(f"endpoint not-found evidence differs for {model}")
+    else:
+        raise ValueError(f"endpoint fetch outcome is invalid for {model}")
+    endpoints = evidence.get("matching_endpoints")
+    if not isinstance(endpoints, list):
+        raise ValueError(f"endpoint evidence is invalid for {model}")
+    provider_is_auto = expected_provider == "auto"
+    expected_provider_name = EXPECTED_PROVIDER_NAMES.get(expected_provider)
+    if not provider_is_auto and not expected_provider_name:
+        raise ValueError(f"provider display-name contract is missing for {expected_provider}")
+
+    operational_count = 0
+    proposer_compatible_count = 0
+    aggregator_compatible_count = 0
+    for endpoint in endpoints:
+        if not isinstance(endpoint, dict):
+            raise ValueError(f"endpoint evidence row is invalid for {model}")
+        if not provider_is_auto and not tag_matches(
+            str(endpoint.get("tag") or ""), expected_provider
+        ):
+            raise ValueError(f"endpoint tag differs for {model} -> {expected_provider}")
+        status = endpoint.get("status")
+        if not (isinstance(status, int) and not isinstance(status, bool) and status == 0):
+            continue
+        operational_count += 1
+        supported = endpoint.get("supported_parameters")
+        if not isinstance(supported, list) or any(
+            not isinstance(item, str) or not item for item in supported
+        ):
+            raise ValueError(f"endpoint parameters are invalid for {model}")
+        supported_parameters = set(supported)
+        identity_matches = (
+            provider_is_auto or endpoint.get("provider_name") == expected_provider_name
+        ) and endpoint.get("model_id") == model
+        if identity_matches and proposer_required_parameters <= supported_parameters:
+            proposer_compatible_count += 1
+        if identity_matches and aggregator_required_parameters <= supported_parameters:
+            aggregator_compatible_count += 1
+
+    if fetch_outcome == "model_not_found":
+        if endpoints:
+            raise ValueError(f"endpoint not-found evidence contains routes for {model}")
+        availability_status = "model_endpoint_not_found"
+    elif not endpoints:
+        availability_status = "no_matching_endpoint"
+    elif operational_count == 0:
+        availability_status = "no_operational_endpoint"
+    elif proposer_compatible_count == 0:
+        availability_status = "no_compatible_request_surface"
+    elif aggregator_compatible_count == 0:
+        availability_status = "proposer_only"
+    else:
+        availability_status = "compatible"
+    expected_values = {
+        "operational_match_count": operational_count,
+        "compatible_operational_match_count": aggregator_compatible_count,
+        "proposer_compatible_operational_match_count": proposer_compatible_count,
+        "aggregator_compatible_operational_match_count": aggregator_compatible_count,
+        "availability_status": availability_status,
+        "proposer_required_parameters": sorted(proposer_required_parameters),
+        "aggregator_required_parameters": sorted(aggregator_required_parameters),
+    }
+    for field, expected in expected_values.items():
+        if evidence.get(field) != expected:
+            raise ValueError(f"saved {field} differs for {model}")
+    return (
+        operational_count,
+        proposer_compatible_count,
+        aggregator_compatible_count,
+        availability_status,
+    )
 
 
 def recompute_model_endpoint_compatibility(
@@ -306,6 +507,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("output", type=Path)
     parser.add_argument("--scope", choices=("b2", "formal"), default="formal")
+    parser.add_argument("--groups", default=",".join(FORMAL_GROUP_ORDER))
     parser.add_argument(
         "--experiment-config",
         type=Path,
@@ -314,7 +516,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.output.exists():
         parser.error(f"refusing to overwrite route preflight evidence: {args.output}")
+    try:
+        args.groups = parse_formal_groups(args.groups)
+    except ValueError as exc:
+        parser.error(str(exc))
     return args
+
+
+def saved_endpoint_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "tag": row.get("tag"),
+            "provider_name": row.get("provider_name"),
+            "model_id": row.get("model_id"),
+            "status": row.get("status"),
+            "supported_parameters": sorted(
+                str(item) for item in (row.get("supported_parameters") or [])
+            ),
+            "pricing": row.get("pricing"),
+            "max_completion_tokens": row.get("max_completion_tokens"),
+        }
+        for row in rows
+    ]
 
 
 def main() -> int:
@@ -341,11 +564,24 @@ def main() -> int:
         if resolved_contract is not None
         else "exact_openrouter_routes"
     )
-    required_parameters = (
+    aggregator_required_parameters = (
         formal_required_parameters(expected_routes)
         if args.scope == "formal"
         else B2_REQUIRED_PARAMETERS
     )
+    proposer_required_parameters = (
+        formal_proposer_required_parameters(expected_routes)
+        if args.scope == "formal"
+        else aggregator_required_parameters
+    )
+    fixed_routes: dict[str, str] = {}
+    fixed_parameters: dict[str, set[str]] = {}
+    if args.scope == "formal":
+        fixed_routes, fixed_parameters = required_fixed_route_specs(
+            experiment=experiment,
+            groups=args.groups,
+            proposer_required_parameters=proposer_required_parameters,
+        )
 
     with httpx.Client(
         timeout=httpx.Timeout(20.0),
@@ -353,7 +589,11 @@ def main() -> int:
         follow_redirects=False,
         headers={"Accept": "application/json"},
     ) as client:
-        providers_payload, providers_sha256 = get_json(client, "/api/v1/providers")
+        providers_payload, providers_sha256, providers_status, providers_hash_kind = get_json(
+            client, "/api/v1/providers"
+        )
+        if providers_status != 200 or providers_hash_kind != "canonical_json":
+            raise SystemExit("OpenRouter providers response status is invalid")
         provider_rows = (
             providers_payload.get("data") if isinstance(providers_payload, dict) else None
         )
@@ -364,23 +604,47 @@ def main() -> int:
             for row in provider_rows
             if isinstance(row, dict) and row.get("slug")
         }
-        missing_slugs = sorted(set(expected_routes.values()) - {"auto"} - provider_slugs)
+        required_provider_slugs = set(expected_routes.values()) | set(fixed_routes.values())
+        missing_slugs = sorted(required_provider_slugs - {"auto"} - provider_slugs)
         if missing_slugs:
             raise SystemExit(f"OpenRouter provider slug(s) unavailable: {missing_slugs}")
 
         model_evidence: dict[str, Any] = {}
+        endpoint_payloads: dict[str, tuple[list[dict[str, Any]], str, str | None, int, str]] = {}
         for model, expected_provider in expected_routes.items():
             encoded_model = "/".join(quote(part, safe="") for part in model.split("/"))
-            payload, response_sha256 = get_json(
+            allow_model_not_found = (
+                args.scope == "formal"
+                and candidate_scope == "registry_all"
+                and model not in fixed_routes
+            )
+            payload, response_sha256, response_status, response_hash_kind = get_json(
                 client,
                 f"/api/v1/models/{encoded_model}/endpoints",
+                allow_model_not_found=allow_model_not_found,
             )
-            data = payload.get("data") if isinstance(payload, dict) else None
-            endpoints = data.get("endpoints") if isinstance(data, dict) else None
-            if not isinstance(endpoints, list):
-                raise SystemExit(f"OpenRouter endpoint schema invalid for {model}")
-            if data.get("id") != model:
-                raise SystemExit(f"OpenRouter endpoint response model differs for {model}")
+            if response_status == 404:
+                data = None
+                endpoints: list[dict[str, Any]] = []
+                response_model_id = None
+                fetch_outcome = "model_not_found"
+            else:
+                data = payload.get("data") if isinstance(payload, dict) else None
+                raw_endpoints = data.get("endpoints") if isinstance(data, dict) else None
+                if not isinstance(raw_endpoints, list):
+                    raise SystemExit(f"OpenRouter endpoint schema invalid for {model}")
+                endpoints = raw_endpoints
+                if data.get("id") != model:
+                    raise SystemExit(f"OpenRouter endpoint response model differs for {model}")
+                response_model_id = str(data.get("id"))
+                fetch_outcome = "ok"
+            endpoint_payloads[model] = (
+                endpoints,
+                response_sha256,
+                response_model_id,
+                response_status,
+                response_hash_kind,
+            )
             provider_is_auto = expected_provider == "auto"
             matches = [
                 row
@@ -389,10 +653,10 @@ def main() -> int:
                 and (provider_is_auto or tag_matches(str(row.get("tag") or ""), expected_provider))
             ]
             operational = [row for row in matches if row.get("status") == 0]
-            compatible = [
+            proposer_compatible = [
                 row
                 for row in operational
-                if required_parameters[model]
+                if proposer_required_parameters[model]
                 <= {str(item) for item in (row.get("supported_parameters") or [])}
                 and (
                     provider_is_auto
@@ -400,48 +664,138 @@ def main() -> int:
                 )
                 and row.get("model_id") == model
             ]
-            if not matches:
-                raise SystemExit(f"No OpenRouter endpoint matches {model} -> {expected_provider}")
-            if not operational:
-                raise SystemExit(
-                    f"No operational OpenRouter endpoint for {model} -> {expected_provider}"
+            aggregator_compatible = [
+                row
+                for row in operational
+                if aggregator_required_parameters[model]
+                <= {str(item) for item in (row.get("supported_parameters") or [])}
+                and (
+                    provider_is_auto
+                    or row.get("provider_name") == EXPECTED_PROVIDER_NAMES[expected_provider]
                 )
-            if not compatible:
-                raise SystemExit(
-                    f"No operational endpoint supports the frozen request surface for {model}"
-                )
+                and row.get("model_id") == model
+            ]
             saved_evidence = {
                 "expected_provider": expected_provider,
-                "response_model_id": data.get("id"),
+                "requested_model_id": model,
+                "endpoint_fetch_outcome": fetch_outcome,
+                "endpoint_http_status": response_status,
+                "response_sha256_kind": response_hash_kind,
+                "response_model_id": response_model_id,
                 "response_sha256": response_sha256,
-                "matching_endpoints": [
-                    {
-                        "tag": row.get("tag"),
-                        "provider_name": row.get("provider_name"),
-                        "model_id": row.get("model_id"),
-                        "status": row.get("status"),
-                        "supported_parameters": sorted(
-                            str(item) for item in (row.get("supported_parameters") or [])
-                        ),
-                        "pricing": row.get("pricing"),
-                        "max_completion_tokens": row.get("max_completion_tokens"),
-                    }
-                    for row in matches
-                ],
+                "matching_endpoints": saved_endpoint_rows(matches),
+                "operational_match_count": len(operational),
+                "compatible_operational_match_count": len(aggregator_compatible),
+                "required_parameters": sorted(aggregator_required_parameters[model]),
+                "proposer_compatible_operational_match_count": len(proposer_compatible),
+                "aggregator_compatible_operational_match_count": len(aggregator_compatible),
+                "proposer_required_parameters": sorted(proposer_required_parameters[model]),
+                "aggregator_required_parameters": sorted(aggregator_required_parameters[model]),
+            }
+            if fetch_outcome == "model_not_found":
+                availability_status = "model_endpoint_not_found"
+            elif not matches:
+                availability_status = "no_matching_endpoint"
+            elif not operational:
+                availability_status = "no_operational_endpoint"
+            elif not proposer_compatible:
+                availability_status = "no_compatible_request_surface"
+            elif not aggregator_compatible:
+                availability_status = "proposer_only"
+            else:
+                availability_status = "compatible"
+            saved_evidence["availability_status"] = availability_status
+            if args.scope != "formal" or candidate_scope == "exact_routes":
+                recompute_model_endpoint_compatibility(
+                    model=model,
+                    expected_provider=expected_provider,
+                    required_parameters=aggregator_required_parameters[model],
+                    evidence=saved_evidence,
+                )
+            else:
+                recompute_model_endpoint_availability(
+                    model=model,
+                    expected_provider=expected_provider,
+                    proposer_required_parameters=proposer_required_parameters[model],
+                    aggregator_required_parameters=aggregator_required_parameters[model],
+                    evidence=saved_evidence,
+                )
+            model_evidence[model] = saved_evidence
+
+        fixed_route_checks: dict[str, Any] = {}
+        for model, expected_provider in fixed_routes.items():
+            (
+                endpoints,
+                response_sha256,
+                response_model_id,
+                response_status,
+                response_hash_kind,
+            ) = endpoint_payloads[model]
+            matches = [
+                row
+                for row in endpoints
+                if isinstance(row, dict)
+                and tag_matches(str(row.get("tag") or ""), expected_provider)
+            ]
+            operational = [row for row in matches if row.get("status") == 0]
+            compatible = [
+                row
+                for row in operational
+                if fixed_parameters[model]
+                <= {str(item) for item in (row.get("supported_parameters") or [])}
+                and row.get("provider_name") == EXPECTED_PROVIDER_NAMES[expected_provider]
+                and row.get("model_id") == model
+            ]
+            fixed_evidence = {
+                "expected_provider": expected_provider,
+                "requested_model_id": model,
+                "endpoint_fetch_outcome": "ok",
+                "endpoint_http_status": response_status,
+                "response_sha256_kind": response_hash_kind,
+                "response_model_id": response_model_id,
+                "response_sha256": response_sha256,
+                "matching_endpoints": saved_endpoint_rows(matches),
                 "operational_match_count": len(operational),
                 "compatible_operational_match_count": len(compatible),
-                "required_parameters": sorted(required_parameters[model]),
+                "required_parameters": sorted(fixed_parameters[model]),
             }
             recompute_model_endpoint_compatibility(
                 model=model,
                 expected_provider=expected_provider,
-                required_parameters=required_parameters[model],
-                evidence=saved_evidence,
+                required_parameters=fixed_parameters[model],
+                evidence=fixed_evidence,
             )
-            model_evidence[model] = saved_evidence
+            fixed_route_checks[model] = fixed_evidence
 
-    evidence = {
-        "schema": "opensquilla.openrouter-route-preflight/v2",
+    proposer_compatible_models = sorted(
+        model
+        for model, row in model_evidence.items()
+        if int(row["proposer_compatible_operational_match_count"]) > 0
+    )
+    aggregator_compatible_models = sorted(
+        model
+        for model, row in model_evidence.items()
+        if int(row["aggregator_compatible_operational_match_count"]) > 0
+    )
+    unavailable_models = sorted(set(expected_routes) - set(proposer_compatible_models))
+    aggregator_ineligible_models = sorted(set(expected_routes) - set(aggregator_compatible_models))
+    required_proposer_count, required_aggregator_count = required_role_capacity(
+        experiment, args.groups
+    )
+    if candidate_scope == "exact_routes":
+        required_proposer_count = len(expected_routes)
+        required_aggregator_count = len(expected_routes)
+    candidate_capacity_pass = (
+        len(proposer_compatible_models) >= required_proposer_count
+        and len(aggregator_compatible_models) >= required_aggregator_count
+    )
+    schema = (
+        ROUTE_PREFLIGHT_SCHEMA
+        if args.scope == "formal"
+        else ("opensquilla.openrouter-route-preflight/v2")
+    )
+    evidence: dict[str, Any] = {
+        "schema": schema,
         "captured_at": datetime.now(UTC).isoformat(),
         "api_origin": API_ORIGIN,
         "scope": args.scope,
@@ -466,10 +820,13 @@ def main() -> int:
             ),
         },
         "required_parameters_sha256": canonical_sha256(
-            {model: sorted(parameters) for model, parameters in required_parameters.items()}
+            {
+                model: sorted(parameters)
+                for model, parameters in aggregator_required_parameters.items()
+            }
         ),
         "models": model_evidence,
-        "route_metadata_pass": True,
+        "route_metadata_pass": candidate_capacity_pass,
         "non_byok_verified": None,
         "billing_verified": None,
         "reasoning_ineligible_models": (
@@ -480,7 +837,55 @@ def main() -> int:
             "usage evidence, canary, and account reconciliation remain mandatory."
         ),
     }
+    if args.scope == "formal":
+        fixed_contract = {
+            model: {
+                "provider": fixed_routes[model],
+                "required_parameters": sorted(fixed_parameters[model]),
+            }
+            for model in fixed_routes
+        }
+        evidence.update(
+            {
+                "groups": list(args.groups),
+                "availability_policy": (
+                    "registry_capacity"
+                    if candidate_scope == "registry_all"
+                    else "strict_all_routes"
+                ),
+                "availability_status": (
+                    "complete"
+                    if not unavailable_models and not aggregator_ineligible_models
+                    else "degraded"
+                ),
+                "proposer_required_parameters_sha256": canonical_sha256(
+                    {
+                        model: sorted(parameters)
+                        for model, parameters in proposer_required_parameters.items()
+                    }
+                ),
+                "proposer_compatible_candidate_count": len(proposer_compatible_models),
+                "aggregator_compatible_candidate_count": len(aggregator_compatible_models),
+                "proposer_compatible_models": proposer_compatible_models,
+                "aggregator_compatible_models": aggregator_compatible_models,
+                "unavailable_models": unavailable_models,
+                "aggregator_ineligible_models": aggregator_ineligible_models,
+                "required_proposer_compatible_candidate_count": (required_proposer_count),
+                "required_aggregator_compatible_candidate_count": (required_aggregator_count),
+                "candidate_capacity_pass": candidate_capacity_pass,
+                "required_fixed_routes": fixed_contract,
+                "required_fixed_routes_sha256": canonical_sha256(fixed_contract),
+                "fixed_route_checks": fixed_route_checks,
+                "fixed_routes_pass": True,
+            }
+        )
     atomic_write_json(args.output, evidence)
+    if not candidate_capacity_pass:
+        raise SystemExit(
+            "OpenRouter dynamic route capacity is insufficient: "
+            f"proposer={len(proposer_compatible_models)}/{required_proposer_count}, "
+            f"aggregator={len(aggregator_compatible_models)}/{required_aggregator_count}"
+        )
     return 0
 
 

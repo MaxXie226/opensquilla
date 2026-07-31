@@ -98,7 +98,17 @@ def test_formal_scope_is_default(tmp_path: Path) -> None:
     args = validator.parse_args([str(tmp_path / "evidence.json")])
 
     assert args.scope == "formal"
+    assert args.groups == validator.FORMAL_GROUP_ORDER
     assert args.experiment_config == validator.DEFAULT_EXPERIMENT_CONFIG_PATH
+
+
+def test_formal_groups_require_a_canonical_subset() -> None:
+    assert validator.parse_formal_groups("G1") == ("G1",)
+    assert validator.parse_formal_groups("B0,B2,G1") == ("B0", "B2", "G1")
+    with pytest.raises(ValueError, match="non-duplicated"):
+        validator.parse_formal_groups("G1,G1")
+    with pytest.raises(ValueError, match="canonical"):
+        validator.parse_formal_groups("G1,B2")
 
 
 def test_formal_routes_are_a_valid_subset_of_router_dynamic_registry() -> None:
@@ -326,3 +336,126 @@ def test_validator_auto_provider_rejects_wrong_serving_model() -> None:
         assert "no saved endpoint supports" in str(exc)
     else:
         raise AssertionError("auto provider must still bind the serving model")
+
+
+def test_v3_registry_model_can_record_explicit_unavailability() -> None:
+    model = "vendor/model"
+    proposer_required = {"max_tokens", "reasoning"}
+    aggregator_required = {*proposer_required, "tools"}
+    evidence = {
+        "expected_provider": "auto",
+        "requested_model_id": model,
+        "endpoint_fetch_outcome": "ok",
+        "endpoint_http_status": 200,
+        "response_sha256_kind": "canonical_json",
+        "response_model_id": model,
+        "matching_endpoints": [],
+        "operational_match_count": 0,
+        "compatible_operational_match_count": 0,
+        "proposer_compatible_operational_match_count": 0,
+        "aggregator_compatible_operational_match_count": 0,
+        "availability_status": "no_matching_endpoint",
+        "proposer_required_parameters": sorted(proposer_required),
+        "aggregator_required_parameters": sorted(aggregator_required),
+    }
+
+    assert validator.recompute_model_endpoint_availability(
+        model=model,
+        expected_provider="auto",
+        proposer_required_parameters=proposer_required,
+        aggregator_required_parameters=aggregator_required,
+        evidence=evidence,
+    ) == (0, 0, 0, "no_matching_endpoint")
+
+    evidence["availability_status"] = "compatible"
+    with pytest.raises(ValueError, match="availability_status"):
+        validator.recompute_model_endpoint_availability(
+            model=model,
+            expected_provider="auto",
+            proposer_required_parameters=proposer_required,
+            aggregator_required_parameters=aggregator_required,
+            evidence=evidence,
+        )
+
+
+def test_v3_registry_model_can_record_endpoint_http_404() -> None:
+    model = "vendor/model"
+    proposer_required = {"max_tokens", "reasoning"}
+    aggregator_required = {*proposer_required, "tools"}
+    evidence = {
+        "expected_provider": "auto",
+        "requested_model_id": model,
+        "endpoint_fetch_outcome": "model_not_found",
+        "endpoint_http_status": 404,
+        "response_sha256_kind": "raw_body",
+        "response_model_id": None,
+        "matching_endpoints": [],
+        "operational_match_count": 0,
+        "compatible_operational_match_count": 0,
+        "proposer_compatible_operational_match_count": 0,
+        "aggregator_compatible_operational_match_count": 0,
+        "availability_status": "model_endpoint_not_found",
+        "proposer_required_parameters": sorted(proposer_required),
+        "aggregator_required_parameters": sorted(aggregator_required),
+    }
+
+    assert validator.recompute_model_endpoint_availability(
+        model=model,
+        expected_provider="auto",
+        proposer_required_parameters=proposer_required,
+        aggregator_required_parameters=aggregator_required,
+        evidence=evidence,
+    ) == (0, 0, 0, "model_endpoint_not_found")
+
+    evidence["response_model_id"] = model
+    with pytest.raises(ValueError, match="not-found evidence"):
+        validator.recompute_model_endpoint_availability(
+            model=model,
+            expected_provider="auto",
+            proposer_required_parameters=proposer_required,
+            aggregator_required_parameters=aggregator_required,
+            evidence=evidence,
+        )
+
+
+def test_get_json_accepts_404_only_when_explicitly_allowed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = b'{"error":"model missing"}'
+
+    def handler(request):
+        return validator.httpx.Response(404, content=body, request=request)
+
+    transport = validator.httpx.MockTransport(handler)
+    with validator.httpx.Client(transport=transport) as client:
+        assert validator.get_json(
+            client,
+            "/api/v1/models/vendor/model/endpoints",
+            allow_model_not_found=True,
+        ) == (None, validator.hashlib.sha256(body).hexdigest(), 404, "raw_body")
+
+        monkeypatch.setattr(validator.time, "sleep", lambda _seconds: None)
+        with pytest.raises(RuntimeError, match="metadata request failed"):
+            validator.get_json(client, "/api/v1/models/vendor/model/endpoints")
+
+
+def test_g1_v3_capacity_and_fixed_routes_are_derived_from_config() -> None:
+    experiment = load_draco_experiment_config(validator.DEFAULT_EXPERIMENT_CONFIG_PATH).config
+    proposer_required = validator.formal_proposer_required_parameters(
+        validator.FORMAL_EXPECTED_ROUTES
+    )
+    fixed_routes, fixed_parameters = validator.required_fixed_route_specs(
+        experiment=experiment,
+        groups=("G1",),
+        proposer_required_parameters=proposer_required,
+    )
+
+    assert validator.required_role_capacity(experiment, ("G1",)) == (10, 3)
+    assert fixed_routes == {
+        "anthropic/claude-opus-4.8": "anthropic",
+        "google/gemini-3.1-pro-preview": "google-ai-studio",
+    }
+    assert (
+        fixed_parameters["anthropic/claude-opus-4.8"]
+        == (proposer_required["anthropic/claude-opus-4.8"])
+    )

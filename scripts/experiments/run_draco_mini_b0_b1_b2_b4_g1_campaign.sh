@@ -1198,7 +1198,9 @@ validate_lock_file
   --repo "$SNAPSHOT_REPO"
 
 ROUTE_EVIDENCE="$ARCHIVE_DIR/preflight/openrouter-route-preflight.json"
-"$PYTHON" "$ROUTE_PREFLIGHT" "$ROUTE_EVIDENCE" --scope formal >/dev/null
+"$PYTHON" "$ROUTE_PREFLIGHT" "$ROUTE_EVIDENCE" \
+  --scope formal \
+  --groups "$DRACO_GROUPS" >/dev/null
 
 STATIC_DIR="$ARCHIVE_DIR/preflight/static"
 mkdir "$STATIC_DIR"

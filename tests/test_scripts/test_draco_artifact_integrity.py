@@ -352,6 +352,129 @@ def _v2_route_preflight(
     }
 
 
+def _refresh_v3_availability_summary(payload: dict[str, object]) -> None:
+    models = payload["models"]
+    assert isinstance(models, dict)
+    proposer_models = sorted(
+        model
+        for model, row in models.items()
+        if isinstance(row, dict) and int(row["proposer_compatible_operational_match_count"]) > 0
+    )
+    aggregator_models = sorted(
+        model
+        for model, row in models.items()
+        if isinstance(row, dict) and int(row["aggregator_compatible_operational_match_count"]) > 0
+    )
+    payload["proposer_compatible_candidate_count"] = len(proposer_models)
+    payload["aggregator_compatible_candidate_count"] = len(aggregator_models)
+    payload["proposer_compatible_models"] = proposer_models
+    payload["aggregator_compatible_models"] = aggregator_models
+    payload["unavailable_models"] = sorted(set(models) - set(proposer_models))
+    payload["aggregator_ineligible_models"] = sorted(set(models) - set(aggregator_models))
+    payload["availability_status"] = (
+        "complete"
+        if not payload["unavailable_models"] and not payload["aggregator_ineligible_models"]
+        else "degraded"
+    )
+    payload["candidate_capacity_pass"] = len(proposer_models) >= int(
+        payload["required_proposer_compatible_candidate_count"]
+    ) and len(aggregator_models) >= int(payload["required_aggregator_compatible_candidate_count"])
+
+
+def _v3_route_preflight(
+    module,
+    *,
+    config_path: Path,
+    config: dict[str, object],
+    config_sha256: str,
+) -> dict[str, object]:
+    payload = _v2_route_preflight(
+        module,
+        config_path=config_path,
+        config=config,
+        config_sha256=config_sha256,
+    )
+    payload["schema"] = module.ROUTE_PREFLIGHT_V3_SCHEMA
+    payload["groups"] = ["G1"]
+    payload["availability_policy"] = "registry_capacity"
+    routes = payload["expected_routes"]
+    models = payload["models"]
+    assert isinstance(routes, dict)
+    assert isinstance(models, dict)
+    _, resolved_contract = module._resolved_g1_contract(config_path)
+    proposer_required = module._formal_proposer_required_parameters(
+        routes,
+        reasoning_ineligible_models=set(resolved_contract["reasoning_ineligible_models"]),
+    )
+    aggregator_required = module._formal_required_parameters(
+        routes,
+        reasoning_ineligible_models=set(resolved_contract["reasoning_ineligible_models"]),
+    )
+    for model, row in models.items():
+        assert isinstance(row, dict)
+        row.update(
+            {
+                "requested_model_id": model,
+                "endpoint_fetch_outcome": "ok",
+                "endpoint_http_status": 200,
+                "response_sha256_kind": "canonical_json",
+                "proposer_required_parameters": proposer_required[model],
+                "aggregator_required_parameters": aggregator_required[model],
+                "proposer_compatible_operational_match_count": 1,
+                "aggregator_compatible_operational_match_count": 1,
+                "availability_status": "compatible",
+            }
+        )
+    payload["proposer_required_parameters_sha256"] = module.canonical_sha256(proposer_required)
+    experiment = module.load_draco_experiment_config(config_path).config
+    fixed_routes, fixed_parameters = module._required_fixed_route_specs(
+        experiment=experiment,
+        groups=("G1",),
+        proposer_required_parameters=proposer_required,
+    )
+    fixed_endpoint_rows: dict[str, list[dict[str, object]]] = {}
+    for model, provider in fixed_routes.items():
+        endpoint = {
+            "tag": provider,
+            "provider_name": module.EXPECTED_PROVIDER_NAMES[provider],
+            "model_id": model,
+            "status": 0,
+            "supported_parameters": aggregator_required[model],
+        }
+        fixed_endpoint_rows[model] = [endpoint]
+        models[model]["matching_endpoints"] = [dict(endpoint)]
+    fixed_contract = {
+        model: {
+            "provider": fixed_routes[model],
+            "required_parameters": fixed_parameters[model],
+        }
+        for model in fixed_routes
+    }
+    payload["required_fixed_routes"] = fixed_contract
+    payload["required_fixed_routes_sha256"] = module.canonical_sha256(fixed_contract)
+    payload["fixed_route_checks"] = {
+        model: {
+            "expected_provider": provider,
+            "requested_model_id": model,
+            "endpoint_fetch_outcome": "ok",
+            "endpoint_http_status": 200,
+            "response_sha256_kind": "canonical_json",
+            "response_model_id": model,
+            "response_sha256": models[model]["response_sha256"],
+            "matching_endpoints": fixed_endpoint_rows[model],
+            "operational_match_count": 1,
+            "compatible_operational_match_count": 1,
+            "required_parameters": fixed_parameters[model],
+        }
+        for model, provider in fixed_routes.items()
+    }
+    payload["fixed_routes_pass"] = True
+    payload["required_proposer_compatible_candidate_count"] = 10
+    payload["required_aggregator_compatible_candidate_count"] = 3
+    _refresh_v3_availability_summary(payload)
+    return payload
+
+
 def _run_formal_success(
     module,
     monkeypatch: pytest.MonkeyPatch,
@@ -439,6 +562,157 @@ def test_formal_success_accepts_recomputed_v2_route_preflight(
     assert contract["candidate_policy"] == resolved_contract["policy"]
     assert contract["expected_candidate_count"] == resolved_contract["expected_candidate_count"]
     assert contract["expected_routes_sha256"] == resolved_contract["expected_routes_sha256"]
+
+
+def test_v3_route_preflight_accepts_one_unavailable_dynamic_candidate(
+    tmp_path: Path,
+) -> None:
+    module = _load(SEAL_ARTIFACTS, "seal_draco_artifacts_v3_degraded_test")
+    config_path, config, config_sha256 = _formal_g1_config(module, tmp_path)
+    payload = _v3_route_preflight(
+        module,
+        config_path=config_path,
+        config=config,
+        config_sha256=config_sha256,
+    )
+    model = "mistralai/devstral-2512"
+    row = payload["models"][model]
+    row.update(
+        {
+            "matching_endpoints": [],
+            "operational_match_count": 0,
+            "compatible_operational_match_count": 0,
+            "proposer_compatible_operational_match_count": 0,
+            "aggregator_compatible_operational_match_count": 0,
+            "availability_status": "no_matching_endpoint",
+        }
+    )
+    _refresh_v3_availability_summary(payload)
+
+    validation = module.validate_route_preflight_payload(
+        payload,
+        experiment_config_sha256=config_sha256,
+        label="v3 evidence",
+    )
+
+    assert payload["proposer_compatible_candidate_count"] == 79
+    assert payload["unavailable_models"] == [model]
+    assert validation["groups"] == ["G1"]
+    assert validation["availability_policy"] == "registry_capacity"
+
+
+def test_v3_route_preflight_accepts_explicit_model_endpoint_404(
+    tmp_path: Path,
+) -> None:
+    module = _load(SEAL_ARTIFACTS, "seal_draco_artifacts_v3_404_test")
+    config_path, config, config_sha256 = _formal_g1_config(module, tmp_path)
+    payload = _v3_route_preflight(
+        module,
+        config_path=config_path,
+        config=config,
+        config_sha256=config_sha256,
+    )
+    model = "mistralai/devstral-2512"
+    row = payload["models"][model]
+    row.update(
+        {
+            "endpoint_fetch_outcome": "model_not_found",
+            "endpoint_http_status": 404,
+            "response_sha256_kind": "raw_body",
+            "response_model_id": None,
+            "matching_endpoints": [],
+            "operational_match_count": 0,
+            "compatible_operational_match_count": 0,
+            "proposer_compatible_operational_match_count": 0,
+            "aggregator_compatible_operational_match_count": 0,
+            "availability_status": "model_endpoint_not_found",
+        }
+    )
+    _refresh_v3_availability_summary(payload)
+
+    validation = module.validate_route_preflight_payload(
+        payload,
+        experiment_config_sha256=config_sha256,
+        label="v3 404 evidence",
+    )
+
+    assert validation["schema"] == module.ROUTE_PREFLIGHT_V3_SCHEMA
+    assert payload["unavailable_models"] == [model]
+
+
+def test_v3_route_preflight_rejects_tampered_availability_or_fixed_route(
+    tmp_path: Path,
+) -> None:
+    module = _load(SEAL_ARTIFACTS, "seal_draco_artifacts_v3_tamper_test")
+    config_path, config, config_sha256 = _formal_g1_config(module, tmp_path)
+    payload = _v3_route_preflight(
+        module,
+        config_path=config_path,
+        config=config,
+        config_sha256=config_sha256,
+    )
+    model = "mistralai/devstral-2512"
+    payload["models"][model]["availability_status"] = "no_matching_endpoint"
+    with pytest.raises(ValueError, match="precomputed availability"):
+        module.validate_route_preflight_payload(
+            payload,
+            experiment_config_sha256=config_sha256,
+            label="tampered availability",
+        )
+
+    payload = _v3_route_preflight(
+        module,
+        config_path=config_path,
+        config=config,
+        config_sha256=config_sha256,
+    )
+    fixed_model = "anthropic/claude-opus-4.8"
+    payload["fixed_route_checks"][fixed_model]["matching_endpoints"] = []
+    with pytest.raises(ValueError, match="fixed-route projection differs"):
+        module.validate_route_preflight_payload(
+            payload,
+            experiment_config_sha256=config_sha256,
+            label="tampered fixed route",
+        )
+
+    payload = _v3_route_preflight(
+        module,
+        config_path=config_path,
+        config=config,
+        config_sha256=config_sha256,
+    )
+    payload["fixed_route_checks"][fixed_model]["response_sha256"] = "f" * 64
+    with pytest.raises(ValueError, match="fixed-route response differs"):
+        module.validate_route_preflight_payload(
+            payload,
+            experiment_config_sha256=config_sha256,
+            label="detached fixed route",
+        )
+
+    payload = _v3_route_preflight(
+        module,
+        config_path=config_path,
+        config=config,
+        config_sha256=config_sha256,
+    )
+    source_row = payload["models"][fixed_model]
+    source_row.update(
+        {
+            "matching_endpoints": [],
+            "operational_match_count": 0,
+            "compatible_operational_match_count": 0,
+            "proposer_compatible_operational_match_count": 0,
+            "aggregator_compatible_operational_match_count": 0,
+            "availability_status": "no_matching_endpoint",
+        }
+    )
+    _refresh_v3_availability_summary(payload)
+    with pytest.raises(ValueError, match="fixed-route projection differs"):
+        module.validate_route_preflight_payload(
+            payload,
+            experiment_config_sha256=config_sha256,
+            label="contradictory fixed route",
+        )
 
 
 def test_formal_success_rejects_v1_without_endpoint_details(tmp_path: Path) -> None:

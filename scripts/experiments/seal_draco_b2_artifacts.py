@@ -23,9 +23,25 @@ SNAPSHOT_SCHEMA = "opensquilla.draco-b2-artifact-snapshot/v1"
 SUCCESS_SCHEMA = "opensquilla.draco-b2-formal-success/v1"
 ROUTE_PREFLIGHT_V1_SCHEMA = "opensquilla.openrouter-route-preflight/v1"
 ROUTE_PREFLIGHT_V2_SCHEMA = "opensquilla.openrouter-route-preflight/v2"
-ROUTE_PREFLIGHT_SCHEMAS = frozenset({ROUTE_PREFLIGHT_V1_SCHEMA, ROUTE_PREFLIGHT_V2_SCHEMA})
+ROUTE_PREFLIGHT_V3_SCHEMA = "opensquilla.openrouter-route-preflight/v3"
+ROUTE_PREFLIGHT_SCHEMAS = frozenset(
+    {ROUTE_PREFLIGHT_V1_SCHEMA, ROUTE_PREFLIGHT_V2_SCHEMA, ROUTE_PREFLIGHT_V3_SCHEMA}
+)
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_EXPERIMENT_CONFIG_PATH = ROOT / "configs" / "benchmarks" / "draco_b2_g12.json"
+FORMAL_GROUP_ORDER = ("B0", "B1", "B2", "B4", "G1")
+TASK_ANALYZER_MODEL = "anthropic/claude-opus-4.8"
+B2_EXPECTED_ROUTES = {
+    "deepseek/deepseek-v4-pro": "deepseek",
+    "z-ai/glm-5.2": "z-ai",
+    "moonshotai/kimi-k2.7-code": "moonshotai",
+    "qwen/qwen3.7-max": "alibaba",
+    "google/gemini-3.1-pro-preview": "google-ai-studio",
+}
+FIXED_GROUP_ROUTES = {
+    "B0": {TASK_ANALYZER_MODEL: "anthropic"},
+    "B4": {"openai/gpt-5.5": "openai"},
+}
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 EXPECTED_PROVIDER_NAMES = {
@@ -45,6 +61,11 @@ EXPECTED_PROVIDER_NAMES = {
     "tencent": "Tencent",
 }
 OPENROUTER_COMPAT_POLICY = compat_policy_for_kind("openrouter")
+B2_REQUIRED_PARAMETERS = {model: {"max_tokens", "reasoning"} for model in B2_EXPECTED_ROUTES}
+B2_REQUIRED_PARAMETERS["deepseek/deepseek-v4-pro"].add("temperature")
+B2_REQUIRED_PARAMETERS["z-ai/glm-5.2"] |= {"temperature", "tools"}
+B2_REQUIRED_PARAMETERS["qwen/qwen3.7-max"].add("temperature")
+B2_REQUIRED_PARAMETERS["google/gemini-3.1-pro-preview"].add("temperature")
 
 
 def file_sha256(path: Path) -> str:
@@ -265,9 +286,10 @@ FORMAL_REASONING_INELIGIBLE_MODELS = frozenset(
 )
 
 
-def _formal_required_parameters(
+def _formal_role_required_parameters(
     expected_routes: dict[str, str],
     *,
+    include_tools: bool,
     reasoning_ineligible_models: set[str] | frozenset[str] = (FORMAL_REASONING_INELIGIBLE_MODELS),
 ) -> dict[str, list[str]]:
     required = {
@@ -280,10 +302,12 @@ def _formal_required_parameters(
                 )
                 else "max_tokens"
             ),
-            "tools",
         }
         for model in expected_routes
     }
+    if include_tools:
+        for parameters in required.values():
+            parameters.add("tools")
     for model in set(expected_routes) - reasoning_ineligible_models:
         required[model].add("reasoning")
     for model in expected_routes:
@@ -293,6 +317,30 @@ def _formal_required_parameters(
         ):
             required[model].add("temperature")
     return {model: sorted(parameters) for model, parameters in required.items()}
+
+
+def _formal_proposer_required_parameters(
+    expected_routes: dict[str, str],
+    *,
+    reasoning_ineligible_models: set[str] | frozenset[str] = (FORMAL_REASONING_INELIGIBLE_MODELS),
+) -> dict[str, list[str]]:
+    return _formal_role_required_parameters(
+        expected_routes,
+        include_tools=False,
+        reasoning_ineligible_models=reasoning_ineligible_models,
+    )
+
+
+def _formal_required_parameters(
+    expected_routes: dict[str, str],
+    *,
+    reasoning_ineligible_models: set[str] | frozenset[str] = (FORMAL_REASONING_INELIGIBLE_MODELS),
+) -> dict[str, list[str]]:
+    return _formal_role_required_parameters(
+        expected_routes,
+        include_tools=True,
+        reasoning_ineligible_models=reasoning_ineligible_models,
+    )
 
 
 def _tag_matches(tag: str, expected: str) -> bool:
@@ -347,6 +395,134 @@ def _recompute_endpoint_counts(
     if operational_count <= 0 or compatible_count <= 0:
         raise ValueError(f"{label} route preflight v2 model has no compatible route: {model}")
     return operational_count, compatible_count
+
+
+def _parse_formal_groups(value: Any, *, label: str) -> tuple[str, ...]:
+    if (
+        not isinstance(value, list)
+        or not value
+        or any(not isinstance(group, str) for group in value)
+    ):
+        raise ValueError(f"{label} route preflight v3 groups are invalid")
+    groups = tuple(value)
+    try:
+        indexes = [FORMAL_GROUP_ORDER.index(group) for group in groups]
+    except ValueError as exc:
+        raise ValueError(f"{label} route preflight v3 group is unsupported") from exc
+    if indexes != sorted(set(indexes)):
+        raise ValueError(f"{label} route preflight v3 groups are not canonical")
+    return groups
+
+
+def _required_fixed_route_specs(
+    *,
+    experiment: Any,
+    groups: tuple[str, ...],
+    proposer_required_parameters: dict[str, list[str]],
+) -> tuple[dict[str, str], dict[str, list[str]]]:
+    routes: dict[str, str] = {}
+    parameters: dict[str, set[str]] = {}
+
+    def add(model: str, provider: str, required: list[str] | set[str]) -> None:
+        existing = routes.get(model)
+        if existing is not None and existing != provider:
+            raise ValueError(f"conflicting fixed providers for {model}: {existing}, {provider}")
+        routes[model] = provider
+        parameters.setdefault(model, set()).update(required)
+
+    for group in groups:
+        for model, provider in FIXED_GROUP_ROUTES.get(group, {}).items():
+            if model not in proposer_required_parameters:
+                raise ValueError(f"fixed route is absent from the frozen registry: {model}")
+            add(model, provider, proposer_required_parameters[model])
+    if "B2" in groups:
+        for model, provider in B2_EXPECTED_ROUTES.items():
+            add(model, provider, B2_REQUIRED_PARAMETERS[model])
+    if "G1" in groups:
+        judge_model = str(experiment.judge.model).strip().lower()
+        for model, provider in {
+            TASK_ANALYZER_MODEL: "anthropic",
+            judge_model: "google-ai-studio",
+        }.items():
+            if model not in proposer_required_parameters:
+                raise ValueError(f"G1 fixed route is absent from the frozen registry: {model}")
+            add(model, provider, proposer_required_parameters[model])
+    return dict(sorted(routes.items())), {
+        model: sorted(parameters[model]) for model in sorted(parameters)
+    }
+
+
+def _required_role_capacity(experiment: Any, groups: tuple[str, ...]) -> tuple[int, int]:
+    if "G1" not in groups:
+        return 0, 0
+    g1 = experiment.g1_routing
+    if g1 is None:
+        raise ValueError("route preflight v3 requires a G1 routing contract")
+    return (
+        int(g1.expected_proposer_count_max)
+        + int(experiment.ensemble.proposer_backup_count)
+        + int(experiment.ensemble.aggregator_recovery_top_k),
+        int(experiment.ensemble.aggregator_recovery_top_k),
+    )
+
+
+def _recompute_v3_endpoint_availability(
+    *,
+    model: str,
+    expected_provider: str,
+    proposer_required_parameters: list[str],
+    aggregator_required_parameters: list[str],
+    endpoints: Any,
+    label: str,
+) -> tuple[int, int, int, str]:
+    if not isinstance(endpoints, list):
+        raise ValueError(f"{label} route preflight v3 endpoint evidence is invalid: {model}")
+    provider_is_auto = expected_provider == "auto"
+    expected_provider_name = EXPECTED_PROVIDER_NAMES.get(expected_provider)
+    if not provider_is_auto and not expected_provider_name:
+        raise ValueError(
+            f"{label} route preflight v3 provider contract is unknown: {expected_provider}"
+        )
+    proposer_required = set(proposer_required_parameters)
+    aggregator_required = set(aggregator_required_parameters)
+    operational_count = 0
+    proposer_compatible_count = 0
+    aggregator_compatible_count = 0
+    for endpoint in endpoints:
+        if not isinstance(endpoint, dict):
+            raise ValueError(f"{label} route preflight v3 endpoint row is invalid: {model}")
+        if not provider_is_auto and not _tag_matches(
+            str(endpoint.get("tag") or ""), expected_provider
+        ):
+            raise ValueError(f"{label} route preflight v3 endpoint provider tag differs: {model}")
+        status = endpoint.get("status")
+        if not (isinstance(status, int) and not isinstance(status, bool) and status == 0):
+            continue
+        operational_count += 1
+        supported = endpoint.get("supported_parameters")
+        if not isinstance(supported, list) or any(
+            not isinstance(item, str) or not item for item in supported
+        ):
+            raise ValueError(f"{label} route preflight v3 endpoint parameters are invalid: {model}")
+        supported_parameters = set(supported)
+        identity_matches = (
+            provider_is_auto or endpoint.get("provider_name") == expected_provider_name
+        ) and endpoint.get("model_id") == model
+        if identity_matches and proposer_required <= supported_parameters:
+            proposer_compatible_count += 1
+        if identity_matches and aggregator_required <= supported_parameters:
+            aggregator_compatible_count += 1
+    if not endpoints:
+        status = "no_matching_endpoint"
+    elif operational_count == 0:
+        status = "no_operational_endpoint"
+    elif proposer_compatible_count == 0:
+        status = "no_compatible_request_surface"
+    elif aggregator_compatible_count == 0:
+        status = "proposer_only"
+    else:
+        status = "compatible"
+    return operational_count, proposer_compatible_count, aggregator_compatible_count, status
 
 
 def validate_route_preflight_payload(
@@ -408,6 +584,7 @@ def validate_route_preflight_payload(
     if file_sha256(config_path) != experiment_config_sha256:
         raise ValueError(f"{label} route preflight v2 experiment config changed")
     try:
+        experiment = load_draco_experiment_config(config_path).config
         g1_contract, resolved_contract = _resolved_g1_contract(config_path)
     except (OSError, ValueError) as exc:
         raise ValueError(f"{label} route preflight v2 experiment config is invalid: {exc}") from exc
@@ -455,20 +632,56 @@ def validate_route_preflight_payload(
         expected_routes,
         reasoning_ineligible_models=set(resolved_contract["reasoning_ineligible_models"]),
     )
+    frozen_proposer_required_parameters = _formal_proposer_required_parameters(
+        expected_routes,
+        reasoning_ineligible_models=set(resolved_contract["reasoning_ineligible_models"]),
+    )
     required_parameters: dict[str, list[str]] = {}
+    proposer_required_parameters: dict[str, list[str]] = {}
+    v3_counts: dict[str, tuple[int, int, int, str]] = {}
     for model, expected_provider in expected_routes.items():
         row = models.get(model)
         if not isinstance(row, dict):
             raise ValueError(f"{label} route preflight v2 model evidence is invalid")
         if row.get("expected_provider") != expected_provider:
             raise ValueError(f"{label} route preflight v2 model provider differs: {model}")
-        if row.get("response_model_id") != model:
-            raise ValueError(f"{label} route preflight v2 endpoint response model differs: {model}")
         response_sha256 = row.get("response_sha256")
         if not isinstance(response_sha256, str) or not HEX64.fullmatch(response_sha256):
             raise ValueError(
                 f"{label} route preflight v2 endpoint response hash is invalid: {model}"
             )
+        if schema == ROUTE_PREFLIGHT_V3_SCHEMA:
+            if row.get("requested_model_id") != model:
+                raise ValueError(f"{label} route preflight v3 requested model differs: {model}")
+            fetch_outcome = row.get("endpoint_fetch_outcome")
+            response_status = row.get("endpoint_http_status")
+            response_hash_kind = row.get("response_sha256_kind")
+            if fetch_outcome == "ok":
+                if (
+                    response_status != 200
+                    or response_hash_kind != "canonical_json"
+                    or row.get("response_model_id") != model
+                ):
+                    raise ValueError(
+                        f"{label} route preflight v3 endpoint fetch evidence differs: {model}"
+                    )
+            elif fetch_outcome == "model_not_found":
+                if (
+                    candidate_scope != "registry_all"
+                    or response_status != 404
+                    or response_hash_kind != "raw_body"
+                    or row.get("response_model_id") is not None
+                    or row.get("matching_endpoints") != []
+                ):
+                    raise ValueError(
+                        f"{label} route preflight v3 endpoint not-found evidence differs: {model}"
+                    )
+            else:
+                raise ValueError(
+                    f"{label} route preflight v3 endpoint fetch outcome is invalid: {model}"
+                )
+        elif row.get("response_model_id") != model:
+            raise ValueError(f"{label} route preflight v2 endpoint response model differs: {model}")
         parameters = row.get("required_parameters")
         if (
             not isinstance(parameters, list)
@@ -479,20 +692,55 @@ def validate_route_preflight_payload(
             raise ValueError(f"{label} route preflight v2 parameters are invalid: {model}")
         if parameters != frozen_required_parameters[model]:
             raise ValueError(f"{label} route preflight v2 frozen parameters differ: {model}")
-        operational_count, compatible_count = _recompute_endpoint_counts(
-            model=model,
-            expected_provider=expected_provider,
-            required_parameters=parameters,
-            endpoints=row.get("matching_endpoints"),
-            label=label,
-        )
-        if (
-            row.get("operational_match_count") != operational_count
-            or row.get("compatible_operational_match_count") != compatible_count
-        ):
-            raise ValueError(
-                f"{label} route preflight v2 precomputed endpoint counts differ: {model}"
+        if schema == ROUTE_PREFLIGHT_V3_SCHEMA:
+            proposer_parameters = row.get("proposer_required_parameters")
+            aggregator_parameters = row.get("aggregator_required_parameters")
+            if proposer_parameters != frozen_proposer_required_parameters[model]:
+                raise ValueError(f"{label} route preflight v3 proposer parameters differ: {model}")
+            if aggregator_parameters != frozen_required_parameters[model]:
+                raise ValueError(
+                    f"{label} route preflight v3 aggregator parameters differ: {model}"
+                )
+            if fetch_outcome == "model_not_found":
+                counts = (0, 0, 0, "model_endpoint_not_found")
+            else:
+                counts = _recompute_v3_endpoint_availability(
+                    model=model,
+                    expected_provider=expected_provider,
+                    proposer_required_parameters=proposer_parameters,
+                    aggregator_required_parameters=aggregator_parameters,
+                    endpoints=row.get("matching_endpoints"),
+                    label=label,
+                )
+            operational_count, proposer_count, aggregator_count, status = counts
+            expected_values = {
+                "operational_match_count": operational_count,
+                "compatible_operational_match_count": aggregator_count,
+                "proposer_compatible_operational_match_count": proposer_count,
+                "aggregator_compatible_operational_match_count": aggregator_count,
+                "availability_status": status,
+            }
+            if any(row.get(field) != value for field, value in expected_values.items()):
+                raise ValueError(
+                    f"{label} route preflight v3 precomputed availability differs: {model}"
+                )
+            proposer_required_parameters[model] = proposer_parameters
+            v3_counts[model] = counts
+        else:
+            operational_count, compatible_count = _recompute_endpoint_counts(
+                model=model,
+                expected_provider=expected_provider,
+                required_parameters=parameters,
+                endpoints=row.get("matching_endpoints"),
+                label=label,
             )
+            if (
+                row.get("operational_match_count") != operational_count
+                or row.get("compatible_operational_match_count") != compatible_count
+            ):
+                raise ValueError(
+                    f"{label} route preflight v2 precomputed endpoint counts differ: {model}"
+                )
         required_parameters[model] = parameters
     required_parameters_sha256 = payload.get("required_parameters_sha256")
     if (
@@ -501,6 +749,161 @@ def validate_route_preflight_payload(
         or canonical_sha256(required_parameters) != required_parameters_sha256
     ):
         raise ValueError(f"{label} route preflight v2 required-parameters hash differs")
+
+    v3_contract: dict[str, Any] = {}
+    if schema == ROUTE_PREFLIGHT_V3_SCHEMA:
+        proposer_parameters_sha256 = payload.get("proposer_required_parameters_sha256")
+        if (
+            not isinstance(proposer_parameters_sha256, str)
+            or not HEX64.fullmatch(proposer_parameters_sha256)
+            or canonical_sha256(proposer_required_parameters) != proposer_parameters_sha256
+        ):
+            raise ValueError(f"{label} route preflight v3 proposer-parameters hash differs")
+        groups = _parse_formal_groups(payload.get("groups"), label=label)
+        expected_availability_policy = (
+            "registry_capacity" if candidate_scope == "registry_all" else "strict_all_routes"
+        )
+        if payload.get("availability_policy") != expected_availability_policy:
+            raise ValueError(f"{label} route preflight v3 availability policy differs")
+
+        proposer_models = sorted(
+            model for model, (_, count, _, _) in v3_counts.items() if count > 0
+        )
+        aggregator_models = sorted(
+            model for model, (_, _, count, _) in v3_counts.items() if count > 0
+        )
+        unavailable_models = sorted(set(expected_routes) - set(proposer_models))
+        aggregator_ineligible_models = sorted(set(expected_routes) - set(aggregator_models))
+        expected_summary = {
+            "proposer_compatible_candidate_count": len(proposer_models),
+            "aggregator_compatible_candidate_count": len(aggregator_models),
+            "proposer_compatible_models": proposer_models,
+            "aggregator_compatible_models": aggregator_models,
+            "unavailable_models": unavailable_models,
+            "aggregator_ineligible_models": aggregator_ineligible_models,
+            "availability_status": (
+                "complete"
+                if not unavailable_models and not aggregator_ineligible_models
+                else "degraded"
+            ),
+        }
+        if any(payload.get(field) != value for field, value in expected_summary.items()):
+            raise ValueError(f"{label} route preflight v3 availability summary differs")
+
+        required_proposer_count, required_aggregator_count = _required_role_capacity(
+            experiment, groups
+        )
+        if candidate_scope == "exact_routes":
+            required_proposer_count = len(expected_routes)
+            required_aggregator_count = len(expected_routes)
+        capacity_pass = (
+            len(proposer_models) >= required_proposer_count
+            and len(aggregator_models) >= required_aggregator_count
+        )
+        capacity_fields = {
+            "required_proposer_compatible_candidate_count": required_proposer_count,
+            "required_aggregator_compatible_candidate_count": required_aggregator_count,
+            "candidate_capacity_pass": capacity_pass,
+        }
+        if any(payload.get(field) != value for field, value in capacity_fields.items()):
+            raise ValueError(f"{label} route preflight v3 capacity evidence differs")
+        if not capacity_pass:
+            raise ValueError(f"{label} route preflight v3 candidate capacity did not pass")
+
+        fixed_routes, fixed_parameters = _required_fixed_route_specs(
+            experiment=experiment,
+            groups=groups,
+            proposer_required_parameters=proposer_required_parameters,
+        )
+        fixed_contract = {
+            model: {
+                "provider": fixed_routes[model],
+                "required_parameters": fixed_parameters[model],
+            }
+            for model in fixed_routes
+        }
+        if payload.get("required_fixed_routes") != fixed_contract:
+            raise ValueError(f"{label} route preflight v3 fixed-route contract differs")
+        fixed_routes_sha256 = payload.get("required_fixed_routes_sha256")
+        if (
+            not isinstance(fixed_routes_sha256, str)
+            or not HEX64.fullmatch(fixed_routes_sha256)
+            or canonical_sha256(fixed_contract) != fixed_routes_sha256
+        ):
+            raise ValueError(f"{label} route preflight v3 fixed-route hash differs")
+        fixed_checks = payload.get("fixed_route_checks")
+        if not isinstance(fixed_checks, dict) or set(fixed_checks) != set(fixed_routes):
+            raise ValueError(f"{label} route preflight v3 fixed-route evidence differs")
+        for model, expected_provider in fixed_routes.items():
+            row = fixed_checks.get(model)
+            if not isinstance(row, dict):
+                raise ValueError(f"{label} route preflight v3 fixed-route row is invalid: {model}")
+            source_row = models[model]
+            if source_row.get("endpoint_fetch_outcome") != "ok":
+                raise ValueError(f"{label} route preflight v3 fixed route was not fetched: {model}")
+            if row.get("expected_provider") != expected_provider:
+                raise ValueError(
+                    f"{label} route preflight v3 fixed-route provider differs: {model}"
+                )
+            for field in (
+                "requested_model_id",
+                "endpoint_fetch_outcome",
+                "endpoint_http_status",
+                "response_sha256_kind",
+                "response_model_id",
+                "response_sha256",
+            ):
+                if row.get(field) != source_row.get(field):
+                    raise ValueError(
+                        f"{label} route preflight v3 fixed-route response differs: {model}"
+                    )
+            if row.get("response_model_id") != model:
+                raise ValueError(f"{label} route preflight v3 fixed-route model differs: {model}")
+            response_hash = row.get("response_sha256")
+            if not isinstance(response_hash, str) or not HEX64.fullmatch(response_hash):
+                raise ValueError(
+                    f"{label} route preflight v3 fixed-route response hash is invalid: {model}"
+                )
+            if row.get("required_parameters") != fixed_parameters[model]:
+                raise ValueError(
+                    f"{label} route preflight v3 fixed-route parameters differ: {model}"
+                )
+            source_endpoints = source_row.get("matching_endpoints")
+            if not isinstance(source_endpoints, list):
+                raise ValueError(
+                    f"{label} route preflight v3 fixed-route source endpoints differ: {model}"
+                )
+            expected_fixed_endpoints = [
+                endpoint
+                for endpoint in source_endpoints
+                if isinstance(endpoint, dict)
+                and _tag_matches(str(endpoint.get("tag") or ""), expected_provider)
+            ]
+            if row.get("matching_endpoints") != expected_fixed_endpoints:
+                raise ValueError(
+                    f"{label} route preflight v3 fixed-route projection differs: {model}"
+                )
+            operational_count, compatible_count = _recompute_endpoint_counts(
+                model=model,
+                expected_provider=expected_provider,
+                required_parameters=fixed_parameters[model],
+                endpoints=expected_fixed_endpoints,
+                label=label,
+            )
+            if (
+                row.get("operational_match_count") != operational_count
+                or row.get("compatible_operational_match_count") != compatible_count
+            ):
+                raise ValueError(f"{label} route preflight v3 fixed-route counts differ: {model}")
+        if payload.get("fixed_routes_pass") is not True:
+            raise ValueError(f"{label} route preflight v3 fixed routes did not pass")
+        v3_contract = {
+            "groups": list(groups),
+            "availability_policy": expected_availability_policy,
+            "required_fixed_routes_sha256": fixed_routes_sha256,
+            "required_proposer_compatible_candidate_count": required_proposer_count,
+            "required_aggregator_compatible_candidate_count": required_aggregator_count,
+        }
 
     return {
         "schema": schema,
@@ -512,6 +915,7 @@ def validate_route_preflight_payload(
         "experiment_config_sha256": experiment_config_sha256,
         "g1_routing_profile_id": profile_id,
         "source_registry_snapshot_version": source_version,
+        **v3_contract,
     }
 
 
@@ -534,10 +938,10 @@ def validate_route_preflight_set(
     schemas = {validation["schema"] for validation in validations}
     if len(schemas) != 1:
         raise ValueError("route preflight evidence schemas differ")
-    if schemas == {ROUTE_PREFLIGHT_V2_SCHEMA} and any(
+    if schemas <= {ROUTE_PREFLIGHT_V2_SCHEMA, ROUTE_PREFLIGHT_V3_SCHEMA} and any(
         validation != validations[0] for validation in validations[1:]
     ):
-        raise ValueError("route preflight v2 G1 contracts differ")
+        raise ValueError("route preflight G1 contracts differ")
     return validations
 
 
@@ -687,7 +1091,10 @@ def main() -> int:
             "size_bytes": resolved.stat().st_size,
             "route_preflight_schema": validation["schema"],
         }
-        if validation["schema"] == ROUTE_PREFLIGHT_V2_SCHEMA:
+        if validation["schema"] in {
+            ROUTE_PREFLIGHT_V2_SCHEMA,
+            ROUTE_PREFLIGHT_V3_SCHEMA,
+        }:
             evidence_record["formal_g1_contract"] = {
                 key: validation[key]
                 for key in (
@@ -701,6 +1108,19 @@ def main() -> int:
                     "source_registry_snapshot_version",
                 )
             }
+            if validation["schema"] == ROUTE_PREFLIGHT_V3_SCHEMA:
+                evidence_record["formal_g1_contract"].update(
+                    {
+                        key: validation[key]
+                        for key in (
+                            "groups",
+                            "availability_policy",
+                            "required_fixed_routes_sha256",
+                            "required_proposer_compatible_candidate_count",
+                            "required_aggregator_compatible_candidate_count",
+                        )
+                    }
+                )
         evidence.append(evidence_record)
     payload = {
         "schema": SUCCESS_SCHEMA,
