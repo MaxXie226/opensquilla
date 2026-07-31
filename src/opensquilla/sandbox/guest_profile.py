@@ -50,11 +50,7 @@ class GuestProfile:
     def cleanup(self) -> None:
         if self.cleaned:
             return
-        # This object owns the factory-created root, including when an embedder
-        # deliberately supplies a custom temp parent outside the system temp
-        # directory. The stricter standalone helper remains for paths recovered
-        # from untrusted task metadata.
-        shutil.rmtree(self.root, ignore_errors=True)
+        cleanup_guest_profile_root(self.root)
         self.cleaned = True
 
 
@@ -91,22 +87,22 @@ class GuestProfileFactory:
     def create(
         task_id: str,
         *,
+        workspace: str | Path,
         runtime_roots: tuple[str | Path, ...] = (),
-        temp_parent: str | Path | None = None,
     ) -> GuestProfile:
-        parent = Path(temp_parent).expanduser().absolute() if temp_parent else None
-        if parent is not None:
-            parent.mkdir(parents=True, exist_ok=True)
+        workspace_path = Path(workspace).expanduser().resolve(strict=False)
+        workspace_path.mkdir(parents=True, exist_ok=True)
+        parent = workspace_path / ".opensquilla-guest"
+        parent.mkdir(parents=True, exist_ok=True)
         root = Path(
             tempfile.mkdtemp(
                 prefix=f"opensquilla-guest-{_safe_task_component(task_id)}-",
-                dir=str(parent) if parent is not None else None,
+                dir=str(parent),
             )
-        ).absolute()
-        workspace = root / "workspace"
+        ).resolve(strict=False)
         home = root / "home"
         temp = root / "tmp"
-        for directory in (workspace, home, temp):
+        for directory in (home, temp):
             directory.mkdir()
         resolved_runtimes = tuple(
             Path(runtime_root).expanduser().absolute()
@@ -114,7 +110,7 @@ class GuestProfileFactory:
             if Path(runtime_root).expanduser().exists()
         )
         mounts = (
-            GuestMount(workspace, "workspace", "rw"),
+            GuestMount(workspace_path, "workspace", "rw"),
             *(
                 GuestMount(runtime_root, "bundled-runtime", "ro")
                 for runtime_root in resolved_runtimes
@@ -122,7 +118,7 @@ class GuestProfileFactory:
         )
         return GuestProfile(
             root=root,
-            workspace=workspace,
+            workspace=workspace_path,
             home=home,
             temp=temp,
             mounts=mounts,
@@ -135,18 +131,15 @@ class GuestProfileFactory:
 
 
 def cleanup_guest_profile_root(value: str | Path) -> bool:
-    """Remove only a factory-shaped guest root below the system temp directory."""
+    """Remove only a factory-shaped scratch root below ``.opensquilla-guest``."""
 
     root = Path(value).expanduser().absolute()
-    temp_root = Path(tempfile.gettempdir()).expanduser().resolve(strict=False)
     canonical_root = root.resolve(strict=False)
-    try:
-        canonical_root.relative_to(temp_root)
-    except ValueError:
-        return False
     if (
         not root.name.startswith("opensquilla-guest-")
         or canonical_root.name != root.name
+        or canonical_root.parent.name != ".opensquilla-guest"
+        or canonical_root.parent == canonical_root
     ):
         return False
     shutil.rmtree(root, ignore_errors=True)

@@ -9,13 +9,15 @@ from opensquilla.sandbox.guest_profile import (
 from opensquilla.sandbox.run_mode import RunMode
 
 
-def test_guest_profile_mounts_only_temp_and_bundled_runtime(tmp_path: Path) -> None:
+def test_guest_profile_mounts_default_workspace_and_bundled_runtime(tmp_path: Path) -> None:
     runtime = tmp_path / "runtime"
     runtime.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
     profile = GuestProfileFactory.create(
         "task/unsafe",
+        workspace=workspace,
         runtime_roots=(runtime,),
-        temp_parent=tmp_path / "guests",
     )
 
     assert profile.host_home_mounted is False
@@ -24,7 +26,9 @@ def test_guest_profile_mounts_only_temp_and_bundled_runtime(tmp_path: Path) -> N
         "bundled-runtime",
     }
     assert profile.run_context().run_mode is RunMode.SAFE
-    assert profile.run_context().workspace == str(profile.workspace)
+    assert profile.run_context().workspace == str(workspace.resolve())
+    assert profile.home.is_relative_to(workspace.resolve())
+    assert profile.temp.is_relative_to(workspace.resolve())
 
     profile.cleanup()
 
@@ -36,7 +40,9 @@ def test_guest_environment_does_not_inherit_host_secrets(
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "secret")
     monkeypatch.setenv("OPENAI_API_KEY", "secret")
 
-    profile = GuestProfileFactory.create("task", temp_parent=tmp_path)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    profile = GuestProfileFactory.create("task", workspace=workspace)
 
     assert "AWS_SECRET_ACCESS_KEY" not in profile.environment
     assert "OPENAI_API_KEY" not in profile.environment
@@ -47,8 +53,10 @@ def test_guest_environment_does_not_inherit_host_secrets(
 
 
 def test_guest_cleanup_removes_entire_task_root(tmp_path: Path) -> None:
-    profile = GuestProfileFactory.create("task", temp_parent=tmp_path)
-    marker = profile.workspace / "result.txt"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    profile = GuestProfileFactory.create("task", workspace=workspace)
+    marker = profile.root / "result.txt"
     marker.write_text("guest", encoding="utf-8")
     root = profile.root
 
@@ -56,6 +64,7 @@ def test_guest_cleanup_removes_entire_task_root(tmp_path: Path) -> None:
     profile.cleanup()
 
     assert not root.exists()
+    assert workspace.exists()
 
 
 def test_guest_cleanup_rejects_non_guest_directory(tmp_path: Path) -> None:

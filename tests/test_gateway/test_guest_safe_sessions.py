@@ -12,6 +12,7 @@ from opensquilla.gateway.routing import (
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError
 from opensquilla.gateway.rpc_sessions import (
     _guest_profile_for_principal,
+    _is_remote_web_guest,
     _trusted_run_mode_hint,
 )
 from opensquilla.sandbox.guest_profile import GuestProfileFactory
@@ -30,6 +31,14 @@ def _guest_principal(*, invalid: bool = False) -> Principal:
     )
 
 
+def test_guest_sensitive_read_overlay_is_remote_web_only() -> None:
+    principal = _guest_principal()
+
+    assert _is_remote_web_guest(principal, {"caller_kind": "web"}) is True
+    assert _is_remote_web_guest(principal, {"caller_kind": "cli"}) is False
+    assert _is_remote_web_guest(principal, {"channel_kind": "channel"}) is False
+
+
 @pytest.mark.parametrize("invalid", [False, True])
 def test_guest_and_invalid_token_reject_explicit_full_before_materialization(
     invalid: bool,
@@ -45,7 +54,9 @@ def test_guest_and_invalid_token_reject_explicit_full_before_materialization(
 def test_guest_route_uses_ephemeral_workspace_and_scrubbed_environment(
     tmp_path: Path,
 ) -> None:
-    profile = GuestProfileFactory.create("turn", temp_parent=tmp_path)
+    workspace = tmp_path / "configured-workspace"
+    workspace.mkdir()
+    profile = GuestProfileFactory.create("turn", workspace=workspace)
     envelope = build_web_route_envelope(session_key="agent:main:web:guest")
     envelope.metadata["guest_safe"] = True
     envelope.metadata["guest_environment"] = dict(profile.environment)
@@ -55,14 +66,17 @@ def test_guest_route_uses_ephemeral_workspace_and_scrubbed_environment(
     context = tool_context_from_envelope(
         envelope,
         is_owner=False,
-        workspace_dir=str(tmp_path / "host-project"),
+        workspace_dir=str(workspace),
     )
 
     assert context.guest_safe is True
     assert context.run_mode == "safe"
-    assert context.workspace_dir == str(profile.workspace)
+    assert Path(context.workspace_dir or "").resolve() == workspace.resolve()
     assert context.environment == profile.environment
+    scratch_root = profile.root
     profile.cleanup()
+    assert workspace.is_dir()
+    assert not scratch_root.exists()
 
 
 def test_guest_shell_environment_never_inherits_host_secret(
@@ -70,7 +84,9 @@ def test_guest_shell_environment_never_inherits_host_secret(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "host-secret")
-    profile = GuestProfileFactory.create("turn", temp_parent=tmp_path)
+    workspace = tmp_path / "configured-workspace"
+    workspace.mkdir()
+    profile = GuestProfileFactory.create("turn", workspace=workspace)
     token = current_tool_context.set(
         ToolContext(
             guest_safe=True,
@@ -90,13 +106,20 @@ def test_guest_shell_environment_never_inherits_host_secret(
 @pytest.mark.parametrize("invalid", [False, True])
 def test_missing_and_invalid_token_materialize_the_same_guest_boundary(
     invalid: bool,
+    tmp_path: Path,
 ) -> None:
+    workspace = tmp_path / "configured-workspace"
+    workspace.mkdir()
     profile = _guest_profile_for_principal(
         _guest_principal(invalid=invalid),
         "turn",
+        workspace=workspace,
     )
 
     assert profile is not None
     assert profile.run_context().run_mode.value == "safe"
+    assert profile.workspace == workspace.resolve()
+    assert profile.home.is_relative_to(profile.workspace)
+    assert profile.temp.is_relative_to(profile.workspace)
     assert profile.host_home_mounted is False
     profile.cleanup()

@@ -374,15 +374,33 @@ def _trusted_run_mode_hint(ctx: RpcContext, source_hint: dict[str, Any]) -> Any 
     return None
 
 
-def _guest_profile_for_principal(principal: Any, task_id: str):
+def _guest_profile_for_principal(
+    principal: Any,
+    task_id: str,
+    *,
+    workspace: str | Path,
+):
     has_capability = getattr(principal, "has", lambda _capability: False)
     if has_capability("guest.safe") and not principal_has_host_execute(principal):
         from opensquilla.sandbox.runtime_launcher import bundled_runtime_resolver
 
         resolver = bundled_runtime_resolver()
         runtime_roots = resolver.runtime_roots() if resolver is not None else ()
-        return GuestProfileFactory.create(task_id, runtime_roots=runtime_roots)
+        return GuestProfileFactory.create(
+            task_id,
+            workspace=workspace,
+            runtime_roots=runtime_roots,
+        )
     return None
+
+
+def _is_remote_web_guest(principal: Any, source_hint: dict[str, Any]) -> bool:
+    has_capability = getattr(principal, "has", lambda _capability: False)
+    return bool(
+        source_hint.get("caller_kind") == "web"
+        and has_capability("guest.safe")
+        and not principal_has_host_execute(principal)
+    )
 
 
 def _apply_run_context_route_metadata(
@@ -2683,10 +2701,7 @@ async def _handle_sessions_send(
     turn_id = uuid.uuid4().hex
     run_mode_hint = _trusted_run_mode_hint(ctx, source_hint)
     guest_profile = None
-    guest_safe = bool(
-        getattr(ctx.principal, "has", lambda _capability: False)("guest.safe")
-        and not principal_has_host_execute(ctx.principal)
-    )
+    guest_safe = _is_remote_web_guest(ctx.principal, source_hint)
     capability_report = None
     if guest_safe:
         capability_report = await current_sandbox_capability_report(ctx.config)
@@ -2698,7 +2713,11 @@ async def _handle_sessions_send(
                 "Safe mode is unavailable for this unauthenticated request.",
                 details={"reason": exc.code, **capability_report.to_payload()},
             ) from exc
-        guest_profile = _guest_profile_for_principal(ctx.principal, turn_id)
+        guest_profile = _guest_profile_for_principal(
+            ctx.principal,
+            turn_id,
+            workspace=workspace_path,
+        )
         run_context = guest_profile.run_context()
         authoritative_guard = None
     else:
