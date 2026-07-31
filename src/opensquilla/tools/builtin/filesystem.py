@@ -647,6 +647,23 @@ def _path_access_denied_message(workspace_root: Path | None) -> str:
 
 
 def _path_access_blocked_envelope(decision: MountDecision) -> dict[str, object]:
+    ctx = current_tool_context.get()
+    if ctx is not None and bool(getattr(ctx, "guest_safe", False)):
+        reason = (
+            "GUEST_WRITE_OUTSIDE_DEFAULT_WORKSPACE"
+            if decision.access == "rw"
+            else "GUEST_SENSITIVE_PATH_DENIED"
+        )
+        return {
+            "status": "blocked",
+            "reason": reason,
+            "path": decision.normalized_path,
+            "message": (
+                "Web guest mode can modify only the configured default workspace."
+                if decision.access == "rw"
+                else "Web guest mode cannot read credential or authority data."
+            ),
+        }
     return {
         "status": "blocked",
         "reason": decision.reason,
