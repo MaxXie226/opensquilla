@@ -10155,6 +10155,75 @@ def _slot_recovery_plan(
     }
 
 
+@pytest.mark.asyncio
+async def test_router_dynamic_aggregator_binds_physical_attempt_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _RecoveryScriptRegistry(
+        {
+            "p0": [[TextDeltaEvent(text="draft 0"), _billed_done("p0", cost=0.1)]],
+            "p1": [[TextDeltaEvent(text="draft 1"), _billed_done("p1", cost=0.1)]],
+            "agg": [[TextDeltaEvent(text="final"), _billed_done("agg", cost=0.2)]],
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    proposers = [_member("p0"), _member("p1")]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        aggregator=_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        shuffle_candidates=False,
+        aggregator_recovery_mode="experiment",
+        selection_plan=_slot_recovery_plan(proposers, []),
+    )
+    scope_id = "router-dynamic-aggregator-evidence"
+    assert provider.begin_provider_retry_scope(
+        scope_id,
+        max_additional_physical_requests=3,
+    )
+
+    events = await _collect(provider)
+
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    [aggregator_attempt] = done.ensemble_trace["aggregator_recovery"][
+        "attempts"
+    ]
+    physical_attempt_id = aggregator_attempt["physical_attempt_id"]
+    assert (
+        len(physical_attempt_id) == 32
+        and all(
+            character in "0123456789abcdef"
+            for character in physical_attempt_id
+        )
+    )
+    assert aggregator_attempt["physical_request_count"] == 1
+    assert (
+        done.ensemble_trace["final_request"]["usage"][
+            "physical_attempt_id"
+        ]
+        == physical_attempt_id
+    )
+    aggregator_rows = [
+        row
+        for row in done.model_usage_breakdown
+        if row["role"] == "aggregator"
+    ]
+    assert aggregator_rows
+    assert {
+        row["physical_attempt_id"] for row in aggregator_rows
+    } == {physical_attempt_id}
+    assert {
+        row["provider_usage"]["physical_attempt_id"]
+        for row in aggregator_rows
+    } == {physical_attempt_id}
+    assert provider.end_provider_retry_scope(scope_id)
+
+
 def _slot_candidate(
     *,
     index: int,

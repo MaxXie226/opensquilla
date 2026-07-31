@@ -10084,6 +10084,15 @@ class EnsembleProvider:
         attempt_request_started = False
         current_physical_attempt_id = ""
         active_member = initial_member or self.aggregator
+
+        def requires_physical_attempt_evidence(
+            member: EnsembleMemberConfig,
+        ) -> bool:
+            return bool(
+                member.thinking_policy_managed
+                or self._router_dynamic_selection()
+            )
+
         active_config = (
             _aggregator_chat_config(
                 config,
@@ -10097,7 +10106,10 @@ class EnsembleProvider:
             if initial_fallback_index > 0
             else config
         )
-        if self.aggregator_recovery_mode == "serving":
+        if (
+            self.aggregator_recovery_mode == "serving"
+            or requires_physical_attempt_evidence(active_member)
+        ):
             active_config = active_config.model_copy(
                 update={"allow_provider_stream_fallback": False}
             )
@@ -10371,7 +10383,10 @@ class EnsembleProvider:
                 request_budget_binding=self._member_request_budget_binding(active_member),
                 record_budget_rebound=False,
             )
-            if recovery_mode == "serving" or active_member.thinking_policy_managed:
+            if (
+                recovery_mode == "serving"
+                or requires_physical_attempt_evidence(active_member)
+            ):
                 active_config = active_config.model_copy(
                     update={"allow_provider_stream_fallback": False}
                 )
@@ -10682,10 +10697,10 @@ class EnsembleProvider:
                 active_config,
             )
             managed_event_missing_count = 0
-            if active_member.thinking_policy_managed:
+            if requires_physical_attempt_evidence(active_member):
                 if not current_physical_attempt_id:
                     raise ValueError(
-                        "managed aggregator completion has no physical attempt"
+                        "tracked aggregator completion has no physical attempt"
                     )
                 (
                     aggregator_rows,
@@ -10702,7 +10717,7 @@ class EnsembleProvider:
                 )
                 if not managed_usage_reported:
                     raise ValueError(
-                        "managed successful aggregator lacks a usage receipt"
+                        "tracked successful aggregator lacks a usage receipt"
                     )
             rows = [
                 *prior_rows,
@@ -10713,12 +10728,12 @@ class EnsembleProvider:
                 _done_event_missing_usage_count(event) if include_event_usage else 0
             )
             if (
-                active_member.thinking_policy_managed
+                requires_physical_attempt_evidence(active_member)
                 and event_missing_count
                 and aggregator_rows
             ):
                 raise ValueError(
-                    "managed aggregator completion contradicts usage_missing_count"
+                    "tracked aggregator completion contradicts usage_missing_count"
                 )
             event_missing_count = max(
                 event_missing_count,
@@ -10762,7 +10777,7 @@ class EnsembleProvider:
                         int(active_config.thinking_budget_tokens or 0),
                     ),
                 }
-                if active_member.thinking_policy_managed is True:
+                if requires_physical_attempt_evidence(active_member):
                     success_attempt["physical_attempt_id"] = (
                         current_physical_attempt_id
                     )
@@ -10912,7 +10927,7 @@ class EnsembleProvider:
                 )
             combined_event_rows = [*event_rows, *diagnostic_rows]
             if (
-                active_member.thinking_policy_managed
+                requires_physical_attempt_evidence(active_member)
                 and not current_attempt_already_recorded
                 and attempt_request_started
             ):
@@ -10931,7 +10946,7 @@ class EnsembleProvider:
                 )
                 if managed_usage_reported and event_missing_count:
                     raise ValueError(
-                        "managed aggregator error contradicts usage_missing_count"
+                        "tracked aggregator error contradicts usage_missing_count"
                     )
                 event_missing_count = max(
                     event_missing_count,
@@ -10968,7 +10983,10 @@ class EnsembleProvider:
                     event,
                     request_started=attempt_request_started,
                 )
-                if active_member.thinking_policy_managed and attempt_request_started:
+                if (
+                    requires_physical_attempt_evidence(active_member)
+                    and attempt_request_started
+                ):
                     physical_request_count = 1
                 failed_attempt = {
                     "kind": attempt_kind,
@@ -10983,7 +11001,7 @@ class EnsembleProvider:
                     "requested_provider": active_member.provider_config.provider,
                     "requested_model": active_member.provider_config.model,
                 }
-                if active_member.thinking_policy_managed is True:
+                if requires_physical_attempt_evidence(active_member):
                     if physical_request_count > 0:
                         failed_attempt["physical_attempt_id"] = (
                             current_physical_attempt_id
@@ -11072,7 +11090,10 @@ class EnsembleProvider:
                 )
             combined_event_rows = [*event_rows, *diagnostic_rows]
             usage_reported = bool(combined_event_rows)
-            if member.thinking_policy_managed and attempt_request_started:
+            if (
+                requires_physical_attempt_evidence(member)
+                and attempt_request_started
+            ):
                 (
                     combined_event_rows,
                     managed_missing_count,
@@ -11088,7 +11109,7 @@ class EnsembleProvider:
                 )
                 if usage_reported and event_missing_count:
                     raise ValueError(
-                        "managed abandoned aggregator contradicts usage_missing_count"
+                        "tracked abandoned aggregator contradicts usage_missing_count"
                     )
                 event_missing_count = max(
                     event_missing_count,
@@ -11110,7 +11131,10 @@ class EnsembleProvider:
                 event,
                 request_started=attempt_request_started,
             )
-            if member.thinking_policy_managed and attempt_request_started:
+            if (
+                requires_physical_attempt_evidence(member)
+                and attempt_request_started
+            ):
                 physical_request_count = 1
             abandoned_attempt = {
                 "kind": kind,
@@ -11136,7 +11160,7 @@ class EnsembleProvider:
                     int(config_for_attempt.thinking_budget_tokens or 0),
                 ),
             }
-            if member.thinking_policy_managed is True:
+            if requires_physical_attempt_evidence(member):
                 if physical_request_count > 0:
                     abandoned_attempt["physical_attempt_id"] = (
                         current_physical_attempt_id
@@ -11192,7 +11216,7 @@ class EnsembleProvider:
                         "requested_model": member.provider_config.model,
                     }
                     if (
-                        member.thinking_policy_managed
+                        requires_physical_attempt_evidence(member)
                         and physical_request_count > 0
                     ):
                         abandoned_request_row["physical_attempt_id"] = (
@@ -11275,7 +11299,7 @@ class EnsembleProvider:
                 physical_attempts_started += 1
                 current_physical_attempt_id = (
                     uuid.uuid4().hex
-                    if active_member.thinking_policy_managed
+                    if requires_physical_attempt_evidence(active_member)
                     else ""
                 )
                 self._record_accounting_request_started(
