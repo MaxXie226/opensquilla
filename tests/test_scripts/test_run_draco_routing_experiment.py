@@ -5774,7 +5774,13 @@ def test_run_wide_generation_policy_overrides_realized_ensemble_members(module) 
             _ensemble_member(module, "qwen/qwen3.7-max"),
             _ensemble_member(module, "x-ai/grok-4.5"),
         ],
+        proposer_backups=[
+            _ensemble_member(module, "deepseek/deepseek-v4-pro"),
+        ],
         aggregator=_ensemble_member(module, "anthropic/claude-sonnet-5"),
+        aggregator_fallbacks=[
+            _ensemble_member(module, "google/gemini-3.1-pro-preview"),
+        ],
     )
     policy = {
         **module.generation_thinking_policy(),
@@ -5796,6 +5802,19 @@ def test_run_wide_generation_policy_overrides_realized_ensemble_members(module) 
     assert aligned.aggregator.temperature == 0.0
     assert all(member.max_tokens == 16_384 for member in aligned.proposers)
     assert aligned.aggregator.max_tokens == 16_384
+    assert all(
+        member.temperature == 0.0
+        and member.max_tokens == 16_384
+        and member.thinking
+        == module.generation_thinking_for_model(
+            member.provider_config.model,
+            policy,
+        )
+        for member in [
+            *aligned.proposer_backups,
+            *aligned.aggregator_fallbacks,
+        ]
+    )
     assert aligned.selection_plan["generation_policy_applied"] is True
     assert {
         row["model"]: row["thinking"] for row in aligned.selection_plan["member_generation"]
@@ -5804,6 +5823,25 @@ def test_run_wide_generation_policy_overrides_realized_ensemble_members(module) 
         "qwen/qwen3.7-max": "high",
         "x-ai/grok-4.5": "high",
         "anthropic/claude-sonnet-5": "max",
+    }
+    assert {
+        (row["role"], row["model"]): row["thinking"]
+        for row in aligned.selection_plan["recovery_member_generation"]
+    } == {
+        (
+            "proposer_backup",
+            "deepseek/deepseek-v4-pro",
+        ): module.generation_thinking_for_model(
+            "deepseek/deepseek-v4-pro",
+            policy,
+        ),
+        (
+            "aggregator_fallback",
+            "google/gemini-3.1-pro-preview",
+        ): module.generation_thinking_for_model(
+            "google/gemini-3.1-pro-preview",
+            policy,
+        ),
     }
 
 
@@ -14701,6 +14739,11 @@ def test_g1_runtime_dynamic_plan_satisfies_frozen_ranking_contract(
         generation_policy,
         allow_unpinned_openrouter=True,
     )
+    assert provider.begin_provider_retry_scope(
+        "post-generation-policy",
+        max_additional_physical_requests=3,
+    )
+    assert provider.end_provider_retry_scope("post-generation-policy")
 
     assert (
         module.g1_registry_contract_reasons(
@@ -14713,7 +14756,12 @@ def test_g1_runtime_dynamic_plan_satisfies_frozen_ranking_contract(
     assert all(
         member.thinking
         in module._openrouter_supported_thinking_levels(member.provider_config.model)
-        for member in [*provider.proposers, provider.aggregator]
+        for member in [
+            *provider.proposers,
+            *provider.proposer_backups,
+            provider.aggregator,
+            *provider.aggregator_fallbacks,
+        ]
     )
     assert all(
         member.provider_config.provider_routing.get(member.provider_config.model) == "auto"

@@ -11099,6 +11099,64 @@ def test_router_dynamic_recovery_guard_detects_generation_config_drift(
         )
 
 
+def test_router_dynamic_recovery_guard_allows_validated_pre_execution_reseal() -> None:
+    proposers = [_member("p0"), _member("p1")]
+    backups = [_member("backup")]
+    aggregator = _member("agg")
+    aggregator_fallback = _member("agg-fallback")
+    selection_plan = _slot_recovery_plan(proposers, backups)
+    selection_plan["aggregator_candidates"] = [
+        "fake:agg",
+        "fake:agg-fallback",
+    ]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        proposer_backups=backups,
+        aggregator=aggregator,
+        aggregator_fallbacks=[aggregator_fallback],
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        selection_plan=selection_plan,
+    )
+
+    provider.proposers = [
+        replace(member, temperature=0.0, max_tokens=16_384)
+        for member in provider.proposers
+    ]
+    provider.proposer_backups = [
+        replace(member, temperature=0.0, max_tokens=16_384)
+        for member in provider.proposer_backups
+    ]
+    provider.aggregator = replace(
+        provider.aggregator,
+        temperature=0.0,
+        max_tokens=16_384,
+    )
+    provider.aggregator_fallbacks = [
+        replace(member, temperature=0.0, max_tokens=16_384)
+        for member in provider.aggregator_fallbacks
+    ]
+    assert (
+        provider._proposer_recovery_plan_guard_reason()
+        == "runtime_execution_config_drift"
+    )
+
+    provider.seal_proposer_recovery_runtime_guard()
+
+    assert provider._proposer_recovery_plan_guard_reason() == ""
+    assert provider.begin_provider_retry_scope(
+        "post-policy",
+        max_additional_physical_requests=3,
+    )
+    assert provider.end_provider_retry_scope("post-policy")
+    with pytest.raises(
+        RuntimeError,
+        match="cannot be resealed after execution",
+    ):
+        provider.seal_proposer_recovery_runtime_guard()
+
+
 def test_router_dynamic_recovery_guard_handles_malformed_runtime_state() -> None:
     proposers = [_member("p0"), _member("p1")]
     provider = EnsembleProvider(

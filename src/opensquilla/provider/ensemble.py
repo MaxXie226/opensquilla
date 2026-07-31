@@ -3183,6 +3183,7 @@ class EnsembleProvider:
             == "router_dynamic"
         )
         self._proposer_recovery_guard_fingerprint = ""
+        self._proposer_recovery_runtime_guard_started = False
         self._proposer_recovery_scope_guard: (
             _ProposerRecoveryScopeGuard | None
         ) = None
@@ -3350,6 +3351,40 @@ class EnsembleProvider:
         self._thinking_execution_guard_immutable_sha256 = (
             self._thinking_execution_immutable_sha256(self.selection_plan)
         )
+
+    def seal_proposer_recovery_runtime_guard(self) -> None:
+        """Seal sanctioned request-configuration setup before execution."""
+
+        if (
+            self._active_chat
+            or self._proposer_recovery_runtime_guard_started
+            or self._proposer_retry_scope is not None
+            or self._proposer_recovery_scope_guard is not None
+            or self._cleanup_is_pending()
+            or self._accounting_state.physical_request_count != 0
+            or self._accounting_state.usage_missing_count != 0
+            or self._accounting_state.usage_rows
+        ):
+            raise RuntimeError(
+                "proposer recovery runtime guard cannot be resealed after execution"
+            )
+        previous_snapshot = self._proposer_recovery_runtime_guard_snapshot
+        self._proposer_recovery_runtime_guard_snapshot = (
+            _proposer_recovery_runtime_guard_snapshot(
+                proposers=self.proposers,
+                proposer_backups=self.proposer_backups,
+                aggregator=self.aggregator,
+                aggregator_fallbacks=self.aggregator_fallbacks,
+            )
+        )
+        recovery_guard_reason = self._proposer_recovery_plan_guard_reason()
+        if recovery_guard_reason:
+            self._proposer_recovery_runtime_guard_snapshot = previous_snapshot
+            raise RuntimeError(
+                "router_dynamic proposer recovery runtime state cannot be "
+                "resealed: "
+                f"{recovery_guard_reason}"
+            )
 
     def _managed_thinking_execution_pre_chat_reason(self) -> str:
         """Fail closed if a later chat no longer extends the frozen ledger."""
@@ -4531,6 +4566,7 @@ class EnsembleProvider:
             raise ValueError(
                 "max_additional_physical_requests must be a non-negative integer"
             )
+        self._proposer_recovery_runtime_guard_started = True
         recovery_guard_reason = self._proposer_recovery_plan_guard_reason()
         if recovery_guard_reason:
             raise RuntimeError(
@@ -5386,6 +5422,7 @@ class EnsembleProvider:
                 physical_request_count=0,
             )
             return
+        self._proposer_recovery_runtime_guard_started = True
         recovery_guard_reason = self._proposer_recovery_plan_guard_reason()
         if recovery_guard_reason:
             yield self._proposer_recovery_plan_drift_error(

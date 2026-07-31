@@ -2910,7 +2910,13 @@ def apply_generation_policy_to_ensemble_provider(
         return replace(member, **updates)
 
     provider.proposers = [_apply(member) for member in provider.proposers]
+    provider.proposer_backups = [
+        _apply(member) for member in provider.proposer_backups
+    ]
     provider.aggregator = _apply(provider.aggregator)
+    provider.aggregator_fallbacks = [
+        _apply(member) for member in provider.aggregator_fallbacks
+    ]
     provider._member_request_budget_bindings = {}
     member_generation = [
         {
@@ -2936,7 +2942,34 @@ def apply_generation_policy_to_ensemble_provider(
         **dict(provider.selection_plan),
         "generation_policy_applied": True,
         "member_generation": member_generation,
+        "recovery_member_generation": [
+            {
+                "role": role,
+                "label": member.label,
+                "provider": member.provider_config.provider,
+                "model": member.provider_config.model,
+                "temperature": member.temperature,
+                "max_tokens": member.max_tokens,
+                "thinking": member.thinking,
+                "thinking_budget_tokens": generation_chat_config(
+                    policy,
+                    model=member.provider_config.model,
+                ).thinking_budget_tokens,
+                "k": member.k,
+            }
+            for role, member in [
+                *(
+                    ("proposer_backup", member)
+                    for member in provider.proposer_backups
+                ),
+                *(
+                    ("aggregator_fallback", member)
+                    for member in provider.aggregator_fallbacks
+                ),
+            ]
+        ],
     }
+    provider.seal_proposer_recovery_runtime_guard()
     return provider
 
 
@@ -2958,7 +2991,12 @@ def validate_strict_openrouter_ensemble_members(
     require_parameters_enabled = require_parameters in truthy
     requests: list[tuple[ProviderConfig, str]] = [
         (member.provider_config, str(member.thinking or ""))
-        for member in [*provider.proposers, provider.aggregator]
+        for member in [
+            *provider.proposers,
+            *provider.proposer_backups,
+            provider.aggregator,
+            *provider.aggregator_fallbacks,
+        ]
     ]
     if fallback_config is not None:
         fallback_thinking = (
