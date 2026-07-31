@@ -84,6 +84,20 @@ class _NamedAuthProfileDeployment:
     blocked_reason: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class _GatewayCompactionCandidate:
+    """One ordered target candidate before physical deployment resolution."""
+
+    provider_id: str
+    model: str
+    source: str
+    provider_config: ProviderConfig | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+
+
 def _qualified_auth_profile_provider(profile_id: str) -> str:
     """Return the provider encoded by a valid ``provider:name`` profile id."""
 
@@ -510,15 +524,43 @@ def resolve_gateway_compaction_target(
         )
     )
 
-    candidates: list[tuple[str, str, str]] = []
-    seen: set[tuple[str, str]] = set()
+    candidates: list[_GatewayCompactionCandidate] = []
+    seen_abstract: set[tuple[str, str]] = set()
+    seen_configs: set[int] = set()
 
-    def add_candidate(provider_id: str, model: str, source: str) -> None:
-        identity = (provider_id, model)
-        if not provider_id or not model or identity in seen:
+    def add_candidate(
+        provider_id: str,
+        model: str,
+        source: str,
+        *,
+        provider_config: ProviderConfig | None = None,
+    ) -> None:
+        provider_id = provider_id.strip().lower()
+        model = model.strip()
+        if not provider_id or not model:
             return
-        seen.add(identity)
-        candidates.append((provider_id, model, source))
+        if provider_config is None:
+            identity = (provider_id, model)
+            if identity in seen_abstract:
+                return
+            seen_abstract.add(identity)
+        else:
+            # The exact ProviderConfig is the physical fallback authorization.
+            # Do not collapse credential-, proxy-, or routing-distinct links by
+            # their public provider/model pair. Exact duplicates are removed
+            # after plan construction by the process-keyed deployment HMAC.
+            config_identity = id(provider_config)
+            if config_identity in seen_configs:
+                return
+            seen_configs.add(config_identity)
+        candidates.append(
+            _GatewayCompactionCandidate(
+                provider_id=provider_id,
+                model=model,
+                source=source,
+                provider_config=provider_config,
+            )
+        )
 
     if explicit:
         add_candidate(configured_provider, configured_model, "explicit_compaction")
@@ -573,6 +615,7 @@ def resolve_gateway_compaction_target(
                 _text(fallback_config.provider).lower(),
                 _text(fallback_config.model),
                 "selector_current" if index == 0 else "selector_fallback",
+                provider_config=fallback_config,
             )
 
     if auth_profile_override and auth_profile_bound_provider:
@@ -583,7 +626,7 @@ def resolve_gateway_compaction_target(
         bound_candidates = [
             candidate
             for candidate in candidates
-            if candidate[0] == auth_profile_bound_provider
+            if candidate.provider_id == auth_profile_bound_provider
         ]
         if not explicit and not model_only:
             bound_model = (
@@ -599,23 +642,24 @@ def resolve_gateway_compaction_target(
             if bound_model:
                 bound_identity = (auth_profile_bound_provider, bound_model)
                 bound_candidates = [
-                    (
-                        auth_profile_bound_provider,
-                        bound_model,
-                        "session_auth_profile",
+                    _GatewayCompactionCandidate(
+                        provider_id=auth_profile_bound_provider,
+                        model=bound_model,
+                        source="session_auth_profile",
                     ),
                     *[
                         candidate
                         for candidate in bound_candidates
-                        if candidate[:2] != bound_identity
+                        if (candidate.provider_id, candidate.model)
+                        != bound_identity
                     ],
                 ]
         candidates = bound_candidates
 
-    preferred_provider = candidates[0][0] if candidates else ""
-    preferred_model = candidates[0][1] if candidates else ""
+    preferred_provider = candidates[0].provider_id if candidates else ""
+    preferred_model = candidates[0].model if candidates else ""
     preferred_source = (
-        candidates[0][2]
+        candidates[0].source
         if candidates
         else _automatic_source(session, inherited)
     )
@@ -673,7 +717,6 @@ def resolve_gateway_compaction_target(
                 ctx,
                 named.provider_config,
                 source=named_source,
-                auth_profile_fingerprint=named.profile_fingerprint,
             )
         except Exception as exc:  # noqa: BLE001 - a named target cannot fall back
             log.warning(
@@ -699,43 +742,57 @@ def resolve_gateway_compaction_target(
         )
 
     resolved_targets: list[CompactionExecutionTarget] = []
-    for provider_id, model, source in candidates:
+    seen_targets: set[str] = set()
+    for candidate in candidates:
         from opensquilla.engine.selector_override import acquire_profile_credential
 
-        resolution = resolve_provider_deployment(
-            gateway_config,
-            provider_id,
-            model,
-            inherited_provider_config=inherited,
-            session_key=_text(getattr(session, "session_key", None)),
-            replay_provider_state=False,
-            credential_pool_acquirer=acquire_profile_credential,
-        )
-        provider_config = resolution.provider_config
-        if resolution.ready and provider_config is not None:
+        provider_config = candidate.provider_config
+        resolution = None
+        if provider_config is None:
+            resolution = resolve_provider_deployment(
+                gateway_config,
+                candidate.provider_id,
+                candidate.model,
+                inherited_provider_config=inherited,
+                session_key=_text(getattr(session, "session_key", None)),
+                replay_provider_state=False,
+                credential_pool_acquirer=acquire_profile_credential,
+            )
+            provider_config = resolution.provider_config
+        if provider_config is not None and (
+            resolution is None or resolution.ready
+        ):
             try:
                 plan = _build_plan(
                     ctx,
                     provider_config,
-                    source=source,
+                    source=candidate.source,
                 )
             except Exception as exc:  # noqa: BLE001
                 log.warning(
                     "compaction_target_build_failed",
-                    provider=provider_id,
-                    model=model,
-                    source=source,
+                    provider=candidate.provider_id,
+                    model=candidate.model,
+                    source=candidate.source,
                     error=type(exc).__name__,
                 )
                 continue
-            resolved_targets.extend(plan.candidates)
+            for target in plan.candidates:
+                if target.deployment_fingerprint in seen_targets:
+                    continue
+                seen_targets.add(target.deployment_fingerprint)
+                resolved_targets.append(target)
             continue
         log.warning(
             "compaction_target_unavailable",
-            provider=provider_id,
-            model=model,
-            source=source,
-            reason=resolution.reason,
+            provider=candidate.provider_id,
+            model=candidate.model,
+            source=candidate.source,
+            reason=(
+                resolution.reason
+                if resolution is not None
+                else "provider_config_unavailable"
+            ),
         )
 
     if resolved_targets:
@@ -1030,7 +1087,6 @@ def _build_plan(
     provider_config: ProviderConfig,
     *,
     source: str,
-    auth_profile_fingerprint: str = "",
 ) -> CompactionExecutionPlan:
     provider_id = _text(provider_config.provider).lower()
     model = _text(provider_config.model)
@@ -1039,20 +1095,11 @@ def _build_plan(
         provider_id,
         model,
     )
-    fingerprint_parts = (
-        provider_id,
-        model,
-        _text(provider_config.base_url),
-        _text(provider_config.org_id),
-        auth_profile_fingerprint,
-    )
-    fingerprint = hashlib.sha256("\0".join(fingerprint_parts).encode("utf-8")).hexdigest()[:24]
     return build_compaction_execution_plan_from_provider_config(
         provider_config,
         context_window_tokens=context_window,
         max_output_tokens=output_tokens,
         provider_request_max_chars=request_max_chars,
-        deployment_fingerprint=fingerprint,
         source=source,
     )
 

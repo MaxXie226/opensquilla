@@ -271,14 +271,16 @@ def test_unavailable_explicit_target_falls_through_to_current_deployment() -> No
 def test_manual_target_freezes_authorized_fallback_chain() -> None:
     config = GatewayConfig()
     current = ProviderConfig(
-        provider="ollama",
+        provider="openai",
         model="qwen-current",
-        base_url="http://127.0.0.1:11434",
+        api_key="primary-secret",
+        base_url="https://api.openai.com/v1",
     )
     fallback = ProviderConfig(
-        provider="ollama",
+        provider="openai",
         model="qwen-fallback",
-        base_url="http://127.0.0.1:11434",
+        api_key="fallback-secret",
+        base_url="https://api.openai.com/v1",
     )
 
     class _ChainSelector(_ReadOnlySelector):
@@ -298,9 +300,54 @@ def test_manual_target_freezes_authorized_fallback_chain() -> None:
         (candidate.provider_id, candidate.model, candidate.source)
         for candidate in target.plan.candidates
     ] == [
-        ("ollama", "qwen-current", "selector_current"),
-        ("ollama", "qwen-fallback", "selector_fallback"),
+        ("openai", "qwen-current", "selector_current"),
+        ("openai", "qwen-fallback", "selector_fallback"),
     ]
+    assert [
+        provider_connection_config(candidate.provider).api_key
+        for candidate in target.plan.candidates
+    ] == ["primary-secret", "fallback-secret"]
+
+
+def test_manual_target_preserves_credential_distinct_same_model_fallback() -> None:
+    config = GatewayConfig()
+    current = ProviderConfig(
+        provider="openai",
+        model="same-model",
+        api_key="primary-secret",
+        base_url="https://api.openai.com/v1",
+    )
+    fallback = ProviderConfig(
+        provider="openai",
+        model="same-model",
+        api_key="fallback-secret",
+        base_url="https://api.openai.com/v1",
+    )
+
+    class _CredentialChainSelector(_ReadOnlySelector):
+        def remaining_chain(self) -> list[ProviderConfig]:
+            return [current, fallback]
+
+    target = resolve_gateway_compaction_target(
+        SimpleNamespace(
+            config=config,
+            provider_selector=_CredentialChainSelector(current),
+        ),
+        SimpleNamespace(session_key="agent:main:webchat:credential-chain"),
+    )
+
+    assert target.plan is not None
+    assert [
+        provider_connection_config(candidate.provider).api_key
+        for candidate in target.plan.candidates
+    ] == ["primary-secret", "fallback-secret"]
+    assert (
+        target.plan.candidates[0].deployment_fingerprint
+        != target.plan.candidates[1].deployment_fingerprint
+    )
+    rendered = repr(target.plan)
+    assert "primary-secret" not in rendered
+    assert "fallback-secret" not in rendered
 
 
 def test_unavailable_session_target_falls_through_to_current_deployment() -> None:
