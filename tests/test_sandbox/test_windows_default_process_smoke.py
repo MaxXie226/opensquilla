@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import os
 import sys
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from opensquilla.sandbox.config import SandboxSettings
+from opensquilla.sandbox.policy import build_policy
 from opensquilla.sandbox.run_mode import RunMode
 from opensquilla.sandbox.types import (
     NetworkMode,
@@ -30,7 +33,10 @@ def _policy() -> SandboxPolicy:
         mounts=(),
         workspace_rw=True,
         tmp_writable=True,
-        limits=ResourceLimits(wall_timeout_s=10),
+        # Cold Windows ACL projection can take tens of seconds on developer
+        # machines with large runtime trees. The native smoke is checking
+        # correctness, not an interactive latency budget.
+        limits=ResourceLimits(wall_timeout_s=90),
         env_allowlist=(
             "PATH",
             "SystemRoot",
@@ -49,15 +55,33 @@ def _policy() -> SandboxPolicy:
 def _request(
     tmp_path: Path, argv: tuple[str, ...], stdin: bytes | None = None
 ) -> SandboxRequest:
+    policy = replace(
+        _policy(),
+        file_system=build_policy(
+            SecurityLevel.STANDARD,
+            "shell.exec",
+            tmp_path,
+            SandboxSettings(),
+        ).file_system,
+    )
     return SandboxRequest(
         argv=argv,
         cwd=tmp_path,
         action_kind="shell.exec",
-        policy=_policy(),
+        policy=policy,
         stdin=stdin,
         env=dict(os.environ),
         run_mode=RunMode.SAFE.value,
     )
+
+
+@pytest.fixture(autouse=True)
+def _use_installed_windows_sandbox(
+    _isolate_opensquilla_state,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    del _isolate_opensquilla_state
+    monkeypatch.delenv("OPENSQUILLA_STATE_DIR", raising=False)
 
 
 @pytest.mark.asyncio
@@ -171,6 +195,15 @@ async def test_windows_default_runs_shell_host_nested_powershell_env_probe(
             "OPENSQUILLA_SANDBOX_NETWORK",
         ),
         require_approval=False,
+    )
+    policy = replace(
+        policy,
+        file_system=build_policy(
+            SecurityLevel.STANDARD,
+            "shell.exec",
+            workspace,
+            SandboxSettings(),
+        ).file_system,
     )
     policy = shell._policy_with_windows_shell_runtime_mounts(policy, runtime)
     result = await WindowsDefaultBackend().run(

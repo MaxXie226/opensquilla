@@ -35,6 +35,8 @@ def test_missing_and_invalid_token_have_same_guest_execution_authority(tmp_path)
     assert missing.auth_state == "guest"
     assert invalid.auth_state == "invalid"
     assert missing.authenticated is invalid.authenticated is False
+    assert "operator.approvals" not in missing.scopes
+    assert "operator.approvals" not in invalid.scopes
 
 
 def test_valid_legacy_operator_token_receives_host_execute(tmp_path) -> None:

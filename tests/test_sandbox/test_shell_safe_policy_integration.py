@@ -13,10 +13,11 @@ from opensquilla.sandbox.integration import (
     configure_runtime,
     reset_runtime,
 )
+from opensquilla.sandbox.operation_profile import OperationProfile
 from opensquilla.sandbox.path_validation import decide_path_access
 from opensquilla.sandbox.permissions import FileSystemAccess
 from opensquilla.sandbox.policy_models import FilePolicySettings, SandboxPolicy
-from opensquilla.tools.builtin import shell
+from opensquilla.tools.builtin import filesystem, shell
 from opensquilla.tools.types import ToolContext, current_tool_context
 
 
@@ -175,6 +176,85 @@ def test_guest_safe_profile_keeps_workspace_boundary_and_protected_carveouts(
     assert outside_write.status != "allowed"
     assert sensitive_read.status == "blocked"
     assert ordinary_read.status == "allowed"
+
+
+@pytest.mark.asyncio
+async def test_guest_safe_outside_write_cannot_request_or_consume_an_approval(
+    tmp_path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside.txt"
+    configure_runtime(
+        SandboxSettings(
+            run_mode="standard",
+            backend="noop",
+            allow_legacy_mode=True,
+            exclude_slash_tmp=True,
+            exclude_tmpdir_env_var=True,
+        ),
+        workspace=workspace,
+    )
+    token = current_tool_context.set(
+        ToolContext(
+            run_mode="safe",
+            guest_safe=True,
+            workspace_dir=str(workspace),
+            sandbox_policy=SandboxPolicy(),
+            sandbox_gateway_config=SimpleNamespace(state_dir=str(tmp_path / "state")),
+        )
+    )
+    try:
+        file_payload = filesystem._sandbox_path_access_envelope(
+            outside,
+            write=True,
+            approval_id="forged-or-stale-approval",
+        )
+        file_gate_payload, elevated = await filesystem._gate_out_of_workspace_write(
+            "write_file",
+            outside,
+            str(outside),
+            "forged-or-stale-approval",
+            sandbox_permissions="require_escalated",
+            justification="try to cross the guest boundary",
+        )
+        payload = shell._sandbox_write_path_access_envelope(
+            OperationProfile(
+                name="guest-outside-write",
+                requested_write_paths=(str(outside),),
+            ),
+            str(workspace),
+            f"write {outside}",
+            approval_id="forged-or-stale-approval",
+        )
+        shell_escalation_payload = json.loads(
+            await shell.exec_command(
+                "Write-Output guest",
+                workdir=str(workspace),
+                sandbox_permissions="require_escalated",
+                justification="try to leave the sandbox",
+                approval_id="forged-or-stale-approval",
+            )
+        )
+    finally:
+        current_tool_context.reset(token)
+        reset_runtime()
+
+    assert payload is not None
+    assert payload["status"] == "blocked"
+    assert payload["reason"] == "GUEST_WRITE_OUTSIDE_DEFAULT_WORKSPACE"
+    assert "approval_id" not in payload
+    assert file_payload is not None
+    assert file_payload["status"] == "blocked"
+    assert file_payload["reason"] == "GUEST_WRITE_OUTSIDE_DEFAULT_WORKSPACE"
+    assert "approval_id" not in file_payload
+    assert file_gate_payload is not None
+    assert file_gate_payload["status"] == "blocked"
+    assert file_gate_payload["reason"] == "GUEST_WRITE_OUTSIDE_DEFAULT_WORKSPACE"
+    assert elevated is False
+    assert shell_escalation_payload["status"] == "blocked"
+    assert shell_escalation_payload["reason"] == "GUEST_HOST_EXECUTION_DENIED"
+    assert "approval_id" not in shell_escalation_payload
 
 
 @pytest.mark.asyncio

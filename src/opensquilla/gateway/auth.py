@@ -202,9 +202,8 @@ class OpenScopeResolver:
       relay.
     * Node → :data:`NODE_DEFAULT_SCOPES` regardless of peer address.
 
-    ``config.debug`` retains the historical "dev mode grants whatever
-    ``token_scopes`` says" behavior so an operator who truly wants the
-    full surface on a public bind can opt in.
+    Debug mode never changes transport-derived authority. A remote no-auth
+    caller remains a guest even during development.
     """
 
     def resolve(
@@ -236,9 +235,7 @@ class OpenScopeResolver:
 
         local_owner = is_loopback_bind(config.host) and is_loopback_address(peer_ip)
 
-        if config.debug:
-            scopes = normalize_operator_scopes(config.auth.token_scopes)
-        elif local_owner:
+        if local_owner:
             scopes = CLI_DEFAULT_OPERATOR_SCOPES
         else:
             scopes = REMOTE_OPERATOR_SCOPES

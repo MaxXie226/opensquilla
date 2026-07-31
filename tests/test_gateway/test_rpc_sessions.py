@@ -40,6 +40,7 @@ from opensquilla.project_workspaces import ProjectWorkspaceStateError
 from opensquilla.provider.selector import ProviderConfig
 from opensquilla.provider.types import ProviderRequestCorrelation
 from opensquilla.sandbox.capability_service import CapabilityReport
+from opensquilla.sandbox.guest_profile import GuestProfileBoundaryError
 from opensquilla.sandbox.run_context import RUN_CONTEXT_ORIGIN_KEY
 from opensquilla.session import storage as session_storage
 from opensquilla.session.compaction import CompactionConfig
@@ -1678,10 +1679,19 @@ class TestSessionsSend:
         assert session.origin["sandbox_run_context"]["run_mode"] == "safe"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "source_hint",
+        [
+            None,
+            {"caller_kind": "web", "channel_kind": "web"},
+            {"caller_kind": "cli", "channel_kind": "cli"},
+        ],
+    )
     async def test_guest_safe_send_never_soft_lands_to_host(
         self,
         dispatcher,
         monkeypatch: pytest.MonkeyPatch,
+        source_hint: dict[str, str] | None,
     ):
         unavailable = CapabilityReport(
             available=False,
@@ -1713,15 +1723,77 @@ class TestSessionsSend:
             principal=guest,
         )
 
+        params: dict[str, Any] = {"key": session.session_key, "message": "hello"}
+        if source_hint is not None:
+            params["_source"] = source_hint
         res = await dispatcher.dispatch(
             "r-guest-no-fallback",
+            "sessions.send",
+            params,
+            ctx,
+        )
+
+        assert res.ok is False
+        assert res.error.code == "SANDBOX_UNAVAILABLE"
+
+    @pytest.mark.asyncio
+    async def test_guest_scratch_boundary_failure_is_a_stable_rpc_error(
+        self,
+        dispatcher,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ):
+        available = CapabilityReport(
+            available=True,
+            backend="windows_default",
+            platform="win32",
+            code="ready",
+            reason="ready",
+            setup_supported=True,
+            restart_required=False,
+            probe_version=1,
+            capabilities=frozenset(
+                {"process", "filesystem-worker", "denyWriteCarveout", "authorityDenyRead"}
+            ),
+        )
+
+        async def report(_config):
+            return available
+
+        def fail_profile(*_args, **_kwargs):
+            raise GuestProfileBoundaryError(
+                "GUEST_DEFAULT_WORKSPACE_UNSAFE: guest scratch directory is retargeted"
+            )
+
+        monkeypatch.setattr(rpc_sessions, "current_sandbox_capability_report", report)
+        monkeypatch.setattr(rpc_sessions, "_guest_profile_for_principal", fail_profile)
+        session = FakeSession(session_key="agent:main:webchat:guest-boundary")
+        guest = Principal(
+            role="operator",
+            scopes=frozenset(["operator.read", "operator.write"]),
+            is_owner=False,
+            authenticated=False,
+            auth_state="guest",
+        )
+        ctx = make_ctx(
+            session_manager=FakeSessionManager([session]),
+            task_runtime=None,
+            principal=guest,
+            config=GatewayConfig(
+                workspace_dir=str(tmp_path / "workspace"),
+                memory={"flush_enabled": False},
+            ),
+        )
+
+        res = await dispatcher.dispatch(
+            "r-guest-boundary",
             "sessions.send",
             {"key": session.session_key, "message": "hello"},
             ctx,
         )
 
         assert res.ok is False
-        assert res.error.code == "SANDBOX_UNAVAILABLE"
+        assert res.error.code == "GUEST_DEFAULT_WORKSPACE_UNSAFE"
 
     @pytest.mark.asyncio
     async def test_legacy_direct_send_holds_registry_admission_through_register(

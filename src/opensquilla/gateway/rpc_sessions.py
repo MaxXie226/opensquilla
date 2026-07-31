@@ -82,7 +82,10 @@ from opensquilla.provider.types import (
     ProviderRequestCorrelation,
     derive_provider_request_correlation,
 )
-from opensquilla.sandbox.guest_profile import GuestProfileFactory
+from opensquilla.sandbox.guest_profile import (
+    GuestProfileBoundaryError,
+    GuestProfileFactory,
+)
 from opensquilla.sandbox.mode_resolver import ModeResolutionError, ResolvedMode, resolve_mode
 from opensquilla.sandbox.run_context import (
     RUN_CONTEXT_ORIGIN_KEY,
@@ -395,10 +398,12 @@ def _guest_profile_for_principal(
 
 
 def _is_remote_web_guest(principal: Any, source_hint: dict[str, Any]) -> bool:
+    # Source hints are client-controlled presentation metadata.  They must not
+    # weaken the server-computed authority of an unauthenticated guest.
+    del source_hint
     has_capability = getattr(principal, "has", lambda _capability: False)
     return bool(
-        source_hint.get("caller_kind") == "web"
-        and has_capability("guest.safe")
+        has_capability("guest.safe")
         and not principal_has_host_execute(principal)
     )
 
@@ -2729,11 +2734,17 @@ async def _handle_sessions_send(
                 exc.code,
                 "The configured default workspace is not safe for a Web guest.",
             ) from exc
-        guest_profile = _guest_profile_for_principal(
-            ctx.principal,
-            turn_id,
-            workspace=workspace_path,
-        )
+        try:
+            guest_profile = _guest_profile_for_principal(
+                ctx.principal,
+                turn_id,
+                workspace=workspace_path,
+            )
+        except GuestProfileBoundaryError as exc:
+            raise RpcHandlerError(
+                exc.code,
+                "The configured default workspace is not safe for a Web guest.",
+            ) from exc
         run_context = guest_profile.run_context()
         authoritative_guard = None
     else:

@@ -250,6 +250,7 @@ def test_ensure_offline_sandbox_user_uses_configured_short_name(monkeypatch, tmp
 
     assert identity["username"] == "ShortSandboxUser"
     assert "$name = 'ShortSandboxUser';" in commands[0]
+    assert "IsAccountLocked = $false" in commands[0]
     assert "OpenSquillaSandboxOffline" not in commands[0]
 
 
@@ -412,6 +413,45 @@ def test_elevated_setup_helper_accepts_desktop_profile_marker(
     ]
 
 
+def test_elevated_setup_persists_rotated_identity_before_acl_repair(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default_setup as mod
+    from opensquilla.sandbox.backend.windows_default_network import (
+        FIREWALL_RULE_VERSION,
+        WFP_RULE_VERSION,
+        WindowsNetworkSetup,
+    )
+
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    marker = mod.default_setup_marker_path(profile)
+    payload = mod._encode_setup_helper_payload(marker, user_sid="S-1-real")
+    network = WindowsNetworkSetup(
+        offline_user_sid="S-1-offline",
+        allowed_proxy_ports=(48123,),
+        allow_local_binding=False,
+        firewall_rule_version=FIREWALL_RULE_VERSION,
+        wfp_rule_version=WFP_RULE_VERSION,
+        offline_username="OpenSquillaSandbox",
+        protected_password="rotated-protected-password",
+    )
+
+    monkeypatch.setattr(mod, "_windows_profile_path_for_sid", lambda _sid: profile)
+    monkeypatch.setattr(mod, "establish_windows_network_setup", lambda _path: network)
+    monkeypatch.setattr(
+        mod,
+        "lock_persistent_sandbox_dirs",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("acl repair failed")),
+    )
+
+    assert mod.elevated_setup_helper_main(["--elevated-helper", payload]) == 1
+    persisted = mod.read_setup_marker(marker)
+    assert persisted is not None
+    assert persisted.network == network
+
+
 def test_elevated_setup_rejects_unrecognized_marker_inside_profile(
     monkeypatch,
     tmp_path,
@@ -436,7 +476,10 @@ def test_elevated_setup_rejects_unrecognized_marker_inside_profile(
     assert not marker.parent.exists()
 
 
-def test_windows_setup_readiness_uses_validated_desktop_marker(tmp_path) -> None:
+def test_windows_setup_readiness_uses_validated_desktop_marker(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from opensquilla.sandbox.backend import windows_default_setup as mod
     from opensquilla.sandbox.backend.windows_default_network import (
         FIREWALL_RULE_VERSION,
@@ -465,6 +508,7 @@ def test_windows_setup_readiness_uses_validated_desktop_marker(tmp_path) -> None
             wfp_rule_version=WFP_RULE_VERSION,
         ),
     )
+    monkeypatch.setattr(mod, "setup_marker_identity_ready", lambda _path: True)
 
     assert mod._windows_setup_is_ready(marker) is True
 
@@ -518,6 +562,19 @@ def test_elevated_setup_helper_skips_duplicate_mutation_after_wait(
     marker = mod.default_setup_marker_path(profile)
     payload = mod._encode_setup_helper_payload(marker, user_sid="S-1-real")
     reports = []
+    repaired = []
+    mod.write_setup_marker(
+        marker,
+        network=mod.WindowsNetworkSetup(
+            offline_user_sid="S-1-offline",
+            allowed_proxy_ports=(48123,),
+            allow_local_binding=False,
+            firewall_rule_version=5,
+            wfp_rule_version=2,
+            offline_username="OpenSquillaSandbox",
+            protected_password="protected",
+        ),
+    )
 
     monkeypatch.setattr(mod, "_windows_profile_path_for_sid", lambda _sid: profile)
     monkeypatch.setattr(mod, "_windows_setup_is_ready", lambda *_args: True, raising=False)
@@ -531,9 +588,15 @@ def test_elevated_setup_helper_skips_duplicate_mutation_after_wait(
         "write_setup_helper_report",
         lambda _path, *, state, detail=None: reports.append((state, detail)),
     )
+    monkeypatch.setattr(
+        mod,
+        "lock_persistent_sandbox_dirs",
+        lambda *_args, **_kwargs: repaired.append(marker),
+    )
 
     assert mod.elevated_setup_helper_main(["--elevated-helper", payload]) == 0
-    assert reports == [("ready", "already_ready")]
+    assert reports == [("ready", "existing_setup_acl_repaired")]
+    assert repaired == [marker]
 
 
 def test_windows_setup_process_lock_releases_named_mutex(monkeypatch, tmp_path) -> None:

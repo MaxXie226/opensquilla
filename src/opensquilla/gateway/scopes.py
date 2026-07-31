@@ -80,7 +80,7 @@ CLI_DEFAULT_OPERATOR_SCOPES: frozenset[str] = frozenset(
 # not get destructive privileges. Pairing and proposals are also excluded:
 # proposal mutation promotes generated SKILL.md files into the managed skill
 # layer, so remote callers need an authenticated/admin path for that surface.
-REMOTE_OPERATOR_SCOPES: frozenset[str] = frozenset({READ_SCOPE, WRITE_SCOPE, APPROVALS_SCOPE})
+REMOTE_OPERATOR_SCOPES: frozenset[str] = frozenset({READ_SCOPE, WRITE_SCOPE})
 
 # Default scopes for the node role (separate scope namespace).
 NODE_DEFAULT_SCOPES: frozenset[str] = frozenset({NODE_SCOPE})

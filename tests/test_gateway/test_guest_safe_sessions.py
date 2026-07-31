@@ -31,12 +31,12 @@ def _guest_principal(*, invalid: bool = False) -> Principal:
     )
 
 
-def test_guest_sensitive_read_overlay_is_remote_web_only() -> None:
+def test_guest_boundary_cannot_be_bypassed_by_spoofing_source_kind() -> None:
     principal = _guest_principal()
 
     assert _is_remote_web_guest(principal, {"caller_kind": "web"}) is True
-    assert _is_remote_web_guest(principal, {"caller_kind": "cli"}) is False
-    assert _is_remote_web_guest(principal, {"channel_kind": "channel"}) is False
+    assert _is_remote_web_guest(principal, {"caller_kind": "cli"}) is True
+    assert _is_remote_web_guest(principal, {"channel_kind": "channel"}) is True
 
 
 @pytest.mark.parametrize("invalid", [False, True])

@@ -35,6 +35,12 @@ def sandbox_disabled_full_host_fallback() -> bool:
 def full_host_access_for_context(ctx: object | None) -> bool:
     """Return Full Host Access state without consulting approval storage."""
 
+    if ctx is not None and bool(getattr(ctx, "guest_safe", False)):
+        # Guest authority is server-computed and cannot soft-land or be
+        # approval-upgraded into host execution, even if the backend later
+        # becomes unavailable.
+        return False
+
     runtime = None
     try:
         from opensquilla.sandbox.integration import get_runtime
@@ -86,6 +92,9 @@ def current_run_mode() -> str | None:
     ctx = current_tool_context.get()
     if ctx is None:
         return None
+    if bool(getattr(ctx, "guest_safe", False)):
+        ctx.run_mode = RunMode.SAFE.value
+        return RunMode.SAFE.value
     if ctx.run_mode is not None:
         with contextlib.suppress(ValueError):
             mode = cast(str, normalize_run_mode(ctx.run_mode).value)

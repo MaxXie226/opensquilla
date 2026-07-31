@@ -693,6 +693,11 @@ def _sandbox_path_access_envelope(
         return None
     if decision.status == "blocked":
         return _path_access_blocked_envelope(decision)
+    ctx = current_tool_context.get()
+    if ctx is not None and bool(getattr(ctx, "guest_safe", False)):
+        return _path_access_blocked_envelope(
+            replace(decision, status="blocked", reason="guest_boundary")
+        )
     if not write and trusted_sandbox_active():
         # Safe mode treats local reads as host-readable. Sensitive data
         # exfiltration remains blocked at the action/network review boundary.
@@ -1336,6 +1341,14 @@ async def _gate_out_of_workspace_write(
         if decision.status == "blocked":
             return _path_access_blocked_envelope(decision), False
         if decision.status == "request":
+            ctx = current_tool_context.get()
+            if ctx is not None and bool(getattr(ctx, "guest_safe", False)):
+                return (
+                    _path_access_blocked_envelope(
+                        replace(decision, status="blocked", reason="guest_boundary")
+                    ),
+                    False,
+                )
             if sandbox_permissions == "use_default":
                 return (
                     {

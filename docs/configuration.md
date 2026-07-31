@@ -409,9 +409,10 @@ non-bypassable policy:
   unavailable.
 
 These restrictions also apply to Shell, Python, Node.js, Git Bash, and their
-child processes. Approvals cannot elevate a guest past this boundary. The
-Gateway refuses Guest Safe startup when the configured default workspace is
-inside a protected credential or authority path.
+child processes. Guests cannot access the global approval queue, and approvals
+cannot elevate a guest past this boundary. The Gateway refuses Guest Safe
+startup when the configured default workspace is inside a protected credential
+or authority path.
 
 ## Safe Mode Policy
 

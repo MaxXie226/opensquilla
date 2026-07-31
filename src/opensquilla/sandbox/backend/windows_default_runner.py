@@ -1609,6 +1609,31 @@ def _sync_allow_acl_state(
             Path(item["path"]).expanduser().absolute(): item["access"]
             for item in principals.get(sid, [])
         }
+        previous_by_key = {
+            _acl_path_key(path): (path, access) for path, access in previous.items()
+        }
+        desired_by_key = {
+            _acl_path_key(path): (path, access) for path, access in normalized.items()
+        }
+        retained_read = {
+            key: item
+            for key, item in previous_by_key.items()
+            if item[1] == "RX" and key not in desired_by_key
+        }
+        # The offline account's allow ACL is only the first half of the
+        # access check. Every untrusted child also carries this request's
+        # capability SIDs as restricting SIDs, so an old RX allow cannot make
+        # an unlisted path readable. Retaining RX avoids expensive read-ACL
+        # teardown/rebuild when shell and filesystem workers alternate. Stale
+        # RWX is still revoked so the trusted offline bootstrap process never
+        # accumulates write authority.
+        effective_by_key = {**retained_read, **desired_by_key}
+        if {
+            key: access for key, (_path, access) in previous_by_key.items()
+        } == {
+            key: access for key, (_path, access) in effective_by_key.items()
+        }:
+            return
         _mark_acl_state_tainted(
             state_path,
             kind="allow",
@@ -1616,23 +1641,19 @@ def _sync_allow_acl_state(
             paths=(*previous, *normalized),
         )
         try:
-            previous_by_key = {
-                _acl_path_key(path): (path, access) for path, access in previous.items()
-            }
-            desired_by_key = {
-                _acl_path_key(path): (path, access) for path, access in normalized.items()
-            }
             for key, (path, access) in desired_by_key.items():
                 old = previous_by_key.get(key)
                 if old is not None and old[1] != access:
                     _revoke_allow_path_for_sid(old[0], sid)
-                _grant_path_to_sid(path, access, sid)
+                if old is None or old[1] != access:
+                    _grant_path_to_sid(path, access, sid)
             for key, (path, _access) in previous_by_key.items():
-                if key not in desired_by_key:
+                if key not in desired_by_key and previous_by_key[key][1] == "RWX":
                     _revoke_allow_path_for_sid(path, sid)
             updated = dict(principals)
             updated[sid] = [
-                {"access": access, "path": str(path)} for path, access in normalized.items()
+                {"access": access, "path": str(path)}
+                for path, access in effective_by_key.values()
             ]
             _write_deny_acl_state(state_path, {"version": 1, "principals": updated})
             _clear_acl_state_taint(state_path)
@@ -2013,19 +2034,21 @@ def _recover_allow_acl_taint(state_path: Path, state: dict[str, Any]) -> None:
         Path(item["path"]).expanduser().absolute(): str(item["access"])
         for item in state["principals"].get(sid, [])
     }
-    paths = _dedupe_acl_paths(
+    intent_paths = _dedupe_acl_paths(
         tuple(Path(item).expanduser().absolute() for item in intent["paths"]) + tuple(persisted)
     )
+    persisted_by_key = {_acl_path_key(path): (path, access) for path, access in persisted.items()}
     try:
-        for path in paths:
-            _revoke_allow_path_for_sid(path, sid)
+        # A crashed transaction can only have removed a persisted RWX grant
+        # (during downgrade/removal) or added a path absent from the persisted
+        # journal. Persisted RX grants are never revoked by normal sync, so
+        # tearing all of them down and rebuilding them turns one cancellation
+        # into a minute-long restart loop on Windows.
+        for path in intent_paths:
+            if _acl_path_key(path) not in persisted_by_key:
+                _revoke_allow_path_for_sid(path, sid)
         for path, access in persisted.items():
-            # Capability probes and other private mounts are intentionally
-            # ephemeral. If the helper was cancelled after marking the ACL
-            # transaction tainted, the temporary directory may be gone before
-            # recovery. A missing path carries no live grant to restore; the
-            # normal desired-state sync below will prune it from the journal.
-            if not path.exists():
+            if access != "RWX" or not path.exists():
                 continue
             _grant_path_to_sid(path, access, sid)
     except BaseException as exc:
@@ -2611,8 +2634,15 @@ def _find_git_worktree_root_for_safe_directory(start: Path) -> Path | None:
     except OSError:
         current = start
     while True:
-        if (current / ".git").exists():
-            return current
+        try:
+            if (current / ".git").exists():
+                return current
+        except OSError:
+            # Parent traversal can cross an intentional deny ACL (for
+            # example a stale or protected .git marker). Git safe-directory
+            # discovery is optional metadata and must not abort the sandboxed
+            # command when that marker is unreadable.
+            pass
         parent = current.parent
         if parent == current:
             return None

@@ -51,3 +51,21 @@ def test_open_auth_public_peer_is_rejected_even_in_debug_mode() -> None:
             ),
             peer_ip="203.0.113.7",
         )
+
+
+def test_debug_mode_does_not_upgrade_private_remote_guest_scopes() -> None:
+    principal = OpenScopeResolver().resolve(
+        {},
+        "operator",
+        GatewayConfig(
+            debug=True,
+            host="0.0.0.0",
+            auth=AuthConfig(token_scopes=["operator.admin", "operator.approvals"]),
+        ),
+        peer_ip="192.168.1.42",
+    )
+
+    assert principal.scopes == REMOTE_OPERATOR_SCOPES
+    assert "operator.admin" not in principal.scopes
+    assert "operator.approvals" not in principal.scopes
+    assert principal.is_owner is False

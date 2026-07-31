@@ -14,6 +14,10 @@ from opensquilla.sandbox.run_context import MountGrant, RunContext
 from opensquilla.sandbox.run_mode import RunMode
 
 
+class GuestProfileBoundaryError(RuntimeError):
+    code = "GUEST_DEFAULT_WORKSPACE_UNSAFE"
+
+
 @dataclass(frozen=True)
 class GuestMount:
     path: Path
@@ -94,12 +98,22 @@ class GuestProfileFactory:
         workspace_path.mkdir(parents=True, exist_ok=True)
         parent = workspace_path / ".opensquilla-guest"
         parent.mkdir(parents=True, exist_ok=True)
+        if os.path.normcase(str(parent.resolve(strict=False))) != os.path.normcase(
+            str(parent.absolute())
+        ):
+            raise GuestProfileBoundaryError(
+                f"{GuestProfileBoundaryError.code}: guest scratch directory is retargeted"
+            )
         root = Path(
             tempfile.mkdtemp(
                 prefix=f"opensquilla-guest-{_safe_task_component(task_id)}-",
                 dir=str(parent),
             )
         ).resolve(strict=False)
+        if root.parent != parent.resolve(strict=False):
+            raise GuestProfileBoundaryError(
+                f"{GuestProfileBoundaryError.code}: guest scratch root escaped its workspace"
+            )
         home = root / "home"
         temp = root / "tmp"
         for directory in (home, temp):
@@ -150,5 +164,6 @@ __all__ = [
     "cleanup_guest_profile_root",
     "GuestMount",
     "GuestProfile",
+    "GuestProfileBoundaryError",
     "GuestProfileFactory",
 ]

@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import os
+import subprocess
 from pathlib import Path
+
+import pytest
 
 from opensquilla.sandbox.guest_profile import (
     GuestProfileFactory,
@@ -73,3 +77,29 @@ def test_guest_cleanup_rejects_non_guest_directory(tmp_path: Path) -> None:
 
     assert cleanup_guest_profile_root(ordinary) is False
     assert ordinary.exists()
+
+
+def test_guest_profile_rejects_retargeted_scratch_parent(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    workspace.mkdir()
+    outside.mkdir()
+    scratch_parent = workspace / ".opensquilla-guest"
+    try:
+        scratch_parent.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        if os.name != "nt":
+            pytest.skip(f"directory symlinks unavailable: {exc}")
+        result = subprocess.run(
+            ["cmd", "/d", "/c", "mklink", "/J", str(scratch_parent), str(outside)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            pytest.skip(f"directory aliases unavailable: {result.stderr or result.stdout}")
+
+    with pytest.raises(RuntimeError, match="GUEST_DEFAULT_WORKSPACE_UNSAFE"):
+        GuestProfileFactory.create("task", workspace=workspace)
+
+    assert list(outside.iterdir()) == []

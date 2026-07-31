@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import subprocess
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 import pytest
@@ -186,6 +188,40 @@ def test_web_guest_workspace_beneath_sensitive_root_is_rejected(tmp_path: Path) 
             platform="linux",
             home=home,
             env={"HOME": str(home)},
+        )
+
+    assert raised.value.code == "GUEST_DEFAULT_WORKSPACE_UNSAFE"
+
+
+def test_web_guest_workspace_alias_to_sensitive_root_is_rejected(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    sensitive = home / ".ssh"
+    sensitive.mkdir(parents=True)
+    alias = tmp_path / "workspace"
+    try:
+        alias.symlink_to(sensitive, target_is_directory=True)
+    except OSError as exc:
+        if os.name != "nt":
+            pytest.skip(f"directory symlinks unavailable: {exc}")
+        result = subprocess.run(
+            ["cmd", "/d", "/c", "mklink", "/J", str(alias), str(sensitive)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            pytest.skip(f"directory aliases unavailable: {result.stderr or result.stdout}")
+
+    with pytest.raises(GuestWorkspacePolicyError) as raised:
+        validate_web_guest_workspace(
+            alias,
+            platform="win32",
+            home=home,
+            env={
+                "USERPROFILE": str(home),
+                "APPDATA": str(home / "AppData" / "Roaming"),
+                "LOCALAPPDATA": str(home / "AppData" / "Local"),
+            },
         )
 
     assert raised.value.code == "GUEST_DEFAULT_WORKSPACE_UNSAFE"

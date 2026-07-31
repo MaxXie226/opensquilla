@@ -1505,6 +1505,37 @@ def _path_access_blocked_envelope(decision: MountDecision) -> dict[str, object]:
     }
 
 
+def _guest_path_access_block(
+    decision: MountDecision,
+) -> dict[str, object] | None:
+    ctx = current_tool_context.get()
+    if ctx is None or not bool(getattr(ctx, "guest_safe", False)):
+        return None
+    return _path_access_blocked_envelope(
+        dataclasses.replace(decision, status="blocked", reason="guest_boundary")
+    )
+
+
+def _guest_host_execution_block(
+    sandbox_permissions: str,
+) -> dict[str, object] | None:
+    ctx = current_tool_context.get()
+    if (
+        sandbox_permissions != "require_escalated"
+        or ctx is None
+        or not bool(getattr(ctx, "guest_safe", False))
+    ):
+        return None
+    return {
+        "status": "blocked",
+        "reason": "GUEST_HOST_EXECUTION_DENIED",
+        "message": (
+            "Web guest permissions cannot be elevated to host execution. "
+            "Authenticate with an authorized token first."
+        ),
+    }
+
+
 def _sandbox_path_access_enabled() -> bool:
     runtime = get_runtime()
     if runtime is None or not runtime.effective.sandbox_enabled:
@@ -3140,6 +3171,9 @@ def _sandbox_workdir_access_envelope(
         return None
     if decision.status == "blocked":
         return _path_access_blocked_envelope(decision)
+    guest_block = _guest_path_access_block(decision)
+    if guest_block is not None:
+        return guest_block
     if (
         allow_trusted_auto_mount
         and trusted_sandbox_active()
@@ -3185,6 +3219,9 @@ def _sandbox_read_path_access_envelope(
             continue
         if decision.status == "blocked":
             return _path_access_blocked_envelope(decision)
+        guest_block = _guest_path_access_block(decision)
+        if guest_block is not None:
+            return guest_block
         if (
             allow_trusted_auto_mount
             and trusted_sandbox_active()
@@ -3248,6 +3285,9 @@ def _sandbox_write_path_access_envelope(
             continue
         if decision.status == "blocked":
             return _path_access_blocked_envelope(decision)
+        guest_block = _guest_path_access_block(decision)
+        if guest_block is not None:
+            return guest_block
         if (
             allow_trusted_auto_mount
             and trusted_sandbox_active()
@@ -5873,6 +5913,9 @@ async def exec_command(
                 "reason": "invalid_sandbox_permissions",
             }
         )
+    guest_host_block = _guest_host_execution_block(sandbox_permissions)
+    if guest_host_block is not None:
+        return json.dumps(guest_host_block, ensure_ascii=False)
     original_profile = _profile_shell_command(command, workdir=workdir)
     host_execution = _host_execution_allowed()
     backend_retry_granted = False
@@ -6345,6 +6388,9 @@ async def background_process(
                 "reason": "invalid_sandbox_permissions",
             }
         )
+    guest_host_block = _guest_host_execution_block(sandbox_permissions)
+    if guest_host_block is not None:
+        return json.dumps(guest_host_block, ensure_ascii=False)
     original_profile = _profile_shell_command(command, workdir=workdir)
     host_execution = _host_execution_allowed()
     backend_retry_granted = False

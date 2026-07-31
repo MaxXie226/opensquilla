@@ -95,9 +95,10 @@ and can write only inside the server's configured default workspace.
 
 The server chooses that workspace; the Web client cannot replace it or create
 another workspace. The boundary is enforced uniformly for file tools, Shell,
-Python, Node.js, Git Bash, and child processes. An approval can authorize an
-action within the guest boundary, but cannot turn a guest into an owner or
-grant host-wide writes.
+Python, Node.js, Git Bash, and child processes. Guests do not receive access to
+the global approval queue, so a pending approval cannot turn a guest into an
+owner, grant host-wide writes, or affect another session. High-risk actions
+that need approval remain blocked until the caller authenticates.
 
 Loopback desktop sessions are local owners. A remote Web session becomes an
 authenticated principal only after presenting a valid named token; the
