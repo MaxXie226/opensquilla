@@ -1150,15 +1150,16 @@ def test_legacy_import_journal_prevents_missing_target_from_looking_fresh(
     assert journal.read_bytes() == before
 
 
-def test_profile_root_special_path_fails_closed(tmp_path: Path) -> None:
+def test_profile_root_special_path_warns_without_blocking(tmp_path: Path) -> None:
     profile = tmp_path / "opensquilla"
     profile.write_text("not a profile directory\n", encoding="utf-8")
 
     report = inspect_profile(profile)
 
-    assert report.outcome == "recovery_required"
+    assert report.outcome == "attention"
     assert report.stable_code == "profile_unsafe_path"
     assert report.candidates == ()
+    assert "choose-workspace" not in report.allowed_actions
 
 
 def test_profile_root_link_resolves_to_target(tmp_path: Path) -> None:
@@ -1177,7 +1178,7 @@ def test_profile_root_link_resolves_to_target(tmp_path: Path) -> None:
     assert Path(report.primary_home) == real
 
 
-def test_profile_root_dangling_link_fails_closed(tmp_path: Path) -> None:
+def test_profile_root_dangling_link_warns_without_blocking(tmp_path: Path) -> None:
     profile = tmp_path / "opensquilla"
     try:
         profile.symlink_to(tmp_path / "does-not-exist", target_is_directory=True)
@@ -1186,9 +1187,63 @@ def test_profile_root_dangling_link_fails_closed(tmp_path: Path) -> None:
 
     report = inspect_profile(profile)
 
-    assert report.outcome == "recovery_required"
+    assert report.outcome == "attention"
     assert report.stable_code == "profile_unsafe_path"
     assert report.candidates == ()
+
+
+def test_unsafe_profile_root_still_blocks_with_pending_transaction(tmp_path: Path) -> None:
+    profile = tmp_path / "opensquilla"
+    profile.write_text("not a profile directory\n", encoding="utf-8")
+    journal = tmp_path / f".{profile.name}.profile-replace.json"
+    journal.write_text('{"schema_version":1,"phase":"prepared"}\n', encoding="utf-8")
+
+    report = inspect_profile(profile)
+
+    assert report.outcome == "recovery_required"
+    assert report.stable_code == "profile_unsafe_path"
+
+
+def test_unsafe_profile_root_still_blocks_when_elevated(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import opensquilla.recovery.engine as recovery_engine
+
+    profile = tmp_path / "opensquilla"
+    profile.write_text("not a profile directory\n", encoding="utf-8")
+    monkeypatch.setattr(recovery_engine, "_elevated_windows_context", lambda: True)
+
+    report = inspect_profile(profile)
+
+    assert report.outcome == "recovery_required"
+    assert report.stable_code == "profile_unsafe_path"
+
+
+def test_config_link_warns_without_blocking_desktop_guard(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "opensquilla"
+    _workspace(home / "workspace")
+    _desktop_config(home)
+    outside = tmp_path / "outside-config.toml"
+    (home / "config.toml").rename(outside)
+    try:
+        (home / "config.toml").symlink_to(outside)
+    except OSError:
+        pytest.skip("symlink creation is unavailable")
+
+    report = inspect_profile(home)
+
+    assert report.outcome == "attention"
+    assert report.stable_code == "config_unsafe_path"
+    assert "choose-workspace" not in report.allowed_actions
+
+    monkeypatch.setenv("OPENSQUILLA_PROFILE_KIND", "desktop-primary")
+    guarded = guard_desktop_profile(home)
+    assert guarded is not None
+    assert guarded.stable_code == "config_unsafe_path"
 
 
 def test_choose_workspace_preserves_comments_unknown_keys_and_nested_key(tmp_path: Path) -> None:

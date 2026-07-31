@@ -870,6 +870,52 @@ def _home_is_unsafe(path: Path) -> bool:
     return is_path_redirecting_stat(value) or not stat.S_ISDIR(value.st_mode)
 
 
+def _elevated_windows_context() -> bool:
+    """Return whether this process runs with Windows administrator rights."""
+
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())  # type: ignore[attr-defined]
+    except Exception:
+        return False
+
+
+def _unsafe_path_blocks_startup(
+    home: Path,
+    *,
+    profile_kind: str,
+    ignore_transaction: bool,
+    ignore_settings_transaction: bool,
+) -> bool:
+    """Return whether an unsafe-path finding must still block startup.
+
+    A path-shape finding alone is a warning: startup proceeds and every
+    recovery mutation still fails closed on its own no-follow checks. The
+    hard gate remains for an elevated Windows process, where following an
+    attacker-planted link would write with administrative rights, and for
+    any pending crash-recovery journal, whose repair must be surfaced
+    before a gateway may touch the half-mutated profile.
+    """
+
+    if _elevated_windows_context():
+        return True
+    if not ignore_transaction and (
+        _unfinished_replace_transaction(home)
+        or _unfinished_cleanup_transaction(home, profile_kind=profile_kind)
+    ):
+        return True
+    if _legacy_import_transaction_present(home):
+        return True
+    if ignore_settings_transaction:
+        return False
+    from opensquilla.recovery.settings_transaction import settings_transaction_exists
+
+    return settings_transaction_exists(home)
+
+
 def _legacy_layout_is_proven(home: Path, config: _ConfigView) -> bool:
     """Recognize the released nested Desktop shape using filesystem evidence.
 
@@ -1887,11 +1933,17 @@ def inspect_profile(
             state_dir=None,
             error_code="profile_unsafe_path",
         )
+        blocks = _unsafe_path_blocks_startup(
+            home_path,
+            profile_kind=kind,
+            ignore_transaction=_ignore_transaction,
+            ignore_settings_transaction=_ignore_settings_transaction,
+        )
         return _report(
             home=home_path,
             config=config,
             candidates=(),
-            outcome="recovery_required",
+            outcome="recovery_required" if blocks else "attention",
             stable_code="profile_unsafe_path",
             effective_workspace=None,
             allowed_actions=_RECOVERY_ACTIONS,
@@ -1962,11 +2014,17 @@ def inspect_profile(
             allowed_actions=_RECOVERY_ACTIONS,
         )
     if config.error_code is not None:
+        blocks = config.error_code != "config_unsafe_path" or _unsafe_path_blocks_startup(
+            home_path,
+            profile_kind=kind,
+            ignore_transaction=_ignore_transaction,
+            ignore_settings_transaction=_ignore_settings_transaction,
+        )
         return _report(
             home=home_path,
             config=config,
             candidates=candidates,
-            outcome="recovery_required",
+            outcome="recovery_required" if blocks else "attention",
             stable_code=config.error_code,
             effective_workspace=None,
             allowed_actions=_RECOVERY_ACTIONS,
