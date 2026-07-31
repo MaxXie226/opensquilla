@@ -397,6 +397,22 @@ Missing, malformed, and incorrect tokens receive guest-safe authority only.
 A valid named token with `host.execute` may select Full Access without gaining
 owner-only settings authority.
 
+For a remote Web guest, the server ignores any client-supplied workspace and
+uses the configured default workspace. All file-capable tools follow the same
+non-bypassable policy:
+
+- ordinary host files are readable;
+- the built-in credential paths and OpenSquilla authority/recovery data are
+  not readable;
+- writes are allowed only inside the configured default workspace;
+- workspace creation, selection, and other owner-only lifecycle operations are
+  unavailable.
+
+These restrictions also apply to Shell, Python, Node.js, Git Bash, and their
+child processes. Approvals cannot elevate a guest past this boundary. The
+Gateway refuses Guest Safe startup when the configured default workspace is
+inside a protected credential or authority path.
+
 ## Safe Mode Policy
 
 Settings -> Sandbox persists a versioned policy snapshot for each new task.

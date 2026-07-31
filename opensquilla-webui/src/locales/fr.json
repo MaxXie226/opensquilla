@@ -480,8 +480,8 @@
         "listen": "Écouter sur le réseau local", "listenDescription": "Lie toutes les interfaces locales après redémarrage ; les pairs publics restent refusés.",
         "allowedCidrs": "CIDR clients autorisés", "cidrDescription": "Facultatif. Vide autorise loopback, RFC1918 et IPv6 ULA ; les entrées ne peuvent que réduire cette plage.",
         "restartRequired": "Redémarrez OpenSquilla pour appliquer la modification.",
-        "title": "Accès LAN et jetons nommés", "description": "Les jetons contrôlent les droits hôte ; HTTPS n'est pas requis pour ce mode LAN.",
-        "guest": "Jeton absent ou incorrect :", "guestDescription": " mode sûr invité uniquement, sans HOME, projet ni secrets hôte.",
+        "title": "Accès Web et jetons nommés", "description": "L'accès Web distant sans jeton valide utilise le mode sûr invité ; les jetons nommés accordent les droits configurés.",
+        "guest": "Jeton absent ou incorrect :", "guestDescription": " mode sûr invité : les fichiers ordinaires sont lisibles, seul l'espace de travail par défaut est modifiable et les identifiants sont illisibles.",
         "authenticated": "Jeton valide :", "authenticatedDescription": " peut utiliser Sûr ou Accès complet selon ses capacités.",
         "tokenName": "Nom du jeton, par ex. Portable", "hostExecute": "Autoriser l'hôte / Accès complet", "createToken": "Créer le jeton",
         "copyNow": "Copiez-le maintenant. Il ne sera plus affiché.", "fullCapable": "Sûr et Accès complet", "safeOnly": "Sûr uniquement", "revoke": "Révoquer"

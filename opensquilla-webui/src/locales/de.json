@@ -480,8 +480,8 @@
         "listen": "Im lokalen Netzwerk lauschen", "listenDescription": "Nach einem Neustart an alle lokalen Schnittstellen binden; öffentliche Peers bleiben gesperrt.",
         "allowedCidrs": "Erlaubte Client-CIDRs", "cidrDescription": "Optional. Leer erlaubt Loopback, RFC1918 und IPv6 ULA; Einträge können den Bereich nur einschränken.",
         "restartRequired": "OpenSquilla neu starten, um die Änderung anzuwenden.",
-        "title": "LAN-Zugriff und benannte Tokens", "description": "Tokens steuern Host-Rechte; für diesen LAN-Modus ist HTTPS nicht erforderlich.",
-        "guest": "Kein oder ungültiges Token:", "guestDescription": " nur Gast-Sicherheitsmodus ohne Host-HOME, Projekt oder geheime Umgebung.",
+        "title": "Web-Zugriff und benannte Tokens", "description": "Entfernter Web-Zugriff ohne gültiges Token nutzt den Gast-Sicherheitsmodus; benannte Tokens vergeben die konfigurierte Berechtigung.",
+        "guest": "Kein oder ungültiges Token:", "guestDescription": " Gast-Sicherheitsmodus: Normale Dateien sind lesbar, nur der Standard-Arbeitsbereich ist beschreibbar und Anmeldedateien sind nicht lesbar.",
         "authenticated": "Gültiges Token:", "authenticatedDescription": " je nach Berechtigung Sicher oder Vollzugriff.",
         "tokenName": "Token-Name, z. B. Laptop", "hostExecute": "Host-Ausführung / Vollzugriff erlauben", "createToken": "Token erstellen",
         "copyNow": "Jetzt kopieren. Das Token wird nicht erneut angezeigt.", "fullCapable": "Sicher und Vollzugriff", "safeOnly": "Nur Sicher", "revoke": "Widerrufen"

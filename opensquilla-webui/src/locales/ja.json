@@ -480,8 +480,8 @@
         "listen": "ローカルネットワークで待ち受ける", "listenDescription": "再起動後に全ローカルインターフェイスへバインドします。公開ピアは引き続き拒否されます。",
         "allowedCidrs": "許可するクライアント CIDR", "cidrDescription": "任意。空欄では loopback、RFC1918、IPv6 ULA を許可し、指定時は範囲を狭めることだけができます。",
         "restartRequired": "変更を適用するには OpenSquilla を再起動してください。",
-        "title": "LAN アクセスと名前付きトークン", "description": "トークンがホスト権限を決めます。この LAN モードでは HTTPS は必須ではありません。",
-        "guest": "トークンなし・誤り:", "guestDescription": " ゲスト安全モードのみで、ホスト HOME、プロジェクト、秘密環境にはアクセスできません。",
+        "title": "Web アクセスと名前付きトークン", "description": "有効なトークンのないリモート Web アクセスはゲスト安全モードを使用し、名前付きトークンは設定された権限を付与します。",
+        "guest": "トークンなし・誤り:", "guestDescription": " ゲスト安全モード：通常ファイルは読み取り可能、書き込みは既定ワークスペースのみ、認証情報ファイルは読み取り不可です。",
         "authenticated": "有効なトークン:", "authenticatedDescription": " 権限に応じて安全またはフルアクセスを利用できます。",
         "tokenName": "トークン名（例: Laptop）", "hostExecute": "ホスト実行 / フルアクセスを許可", "createToken": "トークンを作成",
         "copyNow": "今すぐコピーしてください。再表示されません。", "fullCapable": "安全とフルアクセス", "safeOnly": "安全のみ", "revoke": "無効化"

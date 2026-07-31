@@ -86,6 +86,23 @@ In Safe mode, approvals are intentionally narrow:
 Other commands and ordinary file mutations run automatically. Full Access
 bypasses Safe policy approvals and executes with host permissions.
 
+## Remote Web Guests
+
+A remote Web connection with no token, a malformed token, or an incorrect
+token receives the same Guest Safe permissions. It can read ordinary host
+files, cannot read built-in credential paths or OpenSquilla authority data,
+and can write only inside the server's configured default workspace.
+
+The server chooses that workspace; the Web client cannot replace it or create
+another workspace. The boundary is enforced uniformly for file tools, Shell,
+Python, Node.js, Git Bash, and child processes. An approval can authorize an
+action within the guest boundary, but cannot turn a guest into an owner or
+grant host-wide writes.
+
+Loopback desktop sessions are local owners. A remote Web session becomes an
+authenticated principal only after presenting a valid named token; the
+token's configured scopes then determine its authority.
+
 ## Sandbox Posture
 
 Inspect sandbox posture:

@@ -507,10 +507,10 @@
         "target": "打包目标"
       },
       "lan": {
-        "title": "内网访问与具名 Token",
-        "description": "内网连接只信任真实套接字来源。此局域网模式暂不要求 HTTPS，Token 决定宿主机权限。",
+        "title": "Web 访问与具名 Token",
+        "description": "远程 Web 访问在没有有效 Token 时使用访客安全模式；具名 Token 按配置授予权限。",
         "guest": "无 Token 或 Token 错误：",
-        "guestDescription": "只能使用访客安全模式，无法读取宿主机 HOME、项目和敏感环境变量。",
+        "guestDescription": "访客安全模式：可读取普通文件，只能修改默认工作区；凭据文件不可读取。",
         "authenticated": "有效具名 Token：",
         "authenticatedDescription": "根据 Token 能力使用安全模式或完全访问。",
         "listen": "监听内网",

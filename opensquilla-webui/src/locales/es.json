@@ -480,8 +480,8 @@
         "listen": "Escuchar en la red local", "listenDescription": "Se enlaza a todas las interfaces locales tras reiniciar; los pares públicos siguen bloqueados.",
         "allowedCidrs": "CIDR de clientes permitidos", "cidrDescription": "Opcional. Vacío permite loopback, RFC1918 e IPv6 ULA; solo se puede restringir ese rango.",
         "restartRequired": "Reinicia OpenSquilla para aplicar el cambio.",
-        "title": "Acceso LAN y tokens con nombre", "description": "Los tokens controlan los permisos del host; este modo LAN no exige HTTPS.",
-        "guest": "Sin token o token incorrecto:", "guestDescription": " solo modo seguro invitado, sin HOME, proyecto ni secretos del host.",
+        "title": "Acceso Web y tokens con nombre", "description": "El acceso Web remoto sin un token válido usa el modo seguro de invitado; los tokens con nombre conceden los permisos configurados.",
+        "guest": "Sin token o token incorrecto:", "guestDescription": " modo seguro de invitado: los archivos normales se pueden leer, solo se puede escribir en el espacio de trabajo predeterminado y no se pueden leer credenciales.",
         "authenticated": "Token válido:", "authenticatedDescription": " puede usar Seguro o Acceso completo según sus capacidades.",
         "tokenName": "Nombre del token, por ejemplo Portátil", "hostExecute": "Permitir host / Acceso completo", "createToken": "Crear token",
         "copyNow": "Cópialo ahora. No volverá a mostrarse.", "fullCapable": "Seguro y Acceso completo", "safeOnly": "Solo Seguro", "revoke": "Revocar"

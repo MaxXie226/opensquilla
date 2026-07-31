@@ -507,10 +507,10 @@
         "target": "Package target"
       },
       "lan": {
-        "title": "LAN access and named tokens",
-        "description": "LAN sockets stay private. Tokens control host authority; HTTPS is not required for this local-network mode.",
+        "title": "Web access and named tokens",
+        "description": "Remote Web access without a valid token uses Guest Safe mode. Named tokens grant their configured authority.",
         "guest": "No or invalid token:",
-        "guestDescription": " guest-safe only, with no host home, project, or secret environment access.",
+        "guestDescription": " Guest Safe mode: ordinary files are readable, only the default workspace is writable, and credential files are unreadable.",
         "authenticated": "Valid named token:",
         "authenticatedDescription": " may use Safe or Full Access according to its capabilities.",
         "listen": "Listen on the local network",
