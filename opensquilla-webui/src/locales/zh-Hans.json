@@ -449,6 +449,7 @@
       }
     },
     "sandbox": {
+      "back": "返回",
       "eyebrow": "安全",
       "title": "沙箱",
       "subtitle": "配置安全模式下的文件、命令、网络、随包运行时和内网 Token 行为。",

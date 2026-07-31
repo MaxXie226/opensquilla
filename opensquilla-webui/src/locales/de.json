@@ -449,6 +449,7 @@
       }
     },
     "sandbox": {
+      "back": "Zurück",
       "eyebrow": "Sicherheit",
       "title": "Sandbox",
       "subtitle": "Datei-, Befehls-, Netzwerk-, Laufzeit- und LAN-Token-Regeln für den sicheren Modus.",

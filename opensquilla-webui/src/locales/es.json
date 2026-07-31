@@ -449,6 +449,7 @@
       }
     },
     "sandbox": {
+      "back": "Volver",
       "eyebrow": "Seguridad",
       "title": "Sandbox",
       "subtitle": "Configura archivos, comandos, red, runtimes y tokens LAN del modo seguro.",

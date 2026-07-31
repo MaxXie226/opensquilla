@@ -449,6 +449,7 @@
       }
     },
     "sandbox": {
+      "back": "Back",
       "eyebrow": "Security",
       "title": "Sandbox",
       "subtitle": "Configure Safe mode file, command, network, runtime, and LAN token behavior.",

@@ -13,9 +13,6 @@
       >
         {{ capability.available ? t('settings.sandbox.available') : t('settings.sandbox.unavailable') }}
       </span>
-      <button type="button" class="btn btn--ghost" :disabled="loading" @click="void refreshCapability()">
-        {{ t('settings.sandbox.actions.redetect') }}
-      </button>
     </header>
 
     <div v-if="loading" class="sandbox-settings__state" role="status">
@@ -27,34 +24,30 @@
     </div>
 
     <template v-else-if="draft">
-      <article class="sandbox-card">
-        <div class="sandbox-card__head">
+      <article v-if="activeView === 'overview'" class="sandbox-overview" data-testid="sandbox-overview">
+        <section class="sandbox-mode-picker" aria-labelledby="sandbox-mode-title">
           <div>
-            <h4>{{ t('settings.sandbox.mode.title') }}</h4>
+            <h4 id="sandbox-mode-title">{{ t('settings.sandbox.mode.title') }}</h4>
             <p>{{ t('settings.sandbox.mode.description') }}</p>
           </div>
-        </div>
-        <label class="sandbox-field">
-          <span>{{ t('settings.sandbox.mode.default') }}</span>
-          <select v-model="defaultRunMode" data-testid="sandbox-default-mode">
-            <option value="safe" :disabled="!capability?.available">
+          <div class="sandbox-segmented" data-testid="sandbox-default-mode">
+            <button
+              type="button"
+              :class="{ 'is-selected': defaultRunMode === 'safe' }"
+              :disabled="!capability?.available"
+              @click="defaultRunMode = 'safe'"
+            >
               {{ t('settings.sandbox.mode.safe') }}
-            </option>
-            <option value="full">{{ t('settings.sandbox.mode.full') }}</option>
-          </select>
-        </label>
-        <p v-if="capability && !capability.available" class="sandbox-detail">
-          {{ capability.reason }}
-        </p>
-        <button
-          v-if="desktopWarningPreferenceAvailable && sandboxWarningSuppressed"
-          type="button"
-          class="btn btn--ghost sandbox-reset-warning"
-          :disabled="desktopPreferencePending"
-          @click="void resetSandboxUnavailableWarning()"
-        >
-          {{ t('settings.sandbox.mode.resetWarning') }}
-        </button>
+            </button>
+            <button
+              type="button"
+              :class="{ 'is-selected': defaultRunMode === 'full' }"
+              @click="defaultRunMode = 'full'"
+            >
+              {{ t('settings.sandbox.mode.full') }}
+            </button>
+          </div>
+        </section>
         <SectionActions
           :dirty="defaultRunMode !== defaultRunModeBaseline"
           :pending="defaultRunModePending"
@@ -62,17 +55,54 @@
           @save="void saveDefaultRunMode()"
           @discard="discardDefaultRunMode"
         />
+
+        <nav class="sandbox-list" :aria-label="t('settings.sandbox.title')">
+          <button type="button" class="sandbox-list__row" data-testid="sandbox-open-files" @click="activeView = 'files'">
+            <span class="sandbox-list__icon" aria-hidden="true"><FileIcon /></span>
+            <span><strong>{{ t('settings.sandbox.files.title') }}</strong><small>{{ fileSummary }}</small></span>
+            <span class="sandbox-list__chevron" aria-hidden="true">›</span>
+          </button>
+          <button type="button" class="sandbox-list__row" data-testid="sandbox-open-commands" @click="activeView = 'commands'">
+            <span class="sandbox-list__icon" aria-hidden="true"><CommandIcon /></span>
+            <span><strong>{{ t('settings.sandbox.commands.title') }}</strong><small>{{ commandSummary }}</small></span>
+            <span class="sandbox-list__chevron" aria-hidden="true">›</span>
+          </button>
+          <button type="button" class="sandbox-list__row" data-testid="sandbox-open-network" @click="activeView = 'network'">
+            <span class="sandbox-list__icon" aria-hidden="true"><NetworkIcon /></span>
+            <span><strong>{{ t('settings.sandbox.network.title') }}</strong><small>{{ networkSummary }}</small></span>
+            <span class="sandbox-list__chevron" aria-hidden="true">›</span>
+          </button>
+          <button type="button" class="sandbox-list__row" data-testid="sandbox-open-runtimes" @click="activeView = 'runtimes'">
+            <span class="sandbox-list__icon" aria-hidden="true"><RuntimeIcon /></span>
+            <span><strong>{{ t('settings.sandbox.runtimes.title') }}</strong><small>{{ runtimeSummary }}</small></span>
+            <span class="sandbox-list__chevron" aria-hidden="true">›</span>
+          </button>
+        </nav>
+
+        <button type="button" class="sandbox-advanced-row" data-testid="sandbox-open-advanced" @click="activeView = 'advanced'">
+          <span><strong>{{ t('settings.sandbox.lan.title') }}</strong><small>{{ t('settings.sandbox.lan.description') }}</small></span>
+          <span class="sandbox-list__chevron" aria-hidden="true">›</span>
+        </button>
       </article>
 
-      <article class="sandbox-card">
-        <div class="sandbox-card__head">
-          <div>
-            <h4>{{ t('settings.sandbox.files.title') }}</h4>
-            <p>{{ t('settings.sandbox.files.description') }}</p>
-          </div>
-          <span class="sandbox-card__tag">{{ t('settings.sandbox.files.readsAllowed') }}</span>
+      <header v-else class="sandbox-detail-header" data-testid="sandbox-detail">
+        <button type="button" class="sandbox-back" data-testid="sandbox-detail-back" @click="activeView = 'overview'">
+          <span aria-hidden="true">‹</span>{{ t('settings.sandbox.back') }}
+        </button>
+        <div>
+          <h4>{{ activeViewTitle }}</h4>
+          <p>{{ activeViewDescription }}</p>
         </div>
+        <span v-if="activeView === 'files'" class="sandbox-card__tag sandbox-detail-control">
+          {{ t('settings.sandbox.files.readsAllowed') }}
+        </span>
+        <label v-else-if="activeView === 'runtimes'" class="sandbox-switch sandbox-detail-control">
+          <input v-model="draft.runtimes.enabled" type="checkbox" />
+          <span aria-hidden="true"></span>
+        </label>
+      </header>
 
+      <article v-if="activeView === 'files'" class="sandbox-card">
         <div class="sandbox-rule-list" data-testid="builtin-file-rules">
           <div v-for="path in builtinDenyWritePaths" :key="path" class="sandbox-rule">
             <code>{{ path }}</code>
@@ -135,13 +165,7 @@
         />
       </article>
 
-      <article class="sandbox-card">
-        <div class="sandbox-card__head">
-          <div>
-            <h4>{{ t('settings.sandbox.commands.title') }}</h4>
-            <p>{{ t('settings.sandbox.commands.description') }}</p>
-          </div>
-        </div>
+      <article v-if="activeView === 'commands'" class="sandbox-card">
         <label class="sandbox-field">
           <span>{{ t('settings.sandbox.commands.systemTools') }}</span>
           <select v-model="draft.commands.systemTools">
@@ -176,13 +200,7 @@
         />
       </article>
 
-      <article class="sandbox-card">
-        <div class="sandbox-card__head">
-          <div>
-            <h4>{{ t('settings.sandbox.network.title') }}</h4>
-            <p>{{ t('settings.sandbox.network.description') }}</p>
-          </div>
-        </div>
+      <article v-if="activeView === 'network'" class="sandbox-card">
         <div class="sandbox-option">
           <div>
             <strong>{{ t('settings.sandbox.network.blockAll') }}</strong>
@@ -218,17 +236,7 @@
         />
       </article>
 
-      <article class="sandbox-card">
-        <div class="sandbox-card__head">
-          <div>
-            <h4>{{ t('settings.sandbox.runtimes.title') }}</h4>
-            <p>{{ t('settings.sandbox.runtimes.description') }}</p>
-          </div>
-          <label class="sandbox-switch">
-            <input v-model="draft.runtimes.enabled" type="checkbox" />
-            <span aria-hidden="true"></span>
-          </label>
-        </div>
+      <article v-if="activeView === 'runtimes'" class="sandbox-card">
         <div class="sandbox-runtime-grid">
           <label><span>Python <small>{{ runtimeVersions.python?.version ?? '—' }}</small></span><input v-model="draft.runtimes.python" type="checkbox" :disabled="!draft.runtimes.enabled" /></label>
           <label><span>Node.js <small>{{ runtimeVersions.node?.version ?? '—' }}</small></span><input v-model="draft.runtimes.node" type="checkbox" :disabled="!draft.runtimes.enabled" /></label>
@@ -244,13 +252,25 @@
         />
       </article>
 
-      <article class="sandbox-card">
-        <div class="sandbox-card__head">
+      <article v-if="activeView === 'advanced'" class="sandbox-card">
+        <div class="sandbox-advanced-status">
           <div>
-            <h4>{{ t('settings.sandbox.lan.title') }}</h4>
-            <p>{{ t('settings.sandbox.lan.description') }}</p>
+            <strong>{{ capability?.available ? t('settings.sandbox.available') : t('settings.sandbox.unavailable') }}</strong>
+            <p v-if="capability">{{ capability.reason }}</p>
           </div>
+          <button type="button" class="btn" :disabled="loading" @click="void refreshCapability()">
+            {{ t('settings.sandbox.actions.redetect') }}
+          </button>
         </div>
+        <button
+          v-if="desktopWarningPreferenceAvailable && sandboxWarningSuppressed"
+          type="button"
+          class="btn btn--ghost sandbox-reset-warning"
+          :disabled="desktopPreferencePending"
+          @click="void resetSandboxUnavailableWarning()"
+        >
+          {{ t('settings.sandbox.mode.resetWarning') }}
+        </button>
         <div class="sandbox-lan-rules">
           <p><strong>{{ t('settings.sandbox.lan.guest') }}</strong>{{ t('settings.sandbox.lan.guestDescription') }}</p>
           <p><strong>{{ t('settings.sandbox.lan.authenticated') }}</strong>{{ t('settings.sandbox.lan.authenticatedDescription') }}</p>
@@ -341,6 +361,8 @@ const allowDomain = ref('')
 const denyDomain = ref('')
 const tokenName = ref('')
 const tokenHostExecute = ref(true)
+type SandboxView = 'overview' | 'files' | 'commands' | 'network' | 'runtimes' | 'advanced'
+const activeView = ref<SandboxView>('overview')
 
 const backupQuotaGiB = computed({
   get: () => Number(((draft.value?.files.backupQuotaBytes ?? 3 * 1024 ** 3) / 1024 ** 3).toFixed(2)),
@@ -352,6 +374,72 @@ const backupQuotaGiB = computed({
     )
   },
 })
+
+const fileSummary = computed(() => {
+  const count = builtinDenyWritePaths.value.length + (draft.value?.files.customDenyWritePaths.length ?? 0)
+  return `${count} · ${backupQuotaGiB.value} GiB`
+})
+
+const commandSummary = computed(() => {
+  const count = draft.value?.commands.requireApprovalPrefixes.length ?? 0
+  return `${count} · git push`
+})
+
+const networkSummary = computed(() => {
+  if (draft.value?.network.blockAllNetwork) return t('settings.sandbox.network.blockAll')
+  const customRules = (draft.value?.network.allowDomains.length ?? 0) + (draft.value?.network.denyDomains.length ?? 0)
+  return customRules
+    ? `${customRules} ${t('settings.sandbox.network.title')}`
+    : t('settings.sandbox.network.description')
+})
+
+const runtimeSummary = computed(() => {
+  if (!draft.value?.runtimes.enabled) return t('settings.sandbox.commands.systemToolsDisabled')
+  return [
+    draft.value.runtimes.python && 'Python',
+    draft.value.runtimes.node && 'Node.js',
+    draft.value.runtimes.gitBash && 'Git Bash',
+  ].filter(Boolean).join(' · ')
+})
+
+const activeViewTitle = computed(() => ({
+  overview: t('settings.sandbox.title'),
+  files: t('settings.sandbox.files.title'),
+  commands: t('settings.sandbox.commands.title'),
+  network: t('settings.sandbox.network.title'),
+  runtimes: t('settings.sandbox.runtimes.title'),
+  advanced: t('settings.sandbox.lan.title'),
+})[activeView.value])
+
+const activeViewDescription = computed(() => ({
+  overview: t('settings.sandbox.subtitle'),
+  files: t('settings.sandbox.files.description'),
+  commands: t('settings.sandbox.commands.description'),
+  network: t('settings.sandbox.network.description'),
+  runtimes: t('settings.sandbox.runtimes.description'),
+  advanced: t('settings.sandbox.lan.description'),
+})[activeView.value])
+
+function createLineIcon(paths: string[]) {
+  return defineComponent({
+    setup() {
+      return () => h('svg', {
+        viewBox: '0 0 24 24',
+        fill: 'none',
+        stroke: 'currentColor',
+        'stroke-width': '1.8',
+        'stroke-linecap': 'round',
+        'stroke-linejoin': 'round',
+        'aria-hidden': 'true',
+      }, paths.map(path => h('path', { d: path })))
+    },
+  })
+}
+
+const FileIcon = createLineIcon(['M4 5.5A1.5 1.5 0 0 1 5.5 4H11l2 2h5.5A1.5 1.5 0 0 1 20 7.5v10A1.5 1.5 0 0 1 18.5 19h-13A1.5 1.5 0 0 1 4 17.5z', 'M15 12v4', 'M13 14h4'])
+const CommandIcon = createLineIcon(['M5 7l4 5-4 5', 'M11 17h8'])
+const NetworkIcon = createLineIcon(['M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18z', 'M3 12h18', 'M12 3c2.5 2.5 3.5 5.5 3.5 9s-1 6.5-3.5 9c-2.5-2.5-3.5-5.5-3.5-9s1-6.5 3.5-9z'])
+const RuntimeIcon = createLineIcon(['M8 3h8', 'M9 3v5l-4 8a3 3 0 0 0 2.7 4h8.6a3 3 0 0 0 2.7-4l-4-8V3', 'M7.5 15h9'])
 
 function removeAt<T>(values: T[], index: number): void {
   values.splice(index, 1)
@@ -395,7 +483,7 @@ const SectionActions = defineComponent({
   },
   emits: ['save', 'discard'],
   setup(props, { emit }) {
-    return () => h('div', { class: 'sandbox-actions' }, [
+    return () => (!props.dirty && !props.error) ? null : h('div', { class: 'sandbox-actions' }, [
       props.error ? h('p', { class: 'sandbox-error', role: 'alert' }, props.error) : null,
       h('span', { class: 'sandbox-actions__spacer' }),
       h('button', {
@@ -487,10 +575,10 @@ onMounted(() => void load())
 <style scoped>
 .sandbox-settings {
   display: grid;
-  gap: 1rem;
-  max-width: 920px;
+  gap: 1.25rem;
+  max-width: 840px;
   margin: 0 auto;
-  padding-bottom: 1rem;
+  padding: 0.25rem 0 2rem;
 }
 
 .sandbox-settings__header,
@@ -502,6 +590,10 @@ onMounted(() => void load())
   align-items: center;
   justify-content: space-between;
   gap: 1rem;
+}
+
+.sandbox-settings__header {
+  min-height: 52px;
 }
 
 .sandbox-settings__eyebrow {
@@ -527,6 +619,13 @@ onMounted(() => void load())
   color: var(--text-muted);
   font-size: 0.78rem;
   line-height: 1.45;
+}
+
+.sandbox-settings__header p:last-child {
+  max-width: 620px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .sandbox-runtime-grid small {
@@ -560,6 +659,216 @@ onMounted(() => void load())
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   background: var(--bg-surface);
+}
+
+.sandbox-overview {
+  display: grid;
+  gap: 1.05rem;
+}
+
+.sandbox-mode-picker,
+.sandbox-advanced-row {
+  border: 1px solid color-mix(in srgb, var(--border) 82%, transparent);
+  border-radius: var(--radius-lg);
+  background: color-mix(in srgb, var(--bg-surface) 96%, var(--bg-hover));
+  box-shadow: 0 1px 2px color-mix(in srgb, var(--text) 4%, transparent);
+}
+
+.sandbox-mode-picker {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 1.05rem 1.15rem;
+}
+
+.sandbox-mode-picker p {
+  max-width: 520px;
+  margin-top: 0.25rem;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 0.76rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sandbox-segmented {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  flex: 0 0 auto;
+  gap: 2px;
+  min-width: 210px;
+  padding: 3px;
+  border: 1px solid color-mix(in srgb, var(--border) 75%, transparent);
+  border-radius: var(--radius-md);
+  background: var(--bg-hover);
+}
+
+.sandbox-segmented button {
+  min-height: 34px;
+  padding: 0 0.8rem;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+
+.sandbox-segmented button.is-selected {
+  background: var(--bg-surface);
+  box-shadow: 0 1px 3px color-mix(in srgb, var(--text) 13%, transparent);
+  color: var(--text);
+}
+
+.sandbox-segmented button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.sandbox-list {
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--border) 82%, transparent);
+  border-radius: var(--radius-lg);
+  background: var(--bg-surface);
+  box-shadow: 0 1px 2px color-mix(in srgb, var(--text) 4%, transparent);
+}
+
+.sandbox-list__row,
+.sandbox-advanced-row {
+  width: 100%;
+  border: 0;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  text-align: start;
+}
+
+.sandbox-list__row {
+  display: grid;
+  grid-template-columns: 38px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.8rem;
+  min-height: 66px;
+  padding: 0.7rem 1rem;
+  background: transparent;
+}
+
+.sandbox-list__row:not(:last-child) {
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 76%, transparent);
+}
+
+.sandbox-list__row:hover,
+.sandbox-advanced-row:hover {
+  background: color-mix(in srgb, var(--bg-hover) 70%, transparent);
+}
+
+.sandbox-list__row > span:nth-child(2),
+.sandbox-advanced-row > span:first-child {
+  display: grid;
+  min-width: 0;
+  gap: 0.18rem;
+}
+
+.sandbox-list__row small,
+.sandbox-advanced-row small {
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 0.73rem;
+  font-weight: 400;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sandbox-list__icon {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  place-items: center;
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--accent) 9%, var(--bg-hover));
+  color: var(--accent);
+}
+
+.sandbox-list__icon svg {
+  width: 19px;
+  height: 19px;
+}
+
+.sandbox-list__chevron {
+  color: var(--text-muted);
+  font-size: 1.45rem;
+  font-weight: 300;
+}
+
+.sandbox-advanced-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 1rem;
+  min-height: 58px;
+  padding: 0.75rem 1rem;
+}
+
+.sandbox-detail-header {
+  display: grid;
+  grid-template-columns: 100px minmax(0, 1fr) 100px;
+  align-items: center;
+  min-height: 54px;
+}
+
+.sandbox-detail-header > div {
+  text-align: center;
+}
+
+.sandbox-detail-header p {
+  margin-top: 0.25rem;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 0.74rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sandbox-detail-control {
+  justify-self: end;
+}
+
+.sandbox-back {
+  display: inline-flex;
+  align-items: center;
+  justify-self: start;
+  gap: 0.15rem;
+  min-height: 40px;
+  padding: 0 0.6rem 0 0.25rem;
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.8rem;
+}
+
+.sandbox-back span {
+  font-size: 1.55rem;
+  line-height: 1;
+}
+
+.sandbox-advanced-status {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding-bottom: 0.9rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.sandbox-advanced-status p {
+  margin-top: 0.2rem;
+  color: var(--text-muted);
+  font-size: 0.74rem;
 }
 
 .sandbox-card {
@@ -748,6 +1057,19 @@ onMounted(() => void load())
   .sandbox-inline-form {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .sandbox-mode-picker {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .sandbox-segmented {
+    width: 100%;
+  }
+
+  .sandbox-detail-header {
+    grid-template-columns: auto minmax(0, 1fr);
   }
 }
 </style>

@@ -449,6 +449,7 @@
       }
     },
     "sandbox": {
+      "back": "Retour",
       "eyebrow": "Sécurité",
       "title": "Bac à sable",
       "subtitle": "Configurez les fichiers, commandes, réseau, runtimes et jetons LAN du mode sûr.",

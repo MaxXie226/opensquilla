@@ -127,8 +127,39 @@ afterEach(() => {
 })
 
 describe('SandboxSettingsPanel', () => {
+  it('starts with a quiet overview and keeps rule editors out of sight', async () => {
+    const { el } = await mountPanel()
+
+    expect(el.querySelector('[data-testid="sandbox-overview"]')).toBeTruthy()
+    expect(el.querySelectorAll('[data-testid^="sandbox-open-"]')).toHaveLength(5)
+    expect(el.querySelector('[data-testid="builtin-file-rules"]')).toBeNull()
+    expect(el.querySelector('[data-testid="create-sandbox-token"]')).toBeNull()
+  })
+
+  it('opens focused details and returns without saving', async () => {
+    const { el, call } = await mountPanel()
+
+    el.querySelector<HTMLButtonElement>('[data-testid="sandbox-open-files"]')!.click()
+    await settle()
+    expect(el.querySelector('[data-testid="sandbox-detail"]')).toBeTruthy()
+    expect(el.querySelector('[data-testid="builtin-file-rules"]')?.textContent)
+      .toContain('C:\\Users\\tester\\.ssh')
+
+    el.querySelector<HTMLButtonElement>('[data-testid="sandbox-detail-back"]')!.click()
+    await settle()
+    expect(el.querySelector('[data-testid="sandbox-overview"]')).toBeTruthy()
+    expect(call.mock.calls.some(([method]) => method === 'sandbox.policy.update')).toBe(false)
+
+    el.querySelector<HTMLButtonElement>('[data-testid="sandbox-open-advanced"]')!.click()
+    await settle()
+    expect(el.querySelector('[data-testid="create-sandbox-token"]')).toBeTruthy()
+    expect(el.querySelector('[data-testid="builtin-file-rules"]')).toBeNull()
+  })
+
   it('loads immutable file rules and saves a versioned custom rule', async () => {
     const { el, call } = await mountPanel()
+    el.querySelector<HTMLButtonElement>('[data-testid="sandbox-open-files"]')!.click()
+    await settle()
     expect(el.querySelector('[data-testid="builtin-file-rules"]')?.textContent)
       .toContain('C:\\Users\\tester\\.ssh')
 
@@ -157,6 +188,8 @@ describe('SandboxSettingsPanel', () => {
 
   it('clamps the recursive-delete backup quota to the visible 0.1 GiB minimum', async () => {
     const { el, call } = await mountPanel()
+    el.querySelector<HTMLButtonElement>('[data-testid="sandbox-open-files"]')!.click()
+    await settle()
     const input = el.querySelector<HTMLInputElement>('[data-testid="sandbox-backup-quota"]')!
     input.value = '0'
     input.dispatchEvent(new Event('input', { bubbles: true }))
@@ -179,6 +212,8 @@ describe('SandboxSettingsPanel', () => {
 
   it('shows a newly-created named token only in the create response', async () => {
     const { el, call } = await mountPanel()
+    el.querySelector<HTMLButtonElement>('[data-testid="sandbox-open-advanced"]')!.click()
+    await settle()
     const name = el.querySelector<HTMLInputElement>('input[placeholder^="Token name"]')!
     name.value = 'Laptop'
     name.dispatchEvent(new Event('input', { bubbles: true }))
