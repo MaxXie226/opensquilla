@@ -187,6 +187,25 @@ def test_gateway_run_turns_missing_onboarding_env_into_recovery_hint(
     assert "Traceback" not in output
 
 
+def test_gateway_run_reports_invalid_config_without_traceback(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    target = tmp_path / "custom.toml"
+    target.write_text("workspace_dir = [\n", encoding="utf-8")
+    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(tmp_path / "home"))
+
+    result = runner.invoke(app, ["gateway", "run", "--config", str(target)])
+
+    assert result.exit_code == 1
+    output = result.stdout + (result.stderr or "")
+    compact = "".join(output.split())
+    assert "Invalid gateway config" in output
+    assert "custom.toml" in compact
+    assert "recoveryrecover-config" in compact
+    assert "Traceback" not in output
+
+
 def test_gateway_run_memory_recovery_command_is_bare_on_windows(
     tmp_path,
     monkeypatch,

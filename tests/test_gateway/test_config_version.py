@@ -120,6 +120,47 @@ def test_unstamped_current_payload_is_stamped_but_unchanged(tmp_path: Path) -> N
     assert not list(tmp_path.glob("config.toml.backup.*"))
 
 
+def test_config_parse_error_names_the_offending_file(tmp_path: Path) -> None:
+    from opensquilla.gateway.config_migration import ConfigParseError
+
+    toml_path = tmp_path / "config.toml"
+    toml_path.write_text("workspace_dir = [\n", encoding="utf-8")
+
+    with pytest.raises(ConfigParseError) as excinfo:
+        GatewayConfig.load(toml_path)
+    assert str(toml_path) in str(excinfo.value)
+    assert excinfo.value.path == toml_path
+
+    with pytest.raises(ConfigParseError):
+        GatewayConfig.load_from_toml(toml_path)
+
+
+def test_migrated_config_write_syncs_before_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import os as os_module
+
+    toml_path = _write_toml(
+        tmp_path / "config.toml",
+        {"llm_ensemble": {"stage1_timeout_seconds": 120}},
+    )
+    synced_fds: list[int] = []
+    real_fsync = os_module.fsync
+
+    def record_fsync(fd: int) -> None:
+        synced_fds.append(fd)
+        real_fsync(fd)
+
+    monkeypatch.setattr(migration_module.os, "fsync", record_fsync)
+
+    payload = tomllib.loads(toml_path.read_text(encoding="utf-8"))
+    result = migrate_config_payload(payload)
+    migration_module.backup_and_write_migrated_config(toml_path, result.payload, result)
+
+    assert synced_fds, "the migrated config bytes must reach disk before os.replace"
+    assert list(tmp_path.glob("config.toml.backup.*"))
+
+
 # ---------------------------------------------------------------------------
 # Version-gated migration: llm_ensemble legacy timeout bump
 # ---------------------------------------------------------------------------

@@ -40,6 +40,7 @@ from opensquilla.gateway.config import (
     LlmProviderConfig,
 )
 from opensquilla.gateway.config_migration import (
+    ConfigParseError,
     backup_and_write_migrated_config,
     make_config_backup,
     migrate_config_payload,
@@ -212,7 +213,10 @@ def load_config(
         _remember_load_baseline(cfg)
         return cfg
     with target_io.open("rb") as fh:
-        data = tomllib.load(fh)
+        try:
+            data = tomllib.load(fh)
+        except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
+            raise ConfigParseError(target, exc) from exc
     migration = migrate_config_payload(data)
     cfg = GatewayConfig.model_validate(migration.payload)
     if migration.changed and persist_migrations:

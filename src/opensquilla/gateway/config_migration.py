@@ -25,6 +25,19 @@ from opensquilla.search.types import MAX_SEARCH_RESULTS
 # ``GatewayConfig.config_version`` (gateway/config.py) defaults to this value.
 LATEST_CONFIG_VERSION = 1
 
+
+class ConfigParseError(ValueError):
+    """A user config file holds invalid TOML.
+
+    Loaders raise this instead of a bare ``tomllib.TOMLDecodeError`` so CLI
+    surfaces can name the offending file and point at the offline repair
+    instead of printing a traceback.
+    """
+
+    def __init__(self, path: str | Path, error: Exception) -> None:
+        self.path = Path(path)
+        super().__init__(f"invalid TOML in {self.path}: {error}")
+
 DEPRECATED_MEMORY_FIELDS: frozenset[str] = frozenset(
     {
         "memory.profile",
@@ -662,6 +675,8 @@ def backup_and_write_migrated_config(
     try:
         with os.fdopen(fd, "wb") as fh:
             tomli_w.dump(payload, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
         os.chmod(tmp_name, 0o600)
         os.replace(tmp_name, native_io_path(target))
     except Exception:
