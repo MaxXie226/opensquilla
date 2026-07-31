@@ -4,6 +4,7 @@ import inspect
 import io
 import json
 import os
+import sys
 import threading
 from dataclasses import replace
 from pathlib import Path
@@ -1622,6 +1623,22 @@ def test_allow_acl_grants_child_before_revoking_inherited_parent_access(
     assert calls.index(("grant", child, "RX")) < calls.index(("revoke", parent, None))
 
 
+def test_frozen_offline_helper_argv_uses_internal_child_role(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default_runner as mod
+
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", r"C:\Program Files\OpenSquilla\gateway.exe")
+
+    assert mod._offline_helper_argv() == (
+        r"C:\Program Files\OpenSquilla\gateway.exe",
+        "--internal-child",
+        "windows-default-runner",
+        mod.OFFLINE_PAYLOAD_STDIN_ARG,
+    )
+
+
 @pytest.mark.parametrize("persisted_is_new", [False, True])
 def test_allow_taint_recovers_crash_before_or_after_state_replace(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, persisted_is_new: bool
@@ -1661,6 +1678,41 @@ def test_allow_taint_recovers_crash_before_or_after_state_replace(
     assert ("revoke", previous) in calls
     assert ("revoke", desired) in calls
     assert ("grant", persisted) in calls
+    assert not mod._acl_state_taint_path(state).exists()
+
+
+def test_allow_taint_recovery_prunes_deleted_ephemeral_roots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default_runner as mod
+
+    state = tmp_path / "allow.json"
+    stale = tmp_path / "deleted-capability-probe"
+    current = tmp_path / "current-capability-probe"
+    current.mkdir()
+    state.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "principals": {"S": [{"path": str(stale), "access": "RWX"}]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    mod._mark_acl_state_tainted(state, kind="allow", sid="S", paths=(stale,))
+    grants: list[Path] = []
+    monkeypatch.setattr(mod, "_revoke_allow_path_for_sid", lambda *_args: None)
+    monkeypatch.setattr(
+        mod,
+        "_grant_path_to_sid",
+        lambda path, access, sid: grants.append(path),
+    )
+
+    mod._sync_allow_acl_state(state, "S", {current: "RWX"})
+
+    assert stale not in grants
+    assert current in grants
     assert not mod._acl_state_taint_path(state).exists()
 
 

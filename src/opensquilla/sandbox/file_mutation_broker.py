@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import secrets
 import shutil
+import stat
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
@@ -56,6 +58,46 @@ class ObjectIdentity:
         )
 
 
+def _tree_digest(path: Path) -> str:
+    """Fingerprint one file tree without following symlinks."""
+
+    digest = hashlib.sha256()
+
+    def _visit(current: Path, relative: str) -> None:
+        metadata = current.lstat()
+        digest.update(relative.encode("utf-8", errors="surrogatepass"))
+        digest.update(b"\0")
+        digest.update(
+            json.dumps(
+                {
+                    "device": int(metadata.st_dev),
+                    "inode": int(metadata.st_ino),
+                    "size": int(metadata.st_size),
+                    "mtimeNs": int(metadata.st_mtime_ns),
+                    "mode": int(metadata.st_mode),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        digest.update(b"\0")
+        if stat.S_ISLNK(metadata.st_mode):
+            digest.update(os.readlink(current).encode("utf-8", errors="surrogatepass"))
+            return
+        if stat.S_ISREG(metadata.st_mode):
+            with current.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            return
+        if stat.S_ISDIR(metadata.st_mode):
+            for child in sorted(current.iterdir(), key=lambda item: item.name):
+                child_relative = f"{relative}/{child.name}" if relative else child.name
+                _visit(child, child_relative)
+
+    _visit(path, ".")
+    return digest.hexdigest()
+
+
 @dataclass(frozen=True)
 class MutationPlan:
     operation: Literal["delete"]
@@ -63,6 +105,7 @@ class MutationPlan:
     recursive: bool
     target_identity: ObjectIdentity
     parent_identity: ObjectIdentity
+    tree_digest: str
     approval_required: bool
     warning: str | None
     policy_version: int
@@ -76,6 +119,7 @@ class MutationPlan:
             "recursive": self.recursive,
             "targetIdentity": self.target_identity.__dict__,
             "parentIdentity": self.parent_identity.__dict__,
+            "treeDigest": self.tree_digest,
             "policyVersion": self.policy_version,
         }
         return hashlib.sha256(
@@ -129,6 +173,7 @@ class FileMutationBroker:
             recursive=recursive,
             target_identity=ObjectIdentity.capture(path),
             parent_identity=ObjectIdentity.capture(path.parent),
+            tree_digest=_tree_digest(path),
             approval_required=approval_required,
             warning=RECURSIVE_DELETE_WARNING if recursive else None,
             policy_version=self._policy.policy_version,
@@ -204,6 +249,7 @@ class FileMutationBroker:
         if (
             current_target != plan.target_identity
             or current_parent != plan.parent_identity
+            or _tree_digest(plan.target) != plan.tree_digest
         ):
             raise ObjectIdentityChanged("file object changed after approval")
 

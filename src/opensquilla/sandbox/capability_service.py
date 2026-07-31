@@ -70,25 +70,29 @@ def capability_report_from_setup(
     *,
     backend: str,
 ) -> CapabilityReport:
-    ready = setup.state is SandboxSetupState.READY
     code = {
-        SandboxSetupState.READY: "ready",
+        SandboxSetupState.READY: "probe_required",
         SandboxSetupState.NOT_SETUP: "not_setup",
         SandboxSetupState.SETTING_UP: "setting_up",
         SandboxSetupState.FAILED: "setup_failed",
         SandboxSetupState.UNAVAILABLE: "backend_unavailable",
     }[setup.state]
-    capabilities = REQUIRED_SAFE_CAPABILITIES if ready else frozenset()
     return CapabilityReport(
-        available=ready and REQUIRED_SAFE_CAPABILITIES.issubset(capabilities),
+        # Setup state is only a prerequisite.  It must never manufacture
+        # runtime capabilities; the live canary probe supplies those.
+        available=False,
         backend=str(backend),
         platform=setup.platform,
         code=code,
-        reason=setup.detail or setup.message,
+        reason=(
+            "Sandbox setup is ready; live capability verification is required."
+            if setup.state is SandboxSetupState.READY
+            else setup.detail or setup.message
+        ),
         setup_supported=setup.state is not SandboxSetupState.UNAVAILABLE,
         restart_required=False,
         probe_version=1,
-        capabilities=capabilities,
+        capabilities=frozenset(),
     )
 
 

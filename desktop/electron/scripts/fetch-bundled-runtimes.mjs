@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto'
 import {
   copyFile,
   mkdir,
+  readdir,
   readFile,
   rename,
   rm,
@@ -17,6 +18,7 @@ const scriptDir = dirname(fileURLToPath(import.meta.url))
 const packageRoot = resolve(scriptDir, '..')
 export const defaultManifestPath = join(packageRoot, 'runtime', 'runtime-manifest.json')
 export const defaultRuntimeRoot = join(packageRoot, 'runtime', 'developer')
+export const defaultRuntimeCacheRoot = join(packageRoot, '.runtime-cache')
 const allowedArchiveTypes = new Set(['zip', 'tar.gz', 'tar.xz', '7z-sfx'])
 const runtimeKeys = ['python', 'node', 'gitBash']
 const portableRuntimeKeys = ['python', 'node']
@@ -173,7 +175,25 @@ async function extractAsset(asset, archive, destination) {
   await rm(destination, { recursive: true, force: true })
   await mkdir(destination, { recursive: true })
   if (asset.archiveType === '7z-sfx') {
-    runChecked(archive, ['-y', '-gm2', `-o${destination}`])
+    // PortableGit ignores the generic `-o` argument and extracts into
+    // %EXEDIR%/PortableGit.  Execute the checksum-verified SFX only after
+    // copying it into the isolated staging directory, then flatten its fixed
+    // wrapper folder.  The installer itself is removed before publication.
+    const stagedArchive = join(destination, 'runtime-installer.exe')
+    await copyFile(archive, stagedArchive)
+    try {
+      runChecked(stagedArchive, ['-y', '-gm2'], { cwd: destination })
+    } finally {
+      await rm(stagedArchive, { force: true })
+    }
+    const wrapper = join(destination, 'PortableGit')
+    const wrapperInfo = await stat(wrapper).catch(() => null)
+    if (wrapperInfo?.isDirectory()) {
+      for (const entry of await readdir(wrapper)) {
+        await rename(join(wrapper, entry), join(destination, entry))
+      }
+      await rm(wrapper, { recursive: true, force: true })
+    }
     return
   }
   const args = ['-xf', archive, '-C', destination]
@@ -190,12 +210,16 @@ function targetAssets(manifest, target) {
 export async function fetchRuntimeSet({
   manifestPath = defaultManifestPath,
   runtimeRoot = defaultRuntimeRoot,
+  cacheRoot = defaultRuntimeCacheRoot,
   target = currentRuntimeTarget(),
 } = {}) {
   const manifest = await loadRuntimeManifest(manifestPath)
   const assets = targetAssets(manifest, target)
-  const cacheRoot = join(runtimeRoot, '.downloads')
   const targetRoot = join(runtimeRoot, target)
+  // Older builders cached archives below runtime/developer, which caused
+  // Electron's extraResources rule to ship duplicate installers.  Remove
+  // that generated cache before preparing the packageable runtime tree.
+  await rm(join(runtimeRoot, '.downloads'), { recursive: true, force: true })
   await mkdir(cacheRoot, { recursive: true })
   await mkdir(targetRoot, { recursive: true })
 

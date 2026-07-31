@@ -407,7 +407,7 @@ async def test_project_run_context_set_reports_workspace_before_setup_readiness(
 
     monkeypatch.setattr(
         rpc_sandbox,
-        "current_sandbox_setup_status",
+        "current_sandbox_capability_report",
         setup_must_not_run,
     )
 

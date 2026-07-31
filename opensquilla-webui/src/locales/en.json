@@ -456,11 +456,20 @@
       "unavailable": "Safe unavailable",
       "builtin": "Built in",
       "actions": {
+        "redetect": "Re-detect",
         "add": "Add",
         "remove": "Remove",
         "retry": "Retry",
         "copy": "Copy",
         "saving": "Saving…"
+      },
+      "mode": {
+        "title": "Default access mode",
+        "description": "Choose the starting mode for new tasks. Safe stays unavailable when the capability probe fails.",
+        "default": "Default mode",
+        "safe": "Safe",
+        "full": "Full Access",
+        "resetWarning": "Show the sandbox-unavailable startup warning again"
       },
       "files": {
         "title": "File safety",
@@ -494,7 +503,8 @@
       },
       "runtimes": {
         "title": "Bundled runtimes",
-        "description": "Safe uses packaged tools first. Full Access keeps host tools first."
+        "description": "Safe uses packaged tools first. Full Access keeps host tools first.",
+        "target": "Package target"
       },
       "lan": {
         "title": "LAN access and named tokens",
@@ -503,6 +513,11 @@
         "guestDescription": " guest-safe only, with no host home, project, or secret environment access.",
         "authenticated": "Valid named token:",
         "authenticatedDescription": " may use Safe or Full Access according to its capabilities.",
+        "listen": "Listen on the local network",
+        "listenDescription": "Bind to all local interfaces after restart. Public peers are still rejected.",
+        "allowedCidrs": "Allowed client CIDRs",
+        "cidrDescription": "Optional. Leave empty for all loopback, RFC1918, and IPv6 ULA clients; entries can only narrow that range.",
+        "restartRequired": "Restart OpenSquilla to apply the listening-address change.",
         "tokenName": "Token name, for example Laptop",
         "hostExecute": "Allow host execution / Full Access",
         "createToken": "Create token",

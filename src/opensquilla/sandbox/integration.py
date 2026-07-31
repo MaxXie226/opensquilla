@@ -138,6 +138,13 @@ _SEARCH_PROVIDER_SYSTEM_DOMAINS: dict[str, tuple[str, ...]] = {
 def active_sandbox_policy() -> StoredSandboxPolicy:
     """Return the immutable policy snapshot for the current Safe run."""
     policy = _ACTIVE_SANDBOX_POLICY.get()
+    if policy is None:
+        from opensquilla.tools.types import current_tool_context
+
+        context = current_tool_context.get()
+        candidate = getattr(context, "sandbox_policy", None) if context is not None else None
+        if isinstance(candidate, StoredSandboxPolicy):
+            policy = candidate
     return policy.model_copy(deep=True) if policy is not None else StoredSandboxPolicy()
 
 
@@ -343,6 +350,50 @@ def active_file_system_profile(
     if isinstance(override, FileSystemPermissionProfile):
         return override
 
+    stored_policy = (
+        getattr(tool_context, "sandbox_policy", None)
+        if tool_context is not None
+        else None
+    )
+    safe_profile: FileSystemPermissionProfile | None = None
+    if tool_context is not None and isinstance(stored_policy, StoredSandboxPolicy):
+        from opensquilla.sandbox.file_policy import (
+            authority_roots_for_state,
+            compile_safe_file_profile,
+        )
+
+        config = getattr(tool_context, "sandbox_gateway_config", None)
+        state_dir = str(getattr(config, "state_dir", "") or "").strip()
+        authority_roots = authority_roots_for_state(state_dir) if state_dir else ()
+        effective_workspace = (
+            workspace.expanduser().resolve(strict=False)
+            if workspace is not None
+            else (
+                Path(str(tool_context.workspace_dir)).expanduser().resolve(strict=False)
+                if getattr(tool_context, "workspace_dir", None)
+                else None
+            )
+        )
+        guest_safe = bool(getattr(tool_context, "guest_safe", False))
+        writable_roots: tuple[Path, ...] = ()
+        if effective_workspace is not None and not guest_safe:
+            writable_roots = (
+                effective_workspace,
+                *(
+                    mount.host_path
+                    for mount in _session_mounts_for_policy(effective_workspace)
+                    if mount.mode == "rw"
+                ),
+            )
+        safe_profile = compile_safe_file_profile(
+            stored_policy,
+            authority_roots=authority_roots,
+            writable_roots=writable_roots,
+        )
+        if not guest_safe:
+            return safe_profile
+        safe_profile = safe_profile.as_read_only()
+
     runtime = get_runtime()
     if runtime is None or not runtime.effective.sandbox_enabled:
         return None
@@ -358,7 +409,20 @@ def active_file_system_profile(
         runtime.settings,
         session_mounts=_session_mounts_for_policy(effective_workspace),
     )
-    return policy.file_system
+    base_profile = policy.file_system
+    if safe_profile is None:
+        return base_profile
+    if base_profile is None:
+        return safe_profile.as_read_only()
+    return FileSystemPermissionProfile(
+        entries=(*base_profile.entries, *safe_profile.entries),
+        denied_read_globs=tuple(
+            dict.fromkeys(
+                (*base_profile.denied_read_globs, *safe_profile.denied_read_globs)
+            )
+        ),
+        default_access=base_profile.default_access,
+    )
 
 
 def reset_runtime() -> None:
@@ -872,6 +936,10 @@ async def gate_action(
             and normalize_run_mode(configured_mode) == RunMode.SAFE
         )
     )
+    if managed_execution:
+        safe_profile = active_file_system_profile(workspace)
+        if safe_profile is not None:
+            policy = dataclasses.replace(policy, file_system=safe_profile)
     if managed_execution and policy.require_approval:
         # Safe mode reviews only an exact host escape. Waiting on the
         # legacy policy approval gate here can block a sandboxed tool for five

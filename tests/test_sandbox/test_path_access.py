@@ -25,6 +25,7 @@ from opensquilla.sandbox.permissions import (
     FileSystemPermissionProfile,
 )
 from opensquilla.sandbox.platform_permissions import FileSystemPlatformContext
+from opensquilla.sandbox.policy_models import FilePolicySettings, SandboxPolicy
 from opensquilla.sandbox.run_context import MountGrant, RunContext
 from opensquilla.sandbox.run_mode import RunMode, normalize_run_mode
 from opensquilla.sandbox.types import SandboxBackendError, SandboxRequest
@@ -1077,6 +1078,63 @@ async def test_filesystem_write_outside_workspace_requires_explicit_elevation(
     assert payload["path"] == str(outside.resolve(strict=False))
     assert get_approval_queue().list_pending("exec") == []
     assert not outside.exists()
+
+
+@pytest.mark.asyncio
+async def test_safe_custom_deny_write_path_forces_exact_user_approval(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    protected = workspace / "protected"
+    protected.mkdir(parents=True)
+    target = protected / "credentials.json"
+    state_dir = tmp_path / "state"
+    policy = SandboxPolicy(
+        files=FilePolicySettings(
+            custom_deny_write_paths=[str(protected / "**")],
+        )
+    )
+
+    with tool_context(workspace) as ctx:
+        ctx.sandbox_policy = policy
+        ctx.sandbox_gateway_config = SimpleNamespace(state_dir=str(state_dir))
+        requested = json.loads(await fs.write_file(str(target), "approved\n"))
+        assert requested["status"] == "approval_required"
+        approval_id = requested["approval_id"]
+        pending = get_approval_queue().get(approval_id)
+
+        assert pending.params["reviewer"] == "user"
+        assert pending.params["action"]["target_paths"] == [[str(target), "write"]]
+        assert not target.exists()
+
+        get_approval_queue().resolve(approval_id, True)
+        result = await fs.write_file(
+            str(target),
+            "approved\n",
+            approval_id=approval_id,
+        )
+
+    assert "Written 9 bytes" in result
+    assert target.read_text(encoding="utf-8") == "approved\n"
+    assert get_approval_queue().get(approval_id).consumed is True
+
+
+@pytest.mark.asyncio
+async def test_safe_authority_path_mutation_cannot_be_approved(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(exist_ok=True)
+    state_dir = tmp_path / "state"
+    target = state_dir / "sessions.db"
+
+    with tool_context(workspace) as ctx:
+        ctx.sandbox_policy = SandboxPolicy()
+        ctx.sandbox_gateway_config = SimpleNamespace(state_dir=str(state_dir))
+        payload = json.loads(await fs.write_file(str(target), "blocked\n"))
+
+    assert payload["status"] == "blocked"
+    assert payload["reason"] == "sandbox_authority_read_denied"
+    assert get_approval_queue().list_pending("exec") == []
+    assert not target.exists()
 
 
 @pytest.mark.asyncio

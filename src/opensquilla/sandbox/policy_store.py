@@ -144,7 +144,25 @@ class SandboxPolicyStore:
             connection.close()
 
 
+def pin_sandbox_policy(context: Any, config: Any) -> Any:
+    """Attach one persisted policy snapshot to a runtime ``ToolContext``.
+
+    Embedded/standalone callers may omit ``state_dir``.  They retain the
+    version-zero defaults instead of making turn construction fail.
+    """
+
+    state_dir = str(getattr(config, "state_dir", "") or "").strip()
+    context.sandbox_policy = (
+        SandboxPolicyStore(Path(state_dir) / "sessions.db").read()
+        if state_dir
+        else SandboxPolicy()
+    )
+    context.sandbox_gateway_config = config
+    return context
+
+
 __all__ = [
     "PolicyVersionConflict",
     "SandboxPolicyStore",
+    "pin_sandbox_policy",
 ]

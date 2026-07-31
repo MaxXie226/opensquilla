@@ -2030,6 +2030,9 @@ async def _run_turn_with_streaming(
         workspace_strict=workspace_strict,
         default_elevated=configured_default_elevated(config),
     )
+    from opensquilla.sandbox.policy_store import pin_sandbox_policy
+
+    pin_sandbox_policy(tool_ctx, config)
     use_streaming = resolve_channel_stream_policy(channel).relay_stream
 
     if use_streaming:

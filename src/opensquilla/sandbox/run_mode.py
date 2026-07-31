@@ -140,30 +140,19 @@ def _field_was_set(model: Any, field_name: str) -> bool:
     return field_name in fields_set if fields_set is not None else False
 
 
-def _full_mode_is_explicit(config: Any) -> bool:
-    sandbox = getattr(config, "sandbox", None)
-    permissions = getattr(config, "permissions", None)
-    configured_run_mode = getattr(sandbox, "run_mode", None)
-    if configured_run_mode is not None:
-        return normalize_run_mode(configured_run_mode) is RunMode.FULL
-    sandbox_enabled = getattr(sandbox, "sandbox", None)
-    if _field_was_set(sandbox, "sandbox") and not bool(sandbox_enabled):
-        return True
-    # ``bypass`` is the owner/project default host mode, but the process still
-    # keeps a sandbox-capable runtime for explicit Standard/Trusted calls.
-    # Only an explicit ``full`` selection disables that process-wide capability.
-    return str(getattr(permissions, "default_mode", "")).strip().lower() == "full"
-
-
 def project_default_run_mode(config: Any) -> RunMode:
     return config_run_mode(config)
 
 
 def sandbox_runtime_capability_mode(config: Any) -> RunMode:
-    configured = config_run_mode(config)
-    if configured is RunMode.FULL and not _full_mode_is_explicit(config):
-        return RunMode.SAFE
-    return configured
+    """Keep Safe available independently of the owner's default run mode.
+
+    ``run_mode=full`` means ordinary owner tasks execute on the host.  It must
+    not tear down the process-wide sandbox backend because unauthenticated
+    sessions and an explicit Safe selection still depend on that capability.
+    """
+
+    return RunMode.SAFE
 
 
 __all__ = [

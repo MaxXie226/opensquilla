@@ -1274,6 +1274,55 @@ async def test_backend_returns_helper_result(
 
 
 @pytest.mark.asyncio
+async def test_backend_cancellation_kills_and_reaps_helper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default as mod
+    from opensquilla.sandbox.backend.windows_default import WindowsDefaultBackend
+
+    communicating = asyncio.Event()
+    never_finishes = asyncio.Event()
+
+    class _Proc:
+        returncode = None
+        killed = False
+        waited = False
+
+        async def communicate(self):
+            communicating.set()
+            await never_finishes.wait()
+            return b"", b""
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+
+        async def wait(self):
+            self.waited = True
+            return self.returncode
+
+    proc = _Proc()
+
+    async def fake_exec(*argv, stdout=None, stderr=None, env=None):
+        return proc
+
+    monkeypatch.setattr(mod, "_support_ready", lambda: True)
+    monkeypatch.setattr(mod, "_capability_store_path", lambda: tmp_path / "cap_sids.json")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    task = asyncio.create_task(WindowsDefaultBackend().run(_request(tmp_path)))
+    await communicating.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert proc.killed is True
+    assert proc.waited is True
+
+
+@pytest.mark.asyncio
 async def test_frozen_backend_uses_internal_child_role(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1400,6 +1449,30 @@ def test_payload_contains_profile_workspace_and_required_runtime_acl_plan(
     assert grant_paths[str(tmp_path / "runtime" / "Scripts")] == "RX"
     assert plan["capabilitySids"]
     assert plan["grantCurrentUserAccess"] is True
+
+
+def test_capability_probe_does_not_project_host_tool_path_acl_roots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default as mod
+
+    monkeypatch.setattr(mod, "_support_ready", lambda: True)
+    monkeypatch.setattr(mod, "_capability_store_path", lambda: tmp_path / "cap_sids.json")
+    monkeypatch.setattr(mod, "runtime_rx_roots", lambda executable: ())
+    monkeypatch.setattr(mod, "process_executable_rx_roots", lambda argv, env: ())
+    monkeypatch.setattr(
+        mod,
+        "_windows_tool_path_roots",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("capability canary must not project host tool paths")
+        ),
+    )
+    request = replace(_request(tmp_path), action_kind="capability.probe")
+
+    payload = mod._payload_for_request(request)
+
+    assert payload["argv"]
 
 
 def test_payload_skips_windows_reserved_device_expansion_roots(

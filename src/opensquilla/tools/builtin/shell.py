@@ -54,6 +54,7 @@ from opensquilla.sandbox.backend.seatbelt import (
     seatbelt_env_for_policy,
 )
 from opensquilla.sandbox.backend.unavailable import UnavailableBackend
+from opensquilla.sandbox.backup_vault import BackupTooLarge, BackupVault
 from opensquilla.sandbox.command_policy import CommandAction, decide_shell_command
 from opensquilla.sandbox.denial_attribution import is_likely_sandbox_denied
 from opensquilla.sandbox.elevation import ElevationAction, gate_elevated_action
@@ -63,6 +64,15 @@ from opensquilla.sandbox.escalation import (
     grant_temporary_mount_for_current_tool,
     request_sandbox_approval,
 )
+from opensquilla.sandbox.file_mutation_broker import (
+    OVERSIZE_BACKUP_WARNING,
+    RECURSIVE_DELETE_WARNING,
+    FileMutationBroker,
+    MutationDenied,
+    MutationPlan,
+    ObjectIdentityChanged,
+)
+from opensquilla.sandbox.file_policy import authority_roots_for_state
 from opensquilla.sandbox.integration import (
     SandboxRuntime,
     active_file_system_profile,
@@ -96,6 +106,7 @@ from opensquilla.sandbox.path_validation import (
     logical_tool_path,
     trusted_write_auto_grant_allowed,
 )
+from opensquilla.sandbox.permissions import FileSystemPermissionProfile
 from opensquilla.sandbox.policy import LevelHints
 from opensquilla.sandbox.runtime_launcher import apply_bundled_runtime_path
 from opensquilla.sandbox.runtime_manifest import RuntimeManifestError
@@ -191,6 +202,365 @@ def _apply_safe_command_policy(
             else ""
         ),
     )
+
+
+@dataclass
+class _PendingRecursiveDelete:
+    broker: FileMutationBroker
+    plan: MutationPlan
+    action: ElevationAction
+
+
+_PENDING_RECURSIVE_DELETES: dict[str, _PendingRecursiveDelete] = {}
+_MAX_PENDING_RECURSIVE_DELETES = 256
+_RECURSIVE_DELETE_RISK_RE = re.compile(
+    r"(?is)(?:"
+    r"\brm(?:\.exe)?\b[^\r\n;&|]*(?:\s-[A-Za-z]*r[A-Za-z]*\b|\s--recursive\b)"
+    r"|\bRemove-Item\b[^\r\n;&|]*\s-Recurse\b"
+    r"|\brmdir(?:\.exe)?\b[^\r\n;&|]*\s/(?:s|S)\b"
+    r")"
+)
+_DYNAMIC_DELETE_PATH_RE = re.compile(r"[*?\[\]{}$`]|%\w+%")
+
+
+def _remember_pending_recursive_delete(
+    approval_id: str,
+    pending: _PendingRecursiveDelete,
+) -> None:
+    """Keep the exact-action cache bounded against abandoned approvals."""
+
+    key = str(approval_id)
+    _PENDING_RECURSIVE_DELETES.pop(key, None)
+    _PENDING_RECURSIVE_DELETES[key] = pending
+    while len(_PENDING_RECURSIVE_DELETES) > _MAX_PENDING_RECURSIVE_DELETES:
+        oldest = next(iter(_PENDING_RECURSIVE_DELETES))
+        _PENDING_RECURSIVE_DELETES.pop(oldest, None)
+
+
+def _recursive_delete_target(command: str, cwd: str) -> Path | None:
+    """Return one literal recursive-delete target, or ``None`` if dynamic."""
+
+    if not _RECURSIVE_DELETE_RISK_RE.search(command):
+        return None
+    if re.search(r"&&|\|\||[;\r\n|]", command):
+        # A compound script is not one exact, fingerprintable deletion.
+        return None
+    try:
+        tokens = shlex.split(command, posix=os.name != "nt")
+    except ValueError:
+        return None
+    if not tokens:
+        return None
+    executable = _shell_command_basename(tokens[0])
+    target_tokens: list[str] = []
+    skip_next = False
+    value_flags = {
+        "-filter",
+        "-include",
+        "-exclude",
+        "-erroraction",
+        "-ea",
+    }
+    for token in tokens[1:]:
+        cleaned = token.strip("'\"")
+        folded = cleaned.casefold()
+        if skip_next:
+            skip_next = False
+            continue
+        if folded in value_flags:
+            skip_next = True
+            continue
+        if cleaned.startswith("-") or (
+            executable == "rmdir" and cleaned.startswith("/")
+        ):
+            continue
+        target_tokens.append(cleaned)
+    if len(target_tokens) != 1:
+        return None
+    raw_target = target_tokens[0]
+    if _DYNAMIC_DELETE_PATH_RE.search(raw_target):
+        return None
+    candidate = Path(os.path.expandvars(raw_target)).expanduser()
+    if not candidate.is_absolute():
+        candidate = Path(cwd) / candidate
+    return candidate.resolve(strict=False)
+
+
+def _recursive_delete_action(
+    command: str,
+    cwd: str,
+    plan: MutationPlan,
+    *,
+    without_backup: bool = False,
+) -> ElevationAction:
+    warning = (
+        plan.warning
+        or (
+            OVERSIZE_BACKUP_WARNING
+            if without_backup
+            else RECURSIVE_DELETE_WARNING
+        )
+    )
+    return ElevationAction(
+        tool_name="exec_command",
+        action_kind=(
+            "fs.recursive_delete_without_backup"
+            if without_backup
+            else "fs.recursive_delete"
+        ),
+        argv=("recursive-delete", str(plan.target)),
+        cwd=cwd,
+        sandbox_permissions="require_escalated",
+        justification=warning,
+        target_paths=((str(plan.target), "delete"),),
+        content_digest=plan.fingerprint(),
+        risk_markers=(
+            ("recursive-delete", "without-backup")
+            if without_backup
+            else ("recursive-delete",)
+        ),
+    )
+
+
+def _recursive_delete_approval_envelope(
+    gate: Any,
+    *,
+    warning: str,
+    target: Path,
+) -> str:
+    payload = gate.to_envelope()
+    payload.update(
+        {
+            "warning": warning,
+            "target": str(target),
+            "recursive": True,
+            "irreversible": True,
+        }
+    )
+    return json.dumps(payload, ensure_ascii=False)
+
+
+async def _gate_recursive_delete(
+    command: str,
+    *,
+    cwd: str | None,
+    approval_id: str | None,
+) -> str | None:
+    """Approve, back up, and execute one literal recursive delete in Safe."""
+
+    if full_host_access_active() or not _RECURSIVE_DELETE_RISK_RE.search(command):
+        return None
+    effective_cwd = cwd or str(Path.cwd())
+    pending = _PENDING_RECURSIVE_DELETES.get(str(approval_id or ""))
+    if approval_id and pending is None:
+        return json.dumps(
+            {
+                "status": "approval_action_mismatch",
+                "requested": True,
+                "allowed": False,
+                "approval_id": approval_id,
+                "reason": "approval_action_mismatch",
+                "recursive": True,
+                "irreversible": True,
+            },
+            ensure_ascii=False,
+        )
+    if pending is None:
+        target = _recursive_delete_target(command, effective_cwd)
+        if target is None:
+            return json.dumps(
+                {
+                    "status": "blocked",
+                    "reason": "recursive_delete_target_not_static",
+                    "recursive": True,
+                    "irreversible": True,
+                    "message": (
+                        f"{RECURSIVE_DELETE_WARNING} "
+                        "请把递归删除改成仅包含一个字面量路径的独立命令，"
+                        "OpenSquilla 才能在审批后先备份再删除。"
+                    ),
+                },
+                ensure_ascii=False,
+            )
+        context = current_tool_context.get()
+        config = getattr(context, "sandbox_gateway_config", None)
+        state_dir = str(getattr(config, "state_dir", "") or "").strip()
+        if not state_dir:
+            return json.dumps(
+                {
+                    "status": "blocked",
+                    "reason": "backup_vault_unavailable",
+                    "message": "递归删除需要可用的备份目录；当前未配置 state_dir。",
+                },
+                ensure_ascii=False,
+            )
+        broker = FileMutationBroker(
+            policy=active_sandbox_policy(),
+            vault=BackupVault(Path(state_dir) / "backup-vault"),
+            authority_roots=authority_roots_for_state(state_dir),
+        )
+        try:
+            plan = await asyncio.to_thread(
+                broker.plan_delete,
+                target,
+                recursive=True,
+            )
+        except MutationDenied as exc:
+            return json.dumps(
+                {
+                    "status": "blocked",
+                    "reason": str(exc) or "file_mutation_denied",
+                    "target": str(target),
+                    "message": "This recursive delete target cannot be approved.",
+                },
+                ensure_ascii=False,
+            )
+        except (FileNotFoundError, NotADirectoryError, OSError) as exc:
+            return json.dumps(
+                {
+                    "status": "blocked",
+                    "reason": "recursive_delete_target_invalid",
+                    "target": str(target),
+                    "message": str(exc),
+                },
+                ensure_ascii=False,
+            )
+        pending = _PendingRecursiveDelete(
+            broker=broker,
+            plan=plan,
+            action=_recursive_delete_action(command, effective_cwd, plan),
+        )
+    context = current_tool_context.get()
+    gate = gate_elevated_action(
+        pending.action,
+        approval_id=approval_id,
+        session_key=getattr(context, "session_key", None),
+        # This approval authorizes a brokered sandbox action, not host
+        # execution.  The real Safe profile keeps authority reads denied.
+        file_system_profile=FileSystemPermissionProfile.full_access(),
+    )
+    if not gate.allowed:
+        gate_status = str(getattr(gate, "status", "approval_required"))
+        if approval_id and gate_status in {
+            "approval_denied",
+            "approval_invalid",
+            "approval_action_mismatch",
+            "approval_session_mismatch",
+        }:
+            _PENDING_RECURSIVE_DELETES.pop(approval_id, None)
+        elif gate.approval_id:
+            _remember_pending_recursive_delete(gate.approval_id, pending)
+        return _recursive_delete_approval_envelope(
+            gate,
+            warning=pending.plan.warning or RECURSIVE_DELETE_WARNING,
+            target=pending.plan.target,
+        )
+    if approval_id:
+        _PENDING_RECURSIVE_DELETES.pop(approval_id, None)
+    plan = pending.plan
+    if plan.backup_override_token is None:
+        plan = pending.broker.approve(plan)
+    try:
+        result = await asyncio.to_thread(pending.broker.execute, plan)
+    except BackupTooLarge as exc:
+        override = pending.broker.approve_without_backup(pending.plan, exc)
+        override_pending = _PendingRecursiveDelete(
+            broker=pending.broker,
+            plan=override,
+            action=_recursive_delete_action(
+                command,
+                effective_cwd,
+                override,
+                without_backup=True,
+            ),
+        )
+        second_gate = gate_elevated_action(
+            override_pending.action,
+            approval_id=None,
+            session_key=getattr(context, "session_key", None),
+            file_system_profile=FileSystemPermissionProfile.full_access(),
+        )
+        if second_gate.approval_id:
+            _remember_pending_recursive_delete(
+                second_gate.approval_id,
+                override_pending,
+            )
+        return _recursive_delete_approval_envelope(
+            second_gate,
+            warning=override.warning
+            or OVERSIZE_BACKUP_WARNING.format(
+                size_bytes=exc.size_bytes,
+                quota_bytes=exc.quota_bytes,
+            ),
+            target=override.target,
+        )
+    except ObjectIdentityChanged as exc:
+        return json.dumps(
+            {
+                "status": "blocked",
+                "reason": "recursive_delete_target_changed",
+                "target": str(plan.target),
+                "message": str(exc),
+            },
+            ensure_ascii=False,
+        )
+    except OSError as exc:
+        return json.dumps(
+            {
+                "status": "blocked",
+                "reason": "recursive_delete_backup_failed",
+                "target": str(plan.target),
+                "message": str(exc),
+            },
+            ensure_ascii=False,
+        )
+    return json.dumps(
+        {
+            "status": "deleted",
+            "target": str(plan.target),
+            "recursive": True,
+            "backup": (
+                {
+                    "backupId": result.backup.backup_id,
+                    "entryPath": str(result.backup.entry_path),
+                    "sizeBytes": result.backup.size_bytes,
+                }
+                if result.backup is not None
+                else None
+            ),
+        },
+        ensure_ascii=False,
+    )
+
+
+def _gate_safe_command_approval(
+    command: str,
+    *,
+    cwd: str | None,
+    reason: str,
+    approval_id: str | None,
+) -> str | None:
+    effective_cwd = cwd or str(Path.cwd())
+    action = ElevationAction(
+        tool_name="exec_command",
+        action_kind="sandbox.command",
+        argv=("safe-command", command),
+        cwd=effective_cwd,
+        sandbox_permissions="require_escalated",
+        justification=reason,
+        content_digest=hashlib.sha256(command.encode("utf-8")).hexdigest(),
+        risk_markers=("safe-command-approval",),
+    )
+    context = current_tool_context.get()
+    gate = gate_elevated_action(
+        action,
+        approval_id=approval_id,
+        session_key=getattr(context, "session_key", None),
+        # The approval is consumed only as an exact user decision; execution
+        # remains inside Safe, so denied-read roots are not being bypassed.
+        file_system_profile=FileSystemPermissionProfile.full_access(),
+    )
+    return None if gate.allowed else json.dumps(gate.to_envelope(), ensure_ascii=False)
 
 
 def _base_shell_environment() -> dict[str, str]:
@@ -5517,6 +5887,22 @@ async def exec_command(
     )
     if approval_denial is not None:
         return json.dumps(approval_denial, ensure_ascii=False)
+    recursive_delete = await _gate_recursive_delete(
+        command,
+        cwd=cwd,
+        approval_id=approval_id,
+    )
+    if recursive_delete is not None:
+        return recursive_delete
+    if result.needs_approval:
+        command_approval = _gate_safe_command_approval(
+            command,
+            cwd=cwd,
+            reason=result.reason or "This high-risk command requires approval.",
+            approval_id=approval_id,
+        )
+        if command_approval is not None:
+            return command_approval
     scratch_block = _workspace_scratch_artifact_shell_block("exec_command", command, cwd)
     if scratch_block is not None:
         return json.dumps(scratch_block, ensure_ascii=False)
@@ -5968,6 +6354,22 @@ async def background_process(
     )
     if approval_denial is not None:
         return json.dumps(approval_denial, ensure_ascii=False)
+    recursive_delete = await _gate_recursive_delete(
+        command,
+        cwd=cwd,
+        approval_id=approval_id,
+    )
+    if recursive_delete is not None:
+        return recursive_delete
+    if result.needs_approval:
+        command_approval = _gate_safe_command_approval(
+            command,
+            cwd=cwd,
+            reason=result.reason or "This high-risk command requires approval.",
+            approval_id=approval_id,
+        )
+        if command_approval is not None:
+            return command_approval
     scratch_block = _workspace_scratch_artifact_shell_block(
         "background_process",
         command,

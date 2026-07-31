@@ -19,6 +19,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path, PureWindowsPath
 from typing import Any
 
+from opensquilla.sandbox.runtime_launcher import ChildRole, internal_child_argv
+
 HELPER_MODULE = "opensquilla.sandbox.backend.windows_default_runner"
 _LOCK_ACQUIRE_TIMEOUT_S = 30.0
 _LOCK_RETRY_INTERVAL_S = 0.05
@@ -2018,6 +2020,13 @@ def _recover_allow_acl_taint(state_path: Path, state: dict[str, Any]) -> None:
         for path in paths:
             _revoke_allow_path_for_sid(path, sid)
         for path, access in persisted.items():
+            # Capability probes and other private mounts are intentionally
+            # ephemeral. If the helper was cancelled after marking the ACL
+            # transaction tainted, the temporary directory may be gone before
+            # recovery. A missing path carries no live grant to restore; the
+            # normal desired-state sync below will prune it from the journal.
+            if not path.exists():
+                continue
             _grant_path_to_sid(path, access, sid)
     except BaseException as exc:
         raise SystemExit(
@@ -2240,6 +2249,13 @@ def _cancel_child_pipe_io(kernel32: object, handles: Sequence[object]) -> None:
             cancel(handle, None)
 
 
+def _offline_helper_argv() -> tuple[str, ...]:
+    return internal_child_argv(
+        ChildRole.WINDOWS_DEFAULT_RUNNER,
+        args=(OFFLINE_PAYLOAD_STDIN_ARG,),
+    )
+
+
 def _run_payload_as_offline_identity_native(
     payload: HelperPayload,
     *,
@@ -2460,14 +2476,7 @@ def _run_payload_as_offline_identity_native(
             raise win_error("SetInformationJobObject")
 
         command_line = ctypes.create_unicode_buffer(
-            subprocess.list2cmdline(
-                [
-                    sys.executable,
-                    "-m",
-                    HELPER_MODULE,
-                    OFFLINE_PAYLOAD_STDIN_ARG,
-                ]
-            )
+            subprocess.list2cmdline(_offline_helper_argv())
         )
         child_env = _helper_child_env()
         env_block = ctypes.create_unicode_buffer(_environment_block(child_env))

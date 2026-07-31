@@ -30,7 +30,12 @@ from opensquilla.sandbox.escalation import (
     grant_temporary_mount_for_current_tool,
     request_sandbox_approval,
 )
-from opensquilla.sandbox.integration import active_file_system_profile, get_runtime
+from opensquilla.sandbox.file_policy import authority_roots_for_state, decide_file_access
+from opensquilla.sandbox.integration import (
+    active_file_system_profile,
+    active_sandbox_policy,
+    get_runtime,
+)
 from opensquilla.sandbox.operation_runtime import (
     FilesystemOperationRequest,
     SandboxOperation,
@@ -43,7 +48,7 @@ from opensquilla.sandbox.path_validation import (
     logical_tool_path,
     trusted_write_auto_grant_allowed,
 )
-from opensquilla.sandbox.permissions import FileSystemAccess
+from opensquilla.sandbox.permissions import FileSystemAccess, FileSystemPermissionProfile
 from opensquilla.tools.mutation_receipts import (
     fingerprint_path,
     record_semantic_mutation_receipt,
@@ -1292,6 +1297,17 @@ async def _gate_out_of_workspace_write(
         )
 
     if _sandbox_path_access_enabled():
+        safe_policy_gate = _gate_safe_policy_file_mutation(
+            tool_name,
+            resolved,
+            original_path,
+            approval_id,
+            justification=justification,
+            content_digest=content_digest,
+            prefix_rule=prefix_rule,
+        )
+        if safe_policy_gate is not None:
+            return safe_policy_gate
         decision = decide_path_access(
             resolved,
             workspace=_workspace_root(),
@@ -1363,6 +1379,104 @@ async def _gate_out_of_workspace_write(
     if _active_sandbox_mount_allows(resolved, write=True):
         return None, False
     return _outside_workspace_write_block(tool_name, resolved, original_path), False
+
+
+def _gate_safe_policy_file_mutation(
+    tool_name: str,
+    resolved: Path,
+    original_path: str,
+    approval_id: str | None,
+    *,
+    justification: str,
+    content_digest: str | None,
+    prefix_rule: list[str] | None,
+) -> tuple[dict[str, object] | None, bool] | None:
+    """Gate one exact structured mutation against the pinned Safe file policy.
+
+    A protected user path can be approved because the structured filesystem
+    tool performs only the fingerprinted operation.  This does not grant an
+    arbitrary shell process unsandboxed access.  OpenSquilla authority paths
+    remain non-overridable.
+    """
+
+    ctx = current_tool_context.get()
+    config = getattr(ctx, "sandbox_gateway_config", None) if ctx is not None else None
+    state_dir = str(getattr(config, "state_dir", "") or "").strip()
+    authority_roots = authority_roots_for_state(state_dir) if state_dir else ()
+    decision = decide_file_access(
+        "write",
+        resolved,
+        active_sandbox_policy(),
+        authority_roots=authority_roots,
+    )
+    if decision.allowed:
+        return None
+    if not decision.approval_required:
+        return (
+            {
+                "status": "blocked",
+                "reason": decision.code or "sandbox_file_mutation_denied",
+                "path": str(resolved),
+                "matched_path": (
+                    str(decision.matched_path) if decision.matched_path is not None else None
+                ),
+            },
+            False,
+        )
+    if ctx is not None and bool(getattr(ctx, "guest_safe", False)):
+        return (
+            {
+                "status": "blocked",
+                "reason": "guest_safe_protected_mutation_forbidden",
+                "path": str(resolved),
+                "message": (
+                    "Authentication is required before a protected-path mutation "
+                    "can be submitted for approval."
+                ),
+            },
+            False,
+        )
+
+    action_kinds = {
+        "write_file": "fs.write",
+        "edit_file": "fs.edit",
+        "edit_source": "fs.edit_source",
+        "create_source": "fs.create_source",
+    }
+    action = ElevationAction(
+        tool_name=tool_name,
+        action_kind=action_kinds.get(tool_name, "fs.write"),
+        argv=(tool_name, str(resolved)),
+        cwd=str(_workspace_root() or Path.cwd()),
+        sandbox_permissions="require_escalated",
+        justification=(
+            justification.strip()
+            or f"Modify the exact Safe-mode protected path: {original_path}"
+        ),
+        target_paths=((str(resolved), "write"),),
+        content_digest=content_digest,
+        risk_markers=("safe_policy_protected_path",),
+        prefix_rule=tuple(prefix_rule) if prefix_rule is not None else None,
+    )
+    gate = gate_elevated_action(
+        action,
+        approval_id=approval_id,
+        session_key=ctx.session_key if ctx is not None else None,
+        file_system_profile=FileSystemPermissionProfile.full_access(),
+    )
+    if not gate.allowed:
+        envelope = gate.to_envelope()
+        envelope.update(
+            {
+                "reason": decision.code or "sensitive_file_mutation_requires_approval",
+                "path": str(resolved),
+                "matched_path": (
+                    str(decision.matched_path) if decision.matched_path is not None else None
+                ),
+            }
+        )
+        return envelope, False
+    return None, True
 
 
 @tool(

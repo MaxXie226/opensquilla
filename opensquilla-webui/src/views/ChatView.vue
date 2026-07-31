@@ -662,6 +662,8 @@ import {
   acquireSessionBootstrapAdmission,
   claimSessionBootstrapAdmission,
   optionalSessionRpcCallOptions,
+  runModeWriteRpcCallOptions,
+  sandboxSetupRpcCallOptions,
 } from '@/composables/chat/sessionBootstrapAdmission'
 import { useChatSessionRuntime } from '@/composables/chat/useChatSessionRuntime'
 import { useChatSessionSubscription } from '@/composables/chat/useChatSessionSubscription'
@@ -908,6 +910,7 @@ const {
 } = useChatRunModePreference({
   rpc,
   hydrateCallOptions: optionalSessionRpcCallOptions,
+  writeCallOptions: runModeWriteRpcCallOptions,
   runModePolicy: () => {
     const auth = rpc.auth as RpcAuthPayload | null
     return auth?.runModePolicy
@@ -931,7 +934,7 @@ const runMode = computed<SandboxRunMode>(
 const sandboxSetupRecovery = useSandboxSetupRecovery({
   rpc: {
     call: (method, params) =>
-      rpc.call(method, params, optionalSessionRpcCallOptions),
+      rpc.call(method, params, sandboxSetupRpcCallOptions),
   },
   connectionState: computed(() => rpc.state),
   runMode,

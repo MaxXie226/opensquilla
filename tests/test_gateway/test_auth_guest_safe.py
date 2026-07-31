@@ -62,3 +62,30 @@ def test_missing_token_from_public_peer_is_rejected(tmp_path) -> None:
 
     assert principal is None
 
+
+def test_allowed_client_cidrs_can_narrow_lan_access(tmp_path) -> None:
+    config = GatewayConfig(
+        host="0.0.0.0",
+        state_dir=str(tmp_path),
+        auth=AuthConfig(
+            mode="token",
+            token="correct",
+            allowed_client_cidrs=["192.168.50.0/24"],
+        ),
+    )
+
+    accepted = resolve_auth(
+        config,
+        auth_params={"token": "correct"},
+        role_claim="operator",
+        peer_ip="192.168.50.7",
+    )
+    rejected = resolve_auth(
+        config,
+        auth_params={"token": "correct"},
+        role_claim="operator",
+        peer_ip="192.168.51.7",
+    )
+
+    assert accepted is not None
+    assert rejected is None

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from opensquilla.sandbox.capability_service import (
-    REQUIRED_SAFE_CAPABILITIES,
     CapabilityReport,
     CapabilityService,
     capability_report_from_setup,
@@ -9,7 +8,7 @@ from opensquilla.sandbox.capability_service import (
 from opensquilla.sandbox.setup_state import SandboxSetupState, SetupResult
 
 
-def test_ready_setup_maps_to_required_capability_report() -> None:
+def test_ready_setup_requires_live_capability_probe() -> None:
     report = capability_report_from_setup(
         SetupResult(
             state=SandboxSetupState.READY,
@@ -20,9 +19,10 @@ def test_ready_setup_maps_to_required_capability_report() -> None:
         backend="windows_default",
     )
 
-    assert report.available is True
-    assert REQUIRED_SAFE_CAPABILITIES.issubset(report.capabilities)
+    assert report.available is False
+    assert report.capabilities == frozenset()
     assert report.backend == "windows_default"
+    assert report.code == "probe_required"
 
 
 def test_failed_setup_is_not_available() -> None:

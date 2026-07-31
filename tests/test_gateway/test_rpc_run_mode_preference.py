@@ -134,17 +134,22 @@ async def test_run_mode_preference_set_requires_sandbox_setup(
     monkeypatch,
 ) -> None:
     from opensquilla.gateway import rpc_sandbox
-    from opensquilla.sandbox.setup_state import SandboxSetupState, SetupResult
+    from opensquilla.sandbox.capability_service import CapabilityReport
 
     async def fake_status(config):
-        return SetupResult(
-            state=SandboxSetupState.NOT_SETUP,
+        return CapabilityReport(
+            available=False,
+            backend="seatbelt",
             platform="darwin",
-            message="Sandbox setup has not been completed.",
-            requires_admin=False,
+            code="not_setup",
+            reason="Sandbox setup has not been completed.",
+            setup_supported=True,
+            restart_required=False,
+            probe_version=1,
+            capabilities=frozenset(),
         )
 
-    monkeypatch.setattr(rpc_sandbox, "current_sandbox_setup_status", fake_status)
+    monkeypatch.setattr(rpc_sandbox, "current_sandbox_capability_report", fake_status)
     storage = SessionStorage(":memory:")
     await storage.connect()
     try:
@@ -156,4 +161,4 @@ async def test_run_mode_preference_set_requires_sandbox_setup(
     finally:
         await storage.close()
 
-    assert excinfo.value.code == "SANDBOX_SETUP_REQUIRED"
+    assert excinfo.value.code == "SANDBOX_CAPABILITY_UNAVAILABLE"

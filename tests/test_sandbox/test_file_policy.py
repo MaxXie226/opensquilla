@@ -28,6 +28,28 @@ def test_windows_builtin_deny_write_contains_requested_credentials() -> None:
     assert PureWindowsPath(r"C:\Users\alice\.terraform.d\credentials.tfrc.json") in roots
 
 
+def test_windows_safe_profile_projects_user_home_write_with_read_baseline() -> None:
+    home = PureWindowsPath(r"C:\Users\alice")
+    profile = compile_safe_file_profile(
+        SandboxPolicy(),
+        platform="win32",
+        home=home,
+        env={
+            "USERPROFILE": str(home),
+            "APPDATA": r"C:\Users\alice\AppData\Roaming",
+            "LOCALAPPDATA": r"C:\Users\alice\AppData\Local",
+        },
+    )
+
+    assert profile.default_access is FileSystemAccess.READ
+    assert profile.resolve(home / "Documents" / "ordinary.txt") is FileSystemAccess.WRITE
+    assert profile.resolve(home / ".ssh" / "config") is FileSystemAccess.READ
+    assert any(
+        entry.path == home and entry.access is FileSystemAccess.WRITE
+        for entry in profile.entries
+    )
+
+
 def test_safe_ordinary_read_and_write_are_automatic(tmp_path: Path) -> None:
     policy = SandboxPolicy()
     target = tmp_path / "ordinary.txt"

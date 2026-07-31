@@ -83,3 +83,19 @@ export interface SandboxTokenRecord {
   lastUsedAt: number | null
   lastPeer: string | null
 }
+
+export interface SandboxRuntimeVersion {
+  version: string
+  available: boolean
+}
+
+export interface SandboxPolicyDefaults {
+  builtinDenyWritePaths: string[]
+  runtimeTarget: string | null
+  runtimeVersions: Partial<Record<'python' | 'node' | 'gitBash', SandboxRuntimeVersion>>
+}
+
+export interface SandboxLanSettings {
+  listenOnLan: boolean
+  allowedClientCidrs: string[]
+}

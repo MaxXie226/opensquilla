@@ -456,11 +456,20 @@
       "unavailable": "安全模式不可用",
       "builtin": "内置",
       "actions": {
+        "redetect": "重新检测",
         "add": "添加",
         "remove": "删除",
         "retry": "重试",
         "copy": "复制",
         "saving": "正在保存…"
+      },
+      "mode": {
+        "title": "默认访问模式",
+        "description": "选择新任务的启动模式。能力检测未通过时，安全模式保持不可选。",
+        "default": "默认模式",
+        "safe": "安全模式",
+        "full": "完全访问",
+        "resetWarning": "下次启动时再次提示沙箱不可用"
       },
       "files": {
         "title": "文件安全",
@@ -494,7 +503,8 @@
       },
       "runtimes": {
         "title": "随包运行时",
-        "description": "安全模式优先使用随包工具；完全访问优先使用宿主机工具。"
+        "description": "安全模式优先使用随包工具；完全访问优先使用宿主机工具。",
+        "target": "打包目标"
       },
       "lan": {
         "title": "内网访问与具名 Token",
@@ -503,6 +513,11 @@
         "guestDescription": "只能使用访客安全模式，无法读取宿主机 HOME、项目和敏感环境变量。",
         "authenticated": "有效具名 Token：",
         "authenticatedDescription": "根据 Token 能力使用安全模式或完全访问。",
+        "listen": "监听内网",
+        "listenDescription": "重启后监听所有本地接口；公网来源仍会被拒绝。",
+        "allowedCidrs": "允许的客户端 CIDR",
+        "cidrDescription": "可选。留空时允许回环、RFC1918 和 IPv6 ULA；填写后只能进一步缩小范围。",
+        "restartRequired": "请重启 OpenSquilla 以应用监听地址变更。",
         "tokenName": "Token 名称，例如：笔记本",
         "hostExecute": "允许宿主机执行 / 完全访问",
         "createToken": "创建 Token",

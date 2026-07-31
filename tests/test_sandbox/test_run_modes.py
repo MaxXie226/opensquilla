@@ -260,7 +260,7 @@ def test_project_mode_preserves_explicit_operator_choice(
 @pytest.mark.parametrize(
     ("sandbox", "permissions", "expected"),
     [
-        (SandboxSettings(run_mode="full"), PermissionsConfig(), ("full", "full", "full", False)),
+        (SandboxSettings(run_mode="full"), PermissionsConfig(), ("full", "full", "safe", True)),
         (
             SandboxSettings(run_mode="standard"),
             PermissionsConfig(),

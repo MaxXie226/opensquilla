@@ -455,7 +455,11 @@
       "available": "Sicherer Modus verfügbar",
       "unavailable": "Sicherer Modus nicht verfügbar",
       "builtin": "Integriert",
-      "actions": { "add": "Hinzufügen", "remove": "Entfernen", "retry": "Erneut versuchen", "copy": "Kopieren", "saving": "Speichern…" },
+      "actions": { "add": "Hinzufügen", "remove": "Entfernen", "retry": "Erneut versuchen", "copy": "Kopieren", "saving": "Speichern…", "redetect": "Erneut prüfen" },
+      "mode": {
+        "title": "Standardzugriffsmodus", "description": "Startmodus für neue Aufgaben. Safe bleibt bei fehlgeschlagener Prüfung nicht auswählbar.",
+        "default": "Standardmodus", "safe": "Safe", "full": "Vollzugriff", "resetWarning": "Warnung beim Start wieder anzeigen"
+      },
       "files": {
         "title": "Dateisicherheit", "description": "Normale Dateien sind lesbar. Änderungen an geschützten Pfaden erfordern eine Freigabe.", "readsAllowed": "Lesen erlaubt",
         "customPath": "Eigener geschützter Pfad", "pathPlaceholder": "Geschützten Pfad hinzufügen", "backupTitle": "Vor rekursivem Löschen sichern",
@@ -471,8 +475,11 @@
         "title": "Netzwerksicherheit", "description": "Öffentlicher Netzwerkzugriff ist standardmäßig erlaubt; SSRF- und Metadatenschutz bleiben aktiv.",
         "blockAll": "Gesamten Netzwerkzugriff sperren", "blockAllDescription": "Erlaubte Domains bleiben Ausnahmen.", "allowDomains": "Erlaubte Domains", "denyDomains": "Gesperrte Domains"
       },
-      "runtimes": { "title": "Mitgelieferte Laufzeiten", "description": "Sicher nutzt zuerst mitgelieferte Werkzeuge; Vollzugriff zuerst Host-Werkzeuge." },
+      "runtimes": { "title": "Mitgelieferte Laufzeiten", "description": "Sicher nutzt zuerst mitgelieferte Werkzeuge; Vollzugriff zuerst Host-Werkzeuge.", "target": "Paket-Ziel" },
       "lan": {
+        "listen": "Im lokalen Netzwerk lauschen", "listenDescription": "Nach einem Neustart an alle lokalen Schnittstellen binden; öffentliche Peers bleiben gesperrt.",
+        "allowedCidrs": "Erlaubte Client-CIDRs", "cidrDescription": "Optional. Leer erlaubt Loopback, RFC1918 und IPv6 ULA; Einträge können den Bereich nur einschränken.",
+        "restartRequired": "OpenSquilla neu starten, um die Änderung anzuwenden.",
         "title": "LAN-Zugriff und benannte Tokens", "description": "Tokens steuern Host-Rechte; für diesen LAN-Modus ist HTTPS nicht erforderlich.",
         "guest": "Kein oder ungültiges Token:", "guestDescription": " nur Gast-Sicherheitsmodus ohne Host-HOME, Projekt oder geheime Umgebung.",
         "authenticated": "Gültiges Token:", "authenticatedDescription": " je nach Berechtigung Sicher oder Vollzugriff.",

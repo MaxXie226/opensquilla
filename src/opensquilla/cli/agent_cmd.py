@@ -356,6 +356,9 @@ async def run_agent_once(
             workspace_dir=tool_workspace_dir,
             workspace_strict=effective_workspace_strict,
         )
+        from opensquilla.sandbox.policy_store import pin_sandbox_policy
+
+        pin_sandbox_policy(tool_ctx, service_cfg)
         tool_ctx.scratch_dir = effective_scratch_dir
         tool_ctx.workspace_lockdown = workspace_lockdown
         tool_ctx.workspace_write_deny_globs = list(effective_workspace_write_deny_globs)

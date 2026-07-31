@@ -129,6 +129,10 @@ class ToolContext:
     execution_id: str | None = None
     sandbox_session_manager: Any | None = None
     sandbox_gateway_config: Any | None = None
+    # Immutable Safe policy snapshot pinned at the start of this turn.  The
+    # settings RPC may publish a newer version concurrently, but tools in an
+    # already-running turn must keep evaluating one coherent policy.
+    sandbox_policy: Any | None = field(default=None, repr=False)
     # Resolved per turn by the engine (see tools.description_overrides).
     # Keys name a tool or a "tool.param" parameter; values replace the
     # matching model-facing description verbatim. None = mechanism off.

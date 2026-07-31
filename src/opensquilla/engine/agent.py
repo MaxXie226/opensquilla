@@ -19106,6 +19106,11 @@ class Agent:
             on_runtime_event=self._record_tool_context_runtime_event
             if self.config.runtime_events_path
             else None,
+            sandbox_policy=(
+                self._tool_context.sandbox_policy
+                if self._tool_context is not None
+                else None
+            ),
         )
         self._prepare_subagent_execution_task(
             spec,

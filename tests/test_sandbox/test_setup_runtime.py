@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from opensquilla.sandbox.capability_service import CapabilityReport
 from opensquilla.sandbox.setup_state import SandboxSetupState, SetupResult
 
 
@@ -15,6 +17,16 @@ def reset_setup_runtime_state():
     reset_sandbox_setup_runtime_state()
     yield
     reset_sandbox_setup_runtime_state()
+
+
+def test_live_capability_budget_covers_native_windows_canary_startup() -> None:
+    from opensquilla.sandbox import setup_runtime
+
+    assert setup_runtime._CAPABILITY_PROBE_TIMEOUT_SECONDS >= 20
+    assert (
+        setup_runtime._CAPABILITY_CACHE_TTL_SECONDS
+        > setup_runtime._CAPABILITY_PROBE_TIMEOUT_SECONDS
+    )
 
 
 @pytest.mark.asyncio
@@ -181,9 +193,136 @@ async def test_capability_report_uses_live_setup_and_configured_backend(
         )
 
     monkeypatch.setattr(setup_runtime, "current_sandbox_setup_status", current_probe)
+    expected = CapabilityReport.available_for(
+        backend="windows_default",
+        platform="win32",
+        reason="probe",
+    )
+
+    async def live_probe(*_args: object, **_kwargs: object) -> CapabilityReport:
+        return expected
+
+    monkeypatch.setattr(setup_runtime, "_probe_runtime_capabilities", live_probe)
+    monkeypatch.setattr(
+        "opensquilla.sandbox.integration.get_runtime",
+        lambda: SimpleNamespace(
+            backend=SimpleNamespace(name="windows_default"),
+        ),
+    )
+    setup_runtime.reset_sandbox_setup_runtime_state()
 
     report = await setup_runtime.current_sandbox_capability_report(config)
 
     assert report.available is True
     assert report.backend == "windows_default"
     assert report.code == "ready"
+
+
+@pytest.mark.asyncio
+async def test_capability_report_force_refresh_bypasses_cached_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.sandbox import setup_runtime
+
+    config = SimpleNamespace(sandbox=SimpleNamespace(backend="windows_default"))
+
+    async def current_probe(_config: object) -> SetupResult:
+        return SetupResult(
+            state=SandboxSetupState.READY,
+            platform="win32",
+            message="ready",
+        )
+
+    calls = 0
+
+    async def live_probe(*_args: object, **_kwargs: object) -> CapabilityReport:
+        nonlocal calls
+        calls += 1
+        return CapabilityReport.available_for(
+            backend="windows_default",
+            platform="win32",
+            reason=f"probe-{calls}",
+        )
+
+    monkeypatch.setattr(setup_runtime, "current_sandbox_setup_status", current_probe)
+    monkeypatch.setattr(setup_runtime, "_probe_runtime_capabilities", live_probe)
+    monkeypatch.setattr(
+        "opensquilla.sandbox.integration.get_runtime",
+        lambda: SimpleNamespace(
+            backend=SimpleNamespace(name="windows_default"),
+        ),
+    )
+
+    first = await setup_runtime.current_sandbox_capability_report(config)
+    cached = await setup_runtime.current_sandbox_capability_report(config)
+    refreshed = await setup_runtime.current_sandbox_capability_report(
+        config,
+        force_refresh=True,
+    )
+
+    assert first.reason == cached.reason == "probe-1"
+    assert refreshed.reason == "probe-2"
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_live_capability_probe_scopes_file_profile_to_canary_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from opensquilla.sandbox import file_policy, setup_runtime
+    from opensquilla.sandbox.config import SandboxSettings
+    from opensquilla.sandbox.operation_runtime import SandboxOperationResult
+    from opensquilla.sandbox.permissions import FileSystemPermissionProfile
+    from opensquilla.sandbox.types import SandboxResult
+
+    captured: dict[str, object] = {}
+
+    def compile_profile(*args: object, **kwargs: object) -> FileSystemPermissionProfile:
+        captured.update(kwargs)
+        return FileSystemPermissionProfile(entries=())
+
+    class _Backend:
+        def available(self) -> bool:
+            return True
+
+        def operation_domains_supported(self) -> frozenset[str]:
+            return frozenset({"filesystem"})
+
+        async def run(self, request: object) -> SandboxResult:
+            return SandboxResult(
+                returncode=0,
+                stdout="opensquilla-safe-probe",
+                stderr="",
+                wall_time_s=0.0,
+                backend_used="windows_default",
+            )
+
+        async def run_operation(self, operation: object) -> SandboxOperationResult:
+            path = Path(str(getattr(getattr(operation, "request", None), "path", "")))
+            if path.name in {"must-remain.txt", "authority.txt"}:
+                raise PermissionError("expected canary denial")
+            return SandboxOperationResult(message="worker-ok")
+
+    monkeypatch.setattr(file_policy, "compile_safe_file_profile", compile_profile)
+    setup = SetupResult(
+        state=SandboxSetupState.READY,
+        platform="win32",
+        message="ready",
+    )
+    config = SimpleNamespace(
+        sandbox=SandboxSettings(),
+        state_dir=str(tmp_path),
+    )
+
+    report = await setup_runtime._probe_runtime_capabilities(
+        config,
+        setup=setup,
+        backend="windows_default",
+        backend_object=_Backend(),
+    )
+
+    assert report.available is True
+    assert captured["home"] == captured["writable_roots"][0]
+    assert captured["env"]["USERPROFILE"] == str(captured["home"])
+    assert captured["env"]["HOME"] == str(captured["home"])

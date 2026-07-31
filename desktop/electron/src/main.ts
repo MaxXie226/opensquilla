@@ -8074,7 +8074,7 @@ async function startGatewayWithPortRecovery(): Promise<GatewayState> {
 }
 
 async function loadControlUi(window: BrowserWindow, gatewayUrl: string): Promise<void> {
-  const url = `${gatewayUrl}/control/chat`
+  const url = `${gatewayUrl}/control/chat/new`
   let lastError: Error | null = null
   for (let attempt = 1; attempt <= 10; attempt += 1) {
     try {

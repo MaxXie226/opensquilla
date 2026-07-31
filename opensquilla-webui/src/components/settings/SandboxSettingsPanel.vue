@@ -13,6 +13,9 @@
       >
         {{ capability.available ? t('settings.sandbox.available') : t('settings.sandbox.unavailable') }}
       </span>
+      <button type="button" class="btn btn--ghost" :disabled="loading" @click="void refreshCapability()">
+        {{ t('settings.sandbox.actions.redetect') }}
+      </button>
     </header>
 
     <div v-if="loading" class="sandbox-settings__state" role="status">
@@ -24,6 +27,43 @@
     </div>
 
     <template v-else-if="draft">
+      <article class="sandbox-card">
+        <div class="sandbox-card__head">
+          <div>
+            <h4>{{ t('settings.sandbox.mode.title') }}</h4>
+            <p>{{ t('settings.sandbox.mode.description') }}</p>
+          </div>
+        </div>
+        <label class="sandbox-field">
+          <span>{{ t('settings.sandbox.mode.default') }}</span>
+          <select v-model="defaultRunMode" data-testid="sandbox-default-mode">
+            <option value="safe" :disabled="!capability?.available">
+              {{ t('settings.sandbox.mode.safe') }}
+            </option>
+            <option value="full">{{ t('settings.sandbox.mode.full') }}</option>
+          </select>
+        </label>
+        <p v-if="capability && !capability.available" class="sandbox-detail">
+          {{ capability.reason }}
+        </p>
+        <button
+          v-if="desktopWarningPreferenceAvailable && sandboxWarningSuppressed"
+          type="button"
+          class="btn btn--ghost sandbox-reset-warning"
+          :disabled="desktopPreferencePending"
+          @click="void resetSandboxUnavailableWarning()"
+        >
+          {{ t('settings.sandbox.mode.resetWarning') }}
+        </button>
+        <SectionActions
+          :dirty="defaultRunMode !== defaultRunModeBaseline"
+          :pending="defaultRunModePending"
+          :error="defaultRunModeError"
+          @save="void saveDefaultRunMode()"
+          @discard="discardDefaultRunMode"
+        />
+      </article>
+
       <article class="sandbox-card">
         <div class="sandbox-card__head">
           <div>
@@ -76,7 +116,13 @@
         </div>
         <label class="sandbox-field sandbox-field--compact">
           <span>{{ t('settings.sandbox.files.quota') }}</span>
-          <input v-model.number="backupQuotaGiB" type="number" min="0.1" step="0.5" />
+          <input
+            v-model.number="backupQuotaGiB"
+            data-testid="sandbox-backup-quota"
+            type="number"
+            min="0.1"
+            step="0.5"
+          />
           <span>GiB</span>
         </label>
         <p class="sandbox-warning">{{ t('settings.sandbox.files.recursiveWarning') }}</p>
@@ -184,10 +230,11 @@
           </label>
         </div>
         <div class="sandbox-runtime-grid">
-          <label><span>Python</span><input v-model="draft.runtimes.python" type="checkbox" :disabled="!draft.runtimes.enabled" /></label>
-          <label><span>Node.js</span><input v-model="draft.runtimes.node" type="checkbox" :disabled="!draft.runtimes.enabled" /></label>
-          <label><span>Git Bash</span><input v-model="draft.runtimes.gitBash" type="checkbox" :disabled="!draft.runtimes.enabled" /></label>
+          <label><span>Python <small>{{ runtimeVersions.python?.version ?? '—' }}</small></span><input v-model="draft.runtimes.python" type="checkbox" :disabled="!draft.runtimes.enabled" /></label>
+          <label><span>Node.js <small>{{ runtimeVersions.node?.version ?? '—' }}</small></span><input v-model="draft.runtimes.node" type="checkbox" :disabled="!draft.runtimes.enabled" /></label>
+          <label><span>Git Bash <small>{{ runtimeVersions.gitBash?.version ?? '—' }}</small></span><input v-model="draft.runtimes.gitBash" type="checkbox" :disabled="!draft.runtimes.enabled || !runtimeVersions.gitBash" /></label>
         </div>
+        <p v-if="runtimeTarget" class="sandbox-detail">{{ t('settings.sandbox.runtimes.target') }}: <code>{{ runtimeTarget }}</code></p>
         <SectionActions
           :dirty="sectionDirty('runtimes')"
           :pending="sectionPending.runtimes"
@@ -208,6 +255,35 @@
           <p><strong>{{ t('settings.sandbox.lan.guest') }}</strong>{{ t('settings.sandbox.lan.guestDescription') }}</p>
           <p><strong>{{ t('settings.sandbox.lan.authenticated') }}</strong>{{ t('settings.sandbox.lan.authenticatedDescription') }}</p>
         </div>
+        <template v-if="lanDraft">
+          <div class="sandbox-option">
+            <div>
+              <strong>{{ t('settings.sandbox.lan.listen') }}</strong>
+              <p>{{ t('settings.sandbox.lan.listenDescription') }}</p>
+            </div>
+            <label class="sandbox-switch">
+              <input v-model="lanDraft.listenOnLan" type="checkbox" data-testid="sandbox-listen-lan" />
+              <span aria-hidden="true"></span>
+            </label>
+          </div>
+          <TextRuleEditor
+            v-model="allowedCidr"
+            :title="t('settings.sandbox.lan.allowedCidrs')"
+            placeholder="192.168.1.0/24"
+            :rules="lanDraft.allowedClientCidrs"
+            @add="addTextRule(lanDraft.allowedClientCidrs, allowedCidr, value => { allowedCidr = value })"
+            @remove="removeAt(lanDraft.allowedClientCidrs, $event)"
+          />
+          <p class="sandbox-detail">{{ t('settings.sandbox.lan.cidrDescription') }}</p>
+          <p v-if="lanRestartRequired" class="sandbox-detail">{{ t('settings.sandbox.lan.restartRequired') }}</p>
+          <SectionActions
+            :dirty="lanDirty()"
+            :pending="lanPending"
+            :error="lanError"
+            @save="void saveLan()"
+            @discard="discardLan"
+          />
+        </template>
         <div class="sandbox-token-create">
           <input v-model="tokenName" :placeholder="t('settings.sandbox.lan.tokenName')" />
           <label>
@@ -260,6 +336,19 @@ const {
   capability,
   draft,
   builtinDenyWritePaths,
+  runtimeTarget,
+  runtimeVersions,
+  defaultRunMode,
+  defaultRunModeBaseline,
+  defaultRunModePending,
+  defaultRunModeError,
+  lanDraft,
+  lanPending,
+  lanError,
+  lanRestartRequired,
+  sandboxWarningSuppressed,
+  desktopWarningPreferenceAvailable,
+  desktopPreferencePending,
   tokens,
   revealedToken,
   sectionPending,
@@ -268,6 +357,13 @@ const {
   tokenError,
   sectionDirty,
   load,
+  refreshCapability,
+  saveDefaultRunMode,
+  discardDefaultRunMode,
+  lanDirty,
+  saveLan,
+  discardLan,
+  resetSandboxUnavailableWarning,
   saveSection,
   discardSection,
   createToken,
@@ -279,6 +375,7 @@ const approvalPrefix = ref('')
 const autoPrefix = ref('')
 const allowDomain = ref('')
 const denyDomain = ref('')
+const allowedCidr = ref('')
 const tokenName = ref('')
 const tokenHostExecute = ref(true)
 
@@ -286,7 +383,10 @@ const backupQuotaGiB = computed({
   get: () => Number(((draft.value?.files.backupQuotaBytes ?? 3 * 1024 ** 3) / 1024 ** 3).toFixed(2)),
   set: (value: number) => {
     if (!draft.value || !Number.isFinite(value)) return
-    draft.value.files.backupQuotaBytes = Math.max(1, Math.round(value * 1024 ** 3))
+    draft.value.files.backupQuotaBytes = Math.max(
+      Math.ceil(0.1 * 1024 ** 3),
+      Math.round(value * 1024 ** 3),
+    )
   },
 })
 
@@ -458,11 +558,21 @@ onMounted(() => void load())
 
 .sandbox-settings__header p:last-child,
 .sandbox-card__head p,
-.sandbox-option p {
+.sandbox-option p,
+.sandbox-detail {
   margin-top: 0.3rem;
   color: var(--text-muted);
   font-size: 0.78rem;
   line-height: 1.45;
+}
+
+.sandbox-runtime-grid small {
+  color: var(--text-muted);
+  font-weight: 400;
+}
+
+.sandbox-reset-warning {
+  justify-self: start;
 }
 
 .sandbox-settings__status,

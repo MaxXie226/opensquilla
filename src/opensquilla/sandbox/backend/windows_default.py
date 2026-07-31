@@ -187,6 +187,13 @@ class WindowsDefaultBackend(Backend):
                 proc.communicate(),
                 timeout=helper_wall,
             )
+        except asyncio.CancelledError:
+            proc.kill()
+            try:
+                await proc.wait()
+            except ProcessLookupError:
+                pass
+            raise
         except TimeoutError:
             proc.kill()
             try:
@@ -761,7 +768,7 @@ def _acl_plan_payload(
     )
     tool_rx_roots = (
         ()
-        if _is_filesystem_worker_request(request)
+        if not _request_needs_host_tool_paths(request)
         else tuple(
             root
             for root in _windows_tool_path_roots(
@@ -1127,13 +1134,20 @@ def _process_base_env(request: SandboxRequest) -> dict[str, str]:
         value = request.env.get(key) or os.environ.get(key)
         if isinstance(value, str) and value:
             env[key] = value
-    if not _is_filesystem_worker_request(request):
+    if _request_needs_host_tool_paths(request):
         _prepend_windows_tool_paths(env, host_env=_host_tool_env(request))
     return env
 
 
 def _is_filesystem_worker_request(request: SandboxRequest) -> bool:
     return request.action_kind.startswith("fs.worker.")
+
+
+def _request_needs_host_tool_paths(request: SandboxRequest) -> bool:
+    return (
+        not _is_filesystem_worker_request(request)
+        and request.action_kind != "capability.probe"
+    )
 
 
 def _host_tool_env(request: SandboxRequest) -> dict[str, str]:

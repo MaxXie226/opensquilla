@@ -23,6 +23,7 @@ interface UseChatRunModePreferenceOptions {
   runModePolicy: () => RunModePolicy | null | undefined
   rpc: RunModePreferenceRpc
   hydrateCallOptions?: RpcCallOptions
+  writeCallOptions?: RpcCallOptions
 }
 
 interface RunModePreferenceRpc {
@@ -116,6 +117,7 @@ export function useChatRunModePreference(options: UseChatRunModePreferenceOption
   const runMode = ref<SandboxRunMode>('safe')
   const runModeUserSelected = ref(false)
   const runModeHydrated = ref(false)
+  let writeSequence = 0
 
   const currentRunModePolicy = computed(() => {
     const policy = options.runModePolicy()
@@ -206,14 +208,39 @@ export function useChatRunModePreference(options: UseChatRunModePreferenceOption
     const requested = modesSafeIncludes(allowedRunModes.value, mode)
       ? mode
       : preferredRunMode(allowedRunModes.value, runModePolicyDefault.value)
-    await options.rpc.waitForConnection()
-    const payload = await options.rpc.call('sandbox.run_mode.preference.set', {
-      runMode: requested,
-    })
-    return applyConfirmedPreference(
-      modeFromPayload(payload),
-      { selected: true },
-    )
+    const previous = runMode.value
+    const previousSelected = runModeUserSelected.value
+    const sequence = ++writeSequence
+
+    // A mode switch is a local interaction first. Reflect it immediately so a
+    // slow or queued persistence request cannot make the composer look stuck.
+    // Browser storage remains confirmation-only.
+    runMode.value = requested
+    runModeUserSelected.value = true
+
+    try {
+      await waitForSessionRpcConnection(options.rpc, options.writeCallOptions)
+      const payload = options.writeCallOptions
+        ? await options.rpc.call(
+            'sandbox.run_mode.preference.set',
+            { runMode: requested },
+            options.writeCallOptions,
+          )
+        : await options.rpc.call('sandbox.run_mode.preference.set', {
+            runMode: requested,
+          })
+      if (sequence !== writeSequence) return runMode.value
+      return applyConfirmedPreference(
+        modeFromPayload(payload),
+        { selected: true },
+      )
+    } catch (cause) {
+      if (sequence === writeSequence) {
+        runMode.value = previous
+        runModeUserSelected.value = previousSelected
+      }
+      throw cause
+    }
   }
 
   function applyRunModePreferenceChanged(payload: unknown): SandboxRunMode {

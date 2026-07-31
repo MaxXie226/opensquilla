@@ -125,7 +125,10 @@ class TokenScopeResolver:
         allowed_roles = config.auth.allowed_roles
         if role_claim not in allowed_roles:
             raise ValueError(f"Invalid role: {role_claim!r}")
-        if not _private_or_unknown_peer(peer_ip):
+        if not _private_or_unknown_peer(
+            peer_ip,
+            allowed_cidrs=config.auth.allowed_client_cidrs,
+        ):
             raise ValueError("Public peers are not accepted")
 
         provided = str((auth_params or {}).get("token") or "")
@@ -215,6 +218,11 @@ class OpenScopeResolver:
         allowed_roles = config.auth.allowed_roles
         if role_claim not in allowed_roles:
             raise ValueError(f"Invalid role: {role_claim!r}")
+        if not _private_or_unknown_peer(
+            peer_ip,
+            allowed_cidrs=config.auth.allowed_client_cidrs,
+        ):
+            raise ValueError("Public peers are not accepted")
 
         if role_claim == "node":
             return Principal(
@@ -247,7 +255,11 @@ class OpenScopeResolver:
         )
 
 
-def _private_or_unknown_peer(peer_ip: str | None) -> bool:
+def _private_or_unknown_peer(
+    peer_ip: str | None,
+    *,
+    allowed_cidrs: list[str] | tuple[str, ...] = (),
+) -> bool:
     if peer_ip is None:
         return True
     try:
@@ -256,9 +268,14 @@ def _private_or_unknown_peer(peer_ip: str | None) -> bool:
         # Starlette's in-process test transport uses a symbolic peer name.
         # Real socket peers are always parsed IP literals at this boundary.
         return True
+    networks = (
+        tuple(ipaddress.ip_network(value) for value in allowed_cidrs)
+        if allowed_cidrs
+        else _PRIVATE_CLIENT_NETWORKS
+    )
     return any(
         address.version == network.version and address in network
-        for network in _PRIVATE_CLIENT_NETWORKS
+        for network in networks
     )
 
 

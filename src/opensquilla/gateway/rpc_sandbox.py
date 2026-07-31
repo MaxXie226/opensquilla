@@ -78,10 +78,6 @@ from opensquilla.sandbox.setup_runtime import (
     current_sandbox_setup_runtime_status,
     ensure_sandbox_setup_auto,
 )
-from opensquilla.sandbox.setup_state import (
-    SandboxSetupState,
-    current_sandbox_setup_status,
-)
 from opensquilla.sandbox.status import status_payload
 from opensquilla.session.keys import parse_agent_id
 
@@ -707,7 +703,13 @@ async def _handle_sandbox_setup_status(params: dict | None, ctx: RpcContext) -> 
 async def _handle_sandbox_capability_status(params: dict | None, ctx: RpcContext) -> dict:
     if params is not None and not isinstance(params, dict):
         raise ValueError("params must be an object")
-    report = await current_sandbox_capability_report(ctx.config)
+    refresh = (params or {}).get("refresh", False)
+    if not isinstance(refresh, bool):
+        raise ValueError("params.refresh must be a boolean")
+    report = await current_sandbox_capability_report(
+        ctx.config,
+        force_refresh=refresh,
+    )
     return report.to_payload()
 
 
@@ -722,10 +724,50 @@ async def _handle_sandbox_policy_get(params: dict | None, ctx: RpcContext) -> di
 async def _handle_sandbox_policy_defaults(params: dict | None, ctx: RpcContext) -> dict:
     if params is not None and not isinstance(params, dict):
         raise ValueError("params must be an object")
+    from opensquilla.sandbox.runtime_launcher import bundled_runtime_resolver
+    from opensquilla.sandbox.runtime_manifest import RuntimeManifest
+
+    resolver = bundled_runtime_resolver()
+    if resolver is None:
+        # Source checkouts do not have a packaged developer/ directory.  The
+        # checked-in manifest is still authoritative for the package being
+        # built and lets Settings show the pinned versions during development.
+        candidate = (
+            Path(__file__).resolve().parents[3]
+            / "desktop"
+            / "electron"
+            / "runtime"
+            / "runtime-manifest.json"
+        )
+        if candidate.is_file():
+            try:
+                from opensquilla.sandbox.runtime_manifest import BundledRuntimeResolver
+
+                resolver = BundledRuntimeResolver(
+                    RuntimeManifest.from_path(candidate),
+                    resource_root=candidate.parent / "developer",
+                )
+            except ValueError:
+                resolver = None
+    runtime_versions: dict[str, dict[str, object]] = {}
+    if resolver is not None:
+        assets = resolver.manifest.assets.get(resolver.target, {})
+        executable_paths = resolver.executable_paths()
+        for key, asset in assets.items():
+            executable_names = tuple(asset.executables)
+            runtime_versions[key] = {
+                "version": asset.version,
+                "available": any(
+                    executable_paths.get(name, Path()).is_file()
+                    for name in executable_names
+                ),
+            }
     return {
         "builtinDenyWritePaths": [
             str(path) for path in builtin_deny_write_paths()
         ],
+        "runtimeTarget": resolver.target if resolver is not None else None,
+        "runtimeVersions": runtime_versions,
     }
 
 
@@ -868,12 +910,12 @@ async def _require_sandbox_setup_ready_for_mode(ctx: RpcContext, run_mode: Any) 
     normalized = normalize_run_mode(run_mode)
     if normalized == RunMode.FULL:
         return
-    status = await current_sandbox_setup_status(ctx.config)
-    if status.state != SandboxSetupState.READY:
+    report = await current_sandbox_capability_report(ctx.config)
+    if not report.available:
         raise RpcHandlerError(
-            "SANDBOX_SETUP_REQUIRED",
-            "Sandbox setup must be completed before enabling sandbox run modes.",
-            details=status.to_payload(),
+            "SANDBOX_CAPABILITY_UNAVAILABLE",
+            "Safe mode cannot be enabled because live sandbox verification failed.",
+            details=report.to_payload(),
         )
 
 

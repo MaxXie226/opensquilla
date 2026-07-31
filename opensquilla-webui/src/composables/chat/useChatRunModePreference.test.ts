@@ -22,12 +22,14 @@ function runInScope(
   policy: ReturnType<typeof ref<RunModePolicy | null>>,
   rpc = createRpc(),
   hydrateCallOptions?: RpcCallOptions,
+  writeCallOptions?: RpcCallOptions,
 ) {
   const scope = effectScope()
   const api = scope.run(() => useChatRunModePreference({
     runModePolicy: () => policy.value,
     rpc,
     hydrateCallOptions,
+    writeCallOptions,
   }))!
   return { api, scope, rpc }
 }
@@ -117,6 +119,47 @@ describe('useChatRunModePreference', () => {
       runMode: 'safe',
     })
     expect(api.runMode.value).toBe('safe')
+    expect(localStorage.getItem(RUN_MODE_STORAGE_KEY)).toBe('safe')
+    scope.stop()
+  })
+
+  it('updates the visible selection immediately while persistence is pending', async () => {
+    const policy = ref<RunModePolicy | null>({
+      defaultRunMode: 'full',
+      allowedRunModes: ['safe', 'full'],
+    })
+    const rpc = createRpc()
+    let resolveWrite!: (payload: unknown) => void
+    rpc.call.mockReturnValueOnce(new Promise(resolve => {
+      resolveWrite = resolve
+    }))
+    const writeCallOptions: RpcCallOptions = {
+      timeoutMs: 5_000,
+      timeoutAction: 'reject',
+      abortAction: 'reject',
+    }
+    const { api, scope } = runInScope(policy, rpc, undefined, writeCallOptions)
+
+    const pending = api.setGlobalRunMode('safe')
+
+    expect(api.runMode.value).toBe('safe')
+    expect(rpc.waitForConnection).toHaveBeenCalledWith(
+      5_000,
+      undefined,
+      {
+        timeoutAction: 'reject',
+        abortAction: 'reject',
+      },
+    )
+    await Promise.resolve()
+    expect(rpc.call).toHaveBeenCalledWith(
+      'sandbox.run_mode.preference.set',
+      { runMode: 'safe' },
+      writeCallOptions,
+    )
+
+    resolveWrite({ runMode: 'trusted', source: 'preference' })
+    await expect(pending).resolves.toBe('safe')
     expect(localStorage.getItem(RUN_MODE_STORAGE_KEY)).toBe('safe')
     scope.stop()
   })

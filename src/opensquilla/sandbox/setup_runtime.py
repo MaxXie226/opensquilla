@@ -3,9 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import sys
+import tempfile
+import time
+from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
 from opensquilla.sandbox.capability_service import (
+    REQUIRED_SAFE_CAPABILITIES,
     CapabilityReport,
     capability_report_from_setup,
 )
@@ -19,6 +26,14 @@ from opensquilla.sandbox.setup_state import (
 _LOCK = asyncio.Lock()
 _SETTING_UP = False
 _LAST_RESULT: SetupResult | None = None
+_CAPABILITY_CACHE: dict[str, tuple[float, CapabilityReport]] = {}
+_CAPABILITY_LOCK = asyncio.Lock()
+_CAPABILITY_PROBE_TIMEOUT_SECONDS = 30.0
+# The fingerprint already includes the selected backend, setup marker details,
+# and executable timestamp. Re-running the native canary every few seconds only
+# churns Windows ACL state; one successful check per app session is sufficient,
+# with the explicit refresh RPC available for diagnostics.
+_CAPABILITY_CACHE_TTL_SECONDS = 3600.0
 
 
 async def current_sandbox_setup_runtime_status(config: Any) -> SetupResult:
@@ -34,18 +49,297 @@ async def current_sandbox_setup_runtime_status(config: Any) -> SetupResult:
     return await current_sandbox_setup_status(config)
 
 
-async def current_sandbox_capability_report(config: Any) -> CapabilityReport:
+async def current_sandbox_capability_report(
+    config: Any,
+    *,
+    force_refresh: bool = False,
+) -> CapabilityReport:
     setup = await current_sandbox_setup_runtime_status(config)
-    backend = str(getattr(getattr(config, "sandbox", None), "backend", "auto"))
-    if backend == "auto":
-        try:
-            from opensquilla.sandbox.integration import get_runtime
+    from opensquilla.sandbox.integration import get_runtime
 
-            runtime = get_runtime()
-            backend = str(getattr(getattr(runtime, "backend", None), "name", "auto"))
-        except Exception:  # pragma: no cover - defensive import boundary
-            backend = "auto"
-    return capability_report_from_setup(setup, backend=backend)
+    runtime = get_runtime()
+    backend_object = getattr(runtime, "backend", None)
+    backend = str(
+        getattr(
+            backend_object,
+            "name",
+            getattr(getattr(config, "sandbox", None), "backend", "auto"),
+        )
+    )
+    prerequisite = capability_report_from_setup(setup, backend=backend)
+    if setup.state is not SandboxSetupState.READY:
+        return prerequisite
+    fingerprint = _capability_fingerprint(
+        config,
+        setup=setup,
+        backend=backend,
+        backend_object=backend_object,
+    )
+    if force_refresh:
+        _CAPABILITY_CACHE.pop(fingerprint, None)
+    cached = _CAPABILITY_CACHE.get(fingerprint)
+    if cached is not None and time.monotonic() - cached[0] < _CAPABILITY_CACHE_TTL_SECONDS:
+        return cached[1]
+    async with _CAPABILITY_LOCK:
+        if force_refresh:
+            _CAPABILITY_CACHE.pop(fingerprint, None)
+        cached = _CAPABILITY_CACHE.get(fingerprint)
+        if cached is not None and time.monotonic() - cached[0] < _CAPABILITY_CACHE_TTL_SECONDS:
+            return cached[1]
+        try:
+            report = await asyncio.wait_for(
+                _probe_runtime_capabilities(
+                    config,
+                    setup=setup,
+                    backend=backend,
+                    backend_object=backend_object,
+                ),
+                timeout=_CAPABILITY_PROBE_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            report = _unavailable_capability_report(
+                setup,
+                backend=backend,
+                code="probe_timeout",
+                reason="Sandbox capability verification timed out.",
+            )
+        except Exception as exc:  # noqa: BLE001 - capability boundary
+            report = _unavailable_capability_report(
+                setup,
+                backend=backend,
+                code="probe_failed",
+                reason=f"Sandbox capability verification failed: {type(exc).__name__}",
+            )
+        _CAPABILITY_CACHE[fingerprint] = (time.monotonic(), report)
+        return report
+
+
+def _capability_fingerprint(
+    config: Any,
+    *,
+    setup: SetupResult,
+    backend: str,
+    backend_object: Any,
+) -> str:
+    executable = Path(sys.executable)
+    try:
+        executable_stamp = executable.stat().st_mtime_ns
+    except OSError:
+        executable_stamp = 0
+    sandbox = getattr(config, "sandbox", None)
+    return "|".join(
+        (
+            str(setup.platform),
+            str(setup.detail or setup.message),
+            backend,
+            type(backend_object).__qualname__,
+            str(bool(getattr(sandbox, "sandbox", True))),
+            str(executable),
+            str(executable_stamp),
+        )
+    )
+
+
+def _unavailable_capability_report(
+    setup: SetupResult,
+    *,
+    backend: str,
+    code: str,
+    reason: str,
+    capabilities: frozenset[str] = frozenset(),
+) -> CapabilityReport:
+    return CapabilityReport(
+        available=False,
+        backend=backend,
+        platform=setup.platform,
+        code=code,
+        reason=reason,
+        setup_supported=True,
+        restart_required=False,
+        probe_version=1,
+        capabilities=capabilities,
+    )
+
+
+async def _probe_runtime_capabilities(
+    config: Any,
+    *,
+    setup: SetupResult,
+    backend: str,
+    backend_object: Any,
+) -> CapabilityReport:
+    """Run real process/filesystem/deny canaries through the selected backend."""
+
+    from opensquilla.sandbox.file_policy import compile_safe_file_profile
+    from opensquilla.sandbox.operation_runtime import SandboxOperation
+    from opensquilla.sandbox.policy import build_policy
+    from opensquilla.sandbox.policy_models import (
+        FilePolicySettings,
+    )
+    from opensquilla.sandbox.policy_models import (
+        SandboxPolicy as StoredSandboxPolicy,
+    )
+    from opensquilla.sandbox.types import NetworkMode, SandboxRequest, SecurityLevel
+
+    if backend_object is None or backend == "noop" or not backend_object.available():
+        return _unavailable_capability_report(
+            setup,
+            backend=backend,
+            code="backend_unavailable",
+            reason="The selected sandbox backend is unavailable.",
+        )
+    domains = backend_object.operation_domains_supported()
+    if "filesystem" not in domains:
+        return _unavailable_capability_report(
+            setup,
+            backend=backend,
+            code="filesystem_worker_unavailable",
+            reason="The selected sandbox backend has no filesystem worker.",
+        )
+
+    state_dir = str(getattr(config, "state_dir", "") or "").strip()
+    temp_parent = Path(state_dir) / "capability-probes" if state_dir else None
+    if temp_parent is not None:
+        temp_parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix="opensquilla-safe-probe-",
+        dir=str(temp_parent) if temp_parent is not None else None,
+    ) as raw_root:
+        root = Path(raw_root)
+        workspace = root / "workspace"
+        authority = root / "authority"
+        protected = root / "protected"
+        workspace.mkdir()
+        authority.mkdir()
+        protected.mkdir()
+        authority_secret = authority / "authority.txt"
+        authority_secret.write_text("authority-secret", encoding="utf-8")
+        protected_target = protected / "must-remain.txt"
+        protected_target.write_text("unchanged", encoding="utf-8")
+        worker_target = workspace / "worker.txt"
+        stored_policy = StoredSandboxPolicy(
+            files=FilePolicySettings(custom_deny_write_paths=[str(protected)])
+        )
+        profile = compile_safe_file_profile(
+            stored_policy,
+            authority_roots=(authority,),
+            writable_roots=(workspace,),
+            # The canary validates ACL and deny-carveout mechanics inside its
+            # disposable root. Projecting the user's entire home here makes a
+            # capability check both slow and invasive, and can outlive the RPC
+            # timeout while holding the Windows execution lease.
+            home=workspace,
+            env={
+                **os.environ,
+                "HOME": str(workspace),
+                "USERPROFILE": str(workspace),
+            },
+        )
+        sandbox_settings = getattr(config, "sandbox", None)
+        if sandbox_settings is None:
+            from opensquilla.sandbox.config import SandboxSettings
+
+            sandbox_settings = SandboxSettings()
+        process_policy = replace(
+            build_policy(
+                SecurityLevel.STANDARD,
+                "capability.probe",
+                workspace,
+                sandbox_settings,
+            ),
+            file_system=profile,
+            network=NetworkMode.NONE,
+        )
+        process_argv = (
+            ("cmd.exe", "/d", "/c", "echo", "opensquilla-safe-probe")
+            if os.name == "nt"
+            else ("/bin/sh", "-c", "printf opensquilla-safe-probe")
+        )
+        process = await backend_object.run(
+            SandboxRequest(
+                argv=process_argv,
+                cwd=workspace,
+                action_kind="capability.probe",
+                policy=process_policy,
+                run_mode="safe",
+            )
+        )
+        capabilities: set[str] = set()
+        if process.returncode == 0 and "opensquilla-safe-probe" in process.stdout:
+            capabilities.add("process")
+
+        await backend_object.run_operation(
+            SandboxOperation.filesystem(
+                kind="write_text",
+                workspace=workspace,
+                run_mode="safe",
+                path=worker_target,
+                paths=(worker_target,),
+                content="worker-ok",
+                file_system_profile=profile,
+            )
+        )
+        read_result = await backend_object.run_operation(
+            SandboxOperation.filesystem(
+                kind="read_file",
+                workspace=workspace,
+                run_mode="safe",
+                path=worker_target,
+                paths=(worker_target,),
+                display_path=str(worker_target),
+                file_system_profile=profile,
+            )
+        )
+        if "worker-ok" in read_result.message:
+            capabilities.add("filesystem-worker")
+
+        try:
+            await backend_object.run_operation(
+                SandboxOperation.filesystem(
+                    kind="write_text",
+                    workspace=workspace,
+                    run_mode="safe",
+                    path=protected_target,
+                    paths=(protected_target,),
+                    content="changed",
+                    file_system_profile=profile,
+                )
+            )
+        except Exception:  # noqa: BLE001 - denial is the expected result
+            if protected_target.read_text(encoding="utf-8") == "unchanged":
+                capabilities.add("denyWriteCarveout")
+
+        try:
+            await backend_object.run_operation(
+                SandboxOperation.filesystem(
+                    kind="read_file",
+                    workspace=workspace,
+                    run_mode="safe",
+                    path=authority_secret,
+                    paths=(authority_secret,),
+                    display_path=str(authority_secret),
+                    file_system_profile=profile,
+                )
+            )
+        except Exception:  # noqa: BLE001 - denial is the expected result
+            capabilities.add("authorityDenyRead")
+
+    frozen = frozenset(capabilities)
+    if not REQUIRED_SAFE_CAPABILITIES.issubset(frozen):
+        missing = sorted(REQUIRED_SAFE_CAPABILITIES - frozen)
+        return _unavailable_capability_report(
+            setup,
+            backend=backend,
+            code="capability_missing",
+            reason=f"Sandbox capability verification is missing: {', '.join(missing)}.",
+            capabilities=frozen,
+        )
+    return CapabilityReport.available_for(
+        backend=backend,
+        platform=setup.platform,
+        reason="Live sandbox capability verification passed.",
+        capabilities=frozen,
+    )
 
 
 async def ensure_sandbox_setup_auto(config: Any) -> SetupResult:
@@ -84,11 +378,13 @@ async def ensure_sandbox_setup_auto(config: Any) -> SetupResult:
 
 
 def reset_sandbox_setup_runtime_state() -> None:
-    global _LAST_RESULT, _LOCK, _SETTING_UP
+    global _CAPABILITY_LOCK, _LAST_RESULT, _LOCK, _SETTING_UP
 
     _LOCK = asyncio.Lock()
+    _CAPABILITY_LOCK = asyncio.Lock()
     _SETTING_UP = False
     _LAST_RESULT = None
+    _CAPABILITY_CACHE.clear()
 
 
 __all__ = [

@@ -328,6 +328,7 @@ def compile_safe_file_profile(
     policy: SandboxPolicy,
     *,
     authority_roots: Sequence[str | os.PathLike[str] | PurePath] = (),
+    writable_roots: Sequence[str | os.PathLike[str] | PurePath] = (),
     platform: str | None = None,
     env: Mapping[str, str] | None = None,
     home: str | PurePath | None = None,
@@ -350,8 +351,28 @@ def compile_safe_file_profile(
         ) or str(Path.home())
     pure_home = _pure_path(str(home), platform=target_platform)
     entries: list[FileSystemPermissionEntry] = []
-    default_access = FileSystemAccess.WRITE
-    if target_platform != "windows":
+    if target_platform == "windows":
+        # The native Windows backend grants capability SIDs to concrete ACL
+        # roots.  An implicit full-disk WRITE baseline cannot be projected
+        # without granting a filesystem root, so express the ordinary desktop
+        # write surface as the user's home plus the active workspace/mounts.
+        # More-specific READ/DENY entries below still carve out credentials and
+        # OpenSquilla's own authority state.
+        default_access = FileSystemAccess.READ
+        entries.extend(
+            FileSystemPermissionEntry(root, FileSystemAccess.WRITE)
+            for root in dict.fromkeys(
+                (
+                    pure_home,
+                    *(
+                        _pure_path(str(root), platform=target_platform)
+                        for root in writable_roots
+                    ),
+                )
+            )
+        )
+    else:
+        default_access = FileSystemAccess.WRITE
         entries.append(
             FileSystemPermissionEntry(PurePosixPath("/"), FileSystemAccess.WRITE)
         )

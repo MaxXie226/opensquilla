@@ -455,7 +455,11 @@
       "available": "Mode sûr disponible",
       "unavailable": "Mode sûr indisponible",
       "builtin": "Intégré",
-      "actions": { "add": "Ajouter", "remove": "Retirer", "retry": "Réessayer", "copy": "Copier", "saving": "Enregistrement…" },
+      "actions": { "add": "Ajouter", "remove": "Retirer", "retry": "Réessayer", "copy": "Copier", "saving": "Enregistrement…", "redetect": "Détecter à nouveau" },
+      "mode": {
+        "title": "Mode d’accès par défaut", "description": "Choisissez le mode initial des nouvelles tâches. Le mode sûr reste indisponible si la vérification échoue.",
+        "default": "Mode par défaut", "safe": "Sûr", "full": "Accès complet", "resetWarning": "Réafficher l’avertissement au démarrage"
+      },
       "files": {
         "title": "Sécurité des fichiers", "description": "Les fichiers ordinaires sont lisibles. Les mutations des chemins protégés exigent une approbation.", "readsAllowed": "Lecture autorisée",
         "customPath": "Chemin protégé personnalisé", "pathPlaceholder": "Ajouter un chemin protégé", "backupTitle": "Sauvegarder avant une suppression récursive",
@@ -471,8 +475,11 @@
         "title": "Sécurité réseau", "description": "Le réseau public est autorisé par défaut, avec les protections SSRF et métadonnées.",
         "blockAll": "Bloquer tout le réseau", "blockAllDescription": "Les domaines autorisés restent des exceptions.", "allowDomains": "Domaines autorisés", "denyDomains": "Domaines refusés"
       },
-      "runtimes": { "title": "Runtimes inclus", "description": "Sûr privilégie les outils inclus ; Accès complet privilégie ceux de l'hôte." },
+      "runtimes": { "title": "Runtimes inclus", "description": "Sûr privilégie les outils inclus ; Accès complet privilégie ceux de l'hôte.", "target": "Cible du paquet" },
       "lan": {
+        "listen": "Écouter sur le réseau local", "listenDescription": "Lie toutes les interfaces locales après redémarrage ; les pairs publics restent refusés.",
+        "allowedCidrs": "CIDR clients autorisés", "cidrDescription": "Facultatif. Vide autorise loopback, RFC1918 et IPv6 ULA ; les entrées ne peuvent que réduire cette plage.",
+        "restartRequired": "Redémarrez OpenSquilla pour appliquer la modification.",
         "title": "Accès LAN et jetons nommés", "description": "Les jetons contrôlent les droits hôte ; HTTPS n'est pas requis pour ce mode LAN.",
         "guest": "Jeton absent ou incorrect :", "guestDescription": " mode sûr invité uniquement, sans HOME, projet ni secrets hôte.",
         "authenticated": "Jeton valide :", "authenticatedDescription": " peut utiliser Sûr ou Accès complet selon ses capacités.",

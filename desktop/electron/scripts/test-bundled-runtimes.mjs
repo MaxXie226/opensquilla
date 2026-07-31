@@ -7,6 +7,8 @@ import { pathToFileURL } from 'node:url'
 import {
   assertRuntimeSetReady,
   defaultManifestPath,
+  defaultRuntimeCacheRoot,
+  defaultRuntimeRoot,
   downloadVerifiedAsset,
   loadRuntimeManifest,
   validateRuntimeManifest,
@@ -15,6 +17,11 @@ import {
 const root = await mkdtemp(join(tmpdir(), 'opensquilla-runtime-test-'))
 
 try {
+  assert.equal(
+    defaultRuntimeCacheRoot.startsWith(defaultRuntimeRoot),
+    false,
+    'download archives must stay outside packaged runtime resources',
+  )
   const releaseManifest = await loadRuntimeManifest(defaultManifestPath)
   const requiredTargets = [
     'darwin-arm64',

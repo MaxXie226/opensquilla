@@ -75,6 +75,17 @@ during a chat.
 The Web UI also provides an approvals surface for reviewing pending actions
 outside the message scrollback.
 
+In Safe mode, approvals are intentionally narrow:
+
+- edits, moves, renames, and deletions under protected file paths;
+- every statically identified recursive directory deletion, with an
+  irreversible-action warning and backup result;
+- `git push`, configured high-risk command prefixes, and system tools set to
+  **Ask first**.
+
+Other commands and ordinary file mutations run automatically. Full Access
+bypasses Safe policy approvals and executes with host permissions.
+
 ## Sandbox Posture
 
 Inspect sandbox posture:
@@ -84,14 +95,17 @@ opensquilla sandbox status
 opensquilla sandbox status --json
 ```
 
-Set posture:
+Set the current compatibility posture:
 
 ```sh
 opensquilla sandbox on
-opensquilla sandbox bypass
 opensquilla sandbox full
 opensquilla sandbox reset
 ```
+
+The supported product modes are **Safe** and **Full Access**. Older CLI mode
+names remain accepted only as an upgrade compatibility shim and are not shown
+in the current UI.
 
 Restart the gateway after changing global sandbox posture:
 

@@ -327,7 +327,7 @@ async def test_rpc_run_context_set_decodes_non_owner_legacy_trusted_mode(
     from opensquilla.gateway.auth import Principal
     from opensquilla.gateway.rpc import RpcContext
     from opensquilla.gateway.rpc_sandbox import _handle_sandbox_run_context_set
-    from opensquilla.sandbox.setup_state import SandboxSetupState, SetupResult
+    from opensquilla.sandbox.capability_service import CapabilityReport
 
     manager = _SessionManager()
     config = SimpleNamespace(
@@ -349,14 +349,12 @@ async def test_rpc_run_context_set_decodes_non_owner_legacy_trusted_mode(
     )
 
     async def ready_status(config):
-        return SetupResult(
-            state=SandboxSetupState.READY,
+        return CapabilityReport.available_for(
+            backend="windows_native",
             platform="win32",
-            message="ready",
-            requires_admin=True,
         )
 
-    monkeypatch.setattr(rpc_sandbox, "current_sandbox_setup_status", ready_status)
+    monkeypatch.setattr(rpc_sandbox, "current_sandbox_capability_report", ready_status)
 
     result = await _handle_sandbox_run_context_set(
         {"sessionKey": manager.node.session_key, "runMode": "trusted"},
@@ -410,7 +408,7 @@ async def test_rpc_run_context_set_creates_owner_new_webchat_session(
     from opensquilla.gateway import rpc_sandbox
     from opensquilla.gateway.auth import Principal
     from opensquilla.gateway.rpc import RpcContext
-    from opensquilla.sandbox.setup_state import SandboxSetupState, SetupResult
+    from opensquilla.sandbox.capability_service import CapabilityReport
 
     manager = _SessionManager()
     session_key = "agent:main:webchat:dkkwi6so"
@@ -432,15 +430,13 @@ async def test_rpc_run_context_set_creates_owner_new_webchat_session(
         config=config,
     )
 
-    async def fake_status(config: object) -> SetupResult:
-        return SetupResult(
-            state=SandboxSetupState.READY,
+    async def fake_status(config: object) -> CapabilityReport:
+        return CapabilityReport.available_for(
+            backend="windows_native",
             platform="win32",
-            message="ready",
-            requires_admin=True,
         )
 
-    monkeypatch.setattr(rpc_sandbox, "current_sandbox_setup_status", fake_status)
+    monkeypatch.setattr(rpc_sandbox, "current_sandbox_capability_report", fake_status)
 
     result = await rpc_sandbox._handle_sandbox_run_context_set(
         {"sessionKey": session_key, "runMode": "trusted"},

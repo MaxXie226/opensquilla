@@ -455,7 +455,11 @@
       "available": "Modo seguro disponible",
       "unavailable": "Modo seguro no disponible",
       "builtin": "Integrado",
-      "actions": { "add": "Añadir", "remove": "Quitar", "retry": "Reintentar", "copy": "Copiar", "saving": "Guardando…" },
+      "actions": { "add": "Añadir", "remove": "Quitar", "retry": "Reintentar", "copy": "Copiar", "saving": "Guardando…", "redetect": "Volver a detectar" },
+      "mode": {
+        "title": "Modo de acceso predeterminado", "description": "Elige el modo inicial de las tareas nuevas. Seguro no se puede seleccionar si falla la comprobación.",
+        "default": "Modo predeterminado", "safe": "Seguro", "full": "Acceso completo", "resetWarning": "Volver a mostrar el aviso al iniciar"
+      },
       "files": {
         "title": "Seguridad de archivos", "description": "Los archivos normales son legibles. Los cambios en rutas protegidas requieren aprobación.", "readsAllowed": "Lectura permitida",
         "customPath": "Ruta protegida personalizada", "pathPlaceholder": "Añadir ruta protegida", "backupTitle": "Crear copia antes del borrado recursivo",
@@ -471,8 +475,11 @@
         "title": "Seguridad de red", "description": "La red pública se permite por defecto y se mantienen las protecciones SSRF y de metadatos.",
         "blockAll": "Bloquear toda la red", "blockAllDescription": "Los dominios permitidos siguen siendo excepciones.", "allowDomains": "Dominios permitidos", "denyDomains": "Dominios rechazados"
       },
-      "runtimes": { "title": "Runtimes incluidos", "description": "Seguro prioriza las herramientas incluidas; Acceso completo prioriza las del host." },
+      "runtimes": { "title": "Runtimes incluidos", "description": "Seguro prioriza las herramientas incluidas; Acceso completo prioriza las del host.", "target": "Destino del paquete" },
       "lan": {
+        "listen": "Escuchar en la red local", "listenDescription": "Se enlaza a todas las interfaces locales tras reiniciar; los pares públicos siguen bloqueados.",
+        "allowedCidrs": "CIDR de clientes permitidos", "cidrDescription": "Opcional. Vacío permite loopback, RFC1918 e IPv6 ULA; solo se puede restringir ese rango.",
+        "restartRequired": "Reinicia OpenSquilla para aplicar el cambio.",
         "title": "Acceso LAN y tokens con nombre", "description": "Los tokens controlan los permisos del host; este modo LAN no exige HTTPS.",
         "guest": "Sin token o token incorrecto:", "guestDescription": " solo modo seguro invitado, sin HOME, proyecto ni secretos del host.",
         "authenticated": "Token válido:", "authenticatedDescription": " puede usar Seguro o Acceso completo según sus capacidades.",

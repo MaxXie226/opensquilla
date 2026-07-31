@@ -60,6 +60,18 @@ def test_desktop_gateway_completion_uses_current_live_window() -> None:
     assert "if (mainWindow === window) mainWindow = null" in main_ts
 
 
+def test_desktop_opens_directly_on_the_new_task_route() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    load_control = _section(
+        main_ts,
+        "async function loadControlUi(",
+        "function isAllowedMainWindowNavigation",
+    )
+
+    assert "const url = `${gatewayUrl}/control/chat/new`" in load_control
+    assert "const url = `${gatewayUrl}/control/chat`" not in load_control
+
+
 def test_desktop_activation_and_second_instance_share_safe_reveal_helper() -> None:
     main_ts = _read("desktop/electron/src/main.ts")
 

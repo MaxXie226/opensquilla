@@ -1136,7 +1136,10 @@ async def _ensure_sandbox_setup_on_boot(config: GatewayConfig) -> Any | None:
         log.info("boot.sandbox_setup_auto_disabled")
         return None
 
-    from opensquilla.sandbox.setup_runtime import ensure_sandbox_setup_auto
+    from opensquilla.sandbox.setup_runtime import (
+        current_sandbox_capability_report,
+        ensure_sandbox_setup_auto,
+    )
 
     result = await ensure_sandbox_setup_auto(config)
     log.info(
@@ -1146,6 +1149,20 @@ async def _ensure_sandbox_setup_on_boot(config: GatewayConfig) -> Any | None:
         requires_admin=result.requires_admin,
         detail=result.detail,
     )
+    if result.state.value == "ready":
+        try:
+            capability = await current_sandbox_capability_report(config)
+            log.info(
+                "boot.sandbox_capability_prewarm_completed",
+                available=getattr(capability, "available", False),
+                backend=getattr(capability, "backend", ""),
+                code=getattr(capability, "code", ""),
+            )
+        except Exception as exc:  # noqa: BLE001 - startup prewarm is best-effort.
+            log.warning(
+                "boot.sandbox_capability_prewarm_failed",
+                error=str(exc),
+            )
     return result
 
 
@@ -1301,6 +1318,9 @@ async def dispatch_task_runtime_turn(
         workspace_strict=workspace_strict,
         default_elevated=configured_default_elevated(config),
     )
+    from opensquilla.sandbox.policy_store import pin_sandbox_policy
+
+    pin_sandbox_policy(tool_context, config)
     tool_context.task_id = run.task_id
     if (
         session is None

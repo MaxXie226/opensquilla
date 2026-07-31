@@ -376,6 +376,40 @@ Bind precedence:
 5. config host
 6. `127.0.0.1`
 
+When listening on the LAN, OpenSquilla accepts only loopback, RFC 1918, and
+IPv6 ULA socket peers. `auth.allowed_client_cidrs` can narrow that built-in
+range but cannot add public networks:
+
+```toml
+host = "0.0.0.0"
+
+[auth]
+mode = "token"
+allowed_client_cidrs = ["192.168.50.0/24"]
+```
+
+Missing, malformed, and incorrect tokens receive guest-safe authority only.
+A valid named token with `host.execute` may select Full Access without gaining
+owner-only settings authority.
+
+## Safe Mode Policy
+
+Settings -> Sandbox persists a versioned policy snapshot for each new task.
+Ordinary host files are readable and writable in Safe mode, except OpenSquilla
+authority/recovery data and the built-in or custom deny-write paths. Mutating a
+deny-write path requires an exact user approval.
+
+Recursive directory deletion always requires a dedicated irreversible-action
+confirmation. Backups are enabled by default with a 3 GiB quota; oldest
+backups are evicted first. A target larger than the quota requires a second,
+explicit confirmation to delete without a backup.
+
+Commands run automatically unless a built-in high-risk rule or a configured
+approval prefix matches. An auto-allow prefix takes precedence over approval
+rules. Network access is public by default through the managed boundary, with
+SSRF and local metadata protections; operators can deny domains, allow
+exceptions, or block all network access.
+
 ## Raw Config Editing
 
 For advanced settings, inspect `opensquilla.toml.example` and edit the active

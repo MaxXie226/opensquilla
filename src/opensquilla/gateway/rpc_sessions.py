@@ -3003,6 +3003,9 @@ async def _handle_sessions_send(
                 workspace_strict=workspace_strict,
                 default_elevated=configured_default_elevated(ctx.config),
             )
+            from opensquilla.sandbox.policy_store import pin_sandbox_policy
+
+            pin_sandbox_policy(tool_ctx, ctx.config)
             raw_stream = ctx.turn_runner.run(
                 provider_message_text,
                 key,

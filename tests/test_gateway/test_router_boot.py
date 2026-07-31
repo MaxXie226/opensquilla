@@ -834,16 +834,25 @@ async def test_boot_sandbox_setup_runs_by_default(
             detail="proxy_allowlist=ready",
         )
 
+    async def fake_capability(setup_config: GatewayConfig) -> object:
+        calls.append("capability")
+        assert setup_config is config
+        return object()
+
     monkeypatch.setattr(
         "opensquilla.sandbox.setup_runtime.ensure_sandbox_setup_auto",
         fake_ensure,
+    )
+    monkeypatch.setattr(
+        "opensquilla.sandbox.setup_runtime.current_sandbox_capability_report",
+        fake_capability,
     )
 
     result = await boot._ensure_sandbox_setup_on_boot(config)
 
     assert result is not None
     assert result.state is SandboxSetupState.READY
-    assert calls == ["setup"]
+    assert calls == ["setup", "capability"]
 
 
 @pytest.mark.asyncio
@@ -900,16 +909,25 @@ async def test_boot_sandbox_setup_runs_for_full_host_access_by_default(
             requires_admin=False,
         )
 
+    async def fake_capability(setup_config: GatewayConfig) -> object:
+        calls.append("capability")
+        assert setup_config is config
+        return object()
+
     monkeypatch.setattr(
         "opensquilla.sandbox.setup_runtime.ensure_sandbox_setup_auto",
         fake_ensure,
+    )
+    monkeypatch.setattr(
+        "opensquilla.sandbox.setup_runtime.current_sandbox_capability_report",
+        fake_capability,
     )
 
     result = await boot._ensure_sandbox_setup_on_boot(config)
 
     assert result is not None
     assert result.state is SandboxSetupState.READY
-    assert calls == ["setup"]
+    assert calls == ["setup", "capability"]
 
 
 @pytest.mark.asyncio
@@ -2922,6 +2940,16 @@ async def test_task_runtime_turn_uses_owner_boundary_for_owner_cron_job() -> Non
 
 def test_default_bypass_keeps_sandbox_capability_for_explicit_restricted_calls() -> None:
     settings = _sandbox_settings_for_runtime(GatewayConfig())
+
+    assert settings.run_mode == "safe"
+    assert settings.sandbox is True
+    assert settings.security_grading is True
+
+
+def test_explicit_full_default_keeps_sandbox_capability_for_safe_mode() -> None:
+    config = GatewayConfig(sandbox={"run_mode": "full"})
+
+    settings = _sandbox_settings_for_runtime(config)
 
     assert settings.run_mode == "safe"
     assert settings.sandbox is True

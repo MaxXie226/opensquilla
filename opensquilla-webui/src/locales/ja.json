@@ -455,7 +455,11 @@
       "available": "安全モード利用可能",
       "unavailable": "安全モード利用不可",
       "builtin": "組み込み",
-      "actions": { "add": "追加", "remove": "削除", "retry": "再試行", "copy": "コピー", "saving": "保存中…" },
+      "actions": { "add": "追加", "remove": "削除", "retry": "再試行", "copy": "コピー", "saving": "保存中…", "redetect": "再検出" },
+      "mode": {
+        "title": "既定のアクセスモード", "description": "新しいタスクの開始モードを選びます。能力検証に失敗した場合、Safe は選択できません。",
+        "default": "既定モード", "safe": "Safe", "full": "完全アクセス", "resetWarning": "起動時の警告を再表示"
+      },
       "files": {
         "title": "ファイル保護", "description": "通常のファイルは読み取り可能です。保護パスの変更には承認が必要です。", "readsAllowed": "読み取り許可",
         "customPath": "カスタム保護パス", "pathPlaceholder": "保護パスを追加", "backupTitle": "再帰削除の前にバックアップ",
@@ -471,8 +475,11 @@
         "title": "ネットワーク保護", "description": "公開ネットワークは既定で許可し、SSRF とメタデータ保護を維持します。",
         "blockAll": "すべてのネットワークを遮断", "blockAllDescription": "許可ドメインだけを例外にします。", "allowDomains": "許可ドメイン", "denyDomains": "拒否ドメイン"
       },
-      "runtimes": { "title": "同梱ランタイム", "description": "安全モードは同梱ツールを優先し、フルアクセスはホストツールを優先します。" },
+      "runtimes": { "title": "同梱ランタイム", "description": "安全モードは同梱ツールを優先し、フルアクセスはホストツールを優先します。", "target": "パッケージ対象" },
       "lan": {
+        "listen": "ローカルネットワークで待ち受ける", "listenDescription": "再起動後に全ローカルインターフェイスへバインドします。公開ピアは引き続き拒否されます。",
+        "allowedCidrs": "許可するクライアント CIDR", "cidrDescription": "任意。空欄では loopback、RFC1918、IPv6 ULA を許可し、指定時は範囲を狭めることだけができます。",
+        "restartRequired": "変更を適用するには OpenSquilla を再起動してください。",
         "title": "LAN アクセスと名前付きトークン", "description": "トークンがホスト権限を決めます。この LAN モードでは HTTPS は必須ではありません。",
         "guest": "トークンなし・誤り:", "guestDescription": " ゲスト安全モードのみで、ホスト HOME、プロジェクト、秘密環境にはアクセスできません。",
         "authenticated": "有効なトークン:", "authenticatedDescription": " 権限に応じて安全またはフルアクセスを利用できます。",
