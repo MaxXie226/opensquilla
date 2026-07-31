@@ -453,8 +453,6 @@ usage_delta = usage_after - usage_before
 byok_delta = byok_after - byok_before
 if usage_delta < 0:
     raise SystemExit("OpenRouter usage decreased during the account window")
-if byok_delta != 0:
-    raise SystemExit("OpenRouter BYOK usage changed during the campaign")
 if any(
     str(poll.get("api_key_sha256") or "") != fingerprint
     or poll.get("benchmark_environment_key_verified") is not True
@@ -469,10 +467,13 @@ if poll_usage[0] < usage_before or any(
     later < earlier for earlier, later in zip(poll_usage, poll_usage[1:])
 ):
     raise SystemExit("OpenRouter account poll usage is not monotonic")
+if poll_byok_usage[0] < byok_before or any(
+    later < earlier
+    for earlier, later in zip(poll_byok_usage, poll_byok_usage[1:])
+):
+    raise SystemExit("OpenRouter BYOK account poll usage is not monotonic")
 if poll_usage[-1] != usage_after or poll_byok_usage[-1] != byok_after:
     raise SystemExit("account-after snapshot does not match the final stable poll")
-if any(value != byok_before for value in poll_byok_usage):
-    raise SystemExit("OpenRouter BYOK usage changed during settlement")
 
 observations = [
     {
@@ -548,6 +549,10 @@ payload = {
     "byok_usage_before_usd": str(byok_before),
     "byok_usage_after_usd": str(byok_after),
     "byok_usage_delta_usd": str(byok_delta),
+    # Preserve policy truth without turning a BYOK finding into execution
+    # failure. Finalization reports this independently from usable outputs.
+    "non_byok_policy_pass": byok_delta == 0,
+    "policy_status": "compliant" if byok_delta == 0 else "byok_detected",
     "is_free_tier": False,
     # stable_poll_count is deliberately the length of the consecutive stable
     # tail, not the total number of polls made while waiting for settlement.
@@ -815,7 +820,39 @@ cost_attribution = manifest.get("cost_attribution")
 if not isinstance(cost_attribution, Mapping):
     raise SystemExit("formal manifest lacks cost attribution")
 account_windows = cost_attribution.get("account_windows")
-if not isinstance(account_windows, list) or not account_windows:
+proof = json.loads(
+    (formal_dir / "openrouter-non-byok-campaign-proof.json").read_text(
+        encoding="utf-8"
+    )
+)
+audit = json.loads((formal_dir / "audit.json").read_text(encoding="utf-8"))
+publishable_account_audit_conflict = bool(
+    isinstance(proof, Mapping)
+    and proof.get("publication_eligible") is True
+    and proof.get("audit_conflict_kind") == "account_proof_incomplete"
+    and proof.get("status") == "audit_conflict"
+    and proof.get("pass") is False
+    and proof.get("policy_pass") is False
+    and proof.get("execution_pass") is True
+    and isinstance(proof.get("reconciliation"), Mapping)
+    and proof["reconciliation"].get("pass") is False
+    and proof["reconciliation"].get("status") == "audit_conflict"
+    and proof.get("account_windows") == []
+    and isinstance(proof.get("cost_scope"), Mapping)
+    and proof["cost_scope"].get("account_windows") == []
+    and isinstance(audit, Mapping)
+    and audit.get("execution_pass") is True
+    and audit.get("pass") is False
+    and audit.get("status") == "complete_with_warnings"
+    and manifest.get("execution_pass") is True
+    and manifest.get("audit_pass") is False
+    and manifest.get("audit_status") == "complete_with_warnings"
+    and manifest.get("reconciliation") == proof.get("reconciliation")
+    and manifest.get("account_windows") == []
+)
+if not isinstance(account_windows, list) or (
+    not account_windows and not publishable_account_audit_conflict
+):
     raise SystemExit("formal manifest lacks account windows")
 allowed_window_kinds = {"current", "prior_aborted", "prior_campaign"}
 window_kinds: list[str] = []
@@ -826,7 +863,7 @@ for window in account_windows:
     if not isinstance(kind, str) or kind not in allowed_window_kinds:
         raise SystemExit("formal account window kind differs")
     window_kinds.append(kind)
-if window_kinds.count("current") != 1:
+if account_windows and window_kinds.count("current") != 1:
     raise SystemExit("formal account window kinds differ")
 try:
     has_positive_prior = any(
@@ -932,18 +969,6 @@ accept_or_reject_wave_status() {
     echo "Campaign wave exited unexpectedly with status $runner_status" >&2
     return 2
   fi
-  if jq -e '
-    .. | strings
-    | select(
-        . == "openrouter_non_byok_policy_violation"
-        or . == "openrouter_byok_detected"
-        or . == "cost_audit_failed"
-      )
-  ' "$manifest" >/dev/null; then
-    echo "Campaign wave recorded an explicit OpenRouter non-BYOK policy failure" >&2
-    return 2
-  fi
-
   case "$manifest_status" in
     complete)
       if [[ "$runner_status" != "0" ]]; then
@@ -951,12 +976,13 @@ accept_or_reject_wave_status() {
         return 2
       fi
       ;;
-    metadata_incomplete|judge_incomplete|result_incomplete|resume_repair_incomplete)
+    metadata_incomplete|judge_incomplete|result_incomplete|resume_repair_incomplete|cost_audit_failed|audit_incomplete)
       # These statuses carry sealed rows that the offline action classifier can
-      # route to regeneration, Judge-only repair, or campaign-proof finalization.
-      # Runner exit 2 is expected while any such manifest_failure remains.
+      # route to regeneration, Judge-only repair, or audit-only finalization.
+      # Cost and BYOK findings remain visible but do not invalidate usable
+      # model output.
       ;;
-    cost_audit_failed|preflight_failed)
+    preflight_failed)
       echo "Campaign wave failed closed with manifest status: $manifest_status" >&2
       return 2
       ;;
@@ -1064,6 +1090,7 @@ for group, task_id in sorted(selected):
     prior_used = module.coerce_metric_int(state.get("prior_generation_attempts_used"))
     if action == "policy_violation":
         policy_violations.append({"group": group, "task_id": task_id})
+        campaign_proof_only.append({"group": group, "task_id": task_id})
     elif not state["generation_valid"]:
         target = {"group": group, "task_id": task_id, "action": "regenerate"}
         if prior_used < 3:
@@ -1088,25 +1115,31 @@ for group, task_id in sorted(selected):
                 state["row"]
             )
             if proof_only_reasons:
-                raise SystemExit(
-                    "metadata repair left usage evidence that finalization "
-                    f"cannot canonicalize for {group}/{task_id}: "
-                    f"{proof_only_reasons[:5]}"
+                policy_violations.append(
+                    {
+                        "group": group,
+                        "task_id": task_id,
+                        "audit_reasons": proof_only_reasons[:5],
+                    }
                 )
             campaign_proof_only.append({"group": group, "task_id": task_id})
         else:
             actionable.append(
                 {"group": group, "task_id": task_id, "action": "metadata_only"}
             )
+    elif action == "audit_only":
+        campaign_proof_only.append({"group": group, "task_id": task_id})
+        policy_violations.append(
+            {
+                "group": group,
+                "task_id": task_id,
+                "audit_reasons": list(state.get("audit_reasons") or []),
+            }
+        )
     elif action == "complete":
         complete.append({"group": group, "task_id": task_id})
     else:
         raise SystemExit(f"unsupported resume action: {action}")
-
-if policy_violations:
-    raise SystemExit(
-        "explicit OpenRouter BYOK/provider policy violation in prior campaign rows"
-    )
 
 temporary = output_path.with_name(f".{output_path.name}.tmp-{os.getpid()}")
 with temporary.open("w", encoding="utf-8") as handle:
@@ -1124,10 +1157,12 @@ summary_payload = {
     "generation_budget_exhausted_pair_count": len(budget_exhausted),
     "judge_budget_exhausted_pair_count": len(judge_budget_exhausted),
     "complete_pair_count": len(complete),
+    "audit_finding_pair_count": len(policy_violations),
     "actionable_pairs": actionable,
     "campaign_proof_only_pairs": campaign_proof_only,
     "generation_budget_exhausted_pairs": budget_exhausted,
     "judge_budget_exhausted_pairs": judge_budget_exhausted,
+    "audit_findings": policy_violations,
     "resume_audit": audit,
 }
 temporary_summary = summary_path.with_name(

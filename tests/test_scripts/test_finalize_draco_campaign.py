@@ -53,7 +53,7 @@ def test_formal_model_thinking_levels_match_campaign_config(module) -> None:
 
 
 def test_finalizer_version_covers_canonical_usage_evidence(module) -> None:
-    assert module.FINALIZER_VERSION == 6
+    assert module.FINALIZER_VERSION == 7
 
 
 def test_legacy_managed_v3_source_requires_exact_external_identity(
@@ -881,6 +881,59 @@ def _owner_json(path: Path, value: object) -> None:
     path.chmod(0o600)
 
 
+def _assert_account_audit_conflict(
+    module,
+    args: argparse.Namespace,
+    *,
+    warning: str,
+) -> dict[str, object]:
+    manifest = module.run_finalization(args)
+    proof = json.loads(
+        (args.output_dir / "openrouter-non-byok-campaign-proof.json").read_text()
+    )
+    audit = json.loads((args.output_dir / "audit.json").read_text())
+
+    assert manifest["status"] == "complete"
+    assert manifest["execution_pass"] is True
+    assert manifest["policy_pass"] is False
+    assert manifest["reconciliation"] == {
+        "pass": False,
+        "status": "audit_conflict",
+        "gap_usd": None,
+        "tolerance_usd": None,
+    }
+    assert proof["pass"] is False
+    assert proof["execution_pass"] is True
+    assert proof["policy_pass"] is False
+    assert proof["status"] == "audit_conflict"
+    assert proof["publication_eligible"] is True
+    assert proof["audit_conflict_kind"] == "account_proof_incomplete"
+    assert warning in "\n".join(proof["warnings"])
+    assert audit["pass"] is False
+    assert audit["execution_pass"] is True
+    assert audit["policy_pass"] is False
+    assert audit["status"] == "complete_with_warnings"
+    assert warning in "\n".join(audit["warnings"])
+    return manifest
+
+
+def test_account_proof_allowlist_is_closed(module) -> None:
+    assert module.account_proof_error_is_audit_only(
+        module.FinalizationError("account reconciliation is not stable")
+    ) is True
+    for message in (
+        "runtime/account evidence uses different API keys",
+        "reconciliation runtime file hash differs",
+        "prior account windows overlap",
+        "account counters decreased",
+        "stable observation usage is not monotonic",
+        "campaign account counters are not continuous between windows",
+    ):
+        assert module.account_proof_error_is_audit_only(
+            module.FinalizationError(message)
+        ) is False
+
+
 def _receipt(
     response_id: str,
     model: str,
@@ -1368,6 +1421,8 @@ def _provider_native_recovery_call(
         return {
             "index": index,
             "ok": ok,
+            "usable_for_aggregation": ok,
+            "completion_outcome": "complete" if ok else "failed",
             "request_started": bool(attempts),
             "physical_request_count": len(attempts),
             "usage_reported": True,
@@ -1387,6 +1442,11 @@ def _provider_native_recovery_call(
     call: dict[str, object] = {
         "selection_plan": plan,
         "successful_proposers": 2,
+        "usable_proposers": 2,
+        "partial_proposers": 0,
+        "strict_quorum_met": True,
+        "execution_quorum_required": 2,
+        "execution_quorum_met": True,
         "candidates": [
             candidate(
                 index=0,
@@ -1444,6 +1504,8 @@ def _provider_native_recovery_call(
             "additional_physical_requests_started": 1,
             "remaining_additional_physical_requests": 2,
             "quorum_required": 2,
+            "strict_successful_proposers": 2,
+            "usable_proposers": 2,
             "quorum_reached": True,
             "cumulative_excluded_identities": [],
             "visited_identities": [],
@@ -1493,6 +1555,198 @@ def test_provider_native_proposer_recovery_binds_receipt_and_fingerprint(
         2: "openrouter:model-c",
     }
     assert recovery_ids == {"b" * 32}
+
+
+def test_provider_shaped_dynamic_partial_quorum_separates_strict_and_usable(
+    module,
+) -> None:
+    call, plan = _provider_native_recovery_call(module)
+    candidate = call["candidates"][1]
+    assert isinstance(candidate, dict)
+    physical = candidate["execution"]["physical_attempts"][0]
+    assert isinstance(physical, dict)
+    physical["outcome"] = "failed"
+    candidate.update(
+        {
+            "ok": False,
+            "error": "provider stream ended after a useful prefix",
+            "error_code": "upstream_interrupted",
+            "stream_closed": True,
+            "usable_for_aggregation": True,
+            "completion_outcome": "partial_usable",
+            "content": {
+                "text": "",
+                "chars": 24,
+                "truncated": True,
+                "sha256": "a" * 64,
+            },
+        }
+    )
+    call.update(
+        {
+            "successful_proposers": 1,
+            "usable_proposers": 2,
+            "partial_proposers": 1,
+            "strict_quorum_met": False,
+            "execution_quorum_required": 2,
+            "execution_quorum_met": True,
+        }
+    )
+    receipt = call["proposer_recovery"]
+    assert isinstance(receipt, dict)
+    receipt.update(
+        {
+            "strict_successful_proposers": 1,
+            "usable_proposers": 2,
+            "quorum_reached": True,
+        }
+    )
+
+    _, _, reasons = module.proposer_recovery_execution_reasons(
+        call,
+        executed_plan=plan,
+    )
+
+    assert module.successful_candidate(candidate) is False
+    assert module.partial_usable_candidate(candidate) is True
+    assert reasons == []
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["missing_explicit_flag", "contract_violation", "hard_error"],
+)
+def test_dynamic_partial_quorum_rejects_incomplete_or_hard_partial_evidence(
+    module,
+    mutation: str,
+) -> None:
+    candidate = {
+        "ok": False,
+        "request_started": True,
+        "physical_request_count": 1,
+        "usable_for_aggregation": True,
+        "completion_outcome": "partial_usable",
+        "error_code": "ensemble_proposer_close_timeout",
+        "content": {"text": "draft", "chars": 5, "truncated": False},
+        "execution": {"candidate_mode_contract_violation": False},
+    }
+    if mutation == "missing_explicit_flag":
+        candidate.pop("usable_for_aggregation")
+    elif mutation == "contract_violation":
+        candidate["execution"]["candidate_mode_contract_violation"] = True
+    else:
+        candidate["error_code"] = "proposer_recovery_evidence_unproven"
+
+    assert module.partial_usable_candidate(candidate) is False
+
+
+def _provider_native_cleanup_quorum_bypass_call(
+    module,
+) -> tuple[dict[str, object], dict[str, object]]:
+    call, plan = _provider_native_recovery_call(module)
+    candidate = call["candidates"][2]
+    assert isinstance(candidate, dict)
+    execution = candidate["execution"]
+    assert isinstance(execution, dict)
+    physical = execution["physical_attempts"][0]
+    assert isinstance(physical, dict)
+    physical.update(
+        {
+            "stream_closed": False,
+            "outcome": "interrupted",
+        }
+    )
+    candidate.update(
+        {
+            "stream_closed": False,
+            "error_code": "ensemble_proposer_close_timeout",
+        }
+    )
+    receipt = call["proposer_recovery"]
+    assert isinstance(receipt, dict)
+    receipt["cumulative_excluded_identities"] = [
+        "openrouter:model-c",
+    ]
+    receipt["cleanup_quorum_bypass"] = {
+        "schema": (
+            "opensquilla.router-dynamic-proposer-cleanup-quorum-bypass/v1"
+        ),
+        "applied": True,
+        "quorum_required": 2,
+        "successful_proposers": 2,
+        "usable_proposers": 2,
+        "candidate_indexes": [2],
+        "physical_attempt_ids": ["d" * 32],
+        "recovery_skipped": True,
+        "aggregator_tools_disabled": True,
+    }
+    return call, plan
+
+
+def test_provider_native_cleanup_quorum_bypass_is_auditable(
+    module,
+) -> None:
+    call, plan = _provider_native_cleanup_quorum_bypass_call(module)
+
+    final_identities, recovery_ids, reasons = (
+        module.proposer_recovery_execution_reasons(
+            call,
+            executed_plan=plan,
+        )
+    )
+
+    assert reasons == []
+    assert final_identities == {
+        0: "openrouter:model-a",
+        1: "openrouter:model-b",
+        2: "openrouter:model-c",
+    }
+    assert recovery_ids == {"b" * 32}
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_reason"),
+    [
+        ("missing_marker", "invalid_proposer_recovery_physical_attempt"),
+        (
+            "wrong_physical_id",
+            "proposer_cleanup_quorum_bypass_mismatch",
+        ),
+        (
+            "tools_enabled",
+            "invalid_proposer_cleanup_quorum_bypass",
+        ),
+        (
+            "wrong_success_count",
+            "proposer_cleanup_quorum_bypass_success_mismatch",
+        ),
+    ],
+)
+def test_provider_native_cleanup_quorum_bypass_fails_closed(
+    module,
+    mutation: str,
+    expected_reason: str,
+) -> None:
+    call, plan = _provider_native_cleanup_quorum_bypass_call(module)
+    receipt = call["proposer_recovery"]
+    assert isinstance(receipt, dict)
+    marker = receipt["cleanup_quorum_bypass"]
+    assert isinstance(marker, dict)
+    if mutation == "missing_marker":
+        receipt.pop("cleanup_quorum_bypass")
+    elif mutation == "wrong_physical_id":
+        marker["physical_attempt_ids"] = ["e" * 32]
+    elif mutation == "tools_enabled":
+        marker["aggregator_tools_disabled"] = False
+    else:
+        marker["successful_proposers"] = 3
+
+    _, _, reasons = module.proposer_recovery_execution_reasons(
+        call,
+        executed_plan=plan,
+    )
+
+    assert expected_reason in reasons
 
 
 def test_proposer_recovery_identity_accepts_valid_model_suffixes(
@@ -2082,6 +2336,23 @@ def test_provider_native_formal_quorum_is_two_for_five_proposers(
             }
         )
     call["total_candidates"] = 5
+    call.update(
+        {
+            "successful_proposers": 2,
+            "usable_proposers": 2,
+            "partial_proposers": 0,
+            "strict_quorum_met": True,
+            "execution_quorum_required": 2,
+            "execution_quorum_met": True,
+        }
+    )
+    receipt.update(
+        {
+            "strict_successful_proposers": 2,
+            "usable_proposers": 2,
+            "quorum_reached": True,
+        }
+    )
 
     reasons = module.ensemble_physical_call_reasons(
         call,
@@ -2094,12 +2365,29 @@ def test_provider_native_formal_quorum_is_two_for_five_proposers(
     assert "insufficient_actual_proposer_quorum" not in reasons
 
     one_success = deepcopy(call)
-    one_success["successful_proposers"] = 1
-    one_success["proposer_recovery"]["quorum_reached"] = False
+    one_success.update(
+        {
+            "successful_proposers": 1,
+            "usable_proposers": 1,
+            "partial_proposers": 0,
+            "strict_quorum_met": False,
+            "execution_quorum_required": 2,
+            "execution_quorum_met": False,
+        }
+    )
+    one_success["proposer_recovery"].update(
+        {
+            "strict_successful_proposers": 1,
+            "usable_proposers": 1,
+            "quorum_reached": False,
+        }
+    )
     failed_second = one_success["candidates"][1]
     failed_second.update(
         {
             "ok": False,
+            "usable_for_aggregation": False,
+            "completion_outcome": "failed",
             "provider": "",
             "model": "",
             "content": {"text": "", "chars": 0, "truncated": False},
@@ -2787,6 +3075,10 @@ def _formalize_provider_native_call(
                 "requested_model": model,
                 "usage_reported": True,
                 "usage_missing_count": 0,
+                "usable_for_aggregation": candidate.get("ok") is True,
+                "completion_outcome": (
+                    "complete" if candidate.get("ok") is True else "failed"
+                ),
                 "execution": {
                     "actual_provider": provider,
                     "actual_model": model,
@@ -2807,6 +3099,21 @@ def _formalize_provider_native_call(
         )
         physical_units.append((physical_id, model, "proposer"))
 
+    strict_successful = sum(
+        module.successful_candidate(candidate) for candidate in candidates
+    )
+    usable = sum(module.usable_candidate(candidate) for candidate in candidates)
+    call.update(
+        {
+            "successful_proposers": strict_successful,
+            "usable_proposers": usable,
+            "partial_proposers": usable - strict_successful,
+            "strict_quorum_met": strict_successful >= 2,
+            "execution_quorum_required": 2,
+            "execution_quorum_met": usable >= 2,
+        }
+    )
+
     call["proposer_recovery"] = {
         "schema": module.FORMAL_PROPOSER_RECOVERY_SCHEMA,
         "selection_plan_fingerprint": provider_retry_roster_fingerprint(plan),
@@ -2817,7 +3124,9 @@ def _formalize_provider_native_call(
         "additional_physical_requests_started": 0,
         "remaining_additional_physical_requests": 3,
         "quorum_required": 2,
-        "quorum_reached": call.get("successful_proposers", 0) >= 2,
+        "strict_successful_proposers": strict_successful,
+        "usable_proposers": usable,
+        "quorum_reached": usable >= 2,
         "cumulative_excluded_identities": [],
         "visited_identities": [],
         "executed_proposer_roster_before": list(selected),
@@ -3739,9 +4048,6 @@ def test_g1_ensemble_gate_rejects_forged_or_semantic_aggregator_fallback(
     [
         ("missing_all_candidates", "missing_aggregator_candidate_chain"),
         ("missing_recovery", "missing_aggregator_recovery_evidence"),
-        ("partial_salvage", "invalid_aggregator_recovery_selected_kind"),
-        ("degraded", "degraded_aggregator_recovery_not_formal"),
-        ("partial_delivery", "aggregator_delivery_not_complete"),
         ("wrong_run_outcome", "aggregator_run_outcome_selected_kind_mismatch"),
         ("duplicate_attempt", "invalid_aggregator_recovery_attempt_sequence"),
         ("selected_unstarted", "ambiguous_aggregator_recovery_selected_attempt"),
@@ -3808,6 +4114,105 @@ def test_formal_ensemble_recovery_evidence_fails_closed(
     )
 
     assert expected_reason in reasons
+
+
+def test_provider_shaped_degraded_aggregator_keeps_failed_physical_audit(
+    module,
+) -> None:
+    final_text = "usable degraded answer"
+    trace = _ensemble_trace(
+        list(module.B2_PROPOSERS),
+        module.B2_AGGREGATOR,
+        final_text=final_text,
+        selection_mode="static_openrouter_b5",
+    )
+    call = trace["calls"][0]
+    recovery = call["aggregator_recovery"]
+    code = "ensemble_aggregator_close_timeout"
+    recovery.update(
+        {
+            "selected_kind": "degraded_delivery",
+            "degraded": True,
+            "success": False,
+            "delivery_success": True,
+            "delivery_outcome": "degraded_success",
+            "audit_outcome": "incomplete",
+            "recovery_skipped": True,
+            "tools_disabled_after_partial_output": True,
+            "terminal_code": code,
+            "run_outcome": code,
+        }
+    )
+    recovery["attempts"][0].update(
+        {
+            "stream_closed": False,
+            "outcome": "failed",
+            "code": code,
+            "delivery_selected": True,
+            "visible_output_emitted": True,
+        }
+    )
+    call.update(
+        {
+            "delivery_outcome": "degraded_success",
+            "execution_outcome": "degraded_success",
+            "run_outcome": code,
+        }
+    )
+    row = {
+        "final_text": final_text,
+        "routing_trace": {"selection_plan": deepcopy(call["selection_plan"])},
+        "ensemble_trace": trace,
+    }
+
+    reasons = module.ensemble_gate(
+        row,
+        expected_proposers=module.B2_PROPOSERS,
+        expected_aggregator=module.B2_AGGREGATOR,
+    )
+    blocking, warnings = module.partition_execution_and_audit_reasons(reasons)
+    assert blocking == []
+    assert "aggregator_recovery_selected_stream_not_closed" in warnings
+
+
+def test_failed_aggregator_attempt_without_explicit_degraded_binding_is_hard(
+    module,
+) -> None:
+    final_text = "usable but unauthenticated answer"
+    trace = _ensemble_trace(
+        list(module.B2_PROPOSERS),
+        module.B2_AGGREGATOR,
+        final_text=final_text,
+        selection_mode="static_openrouter_b5",
+    )
+    call = trace["calls"][0]
+    recovery = call["aggregator_recovery"]
+    recovery["attempts"][0].update(
+        {
+            "outcome": "failed",
+            "delivery_selected": True,
+            "visible_output_emitted": True,
+        }
+    )
+    recovery.update({"selected_kind": "degraded_delivery", "degraded": True})
+    call.update(
+        {
+            "delivery_outcome": "degraded_success",
+            "execution_outcome": "degraded_success",
+        }
+    )
+
+    reasons = module.ensemble_gate(
+        {
+            "final_text": final_text,
+            "routing_trace": {"selection_plan": deepcopy(call["selection_plan"])},
+            "ensemble_trace": trace,
+        },
+        expected_proposers=module.B2_PROPOSERS,
+        expected_aggregator=module.B2_AGGREGATOR,
+    )
+
+    assert "ambiguous_aggregator_recovery_selected_attempt" in reasons
 
 
 def test_static_aggregator_chain_can_be_bound_by_execution_receipt(module) -> None:
@@ -5967,7 +6372,7 @@ def test_prior_campaign_window_reconciles_physical_first_sources(
 
 
 @pytest.mark.parametrize(
-    ("outside_evidence", "error_pattern"),
+    ("outside_evidence", "warning_pattern"),
     [
         (
             "physical_attempt",
@@ -5983,7 +6388,7 @@ def test_prior_campaign_rejects_source_timing_outside_manifest(
     module,
     tmp_path: Path,
     outside_evidence: str,
-    error_pattern: str,
+    warning_pattern: str,
 ) -> None:
     args, _, lock_fd = _campaign(module, tmp_path)
     _bind_prior_campaign_window(module, args, tmp_path)
@@ -5998,11 +6403,10 @@ def test_prior_campaign_rejects_source_timing_outside_manifest(
         result_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
         result_path.chmod(0o600)
     try:
-        with pytest.raises(module.FinalizationError, match=error_pattern):
+        with pytest.raises(module.FinalizationError, match=warning_pattern):
             module.run_finalization(args)
     finally:
         os.close(lock_fd)
-    assert not args.output_dir.exists()
 
 
 @pytest.mark.parametrize("binding", ["lock", "runtime"])
@@ -6034,7 +6438,6 @@ def test_prior_campaign_requires_same_runtime_and_lock(
             module.run_finalization(args)
     finally:
         os.close(lock_fd)
-    assert not args.output_dir.exists()
 
 
 def test_full_offline_finalization_is_atomic_and_preserves_contracts(
@@ -6385,7 +6788,10 @@ def test_prior_account_before_must_precede_first_stable_observation(
     _owner_json(prior / "openrouter-account-before.json", before)
     args.prior_account_window_dir = [prior]
     try:
-        with pytest.raises(module.FinalizationError, match="precede settlement observations"):
+        with pytest.raises(
+            module.FinalizationError,
+            match="precede settlement observations",
+        ):
             module.run_finalization(args)
     finally:
         os.close(lock_fd)
@@ -6846,7 +7252,7 @@ def test_cleanup_failure_setup_attempt_blocks_unreconstructed_later_success(
     assert not args.output_dir.exists()
 
 
-def test_explicit_byok_is_fatal_even_when_account_delta_is_zero(module, tmp_path: Path) -> None:
+def test_explicit_byok_fails_policy_but_preserves_execution(module, tmp_path: Path) -> None:
     args, _, lock_fd = _campaign(module, tmp_path, with_repair=False)
     path = args.result[0]
     rows = [json.loads(line) for line in path.read_text().splitlines()]
@@ -6860,11 +7266,22 @@ def test_explicit_byok_is_fatal_even_when_account_delta_is_zero(module, tmp_path
     path.write_text("".join(json.dumps(value) + "\n" for value in rows))
     path.chmod(0o600)
     try:
-        with pytest.raises(module.FinalizationError, match="explicit BYOK"):
-            module.run_finalization(args)
+        manifest = module.run_finalization(args)
     finally:
         os.close(lock_fd)
-    assert not args.output_dir.exists()
+    proof = json.loads(
+        (args.output_dir / "openrouter-non-byok-campaign-proof.json").read_text()
+    )
+    audit = json.loads((args.output_dir / "audit.json").read_text())
+    assert manifest["status"] == "complete"
+    assert manifest["execution_pass"] is True
+    assert manifest["policy_pass"] is False
+    assert proof["pass"] is False
+    assert proof["policy_pass"] is False
+    assert proof["local_physical_request_evidence"]["explicit_byok_request_count"] == 1
+    assert audit["execution_pass"] is True
+    assert audit["policy_pass"] is False
+    assert audit["pass"] is False
 
 
 def test_generation_attempt_budget_over_three_is_fatal(module, tmp_path: Path) -> None:
@@ -7016,15 +7433,128 @@ def test_b2_physical_call_rejects_declared_success_count_above_proven_count(
     )
 
 
-def test_b2_physical_call_rejects_two_of_four_below_quorum(module) -> None:
+def test_b2_physical_call_accepts_two_of_four_usable_quorum(module) -> None:
     call = _b2_physical_call(module, proven_successes=2)
 
+    assert _b2_physical_call_reasons(module, call) == []
+
+
+def test_static_b2_does_not_replace_strict_success_with_partial_quorum(module) -> None:
+    call = _b2_physical_call(
+        module,
+        proven_successes=1,
+        declared_successes=2,
+    )
+    candidate = call["candidates"][1]
+    model = module.B2_PROPOSERS[1]
+    candidate.update(
+        {
+            "usable_for_aggregation": True,
+            "completion_outcome": "partial_usable",
+            "provider": "openrouter",
+            "model": model,
+            "content": {
+                "text": "",
+                "chars": 12,
+                "truncated": True,
+                "sha256": "a" * 64,
+            },
+        }
+    )
+
+    assert module.successful_candidate(candidate) is False
+    assert module.partial_usable_candidate(candidate) is True
     reasons = _b2_physical_call_reasons(module, call)
-    assert "proposer_quorum_not_met" in reasons
+    assert "successful_proposer_count_mismatch" in reasons
     assert "insufficient_actual_proposer_quorum" in reasons
 
 
-def test_nonzero_decimal_byok_delta_is_fatal(module, tmp_path: Path) -> None:
+def test_degraded_generation_requires_closed_explicit_evidence(module) -> None:
+    selected_attempt = {
+        "attempt": 1,
+        "kind": "primary",
+        "outcome": "failed",
+        "code": "ensemble_aggregator_close_timeout",
+        "physical_request_count": 1,
+        "delivery_selected": True,
+        "visible_output_emitted": True,
+        "request_started": True,
+    }
+    row = {
+        "execution_status": {
+            "status": "degraded_success",
+            "success": True,
+        },
+        "ensemble_trace": {
+            "execution_outcome": "degraded_success",
+            "delivery_outcome": "degraded_success",
+            "run_outcome": "ensemble_aggregator_close_timeout",
+            "assembled_output": {
+                "text": "usable answer",
+                "chars": 13,
+                "truncated": False,
+            },
+            "aggregator_recovery": {
+                "degraded": True,
+                "success": False,
+                "delivery_success": True,
+                "delivery_outcome": "degraded_success",
+                "audit_outcome": "incomplete",
+                "recovery_skipped": True,
+                "tools_disabled_after_partial_output": True,
+                "selected_kind": "degraded_delivery",
+                "run_outcome": "ensemble_aggregator_close_timeout",
+                "terminal_code": "ensemble_aggregator_close_timeout",
+                "selected_attempt": 1,
+                "attempts": [selected_attempt],
+            },
+        },
+    }
+
+    assert module.explicit_degraded_success(row) is True
+    assert module.audit_only_error_text(
+        "ensemble_aggregator_close_timeout",
+        degraded_success=True,
+    ) is True
+
+    row["ensemble_trace"]["aggregator_recovery"]["attempts"][0][
+        "delivery_selected"
+    ] = False
+    assert module.explicit_degraded_success(row) is False
+    assert module.audit_only_error_text("stream_protocol_identity_conflict") is False
+    assert module.audit_only_error_text("usage_receipt_tampered") is False
+
+
+def test_unaccepted_generation_is_blocking_without_degraded_receipt(module) -> None:
+    blocking, warnings = module.partition_execution_and_audit_reasons(
+        ["selected_generation_not_successful", "generation_not_accepted"]
+    )
+
+    assert blocking == [
+        "selected_generation_not_successful",
+        "generation_not_accepted",
+    ]
+    assert warnings == []
+
+
+def test_judge_audit_demotion_is_closed_to_missing_usage(module) -> None:
+    assert module.judge_evidence_error_is_audit_only(
+        module.FinalizationError(
+            "Judge attempt abc does not represent every physical request in usage"
+        )
+    ) is True
+    for message in (
+        "Judge attempt id abc is reused by another unit",
+        "Judge attempt budget exceeds 3",
+        "Judge attempt abc receipt repair conflicts on exact cost",
+        "Judge attempt abc violates the frozen route",
+    ):
+        assert module.judge_evidence_error_is_audit_only(
+            module.FinalizationError(message)
+        ) is False
+
+
+def test_nonzero_decimal_byok_delta_fails_policy_not_execution(module, tmp_path: Path) -> None:
     args, _, lock_fd = _campaign(module, tmp_path)
     after = json.loads(args.account_after.read_text())
     after["byok_usage"] = "0.000000001"
@@ -7036,13 +7566,100 @@ def test_nonzero_decimal_byok_delta_is_fatal(module, tmp_path: Path) -> None:
         observation["byok_usage"] = "0.000000001"
     _owner_json(args.account_reconciliation, reconciliation)
     try:
-        with pytest.raises(module.FinalizationError, match="BYOK delta"):
-            module.run_finalization(args)
+        manifest = module.run_finalization(args)
+    finally:
+        os.close(lock_fd)
+    proof = json.loads(
+        (args.output_dir / "openrouter-non-byok-campaign-proof.json").read_text()
+    )
+    assert manifest["status"] == "complete"
+    assert manifest["execution_pass"] is True
+    assert manifest["policy_pass"] is False
+    assert proof["pass"] is False
+    assert proof["account"]["campaign_byok_usage_delta_usd"] == "1E-9"
+
+
+def test_incomplete_settlement_publishes_explicit_account_audit_conflict(
+    module,
+    tmp_path: Path,
+) -> None:
+    args, _, lock_fd = _campaign(module, tmp_path)
+    reconciliation = json.loads(args.account_reconciliation.read_text())
+    reconciliation["settlement_status"] = "pending"
+    _owner_json(args.account_reconciliation, reconciliation)
+    try:
+        manifest = _assert_account_audit_conflict(
+            module,
+            args,
+            warning="account reconciliation is not stable",
+        )
     finally:
         os.close(lock_fd)
 
+    proof = json.loads(
+        (args.output_dir / "openrouter-non-byok-campaign-proof.json").read_text()
+    )
+    assert manifest["account_windows"] == []
+    assert manifest["cost_attribution"]["account_windows"] == []
+    assert proof["account_windows"] == []
 
-def test_unexplained_account_to_exact_ledger_delta_is_fatal(module, tmp_path: Path) -> None:
+
+def test_prior_campaign_byok_delta_preserves_actual_account_cost(
+    module, tmp_path: Path
+) -> None:
+    args, _, lock_fd = _campaign(module, tmp_path)
+    prior = _bind_prior_campaign_window(module, args, tmp_path)
+    prior_after_path = prior / "openrouter-account-after.json"
+    prior_after = json.loads(prior_after_path.read_text())
+    prior_after["byok_usage"] = "0.05"
+    _owner_json(prior_after_path, prior_after)
+    prior_reconciliation_path = prior / "openrouter-account-reconciliation.json"
+    prior_reconciliation = json.loads(prior_reconciliation_path.read_text())
+    prior_reconciliation.update(
+        {
+            "byok_usage_after_usd": "0.05",
+            "byok_usage_delta_usd": "0.05",
+        }
+    )
+    for observation in prior_reconciliation["stable_observations"]:
+        observation["byok_usage"] = "0.05"
+    _owner_json(prior_reconciliation_path, prior_reconciliation)
+
+    for path in (args.account_before, args.account_after):
+        payload = json.loads(path.read_text())
+        payload["byok_usage"] = "0.05"
+        _owner_json(path, payload)
+    reconciliation = json.loads(args.account_reconciliation.read_text())
+    reconciliation.update(
+        {
+            "byok_usage_before_usd": "0.05",
+            "byok_usage_after_usd": "0.05",
+            "byok_usage_delta_usd": "0",
+        }
+    )
+    for observation in reconciliation["stable_observations"]:
+        observation["byok_usage"] = "0.05"
+    _owner_json(args.account_reconciliation, reconciliation)
+
+    try:
+        manifest = module.run_finalization(args)
+    finally:
+        os.close(lock_fd)
+
+    proof = json.loads(
+        (args.output_dir / "openrouter-non-byok-campaign-proof.json").read_text()
+    )
+    assert manifest["status"] == "complete"
+    assert manifest["execution_pass"] is True
+    assert manifest["policy_pass"] is False
+    assert proof["account"]["campaign_usage_delta_usd"] == "3.9"
+    assert proof["account"]["campaign_byok_usage_delta_usd"] == "0.05"
+    assert proof["cost_scope"]["campaign_bound_account_window_total_usd"] == "3.9"
+
+
+def test_unexplained_account_to_exact_ledger_delta_is_a_reconciliation_warning(
+    module, tmp_path: Path
+) -> None:
     args, _, lock_fd = _campaign(module, tmp_path)
     after = json.loads(args.account_after.read_text())
     after["usage"] = "14"
@@ -7054,14 +7671,22 @@ def test_unexplained_account_to_exact_ledger_delta_is_fatal(module, tmp_path: Pa
         observation["usage"] = "14"
     _owner_json(args.account_reconciliation, reconciliation)
     try:
-        with pytest.raises(module.FinalizationError, match="unexplained OpenRouter"):
-            module.run_finalization(args)
+        manifest = module.run_finalization(args)
     finally:
         os.close(lock_fd)
-    assert not args.output_dir.exists()
+    proof = json.loads(
+        (args.output_dir / "openrouter-non-byok-campaign-proof.json").read_text()
+    )
+    assert manifest["status"] == "complete"
+    assert manifest["execution_pass"] is True
+    assert manifest["policy_pass"] is True
+    assert manifest["reconciliation"]["pass"] is False
+    assert proof["pass"] is True
+    assert proof["reconciliation"]["status"] == "conflict"
+    assert any("unexplained OpenRouter" in value for value in proof["warnings"])
 
 
-def test_three_identical_stable_polls_and_preheld_lock_are_mandatory(
+def test_invalid_settlement_or_lock_fails_audit_without_erasing_execution(
     module, tmp_path: Path
 ) -> None:
     args, _, lock_fd = _campaign(module, tmp_path)
@@ -7069,10 +7694,17 @@ def test_three_identical_stable_polls_and_preheld_lock_are_mandatory(
     reconciliation["stable_poll_count"] = 2
     _owner_json(args.account_reconciliation, reconciliation)
     try:
-        with pytest.raises(module.FinalizationError, match="stable_poll_count"):
-            module.run_finalization(args)
+        manifest = module.run_finalization(args)
     finally:
         os.close(lock_fd)
+    proof = json.loads(
+        (args.output_dir / "openrouter-non-byok-campaign-proof.json").read_text()
+    )
+    assert manifest["status"] == "complete"
+    assert manifest["execution_pass"] is True
+    assert manifest["policy_pass"] is False
+    assert proof["pass"] is False
+    assert "stable_poll_count" in proof["warnings"][0]
 
     other = tmp_path / "other"
     args2, _, lock_fd2 = _campaign(module, other)
@@ -7082,6 +7714,9 @@ def test_three_identical_stable_polls_and_preheld_lock_are_mandatory(
             module.run_finalization(args2)
     finally:
         os.close(lock_fd2)
+    assert not (
+        args2.output_dir / "openrouter-non-byok-campaign-proof.json"
+    ).exists()
 
 
 def test_source_hash_recheck_detects_mutation(module, tmp_path: Path) -> None:
@@ -7259,6 +7894,75 @@ def test_none_cost_source_does_not_turn_billed_default_into_recorded_zero(
         assert generation["cost_precision"] == expected_precision
     finally:
         os.close(lock_fd)
+
+
+def test_static_estimate_takes_precedence_over_normalized_billed_zero(
+    module,
+    tmp_path: Path,
+) -> None:
+    args, _, lock_fd = _campaign(module, tmp_path, with_repair=False)
+    try:
+        path = args.result[0]
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        unit = rows[0]["execution"]["generation_attempts"][0]["run"]["usage"][
+            "model_usage_breakdown"
+        ][0]
+        unit["provider_usage"].pop("provider_reported_cost")
+        unit.update(
+            {
+                "billed_cost": 0.0,
+                "cost_source": "opensquilla_static_estimate",
+                "estimated_cost_usd": 0.42,
+                "cost_usd": 0.42,
+            }
+        )
+        rows[0] = module.seal_result_row(rows[0])
+        path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        path.chmod(0o600)
+        records, _ = module.read_source_rows([path])
+
+        ledger, _ = module.build_actual_spend_ledger(records)
+        generation = next(
+            row
+            for row in ledger
+            if "generation" in row["scopes"]
+            and {"group": "B0", "task_id": "task-1"}
+            in row["group_task_pairs"]
+        )
+
+        assert generation["recorded_cost_usd"] == "0.42"
+        assert generation["cost_precision"] == "estimated"
+    finally:
+        os.close(lock_fd)
+
+
+def test_estimated_generation_cost_is_in_total_but_not_exact_total(module) -> None:
+    pair = {"group": "B0", "task_id": "task-1"}
+    rows = [{**pair, "usage": {}}]
+    ledger = [
+        {
+            "generation_disposition": "selected",
+            "group_task_pairs": [pair],
+            "recorded_cost_usd": "0.10",
+            "cost_precision": "exact",
+        },
+        {
+            "generation_disposition": "selected",
+            "group_task_pairs": [pair],
+            "recorded_cost_usd": "0.25",
+            "cost_precision": "estimated",
+        },
+    ]
+
+    summaries, audit = module.selected_generation_costs_from_ledger(rows, ledger)
+    summary = summaries["B0/task-1"]
+    assert summary["value"] == module.Decimal("0.35")
+    assert summary["recorded_cost_usd"] == "0.35"
+    assert summary["exact_cost_usd"] == "0.10"
+    assert summary["estimated_cost_usd"] == "0.25"
+    assert summary["exact"] is False
+    assert summary["complete"] is True
+    assert audit["exact_pair_count"] == 0
 
 
 def test_g1_plan_must_be_bound_to_frozen_registry(module, tmp_path: Path) -> None:
@@ -7449,7 +8153,9 @@ def test_non_exact_estimates_may_exceed_exact_account_delta(module, tmp_path: Pa
         ]
         for unit in [*generation_units, *judge_units]:
             unit["provider_usage"].pop("provider_reported_cost", None)
-            unit["billed_cost"] = 0.2
+            unit["billed_cost"] = 0.0
+            unit["estimated_cost_usd"] = 0.2
+            unit["cost_usd"] = 0.2
             unit["cost_source"] = "opensquilla_static_estimate"
         selected_cost = 0.2 * len(generation_units)
         row["cost_accounting"]["selected_generation_attempt"]["recorded_cost_usd"] = selected_cost
@@ -7823,7 +8529,10 @@ def test_judge_receipt_conflict_and_missing_route_are_fatal(module, tmp_path: Pa
     rows2[0] = module.seal_result_row(rows2[0])
     args2.result[0].write_text("".join(json.dumps(row) + "\n" for row in rows2))
     try:
-        with pytest.raises(module.FinalizationError, match="Judge attempt"):
+        with pytest.raises(
+            module.FinalizationError,
+            match="Judge attempt|latest repair lacks a complete Judge",
+        ):
             module.run_finalization(args2)
     finally:
         os.close(lock_fd2)
@@ -8008,10 +8717,12 @@ def test_selected_generation_cost_is_reconciled_to_physical_ledger(module, tmp_p
     rows[0] = module.seal_result_row(rows[0])
     args.result[0].write_text("".join(json.dumps(row) + "\n" for row in rows))
     try:
-        with pytest.raises(module.FinalizationError, match="cost conflicts with ledger"):
-            module.run_finalization(args)
+        manifest = module.run_finalization(args)
     finally:
         os.close(lock_fd)
+    assert manifest["status"] == "complete"
+    assert manifest["execution_pass"] is True
+    assert any("cost conflicts with ledger" in warning for warning in manifest["warnings"])
 
 
 def _g1_retrospective_fixture(module, tmp_path: Path):

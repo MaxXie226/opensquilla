@@ -110,11 +110,12 @@ def _account_snapshot(
     captured_at: datetime,
     usage: str,
     fingerprint: str,
+    byok_usage: str = "0",
 ) -> dict[str, object]:
     return {
         "captured_at": captured_at.isoformat(),
         "usage": usage,
-        "byok_usage": "0",
+        "byok_usage": byok_usage,
         "api_key_sha256": fingerprint,
         "benchmark_environment_key_verified": True,
         "is_free_tier": False,
@@ -187,6 +188,70 @@ def test_reconciliation_requires_long_stable_same_key_non_byok_window(
     assert reconciliation["observation_span_seconds"] == 210.0
     assert reconciliation["minimum_settlement_seconds"] == 180
     assert reconciliation["minimum_stable_tail_seconds"] == 75
+    assert reconciliation["non_byok_policy_pass"] is True
+    assert reconciliation["policy_status"] == "compliant"
+
+
+def test_reconciliation_records_byok_delta_without_rejecting_execution(
+    tmp_path: Path,
+) -> None:
+    reconciliation_block = _embedded_python_blocks()[1]
+    fingerprint = "a" * 64
+    base = datetime(2026, 7, 25, tzinfo=UTC)
+    before_path = tmp_path / "before.json"
+    after_path = tmp_path / "after.json"
+    output_path = tmp_path / "reconciliation.json"
+    runtime_path = tmp_path / "runtime.json"
+    lock_path = tmp_path / "campaign.lock"
+    lock_path.touch(mode=0o600)
+    _write_json(
+        before_path,
+        _account_snapshot(
+            captured_at=base - timedelta(seconds=1),
+            usage="10.0",
+            byok_usage="2.0",
+            fingerprint=fingerprint,
+        ),
+    )
+    _write_json(runtime_path, {"environment_sha256": "b" * 64})
+    poll_paths: list[Path] = []
+    for index, offset in enumerate((0, 60, 120, 180, 195, 210), start=1):
+        poll_path = tmp_path / f"poll-{index}.json"
+        _write_json(
+            poll_path,
+            _account_snapshot(
+                captured_at=base + timedelta(seconds=offset),
+                usage="11.25",
+                byok_usage="2.50",
+                fingerprint=fingerprint,
+            ),
+        )
+        poll_paths.append(poll_path)
+    after_path.write_bytes(poll_paths[-1].read_bytes())
+
+    lock_fd = os.open(lock_path, os.O_RDWR)
+    try:
+        completed = _run_embedded_python(
+            reconciliation_block,
+            str(before_path),
+            str(after_path),
+            str(output_path),
+            str(runtime_path),
+            str(lock_path),
+            "180",
+            "6",
+            "15",
+            *(str(path) for path in poll_paths),
+            lock_fd=lock_fd,
+        )
+    finally:
+        os.close(lock_fd)
+
+    assert completed.returncode == 0, completed.stderr
+    reconciliation = json.loads(output_path.read_text(encoding="utf-8"))
+    assert reconciliation["byok_usage_delta_usd"] == "0.50"
+    assert reconciliation["non_byok_policy_pass"] is False
+    assert reconciliation["policy_status"] == "byok_detected"
 
 
 def test_reconciliation_rejects_short_or_mismatched_settlement(
@@ -599,7 +664,10 @@ def test_fd9_covers_account_window_waves_settlement_and_finalizer() -> None:
     assert 'capture_account_snapshot "$poll_path" || return 2' in script
     assert "write_account_reconciliation || return 2" in script
     assert "required stable settlement window" in script
-    assert "if byok_delta != 0:" in script
+    assert "if byok_delta != 0:" not in script
+    assert '"non_byok_policy_pass": byok_delta == 0' in script
+    assert '"policy_status": "compliant" if byok_delta == 0 else "byok_detected"' in script
+    assert "OpenRouter BYOK account poll usage is not monotonic" in script
 
 
 def test_settlement_retry_keeps_unique_polls_and_cannot_false_settle(
@@ -709,15 +777,23 @@ def test_recoverable_exit_two_is_recorded_before_wave_status_is_gated() -> None:
         "resume_repair_incomplete",
     ):
         assert recoverable in script
-    assert "Runner exit 2 is expected" in script
+    assert "Cost and BYOK findings remain visible" in script
 
 
-def test_explicit_policy_preflight_and_malformed_waves_fail_closed() -> None:
+def test_audit_findings_are_preserved_while_malformed_waves_fail_closed() -> None:
     script = _script()
-    assert '. == "openrouter_non_byok_policy_violation"' in script
-    assert '. == "openrouter_byok_detected"' in script
-    assert '. == "cost_audit_failed"' in script
-    assert "cost_audit_failed|preflight_failed" in script
+    assert '. == "openrouter_non_byok_policy_violation"' not in script
+    assert '. == "openrouter_byok_detected"' not in script
+    recoverable_pattern = (
+        "metadata_incomplete|judge_incomplete|result_incomplete|"
+        "resume_repair_incomplete|cost_audit_failed|audit_incomplete"
+    )
+    assert recoverable_pattern in script
+    assert '"audit_findings": policy_violations' in script
+    assert 'elif action == "audit_only":' in script
+    assert '"audit_reasons": list(state.get("audit_reasons") or [])' in script
+    assert "if policy_violations:" not in script
+    assert "preflight_failed)" in script
     assert "Missing/duplicate artifacts remain fatal" in script
     assert "Campaign wave exited unexpectedly" in script
     assert "Campaign wave has an unexpected manifest status" in script
@@ -795,7 +871,10 @@ def _write_formal_publication_fixture(
     artifact_records: dict[str, dict[str, object]] = {}
     for name in artifact_names:
         artifact_path = formal_dir / name
-        artifact_path.write_text(f"{name}\n", encoding="utf-8")
+        if name in {"openrouter-non-byok-campaign-proof.json", "audit.json"}:
+            artifact_path.write_text("{}\n", encoding="utf-8")
+        else:
+            artifact_path.write_text(f"{name}\n", encoding="utf-8")
         artifact_path.chmod(0o600)
         artifact_records[name] = {
             "path": name,
@@ -874,6 +953,54 @@ def _write_formal_publication_fixture(
     )
     manifest_path.chmod(0o600)
     return output_dir, archive_dir, formal_dir
+
+
+def _make_publication_fixture_account_audit_conflict(
+    formal_dir: Path,
+) -> None:
+    manifest_path = formal_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    proof_path = formal_dir / "openrouter-non-byok-campaign-proof.json"
+    audit_path = formal_dir / "audit.json"
+    reconciliation = {"pass": False, "status": "audit_conflict"}
+    proof = {
+        "publication_eligible": True,
+        "audit_conflict_kind": "account_proof_incomplete",
+        "status": "audit_conflict",
+        "pass": False,
+        "policy_pass": False,
+        "execution_pass": True,
+        "reconciliation": reconciliation,
+        "account_windows": [],
+        "cost_scope": {"account_windows": []},
+    }
+    audit = {
+        "status": "complete_with_warnings",
+        "pass": False,
+        "execution_pass": True,
+    }
+    proof_path.write_text(json.dumps(proof) + "\n", encoding="utf-8")
+    audit_path.write_text(json.dumps(audit) + "\n", encoding="utf-8")
+    proof_path.chmod(0o600)
+    audit_path.chmod(0o600)
+    manifest["artifacts"][proof_path.name].update(
+        sha256=_file_sha256(proof_path),
+        size_bytes=proof_path.stat().st_size,
+    )
+    manifest["artifacts"][audit_path.name].update(
+        sha256=_file_sha256(audit_path),
+        size_bytes=audit_path.stat().st_size,
+    )
+    manifest["cost_attribution"]["account_windows"] = []
+    manifest["execution_pass"] = True
+    manifest["audit_pass"] = False
+    manifest["audit_status"] = "complete_with_warnings"
+    manifest["reconciliation"] = reconciliation
+    manifest["account_windows"] = []
+    manifest.pop("manifest_sha256")
+    manifest["manifest_sha256"] = _canonical_sha256(manifest)
+    manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+    manifest_path.chmod(0o600)
 
 
 def test_output_layout_archives_process_material_and_has_no_final_directory() -> None:
@@ -995,6 +1122,74 @@ def test_final_publication_accepts_current_only_account_window(
     assert [window["kind"] for window in manifest["cost_attribution"]["account_windows"]] == [
         "current"
     ]
+
+
+def test_final_publication_accepts_explicit_account_audit_conflict_without_windows(
+    tmp_path: Path,
+) -> None:
+    publisher_block = _embedded_python_blocks()[2]
+    output_dir, archive_dir, formal_dir = _write_formal_publication_fixture(tmp_path)
+    _make_publication_fixture_account_audit_conflict(formal_dir)
+    lock_path = tmp_path / "publisher.lock"
+    lock_path.touch(mode=0o600)
+    lock_fd = os.open(lock_path, os.O_RDWR)
+    try:
+        completed = _run_embedded_python(
+            publisher_block,
+            str(formal_dir),
+            str(output_dir),
+            str(archive_dir),
+            lock_fd=lock_fd,
+        )
+    finally:
+        os.close(lock_fd)
+
+    assert completed.returncode == 0, completed.stderr
+    manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["cost_attribution"]["account_windows"] == []
+    assert manifest["execution_pass"] is True
+    assert manifest["audit_pass"] is False
+
+
+def test_final_publication_rejects_empty_windows_without_closed_conflict_marker(
+    tmp_path: Path,
+) -> None:
+    publisher_block = _embedded_python_blocks()[2]
+    output_dir, archive_dir, formal_dir = _write_formal_publication_fixture(tmp_path)
+    _make_publication_fixture_account_audit_conflict(formal_dir)
+    proof_path = formal_dir / "openrouter-non-byok-campaign-proof.json"
+    proof = json.loads(proof_path.read_text(encoding="utf-8"))
+    proof["policy_pass"] = True
+    proof_path.write_text(json.dumps(proof) + "\n", encoding="utf-8")
+    proof_path.chmod(0o600)
+    manifest_path = formal_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["artifacts"][proof_path.name].update(
+        sha256=_file_sha256(proof_path),
+        size_bytes=proof_path.stat().st_size,
+    )
+    manifest.pop("manifest_sha256")
+    manifest["manifest_sha256"] = _canonical_sha256(manifest)
+    manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+    manifest_path.chmod(0o600)
+    lock_path = tmp_path / "publisher.lock"
+    lock_path.touch(mode=0o600)
+    lock_fd = os.open(lock_path, os.O_RDWR)
+    try:
+        completed = _run_embedded_python(
+            publisher_block,
+            str(formal_dir),
+            str(output_dir),
+            str(archive_dir),
+            lock_fd=lock_fd,
+        )
+    finally:
+        os.close(lock_fd)
+
+    assert completed.returncode != 0
+    assert "formal manifest lacks account windows" in completed.stderr
+    assert formal_dir.is_dir()
+    assert not (output_dir / "manifest.json").exists()
 
 
 def test_final_publication_accepts_prior_campaign_account_window(

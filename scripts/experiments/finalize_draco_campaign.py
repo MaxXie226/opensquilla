@@ -4,9 +4,9 @@
 This command deliberately performs no networking or model-provider calls.  It
 validates immutable source shards, replays the pure frozen G1 ranker, selects
 one completed result per expected group/task pair, rebuilds whole-campaign
-spend from physical request receipts, binds incomplete receipt metadata to a
-stable account-level non-BYOK proof, reseals results, rebuilds traces, and
-publishes one directory atomically.
+spend from physical request receipts, binds incomplete metadata to account
+reconciliation and policy evidence while preserving audit failures separately,
+reseals results, rebuilds traces, and publishes one directory atomically.
 """
 
 from __future__ import annotations
@@ -74,7 +74,7 @@ LEGACY_MANAGED_V3_SOURCE_IDENTITY = {
 JUDGE_ATTEMPT_BUDGET_SCOPE = "criterion_repeat_campaign"
 JUDGE_ATTEMPT_BUDGET_LIMIT = 3
 JUDGE_ATTEMPT_BUDGET_EXHAUSTED_ERROR = "judge_attempt_budget_exhausted"
-FINALIZER_VERSION = 6
+FINALIZER_VERSION = 7
 FROZEN_DRACO_MINI_TASK_COUNT = 10
 FROZEN_DRACO_MINI_SHA256 = "1eb4e618c8df8e7f68bded3d2b6f77a541744aa1072eb338835b776183188a8d"
 FORMAL_REQUIRED_STABLE_POLL_COUNT = 6
@@ -217,6 +217,194 @@ POLICY_VIOLATION_ERRORS = frozenset(
         "openrouter_byok_detected",
     }
 )
+
+# These failures describe policy, receipt, metering, or stream-finalization
+# confidence.  They must remain visible in the published audit, but they do
+# not erase a response that is already bound to a real request and has a
+# non-empty, integrity-checked answer.  Requested/actual provider and model
+# mismatches deliberately are not in this set: those are execution-contract
+# failures, not audit uncertainty.
+AUDIT_ONLY_GENERATION_REASONS = frozenset(
+    {
+        "openrouter_policy_violation",
+        "selected_generation_degraded_success",
+        "generation_accepted_as_degraded_success",
+        "missing_generation_usage_route_evidence",
+        "missing_successful_router_receipt",
+        "successful_judge_has_unknown_usage",
+        "aggregator_recovery_selected_stream_not_closed",
+        "proposer_recovery_stream_not_closed",
+    }
+)
+
+AUDIT_ONLY_ERROR_CODES = frozenset(
+    {
+        "openrouter_non_byok_verification_failed",
+        "openrouter_non_byok_metadata_incomplete",
+        "openrouter_non_byok_policy_violation",
+        "openrouter_byok_detected",
+        "cost_metadata_incomplete",
+        "usage_metadata_incomplete",
+        "usage_unknown",
+    }
+)
+
+DEGRADED_DELIVERY_ERROR_CODES = frozenset(
+    {
+        "ensemble_aggregator_close_timeout",
+        "ensemble_aggregator_timeout",
+        "ensemble_aggregator_length_capped",
+        "ensemble_aggregator_stream_error",
+        "ensemble_aggregator_incomplete",
+    }
+)
+
+
+def explicit_degraded_call_attempt(call: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """Return the real failed physical attempt selected for degraded delivery."""
+
+    recovery = call.get("aggregator_recovery")
+    if not isinstance(recovery, Mapping):
+        return None
+    selected_attempt = recovery.get("selected_attempt")
+    attempts = recovery.get("attempts")
+    selected = (
+        next(
+            (
+                attempt
+                for attempt in attempts
+                if isinstance(attempt, Mapping)
+                and attempt.get("attempt") == selected_attempt
+            ),
+            None,
+        )
+        if isinstance(attempts, list)
+        else None
+    )
+    assembled = call.get("assembled_output")
+    visible = bool(
+        isinstance(assembled, Mapping)
+        and nonnegative_int(assembled.get("chars")) > 0
+        and (
+            bool(str(assembled.get("text") or "").strip())
+            or HEX64.fullmatch(str(assembled.get("sha256") or "")) is not None
+            or SHA256_VALUE.fullmatch(str(assembled.get("sha256") or "")) is not None
+        )
+    )
+    run_outcome = str(call.get("run_outcome") or "")
+    if not (
+        call.get("execution_outcome") == "degraded_success"
+        and call.get("delivery_outcome") == "degraded_success"
+        and recovery.get("degraded") is True
+        and recovery.get("success") is False
+        and recovery.get("delivery_success") is True
+        and recovery.get("delivery_outcome") == "degraded_success"
+        and recovery.get("audit_outcome") == "incomplete"
+        and recovery.get("recovery_skipped") is True
+        and recovery.get("tools_disabled_after_partial_output") is True
+        and recovery.get("selected_kind") == "degraded_delivery"
+        and isinstance(selected_attempt, int)
+        and not isinstance(selected_attempt, bool)
+        and selected_attempt > 0
+        and isinstance(selected, Mapping)
+        and selected.get("outcome") == "failed"
+        and selected.get("delivery_selected") is True
+        and selected.get("visible_output_emitted") is True
+        and selected.get("request_started") is True
+        and isinstance(selected.get("physical_request_count"), int)
+        and not isinstance(selected.get("physical_request_count"), bool)
+        and selected.get("physical_request_count") > 0
+        and str(selected.get("code") or "") == run_outcome
+        and str(recovery.get("terminal_code") or "") == run_outcome
+        and str(recovery.get("run_outcome") or "") == run_outcome
+        and structural_aggregator_recovery_trigger(run_outcome)
+        and visible
+    ):
+        return None
+    return selected
+
+
+def explicit_degraded_success(row: Mapping[str, Any]) -> bool:
+    """Require a fully bound degraded-delivery receipt before accepting it."""
+
+    execution_status = row.get("execution_status")
+    if not (
+        isinstance(execution_status, Mapping)
+        and execution_status.get("status") == "degraded_success"
+        and execution_status.get("success") is True
+    ):
+        return False
+    trace = row.get("ensemble_trace")
+    if not isinstance(trace, Mapping):
+        return False
+    traces = [trace]
+    calls = trace.get("calls")
+    if isinstance(calls, list):
+        traces.extend(call for call in calls if isinstance(call, Mapping))
+    return any(explicit_degraded_call_attempt(call) is not None for call in traces)
+
+
+def audit_only_error_text(value: Any, *, degraded_success: bool = False) -> bool:
+    """Match only closed, explicit audit/degraded error codes.
+
+    In particular, words such as ``usage``, ``receipt`` and ``stream`` are not
+    sufficient: identity, route, protocol and tamper errors often contain the
+    same words and must remain execution-invalid.
+    """
+
+    normalized = str(value or "").strip().casefold()
+    if normalized in AUDIT_ONLY_ERROR_CODES:
+        return True
+    return degraded_success and normalized in DEGRADED_DELIVERY_ERROR_CODES
+
+
+def judge_evidence_error_is_audit_only(error: FinalizationError) -> bool:
+    """Allow only missing/unknown Judge metering evidence to be non-blocking."""
+
+    message = str(error).casefold()
+    return any(
+        marker in message
+        for marker in (
+            "does not represent every physical request in usage",
+            "successful_judge_has_unknown_usage",
+            "judge_usage_unknown",
+            "judge_stream_not_closed",
+        )
+    )
+
+
+def account_proof_error_is_audit_only(error: FinalizationError) -> bool:
+    """Demote only settlement/cost incompleteness, never identity or tamper faults."""
+
+    message = str(error).strip().casefold()
+    return message in {
+        "account reconciliation is not stable",
+        "reconciliation lacks the formal account observation count",
+        "reconciliation stable_poll_count is invalid",
+        "formal account settlement window is too short",
+        "formal stable account tail is too short",
+    } or message.startswith(
+        (
+            "ledger recorded cost is ",
+            "ledger exact cost is ",
+            "cost reconciliation tolerance is ",
+        )
+    )
+
+
+def partition_execution_and_audit_reasons(
+    reasons: Iterable[str],
+) -> tuple[list[str], list[str]]:
+    """Split hard execution failures from publishable audit warnings."""
+
+    blocking: list[str] = []
+    warnings: list[str] = []
+    for reason in dict.fromkeys(str(value) for value in reasons if str(value)):
+        if reason in AUDIT_ONLY_GENERATION_REASONS or reason.startswith("audit:"):
+            warnings.append(reason)
+        else:
+            blocking.append(reason)
+    return blocking, warnings
 USAGE_CONTRACT_KEYS = (
     "provider",
     "model",
@@ -683,8 +871,10 @@ def verify_source_snapshots(snapshots: Mapping[str, str]) -> None:
             raise FinalizationError(f"source shard changed during finalization: {path}")
 
 
-def validate_source_policy_history(records: Sequence[SourceRecord]) -> None:
-    """Make explicit BYOK/provider failures campaign-fatal across every wave."""
+def validate_source_policy_history(
+    records: Sequence[SourceRecord],
+) -> list[dict[str, Any]]:
+    """Return immutable policy failures for audit without erasing execution."""
 
     failures: list[dict[str, Any]] = []
     for record in records:
@@ -713,10 +903,7 @@ def validate_source_policy_history(records: Sequence[SourceRecord]) -> None:
                     "audit_status": audit_status,
                 }
             )
-    if failures:
-        raise FinalizationError(
-            f"campaign source history contains explicit BYOK/provider failures: {failures[:5]}"
-        )
+    return failures
 
 
 def load_manifest_contracts(
@@ -735,15 +922,16 @@ def load_manifest_contracts(
     allowed_statuses = {
         "complete",
         "metadata_incomplete",
+        "cost_audit_failed",
+        "audit_incomplete",
         "judge_incomplete",
         "result_incomplete",
         "resume_repair_incomplete",
     }
-    forbidden_failure_markers = {
+    audit_failure_markers = {
         "openrouter_non_byok_policy_violation",
         "openrouter_byok_detected",
         "cost_audit_failed",
-        "preflight_failed",
     }
     authoritative_fingerprints: dict[str, str] | None = None
     authoritative_contracts: dict[str, dict[str, Any]] | None = None
@@ -766,8 +954,11 @@ def load_manifest_contracts(
                 f"source manifest status is not allowed for finalization: {status!r} at {path}"
             )
         failure_text = json.dumps(payload.get("failure"), ensure_ascii=False, sort_keys=True)
-        if any(marker in failure_text for marker in forbidden_failure_markers):
-            raise FinalizationError(f"source manifest contains a fatal policy/cost failure: {path}")
+        manifest_audit_warnings = sorted(
+            marker for marker in audit_failure_markers if marker in failure_text
+        )
+        if "preflight_failed" in failure_text:
+            raise FinalizationError(f"source manifest contains a fatal preflight failure: {path}")
         tool_policy = payload.get("tool_policy")
         local_tools = (
             tool_policy.get("local_web_tools") if isinstance(tool_policy, Mapping) else None
@@ -1022,6 +1213,7 @@ def load_manifest_contracts(
                 },
                 "resume_scheduled_pairs": resume_scheduled_pairs,
                 "resume_schedule_contract_verified": (resume_schedule_contract_verified),
+                "audit_warnings": manifest_audit_warnings,
             }
         )
     assert authoritative_fingerprints is not None
@@ -2934,20 +3126,72 @@ def ensemble_call_trace_sequence(
     return call_traces, reasons
 
 
-def successful_candidate(candidate: Any) -> bool:
+_PARTIAL_PROPOSER_HARD_ERROR_CODES = frozenset(
+    {
+        "candidate_mode_contract_violation",
+        "router_dynamic_proposer_recovery_plan_drift",
+        "proposer_recovery_budget_overrun",
+        "proposer_recovery_evidence_unproven",
+        "quorum_cancelled",
+        "quorum_unreachable",
+        "soft_deadline",
+    }
+)
+
+
+def _candidate_has_visible_content(candidate: Any) -> bool:
     content = candidate.get("content") if isinstance(candidate, Mapping) else None
+    return bool(
+        isinstance(content, Mapping)
+        and nonnegative_int(content.get("chars")) > 0
+        and (
+            bool(str(content.get("text") or "").strip())
+            or HEX64.fullmatch(str(content.get("sha256") or "")) is not None
+            or SHA256_VALUE.fullmatch(str(content.get("sha256") or "")) is not None
+        )
+    )
+
+
+def successful_candidate(candidate: Any) -> bool:
+    """Validate a strict, physically successful proposer receipt."""
+
     return bool(
         isinstance(candidate, Mapping)
         and candidate.get("ok") is True
+        and not candidate.get("error")
         and candidate.get("request_started") is True
         and isinstance(candidate.get("physical_request_count"), int)
         and not isinstance(candidate.get("physical_request_count"), bool)
         and candidate.get("physical_request_count") > 0
-        and not candidate.get("error")
-        and isinstance(content, Mapping)
-        and nonnegative_int(content.get("chars")) > 0
-        and bool(str(content.get("text") or "").strip())
+        and _candidate_has_visible_content(candidate)
     )
+
+
+def partial_usable_candidate(candidate: Any) -> bool:
+    """Validate the explicit provider receipt for one inert partial draft."""
+
+    execution = candidate.get("execution") if isinstance(candidate, Mapping) else None
+    error_code = str(candidate.get("error_code") or "") if isinstance(candidate, Mapping) else ""
+    return bool(
+        isinstance(candidate, Mapping)
+        and candidate.get("ok") is False
+        and candidate.get("usable_for_aggregation") is True
+        and candidate.get("completion_outcome") == "partial_usable"
+        and candidate.get("request_started") is True
+        and isinstance(candidate.get("physical_request_count"), int)
+        and not isinstance(candidate.get("physical_request_count"), bool)
+        and candidate.get("physical_request_count") > 0
+        and _candidate_has_visible_content(candidate)
+        and error_code not in _PARTIAL_PROPOSER_HARD_ERROR_CODES
+        and not (
+            isinstance(execution, Mapping)
+            and execution.get("candidate_mode_contract_violation") is True
+        )
+    )
+
+
+def usable_candidate(candidate: Any) -> bool:
+    return successful_candidate(candidate) or partial_usable_candidate(candidate)
 
 
 def _trace_output_binding_reasons(
@@ -3162,10 +3406,20 @@ _FORMAL_AGGREGATOR_SELECTED_KINDS = frozenset(
         "same_model_recovery",
         "model_fallback",
         "continuation_fallback",
+        "partial_salvage",
+        "degraded_delivery",
     }
 )
 _FORMAL_AGGREGATOR_ATTEMPT_OUTCOMES = frozenset(
-    {"succeeded", "abandoned", "failed", "provider_build_failed", "member_unavailable"}
+    {
+        "succeeded",
+        "degraded_success",
+        "partial_usable",
+        "abandoned",
+        "failed",
+        "provider_build_failed",
+        "member_unavailable",
+    }
 )
 
 
@@ -3195,6 +3449,7 @@ def _request_identity_reasons(
     *,
     expected_identity: str,
     label: str,
+    allow_unknown_usage: bool = False,
 ) -> list[str]:
     """Bind requested and actual request identity to one frozen candidate."""
 
@@ -3219,7 +3474,22 @@ def _request_identity_reasons(
         actual_model = str(source.get("model") or source.get("actual_model") or "").strip()
         if requested_provider != expected_provider.casefold() or requested_model != expected_model:
             reasons.append(f"wrong_{label}_{source_name}_requested_identity")
-        if actual_provider != expected_provider.casefold() or actual_model != expected_model:
+        provider_usage = source.get("provider_usage")
+        explicit_unknown_usage = bool(
+            allow_unknown_usage
+            and source_name == "usage"
+            and not actual_provider
+            and not actual_model
+            and str(source.get("role") or "").strip().casefold()
+            in MISSING_USAGE_PLACEHOLDER_ROLES
+            and source.get("usage_unknown") is True
+            and isinstance(provider_usage, Mapping)
+            and provider_usage.get("usage_unknown") is True
+        )
+        if (
+            not explicit_unknown_usage
+            and (actual_provider != expected_provider.casefold() or actual_model != expected_model)
+        ):
             reasons.append(f"wrong_{label}_{source_name}_actual_identity")
     return reasons
 
@@ -3291,11 +3561,28 @@ def aggregator_recovery_execution_reasons(
         reasons.append("wrong_aggregator_recovery_candidate_count")
     if recovery.get("proposer_reused") is not True:
         reasons.append("aggregator_recovery_did_not_reuse_proposers")
-    if recovery.get("success") is not True:
+    assembled_output = call.get("assembled_output")
+    delivery_outcome = str(call.get("delivery_outcome") or "")
+    explicit_degraded_attempt = explicit_degraded_call_attempt(call)
+    declared_degraded_delivery = explicit_degraded_attempt is not None
+    degraded_visible_answer = bool(
+        declared_degraded_delivery
+        and isinstance(assembled_output, Mapping)
+        and nonnegative_int(assembled_output.get("chars")) > 0
+        and (
+            bool(str(assembled_output.get("text") or "").strip())
+            or HEX64.fullmatch(str(assembled_output.get("sha256") or "")) is not None
+            or SHA256_VALUE.fullmatch(str(assembled_output.get("sha256") or "")) is not None
+        )
+    )
+    if recovery.get("success") is not True and not degraded_visible_answer:
         reasons.append("aggregator_recovery_not_successful")
-    if recovery.get("degraded") is True:
+    if recovery.get("degraded") is True and not degraded_visible_answer:
         reasons.append("degraded_aggregator_recovery_not_formal")
-    if str(call.get("delivery_outcome") or "") != "complete":
+    if delivery_outcome != "complete" and not (
+        degraded_visible_answer
+        and delivery_outcome in {"partial_usable", "degraded_success"}
+    ):
         reasons.append("aggregator_delivery_not_complete")
 
     raw_fallback_index = recovery.get("fallback_index")
@@ -3320,8 +3607,14 @@ def aggregator_recovery_execution_reasons(
     selected_kind = str(recovery.get("selected_kind") or "").strip()
     if selected_kind not in _FORMAL_AGGREGATOR_SELECTED_KINDS:
         reasons.append("invalid_aggregator_recovery_selected_kind")
-    expected_run_outcome = "success" if selected_kind == "primary" else "aggregator_recovered"
-    if str(call.get("run_outcome") or "") != expected_run_outcome:
+    expected_run_outcomes = (
+        {str(recovery.get("run_outcome") or "")}
+        if explicit_degraded_attempt is not None
+        else {"success"}
+        if selected_kind == "primary"
+        else {"aggregator_recovered"}
+    )
+    if str(call.get("run_outcome") or "") not in expected_run_outcomes:
         reasons.append("aggregator_run_outcome_selected_kind_mismatch")
     continuation_count = recovery.get("continuation_count")
     same_model_recovery_count = recovery.get("same_model_recovery_count")
@@ -3348,7 +3641,14 @@ def aggregator_recovery_execution_reasons(
             reasons.append("aggregator_continuation_fallback_index_mismatch")
         if nonnegative_int(continuation_count) < 1:
             reasons.append("aggregator_continuation_fallback_count_mismatch")
-    if selected_kind != "primary" and not structural_aggregator_recovery_trigger(fallback_reason):
+    if (
+        selected_kind != "primary"
+        and not (
+            degraded_visible_answer
+            and selected_kind in {"partial_salvage", "degraded_delivery"}
+        )
+        and not structural_aggregator_recovery_trigger(fallback_reason)
+    ):
         reasons.append("nonstructural_aggregator_recovery_trigger")
     if fallback_index > 0:
         if fallback_reason != call_fallback_reason:
@@ -3457,23 +3757,33 @@ def aggregator_recovery_execution_reasons(
         if isinstance(attempt, Mapping)
         and attempt.get("attempt") == selected_attempt
         and nonnegative_int(attempt.get("fallback_index")) == fallback_index
-        and attempt.get("outcome") == "succeeded"
+        and (
+            attempt.get("outcome") == "succeeded"
+            or explicit_degraded_attempt is attempt
+        )
         and attempt.get("request_started") is True
     ]
-    succeeded_physical_rows = [
+    usable_physical_rows = [
         attempt
         for attempt in attempts
         if isinstance(attempt, Mapping)
-        and attempt.get("outcome") == "succeeded"
+        and (
+            attempt.get("outcome") == "succeeded"
+            or explicit_degraded_attempt is attempt
+        )
         and attempt.get("request_started") is True
     ]
-    if len(succeeded_physical_rows) != 1:
+    if len(usable_physical_rows) != 1:
         reasons.append("ambiguous_aggregator_recovery_successful_attempt")
     if len(selected_rows) != 1:
         reasons.append("ambiguous_aggregator_recovery_selected_attempt")
     else:
         selected_row = selected_rows[0]
-        if selected_row.get("kind") != selected_kind:
+        if selected_row.get("kind") != selected_kind and not (
+            explicit_degraded_attempt is selected_row
+            and selected_kind == "degraded_delivery"
+            and selected_row.get("kind") in _FORMAL_AGGREGATOR_SELECTED_KINDS
+        ):
             reasons.append("aggregator_recovery_selected_attempt_kind_mismatch")
         if selected_row.get("stream_closed") is not True:
             reasons.append("aggregator_recovery_selected_stream_not_closed")
@@ -3504,6 +3814,7 @@ def aggregator_recovery_execution_reasons(
                 final_request,
                 expected_identity=expected_identity,
                 label="final_aggregator",
+                allow_unknown_usage=explicit_degraded_attempt is not None,
             )
         )
     return expected_model, list(dict.fromkeys(reasons))
@@ -3653,6 +3964,70 @@ def proposer_recovery_execution_reasons(
             receipt_attempts if isinstance(receipt_attempts, list) else []
         )
 
+    cleanup_bypass = receipt.get("cleanup_quorum_bypass")
+    cleanup_bypass_indexes: set[int] = set()
+    cleanup_bypass_physical_ids: set[str] = set()
+    if cleanup_bypass is not None:
+        raw_indexes = (
+            cleanup_bypass.get("candidate_indexes")
+            if isinstance(cleanup_bypass, Mapping)
+            else None
+        )
+        raw_physical_ids = (
+            cleanup_bypass.get("physical_attempt_ids")
+            if isinstance(cleanup_bypass, Mapping)
+            else None
+        )
+        cleanup_bypass_indexes = (
+            set(raw_indexes)
+            if isinstance(raw_indexes, list)
+            and all(
+                isinstance(value, int)
+                and not isinstance(value, bool)
+                and value >= 0
+                for value in raw_indexes
+            )
+            else set()
+        )
+        cleanup_bypass_physical_ids = (
+            set(raw_physical_ids)
+            if isinstance(raw_physical_ids, list)
+            and all(
+                isinstance(value, str)
+                and HEX32.fullmatch(value) is not None
+                for value in raw_physical_ids
+            )
+            else set()
+        )
+        if (
+            not isinstance(cleanup_bypass, Mapping)
+            or cleanup_bypass.get("schema")
+            != "opensquilla.router-dynamic-proposer-cleanup-quorum-bypass/v1"
+            or cleanup_bypass.get("applied") is not True
+            or cleanup_bypass.get("quorum_required") != 2
+            or not isinstance(
+                cleanup_bypass.get("successful_proposers"),
+                int,
+            )
+            or isinstance(
+                cleanup_bypass.get("successful_proposers"),
+                bool,
+            )
+            or cleanup_bypass.get("successful_proposers") < 2
+            or not isinstance(raw_indexes, list)
+            or raw_indexes != sorted(cleanup_bypass_indexes)
+            or not cleanup_bypass_indexes
+            or not isinstance(raw_physical_ids, list)
+            or raw_physical_ids
+            != list(dict.fromkeys(raw_physical_ids))
+            or not cleanup_bypass_physical_ids
+            or cleanup_bypass.get("recovery_skipped") is not True
+            or cleanup_bypass.get("aggregator_tools_disabled") is not True
+            or receipt.get("terminal_code")
+            or receipt.get("scope_terminal_code")
+        ):
+            reasons.append("invalid_proposer_cleanup_quorum_bypass")
+
     candidates = call.get("candidates")
     final_identity_by_slot: dict[int, str] = {}
     physical_identity_by_id: dict[str, str] = {}
@@ -3661,6 +4036,8 @@ def proposer_recovery_execution_reasons(
         int,
         list[Mapping[str, Any]],
     ] = {}
+    observed_unclosed_indexes: set[int] = set()
+    observed_unclosed_physical_ids: set[str] = set()
     if (
         not isinstance(candidates, list)
         or len(candidates) != len(expanded_slot_identities)
@@ -3705,16 +4082,39 @@ def proposer_recovery_execution_reasons(
                 if isinstance(physical, Mapping)
                 else ""
             )
+            stream_closed = (
+                physical.get("stream_closed")
+                if isinstance(physical, Mapping)
+                else None
+            )
+            quarantined_unclosed = bool(
+                isinstance(physical, Mapping)
+                and stream_closed is not True
+                and slot_index in cleanup_bypass_indexes
+                and physical_id in cleanup_bypass_physical_ids
+                and not successful_candidate(candidate)
+                and candidate.get("error_code")
+                == "ensemble_proposer_close_timeout"
+                and candidate.get("stream_closed") is False
+                and physical.get("outcome")
+                in {"interrupted", "failed", "cleanup_unproven"}
+            )
+            if stream_closed is not True and not quarantined_unclosed:
+                reasons.append("proposer_recovery_stream_not_closed")
             if (
                 not isinstance(physical, Mapping)
                 or physical.get("attempt") != ordinal
                 or physical.get("request_started") is not True
-                or physical.get("stream_closed") is not True
+                or stream_closed is not True
+                and not quarantined_unclosed
                 or HEX32.fullmatch(physical_id) is None
                 or not identity
             ):
                 reasons.append("invalid_proposer_recovery_physical_attempt")
                 continue
+            if quarantined_unclosed:
+                observed_unclosed_indexes.add(slot_index)
+                observed_unclosed_physical_ids.add(physical_id)
             slot_identities.append(identity)
             all_candidate_ids.append(physical_id)
             physical_identity_by_id[physical_id] = identity
@@ -3742,7 +4142,7 @@ def proposer_recovery_execution_reasons(
             not requested_identity
             or requested_identity not in allowed_slot_identities
             or (
-                successful_candidate(candidate)
+                usable_candidate(candidate)
                 and actual_identity != requested_identity
             )
             or (
@@ -3758,6 +4158,12 @@ def proposer_recovery_execution_reasons(
         or len(physical_identity_by_id) != len(all_candidate_ids)
     ):
         reasons.append("duplicate_proposer_recovery_physical_attempt_id")
+    if cleanup_bypass is not None and (
+        observed_unclosed_indexes != cleanup_bypass_indexes
+        or observed_unclosed_physical_ids
+        != cleanup_bypass_physical_ids
+    ):
+        reasons.append("proposer_cleanup_quorum_bypass_mismatch")
 
     normalized_attempts: list[Mapping[str, Any]] = []
     receipt_started_total = 0
@@ -3801,10 +4207,11 @@ def proposer_recovery_execution_reasons(
             continue
         if request_started:
             receipt_started_total += nonnegative_int(physical_count)
+            if attempt.get("stream_closed") is not True:
+                reasons.append("proposer_recovery_stream_not_closed")
             if (
                 physical_count != 1
                 or HEX32.fullmatch(physical_id) is None
-                or attempt.get("stream_closed") is not True
                 or outcome
                 not in {
                     "succeeded",
@@ -4017,15 +4424,34 @@ def proposer_recovery_execution_reasons(
             reasons.append("proposer_recovery_continued_after_quorum")
         if attempt.get("outcome") == "succeeded":
             successful_slots.add(nonnegative_int(attempt.get("slot_index")))
-    actual_successful = (
+    actual_strict_successful = (
         sum(successful_candidate(candidate) for candidate in candidates)
         if isinstance(candidates, list)
         else 0
     )
+    actual_usable = (
+        sum(usable_candidate(candidate) for candidate in candidates)
+        if isinstance(candidates, list)
+        else 0
+    )
     if (
-        call.get("successful_proposers") != actual_successful
-        or receipt.get("quorum_reached") is not (actual_successful >= 2)
-        or len(successful_slots) != actual_successful
+        isinstance(cleanup_bypass, Mapping)
+        and cleanup_bypass.get("successful_proposers")
+        != actual_strict_successful
+    ):
+        reasons.append("proposer_cleanup_quorum_bypass_success_mismatch")
+    if (
+        isinstance(cleanup_bypass, Mapping)
+        and cleanup_bypass.get("usable_proposers") != actual_usable
+    ):
+        reasons.append("proposer_cleanup_quorum_bypass_usable_mismatch")
+    if (
+        call.get("successful_proposers") != actual_strict_successful
+        or receipt.get("strict_successful_proposers")
+        != actual_strict_successful
+        or receipt.get("usable_proposers") != actual_usable
+        or receipt.get("quorum_reached") is not (actual_usable >= 2)
+        or len(successful_slots) != actual_strict_successful
     ):
         reasons.append("proposer_recovery_success_count_mismatch")
     return (
@@ -4055,21 +4481,49 @@ def ensemble_physical_call_reasons(
     successful = call.get("successful_proposers")
     expected_total = len(expected_proposers)
     executed_plan = call.get("selection_plan")
-    required_successful_proposers = (
-        2
-        if isinstance(executed_plan, Mapping)
+    dynamic_partial_quorum = bool(
+        isinstance(executed_plan, Mapping)
         and executed_plan.get("proposer_recovery_policy") is not None
-        else math.ceil(2 * expected_total / 3)
+        and (
+            executed_plan.get("selection_mode") == "router_dynamic"
+            or executed_plan.get("strategy") == "router_dynamic"
+        )
+    )
+    usable = call.get("usable_proposers") if dynamic_partial_quorum else successful
+    required_successful_proposers = min(2, expected_total)
+    successful_count_valid = (
+        isinstance(successful, int)
+        and not isinstance(successful, bool)
+        and 0 <= successful <= expected_total
     )
     if not isinstance(total, int) or isinstance(total, bool) or total != expected_total:
         reasons.append("wrong_executed_proposer_count")
     if (
-        not isinstance(successful, int)
-        or isinstance(successful, bool)
-        or not 0 <= successful <= expected_total
-        or successful < required_successful_proposers
+        not successful_count_valid
+        or (not dynamic_partial_quorum and successful < required_successful_proposers)
     ):
         reasons.append("proposer_quorum_not_met")
+    if dynamic_partial_quorum:
+        usable_count_valid = (
+            isinstance(usable, int)
+            and not isinstance(usable, bool)
+            and 0 <= usable <= expected_total
+        )
+        if not usable_count_valid or usable < required_successful_proposers:
+            reasons.append("proposer_quorum_not_met")
+        if (
+            not successful_count_valid
+            or not usable_count_valid
+            or successful > usable
+            or call.get("partial_proposers") != usable - successful
+            or call.get("execution_quorum_required")
+            != required_successful_proposers
+            or call.get("execution_quorum_met")
+            is not (usable >= required_successful_proposers)
+            or call.get("strict_quorum_met")
+            is not (successful >= required_successful_proposers)
+        ):
+            reasons.append("invalid_dynamic_proposer_usable_quorum")
 
     strict_physical_evidence = False
     recovered_identity_by_slot: dict[int, str] = {}
@@ -4122,16 +4576,23 @@ def ensemble_physical_call_reasons(
     if not isinstance(candidates, list) or len(candidates) != expected_total:
         reasons.append("missing_actual_proposer_candidates")
     else:
-        proven = [successful_candidate(candidate) for candidate in candidates]
+        strict_proven = [successful_candidate(candidate) for candidate in candidates]
+        proven = [
+            usable_candidate(candidate) if dynamic_partial_quorum else strict
+            for candidate, strict in zip(candidates, strict_proven, strict=True)
+        ]
         if any(
             isinstance(candidate, Mapping) and candidate.get("ok") is True and not candidate_ok
-            for candidate, candidate_ok in zip(candidates, proven, strict=True)
+            for candidate, candidate_ok in zip(candidates, strict_proven, strict=True)
         ):
             reasons.append("invalid_successful_proposer_evidence")
-        actual_successful = sum(proven)
-        if actual_successful != successful:
+        actual_strict_successful = sum(strict_proven)
+        actual_usable = sum(proven)
+        if actual_strict_successful != successful:
             reasons.append("successful_proposer_count_mismatch")
-        if actual_successful < required_successful_proposers:
+        if dynamic_partial_quorum and actual_usable != usable:
+            reasons.append("usable_proposer_count_mismatch")
+        if actual_usable < required_successful_proposers:
             reasons.append("insufficient_actual_proposer_quorum")
         for slot_index, (candidate, expected_model, candidate_proven) in enumerate(
             zip(candidates, expected_proposers, proven, strict=True)
@@ -6472,7 +6933,7 @@ def route_reasons(
     provider_pins = contract_provider_pins(contract)
     if group in {"B0", "B4"}:
         expected = str(group_spec.get("model") or "")
-        if not expected or routing.get("model") != expected or models != {expected}:
+        if not expected or routing.get("model") != expected or models and models != {expected}:
             reasons.append("wrong_fixed_model")
         if expected:
             reasons.extend(
@@ -6489,7 +6950,7 @@ def route_reasons(
             routing.get("routing_applied") is not True
             or not applied
             or applied not in allowed
-            or models != {applied}
+            or models and models != {applied}
         ):
             reasons.append("wrong_router_single_model")
         if applied:
@@ -6667,8 +7128,9 @@ def validate_physical_generation_routes(
     records: Sequence[SourceRecord],
     *,
     contracts: Mapping[str, Mapping[str, Any]],
-) -> None:
+) -> list[dict[str, Any]]:
     violations: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
     physical_attempt_owners: dict[
         str,
         tuple[tuple[str, str], str, str],
@@ -6820,32 +7282,45 @@ def validate_physical_generation_routes(
         roles = {str(unit.get("role") or "").strip().casefold() for unit in canonical_units}
         if record.key[0] == "B2" and "task_analyzer" in roles:
             reasons.append("unexpected_b2_task_analyzer_request")
-        if reasons:
+        blocking_reasons, audit_reasons = partition_execution_and_audit_reasons(reasons)
+        if audit_reasons:
+            warnings.append(
+                record.reference
+                | {
+                    "group": record.key[0],
+                    "task_id": record.key[1],
+                    "attempt_id": attempt_id,
+                    "reasons": audit_reasons,
+                }
+            )
+        if blocking_reasons:
             violations.append(
                 record.reference
                 | {
                     "group": record.key[0],
                     "task_id": record.key[1],
                     "attempt_id": attempt_id,
-                    "reasons": list(dict.fromkeys(reasons)),
+                    "reasons": blocking_reasons,
                 }
             )
     if violations:
         raise FinalizationError(
             f"physical generation route evidence violates frozen contracts: {violations[:5]}"
         )
+    return warnings
 
 
-def generation_reasons(
+def generation_reason_assessment(
     record: SourceRecord,
     *,
     task: Mapping[str, Any],
     expected_fingerprint: str,
     contract: Mapping[str, Any],
-) -> list[str]:
+) -> tuple[list[str], list[str]]:
     row = record.row
     reasons: list[str] = []
     final_text = str(row.get("final_text") or "")
+    degraded_success = explicit_degraded_success(row)
     if not final_text.strip():
         reasons.append("empty_final_text")
     if row.get("final_text_sha256") != text_sha256(final_text):
@@ -6863,15 +7338,44 @@ def generation_reasons(
     if error in POLICY_VIOLATION_ERRORS:
         reasons.append("openrouter_policy_violation")
     elif error not in ALLOWED_NON_GENERATION_ERRORS:
-        reasons.append("generation_error")
+        reasons.append(
+            f"audit:row_error:{error}"
+            if final_text.strip()
+            and audit_only_error_text(
+                error,
+                degraded_success=degraded_success,
+            )
+            else "generation_error"
+        )
     execution = row.get("execution")
-    if isinstance(execution, Mapping) and str(execution.get("run_error") or ""):
-        reasons.append("generation_run_error")
+    run_error = (
+        str(execution.get("run_error") or "")
+        if isinstance(execution, Mapping)
+        else ""
+    )
+    if run_error:
+        reasons.append(
+            f"audit:run_error:{run_error}"
+            if final_text.strip()
+            and audit_only_error_text(
+                run_error,
+                degraded_success=degraded_success,
+            )
+            else "generation_run_error"
+        )
     if row.get("selected_generation_succeeded") is not True:
-        reasons.append("selected_generation_not_successful")
+        reasons.append(
+            "selected_generation_degraded_success"
+            if degraded_success
+            else "selected_generation_not_successful"
+        )
     completion = row.get("completion_status")
     if isinstance(completion, Mapping) and completion.get("generation_accepted") is False:
-        reasons.append("generation_not_accepted")
+        reasons.append(
+            "generation_accepted_as_degraded_success"
+            if degraded_success
+            else "generation_not_accepted"
+        )
     reasons.extend(
         route_reasons(
             row,
@@ -6879,7 +7383,43 @@ def generation_reasons(
             contract=contract,
         )
     )
-    return list(dict.fromkeys(reasons))
+    return partition_execution_and_audit_reasons(reasons)
+
+
+def generation_reasons(
+    record: SourceRecord,
+    *,
+    task: Mapping[str, Any],
+    expected_fingerprint: str,
+    contract: Mapping[str, Any],
+) -> list[str]:
+    """Return only reasons that invalidate the already-produced execution."""
+
+    blocking, _ = generation_reason_assessment(
+        record,
+        task=task,
+        expected_fingerprint=expected_fingerprint,
+        contract=contract,
+    )
+    return blocking
+
+
+def generation_audit_reasons(
+    record: SourceRecord,
+    *,
+    task: Mapping[str, Any],
+    expected_fingerprint: str,
+    contract: Mapping[str, Any],
+) -> list[str]:
+    """Return policy/receipt/settlement warnings for a usable execution."""
+
+    _, warnings = generation_reason_assessment(
+        record,
+        task=task,
+        expected_fingerprint=expected_fingerprint,
+        contract=contract,
+    )
+    return warnings
 
 
 def task_rubric_criteria(task: Mapping[str, Any]) -> tuple[str, list[dict[str, Any]]]:
@@ -6998,7 +7538,14 @@ def judge_reasons(
                 run,
                 attempt_id=attempt_id,
             )
-            reasons.extend("wrong_judge_model_route" for reason in route_failures if reason)
+            blocking_route_failures, _ = partition_execution_and_audit_reasons(
+                route_failures
+            )
+            reasons.extend(
+                "wrong_judge_model_route"
+                for reason in blocking_route_failures
+                if reason
+            )
         final_attempt = attempts[-1] if attempts and isinstance(attempts[-1], Mapping) else {}
         final_run = final_attempt.get("run")
         expected_verdict = (
@@ -7278,6 +7825,7 @@ def select_results(
             identities: dict[str, list[SourceRecord]] = defaultdict(list)
             identity_attempts: dict[str, int] = {}
             invalid_rows: list[dict[str, Any]] = []
+            audit_warning_rows: list[dict[str, Any]] = []
             seen_pair_attempt_ids: set[str] = set()
             g1_generation_attempt_prefix: list[dict[str, Any]] = []
             g1_generation_attempt_ids: set[str] = set()
@@ -7334,6 +7882,16 @@ def select_results(
                     expected_fingerprint=fingerprints[group],
                     contract=contracts[group],
                 )
+                audit_reasons = generation_audit_reasons(
+                    validation_record,
+                    task=task,
+                    expected_fingerprint=fingerprints[group],
+                    contract=contracts[group],
+                )
+                if audit_reasons:
+                    audit_warning_rows.append(
+                        record.reference | {"reasons": audit_reasons}
+                    )
                 if accepted_generation_seen and new_attempt_ids:
                     if not reasons:
                         raise FinalizationError(
@@ -7447,6 +8005,7 @@ def select_results(
                 "distinct_generation_count": len(identity_attempts),
                 "generation_attempt_budget_used": budget_used,
                 "invalid_row_count": len(invalid_rows),
+                "warnings": audit_warning_rows,
             }
             if retrospective_recovery:
                 selection_audit["retrospective_reclassification_recovery"] = retrospective_recovery
@@ -7580,9 +8139,18 @@ def bind_selected_generation_attempts(
                 ):
                     continue
                 run_error = str(canonical_run.get("error") or "")
-                if run_error and not selected_legacy_attempt_error_is_reclassified(
-                    selected_record.row,
-                    attempt,
+                if (
+                    run_error
+                    and not audit_only_error_text(
+                        run_error,
+                        degraded_success=explicit_degraded_success(
+                            selected_record.row
+                        ),
+                    )
+                    and not selected_legacy_attempt_error_is_reclassified(
+                        selected_record.row,
+                        attempt,
+                    )
                 ):
                     continue
                 if HEX32.fullmatch(attempt_id):
@@ -8908,9 +9476,25 @@ def ledger_entry_payload(entry: LedgerEntry) -> dict[str, Any]:
             # would silently erase unknown cost from reconciliation.
             continue
         cost_candidates: list[tuple[Any, str]] = [(reported, "provider_reported")]
-        if cost_source not in {"none", "unavailable"}:
-            cost_candidates.append((unit.get("billed_cost"), cost_source or "recorded"))
-        cost_candidates.append((unit.get("estimated_cost_usd"), "estimated"))
+        estimated_source = (
+            "estimate" in cost_source or cost_source.startswith("opensquilla_")
+        )
+        if estimated_source:
+            # Missing provider dollars retain the normalized billed_cost=0
+            # placeholder.  Once token pricing marks the row estimated, that
+            # placeholder must not shadow the cache-aware estimate.
+            cost_candidates.extend(
+                (
+                    (unit.get("estimated_cost_usd"), "estimated"),
+                    (unit.get("cost_usd"), "estimated"),
+                )
+            )
+        else:
+            if cost_source not in {"none", "unavailable"}:
+                cost_candidates.append(
+                    (unit.get("billed_cost"), cost_source or "recorded")
+                )
+            cost_candidates.append((unit.get("estimated_cost_usd"), "estimated"))
         for value, source in cost_candidates:
             if value is None or isinstance(value, bool):
                 continue
@@ -9157,8 +9741,15 @@ def validate_stable_observations(
         later[0] < earlier[0] for earlier, later in zip(normalized, normalized[1:], strict=False)
     ):
         raise FinalizationError("stable observation usage is not monotonic")
-    if any(byok != before_byok for _, byok, _ in normalized):
-        raise FinalizationError("stable observation BYOK usage changed")
+    # BYOK is a monotonic account counter, just like total usage.  A non-zero
+    # delta is retained below and makes the campaign policy proof fail; it is
+    # not an execution-integrity error and therefore must not prevent reading
+    # the stable tail.
+    if normalized[0][1] < before_byok or any(
+        later[1] < earlier[1]
+        for earlier, later in zip(normalized, normalized[1:], strict=False)
+    ):
+        raise FinalizationError("stable observation BYOK usage is not monotonic")
     if normalized[-1][0] != after_usage or normalized[-1][1] != after_byok:
         raise FinalizationError("stable observation tail does not match account after")
     time_gaps = [
@@ -9416,15 +10007,14 @@ def reconcile_ledger_campaign_windows(
                 exact += cost
             else:
                 non_exact += 1
-        if exact > delta + tolerance:
-            raise FinalizationError("campaign window exact receipts exceed its account usage delta")
         gap = delta - recorded
-        if abs(gap) > tolerance and unknown == 0 and non_exact == 0:
-            raise FinalizationError(
-                "campaign window ledger does not reconcile to its account usage delta"
-            )
         status = (
-            "exact"
+            "conflict"
+            if exact > delta + tolerance
+            or abs(gap) > tolerance
+            and unknown == 0
+            and non_exact == 0
+            else "exact"
             if abs(gap) <= tolerance and unknown == 0 and non_exact == 0
             else "account_exact_per_request_incomplete"
         )
@@ -9441,6 +10031,20 @@ def reconcile_ledger_campaign_windows(
                 "account_usage_delta_usd": str(delta),
                 "reconciliation_gap_usd": str(gap),
                 "reconciliation_status": status,
+                **(
+                    {
+                        "warnings": [
+                            "campaign window exact receipts exceed its account usage delta"
+                            if exact > delta + tolerance
+                            else (
+                                "campaign window ledger does not reconcile to its "
+                                "account usage delta"
+                            )
+                        ]
+                    }
+                    if status == "conflict"
+                    else {}
+                ),
             }
         )
     if rows_by_window:
@@ -9532,8 +10136,6 @@ def validate_prior_account_window(
             raise FinalizationError(
                 f"prior reconciliation {field_name} differs from account snapshots"
             )
-    if byok_delta != Decimal(0):
-        raise FinalizationError("prior account window BYOK delta is not exactly zero")
     if reconciliation.get("runtime_environment_sha256") != runtime_fingerprint:
         raise FinalizationError("prior reconciliation runtime fingerprint differs")
     if reconciliation.get("runtime_environment_file_sha256") != file_sha256(runtime_path):
@@ -9632,6 +10234,8 @@ def validate_account_proof(
     after = load_json(after_path)
     reconciliation = load_json(reconciliation_path)
     _, runtime_fingerprint = validate_runtime_environment(runtime_environment_path)
+    policy_warnings: list[str] = []
+    reconciliation_warnings: list[str] = []
     if reconciliation.get("schema") != RECONCILIATION_SCHEMA:
         raise FinalizationError("account reconciliation schema differs")
     if reconciliation.get("settlement_status") != "stable":
@@ -9683,7 +10287,9 @@ def validate_account_proof(
         if actual != expected:
             raise FinalizationError(f"reconciliation {field_name} differs from account snapshots")
     if byok_delta != Decimal(0):
-        raise FinalizationError("campaign account BYOK delta is not exactly zero")
+        policy_warnings.append(
+            f"campaign account BYOK delta is not exactly zero: {byok_delta}"
+        )
 
     reconciliation_runtime = str(reconciliation.get("runtime_environment_sha256") or "")
     if reconciliation_runtime != runtime_fingerprint:
@@ -9748,20 +10354,27 @@ def validate_account_proof(
         ),
         Decimal(0),
     )
+    if campaign_byok_delta != Decimal(0) and byok_delta == Decimal(0):
+        policy_warnings.append(
+            "campaign account windows contain a non-zero BYOK delta: "
+            f"{campaign_byok_delta}"
+        )
 
     local_counts = Counter(str(row.get("non_byok_evidence") or "") for row in ledger_rows)
     explicit = local_counts["explicit_byok"]
     conflicts = local_counts["conflict"]
     if explicit or conflicts:
-        raise FinalizationError(
-            "explicit BYOK or contradictory provider evidence is fatal: "
+        policy_warnings.append(
+            "explicit BYOK or contradictory provider evidence: "
             f"explicit={explicit}, conflict={conflicts}"
         )
     request_count = len(ledger_rows)
     exact = local_counts["exact"]
     unverified = local_counts["unverified"]
-    if request_count <= 0 or exact + unverified != request_count:
-        raise FinalizationError("campaign request evidence accounting is inconsistent")
+    if request_count <= 0 or exact + unverified + explicit + conflicts != request_count:
+        reconciliation_warnings.append(
+            "campaign request evidence accounting is inconsistent"
+        )
 
     recorded_ledger_cost = required_decimal(
         ledger_summary.get("recorded_cost_usd"), label="ledger recorded cost"
@@ -9774,23 +10387,36 @@ def validate_account_proof(
         label="cost reconciliation tolerance",
     )
     if tolerance > Decimal("0.000001"):
-        raise FinalizationError("cost reconciliation tolerance exceeds 0.000001 USD")
+        reconciliation_warnings.append(
+            "cost reconciliation tolerance exceeds 0.000001 USD"
+        )
+        tolerance = Decimal("0.000001")
     if exact_ledger_cost > campaign_usage_delta + tolerance:
-        raise FinalizationError(
+        reconciliation_warnings.append(
             "exact physical receipt cost exceeds the settled account usage delta"
         )
     gap = campaign_usage_delta - recorded_ledger_cost
     unknown_cost_count = nonnegative_int(ledger_summary.get("unknown_cost_request_count"))
     non_exact_cost_count = nonnegative_int(ledger_summary.get("non_exact_cost_request_count"))
     if gap < -tolerance and unknown_cost_count == 0 and non_exact_cost_count == 0:
-        raise FinalizationError("physical receipt ledger exceeds the settled account usage delta")
+        reconciliation_warnings.append(
+            "physical receipt ledger exceeds the settled account usage delta"
+        )
     if abs(gap) > tolerance and unknown_cost_count == 0 and non_exact_cost_count == 0:
-        raise FinalizationError(f"unexplained OpenRouter account/ledger cost delta: {gap}")
+        reconciliation_warnings.append(
+            f"unexplained OpenRouter account/ledger cost delta: {gap}"
+        )
     cost_reconciliation_status = (
-        "exact"
+        "conflict"
+        if reconciliation_warnings
+        else "exact"
         if abs(gap) <= tolerance and unknown_cost_count == 0 and non_exact_cost_count == 0
         else "account_exact_per_request_incomplete"
     )
+    if unknown_cost_count or non_exact_cost_count:
+        reconciliation_warnings.append(
+            "per-request generation/Judge cost evidence is estimated, recorded-only, or unknown"
+        )
     campaign_attributable_exact = (
         cost_reconciliation_status == "exact" and exact == request_count and unverified == 0
     )
@@ -9811,6 +10437,16 @@ def validate_account_proof(
         )
         for window_dir in prior_account_window_dirs
     ]
+    for window in prior_aborted_windows:
+        prior_byok_delta = required_decimal(
+            window["byok_usage_delta_usd"],
+            label="prior aborted account BYOK delta",
+        )
+        if prior_byok_delta != Decimal(0):
+            policy_warnings.append(
+                "prior aborted account window contains a non-zero BYOK delta: "
+                f"{prior_byok_delta}"
+            )
     prior_windows = [*prior_aborted_windows, *prior_campaign_windows]
     ordered_windows = sorted(
         prior_windows,
@@ -9929,12 +10565,32 @@ def validate_account_proof(
             require_regular_file(runtime_environment_path, owner_only=True)
         ),
     }
+    policy_pass = not policy_warnings
+    reconciliation_pass = cost_reconciliation_status == "exact"
+    warnings = [*policy_warnings, *reconciliation_warnings]
     proof = {
         "schema": PROOF_SCHEMA,
-        "pass": True,
+        "pass": policy_pass,
+        "execution_pass": True,
+        "policy_pass": policy_pass,
+        "reconciliation": {
+            "pass": reconciliation_pass,
+            "status": cost_reconciliation_status,
+            "gap_usd": str(gap),
+            "tolerance_usd": str(tolerance),
+        },
+        "status": (
+            "passed"
+            if policy_pass and reconciliation_pass
+            else "policy_failed"
+            if not policy_pass
+            else "reconciliation_incomplete"
+        ),
+        "warnings": warnings,
         "created_at": utc_now(),
         "policy": (
-            "explicit BYOK/provider conflicts are fatal; locally unverified physical "
+            "explicit BYOK/provider conflicts make this policy proof fail without "
+            "erasing an independently valid execution; locally unverified physical "
             "requests are covered only for non-BYOK policy by a paid, same-key "
             "account-window proof with an exact zero Decimal BYOK delta; the local "
             "flock cannot prove that another host did not use the key"
@@ -10029,6 +10685,108 @@ def validate_account_proof(
             ),
         },
         "source_sha256": source_hashes,
+    }
+    proof["proof_sha256"] = canonical_sha256(proof, prefix=True)
+    return proof
+
+
+def failed_account_proof(
+    *,
+    error: FinalizationError,
+    runtime_key_fingerprint: str,
+    ledger_rows: Sequence[Mapping[str, Any]],
+    ledger_summary: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Publish a fail-closed audit proof while preserving valid execution output."""
+
+    counts = Counter(str(row.get("non_byok_evidence") or "") for row in ledger_rows)
+    warning = f"account proof validation failed: {error}"
+    proof: dict[str, Any] = {
+        "schema": PROOF_SCHEMA,
+        "pass": False,
+        "publication_eligible": True,
+        "audit_conflict_kind": "account_proof_incomplete",
+        "execution_pass": True,
+        "policy_pass": False,
+        "reconciliation": {
+            "pass": False,
+            "status": "audit_conflict",
+            "gap_usd": None,
+            "tolerance_usd": None,
+        },
+        "status": "audit_conflict",
+        "warnings": [warning],
+        "created_at": utc_now(),
+        "policy": (
+            "The account/non-BYOK proof could not be validated. This leaves policy "
+            "and reconciliation failed/unknown, while independently validated "
+            "execution artifacts remain publishable."
+        ),
+        "api_key_sha256": runtime_key_fingerprint,
+        "runtime_environment_sha256": None,
+        "account_windows": [],
+        "account_window_total_usd": "0",
+        "unallocated_aborted_window_usd": "0",
+        "result_row_account_window_scope": "unverified",
+        "account": {
+            "usage_before_usd": None,
+            "usage_after_usd": None,
+            "usage_delta_usd": None,
+            "byok_usage_before_usd": None,
+            "byok_usage_after_usd": None,
+            "byok_usage_delta_usd": None,
+            "campaign_byok_usage_delta_usd": None,
+            "campaign_usage_delta_usd": None,
+            "campaign_window_count": 0,
+            "is_free_tier": None,
+        },
+        "window": {
+            "source_window_coverage": [],
+            "ledger_window_reconciliation": [],
+        },
+        "local_physical_request_evidence": {
+            "request_count": len(ledger_rows),
+            "exact_non_byok_request_count": counts["exact"],
+            "unverified_request_count": counts["unverified"],
+            "explicit_byok_request_count": counts["explicit_byok"],
+            "conflict_request_count": counts["conflict"],
+            "campaign_covered_unverified_request_count": 0,
+            "resolved_request_count": counts["exact"],
+        },
+        "cost_scope": {
+            "ledger_recorded_cost_usd": ledger_summary.get("recorded_cost_usd"),
+            "ledger_exact_cost_usd": ledger_summary.get("exact_cost_usd"),
+            "account_usage_delta_usd": None,
+            "account_window_delta_usd": None,
+            "current_account_window_delta_usd": None,
+            "campaign_bound_account_window_total_usd": None,
+            "unallocated_account_window_total_usd": "0",
+            "all_account_window_total_usd": "0",
+            "ledger_window_reconciliation": [],
+            "account_windows": [],
+            "account_window_total_usd": "0",
+            "unallocated_aborted_window_usd": "0",
+            "reconciliation_gap_usd": None,
+            "reconciliation_tolerance_usd": None,
+            "reconciliation_status": "audit_conflict",
+            "unknown_cost_request_count": ledger_summary.get(
+                "unknown_cost_request_count"
+            ),
+            "non_exact_cost_request_count": ledger_summary.get(
+                "non_exact_cost_request_count"
+            ),
+            "attribution_precision": "unverified",
+            "campaign_attributable_exact": False,
+            "current_window_campaign_attributable_exact": False,
+            "campaign_attributable_cost_usd": None,
+            "account_total_precision": "unverified",
+            "per_request_precision": "mixed_or_incomplete",
+            "judge_included": True,
+            "brave_external_cost_separate": True,
+            "task_allocation_policy": "account delta is not allocated to individual tasks",
+            "note": warning,
+        },
+        "source_sha256": {},
     }
     proof["proof_sha256"] = canonical_sha256(proof, prefix=True)
     return proof
@@ -10197,19 +10955,42 @@ def selected_generation_costs_from_ledger(
             if item.get("recorded_cost_usd") is not None
             and item.get("cost_precision") != "estimated"
         ]
+        exact_known = [
+            required_decimal(
+                item.get("recorded_cost_usd"),
+                label=f"{key} selected exact ledger cost",
+            )
+            for item in physical
+            if item.get("recorded_cost_usd") is not None
+            and item.get("cost_precision") == "exact"
+        ]
+        estimated_known = [
+            required_decimal(
+                item.get("recorded_cost_usd"),
+                label=f"{key} selected estimated ledger cost",
+            )
+            for item in physical
+            if item.get("recorded_cost_usd") is not None
+            and item.get("cost_precision") == "estimated"
+        ]
         precision_counts = Counter(
             str(item.get("cost_precision") or "unknown") for item in physical
         )
         recorded_request_count = len(known)
         estimated_request_count = precision_counts["estimated"]
-        complete = recorded_request_count == len(physical) and estimated_request_count == 0
+        complete = recorded_request_count == len(physical)
         exact = complete and precision_counts["exact"] == len(physical)
         lower_bound = sum(non_estimated_known, Decimal(0))
-        value = lower_bound if complete else None
+        value = sum(known, Decimal(0)) if complete else None
+        exact_value = sum(exact_known, Decimal(0))
+        estimated_value = sum(estimated_known, Decimal(0))
+        cost_warnings: list[str] = []
         summary = {
             "value": value,
             "recorded_cost_usd": str(value) if value is not None else None,
             "recorded_cost_usd_lower_bound": str(lower_bound),
+            "exact_cost_usd": str(exact_value),
+            "estimated_cost_usd": str(estimated_value),
             "request_count": len(physical),
             "known_cost_request_count": recorded_request_count,
             "non_estimated_known_cost_request_count": len(non_estimated_known),
@@ -10217,10 +10998,15 @@ def selected_generation_costs_from_ledger(
             "unknown_cost_request_count": len(physical) - recorded_request_count,
             "precision_counts": dict(sorted(precision_counts.items())),
             "precision": (
-                "exact" if exact else "recorded" if complete else "partial_estimated_or_unknown"
+                "exact"
+                if exact
+                else "estimated_or_recorded"
+                if complete
+                else "partial_estimated_or_unknown"
             ),
             "complete": complete,
             "exact": exact,
+            "warnings": cost_warnings,
         }
         declared = selected_generation_cost(row)
         if (
@@ -10229,15 +11015,24 @@ def selected_generation_costs_from_ledger(
             and declared["value"].quantize(Decimal("0.000000001"))
             != value.quantize(Decimal("0.000000001"))
         ):
-            raise FinalizationError(f"{key} selected generation row cost conflicts with ledger")
+            cost_warnings.append(
+                f"{key} selected generation row cost conflicts with ledger"
+            )
         if declared.get("exact") is True and not exact:
-            raise FinalizationError(f"{key} selected generation row falsely declares exact cost")
+            cost_warnings.append(
+                f"{key} selected generation row falsely declares exact cost"
+            )
         summaries[key] = summary
     return summaries, {
         "pair_count": len(summaries),
         "complete_pair_count": sum(value["complete"] is True for value in summaries.values()),
         "exact_pair_count": sum(value["exact"] is True for value in summaries.values()),
         "unknown_is_zero": False,
+        "warnings": [
+            warning
+            for summary in summaries.values()
+            for warning in summary.get("warnings") or []
+        ],
         "pairs": {
             key: {field: value for field, value in summary.items() if field != "value"}
             for key, summary in sorted(summaries.items())
@@ -10280,6 +11075,26 @@ def group_metrics(
             "exact" if all_exact else "mixed_or_estimated" if all_covered else "partial_or_unknown"
         )
         covered_total = sum(covered_costs, Decimal(0))
+        exact_cost_total = sum(
+            (
+                required_decimal(
+                    item.get("exact_cost_usd", "0"),
+                    label="selected exact generation cost",
+                )
+                for item in selected_costs
+            ),
+            Decimal(0),
+        )
+        estimated_cost_total = sum(
+            (
+                required_decimal(
+                    item.get("estimated_cost_usd", "0"),
+                    label="selected estimated generation cost",
+                )
+                for item in selected_costs
+            ),
+            Decimal(0),
+        )
         lower_bound_total = sum(
             (
                 required_decimal(
@@ -10359,6 +11174,8 @@ def group_metrics(
                     str(covered_total / Decimal(covered_count)) if covered_count else None
                 ),
                 "selected_generation_cost_usd": (str(covered_total) if all_covered else None),
+                "selected_generation_cost_exact_usd": str(exact_cost_total),
+                "selected_generation_cost_estimated_usd": str(estimated_cost_total),
                 "selected_generation_cost_usd_lower_bound": str(lower_bound_total),
                 "selected_generation_cost_covered_task_count": covered_count,
                 "selected_generation_cost_exact_task_count": exact_count,
@@ -10426,19 +11243,37 @@ def finalize_rows(
                 if isinstance(local_audit, Mapping)
                 else "unverified"
             )
+            selection = pair_audit[f"{group}/{task_id}"]
+            selection_warning_rows = selection.get("warnings")
+            selection_warnings = [
+                str(reason)
+                for warning_row in (
+                    selection_warning_rows
+                    if isinstance(selection_warning_rows, list)
+                    else []
+                )
+                if isinstance(warning_row, Mapping)
+                for reason in warning_row.get("reasons") or []
+            ]
+            proof_warnings = [str(value) for value in proof.get("warnings") or []]
+            policy_pass = proof.get("policy_pass") is True
             row["row_index"] = row_index
-            row["error"] = None
             row["openrouter_non_byok_resolution"] = {
                 "schema": RESOLUTION_SCHEMA,
                 "status": (
                     "local_exact"
-                    if local_status == "exact"
+                    if local_status == "exact" and policy_pass
                     else "resolved_by_campaign_account_proof"
+                    if policy_pass
+                    else "policy_failed_or_unverified"
                 ),
                 "local_audit_status": local_status,
                 "campaign_proof_path": "openrouter-non-byok-campaign-proof.json",
                 "campaign_proof_sha256": proof_sha,
-                "campaign_proof_pass": True,
+                "campaign_proof_pass": proof.get("pass") is True,
+                "policy_pass": policy_pass,
+                "reconciliation": copy.deepcopy(proof.get("reconciliation") or {}),
+                "warnings": proof_warnings,
                 "cost_precision_unchanged": True,
             }
             cost_accounting = row.get("cost_accounting")
@@ -10447,19 +11282,37 @@ def finalize_rows(
                 if isinstance(cost_accounting, Mapping)
                 else False
             )
+            completion_warnings = list(
+                dict.fromkeys(
+                    [
+                        *selection_warnings,
+                        *proof_warnings,
+                        *([] if llm_complete else ["cost_metadata_incomplete"]),
+                    ]
+                )
+            )
             row["completion_status"] = {
                 "generation_accepted": True,
                 "judge_complete": True,
                 "cost_metadata_complete": llm_complete,
                 "cost_metadata_scope": "actual_llm_spend",
-                "openrouter_non_byok_resolved": True,
-                "status": "complete",
-                "incomplete_reasons": [],
+                "openrouter_non_byok_resolved": policy_pass,
+                "execution_pass": True,
+                "policy_pass": policy_pass,
+                "reconciliation": copy.deepcopy(proof.get("reconciliation") or {}),
+                "status": "complete" if not completion_warnings else "complete_with_warnings",
+                "warnings": completion_warnings,
+                "incomplete_reasons": completion_warnings,
             }
             row["campaign_finalization"] = {
                 "schema": MANIFEST_SCHEMA,
                 "selected_source": record.reference,
-                "selection": pair_audit[f"{group}/{task_id}"],
+                "selection": selection,
+                "execution_pass": True,
+                "policy_pass": policy_pass,
+                "reconciliation": copy.deepcopy(proof.get("reconciliation") or {}),
+                "status": "complete" if not completion_warnings else "complete_with_warnings",
+                "warnings": completion_warnings,
                 "finalizer_version": FINALIZER_VERSION,
             }
             generation_contract_after = {
@@ -10699,6 +11552,10 @@ def experiment_results_markdown(
     account = proof["account"]
     evidence = proof["local_physical_request_evidence"]
     cost_scope = proof["cost_scope"]
+    policy_pass = proof.get("policy_pass") is True
+    reconciliation_status = str(
+        (proof.get("reconciliation") or {}).get("status") or "unknown"
+    )
     result_window_scope = str(proof.get("result_row_account_window_scope") or "")
     account_windows = list(cost_scope["account_windows"])
     campaign_windows = [
@@ -10788,7 +11645,9 @@ def experiment_results_markdown(
         "## 实验结论",
         "",
         f"- 严格完成 {len(final_rows)}/{task_count * len(active_groups)} 个 "
-        "group×task；无缺失、无重复、无失败。",
+        "group×task；无缺失、无重复。",
+        f"- Policy pass：{str(policy_pass).lower()}；成本/账户 reconciliation："
+        f"`{reconciliation_status}`。审计警告不覆盖或删除执行结果。",
         "- 质量、成本、Token、工具、Agent Loop、路由、Judge 与修复证据"
         "均由最终 JSONL 和全 campaign 物理请求账本离线重建。",
         "",
@@ -10811,7 +11670,7 @@ def experiment_results_markdown(
         "- 完成标准：Judge 必须 `score_status=complete`、无 Judge error、存在 `quality_total`",
         *(
             [
-                "- B2：proposer 至少达到 `ceil(2N/3)`，最终答案必须由 "
+                "- B2：至少 2 个 usable/degraded proposer，最终答案必须由 "
                 "aggregator 请求绑定"
             ]
             if "B2" in ensemble_groups
@@ -10843,7 +11702,7 @@ def experiment_results_markdown(
         "## 分组指标",
         "",
         "| Group | Rows | Done | AvgQ | AvgPass | JudgeErr | Avg Gen$ | "
-        "Total Gen$ | Gen exact | Avg Prompt | Avg Completion | Avg Reason | "
+        "Total Gen$ | Gen exact$ (tasks) | Avg Prompt | Avg Completion | Avg Reason | "
         "Avg Visible | Avg Tokens | Avg Tools | Tool% | Avg Steps | Avg LLMReq | "
         "p50 ms | p95 ms |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
@@ -10862,10 +11721,15 @@ def experiment_results_markdown(
             if total_cost is not None
             else "N/A"
         )
+        rendered_exact_total = str(
+            Decimal(str(metric["selected_generation_cost_exact_usd"])).quantize(
+                Decimal("0.000001")
+            )
+        )
         visible = metric["avg_visible_tokens"] or "N/A"
         lines.append(
             "| {group} | {task_count} | {done} | {quality} | {pass_rate}% | "
-            "{judge_error} | {cost} | {total_cost} | {exact}/{tasks} | "
+            "{judge_error} | {cost} | {total_cost} | ${exact_total} ({exact}/{tasks}) | "
             "{prompt} | {completion} | {reason} | {visible} | {tokens} | "
             "{tools} | {tool_rate}% | {steps} | {requests} | {p50} | {p95} |".format(
                 group=metric["group"],
@@ -10878,6 +11742,7 @@ def experiment_results_markdown(
                 judge_error=metric["judge_error_count"],
                 cost=rendered_cost,
                 total_cost=rendered_total,
+                exact_total=rendered_exact_total,
                 exact=metric["selected_generation_cost_exact_task_count"],
                 tasks=metric["task_count"],
                 prompt=Decimal(str(metric["avg_input_tokens"])).quantize(Decimal("0.1")),
@@ -11112,8 +11977,9 @@ def experiment_results_markdown(
             f"replaced=${disposition_costs.get('replaced', '0')}，"
             f"failed=${disposition_costs.get('failed', '0')}。",
             "- 上表成本只统计最终选中的成功 generation；不包含 Judge。",
-            "- 缺失或不完整的成功 generation 成本不会按 $0 参与平均；表中 N/A "
-            "表示无法对全组给出逐任务成本，coverage/precision 为机器可审计口径。",
+            "- 有显式 estimate 的成功 generation 会计入总费用，但不会计入 Gen exact；"
+            "真正 unknown 的成本不会按 $0 参与平均。表中 N/A 表示无法对全组给出"
+            "逐任务总成本，coverage/precision 为机器可审计口径。",
             "- `actual-spend-ledger.jsonl` 从所有 wave 的 generation attempts "
             "与 Judge attempts 重建，"
             "失败或被替换 attempt 仍计入真实花费，复制到 repair row 的请求按物理回执去重。",
@@ -11151,12 +12017,13 @@ def experiment_results_markdown(
             "",
             f"- OpenRouter BYOK 增量（Decimal 精确值）："
             f"{account.get('campaign_byok_usage_delta_usd', account['byok_usage_delta_usd'])}；"
-            "同一 paid key、本机文件锁、完整 before→stable-after 窗口证明通过；"
-            "本机锁不证明跨主机独占。",
+            f"policy proof={'通过' if policy_pass else '未通过'}；"
+            "本机锁不证明跨主机独占，BYOK/冲突证据会保留并使 proof.pass=false。",
             f"- 本地 exact non-BYOK 请求：{evidence['exact_non_byok_request_count']}；"
             f"由 campaign 账户证明覆盖的元数据不完整请求："
-            f"{evidence['campaign_covered_unverified_request_count']}；"
-            "明确 BYOK/冲突请求为 0。",
+            f"{evidence['campaign_covered_unverified_request_count']}；明确 BYOK="
+            f"{evidence['explicit_byok_request_count']}、冲突="
+            f"{evidence['conflict_request_count']}。",
             f"- 任务内 Web/Brave 调用数："
             f"{external_tool_cost['task_generation_tool_call_count']}；"
             f"live wave preflight 额外调用数："
@@ -11284,6 +12151,7 @@ def final_audit(
     selected_cost_reconciliation: Mapping[str, Any],
     judge_attempt_evidence_audit: Mapping[str, Any],
     max_attempts: int,
+    warnings: Sequence[Any] = (),
 ) -> dict[str, Any]:
     expected = {(group, str(task["id"])) for task in tasks for group in groups}
     observed = [(str(row.get("group") or ""), str(row.get("task_id") or "")) for row in rows]
@@ -11306,23 +12174,74 @@ def final_audit(
             task=tasks_by_id.get(str(row.get("task_id") or "")),
         )
     ]
-    passed = (
+    execution_pass = (
         set(observed) == expected
         and len(rows) == len(expected)
         and duplicate_count == 0
         and seal_failures == 0
         and trace_failures == 0
         and not attempt_violations
-        and proof.get("pass") is True
         and nonnegative_int(ledger_summary.get("physical_request_count")) > 0
         and ledger_summary.get("selected_generation_pair_count") == len(expected)
         and len(selected_attempt_bindings) == len(expected)
+        and not strict_judge_failures
+    )
+    policy_pass = proof.get("policy_pass") is True
+    reconciliation = dict(proof.get("reconciliation") or {})
+    reconciliation_pass = reconciliation.get("pass") is True
+    passed = (
+        execution_pass
+        and policy_pass
+        and reconciliation_pass
         and selected_cost_reconciliation.get("pair_count") == len(expected)
         and not strict_judge_failures
     )
+    published_warnings: list[str] = []
+    for warning in warnings:
+        if isinstance(warning, Mapping):
+            published_warnings.append(
+                json.dumps(warning, ensure_ascii=False, sort_keys=True)
+            )
+        else:
+            published_warnings.append(str(warning))
+    published_warnings.extend(str(value) for value in proof.get("warnings") or [])
+    published_warnings.extend(
+        str(value) for value in selected_cost_reconciliation.get("warnings") or []
+    )
+    for pair, selection in pair_audit.items():
+        warning_rows = selection.get("warnings") if isinstance(selection, Mapping) else None
+        for warning_row in warning_rows if isinstance(warning_rows, list) else []:
+            if not isinstance(warning_row, Mapping):
+                continue
+            published_warnings.extend(
+                f"{pair}: {reason}" for reason in warning_row.get("reasons") or []
+            )
+    if not policy_pass:
+        published_warnings.append("OpenRouter non-BYOK policy proof did not pass")
+    if not reconciliation_pass:
+        published_warnings.append(
+            "cost/account reconciliation is not exact: "
+            f"{reconciliation.get('status') or 'unknown'}"
+        )
+    if strict_judge_failures:
+        published_warnings.append(
+            f"Judge contract failures: {strict_judge_failures}"
+        )
+    published_warnings = list(dict.fromkeys(published_warnings))
     audit = {
         "schema": AUDIT_SCHEMA,
         "pass": passed,
+        "execution_pass": execution_pass,
+        "policy_pass": policy_pass,
+        "reconciliation": reconciliation,
+        "status": (
+            "passed"
+            if passed
+            else "complete_with_warnings"
+            if execution_pass
+            else "execution_failed"
+        ),
+        "warnings": published_warnings,
         "created_at": utc_now(),
         "groups": list(groups),
         "task_count": len(tasks),
@@ -11390,7 +12309,7 @@ def final_audit(
         "repair_action_details": [dict(detail) for detail in repair_details],
         "pair_selection": pair_audit,
     }
-    if not passed:
+    if not execution_pass:
         raise FinalizationError(f"final campaign audit failed: {audit}")
     return audit
 
@@ -11482,7 +12401,11 @@ def run_finalization(args: argparse.Namespace) -> dict[str, Any]:
             "result sources contain groups outside the active finalization scope: "
             f"{unexpected_source_groups}"
         )
-    validate_source_policy_history(source_records)
+    source_policy_findings = validate_source_policy_history(source_records)
+    finalization_warnings: list[Any] = [
+        {"kind": "source_policy_finding", **finding}
+        for finding in source_policy_findings
+    ]
     critical_source_snapshots = dict(source_snapshots)
     for raw_path in (
         input_path,
@@ -11517,17 +12440,44 @@ def run_finalization(args: argparse.Namespace) -> dict[str, Any]:
         groups=groups,
         expected_task_concurrency=expected_task_concurrency,
     )
+    finalization_warnings.extend(
+        {
+            "kind": "source_manifest_audit_warning",
+            "path": source.get("path"),
+            "warning": warning,
+        }
+        for source in manifest_sources
+        for warning in source.get("audit_warnings") or []
+    )
     validate_formal_campaign_contracts(contracts, groups=groups)
     if "G1" in groups:
         validate_g1_paid_attempt_plan_history(
             source_records,
             contracts=contracts,
         )
-    validate_physical_generation_routes(
-        source_records,
-        contracts=contracts,
+    finalization_warnings.extend(
+        {
+            "kind": "physical_generation_audit_warning",
+            **warning,
+        }
+        for warning in validate_physical_generation_routes(
+            source_records,
+            contracts=contracts,
+        )
     )
-    judge_attempt_evidence_audit = validate_judge_attempt_evidence(source_records)
+    try:
+        judge_attempt_evidence_audit = validate_judge_attempt_evidence(source_records)
+    except FinalizationError as exc:
+        if not judge_evidence_error_is_audit_only(exc):
+            raise
+        judge_attempt_evidence_audit = {
+            "status": "audit_conflict",
+            "pass": False,
+            "warning": str(exc),
+        }
+        finalization_warnings.append(
+            {"kind": "judge_attempt_audit_conflict", "warning": str(exc)}
+        )
     selected, pair_audit = select_results(
         source_records,
         tasks=tasks,
@@ -11554,21 +12504,88 @@ def run_finalization(args: argparse.Namespace) -> dict[str, Any]:
         source_records,
         manifest_sources=manifest_sources,
     )
-    proof = validate_account_proof(
-        before_path=args.account_before,
-        after_path=args.account_after,
-        reconciliation_path=args.account_reconciliation,
-        runtime_environment_path=args.runtime_environment,
-        lock_file=args.lock_file,
-        lock_fd=args.lock_fd,
-        runtime_key_fingerprint=runtime_key,
-        source_records=source_records,
-        manifest_sources=manifest_sources,
-        ledger_rows=ledger_rows,
-        ledger_summary=ledger_summary,
-        prior_account_window_dirs=prior_account_window_dirs,
-        prior_campaign_account_window_dirs=prior_campaign_account_window_dirs,
-    )
+    try:
+        proof = validate_account_proof(
+            before_path=args.account_before,
+            after_path=args.account_after,
+            reconciliation_path=args.account_reconciliation,
+            runtime_environment_path=args.runtime_environment,
+            lock_file=args.lock_file,
+            lock_fd=args.lock_fd,
+            runtime_key_fingerprint=runtime_key,
+            source_records=source_records,
+            manifest_sources=manifest_sources,
+            ledger_rows=ledger_rows,
+            ledger_summary=ledger_summary,
+            prior_account_window_dirs=prior_account_window_dirs,
+            prior_campaign_account_window_dirs=prior_campaign_account_window_dirs,
+        )
+    except FinalizationError as exc:
+        if not account_proof_error_is_audit_only(exc):
+            raise
+        proof = failed_account_proof(
+            error=exc,
+            runtime_key_fingerprint=runtime_key,
+            ledger_rows=ledger_rows,
+            ledger_summary=ledger_summary,
+        )
+        finalization_warnings.append(
+            {"kind": "account_proof_audit_conflict", "warning": str(exc)}
+        )
+    inherited_policy_warnings = [
+        *(
+            "source history policy finding: "
+            + json.dumps(finding, ensure_ascii=False, sort_keys=True)
+            for finding in source_policy_findings
+        ),
+        *(
+            f"source manifest policy finding: {warning}"
+            for source in manifest_sources
+            for warning in source.get("audit_warnings") or []
+            if "byok" in str(warning).casefold()
+            or "non_byok_policy_violation" in str(warning).casefold()
+        ),
+    ]
+    if inherited_policy_warnings:
+        proof = copy.deepcopy(proof)
+        proof.pop("proof_sha256", None)
+        proof["pass"] = False
+        proof["policy_pass"] = False
+        proof["status"] = "policy_failed"
+        proof["warnings"] = list(
+            dict.fromkeys(
+                [
+                    *(str(value) for value in proof.get("warnings") or []),
+                    *inherited_policy_warnings,
+                ]
+            )
+        )
+        proof["proof_sha256"] = canonical_sha256(proof, prefix=True)
+    inherited_reconciliation_warnings = [
+        f"source manifest reconciliation finding: {warning}"
+        for source in manifest_sources
+        for warning in source.get("audit_warnings") or []
+        if "cost" in str(warning).casefold()
+    ]
+    if inherited_reconciliation_warnings:
+        proof = copy.deepcopy(proof)
+        proof.pop("proof_sha256", None)
+        proof["reconciliation"] = {
+            **dict(proof.get("reconciliation") or {}),
+            "pass": False,
+            "status": "audit_conflict",
+        }
+        if proof.get("policy_pass") is True:
+            proof["status"] = "reconciliation_incomplete"
+        proof["warnings"] = list(
+            dict.fromkeys(
+                [
+                    *(str(value) for value in proof.get("warnings") or []),
+                    *inherited_reconciliation_warnings,
+                ]
+            )
+        )
+        proof["proof_sha256"] = canonical_sha256(proof, prefix=True)
     final_rows = finalize_rows(
         selected,
         tasks=tasks,
@@ -11606,6 +12623,7 @@ def run_finalization(args: argparse.Namespace) -> dict[str, Any]:
         selected_cost_reconciliation=selected_cost_reconciliation,
         judge_attempt_evidence_audit=judge_attempt_evidence_audit,
         max_attempts=args.max_generation_attempts,
+        warnings=finalization_warnings,
     )
     audit["generation_attempt_evidence_schema"] = GENERATION_ATTEMPT_EVIDENCE_SCHEMA
     audit["generation_attempt_evidence"] = attempt_evidence_audit
@@ -11631,7 +12649,13 @@ def run_finalization(args: argparse.Namespace) -> dict[str, Any]:
     )
     manifest_base = {
         "schema": MANIFEST_SCHEMA,
-        "status": "complete",
+        "status": "complete" if audit["execution_pass"] else "execution_failed",
+        "execution_pass": audit["execution_pass"],
+        "policy_pass": audit["policy_pass"],
+        "reconciliation": audit["reconciliation"],
+        "audit_pass": audit["pass"],
+        "audit_status": audit["status"],
+        "warnings": audit["warnings"],
         "created_at": utc_now(),
         "finalizer_version": FINALIZER_VERSION,
         "groups": list(groups),

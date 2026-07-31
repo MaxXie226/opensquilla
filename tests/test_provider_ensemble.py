@@ -42,6 +42,7 @@ from opensquilla.provider.ensemble import (
     EnsembleMemberConfig,
     EnsembleProvider,
     _attach_final_request_output,
+    _bind_managed_usage_rows,
     _CandidateResult,
     _canonicalize_usage_row,
     _close_async_iterator,
@@ -168,6 +169,57 @@ def test_managed_completion_keeps_physical_id_in_usage_evidence() -> None:
         final_usage["provider_usage"]["physical_attempt_id"]
         == physical_attempt_id
     )
+
+
+def test_managed_unknown_usage_placeholder_remains_missing_after_binding() -> None:
+    physical_attempt_id = "b" * 32
+
+    rows, missing_count, usage_reported = _bind_managed_usage_rows(
+        [
+            {
+                "role": "usage_missing",
+                "requested_provider": "fake",
+                "requested_model": "p0",
+                "billed_cost": 0.0,
+                "cost_source": "none",
+                "usage_unknown": True,
+                "provider_usage": {"usage_unknown": True},
+            }
+        ],
+        physical_attempt_id=physical_attempt_id,
+        requested_provider="fake",
+        requested_model="p0",
+        role="usage_missing",
+        profile="router_dynamic/c2",
+        label="slot-0",
+    )
+
+    assert missing_count == 1
+    assert usage_reported is False
+    assert len(rows) == 1
+    assert rows[0]["usage_unknown"] is True
+    assert rows[0]["physical_attempt_id"] == physical_attempt_id
+    assert (
+        rows[0]["provider_usage"]["physical_attempt_id"]
+        == physical_attempt_id
+    )
+
+
+def test_candidate_without_started_request_cannot_contribute_to_quorum() -> None:
+    candidate = _CandidateResult(
+        index=0,
+        sample_index=0,
+        label="synthetic",
+        provider="fake",
+        model="p0",
+        requested_provider="fake",
+        requested_model="p0",
+        text="A plausible-looking draft that did not come from a request.",
+        request_started=False,
+    )
+
+    assert candidate.ok is True
+    assert candidate.usable_for_aggregation is False
 
 
 def test_cost_source_rollup_preserves_byok_and_unverified_evidence() -> None:
@@ -1457,6 +1509,10 @@ def test_unmanaged_candidate_trace_row_preserves_reasoning_usage_evidence() -> N
         model="model-a",
         text="draft",
         reasoning_tokens=17,
+        request_started=True,
+        stream_closed=True,
+        physical_request_count=1,
+        usage_reported=True,
     )
 
     assert candidate.trace_row(include_text=False, content_max_chars=8_000) == {
@@ -1468,9 +1524,12 @@ def test_unmanaged_candidate_trace_row_preserves_reasoning_usage_evidence() -> N
         "model": "model-a",
         "requested_model": "",
         "ok": True,
-        "request_started": False,
-        "usage_reported": False,
-        "physical_request_count": 0,
+        "usable_for_aggregation": True,
+        "completion_outcome": "complete",
+        "request_started": True,
+        "stream_closed": True,
+        "usage_reported": True,
+        "physical_request_count": 1,
         "usage_missing_count": 0,
         "stop_reason": "",
         "elapsed_ms": 0,
@@ -2869,6 +2928,8 @@ async def test_ensemble_proposer_tool_events_violate_inert_candidate_contract(
 
     assert candidate.ok is False
     assert candidate.error_code == "candidate_mode_contract_violation"
+    assert candidate.stream_closed is True
+    assert candidate.execution["candidate_mode_contract_violation"] is True
     assert candidate.text == ""
     assert [call["model"] for call in registry.calls] == ["p1"]
 
@@ -10312,6 +10373,572 @@ def _slot_candidate(
             ]
         },
     )
+
+
+@pytest.mark.asyncio
+async def test_router_dynamic_quarantines_unclosed_proposer_after_quorum(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _RecoveryScriptRegistry(
+        {
+            "agg": [[TextDeltaEvent(text="final"), _billed_done("agg", cost=0.2)]],
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    proposers = [_member("p0"), _member("p1"), _member("p2")]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        aggregator=_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        shuffle_candidates=False,
+        aggregator_tools=True,
+        aggregator_recovery_mode="experiment",
+        selection_plan=_slot_recovery_plan(proposers, []),
+    )
+    scope_id = "router-dynamic-unclosed-quorum"
+    assert provider.begin_provider_retry_scope(
+        scope_id,
+        max_additional_physical_requests=3,
+    )
+    unclosed_physical_attempt_id = "c" * 32
+    unclosed = _slot_candidate(
+        index=2,
+        model="p2",
+        error="provider stream cleanup did not finish",
+        error_code="ensemble_proposer_close_timeout",
+        usage_reported=False,
+        physical_attempt_id=unclosed_physical_attempt_id,
+    )
+    unclosed.stream_closed = False
+    unclosed.model_usage_breakdown = []
+    unclosed.execution["physical_attempts"][0].update(
+        {
+            "attempt": 1,
+            "identity": "fake:p2",
+            "outcome": "interrupted",
+            "stream_closed": False,
+        }
+    )
+
+    async def fake_run_proposers(*args: Any, **kwargs: Any) -> list[_CandidateResult]:
+        del args, kwargs
+        return [
+            _slot_candidate(
+                index=0,
+                model="p0",
+                text="draft 0",
+                physical_attempt_id="a" * 32,
+            ),
+            _slot_candidate(
+                index=1,
+                model="p1",
+                text="draft 1",
+                physical_attempt_id="b" * 32,
+            ),
+            unclosed,
+        ]
+
+    monkeypatch.setattr(provider, "_run_proposers", fake_run_proposers)
+
+    events = await _collect(provider)
+
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    [aggregator_call] = [
+        call for call in registry.calls if call["model"] == "agg"
+    ]
+    assert aggregator_call["tools"] is None
+    assert done.ensemble_trace["successful_proposers"] == 2
+    [quarantined] = [
+        candidate
+        for candidate in done.ensemble_trace["candidates"]
+        if candidate["index"] == 2
+    ]
+    assert quarantined["ok"] is False
+    assert quarantined["stream_closed"] is False
+    assert quarantined["error_code"] == "ensemble_proposer_close_timeout"
+    marker = done.ensemble_trace["proposer_cleanup_quorum_bypass"]
+    assert marker == {
+        "schema": (
+            "opensquilla.router-dynamic-proposer-cleanup-quorum-bypass/v1"
+        ),
+        "applied": True,
+        "quorum_required": 2,
+        "successful_proposers": 2,
+        "usable_proposers": 2,
+        "candidate_indexes": [2],
+        "physical_attempt_ids": [unclosed_physical_attempt_id],
+        "recovery_skipped": True,
+        "aggregator_tools_disabled": True,
+    }
+    [unknown_row] = [
+        row
+        for row in done.model_usage_breakdown
+        if row.get("physical_attempt_id") == unclosed_physical_attempt_id
+    ]
+    assert unknown_row["role"] == "abandoned_stream"
+    assert unknown_row["usage_unknown"] is True
+    assert (
+        unknown_row["usage_evidence_source"]
+        == "unclosed_physical_request_unknown_usage"
+    )
+    assert done.usage_missing_count == 1
+    assert (
+        done.ensemble_trace["proposer_recovery"]["attempts"] == []
+    )
+    assert provider.end_provider_retry_scope(scope_id)
+
+
+@pytest.mark.asyncio
+async def test_router_dynamic_uses_partial_unclosed_draft_for_two_draft_quorum(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _RecoveryScriptRegistry(
+        {
+            "agg": [
+                [
+                    TextDeltaEvent(text="Fused final answer."),
+                    _billed_done("agg", cost=0.2),
+                ]
+            ],
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    proposers = [_member("p0"), _member("p1")]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        proposer_backups=[_member("backup-must-not-run")],
+        aggregator=_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        shuffle_candidates=False,
+        aggregator_tools=True,
+        aggregator_recovery_mode="experiment",
+        selection_plan=_slot_recovery_plan(
+            proposers,
+            [_member("backup-must-not-run")],
+        ),
+    )
+    scope_id = "router-dynamic-partial-unclosed-quorum"
+    assert provider.begin_provider_retry_scope(
+        scope_id,
+        max_additional_physical_requests=3,
+    )
+    partial_attempt_id = "d" * 32
+    partial = _slot_candidate(
+        index=1,
+        model="p1",
+        text="This partial draft is useful enough to aggregate.",
+        error="provider stream cleanup did not finish",
+        error_code="ensemble_proposer_close_timeout",
+        usage_reported=False,
+        physical_attempt_id=partial_attempt_id,
+    )
+    partial.stream_closed = False
+    partial.model_usage_breakdown = []
+    partial.execution["physical_attempts"][0].update(
+        {
+            "attempt": 1,
+            "identity": "fake:p1",
+            "outcome": "interrupted",
+            "stream_closed": False,
+        }
+    )
+
+    async def fake_run_proposers(*args: Any, **kwargs: Any) -> list[_CandidateResult]:
+        del args, kwargs
+        return [
+            _slot_candidate(
+                index=0,
+                model="p0",
+                text="Complete draft.",
+                physical_attempt_id="a" * 32,
+            ),
+            partial,
+        ]
+
+    monkeypatch.setattr(provider, "_run_proposers", fake_run_proposers)
+
+    events = await _collect(provider)
+
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert registry.call_counts == {"agg": 1}
+    [aggregator_call] = registry.calls
+    assert aggregator_call["tools"] is None
+    assert aggregator_call["config"].allow_provider_stream_fallback is False
+    assert "This partial draft is useful enough" in str(
+        aggregator_call["messages"][-1].content
+    )
+    trace = done.ensemble_trace
+    assert trace["successful_proposers"] == 1
+    assert trace["usable_proposers"] == 2
+    assert trace["partial_proposers"] == 1
+    assert trace["strict_quorum_met"] is False
+    assert trace["execution_quorum_required"] == 2
+    assert trace["execution_quorum_met"] is True
+    assert trace["selected_candidate_indexes"] == [0, 1]
+    [partial_trace] = [
+        candidate
+        for candidate in trace["candidates"]
+        if candidate["index"] == 1
+    ]
+    assert partial_trace["ok"] is False
+    assert partial_trace["usable_for_aggregation"] is True
+    assert partial_trace["completion_outcome"] == "partial_usable"
+    assert partial_trace["selected_for_aggregation"] is True
+    assert partial_trace["stream_closed"] is False
+    marker = trace["proposer_cleanup_quorum_bypass"]
+    assert marker["successful_proposers"] == 1
+    assert marker["usable_proposers"] == 2
+    assert marker["recovery_skipped"] is True
+    assert trace["proposer_partial_quorum"]["aggregator_isolated"] is True
+    assert trace["proposer_recovery"]["attempts"] == []
+    [unknown_row] = [
+        row
+        for row in done.model_usage_breakdown
+        if row.get("physical_attempt_id") == partial_attempt_id
+    ]
+    assert unknown_row["usage_unknown"] is True
+    assert done.usage_missing_count == 1
+    assert provider.end_provider_retry_scope(scope_id)
+
+
+@pytest.mark.asyncio
+async def test_router_dynamic_excludes_contract_violating_unclosed_draft(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = asyncio.Event()
+    closed = asyncio.Event()
+    registry = _RecoveryScriptRegistry(
+        {
+            "p0": [
+                [TextDeltaEvent(text="Draft zero."), _billed_done("p0", cost=0.1)]
+            ],
+            "p1": [
+                [TextDeltaEvent(text="Draft one."), _billed_done("p1", cost=0.1)]
+            ],
+            "agg": [
+                [TextDeltaEvent(text="Fused final answer."), _billed_done("agg", cost=0.2)]
+            ],
+        }
+    )
+
+    class _ContractViolatingUnclosedProposer:
+        provider_name = "fake"
+
+        def chat(
+            self,
+            messages: list[Message],
+            tools: list[ToolDefinition] | None = None,
+            config: ChatConfig | None = None,
+        ) -> AsyncIterator[StreamEvent]:
+            del messages, tools, config
+
+            async def _stream() -> AsyncIterator[StreamEvent]:
+                try:
+                    yield TextDeltaEvent(
+                        text=(
+                            "This draft looks useful but violates the inert "
+                            "candidate protocol."
+                        )
+                    )
+                    yield ToolUseStartEvent(
+                        tool_use_id="forbidden-tool",
+                        tool_name="lookup",
+                    )
+                finally:
+                    while not release.is_set():
+                        try:
+                            await release.wait()
+                        except asyncio.CancelledError:
+                            continue
+                    closed.set()
+
+            return _stream()
+
+        async def list_models(self) -> list[Any]:
+            return []
+
+    def build_provider(cfg: ProviderConfig) -> Any:
+        if cfg.model == "violator":
+            return _ContractViolatingUnclosedProposer()
+        return registry.provider_for(cfg)
+
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        build_provider,
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._ENSEMBLE_CANCEL_CLEANUP_TIMEOUT_SECONDS",
+        0.01,
+    )
+    proposers = [_member("p0"), _member("p1"), _member("violator")]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        aggregator=_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        shuffle_candidates=False,
+        aggregator_tools=True,
+        aggregator_recovery_mode="experiment",
+        selection_plan=_slot_recovery_plan(proposers, []),
+    )
+    scope_id = "router-dynamic-contract-violation-close-timeout"
+    assert provider.begin_provider_retry_scope(
+        scope_id,
+        max_additional_physical_requests=3,
+    )
+
+    try:
+        events = await asyncio.wait_for(_collect(provider), timeout=1.0)
+    finally:
+        release.set()
+    await asyncio.wait_for(closed.wait(), timeout=1.0)
+
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert registry.call_counts == {"p0": 1, "p1": 1, "agg": 1}
+    [aggregator_call] = [
+        call for call in registry.calls if call["model"] == "agg"
+    ]
+    assert aggregator_call["tools"] is None
+    [violator] = [
+        candidate
+        for candidate in done.ensemble_trace["candidates"]
+        if candidate["requested_model"] == "violator"
+    ]
+    assert violator["content"]["chars"] > 32
+    assert violator["content"]["truncated"] is False
+    assert violator["ok"] is False
+    assert violator["usable_for_aggregation"] is False
+    assert violator["selected_for_aggregation"] is False
+    assert violator["error_code"] == "ensemble_proposer_close_timeout"
+    assert violator["stream_closed"] is False
+    assert (
+        violator["execution"]["candidate_mode_contract_violation"]
+        is True
+    )
+    assert done.ensemble_trace["usable_proposers"] == 2
+    marker = done.ensemble_trace["proposer_cleanup_quorum_bypass"]
+    assert marker["candidate_indexes"] == [2]
+    assert done.usage_missing_count == 1
+    assert provider.end_provider_retry_scope(scope_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recovery_mode", ["off", "serving", "experiment"])
+@pytest.mark.parametrize(
+    ("terminal_kind", "expected_missing"),
+    [("error", 0), ("incomplete", 1), ("length", 0)],
+)
+async def test_router_dynamic_usable_aggregator_prefix_is_degraded_without_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    recovery_mode: Literal["off", "serving", "experiment"],
+    terminal_kind: str,
+    expected_missing: int,
+) -> None:
+    visible_text = "This visible aggregator answer is useful and complete enough."
+    if terminal_kind == "error":
+        aggregator_events: list[StreamEvent] = [
+            TextDeltaEvent(text=visible_text),
+            ErrorEvent(
+                message="upstream interrupted after visible output",
+                code="upstream_interrupted",
+                diagnostic_done=_billed_done("agg", cost=0.3),
+                request_started=True,
+                physical_request_count=1,
+            ),
+        ]
+    elif terminal_kind == "length":
+        aggregator_events = [
+            TextDeltaEvent(text=visible_text),
+            _billed_done("agg", cost=0.3, stop_reason="length"),
+        ]
+    else:
+        aggregator_events = [TextDeltaEvent(text=visible_text)]
+
+    registry = _RecoveryScriptRegistry(
+        {
+            "p0": [
+                [TextDeltaEvent(text="Draft zero."), _billed_done("p0", cost=0.1)]
+            ],
+            "p1": [
+                [TextDeltaEvent(text="Draft one."), _billed_done("p1", cost=0.1)]
+            ],
+            "agg": [aggregator_events],
+            "agg-backup": [
+                [
+                    TextDeltaEvent(text="must not run"),
+                    _billed_done("agg-backup", cost=0.4),
+                ]
+            ],
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    proposers = [_member("p0"), _member("p1")]
+    aggregator_fallbacks = (
+        [] if recovery_mode == "off" else [_member("agg-backup")]
+    )
+    selection_plan = _slot_recovery_plan(proposers, [])
+    selection_plan["aggregator_candidates"] = [
+        "fake:agg",
+        *([] if recovery_mode == "off" else ["fake:agg-backup"]),
+    ]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        aggregator=_member("agg"),
+        aggregator_fallbacks=aggregator_fallbacks,
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        shuffle_candidates=False,
+        aggregator_recovery_mode=recovery_mode,
+        aggregator_recovery_top_k=(1 if recovery_mode == "off" else 2),
+        selection_plan=selection_plan,
+    )
+    scope_id = f"dynamic-degraded-{recovery_mode}-{terminal_kind}"
+    assert provider.begin_provider_retry_scope(
+        scope_id,
+        max_additional_physical_requests=3,
+    )
+
+    events = await _collect(provider)
+
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert registry.call_counts == {"p0": 1, "p1": 1, "agg": 1}
+    assert "".join(
+        event.text for event in events if isinstance(event, TextDeltaEvent)
+    ) == visible_text
+    assert done.usage_missing_count == expected_missing
+    assert done.ensemble_trace["physical_request_count"] == 3
+    assert done.ensemble_trace["delivery_outcome"] == "degraded_success"
+    assert done.ensemble_trace["execution_outcome"] == "degraded_success"
+    assert done.ensemble_trace["audit_outcome"] == "incomplete"
+    recovery = done.ensemble_trace["aggregator_recovery"]
+    assert recovery["degraded"] is True
+    assert recovery["success"] is False
+    assert recovery["delivery_success"] is True
+    assert recovery["delivery_outcome"] == "degraded_success"
+    assert recovery["audit_outcome"] == "incomplete"
+    assert recovery["recovery_skipped"] is True
+    assert recovery["selected_kind"] == "degraded_delivery"
+    [attempt] = [
+        row for row in recovery["attempts"] if row.get("request_started") is True
+    ]
+    assert attempt["outcome"] == "failed"
+    assert attempt["delivery_selected"] is True
+    assert attempt["physical_request_count"] == 1
+    final_usage = done.ensemble_trace["final_request"]["usage"]
+    assert final_usage.get("physical_attempt_id") == attempt["physical_attempt_id"]
+    if terminal_kind == "incomplete":
+        assert final_usage["usage_unknown"] is True
+        assert final_usage["cost_source"] == "none"
+    else:
+        assert final_usage.get("usage_unknown") is not True
+        assert done.billed_cost == pytest.approx(0.5)
+    assert provider.end_provider_retry_scope(scope_id)
+
+
+@pytest.mark.asyncio
+async def test_router_dynamic_unknown_error_usage_closes_and_aggregates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _RecoveryScriptRegistry(
+        {
+            "p0": [[TextDeltaEvent(text="draft 0"), _billed_done("p0", cost=0.1)]],
+            "p1": [[TextDeltaEvent(text="draft 1"), _billed_done("p1", cost=0.1)]],
+            "p2": [
+                [
+                    ErrorEvent(
+                        message="upstream stream interrupted",
+                        code="upstream_failure",
+                        request_started=True,
+                        physical_request_count=1,
+                        usage_missing_count=1,
+                        model_usage_breakdown=[
+                            {
+                                "role": "usage_missing",
+                                "requested_provider": "fake",
+                                "requested_model": "p2",
+                                "billed_cost": 0.0,
+                                "cost_source": "none",
+                                "usage_unknown": True,
+                                "provider_usage": {"usage_unknown": True},
+                            }
+                        ],
+                    )
+                ]
+            ],
+            "agg": [[TextDeltaEvent(text="final"), _billed_done("agg", cost=0.2)]],
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    proposers = [_member("p0"), _member("p1"), _member("p2")]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        aggregator=_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        shuffle_candidates=False,
+        aggregator_tools=True,
+        aggregator_recovery_mode="experiment",
+        selection_plan=_slot_recovery_plan(proposers, []),
+    )
+    scope_id = "router-dynamic-unknown-error-usage"
+    assert provider.begin_provider_retry_scope(
+        scope_id,
+        max_additional_physical_requests=3,
+    )
+
+    events = await _collect(provider)
+
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    [failed_candidate] = [
+        candidate
+        for candidate in done.ensemble_trace["candidates"]
+        if candidate["requested_model"] == "p2"
+    ]
+    assert failed_candidate["ok"] is False
+    assert failed_candidate["stream_closed"] is True
+    assert failed_candidate["error_code"] == "upstream_failure"
+    assert "proposer_cleanup_quorum_bypass" not in done.ensemble_trace
+    [aggregator_call] = [
+        call for call in registry.calls if call["model"] == "agg"
+    ]
+    assert aggregator_call["tools"] is not None
+    assert done.usage_missing_count == 1
+    [unknown_row] = [
+        row
+        for row in done.model_usage_breakdown
+        if row.get("requested_model") == "p2"
+    ]
+    assert unknown_row["usage_unknown"] is True
+    assert len(unknown_row["physical_attempt_id"]) == 32
+    assert (
+        unknown_row["provider_usage"]["physical_attempt_id"]
+        == unknown_row["physical_attempt_id"]
+    )
+    assert provider.end_provider_retry_scope(scope_id)
 
 
 def _managed_recovery_member(

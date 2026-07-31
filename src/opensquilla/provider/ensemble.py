@@ -375,6 +375,7 @@ async def _closing_async_iterator(
     phase: str,
     pending_cleanup_tracker: Callable[[asyncio.Future[Any], str], None] | None = None,
     terminal_observed: Callable[[], bool] | None = None,
+    close_observed: Callable[[bool], None] | None = None,
 ) -> AsyncIterator[AsyncIterator[StreamEvent]]:
     """Relay an async stream and synchronously close the lower iterator.
 
@@ -393,6 +394,8 @@ async def _closing_async_iterator(
             require_aclose=True,
             pending_cleanup_tracker=pending_cleanup_tracker,
         )
+        if close_observed is not None:
+            close_observed(closed)
         if not closed:
             raise _EnsembleStreamCloseError(phase) from exc
         raise
@@ -410,6 +413,8 @@ async def _closing_async_iterator(
             require_aclose=not bool(terminal_observed is not None and terminal_observed()),
             pending_cleanup_tracker=pending_cleanup_tracker,
         )
+        if close_observed is not None:
+            close_observed(closed)
         if not closed:
             raise _EnsembleStreamCloseError(phase)
 
@@ -942,6 +947,41 @@ class _CandidateResult:
         return not self.error and bool(self.text.strip())
 
     @property
+    def usable_for_aggregation(self) -> bool:
+        """Whether this attempt left a meaningful inert draft to fuse.
+
+        ``ok`` deliberately remains the strict physical-call outcome.  A
+        provider stream may fail after emitting a useful text draft; that
+        draft is execution input, not evidence that the physical request
+        succeeded.  Contract violations, locally scheduled cancellation, and
+        requests that never started cannot contribute to quorum.
+        """
+
+        if not self.request_started:
+            return False
+        if self.execution.get("candidate_mode_contract_violation") is True:
+            return False
+        if self.ok:
+            return True
+        if self.error_code in {
+            "candidate_mode_contract_violation",
+            _ROUTER_DYNAMIC_RECOVERY_PLAN_DRIFT_CODE,
+            _PROPOSER_RECOVERY_BUDGET_OVERRUN_CODE,
+            _PROPOSER_RECOVERY_EVIDENCE_UNPROVEN_CODE,
+            *_PROPOSER_LOCAL_SCHEDULING_CANCELLATION_CODES,
+        }:
+            return False
+        return _visible_answer_looks_usable(self.text)
+
+    @property
+    def completion_outcome(self) -> str:
+        if self.ok:
+            return "complete"
+        if self.usable_for_aggregation:
+            return "partial_usable"
+        return "failed"
+
+    @property
     def thinking_policy_managed(self) -> bool:
         return bool(self.thinking_policy_version)
 
@@ -995,7 +1035,10 @@ class _CandidateResult:
             "model": self.model,
             "requested_model": self.requested_model,
             "ok": self.ok,
+            "usable_for_aggregation": self.usable_for_aggregation,
+            "completion_outcome": self.completion_outcome,
             "request_started": self.request_started,
+            "stream_closed": self.stream_closed,
             "usage_reported": self.usage_reported,
             "physical_request_count": self.physical_request_count,
             "usage_missing_count": self.usage_missing_count,
@@ -2058,6 +2101,35 @@ def _visible_answer_looks_usable(
     return candidate.endswith((".", "!", "?", "。", "！", "？", "}", "]", "```"))
 
 
+def _usable_proposer_candidates(
+    candidates: Sequence[_CandidateResult],
+) -> list[_CandidateResult]:
+    return [candidate for candidate in candidates if candidate.usable_for_aggregation]
+
+
+def _proposer_execution_quorum_required(
+    candidates: Sequence[_CandidateResult],
+    configured_quorum: int,
+) -> int:
+    """Require two independent drafts whenever partial output is admitted."""
+
+    configured = max(1, int(configured_quorum or 1))
+    has_partial = any(
+        candidate.usable_for_aggregation and not candidate.ok
+        for candidate in candidates
+    )
+    return max(2, configured) if has_partial else configured
+
+
+def _proposer_execution_quorum_met(
+    candidates: Sequence[_CandidateResult],
+    configured_quorum: int,
+) -> bool:
+    return len(_usable_proposer_candidates(candidates)) >= (
+        _proposer_execution_quorum_required(candidates, configured_quorum)
+    )
+
+
 def _usage_value(value: object, *names: str, default: Any = None) -> Any:
     if isinstance(value, Mapping):
         for name in names:
@@ -2313,13 +2385,14 @@ def _bind_managed_usage_rows(
             "managed provider invocation emitted multiple physical usage units"
         )
     if normalized:
+        bound = _usage_row_with_physical_attempt_id(
+            normalized[0],
+            physical_attempt_id=physical_attempt_id,
+        )
+        if _is_missing_request_placeholder(bound):
+            return ([bound], 1, False)
         return (
-            [
-                _usage_row_with_physical_attempt_id(
-                    normalized[0],
-                    physical_attempt_id=physical_attempt_id,
-                )
-            ],
+            [bound],
             0,
             True,
         )
@@ -5107,7 +5180,7 @@ class EnsembleProvider:
             tuple[_CandidateResult, EnsembleMemberConfig]
         ] = []
         for candidate in candidates:
-            if candidate.ok:
+            if candidate.usable_for_aggregation:
                 continue
             member = state.effective_members.get(candidate.index)
             if member is not None:
@@ -5855,16 +5928,16 @@ class EnsembleProvider:
                 with contextlib.suppress(asyncio.CancelledError):
                     await proposer_task
         recovery_policy_enabled = self._router_dynamic_selection()
+        cleanup_quorum_bypass: dict[str, Any] = {}
         proposer_close_failures = [
             candidate
             for candidate in candidates
             if candidate.error_code == _ENSEMBLE_PROPOSER_CLOSE_TIMEOUT_CODE
         ]
         if proposer_close_failures and not recovery_policy_enabled:
-            # A cancelled/timed-out proposer can still own a live billable
-            # request when its adapter suppresses cancellation. Starting an
-            # aggregator or fallback here would overlap physical requests, so
-            # the entire composite call fails closed even if quorum was met.
+            # Static/non-dynamic ensembles retain their strict cleanup
+            # contract.  The partial-draft exception is owned exclusively by
+            # the frozen router_dynamic execution policy.
             close_reason = (
                 "ensemble proposer cleanup did not finish; aggregation and "
                 "fallback were not started"
@@ -5924,6 +5997,13 @@ class EnsembleProvider:
                 soft_deadline_triggered=soft_deadline_triggered,
             )
             recovery_trace = self._current_proposer_recovery_trace or {}
+            raw_cleanup_quorum_bypass = recovery_trace.get(
+                "cleanup_quorum_bypass"
+            )
+            if isinstance(raw_cleanup_quorum_bypass, Mapping):
+                cleanup_quorum_bypass = dict(
+                    raw_cleanup_quorum_bypass
+                )
             recovery_terminal_code = str(
                 recovery_trace.get("terminal_code") or ""
             ).strip()
@@ -6013,8 +6093,29 @@ class EnsembleProvider:
         if soft_finalize:
             soft_deadline_triggered.set()
             soft_trace_overrides = _soft_finalization_trace()
-        successful = [candidate for candidate in candidates if candidate.ok]
-        if len(successful) < self.min_successful_proposers:
+        strict_successful = [candidate for candidate in candidates if candidate.ok]
+        dynamic_partial_quorum = recovery_policy_enabled
+        successful = (
+            _usable_proposer_candidates(candidates)
+            if dynamic_partial_quorum
+            else strict_successful
+        )
+        execution_quorum_required = (
+            _proposer_execution_quorum_required(
+                candidates,
+                self.min_successful_proposers,
+            )
+            if dynamic_partial_quorum
+            else self.min_successful_proposers
+        )
+        partial_candidates = [
+            candidate for candidate in successful if not candidate.ok
+        ]
+        aggregation_isolated = bool(
+            partial_candidates
+            or cleanup_quorum_bypass.get("applied") is True
+        )
+        if len(successful) < execution_quorum_required:
             if not soft_finalize and _soft_deadline_reached():
                 soft_finalize = True
                 soft_deadline_triggered.set()
@@ -6029,8 +6130,8 @@ class EnsembleProvider:
                     config=config,
                     reason=(
                         "llm ensemble had "
-                        f"{len(successful)} successful proposer(s), "
-                        f"requires {self.min_successful_proposers}"
+                        f"{len(successful)} usable proposer draft(s), "
+                        f"requires {execution_quorum_required}"
                     ),
                     code="ensemble_insufficient_proposers",
                     candidates=candidates,
@@ -6090,6 +6191,13 @@ class EnsembleProvider:
                 request_config = request_config.model_copy(
                     update={"allow_provider_stream_fallback": False}
                 )
+            if aggregation_isolated:
+                request_config = request_config.model_copy(
+                    update={
+                        "allow_provider_stream_fallback": False,
+                        "tool_choice": None,
+                    }
+                )
             if (
                 finalize_directly
                 and not self.aggregator.thinking_policy_managed
@@ -6108,6 +6216,10 @@ class EnsembleProvider:
                         "thinking_budget_tokens": 0,
                         "thinking_budget_explicit": False,
                     }
+                )
+            if aggregation_isolated:
+                request_config = request_config.model_copy(
+                    update={"tool_choice": None}
                 )
             if finalize_directly and bool(
                 getattr(
@@ -6129,12 +6241,15 @@ class EnsembleProvider:
             )
             request_tools = (
                 None
-                if finalize_directly
-                and bool(
-                    getattr(
-                        config,
-                        "ensemble_soft_deadline_disable_tools",
-                        False,
+                if aggregation_isolated
+                or (
+                    finalize_directly
+                    and bool(
+                        getattr(
+                            config,
+                            "ensemble_soft_deadline_disable_tools",
+                            False,
+                        )
                     )
                 )
                 else tools
@@ -6145,7 +6260,7 @@ class EnsembleProvider:
                 request_config = request_config.model_copy(update={"tool_choice": None})
             request_trace = self._trace_payload(
                 candidates,
-                successful_count=len(successful),
+                successful_count=len(strict_successful),
                 fallback_used=False,
                 fallback_reason="",
                 final_request_role="aggregator",
@@ -6158,6 +6273,25 @@ class EnsembleProvider:
                 candidate_order_seed=candidate_order_seed,
                 candidate_display_order=[candidate.index for candidate in ordered_candidates],
             )
+            if cleanup_quorum_bypass:
+                request_trace["proposer_cleanup_quorum_bypass"] = deepcopy(
+                    cleanup_quorum_bypass
+                )
+            if partial_candidates:
+                request_trace["proposer_partial_quorum"] = {
+                    "schema": "opensquilla.ensemble-partial-proposer-quorum/v1",
+                    "applied": True,
+                    "quorum_required": execution_quorum_required,
+                    "strict_successful_proposers": len(strict_successful),
+                    "usable_proposers": len(successful),
+                    "partial_candidate_indexes": [
+                        candidate.index for candidate in partial_candidates
+                    ],
+                    "recovery_skipped": True,
+                    "aggregator_isolated": True,
+                    "aggregator_tools_disabled": True,
+                }
+            request_trace["aggregator_isolated"] = aggregation_isolated
             if finalize_directly:
                 request_trace.update(_soft_finalization_trace(quorum_met=True))
                 request_trace["physical_request_count"] = int(
@@ -6224,7 +6358,10 @@ class EnsembleProvider:
                 }
             )
             provider = None
-            if self.aggregator_recovery_mode != "off":
+            if (
+                self.aggregator_recovery_mode != "off"
+                and not aggregation_isolated
+            ):
                 for fallback_index, fallback_member in enumerate(
                     self.aggregator_fallbacks,
                     start=1,
@@ -6296,7 +6433,10 @@ class EnsembleProvider:
                                 "terminal_code": "provider_build_failed",
                             },
                         },
-                        allow_single_fallback=(self.aggregator_recovery_mode != "experiment"),
+                        allow_single_fallback=(
+                            self.aggregator_recovery_mode != "experiment"
+                            and not aggregation_isolated
+                        ),
                         soft_deadline=soft_deadline,
                         soft_deadline_seconds=soft_deadline_seconds,
                         soft_deadline_triggered=soft_deadline_triggered,
@@ -6426,6 +6566,7 @@ class EnsembleProvider:
                     initial_fallback_index=initial_aggregator_fallback_index,
                     initial_trigger=initial_aggregator_trigger,
                     initial_unstarted_attempts=initial_unstarted_attempts,
+                    disable_recovery=aggregation_isolated,
                 ),
                 phase="ensemble_final_aggregator_attempt_relay",
             ) as aggregator_stream:
@@ -6442,6 +6583,7 @@ class EnsembleProvider:
                 return
             fallback_allowed = (
                 self.aggregator_recovery_mode == "off"
+                and not aggregation_isolated
                 and not visible_output
                 and terminal_error.code != "ensemble_aggregator_close_timeout"
                 and not self._thinking_policy_active()
@@ -6461,7 +6603,7 @@ class EnsembleProvider:
                 async for event in fallback_stream:
                     yield event
 
-        if soft_deadline is None or soft_finalize:
+        if aggregation_isolated or soft_deadline is None or soft_finalize:
             async with _closing_async_iterator(
                 _stream_aggregator_with_runtime_fallback(
                     request_messages=aggregator_messages,
@@ -6516,6 +6658,7 @@ class EnsembleProvider:
                 initial_fallback_index=initial_aggregator_fallback_index,
                 initial_trigger=initial_aggregator_trigger,
                 initial_unstarted_attempts=initial_unstarted_attempts,
+                disable_recovery=aggregation_isolated,
             ),
             phase="ensemble_soft_deadline_aggregator_relay",
         ) as child_stream:
@@ -6557,6 +6700,7 @@ class EnsembleProvider:
         )
         runtime_fallback_allowed = (
             self.aggregator_recovery_mode == "off"
+            and not aggregation_isolated
             and terminal_event is not None
             and not buffered_visible_output
             and terminal_event.code != "ensemble_aggregator_close_timeout"
@@ -7086,6 +7230,129 @@ class EnsembleProvider:
         result.usage_missing_count = 1
         return True
 
+    def _persist_unclosed_request_usage(
+        self,
+        result: _CandidateResult,
+    ) -> bool:
+        """Bind one explicit unknown usage unit to every quarantined request.
+
+        This does not claim that a physical stream closed.  It only makes an
+        already-started request auditable when proposer quorum lets the current
+        composite call continue without recovering the failed slot.
+        """
+
+        attempts = result.execution.get("physical_attempts")
+        if (
+            not result.request_started
+            or result.stream_closed
+            or result.physical_request_count <= 0
+            or not isinstance(attempts, list)
+            or len(attempts) != result.physical_request_count
+        ):
+            return False
+        expected_identity = _normalized_provider_model_identity(
+            result.requested_provider,
+            result.requested_model,
+        )
+        if not expected_identity:
+            return False
+        attempt_ids: list[str] = []
+        unclosed_attempt_ids: list[str] = []
+        for ordinal, attempt in enumerate(attempts, start=1):
+            if not isinstance(attempt, Mapping):
+                return False
+            physical_attempt_id = str(
+                attempt.get("physical_attempt_id") or ""
+            ).strip()
+            stream_closed = attempt.get("stream_closed")
+            if (
+                attempt.get("attempt") != ordinal
+                or len(physical_attempt_id) != 32
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in physical_attempt_id
+                )
+                or str(attempt.get("identity") or "").strip().casefold()
+                != expected_identity
+                or attempt.get("request_started") is not True
+                or type(stream_closed) is not bool
+            ):
+                return False
+            attempt_ids.append(physical_attempt_id)
+            if stream_closed is False:
+                if attempt.get("outcome") not in {
+                    "interrupted",
+                    "failed",
+                    "cleanup_unproven",
+                }:
+                    return False
+                unclosed_attempt_ids.append(physical_attempt_id)
+        if (
+            len(set(attempt_ids)) != len(attempt_ids)
+            or not unclosed_attempt_ids
+        ):
+            return False
+
+        rows_by_id: dict[str, dict[str, Any]] = {}
+        for source_row in result.model_usage_breakdown:
+            if not isinstance(source_row, Mapping):
+                return False
+            provider_usage = source_row.get("provider_usage")
+            physical_attempt_id = str(
+                source_row.get("physical_attempt_id")
+                or (
+                    provider_usage.get("physical_attempt_id")
+                    if isinstance(provider_usage, Mapping)
+                    else ""
+                )
+                or ""
+            ).strip()
+            if (
+                physical_attempt_id not in attempt_ids
+                or physical_attempt_id in rows_by_id
+            ):
+                return False
+            try:
+                rows_by_id[physical_attempt_id] = (
+                    _usage_row_with_physical_attempt_id(
+                        source_row,
+                        physical_attempt_id=physical_attempt_id,
+                    )
+                )
+            except ValueError:
+                return False
+
+        for physical_attempt_id in attempt_ids:
+            if physical_attempt_id in rows_by_id:
+                continue
+            placeholder = _managed_missing_usage_row(
+                physical_attempt_id=physical_attempt_id,
+                requested_provider=result.requested_provider,
+                requested_model=result.requested_model,
+                role="abandoned_stream",
+                profile=self.profile_name,
+                label=result.label,
+            )
+            placeholder["usage_evidence_source"] = (
+                "unclosed_physical_request_unknown_usage"
+            )
+            rows_by_id[physical_attempt_id] = placeholder
+
+        result.model_usage_breakdown = [
+            rows_by_id[physical_attempt_id]
+            for physical_attempt_id in attempt_ids
+        ]
+        result.usage_missing_count = sum(
+            1
+            for row in result.model_usage_breakdown
+            if _is_missing_request_placeholder(row)
+        )
+        result.usage_reported = any(
+            not _is_missing_request_placeholder(row)
+            for row in result.model_usage_breakdown
+        )
+        return len(result.model_usage_breakdown) == result.physical_request_count
+
     def _seal_clean_proposer_cleanup(
         self,
         result: _CandidateResult,
@@ -7363,9 +7630,19 @@ class EnsembleProvider:
             - state.additional_physical_requests_started
             - state.internal_physical_requests_pending,
         )
-        trace["quorum_reached"] = (
-            sum(1 for candidate in candidates if candidate.ok)
-            >= self.min_successful_proposers
+        trace["strict_successful_proposers"] = sum(
+            1 for candidate in candidates if candidate.ok
+        )
+        trace["usable_proposers"] = len(
+            _usable_proposer_candidates(candidates)
+        )
+        trace["quorum_required"] = _proposer_execution_quorum_required(
+            candidates,
+            self.min_successful_proposers,
+        )
+        trace["quorum_reached"] = _proposer_execution_quorum_met(
+            candidates,
+            self.min_successful_proposers,
         )
         trace["quorum_reached_once"] = state.quorum_reached_once
         trace["scope_terminal_code"] = state.terminal_code
@@ -7847,6 +8124,18 @@ class EnsembleProvider:
             return recovered
         trace = self._new_proposer_recovery_trace(state)
         self._current_proposer_recovery_trace = trace
+        successful_count = sum(1 for candidate in recovered if candidate.ok)
+        usable_count = len(_usable_proposer_candidates(recovered))
+        # Continuing while one physical stream remains unclosed is a narrower
+        # exception than the normal configurable ensemble quorum.  Require at
+        # least two independent completed drafts even when a serving profile
+        # is configured with a one-proposer quorum.
+        cleanup_bypass_quorum = max(2, self.min_successful_proposers)
+        cleanup_bypass_quorum_met = (
+            usable_count >= cleanup_bypass_quorum
+        )
+        quarantined_cleanup_indexes: list[int] = []
+        quarantined_physical_attempt_ids: list[str] = []
         for candidate in recovered:
             if candidate.request_started and (
                 not candidate.stream_closed
@@ -7857,6 +8146,21 @@ class EnsembleProvider:
                     "proposer physical provider stream closure is unproven"
                 )
                 candidate.error_code = _ENSEMBLE_PROPOSER_CLOSE_TIMEOUT_CODE
+                if (
+                    cleanup_bypass_quorum_met
+                    and not candidate.ok
+                    and self._persist_unclosed_request_usage(candidate)
+                ):
+                    quarantined_cleanup_indexes.append(candidate.index)
+                    attempts = candidate.execution.get("physical_attempts")
+                    if isinstance(attempts, list):
+                        quarantined_physical_attempt_ids.extend(
+                            str(attempt.get("physical_attempt_id") or "")
+                            for attempt in attempts
+                            if isinstance(attempt, Mapping)
+                            and attempt.get("stream_closed") is not True
+                        )
+                    continue
                 self._set_proposer_recovery_terminal(
                     trace,
                     state=state,
@@ -7878,6 +8182,20 @@ class EnsembleProvider:
                 )
                 self._refresh_proposer_recovery_trace(trace, state, recovered)
                 return recovered
+        if quarantined_cleanup_indexes:
+            trace["cleanup_quorum_bypass"] = {
+                "schema": (
+                    "opensquilla.router-dynamic-proposer-cleanup-quorum-bypass/v1"
+                ),
+                "applied": True,
+                "quorum_required": cleanup_bypass_quorum,
+                "successful_proposers": successful_count,
+                "usable_proposers": usable_count,
+                "candidate_indexes": sorted(quarantined_cleanup_indexes),
+                "physical_attempt_ids": quarantined_physical_attempt_ids,
+                "recovery_skipped": True,
+                "aggregator_tools_disabled": True,
+            }
         # A terminally failed effective identity is excluded for the remainder
         # of this run-turn scope, even when the current chat already reached
         # quorum and therefore needs no immediate replacement. Otherwise a
@@ -7898,7 +8216,10 @@ class EnsembleProvider:
         if not self._router_dynamic_proposer_recovery_enabled():
             self._refresh_proposer_recovery_trace(trace, state, recovered)
             return recovered
-        if sum(1 for candidate in recovered if candidate.ok) >= self.min_successful_proposers:
+        if _proposer_execution_quorum_met(
+            recovered,
+            self.min_successful_proposers,
+        ):
             self._refresh_proposer_recovery_trace(trace, state, recovered)
             return recovered
 
@@ -7923,11 +8244,15 @@ class EnsembleProvider:
             return None
 
         for position, failed in enumerate(list(recovered)):
-            if failed.ok:
+            # A partial usable draft is quarantined as a failed physical call,
+            # but is never replayed, continued, downgraded, or replaced.
+            if failed.usable_for_aggregation:
                 continue
             if (
-                sum(1 for candidate in recovered if candidate.ok)
-                >= self.min_successful_proposers
+                _proposer_execution_quorum_met(
+                    recovered,
+                    self.min_successful_proposers,
+                )
                 or state.additional_physical_requests_started
                 >= state.max_additional_physical_requests
             ):
@@ -8105,8 +8430,10 @@ class EnsembleProvider:
                     self._member_identity(effective_member),
                 )
                 if (
-                    sum(1 for candidate in recovered if candidate.ok)
-                    >= self.min_successful_proposers
+                    _proposer_execution_quorum_met(
+                        recovered,
+                        self.min_successful_proposers,
+                    )
                 ):
                     break
                 continue
@@ -8120,8 +8447,13 @@ class EnsembleProvider:
                     recovered,
                 )
 
+            if current.usable_for_aggregation:
+                # Preserve the partial draft as execution input, but keep its
+                # identity failed/quarantined for the rest of this scope.
+                continue
+
             while (
-                not current.ok
+                not current.usable_for_aggregation
                 and state.additional_physical_requests_started
                 < state.max_additional_physical_requests
             ):
@@ -8175,6 +8507,8 @@ class EnsembleProvider:
                         kind="backup_replacement",
                         reason="frozen_backup_order",
                     )
+                    break
+                if current.usable_for_aggregation:
                     break
 
                 backup_failure_kind = self._proposer_failure_kind(
@@ -8267,6 +8601,8 @@ class EnsembleProvider:
                                 ),
                             )
                             break
+                        if current.usable_for_aggregation:
+                            break
                         backup_failure_kind = (
                             self._proposer_failure_kind(
                                 downgraded,
@@ -8320,6 +8656,8 @@ class EnsembleProvider:
                                 reason="transient_same_model_retry",
                             )
                             break
+                        if current.usable_for_aggregation:
+                            break
                         backup_failure_kind = (
                             self._proposer_failure_kind(
                                 retried,
@@ -8336,8 +8674,10 @@ class EnsembleProvider:
             if trace.get("terminal_reason"):
                 break
             if (
-                sum(1 for candidate in recovered if candidate.ok)
-                >= self.min_successful_proposers
+                _proposer_execution_quorum_met(
+                    recovered,
+                    self.min_successful_proposers,
+                )
             ):
                 break
 
@@ -8477,7 +8817,20 @@ class EnsembleProvider:
         cancel_code = ""
         cancel_message = ""
         try:
-            successful_count = sum(1 for result in results if result.ok)
+            dynamic_partial_quorum = self._router_dynamic_selection()
+            usable_count = (
+                len(_usable_proposer_candidates(results))
+                if dynamic_partial_quorum
+                else sum(1 for result in results if result.ok)
+            )
+            execution_quorum_required = (
+                _proposer_execution_quorum_required(
+                    results,
+                    self.min_successful_proposers,
+                )
+                if dynamic_partial_quorum
+                else self.min_successful_proposers
+            )
             recovery_guard_reason = (
                 self._proposer_recovery_plan_guard_reason(recovery_state)
             )
@@ -8496,18 +8849,18 @@ class EnsembleProvider:
                     )
                 )
                 if (
-                    successful_count
+                    usable_count
                     + len(pending)
                     + remaining_recovery_capacity
-                    < self.min_successful_proposers
+                    < execution_quorum_required
                 ):
                     cancel_code = "quorum_unreachable"
                     cancel_message = (
                         "proposer cancelled because ensemble quorum is "
-                        f"unreachable: {successful_count} successful + "
+                        f"unreachable: {usable_count} usable + "
                         f"{len(pending)} pending + "
                         f"{remaining_recovery_capacity} recovery capacity "
-                        f"< {self.min_successful_proposers} required"
+                        f"< {execution_quorum_required} required"
                     )
             if not cancel_code:
                 proposer_start_gate.set()
@@ -8543,17 +8896,19 @@ class EnsembleProvider:
                     )
                     break
 
-                if any(
-                    result.error_code == _ENSEMBLE_PROPOSER_CLOSE_TIMEOUT_CODE for result in results
-                ):
-                    cancel_code = _ENSEMBLE_PROPOSER_CLOSE_TIMEOUT_CODE
-                    cancel_message = (
-                        "proposer batch stopped because a physical provider stream "
-                        "did not close within the cleanup window"
+                usable_count = (
+                    len(_usable_proposer_candidates(results))
+                    if dynamic_partial_quorum
+                    else sum(1 for result in results if result.ok)
+                )
+                execution_quorum_required = (
+                    _proposer_execution_quorum_required(
+                        results,
+                        self.min_successful_proposers,
                     )
-                    break
-
-                successful_count = sum(1 for result in results if result.ok)
+                    if dynamic_partial_quorum
+                    else self.min_successful_proposers
+                )
                 if (
                     pending
                     and not cancel_code
@@ -8575,22 +8930,30 @@ class EnsembleProvider:
                     )
                 )
                 if (
-                    successful_count
+                    usable_count
                     + len(pending)
                     + remaining_recovery_capacity
-                    < self.min_successful_proposers
+                    < execution_quorum_required
                 ):
                     cancel_code = "quorum_unreachable"
                     cancel_message = (
                         "proposer cancelled because ensemble quorum became unreachable: "
-                        f"{successful_count} successful + {len(pending)} pending + "
+                        f"{usable_count} usable + {len(pending)} pending + "
                         f"{remaining_recovery_capacity} recovery capacity "
-                        f"< {self.min_successful_proposers} required"
+                        f"< {execution_quorum_required} required"
                     )
                     break
                 if (
                     self.quorum_grace_seconds > 0
-                    and successful_count >= self.min_successful_proposers
+                    and (
+                        _proposer_execution_quorum_met(
+                            results,
+                            self.min_successful_proposers,
+                        )
+                        if dynamic_partial_quorum
+                        else sum(1 for result in results if result.ok)
+                        >= self.min_successful_proposers
+                    )
                 ):
                     break
 
@@ -8604,14 +8967,6 @@ class EnsembleProvider:
                 done, pending = await asyncio.wait(pending, timeout=grace_timeout)
                 for task in done:
                     results.append(await task)
-                if any(
-                    result.error_code == _ENSEMBLE_PROPOSER_CLOSE_TIMEOUT_CODE for result in results
-                ):
-                    cancel_code = _ENSEMBLE_PROPOSER_CLOSE_TIMEOUT_CODE
-                    cancel_message = (
-                        "proposer batch stopped because a physical provider stream "
-                        "did not close within the cleanup window"
-                    )
                 if (
                     pending
                     and not cancel_code
@@ -8644,13 +8999,17 @@ class EnsembleProvider:
                     self._track_pending_cleanup(task, "proposers")
                 lingering = await _bounded_task_cleanup(remaining, phase="proposers")
                 for task in remaining:
+                    task_controlled_code = controlled_code
+                    task_controlled_message = controlled_message
                     if task.done():
                         try:
                             item = task.result()
                         except _EnsembleStreamCloseError:
                             item = None
-                            controlled_code = _ENSEMBLE_PROPOSER_CLOSE_TIMEOUT_CODE
-                            controlled_message = (
+                            task_controlled_code = (
+                                _ENSEMBLE_PROPOSER_CLOSE_TIMEOUT_CODE
+                            )
+                            task_controlled_message = (
                                 "proposer batch stopped because a physical provider "
                                 "stream did not close within the cleanup window"
                             )
@@ -8709,7 +9068,10 @@ class EnsembleProvider:
                             )
                             if isinstance(row, Mapping)
                         ]
-                        if member.thinking_policy_managed:
+                        if (
+                            member.thinking_policy_managed
+                            or self._router_dynamic_selection()
+                        ):
                             physical_request_count = len(task_physical_attempts)
                             request_started = physical_request_count > 0
                         attempt_snapshots = [
@@ -8732,7 +9094,10 @@ class EnsembleProvider:
                                     profile=self.profile_name,
                                 )
                             )
-                        if member.thinking_policy_managed:
+                        if (
+                            member.thinking_policy_managed
+                            or self._router_dynamic_selection()
+                        ):
                             represented_ids = {
                                 str(row.get("physical_attempt_id") or "")
                                 for row in published_rows
@@ -8765,6 +9130,17 @@ class EnsembleProvider:
                         usage_missing_count = published_missing_count + max(
                             0,
                             physical_request_count - published_physical_count,
+                        )
+                        stream_closed = bool(
+                            not request_started
+                            or (
+                                task not in lingering
+                                and task_physical_attempts
+                                and all(
+                                    attempt.get("stream_closed") is True
+                                    for attempt in task_physical_attempts
+                                )
+                            )
                         )
                         latest_snapshot = attempt_snapshots[-1] if attempt_snapshots else None
                         results.append(
@@ -8835,18 +9211,19 @@ class EnsembleProvider:
                                     "proposer physical provider stream did not close "
                                     "within the cleanup window"
                                     if task in lingering
-                                    else controlled_message
+                                    else task_controlled_message
                                 ),
                                 error_code=(
                                     _ENSEMBLE_PROPOSER_CLOSE_TIMEOUT_CODE
                                     if task in lingering
-                                    else controlled_code
+                                    else task_controlled_code
                                 ),
                                 # A soft deadline can fire before a scheduled
                                 # coroutine reaches its provider.  Preserve the
                                 # exact physical-request fact recorded at the
                                 # point where the lower stream is entered.
                                 request_started=request_started,
+                                stream_closed=stream_closed,
                                 physical_request_count=physical_request_count,
                                 usage_missing_count=usage_missing_count,
                                 usage_reported=any(
@@ -8867,7 +9244,10 @@ class EnsembleProvider:
                                         ),
                                         "scheduler_cancellation": True,
                                     }
-                                    if member.thinking_policy_managed
+                                    if (
+                                        member.thinking_policy_managed
+                                        or self._router_dynamic_selection()
+                                    )
                                     else {
                                         "scheduler_cancellation": True,
                                     }
@@ -9342,11 +9722,20 @@ class EnsembleProvider:
             provider = _build_provider(member.provider_config)
             raw_stream = provider.chat(messages, tools=tools, config=chat_cfg)
             mark_request_started()
+
+        def mark_stream_close_result(closed: bool) -> None:
+            if not closed:
+                return
+            result.stream_closed = True
+            if current_physical_attempt is not None:
+                current_physical_attempt["stream_closed"] = True
+
         async with _closing_async_iterator(
             raw_stream,
             phase=f"ensemble_proposer_{result.index}",
             pending_cleanup_tracker=self._track_pending_cleanup,
             terminal_observed=lambda: terminal_event_observed,
+            close_observed=mark_stream_close_result,
         ) as provider_stream:
             async for event in provider_stream:
                 if isinstance(event, TextDeltaEvent):
@@ -9354,6 +9743,13 @@ class EnsembleProvider:
                     if result.ttft_ms is None and event.text:
                         result.ttft_ms = int((time.monotonic() - started) * 1000)
                     text_parts.append(event.text)
+                    # Publish text incrementally to the outer cleanup owner.
+                    # If iterator close later times out, `_collect_candidate`
+                    # still has the useful prefix instead of an empty result.
+                    result.text = _truncate_text(
+                        result.text + event.text,
+                        self.candidate_max_chars,
+                    )
                 elif isinstance(event, ReasoningDeltaEvent):
                     response_observed = response_observed or bool(event.text)
                     reasoning_observed = reasoning_observed or bool(event.text)
@@ -9363,6 +9759,12 @@ class EnsembleProvider:
                     (ToolUseStartEvent, ToolUseDeltaEvent, ToolUseEndEvent),
                 ):
                     response_observed = True
+                    # Keep this semantic failure independent from transport
+                    # cleanup.  If ``aclose`` subsequently times out, the
+                    # outer boundary must report that physical fact without
+                    # accidentally making the already-invalid draft eligible
+                    # for the router_dynamic partial-output quorum.
+                    result.execution["candidate_mode_contract_violation"] = True
                     result.error = "proposer provider violated the inert candidate-output contract"
                     result.error_code = "candidate_mode_contract_violation"
                     break
@@ -9941,6 +10343,29 @@ class EnsembleProvider:
         candidate_display_order: Sequence[int] | None = None,
     ) -> dict[str, Any]:
         selected = list(selected_candidates or [])
+        selected_keys = {
+            (candidate.index, candidate.sample_index) for candidate in selected
+        }
+        usable_count = len(_usable_proposer_candidates(candidates))
+        partial_count = sum(
+            1
+            for candidate in candidates
+            if candidate.usable_for_aggregation and not candidate.ok
+        )
+        dynamic_partial_quorum = self._router_dynamic_selection()
+        execution_quorum_required = (
+            _proposer_execution_quorum_required(
+                candidates,
+                self.min_successful_proposers,
+            )
+            if dynamic_partial_quorum
+            else self.min_successful_proposers
+        )
+        execution_quorum_met = (
+            usable_count >= execution_quorum_required
+            if dynamic_partial_quorum
+            else successful_count >= execution_quorum_required
+        )
         trace = {
             "output_binding_schema": "opensquilla.ensemble-output-binding/v1",
             "output_components": [],
@@ -9948,6 +10373,11 @@ class EnsembleProvider:
             "profile": self.profile_name,
             "selection_strategy": self.selection_plan.get("strategy", "router_dynamic"),
             "successful_proposers": successful_count,
+            "usable_proposers": usable_count,
+            "partial_proposers": partial_count,
+            "strict_quorum_met": successful_count >= self.min_successful_proposers,
+            "execution_quorum_required": execution_quorum_required,
+            "execution_quorum_met": execution_quorum_met,
             "total_candidates": len(candidates),
             "fallback_used": fallback_used,
             "fallback_reason": fallback_reason,
@@ -9993,10 +10423,17 @@ class EnsembleProvider:
             "candidate_order_seed": candidate_order_seed,
             "candidate_display_order": list(candidate_display_order or []),
             "candidates": [
-                candidate.trace_row(
-                    include_text=self.record_candidates,
-                    content_max_chars=TRACE_CONTENT_MAX_CHARS,
-                )
+                {
+                    **candidate.trace_row(
+                        include_text=self.record_candidates,
+                        content_max_chars=TRACE_CONTENT_MAX_CHARS,
+                    ),
+                    "selected_for_aggregation": (
+                        candidate.index,
+                        candidate.sample_index,
+                    )
+                    in selected_keys,
+                }
                 for candidate in candidates
             ],
         }
@@ -10572,6 +11009,7 @@ class EnsembleProvider:
             selected_kind_override: str | None = None,
             physical_output_text: str | None = None,
             assembled_contribution_text: str | None = None,
+            final_request_usage_override: Mapping[str, Any] | None = None,
         ) -> DoneEvent:
             selected_kind = selected_kind_override or attempt_kind
             finalize_thinking_fallback("succeeded" if recovery_success else "failed")
@@ -10626,6 +11064,10 @@ class EnsembleProvider:
                 requested_provider=active_member.provider_config.provider,
                 requested_model=active_member.provider_config.model,
             )
+            if final_request_usage_override is not None:
+                trace.setdefault("final_request", {})["usage"] = _json_safe(
+                    dict(final_request_usage_override)
+                )
             if isinstance(selected_physical_binding, Mapping):
                 trace.setdefault("final_request", {})["output"] = dict(selected_physical_binding)
             trace["assembled_output"] = _trace_output_content(assembled_output_text)
@@ -10697,7 +11139,17 @@ class EnsembleProvider:
                 active_config,
             )
             managed_event_missing_count = 0
-            if requires_physical_attempt_evidence(active_member):
+            # A degraded/partial delivery records the failed physical attempt
+            # through ``record_abandoned_attempt`` before entering this
+            # helper.  In that case ``include_event_usage`` is false and the
+            # already-bound row in ``abandoned_rows`` is the authoritative
+            # receipt (or explicit unknown placeholder).  Rebinding an empty
+            # ``aggregator_rows`` list here would misclassify that failed
+            # attempt as a successful completion without a receipt.
+            if (
+                requires_physical_attempt_evidence(active_member)
+                and include_event_usage
+            ):
                 if not current_physical_attempt_id:
                     raise ValueError(
                         "tracked aggregator completion has no physical attempt"
@@ -10824,10 +11276,14 @@ class EnsembleProvider:
             trace["fallback_reason"] = attempt_trigger if active_fallback_index > 0 else ""
             if recovery_trace.get("degraded") is True:
                 trace["run_outcome"] = str(
-                    recovery_trace.get("run_outcome") or "length_capped_usable"
+                    recovery_trace.get("run_outcome") or "aggregator_incomplete"
                 )
                 trace["delivery_outcome"] = str(
-                    recovery_trace.get("delivery_outcome") or "partial_usable"
+                    recovery_trace.get("delivery_outcome") or "degraded_success"
+                )
+                trace["execution_outcome"] = "degraded_success"
+                trace["audit_outcome"] = str(
+                    recovery_trace.get("audit_outcome") or "incomplete"
                 )
             else:
                 trace["run_outcome"] = (
@@ -11227,6 +11683,128 @@ class EnsembleProvider:
                 trace["usage_missing_count"] = prior_missing_count + abandoned_missing_count
             return recorded_attempt
 
+        def degraded_delivery_done(
+            error: ErrorEvent,
+            *,
+            stream_closed: bool,
+            completion_observed: bool,
+            physical_output_text: str,
+            assembled_contribution_text: str,
+            stop_reason: str = "",
+        ) -> DoneEvent:
+            """Deliver one useful prefix without rewriting physical evidence."""
+
+            selected_attempt = record_abandoned_attempt(
+                error,
+                trigger=error.code or "aggregator_incomplete",
+                stream_closed=stream_closed,
+                stop_reason=stop_reason,
+                physical_output_text=physical_output_text,
+                assembled_contribution_text=assembled_contribution_text,
+            )
+            selected_attempt_row = next(
+                (
+                    row
+                    for row in recovery_attempts
+                    if isinstance(row, dict)
+                    and row.get("attempt") == selected_attempt
+                ),
+                None,
+            )
+            if isinstance(selected_attempt_row, dict):
+                selected_attempt_row.update(
+                    {
+                        "outcome": "failed",
+                        "delivery_selected": True,
+                        "completion_observed": completion_observed,
+                    }
+                )
+
+            recovery_trace.update(
+                {
+                    "degraded": True,
+                    "success": False,
+                    "delivery_success": True,
+                    "delivery_outcome": "degraded_success",
+                    "audit_outcome": "incomplete",
+                    "run_outcome": error.code or "aggregator_incomplete",
+                    "terminal_code": error.code or "aggregator_incomplete",
+                    "completion_observed": completion_observed,
+                    "stream_closed": stream_closed,
+                    "recovery_skipped": True,
+                    "tools_disabled_after_partial_output": True,
+                }
+            )
+
+            usage_override = next(
+                (
+                    dict(row)
+                    for row in reversed(abandoned_rows)
+                    if isinstance(row, Mapping)
+                    and (
+                        not current_physical_attempt_id
+                        or str(row.get("physical_attempt_id") or "")
+                        == current_physical_attempt_id
+                    )
+                ),
+                None,
+            )
+            if usage_override is None:
+                usage_override = {
+                    "usage_evidence_schema": USAGE_EVIDENCE_SCHEMA,
+                    "usage_evidence_source": (
+                        "degraded_aggregator_request_unknown_usage"
+                    ),
+                    "role": "unknown_request",
+                    "profile": self.profile_name,
+                    "label": f"aggregator_attempt_{attempt + 1}",
+                    "provider": "",
+                    "model": "",
+                    "requested_provider": (
+                        active_member.provider_config.provider
+                    ),
+                    "requested_model": active_member.provider_config.model,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "reasoning_tokens": 0,
+                    "cached_tokens": 0,
+                    "cache_write_tokens": 0,
+                    "billed_cost": 0.0,
+                    "cost_source": "none",
+                    "usage_unknown": True,
+                    "provider_usage": {"usage_unknown": True},
+                }
+                if current_physical_attempt_id:
+                    usage_override = _usage_row_with_physical_attempt_id(
+                        usage_override,
+                        physical_attempt_id=current_physical_attempt_id,
+                    )
+
+            evidence = (
+                error.diagnostic_done
+                or last_partial_done_event
+                or DoneEvent(
+                    model=active_member.provider_config.model,
+                    provider=active_member.provider_config.provider,
+                    requested_model=active_member.provider_config.model,
+                    requested_provider=active_member.provider_config.provider,
+                )
+            )
+            delivered_event = replace(evidence, stop_reason="end_turn")
+            return ensemble_done(
+                delivered_event,
+                aggregator_elapsed_ms=int(
+                    (time.monotonic() - aggregator_started) * 1000
+                ),
+                include_event_usage=False,
+                record_success_attempt=False,
+                recovery_success=False,
+                final_request_event=evidence,
+                selected_attempt_override=selected_attempt,
+                selected_kind_override="degraded_delivery",
+                final_request_usage_override=usage_override,
+            )
+
         yield aggregator_progress("aggregator_start")
         attempt = 0
         physical_attempts_started = 0
@@ -11513,6 +12091,15 @@ class EnsembleProvider:
                     raise _EnsembleStreamCloseError("ensemble_aggregator_external_close")
             if completed_provider_event is not None:
                 aggregator_elapsed_ms = int((time.monotonic() - aggregator_started) * 1000)
+                attempt_visible_text = "".join(attempt_text_parts)
+                if attempt_kind.startswith("continuation"):
+                    attempt_visible_text = _deduplicate_continuation(
+                        "".join(final_text_parts),
+                        attempt_visible_text,
+                    )
+                    if attempt_visible_text:
+                        final_text_parts.append(attempt_visible_text)
+                        yield TextDeltaEvent(text=attempt_visible_text)
                 if not stream_closed:
                     close_error = ErrorEvent(
                         message=(
@@ -11524,6 +12111,26 @@ class EnsembleProvider:
                         request_started=True,
                         physical_request_count=1,
                     )
+                    if (
+                        self._router_dynamic_selection()
+                        and not tool_output_streamed
+                        and _visible_answer_looks_usable(
+                            "".join(final_text_parts)
+                        )
+                    ):
+                        done_event = degraded_delivery_done(
+                            close_error,
+                            stream_closed=False,
+                            completion_observed=True,
+                            physical_output_text="".join(attempt_text_parts),
+                            assembled_contribution_text=attempt_visible_text,
+                            stop_reason=str(
+                                completed_provider_event.stop_reason or ""
+                            ),
+                        )
+                        yield aggregator_progress("aggregator_finish")
+                        yield done_event
+                        return
                     yield aggregator_progress(
                         "aggregator_finish",
                         error=close_error.message,
@@ -11532,15 +12139,6 @@ class EnsembleProvider:
                     return
 
                 stop_reason = str(completed_provider_event.stop_reason or "").strip().lower()
-                attempt_visible_text = "".join(attempt_text_parts)
-                if attempt_kind.startswith("continuation"):
-                    attempt_visible_text = _deduplicate_continuation(
-                        "".join(final_text_parts),
-                        attempt_visible_text,
-                    )
-                    if attempt_visible_text:
-                        final_text_parts.append(attempt_visible_text)
-                        yield TextDeltaEvent(text=attempt_visible_text)
                 length_capped = stop_reason in {"length", "max_tokens"} or (
                     active_member.thinking_policy_managed is True
                     and stop_reason == "max_output_tokens"
@@ -11577,6 +12175,25 @@ class EnsembleProvider:
                     request_started=True,
                     physical_request_count=1,
                 )
+
+                if (
+                    self._router_dynamic_selection()
+                    and partial_visible_length
+                    and _visible_answer_looks_usable(
+                        "".join(final_text_parts)
+                    )
+                ):
+                    done_event = degraded_delivery_done(
+                        diagnostic_error,
+                        stream_closed=True,
+                        completion_observed=True,
+                        physical_output_text="".join(attempt_text_parts),
+                        assembled_contribution_text=attempt_visible_text,
+                        stop_reason=stop_reason,
+                    )
+                    yield aggregator_progress("aggregator_finish")
+                    yield done_event
+                    return
 
                 if (
                     partial_visible_length
@@ -11921,6 +12538,36 @@ class EnsembleProvider:
                         ),
                         code="ensemble_aggregator_close_timeout",
                     )
+                degraded_contribution = (
+                    "".join(attempt_text_parts)
+                    if not attempt_kind.startswith("continuation")
+                    else _deduplicate_continuation(
+                        "".join(final_text_parts),
+                        "".join(attempt_text_parts),
+                    )
+                )
+                if (
+                    self._router_dynamic_selection()
+                    and attempt_kind.startswith("continuation")
+                    and degraded_contribution
+                ):
+                    final_text_parts.append(degraded_contribution)
+                    yield TextDeltaEvent(text=degraded_contribution)
+                if (
+                    self._router_dynamic_selection()
+                    and not tool_output_streamed
+                    and _visible_answer_looks_usable("".join(final_text_parts))
+                ):
+                    done_event = degraded_delivery_done(
+                        terminal_stream_error,
+                        stream_closed=stream_closed,
+                        completion_observed=False,
+                        physical_output_text="".join(attempt_text_parts),
+                        assembled_contribution_text=degraded_contribution,
+                    )
+                    yield aggregator_progress("aggregator_finish")
+                    yield done_event
+                    return
                 if (
                     recovery_mode == "serving"
                     and final_text_parts
@@ -12138,6 +12785,47 @@ class EnsembleProvider:
                     message="ensemble aggregator stream ended before DoneEvent",
                     code="ensemble_aggregator_incomplete",
                 )
+                if self._router_dynamic_selection():
+                    degraded_contribution = (
+                        "".join(attempt_text_parts)
+                        if not attempt_kind.startswith("continuation")
+                        else _deduplicate_continuation(
+                            "".join(final_text_parts),
+                            "".join(attempt_text_parts),
+                        )
+                    )
+                    if (
+                        attempt_kind.startswith("continuation")
+                        and degraded_contribution
+                    ):
+                        final_text_parts.append(degraded_contribution)
+                        yield TextDeltaEvent(text=degraded_contribution)
+                    if (
+                        not tool_output_streamed
+                        and _visible_answer_looks_usable(
+                            "".join(final_text_parts)
+                        )
+                    ):
+                        if not stream_closed:
+                            error = replace(
+                                error,
+                                message=(
+                                    "ensemble aggregator ended without a terminal "
+                                    "event and its provider stream did not close "
+                                    "within the cleanup window"
+                                ),
+                                code="ensemble_aggregator_close_timeout",
+                            )
+                        done_event = degraded_delivery_done(
+                            error,
+                            stream_closed=stream_closed,
+                            completion_observed=False,
+                            physical_output_text="".join(attempt_text_parts),
+                            assembled_contribution_text=degraded_contribution,
+                        )
+                        yield aggregator_progress("aggregator_finish")
+                        yield done_event
+                        return
                 if stream_closed and not content_streamed and attempt < max_transient_retries:
                     retry_error = error
                 else:

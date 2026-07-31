@@ -10,6 +10,7 @@ import sys
 from collections.abc import Iterator, Mapping
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -9038,6 +9039,14 @@ def test_main_and_resume_share_identical_critical_runtime_functions() -> None:
         "exact_provider_usage_cost",
         "trusted_provider_billed_cost",
         "_mixed_usage_cost",
+        "_load_frozen_model_registry_snapshot",
+        "_registry_price_value",
+        "_frozen_openrouter_registry_price_index",
+        "_frozen_estimate_price",
+        "_stored_estimate_price_source",
+        "_discard_non_frozen_stored_estimate",
+        "estimate_missing_usage_costs",
+        "repair_row_cost_metadata_with_estimates",
         "build_stable_receipt_evidence",
         "ignored_agent_done_summary_policy_evidence",
         "merge_usage_receipt_provenance",
@@ -9228,7 +9237,6 @@ def test_resume_rejects_legacy_or_incompatible_contract_rows(tmp_path: Path) -> 
 
     assert completed == set()
     assert audit["strict_invalid_reason_counts"] == {
-        "cost_metadata_incomplete": 2,
         "invalid_result_evidence": 1,
         "missing_run_compatibility_fingerprint": 1,
         "missing_task_input_sha256": 1,
@@ -9264,7 +9272,15 @@ def test_resume_requires_recomputed_non_byok_cost_evidence() -> None:
         expected_run_compatibility_fingerprint="sha256:run-contract",
         require_openrouter_non_byok=True,
     )
-    assert "openrouter_non_byok_metadata_incomplete" in invalid_reasons
+    invalid_state = resume_runner.resume_row_completion_state(
+        invalid,
+        expected_prompt_sha256=prompt_hash,
+        expected_task_input_sha256="sha256:task-input",
+        expected_run_compatibility_fingerprint="sha256:run-contract",
+        require_openrouter_non_byok=True,
+    )
+    assert "openrouter_non_byok_metadata_incomplete" not in invalid_reasons
+    assert "openrouter_non_byok_metadata_incomplete" in invalid_state["audit_reasons"]
 
     exact = {
         **base,
@@ -9293,7 +9309,35 @@ def test_resume_requires_recomputed_non_byok_cost_evidence() -> None:
     assert exact_reasons == []
 
 
-def test_resume_policy_violation_overrides_regeneration_and_is_never_repairable() -> None:
+def test_resume_byok_violation_is_audit_only_and_never_overrides_execution(
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
+    frozen_snapshot = {
+        "schema_version": "test/v1",
+        "snapshot_version": "resume-byok-price-v1",
+        "models": [
+            {
+                "registry_facts": {
+                    "provider": "openrouter",
+                    "model_id": "model-a",
+                    "price": {
+                        "input_per_million": 2.0,
+                        "output_per_million": 4.0,
+                    },
+                }
+            }
+        ],
+    }
+    resume_runner._frozen_openrouter_registry_price_index.cache_clear()
+    request.addfinalizer(
+        resume_runner._frozen_openrouter_registry_price_index.cache_clear
+    )
+    monkeypatch.setattr(
+        resume_runner,
+        "_load_frozen_model_registry_snapshot",
+        lambda: frozen_snapshot,
+    )
     prompt_hash = resume_runner.text_sha256("same prompt")
     explicit_byok_usage = {
         "provider": "openrouter",
@@ -9343,8 +9387,9 @@ def test_resume_policy_violation_overrides_regeneration_and_is_never_repairable(
     )
 
     assert "empty_final_text" in state["generation_reasons"]
-    assert state["action"] == "policy_violation"
-    assert "openrouter_non_byok_policy_violation" in state["fatal_policy_reasons"]
+    assert state["action"] == "regenerate"
+    assert "openrouter_non_byok_policy_violation" in state["audit_reasons"]
+    assert state["fatal_policy_reasons"] == []
 
     stored_marker = {
         **row,
@@ -9359,12 +9404,43 @@ def test_resume_policy_violation_overrides_regeneration_and_is_never_repairable(
         require_openrouter_non_byok=False,
         judge_required=False,
     )
-    assert stored_state["action"] == "policy_violation"
-    assert stored_state["cost_metadata_complete"] is False
+    # The explicit BYOK receipt is not an exact OpenRouter charge. Repair its
+    # missing dollars from token usage before recording the audit-only state.
+    assert stored_state["action"] == "metadata_only"
+    assert "openrouter_non_byok_policy_violation" in stored_state["audit_reasons"]
+    assert stored_state["fatal_policy_reasons"] == []
+
+    estimated_marker = deepcopy(stored_marker)
+    assert resume_runner.repair_row_cost_metadata_with_estimates(estimated_marker) is True
+    estimated_marker["execution"] = {"metadata_repair_attempted": True}
+    estimated_state = resume_runner.resume_row_completion_state(
+        resume_runner.seal_result_row(estimated_marker),
+        expected_prompt_sha256=prompt_hash,
+        expected_task_input_sha256="sha256:task-input",
+        expected_run_compatibility_fingerprint="sha256:run-contract",
+        require_openrouter_non_byok=True,
+        judge_required=False,
+    )
+    assert estimated_state["action"] == "audit_only"
+    assert estimated_state["cost_metadata_complete"] is True
+
+    recorded_marker = deepcopy(estimated_marker)
+    recorded_marker["error"] = None
+    recorded_marker["execution"]["audit_only_recorded"] = True
+    recorded_state = resume_runner.resume_row_completion_state(
+        resume_runner.seal_result_row(recorded_marker),
+        expected_prompt_sha256=prompt_hash,
+        expected_task_input_sha256="sha256:task-input",
+        expected_run_compatibility_fingerprint="sha256:run-contract",
+        require_openrouter_non_byok=True,
+        judge_required=False,
+    )
+    assert recorded_state["action"] == "complete"
+    assert "openrouter_non_byok_policy_violation" in recorded_state["audit_reasons"]
 
 
 @pytest.mark.asyncio
-async def test_resume_source_policy_violation_stops_before_any_new_call(
+async def test_resume_source_byok_history_does_not_abort_or_schedule_new_calls(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -9415,17 +9491,9 @@ async def test_resume_source_policy_violation_stops_before_any_new_call(
     }
     explicit["error"] = "openrouter_non_byok_policy_violation"
     explicit["openrouter_non_byok_audit"] = resume_runner.openrouter_non_byok_audit(explicit)
-    exact = json.loads(json.dumps(base))
-    exact["usage"]["provider_usage"] = _openrouter_exact_evidence(
-        0.01,
-        "resume-later-exact-generation",
-    )
-    exact["error"] = None
-    exact["openrouter_non_byok_audit"] = resume_runner.openrouter_non_byok_audit(exact)
     resume_path = tmp_path / "prior.jsonl"
     resume_path.write_text(
-        "\n".join(json.dumps(resume_runner.seal_result_row(row)) for row in (explicit, exact))
-        + "\n",
+        json.dumps(resume_runner.seal_result_row(explicit)) + "\n",
         encoding="utf-8",
     )
     args = resume_runner.build_parser().parse_args(
@@ -9470,7 +9538,7 @@ async def test_resume_source_policy_violation_stops_before_any_new_call(
 
     async def forbidden_preflight(*_args, **_kwargs):
         call_counts["preflight"] += 1
-        raise AssertionError("web preflight must not start after a policy violation")
+        raise AssertionError("completed resume source must not need web preflight")
 
     def forbidden_provider(*_args, **_kwargs):
         call_counts["provider"] += 1
@@ -9495,20 +9563,38 @@ async def test_resume_source_policy_violation_stops_before_any_new_call(
 
     status = await resume_runner.amain(args)
 
-    assert status == 2
+    assert status == 0
     assert call_counts == {
         "preflight": 0,
         "provider": 0,
         "generation": 0,
         "judge": 0,
     }
-    assert not list(output_dir.glob("draco_ensemble_*.jsonl"))
-    manifests = list(output_dir.glob("*.policy-violation.manifest.json"))
-    assert len(manifests) == 1
-    manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
-    assert manifest["status"] == "cost_audit_failed"
-    assert manifest["failure"]["stage"] == "resume_source_openrouter_non_byok_policy_violation"
-    assert manifest["failure"]["model_or_judge_started"] is False
+    result_paths = list(output_dir.glob("draco_ensemble_*.jsonl"))
+    assert len(result_paths) == 1
+    repaired = json.loads(
+        next(
+            line
+            for line in result_paths[0].read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        )
+    )
+    assert repaired["error"] is None
+    assert repaired["execution"]["resume_action"] == "metadata_only"
+    assert repaired["execution"]["metadata_repair_attempted"] is True
+    assert repaired["execution"]["metadata_repair_summary"]["generation_called"] is False
+    assert repaired["execution"]["metadata_repair_summary"]["judge_called"] is False
+    assert repaired["resume_completion"]["post_repair_action"] == "audit_only"
+    assert repaired["usage"]["cost_source"] == "opensquilla_static_estimate"
+    assert repaired["usage"]["provider_usage"]["estimate_basis"] in {
+        "cache_aware",
+        "cache_blind",
+        "free",
+    }
+    assert repaired["completion_status"]["status"] == "complete"
+    assert repaired["audit_status"]["policy"]["compliant"] is False
+    assert repaired["openrouter_non_byok_audit"]["status"] == "policy_violation"
+    assert not list(output_dir.glob("*.policy-violation.manifest.json"))
 
 
 @pytest.mark.asyncio
@@ -9616,7 +9702,7 @@ async def test_resume_missing_non_byok_receipt_reruns_only_missing_judge(
 
     status = await resume_runner.amain(args)
 
-    assert status == 2
+    assert status == 0
     assert call_counts == {"provider": 1, "generation": 0, "judge": 1}
     result_paths = list(output_dir.glob("draco_ensemble_*.jsonl"))
     assert len(result_paths) == 1
@@ -9636,7 +9722,10 @@ async def test_resume_missing_non_byok_receipt_reruns_only_missing_judge(
     assert repaired["generation_attempt_budget_used"] == 1
     assert repaired["judge"]["score_status"] == "complete"
     assert repaired["openrouter_non_byok_audit"]["status"] == ("metadata_incomplete")
-    assert repaired["error"] == "openrouter_non_byok_metadata_incomplete"
+    assert repaired["error"] is None
+    assert repaired["completion_status"]["status"] == "complete"
+    assert repaired["audit_status"]["status"] == "warning"
+    assert repaired["audit_status"]["separate_from_execution"] is True
     manifests = list(output_dir.glob("draco_run_*.manifest.json"))
     assert len(manifests) == 1
     manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
@@ -9753,7 +9842,7 @@ async def test_resume_metadata_only_repairs_once_without_generation_or_judge(
 
     status = await resume_runner.amain(args)
 
-    assert status in {0, 2}
+    assert status == 0
     assert call_counts == {"generation": 0, "judge": 0, "metadata": 1}
     result_paths = list(output_dir.glob("draco_ensemble_*.jsonl"))
     assert len(result_paths) == 1
@@ -9890,8 +9979,19 @@ def test_resume_classifies_generation_judge_and_metadata_independently() -> None
         expected_task_input_sha256="sha256:task-input",
         expected_run_compatibility_fingerprint="sha256:run-contract",
     )
-    assert already_attempted["action"] == "metadata_only"
+    assert already_attempted["action"] == "audit_only"
     assert already_attempted["metadata_repair_attempted"] is True
+
+    already_audited_row = json.loads(json.dumps(already_attempted_row))
+    already_audited_row["execution"]["audit_only_recorded"] = True
+    already_audited = resume_runner.resume_row_completion_state(
+        resume_runner.seal_result_row(already_audited_row),
+        expected_prompt_sha256=prompt_hash,
+        expected_task_input_sha256="sha256:task-input",
+        expected_run_compatibility_fingerprint="sha256:run-contract",
+    )
+    assert already_audited["action"] == "complete"
+    assert already_audited["cost_metadata_complete"] is False
 
     regenerate = resume_runner.resume_row_completion_state(
         resume_runner.seal_result_row({**base, "final_text": ""}),
@@ -13101,7 +13201,7 @@ def test_resume_does_not_apply_ensemble_proof_to_single_agent_loop_calls(
 
     assert state["generation_valid"] is True
     assert state["generation_reasons"] == []
-    assert state["action"] == "metadata_only"
+    assert state["action"] == "audit_only"
 
 
 def test_resume_binds_final_aggregator_output_to_agent_text_tail() -> None:
@@ -14983,14 +15083,20 @@ def test_repair_only_source_drift_inherits_expected_contract_and_actions(
     assert audit["groups"]["B0"]["source_identity_changed"] is True
     assert audit["groups"]["B0"]["non_source_contract_match"] is True
     action_audit = module.repair_only_resume_classification_audit(
-        selected_keys={("B2", "task-1"), ("G1", "task-1")},
+        selected_keys={
+            ("B2", "task-1"),
+            ("G1", "task-1"),
+            ("B4", "task-1"),
+        },
         resume_states={
             ("B2", "task-1"): {"action": "judge_only"},
             ("G1", "task-1"): {"action": "metadata_only"},
+            ("B4", "task-1"): {"action": "audit_only"},
         },
     )
     assert action_audit["status"] == "repair_actions_validated"
     assert action_audit["action_counts"] == {
+        "audit_only": 1,
         "judge_only": 1,
         "metadata_only": 1,
     }
@@ -15548,6 +15654,651 @@ def test_openrouter_non_byok_audit_rejects_zero_request_vacuous_pass(module) -> 
 
 
 @pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+def test_missing_cost_is_estimated_cache_aware_with_frozen_price_provenance(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
+    snapshot = {
+        "schema_version": "test/v1",
+        "snapshot_version": "frozen-price-test-v1",
+        "models": [
+            {
+                "registry_facts": {
+                    "provider": "openrouter",
+                    "model_id": "model-a",
+                    "price": {
+                        "input_per_million": 2.0,
+                        "output_per_million": 4.0,
+                        "cache_read_per_million": 0.5,
+                        "cache_write_per_million": 3.0,
+                    },
+                }
+            }
+        ],
+    }
+    module._frozen_openrouter_registry_price_index.cache_clear()
+    request.addfinalizer(module._frozen_openrouter_registry_price_index.cache_clear)
+    monkeypatch.setattr(
+        module,
+        "_load_frozen_model_registry_snapshot",
+        lambda: snapshot,
+    )
+    monkeypatch.setattr(
+        module,
+        "resolve_model_price",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("exact frozen registry price must win before layered pricing")
+        ),
+    )
+    usage = {
+        "provider": "openrouter",
+        "model": "model-a",
+        "input_tokens": 100,
+        "output_tokens": 20,
+        # Some legacy adapters populate only ``cached_tokens`` while newer
+        # ones also emit a smaller cache_read_tokens bucket.  The normalized
+        # estimate must conservatively retain the larger observed count.
+        "cache_read_tokens": 10,
+        "cached_tokens": 40,
+        "cache_write_tokens": 10,
+        "cost_source": "none",
+    }
+
+    assert module.estimate_missing_usage_costs(usage) is True
+
+    assert usage["estimated_cost_usd"] == pytest.approx(230.0 / 1_000_000)
+    assert usage["cost_usd"] == pytest.approx(230.0 / 1_000_000)
+    assert usage["cost_source"] == "opensquilla_static_estimate"
+    provider_usage = usage["provider_usage"]
+    assert provider_usage["cost_repair"] == "token_price_estimate"
+    assert provider_usage["estimate_basis"] == "cache_aware"
+    assert provider_usage["price_source"] == "frozen_openrouter_model_registry"
+    assert provider_usage["estimate_pricing"] == {
+        "source": "frozen_openrouter_model_registry",
+        "snapshot_version": "frozen-price-test-v1",
+        "snapshot_canonical_sha256": module.canonical_json_sha256(snapshot),
+        "registry_provider": "openrouter",
+        "registry_model_id": "model-a",
+        "provider": "openrouter",
+        "model": "model-a",
+        "input_per_m": 2.0,
+        "output_per_m": 4.0,
+        "cache_read_per_m": 0.5,
+        "cache_write_per_m": 3.0,
+    }
+
+
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+@pytest.mark.parametrize("provider", ["openrouter", ""], ids=["explicit", "legacy-empty"])
+def test_openrouter_frozen_registry_miss_never_calls_layered_price_resolver(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+    provider: str,
+) -> None:
+    snapshot = {
+        "schema_version": "test/v1",
+        "snapshot_version": "frozen-price-test-v1",
+        "models": [],
+    }
+    module._frozen_openrouter_registry_price_index.cache_clear()
+    request.addfinalizer(module._frozen_openrouter_registry_price_index.cache_clear)
+    monkeypatch.setattr(
+        module,
+        "_load_frozen_model_registry_snapshot",
+        lambda: snapshot,
+    )
+    monkeypatch.setattr(
+        module,
+        "resolve_model_price",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("a frozen OpenRouter registry miss must not perform live lookup")
+        ),
+    )
+    usage = {
+        "provider": provider,
+        "model": "unknown/model",
+        "input_tokens": 100,
+        "output_tokens": 20,
+        "cost_source": "none",
+    }
+
+    assert module.estimate_missing_usage_costs(usage) is True
+    assert usage["cost_source"] == "none"
+    assert "estimated_cost_usd" not in usage
+    assert "cost_usd" not in usage
+    assert usage["provider_usage"]["cost_estimate_provenance"] == {
+        "status": "unavailable",
+        "reason": "frozen_registry_price_unavailable",
+        "provider": provider,
+        "model": "unknown/model",
+        "source": "frozen_openrouter_model_registry",
+        "snapshot_version": "frozen-price-test-v1",
+        "snapshot_canonical_sha256": module.canonical_json_sha256(snapshot),
+        "registry_provider": "openrouter",
+        "registry_model_id": "unknown/model",
+    }
+
+
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+@pytest.mark.parametrize(
+    "price_source",
+    ["catalog", "live_openrouter", "user_override", "default", "unknown"],
+)
+def test_missing_cost_rejects_non_frozen_price_sources_without_inventing_zero(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+    price_source: str,
+) -> None:
+    price = SimpleNamespace(
+        input_per_m=2.0,
+        output_per_m=4.0,
+        cache_read_per_m=0.5,
+        cache_write_per_m=3.0,
+    )
+    module._frozen_openrouter_registry_price_index.cache_clear()
+    request.addfinalizer(module._frozen_openrouter_registry_price_index.cache_clear)
+    monkeypatch.setattr(
+        module,
+        "_load_frozen_model_registry_snapshot",
+        lambda: {
+            "schema_version": "test/v1",
+            "snapshot_version": "frozen-price-test-v1",
+            "models": [],
+        },
+    )
+    monkeypatch.setattr(
+        module,
+        "resolve_model_price",
+        lambda _model, _provider: SimpleNamespace(
+            entry=price,
+            source=price_source,
+        ),
+    )
+    usage = {
+        "provider": "anthropic",
+        "model": "unknown/model",
+        "input_tokens": 100,
+        "output_tokens": 20,
+        "cached_tokens": 40,
+        "cache_write_tokens": 10,
+        "billed_cost": 0.0,
+        "estimated_cost_usd": 99.0,
+        "cost_usd": 99.0,
+        "cost_source": "opensquilla_static_estimate",
+        "provider_usage": {
+            "response_ids": ["response-1"],
+            "price_source": price_source,
+        },
+    }
+
+    # Recording why no estimate was possible is a metadata repair, but no
+    # dollar value or completeness claim may be synthesized from this source.
+    assert module.estimate_missing_usage_costs(usage) is True
+    assert usage["billed_cost"] == 0.0
+    assert usage["cost_source"] == "none"
+    assert "estimated_cost_usd" not in usage
+    assert "cost_usd" not in usage
+    assert usage["provider_usage"]["response_ids"] == ["response-1"]
+    assert usage["provider_usage"]["discarded_cost_estimate_provenance"] == {
+        "reason": "non_frozen_price_source",
+        "cost_source": "opensquilla_static_estimate",
+        "price_source": price_source,
+        "estimated_cost_usd": 99.0,
+    }
+    assert usage["provider_usage"]["cost_estimate_provenance"] == {
+        "status": "unavailable",
+        "reason": "non_frozen_price_source",
+        "provider": "anthropic",
+        "model": "unknown/model",
+        "source": price_source,
+        "snapshot_version": "",
+        "snapshot_canonical_sha256": "",
+        "registry_provider": "",
+        "registry_model_id": "",
+    }
+    accounting = module.usage_cost_accounting(
+        usage,
+        expected_requests=1,
+        scope="test",
+    )
+    assert accounting["recorded_cost_usd"] == 0.0
+    assert accounting["unknown_request_count"] == 1
+    assert accounting["cost_complete"] is False
+    assert accounting["cost_exact"] is False
+
+
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+def test_unclosed_stream_and_byok_are_degraded_execution_and_audit_warning(module) -> None:
+    execution = module.execution_status_payload(
+        generation_accepted=True,
+        final_text="accepted answer",
+        run_error=None,
+        ensemble_trace={"candidates": [{"stream_closed": False}]},
+    )
+    audit = module.row_audit_status(
+        {
+            "cost_accounting": {
+                "actual_llm_total": {
+                    "cost_complete": True,
+                    "cost_exact": False,
+                    "estimated_request_count": 1,
+                    "mixed_request_count": 0,
+                    "unknown_request_count": 0,
+                }
+            },
+            "ensemble_trace": {"candidates": [{"stream_closed": False}]},
+            "usage": {},
+        },
+        non_byok_audit={
+            "status": "policy_violation",
+            "pass": False,
+        },
+    )
+
+    assert execution["status"] == "degraded_success"
+    assert execution["success"] is True
+    assert execution["degraded_reasons"] == ["unclosed_physical_stream"]
+    assert audit["status"] == "warning"
+    assert audit["separate_from_execution"] is True
+    assert audit["policy"]["compliant"] is False
+    assert audit["cost"]["status"] == "estimated"
+    assert audit["warnings"] == [
+        "openrouter_non_byok_policy_violation",
+        "llm_cost_estimated",
+        "unclosed_physical_stream",
+    ]
+
+
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+def test_dynamic_partial_proposer_quorum_is_usable_but_not_strict_success(module) -> None:
+    plan = {
+        "strategy": "router_dynamic",
+        "selection_mode": "router_dynamic",
+        "profile": "test",
+        "proposer_models": ["p1", "p2", "p3"],
+        "proposer_sample_count": 3,
+        "selected_P": ["openrouter:p1", "openrouter:p2", "openrouter:p3"],
+        "aggregator_model": "agg-primary",
+        "selected_A": "openrouter:agg-primary",
+        "aggregator_candidates": [
+            "openrouter:agg-primary",
+            "openrouter:agg-backup",
+        ],
+        "effective_min_successful_proposers": 2,
+    }
+    trace = _terminal_policy_call(
+        index=1,
+        plan=plan,
+        successful=1,
+        fallback=False,
+        output="final answer",
+    )
+    for index, candidate in enumerate(trace["candidates"]):
+        candidate.update(
+            {
+                "usable_for_aggregation": index < 2,
+                "completion_outcome": (
+                    "complete" if index == 0 else "partial_usable" if index == 1 else "failed"
+                ),
+                "selected_for_aggregation": index < 2,
+                "error_code": "" if index == 0 else "stream_interrupted",
+            }
+        )
+    partial = trace["candidates"][1]
+    partial_text = "Partial but meaningful proposer draft that can be fused."
+    partial["content"] = {
+        "text": partial_text,
+        "chars": len(partial_text),
+        "truncated": False,
+    }
+    trace.update(
+        {
+            "usable_proposers": 2,
+            "partial_proposers": 1,
+            "selected_candidate_count": 2,
+            "execution_quorum_required": 2,
+            "execution_quorum_met": True,
+        }
+    )
+
+    assert module.ensemble_call_core_reasons(
+        trace,
+        expected_selection_mode="router_dynamic",
+        expected_selection_plan=plan,
+        final_text="final answer",
+        require_output_binding=True,
+    ) == []
+
+    tampered = deepcopy(trace)
+    tampered["usable_proposers"] = 1
+    assert "invalid_proposer_execution_quorum_evidence" in (
+        module.ensemble_call_core_reasons(
+            tampered,
+            expected_selection_mode="router_dynamic",
+            expected_selection_plan=plan,
+            final_text="final answer",
+            require_output_binding=True,
+        )
+    )
+
+    insufficient = deepcopy(trace)
+    failed = insufficient["candidates"][1]
+    failed.update(
+        {
+            "usable_for_aggregation": False,
+            "completion_outcome": "failed",
+            "selected_for_aggregation": False,
+            "content": {"text": "", "chars": 0, "truncated": False},
+        }
+    )
+    insufficient.update(
+        {
+            "usable_proposers": 1,
+            "partial_proposers": 0,
+            "selected_candidate_count": 1,
+            "execution_quorum_required": 2,
+            "execution_quorum_met": False,
+        }
+    )
+    assert "insufficient_actual_proposer_quorum" in (
+        module.ensemble_call_core_reasons(
+            insufficient,
+            expected_selection_mode="router_dynamic",
+            expected_selection_plan=plan,
+            final_text="final answer",
+            require_output_binding=True,
+        )
+    )
+
+
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+def test_dynamic_aggregator_fallback_requires_frozen_physical_identity(module) -> None:
+    plan = {
+        "strategy": "router_dynamic",
+        "selection_mode": "router_dynamic",
+        "profile": "test",
+        "proposer_models": ["p1", "p2"],
+        "proposer_sample_count": 2,
+        "selected_P": ["openrouter:p1", "openrouter:p2"],
+        "aggregator_model": "agg-primary",
+        "selected_A": "openrouter:agg-primary",
+        "aggregator_candidates": [
+            "openrouter:agg-primary",
+            "openrouter:agg-backup",
+        ],
+        "effective_min_successful_proposers": 2,
+    }
+    trace = _terminal_policy_call(
+        index=1,
+        plan=plan,
+        successful=2,
+        fallback=False,
+        output="fallback answer",
+    )
+    for candidate in trace["candidates"]:
+        candidate.update(
+            {
+                "usable_for_aggregation": True,
+                "completion_outcome": "complete",
+                "selected_for_aggregation": True,
+            }
+        )
+    trace.update(
+        {
+            "usable_proposers": 2,
+            "partial_proposers": 0,
+            "selected_candidate_count": 2,
+            "execution_quorum_required": 2,
+            "execution_quorum_met": True,
+            "fallback_used": True,
+            "fallback_reason": "primary_failed",
+            "executed_A": "openrouter:agg-backup",
+        }
+    )
+    final_request = trace["final_request"]
+    for key in ("role",):
+        final_request[key] = "aggregator"
+    trace["final_request_role"] = "aggregator"
+    final_request["execution"].update(
+        {
+            "role": "aggregator",
+            "provider": "openrouter",
+            "requested_provider": "openrouter",
+            "actual_provider": "openrouter",
+            "model": "agg-backup",
+            "requested_model": "agg-backup",
+            "actual_model": "agg-backup",
+        }
+    )
+    final_request["usage"].update(
+        {
+            "provider": "openrouter",
+            "requested_provider": "openrouter",
+            "model": "agg-backup",
+            "requested_model": "agg-backup",
+            "physical_attempt_id": "2" * 32,
+        }
+    )
+    trace["aggregator_recovery"] = {
+        "schema": "opensquilla.ensemble-aggregator-recovery/v1",
+        "candidate_ids": list(plan["aggregator_candidates"]),
+        "attempts": [
+            {
+                "attempt": 1,
+                "fallback_index": 0,
+                "request_started": True,
+                "physical_request_count": 1,
+                "physical_attempt_id": "1" * 32,
+                "outcome": "failed",
+                "requested_provider": "openrouter",
+                "requested_model": "agg-primary",
+            },
+            {
+                "attempt": 2,
+                "fallback_index": 1,
+                "request_started": True,
+                "physical_request_count": 1,
+                "physical_attempt_id": "2" * 32,
+                "outcome": "succeeded",
+                "requested_provider": "openrouter",
+                "requested_model": "agg-backup",
+            },
+        ],
+        "selected_attempt": 2,
+        "fallback_index": 1,
+        "executed_A": "openrouter:agg-backup",
+        "success": True,
+        "degraded": False,
+    }
+
+    assert module.ensemble_call_core_reasons(
+        trace,
+        expected_selection_mode="router_dynamic",
+        expected_selection_plan=plan,
+        final_text="fallback answer",
+        require_output_binding=True,
+    ) == []
+    status = module.execution_status_payload(
+        generation_accepted=True,
+        final_text="fallback answer",
+        run_error=None,
+        ensemble_trace=trace,
+    )
+    assert status["status"] == "degraded_success"
+    assert "aggregator_fallback_used" in status["degraded_reasons"]
+
+    unknown_usage_degraded = deepcopy(trace)
+    unknown_final_request = unknown_usage_degraded["final_request"]
+    unknown_final_request["usage"].update(
+        {
+            "provider": "",
+            "model": "",
+            "usage_unknown": True,
+            "cost_source": "none",
+        }
+    )
+    unknown_final_request["usage"].pop("stop_reason", None)
+    unknown_final_request["execution"].pop("actual_provider", None)
+    unknown_final_request["execution"].pop("actual_model", None)
+    unknown_usage_degraded.update(
+        {
+            "execution_outcome": "degraded_success",
+            "delivery_outcome": "degraded_success",
+        }
+    )
+    unknown_recovery = unknown_usage_degraded["aggregator_recovery"]
+    unknown_recovery.update(
+        {
+            "degraded": True,
+            "success": False,
+            "delivery_success": True,
+            "delivery_outcome": "degraded_success",
+            "audit_outcome": "incomplete",
+        }
+    )
+    unknown_recovery["attempts"][1]["outcome"] = "failed"
+    unknown_reasons = module.ensemble_call_core_reasons(
+        unknown_usage_degraded,
+        expected_selection_mode="router_dynamic",
+        expected_selection_plan=plan,
+        final_text="fallback answer",
+        require_output_binding=True,
+    )
+    assert set(unknown_reasons) == {
+        "missing_actual_aggregator_model",
+        "missing_actual_aggregator_provider",
+        "missing_aggregator_stop_reason",
+    }
+    assert all(module.ensemble_metadata_only_reason(reason) for reason in unknown_reasons)
+    assert unknown_final_request["usage"]["physical_attempt_id"] == "2" * 32
+    assert (
+        module.ensemble_generation_retry_reason(
+            module.RunResult(
+                final_text="fallback answer",
+                done=module.DoneEvent(ensemble_trace=unknown_usage_degraded),
+            ),
+            expected_selection_mode="router_dynamic",
+            expected_selection_plan=plan,
+        )
+        == ""
+    )
+
+    missing_usage_physical = deepcopy(trace)
+    missing_usage_physical["final_request"]["usage"].pop("physical_attempt_id")
+    assert "invalid_aggregator_fallback_physical_evidence" in (
+        module.ensemble_call_core_reasons(
+            missing_usage_physical,
+            expected_selection_mode="router_dynamic",
+            expected_selection_plan=plan,
+        )
+    )
+
+    wrong_identity = deepcopy(trace)
+    wrong_identity["final_request"]["usage"]["model"] = "outside-roster"
+    assert "unauthorized_aggregator_fallback_identity" in (
+        module.ensemble_call_core_reasons(
+            wrong_identity,
+            expected_selection_mode="router_dynamic",
+            expected_selection_plan=plan,
+        )
+    )
+    conflicting_actual_identity = deepcopy(trace)
+    conflicting_actual_identity["final_request"]["execution"]["actual_model"] = (
+        "outside-roster"
+    )
+    assert "unauthorized_aggregator_fallback_identity" in (
+        module.ensemble_call_core_reasons(
+            conflicting_actual_identity,
+            expected_selection_mode="router_dynamic",
+            expected_selection_plan=plan,
+        )
+    )
+    bad_physical = deepcopy(trace)
+    bad_physical["aggregator_recovery"]["attempts"][1]["physical_attempt_id"] = "bad"
+    assert "invalid_aggregator_fallback_physical_evidence" in (
+        module.ensemble_call_core_reasons(
+            bad_physical,
+            expected_selection_mode="router_dynamic",
+            expected_selection_plan=plan,
+        )
+    )
+
+    mismatched_physical = deepcopy(trace)
+    mismatched_physical["aggregator_recovery"]["attempts"][1][
+        "physical_attempt_id"
+    ] = "3" * 32
+    assert "invalid_aggregator_fallback_physical_evidence" in (
+        module.ensemble_call_core_reasons(
+            mismatched_physical,
+            expected_selection_mode="router_dynamic",
+            expected_selection_plan=plan,
+        )
+    )
+
+    wrong_selected_index = deepcopy(trace)
+    wrong_selected_index["aggregator_recovery"]["attempts"][1]["fallback_index"] = 2
+    assert "invalid_aggregator_fallback_physical_evidence" in (
+        module.ensemble_call_core_reasons(
+            wrong_selected_index,
+            expected_selection_mode="router_dynamic",
+            expected_selection_plan=plan,
+        )
+    )
+
+    wrong_recovery_index = deepcopy(trace)
+    wrong_recovery_index["aggregator_recovery"]["fallback_index"] = 2
+    assert "invalid_aggregator_fallback_physical_evidence" in (
+        module.ensemble_call_core_reasons(
+            wrong_recovery_index,
+            expected_selection_mode="router_dynamic",
+            expected_selection_plan=plan,
+        )
+    )
+
+    duplicate_selected_attempt = deepcopy(trace)
+    duplicate_selected_attempt["aggregator_recovery"]["attempts"].append(
+        deepcopy(duplicate_selected_attempt["aggregator_recovery"]["attempts"][1])
+    )
+    assert "invalid_aggregator_fallback_physical_evidence" in (
+        module.ensemble_call_core_reasons(
+            duplicate_selected_attempt,
+            expected_selection_mode="router_dynamic",
+            expected_selection_plan=plan,
+        )
+    )
+
+
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+def test_closed_partial_aggregator_delivery_is_degraded_execution(module) -> None:
+    trace = {
+        "execution_outcome": "degraded_success",
+        "delivery_outcome": "partial_usable",
+        "aggregator_recovery": {
+            "schema": "opensquilla.ensemble-aggregator-recovery/v1",
+            "degraded": True,
+            "success": False,
+            "attempts": [{"outcome": "failed", "stream_closed": True}],
+        },
+    }
+    execution = module.execution_status_payload(
+        generation_accepted=True,
+        final_text="usable visible answer",
+        run_error=None,
+        ensemble_trace=trace,
+    )
+
+    assert execution["status"] == "degraded_success"
+    assert execution["success"] is True
+    assert execution["degraded_reasons"] == [
+        "aggregator_partial_usable",
+        "aggregator_recovery_degraded",
+    ]
+
+
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
 @pytest.mark.parametrize("extra_kind", ["explicit_byok", "conflict"])
 def test_openrouter_non_byok_audit_does_not_hide_extra_policy_evidence(
     module,
@@ -15601,14 +16352,12 @@ def test_openrouter_non_byok_audit_does_not_hide_extra_policy_evidence(
         "strict",
         "expected_requests",
         "explicit_byok",
-        "expected_judge_calls",
-        "expected_error",
     ),
     [
-        (True, 5, False, 1, "openrouter_non_byok_metadata_incomplete"),
-        (True, 4, False, 1, None),
-        (True, 4, True, 0, "openrouter_non_byok_policy_violation"),
-        (False, 5, False, 1, "cost_metadata_incomplete"),
+        (True, 5, False),
+        (True, 4, False),
+        (True, 4, True),
+        (False, 5, False),
     ],
     ids=[
         "strict-missing-receipt",
@@ -15617,13 +16366,11 @@ def test_openrouter_non_byok_audit_does_not_hide_extra_policy_evidence(
         "non-strict-unchanged",
     ],
 )
-async def test_generation_non_byok_gate_runs_before_judge(
+async def test_generation_non_byok_audit_never_blocks_judge_or_task_success(
     monkeypatch: pytest.MonkeyPatch,
     strict: bool,
     expected_requests: int,
     explicit_byok: bool,
-    expected_judge_calls: int,
-    expected_error: str | None,
 ) -> None:
     config, inherited = _openrouter_config()
     rows = [
@@ -15717,12 +16464,20 @@ async def test_generation_non_byok_gate_runs_before_judge(
         require_openrouter_non_byok=strict,
     )
 
-    assert judge_calls == expected_judge_calls
-    assert row["error"] == expected_error
-    assert (row.get("judge") is not None) is bool(expected_judge_calls)
+    assert judge_calls == 1
+    assert row["error"] is None
+    assert row.get("judge") is not None
+    assert row["completion_status"]["status"] == "complete"
+    assert row["execution_status"]["success"] is True
     if strict:
-        assert row["openrouter_non_byok_audit"]["pass"] is (not expected_error)
+        assert row["openrouter_non_byok_audit"]["pass"] is (
+            expected_requests == 4 and not explicit_byok
+        )
         assert row["openrouter_non_byok_audit"]["policy_safe_to_continue"] is (not explicit_byok)
+        assert row["audit_status"]["status"] == (
+            "pass" if expected_requests == 4 and not explicit_byok else "warning"
+        )
+        assert row["audit_status"]["separate_from_execution"] is True
     else:
         assert "openrouter_non_byok_audit" not in row
 
@@ -17478,3 +18233,87 @@ def test_g1_registry_audit_distinguishes_member_and_sample_counts(
     )
     assert "invalid_g1_expanded_proposer_roster" in reasons
     assert "wrong_g1_selected_proposer_count" in reasons
+
+
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+def test_ensemble_call_core_uses_frozen_provider_quorum(module) -> None:
+    plan = {
+        "strategy": "router_dynamic",
+        "selection_mode": "router_dynamic",
+        "proposer_models": [f"model-{index}" for index in range(5)],
+        "proposer_sample_count": 5,
+        "effective_min_successful_proposers": 2,
+        "proposer_recovery_policy": {"quorum_required": 2},
+        "aggregator_model": "aggregator",
+        "selected_A": "openrouter:aggregator",
+    }
+
+    def candidate(index: int, *, ok: bool) -> dict[str, object]:
+        text = f"candidate-{index}" if ok else ""
+        return {
+            "ok": ok,
+            "request_started": True,
+            "physical_request_count": 1,
+            "usage_reported": ok,
+            "stop_reason": "end_turn" if ok else "",
+            "error": "" if ok else "failed",
+            "content": {
+                "text": text,
+                "chars": len(text),
+            },
+        }
+
+    trace: dict[str, object] = {
+        "request_outcome": "llm_response",
+        "fallback_used": False,
+        "final_request_role": "aggregator",
+        "selection_plan": deepcopy(plan),
+        "total_candidates": 5,
+        "successful_proposers": 2,
+        "candidates": [
+            candidate(index, ok=index < 2)
+            for index in range(5)
+        ],
+        "final_request": {
+            "request_started": True,
+            "role": "aggregator",
+            "error": "",
+            "usage": {
+                "provider": "openrouter",
+                "requested_provider": "openrouter",
+                "model": "aggregator",
+                "requested_model": "aggregator",
+                "stop_reason": "end_turn",
+            },
+        },
+    }
+
+    reasons = module.ensemble_call_core_reasons(
+        trace,
+        expected_selection_plan=plan,
+    )
+    assert reasons == []
+
+    trace["successful_proposers"] = 1
+    candidates = trace["candidates"]
+    assert isinstance(candidates, list)
+    candidates[1] = candidate(1, ok=False)
+    reasons = module.ensemble_call_core_reasons(
+        trace,
+        expected_selection_plan=plan,
+    )
+    assert "insufficient_proposer_quorum" in reasons
+    assert "insufficient_configured_proposer_quorum" in reasons
+    assert "insufficient_actual_proposer_quorum" in reasons
+
+    invalid_policy = deepcopy(plan)
+    invalid_policy["proposer_recovery_policy"] = {
+        "quorum_required": True,
+    }
+    assert module.frozen_proposer_quorum(invalid_policy, 5) == 2
+    invalid_policy.pop("effective_min_successful_proposers")
+    assert (
+        module.frozen_proposer_quorum(invalid_policy, 5)
+        == module.legal_proposer_quorum(5)
+        == 4
+    )
