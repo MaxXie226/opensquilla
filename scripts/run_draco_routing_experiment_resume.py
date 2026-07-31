@@ -19339,6 +19339,9 @@ def load_resume_group_task_states(
     action_counts = {
         action: sum(1 for state in best.values() if state["action"] == action) for action in actions
     }
+    # Keep the serialized action-count domain stable even though policy/BYOK
+    # findings are audit state, never an execution action.
+    action_counts["policy_violation"] = 0
     return best, {
         "resume_source_count": len(resume_paths),
         "matching_attempt_count": matching_attempts,

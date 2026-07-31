@@ -10301,6 +10301,15 @@ def test_resume_prefers_cost_complete_duplicate_that_can_converge(
     assert state["action"] == "judge_only"
     assert state["row"]["source_marker"] == "repairable"
     assert audit["strict_invalid_attempt_count"] == 2
+    assert set(audit["resume_action_counts"]) == {
+        "regenerate",
+        "judge_only",
+        "metadata_only",
+        "audit_only",
+        "complete",
+        "policy_violation",
+    }
+    assert audit["resume_action_counts"]["policy_violation"] == 0
 
 
 @pytest.mark.parametrize("reverse_order", [False, True])

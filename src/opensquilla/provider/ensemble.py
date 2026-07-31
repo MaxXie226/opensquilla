@@ -8791,6 +8791,7 @@ class EnsembleProvider:
                             execution={
                                 "request_started": False,
                                 "stream_closed": True,
+                                "physical_attempts": [],
                                 "blocked_reason": (
                                     "scope_failed_identity"
                                 ),

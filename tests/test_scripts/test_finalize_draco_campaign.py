@@ -1574,6 +1574,8 @@ def test_provider_shaped_dynamic_partial_quorum_separates_strict_and_usable(
             "stream_closed": True,
             "usable_for_aggregation": True,
             "completion_outcome": "partial_usable",
+            "provider": "",
+            "model": "",
             "content": {
                 "text": "",
                 "chars": 24,
@@ -1610,6 +1612,123 @@ def test_provider_shaped_dynamic_partial_quorum_separates_strict_and_usable(
     assert module.successful_candidate(candidate) is False
     assert module.partial_usable_candidate(candidate) is True
     assert reasons == []
+
+    outer_reasons = module.ensemble_physical_call_reasons(
+        call,
+        expected_proposers=plan["proposer_models"],
+        expected_aggregator="model-f",
+        final_text="",
+        require_output_binding=False,
+    )
+    assert "wrong_actual_proposer_provider" not in outer_reasons
+    assert "wrong_actual_proposer_model" not in outer_reasons
+
+
+def test_proposer_transport_success_does_not_promote_semantic_failure(
+    module,
+) -> None:
+    call, plan = _provider_native_recovery_call(module)
+    failed_candidate = call["candidates"][2]
+    failed_candidate["execution"]["physical_attempts"][0]["outcome"] = (
+        "succeeded"
+    )
+
+    _, _, reasons = module.proposer_recovery_execution_reasons(
+        call,
+        executed_plan=plan,
+    )
+
+    assert "proposer_recovery_success_count_mismatch" not in reasons
+    assert reasons == []
+
+
+def _legacy_excluded_zero_request_recovery_call(module):
+    call, plan = _provider_native_recovery_call(module)
+    identity = "openrouter:model-c"
+    call["candidates"][2] = {
+        "index": 2,
+        "label": "proposer_3",
+        "provider": "",
+        "requested_provider": "openrouter",
+        "model": "",
+        "requested_model": "model-c",
+        "ok": False,
+        "usable_for_aggregation": False,
+        "completion_outcome": "failed",
+        "request_started": False,
+        "stream_closed": True,
+        "usage_reported": False,
+        "physical_request_count": 0,
+        "usage_missing_count": 0,
+        "stop_reason": "",
+        "elapsed_ms": 0,
+        "ttft_ms": None,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_tokens": 0,
+        "billed_cost": 0.0,
+        "cost_source": "none",
+        "content": {"text": "", "chars": 0, "truncated": False},
+        "error": (
+            "proposer identity was excluded after an earlier failure in this "
+            "retry scope"
+        ),
+        "error_code": "proposer_recovery_identity_excluded",
+        "execution": {
+            "request_started": False,
+            "stream_closed": True,
+            "blocked_reason": "scope_failed_identity",
+            "blocked_identity": identity,
+        },
+    }
+    call["proposer_recovery"]["cumulative_excluded_identities"] = [identity]
+    return call, plan
+
+
+def test_legacy_excluded_zero_request_candidate_gets_narrow_empty_ledger_compat(
+    module,
+) -> None:
+    call, plan = _legacy_excluded_zero_request_recovery_call(module)
+
+    _, _, reasons = module.proposer_recovery_execution_reasons(
+        call,
+        executed_plan=plan,
+    )
+
+    assert reasons == []
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["started", "cost", "text", "wrong_identity", "unexpected_execution"],
+)
+def test_legacy_excluded_zero_request_candidate_compat_stays_fail_closed(
+    module,
+    mutation: str,
+) -> None:
+    call, plan = _legacy_excluded_zero_request_recovery_call(module)
+    candidate = call["candidates"][2]
+    if mutation == "started":
+        candidate["request_started"] = True
+    elif mutation == "cost":
+        candidate["billed_cost"] = 0.01
+    elif mutation == "text":
+        candidate["content"] = {
+            "text": "draft",
+            "chars": 5,
+            "truncated": False,
+        }
+    elif mutation == "wrong_identity":
+        candidate["execution"]["blocked_identity"] = "openrouter:model-b"
+    else:
+        candidate["execution"]["unexpected"] = True
+
+    _, _, reasons = module.proposer_recovery_execution_reasons(
+        call,
+        executed_plan=plan,
+    )
+
+    assert "invalid_proposer_recovery_physical_ledger" in reasons
 
 
 @pytest.mark.parametrize(
@@ -6590,6 +6709,19 @@ def test_g1_only_finalization_scopes_all_formal_outputs(
     assert audit["paired_quality_comparisons"] == []
     assert proof["pass"] is True
     assert proof["account"]["campaign_byok_usage_delta_usd"] == "0"
+    assert (
+        "| Group | Rows | Done | AvgQ | AvgPass | JudgeErr | Avg Gen$† | "
+        "Total Gen$† | Gen exact | Avg Input | Avg Output | Avg Reason | "
+        "Avg Cache | Avg Visible | Avg Tokens | Avg Tools | Tool% | Avg Steps | "
+        "Avg LLMReq | p50 ms | p95 ms |"
+    ) in report
+    g1_metric_row = next(
+        line
+        for line in report.splitlines()
+        if line.startswith("| G1 |") and len(line.split("|")) == 23
+    )
+    assert len(g1_metric_row.split("|")) == 23
+    assert "† 上表成本只统计最终选中的成功 generation" in report
     assert proof["cost_scope"]["ledger_window_reconciliation"] == [
         {
             "account_window_path": str(tmp_path.resolve()),
@@ -9158,19 +9290,193 @@ def _install_complete_metadata_schedule(module, args: argparse.Namespace) -> dic
         "scheduled_pair_count": pair_count,
         "regenerate_pair_count": 0,
         "model_regenerate_pair_count": 0,
+        "generation_budget_exhausted_pair_count": 0,
+        "generation_auto_retry_blocked_pair_count": 0,
         "judge_only_pair_count": 0,
         "metadata_only_pair_count": pair_count,
+        "audit_only_pair_count": 0,
         "policy_violation_pair_count": 0,
+        "best_pair_count": pair_count,
+        "strict_valid_pair_count": 0,
         "scheduled_pairs": scheduled_pairs,
         "resume_action_counts": {
-            "policy_violation": 0,
             "regenerate": 0,
             "judge_only": 0,
             "metadata_only": pair_count,
+            "audit_only": 0,
+            "complete": 0,
         },
     }
     _owner_json(args.manifest[1], manifest)
     return manifest
+
+
+def test_manifest_resume_schedule_accepts_legacy_missing_reserved_zero(
+    module,
+    tmp_path: Path,
+) -> None:
+    args, _, lock_fd = _campaign(module, tmp_path)
+    try:
+        _install_complete_metadata_schedule(module, args)
+        module.load_manifest_contracts(
+            args.manifest,
+            result_paths=args.result,
+            groups=module.GROUPS,
+        )
+    finally:
+        os.close(lock_fd)
+
+
+@pytest.mark.parametrize("bad_value", [1, True])
+def test_manifest_resume_schedule_rejects_nonzero_or_boolean_policy_counter(
+    module,
+    tmp_path: Path,
+    bad_value,
+) -> None:
+    args, _, lock_fd = _campaign(module, tmp_path)
+    try:
+        manifest = _install_complete_metadata_schedule(module, args)
+        manifest["resume_selection"]["resume_action_counts"][
+            "policy_violation"
+        ] = bad_value
+        _owner_json(args.manifest[1], manifest)
+        with pytest.raises(
+            module.FinalizationError,
+            match="resume schedule counters differ from its result shard",
+        ):
+            module.load_manifest_contracts(
+                args.manifest,
+                result_paths=args.result,
+                groups=module.GROUPS,
+            )
+    finally:
+        os.close(lock_fd)
+
+
+def _install_audit_only_schedule(module, args: argparse.Namespace) -> None:
+    manifest = _install_complete_metadata_schedule(module, args)
+    rows = [json.loads(line) for line in args.result[1].read_text().splitlines()]
+    for row in rows:
+        execution = dict(row["execution"])
+        execution.update(
+            {
+                "resume_action": "audit_only",
+                "generation_reused": True,
+                "judge_reran": False,
+                "audit_only_recorded": True,
+                "audit_only_summary": {
+                    "status": "recorded",
+                    "generation_called": False,
+                    "judge_called": False,
+                },
+            }
+        )
+        row["execution"] = execution
+        completion = dict(row.get("resume_completion") or {})
+        completion.update(
+            {"action": "audit_only", "generation_reused": True}
+        )
+        row["resume_completion"] = completion
+    rows = [module.seal_result_row(row) for row in rows]
+    args.result[1].write_text(
+        "".join(json.dumps(row) + "\n" for row in rows)
+    )
+    args.result[1].chmod(0o600)
+
+    resume = manifest["resume_selection"]
+    for scheduled in resume["scheduled_pairs"]:
+        scheduled["action"] = "audit_only"
+    pair_count = len(resume["scheduled_pairs"])
+    resume["metadata_only_pair_count"] = 0
+    resume["audit_only_pair_count"] = pair_count
+    resume["resume_action_counts"]["metadata_only"] = 0
+    resume["resume_action_counts"]["audit_only"] = pair_count
+    _owner_json(args.manifest[1], manifest)
+
+
+@pytest.mark.parametrize("tamper", [None, "missing_marker", "judge_reran"])
+def test_audit_only_no_generation_wave_contract(
+    module,
+    tmp_path: Path,
+    tamper: str | None,
+) -> None:
+    args, _, lock_fd = _campaign(module, tmp_path)
+    try:
+        _install_audit_only_schedule(module, args)
+        if tamper is not None:
+            rows = [
+                json.loads(line)
+                for line in args.result[1].read_text().splitlines()
+            ]
+            if tamper == "missing_marker":
+                rows[0]["execution"].pop("audit_only_recorded")
+            else:
+                rows[0]["execution"]["judge_reran"] = True
+            rows[0] = module.seal_result_row(rows[0])
+            args.result[1].write_text(
+                "".join(json.dumps(row) + "\n" for row in rows)
+            )
+            args.result[1].chmod(0o600)
+
+        if tamper is None:
+            module.load_manifest_contracts(
+                args.manifest,
+                result_paths=args.result,
+                groups=module.GROUPS,
+            )
+        else:
+            with pytest.raises(
+                module.FinalizationError,
+                match="skipped Web preflight is not bound",
+            ):
+                module.load_manifest_contracts(
+                    args.manifest,
+                    result_paths=args.result,
+                    groups=module.GROUPS,
+                )
+    finally:
+        os.close(lock_fd)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected"),
+    [
+        (None, True),
+        ("missing_marker", False),
+        ("judge_reran", False),
+        ("generation_called", False),
+    ],
+)
+def test_audit_only_repair_evidence_is_explicit(
+    module,
+    mutation: str | None,
+    expected: bool,
+) -> None:
+    execution = {
+        "resume_action": "audit_only",
+        "generation_reused": True,
+        "judge_reran": False,
+        "audit_only_recorded": True,
+        "audit_only_summary": {
+            "status": "recorded",
+            "generation_called": False,
+            "judge_called": False,
+        },
+    }
+    if mutation == "missing_marker":
+        execution.pop("audit_only_recorded")
+    elif mutation == "judge_reran":
+        execution["judge_reran"] = True
+    elif mutation == "generation_called":
+        execution["audit_only_summary"]["generation_called"] = True
+
+    row = {
+        "resume_completion": {
+            "action": "audit_only",
+            "generation_reused": True,
+        }
+    }
+    assert module.repair_evidence(row, execution) is expected
 
 
 @pytest.mark.parametrize("tamper", ["counter", "result_pair_set"])

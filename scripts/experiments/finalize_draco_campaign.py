@@ -1031,10 +1031,29 @@ def load_manifest_contracts(
                     not isinstance(row.get("execution"), Mapping)
                     or row["execution"].get("generation_reused") is not True
                     or str(row["execution"].get("resume_action") or "")
-                    not in {"judge_only", "metadata_only"}
+                    not in {"judge_only", "metadata_only", "audit_only"}
                     or (
                         str(row["execution"].get("resume_action") or "") == "metadata_only"
                         and row["execution"].get("judge_reran") is True
+                    )
+                    or (
+                        str(row["execution"].get("resume_action") or "") == "audit_only"
+                        and (
+                            row["execution"].get("judge_reran") is not False
+                            or row["execution"].get("audit_only_recorded") is not True
+                            or not isinstance(
+                                row["execution"].get("audit_only_summary"),
+                                Mapping,
+                            )
+                            or row["execution"]["audit_only_summary"].get("status")
+                            != "recorded"
+                            or row["execution"]["audit_only_summary"].get(
+                                "generation_called"
+                            )
+                            is not False
+                            or row["execution"]["audit_only_summary"].get("judge_called")
+                            is not False
+                        )
                     )
                     for row in result_rows
                     if isinstance(row, Mapping)
@@ -1086,7 +1105,13 @@ def load_manifest_contracts(
                 scheduled_group not in manifest_groups
                 or scheduled_task not in manifest_task_ids
                 or scheduled_action
-                not in {"regenerate", "model_regenerate", "judge_only", "metadata_only"}
+                not in {
+                    "regenerate",
+                    "model_regenerate",
+                    "judge_only",
+                    "metadata_only",
+                    "audit_only",
+                }
                 or scheduled_key in seen_scheduled_pairs
             ):
                 raise FinalizationError(
@@ -1107,7 +1132,7 @@ def load_manifest_contracts(
                 for row in result_rows
                 if isinstance(row, Mapping)
             }
-            action_counts = Counter(
+            scheduled_action_counts = Counter(
                 (
                     "regenerate"
                     if scheduled["action"] in {"regenerate", "model_regenerate"}
@@ -1116,33 +1141,144 @@ def load_manifest_contracts(
                 for scheduled in resume_scheduled_pairs
             )
             declared_action_counts = raw_resume_selection.get("resume_action_counts")
-            expected_counts = {
-                "selected_pair_count": len(resume_scheduled_pairs),
+            expected_schedule_counts = {
                 "scheduled_pair_count": len(resume_scheduled_pairs),
-                "regenerate_pair_count": action_counts["regenerate"],
-                "model_regenerate_pair_count": action_counts["regenerate"],
-                "judge_only_pair_count": action_counts["judge_only"],
-                "metadata_only_pair_count": action_counts["metadata_only"],
+                "regenerate_pair_count": scheduled_action_counts["regenerate"],
+                "judge_only_pair_count": scheduled_action_counts["judge_only"],
+                "metadata_only_pair_count": scheduled_action_counts["metadata_only"],
+                "audit_only_pair_count": scheduled_action_counts["audit_only"],
                 "policy_violation_pair_count": 0,
             }
+
+            expected_resume_actions = {
+                "policy_violation",
+                "regenerate",
+                "judge_only",
+                "metadata_only",
+                "audit_only",
+                "complete",
+            }
+            normalized_resume_counts: dict[str, int] = {}
+            counter_contract_valid = isinstance(declared_action_counts, Mapping)
+            if counter_contract_valid:
+                declared_keys = set(declared_action_counts)
+                counter_contract_valid = bool(
+                    declared_keys == expected_resume_actions
+                    or declared_keys
+                    == expected_resume_actions - {"policy_violation"}
+                )
+                for action in expected_resume_actions:
+                    raw_count = declared_action_counts.get(action)
+                    if action == "policy_violation" and action not in declared_action_counts:
+                        # Narrow legacy compatibility for the producer's one
+                        # omitted reserved-zero key.
+                        raw_count = 0
+                    if (
+                        isinstance(raw_count, bool)
+                        or not isinstance(raw_count, int)
+                        or raw_count < 0
+                    ):
+                        counter_contract_valid = False
+                    else:
+                        normalized_resume_counts[action] = raw_count
+
+            selected_pair_count = raw_resume_selection.get("selected_pair_count")
+            best_pair_count = raw_resume_selection.get("best_pair_count")
+            strict_valid_pair_count = raw_resume_selection.get(
+                "strict_valid_pair_count"
+            )
+            if (
+                isinstance(selected_pair_count, bool)
+                or not isinstance(selected_pair_count, int)
+                or selected_pair_count < len(resume_scheduled_pairs)
+                or isinstance(best_pair_count, bool)
+                or not isinstance(best_pair_count, int)
+                or best_pair_count < 0
+                or isinstance(strict_valid_pair_count, bool)
+                or not isinstance(strict_valid_pair_count, int)
+                or strict_valid_pair_count < 0
+            ):
+                counter_contract_valid = False
+            elif counter_contract_valid:
+                completed_pair_count = normalized_resume_counts["complete"]
+                counter_contract_valid = bool(
+                    selected_pair_count
+                    == len(resume_scheduled_pairs) + strict_valid_pair_count
+                    and completed_pair_count == strict_valid_pair_count
+                    and best_pair_count
+                    == sum(
+                        normalized_resume_counts[action]
+                        for action in expected_resume_actions
+                        if action != "policy_violation"
+                    )
+                    and best_pair_count <= selected_pair_count
+                    and normalized_resume_counts["policy_violation"] == 0
+                    and normalized_resume_counts["judge_only"]
+                    == scheduled_action_counts["judge_only"]
+                    and normalized_resume_counts["metadata_only"]
+                    == scheduled_action_counts["metadata_only"]
+                    and normalized_resume_counts["audit_only"]
+                    == scheduled_action_counts["audit_only"]
+                    and normalized_resume_counts["regenerate"]
+                    <= scheduled_action_counts["regenerate"]
+                )
+
+            model_regenerate_count = raw_resume_selection.get(
+                "model_regenerate_pair_count"
+            )
+            regenerate_count = scheduled_action_counts["regenerate"]
+            explicit_model_regenerate_count = sum(
+                scheduled["action"] == "model_regenerate"
+                for scheduled in resume_scheduled_pairs
+            )
+            if (
+                isinstance(model_regenerate_count, bool)
+                or not isinstance(model_regenerate_count, int)
+                or not explicit_model_regenerate_count
+                <= model_regenerate_count
+                <= regenerate_count
+            ):
+                counter_contract_valid = False
+            else:
+                exhausted = raw_resume_selection.get(
+                    "generation_budget_exhausted_pair_count"
+                )
+                blocked = raw_resume_selection.get(
+                    "generation_auto_retry_blocked_pair_count"
+                )
+                if exhausted is None and blocked is None:
+                    # Legacy manifests did not expose the non-model subsets.
+                    counter_contract_valid = bool(
+                        counter_contract_valid
+                        and model_regenerate_count == regenerate_count
+                    )
+                elif (
+                    isinstance(exhausted, bool)
+                    or not isinstance(exhausted, int)
+                    or exhausted < 0
+                    or isinstance(blocked, bool)
+                    or not isinstance(blocked, int)
+                    or blocked < 0
+                ):
+                    counter_contract_valid = False
+                else:
+                    non_model_regenerate_count = (
+                        regenerate_count - model_regenerate_count
+                    )
+                    counter_contract_valid = bool(
+                        counter_contract_valid
+                        and max(exhausted, blocked)
+                        <= non_model_regenerate_count
+                        <= exhausted + blocked
+                    )
             if (
                 seen_scheduled_pairs != result_pairs
                 or any(
                     isinstance(raw_resume_selection.get(field_name), bool)
                     or raw_resume_selection.get(field_name) != expected
-                    for field_name, expected in expected_counts.items()
+                    for field_name, expected in expected_schedule_counts.items()
                 )
-                or not isinstance(declared_action_counts, Mapping)
-                or any(
-                    isinstance(declared_action_counts.get(action), bool)
-                    or declared_action_counts.get(action) != expected
-                    for action, expected in {
-                        "policy_violation": 0,
-                        "regenerate": action_counts["regenerate"],
-                        "judge_only": action_counts["judge_only"],
-                        "metadata_only": action_counts["metadata_only"],
-                    }.items()
-                )
+                or not counter_contract_valid
             ):
                 raise FinalizationError(
                     f"manifest resume schedule counters differ from its result shard: {path}"
@@ -1593,7 +1729,7 @@ def repair_evidence(row: Mapping[str, Any], execution: Mapping[str, Any]) -> boo
     if execution.get("generation_reused") is not True:
         return False
     action = str(execution.get("resume_action") or "")
-    if action not in {"judge_only", "metadata_only"}:
+    if action not in {"judge_only", "metadata_only", "audit_only"}:
         return False
     completion = row.get("resume_completion")
     if isinstance(completion, Mapping):
@@ -1601,6 +1737,17 @@ def repair_evidence(row: Mapping[str, Any], execution: Mapping[str, Any]) -> boo
             return False
         completion_action = str(completion.get("action") or "")
         if completion_action and completion_action != action:
+            return False
+    if action == "audit_only":
+        summary = execution.get("audit_only_summary")
+        if (
+            execution.get("audit_only_recorded") is not True
+            or execution.get("judge_reran") is not False
+            or not isinstance(summary, Mapping)
+            or summary.get("status") != "recorded"
+            or summary.get("generation_called") is not False
+            or summary.get("judge_called") is not False
+        ):
             return False
     # The action itself records the reason a repair wave was emitted.  The
     # booleans describe its outcome and may legitimately both be false when a
@@ -3194,6 +3341,103 @@ def usable_candidate(candidate: Any) -> bool:
     return successful_candidate(candidate) or partial_usable_candidate(candidate)
 
 
+def _strict_zero_number(value: Any) -> bool:
+    if isinstance(value, bool):
+        return False
+    try:
+        return Decimal(str(value)) == 0
+    except (InvalidOperation, TypeError, ValueError):
+        return False
+
+
+def _legacy_excluded_zero_request_candidate(
+    candidate: Mapping[str, Any],
+    *,
+    expected_identity: str,
+    excluded_identities: set[str],
+) -> bool:
+    """Recognize the one legacy zero-request receipt that omitted ``[]``.
+
+    Older router_dynamic runs serialized locally excluded proposer slots without
+    ``execution.physical_attempts``.  Accept only that exact, inert shape; any
+    evidence of dispatch, output, usage, cost, or identity drift stays fatal.
+    """
+
+    execution = candidate.get("execution")
+    content = candidate.get("content")
+    requested_identity = _canonical_proposer_recovery_identity(
+        f"{str(candidate.get('requested_provider') or '')}:"
+        f"{str(candidate.get('requested_model') or '')}"
+    )
+    blocked_identity = (
+        _canonical_proposer_recovery_identity(execution.get("blocked_identity"))
+        if isinstance(execution, Mapping)
+        else ""
+    )
+    if (
+        not expected_identity
+        or requested_identity != expected_identity
+        or blocked_identity != expected_identity
+        or expected_identity not in excluded_identities
+        or not isinstance(execution, Mapping)
+        or set(execution)
+        != {
+            "request_started",
+            "stream_closed",
+            "blocked_reason",
+            "blocked_identity",
+        }
+        or execution.get("request_started") is not False
+        or execution.get("stream_closed") is not True
+        or execution.get("blocked_reason") != "scope_failed_identity"
+        or "physical_attempts" in execution
+        or candidate.get("error_code")
+        != "proposer_recovery_identity_excluded"
+        or candidate.get("error")
+        != (
+            "proposer identity was excluded after an earlier failure in this "
+            "retry scope"
+        )
+        or candidate.get("ok") is not False
+        or candidate.get("usable_for_aggregation") is not False
+        or candidate.get("completion_outcome") != "failed"
+        or candidate.get("request_started") is not False
+        or candidate.get("stream_closed") is not True
+        or candidate.get("physical_request_count") != 0
+        or candidate.get("usage_reported") is not False
+        or candidate.get("usage_missing_count") != 0
+        or str(candidate.get("provider") or "")
+        or str(candidate.get("model") or "")
+        or str(candidate.get("stop_reason") or "")
+        or candidate.get("elapsed_ms") != 0
+        or candidate.get("ttft_ms") is not None
+        or not isinstance(content, Mapping)
+        or content.get("text") != ""
+        or content.get("chars") != 0
+        or content.get("truncated") is not False
+        or str(content.get("sha256") or "")
+        or str(candidate.get("text") or "")
+        or any(
+            candidate.get(field_name, 0) != 0
+            for field_name in (
+                "input_tokens",
+                "output_tokens",
+                "reasoning_tokens",
+                "cached_tokens",
+                "cache_write_tokens",
+            )
+        )
+        or not _strict_zero_number(candidate.get("billed_cost"))
+        or candidate.get("cost_source") != "none"
+        or candidate.get("model_usage_breakdown") not in (None, [])
+        or candidate.get("diagnostic_model_usage_breakdown") not in (None, [])
+        or candidate.get("provider_usage") not in (None, {})
+        or candidate.get("billing_receipt") is not None
+    ):
+        return False
+    return True
+
+
 def _trace_output_binding_reasons(
     output: Any,
     *,
@@ -4036,6 +4280,16 @@ def proposer_recovery_execution_reasons(
         int,
         list[Mapping[str, Any]],
     ] = {}
+    raw_excluded_identities = receipt.get("cumulative_excluded_identities")
+    excluded_identities = (
+        {
+            identity
+            for value in raw_excluded_identities
+            if (identity := _canonical_proposer_recovery_identity(value))
+        }
+        if isinstance(raw_excluded_identities, list)
+        else set()
+    )
     observed_unclosed_indexes: set[int] = set()
     observed_unclosed_physical_ids: set[str] = set()
     if (
@@ -4048,6 +4302,18 @@ def proposer_recovery_execution_reasons(
         if not isinstance(candidate, Mapping):
             reasons.append("invalid_proposer_recovery_candidate")
             continue
+        requested_identity = _canonical_proposer_recovery_identity(
+            f"{str(candidate.get('requested_provider') or '')}:"
+            f"{str(candidate.get('requested_model') or '')}"
+        )
+        allowed_slot_identities = (
+            {
+                expanded_slot_identities[slot_index],
+                *backup_identities,
+            }
+            if slot_index < len(expanded_slot_identities)
+            else set(backup_identities)
+        )
         execution = candidate.get("execution")
         physical_attempts = (
             execution.get("physical_attempts")
@@ -4056,6 +4322,14 @@ def proposer_recovery_execution_reasons(
         )
         physical_count = candidate.get("physical_request_count")
         request_started = candidate.get("request_started")
+        if not isinstance(physical_attempts, list) and _legacy_excluded_zero_request_candidate(
+            candidate,
+            expected_identity=requested_identity,
+            excluded_identities=excluded_identities.intersection(
+                allowed_slot_identities
+            ),
+        ):
+            physical_attempts = []
         if (
             type(request_started) is not bool
             or isinstance(physical_count, bool)
@@ -4122,29 +4396,25 @@ def proposer_recovery_execution_reasons(
         candidate_physical_attempts_by_slot[slot_index] = (
             valid_slot_attempts
         )
-        requested_identity = _canonical_proposer_recovery_identity(
-            f"{str(candidate.get('requested_provider') or '')}:"
-            f"{str(candidate.get('requested_model') or '')}"
-        )
         actual_identity = _canonical_proposer_recovery_identity(
             f"{str(candidate.get('provider') or '')}:"
             f"{str(candidate.get('model') or '')}"
         )
-        allowed_slot_identities = (
-            {
-                expanded_slot_identities[slot_index],
-                *backup_identities,
-            }
-            if slot_index < len(expanded_slot_identities)
-            else set(backup_identities)
-        )
+        strict_candidate = successful_candidate(candidate)
+        partial_candidate = partial_usable_candidate(candidate)
         if (
             not requested_identity
             or requested_identity not in allowed_slot_identities
             or (
-                usable_candidate(candidate)
+                strict_candidate
                 and actual_identity != requested_identity
             )
+            or (
+                partial_candidate
+                and actual_identity
+                and actual_identity != requested_identity
+            )
+            or (partial_candidate and not actual_identity and not slot_identities)
             or (
                 slot_identities
                 and slot_identities[-1] != requested_identity
@@ -4277,6 +4547,12 @@ def proposer_recovery_execution_reasons(
     current_recovery_ids: list[str] = []
     primary_success_slots: set[int] = set()
     primary_identity_by_slot: dict[int, str] = {}
+    strict_successful_slots = {
+        slot_index
+        for slot_index, candidate in enumerate(candidates)
+        if successful_candidate(candidate)
+    }
+    final_physical_id_by_slot: dict[int, str] = {}
     for slot_index, physical_attempts in (
         candidate_physical_attempts_by_slot.items()
     ):
@@ -4289,6 +4565,8 @@ def proposer_recovery_execution_reasons(
             for physical_id in candidate_ids
             if physical_id in receipt_physical_id_set
         ]
+        if candidate_ids:
+            final_physical_id_by_slot[slot_index] = candidate_ids[-1]
         current_recovery_ids.extend(candidate_recovery_ids)
         primary_rows = [
             physical
@@ -4312,7 +4590,11 @@ def proposer_recovery_execution_reasons(
                 primary_rows[0].get("identity")
             )
             primary_identity_by_slot[slot_index] = primary_identity
-            if primary_rows[0].get("outcome") == "succeeded":
+            if (
+                primary_rows[0].get("outcome") == "succeeded"
+                and slot_index in strict_successful_slots
+                and not candidate_recovery_ids
+            ):
                 primary_success_slots.add(slot_index)
         expected_slot_recovery_ids = [
             str(attempt.get("physical_attempt_id") or "")
@@ -4422,8 +4704,13 @@ def proposer_recovery_execution_reasons(
             continue
         if len(successful_slots) >= 2:
             reasons.append("proposer_recovery_continued_after_quorum")
-        if attempt.get("outcome") == "succeeded":
-            successful_slots.add(nonnegative_int(attempt.get("slot_index")))
+        slot_index = nonnegative_int(attempt.get("slot_index"))
+        if (
+            attempt.get("outcome") == "succeeded"
+            and slot_index in strict_successful_slots
+            and final_physical_id_by_slot.get(slot_index) == physical_id
+        ):
+            successful_slots.add(slot_index)
     actual_strict_successful = (
         sum(successful_candidate(candidate) for candidate in candidates)
         if isinstance(candidates, list)
@@ -4594,8 +4881,19 @@ def ensemble_physical_call_reasons(
             reasons.append("usable_proposer_count_mismatch")
         if actual_usable < required_successful_proposers:
             reasons.append("insufficient_actual_proposer_quorum")
-        for slot_index, (candidate, expected_model, candidate_proven) in enumerate(
-            zip(candidates, expected_proposers, proven, strict=True)
+        for slot_index, (
+            candidate,
+            expected_model,
+            candidate_proven,
+            candidate_strict,
+        ) in enumerate(
+            zip(
+                candidates,
+                expected_proposers,
+                proven,
+                strict_proven,
+                strict=True,
+            )
         ):
             if not isinstance(candidate, Mapping):
                 continue
@@ -4643,10 +4941,39 @@ def ensemble_physical_call_reasons(
                 or (execution.get("requested_model") if isinstance(execution, Mapping) else "")
                 or ""
             ).strip()
+            attempts = (
+                execution.get("physical_attempts")
+                if isinstance(execution, Mapping)
+                else None
+            )
+            physical_count = candidate.get("physical_request_count")
+            final_physical_identity = (
+                _canonical_proposer_recovery_identity(
+                    attempts[-1].get("identity")
+                )
+                if isinstance(attempts, list)
+                and isinstance(physical_count, int)
+                and not isinstance(physical_count, bool)
+                and physical_count > 0
+                and len(attempts) == physical_count
+                and isinstance(attempts[-1], Mapping)
+                else ""
+            )
+            partial_actual_identity_omission_proven = bool(
+                partial_usable_candidate(candidate)
+                and not actual_provider
+                and not actual_model
+                and final_physical_identity == expected_identity
+            )
             if (
                 requested_provider != expected_provider
                 or (actual_provider and actual_provider != expected_provider)
-                or (candidate_proven and not actual_provider)
+                or (
+                    candidate_proven
+                    and not actual_provider
+                    and not partial_actual_identity_omission_proven
+                )
+                or (candidate_strict and not actual_provider)
             ):
                 reasons.append("wrong_actual_proposer_provider")
             if (
@@ -4655,7 +4982,12 @@ def ensemble_physical_call_reasons(
                     actual_model
                     and actual_model != expected_candidate_model
                 )
-                or (candidate_proven and not actual_model)
+                or (
+                    candidate_proven
+                    and not actual_model
+                    and not partial_actual_identity_omission_proven
+                )
+                or (candidate_strict and not actual_model)
             ):
                 reasons.append("wrong_actual_proposer_model")
 
@@ -11701,12 +12033,11 @@ def experiment_results_markdown(
         "",
         "## 分组指标",
         "",
-        "| Group | Rows | Done | AvgQ | AvgPass | JudgeErr | Avg Gen$ | "
-        "Total Gen$ | Gen exact$ (tasks) | Avg Prompt | Avg Completion | Avg Reason | "
+        "| Group | Rows | Done | AvgQ | AvgPass | JudgeErr | Avg Gen$† | "
+        "Total Gen$† | Gen exact | Avg Input | Avg Output | Avg Reason | Avg Cache | "
         "Avg Visible | Avg Tokens | Avg Tools | Tool% | Avg Steps | Avg LLMReq | "
         "p50 ms | p95 ms |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
-        "---:|---:|---:|---:|---:|---:|---:|---:|",
+        "|---|" + "---:|" * 20,
     ]
     for metric in metrics:
         raw_cost = metric["avg_selected_generation_cost_usd"]
@@ -11721,16 +12052,11 @@ def experiment_results_markdown(
             if total_cost is not None
             else "N/A"
         )
-        rendered_exact_total = str(
-            Decimal(str(metric["selected_generation_cost_exact_usd"])).quantize(
-                Decimal("0.000001")
-            )
-        )
         visible = metric["avg_visible_tokens"] or "N/A"
         lines.append(
             "| {group} | {task_count} | {done} | {quality} | {pass_rate}% | "
-            "{judge_error} | {cost} | {total_cost} | ${exact_total} ({exact}/{tasks}) | "
-            "{prompt} | {completion} | {reason} | {visible} | {tokens} | "
+            "{judge_error} | {cost} | {total_cost} | {exact}/{tasks} | "
+            "{prompt} | {completion} | {reason} | {cache} | {visible} | {tokens} | "
             "{tools} | {tool_rate}% | {steps} | {requests} | {p50} | {p95} |".format(
                 group=metric["group"],
                 task_count=metric["task_count"],
@@ -11742,12 +12068,12 @@ def experiment_results_markdown(
                 judge_error=metric["judge_error_count"],
                 cost=rendered_cost,
                 total_cost=rendered_total,
-                exact_total=rendered_exact_total,
                 exact=metric["selected_generation_cost_exact_task_count"],
                 tasks=metric["task_count"],
                 prompt=Decimal(str(metric["avg_input_tokens"])).quantize(Decimal("0.1")),
                 completion=Decimal(str(metric["avg_output_tokens"])).quantize(Decimal("0.1")),
                 reason=Decimal(str(metric["avg_reasoning_tokens"])).quantize(Decimal("0.1")),
+                cache=Decimal(str(metric["avg_cached_tokens"])).quantize(Decimal("0.1")),
                 visible=(
                     Decimal(str(visible)).quantize(Decimal("0.1")) if visible != "N/A" else visible
                 ),
@@ -11976,7 +12302,7 @@ def experiment_results_markdown(
             f"${disposition_costs.get('selected', '0')}，"
             f"replaced=${disposition_costs.get('replaced', '0')}，"
             f"failed=${disposition_costs.get('failed', '0')}。",
-            "- 上表成本只统计最终选中的成功 generation；不包含 Judge。",
+            "- † 上表成本只统计最终选中的成功 generation；不包含 Judge。",
             "- 有显式 estimate 的成功 generation 会计入总费用，但不会计入 Gen exact；"
             "真正 unknown 的成本不会按 $0 参与平均。表中 N/A 表示无法对全组给出"
             "逐任务总成本，coverage/precision 为机器可审计口径。",

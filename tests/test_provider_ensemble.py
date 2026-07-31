@@ -12358,6 +12358,7 @@ async def test_proposer_recovery_never_replays_failed_identity_across_chats(
     assert excluded.request_started is False
     assert excluded.error_code == "proposer_recovery_identity_excluded"
     assert excluded.execution["blocked_identity"] == "fake:a"
+    assert excluded.execution["physical_attempts"] == []
     second = await provider._recover_proposers_serially(
         second_primary,
         state=state,
