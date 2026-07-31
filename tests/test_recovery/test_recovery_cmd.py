@@ -46,6 +46,7 @@ def test_recovery_command_surface_is_registered_with_complete_offline_actions() 
         "choose-workspace",
         "apply-settings",
         "recover-settings",
+        "recover-config",
         "restore-profile",
         "recover-transaction",
         "consolidate-profiles",
@@ -138,6 +139,30 @@ def test_inspect_command_emits_fixed_json_protocol(tmp_path: Path) -> None:
     }
     assert payload["outcome"] == "ready"
     assert payload["effective_workspace"] == str(workspace)
+
+
+def test_recover_config_command_repairs_corrupt_config_over_json_protocol(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_USER_STATE_DIR", str(tmp_path / "user-state"))
+    home = tmp_path / "opensquilla"
+    _workspace(home / "workspace", "current identity")
+    (home / "state").mkdir(parents=True)
+    good = 'state_dir = "state"\nworkspace_dir = "workspace"\n'
+    (home / "config.toml.backup.20260101000000000000").write_text(good, encoding="utf-8")
+    (home / "config.toml").write_text("workspace_dir = [\n", encoding="utf-8")
+
+    result = CliRunner().invoke(
+        recovery_app,
+        ["recover-config", "--home", str(home), "--json"],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["outcome"] == "ready"
+    assert (home / "config.toml").read_text(encoding="utf-8") == good
+    assert list(home.glob("config.toml.corrupt.*"))
 
 
 def test_cleanup_inspect_command_emits_complete_read_only_inventory(tmp_path: Path) -> None:

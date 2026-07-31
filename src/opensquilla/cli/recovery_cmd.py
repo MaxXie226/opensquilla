@@ -346,6 +346,28 @@ def recovery_recover_settings(
     )
 
 
+@recovery_app.command("recover-config")
+def recovery_recover_config(
+    home: Path = typer.Option(..., "--home", help="Desktop profile root H."),
+    json_output: bool = typer.Option(False, "--json", help="Emit the fixed JSON protocol."),
+) -> None:
+    """Replace a corrupt config.toml from its newest valid sibling backup.
+
+    The corrupt file is always preserved next to itself as
+    ``config.toml.corrupt.<stamp>`` first; without a usable backup a minimal
+    default config is written so startup can proceed.
+    """
+
+    from opensquilla.recovery.config_recovery import recover_config
+
+    _run(
+        lambda: recover_config(home),
+        home=home,
+        json_output=json_output,
+        profile_kind="desktop-primary",
+    )
+
+
 @recovery_app.command("restore-profile")
 def recovery_restore_profile(
     backup: Path = typer.Option(..., "--backup", help="Exact recorded profile backup path."),

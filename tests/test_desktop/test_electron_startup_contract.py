@@ -3145,3 +3145,9 @@ def test_blocked_consolidation_defers_only_after_primary_is_bootable() -> None:
     # severe blocking UI is considered.
     assert "inspection.allowed_actions.includes('recover-transaction')" in startup
     assert "'profile_transaction_auto_recovery_failed'" in startup
+
+    # A corrupt config is repaired automatically from its newest valid backup
+    # (defaults otherwise) after the corrupt file is preserved beside itself.
+    assert "inspection.allowed_actions.includes('recover-config')" in startup
+    assert "'recover-config', '--home', active.home, '--json'," in startup
+    assert "'config_auto_recovery_failed'" in startup

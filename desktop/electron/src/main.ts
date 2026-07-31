@@ -8241,6 +8241,26 @@ async function inspectActiveProfileBeforeStartup(): Promise<boolean> {
     }
   }
 
+  if (
+    inspection.outcome === 'recovery_required'
+    && inspection.allowed_actions.includes('recover-config')
+  ) {
+    if (gatewayProcess && gatewayState.owned) await stopOwnedGatewayAndWait()
+    try {
+      // The CLI preserves the corrupt config.toml beside itself before it
+      // restores the newest valid backup (or minimal defaults), so the
+      // automatic path never destroys evidence.
+      inspection = await runRecoveryCli(active, [
+        'recover-config', '--home', active.home, '--json',
+      ])
+    } catch (error) {
+      desktopLog('config_auto_recovery_failed', {
+        error: error instanceof Error ? error.message : 'unknown error',
+      })
+      inspection = recoveryFailureResult(active.home, 'config_auto_recovery_failed')
+    }
+  }
+
   const provenReconcile = inspection.outcome === 'recovery_required'
     && inspection.allowed_actions.includes('reconcile')
   const safeLayoutFinalize = inspection.outcome === 'ready'

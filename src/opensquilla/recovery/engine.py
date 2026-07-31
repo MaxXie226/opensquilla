@@ -2020,6 +2020,12 @@ def inspect_profile(
             ignore_transaction=_ignore_transaction,
             ignore_settings_transaction=_ignore_settings_transaction,
         )
+        actions = _RECOVERY_ACTIONS
+        if config.error_code in ("config_invalid", "config_unreadable"):
+            # The repair restores the newest valid sibling backup or, failing
+            # that, preserves the corrupt file and starts with defaults, so it
+            # is offered whether or not a backup currently exists.
+            actions = ("recover-config", *_RECOVERY_ACTIONS)
         return _report(
             home=home_path,
             config=config,
@@ -2027,7 +2033,7 @@ def inspect_profile(
             outcome="recovery_required" if blocks else "attention",
             stable_code=config.error_code,
             effective_workspace=None,
-            allowed_actions=_RECOVERY_ACTIONS,
+            allowed_actions=actions,
         )
     if kind == "desktop-recovery":
         isolation_code = _recovery_profile_isolation_code(home_path, config)
