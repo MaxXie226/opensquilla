@@ -8,6 +8,7 @@ import type { RpcCallOptions } from '@/lib/rpc'
 import type { RawSessionItem, RawSessionListEntry, SessionsListResponse } from '@/types/rpc'
 import type { ProjectWorkspaceItem } from '@/types/rpc'
 import { normalizeTurnOutcome, turnOutcomePresentation } from '@/utils/chat/turnOutcome'
+import type { SessionTaskAttention } from '@/composables/useSessionTaskAttention'
 
 export const SESSION_LIST_VIEW = 'session-list-v1'
 
@@ -424,6 +425,7 @@ export interface SidebarSectionRow {
   depth: number
   runStatus: string
   runLabel: string
+  taskAttention: SessionTaskAttention
   updatedAt: number
   hasContractGaps: boolean
   workspace?: string
@@ -505,6 +507,7 @@ export function arrangeSidebarSections(
     depth,
     runStatus: item.runStatus,
     runLabel: item.runLabel,
+    taskAttention: ['queued', 'running'].includes(item.runStatus) ? 'running' : 'none',
     updatedAt: item.updatedAt || 0,
     hasContractGaps: item.contractGaps.length > 0,
     workspace: item.workspace,
@@ -573,6 +576,7 @@ export function arrangeSidebarSections(
           depth: 0,
           runStatus: 'idle',
           runLabel: '',
+          taskAttention: 'none',
           updatedAt: bucket.updatedAt,
           hasContractGaps: false,
           workspace: entry.workspace,
@@ -603,6 +607,7 @@ export function arrangeSidebarSections(
         depth: 0,
         runStatus: 'idle',
         runLabel: '',
+        taskAttention: 'none',
         updatedAt: 0,
         hasContractGaps: false,
         workspace: project.path,
@@ -625,6 +630,7 @@ export function arrangeSidebarSections(
           depth: 1,
           runStatus: 'idle',
           runLabel: '',
+          taskAttention: 'none',
           updatedAt: 0,
           hasContractGaps: false,
           workspace: project.path,
