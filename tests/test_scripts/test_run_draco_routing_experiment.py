@@ -458,6 +458,78 @@ def _valid_ensemble_trace(
     }
 
 
+def _k21_router_dynamic_plan() -> dict[str, object]:
+    return {
+        "strategy": "router_dynamic",
+        "selection_mode": "router_dynamic",
+        "profile": "router_dynamic/c2",
+        "proposer_models": ["p0", "p0", "p1"],
+        "proposer_count": 2,
+        "proposer_sample_count": 3,
+        "selected_P": ["openrouter:p0", "openrouter:p1"],
+        "backup_P": ["openrouter:b0", "openrouter:b1"],
+        "aggregator_model": "agg",
+        "selected_A": "openrouter:agg",
+        "aggregator_candidates": ["openrouter:agg"],
+        "effective_min_successful_proposers": 2,
+        "proposer_recovery_policy": deepcopy(
+            runner.FORMAL_PROPOSER_RECOVERY_POLICY
+        ),
+    }
+
+
+def _k21_ensemble_trace(
+    plan: dict[str, object],
+    *,
+    include_requested_identity: bool = True,
+) -> dict[str, object]:
+    trace = _valid_ensemble_trace(
+        selection_mode="router_dynamic",
+        llm_request_count=4,
+        total_candidates=3,
+        successful_proposers=3,
+    )
+    expanded = ("openrouter:p0", "openrouter:p0", "openrouter:p1")
+    for index, (candidate, identity) in enumerate(
+        zip(trace["candidates"], expanded, strict=True)
+    ):
+        assert isinstance(candidate, dict)
+        provider, model = identity.split(":", 1)
+        candidate["sample_index"] = 1 if index == 1 else 0
+        candidate["provider"] = provider
+        candidate["model"] = model
+        if include_requested_identity:
+            candidate["requested_provider"] = provider
+            candidate["requested_model"] = model
+        else:
+            candidate["requested_provider"] = ""
+            candidate["requested_model"] = ""
+    trace["selection_plan"] = deepcopy(plan)
+    trace["agent_call_index"] = 1
+    trace["request_outcome"] = "llm_response"
+    final_request = trace["final_request"]
+    assert isinstance(final_request, dict)
+    usage = final_request["usage"]
+    assert isinstance(usage, dict)
+    usage.update(
+        {
+            "provider": "openrouter",
+            "model": "agg",
+            "requested_provider": "openrouter",
+            "requested_model": "agg",
+        }
+    )
+    final_request["execution"] = {
+        "provider": "openrouter",
+        "actual_provider": "openrouter",
+        "model": "agg",
+        "actual_model": "agg",
+        "requested_provider": "openrouter",
+        "requested_model": "agg",
+    }
+    return trace
+
+
 def _load_resume_runner():
     spec = importlib.util.spec_from_file_location(
         "run_draco_routing_experiment_resume_under_test",
@@ -2077,12 +2149,14 @@ async def test_provider_native_g1_recovery_never_enters_outer_generation_retry(
         lambda *_args, **_kwargs: [],
     )
 
+    paid_attempt_sink: dict[str, object] = {}
     result, attempts, selected_attempt = await module.collect_generation_with_retries(
         Provider(),
         "prompt",
         timeout=30,
         group="G1",
         max_attempts=3,
+        paid_attempt_sink=paid_attempt_sink,
     )
 
     assert result.error == "ensemble_insufficient_proposers"
@@ -2098,6 +2172,9 @@ async def test_provider_native_g1_recovery_never_enters_outer_generation_retry(
     assert attempts[0]["deterministic_proposer_failures"] == []
     assert attempts[0]["excluded_proposer_identities"] == []
     assert "ensemble_trace" in attempts[0]["run"]
+    assert (
+        paid_attempt_sink["provider_native_g1_recovery"] is True
+    )
 
 
 @pytest.mark.asyncio
@@ -8950,6 +9027,7 @@ def test_main_and_resume_share_identical_critical_runtime_functions() -> None:
         "classify_openrouter_non_byok_unit",
         "normalized_agent_finalization_policy",
         "legal_proposer_quorum",
+        "expanded_proposer_slot_identities",
         "validate_g1_registry_contract",
         "g1_registry_contract_reasons",
         "apply_b2_g12_argument_alignment",
@@ -14078,7 +14156,7 @@ async def test_g1_dry_build_records_registry_all_candidate_allowlist(module) -> 
         f"{experiment.g1_routing.source_registry_snapshot_version}+"
     )
     assert len(plan["selected_P"]) == 2
-    assert plan["N_min"] == 1
+    assert plan["N_min"] == 2
     assert plan["N_max"] == 2
     assert plan["proposer_count"] == 2
     assert plan["ranking_config_hash"] == (experiment.g1_routing.expected_ranking_config_sha256)
@@ -14088,6 +14166,59 @@ async def test_g1_dry_build_records_registry_all_candidate_allowlist(module) -> 
     assert plan["aggregator_recovery_top_k"] == 3
     assert plan["aggregator_max_tokens_cap"] == 65_536
     assert plan["aggregator_visible_answer_reserve_tokens"] == 8_192
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("module", [runner, _load_resume_runner()], ids=["main", "resume"])
+@pytest.mark.parametrize(
+    ("wait_for_all_proposers", "quorum_grace_seconds"),
+    [(True, 0.0), (False, 7.5)],
+    ids=["wait-all-current", "bounded-grace"],
+)
+async def test_g1_dry_build_applies_experiment_quorum_wait_policy(
+    module,
+    wait_for_all_proposers: bool,
+    quorum_grace_seconds: float,
+) -> None:
+    experiment = module.load_draco_experiment_config(
+        module.DEFAULT_B2_EXPERIMENT_CONFIG_PATH
+    ).config
+    payload = experiment.model_dump(mode="json")
+    payload["ensemble"]["wait_for_all_proposers"] = wait_for_all_proposers
+    payload["ensemble"]["quorum_grace_seconds"] = quorum_grace_seconds
+    experiment = type(experiment).model_validate(payload)
+    config = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "deepseek/deepseek-v4-pro",
+            "api_key": "fake",
+        }
+    )
+    contract = _resolved_g1_registry_contract(module, experiment, config)
+
+    result = await module.build_experiment_provider(
+        config=config,
+        inherited=ProviderConfig(
+            provider="openrouter",
+            model="deepseek/deepseek-v4-pro",
+            api_key="fake",
+        ),
+        group="G1",
+        prompt="dry quorum policy prompt",
+        dry_run=True,
+        enable_proposer_tools=False,
+        ensemble_proposer_timeout=None,
+        ensemble_aggregator_timeout=None,
+        experiment_config=experiment,
+        g1_registry_contract=contract,
+        generation_policy={},
+    )
+
+    plan = result.routing_trace["selection_plan"]
+    assert result.provider.quorum_grace_seconds == pytest.approx(quorum_grace_seconds)
+    assert plan["quorum_grace_seconds"] == pytest.approx(quorum_grace_seconds)
+    assert plan["wait_for_all_proposers"] is wait_for_all_proposers
+    assert result.provider.selection_plan == plan
 
 
 def test_g1_dry_cli_main_exits_zero_with_frozen_registry_contract(
@@ -16230,6 +16361,72 @@ def test_paid_generation_recovery_survives_broken_summary_and_canonicalizer(
     ]
 
 
+@pytest.mark.parametrize(
+    "module",
+    [runner, _load_resume_runner()],
+    ids=["main", "resume"],
+)
+def test_provider_native_paid_postprocessing_recovery_preserves_plan_and_owner(
+    module,
+) -> None:
+    selection_plan = {
+        "strategy": "router_dynamic",
+        "selected_P": [
+            "openrouter:model-a",
+            "openrouter:model-b",
+        ],
+        "backup_P": [
+            "openrouter:model-c",
+            "openrouter:model-d",
+        ],
+        "aggregator_candidates": ["openrouter:model-e"],
+        "effective_min_successful_proposers": 2,
+        "proposer_recovery_policy": deepcopy(
+            module.FORMAL_PROPOSER_RECOVERY_POLICY
+        ),
+    }
+    result = module.RunResult(
+        final_text="",
+        done=None,
+        error="HTTP 503",
+        trace_events=[
+            {
+                "kind": "error",
+                "code": "503",
+                "request_started": True,
+                "physical_request_count": 1,
+            }
+        ],
+    )
+    pending = {
+        "result": result,
+        "attempts": [],
+        "attempt_id": "5" * 32,
+        "attempt_index": 1,
+        "attempt_started_at": 1.0,
+        "selection_plan": selection_plan,
+        "adaptive_g1": False,
+        "provider_native_g1_recovery": True,
+        "excluded_proposer_identities": (),
+        "stage": "run_result_summary",
+    }
+
+    _, attempts, selected, _ = (
+        module.recover_paid_generation_postprocessing_failure(
+            pending,
+            RuntimeError("postprocessing failed"),
+        )
+    )
+
+    assert selected == 0
+    assert len(attempts) == 1
+    attempt = attempts[0]
+    assert attempt["selection_plan"] == selection_plan
+    assert attempt["proposer_recovery_owner"] == "provider"
+    assert attempt["deterministic_proposer_failures"] == []
+    assert attempt["excluded_proposer_identities"] == []
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("module", [runner, _load_resume_runner()], ids=["main", "resume"])
 async def test_run_one_freezes_dataclass_routing_receipt(
@@ -16521,6 +16718,80 @@ def test_provider_native_formal_quorum_stays_two_for_five_proposers(
     legacy.min_successful_proposers = 4
     legacy = module.enforce_draco_legal_proposer_quorum(legacy)
     assert legacy.min_successful_proposers == 4
+
+
+@pytest.mark.parametrize("module", [runner, _load_resume_runner()], ids=["main", "resume"])
+@pytest.mark.parametrize(
+    "policy_quorum",
+    [0, True, "2", 3],
+    ids=["zero", "bool", "string", "mismatch"],
+)
+def test_proposer_recovery_policy_quorum_mismatch_fails_before_mutation(
+    module,
+    policy_quorum: object,
+) -> None:
+    class Member:
+        k = 1
+
+    class Provider:
+        pass
+
+    policy = deepcopy(module.FORMAL_PROPOSER_RECOVERY_POLICY)
+    policy["quorum_required"] = policy_quorum
+    provider = Provider()
+    provider.proposers = [Member() for _ in range(5)]
+    provider.min_successful_proposers = 4
+    provider.selection_plan = {
+        "proposer_recovery_policy": policy,
+        "configured_min_successful_proposers": 4,
+        "sentinel": {"unchanged": True},
+    }
+    original_plan = provider.selection_plan
+    original_snapshot = deepcopy(original_plan)
+
+    with pytest.raises(
+        ValueError,
+        match=r"proposer_recovery_policy\.quorum_required",
+    ):
+        module.enforce_draco_legal_proposer_quorum(provider)
+
+    assert provider.min_successful_proposers == 4
+    assert provider.selection_plan is original_plan
+    assert provider.selection_plan == original_snapshot
+
+
+@pytest.mark.parametrize("module", [runner, _load_resume_runner()], ids=["main", "resume"])
+def test_enforced_proposer_quorum_above_sample_count_fails_before_mutation(
+    module,
+) -> None:
+    class Member:
+        k = 1
+
+    class Provider:
+        pass
+
+    provider = Provider()
+    provider.proposers = [Member()]
+    provider.min_successful_proposers = 1
+    provider.selection_plan = {
+        "proposer_recovery_policy": deepcopy(
+            module.FORMAL_PROPOSER_RECOVERY_POLICY
+        ),
+        "configured_min_successful_proposers": 1,
+        "sentinel": {"unchanged": True},
+    }
+    original_plan = provider.selection_plan
+    original_snapshot = deepcopy(original_plan)
+
+    with pytest.raises(
+        ValueError,
+        match="enforced proposer quorum 2 exceeds proposer sample count 1",
+    ):
+        module.enforce_draco_legal_proposer_quorum(provider)
+
+    assert provider.min_successful_proposers == 1
+    assert provider.selection_plan is original_plan
+    assert provider.selection_plan == original_snapshot
 
 
 @pytest.mark.parametrize("module", [runner, _load_resume_runner()], ids=["main", "resume"])
@@ -16858,3 +17129,304 @@ def test_experiment_config_artifacts_save_source_effective_and_resolution(
     assert inline == [{"path": "runner.concurrency", "value": 4}]
     assert resolution["input_validation"]["status"] == "matched"
     assert resolution["artifact_keys"] == sorted(artifacts)
+
+
+@pytest.mark.parametrize(
+    "module",
+    [runner, resume_runner],
+    ids=["main", "resume"],
+)
+def test_expanded_proposer_slot_identities_supports_k21_and_fails_closed(
+    module,
+) -> None:
+    plan = _k21_router_dynamic_plan()
+
+    assert module.expanded_proposer_slot_identities(plan) == (
+        "openrouter:p0",
+        "openrouter:p0",
+        "openrouter:p1",
+    )
+
+    noncontiguous = deepcopy(plan)
+    noncontiguous["proposer_models"] = ["p0", "p1", "p0"]
+    assert module.expanded_proposer_slot_identities(noncontiguous) == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "module",
+    [runner, resume_runner],
+    ids=["main", "resume"],
+)
+async def test_dry_ensemble_emits_expanded_k21_proposer_identity_roster(
+    module,
+) -> None:
+    plan = _k21_router_dynamic_plan()
+    provider = module.DryEnsembleProvider(
+        group="G1",
+        profile="router_dynamic/c2",
+        proposer_models=list(plan["proposer_models"]),
+        model="agg",
+        selection_mode="router_dynamic",
+    )
+    provider.selection_plan = deepcopy(plan)
+
+    events = [
+        event
+        async for event in provider.chat(
+            [module.Message(role="user", content="task")]
+        )
+    ]
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    trace = done.ensemble_trace
+    assert isinstance(trace, dict)
+    candidates = trace["candidates"]
+    assert [
+        (
+            candidate["requested_provider"],
+            candidate["requested_model"],
+            candidate["sample_index"],
+        )
+        for candidate in candidates
+    ] == [
+        ("openrouter", "p0", 0),
+        ("openrouter", "p0", 1),
+        ("openrouter", "p1", 0),
+    ]
+    recovery = trace["proposer_recovery"]
+    assert recovery["executed_proposer_roster_before"] == [
+        "openrouter:p0",
+        "openrouter:p0",
+        "openrouter:p1",
+    ]
+    assert recovery["executed_proposer_roster_after"] == [
+        "openrouter:p0",
+        "openrouter:p0",
+        "openrouter:p1",
+    ]
+
+
+@pytest.mark.parametrize(
+    "module",
+    [runner, resume_runner],
+    ids=["main", "resume"],
+)
+def test_ensemble_call_core_audits_expanded_k21_candidate_slots(
+    module,
+) -> None:
+    plan = _k21_router_dynamic_plan()
+    trace = _k21_ensemble_trace(plan)
+
+    assert (
+        module.ensemble_call_core_reasons(
+            trace,
+            expected_selection_mode="router_dynamic",
+            expected_selection_plan=plan,
+        )
+        == []
+    )
+
+    wrong_slot = deepcopy(trace)
+    wrong_slot["candidates"][1]["requested_model"] = "p1"
+    assert "wrong_requested_proposer_identity" in (
+        module.ensemble_call_core_reasons(
+            wrong_slot,
+            expected_selection_mode="router_dynamic",
+            expected_selection_plan=plan,
+        )
+    )
+
+
+def test_resume_completion_accepts_k21_plan_and_rejects_ambiguous_slots() -> None:
+    plan = _k21_router_dynamic_plan()
+    trace = _k21_ensemble_trace(plan)
+    row = {
+        "group": "G1",
+        "provider_spec": dict(resume_runner.GROUP_SPECS["G1"]),
+        "routing_trace": {"selection_plan": deepcopy(plan)},
+        "final_text": "answer",
+        "ensemble_trace": {
+            "calls": [trace],
+            "agent_llm_call_count": 1,
+        },
+    }
+
+    assert resume_runner.ensemble_generation_completion_reasons(row) == []
+
+    ambiguous = deepcopy(row)
+    ambiguous_plan = ambiguous["routing_trace"]["selection_plan"]
+    ambiguous_plan["proposer_models"] = ["p0", "p1", "p0"]
+    ambiguous["ensemble_trace"]["calls"][0]["selection_plan"] = deepcopy(
+        ambiguous_plan
+    )
+    reasons = resume_runner.ensemble_generation_completion_reasons(
+        ambiguous
+    )
+    assert "invalid_expected_selection_plan" in reasons
+    assert "invalid_expected_proposer_slot_roster" in reasons
+
+
+@pytest.mark.parametrize(
+    "module",
+    [runner, resume_runner],
+    ids=["main", "resume"],
+)
+def test_requested_identity_backfill_uses_expanded_k21_slots(module) -> None:
+    plan = _k21_router_dynamic_plan()
+    trace = _k21_ensemble_trace(
+        plan,
+        include_requested_identity=False,
+    )
+    done = module.DoneEvent(
+        model="agg",
+        provider="openrouter",
+        requested_model="agg",
+        requested_provider="openrouter",
+        ensemble_trace={"calls": [trace]},
+    )
+    result = module.RunResult(final_text="answer", done=done)
+
+    assert module.backfill_result_requested_identity(
+        result,
+        expected_model="agg",
+        expected_provider="openrouter",
+        expected_selection_plan=plan,
+    )
+    assert [
+        (
+            candidate["requested_provider"],
+            candidate["requested_model"],
+        )
+        for candidate in trace["candidates"]
+    ] == [
+        ("openrouter", "p0"),
+        ("openrouter", "p0"),
+        ("openrouter", "p1"),
+    ]
+
+    malformed_plan = deepcopy(plan)
+    malformed_plan["proposer_models"] = ["p0", "p1", "p0"]
+    malformed_trace = _k21_ensemble_trace(
+        malformed_plan,
+        include_requested_identity=False,
+    )
+    malformed_result = module.RunResult(
+        final_text="answer",
+        done=module.DoneEvent(
+            model="agg",
+            provider="openrouter",
+            requested_model="agg",
+            requested_provider="openrouter",
+            ensemble_trace={"calls": [malformed_trace]},
+        ),
+    )
+    assert not module.backfill_result_requested_identity(
+        malformed_result,
+        expected_model="agg",
+        expected_provider="openrouter",
+        expected_selection_plan=malformed_plan,
+    )
+
+
+@pytest.mark.parametrize(
+    "module",
+    [runner, resume_runner],
+    ids=["main", "resume"],
+)
+def test_g1_registry_audit_distinguishes_member_and_sample_counts(
+    module,
+) -> None:
+    from opensquilla.provider.ranking_router import (
+        load_model_registry_snapshot,
+        ranking_config_snapshot,
+    )
+
+    registry = load_model_registry_snapshot()
+    ranking = ranking_config_snapshot(thinking_assignment_enabled=True)
+
+    def _sha256(value) -> str:
+        payload = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    routes = {
+        str(row["registry_facts"]["model_id"]).strip().lower(): "auto"
+        for row in registry["models"]
+    }
+    contract = {
+        "profile_id": "test-k21-registry",
+        "selection_mode": "router_dynamic",
+        "candidate_scope": "registry_all",
+        "policy": "all_registry_models",
+        "user_profile_enabled": False,
+        "source_registry_snapshot_version": registry["snapshot_version"],
+        "expected_source_registry_snapshot_sha256": _sha256(registry),
+        "expected_ranking_config_schema_version": ranking["schema_version"],
+        "expected_ranking_config_version": ranking["config_version"],
+        "expected_ranking_config_sha256": _sha256(ranking),
+        "expected_proposer_count_max": 5,
+        "expected_candidate_count": len(routes),
+        "expected_routes_sha256": _sha256(routes),
+        "expected_routes": routes,
+    }
+    config = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "deepseek/deepseek-v4-pro",
+            "api_key": "fake",
+            "provider_routing": routes,
+        },
+        llm_ensemble={
+            "enabled": True,
+            "selection_mode": "router_dynamic",
+            "ranking_thinking_assignment_enabled": True,
+        },
+    )
+    provider = build_ensemble_provider_from_config(
+        config=config,
+        inherited_provider_config=ProviderConfig(
+            provider="openrouter",
+            model="deepseek/deepseek-v4-pro",
+            api_key="fake",
+            provider_routing=routes,
+        ),
+        fallback_provider=None,
+        turn_metadata={
+            "routed_tier": "c1",
+            "routing_confidence": 0.9,
+        },
+        ranking_inputs={
+            "registry_allowlist": contract,
+        },
+    )
+    plan = deepcopy(provider.selection_plan)
+    proposer_models = list(plan["proposer_models"])
+    proposer_models.insert(1, proposer_models[0])
+    plan["proposer_models"] = proposer_models
+    plan["proposer_sample_count"] = len(proposer_models)
+
+    reasons = module.g1_registry_contract_reasons(
+        {"selection_plan": plan},
+        contract,
+    )
+    assert "invalid_g1_expanded_proposer_roster" not in reasons
+    assert "wrong_g1_selected_proposer_count" not in reasons
+
+    noncontiguous = deepcopy(plan)
+    noncontiguous_models = list(noncontiguous["proposer_models"])
+    noncontiguous_models[1:3] = [
+        noncontiguous_models[2],
+        noncontiguous_models[1],
+    ]
+    noncontiguous["proposer_models"] = noncontiguous_models
+    reasons = module.g1_registry_contract_reasons(
+        {"selection_plan": noncontiguous},
+        contract,
+    )
+    assert "invalid_g1_expanded_proposer_roster" in reasons
+    assert "wrong_g1_selected_proposer_count" in reasons

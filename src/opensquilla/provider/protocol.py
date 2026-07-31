@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections import Counter
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
@@ -410,15 +410,103 @@ def _canonical_provider_model_identity(
     if (
         not isinstance(value, str)
         or value != value.strip()
-        or value != value.casefold()
-        or value.count(":") != 1
+        or ":" not in value
         or any(character.isspace() for character in value)
     ):
         return None
     provider, model = value.split(":", 1)
-    if not provider or not model:
+    if (
+        not provider
+        or provider != provider.casefold()
+        or not model
+        or any(not segment for segment in model.split(":"))
+    ):
         return None
     return provider, model
+
+
+def provider_retry_expanded_proposer_identities(
+    plan: object,
+) -> tuple[str, ...]:
+    """Bind every k-expanded proposer sample to one exact provider identity.
+
+    ``selected_P`` names distinct ranked members, while ``proposer_models``
+    records their physical samples after each member's ``k`` expansion. The
+    latter omits provider ids. A one-sample-per-member roster is still
+    unambiguous by position even when two providers expose the same model id.
+    For k-expanded rosters, selected members must expose distinct model ids and
+    each model must occupy one non-empty contiguous block in ranking order.
+    An empty tuple is the fail-closed invalid result.
+    """
+
+    if not isinstance(plan, Mapping):
+        try:
+            plan = dict(plan)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return ()
+    selected_p = plan.get("selected_P")
+    proposer_models = plan.get("proposer_models")
+    if (
+        not isinstance(selected_p, list)
+        or not selected_p
+        or not isinstance(proposer_models, list)
+        or not proposer_models
+    ):
+        return ()
+    selected_parts = [
+        _canonical_provider_model_identity(identity)
+        for identity in selected_p
+    ]
+    selected_identities = [
+        identity for identity in selected_p if isinstance(identity, str)
+    ]
+    if (
+        any(parts is None for parts in selected_parts)
+        or len(selected_identities) != len(selected_p)
+        or len(set(selected_identities)) != len(selected_identities)
+    ):
+        return ()
+    selected_models = [
+        parts[1]
+        for parts in selected_parts
+        if parts is not None
+    ]
+    if any(
+        not isinstance(model, str)
+        or not model
+        or model != model.strip()
+        or any(character.isspace() for character in model)
+        or any(not segment for segment in model.split(":"))
+        for model in proposer_models
+    ):
+        return ()
+
+    if len(proposer_models) == len(selected_models):
+        if proposer_models != selected_models:
+            return ()
+        return tuple(selected_identities)
+    if len(set(selected_models)) != len(selected_models):
+        return ()
+
+    expanded: list[str] = []
+    model_index = 0
+    for identity, model in zip(
+        selected_identities,
+        selected_models,
+        strict=True,
+    ):
+        block_start = model_index
+        while (
+            model_index < len(proposer_models)
+            and proposer_models[model_index] == model
+        ):
+            expanded.append(identity)
+            model_index += 1
+        if model_index == block_start:
+            return ()
+    if model_index != len(proposer_models):
+        return ()
+    return tuple(expanded)
 
 
 def provider_retry_roster_fingerprint(plan: object) -> str:
@@ -475,8 +563,10 @@ def provider_retry_roster_fingerprint(plan: object) -> str:
             isinstance(model, str)
             and model
             and model == model.strip()
-            and model == model.casefold()
             and not any(character.isspace() for character in model)
+            and not any(
+                not segment for segment in model.split(":")
+            )
             for model in proposer_models
         )
         else []
@@ -511,8 +601,12 @@ def provider_retry_roster_fingerprint(plan: object) -> str:
         and isinstance(backup_p, list)
         and any(candidate in backup_p for candidate in aggregator_candidates)
     )
+    expanded_proposer_identities = (
+        provider_retry_expanded_proposer_identities(plan)
+    )
     valid_recovery_policy = False
-    if isinstance(proposer_recovery_policy, dict):
+    normalized_recovery_policy: dict[str, object] = {}
+    if isinstance(proposer_recovery_policy, Mapping):
         configured_backup_count = proposer_recovery_policy.get(
             "configured_backup_count"
         )
@@ -564,14 +658,34 @@ def provider_retry_roster_fingerprint(plan: object) -> str:
             and transient_retries == 1
             and backup_downgrades == 1
         )
+        if valid_recovery_policy:
+            # Fingerprint only the versioned execution contract. Unknown
+            # metadata is deliberately excluded: it cannot change execution,
+            # and including arbitrary extension values would make hashing
+            # raise for otherwise harmless non-JSON objects or cycles.
+            normalized_recovery_policy = {
+                "schema": proposer_recovery_policy.get("schema"),
+                "configured_backup_count": configured_backup_count,
+                "effective_backup_count": effective_backup_count,
+                "max_additional_physical_requests": max_additional,
+                "quorum_required": policy_quorum,
+                "max_tokens_cap": proposer_cap,
+                "visible_answer_reserve_tokens": proposer_reserve,
+                "thinking_downgrade_order": list(downgrade_order),
+                "transient_same_model_retries": transient_retries,
+                "backup_reasoning_downgrades": backup_downgrades,
+            }
     if (
-        strategy != "router_dynamic"
+        plan.get("strategy") != "router_dynamic"
+        or plan.get("selection_mode") != "router_dynamic"
+        or strategy != "router_dynamic"
         or selection_mode != "router_dynamic"
         or not isinstance(selected_p, list)
         or not selected_p
         or any(parts is None for parts in selected_p_parts)
         or len(selected_p_strings) != len(selected_p)
         or len(set(selected_p_strings)) != len(selected_p_strings)
+        or not expanded_proposer_identities
         or not isinstance(backup_p, list)
         or any(parts is None for parts in backup_p_parts)
         or len(backup_p_strings) != len(backup_p)
@@ -608,7 +722,7 @@ def provider_retry_roster_fingerprint(plan: object) -> str:
         "selection_mode": selection_mode,
         "selected_P": selected_p,
         "backup_P": backup_p,
-        "proposer_recovery_policy": proposer_recovery_policy,
+        "proposer_recovery_policy": normalized_recovery_policy,
         "proposer_models": normalized_proposer_models,
         "selected_A": selected_a,
         "aggregator_candidates": aggregator_candidates,

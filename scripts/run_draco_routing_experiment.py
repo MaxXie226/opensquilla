@@ -97,6 +97,9 @@ from opensquilla.provider.ensemble import (
     openrouter_static_capabilities,
     resolve_effective_generation_request_parameters,
 )
+from opensquilla.provider.protocol import (
+    provider_retry_expanded_proposer_identities,
+)
 from opensquilla.provider.registry import get_provider_spec
 from opensquilla.provider.selector import (
     ModelSelector,
@@ -328,6 +331,60 @@ def legal_proposer_quorum(proposer_count: int) -> int:
     if proposer_count < 0:
         raise ValueError("proposer_count must be a non-negative integer")
     return (2 * proposer_count + 2) // 3 if proposer_count else 0
+
+
+def expanded_proposer_slot_identities(
+    plan: object,
+) -> tuple[str, ...]:
+    """Return the exact provider identity bound to every proposer sample."""
+
+    expanded = provider_retry_expanded_proposer_identities(plan)
+    if expanded:
+        return expanded
+    if not isinstance(plan, Mapping):
+        return ()
+    recovery_policy = plan.get("proposer_recovery_policy")
+    if (
+        isinstance(recovery_policy, Mapping)
+        and recovery_policy.get("schema") == PROPOSER_RECOVERY_SCHEMA
+    ):
+        return ()
+    selected_p = plan.get("selected_P")
+    proposer_models = plan.get("proposer_models")
+    if (
+        not isinstance(selected_p, list)
+        or not selected_p
+        or not isinstance(proposer_models, list)
+        or len(selected_p) != len(proposer_models)
+    ):
+        return ()
+    normalized: list[str] = []
+    for identity, expected_model in zip(
+        selected_p,
+        proposer_models,
+        strict=True,
+    ):
+        if (
+            not isinstance(identity, str)
+            or identity != identity.strip()
+            or any(character.isspace() for character in identity)
+            or not isinstance(expected_model, str)
+            or expected_model != expected_model.strip()
+            or any(character.isspace() for character in expected_model)
+        ):
+            return ()
+        provider, separator, model = identity.partition(":")
+        if (
+            separator != ":"
+            or not provider
+            or provider != provider.casefold()
+            or not model
+            or any(not segment for segment in model.split(":"))
+            or model != expected_model
+        ):
+            return ()
+        normalized.append(identity)
+    return tuple(normalized)
 
 
 def validate_g1_registry_contract(
@@ -958,6 +1015,20 @@ class DryEnsembleProvider:
             and dict(recovery_policy)
             == FORMAL_PROPOSER_RECOVERY_POLICY
         )
+        expanded_selected_identities = list(
+            expanded_proposer_slot_identities(self.selection_plan)
+        )
+        if formal_recovery and (
+            len(expanded_selected_identities) != len(self.proposer_models)
+        ):
+            raise ValueError(
+                "dry router_dynamic proposer sample roster is invalid"
+            )
+        slot_identities = (
+            expanded_selected_identities
+            if expanded_selected_identities
+            else selected_identities
+        )
         chat_sequence = int(
             getattr(self, "_draco_dry_chat_sequence", 0)
         ) + 1
@@ -986,8 +1057,9 @@ class DryEnsembleProvider:
             sample_index = sample_indexes.get(model, 0)
             sample_indexes[model] = sample_index + 1
             identity = (
-                selected_identities[index]
-                if index < len(selected_identities) and isinstance(selected_identities[index], str)
+                slot_identities[index]
+                if index < len(slot_identities)
+                and isinstance(slot_identities[index], str)
                 else f"dry:{model}"
             )
             provider, separator, selected_model = identity.partition(":")
@@ -1227,10 +1299,10 @@ class DryEnsembleProvider:
                             "cumulative_excluded_identities": [],
                             "visited_identities": [],
                             "executed_proposer_roster_before": list(
-                                selected_identities
+                                slot_identities
                             ),
                             "executed_proposer_roster_after": list(
-                                selected_identities
+                                slot_identities
                             ),
                             "attempts": [],
                         }
@@ -2777,6 +2849,32 @@ def enforce_draco_legal_proposer_quorum(provider: Any) -> Any:
         if formal_provider_native
         else legal_proposer_quorum(proposer_count)
     )
+    if required > proposer_count:
+        raise ValueError(
+            f"DRACO enforced proposer quorum {required} exceeds proposer "
+            f"sample count {proposer_count}"
+        )
+    if "proposer_recovery_policy" in selection_plan:
+        if not isinstance(provider_native_policy, Mapping):
+            raise ValueError(
+                "DRACO proposer_recovery_policy must be a mapping"
+            )
+        policy_quorum = provider_native_policy.get("quorum_required")
+        if (
+            isinstance(policy_quorum, bool)
+            or not isinstance(policy_quorum, int)
+            or policy_quorum <= 0
+        ):
+            raise ValueError(
+                "DRACO proposer_recovery_policy.quorum_required must be "
+                "a positive integer"
+            )
+        if policy_quorum != required:
+            raise ValueError(
+                "DRACO proposer_recovery_policy.quorum_required="
+                f"{policy_quorum} does not match enforced proposer quorum "
+                f"{required}"
+            )
     configured = int(getattr(provider, "min_successful_proposers", 1) or 1)
     provider.min_successful_proposers = required
     selection_plan.setdefault("configured_min_successful_proposers", configured)
@@ -3598,6 +3696,11 @@ async def build_experiment_provider(
     )
     if group == "G1" and g1_routing is None:
         raise ValueError("G1 requires a versioned g1_routing experiment contract")
+    g1_ensemble = (
+        experiment_config.ensemble
+        if g1_routing is not None and experiment_config is not None
+        else None
+    )
     resolved_g1_registry_contract = (
         dict(g1_registry_contract)
         if isinstance(g1_registry_contract, Mapping)
@@ -3822,6 +3925,12 @@ async def build_experiment_provider(
                 ranking_inputs=dry_ranking_inputs,
             )
             plan = copy.deepcopy(dry_dynamic_provider.selection_plan)
+            if g1_ensemble is not None:
+                dry_provider.quorum_grace_seconds = g1_ensemble.quorum_grace_seconds
+                plan["quorum_grace_seconds"] = g1_ensemble.quorum_grace_seconds
+                plan["wait_for_all_proposers"] = (
+                    g1_ensemble.wait_for_all_proposers
+                )
             proposer_models = list(plan.get("proposer_models") or [])
             aggregator_model = str(plan.get("aggregator_model") or "")
             dry_provider.proposer_models = proposer_models
@@ -4273,6 +4382,14 @@ async def build_experiment_provider(
             materialized = align_b2_provider_to_g12(materialized, b2_experiment)
         if g1_routing is not None:
             materialized.selection_plan["user_profile_enabled"] = user_profile_enabled
+            if g1_ensemble is not None:
+                materialized.quorum_grace_seconds = g1_ensemble.quorum_grace_seconds
+                materialized.selection_plan["quorum_grace_seconds"] = (
+                    g1_ensemble.quorum_grace_seconds
+                )
+                materialized.selection_plan["wait_for_all_proposers"] = (
+                    g1_ensemble.wait_for_all_proposers
+                )
         materialized = enforce_draco_legal_proposer_quorum(materialized)
         if generation_policy is not None:
             materialized = apply_generation_policy_to_ensemble_provider(
@@ -6963,7 +7080,10 @@ def recover_paid_generation_postprocessing_failure(
             "started_at": pending.get("attempt_started_at"),
             "completed_at": time.time(),
         }
-        if pending.get("adaptive_g1") is True:
+        provider_native_g1_recovery = (
+            pending.get("provider_native_g1_recovery") is True
+        )
+        if pending.get("adaptive_g1") is True or provider_native_g1_recovery:
             try:
                 safe_plan = json_safe(
                     copy.deepcopy(
@@ -6990,6 +7110,8 @@ def recover_paid_generation_postprocessing_failure(
                     ),
                 }
             )
+            if provider_native_g1_recovery:
+                existing["proposer_recovery_owner"] = "provider"
         attempts.append(existing)
     existing.update(
         {
@@ -7237,6 +7359,21 @@ def g1_registry_contract_reasons(
             reasons.append("invalid_g1_proposer_bound_evidence")
     else:
         reasons.append("missing_g1_task_profile")
+    proposer_policy = executed_plan.get("proposer_recovery_policy")
+    explicit_quorum = (
+        proposer_policy.get("quorum_required")
+        if isinstance(proposer_policy, Mapping)
+        else None
+    )
+    if (
+        isinstance(explicit_quorum, int)
+        and not isinstance(explicit_quorum, bool)
+        and explicit_quorum > 0
+        and (explicit_quorum > derived_min or explicit_quorum > derived_max)
+    ):
+        derived_min = max(derived_min, explicit_quorum)
+        derived_max = max(derived_max, explicit_quorum)
+        derived_bound_reasons.append("proposer_recovery_quorum")
     declared_min = coerce_metric_int(executed_plan.get("N_min"))
     declared_max = coerce_metric_int(executed_plan.get("N_max"))
     traced_bound_reasons = executed_plan.get("bound_reasons")
@@ -7251,19 +7388,22 @@ def g1_registry_contract_reasons(
     ):
         reasons.append("wrong_g1_proposer_bounds")
     selected_count = len(selected_p) if isinstance(selected_p, list) else 0
-    selected_models = (
-        [str(identity).partition(":")[2] for identity in selected_p]
-        if isinstance(selected_p, list)
-        else []
-    )
+    expanded_selected_p = expanded_proposer_slot_identities(executed_plan)
+    expanded_models = [
+        identity.partition(":")[2] for identity in expanded_selected_p
+    ]
+    expanded_count = len(expanded_selected_p)
+    if not expanded_selected_p:
+        reasons.append("invalid_g1_expanded_proposer_roster")
     selected_aggregator_model = selected_a.partition(":")[2] if isinstance(selected_a, str) else ""
     if (
         selected_count < derived_min
         or selected_count > derived_max
         or selected_count > expected_proposer_max
         or coerce_metric_int(executed_plan.get("proposer_count")) != selected_count
-        or coerce_metric_int(executed_plan.get("proposer_sample_count")) != selected_count
-        or executed_plan.get("proposer_models") != selected_models
+        or coerce_metric_int(executed_plan.get("proposer_sample_count"))
+        != expanded_count
+        or executed_plan.get("proposer_models") != expanded_models
         or str(executed_plan.get("aggregator_model") or "") != selected_aggregator_model
     ):
         reasons.append("wrong_g1_selected_proposer_count")
@@ -7410,9 +7550,14 @@ def ensemble_call_core_reasons(
             reasons.append("successful_proposer_count_mismatch")
         if expected_total and actual_successful < legal_proposer_quorum(expected_total):
             reasons.append("insufficient_actual_proposer_quorum")
-        expected_selected_p = expected_plan.get("selected_P")
-        if isinstance(expected_selected_p, list):
-            if len(candidate_rows) != len(expected_selected_p):
+        raw_expected_selected_p = expected_plan.get("selected_P")
+        expected_slot_identities = expanded_proposer_slot_identities(
+            expected_plan
+        )
+        if isinstance(raw_expected_selected_p, list):
+            if not expected_slot_identities:
+                reasons.append("invalid_expected_proposer_slot_roster")
+            elif len(candidate_rows) != len(expected_slot_identities):
                 reasons.append("wrong_actual_proposer_count")
             else:
                 requested_identity_missing = False
@@ -7422,7 +7567,7 @@ def ensemble_call_core_reasons(
                 for candidate_index, (candidate, identity) in enumerate(
                     zip(
                         candidate_rows,
-                        expected_selected_p,
+                        expected_slot_identities,
                         strict=True,
                     )
                 ):
@@ -8062,10 +8207,14 @@ def backfill_result_requested_identity(
                 if isinstance(call_trace.get("selection_plan"), Mapping)
                 else plan
             )
-            selected_p = call_plan.get("selected_P") if isinstance(call_plan, Mapping) else None
+            selected_p = (
+                expanded_proposer_slot_identities(call_plan)
+                if isinstance(call_plan, Mapping)
+                else ()
+            )
             candidates = call_trace.get("candidates")
             if (
-                isinstance(selected_p, list)
+                selected_p
                 and isinstance(candidates, list)
                 and len(selected_p) == len(candidates)
             ):
@@ -9301,6 +9450,9 @@ async def collect_generation_with_retries(
                     "attempt_started_at": attempt_started_at,
                     "selection_plan": expected_selection_plan,
                     "adaptive_g1": adaptive_g1,
+                    "provider_native_g1_recovery": (
+                        provider_native_g1_recovery
+                    ),
                     "excluded_proposer_identities": tuple(
                         sorted(excluded_proposer_identities)
                     ),

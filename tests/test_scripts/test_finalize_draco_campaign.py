@@ -252,6 +252,89 @@ def test_physical_attempt_ids_are_unique_across_request_owners(
     ]
 
 
+def test_provider_native_physical_ids_are_unique_without_thinking_schema(
+    module,
+) -> None:
+    shared_physical_attempt_id = "d" * 32
+    contract = _contract(module, "G1", "a" * 64)
+    records = []
+    for source_index in (1, 2):
+        task_id = f"task-{source_index}"
+        task = {
+            "id": task_id,
+            "prompt": "research this",
+            "rubric": {
+                "id": "rubric-1",
+                "sections": [
+                    {
+                        "id": "quality",
+                        "title": "Quality",
+                        "criteria": [
+                            {
+                                "id": "core",
+                                "weight": 100,
+                                "requirement": "core",
+                            }
+                        ],
+                    }
+                ],
+            },
+        }
+        row = _row(
+            module,
+            group="G1",
+            task=task,
+            fingerprint="fingerprint",
+            response_prefix=f"physical-owner-{source_index}",
+        )
+        attempt = row["execution"]["generation_attempts"][0]
+        run = attempt["run"]
+        run["ensemble_trace"] = deepcopy(row["ensemble_trace"])
+        call = run["ensemble_trace"]["calls"][0]
+        plan = call["selection_plan"]
+        plan.pop("thinking_physical_evidence_schema", None)
+        assert plan.get("proposer_recovery_policy") is not None
+        physical = call["candidates"][0]["execution"][
+            "physical_attempts"
+        ][0]
+        prior_physical_attempt_id = physical["physical_attempt_id"]
+        physical["physical_attempt_id"] = shared_physical_attempt_id
+        usage_units = run["usage"]["model_usage_breakdown"]
+        matching_units = [
+            unit
+            for unit in usage_units
+            if unit.get("physical_attempt_id")
+            == prior_physical_attempt_id
+        ]
+        assert len(matching_units) == 1
+        usage_unit = matching_units[0]
+        usage_unit["physical_attempt_id"] = shared_physical_attempt_id
+        usage_unit["provider_usage"]["physical_attempt_id"] = (
+            shared_physical_attempt_id
+        )
+        assert (
+            module.g1_thinking_physical_usage_binding_reasons(run)
+            == []
+        )
+        records.append(
+            module.SourceRecord(
+                path=Path(f"wave-{source_index}.jsonl"),
+                source_index=source_index,
+                line=1,
+                row=row,
+            )
+        )
+
+    with pytest.raises(
+        module.FinalizationError,
+        match="physical_attempt_id_reused_across_generation_attempts",
+    ):
+        module.validate_physical_generation_routes(
+            records,
+            contracts={"G1": contract},
+        )
+
+
 def test_text_sha256_matches_runner_wire_format(module) -> None:
     assert module.text_sha256("value") == hashlib.sha256(b"value").hexdigest()
 
@@ -1412,6 +1495,186 @@ def test_provider_native_proposer_recovery_binds_receipt_and_fingerprint(
     assert recovery_ids == {"b" * 32}
 
 
+def test_proposer_recovery_identity_accepts_valid_model_suffixes(
+    module,
+) -> None:
+    assert (
+        module._canonical_proposer_recovery_identity(
+            "openrouter:model:free"
+        )
+        == "openrouter:model:free"
+    )
+    assert (
+        module._canonical_proposer_recovery_identity(
+            "openrouter:Vendor/Model-X"
+        )
+        == "openrouter:Vendor/Model-X"
+    )
+    assert (
+        module._canonical_proposer_recovery_identity(
+            "openrouter:model::free"
+        )
+        == ""
+    )
+
+
+def test_expanded_proposer_slots_allow_positional_cross_provider_model(
+    module,
+) -> None:
+    slots, reasons = module.expanded_proposer_slot_identities(
+        {
+            "selected_P": [
+                "openrouter:model/shared",
+                "anthropic:model/shared",
+            ],
+            "proposer_models": [
+                "model/shared",
+                "model/shared",
+            ],
+        }
+    )
+
+    assert slots == (
+        "openrouter:model/shared",
+        "anthropic:model/shared",
+    )
+    assert reasons == []
+
+
+def test_expanded_proposer_slots_reject_ambiguous_cross_provider_k_expansion(
+    module,
+) -> None:
+    slots, reasons = module.expanded_proposer_slot_identities(
+        {
+            "selected_P": [
+                "openrouter:model/shared",
+                "anthropic:model/shared",
+            ],
+            "proposer_models": [
+                "model/shared",
+                "model/shared",
+                "model/shared",
+            ],
+        }
+    )
+
+    assert slots == ()
+    assert reasons == ["invalid_expanded_proposer_sample_roster"]
+
+
+def test_provider_native_proposer_recovery_binds_expanded_k_slots(
+    module,
+) -> None:
+    """Recovery receipts index physical samples, not distinct selected_P rows."""
+
+    call, plan = _provider_native_recovery_call(module)
+    selected = list(plan["selected_P"])
+    plan["proposer_models"] = [
+        "model-a",
+        "model-a",
+        "model-b",
+        "model-c",
+    ]
+    plan["proposer_sample_count"] = 4
+    from opensquilla.provider.protocol import (
+        provider_retry_roster_fingerprint,
+    )
+
+    receipt = call["proposer_recovery"]
+    assert isinstance(receipt, dict)
+    receipt["selection_plan_fingerprint"] = provider_retry_roster_fingerprint(
+        plan
+    )
+    receipt["executed_proposer_roster_before"] = [
+        selected[0],
+        selected[0],
+        selected[1],
+        selected[2],
+    ]
+    receipt["executed_proposer_roster_after"] = list(
+        receipt["executed_proposer_roster_before"]
+    )
+
+    candidates = call["candidates"]
+    assert isinstance(candidates, list)
+    duplicate_a = deepcopy(candidates[0])
+    duplicate_a.update(
+        {
+            "index": 1,
+            "ok": True,
+            "requested_model": "model-a",
+            "provider": "openrouter",
+            "model": "model-a",
+            "content": {
+                "text": "duplicate-a",
+                "chars": len("duplicate-a"),
+                "truncated": False,
+            },
+            "physical_request_count": 1,
+        }
+    )
+    duplicate_a["execution"] = {
+        "physical_attempts": [
+            {
+                "attempt": 1,
+                "request_started": True,
+                "stream_closed": True,
+                "physical_attempt_id": "e" * 32,
+                "identity": selected[0],
+                "outcome": "succeeded",
+            }
+        ]
+    }
+    candidates.insert(1, duplicate_a)
+    for index, candidate in enumerate(candidates):
+        assert isinstance(candidate, dict)
+        candidate["index"] = index
+    failed_b = candidates[2]
+    assert isinstance(failed_b, dict)
+    failed_b.update(
+        {
+            "ok": False,
+            "provider": "",
+            "model": "",
+            "content": {"text": "", "chars": 0, "truncated": False},
+        }
+    )
+    failed_b_attempts = failed_b["execution"]["physical_attempts"]
+    assert isinstance(failed_b_attempts, list)
+    assert isinstance(failed_b_attempts[0], dict)
+    failed_b_attempts[0]["outcome"] = "failed"
+    call["successful_proposers"] = 2
+
+    final_identities, recovery_ids, reasons = (
+        module.proposer_recovery_execution_reasons(
+            call,
+            executed_plan=plan,
+        )
+    )
+
+    assert reasons == []
+    assert final_identities == {
+        0: selected[0],
+        1: selected[0],
+        2: selected[1],
+        3: selected[2],
+    }
+    assert recovery_ids == {"b" * 32}
+
+    wrong_slot = deepcopy(call)
+    wrong_receipt = wrong_slot["proposer_recovery"]
+    assert isinstance(wrong_receipt, dict)
+    attempts = wrong_receipt["attempts"]
+    assert isinstance(attempts, list)
+    assert isinstance(attempts[0], dict)
+    attempts[0]["slot_index"] = 2
+    _, _, wrong_reasons = module.proposer_recovery_execution_reasons(
+        wrong_slot,
+        executed_plan=plan,
+    )
+    assert "invalid_proposer_recovery_executed_roster" in wrong_reasons
+
+
 def test_provider_native_backup_roster_is_reused_by_the_next_agent_call(
     module,
 ) -> None:
@@ -2432,6 +2695,60 @@ def _g1_plan(module, proposers: list[str], aggregator: str) -> dict[str, object]
     return plan
 
 
+def _c0_proposer_bound_plan(
+    *,
+    quorum_required: object = None,
+) -> dict[str, object]:
+    from opensquilla.provider.ranking_router import ranking_config_snapshot
+
+    plan: dict[str, object] = {
+        "ranking_parameters": ranking_config_snapshot(),
+        "task_profile": {
+            "tier_dist": {"1": 1.0},
+            "constraints": {
+                "cost": "medium",
+                "latency": "normal",
+                "risk": "low",
+            },
+        },
+    }
+    if quorum_required is not None:
+        plan["proposer_recovery_policy"] = {
+            "quorum_required": quorum_required,
+        }
+    return plan
+
+
+def test_g1_recomputed_proposer_bounds_apply_explicit_recovery_quorum(
+    module,
+) -> None:
+    plan = _c0_proposer_bound_plan(quorum_required=2)
+
+    assert module.g1_recomputed_proposer_bounds(plan) == (
+        2,
+        2,
+        ["tier_1", "proposer_recovery_quorum"],
+    )
+
+
+@pytest.mark.parametrize(
+    "quorum_required",
+    [None, True, 0, "2"],
+    ids=["missing", "bool", "zero", "string"],
+)
+def test_g1_recomputed_proposer_bounds_do_not_apply_invalid_recovery_quorum(
+    module,
+    quorum_required: object,
+) -> None:
+    plan = _c0_proposer_bound_plan(quorum_required=quorum_required)
+
+    assert module.g1_recomputed_proposer_bounds(plan) == (
+        1,
+        1,
+        ["tier_1"],
+    )
+
+
 def _formalize_provider_native_call(
     module,
     call: dict[str, object],
@@ -2446,7 +2763,8 @@ def _formalize_provider_native_call(
     )
 
     call["selection_plan"] = deepcopy(plan)
-    selected = [str(identity) for identity in plan["selected_P"]]
+    selected, slot_reasons = module.expanded_proposer_slot_identities(plan)
+    assert slot_reasons == []
     candidates = call["candidates"]
     assert isinstance(candidates, list)
     assert len(candidates) == len(selected)
@@ -3065,6 +3383,77 @@ def test_g1_ensemble_gate_accepts_only_frozen_ranked_aggregator_fallbacks(
             row,
             expected_proposers=plan["proposer_models"],
             expected_aggregator=primary_model,
+            allowed_models=set(_g1_routes()),
+        )
+        == []
+    )
+
+
+def test_g1_registry_plan_returns_expanded_proposer_samples_for_k_gt_one(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        module,
+        "FORMAL_G1_RANKING_CONFIG_SHA256",
+        module.canonical_sha256(_test_ranking_config(module)),
+    )
+    plan = _g1_plan(
+        module,
+        [
+            "deepseek/deepseek-v4-pro",
+            "qwen/qwen3.7-max",
+            "z-ai/glm-5.2",
+        ],
+        "z-ai/glm-5.2",
+    )
+    selected = [str(identity) for identity in plan["selected_P"]]
+    expanded_models = [
+        selected[0].partition(":")[2],
+        selected[0].partition(":")[2],
+        selected[1].partition(":")[2],
+        selected[2].partition(":")[2],
+    ]
+    plan["proposer_models"] = expanded_models
+    plan["proposer_sample_count"] = len(expanded_models)
+    contract = _contract(module, "G1", "a" * 64)["g1_registry_contract"]
+
+    reasons, proposer_samples, aggregator = module.g1_registry_plan_reasons(
+        plan,
+        contract=contract,
+    )
+
+    assert reasons == []
+    assert proposer_samples == tuple(expanded_models)
+    final_text = "expanded proposer samples"
+    trace = _ensemble_trace(
+        expanded_models,
+        aggregator,
+        final_text=final_text,
+        selection_mode="router_dynamic",
+    )
+    calls = trace["calls"]
+    assert isinstance(calls, list)
+    assert isinstance(calls[0], dict)
+    recovery = calls[0]["aggregator_recovery"]
+    assert isinstance(recovery, dict)
+    recovery["candidate_ids"] = list(plan["aggregator_candidates"])
+    recovery["candidate_count"] = len(plan["aggregator_candidates"])
+    _formalize_provider_native_call(
+        module,
+        calls[0],
+        plan,
+        scope_id="expanded-k-slots",
+    )
+    assert (
+        module.ensemble_gate(
+            {
+                "final_text": final_text,
+                "routing_trace": {"selection_plan": deepcopy(plan)},
+                "ensemble_trace": trace,
+            },
+            expected_proposers=proposer_samples,
+            expected_aggregator=aggregator,
             allowed_models=set(_g1_routes()),
         )
         == []

@@ -7,7 +7,7 @@ import time
 from collections.abc import AsyncIterator
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, fields, replace
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from typing import Any, Literal
 
 import pytest
@@ -62,6 +62,9 @@ from opensquilla.provider.ensemble import (
     _unrepresented_diagnostic_usage_rows,
     build_ensemble_provider_from_config,
     openrouter_static_capabilities,
+)
+from opensquilla.provider.protocol import (
+    provider_retry_expanded_proposer_identities,
 )
 from opensquilla.provider.ranking_router import (
     DynamicRankingError,
@@ -3778,17 +3781,166 @@ def test_retry_roster_fingerprint_accepts_legal_repeated_samples() -> None:
     )
 
     assert len(provider_retry_roster_fingerprint(plan)) == 64
+    assert provider_retry_expanded_proposer_identities(plan) == (
+        "openrouter:model/p1",
+        "openrouter:model/p1",
+        "anthropic:model/p2",
+    )
+
+
+def test_retry_roster_fingerprint_accepts_model_variant_suffixes() -> None:
+    plan = _retry_roster_plan(
+        [
+            "openrouter:openai/gpt-oss-120b:free",
+            "openrouter:qwen/qwen-plus-2025-07-28:thinking",
+        ],
+        proposer_models=[
+            "openai/gpt-oss-120b:free",
+            "qwen/qwen-plus-2025-07-28:thinking",
+        ],
+        aggregator_candidates=[
+            "openrouter:qwen/qwen3-coder:free",
+            "anthropic:model/agg-fallback",
+        ],
+    )
+
+    assert len(provider_retry_roster_fingerprint(plan)) == 64
+
+
+def test_retry_roster_fingerprint_preserves_model_identifier_case() -> None:
+    plan = _retry_roster_plan(
+        [
+            "openrouter:Vendor/Model-X",
+            "anthropic:anthropic/model-p2",
+        ],
+        proposer_models=[
+            "Vendor/Model-X",
+            "anthropic/model-p2",
+        ],
+    )
+    assert len(provider_retry_roster_fingerprint(plan)) == 64
+    assert provider_retry_expanded_proposer_identities(plan) == (
+        "openrouter:Vendor/Model-X",
+        "anthropic:anthropic/model-p2",
+    )
+
+
+def test_retry_roster_fingerprint_allows_positional_cross_provider_model() -> None:
+    plan = _retry_roster_plan(
+        [
+            "openrouter:model/shared",
+            "anthropic:model/shared",
+        ],
+        proposer_models=[
+            "model/shared",
+            "model/shared",
+        ],
+    )
+
+    assert len(provider_retry_roster_fingerprint(plan)) == 64
+    assert provider_retry_expanded_proposer_identities(plan) == (
+        "openrouter:model/shared",
+        "anthropic:model/shared",
+    )
+
+
+def test_retry_roster_fingerprint_ignores_nonexecution_policy_extensions() -> None:
+    plan = _retry_roster_plan(
+        ["openrouter:model/p1", "anthropic:model/p2"],
+    )
+    expected = provider_retry_roster_fingerprint(plan)
+    policy = plan["proposer_recovery_policy"]
+    policy["opaque_metadata"] = object()
+    policy["cyclic_metadata"] = policy
+
+    assert provider_retry_roster_fingerprint(plan) == expected
+
+    proxy_plan = _retry_roster_plan(
+        ["openrouter:model/p1", "anthropic:model/p2"],
+    )
+    proxy_plan["proposer_recovery_policy"] = MappingProxyType(
+        proxy_plan["proposer_recovery_policy"]
+    )
+    assert provider_retry_roster_fingerprint(proxy_plan) == expected
+
+
+def test_router_dynamic_constructor_detaches_nested_mapping_policy() -> None:
+    proposers = [_member("p0"), _member("p1")]
+    plan = _slot_recovery_plan(proposers, [])
+    mutable_policy = dict(plan["proposer_recovery_policy"])
+    plan["proposer_recovery_policy"] = MappingProxyType(
+        mutable_policy
+    )
+
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        aggregator=_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        selection_plan=plan,
+    )
+    mutable_policy["max_tokens_cap"] = 32_768
+
+    assert provider.selection_plan["proposer_recovery_policy"][
+        "max_tokens_cap"
+    ] == 65_536
+    assert provider._proposer_recovery_plan_guard_reason() == ""
+
+
+@pytest.mark.asyncio
+async def test_router_dynamic_trace_serializes_cyclic_policy_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proposers = [_member("p0"), _member("p1")]
+    plan = _slot_recovery_plan(proposers, [])
+    policy = plan["proposer_recovery_policy"]
+    policy["cyclic_metadata"] = policy
+    shared_metadata = {"source": "extension"}
+    policy["shared_left"] = shared_metadata
+    policy["shared_right"] = shared_metadata
+    registry = _FakeRegistry(
+        {
+            "p0": _FakePlan(
+                [TextDeltaEvent(text="draft-0"), DoneEvent(model="p0")]
+            ),
+            "p1": _FakePlan(
+                [TextDeltaEvent(text="draft-1"), DoneEvent(model="p1")]
+            ),
+            "agg": _FakePlan(
+                [TextDeltaEvent(text="final"), DoneEvent(model="agg")]
+            ),
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        aggregator=_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        selection_plan=plan,
+    )
+
+    events = await _collect(provider)
+
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    traced_policy = done.ensemble_trace["selection_plan"][
+        "proposer_recovery_policy"
+    ]
+    assert traced_policy["cyclic_metadata"] == "<cycle>"
+    assert traced_policy["shared_left"] == {"source": "extension"}
+    assert traced_policy["shared_right"] == {"source": "extension"}
 
 
 @pytest.mark.parametrize(
     "mutation",
     [
-        {
-            "selected_P": [
-                "openrouter:model/p1:free",
-                "anthropic:model/p2",
-            ]
-        },
+        {"strategy": "ROUTER_DYNAMIC"},
+        {"selection_mode": " router_dynamic"},
         {
             "selected_P": [
                 "OpenRouter:model/p1",
@@ -3802,13 +3954,39 @@ def test_retry_roster_fingerprint_accepts_legal_repeated_samples() -> None:
             ]
         },
         {
+            "selected_P": [
+                "openrouter:model/shared",
+                "anthropic:model/shared",
+            ],
+            "proposer_models": [
+                "model/shared",
+                "model/shared",
+                "model/shared",
+            ],
+            "proposer_sample_count": 3,
+        },
+        {
             "proposer_models": [
                 "model/p1",
                 "model/unknown",
             ]
         },
+        {
+            "proposer_models": [
+                "model/p1",
+                "model/p2",
+                "model/p1",
+            ],
+            "proposer_sample_count": 3,
+        },
         {"proposer_sample_count": 3},
-        {"selected_A": "openrouter:model/agg:free"},
+        {
+            "selected_A": "openrouter:model/agg::free",
+            "aggregator_candidates": [
+                "openrouter:model/agg::free",
+                "anthropic:model/agg-fallback",
+            ],
+        },
         {
             "aggregator_candidates": [
                 "anthropic:model/agg-fallback",
@@ -3840,12 +4018,15 @@ def test_retry_roster_fingerprint_accepts_legal_repeated_samples() -> None:
         },
     ],
     ids=[
-        "proposer-extra-colon",
+        "strategy-not-canonical",
+        "selection-mode-not-canonical",
         "proposer-not-canonical",
         "duplicate-proposer",
+        "ambiguous-cross-provider-model",
         "proposer-model-not-aligned",
+        "interleaved-proposer-samples",
         "sample-count-mismatch",
-        "aggregator-extra-colon",
+        "aggregator-empty-variant",
         "selected-aggregator-not-first",
         "duplicate-aggregator",
         "aggregator-wrong-type",
@@ -9949,12 +10130,16 @@ def _slot_recovery_plan(
         "selected_P": selected,
         "backup_P": backup_ids,
         "proposer_models": [
-            member.provider_config.model for member in proposers
+            member.provider_config.model
+            for member in proposers
+            for _ in range(max(1, int(member.k or 1)))
         ],
         "selected_A": "fake:agg",
         "aggregator_candidates": ["fake:agg"],
         "effective_min_successful_proposers": 2,
-        "proposer_sample_count": len(proposers),
+        "proposer_sample_count": sum(
+            max(1, int(member.k or 1)) for member in proposers
+        ),
         "proposer_recovery_policy": {
             "schema": "opensquilla.router-dynamic-proposer-recovery/v1",
             "configured_backup_count": len(backups),
@@ -10322,6 +10507,1013 @@ async def test_proposer_recovery_transient_then_backup_is_serial_and_bounded(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("terminal_kind", "max_additional", "expected_code", "expected_reason"),
+    [
+        (
+            "cleanup",
+            3,
+            "ensemble_proposer_close_timeout",
+            "cleanup_unproven",
+        ),
+        (
+            "evidence",
+            3,
+            "proposer_recovery_evidence_unproven",
+            "evidence_unproven",
+        ),
+        (
+            "budget",
+            1,
+            "proposer_recovery_budget_overrun",
+            "budget_overrun",
+        ),
+    ],
+)
+async def test_proposer_recovery_terminal_attempt_stops_all_later_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_kind: str,
+    max_additional: int,
+    expected_code: str,
+    expected_reason: str,
+) -> None:
+    proposers = [_member("p0"), _member("p1"), _member("p2")]
+    backups = [_member("b0"), _member("b1")]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        proposer_backups=backups,
+        aggregator=_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        proposer_recovery_max_additional_calls=max_additional,
+        selection_plan=_slot_recovery_plan(
+            proposers,
+            backups,
+            max_additional=max_additional,
+        ),
+    )
+    candidates = [
+        _slot_candidate(
+            index=0,
+            model="p0",
+            text="existing draft",
+            physical_attempt_id="0" * 32,
+        ),
+        _slot_candidate(
+            index=1,
+            model="p1",
+            error="invalid api key",
+            error_code="401",
+            physical_attempt_id="1" * 32,
+        ),
+        _slot_candidate(
+            index=2,
+            model="p2",
+            error="invalid api key",
+            error_code="401",
+            physical_attempt_id="2" * 32,
+        ),
+    ]
+    calls: list[str] = []
+
+    async def fake_collect_candidate(**kwargs: Any) -> _CandidateResult:
+        model = kwargs["member"].provider_config.model
+        calls.append(model)
+        attempt = _slot_candidate(
+            index=kwargs["index"],
+            model=model,
+            error="failed recovery",
+            error_code="503",
+            physical_attempt_id="a" * 32,
+        )
+        if terminal_kind == "cleanup":
+            attempt.stream_closed = False
+            attempt.execution["physical_attempts"][0]["stream_closed"] = False
+        else:
+            attempt.physical_request_count = 2
+        return attempt
+
+    monkeypatch.setattr(provider, "_collect_candidate", fake_collect_candidate)
+    recovered = await provider._recover_proposers_serially(
+        candidates,
+        state=provider._chat_proposer_recovery_state(),
+        messages=[Message(role="user", content="task")],
+        tools=None,
+        config=ChatConfig(),
+    )
+
+    assert calls == ["b0"]
+    assert recovered[1].error_code == expected_code
+    trace = provider._current_proposer_recovery_trace
+    assert trace["terminal_code"] == expected_code
+    assert trace["terminal_reason"] == expected_reason
+    assert trace["attempts"][-1]["terminal_code"] == expected_code
+
+
+@pytest.mark.asyncio
+async def test_initial_unclosed_dynamic_proposer_blocks_recovery_aggregator_and_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proposers = [_member("p0"), _member("p1")]
+    provider_calls: list[str] = []
+    fallback_calls = 0
+
+    class _ForbiddenFallback:
+        provider_name = "fallback"
+
+        def chat(
+            self,
+            messages: list[Message],
+            tools: list[ToolDefinition] | None = None,
+            config: ChatConfig | None = None,
+        ) -> AsyncIterator[StreamEvent]:
+            del messages, tools, config
+
+            async def _stream() -> AsyncIterator[StreamEvent]:
+                nonlocal fallback_calls
+                fallback_calls += 1
+                yield DoneEvent(model="fallback")
+
+            return _stream()
+
+        async def list_models(self) -> list[Any]:
+            return []
+
+    selection_plan = _slot_recovery_plan(
+        proposers,
+        [_member("b0")],
+    )
+    selection_plan["effective_min_successful_proposers"] = 1
+    selection_plan["proposer_recovery_policy"]["quorum_required"] = 1
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        proposer_backups=[_member("b0")],
+        aggregator=_member("agg"),
+        fallback_provider=_ForbiddenFallback(),
+        min_successful_proposers=1,
+        all_failed_policy="fallback_single",
+        selection_plan=selection_plan,
+    )
+    unclosed = _slot_candidate(
+        index=1,
+        model="p1",
+        error="upstream failed during cleanup",
+        error_code="503",
+        physical_attempt_id="1" * 32,
+    )
+    unclosed.stream_closed = False
+    unclosed.execution["physical_attempts"][0]["stream_closed"] = False
+
+    async def fake_run_proposers(*args: Any, **kwargs: Any) -> list[_CandidateResult]:
+        del args, kwargs
+        return [
+            _slot_candidate(
+                index=0,
+                model="p0",
+                text="existing draft",
+                physical_attempt_id="0" * 32,
+            ),
+            unclosed,
+        ]
+
+    def forbidden_provider_build(config: ProviderConfig) -> Any:
+        provider_calls.append(config.model)
+        raise AssertionError("aggregator or backup was started after terminal cleanup")
+
+    monkeypatch.setattr(provider, "_run_proposers", fake_run_proposers)
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        forbidden_provider_build,
+    )
+
+    events = await _collect(provider)
+
+    assert provider_calls == []
+    assert fallback_calls == 0
+    assert not any(isinstance(event, DoneEvent) for event in events)
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert error.code == "ensemble_proposer_close_timeout"
+    assert error.ensemble_trace["final_request_role"] == "none"
+    recovery = error.ensemble_trace["proposer_recovery"]
+    assert recovery["terminal_code"] == "ensemble_proposer_close_timeout"
+    assert recovery["terminal_reason"] == "cleanup_unproven"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mode", "expected_code"),
+    [
+        ("timeout", "timeout"),
+        ("controlled_cancel", "quorum_cancelled"),
+    ],
+)
+async def test_clean_interruption_seals_evidence_and_can_recover(
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    expected_code: str,
+) -> None:
+    started = asyncio.Event()
+    closed = asyncio.Event()
+    never = asyncio.Event()
+
+    class _BlockingProvider:
+        provider_name = "fake"
+
+        def chat(
+            self,
+            messages: list[Message],
+            tools: list[ToolDefinition] | None = None,
+            config: ChatConfig | None = None,
+        ) -> AsyncIterator[StreamEvent]:
+            del messages, tools, config
+
+            async def _stream() -> AsyncIterator[StreamEvent]:
+                started.set()
+                try:
+                    await never.wait()
+                finally:
+                    closed.set()
+                if False:  # pragma: no cover - keep an async generator
+                    yield DoneEvent(model="slow")
+
+            return _stream()
+
+        async def list_models(self) -> list[Any]:
+            return []
+
+    proposers = [_member("p0"), _member("slow")]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        proposer_backups=[_member("b0")],
+        aggregator=_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        proposer_timeout_seconds=0.01 if mode == "timeout" else 10,
+        selection_plan=_slot_recovery_plan(
+            proposers,
+            [_member("b0")],
+        ),
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        lambda _config: _BlockingProvider(),
+    )
+    candidate_task = asyncio.create_task(
+        provider._collect_candidate(
+            index=1,
+            sample_index=0,
+            member=proposers[1],
+            messages=[Message(role="user", content="task")],
+            tools=None,
+            config=ChatConfig(),
+        )
+    )
+    if mode == "controlled_cancel":
+        await asyncio.wait_for(started.wait(), timeout=1)
+        setattr(
+            candidate_task,
+            "_opensquilla_ensemble_cancel_code",
+            "quorum_cancelled",
+        )
+        setattr(
+            candidate_task,
+            "_opensquilla_ensemble_cancel_message",
+            "controlled cancellation",
+        )
+        candidate_task.cancel()
+    interrupted = await asyncio.wait_for(candidate_task, timeout=1)
+
+    assert closed.is_set()
+    assert interrupted.error_code == expected_code
+    assert interrupted.ok is False
+    assert interrupted.stream_closed is True
+    assert interrupted.request_started is True
+    assert interrupted.physical_request_count == 1
+    [physical_attempt] = interrupted.execution["physical_attempts"]
+    assert physical_attempt["stream_closed"] is True
+    assert interrupted.usage_reported is False
+    assert interrupted.usage_missing_count == 1
+    assert len(interrupted.model_usage_breakdown) == 1
+    assert provider._proposer_recovery_evidence_proven(interrupted)
+
+    recovery_calls: list[str] = []
+
+    async def successful_recovery(**kwargs: Any) -> _CandidateResult:
+        model = kwargs["member"].provider_config.model
+        recovery_calls.append(model)
+        return _slot_candidate(
+            index=kwargs["index"],
+            model=model,
+            text="replacement draft",
+            physical_attempt_id="b" * 32,
+        )
+
+    monkeypatch.setattr(provider, "_collect_candidate", successful_recovery)
+    recovered = await provider._recover_proposers_serially(
+        [
+            _slot_candidate(
+                index=0,
+                model="p0",
+                text="existing draft",
+                physical_attempt_id="0" * 32,
+            ),
+            interrupted,
+        ],
+        state=provider._chat_proposer_recovery_state(),
+        messages=[Message(role="user", content="task")],
+        tools=None,
+        config=ChatConfig(),
+    )
+
+    assert len(recovery_calls) == 1
+    assert sum(candidate.ok for candidate in recovered) == 2
+    assert "terminal_code" not in provider._current_proposer_recovery_trace
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("active_scope", [False, True])
+async def test_router_dynamic_aggregator_only_requires_prior_scoped_quorum(
+    monkeypatch: pytest.MonkeyPatch,
+    active_scope: bool,
+) -> None:
+    proposers = [_member("p0"), _member("p1")]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        aggregator=_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        selection_plan=_slot_recovery_plan(proposers, []),
+    )
+    provider_calls: list[str] = []
+
+    def forbidden_provider_build(config: ProviderConfig) -> Any:
+        provider_calls.append(config.model)
+        raise AssertionError("aggregator-only request bypassed quorum proof")
+
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        forbidden_provider_build,
+    )
+    if active_scope:
+        assert provider.begin_provider_retry_scope(
+            "aggregator-only-unproven",
+            max_additional_physical_requests=3,
+        )
+
+    events = [
+        event
+        async for event in provider.chat(
+            [Message(role="user", content="finalize")],
+            config=ChatConfig(
+                max_tokens=32,
+                thinking=False,
+                ensemble_execution_mode="aggregator_only",
+            ),
+        )
+    ]
+
+    assert provider_calls == []
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert error.code == "router_dynamic_aggregator_only_quorum_unproven"
+    assert error.request_started is False
+    assert error.physical_request_count == 0
+    assert error.usage_missing_count == 0
+    assert error.ensemble_trace["execution_mode"] == "aggregator_only"
+    assert error.ensemble_trace["final_request_role"] == "none"
+    proof = error.ensemble_trace["aggregator_only_quorum_proof"]
+    assert proof["scope_active"] is active_scope
+    assert proof["quorum_reached_once"] is False
+    assert proof["quorum_required"] == 2
+    if active_scope:
+        assert provider.end_provider_retry_scope("aggregator-only-unproven")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("malformed_policy", [None, "damaged"])
+async def test_declared_router_dynamic_aggregator_only_rejects_invalid_policy(
+    monkeypatch: pytest.MonkeyPatch,
+    malformed_policy: str | None,
+) -> None:
+    proposers = [_member("p0"), _member("p1")]
+    selection_plan = _slot_recovery_plan(proposers, [])
+    if malformed_policy is None:
+        selection_plan.pop("proposer_recovery_policy")
+    else:
+        selection_plan["proposer_recovery_policy"] = malformed_policy
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        aggregator=_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        selection_plan=selection_plan,
+    )
+    provider_calls: list[str] = []
+
+    def forbidden_provider_build(config: ProviderConfig) -> Any:
+        provider_calls.append(config.model)
+        raise AssertionError("malformed router_dynamic plan bypassed guard")
+
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        forbidden_provider_build,
+    )
+    events = [
+        event
+        async for event in provider.chat(
+            [Message(role="user", content="finalize")],
+            config=ChatConfig(
+                max_tokens=32,
+                thinking=False,
+                ensemble_execution_mode="aggregator_only",
+            ),
+        )
+    ]
+
+    assert provider_calls == []
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert error.code == "router_dynamic_aggregator_only_quorum_unproven"
+    assert error.request_started is False
+    assert error.physical_request_count == 0
+
+
+@pytest.mark.asyncio
+async def test_router_dynamic_recovery_plan_drift_fails_before_physical_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proposers = [_member("p0"), _member("p1")]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        aggregator=_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        selection_plan=_slot_recovery_plan(proposers, []),
+    )
+    provider.selection_plan["proposer_recovery_policy"][
+        "max_tokens_cap"
+    ] = 32_768
+    provider_calls: list[str] = []
+
+    def forbidden_provider_build(config: ProviderConfig) -> Any:
+        provider_calls.append(config.model)
+        raise AssertionError("drifted recovery plan started a provider")
+
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        forbidden_provider_build,
+    )
+    events = await _collect(provider)
+
+    assert provider_calls == []
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert error.code == "router_dynamic_proposer_recovery_plan_drift"
+    assert error.request_started is False
+    assert error.physical_request_count == 0
+    assert error.usage_missing_count == 0
+    assert error.ensemble_trace["final_request_role"] == "none"
+    guard = error.ensemble_trace["proposer_recovery_plan_guard"]
+    assert guard["valid"] is False
+    assert guard["reason"] == "selection_plan_fingerprint_drift"
+    assert guard["frozen_fingerprint"] == (
+        provider._proposer_recovery_guard_fingerprint
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="selection_plan_fingerprint_drift",
+    ):
+        provider.begin_provider_retry_scope(
+            "drifted-plan",
+            max_additional_physical_requests=3,
+        )
+
+
+def test_router_dynamic_recovery_guard_detects_runtime_roster_drift() -> None:
+    proposers = [_member("p0"), _member("p1")]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        aggregator=_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        selection_plan=_slot_recovery_plan(proposers, []),
+    )
+    provider.proposers[0] = _member("replacement")
+
+    with pytest.raises(
+        RuntimeError,
+        match="runtime_primary_roster_drift",
+    ):
+        provider.begin_provider_retry_scope(
+            "runtime-roster-drift",
+            max_additional_physical_requests=3,
+        )
+
+
+def test_router_dynamic_recovery_guard_detects_credential_runtime_drift() -> None:
+    proposers = [_member("p0"), _member("p1")]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        aggregator=_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        selection_plan=_slot_recovery_plan(proposers, []),
+    )
+    provider.aggregator.provider_config.api_key = "injected"
+
+    with pytest.raises(
+        RuntimeError,
+        match="runtime_execution_config_drift",
+    ):
+        provider.begin_provider_retry_scope(
+            "runtime-credential-drift",
+            max_additional_physical_requests=3,
+        )
+
+
+@pytest.mark.parametrize(
+    "runtime_role",
+    [
+        "proposer",
+        "proposer_backup",
+        "aggregator",
+        "aggregator_fallback",
+    ],
+)
+def test_router_dynamic_recovery_guard_detects_generation_config_drift(
+    runtime_role: str,
+) -> None:
+    proposers = [_member("p0"), _member("p1")]
+    backups = [_member("backup")]
+    aggregator = _member("agg")
+    aggregator_fallback = _member("agg-fallback")
+    selection_plan = _slot_recovery_plan(proposers, backups)
+    selection_plan["aggregator_candidates"] = [
+        "fake:agg",
+        "fake:agg-fallback",
+    ]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        proposer_backups=backups,
+        aggregator=aggregator,
+        aggregator_fallbacks=[aggregator_fallback],
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        selection_plan=selection_plan,
+    )
+
+    if runtime_role == "proposer":
+        provider.proposers[0] = replace(
+            provider.proposers[0],
+            max_tokens=12_345,
+        )
+    elif runtime_role == "proposer_backup":
+        provider.proposer_backups[0] = replace(
+            provider.proposer_backups[0],
+            temperature=0.75,
+        )
+    elif runtime_role == "aggregator":
+        provider.aggregator = replace(
+            provider.aggregator,
+            thinking="low",
+        )
+    else:
+        provider.aggregator_fallbacks[0] = replace(
+            provider.aggregator_fallbacks[0],
+            thinking_fallbacks=(("low", "low"),),
+        )
+
+    with pytest.raises(
+        RuntimeError,
+        match="runtime_execution_config_drift",
+    ):
+        provider.begin_provider_retry_scope(
+            f"{runtime_role}-config-drift",
+            max_additional_physical_requests=3,
+        )
+
+
+def test_router_dynamic_recovery_guard_handles_malformed_runtime_state() -> None:
+    proposers = [_member("p0"), _member("p1")]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        aggregator=_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        selection_plan=_slot_recovery_plan(proposers, []),
+    )
+    selection_plan = provider.selection_plan
+
+    setattr(provider, "selection_plan", None)
+    assert (
+        provider._proposer_recovery_plan_guard_reason()
+        == "invalid_selection_plan"
+    )
+
+    provider.selection_plan = selection_plan
+    setattr(provider, "proposers", [object()])
+    assert (
+        provider._proposer_recovery_plan_guard_reason()
+        == "runtime_roster_invalid"
+    )
+
+
+def test_router_dynamic_recovery_guard_allows_non_fingerprint_metadata() -> None:
+    proposers = [_member("p0"), _member("p1")]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        aggregator=_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        selection_plan=_slot_recovery_plan(proposers, []),
+    )
+    frozen_fingerprint = provider._proposer_recovery_guard_fingerprint
+    provider.quorum_grace_seconds = 1.25
+    provider.selection_plan.update(
+        {
+            "quorum_grace_seconds": 1.25,
+            "wait_for_all_proposers": False,
+            "user_profile_enabled": False,
+        }
+    )
+
+    assert provider_retry_roster_fingerprint(
+        provider.selection_plan
+    ) == frozen_fingerprint
+    assert provider.begin_provider_retry_scope(
+        "legal-metadata-update",
+        max_additional_physical_requests=3,
+    )
+    assert provider.end_provider_retry_scope("legal-metadata-update")
+
+
+@pytest.mark.asyncio
+async def test_router_dynamic_recovery_policy_cannot_be_injected_after_init(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proposers = [_member("p0"), _member("p1")]
+    plan = _slot_recovery_plan(proposers, [])
+    recovery_policy = plan.pop("proposer_recovery_policy")
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        aggregator=_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        selection_plan=plan,
+    )
+    provider.selection_plan["proposer_recovery_policy"] = recovery_policy
+
+    provider_calls: list[str] = []
+
+    def forbidden_provider_build(config: ProviderConfig) -> Any:
+        provider_calls.append(config.model)
+        raise AssertionError("injected recovery plan started a provider")
+
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        forbidden_provider_build,
+    )
+    events = await _collect(provider)
+
+    assert provider_calls == []
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert error.code == "router_dynamic_proposer_recovery_plan_drift"
+    guard = error.ensemble_trace["proposer_recovery_plan_guard"]
+    assert guard["valid"] is False
+    assert guard["reason"] == "unfrozen_recovery_plan"
+    assert guard["frozen_fingerprint"] == ""
+
+
+@pytest.mark.asyncio
+async def test_no_request_candidate_cannot_forge_successful_proposer_quorum(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proposers = [_member("p0")]
+    selection_plan = _slot_recovery_plan(proposers, [])
+    selection_plan["effective_min_successful_proposers"] = 1
+    selection_plan["proposer_recovery_policy"]["quorum_required"] = 1
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c1",
+        proposers=proposers,
+        aggregator=_member("agg"),
+        min_successful_proposers=1,
+        all_failed_policy="error",
+        selection_plan=selection_plan,
+    )
+    provider_calls: list[str] = []
+    forged = _CandidateResult(
+        index=0,
+        sample_index=0,
+        label="p0",
+        provider="fake",
+        model="p0",
+        requested_provider="fake",
+        requested_model="p0",
+        text="forged draft without a request",
+        request_started=False,
+        stream_closed=True,
+        physical_request_count=0,
+        usage_reported=False,
+        usage_missing_count=0,
+        execution={"physical_attempts": []},
+    )
+
+    async def fake_run_proposers(
+        *args: Any,
+        **kwargs: Any,
+    ) -> list[_CandidateResult]:
+        del args, kwargs
+        return [forged]
+
+    def forbidden_provider_build(config: ProviderConfig) -> Any:
+        provider_calls.append(config.model)
+        raise AssertionError("forged proposer quorum started aggregator")
+
+    monkeypatch.setattr(provider, "_run_proposers", fake_run_proposers)
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        forbidden_provider_build,
+    )
+
+    events = await _collect(provider)
+
+    assert provider_calls == []
+    assert not any(isinstance(event, DoneEvent) for event in events)
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert error.code == "proposer_recovery_evidence_unproven"
+    assert error.request_started is False
+    assert error.physical_request_count == 0
+    [candidate] = error.ensemble_trace["candidates"]
+    assert candidate["ok"] is False
+    assert candidate["error_code"] == "proposer_recovery_evidence_unproven"
+
+
+@pytest.mark.asyncio
+async def test_router_dynamic_aggregator_only_accepts_prior_full_quorum_in_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _FakeRegistry(
+        {
+            "p0": _FakePlan(
+                [TextDeltaEvent(text="draft zero"), DoneEvent(model="p0")]
+            ),
+            "p1": _FakePlan(
+                [TextDeltaEvent(text="draft one"), DoneEvent(model="p1")]
+            ),
+            "agg": _FakePlan(
+                [TextDeltaEvent(text="final"), DoneEvent(model="agg")]
+            ),
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    proposers = [_member("p0"), _member("p1")]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        aggregator=_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        shuffle_candidates=False,
+        selection_plan=_slot_recovery_plan(proposers, []),
+    )
+    assert provider.begin_provider_retry_scope(
+        "aggregator-only-proven",
+        max_additional_physical_requests=3,
+    )
+
+    full_events = await _collect(provider)
+
+    assert any(isinstance(event, DoneEvent) for event in full_events)
+    state = provider._proposer_retry_scope
+    assert state is not None
+    assert state.quorum_reached_once is True
+    aggregator_only_events = [
+        event
+        async for event in provider.chat(
+            [Message(role="user", content="finalize existing evidence")],
+            config=ChatConfig(
+                max_tokens=32,
+                thinking=False,
+                ensemble_execution_mode="aggregator_only",
+            ),
+        )
+    ]
+
+    assert [call["model"] for call in registry.calls].count("p0") == 1
+    assert [call["model"] for call in registry.calls].count("p1") == 1
+    assert [call["model"] for call in registry.calls].count("agg") == 2
+    done = next(
+        event
+        for event in aggregator_only_events
+        if isinstance(event, DoneEvent)
+    )
+    assert done.ensemble_trace["execution_mode"] == "aggregator_only"
+    assert done.ensemble_trace["llm_request_count"] == 1
+    assert provider.end_provider_retry_scope("aggregator-only-proven")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("terminal_kind", "max_additional", "expected_code"),
+    [
+        (
+            "evidence",
+            3,
+            "proposer_recovery_evidence_unproven",
+        ),
+        (
+            "budget",
+            1,
+            "proposer_recovery_budget_overrun",
+        ),
+    ],
+)
+async def test_recovery_terminal_poisons_later_chats_in_same_scope(
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_kind: str,
+    max_additional: int,
+    expected_code: str,
+) -> None:
+    registry = _FakeRegistry(
+        {
+            "p0": _FakePlan(
+                [TextDeltaEvent(text="draft zero"), DoneEvent(model="p0")]
+            ),
+            "p1": _FakePlan(
+                [TextDeltaEvent(text="draft one"), DoneEvent(model="p1")]
+            ),
+            "agg": _FakePlan(
+                [TextDeltaEvent(text="final"), DoneEvent(model="agg")]
+            ),
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    proposers = [_member("p0"), _member("p1")]
+    backups = [_member("b0")]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        proposer_backups=backups,
+        aggregator=_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        shuffle_candidates=False,
+        proposer_recovery_max_additional_calls=max_additional,
+        selection_plan=_slot_recovery_plan(
+            proposers,
+            backups,
+            max_additional=max_additional,
+        ),
+    )
+    scope_id = f"terminal-{terminal_kind}"
+    assert provider.begin_provider_retry_scope(
+        scope_id,
+        max_additional_physical_requests=max_additional,
+    )
+    full_events = await _collect(provider)
+    assert any(isinstance(event, DoneEvent) for event in full_events)
+    state = provider._proposer_retry_scope
+    assert state is not None
+    assert state.quorum_reached_once is True
+
+    recovery_dispatches: list[str] = []
+
+    async def terminal_recovery(**kwargs: Any) -> _CandidateResult:
+        model = kwargs["member"].provider_config.model
+        recovery_dispatches.append(model)
+        attempt = _slot_candidate(
+            index=kwargs["index"],
+            model=model,
+            error="failed recovery",
+            error_code="503",
+            physical_attempt_id="a" * 32,
+        )
+        attempt.physical_request_count = 2
+        return attempt
+
+    monkeypatch.setattr(provider, "_collect_candidate", terminal_recovery)
+    await provider._recover_proposers_serially(
+        [
+            _slot_candidate(
+                index=0,
+                model="p0",
+                text="existing draft",
+                physical_attempt_id="0" * 32,
+            ),
+            _slot_candidate(
+                index=1,
+                model="p1",
+                error="invalid api key",
+                error_code="401",
+                physical_attempt_id="1" * 32,
+            ),
+        ],
+        state=state,
+        messages=[Message(role="user", content="recover")],
+        tools=None,
+        config=ChatConfig(),
+    )
+
+    assert recovery_dispatches == ["b0"]
+    assert state.terminal_code == expected_code
+    assert state.terminal_reason == (
+        "evidence_unproven"
+        if terminal_kind == "evidence"
+        else "budget_overrun"
+    )
+    started_before_reserve = state.additional_physical_requests_started
+    assert (
+        provider.reserve_provider_retry_physical_request(
+            scope_id,
+            physical_request_count=1,
+        )
+        is False
+    )
+    assert state.additional_physical_requests_started == started_before_reserve
+    assert provider.prepare_retry_after_failure is None
+
+    future_physical_calls: list[str] = []
+
+    async def forbidden_collect_candidate(**kwargs: Any) -> _CandidateResult:
+        future_physical_calls.append(
+            f"proposer:{kwargs['member'].provider_config.model}"
+        )
+        raise AssertionError("poisoned scope started a proposer")
+
+    def forbidden_provider_build(config: ProviderConfig) -> Any:
+        future_physical_calls.append(f"provider:{config.model}")
+        raise AssertionError("poisoned scope built a provider")
+
+    monkeypatch.setattr(
+        provider,
+        "_collect_candidate",
+        forbidden_collect_candidate,
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        forbidden_provider_build,
+    )
+    configs = [
+        ChatConfig(
+            max_tokens=32,
+            thinking=False,
+            ensemble_execution_mode="aggregator_only",
+        ),
+        ChatConfig(max_tokens=32, thinking=False),
+    ]
+    for request_config in configs:
+        events = [
+            event
+            async for event in provider.chat(
+                [Message(role="user", content="must stay local")],
+                config=request_config,
+            )
+        ]
+        error = next(
+            event for event in events if isinstance(event, ErrorEvent)
+        )
+        assert error.code == expected_code
+        assert error.request_started is False
+        assert error.physical_request_count == 0
+        assert error.usage_missing_count == 0
+        terminal = error.ensemble_trace["run_turn_recovery_terminal"]
+        assert terminal["terminal_code"] == expected_code
+        assert terminal["quorum_reached_once"] is True
+    assert future_physical_calls == []
+
+    assert provider.end_provider_retry_scope(scope_id)
+    assert provider.begin_provider_retry_scope(
+        "fresh-scope",
+        max_additional_physical_requests=max_additional,
+    )
+    fresh_state = provider._proposer_retry_scope
+    assert fresh_state is not None
+    assert fresh_state.terminal_code == ""
+    assert fresh_state.terminal_reason == ""
+    assert fresh_state.quorum_reached_once is False
+    assert provider.reserve_provider_retry_physical_request(
+        "fresh-scope",
+        physical_request_count=1,
+    )
+    assert provider.end_provider_retry_scope("fresh-scope")
+
+
+@pytest.mark.asyncio
 async def test_proposer_recovery_never_replays_failed_identity_across_chats(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -10444,6 +11636,1159 @@ async def test_proposer_recovery_never_replays_failed_identity_across_chats(
         "proposer_recovery_identity_excluded"
     )
     assert provider.end_provider_retry_scope("cross-chat-exclusions")
+
+
+@pytest.mark.asyncio
+async def test_zero_scope_recovery_budget_cancels_unreachable_primary_before_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proposers = [_member("p0"), _member("p1")]
+    backups = [_member("b0")]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        proposer_backups=backups,
+        aggregator=_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        selection_plan=_slot_recovery_plan(proposers, backups),
+    )
+    scope_id = "zero-recovery-budget"
+    assert provider.begin_provider_retry_scope(
+        scope_id,
+        max_additional_physical_requests=0,
+    )
+    state = provider._proposer_retry_scope
+    assert state is not None
+    provider._mark_failed_proposer_identity(
+        state,
+        "fake:p0",
+        [],
+    )
+
+    physical_calls: list[str] = []
+
+    async def forbidden_collect_candidate(**kwargs: Any) -> _CandidateResult:
+        physical_calls.append(kwargs["member"].provider_config.model)
+        raise AssertionError("unreachable proposer started a physical request")
+
+    monkeypatch.setattr(
+        provider,
+        "_collect_candidate",
+        forbidden_collect_candidate,
+    )
+
+    candidates = await provider._run_proposers(
+        [Message(role="user", content="cannot reach quorum")],
+        tools=None,
+        config=ChatConfig(),
+        recovery_state=state,
+    )
+
+    assert physical_calls == []
+    assert [candidate.error_code for candidate in candidates] == [
+        "proposer_recovery_identity_excluded",
+        "quorum_unreachable",
+    ]
+    assert sum(candidate.physical_request_count for candidate in candidates) == 0
+    assert provider.end_provider_retry_scope(scope_id)
+
+
+@pytest.mark.asyncio
+async def test_exhausted_prior_chat_recovery_budget_cancels_next_unreachable_primary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proposers = [_member("p0"), _member("p1")]
+    backups = [_member("b0")]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        proposer_backups=backups,
+        aggregator=_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        selection_plan=_slot_recovery_plan(proposers, backups),
+    )
+    scope_id = "prior-chat-exhausted-budget"
+    assert provider.begin_provider_retry_scope(
+        scope_id,
+        max_additional_physical_requests=1,
+    )
+    state = provider._proposer_retry_scope
+    assert state is not None
+    provider._mark_failed_proposer_identity(
+        state,
+        "fake:p0",
+        [],
+    )
+    assert provider.reserve_provider_retry_physical_request(scope_id)
+    assert state.additional_physical_requests_started == 1
+
+    physical_calls: list[str] = []
+
+    async def forbidden_collect_candidate(**kwargs: Any) -> _CandidateResult:
+        physical_calls.append(kwargs["member"].provider_config.model)
+        raise AssertionError("exhausted scope started a physical request")
+
+    monkeypatch.setattr(
+        provider,
+        "_collect_candidate",
+        forbidden_collect_candidate,
+    )
+
+    candidates = await provider._run_proposers(
+        [Message(role="user", content="next chat cannot reach quorum")],
+        tools=None,
+        config=ChatConfig(),
+        recovery_state=state,
+    )
+
+    assert physical_calls == []
+    assert [candidate.error_code for candidate in candidates] == [
+        "proposer_recovery_identity_excluded",
+        "quorum_unreachable",
+    ]
+    assert sum(candidate.physical_request_count for candidate in candidates) == 0
+    assert provider.end_provider_retry_scope(scope_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "backup_state",
+    ["absent", "visited", "failed", "unready"],
+)
+async def test_unrecoverable_excluded_slot_cancels_pending_before_request(
+    monkeypatch: pytest.MonkeyPatch,
+    backup_state: str,
+) -> None:
+    proposers = [_member("p0"), _member("p1")]
+    backups = (
+        []
+        if backup_state == "absent"
+        else [
+            replace(
+                _member("b0"),
+                ready=backup_state != "unready",
+                unavailable_reason=(
+                    "deployment_unavailable"
+                    if backup_state == "unready"
+                    else ""
+                ),
+            )
+        ]
+    )
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        proposer_backups=backups,
+        aggregator=_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        selection_plan=_slot_recovery_plan(proposers, backups),
+    )
+    scope_id = f"unrecoverable-{backup_state}"
+    assert provider.begin_provider_retry_scope(
+        scope_id,
+        max_additional_physical_requests=3,
+    )
+    state = provider._proposer_retry_scope
+    assert state is not None
+    provider._mark_failed_proposer_identity(
+        state,
+        "fake:p0",
+        [],
+    )
+    if backup_state == "visited":
+        provider._mark_visited_proposer_identity(
+            state,
+            "fake:b0",
+        )
+    elif backup_state == "failed":
+        provider._mark_failed_proposer_identity(
+            state,
+            "fake:b0",
+            [],
+        )
+
+    physical_calls: list[str] = []
+
+    async def forbidden_collect_candidate(**kwargs: Any) -> _CandidateResult:
+        physical_calls.append(kwargs["member"].provider_config.model)
+        raise AssertionError("unrecoverable quorum started a physical request")
+
+    monkeypatch.setattr(
+        provider,
+        "_collect_candidate",
+        forbidden_collect_candidate,
+    )
+
+    candidates = await provider._run_proposers(
+        [Message(role="user", content="cannot recover excluded slot")],
+        tools=None,
+        config=ChatConfig(),
+        recovery_state=state,
+    )
+
+    assert physical_calls == []
+    assert [candidate.error_code for candidate in candidates] == [
+        "proposer_recovery_identity_excluded",
+        "quorum_unreachable",
+    ]
+    assert sum(candidate.physical_request_count for candidate in candidates) == 0
+    assert provider.end_provider_retry_scope(scope_id)
+
+
+@pytest.mark.asyncio
+async def test_remaining_recovery_capacity_keeps_still_reachable_primary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proposers = [_member("p0"), _member("p1")]
+    backups = [_member("b0")]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        proposer_backups=backups,
+        aggregator=_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        selection_plan=_slot_recovery_plan(proposers, backups),
+    )
+    scope_id = "remaining-recovery-capacity"
+    assert provider.begin_provider_retry_scope(
+        scope_id,
+        max_additional_physical_requests=1,
+    )
+    state = provider._proposer_retry_scope
+    assert state is not None
+    provider._mark_failed_proposer_identity(
+        state,
+        "fake:p0",
+        [],
+    )
+    physical_calls: list[str] = []
+
+    async def successful_collect_candidate(**kwargs: Any) -> _CandidateResult:
+        model = kwargs["member"].provider_config.model
+        physical_calls.append(model)
+        return _slot_candidate(
+            index=kwargs["index"],
+            model=model,
+            text="usable draft",
+            physical_attempt_id="f" * 32,
+        )
+
+    monkeypatch.setattr(
+        provider,
+        "_collect_candidate",
+        successful_collect_candidate,
+    )
+
+    candidates = await provider._run_proposers(
+        [Message(role="user", content="quorum remains reachable")],
+        tools=None,
+        config=ChatConfig(),
+        recovery_state=state,
+    )
+
+    assert physical_calls == ["p1"]
+    assert sum(candidate.ok for candidate in candidates) == 1
+    assert candidates[0].error_code == "proposer_recovery_identity_excluded"
+    assert provider.end_provider_retry_scope(scope_id)
+
+
+def test_remaining_recovery_capacity_counts_same_identity_retry() -> None:
+    proposers = [_member("p0"), _member("p1")]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        aggregator=_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        proposer_recovery_max_additional_calls=1,
+        selection_plan=_slot_recovery_plan(
+            proposers,
+            [],
+            max_additional=1,
+        ),
+    )
+    state = provider._chat_proposer_recovery_state()
+    transient = _slot_candidate(
+        index=0,
+        model="p0",
+        error="HTTP 503 upstream unavailable",
+        error_code="503",
+        usage_reported=False,
+        physical_attempt_id="a" * 32,
+    )
+
+    assert provider._remaining_proposer_recovery_capacity(
+        state,
+        [transient],
+    ) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "cancel_code",
+    ["quorum_cancelled", "quorum_unreachable", "soft_deadline"],
+)
+async def test_local_scheduler_cancellation_does_not_poison_next_chat(
+    monkeypatch: pytest.MonkeyPatch,
+    cancel_code: str,
+) -> None:
+    proposers = [_member("p0"), _member("p1")]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        aggregator=_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        proposer_recovery_max_additional_calls=1,
+        selection_plan=_slot_recovery_plan(
+            proposers,
+            [],
+            max_additional=1,
+        ),
+    )
+    scope_id = f"local-cancel-{cancel_code}"
+    assert provider.begin_provider_retry_scope(
+        scope_id,
+        max_additional_physical_requests=1,
+    )
+    state = provider._proposer_retry_scope
+    assert state is not None
+    cancelled = _slot_candidate(
+        index=1,
+        model="p1",
+        error="cancelled by the local ensemble scheduler",
+        error_code=cancel_code,
+        physical_attempt_id="1" * 32,
+    )
+    cancelled.execution["scheduler_cancellation"] = True
+
+    await provider._recover_proposers_serially(
+        [
+            _slot_candidate(
+                index=0,
+                model="p0",
+                text="first draft",
+                physical_attempt_id="0" * 32,
+            ),
+            cancelled,
+        ],
+        state=state,
+        messages=[Message(role="user", content="first chat")],
+        tools=None,
+        config=ChatConfig(),
+    )
+
+    assert "fake:p1" not in state.failed_identities
+    calls: list[str] = []
+
+    async def successful_collect_candidate(**kwargs: Any) -> _CandidateResult:
+        model = kwargs["member"].provider_config.model
+        calls.append(model)
+        return _slot_candidate(
+            index=kwargs["index"],
+            model=model,
+            text=f"draft from {model}",
+            physical_attempt_id=(
+                "2" * 32 if model == "p0" else "3" * 32
+            ),
+        )
+
+    monkeypatch.setattr(
+        provider,
+        "_collect_candidate",
+        successful_collect_candidate,
+    )
+    second = await provider._run_proposers(
+        [Message(role="user", content="second chat")],
+        tools=None,
+        config=ChatConfig(),
+        recovery_state=state,
+    )
+
+    assert set(calls) == {"p0", "p1"}
+    assert sum(candidate.ok for candidate in second) == 2
+    assert provider.end_provider_retry_scope(scope_id)
+
+
+@pytest.mark.asyncio
+async def test_failed_repeated_sample_does_not_exclude_successful_sibling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proposers = [replace(_member("p0"), k=2), _member("p1")]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        aggregator=_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        proposer_recovery_max_additional_calls=0,
+        selection_plan=_slot_recovery_plan(
+            proposers,
+            [],
+            max_additional=0,
+        ),
+    )
+    scope_id = "repeated-sample-sibling"
+    assert provider.begin_provider_retry_scope(
+        scope_id,
+        max_additional_physical_requests=0,
+    )
+    state = provider._proposer_retry_scope
+    assert state is not None
+
+    await provider._recover_proposers_serially(
+        [
+            _slot_candidate(
+                index=0,
+                model="p0",
+                text="successful sibling",
+                physical_attempt_id="0" * 32,
+            ),
+            _slot_candidate(
+                index=1,
+                model="p0",
+                error="one sample failed",
+                error_code="500",
+                physical_attempt_id="1" * 32,
+            ),
+            _slot_candidate(
+                index=2,
+                model="p1",
+                text="second identity",
+                physical_attempt_id="2" * 32,
+            ),
+        ],
+        state=state,
+        messages=[Message(role="user", content="first chat")],
+        tools=None,
+        config=ChatConfig(),
+    )
+
+    assert "fake:p0" not in state.failed_identities
+    calls: list[tuple[str, int]] = []
+
+    async def successful_collect_candidate(**kwargs: Any) -> _CandidateResult:
+        model = kwargs["member"].provider_config.model
+        index = kwargs["index"]
+        calls.append((model, index))
+        return _slot_candidate(
+            index=index,
+            model=model,
+            text=f"draft {index}",
+            physical_attempt_id=f"{index + 3:032x}",
+        )
+
+    monkeypatch.setattr(
+        provider,
+        "_collect_candidate",
+        successful_collect_candidate,
+    )
+    second = await provider._run_proposers(
+        [Message(role="user", content="second chat")],
+        tools=None,
+        config=ChatConfig(),
+        recovery_state=state,
+    )
+
+    assert sorted(calls) == [("p0", 0), ("p0", 1), ("p1", 2)]
+    assert sum(candidate.ok for candidate in second) == 3
+    assert provider.end_provider_retry_scope(scope_id)
+
+
+@pytest.mark.asyncio
+async def test_eager_task_factory_cannot_dispatch_before_quorum_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proposers = [_member("p0"), _member("p1")]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        aggregator=_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        proposer_recovery_max_additional_calls=0,
+        selection_plan=_slot_recovery_plan(
+            proposers,
+            [],
+            max_additional=0,
+        ),
+    )
+    scope_id = "eager-preflight"
+    assert provider.begin_provider_retry_scope(
+        scope_id,
+        max_additional_physical_requests=0,
+    )
+    state = provider._proposer_retry_scope
+    assert state is not None
+    provider._mark_failed_proposer_identity(
+        state,
+        "fake:p0",
+        [],
+    )
+    calls: list[str] = []
+
+    async def forbidden_collect_candidate(**kwargs: Any) -> _CandidateResult:
+        calls.append(kwargs["member"].provider_config.model)
+        raise AssertionError("eager task crossed the preflight gate")
+
+    monkeypatch.setattr(
+        provider,
+        "_collect_candidate",
+        forbidden_collect_candidate,
+    )
+    loop = asyncio.get_running_loop()
+    previous_factory = loop.get_task_factory()
+    loop.set_task_factory(asyncio.eager_task_factory)
+    try:
+        candidates = await provider._run_proposers(
+            [Message(role="user", content="cannot reach quorum")],
+            tools=None,
+            config=ChatConfig(),
+            recovery_state=state,
+        )
+    finally:
+        loop.set_task_factory(previous_factory)
+
+    assert calls == []
+    assert [candidate.error_code for candidate in candidates] == [
+        "proposer_recovery_identity_excluded",
+        "quorum_unreachable",
+    ]
+    assert provider.end_provider_retry_scope(scope_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mutation", "expected_reason"),
+    [
+        ("backup_without_receipt", "scope_effective_member_config_drift"),
+        ("api_key", "scope_effective_member_config_drift"),
+        ("budget", "scope_recovery_budget_drift"),
+        ("quorum", "scope_quorum_proof_drift"),
+        ("terminal", "scope_terminal_state_drift"),
+        ("failed_clear", "scope_recovery_identity_ledger_drift"),
+        ("counter_reset", "scope_recovery_counter_drift"),
+        ("scope_id", "scope_id_drift"),
+    ],
+)
+async def test_active_scope_drift_fails_before_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    expected_reason: str,
+) -> None:
+    proposers = [_member("p0"), _member("p1")]
+    backups = [_member("b0")]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        proposer_backups=backups,
+        aggregator=_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        selection_plan=_slot_recovery_plan(proposers, backups),
+    )
+    scope_id = f"scope-drift-{mutation}"
+    assert provider.begin_provider_retry_scope(
+        scope_id,
+        max_additional_physical_requests=3,
+    )
+    state = provider._proposer_retry_scope
+    assert state is not None
+    if mutation == "backup_without_receipt":
+        state.effective_members[0] = replace(
+            provider.proposer_backups[0],
+            label=provider.proposers[0].label,
+        )
+    elif mutation == "api_key":
+        state.effective_members[0].provider_config.api_key = "injected"
+    elif mutation == "budget":
+        state.max_additional_physical_requests = 2
+    elif mutation == "quorum":
+        state.quorum_reached_once = True
+    elif mutation == "terminal":
+        provider._poison_proposer_recovery_scope(
+            state,
+            code="test_terminal",
+            reason="test_terminal_reason",
+        )
+        state.terminal_code = ""
+        state.terminal_reason = ""
+    elif mutation == "counter_reset":
+        assert provider.reserve_provider_retry_physical_request(scope_id)
+        state.additional_physical_requests_started = 0
+        state.external_physical_requests_reserved = 0
+    elif mutation == "scope_id":
+        state.scope_id = ""
+    else:
+        provider._mark_failed_proposer_identity(
+            state,
+            "fake:p0",
+            [],
+        )
+        state.failed_identities.clear()
+
+    calls: list[str] = []
+
+    def forbidden_provider_build(config: ProviderConfig) -> Any:
+        calls.append(config.model)
+        raise AssertionError("drifted scope dispatched a provider")
+
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        forbidden_provider_build,
+    )
+    events = await _collect(provider)
+
+    assert calls == []
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert error.code == "router_dynamic_proposer_recovery_plan_drift"
+    assert error.request_started is False
+    assert error.physical_request_count == 0
+    assert error.ensemble_trace["proposer_recovery_plan_guard"][
+        "reason"
+    ] == expected_reason
+    if mutation == "scope_id":
+        state.scope_id = scope_id
+    assert provider.end_provider_retry_scope(scope_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mutation", "expected_reason"),
+    [
+        ("plan", "invalid_selection_plan"),
+        ("roster", "runtime_roster_invalid"),
+    ],
+)
+async def test_malformed_recovery_state_returns_structured_drift_error(
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    expected_reason: str,
+) -> None:
+    proposers = [_member("p0"), _member("p1")]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        aggregator=_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        selection_plan=_slot_recovery_plan(proposers, []),
+    )
+    if mutation == "plan":
+        setattr(provider, "selection_plan", None)
+    else:
+        setattr(provider, "proposers", [object()])
+    calls: list[str] = []
+
+    def forbidden_provider_build(config: ProviderConfig) -> Any:
+        calls.append(config.model)
+        raise AssertionError("malformed recovery state dispatched a provider")
+
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        forbidden_provider_build,
+    )
+    events = await _collect(provider)
+
+    assert calls == []
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert error.code == "router_dynamic_proposer_recovery_plan_drift"
+    assert error.request_started is False
+    assert error.ensemble_trace["proposer_recovery_plan_guard"][
+        "reason"
+    ] == expected_reason
+
+
+@pytest.mark.asyncio
+async def test_plan_drift_after_proposer_heartbeat_stops_before_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proposers = [_member("p0"), _member("p1")]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        aggregator=_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        selection_plan=_slot_recovery_plan(proposers, []),
+    )
+    calls: list[str] = []
+
+    def forbidden_provider_build(config: ProviderConfig) -> Any:
+        calls.append(config.model)
+        raise AssertionError("post-heartbeat plan drift dispatched a provider")
+
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        forbidden_provider_build,
+    )
+    stream = provider.chat(
+        [Message(role="user", content="task")],
+        config=ChatConfig(),
+    )
+    first = await anext(stream)
+    assert isinstance(first, ProviderHeartbeatEvent)
+    assert first.phase == "ensemble_proposers"
+    provider.selection_plan["proposer_recovery_policy"][
+        "max_tokens_cap"
+    ] = 32_768
+    remaining = [event async for event in stream]
+
+    assert calls == []
+    error = next(
+        event for event in remaining if isinstance(event, ErrorEvent)
+    )
+    assert error.code == "router_dynamic_proposer_recovery_plan_drift"
+    assert error.request_started is False
+    assert error.physical_request_count == 0
+
+
+@pytest.mark.asyncio
+async def test_plan_drift_from_proposer_start_callback_stops_before_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proposers = [_member("p0"), _member("p1")]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        aggregator=_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        selection_plan=_slot_recovery_plan(proposers, []),
+    )
+    provider_calls: list[str] = []
+    mutation_done = False
+
+    def forbidden_provider_build(config: ProviderConfig) -> Any:
+        provider_calls.append(config.model)
+        raise AssertionError("post-start-callback drift dispatched a provider")
+
+    def mutate_runtime_on_proposer_start(
+        event: EnsembleProgressEvent,
+    ) -> None:
+        nonlocal mutation_done
+        if event.event_type != "proposer_start" or mutation_done:
+            return
+        mutation_done = True
+        provider.proposers[0] = replace(
+            provider.proposers[0],
+            max_tokens=12_345,
+        )
+
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        forbidden_provider_build,
+    )
+    candidates = await provider._run_proposers(
+        [Message(role="user", content="task")],
+        tools=None,
+        config=ChatConfig(),
+        progress=mutate_runtime_on_proposer_start,
+        recovery_state=provider._chat_proposer_recovery_state(),
+    )
+
+    assert mutation_done is True
+    assert provider_calls == []
+    assert len(candidates) == 2
+    assert all(
+        candidate.error_code
+        == "router_dynamic_proposer_recovery_plan_drift"
+        for candidate in candidates
+    )
+    assert all(candidate.request_started is False for candidate in candidates)
+    assert all(candidate.physical_request_count == 0 for candidate in candidates)
+    assert {
+        candidate.execution["plan_guard_reason"]
+        for candidate in candidates
+    } == {"runtime_execution_config_drift"}
+
+
+@pytest.mark.asyncio
+async def test_plan_drift_during_recovery_backoff_stops_before_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proposers = [_member("p0"), _member("p1")]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        aggregator=_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        selection_plan=_slot_recovery_plan(proposers, []),
+    )
+    state = provider._chat_proposer_recovery_state()
+    trace = provider._new_proposer_recovery_trace(state)
+    calls: list[str] = []
+
+    async def mutate_plan_during_backoff(_: float) -> None:
+        provider.selection_plan["proposer_recovery_policy"][
+            "max_tokens_cap"
+        ] = 32_768
+
+    async def forbidden_collect_candidate(**kwargs: Any) -> _CandidateResult:
+        calls.append(kwargs["member"].provider_config.model)
+        raise AssertionError("recovery drift dispatched a provider")
+
+    monkeypatch.setattr(asyncio, "sleep", mutate_plan_during_backoff)
+    monkeypatch.setattr(
+        provider,
+        "_collect_candidate",
+        forbidden_collect_candidate,
+    )
+    attempt = await provider._run_one_proposer_recovery_attempt(
+        state=state,
+        trace=trace,
+        slot_index=0,
+        member=proposers[0],
+        source_identity="fake:p0",
+        kind="transient_retry",
+        failure_kind="provider_overloaded",
+        reason="transient_same_model_retry",
+        messages=[Message(role="user", content="task")],
+        tools=None,
+        config=ChatConfig(),
+        backoff_s=1.0,
+    )
+
+    assert attempt is None
+    assert calls == []
+    assert trace["terminal_code"] == (
+        "router_dynamic_proposer_recovery_plan_drift"
+    )
+    [receipt] = trace["attempts"]
+    assert receipt["request_started"] is False
+    assert receipt["outcome"] == "not_started"
+    assert receipt["terminal_reason"] == "selection_plan_fingerprint_drift"
+
+
+@pytest.mark.asyncio
+async def test_recovery_dispatch_plan_drift_is_terminal_even_if_state_recovers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proposers = [_member("p0"), _member("p1")]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        aggregator=_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        proposer_recovery_max_additional_calls=2,
+        selection_plan=_slot_recovery_plan(
+            proposers,
+            [],
+            max_additional=2,
+        ),
+    )
+    scope_id = "recovery-dispatch-drift"
+    assert provider.begin_provider_retry_scope(
+        scope_id,
+        max_additional_physical_requests=2,
+    )
+    state = provider._proposer_retry_scope
+    assert state is not None
+    trace = provider._new_proposer_recovery_trace(state)
+
+    async def drifted_collect_candidate(
+        **kwargs: Any,
+    ) -> _CandidateResult:
+        return _CandidateResult(
+            index=kwargs["index"],
+            sample_index=0,
+            label="p0",
+            provider="",
+            model="",
+            requested_provider="fake",
+            requested_model="p0",
+            error=(
+                "router_dynamic proposer recovery state changed before "
+                "physical provider dispatch"
+            ),
+            error_code=(
+                "router_dynamic_proposer_recovery_plan_drift"
+            ),
+            request_started=False,
+            stream_closed=True,
+            physical_request_count=0,
+            usage_missing_count=0,
+            execution={
+                "plan_guard_reason": "runtime_execution_config_drift",
+            },
+        )
+
+    monkeypatch.setattr(
+        provider,
+        "_collect_candidate",
+        drifted_collect_candidate,
+    )
+    attempt = await provider._run_one_proposer_recovery_attempt(
+        state=state,
+        trace=trace,
+        slot_index=0,
+        member=proposers[0],
+        source_identity="fake:p0",
+        kind="transient_retry",
+        failure_kind="provider_overloaded",
+        reason="transient_same_model_retry",
+        messages=[Message(role="user", content="task")],
+        tools=None,
+        config=ChatConfig(),
+    )
+
+    assert attempt is not None
+    assert attempt.request_started is False
+    assert state.internal_physical_requests_pending == 0
+    assert state.additional_physical_requests_started == 0
+    assert state.terminal_code == (
+        "router_dynamic_proposer_recovery_plan_drift"
+    )
+    assert state.terminal_reason == "runtime_execution_config_drift"
+    assert trace["terminal_code"] == state.terminal_code
+    assert not provider.reserve_provider_retry_physical_request(scope_id)
+    [receipt] = state.receipts
+    assert receipt["request_started"] is False
+    assert receipt["physical_request_count"] == 0
+    assert receipt["outcome"] == "not_started"
+    assert receipt["terminal_code"] == state.terminal_code
+    assert receipt["terminal_reason"] == state.terminal_reason
+    assert provider.end_provider_retry_scope(scope_id)
+
+
+@pytest.mark.asyncio
+async def test_internal_recovery_reservation_blocks_concurrent_external_reserve(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proposers = [_member("p0"), _member("p1")]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        aggregator=_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        proposer_recovery_max_additional_calls=1,
+        selection_plan=_slot_recovery_plan(
+            proposers,
+            [],
+            max_additional=1,
+        ),
+    )
+    scope_id = "atomic-recovery-reservation"
+    assert provider.begin_provider_retry_scope(
+        scope_id,
+        max_additional_physical_requests=1,
+    )
+    state = provider._proposer_retry_scope
+    assert state is not None
+    trace = provider._new_proposer_recovery_trace(state)
+    external_reservations: list[bool] = []
+
+    async def successful_collect_candidate(**kwargs: Any) -> _CandidateResult:
+        external_reservations.append(
+            provider.reserve_provider_retry_physical_request(scope_id)
+        )
+        return _slot_candidate(
+            index=kwargs["index"],
+            model=kwargs["member"].provider_config.model,
+            text="recovered",
+            physical_attempt_id="a" * 32,
+        )
+
+    monkeypatch.setattr(
+        provider,
+        "_collect_candidate",
+        successful_collect_candidate,
+    )
+    attempt = await provider._run_one_proposer_recovery_attempt(
+        state=state,
+        trace=trace,
+        slot_index=0,
+        member=proposers[0],
+        source_identity="fake:p0",
+        kind="transient_retry",
+        failure_kind="provider_overloaded",
+        reason="transient_same_model_retry",
+        messages=[Message(role="user", content="task")],
+        tools=None,
+        config=ChatConfig(),
+    )
+
+    assert attempt is not None and attempt.ok
+    assert external_reservations == [False]
+    assert state.internal_physical_requests_pending == 0
+    assert state.external_physical_requests_reserved == 0
+    assert state.additional_physical_requests_started == 1
+    assert provider._proposer_recovery_plan_guard_reason(state) == ""
+    assert provider.end_provider_retry_scope(scope_id)
+
+
+@pytest.mark.asyncio
+async def test_interrupted_started_recovery_is_committed_and_poisoned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proposers = [_member("p0"), _member("p1")]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        aggregator=_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        proposer_recovery_max_additional_calls=1,
+        selection_plan=_slot_recovery_plan(
+            proposers,
+            [],
+            max_additional=1,
+        ),
+    )
+    scope_id = "interrupted-recovery"
+    assert provider.begin_provider_retry_scope(
+        scope_id,
+        max_additional_physical_requests=1,
+    )
+    state = provider._proposer_retry_scope
+    assert state is not None
+    trace = provider._new_proposer_recovery_trace(state)
+
+    async def interrupted_collect_candidate(**kwargs: Any) -> _CandidateResult:
+        del kwargs
+        request_task = asyncio.current_task()
+        assert request_task is not None
+        setattr(
+            request_task,
+            "_opensquilla_ensemble_physical_attempts",
+            [
+                {
+                    "physical_attempt_id": "c" * 32,
+                    "request_started": True,
+                    "stream_closed": True,
+                }
+            ],
+        )
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(
+        provider,
+        "_collect_candidate",
+        interrupted_collect_candidate,
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await provider._run_one_proposer_recovery_attempt(
+            state=state,
+            trace=trace,
+            slot_index=0,
+            member=proposers[0],
+            source_identity="fake:p0",
+            kind="transient_retry",
+            failure_kind="provider_overloaded",
+            reason="transient_same_model_retry",
+            messages=[Message(role="user", content="task")],
+            tools=None,
+            config=ChatConfig(),
+        )
+
+    assert state.internal_physical_requests_pending == 0
+    assert state.additional_physical_requests_started == 1
+    assert state.terminal_code == "proposer_recovery_evidence_unproven"
+    [receipt] = state.receipts
+    assert receipt["physical_request_count"] == 1
+    assert receipt["physical_attempt_id"] == "c" * 32
+    assert receipt["outcome"] == "evidence_unproven"
+    assert provider._proposer_recovery_plan_guard_reason(state) == ""
+    assert not provider.reserve_provider_retry_physical_request(scope_id)
+    assert provider.end_provider_retry_scope(scope_id)
+
+
+@pytest.mark.asyncio
+async def test_active_scope_receipt_is_append_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proposers = [_member("p0"), _member("p1")]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        aggregator=_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        proposer_recovery_max_additional_calls=1,
+        selection_plan=_slot_recovery_plan(
+            proposers,
+            [],
+            max_additional=1,
+        ),
+    )
+    scope_id = "receipt-append-only"
+    assert provider.begin_provider_retry_scope(
+        scope_id,
+        max_additional_physical_requests=1,
+    )
+    state = provider._proposer_retry_scope
+    assert state is not None
+    trace = provider._new_proposer_recovery_trace(state)
+
+    async def successful_collect_candidate(**kwargs: Any) -> _CandidateResult:
+        return _slot_candidate(
+            index=kwargs["index"],
+            model=kwargs["member"].provider_config.model,
+            text="recovered",
+            physical_attempt_id="b" * 32,
+        )
+
+    monkeypatch.setattr(
+        provider,
+        "_collect_candidate",
+        successful_collect_candidate,
+    )
+    attempt = await provider._run_one_proposer_recovery_attempt(
+        state=state,
+        trace=trace,
+        slot_index=0,
+        member=proposers[0],
+        source_identity="fake:p0",
+        kind="transient_retry",
+        failure_kind="provider_overloaded",
+        reason="transient_same_model_retry",
+        messages=[Message(role="user", content="task")],
+        tools=None,
+        config=ChatConfig(),
+    )
+    assert attempt is not None and attempt.ok
+    state.receipts[0]["reason"] = "forged"
+
+    assert (
+        provider._proposer_recovery_plan_guard_reason(state)
+        == "scope_recovery_receipt_drift"
+    )
+    assert provider.end_provider_retry_scope(scope_id)
+
+
+def test_router_dynamic_constructor_detaches_caller_owned_plan_and_members() -> None:
+    proposers = [_member("p0"), _member("p1")]
+    plan = _slot_recovery_plan(proposers, [])
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        aggregator=_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        selection_plan=plan,
+    )
+    frozen_fingerprint = provider._proposer_recovery_guard_fingerprint
+
+    plan["proposer_recovery_policy"]["max_tokens_cap"] = 32_768
+    proposers[0].provider_config.base_url = "https://caller.invalid"
+    proposers[0].provider_config.provider_routing["only"] = "caller"
+
+    assert provider.selection_plan["proposer_recovery_policy"][
+        "max_tokens_cap"
+    ] == 65_536
+    assert provider.proposers[0].provider_config.base_url == ""
+    assert provider.proposers[0].provider_config.provider_routing == {}
+    assert provider._proposer_recovery_plan_guard_reason() == ""
+    assert provider_retry_roster_fingerprint(
+        provider.selection_plan
+    ) == frozen_fingerprint
 
 
 def test_provider_retry_scope_helpers_bind_zero_budget_and_fail_closed() -> None:

@@ -5070,6 +5070,20 @@ def _assign_thinking_levels(
     )
 
 
+def _proposer_global_ceiling(
+    ranking_config: Mapping[str, Any],
+) -> int:
+    """Largest proposer set allowed by any configured routing envelope."""
+
+    return max(
+        *(
+            _ranking_int(ranking_config, "proposer_count", "by_tier", tier, "max")
+            for tier in TIERS
+        ),
+        _ranking_int(ranking_config, "proposer_count", "high_risk", "max"),
+    )
+
+
 def _proposer_bounds(
     task_profile: Mapping[str, Any],
     user_profile: Mapping[str, Any],
@@ -5451,6 +5465,17 @@ def rank_models(
             "router_dynamic thinking-policy-v1 requires "
             "proposer_count.effective_tier_rounding_offset to be 0.5"
         )
+    proposer_global_ceiling = _proposer_global_ceiling(effective_ranking_config)
+    if (
+        proposer_recovery_quorum is not None
+        and proposer_recovery_quorum > proposer_global_ceiling
+    ):
+        raise DynamicRankingError(
+            "router_dynamic configured proposer recovery quorum "
+            f"{proposer_recovery_quorum} exceeds the global proposer ceiling "
+            f"{proposer_global_ceiling}",
+            reason="proposer_recovery_quorum_unreachable",
+        )
     thinking_policy = (
         _thinking_assignment_policy(effective_ranking_config)
         if ranking_thinking_assignment_enabled
@@ -5495,6 +5520,12 @@ def rank_models(
     minimum, maximum, bound_reasons = _proposer_bounds(
         task_profile, effective_user_profile, effective_ranking_config
     )
+    if proposer_recovery_quorum is not None and (
+        proposer_recovery_quorum > minimum or proposer_recovery_quorum > maximum
+    ):
+        minimum = max(minimum, proposer_recovery_quorum)
+        maximum = max(maximum, proposer_recovery_quorum)
+        bound_reasons.append("proposer_recovery_quorum")
 
     proposer_filters: list[dict[str, Any]] = []
     eligible: list[RankedModel] = []
@@ -5539,6 +5570,13 @@ def rank_models(
     proposer_thinking_unavailable = any(
         "thinking_level_unavailable" in row["reasons"] for row in proposer_filters
     )
+    if proposer_recovery_quorum is not None and len(eligible) < proposer_recovery_quorum:
+        raise DynamicRankingError(
+            "router_dynamic proposer recovery quorum requires "
+            f"{proposer_recovery_quorum} proposer(s), but hard filtering left "
+            f"{len(eligible)} eligible",
+            reason="proposer_recovery_quorum_unreachable",
+        )
     if generation_policy_exclusions and len(eligible) < minimum:
         excluded = ", ".join(row["identity"] for row in generation_policy_exclusions)
         raise DynamicRankingError(
@@ -5637,6 +5675,16 @@ def rank_models(
         if passes_quality_floor:
             quality_candidate_rows.append(row)
 
+    if (
+        proposer_recovery_quorum is not None
+        and len(quality_candidate_rows) < proposer_recovery_quorum
+    ):
+        raise DynamicRankingError(
+            "router_dynamic proposer recovery quorum requires "
+            f"{proposer_recovery_quorum} proposer(s), but the quality floor left "
+            f"{len(quality_candidate_rows)} eligible",
+            reason="proposer_recovery_quorum_unreachable",
+        )
     selected: list[RankedModel] = []
     selection_steps: list[dict[str, Any]] = []
     aggregator_feasibility: list[dict[str, Any]] = []
@@ -5780,6 +5828,13 @@ def rank_models(
             reason=("thinking_level_unavailable" if proposer_thinking_unavailable else ""),
         )
     if not selected:
+        if proposer_recovery_quorum is not None:
+            raise DynamicRankingError(
+                "router_dynamic proposer recovery quorum requires "
+                f"{proposer_recovery_quorum} proposer(s), but only 0 have a feasible "
+                f"aggregator (stop_reason={stop_reason})",
+                reason="proposer_recovery_quorum_unreachable",
+            )
         thinking_infeasible = any(
             row.get("filter_reason_counts", {}).get("thinking_level_unavailable")
             for row in aggregator_feasibility
@@ -5789,6 +5844,13 @@ def rank_models(
             "router_dynamic cannot select a proposer with a feasible aggregator"
             + (": thinking_level_unavailable" if thinking_infeasible else ""),
             reason=("thinking_level_unavailable" if thinking_infeasible else ""),
+        )
+    if proposer_recovery_quorum is not None and len(selected) < proposer_recovery_quorum:
+        raise DynamicRankingError(
+            "router_dynamic proposer recovery quorum requires "
+            f"{proposer_recovery_quorum} proposer(s), but only {len(selected)} have "
+            f"a feasible aggregator (stop_reason={stop_reason})",
+            reason="proposer_recovery_quorum_unreachable",
         )
     aggregator_rows, aggregator_filters = _aggregator_rows(
         models,
@@ -5837,9 +5899,10 @@ def rank_models(
         and row["model"].identity not in aggregator_candidate_identities
     ][:proposer_backup_count]
     backup_proposers = tuple(row["model"] for row in backup_rows)
-    recovery_quorum = min(
-        proposer_recovery_quorum or minimum,
-        len(selected),
+    recovery_quorum = (
+        proposer_recovery_quorum
+        if proposer_recovery_quorum is not None
+        else min(minimum, len(selected))
     )
     coverage_shortfall = len(selected) < minimum
     session_adjusted_ids = sorted(

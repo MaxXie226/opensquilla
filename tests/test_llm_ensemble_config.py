@@ -12,7 +12,10 @@ from opensquilla.gateway.config import GatewayConfig, LlmProviderProfile
 from opensquilla.provider.compat_policy import compat_policy_for_kind
 from opensquilla.provider.ensemble import build_ensemble_provider_from_config
 from opensquilla.provider.openai import _build_openai_wire_messages
-from opensquilla.provider.ranking_router import load_model_registry_snapshot
+from opensquilla.provider.ranking_router import (
+    DynamicRankingError,
+    load_model_registry_snapshot,
+)
 from opensquilla.provider.selector import ProviderConfig
 from opensquilla.provider.types import ChatConfig, Message, ModelCapabilities
 
@@ -585,7 +588,7 @@ def test_build_ensemble_provider_inherits_current_openrouter_credentials() -> No
 
 
 @pytest.mark.parametrize("routed_tier", ["c0", "t1"])
-def test_router_dynamic_ensemble_uses_step2_tier1_single_proposer_bound(
+def test_router_dynamic_ensemble_uses_step2_default_tier1_single_proposer_bound(
     routed_tier: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -598,7 +601,6 @@ def test_router_dynamic_ensemble_uses_step2_tier1_single_proposer_bound(
         llm_ensemble={
             "enabled": True,
             "selection_mode": "router_dynamic",
-            "min_successful_proposers": 4,
         }
     )
     inherited = ProviderConfig(
@@ -619,6 +621,8 @@ def test_router_dynamic_ensemble_uses_step2_tier1_single_proposer_bound(
     assert [member.label for member in provider.proposers] == ["proposer_1"]
     assert len(provider.proposers) == 1
     assert provider.min_successful_proposers == 1
+    assert provider.selection_plan["configured_min_successful_proposers"] == 1
+    assert provider.selection_plan["effective_min_successful_proposers"] == 1
     assert provider.selection_plan["ranking_version"] == "step2-ranking-v2"
     assert provider.selection_plan["user_profile_enabled"] is False
     assert provider.selection_plan["N_min"] == 1
@@ -635,6 +639,209 @@ def test_router_dynamic_ensemble_uses_step2_tier1_single_proposer_bound(
     assert provider.proposer_timeout_seconds == 3600.0
     assert provider.aggregator_timeout_seconds == 3600.0
     assert provider.quorum_grace_seconds == 0.0
+
+
+def test_router_dynamic_explicit_quorum_one_is_not_treated_as_auto() -> None:
+    cfg = GatewayConfig(
+        llm_ensemble={
+            "enabled": True,
+            "selection_mode": "router_dynamic",
+            "min_successful_proposers": 1,
+        }
+    )
+    inherited = ProviderConfig(
+        provider="openrouter",
+        model="z-ai/glm-5.2",
+        api_key="fake",
+        base_url="https://openrouter.example/api/v1",
+    )
+
+    provider = build_ensemble_provider_from_config(
+        config=cfg,
+        inherited_provider_config=inherited,
+        fallback_provider=None,
+        turn_metadata={"routed_tier": "c2", "routing_confidence": 0.82},
+    )
+
+    assert "min_successful_proposers" in cfg.llm_ensemble.model_fields_set
+    assert provider.selection_plan["N_min"] == 2
+    assert len(provider.proposers) >= 2
+    assert provider.min_successful_proposers == 1
+    assert provider.selection_plan["configured_min_successful_proposers"] == 1
+    assert provider.selection_plan["effective_min_successful_proposers"] == 1
+    assert provider.selection_plan["proposer_recovery_policy"]["quorum_required"] == 1
+
+
+def test_router_dynamic_explicit_quorum_two_lifts_c0_selection_bound() -> None:
+    cfg = GatewayConfig(
+        llm_ensemble={
+            "enabled": True,
+            "selection_mode": "router_dynamic",
+            "min_successful_proposers": 2,
+        }
+    )
+    inherited = ProviderConfig(
+        provider="openrouter",
+        model="deepseek/deepseek-v4-flash",
+        api_key="fake",
+        base_url="https://openrouter.example/api/v1",
+    )
+
+    provider = build_ensemble_provider_from_config(
+        config=cfg,
+        inherited_provider_config=inherited,
+        fallback_provider=None,
+        turn_metadata={"routed_tier": "c0", "routing_confidence": 0.93},
+    )
+
+    assert provider.selection_plan["N_min"] == 2
+    assert provider.selection_plan["N_max"] == 2
+    assert len(provider.proposers) >= 2
+    assert provider.min_successful_proposers == 2
+    assert provider.selection_plan["effective_min_successful_proposers"] == 2
+    assert provider.selection_plan["proposer_recovery_policy"]["quorum_required"] == 2
+
+
+def test_router_dynamic_explicit_unreachable_quorum_fails_before_provider_construction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    experiment = load_draco_experiment_config(
+        ROOT / "configs" / "benchmarks" / "draco_b2_g12.json"
+    ).config
+    assert experiment.g1_routing is not None
+    routes = {"deepseek/deepseek-v4-pro": "deepseek"}
+    contract = experiment.g1_routing.model_dump(mode="json", exclude_none=True)
+    contract.update(
+        {
+            "candidate_scope": "exact_routes",
+            "policy": "exact_openrouter_routes",
+            "expected_candidate_count": len(routes),
+            "expected_routes": routes,
+            "expected_routes_sha256": hashlib.sha256(
+                json.dumps(
+                    routes,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+        }
+    )
+    cfg = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "deepseek/deepseek-v4-pro",
+            "api_key": "fake",
+            "base_url": "https://openrouter.example/api/v1",
+        },
+        llm_ensemble={
+            "enabled": True,
+            "selection_mode": "router_dynamic",
+            "min_successful_proposers": 2,
+        },
+    )
+    inherited = ProviderConfig(
+        provider="openrouter",
+        model="deepseek/deepseek-v4-pro",
+        api_key="fake",
+        base_url="https://openrouter.example/api/v1",
+    )
+    provider_constructions: list[bool] = []
+
+    def unexpected_provider_construction(
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        provider_constructions.append(True)
+        raise AssertionError("provider construction must not be reached")
+
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble.EnsembleProvider",
+        unexpected_provider_construction,
+    )
+
+    with pytest.raises(
+        DynamicRankingError,
+        match=r"quorum requires 2 proposer\(s\).*hard filtering left 1 eligible",
+    ) as exc_info:
+        build_ensemble_provider_from_config(
+            config=cfg,
+            inherited_provider_config=inherited,
+            fallback_provider=None,
+            turn_metadata={"routed_tier": "c0", "routing_confidence": 0.93},
+            ranking_inputs={"registry_allowlist": contract},
+        )
+
+    assert exc_info.value.reason == "proposer_recovery_quorum_unreachable"
+    assert provider_constructions == []
+
+
+@pytest.mark.parametrize(
+    "invalid_quorum",
+    [
+        pytest.param(0, id="zero"),
+        pytest.param(False, id="boolean-false"),
+        pytest.param("2", id="numeric-string"),
+    ],
+)
+def test_router_dynamic_runtime_invalid_quorum_fails_before_ranking_or_provider(
+    invalid_quorum: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = GatewayConfig(
+        llm_ensemble={
+            "enabled": True,
+            "selection_mode": "router_dynamic",
+        }
+    )
+    cfg.llm_ensemble.min_successful_proposers = invalid_quorum
+    ranking_calls: list[bool] = []
+    provider_constructions: list[bool] = []
+
+    def unexpected_ranking(
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        ranking_calls.append(True)
+        raise AssertionError("ranking must not be reached")
+
+    def unexpected_provider_construction(
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        provider_constructions.append(True)
+        raise AssertionError("provider construction must not be reached")
+
+    monkeypatch.setattr(
+        "opensquilla.provider.ranking_router.rank_models",
+        unexpected_ranking,
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble.EnsembleProvider",
+        unexpected_provider_construction,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"router_dynamic llm_ensemble\.min_successful_proposers "
+            r"must be a non-boolean integer >= 1"
+        ),
+    ):
+        build_ensemble_provider_from_config(
+            config=cfg,
+            inherited_provider_config=ProviderConfig(
+                provider="openrouter",
+                model="deepseek/deepseek-v4-flash",
+                api_key="fake",
+                base_url="https://openrouter.example/api/v1",
+            ),
+            fallback_provider=None,
+            turn_metadata={"routed_tier": "c0", "routing_confidence": 0.93},
+        )
+
+    assert ranking_calls == []
+    assert provider_constructions == []
 
 
 def test_router_dynamic_ensemble_uses_step2_greedy_c2_selection() -> None:

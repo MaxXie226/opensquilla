@@ -32,6 +32,9 @@ from functools import cache
 from pathlib import Path
 from typing import Any
 
+from opensquilla.provider.protocol import (
+    provider_retry_expanded_proposer_identities,
+)
 from opensquilla.provider.types import REASONING_ONLY_LENGTH_STOP_REASONS
 from opensquilla.usage_evidence import (
     MISSING_USAGE_PLACEHOLDER_ROLES,
@@ -3507,16 +3510,43 @@ def aggregator_recovery_execution_reasons(
 
 
 def _canonical_proposer_recovery_identity(value: Any) -> str:
-    identity = str(value or "")
+    if not isinstance(value, str):
+        return ""
+    identity = value
     if (
         not identity
-        or identity != identity.strip().casefold()
-        or identity.count(":") != 1
+        or identity != identity.strip()
         or any(character.isspace() for character in identity)
     ):
         return ""
-    provider, model = identity.split(":", 1)
-    return identity if provider and model else ""
+    provider, separator, model = identity.partition(":")
+    if (
+        not separator
+        or not provider
+        or provider != provider.casefold()
+        or not model
+        or any(not segment for segment in model.split(":"))
+    ):
+        return ""
+    return identity
+
+
+def expanded_proposer_slot_identities(
+    plan: Mapping[str, Any],
+) -> tuple[tuple[str, ...], list[str]]:
+    """Resolve every runtime proposer sample slot to its frozen identity.
+
+    ``selected_P`` lists distinct ranking choices, whereas ``proposer_models``
+    lists physical proposer samples after each selected member's ``k`` was
+    expanded. Recovery receipts are indexed by those physical sample slots.
+    Require the exact block expansion emitted by the provider: every selected
+    identity appears at least once, in ranking order.
+    """
+
+    expanded = provider_retry_expanded_proposer_identities(plan)
+    if not expanded:
+        return (), ["invalid_expanded_proposer_sample_roster"]
+    return expanded, []
 
 
 def proposer_recovery_execution_reasons(
@@ -3576,6 +3606,10 @@ def proposer_recovery_execution_reasons(
         or executed_plan.get("effective_min_successful_proposers") != 2
     ):
         reasons.append("invalid_proposer_recovery_roster")
+    expanded_slot_identities, expanded_slot_reasons = (
+        expanded_proposer_slot_identities(executed_plan)
+    )
+    reasons.extend(expanded_slot_reasons)
 
     try:
         from opensquilla.provider.protocol import (
@@ -3629,7 +3663,7 @@ def proposer_recovery_execution_reasons(
     ] = {}
     if (
         not isinstance(candidates, list)
-        or len(candidates) != len(selected_identities)
+        or len(candidates) != len(expanded_slot_identities)
     ):
         reasons.append("invalid_proposer_recovery_candidate_slots")
         candidates = candidates if isinstance(candidates, list) else []
@@ -3698,10 +3732,10 @@ def proposer_recovery_execution_reasons(
         )
         allowed_slot_identities = (
             {
-                selected_identities[slot_index],
+                expanded_slot_identities[slot_index],
                 *backup_identities,
             }
-            if slot_index < len(selected_identities)
+            if slot_index < len(expanded_slot_identities)
             else set(backup_identities)
         )
         if (
@@ -3717,7 +3751,7 @@ def proposer_recovery_execution_reasons(
             )
         ):
             reasons.append("wrong_proposer_recovery_final_identity")
-        elif slot_index < len(selected_identities):
+        elif slot_index < len(expanded_slot_identities):
             final_identity_by_slot[slot_index] = requested_identity
     if (
         len(all_candidate_ids) != len(set(all_candidate_ids))
@@ -3750,7 +3784,7 @@ def proposer_recovery_execution_reasons(
             attempt.get("sequence") != sequence
             or isinstance(slot_index, bool)
             or not isinstance(slot_index, int)
-            or not 0 <= slot_index < len(selected_identities)
+            or not 0 <= slot_index < len(expanded_slot_identities)
             or kind
             not in {
                 "thinking_downgrade",
@@ -3919,15 +3953,14 @@ def proposer_recovery_execution_reasons(
         else []
     )
     allowed_identities_by_slot = [
-        {selected_identity, *backup_identities}
-        for selected_identity in selected_identities
+        {slot_identity, *backup_identities}
+        for slot_identity in expanded_slot_identities
     ]
 
     def valid_executed_roster(roster: list[str]) -> bool:
         return (
-            len(roster) == len(selected_identities)
+            len(roster) == len(expanded_slot_identities)
             and all(roster)
-            and len(set(roster)) == len(roster)
             and all(
                 identity in allowed_identities_by_slot[slot_index]
                 for slot_index, identity in enumerate(roster)
@@ -4041,6 +4074,7 @@ def ensemble_physical_call_reasons(
     strict_physical_evidence = False
     recovered_identity_by_slot: dict[int, str] = {}
     recovery_physical_ids: set[str] = set()
+    initial_identity_by_slot: tuple[str, ...] = ()
     if not isinstance(executed_plan, Mapping):
         reasons.append("missing_executed_selection_plan")
     else:
@@ -4060,6 +4094,13 @@ def ensemble_physical_call_reasons(
             reasons.append("wrong_aggregator_model")
         if executed_plan.get("proposer_recovery_policy") is not None:
             strict_physical_evidence = True
+            (
+                initial_identity_by_slot,
+                expanded_slot_reasons,
+            ) = expanded_proposer_slot_identities(executed_plan)
+            reasons.extend(expanded_slot_reasons)
+            if len(initial_identity_by_slot) != expected_total:
+                reasons.append("wrong_proposer_recovery_sample_slots")
             (
                 recovered_identity_by_slot,
                 recovery_physical_ids,
@@ -4099,7 +4140,11 @@ def ensemble_physical_call_reasons(
                 continue
             expected_identity = recovered_identity_by_slot.get(
                 slot_index,
-                f"openrouter:{expected_model}",
+                (
+                    initial_identity_by_slot[slot_index]
+                    if slot_index < len(initial_identity_by_slot)
+                    else f"openrouter:{expected_model}"
+                ),
             )
             expected_provider, _, expected_candidate_model = (
                 expected_identity.partition(":")
@@ -4723,6 +4768,21 @@ def g1_recomputed_proposer_bounds(
             return None
         minimum = min(minimum, maximum)
         reasons.append("cost_or_latency_constrained")
+    proposer_policy = plan.get("proposer_recovery_policy")
+    explicit_quorum = (
+        proposer_policy.get("quorum_required")
+        if isinstance(proposer_policy, Mapping)
+        else None
+    )
+    if (
+        isinstance(explicit_quorum, int)
+        and not isinstance(explicit_quorum, bool)
+        and explicit_quorum > 0
+        and (explicit_quorum > minimum or explicit_quorum > maximum)
+    ):
+        minimum = max(minimum, explicit_quorum)
+        maximum = max(maximum, explicit_quorum)
+        reasons.append("proposer_recovery_quorum")
     return minimum, maximum, reasons
 
 
@@ -4880,17 +4940,27 @@ def g1_registry_plan_reasons(
         or any(str(value) not in expected_identities for value in selected_p)
     ):
         reasons.append("wrong_g1_selected_proposers")
-        proposer_models: tuple[str, ...] = ()
+        selected_proposer_models: tuple[str, ...] = ()
     else:
-        proposer_models = tuple(str(identity).partition(":")[2] for identity in selected_p)
+        selected_proposer_models = tuple(
+            str(identity).partition(":")[2] for identity in selected_p
+        )
         if not (
             isinstance(n_min, int)
             and not isinstance(n_min, bool)
             and isinstance(n_max, int)
             and not isinstance(n_max, bool)
-            and n_min <= len(proposer_models) <= n_max
+            and n_min <= len(selected_proposer_models) <= n_max
         ):
             reasons.append("g1_selected_proposer_count_outside_bounds")
+    expanded_slot_identities, expanded_slot_reasons = (
+        expanded_proposer_slot_identities(plan)
+    )
+    reasons.extend(expanded_slot_reasons)
+    proposer_models = tuple(
+        identity.partition(":")[2]
+        for identity in expanded_slot_identities
+    )
     selected_a = str(plan.get("selected_A") or "")
     aggregator_model = selected_a.partition(":")[2] if selected_a in expected_identities else ""
     if not aggregator_model:
@@ -4984,14 +5054,14 @@ def g1_registry_plan_reasons(
     selection_steps = plan.get("selection_steps")
     if (
         not isinstance(selection_steps, list)
-        or len(selection_steps) != len(proposer_models)
+        or len(selection_steps) != len(selected_proposer_models)
         or any(
             not isinstance(step, Mapping)
             or step.get("step") != index
             or str(step.get("selected") or "") != selected_p[index - 1]
             for index, step in enumerate(selection_steps, start=1)
         )
-        or plan.get("proposer_count") != len(proposer_models)
+        or plan.get("proposer_count") != len(selected_proposer_models)
     ):
         reasons.append("wrong_g1_selection_steps")
     try:
@@ -6535,7 +6605,7 @@ def _strict_g1_physical_generation_usage_ids(
     *,
     identity_seed: str,
 ) -> list[str]:
-    """Return explicit generation IDs only for the strict thinking schema."""
+    """Return generation IDs for every strict G1 physical ledger."""
 
     trace = run.get("ensemble_trace")
     calls, _ = ensemble_call_trace_sequence(
@@ -6543,10 +6613,16 @@ def _strict_g1_physical_generation_usage_ids(
     )
     if not any(
         isinstance(call.get("selection_plan"), Mapping)
-        and call["selection_plan"].get(
-            "thinking_physical_evidence_schema"
+        and (
+            call["selection_plan"].get(
+                "thinking_physical_evidence_schema"
+            )
+            == THINKING_PHYSICAL_EVIDENCE_SCHEMA
+            or call["selection_plan"].get(
+                "proposer_recovery_policy"
+            )
+            is not None
         )
-        == THINKING_PHYSICAL_EVIDENCE_SCHEMA
         for call in calls
     ):
         return []
@@ -7718,12 +7794,16 @@ def g1_thinking_physical_usage_binding_reasons(
             reasons.append("proposer_recovery_scope_changed")
         if recovery_fingerprint and fingerprint != recovery_fingerprint:
             reasons.append("proposer_recovery_fingerprint_changed")
+        initial_slot_identities, initial_slot_reasons = (
+            expanded_proposer_slot_identities(plan)
+            if isinstance(plan, Mapping)
+            else ((), ["invalid_expanded_proposer_sample_roster"])
+        )
+        reasons.extend(initial_slot_reasons)
         if (
             prior_recovery_roster_after is None
-            and isinstance(plan, Mapping)
-            and isinstance(plan.get("selected_P"), list)
             and normalized_before
-            != [str(identity or "") for identity in plan["selected_P"]]
+            != list(initial_slot_identities)
         ):
             reasons.append("proposer_recovery_roster_prefix_changed")
         elif (

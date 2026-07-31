@@ -224,16 +224,23 @@ def _decision(
     user_profile: dict[str, Any] | None = None,
     ranking_config: dict[str, Any] | None = None,
     thinking_assignment_enabled: bool = False,
+    proposer_recovery_quorum: int | None = None,
+    user_profile_enabled: bool = True,
 ):
     return rank_models(
         task_analysis=analysis or _analysis(),
-        user_profile=user_profile or mock_user_profile(),
+        user_profile=(
+            user_profile or mock_user_profile()
+            if user_profile_enabled
+            else None
+        ),
         request_context=context or _context(),
         registry_snapshot=_snapshot(*models),
         routed_tier="c2",
         routing_confidence=0.9,
         ranking_config=ranking_config,
         ranking_thinking_assignment_enabled=thinking_assignment_enabled,
+        proposer_recovery_quorum=proposer_recovery_quorum,
     )
 
 
@@ -2617,17 +2624,182 @@ def test_redo_stops_escalating_at_the_configured_ceiling() -> None:
     assert decision.trace["session"]["escalation_level"] == 2
 
 
+def test_explicit_proposer_recovery_quorum_one_preserves_ranked_selection() -> None:
+    models = (
+        _model("primary", provider="provider-a", capability=0.90),
+        _model("secondary", provider="provider-b", capability=0.85),
+    )
+    baseline = _decision(
+        *models,
+        analysis=_analysis(tier=3, latency="interactive"),
+        user_profile_enabled=False,
+    )
+    explicit = _decision(
+        *models,
+        analysis=_analysis(tier=3, latency="interactive"),
+        proposer_recovery_quorum=1,
+        user_profile_enabled=False,
+    )
+
+    assert explicit.trace["selected_P"] == baseline.trace["selected_P"]
+    assert explicit.trace["N_min"] == baseline.trace["N_min"] == 2
+    assert explicit.trace["N_max"] == baseline.trace["N_max"] == 2
+    assert explicit.trace["proposer_recovery_policy"]["quorum_required"] == 1
+    assert ranking_trace_replay_reasons(explicit.trace) == []
+
+
+def test_explicit_proposer_recovery_quorum_one_allows_original_bound_shortfall() -> None:
+    decision = _decision(
+        _model("only"),
+        analysis=_analysis(tier=3),
+        proposer_recovery_quorum=1,
+    )
+
+    assert decision.trace["N_min"] == 2
+    assert len(decision.proposers) == 1
+    assert decision.trace["coverage_shortfall"] is True
+    assert decision.trace["proposer_recovery_policy"]["quorum_required"] == 1
+
+
+def test_explicit_proposer_recovery_quorum_lifts_c0_selection_bounds() -> None:
+    decision = _decision(
+        _model("primary", provider="provider-a", capability=0.90),
+        _model("secondary", provider="provider-b", capability=0.85),
+        analysis=_analysis(tier=1),
+        proposer_recovery_quorum=2,
+        user_profile_enabled=False,
+    )
+
+    assert decision.trace["N_min"] == 2
+    assert decision.trace["N_max"] == 2
+    assert len(decision.proposers) == 2
+    assert decision.trace["coverage_shortfall"] is False
+    assert decision.trace["proposer_recovery_policy"]["quorum_required"] == 2
+    assert ranking_trace_replay_reasons(decision.trace) == []
+
+
+def test_explicit_proposer_recovery_quorum_allows_global_ceiling() -> None:
+    ranking_config = load_ranking_config()
+    ceiling = ranking_router._proposer_global_ceiling(ranking_config)
+    models = tuple(
+        _model(
+            f"model-{index}",
+            provider=f"provider-{index}",
+            capability=0.90,
+        )
+        for index in range(ceiling)
+    )
+
+    decision = _decision(
+        *models,
+        analysis=_analysis(tier=1),
+        ranking_config=ranking_config,
+        proposer_recovery_quorum=ceiling,
+        user_profile_enabled=False,
+    )
+
+    assert ceiling == 5
+    assert decision.trace["N_min"] == ceiling
+    assert decision.trace["N_max"] == ceiling
+    assert len(decision.proposers) == ceiling
+    assert decision.trace["proposer_recovery_policy"]["quorum_required"] == ceiling
+    assert ranking_trace_replay_reasons(decision.trace) == []
+
+
+def test_explicit_proposer_recovery_quorum_above_global_ceiling_fails_early(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ranking_config = load_ranking_config()
+    ceiling = ranking_router._proposer_global_ceiling(ranking_config)
+
+    def unexpected_normalization(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("registry normalization must not start")
+
+    monkeypatch.setattr(ranking_router, "_normalize_model", unexpected_normalization)
+    with pytest.raises(
+        DynamicRankingError,
+        match=(
+            f"configured proposer recovery quorum {ceiling + 1} "
+            f"exceeds the global proposer ceiling {ceiling}"
+        ),
+    ) as exc_info:
+        _decision(
+            _model("unused"),
+            analysis=_analysis(tier=1),
+            ranking_config=ranking_config,
+            proposer_recovery_quorum=ceiling + 1,
+        )
+
+    assert exc_info.value.reason == "proposer_recovery_quorum_unreachable"
+
+
+@pytest.mark.parametrize(
+    ("models", "context", "message"),
+    [
+        pytest.param(
+            (
+                _model("eligible"),
+                _model("filtered", credential_available=False),
+            ),
+            _context(),
+            "hard filtering left 1 eligible",
+            id="hard-filter",
+        ),
+        pytest.param(
+            (
+                _model("strong", capability=0.90),
+                _model("weak", provider="provider-b", capability=0.10),
+            ),
+            _context(),
+            "quality floor left 1 eligible",
+            id="quality-floor",
+        ),
+        pytest.param(
+            (
+                _model("proposer-a", provider="provider-a", roles=["proposer"]),
+                _model("proposer-b", provider="provider-b", roles=["proposer"]),
+                _model(
+                    "aggregator",
+                    provider="provider-c",
+                    roles=["aggregator"],
+                    context_window=3_500,
+                ),
+            ),
+            _context(input_tokens=1_000, candidate_tokens=1_000, aggregator_tokens=1_000),
+            "only 1 have a feasible aggregator .*stop_reason=aggregator_infeasible",
+            id="aggregator-feasibility",
+        ),
+    ],
+)
+def test_explicit_proposer_recovery_quorum_unreachable_fails_closed(
+    models: tuple[dict[str, Any], ...],
+    context: dict[str, Any],
+    message: str,
+) -> None:
+    with pytest.raises(DynamicRankingError, match=message) as exc_info:
+        _decision(
+            *models,
+            analysis=_analysis(tier=1, risk="low"),
+            context=context,
+            proposer_recovery_quorum=2,
+        )
+
+    assert exc_info.value.reason == "proposer_recovery_quorum_unreachable"
+
+
 def test_high_risk_shortfall_is_recorded_without_violating_filters() -> None:
     decision = _decision(
         _model("one", provider="provider-a"),
         _model("two", provider="provider-b"),
         analysis=_analysis(tier=4, risk="high"),
+        proposer_recovery_quorum=None,
     )
 
     assert decision.trace["N_min"] == 4
     assert len(decision.proposers) == 2
     assert decision.trace["coverage_shortfall"] is True
     assert decision.trace["stop_reason"] == "candidate_pool_exhausted"
+    assert decision.trace["proposer_recovery_policy"]["quorum_required"] == 2
 
 
 def test_no_feasible_aggregator_fails_with_explicit_error() -> None:
