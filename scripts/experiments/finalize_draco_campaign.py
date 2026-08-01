@@ -74,7 +74,7 @@ LEGACY_MANAGED_V3_SOURCE_IDENTITY = {
 JUDGE_ATTEMPT_BUDGET_SCOPE = "criterion_repeat_campaign"
 JUDGE_ATTEMPT_BUDGET_LIMIT = 3
 JUDGE_ATTEMPT_BUDGET_EXHAUSTED_ERROR = "judge_attempt_budget_exhausted"
-FINALIZER_VERSION = 7
+FINALIZER_VERSION = 8
 FROZEN_DRACO_MINI_TASK_COUNT = 10
 FROZEN_DRACO_MINI_SHA256 = "1eb4e618c8df8e7f68bded3d2b6f77a541744aa1072eb338835b776183188a8d"
 FORMAL_REQUIRED_STABLE_POLL_COUNT = 6
@@ -11310,32 +11310,50 @@ def selected_generation_costs_from_ledger(
             str(item.get("cost_precision") or "unknown") for item in physical
         )
         recorded_request_count = len(known)
-        estimated_request_count = precision_counts["estimated"]
+        exact_request_count = len(exact_known)
+        estimated_request_count = len(estimated_known)
+        recorded_non_exact_request_count = (
+            recorded_request_count - exact_request_count - estimated_request_count
+        )
+        ignored_request_count = len(physical) - recorded_request_count
         complete = recorded_request_count == len(physical)
         exact = complete and precision_counts["exact"] == len(physical)
         lower_bound = sum(non_estimated_known, Decimal(0))
-        value = sum(known, Decimal(0)) if complete else None
+        # Reporting deliberately separates execution cost from evidence
+        # completeness. Exact/recorded dollars are preferred; a frozen-price
+        # estimate materialized by the runner is next (cache-aware when frozen
+        # cache rates exist, cache-blind otherwise). Requests that remain
+        # unpriced are excluded, never coerced to $0. A pair with no priced
+        # request has no subtotal.
+        value = sum(known, Decimal(0)) if known else None
         exact_value = sum(exact_known, Decimal(0))
         estimated_value = sum(estimated_known, Decimal(0))
         cost_warnings: list[str] = []
         summary = {
             "value": value,
-            "recorded_cost_usd": str(value) if value is not None else None,
+            # Preserve the legacy meaning: this is a complete pair total.
+            # counted_cost_usd is the report subtotal after excluding unknowns.
+            "recorded_cost_usd": str(value) if complete and value is not None else None,
+            "counted_cost_usd": str(value) if value is not None else None,
             "recorded_cost_usd_lower_bound": str(lower_bound),
             "exact_cost_usd": str(exact_value),
             "estimated_cost_usd": str(estimated_value),
             "request_count": len(physical),
             "known_cost_request_count": recorded_request_count,
+            "exact_cost_request_count": exact_request_count,
             "non_estimated_known_cost_request_count": len(non_estimated_known),
             "estimated_cost_request_count": estimated_request_count,
-            "unknown_cost_request_count": len(physical) - recorded_request_count,
+            "recorded_non_exact_cost_request_count": recorded_non_exact_request_count,
+            "unknown_cost_request_count": ignored_request_count,
+            "ignored_cost_request_count": ignored_request_count,
+            "ignored_cost_requests_are_zero": False,
             "precision_counts": dict(sorted(precision_counts.items())),
             "precision": (
                 "exact"
                 if exact
                 else "estimated_or_recorded"
                 if complete
-                else "partial_estimated_or_unknown"
+                else "partial_excluding_unknown"
             ),
             "complete": complete,
             "exact": exact,
@@ -11343,7 +11361,7 @@ def selected_generation_costs_from_ledger(
         }
         declared = selected_generation_cost(row)
         if (
-            value is not None
+            isinstance(value, Decimal)
             and isinstance(declared.get("value"), Decimal)
             and declared["value"].quantize(Decimal("0.000000001"))
             != value.quantize(Decimal("0.000000001"))
@@ -11356,11 +11374,43 @@ def selected_generation_costs_from_ledger(
                 f"{key} selected generation row falsely declares exact cost"
             )
         summaries[key] = summary
+    counted_values = [
+        summary["value"]
+        for summary in summaries.values()
+        if isinstance(summary.get("value"), Decimal)
+    ]
+    counted_cost = sum(counted_values, Decimal(0)) if counted_values else None
     return summaries, {
         "pair_count": len(summaries),
         "complete_pair_count": sum(value["complete"] is True for value in summaries.values()),
         "exact_pair_count": sum(value["exact"] is True for value in summaries.values()),
+        "counted_pair_count": len(counted_values),
+        "counted_cost_usd": str(counted_cost) if counted_cost is not None else None,
+        "request_count": sum(value["request_count"] for value in summaries.values()),
+        "known_cost_request_count": sum(
+            value["known_cost_request_count"] for value in summaries.values()
+        ),
+        "exact_cost_request_count": sum(
+            value["exact_cost_request_count"] for value in summaries.values()
+        ),
+        "estimated_cost_request_count": sum(
+            value["estimated_cost_request_count"] for value in summaries.values()
+        ),
+        "recorded_non_exact_cost_request_count": sum(
+            value["recorded_non_exact_cost_request_count"] for value in summaries.values()
+        ),
+        "ignored_cost_request_count": sum(
+            value["ignored_cost_request_count"] for value in summaries.values()
+        ),
         "unknown_is_zero": False,
+        "reporting_policy": {
+            "priority": [
+                "recorded_dollar_cost",
+                "frozen_cache_aware_token_estimate",
+                "exclude_unpriced_request",
+            ],
+            "ignored_cost_requests_are_zero": False,
+        },
         "warnings": [
             warning
             for summary in summaries.values()
@@ -11396,18 +11446,59 @@ def group_metrics(
             )
             for row in values
         ]
-        covered_costs = [
+        counted_costs = [
             item["value"] for item in selected_costs if isinstance(item.get("value"), Decimal)
         ]
-        covered_count = len(covered_costs)
+        covered_count = len(counted_costs)
+        all_counted = covered_count == len(values)
         exact_count = sum(item["exact"] is True for item in selected_costs)
         complete_count = sum(item["complete"] is True for item in selected_costs)
-        all_covered = covered_count == len(values)
         all_exact = exact_count == len(values)
-        cost_precision = (
-            "exact" if all_exact else "mixed_or_estimated" if all_covered else "partial_or_unknown"
+        ignored_request_count = sum(
+            nonnegative_int(
+                item.get(
+                    "ignored_cost_request_count",
+                    item.get("unknown_cost_request_count", 1 if item.get("value") is None else 0),
+                )
+            )
+            for item in selected_costs
         )
-        covered_total = sum(covered_costs, Decimal(0))
+        request_count = sum(
+            nonnegative_int(item.get("request_count", 1)) for item in selected_costs
+        )
+        known_request_count = sum(
+            nonnegative_int(
+                item.get("known_cost_request_count", 0 if item.get("value") is None else 1)
+            )
+            for item in selected_costs
+        )
+        exact_request_count = sum(
+            nonnegative_int(
+                item.get("exact_cost_request_count", 1 if item.get("exact") is True else 0)
+            )
+            for item in selected_costs
+        )
+        estimated_request_count = sum(
+            nonnegative_int(
+                item.get(
+                    "estimated_cost_request_count",
+                    1 if item.get("precision") == "estimated" else 0,
+                )
+            )
+            for item in selected_costs
+        )
+        recorded_non_exact_request_count = max(
+            0,
+            known_request_count - exact_request_count - estimated_request_count,
+        )
+        cost_precision = (
+            "exact"
+            if all_exact
+            else "partial_excluding_unknown"
+            if ignored_request_count
+            else "mixed_or_estimated"
+        )
+        counted_total = sum(counted_costs, Decimal(0))
         exact_cost_total = sum(
             (
                 required_decimal(
@@ -11501,15 +11592,28 @@ def group_metrics(
                 "avg_pass_rate": str(sum(pass_rates, Decimal(0)) / denominator),
                 "judge_error_count": judge_errors,
                 "avg_selected_generation_cost_usd": (
-                    str(covered_total / Decimal(len(values))) if all_covered else None
+                    str(counted_total / Decimal(len(values))) if all_counted else None
                 ),
                 "covered_avg_selected_generation_cost_usd": (
-                    str(covered_total / Decimal(covered_count)) if covered_count else None
+                    str(counted_total / Decimal(covered_count)) if covered_count else None
                 ),
-                "selected_generation_cost_usd": (str(covered_total) if all_covered else None),
+                "selected_generation_cost_usd": (str(counted_total) if all_counted else None),
+                "selected_generation_cost_counted_usd": (
+                    str(counted_total) if covered_count else None
+                ),
                 "selected_generation_cost_exact_usd": str(exact_cost_total),
                 "selected_generation_cost_estimated_usd": str(estimated_cost_total),
                 "selected_generation_cost_usd_lower_bound": str(lower_bound_total),
+                "selected_generation_cost_request_count": request_count,
+                "selected_generation_cost_known_request_count": known_request_count,
+                "selected_generation_cost_exact_request_count": exact_request_count,
+                "selected_generation_cost_estimated_request_count": estimated_request_count,
+                "selected_generation_cost_recorded_non_exact_request_count": (
+                    recorded_non_exact_request_count
+                ),
+                "selected_generation_cost_ignored_request_count": ignored_request_count,
+                "selected_generation_cost_ignored_requests_are_zero": False,
+                "selected_generation_cost_reported_task_count": covered_count,
                 "selected_generation_cost_covered_task_count": covered_count,
                 "selected_generation_cost_exact_task_count": exact_count,
                 "selected_generation_cost_complete_task_count": complete_count,
@@ -11952,6 +12056,28 @@ def experiment_results_markdown(
         Decimal(0),
     )
     disposition_costs = ledger_summary["generation_disposition_recorded_cost_usd"]
+    selected_cost_request_count = sum(
+        nonnegative_int(metric.get("selected_generation_cost_request_count"))
+        for metric in metrics
+    )
+    selected_cost_exact_request_count = sum(
+        nonnegative_int(metric.get("selected_generation_cost_exact_request_count"))
+        for metric in metrics
+    )
+    selected_cost_estimated_request_count = sum(
+        nonnegative_int(metric.get("selected_generation_cost_estimated_request_count"))
+        for metric in metrics
+    )
+    selected_cost_recorded_non_exact_request_count = sum(
+        nonnegative_int(
+            metric.get("selected_generation_cost_recorded_non_exact_request_count")
+        )
+        for metric in metrics
+    )
+    selected_cost_ignored_request_count = sum(
+        nonnegative_int(metric.get("selected_generation_cost_ignored_request_count"))
+        for metric in metrics
+    )
     retrospective_recoveries: list[tuple[Mapping[str, Any], Mapping[str, Any]]] = []
     for row in final_rows:
         finalization = row.get("campaign_finalization")
@@ -12303,10 +12429,20 @@ def experiment_results_markdown(
             f"${disposition_costs.get('selected', '0')}，"
             f"replaced=${disposition_costs.get('replaced', '0')}，"
             f"failed=${disposition_costs.get('failed', '0')}。",
-            "- † 上表成本只统计最终选中的成功 generation；不包含 Judge。",
-            "- 有显式 estimate 的成功 generation 会计入总费用，但不会计入 Gen exact；"
-            "真正 unknown 的成本不会按 $0 参与平均。表中 N/A 表示无法对全组给出"
-            "逐任务总成本，coverage/precision 为机器可审计口径。",
+            "- † 上表成本只统计最终选中的成功 generation；不包含 Judge，也不包含"
+            "失败或被替换的 generation attempt。多次重试只统计最终被采用的 attempt。",
+            "- Selected generation 费用按固定优先级统计：先使用请求已有的美元费用；"
+            "若没有美元费用但有 token usage，则使用仓库冻结价格按 input/output/"
+            "cache-read/cache-write 分桶补算，并标记 estimated。冻结价格包含 cache "
+            "rate 时采用 cache-aware 结果；缺少 cache rate 时保留 pricing engine 的 "
+            "cache-blind 上界及其 basis。若补算后仍没有美元费用，则从金额小计中忽略。",
+            f"- Selected generation 物理请求：{selected_cost_request_count}；"
+            f"exact={selected_cost_exact_request_count}、estimated="
+            f"{selected_cost_estimated_request_count}、recorded non-exact="
+            f"{selected_cost_recorded_non_exact_request_count}、ignored="
+            f"{selected_cost_ignored_request_count}。ignored 只表示未纳入小计，不是 "
+            "$0；相应 task/group 仍保留 `complete=false` 与 "
+            "`partial_excluding_unknown` 精度。",
             "- `actual-spend-ledger.jsonl` 从所有 wave 的 generation attempts "
             "与 Judge attempts 重建，"
             "失败或被替换 attempt 仍计入真实花费，复制到 repair row 的请求按物理回执去重。",

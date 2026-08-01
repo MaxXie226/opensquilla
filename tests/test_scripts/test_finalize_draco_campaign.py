@@ -53,7 +53,7 @@ def test_formal_model_thinking_levels_match_campaign_config(module) -> None:
 
 
 def test_finalizer_version_covers_canonical_usage_evidence(module) -> None:
-    assert module.FINALIZER_VERSION == 7
+    assert module.FINALIZER_VERSION == 8
 
 
 def test_legacy_managed_v3_source_requires_exact_external_identity(
@@ -6623,6 +6623,11 @@ def test_full_offline_finalization_is_atomic_and_preserves_contracts(
     assert "`research.perplexity.ai`" in report
     assert "只允许 non-BYOK" in report
     assert "response cache 关闭" in report
+    assert "Selected generation 费用按固定优先级统计" in report
+    assert "cache-read/cache-write 分桶补算" in report
+    assert "cache-aware 结果" in report
+    assert "cache-blind 上界" in report
+    assert "ignored 只表示未纳入小计，不是 $0" in report
     assert "Rubric 分项平均" in report
     assert "修复动作明细" in report
     proof = json.loads((output / "openrouter-non-byok-campaign-proof.json").read_text())
@@ -8096,6 +8101,128 @@ def test_estimated_generation_cost_is_in_total_but_not_exact_total(module) -> No
     assert summary["exact"] is False
     assert summary["complete"] is True
     assert audit["exact_pair_count"] == 0
+    assert audit["ignored_cost_request_count"] == 0
+    assert audit["reporting_policy"]["priority"] == [
+        "recorded_dollar_cost",
+        "frozen_cache_aware_token_estimate",
+        "exclude_unpriced_request",
+    ]
+
+
+def test_unknown_selected_request_is_ignored_without_erasing_known_subtotal(module) -> None:
+    pair = {"group": "B0", "task_id": "task-1"}
+    rows = [
+        {
+            **pair,
+            "quality_total": 80,
+            "usage": {},
+            "judge": {
+                "criterion_judgments": [{"met": True, "weight": 1}],
+                "judge_error_count": 0,
+            },
+        }
+    ]
+    ledger = [
+        {
+            "generation_disposition": "selected",
+            "group_task_pairs": [pair],
+            "recorded_cost_usd": "0.10",
+            "cost_precision": "exact",
+        },
+        {
+            "generation_disposition": "selected",
+            "group_task_pairs": [pair],
+            "recorded_cost_usd": "0.25",
+            "cost_precision": "estimated",
+        },
+        {
+            "generation_disposition": "selected",
+            "group_task_pairs": [pair],
+            "recorded_cost_usd": None,
+            "cost_precision": "unknown",
+        },
+    ]
+
+    summaries, audit = module.selected_generation_costs_from_ledger(rows, ledger)
+    summary = summaries["B0/task-1"]
+    assert summary["value"] == module.Decimal("0.35")
+    assert summary["recorded_cost_usd"] is None
+    assert summary["counted_cost_usd"] == "0.35"
+    assert summary["exact_cost_usd"] == "0.10"
+    assert summary["estimated_cost_usd"] == "0.25"
+    assert summary["ignored_cost_request_count"] == 1
+    assert summary["ignored_cost_requests_are_zero"] is False
+    assert summary["precision"] == "partial_excluding_unknown"
+    assert summary["complete"] is False
+    assert summary["exact"] is False
+    assert audit["counted_cost_usd"] == "0.35"
+    assert audit["known_cost_request_count"] == 2
+    assert audit["estimated_cost_request_count"] == 1
+    assert audit["ignored_cost_request_count"] == 1
+    assert audit["unknown_is_zero"] is False
+
+    metric = module.group_metrics(
+        rows,
+        selected_costs_by_pair=summaries,
+        groups=("B0",),
+    )[0]
+    assert metric["avg_selected_generation_cost_usd"] == "0.35"
+    assert metric["selected_generation_cost_usd"] == "0.35"
+    assert metric["selected_generation_cost_complete"] is False
+    assert metric["selected_generation_cost_covered_task_count"] == 1
+    assert metric["selected_generation_cost_exact_task_count"] == 0
+    assert metric["selected_generation_cost_ignored_request_count"] == 1
+    assert metric["selected_generation_cost_precision"] == "partial_excluding_unknown"
+
+
+def test_all_unknown_selected_requests_have_no_subtotal_and_are_not_zero_cost(module) -> None:
+    pair = {"group": "B0", "task_id": "task-1"}
+    rows = [
+        {
+            **pair,
+            "quality_total": 80,
+            "usage": {},
+            "judge": {
+                "criterion_judgments": [{"met": True, "weight": 1}],
+                "judge_error_count": 0,
+            },
+        }
+    ]
+    ledger = [
+        {
+            "generation_disposition": "selected",
+            "group_task_pairs": [pair],
+            "recorded_cost_usd": None,
+            "cost_precision": "unknown",
+        }
+    ]
+
+    summaries, audit = module.selected_generation_costs_from_ledger(rows, ledger)
+    summary = summaries["B0/task-1"]
+    assert summary["value"] is None
+    assert summary["recorded_cost_usd"] is None
+    assert summary["counted_cost_usd"] is None
+    assert summary["ignored_cost_request_count"] == 1
+    assert summary["ignored_cost_requests_are_zero"] is False
+    assert summary["complete"] is False
+    assert audit["counted_pair_count"] == 0
+    assert audit["counted_cost_usd"] is None
+    assert audit["known_cost_request_count"] == 0
+    assert audit["ignored_cost_request_count"] == 1
+    assert audit["unknown_is_zero"] is False
+
+    metric = module.group_metrics(
+        rows,
+        selected_costs_by_pair=summaries,
+        groups=("B0",),
+    )[0]
+    assert metric["avg_selected_generation_cost_usd"] is None
+    assert metric["selected_generation_cost_usd"] is None
+    assert metric["selected_generation_cost_counted_usd"] is None
+    assert metric["selected_generation_cost_covered_task_count"] == 0
+    assert metric["selected_generation_cost_complete"] is False
+    assert metric["selected_generation_cost_ignored_requests_are_zero"] is False
+    assert metric["selected_generation_cost_precision"] == "partial_excluding_unknown"
 
 
 def test_g1_plan_must_be_bound_to_frozen_registry(module, tmp_path: Path) -> None:
