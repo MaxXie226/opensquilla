@@ -9,6 +9,7 @@ import json
 import os
 import tempfile
 import time
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -16,7 +17,11 @@ from urllib.parse import quote
 
 import httpx
 
-from opensquilla.eval.draco_experiment_config import load_draco_experiment_config
+from opensquilla.eval.draco_experiment_config import (
+    DracoExperimentConfigBundle,
+    load_draco_experiment_config,
+    validate_formal_draco_credential_bindings,
+)
 from opensquilla.provider.compat_policy import (
     compat_policy_for_kind,
     model_matches_policy_prefix,
@@ -27,9 +32,9 @@ ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_EXPERIMENT_CONFIG_PATH = ROOT / "configs" / "benchmarks" / "draco_b2_g12.json"
 ROUTE_PREFLIGHT_SCHEMA = "opensquilla.openrouter-route-preflight/v3"
 FORMAL_GROUP_ORDER = ("B0", "B1", "B2", "B4", "G1")
-TASK_ANALYZER_MODEL = "anthropic/claude-opus-4.8"
+B0_MODEL = "anthropic/claude-opus-4.8"
 FIXED_GROUP_ROUTES = {
-    "B0": {TASK_ANALYZER_MODEL: "anthropic"},
+    "B0": {B0_MODEL: "anthropic"},
     "B4": {"openai/gpt-5.5": "openai"},
 }
 B2_EXPECTED_ROUTES = {
@@ -72,8 +77,16 @@ def formal_registry_snapshot(contract: Any) -> dict[str, Any]:
     raise ValueError("formal route preflight registry hash differs")
 
 
-def resolved_g1_contract(experiment_config: Path) -> tuple[Any, dict[str, Any]]:
-    config = load_draco_experiment_config(experiment_config).config
+def resolved_g1_contract(
+    experiment_config: Path,
+    *,
+    inline_overlay_json: str | None = None,
+) -> tuple[Any, dict[str, Any]]:
+    config = load_draco_experiment_config(
+        experiment_config,
+        inline_overlay_json=inline_overlay_json,
+    ).config
+    validate_formal_draco_credential_bindings(config)
     contract = config.g1_routing
     if contract is None:
         raise ValueError("formal route preflight requires g1_routing.expected_routes")
@@ -269,11 +282,32 @@ def parse_formal_groups(value: str) -> tuple[str, ...]:
     return groups
 
 
+def resolved_task_analyzer_policy(
+    ranking_resolution: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Derive the analyzer route only from the authenticated effective policy."""
+
+    from opensquilla.provider.ranking_router import task_analyzer_policy
+
+    effective = ranking_resolution.get("effective_config")
+    if not isinstance(effective, Mapping):
+        raise ValueError("formal route preflight lacks a frozen effective ranking config")
+    policy = task_analyzer_policy(effective)
+    if policy.get("provider") != "openrouter":
+        raise ValueError("formal route preflight task analyzer must use OpenRouter")
+    if policy.get("upstream_provider") == "auto":
+        raise ValueError(
+            "formal route preflight task analyzer upstream provider must be explicitly pinned"
+        )
+    return dict(policy)
+
+
 def required_fixed_route_specs(
     *,
     experiment: Any,
     groups: tuple[str, ...],
     proposer_required_parameters: dict[str, set[str]],
+    ranking_resolution: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, str], dict[str, set[str]]]:
     routes: dict[str, str] = {}
     parameters: dict[str, set[str]] = {}
@@ -295,8 +329,15 @@ def required_fixed_route_specs(
             add(model, provider, set(B2_REQUIRED_PARAMETERS[model]))
     if "G1" in groups:
         judge_model = str(experiment.judge.model).strip().lower()
+        if judge_model != "google/gemini-3.1-pro-preview":
+            raise ValueError(
+                "formal route preflight currently requires the frozen Gemini Judge model"
+            )
+        analyzer_policy = resolved_task_analyzer_policy(
+            ranking_resolution or effective_ranking_resolution(experiment)
+        )
         for model, provider in {
-            TASK_ANALYZER_MODEL: "anthropic",
+            str(analyzer_policy["model"]): str(analyzer_policy["upstream_provider"]),
             judge_model: "google-ai-studio",
         }.items():
             if model not in proposer_required_parameters:
@@ -305,15 +346,80 @@ def required_fixed_route_specs(
     return dict(sorted(routes.items())), {model: parameters[model] for model in sorted(parameters)}
 
 
-def required_role_capacity(experiment: Any, groups: tuple[str, ...]) -> tuple[int, int]:
+def effective_ranking_resolution(experiment: Any) -> dict[str, Any]:
+    """Resolve the immutable ranking policy used by the runner and finalizer."""
+
+    from opensquilla.provider.ranking_router import ranking_config_resolution
+
+    resolution = ranking_config_resolution(
+        override=(experiment.router_dynamic_ranking_override or None),
+    )
+    contract = experiment.g1_routing
+    if contract is None:
+        return resolution
+    base = resolution.get("base_config")
+    if not isinstance(base, Mapping):
+        raise ValueError("formal route preflight lacks a frozen baseline ranking config")
+    if (
+        base.get("schema_version") != contract.expected_ranking_config_schema_version
+        or base.get("config_version") != contract.expected_ranking_config_version
+        or resolution.get("base_sha256") != contract.expected_ranking_config_sha256
+    ):
+        raise ValueError(
+            "formal route preflight baseline ranking config differs from the G1 contract"
+        )
+    if _effective_proposer_max(base) != contract.expected_proposer_count_max:
+        raise ValueError(
+            "formal route preflight baseline proposer maximum differs from the G1 contract"
+        )
+    return resolution
+
+
+def _effective_proposer_max(ranking_config: Mapping[str, Any]) -> int:
+    proposer_count = ranking_config.get("proposer_count")
+    by_tier = proposer_count.get("by_tier") if isinstance(proposer_count, Mapping) else None
+    high_risk = proposer_count.get("high_risk") if isinstance(proposer_count, Mapping) else None
+    try:
+        return max(
+            *(int(row["max"]) for row in by_tier.values() if isinstance(row, Mapping)),
+            int(high_risk["max"]),
+        )
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        raise ValueError("frozen ranking proposer bounds are malformed") from exc
+
+
+def _effective_backup_count(ranking_config: Mapping[str, Any]) -> int:
+    proposer_count = ranking_config.get("proposer_count")
+    raw = proposer_count.get("backup_count") if isinstance(proposer_count, Mapping) else None
+    if isinstance(raw, bool) or not isinstance(raw, int) or not 0 <= raw <= 2:
+        raise ValueError("frozen ranking proposer backup_count must be between 0 and 2")
+    return raw
+
+
+def required_role_capacity(
+    experiment: Any,
+    groups: tuple[str, ...],
+    *,
+    ranking_resolution: Mapping[str, Any] | None = None,
+) -> tuple[int, int]:
     if "G1" not in groups:
         return 0, 0
     g1 = experiment.g1_routing
     if g1 is None:
         raise ValueError("formal route preflight requires a G1 routing contract")
+    resolution = (
+        dict(ranking_resolution)
+        if ranking_resolution is not None
+        else effective_ranking_resolution(experiment)
+    )
+    ranking_config = resolution.get("effective_config")
+    if not isinstance(ranking_config, Mapping):
+        raise ValueError("formal route preflight lacks a frozen effective ranking config")
+    proposer_max = _effective_proposer_max(ranking_config)
+    backup_count = _effective_backup_count(ranking_config)
     proposer_count = (
-        int(g1.expected_proposer_count_max)
-        + int(experiment.ensemble.proposer_backup_count)
+        proposer_max
+        + backup_count
         + int(experiment.ensemble.aggregator_recovery_top_k)
     )
     return proposer_count, int(experiment.ensemble.aggregator_recovery_top_k)
@@ -484,23 +590,92 @@ def recompute_model_endpoint_compatibility(
     return operational_count, compatible_count
 
 
-def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+def atomic_write_json(path: Path, payload: dict[str, Any]) -> tuple[int, int]:
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    fd, temporary_raw = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(temporary_raw)
+    identity: tuple[int, int] | None = None
     try:
-        os.fchmod(fd, 0o600)
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
             json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
-    except BaseException:
+        temporary_stat = os.stat(temporary, follow_symlinks=False)
+        identity = (temporary_stat.st_dev, temporary_stat.st_ino)
+        os.link(temporary, path, follow_symlinks=False)
+    finally:
+        if fd >= 0:
+            os.close(fd)
         try:
             os.unlink(temporary)
         except FileNotFoundError:
             pass
+    if identity is None:
+        raise RuntimeError("atomic JSON writer did not capture its temporary file identity")
+    return identity
+
+
+def atomic_write_json_bundle(entries: list[tuple[Path, dict[str, Any]]]) -> None:
+    published: list[tuple[Path, tuple[int, int]]] = []
+    try:
+        for path, payload in entries:
+            identity = atomic_write_json(path, payload)
+            published.append((path, identity))
+    except BaseException:
+        for path, identity in reversed(published):
+            try:
+                current = os.stat(path, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if (current.st_dev, current.st_ino) == identity:
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
         raise
+
+
+def effective_experiment_config_path(output: Path) -> Path:
+    return output.with_suffix(".experiment-config.effective.json")
+
+
+def experiment_config_evidence(
+    bundle: DracoExperimentConfigBundle,
+    *,
+    effective_path: Path,
+) -> dict[str, Any]:
+    effective_config = bundle.config.model_dump(mode="json")
+    provenance = bundle.provenance()
+    base_provenance = provenance["base"]
+    inline_overlay = provenance["inline_overlay"]
+    inline_overrides = provenance["inline_overrides"]
+    return {
+        "path": str(base_provenance["path"]),
+        "sha256": str(base_provenance["sha256"]),
+        "provenance": provenance,
+        "inline_overlay_present": bool(inline_overlay["present"]),
+        "inline_overlay_field_paths": list(inline_overlay["field_paths"]),
+        "inline_override_count": int(inline_overrides["count"]),
+        "inline_override_paths": list(inline_overrides["paths"]),
+        "effective_config": {
+            "path": str(effective_path.expanduser().resolve()),
+            "sha256": canonical_sha256(effective_config),
+        },
+        "g1_routing_profile_id": (
+            bundle.config.g1_routing.profile_id
+            if bundle.config.g1_routing is not None
+            else None
+        ),
+        "source_registry_snapshot_version": (
+            bundle.config.g1_routing.source_registry_snapshot_version
+            if bundle.config.g1_routing is not None
+            else None
+        ),
+    }
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -513,9 +688,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         default=DEFAULT_EXPERIMENT_CONFIG_PATH,
     )
+    parser.add_argument(
+        "--experiment-config-override-json",
+        help="Sparse experiment JSON merged after the base config before preflight.",
+    )
     args = parser.parse_args(argv)
     if args.output.exists():
         parser.error(f"refusing to overwrite route preflight evidence: {args.output}")
+    effective_path = effective_experiment_config_path(args.output)
+    if effective_path.exists():
+        parser.error(
+            "refusing to overwrite route preflight effective config: "
+            f"{effective_path}"
+        )
     try:
         args.groups = parse_formal_groups(args.groups)
     except ValueError as exc:
@@ -543,10 +728,22 @@ def saved_endpoint_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def main() -> int:
     args = parse_args()
 
-    experiment = load_draco_experiment_config(args.experiment_config).config
-    resolved_contract = (
-        resolved_g1_contract(args.experiment_config)[1] if args.scope == "formal" else None
+    experiment_bundle = load_draco_experiment_config(
+        args.experiment_config,
+        inline_overlay_json=args.experiment_config_override_json,
     )
+    experiment = experiment_bundle.config
+    validate_formal_draco_credential_bindings(experiment)
+    effective_config_path = effective_experiment_config_path(args.output)
+    resolved_contract = (
+        resolved_g1_contract(
+            args.experiment_config,
+            inline_overlay_json=args.experiment_config_override_json,
+        )[1]
+        if args.scope == "formal"
+        else None
+    )
+    ranking_resolution = effective_ranking_resolution(experiment)
     expected_routes = (
         dict(resolved_contract["expected_routes"])
         if resolved_contract is not None
@@ -576,12 +773,16 @@ def main() -> int:
     )
     fixed_routes: dict[str, str] = {}
     fixed_parameters: dict[str, set[str]] = {}
+    analyzer_policy: dict[str, Any] | None = None
     if args.scope == "formal":
         fixed_routes, fixed_parameters = required_fixed_route_specs(
             experiment=experiment,
             groups=args.groups,
             proposer_required_parameters=proposer_required_parameters,
+            ranking_resolution=ranking_resolution,
         )
+        if "G1" in args.groups:
+            analyzer_policy = resolved_task_analyzer_policy(ranking_resolution)
 
     with httpx.Client(
         timeout=httpx.Timeout(20.0),
@@ -780,7 +981,9 @@ def main() -> int:
     unavailable_models = sorted(set(expected_routes) - set(proposer_compatible_models))
     aggregator_ineligible_models = sorted(set(expected_routes) - set(aggregator_compatible_models))
     required_proposer_count, required_aggregator_count = required_role_capacity(
-        experiment, args.groups
+        experiment,
+        args.groups,
+        ranking_resolution=ranking_resolution,
     )
     if candidate_scope == "exact_routes":
         required_proposer_count = len(expected_routes)
@@ -805,20 +1008,11 @@ def main() -> int:
         "candidate_policy": candidate_policy,
         "expected_routes": expected_routes,
         "expected_routes_sha256": canonical_sha256(expected_routes),
-        "experiment_config": {
-            "path": str(args.experiment_config.expanduser().resolve()),
-            "sha256": hashlib.sha256(
-                args.experiment_config.expanduser().resolve().read_bytes()
-            ).hexdigest(),
-            "g1_routing_profile_id": (
-                experiment.g1_routing.profile_id if experiment.g1_routing is not None else None
-            ),
-            "source_registry_snapshot_version": (
-                experiment.g1_routing.source_registry_snapshot_version
-                if experiment.g1_routing is not None
-                else None
-            ),
-        },
+        "experiment_config": experiment_config_evidence(
+            experiment_bundle,
+            effective_path=effective_config_path,
+        ),
+        "ranking_config_resolution": ranking_resolution,
         "required_parameters_sha256": canonical_sha256(
             {
                 model: sorted(parameters)
@@ -847,6 +1041,7 @@ def main() -> int:
         }
         evidence.update(
             {
+                "task_analyzer": analyzer_policy,
                 "groups": list(args.groups),
                 "availability_policy": (
                     "registry_capacity"
@@ -879,7 +1074,12 @@ def main() -> int:
                 "fixed_routes_pass": True,
             }
         )
-    atomic_write_json(args.output, evidence)
+    atomic_write_json_bundle(
+        [
+            (effective_config_path, experiment.model_dump(mode="json")),
+            (args.output, evidence),
+        ]
+    )
     if not candidate_capacity_pass:
         raise SystemExit(
             "OpenRouter dynamic route capacity is insufficient: "

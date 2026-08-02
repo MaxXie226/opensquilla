@@ -6,7 +6,6 @@ umask 077
 readonly EXPECTED_INPUT_SHA256="1eb4e618c8df8e7f68bded3d2b6f77a541744aa1072eb338835b776183188a8d"
 readonly SUPPORTED_DRACO_GROUPS="B0,B1,B2,B4,G1"
 readonly DEFAULT_DRACO_GROUPS="$SUPPORTED_DRACO_GROUPS"
-readonly BLOCKED_DOMAINS="hf.co,huggingface.co,datasets-server.huggingface.co,github.com,raw.githubusercontent.com,openrouter.ai,perplexity.ai,research.perplexity.ai"
 readonly ACCOUNT_SETTLEMENT_MIN_SECONDS=180
 readonly ACCOUNT_SETTLEMENT_STABLE_POLLS=6
 readonly ACCOUNT_SETTLEMENT_POLL_SECONDS=15
@@ -20,6 +19,7 @@ Usage:
     [--output-name NEW_DIRECTORY_NAME]
     [--prior-account-window-dir ABORTED_CAMPAIGN_ACCOUNT_DIR]
     [--groups CANONICAL_GROUP_SUBSET]
+    [--experiment-config-override-json JSON_OBJECT]
 
 By default, output is a new direct child of:
   SNAPSHOT_REPO/reports/draco
@@ -32,7 +32,9 @@ Environment overrides:
                                   and .local-state/config.toml
   DRACO_CAMPAIGN_PYTHON           Python executable (default:
                                   SNAPSHOT_REPO/.venv/bin/python)
-  DRACO_CAMPAIGN_TASK_CONCURRENCY Generation task concurrency (default: 5)
+  DRACO_CAMPAIGN_TASK_CONCURRENCY Explicit high-priority generation concurrency.
+                                  When unset, runner.concurrency is read from the
+                                  effective experiment JSON.
 EOF
 }
 
@@ -76,14 +78,21 @@ validate_draco_groups() {
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SNAPSHOT_REPO="${DRACO_CAMPAIGN_SNAPSHOT_REPO:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
-TASK_CONCURRENCY="${DRACO_CAMPAIGN_TASK_CONCURRENCY:-5}"
-if [[ ! "$TASK_CONCURRENCY" =~ ^[1-9][0-9]*$ ]]; then
-  echo "DRACO_CAMPAIGN_TASK_CONCURRENCY must be a positive integer" >&2
-  exit 2
+TASK_CONCURRENCY_OVERRIDE_PRESENT=0
+TASK_CONCURRENCY_OVERRIDE=""
+if [[ "${DRACO_CAMPAIGN_TASK_CONCURRENCY+x}" == "x" ]]; then
+  TASK_CONCURRENCY_OVERRIDE_PRESENT=1
+  TASK_CONCURRENCY_OVERRIDE="$DRACO_CAMPAIGN_TASK_CONCURRENCY"
+  if [[ ! "$TASK_CONCURRENCY_OVERRIDE" =~ ^[1-9][0-9]*$ ]]; then
+    echo "DRACO_CAMPAIGN_TASK_CONCURRENCY must be a positive integer" >&2
+    exit 2
+  fi
 fi
-readonly TASK_CONCURRENCY
+readonly TASK_CONCURRENCY_OVERRIDE_PRESENT TASK_CONCURRENCY_OVERRIDE
 DRACO_GROUPS="$DEFAULT_DRACO_GROUPS"
 OUTPUT_NAME="${DRACO_CAMPAIGN_OUTPUT_NAME:-}"
+EXPERIMENT_CONFIG_OVERRIDE_JSON=""
+EXPERIMENT_CONFIG_OVERRIDE_JSON_PRESENT=0
 PRIOR_ACCOUNT_WINDOW_SOURCES=()
 if [[ -n "${DRACO_CAMPAIGN_PRIOR_ACCOUNT_WINDOW_DIR:-}" ]]; then
   PRIOR_ACCOUNT_WINDOW_SOURCES+=("$DRACO_CAMPAIGN_PRIOR_ACCOUNT_WINDOW_DIR")
@@ -111,6 +120,12 @@ while [[ "$#" -gt 0 ]]; do
       DRACO_GROUPS="$2"
       shift 2
       ;;
+    --experiment-config-override-json)
+      [[ "$#" -ge 2 ]] || { usage; exit 2; }
+      EXPERIMENT_CONFIG_OVERRIDE_JSON="$2"
+      EXPERIMENT_CONFIG_OVERRIDE_JSON_PRESENT=1
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -128,14 +143,6 @@ readonly DRACO_GROUPS
 DRACO_GROUP_SLUG="${DRACO_GROUPS,,}"
 DRACO_GROUP_SLUG="${DRACO_GROUP_SLUG//,/-}"
 readonly DRACO_GROUP_SLUG
-if [[ -z "$OUTPUT_NAME" ]]; then
-  OUTPUT_NAME="draco-mini-${DRACO_GROUP_SLUG}-c${TASK_CONCURRENCY}-j6-a3-$(date +%Y%m%d-%H%M%S)"
-fi
-
-if [[ ! "$OUTPUT_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
-  echo "--output-name must be one safe path component" >&2
-  exit 2
-fi
 
 SNAPSHOT_REPO="$(realpath "$SNAPSHOT_REPO")"
 REPORT_ROOT="${DRACO_CAMPAIGN_REPORT_ROOT:-$SNAPSHOT_REPO/reports/draco}"
@@ -145,9 +152,6 @@ REFERENCE_REPO="$(realpath "$REFERENCE_REPO")"
 INPUT="$REFERENCE_REPO/data/draco/mini.jsonl"
 CONFIG="$REFERENCE_REPO/.local-state/config.toml"
 readonly REPORT_ROOT REFERENCE_REPO INPUT CONFIG
-OUTPUT_DIR="$REPORT_ROOT/$OUTPUT_NAME"
-ARCHIVE_DIR="$OUTPUT_DIR/archive"
-FINAL_OUTPUT_DIR="$OUTPUT_DIR/.formal-results"
 EXPERIMENT_CONFIG="$SNAPSHOT_REPO/configs/benchmarks/draco_b2_g12.json"
 PYTHON="${DRACO_CAMPAIGN_PYTHON:-$SNAPSHOT_REPO/.venv/bin/python}"
 MAIN_RUNNER="$SNAPSHOT_REPO/scripts/run_draco_routing_experiment.py"
@@ -192,6 +196,62 @@ if [[ -n "$(git -C "$SNAPSHOT_REPO" status --porcelain=v1 --untracked-files=all)
   echo "Formal campaign requires a completely clean source snapshot" >&2
   exit 2
 fi
+
+# Resolve the same sparse overlay before creating output paths. This keeps the
+# campaign label, finalizer contract, and runner concurrency aligned with the
+# effective experiment config. The legacy environment variable remains an
+# explicit high-priority input, but an unset variable never masks inline JSON.
+if ! EFFECTIVE_CONFIG_RUNTIME_VALUES="$(
+  "$PYTHON" -c '
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+from opensquilla.eval.draco_experiment_config import load_draco_experiment_config
+
+bundle = load_draco_experiment_config(
+    Path(sys.argv[2]),
+    inline_overlay_json=(sys.argv[3] if sys.argv[4] == "1" else None),
+)
+config = bundle.config
+print(
+    f"{config.runner.concurrency}\t"
+    f"{config.judge.concurrency}\t"
+    f"{config.generation.max_attempts}"
+)
+' "$SNAPSHOT_REPO/src" "$EXPERIMENT_CONFIG" \
+  "$EXPERIMENT_CONFIG_OVERRIDE_JSON" "$EXPERIMENT_CONFIG_OVERRIDE_JSON_PRESENT"
+)"; then
+  echo "Unable to resolve the effective DRACO experiment config" >&2
+  exit 2
+fi
+IFS=$'\t' read -r CONFIG_TASK_CONCURRENCY JUDGE_CONCURRENCY \
+  GENERATION_MAX_ATTEMPTS <<<"$EFFECTIVE_CONFIG_RUNTIME_VALUES"
+if [[
+  ! "$CONFIG_TASK_CONCURRENCY" =~ ^[1-9][0-9]*$
+  || ! "$JUDGE_CONCURRENCY" =~ ^[1-9][0-9]*$
+  || ! "$GENERATION_MAX_ATTEMPTS" =~ ^[1-9][0-9]*$
+]]; then
+  echo "Effective DRACO runtime values are invalid" >&2
+  exit 2
+fi
+TASK_CONCURRENCY="$CONFIG_TASK_CONCURRENCY"
+if [[ "$TASK_CONCURRENCY_OVERRIDE_PRESENT" == "1" ]]; then
+  TASK_CONCURRENCY="$TASK_CONCURRENCY_OVERRIDE"
+fi
+readonly TASK_CONCURRENCY JUDGE_CONCURRENCY GENERATION_MAX_ATTEMPTS
+
+if [[ -z "$OUTPUT_NAME" ]]; then
+  OUTPUT_NAME="draco-mini-${DRACO_GROUP_SLUG}-c${TASK_CONCURRENCY}-j${JUDGE_CONCURRENCY}-a${GENERATION_MAX_ATTEMPTS}-$(date +%Y%m%d-%H%M%S)"
+fi
+if [[ ! "$OUTPUT_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+  echo "--output-name must be one safe path component" >&2
+  exit 2
+fi
+OUTPUT_DIR="$REPORT_ROOT/$OUTPUT_NAME"
+ARCHIVE_DIR="$OUTPUT_DIR/archive"
+FINAL_OUTPUT_DIR="$OUTPUT_DIR/.formal-results"
+readonly OUTPUT_DIR ARCHIVE_DIR FINAL_OUTPUT_DIR
 
 if [[ "$(sha256sum "$INPUT" | awk '{print $1}')" != "$EXPECTED_INPUT_SHA256" ]]; then
   echo "DRACO mini input hash does not match the frozen 10-task set" >&2
@@ -318,32 +378,17 @@ COMMON_ARGS=(
   --experiment-config "$EXPERIMENT_CONFIG"
   --groups "$DRACO_GROUPS"
   --max-tasks 10
-  --concurrency "$TASK_CONCURRENCY"
-  --timeout 10800
-  --ensemble-proposer-timeout 907.5
-  --ensemble-aggregator-timeout 2662.5
-  --runner-mode agent_loop
-  --agent-max-iterations 20
-  --judge-model google/gemini-3.1-pro-preview
-  --judge-repeats 3
-  --judge-concurrency 6
-  --judge-max-attempts 3
-  --generation-max-attempts 3
-  --generation-max-tokens 16384
-  --generation-retry-backoff 2
-  --tool-mode local_web_tools
-  --local-web-search-provider brave
-  --local-web-search-api-key-env BRAVE_SEARCH_API_KEY
-  --contamination-blocked-domains "$BLOCKED_DOMAINS"
-  --experiment-config-set timeouts.task_seconds=10800
-  --experiment-config-set runner.agent_max_iterations=20
-  --experiment-config-set "runner.concurrency=$TASK_CONCURRENCY"
-  --experiment-config-set judge.concurrency=6
-  --experiment-config-set ensemble.aggregator_recovery_mode=experiment
-  --experiment-config-set ensemble.aggregator_recovery_top_k=3
-  --experiment-config-set ensemble.aggregator_max_tokens_cap=65536
-  --experiment-config-set ensemble.aggregator_visible_answer_reserve_tokens=8192
 )
+if [[ "$EXPERIMENT_CONFIG_OVERRIDE_JSON_PRESENT" == "1" ]]; then
+  COMMON_ARGS+=(
+    --experiment-config-override-json "$EXPERIMENT_CONFIG_OVERRIDE_JSON"
+  )
+fi
+if [[ "$TASK_CONCURRENCY_OVERRIDE_PRESENT" == "1" ]]; then
+  COMMON_ARGS+=(
+    --experiment-config-set "runner.concurrency=$TASK_CONCURRENCY"
+  )
+fi
 
 RESULT_JSONLS=()
 MANIFESTS=()
@@ -1063,6 +1108,23 @@ manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 compatibility = manifest.get("run_compatibility")
 if not isinstance(compatibility, dict):
     raise SystemExit("compatibility manifest lacks run_compatibility")
+contracts = compatibility.get("contracts")
+if not isinstance(contracts, dict):
+    raise SystemExit("compatibility manifest lacks authenticated contracts")
+generation_attempt_limits = {}
+for group in groups:
+    contract = contracts.get(group)
+    generation = contract.get("generation") if isinstance(contract, dict) else None
+    limit = generation.get("max_attempts") if isinstance(generation, dict) else None
+    if (
+        isinstance(limit, bool)
+        or not isinstance(limit, int)
+        or not 1 <= limit <= module.GENERATION_MAX_ATTEMPTS
+    ):
+        raise SystemExit(
+            f"compatibility contract for {group} has an invalid generation attempt limit"
+        )
+    generation_attempt_limits[group] = limit
 
 states, audit = module.load_resume_group_task_states(
     resume_paths=result_paths,
@@ -1093,7 +1155,7 @@ for group, task_id in sorted(selected):
         campaign_proof_only.append({"group": group, "task_id": task_id})
     elif not state["generation_valid"]:
         target = {"group": group, "task_id": task_id, "action": "regenerate"}
-        if prior_used < 3:
+        if prior_used < generation_attempt_limits[group]:
             actionable.append(target)
         else:
             budget_exhausted.append(target)
@@ -1198,9 +1260,18 @@ validate_lock_file
   --repo "$SNAPSHOT_REPO"
 
 ROUTE_EVIDENCE="$ARCHIVE_DIR/preflight/openrouter-route-preflight.json"
-"$PYTHON" "$ROUTE_PREFLIGHT" "$ROUTE_EVIDENCE" \
-  --scope formal \
-  --groups "$DRACO_GROUPS" >/dev/null
+ROUTE_PREFLIGHT_ARGS=(
+  "$ROUTE_EVIDENCE"
+  --scope formal
+  --groups "$DRACO_GROUPS"
+  --experiment-config "$EXPERIMENT_CONFIG"
+)
+if [[ "$EXPERIMENT_CONFIG_OVERRIDE_JSON_PRESENT" == "1" ]]; then
+  ROUTE_PREFLIGHT_ARGS+=(
+    --experiment-config-override-json "$EXPERIMENT_CONFIG_OVERRIDE_JSON"
+  )
+fi
+"$PYTHON" "$ROUTE_PREFLIGHT" "${ROUTE_PREFLIGHT_ARGS[@]}" >/dev/null
 
 STATIC_DIR="$ARCHIVE_DIR/preflight/static"
 mkdir "$STATIC_DIR"
@@ -1290,13 +1361,23 @@ done
 capture_stable_after
 ACCOUNT_WINDOW_OPEN=0
 
+# Reclassify after the final resume wave.  The per-wave gate is intentionally
+# computed before each wave to select its work; it cannot describe attempts
+# consumed by that wave and therefore must not drive the terminal decision.
+FINAL_ACTIONABLE_KEYS="$ARCHIVE_DIR/gates/final-actionable.jsonl"
+FINAL_GATE_SUMMARY="$ARCHIVE_DIR/gates/final-summary.json"
+write_actionable_keys \
+  "$FINAL_ACTIONABLE_KEYS" \
+  "$FINAL_GATE_SUMMARY" \
+  "${RESULT_JSONLS[@]}"
+
 # A model-attempt budget exhaustion cannot be repaired by the offline
 # finalizer.  Persist a machine-readable terminal disposition and stop before
 # running a finalizer that is guaranteed to reject the incomplete pair.
 if jq -e '
   (.generation_budget_exhausted_pair_count // 0) > 0
   or (.judge_budget_exhausted_pair_count // 0) > 0
-' "$GATE_SUMMARY" >/dev/null; then
+' "$FINAL_GATE_SUMMARY" >/dev/null; then
   FINALIZATION_STATUS_TMP="$ARCHIVE_DIR/.finalization-status.json.tmp-$$"
   if "$PYTHON" "$RECOVERY_STATUS" status "$OUTPUT_DIR" \
       >"$FINALIZATION_STATUS_TMP"; then
@@ -1328,8 +1409,9 @@ FINALIZER_ARGS=(
   --lock-fd 9
   --output-dir "$FINAL_OUTPUT_DIR"
   --groups "$DRACO_GROUPS"
-  --max-generation-attempts 3
+  --max-generation-attempts "$GENERATION_MAX_ATTEMPTS"
   --expected-task-concurrency "$TASK_CONCURRENCY"
+  --expected-judge-concurrency "$JUDGE_CONCURRENCY"
 )
 for prior_account_window_dir in "${PRIOR_ACCOUNT_WINDOW_DIRS[@]}"; do
   FINALIZER_ARGS+=(--prior-account-window-dir "$prior_account_window_dir")

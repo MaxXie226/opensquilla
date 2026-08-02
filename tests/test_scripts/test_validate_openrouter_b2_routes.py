@@ -100,6 +100,179 @@ def test_formal_scope_is_default(tmp_path: Path) -> None:
     assert args.scope == "formal"
     assert args.groups == validator.FORMAL_GROUP_ORDER
     assert args.experiment_config == validator.DEFAULT_EXPERIMENT_CONFIG_PATH
+    assert args.experiment_config_override_json is None
+
+
+def test_inline_experiment_override_reaches_frozen_ranking_resolution(
+    tmp_path: Path,
+) -> None:
+    raw_overlay = json.dumps(
+        {
+            "router_dynamic_ranking_override": {
+                "proposer_count": {"backup_count": 1}
+            }
+        }
+    )
+    args = validator.parse_args(
+        [
+            str(tmp_path / "evidence.json"),
+            "--experiment-config-override-json",
+            raw_overlay,
+        ]
+    )
+    experiment, _ = validator.resolved_g1_contract(
+        validator.DEFAULT_EXPERIMENT_CONFIG_PATH,
+        inline_overlay_json=args.experiment_config_override_json,
+    )
+    resolution = validator.effective_ranking_resolution(experiment)
+
+    assert resolution["effective_config"]["proposer_count"]["backup_count"] == 1
+    assert validator.required_role_capacity(
+        experiment,
+        ("G1",),
+        ranking_resolution=resolution,
+    ) == (9, 3)
+
+
+def test_preflight_experiment_evidence_uses_hashes_and_private_effective_config(
+    tmp_path: Path,
+) -> None:
+    marker = "preflight-inline-secret-marker"
+    bundle = load_draco_experiment_config(
+        validator.DEFAULT_EXPERIMENT_CONFIG_PATH,
+        inline_overlay_json=json.dumps(
+            {
+                "reference": {"repository": marker},
+                "generation": {"max_attempts": 2},
+            }
+        ),
+    )
+    output = tmp_path / "route-preflight.json"
+    effective_path = validator.effective_experiment_config_path(output)
+    validator.atomic_write_json(
+        effective_path,
+        bundle.config.model_dump(mode="json"),
+    )
+
+    evidence = validator.experiment_config_evidence(
+        bundle,
+        effective_path=effective_path,
+    )
+    serialized = json.dumps(evidence, ensure_ascii=False)
+
+    assert marker not in serialized
+    assert "inline_overlay" not in evidence
+    assert "inline_overlay_sha256" not in evidence
+    assert bundle.inline_overlay_sha256 not in serialized
+    assert evidence["inline_overlay_present"] is True
+    assert evidence["inline_overlay_field_paths"] == [
+        "generation.max_attempts",
+        "reference.repository",
+    ]
+    assert evidence["inline_override_count"] == 0
+    assert evidence["inline_override_paths"] == []
+    assert evidence["effective_config"]["path"] == str(effective_path.resolve())
+    assert effective_path.stat().st_mode & 0o777 == 0o600
+
+
+def test_atomic_write_json_does_not_overwrite_a_racing_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "route-preflight.json"
+    sentinel = b"racing-writer-won\n"
+    real_link = validator.os.link
+
+    def racing_link(source, destination, *, follow_symlinks=True):
+        Path(destination).write_bytes(sentinel)
+        return real_link(
+            source,
+            destination,
+            follow_symlinks=follow_symlinks,
+        )
+
+    monkeypatch.setattr(validator.os, "link", racing_link)
+
+    with pytest.raises(FileExistsError):
+        validator.atomic_write_json(output, {"new": "payload"})
+
+    assert output.read_bytes() == sentinel
+    assert not list(tmp_path.glob(f".{output.name}.*"))
+
+
+def test_atomic_write_json_bundle_rolls_back_only_its_earlier_publication(
+    tmp_path: Path,
+) -> None:
+    effective = tmp_path / "route-preflight.experiment-config.effective.json"
+    evidence = tmp_path / "route-preflight.json"
+    sentinel = b"preexisting-evidence\n"
+    evidence.write_bytes(sentinel)
+
+    with pytest.raises(FileExistsError):
+        validator.atomic_write_json_bundle(
+            [
+                (effective, {"effective": True}),
+                (evidence, {"evidence": True}),
+            ]
+        )
+
+    assert not effective.exists()
+    assert evidence.read_bytes() == sentinel
+    assert not list(tmp_path.glob(".*"))
+
+
+def test_atomic_write_json_bundle_does_not_remove_a_replaced_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    effective = tmp_path / "route-preflight.experiment-config.effective.json"
+    evidence = tmp_path / "route-preflight.json"
+    replacement = b"replacement-from-racing-writer\n"
+    real_atomic_write = validator.atomic_write_json
+    calls = 0
+
+    def replace_then_fail(path: Path, payload: dict[str, object]):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return real_atomic_write(path, payload)
+        effective.unlink()
+        effective.write_bytes(replacement)
+        raise RuntimeError("injected second-publication failure")
+
+    monkeypatch.setattr(validator, "atomic_write_json", replace_then_fail)
+
+    with pytest.raises(RuntimeError, match="injected second-publication failure"):
+        validator.atomic_write_json_bundle(
+            [
+                (effective, {"effective": True}),
+                (evidence, {"evidence": True}),
+            ]
+        )
+
+    assert effective.read_bytes() == replacement
+    assert not evidence.exists()
+
+
+def test_formal_route_contract_rejects_credentialed_member_url() -> None:
+    marker = "url-secret-marker"
+    with pytest.raises(ValueError, match=r"ensemble\.aggregator\.base_url") as error:
+        validator.resolved_g1_contract(
+            validator.DEFAULT_EXPERIMENT_CONFIG_PATH,
+            inline_overlay_json=json.dumps(
+                {
+                    "ensemble": {
+                        "aggregator": {
+                            "base_url": (
+                                f"https://user:{marker}@openrouter.ai/api/v1?token={marker}"
+                            )
+                        }
+                    }
+                }
+            ),
+        )
+
+    assert marker not in str(error.value)
 
 
 def test_formal_groups_require_a_canonical_subset() -> None:
@@ -459,3 +632,136 @@ def test_g1_v3_capacity_and_fixed_routes_are_derived_from_config() -> None:
         fixed_parameters["anthropic/claude-opus-4.8"]
         == (proposer_required["anthropic/claude-opus-4.8"])
     )
+
+
+def test_g1_fixed_analyzer_route_uses_effective_policy_and_b0_stays_fixed() -> None:
+    experiment = load_draco_experiment_config(
+        validator.DEFAULT_EXPERIMENT_CONFIG_PATH,
+        inline_overlay_json=json.dumps(
+            {
+                "router_dynamic_ranking_override": {
+                    "task_analyzer": {
+                        "model": "z-ai/glm-5.2",
+                        "upstream_provider": "z-ai",
+                        "max_retries": 1,
+                    }
+                }
+            }
+        ),
+    ).config
+    resolution = validator.effective_ranking_resolution(experiment)
+    proposer_required = validator.formal_proposer_required_parameters(
+        validator.FORMAL_EXPECTED_ROUTES
+    )
+
+    g1_routes, _ = validator.required_fixed_route_specs(
+        experiment=experiment,
+        groups=("G1",),
+        proposer_required_parameters=proposer_required,
+        ranking_resolution=resolution,
+    )
+    b0_routes, _ = validator.required_fixed_route_specs(
+        experiment=experiment,
+        groups=("B0",),
+        proposer_required_parameters=proposer_required,
+        ranking_resolution=resolution,
+    )
+
+    assert validator.resolved_task_analyzer_policy(resolution) == {
+        **validator.resolved_task_analyzer_policy(resolution),
+        "model": "z-ai/glm-5.2",
+        "upstream_provider": "z-ai",
+        "max_retries": 1,
+    }
+    assert g1_routes["z-ai/glm-5.2"] == "z-ai"
+    assert "anthropic/claude-opus-4.8" not in g1_routes
+    assert b0_routes == {"anthropic/claude-opus-4.8": "anthropic"}
+
+
+def test_formal_route_preflight_rejects_auto_task_analyzer_upstream() -> None:
+    experiment = load_draco_experiment_config(
+        validator.DEFAULT_EXPERIMENT_CONFIG_PATH,
+        inline_overlay_json=json.dumps(
+            {
+                "router_dynamic_ranking_override": {
+                    "task_analyzer": {"upstream_provider": "auto"}
+                }
+            }
+        ),
+    ).config
+    resolution = validator.effective_ranking_resolution(experiment)
+
+    with pytest.raises(ValueError, match="must be explicitly pinned"):
+        validator.resolved_task_analyzer_policy(resolution)
+
+
+def test_formal_route_preflight_rejects_custom_judge_without_explicit_pin_contract() -> None:
+    experiment = load_draco_experiment_config(
+        validator.DEFAULT_EXPERIMENT_CONFIG_PATH,
+        inline_overlay_json=json.dumps({"judge": {"model": "openai/gpt-5.5"}}),
+    ).config
+    proposer_required = validator.formal_proposer_required_parameters(
+        validator.FORMAL_EXPECTED_ROUTES
+    )
+
+    with pytest.raises(ValueError, match="frozen Gemini Judge model"):
+        validator.required_fixed_route_specs(
+            experiment=experiment,
+            groups=("G1",),
+            proposer_required_parameters=proposer_required,
+            ranking_resolution=validator.effective_ranking_resolution(experiment),
+        )
+
+
+@pytest.mark.parametrize(
+    ("backup_count", "required_proposer_count"),
+    [(0, 8), (1, 9), (2, 10)],
+)
+def test_g1_v3_capacity_uses_effective_ranking_backup_override(
+    backup_count: int,
+    required_proposer_count: int,
+) -> None:
+    overlay = json.dumps(
+        {
+            "router_dynamic_ranking_override": {
+                "proposer_count": {"backup_count": backup_count}
+            }
+        }
+    )
+    experiment = load_draco_experiment_config(
+        validator.DEFAULT_EXPERIMENT_CONFIG_PATH,
+        inline_overlay_json=overlay,
+    ).config
+    resolution = validator.effective_ranking_resolution(experiment)
+
+    assert validator.required_role_capacity(
+        experiment,
+        ("G1",),
+        ranking_resolution=resolution,
+    ) == (required_proposer_count, 3)
+
+    # The archived field is accepted only as matching loader compatibility.
+    # It is deliberately not an authority for the frozen preflight capacity.
+    object.__setattr__(experiment.ensemble, "proposer_backup_count", 2 - backup_count)
+    assert validator.required_role_capacity(
+        experiment,
+        ("G1",),
+        ranking_resolution=resolution,
+    ) == (required_proposer_count, 3)
+
+
+def test_g1_v3_capacity_accepts_matching_legacy_backup_but_uses_ranking() -> None:
+    experiment = load_draco_experiment_config(
+        validator.DEFAULT_EXPERIMENT_CONFIG_PATH,
+        inline_overlay_json=json.dumps(
+            {
+                "router_dynamic_ranking_override": {
+                    "proposer_count": {"backup_count": 1}
+                },
+                "ensemble": {"proposer_backup_count": 1},
+            }
+        ),
+    ).config
+
+    assert experiment.ensemble.proposer_backup_count == 1
+    assert validator.required_role_capacity(experiment, ("G1",)) == (9, 3)

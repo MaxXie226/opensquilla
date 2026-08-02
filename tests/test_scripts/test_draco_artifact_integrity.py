@@ -285,9 +285,18 @@ def _owner_only_json(path: Path, payload: dict[str, object]) -> None:
     path.chmod(0o600)
 
 
-def _formal_g1_config(module, tmp_path: Path) -> tuple[Path, dict[str, object], str]:
+def _formal_g1_config(
+    module,
+    tmp_path: Path,
+    *,
+    backup_count: int | None = None,
+) -> tuple[Path, dict[str, object], str]:
     source = ROOT / "configs" / "benchmarks" / "draco_b2_g12.json"
     config = json.loads(source.read_text(encoding="utf-8"))
+    if backup_count is not None:
+        config["router_dynamic_ranking_override"] = {
+            "proposer_count": {"backup_count": backup_count}
+        }
     path = tmp_path / "experiment-config.json"
     _owner_only_json(path, config)
     return path, config, module.file_sha256(path)
@@ -299,10 +308,20 @@ def _v2_route_preflight(
     config_path: Path,
     config: dict[str, object],
     config_sha256: str,
+    inline_overlay: dict[str, object] | None = None,
 ) -> dict[str, object]:
     raw_g1 = config["g1_routing"]
     assert isinstance(raw_g1, dict)
-    resolved, resolved_contract = module._resolved_g1_contract(config_path)
+    inline_overlay_json = json.dumps(inline_overlay) if inline_overlay is not None else None
+    resolved, resolved_contract = module._resolved_g1_contract(
+        config_path,
+        inline_overlay_json=inline_overlay_json,
+    )
+    experiment = module.load_draco_experiment_config(
+        config_path,
+        inline_overlay_json=inline_overlay_json,
+    ).config
+    ranking_resolution = module._effective_ranking_resolution(experiment)
     routes = dict(resolved_contract["expected_routes"])
     candidate_scope = str(resolved_contract["candidate_scope"])
     candidate_policy = str(resolved_contract["policy"])
@@ -320,9 +339,17 @@ def _v2_route_preflight(
         "experiment_config": {
             "path": str(config_path.resolve()),
             "sha256": config_sha256,
+            "inline_overlay": inline_overlay,
+            "inline_overlay_sha256": (
+                module.canonical_sha256(inline_overlay)
+                if inline_overlay is not None
+                else None
+            ),
             "g1_routing_profile_id": resolved.profile_id,
             "source_registry_snapshot_version": resolved.source_registry_snapshot_version,
         },
+        "ranking_config_resolution": ranking_resolution,
+        "task_analyzer": module._resolved_task_analyzer_policy(ranking_resolution),
         "required_parameters_sha256": module.canonical_sha256(required_parameters),
         "models": {
             model: {
@@ -387,12 +414,14 @@ def _v3_route_preflight(
     config_path: Path,
     config: dict[str, object],
     config_sha256: str,
+    inline_overlay: dict[str, object] | None = None,
 ) -> dict[str, object]:
     payload = _v2_route_preflight(
         module,
         config_path=config_path,
         config=config,
         config_sha256=config_sha256,
+        inline_overlay=inline_overlay,
     )
     payload["schema"] = module.ROUTE_PREFLIGHT_V3_SCHEMA
     payload["groups"] = ["G1"]
@@ -401,7 +430,11 @@ def _v3_route_preflight(
     models = payload["models"]
     assert isinstance(routes, dict)
     assert isinstance(models, dict)
-    _, resolved_contract = module._resolved_g1_contract(config_path)
+    inline_overlay_json = json.dumps(inline_overlay) if inline_overlay is not None else None
+    _, resolved_contract = module._resolved_g1_contract(
+        config_path,
+        inline_overlay_json=inline_overlay_json,
+    )
     proposer_required = module._formal_proposer_required_parameters(
         routes,
         reasoning_ineligible_models=set(resolved_contract["reasoning_ineligible_models"]),
@@ -426,7 +459,10 @@ def _v3_route_preflight(
             }
         )
     payload["proposer_required_parameters_sha256"] = module.canonical_sha256(proposer_required)
-    experiment = module.load_draco_experiment_config(config_path).config
+    experiment = module.load_draco_experiment_config(
+        config_path,
+        inline_overlay_json=inline_overlay_json,
+    ).config
     fixed_routes, fixed_parameters = module._required_fixed_route_specs(
         experiment=experiment,
         groups=("G1",),
@@ -469,8 +505,13 @@ def _v3_route_preflight(
         for model, provider in fixed_routes.items()
     }
     payload["fixed_routes_pass"] = True
-    payload["required_proposer_compatible_candidate_count"] = 10
-    payload["required_aggregator_compatible_candidate_count"] = 3
+    required_proposer_count, required_aggregator_count = module._required_role_capacity(
+        experiment,
+        ("G1",),
+        ranking_resolution=payload["ranking_config_resolution"],
+    )
+    payload["required_proposer_compatible_candidate_count"] = required_proposer_count
+    payload["required_aggregator_compatible_candidate_count"] = required_aggregator_count
     _refresh_v3_availability_summary(payload)
     return payload
 
@@ -599,6 +640,149 @@ def test_v3_route_preflight_accepts_one_unavailable_dynamic_candidate(
     assert payload["unavailable_models"] == [model]
     assert validation["groups"] == ["G1"]
     assert validation["availability_policy"] == "registry_capacity"
+
+
+@pytest.mark.parametrize(
+    ("backup_count", "required_proposer_count"),
+    [(0, 8), (1, 9), (2, 10)],
+)
+def test_v3_route_preflight_capacity_uses_frozen_ranking_backup_override(
+    tmp_path: Path,
+    backup_count: int,
+    required_proposer_count: int,
+) -> None:
+    module = _load(SEAL_ARTIFACTS, f"seal_draco_artifacts_v3_backup_{backup_count}_test")
+    config_path, config, config_sha256 = _formal_g1_config(
+        module,
+        tmp_path,
+        backup_count=backup_count,
+    )
+    payload = _v3_route_preflight(
+        module,
+        config_path=config_path,
+        config=config,
+        config_sha256=config_sha256,
+    )
+
+    validation = module.validate_route_preflight_payload(
+        payload,
+        experiment_config_sha256=config_sha256,
+        label="ranking override evidence",
+    )
+
+    assert payload["required_proposer_compatible_candidate_count"] == (
+        required_proposer_count
+    )
+    assert validation["required_proposer_compatible_candidate_count"] == (
+        required_proposer_count
+    )
+
+    experiment = module.load_draco_experiment_config(config_path).config
+    resolution = module._effective_ranking_resolution(experiment)
+    object.__setattr__(experiment.ensemble, "proposer_backup_count", 2 - backup_count)
+    assert module._required_role_capacity(
+        experiment,
+        ("G1",),
+        ranking_resolution=resolution,
+    ) == (required_proposer_count, 3)
+
+
+def test_v3_route_preflight_rejects_tampered_frozen_ranking_resolution(
+    tmp_path: Path,
+) -> None:
+    module = _load(SEAL_ARTIFACTS, "seal_draco_artifacts_v3_ranking_tamper_test")
+    config_path, config, config_sha256 = _formal_g1_config(
+        module,
+        tmp_path,
+        backup_count=1,
+    )
+    payload = _v3_route_preflight(
+        module,
+        config_path=config_path,
+        config=config,
+        config_sha256=config_sha256,
+    )
+    payload["ranking_config_resolution"]["effective_config"]["proposer_count"][
+        "backup_count"
+    ] = 2
+
+    with pytest.raises(ValueError, match="frozen ranking resolution differs"):
+        module.validate_route_preflight_payload(
+            payload,
+            experiment_config_sha256=config_sha256,
+            label="tampered ranking evidence",
+        )
+
+
+def test_v3_route_preflight_authenticates_inline_ranking_override(
+    tmp_path: Path,
+) -> None:
+    module = _load(SEAL_ARTIFACTS, "seal_draco_artifacts_v3_inline_override_test")
+    config_path, config, config_sha256 = _formal_g1_config(module, tmp_path)
+    inline_overlay = {
+        "router_dynamic_ranking_override": {
+            "proposer_count": {"backup_count": 1}
+        }
+    }
+    payload = _v3_route_preflight(
+        module,
+        config_path=config_path,
+        config=config,
+        config_sha256=config_sha256,
+        inline_overlay=inline_overlay,
+    )
+
+    validation = module.validate_route_preflight_payload(
+        payload,
+        experiment_config_sha256=config_sha256,
+        label="inline ranking override evidence",
+    )
+
+    assert payload["required_proposer_compatible_candidate_count"] == 9
+    assert validation["required_proposer_compatible_candidate_count"] == 9
+    assert validation["experiment_config_inline_overlay_sha256"] == (
+        module.canonical_sha256(inline_overlay)
+    )
+
+
+def test_v3_route_preflight_authenticates_private_effective_config_without_raw_overlay(
+    tmp_path: Path,
+) -> None:
+    module = _load(SEAL_ARTIFACTS, "seal_draco_artifacts_v3_private_effective_test")
+    config_path, config, config_sha256 = _formal_g1_config(module, tmp_path)
+    marker = "private-overlay-secret-marker"
+    inline_overlay = {"reference": {"repository": marker}}
+    payload = _v3_route_preflight(
+        module,
+        config_path=config_path,
+        config=config,
+        config_sha256=config_sha256,
+        inline_overlay=inline_overlay,
+    )
+    effective = module.load_draco_experiment_config(
+        config_path,
+        inline_overlay_json=json.dumps(inline_overlay),
+    ).config.model_dump(mode="json")
+    effective_path = tmp_path / "experiment-config.effective.json"
+    _owner_only_json(effective_path, effective)
+    evidence = payload["experiment_config"]
+    assert isinstance(evidence, dict)
+    evidence.pop("inline_overlay")
+    evidence["effective_config"] = {
+        "path": str(effective_path.resolve()),
+        "sha256": module.canonical_sha256(effective),
+    }
+
+    validation = module.validate_route_preflight_payload(
+        payload,
+        experiment_config_sha256=config_sha256,
+        label="private effective config evidence",
+    )
+
+    assert marker not in json.dumps(payload, ensure_ascii=False)
+    assert validation["experiment_config_inline_overlay_sha256"] == (
+        module.canonical_sha256(inline_overlay)
+    )
 
 
 def test_v3_route_preflight_accepts_explicit_model_endpoint_404(

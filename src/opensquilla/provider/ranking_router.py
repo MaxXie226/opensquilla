@@ -37,17 +37,21 @@ RANKING_CONFIG_SCHEMA_VERSION = "step2-ranking-config-v4"
 LEGACY_RANKING_CONFIG_SCHEMA_VERSION = "step2-ranking-config-v3"
 MODEL_REGISTRY_SCHEMA_VERSION = "step2-model-registry-v2"
 LEGACY_MODEL_REGISTRY_SCHEMA_VERSION = "step2-model-registry-v1"
-_PACKAGED_RANKING_CONFIG_VERSION = "step2-ranking-2026-07-27.1"
-_LEGACY_PACKAGED_RANKING_CONFIG_VERSION = "step2-ranking-2026-07-22.1"
+_PACKAGED_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-02.2"
+_LEGACY_PACKAGED_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-02.2"
+_PRE_ROSTER_PACKAGED_RANKING_CONFIG_VERSION = "step2-ranking-2026-07-27.1"
+_PRE_ROSTER_LEGACY_RANKING_CONFIG_VERSION = "step2-ranking-2026-07-22.1"
 _PACKAGED_REGISTRY_SNAPSHOT_VERSION = "curated-openrouter-step2-2026-07-27.1"
 _LEGACY_PACKAGED_REGISTRY_SNAPSHOT_VERSION = "curated-openrouter-step2-2026-07-24.3"
 TASK_ANALYZER_PROVIDER_ID = "openrouter"
 TASK_ANALYZER_MODEL_ID = "anthropic/claude-opus-4.8"
+TASK_ANALYZER_UPSTREAM_PROVIDER = "anthropic"
 TASK_ANALYZER_VERSION = "opus-4.8-json-v3"
 TASK_PROFILE_SCHEMA_VERSION = "step2-task-profile-v1"
 THINKING_POLICY_VERSION = "thinking-policy-v1"
 GENERATION_POLICY_FILTER_REASON_PREFIX = "generation_policy_"
-_TASK_ANALYZER_STREAM_CLOSE_TIMEOUT_SECONDS = 1.0
+TASK_ANALYZER_STREAM_CLOSE_TIMEOUT_SECONDS = 1.0
+_TASK_ANALYZER_UPSTREAM_PROVIDER_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 _PHYSICAL_ATTEMPT_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _NATIVE_IMAGE_ATTACHMENT_MIMES = frozenset(
     {
@@ -344,9 +348,28 @@ def _clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
     return max(low, min(high, value))
 
 
-def _canonical_hash(value: Any) -> str:
-    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode()
-    return hashlib.sha256(encoded).hexdigest()
+def canonical_json_bytes(value: Any) -> bytes:
+    """Serialize public routing evidence with one deterministic UTF-8 contract."""
+
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def canonical_json_sha256(value: Any) -> str:
+    """Hash public routing evidence using :func:`canonical_json_bytes`."""
+
+    return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
+
+
+# Private compatibility alias for the existing ranking implementation.  New
+# cross-component consumers should import the public helper above so runtime
+# and offline verification cannot silently choose different JSON encodings.
+_canonical_hash = canonical_json_sha256
 
 
 def _legacy_ranking_config_projection(config: Mapping[str, Any]) -> dict[str, Any]:
@@ -358,8 +381,34 @@ def _legacy_ranking_config_projection(config: Mapping[str, Any]) -> dict[str, An
     projected["schema_version"] = LEGACY_RANKING_CONFIG_SCHEMA_VERSION
     if projected.get("config_version") == _PACKAGED_RANKING_CONFIG_VERSION:
         projected["config_version"] = _LEGACY_PACKAGED_RANKING_CONFIG_VERSION
+    elif projected.get("config_version") == _PRE_ROSTER_PACKAGED_RANKING_CONFIG_VERSION:
+        projected["config_version"] = _PRE_ROSTER_LEGACY_RANKING_CONFIG_VERSION
     projected.pop("thinking_assignment", None)
     return projected
+
+
+def _is_pre_roster_ranking_config_version(value: Any) -> bool:
+    """Return whether ``value`` identifies the archived pre-roster policy."""
+
+    version = str(value or "").strip()
+    return any(
+        version == base or version.startswith(f"{base}+override.")
+        for base in (
+            _PRE_ROSTER_PACKAGED_RANKING_CONFIG_VERSION,
+            _PRE_ROSTER_LEGACY_RANKING_CONFIG_VERSION,
+        )
+    )
+
+
+def _is_pre_task_analyzer_policy_config_version(value: Any) -> bool:
+    """Return whether an archived config predates public analyzer identity fields."""
+
+    version = str(value or "").strip().split("+override.", 1)[0]
+    return version in {
+        "step2-ranking-2026-08-02.1",
+        _PRE_ROSTER_PACKAGED_RANKING_CONFIG_VERSION,
+        _PRE_ROSTER_LEGACY_RANKING_CONFIG_VERSION,
+    }
 
 
 def _legacy_registry_snapshot_projection(snapshot: Mapping[str, Any]) -> dict[str, Any]:
@@ -692,13 +741,23 @@ def _require_exact_config_keys(
     )
 
 
-def _thinking_assignment_policy(config: Mapping[str, Any]) -> dict[str, Any]:
+def _thinking_assignment_policy(
+    config: Mapping[str, Any],
+    *,
+    allow_legacy_external_switch: bool = False,
+) -> dict[str, Any]:
     """Return the strictly validated, versioned unified-thinking policy."""
+
+    thinking_assignment = _ranking_mapping(config, "thinking_assignment")
+    legacy_external_switch = (
+        allow_legacy_external_switch and "enabled" not in thinking_assignment
+    )
 
     _require_exact_config_keys(
         config,
         ("thinking_assignment",),
         {
+            *(set() if legacy_external_switch else {"enabled"}),
             "policy_version",
             "level_order",
             "tier_mapping",
@@ -706,6 +765,12 @@ def _thinking_assignment_policy(config: Mapping[str, Any]) -> dict[str, Any]:
             "risk_floor",
             "resource_constraints",
         },
+    )
+
+    enabled = (
+        True
+        if legacy_external_switch
+        else _ranking_bool(config, "thinking_assignment", "enabled")
     )
     _require_exact_config_keys(
         config,
@@ -824,6 +889,7 @@ def _thinking_assignment_policy(config: Mapping[str, Any]) -> dict[str, Any]:
         )
 
     return {
+        "enabled": enabled,
         "policy_version": policy_version,
         "level_order": tuple(level_order),
         "tier_mapping": tier_mapping,
@@ -837,7 +903,11 @@ def _thinking_assignment_policy(config: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _validate_ranking_config(raw: Any) -> _ValidatedRankingConfig:
+def _validate_ranking_config(
+    raw: Any,
+    *,
+    allow_legacy_external_thinking_switch: bool = False,
+) -> _ValidatedRankingConfig:
     if not isinstance(raw, Mapping):
         raise DynamicRankingError("router_dynamic ranking config must be an object")
     config = copy.deepcopy(dict(raw))
@@ -852,6 +922,13 @@ def _validate_ranking_config(raw: Any) -> _ValidatedRankingConfig:
             f"{RANKING_CONFIG_SCHEMA_VERSION}"
         )
     has_thinking_policy = "thinking_assignment" in config
+    legacy_external_thinking_switch = False
+    if has_thinking_policy and schema_version == RANKING_CONFIG_SCHEMA_VERSION:
+        thinking_assignment = _ranking_mapping(config, "thinking_assignment")
+        legacy_external_thinking_switch = (
+            allow_legacy_external_thinking_switch
+            and "enabled" not in thinking_assignment
+        )
     if schema_version == RANKING_CONFIG_SCHEMA_VERSION and not has_thinking_policy:
         raise DynamicRankingError("router_dynamic ranking config v4 requires thinking_assignment")
     if schema_version == LEGACY_RANKING_CONFIG_SCHEMA_VERSION and has_thinking_policy:
@@ -891,6 +968,42 @@ def _validate_ranking_config(raw: Any) -> _ValidatedRankingConfig:
         raise DynamicRankingError(
             "router_dynamic ranking config has unknown or missing top-level keys"
         )
+    config_version = _ranking_string(config, "config_version")
+    proposer_count_config = _ranking_mapping(config, "proposer_count")
+    aggregator_config = _ranking_mapping(config, "aggregator")
+    has_backup_count = "backup_count" in proposer_count_config
+    has_aggregator_candidate_count = "candidate_count" in aggregator_config
+    if has_backup_count != has_aggregator_candidate_count:
+        raise DynamicRankingError(
+            "router_dynamic ranking config must declare proposer_count.backup_count "
+            "and aggregator.candidate_count together"
+        )
+    has_roster_policy = has_backup_count and has_aggregator_candidate_count
+    if not has_roster_policy and not _is_pre_roster_ranking_config_version(config_version):
+        raise DynamicRankingError(
+            "router_dynamic ranking config lacks the versioned selection roster policy"
+        )
+    task_analyzer_config = _ranking_mapping(config, "task_analyzer")
+    analyzer_policy_keys = {
+        "provider",
+        "model",
+        "upstream_provider",
+        "stream_close_timeout_seconds",
+    }
+    present_analyzer_policy_keys = set(task_analyzer_config) & analyzer_policy_keys
+    if present_analyzer_policy_keys and present_analyzer_policy_keys != analyzer_policy_keys:
+        raise DynamicRankingError(
+            "router_dynamic task_analyzer identity policy must declare provider, model, "
+            "upstream_provider, and stream_close_timeout_seconds together"
+        )
+    has_task_analyzer_policy = present_analyzer_policy_keys == analyzer_policy_keys
+    if (
+        not has_task_analyzer_policy
+        and not _is_pre_task_analyzer_policy_config_version(config_version)
+    ):
+        raise DynamicRankingError(
+            "router_dynamic ranking config lacks the versioned task_analyzer identity policy"
+        )
     fixed_object_keys = {
         ("validation",): {
             "weight_sum_tolerance",
@@ -903,6 +1016,7 @@ def _validate_ranking_config(raw: Any) -> _ValidatedRankingConfig:
         },
         ("routing_tiers",): {"default_router_tier", "mapping"},
         ("thinking_assignment",): {
+            *(set() if legacy_external_thinking_switch else {"enabled"}),
             "policy_version",
             "level_order",
             "tier_mapping",
@@ -952,6 +1066,7 @@ def _validate_ranking_config(raw: Any) -> _ValidatedRankingConfig:
             "default_session_intent",
         },
         ("task_analyzer",): {
+            *(analyzer_policy_keys if has_task_analyzer_policy else set()),
             "timeout_seconds",
             "input_max_chars",
             "response_max_chars",
@@ -1068,6 +1183,7 @@ def _validate_ranking_config(raw: Any) -> _ValidatedRankingConfig:
         },
         ("proposer_count",): {
             "effective_tier_rounding_offset",
+            *(("backup_count",) if has_roster_policy else ()),
             "by_tier",
             "high_risk",
             "constrained_max",
@@ -1099,6 +1215,7 @@ def _validate_ranking_config(raw: Any) -> _ValidatedRankingConfig:
             "unrelated_score",
         },
         ("aggregator",): {
+            *(("candidate_count",) if has_roster_policy else ()),
             "task_match_weight",
             "role_fit_weight",
             "same_model_penalty",
@@ -1113,9 +1230,11 @@ def _validate_ranking_config(raw: Any) -> _ValidatedRankingConfig:
         }
     for object_path, expected_keys in fixed_object_keys.items():
         _require_exact_config_keys(config, object_path, expected_keys)
-    _ranking_string(config, "config_version")
     if has_thinking_policy:
-        _thinking_assignment_policy(config)
+        _thinking_assignment_policy(
+            config,
+            allow_legacy_external_switch=legacy_external_thinking_switch,
+        )
 
     weight_sum_tolerance = _ranking_number(config, "validation", "weight_sum_tolerance")
     if not 0.0 < weight_sum_tolerance < 1.0:
@@ -1289,6 +1408,53 @@ def _validate_ranking_config(raw: Any) -> _ValidatedRankingConfig:
             raise DynamicRankingError(f"router_dynamic task_analyzer.{key} must be positive")
     if _ranking_number(config, "task_analyzer", "timeout_seconds") <= 0.0:
         raise DynamicRankingError("router_dynamic task_analyzer.timeout_seconds must be positive")
+    if has_task_analyzer_policy:
+        analyzer_provider = _ranking_string(config, "task_analyzer", "provider")
+        if (
+            analyzer_provider != analyzer_provider.casefold()
+            or analyzer_provider != str(task_analyzer_config.get("provider"))
+            or analyzer_provider != TASK_ANALYZER_PROVIDER_ID
+        ):
+            raise DynamicRankingError(
+                "router_dynamic task_analyzer.provider currently must be openrouter"
+            )
+        analyzer_model = _ranking_string(config, "task_analyzer", "model")
+        if (
+            analyzer_model != analyzer_model.casefold()
+            or analyzer_model != str(task_analyzer_config.get("model"))
+            or any(character.isspace() for character in analyzer_model)
+            or "/" not in analyzer_model
+            or any(not segment for segment in analyzer_model.split("/"))
+        ):
+            raise DynamicRankingError(
+                "router_dynamic task_analyzer.model must be lowercase, trimmed, "
+                "contain '/', and contain no whitespace"
+            )
+        upstream_provider = _ranking_string(
+            config,
+            "task_analyzer",
+            "upstream_provider",
+        )
+        if (
+            upstream_provider != upstream_provider.casefold()
+            or upstream_provider != str(task_analyzer_config.get("upstream_provider"))
+            or _TASK_ANALYZER_UPSTREAM_PROVIDER_RE.fullmatch(upstream_provider) is None
+        ):
+            raise DynamicRankingError(
+                "router_dynamic task_analyzer.upstream_provider must be a lowercase "
+                "provider slug or auto"
+            )
+        stream_close_timeout = _ranking_number(
+            config,
+            "task_analyzer",
+            "stream_close_timeout_seconds",
+        )
+        analyzer_timeout = _ranking_number(config, "task_analyzer", "timeout_seconds")
+        if not 0.0 < stream_close_timeout <= min(analyzer_timeout, 60.0):
+            raise DynamicRankingError(
+                "router_dynamic task_analyzer.stream_close_timeout_seconds must be "
+                "positive, at most 60 seconds, and no greater than timeout_seconds"
+            )
     analyzer_temperature = _ranking_number(config, "task_analyzer", "temperature")
     if analyzer_temperature < 0.0:
         raise DynamicRankingError("router_dynamic task_analyzer.temperature cannot be negative")
@@ -1560,6 +1726,21 @@ def _validate_ranking_config(raw: Any) -> _ValidatedRankingConfig:
         raise DynamicRankingError("router_dynamic proposer_count.high_risk has invalid bounds")
     if _ranking_int(config, "proposer_count", "constrained_max") < 1:
         raise DynamicRankingError("router_dynamic proposer_count.constrained_max must be positive")
+    if has_roster_policy:
+        backup_count = _ranking_int(config, "proposer_count", "backup_count")
+        if not 0 <= backup_count <= 2:
+            raise DynamicRankingError(
+                "router_dynamic proposer_count.backup_count must be between 0 and 2"
+            )
+        aggregator_candidate_count = _ranking_int(
+            config,
+            "aggregator",
+            "candidate_count",
+        )
+        if not 1 <= aggregator_candidate_count <= 3:
+            raise DynamicRankingError(
+                "router_dynamic aggregator.candidate_count must be between 1 and 3"
+            )
     if _ranking_int(config, "session", "max_escalation_level") < 0:
         raise DynamicRankingError("router_dynamic session.max_escalation_level cannot be negative")
     if _ranking_int(config, "session", "route_cache_max_entries") <= 0:
@@ -1631,6 +1812,85 @@ def _packaged_ranking_config() -> _ValidatedRankingConfig:
     return _validate_ranking_config(payload)
 
 
+def _normalize_ranking_config_override(
+    value: Any,
+    *,
+    path: tuple[str, ...] = (),
+) -> Any:
+    """Return a detached, strictly JSON-compatible override value."""
+
+    if isinstance(value, Mapping):
+        normalized: dict[str, Any] = {}
+        for raw_key, child in value.items():
+            if not isinstance(raw_key, str):
+                location = ".".join(path) or "<root>"
+                raise DynamicRankingError(
+                    "router_dynamic ranking config override must use string keys at "
+                    f"{location}"
+                )
+            normalized[raw_key] = _normalize_ranking_config_override(
+                child,
+                path=(*path, raw_key),
+            )
+        return normalized
+    if isinstance(value, list):
+        return [
+            _normalize_ranking_config_override(child, path=(*path, str(index)))
+            for index, child in enumerate(value)
+        ]
+    if value is None or isinstance(value, (str, bool, int)):
+        return copy.deepcopy(value)
+    if isinstance(value, float) and math.isfinite(value):
+        return value
+    location = ".".join(path) or "<root>"
+    raise DynamicRankingError(
+        "router_dynamic ranking config override must contain only JSON values at "
+        f"{location}"
+    )
+
+
+def _assert_no_sensitive_ranking_config_override_keys(
+    value: Any,
+    *,
+    path: tuple[str, ...] = (),
+) -> None:
+    if isinstance(value, Mapping):
+        for raw_key, child in value.items():
+            key = raw_key.strip().casefold().replace("-", "_")
+            child_path = (*path, raw_key)
+            if (
+                any(fragment in key for fragment in _TRACE_SECRET_KEY_FRAGMENTS)
+                or key in {"token", "bearer", "proxy"}
+                or key.endswith("_token")
+            ):
+                raise DynamicRankingError(
+                    "router_dynamic ranking config override contains secret-like field "
+                    f"{'.'.join(child_path)}"
+                )
+            _assert_no_sensitive_ranking_config_override_keys(child, path=child_path)
+        return
+    if isinstance(value, list):
+        for index, child in enumerate(value):
+            _assert_no_sensitive_ranking_config_override_keys(
+                child,
+                path=(*path, str(index)),
+            )
+
+
+def _deep_merge_ranking_config_override(
+    base: Mapping[str, Any],
+    override: Mapping[str, Any],
+) -> dict[str, Any]:
+    merged = copy.deepcopy(dict(base))
+    for key, value in override.items():
+        current = merged.get(key)
+        if isinstance(current, Mapping) and isinstance(value, Mapping):
+            merged[key] = _deep_merge_ranking_config_override(current, value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
 def load_ranking_config() -> dict[str, Any]:
     """Return an isolated copy of the versioned Step2 ranking parameters."""
 
@@ -1642,17 +1902,158 @@ def _packaged_legacy_ranking_config() -> _ValidatedRankingConfig:
     return _validate_ranking_config(_legacy_ranking_config_projection(_packaged_ranking_config()))
 
 
-def ranking_config_snapshot(
-    *,
-    thinking_assignment_enabled: bool = False,
-) -> Mapping[str, Any]:
-    """Return the validated config for the effective default-off policy."""
+@cache
+def _packaged_enabled_ranking_config() -> _ValidatedRankingConfig:
+    """Return the packaged v4 policy with its compatibility switch enabled."""
 
-    return (
-        _packaged_ranking_config()
-        if thinking_assignment_enabled
+    enabled = copy.deepcopy(dict(_packaged_ranking_config()))
+    enabled["thinking_assignment"]["enabled"] = True
+    return _validate_ranking_config(enabled)
+
+
+def ranking_config_resolution(
+    *,
+    thinking_assignment_enabled: bool | None = None,
+    override: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Resolve and fingerprint one immutable runtime ranking configuration.
+
+    The packaged policy is the authoritative base.  A supplied override is a
+    sparse JSON object layered on top of that base before the existing strict
+    full-config validator runs.  Identity fields are derived, never caller
+    controlled, so traces can bind an override to one deterministic version.
+    """
+
+    if thinking_assignment_enabled is not None and not isinstance(
+        thinking_assignment_enabled,
+        bool,
+    ):
+        raise DynamicRankingError(
+            "router_dynamic legacy thinking assignment switch must be a boolean"
+        )
+    packaged_default_enabled = _ranking_bool(
+        _packaged_ranking_config(),
+        "thinking_assignment",
+        "enabled",
+    )
+    compatibility_enabled = (
+        thinking_assignment_enabled
+        if thinking_assignment_enabled is not None
+        else packaged_default_enabled
+    )
+    base = (
+        _packaged_enabled_ranking_config()
+        if compatibility_enabled
         else _packaged_legacy_ranking_config()
     )
+    base_config = copy.deepcopy(dict(base))
+    base_sha256 = _canonical_hash(base_config)
+    if override is None:
+        return {
+            "base_config": copy.deepcopy(base_config),
+            "override": None,
+            "effective_config": copy.deepcopy(base_config),
+            "base_sha256": base_sha256,
+            "override_sha256": None,
+            "effective_sha256": base_sha256,
+            "thinking_assignment_enabled": compatibility_enabled,
+        }
+    if not isinstance(override, Mapping):
+        raise DynamicRankingError(
+            "router_dynamic ranking config override must be a JSON object"
+        )
+    normalized_override = _normalize_ranking_config_override(override)
+    if not normalized_override:
+        return {
+            "base_config": copy.deepcopy(base_config),
+            "override": None,
+            "effective_config": copy.deepcopy(base_config),
+            "base_sha256": base_sha256,
+            "override_sha256": None,
+            "effective_sha256": base_sha256,
+            "thinking_assignment_enabled": compatibility_enabled,
+        }
+    if "schema_version" in normalized_override or "config_version" in normalized_override:
+        raise DynamicRankingError(
+            "router_dynamic ranking config override cannot override "
+            "schema_version or config_version"
+        )
+    _assert_no_sensitive_ranking_config_override_keys(normalized_override)
+    _assert_public_ranking_trace_payload(
+        normalized_override,
+        label="router_dynamic ranking config override",
+    )
+    thinking_override = normalized_override.get("thinking_assignment")
+    explicit_override_enabled: bool | None = None
+    if isinstance(thinking_override, Mapping) and "enabled" in thinking_override:
+        raw_override_enabled = thinking_override["enabled"]
+        if not isinstance(raw_override_enabled, bool):
+            raise DynamicRankingError(
+                "router_dynamic ranking config thinking_assignment.enabled "
+                "must be boolean"
+            )
+        explicit_override_enabled = raw_override_enabled
+    if (
+        thinking_assignment_enabled is not None
+        and explicit_override_enabled is not None
+        and explicit_override_enabled is not thinking_assignment_enabled
+    ):
+        raise DynamicRankingError(
+            "router_dynamic ranking config override thinking_assignment.enabled "
+            "conflicts with the legacy ranking_thinking_assignment_enabled switch"
+        )
+    override_sha256 = _canonical_hash(normalized_override)
+    full_base = copy.deepcopy(dict(_packaged_ranking_config()))
+    full_base["thinking_assignment"]["enabled"] = compatibility_enabled
+    effective_full = _deep_merge_ranking_config_override(
+        full_base,
+        normalized_override,
+    )
+    effective_full["config_version"] = (
+        f"{base_config['config_version']}+override.{override_sha256[:12]}"
+    )
+    validated_full = _validate_ranking_config(effective_full)
+    effective_enabled = _ranking_bool(
+        validated_full,
+        "thinking_assignment",
+        "enabled",
+    )
+    effective = (
+        validated_full
+        if effective_enabled
+        else _legacy_ranking_config_projection(validated_full)
+    )
+    validated_effective = _validate_ranking_config(effective)
+    effective_config = copy.deepcopy(dict(validated_effective))
+    return {
+        "base_config": copy.deepcopy(base_config),
+        "override": copy.deepcopy(normalized_override),
+        "effective_config": effective_config,
+        "base_sha256": base_sha256,
+        "override_sha256": override_sha256,
+        "effective_sha256": _canonical_hash(effective_config),
+        "thinking_assignment_enabled": effective_enabled,
+    }
+
+
+def ranking_config_snapshot(
+    *,
+    thinking_assignment_enabled: bool | None = None,
+    override: Mapping[str, Any] | None = None,
+) -> Mapping[str, Any]:
+    """Return the validated effective packaged policy plus any sparse override.
+
+    ``None`` means "use the packaged default", not "force the legacy policy
+    off".  Keeping this helper on the same resolution path as startup freezing
+    prevents a future packaged default change from producing two different
+    router policies depending on which public helper a caller used.
+    """
+
+    resolution = ranking_config_resolution(
+        thinking_assignment_enabled=thinking_assignment_enabled,
+        override=override,
+    )
+    return _ValidatedRankingConfig(resolution["effective_config"])
 
 
 def _resolve_ranking_config(
@@ -1665,6 +2066,66 @@ def _resolve_ranking_config(
         if ranking_config is not None
         else _packaged_ranking_config()
     )
+
+
+def task_analyzer_policy(
+    ranking_config: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return the validated, public task-analyzer execution policy.
+
+    Archived ranking configs predate these identity fields.  They replay with
+    the exact historical Opus/OpenRouter defaults without mutating their
+    authenticated config payload or hash.
+    """
+
+    effective = _resolve_ranking_config(ranking_config)
+    analyzer = _ranking_mapping(effective, "task_analyzer")
+    has_public_policy = all(
+        key in analyzer
+        for key in (
+            "provider",
+            "model",
+            "upstream_provider",
+            "stream_close_timeout_seconds",
+        )
+    )
+    return {
+        "protocol_version": TASK_ANALYZER_VERSION,
+        "provider": (
+            _ranking_string(effective, "task_analyzer", "provider")
+            if has_public_policy
+            else TASK_ANALYZER_PROVIDER_ID
+        ),
+        "model": (
+            _ranking_string(effective, "task_analyzer", "model")
+            if has_public_policy
+            else TASK_ANALYZER_MODEL_ID
+        ),
+        "upstream_provider": (
+            _ranking_string(effective, "task_analyzer", "upstream_provider")
+            if has_public_policy
+            else TASK_ANALYZER_UPSTREAM_PROVIDER
+        ),
+        "stream_close_timeout_seconds": (
+            _ranking_number(
+                effective,
+                "task_analyzer",
+                "stream_close_timeout_seconds",
+            )
+            if has_public_policy
+            else TASK_ANALYZER_STREAM_CLOSE_TIMEOUT_SECONDS
+        ),
+        "timeout_seconds": _ranking_number(
+            effective,
+            "task_analyzer",
+            "timeout_seconds",
+        ),
+        "max_retries": _ranking_int(
+            effective,
+            "task_analyzer",
+            "max_retries",
+        ),
+    }
 
 
 def default_session_quality_feedback() -> float:
@@ -2969,6 +3430,21 @@ async def analyze_task_with_provider(
     """Use the caller-supplied dedicated provider as the task analyzer."""
 
     effective_config = _resolve_ranking_config(ranking_config)
+    configured_policy = task_analyzer_policy(effective_config)
+    configured_provider_id = str(configured_policy["provider"])
+    configured_model_id = str(configured_policy["model"])
+    explicit_provider_id = analyzer_provider_id.strip()
+    explicit_model_id = analyzer_model_id.strip()
+    if explicit_provider_id and explicit_provider_id != configured_provider_id:
+        raise DynamicRankingError(
+            "task analyzer caller provider identity conflicts with the frozen "
+            "router_dynamic ranking config"
+        )
+    if explicit_model_id and explicit_model_id != configured_model_id:
+        raise DynamicRankingError(
+            "task analyzer caller model identity conflicts with the frozen "
+            "router_dynamic ranking config"
+        )
     analyzer_input_max_chars = _ranking_int(effective_config, "task_analyzer", "input_max_chars")
     analyzer_response_max_chars = _ranking_int(
         effective_config, "task_analyzer", "response_max_chars"
@@ -2990,8 +3466,8 @@ async def analyze_task_with_provider(
         request_context=request_context,
         ranking_config=effective_config,
     )
-    provider_id = analyzer_provider_id.strip() or str(getattr(provider, "provider_name", "") or "")
-    model_id = analyzer_model_id.strip() or str(getattr(provider, "model", "") or "")
+    provider_id = configured_provider_id
+    model_id = configured_model_id
     if provider is None:
         log.warning(
             "llm_ensemble.router_dynamic.task_analyzer_fallback",
@@ -3155,11 +3631,17 @@ async def analyze_task_with_provider(
                         got_done = True
                         terminal_observed = True
                         usage = _task_analyzer_usage_from_done(event)
+                        usage["provider"] = str(
+                            usage.get("provider") or configured_provider_id
+                        )
+                        usage["model"] = str(
+                            usage.get("model") or configured_model_id
+                        )
                         usage["requested_provider"] = str(
-                            event.requested_provider or analyzer_provider_id or ""
+                            event.requested_provider or configured_provider_id
                         )
                         usage["requested_model"] = str(
-                            event.requested_model or analyzer_model_id or ""
+                            event.requested_model or configured_model_id
                         )
                         done_reported_ids = (
                             _event_reported_physical_attempt_ids(event)
@@ -3323,7 +3805,7 @@ async def analyze_task_with_provider(
                     stream_exhausted = True
         finally:
             close_timeout = min(
-                _TASK_ANALYZER_STREAM_CLOSE_TIMEOUT_SECONDS,
+                float(configured_policy["stream_close_timeout_seconds"]),
                 max(0.0, effective_timeout),
             )
             closed = await _bounded_close_task_analyzer_stream(
@@ -3409,8 +3891,8 @@ async def analyze_task_with_provider(
                 timeout_seconds=timeout_seconds,
                 usage_tracker=usage_tracker,
                 session_key=session_key,
-                analyzer_provider_id=analyzer_provider_id,
-                analyzer_model_id=analyzer_model_id,
+                analyzer_provider_id=configured_provider_id,
+                analyzer_model_id=configured_model_id,
                 ranking_config=effective_config,
                 decision_id=decision_id,
                 _attempt=_attempt + 1,
@@ -5372,6 +5854,52 @@ def _aggregator_score_trace(
     }
 
 
+def _selection_roster_counts(
+    ranking_config: Mapping[str, Any],
+    *,
+    legacy_proposer_backup_count: int | None = None,
+) -> tuple[int, int]:
+    """Return config-owned aggregator/proposer roster sizes.
+
+    Only replay of the two archived pre-roster config versions may supply the
+    historical proposer count that used to live in gateway configuration.
+    Every current runtime config must carry both counts explicitly.
+    """
+
+    proposer_count = _ranking_mapping(ranking_config, "proposer_count")
+    aggregator = _ranking_mapping(ranking_config, "aggregator")
+    has_roster_policy = (
+        "backup_count" in proposer_count and "candidate_count" in aggregator
+    )
+    if has_roster_policy:
+        if legacy_proposer_backup_count is not None:
+            raise DynamicRankingError(
+                "router_dynamic legacy proposer backup count cannot override "
+                "the ranking config roster policy"
+            )
+        return (
+            _ranking_int(ranking_config, "aggregator", "candidate_count"),
+            _ranking_int(ranking_config, "proposer_count", "backup_count"),
+        )
+    if not _is_pre_roster_ranking_config_version(
+        ranking_config.get("config_version")
+    ):
+        raise DynamicRankingError(
+            "router_dynamic ranking config lacks the selection roster policy"
+        )
+    if (
+        legacy_proposer_backup_count is None
+        or isinstance(legacy_proposer_backup_count, bool)
+        or not isinstance(legacy_proposer_backup_count, int)
+        or legacy_proposer_backup_count < 0
+    ):
+        raise DynamicRankingError(
+            "router_dynamic pre-roster replay requires a non-negative legacy "
+            "proposer backup count"
+        )
+    return 3, legacy_proposer_backup_count
+
+
 def rank_models(
     *,
     task_analysis: TaskAnalysisResult,
@@ -5383,7 +5911,7 @@ def rank_models(
     ranking_config: Mapping[str, Any] | None = None,
     decision_id: str = "",
     ranking_thinking_assignment_enabled: bool = False,
-    proposer_backup_count: int = 2,
+    legacy_proposer_backup_count: int | None = None,
     proposer_recovery_max_additional_calls: int = 3,
     proposer_max_tokens_cap: int = 65_536,
     proposer_visible_answer_reserve_tokens: int = 4_096,
@@ -5394,14 +5922,6 @@ def rank_models(
     if not isinstance(ranking_thinking_assignment_enabled, bool):
         raise DynamicRankingError(
             "router_dynamic ranking_thinking_assignment_enabled must be a boolean"
-        )
-    if (
-        isinstance(proposer_backup_count, bool)
-        or not isinstance(proposer_backup_count, int)
-        or proposer_backup_count < 0
-    ):
-        raise DynamicRankingError(
-            "router_dynamic proposer_backup_count must be a non-negative integer"
         )
     if (
         isinstance(proposer_recovery_max_additional_calls, bool)
@@ -5438,7 +5958,22 @@ def rank_models(
             "router_dynamic proposer recovery quorum must be a positive integer"
         )
     if ranking_thinking_assignment_enabled:
-        effective_ranking_config = _resolve_ranking_config(ranking_config)
+        if ranking_config is None:
+            effective_ranking_config = _packaged_enabled_ranking_config()
+        else:
+            source_config = copy.deepcopy(dict(ranking_config))
+            thinking_section = source_config.get("thinking_assignment")
+            if (
+                isinstance(thinking_section, dict)
+                and thinking_section.get("enabled") is False
+            ):
+                # Compatibility adapter for callers that still pass the old
+                # out-of-band switch together with the packaged v4 template.
+                thinking_section["enabled"] = True
+            effective_ranking_config = _validate_ranking_config(
+                source_config,
+                allow_legacy_external_thinking_switch=True,
+            )
     else:
         source_config = ranking_config if ranking_config is not None else _packaged_ranking_config()
         effective_ranking_config = _validate_ranking_config(
@@ -5465,6 +6000,10 @@ def rank_models(
             "router_dynamic thinking-policy-v1 requires "
             "proposer_count.effective_tier_rounding_offset to be 0.5"
         )
+    aggregator_candidate_count, proposer_backup_count = _selection_roster_counts(
+        effective_ranking_config,
+        legacy_proposer_backup_count=legacy_proposer_backup_count,
+    )
     proposer_global_ceiling = _proposer_global_ceiling(effective_ranking_config)
     if (
         proposer_recovery_quorum is not None
@@ -5477,7 +6016,10 @@ def rank_models(
             reason="proposer_recovery_quorum_unreachable",
         )
     thinking_policy = (
-        _thinking_assignment_policy(effective_ranking_config)
+        _thinking_assignment_policy(
+            effective_ranking_config,
+            allow_legacy_external_switch=True,
+        )
         if ranking_thinking_assignment_enabled
         else None
     )
@@ -5885,7 +6427,7 @@ def rank_models(
             + (": thinking_level_unavailable" if thinking_unavailable else ""),
             reason=("thinking_level_unavailable" if thinking_unavailable else ""),
         )
-    aggregator_candidate_rows = aggregator_rows[:3]
+    aggregator_candidate_rows = aggregator_rows[:aggregator_candidate_count]
     aggregator_row = aggregator_candidate_rows[0]
     aggregator = aggregator_row["model"]
     aggregator_candidates = tuple(row["model"] for row in aggregator_candidate_rows)
@@ -6120,6 +6662,10 @@ def rank_models(
             "backup_reasoning_downgrades": 1,
         },
         "selected_A": aggregator.identity,
+        "configured_aggregator_candidate_count": aggregator_candidate_count,
+        "effective_aggregator_candidate_count": len(
+            assigned_aggregator_candidates
+        ),
         "aggregator_candidates": [model.identity for model in assigned_aggregator_candidates],
         "exploration": copy.deepcopy(
             dict(_ranking_mapping(effective_ranking_config, "exploration"))
@@ -6282,6 +6828,8 @@ _RANKING_REPLAY_FIELDS = (
     "effective_proposer_backup_count",
     "proposer_recovery_policy",
     "selected_A",
+    "configured_aggregator_candidate_count",
+    "effective_aggregator_candidate_count",
     "aggregator_candidates",
     "thinking_policy_version",
     "thinking_assignment",
@@ -6339,6 +6887,19 @@ def ranking_trace_replay_reasons(
         present_proposer_recovery_fields != proposer_recovery_fields
     ):
         reasons.append("incomplete_g1_replay_proposer_recovery_policy")
+    aggregator_roster_fields = {
+        "configured_aggregator_candidate_count",
+        "effective_aggregator_candidate_count",
+    }
+    present_aggregator_roster_fields = {
+        field_name
+        for field_name in aggregator_roster_fields
+        if field_name in trace
+    }
+    if present_aggregator_roster_fields and (
+        present_aggregator_roster_fields != aggregator_roster_fields
+    ):
+        reasons.append("incomplete_g1_replay_aggregator_roster_policy")
     if trace.get("user_profile_enabled") is not False:
         reasons.append("g1_ranking_replay_requires_disabled_user_profile")
     registry_snapshot = trace.get("registry_snapshot")
@@ -6383,6 +6944,22 @@ def ranking_trace_replay_reasons(
     if reasons:
         return list(dict.fromkeys(reasons))
 
+    ranking_proposer_policy = ranking_parameters.get("proposer_count")
+    ranking_proposer_policy = (
+        ranking_proposer_policy
+        if isinstance(ranking_proposer_policy, Mapping)
+        else {}
+    )
+    legacy_replay_backup_count: int | None = None
+    if "backup_count" not in ranking_proposer_policy:
+        configured_backup_count = trace.get("configured_proposer_backup_count")
+        legacy_replay_backup_count = (
+            int(configured_backup_count)
+            if isinstance(configured_backup_count, int)
+            and not isinstance(configured_backup_count, bool)
+            else 0
+        )
+
     analyzer = trace.get("task_analyzer")
     analyzer = analyzer if isinstance(analyzer, Mapping) else {}
     try:
@@ -6417,12 +6994,7 @@ def ranking_trace_replay_reasons(
             ranking_config=copy.deepcopy(dict(ranking_parameters)),
             decision_id=str(trace.get("decision_id") or ""),
             ranking_thinking_assignment_enabled=thinking_assignment_enabled,
-            proposer_backup_count=(
-                int(trace.get("configured_proposer_backup_count"))
-                if isinstance(trace.get("configured_proposer_backup_count"), int)
-                and not isinstance(trace.get("configured_proposer_backup_count"), bool)
-                else 0
-            ),
+            legacy_proposer_backup_count=legacy_replay_backup_count,
             proposer_recovery_max_additional_calls=(
                 int(
                     (trace.get("proposer_recovery_policy") or {}).get(
@@ -6505,6 +7077,14 @@ def ranking_trace_replay_reasons(
         ):
             # Pre-recovery frozen traces remain replayable as legacy evidence,
             # but cannot acquire a partial/new policy projection.
+            continue
+        if (
+            field_name in aggregator_roster_fields
+            and not present_aggregator_roster_fields
+        ):
+            # Pre-roster frozen traces bind the historical hard-coded
+            # three-candidate aggregator chain, but do not acquire the new
+            # explicit configured/effective count fields during replay.
             continue
         if field_name == "ranking_version" and (
             legacy_disabled_replay or legacy_thinking_trace

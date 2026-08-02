@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from collections.abc import AsyncIterator
 from copy import deepcopy
@@ -20,6 +21,7 @@ from opensquilla.provider.ranking_router import (
     DOMAINS,
     TASK_ANALYZER_MODEL_ID,
     TASK_ANALYZER_PROVIDER_ID,
+    TASK_ANALYZER_VERSION,
     THINKING_LEVELS,
     DynamicRankingError,
     TaskAnalysisResult,
@@ -28,6 +30,7 @@ from opensquilla.provider.ranking_router import (
     analyze_task_with_provider,
     build_model_registry_snapshot,
     build_request_context,
+    canonical_json_sha256,
     dynamic_output_token_budgets,
     fallback_task_profile,
     load_model_registry_snapshot,
@@ -35,7 +38,10 @@ from opensquilla.provider.ranking_router import (
     mock_user_profile,
     normalize_task_profile,
     rank_models,
+    ranking_config_resolution,
+    ranking_config_snapshot,
     ranking_trace_replay_reasons,
+    task_analyzer_policy,
 )
 from opensquilla.provider.types import (
     ChatConfig,
@@ -295,6 +301,30 @@ def test_v3_replay_binds_frozen_aggregator_candidate_chain() -> None:
     )
 
 
+def test_legacy_v4_trace_without_embedded_enabled_switch_remains_replayable() -> None:
+    trace = rank_models(
+        task_analysis=_analysis(tier=3),
+        user_profile=None,
+        request_context=_context(),
+        registry_snapshot=_snapshot(
+            _thinking_model("alpha", provider="provider-a", capability=0.95),
+            _thinking_model("beta", provider="provider-b", capability=0.90),
+            _thinking_model("gamma", provider="provider-c", capability=0.85),
+        ),
+        routed_tier="c2",
+        routing_confidence=0.91,
+        decision_id="legacy-v4-switch-replay",
+        ranking_thinking_assignment_enabled=True,
+    ).trace
+    legacy = deepcopy(trace)
+    legacy["ranking_parameters"]["thinking_assignment"].pop("enabled")
+    legacy["ranking_config_hash"] = canonical_json_sha256(
+        legacy["ranking_parameters"]
+    )
+
+    assert ranking_trace_replay_reasons(legacy) == []
+
+
 def test_v3_managed_thinking_trace_requires_explicit_compatibility() -> None:
     trace = rank_models(
         task_analysis=_analysis(tier=3),
@@ -427,6 +457,10 @@ def test_packaged_ranking_config_is_versioned_validated_and_isolated() -> None:
     assert first["schema_version"] == "step2-ranking-config-v4"
     assert first["config_version"].startswith("step2-ranking-")
     assert first["task_analyzer"]["max_output_tokens"] == 1_200
+    assert first["task_analyzer"]["provider"] == "openrouter"
+    assert first["task_analyzer"]["model"] == TASK_ANALYZER_MODEL_ID
+    assert first["task_analyzer"]["upstream_provider"] == "anthropic"
+    assert first["task_analyzer"]["stream_close_timeout_seconds"] == 1.0
     assert first["routing_tiers"]["mapping"] == {"c0": 1, "c1": 2, "c2": 3, "c3": 4}
     assert first["context"]["bucket_min_tokens"]["extra_long"] == 128_000
     assert first["context"]["token_estimation"]["dense_chars_per_token"] == 1
@@ -435,9 +469,308 @@ def test_packaged_ranking_config_is_versioned_validated_and_isolated() -> None:
     assert first["synthetic_model"]["context_window"] == 128_000
     assert first["hard_filter"]["eligible_statuses"] == ["enabled", "canary"]
     assert first["exploration"] == {"enabled": False, "decision_propensity": 1.0}
+    assert first["thinking_assignment"]["enabled"] is False
     assert first["rerank"]["similarity_penalty_weight"] == pytest.approx(0.25)
+    assert first["proposer_count"]["backup_count"] == 2
+    assert first["aggregator"]["candidate_count"] == 3
     first["rerank"]["similarity_penalty_weight"] = 99.0
     assert second["rerank"]["similarity_penalty_weight"] == pytest.approx(0.25)
+
+
+def test_ranking_snapshot_none_tracks_the_packaged_thinking_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    packaged = load_ranking_config()
+    packaged["thinking_assignment"]["enabled"] = True
+    validated = ranking_router._validate_ranking_config(packaged)
+    monkeypatch.setattr(
+        ranking_router,
+        "_packaged_ranking_config",
+        lambda: validated,
+    )
+    monkeypatch.setattr(
+        ranking_router,
+        "_packaged_enabled_ranking_config",
+        lambda: validated,
+    )
+
+    snapshot = ranking_config_snapshot()
+    resolution = ranking_config_resolution()
+
+    assert snapshot == resolution["effective_config"]
+    assert snapshot["thinking_assignment"]["enabled"] is True
+    assert resolution["thinking_assignment_enabled"] is True
+
+
+@pytest.mark.parametrize(
+    ("thinking_assignment_enabled", "schema_version", "config_version", "sha256"),
+    [
+        (
+            False,
+            "step2-ranking-config-v3",
+            "step2-ranking-2026-08-02.2",
+            "71be283f94095bc3ced34d39ae9ed58abbaa7e4d273b0a074e7e8a4a6e4b5fc6",
+        ),
+        (
+            True,
+            "step2-ranking-config-v4",
+            "step2-ranking-2026-08-02.2",
+            "c128270d4e7e20459fb4c86339c425f2100373455bb4725716b57208bbeafb86",
+        ),
+    ],
+)
+def test_ranking_config_resolution_without_override_preserves_packaged_identity(
+    thinking_assignment_enabled: bool,
+    schema_version: str,
+    config_version: str,
+    sha256: str,
+) -> None:
+    snapshot = ranking_config_snapshot(
+        thinking_assignment_enabled=thinking_assignment_enabled
+    )
+    resolution = ranking_config_resolution(
+        thinking_assignment_enabled=thinking_assignment_enabled
+    )
+    empty_resolution = ranking_config_resolution(
+        thinking_assignment_enabled=thinking_assignment_enabled,
+        override={},
+    )
+
+    assert resolution["override"] is None
+    assert resolution["override_sha256"] is None
+    assert resolution["base_config"] == snapshot
+    assert resolution["effective_config"] == snapshot
+    assert resolution["base_sha256"] == sha256
+    assert resolution["effective_sha256"] == sha256
+    assert resolution["effective_config"]["schema_version"] == schema_version
+    assert resolution["effective_config"]["config_version"] == config_version
+    assert empty_resolution == resolution
+    assert ranking_config_snapshot(
+        thinking_assignment_enabled=thinking_assignment_enabled,
+        override={},
+    ) == snapshot
+
+
+def test_ranking_config_resolution_deep_merges_sparse_nested_override() -> None:
+    override = {"penalties": {"task_cost_weights": {"medium": 0.17}}}
+
+    resolution = ranking_config_resolution(override=override)
+    snapshot = ranking_config_snapshot(override=override)
+
+    assert resolution["base_config"]["penalties"]["task_cost_weights"]["medium"] == 0.10
+    assert resolution["effective_config"]["penalties"]["task_cost_weights"] == {
+        "low": 0.20,
+        "medium": 0.17,
+        "high": 0.04,
+        "hard_limit": 0.28,
+    }
+    assert snapshot == resolution["effective_config"]
+    assert resolution["effective_config"]["config_version"] == (
+        "step2-ranking-2026-08-02.2+override."
+        f"{resolution['override_sha256'][:12]}"
+    )
+    assert resolution["effective_sha256"] != resolution["base_sha256"]
+    override["penalties"]["task_cost_weights"]["medium"] = 99
+    assert resolution["override"]["penalties"]["task_cost_weights"]["medium"] == 0.17
+
+
+def test_task_analyzer_policy_is_public_overrideable_and_protocol_pinned() -> None:
+    resolution = ranking_config_resolution(
+        override={
+            "task_analyzer": {
+                "model": "openai/gpt-5.2",
+                "upstream_provider": "openai",
+                "stream_close_timeout_seconds": 2.5,
+                "max_retries": 2,
+            }
+        }
+    )
+
+    assert task_analyzer_policy(resolution["effective_config"]) == {
+        "protocol_version": TASK_ANALYZER_VERSION,
+        "provider": "openrouter",
+        "model": "openai/gpt-5.2",
+        "upstream_provider": "openai",
+        "stream_close_timeout_seconds": 2.5,
+        "timeout_seconds": 20.0,
+        "max_retries": 2,
+    }
+
+
+def test_task_analyzer_policy_replays_authenticated_legacy_shape() -> None:
+    legacy = load_ranking_config()
+    legacy["config_version"] = "step2-ranking-2026-08-02.1"
+    for key in (
+        "provider",
+        "model",
+        "upstream_provider",
+        "stream_close_timeout_seconds",
+    ):
+        legacy["task_analyzer"].pop(key)
+
+    assert task_analyzer_policy(legacy)["model"] == TASK_ANALYZER_MODEL_ID
+    current = deepcopy(legacy)
+    current["config_version"] = "step2-ranking-2026-08-02.2"
+    with pytest.raises(DynamicRankingError, match="lacks the versioned task_analyzer"):
+        task_analyzer_policy(current)
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        (["not", "an", "object"], "must be a JSON object"),
+        ({"schema_version": "other"}, "cannot override"),
+        ({"config_version": "caller-controlled"}, "cannot override"),
+        ({"penalties": {"unknown": 1}}, "unknown or missing keys"),
+        (
+            {"penalties": {"task_cost_weights": {"low": "0.20"}}},
+            "must be numeric",
+        ),
+        (
+            {"proposer_count": {"backup_count": 3}},
+            "backup_count must be between 0 and 2",
+        ),
+        (
+            {"aggregator": {"candidate_count": 0}},
+            "candidate_count must be between 1 and 3",
+        ),
+        (
+            {"task_analyzer": {"provider": "anthropic"}},
+            "provider currently must be openrouter",
+        ),
+        (
+            {"task_analyzer": {"model": "OpenAI/GPT-5.2"}},
+            "model must be lowercase",
+        ),
+        (
+            {"task_analyzer": {"model": "invalid-model"}},
+            "contain '/'",
+        ),
+        (
+            {"task_analyzer": {"upstream_provider": "Google AI"}},
+            "upstream_provider must be a lowercase",
+        ),
+        (
+            {"task_analyzer": {"stream_close_timeout_seconds": 0.0}},
+            "stream_close_timeout_seconds must be positive",
+        ),
+        (
+            {"task_analyzer": {"stream_close_timeout_seconds": 21.0}},
+            "no greater than timeout_seconds",
+        ),
+        ({"penalties": {"api_key": "redacted"}}, "secret-like field"),
+        ({"penalties": {"credential_available": True}}, "secret-like field"),
+    ],
+)
+def test_ranking_config_resolution_rejects_invalid_sparse_override(
+    override: Any,
+    message: str,
+) -> None:
+    with pytest.raises(DynamicRankingError, match=message):
+        ranking_config_resolution(override=override)
+
+
+def test_ranking_config_override_hash_and_version_are_key_order_stable() -> None:
+    first = {
+        "penalties": {"task_cost_weights": {"medium": 0.17, "low": 0.31}},
+        "rerank": {"similarity_penalty_weight": 0.20},
+    }
+    second = {
+        "rerank": {"similarity_penalty_weight": 0.20},
+        "penalties": {"task_cost_weights": {"low": 0.31, "medium": 0.17}},
+    }
+
+    first_resolution = ranking_config_resolution(override=first)
+    second_resolution = ranking_config_resolution(override=second)
+
+    assert first_resolution["override_sha256"] == second_resolution["override_sha256"]
+    assert first_resolution["effective_sha256"] == second_resolution["effective_sha256"]
+    assert (
+        first_resolution["effective_config"]["config_version"]
+        == second_resolution["effective_config"]["config_version"]
+    )
+
+
+def test_ranking_config_override_unicode_hash_uses_canonical_utf8() -> None:
+    override = {"mock_user_profile": {"profile_source": "实验-中文"}}
+
+    resolution = ranking_config_resolution(override=override)
+    normalized_override = resolution["override"]
+    expected = hashlib.sha256(
+        json.dumps(
+            normalized_override,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    ascii_escaped = hashlib.sha256(
+        json.dumps(
+            normalized_override,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+    assert resolution["override_sha256"] == expected
+    assert canonical_json_sha256(normalized_override) == expected
+    assert expected != ascii_escaped
+    assert resolution["effective_config"]["config_version"].endswith(expected[:12])
+
+
+def test_ranking_config_override_resolves_against_selected_thinking_base() -> None:
+    override = {"penalties": {"task_cost_weights": {"medium": 0.17}}}
+
+    legacy = ranking_config_resolution(override=override)
+    thinking = ranking_config_resolution(
+        thinking_assignment_enabled=True,
+        override=override,
+    )
+
+    assert legacy["override_sha256"] == thinking["override_sha256"]
+    assert legacy["effective_sha256"] != thinking["effective_sha256"]
+    assert legacy["effective_config"]["schema_version"] == "step2-ranking-config-v3"
+    assert "thinking_assignment" not in legacy["effective_config"]
+    assert thinking["effective_config"]["schema_version"] == "step2-ranking-config-v4"
+    assert "thinking_assignment" in thinking["effective_config"]
+    suffix = legacy["override_sha256"][:12]
+    assert legacy["effective_config"]["config_version"] == (
+        f"step2-ranking-2026-08-02.2+override.{suffix}"
+    )
+    assert thinking["effective_config"]["config_version"] == (
+        f"step2-ranking-2026-08-02.2+override.{suffix}"
+    )
+
+
+def test_ranking_config_override_is_the_authoritative_thinking_switch() -> None:
+    override = {"thinking_assignment": {"enabled": True}}
+
+    resolution = ranking_config_resolution(override=override)
+
+    assert resolution["base_config"]["schema_version"] == "step2-ranking-config-v3"
+    assert "thinking_assignment" not in resolution["base_config"]
+    assert resolution["effective_config"]["schema_version"] == "step2-ranking-config-v4"
+    assert resolution["effective_config"]["thinking_assignment"]["enabled"] is True
+    assert resolution["thinking_assignment_enabled"] is True
+    assert ranking_config_snapshot(override=override) == resolution["effective_config"]
+
+
+@pytest.mark.parametrize(
+    ("legacy_switch", "override_switch"),
+    [(False, True), (True, False)],
+)
+def test_ranking_config_override_rejects_conflicting_legacy_thinking_switch(
+    legacy_switch: bool,
+    override_switch: bool,
+) -> None:
+    with pytest.raises(DynamicRankingError, match="conflicts with the legacy"):
+        ranking_config_resolution(
+            thinking_assignment_enabled=legacy_switch,
+            override={"thinking_assignment": {"enabled": override_switch}},
+        )
 
 
 def test_invalid_ranking_config_fails_before_selection() -> None:
@@ -1204,7 +1537,6 @@ class _AnalyzerTerminalProvider:
 
 @pytest.mark.asyncio
 async def test_task_analyzer_hanging_stream_close_is_bounded(
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class _HangingStream:
         def __init__(self) -> None:
@@ -1238,11 +1570,7 @@ async def test_task_analyzer_hanging_stream_close_is_bounded(
 
     config = load_ranking_config()
     config["task_analyzer"]["max_retries"] = 0
-    monkeypatch.setattr(
-        ranking_router,
-        "_TASK_ANALYZER_STREAM_CLOSE_TIMEOUT_SECONDS",
-        0.01,
-    )
+    config["task_analyzer"]["stream_close_timeout_seconds"] = 0.01
     provider = _HangingProvider()
 
     with pytest.raises(TaskAnalyzerStreamCleanupError):
@@ -1340,6 +1668,59 @@ async def test_task_analyzer_uses_provider_interface_and_validates_json() -> Non
     assert analyzer_payload["allowed_session_intents"] == ["new_task", "continue", "redo"]
     # The profile never reaches the analyzer provider, even when one is supplied.
     assert "user_profile" not in analyzer_payload
+
+
+@pytest.mark.asyncio
+async def test_task_analyzer_override_controls_request_usage_and_trace_identity() -> None:
+    provider = _AnalyzerProvider(json.dumps(_task_profile(tier=2)))
+    ranking_config = ranking_config_snapshot(
+        override={
+            "task_analyzer": {
+                "model": "openai/gpt-5.2",
+                "upstream_provider": "openai",
+            }
+        }
+    )
+
+    result = await analyze_task_with_provider(
+        provider=provider,
+        message="implement a parser",
+        user_profile_enabled=False,
+        request_context=_context(),
+        routed_tier="c1",
+        routing_confidence=0.8,
+        ranking_config=ranking_config,
+    )
+
+    assert result.provider_id == "openrouter"
+    assert result.model_id == "openai/gpt-5.2"
+    assert result.trace(ranking_config)["model"] == "openai/gpt-5.2"
+    assert result.usage["provider"] == "openrouter"
+    assert result.usage["model"] == "analyzer-test"
+    assert result.usage["requested_provider"] == "openrouter"
+    assert result.usage["requested_model"] == "openai/gpt-5.2"
+
+
+@pytest.mark.asyncio
+async def test_task_analyzer_explicit_identity_mismatch_fails_before_request() -> None:
+    provider = _AnalyzerProvider(json.dumps(_task_profile(tier=2)))
+    ranking_config = ranking_config_snapshot(
+        override={"task_analyzer": {"model": "openai/gpt-5.2"}}
+    )
+
+    with pytest.raises(DynamicRankingError, match="caller model identity conflicts"):
+        await analyze_task_with_provider(
+            provider=provider,
+            message="implement a parser",
+            user_profile_enabled=False,
+            request_context=_context(),
+            routed_tier="c1",
+            routing_confidence=0.8,
+            analyzer_model_id=TASK_ANALYZER_MODEL_ID,
+            ranking_config=ranking_config,
+        )
+
+    assert provider.calls == []
 
 
 @pytest.mark.asyncio
@@ -2977,7 +3358,7 @@ def test_disabled_thinking_assignment_preserves_exact_legacy_trace_shape() -> No
     assert disabled.trace["ranking_version"] == "step2-ranking-v2"
     assert (
         disabled.trace["ranking_config_hash"]
-        == "a8addcdefa04349209c20e97ca5851ed0f5ca55646c9d0c5badc5d32dd7ef10c"
+        == "71be283f94095bc3ced34d39ae9ed58abbaa7e4d273b0a074e7e8a4a6e4b5fc6"
     )
     for field in (
         "ranking_thinking_assignment_enabled",
@@ -3439,7 +3820,6 @@ def test_ranker_freezes_ordered_disjoint_proposer_backups_and_replays_exactly() 
         routing_confidence=0.91,
         decision_id="backup-replay-decision",
         ranking_thinking_assignment_enabled=True,
-        proposer_backup_count=2,
         proposer_recovery_max_additional_calls=3,
         proposer_max_tokens_cap=65_536,
         proposer_visible_answer_reserve_tokens=4_096,
@@ -3476,6 +3856,87 @@ def test_ranker_freezes_ordered_disjoint_proposer_backups_and_replays_exactly() 
         "g1_frozen_ranker_replay_mismatch_proposer_recovery_policy"
         in ranking_trace_replay_reasons(tampered)
     )
+
+
+def test_ranker_roster_counts_are_owned_by_effective_ranking_config() -> None:
+    models = [
+        _thinking_model(
+            f"roster-{index}",
+            provider=f"provider-{index}",
+            capability=0.99 - index * 0.02,
+        )
+        for index in range(9)
+    ]
+    ranking_config = ranking_config_snapshot(
+        thinking_assignment_enabled=True,
+        override={
+            "proposer_count": {"backup_count": 1},
+            "aggregator": {"candidate_count": 2},
+        },
+    )
+
+    decision = rank_models(
+        task_analysis=_analysis(tier=3),
+        user_profile=None,
+        request_context=_context(),
+        registry_snapshot=_snapshot(*models),
+        routed_tier="c2",
+        routing_confidence=0.91,
+        ranking_config=ranking_config,
+        decision_id="ranking-owned-roster",
+        ranking_thinking_assignment_enabled=True,
+        proposer_recovery_max_additional_calls=3,
+        proposer_recovery_quorum=2,
+    )
+
+    assert len(decision.backup_proposers) == 1
+    assert len(decision.aggregator_candidates) == 2
+    assert decision.trace["configured_proposer_backup_count"] == 1
+    assert decision.trace["effective_proposer_backup_count"] == 1
+    assert decision.trace["configured_aggregator_candidate_count"] == 2
+    assert decision.trace["effective_aggregator_candidate_count"] == 2
+    assert ranking_trace_replay_reasons(decision.trace) == []
+
+    tampered = deepcopy(decision.trace)
+    tampered["configured_aggregator_candidate_count"] = 3
+    assert (
+        "g1_frozen_ranker_replay_mismatch_configured_aggregator_candidate_count"
+        in ranking_trace_replay_reasons(tampered)
+    )
+
+
+def test_pre_roster_trace_replay_keeps_archived_gateway_backup_count() -> None:
+    ranking_config = load_ranking_config()
+    ranking_config["config_version"] = "step2-ranking-2026-07-27.1"
+    ranking_config["proposer_count"].pop("backup_count")
+    ranking_config["aggregator"].pop("candidate_count")
+    decision = rank_models(
+        task_analysis=_analysis(tier=3),
+        user_profile=None,
+        request_context=_context(),
+        registry_snapshot=_snapshot(
+            *[
+                _thinking_model(
+                    f"archived-{index}",
+                    provider=f"provider-{index}",
+                    capability=0.99 - index * 0.03,
+                )
+                for index in range(9)
+            ]
+        ),
+        routed_tier="c2",
+        routing_confidence=0.91,
+        ranking_config=ranking_config,
+        decision_id="pre-roster-replay",
+        ranking_thinking_assignment_enabled=True,
+        legacy_proposer_backup_count=1,
+    )
+    archived_trace = deepcopy(decision.trace)
+    archived_trace.pop("configured_aggregator_candidate_count")
+    archived_trace.pop("effective_aggregator_candidate_count")
+
+    assert archived_trace["configured_proposer_backup_count"] == 1
+    assert ranking_trace_replay_reasons(archived_trace) == []
 
 
 def test_ranker_legacy_replay_allows_no_recovery_projection_but_rejects_partial() -> None:

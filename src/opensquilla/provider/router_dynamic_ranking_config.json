@@ -1,6 +1,6 @@
 {
   "schema_version": "step2-ranking-config-v4",
-  "config_version": "step2-ranking-2026-07-27.1",
+  "config_version": "step2-ranking-2026-08-02.2",
   "validation": {
     "weight_sum_tolerance": 1e-9,
     "task_profile_sum_tolerance": 0.02
@@ -20,6 +20,7 @@
     }
   },
   "thinking_assignment": {
+    "enabled": false,
     "policy_version": "thinking-policy-v1",
     "level_order": [
       "low",
@@ -87,7 +88,11 @@
     "default_session_intent": "new_task"
   },
   "task_analyzer": {
+    "provider": "openrouter",
+    "model": "anthropic/claude-opus-4.8",
+    "upstream_provider": "anthropic",
     "timeout_seconds": 20.0,
+    "stream_close_timeout_seconds": 1.0,
     "input_max_chars": 24000,
     "response_max_chars": 48000,
     "max_output_tokens": 1200,
@@ -248,6 +253,7 @@
   },
   "proposer_count": {
     "effective_tier_rounding_offset": 0.50,
+    "backup_count": 2,
     "by_tier": {
       "1": {"min": 1, "max": 1},
       "2": {"min": 1, "max": 2},
@@ -292,6 +298,7 @@
     ]
   },
   "aggregator": {
+    "candidate_count": 3,
     "task_match_weight": 0.78,
     "role_fit_weight": 0.22,
     "same_model_penalty": 0.08,

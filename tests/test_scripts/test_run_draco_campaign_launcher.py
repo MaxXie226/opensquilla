@@ -327,37 +327,42 @@ def test_campaign_shape_and_runtime_policy_are_frozen() -> None:
         'DRACO_GROUPS="$DEFAULT_DRACO_GROUPS"',
         '--groups "$DRACO_GROUPS"',
         "--max-tasks 10",
-        '--concurrency "$TASK_CONCURRENCY"',
-        "--experiment-config-set timeouts.task_seconds=10800",
-        "--experiment-config-set runner.agent_max_iterations=20",
         '--experiment-config-set "runner.concurrency=$TASK_CONCURRENCY"',
-        "--judge-concurrency 6",
-        "--experiment-config-set judge.concurrency=6",
-        "--experiment-config-set ensemble.aggregator_recovery_mode=experiment",
-        "--experiment-config-set ensemble.aggregator_recovery_top_k=3",
-        "--experiment-config-set ensemble.aggregator_max_tokens_cap=65536",
-        ("--experiment-config-set ensemble.aggregator_visible_answer_reserve_tokens=8192"),
-        "--timeout 10800",
-        "--ensemble-proposer-timeout 907.5",
-        "--ensemble-aggregator-timeout 2662.5",
-        "--runner-mode agent_loop",
-        "--agent-max-iterations 20",
-        "--generation-max-attempts 3",
-        "--generation-max-tokens 16384",
-        "--judge-model google/gemini-3.1-pro-preview",
-        "--judge-repeats 3",
-        "--judge-max-attempts 3",
-        "--tool-mode local_web_tools",
-        "--local-web-search-provider brave",
-        "--local-web-search-api-key-env BRAVE_SEARCH_API_KEY",
+        '--max-generation-attempts "$GENERATION_MAX_ATTEMPTS"',
         "--require-openrouter-non-byok",
         '--expected-task-concurrency "$TASK_CONCURRENCY"',
+        '--experiment-config-override-json "$EXPERIMENT_CONFIG_OVERRIDE_JSON"',
     )
     for fragment in required_fragments:
         assert fragment in script
     # Static compatibility, wave 1, and resume waves must fingerprint the
     # same strict non-BYOK policy.
     assert script.count("--require-openrouter-non-byok") == 3
+    # The only campaign-owned dotted override is the explicit legacy
+    # concurrency environment variable. Defaults and inline JSON must never be
+    # silently overwritten by fixed launcher values.
+    assert script.count("--experiment-config-set") == 1
+    forbidden_fixed_args = (
+        '--concurrency "$TASK_CONCURRENCY"',
+        "--experiment-config-set timeouts.task_seconds=10800",
+        "--experiment-config-set runner.agent_max_iterations=20",
+        "--experiment-config-set judge.concurrency=6",
+        "--experiment-config-set ensemble.aggregator_recovery_mode=experiment",
+        "--experiment-config-set ensemble.aggregator_recovery_top_k=3",
+        "--experiment-config-set ensemble.aggregator_max_tokens_cap=65536",
+        "--experiment-config-set ensemble.aggregator_visible_answer_reserve_tokens=8192",
+        "--timeout 10800",
+        "--ensemble-proposer-timeout 907.5",
+        "--ensemble-aggregator-timeout 2662.5",
+        "--runner-mode agent_loop",
+        "--agent-max-iterations 20",
+        "--judge-concurrency 6",
+        "--generation-max-attempts 3",
+        "--generation-max-tokens 16384",
+        "--tool-mode local_web_tools",
+    )
+    for fragment in forbidden_fixed_args:
+        assert fragment not in script
     supported_groups = re.search(
         r'readonly SUPPORTED_DRACO_GROUPS="([^"]+)"',
         script,
@@ -402,15 +407,12 @@ def test_group_subset_drives_default_slug_runner_gate_and_finalizer() -> None:
     assert 'DRACO_GROUP_SLUG="${DRACO_GROUP_SLUG//,/-}"' in script
     assert (
         'OUTPUT_NAME="draco-mini-${DRACO_GROUP_SLUG}-c${TASK_CONCURRENCY}'
-        '-j6-a3-$(date +%Y%m%d-%H%M%S)"'
+        "-j${JUDGE_CONCURRENCY}-a${GENERATION_MAX_ATTEMPTS}"
+        '-$(date +%Y%m%d-%H%M%S)"'
     ) in script
     assert '--groups "$DRACO_GROUPS"' in script
     assert script.count('--groups "$DRACO_GROUPS"') == 3
-    assert (
-        '"$summary" \\\n'
-        '    "$DRACO_GROUPS" \\\n'
-        '    "$@" <<\'PY\''
-    ) in script
+    assert ('"$summary" \\\n    "$DRACO_GROUPS" \\\n    "$@" <<\'PY\'') in script
     assert "groups_raw = sys.argv[7]" in script
     assert "result_paths = [Path(value) for value in sys.argv[8:]]" in script
     assert re.search(r'(?m)^groups = \("B0", "B1", "B2", "B4", "G1"\)$', script) is None
@@ -421,10 +423,7 @@ def test_group_subset_drives_default_slug_runner_gate_and_finalizer() -> None:
 def test_g1_only_selects_ten_resume_gate_pairs() -> None:
     script = _script()
     assert "tasks = module.load_tasks(input_path, max_tasks=0)" in script
-    assert (
-        'selected = {(group, str(task["id"])) for task in tasks for group in groups}'
-        in script
-    )
+    assert 'selected = {(group, str(task["id"])) for task in tasks for group in groups}' in script
     # The frozen input preflight proves exactly ten unique tasks. With the gate
     # consuming the validated one-element ("G1",) subset, the target is 10.
     assert "length == 10" in script
@@ -474,6 +473,8 @@ def load_resume_group_task_states(*, selected_keys, **kwargs):
 
 def coerce_metric_int(value):
     return int(value or 0)
+
+GENERATION_MAX_ATTEMPTS = 3
 """.lstrip(),
         encoding="utf-8",
     )
@@ -492,8 +493,10 @@ def coerce_metric_int(value):
         json.dumps(
             {
                 "run_compatibility": {
-                    "fingerprints": {"fixture": "fingerprint"},
-                    "contracts": {"fixture": "contract"},
+                    "fingerprints": {"G1": "fingerprint"},
+                    "contracts": {
+                        "G1": {"generation": {"max_attempts": 3}}
+                    },
                 }
             }
         ),
@@ -519,10 +522,7 @@ def coerce_metric_int(value):
     )
 
     assert completed.returncode == 0, completed.stderr
-    actionable = [
-        json.loads(line)
-        for line in output_path.read_text(encoding="utf-8").splitlines()
-    ]
+    actionable = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()]
     assert len(actionable) == 10
     assert {row["group"] for row in actionable} == {"G1"}
     assert {row["action"] for row in actionable} == {"regenerate"}
@@ -530,6 +530,95 @@ def coerce_metric_int(value):
     assert summary["groups"] == ["G1"]
     assert summary["selected_pair_count"] == 10
     assert summary["actionable_pair_count"] == 10
+
+
+def test_resume_gate_uses_the_authenticated_dynamic_generation_budget(
+    tmp_path: Path,
+) -> None:
+    gate_block = _embedded_python_blocks()[3]
+    runner_path = tmp_path / "resume_runner.py"
+    finalizer_path = tmp_path / "finalizer.py"
+    input_path = tmp_path / "mini.jsonl"
+    manifest_path = tmp_path / "manifest.json"
+    output_path = tmp_path / "actionable.jsonl"
+    summary_path = tmp_path / "summary.json"
+
+    runner_path.write_text(
+        """
+import hashlib
+import json
+
+GENERATION_MAX_ATTEMPTS = 3
+
+def load_tasks(path, *, max_tasks):
+    return [json.loads(path.read_text(encoding="utf-8"))]
+
+def text_sha256(value):
+    return hashlib.sha256(value.encode()).hexdigest()
+
+def canonical_json_sha256(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+
+def load_resume_group_task_states(**kwargs):
+    return {
+        ("B0", "task-1"): {
+            "action": "regenerate",
+            "generation_valid": False,
+            "judge_complete": False,
+            "prior_generation_attempts_used": 2,
+        }
+    }, {}
+
+def coerce_metric_int(value):
+    return int(value or 0)
+""".lstrip(),
+        encoding="utf-8",
+    )
+    finalizer_path.write_text(
+        "def proof_only_usage_evidence_reasons(row):\n    return []\n",
+        encoding="utf-8",
+    )
+    input_path.write_text(
+        json.dumps({"id": "task-1", "prompt": "prompt"}),
+        encoding="utf-8",
+    )
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "run_compatibility": {
+                    "fingerprints": {"B0": "fingerprint"},
+                    "contracts": {
+                        "B0": {"generation": {"max_attempts": 2}}
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            gate_block,
+            str(runner_path),
+            str(finalizer_path),
+            str(input_path),
+            str(manifest_path),
+            str(output_path),
+            str(summary_path),
+            "B0",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert output_path.read_text(encoding="utf-8") == ""
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary["actionable_pair_count"] == 0
+    assert summary["generation_budget_exhausted_pair_count"] == 1
 
 
 def test_exact_input_and_new_main_repo_report_child_are_enforced() -> None:
@@ -544,11 +633,21 @@ def test_exact_input_and_new_main_repo_report_child_are_enforced() -> None:
     assert 'CONFIG="$REFERENCE_REPO/.local-state/config.toml"' in script
     assert "DRACO_CAMPAIGN_REPORT_ROOT" in script
     assert "DRACO_CAMPAIGN_REFERENCE_REPO" in script
-    assert 'TASK_CONCURRENCY="${DRACO_CAMPAIGN_TASK_CONCURRENCY:-5}"' in script
-    assert '[[ ! "$TASK_CONCURRENCY" =~ ^[1-9][0-9]*$ ]]' in script
+    assert 'if [[ "${DRACO_CAMPAIGN_TASK_CONCURRENCY+x}" == "x" ]]' in script
+    assert 'TASK_CONCURRENCY="$CONFIG_TASK_CONCURRENCY"' in script
+    assert 'TASK_CONCURRENCY="$TASK_CONCURRENCY_OVERRIDE"' in script
+    assert '[[ ! "$TASK_CONCURRENCY_OVERRIDE" =~ ^[1-9][0-9]*$ ]]' in script
     assert "DRACO_CAMPAIGN_TASK_CONCURRENCY must be a positive integer" in script
-    assert "c${TASK_CONCURRENCY}-j6-a3-" in script
-    assert "draco-mini-${DRACO_GROUP_SLUG}-c${TASK_CONCURRENCY}-j6-a3-" in script
+    assert 'inline_overlay_json=(sys.argv[3] if sys.argv[4] == "1" else None)' in script
+    assert 'EXPERIMENT_CONFIG_OVERRIDE_JSON_PRESENT=1' in script
+    assert "config.runner.concurrency" in script
+    assert "config.judge.concurrency" in script
+    assert "config.generation.max_attempts" in script
+    assert "c${TASK_CONCURRENCY}-j${JUDGE_CONCURRENCY}-a${GENERATION_MAX_ATTEMPTS}-" in script
+    assert (
+        "draco-mini-${DRACO_GROUP_SLUG}-c${TASK_CONCURRENCY}-"
+        "j${JUDGE_CONCURRENCY}-a${GENERATION_MAX_ATTEMPTS}-"
+    ) in script
     assert (
         'readonly EXPECTED_INPUT_SHA256="'
         "1eb4e618c8df8e7f68bded3d2b6f77a541744aa1072eb338835b776183188a8d"
@@ -575,10 +674,7 @@ def test_snapshot_is_parameterized_and_must_be_clean() -> None:
 
 def test_campaign_python_can_reuse_an_external_executable() -> None:
     script = _script()
-    assert (
-        'PYTHON="${DRACO_CAMPAIGN_PYTHON:-$SNAPSHOT_REPO/.venv/bin/python}"'
-        in script
-    )
+    assert 'PYTHON="${DRACO_CAMPAIGN_PYTHON:-$SNAPSHOT_REPO/.venv/bin/python}"' in script
     assert '[[ ! -f "$PYTHON" || ! -x "$PYTHON" ]]' in script
     assert "Campaign Python must be an executable file" in script
     python_check = script.index('if [[ ! -f "$PYTHON" || ! -x "$PYTHON" ]]')
@@ -747,7 +843,8 @@ def test_resume_gate_schedules_one_offline_metadata_repair_without_model_work() 
     assert 'state.get("metadata_repair_attempted") is True' in script
     assert '{"group": group, "task_id": task_id, "action": "metadata_only"}' in script
     assert "campaign_proof_only.append" in script
-    assert "prior_used < 3" in script
+    assert "prior_used < generation_attempt_limits[group]" in script
+    assert 'generation.get("max_attempts")' in script
     assert "generation_budget_exhausted" in script
     assert 'if [[ ! -s "$ACTIONABLE_KEYS" ]]' in script
     assert '--only-group-task-keys "$ACTIONABLE_KEYS"' in script
@@ -817,7 +914,7 @@ def test_every_prior_result_is_passed_to_resume_and_finalizer() -> None:
         '--lock-file "$LOCK_FILE"',
         '--output-dir "$FINAL_OUTPUT_DIR"',
         '--groups "$DRACO_GROUPS"',
-        "--max-generation-attempts 3",
+        '--max-generation-attempts "$GENERATION_MAX_ATTEMPTS"',
     ):
         assert fragment in script
 
@@ -1036,9 +1133,14 @@ def test_terminal_model_budget_exhaustion_is_recorded_before_finalizer() -> None
     script = _script()
 
     settlement = script.index("capture_stable_after")
+    final_gate = script.index(
+        'FINAL_GATE_SUMMARY="$ARCHIVE_DIR/gates/final-summary.json"',
+        settlement,
+    )
+    final_reclassification = script.index("write_actionable_keys", final_gate)
     terminal_gate = script.index(
         "(.generation_budget_exhausted_pair_count // 0) > 0",
-        settlement,
+        final_reclassification,
     )
     status = script.index(
         '"$RECOVERY_STATUS" status "$OUTPUT_DIR"',
@@ -1049,7 +1151,19 @@ def test_terminal_model_budget_exhaustion_is_recorded_before_finalizer() -> None
         status,
     )
 
-    assert settlement < terminal_gate < status < finalizer
+    assert (
+        settlement
+        < final_gate
+        < final_reclassification
+        < terminal_gate
+        < status
+        < finalizer
+    )
+    final_gate_block = script[final_reclassification:terminal_gate]
+    assert '"$FINAL_ACTIONABLE_KEYS"' in final_gate_block
+    assert '"$FINAL_GATE_SUMMARY"' in final_gate_block
+    assert '"${RESULT_JSONLS[@]}"' in final_gate_block
+    assert "' \"$FINAL_GATE_SUMMARY\" >/dev/null" in script[terminal_gate:status]
     assert '.reason_code == "model_attempt_budget_exhausted"' in script
     assert '"$ARCHIVE_DIR/finalization-status.json"' in script
     assert (

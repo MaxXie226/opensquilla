@@ -88,6 +88,9 @@ from opensquilla.eval.draco_experiment_config import (
     DracoExperimentConfig,
     DracoExperimentConfigBundle,
     load_draco_experiment_config,
+    validate_formal_draco_credential_bindings,
+    validate_formal_draco_ensemble_member_binding,
+    validate_formal_draco_gateway_credential_binding,
     validate_reference_input,
 )
 from opensquilla.execution_status import compact_provider_status
@@ -294,18 +297,105 @@ GENERATION_MISSING_DONE_ERROR = "generation_missing_done"
 RUNNER_STREAM_CLEANUP_TIMEOUT_SECONDS = 1.0
 RUN_COMPATIBILITY_SCHEMA = "opensquilla.draco.run-compatibility/v1"
 PROPOSER_RECOVERY_SCHEMA = "opensquilla.router-dynamic-proposer-recovery/v1"
-FORMAL_PROPOSER_RECOVERY_POLICY: dict[str, Any] = {
-    "schema": PROPOSER_RECOVERY_SCHEMA,
-    "configured_backup_count": 2,
-    "effective_backup_count": 2,
-    "max_additional_physical_requests": 3,
-    "quorum_required": 2,
-    "max_tokens_cap": 65_536,
-    "visible_answer_reserve_tokens": 4_096,
-    "thinking_downgrade_order": ["one_strictly_lower"],
-    "transient_same_model_retries": 1,
-    "backup_reasoning_downgrades": 1,
-}
+
+
+def formal_proposer_recovery_policy(
+    backup_count: int,
+    *,
+    max_additional_physical_requests: int = 3,
+    max_tokens_cap: int = 65_536,
+    visible_answer_reserve_tokens: int = 4_096,
+) -> dict[str, Any]:
+    """Return the execution policy bound to a frozen ranking roster size."""
+
+    if (
+        isinstance(backup_count, bool)
+        or not isinstance(backup_count, int)
+        or not 0 <= backup_count <= 2
+    ):
+        raise ValueError("ranking proposer backup_count must be between 0 and 2")
+    if (
+        isinstance(max_additional_physical_requests, bool)
+        or not isinstance(max_additional_physical_requests, int)
+        or not 0 <= max_additional_physical_requests <= 3
+    ):
+        raise ValueError(
+            "proposer max_additional_physical_requests must be between 0 and 3"
+        )
+    if (
+        isinstance(max_tokens_cap, bool)
+        or not isinstance(max_tokens_cap, int)
+        or max_tokens_cap < 2
+    ):
+        raise ValueError("proposer max_tokens_cap must be at least 2")
+    if (
+        isinstance(visible_answer_reserve_tokens, bool)
+        or not isinstance(visible_answer_reserve_tokens, int)
+        or not 1 <= visible_answer_reserve_tokens < max_tokens_cap
+    ):
+        raise ValueError(
+            "proposer visible_answer_reserve_tokens must be between 1 and "
+            "max_tokens_cap - 1"
+        )
+    return {
+        "schema": PROPOSER_RECOVERY_SCHEMA,
+        "configured_backup_count": backup_count,
+        "effective_backup_count": backup_count,
+        "max_additional_physical_requests": max_additional_physical_requests,
+        "quorum_required": 2,
+        "max_tokens_cap": max_tokens_cap,
+        "visible_answer_reserve_tokens": visible_answer_reserve_tokens,
+        "thinking_downgrade_order": ["one_strictly_lower"],
+        "transient_same_model_retries": 1,
+        "backup_reasoning_downgrades": 1,
+    }
+
+
+FORMAL_PROPOSER_RECOVERY_POLICY: dict[str, Any] = formal_proposer_recovery_policy(2)
+
+
+def ranking_proposer_backup_count(ranking_config: Mapping[str, Any]) -> int:
+    """Read the sole authoritative proposer backup roster size."""
+
+    proposer_count = ranking_config.get("proposer_count")
+    raw = proposer_count.get("backup_count") if isinstance(proposer_count, Mapping) else None
+    if isinstance(raw, bool) or not isinstance(raw, int) or not 0 <= raw <= 2:
+        raise ValueError("frozen ranking proposer_count.backup_count must be between 0 and 2")
+    return raw
+
+
+def formal_proposer_recovery_policy_for_plan(
+    plan: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    policy = plan.get("proposer_recovery_policy")
+    if not isinstance(policy, Mapping):
+        return None
+    ranking_config = plan.get("ranking_parameters")
+    if isinstance(ranking_config, Mapping):
+        try:
+            backup_count = ranking_proposer_backup_count(ranking_config)
+        except ValueError:
+            return None
+    else:
+        # Archived plans predate embedded ranking_parameters. Their signed
+        # recovery policy remains replayable, but it still has to normalize to
+        # the exact formal schema below.
+        backup_count = policy.get("configured_backup_count")
+    try:
+        return formal_proposer_recovery_policy(
+            backup_count,
+            max_additional_physical_requests=policy.get(
+                "max_additional_physical_requests"
+            ),
+            max_tokens_cap=policy.get("max_tokens_cap"),
+            visible_answer_reserve_tokens=policy.get(
+                "visible_answer_reserve_tokens"
+            ),
+        )
+    except ValueError:
+        return None
+
+
 REPAIR_ONLY_SOURCE_DRIFT_SCHEMA = "opensquilla.draco.repair-only-source-drift/v1"
 
 
@@ -431,13 +521,29 @@ def validate_g1_registry_contract(
     from opensquilla.provider.ranking_router import (
         _legacy_registry_snapshot_projection,
         load_model_registry_snapshot,
-        ranking_config_snapshot,
+        ranking_config_resolution,
+        task_analyzer_policy,
     )
 
-    snapshot = load_model_registry_snapshot()
-    thinking_assignment_enabled = (
-        config.llm_ensemble.ranking_thinking_assignment_enabled is True
+    frozen_resolution = getattr(
+        config.llm_ensemble,
+        "ranking_config_resolution_snapshot",
+        None,
     )
+    if callable(frozen_resolution):
+        ranking_resolution = frozen_resolution()
+        thinking_assignment_enabled = (
+            ranking_resolution.get("thinking_assignment_enabled") is True
+        )
+    else:
+        thinking_assignment_enabled = (
+            config.llm_ensemble.ranking_thinking_assignment_enabled is True
+        )
+        ranking_resolution = ranking_config_resolution(
+            thinking_assignment_enabled=thinking_assignment_enabled,
+            override=(config.llm_ensemble.ranking_config_override or None),
+        )
+    snapshot = load_model_registry_snapshot()
     if not thinking_assignment_enabled:
         snapshot = _legacy_registry_snapshot_projection(snapshot)
     actual_version = str(snapshot.get("snapshot_version") or "").strip()
@@ -446,36 +552,42 @@ def validate_g1_registry_contract(
     actual_registry_hash = canonical_json_sha256(snapshot).removeprefix("sha256:")
     if actual_registry_hash != contract.expected_source_registry_snapshot_sha256:
         raise ValueError("G1 registry snapshot content differs from the experiment contract")
-    ranking_config = ranking_config_snapshot(
-        thinking_assignment_enabled=thinking_assignment_enabled,
-    )
+    base_ranking_config = ranking_resolution["base_config"]
+    ranking_config = ranking_resolution["effective_config"]
+    analyzer_policy = task_analyzer_policy(ranking_config)
+    base_ranking_schema = str(base_ranking_config.get("schema_version") or "").strip()
+    base_ranking_version = str(base_ranking_config.get("config_version") or "").strip()
+    base_ranking_hash = str(ranking_resolution["base_sha256"])
+    if (
+        base_ranking_schema != contract.expected_ranking_config_schema_version
+        or base_ranking_version != contract.expected_ranking_config_version
+        or base_ranking_hash != contract.expected_ranking_config_sha256
+    ):
+        raise ValueError("G1 baseline ranking configuration differs from the experiment contract")
     actual_ranking_schema = str(ranking_config.get("schema_version") or "").strip()
     actual_ranking_version = str(ranking_config.get("config_version") or "").strip()
-    actual_ranking_hash = canonical_json_sha256(ranking_config).removeprefix("sha256:")
-    if (
-        actual_ranking_schema != contract.expected_ranking_config_schema_version
-        or actual_ranking_version != contract.expected_ranking_config_version
-        or actual_ranking_hash != contract.expected_ranking_config_sha256
-    ):
-        raise ValueError("G1 ranking configuration differs from the experiment contract")
-    proposer_count_config = ranking_config.get("proposer_count")
-    by_tier = (
-        proposer_count_config.get("by_tier") if isinstance(proposer_count_config, Mapping) else None
-    )
-    high_risk = (
-        proposer_count_config.get("high_risk")
-        if isinstance(proposer_count_config, Mapping)
-        else None
-    )
-    try:
-        actual_proposer_max = max(
-            *(int(row["max"]) for row in by_tier.values() if isinstance(row, Mapping)),
-            int(high_risk["max"]),
+    actual_ranking_hash = str(ranking_resolution["effective_sha256"])
+
+    def _proposer_max(ranking: Mapping[str, Any]) -> int:
+        proposer_count = ranking.get("proposer_count")
+        by_tier = proposer_count.get("by_tier") if isinstance(proposer_count, Mapping) else None
+        high_risk = (
+            proposer_count.get("high_risk") if isinstance(proposer_count, Mapping) else None
         )
-    except (AttributeError, KeyError, TypeError, ValueError) as exc:
-        raise ValueError("G1 ranking proposer bounds are malformed") from exc
-    if actual_proposer_max != contract.expected_proposer_count_max:
-        raise ValueError("G1 ranking proposer maximum differs from the experiment contract")
+        try:
+            return max(
+                *(int(row["max"]) for row in by_tier.values() if isinstance(row, Mapping)),
+                int(high_risk["max"]),
+            )
+        except (AttributeError, KeyError, TypeError, ValueError) as exc:
+            raise ValueError("G1 ranking proposer bounds are malformed") from exc
+
+    baseline_proposer_max = _proposer_max(base_ranking_config)
+    if baseline_proposer_max != contract.expected_proposer_count_max:
+        raise ValueError(
+            "G1 baseline ranking proposer maximum differs from the experiment contract"
+        )
+    actual_proposer_max = _proposer_max(ranking_config)
     rows = snapshot.get("models")
     if not isinstance(rows, list):
         raise ValueError("G1 registry snapshot has no model rows")
@@ -490,6 +602,19 @@ def validate_g1_registry_contract(
         if not model or model in available:
             raise ValueError("G1 registry snapshot contains a missing or duplicate model id")
         available.add(model)
+    analyzer_model = str(analyzer_policy["model"])
+    analyzer_upstream_provider = str(analyzer_policy["upstream_provider"])
+    if analyzer_upstream_provider == "auto":
+        raise ValueError(
+            "formal G1 task analyzer upstream provider must be explicitly pinned"
+        )
+    if analyzer_model not in available:
+        raise ValueError("G1 task analyzer model is missing from the frozen registry")
+    runtime = resolve_llm_runtime_config(config)
+    if runtime.provider != str(analyzer_policy["provider"]):
+        raise ValueError("G1 task analyzer provider differs from the resolved runtime")
+    if runtime.provider_routing.get(analyzer_model) != analyzer_upstream_provider:
+        raise ValueError("G1 task analyzer upstream provider pin differs from the runtime")
     if contract.candidate_scope == "exact_routes":
         assert contract.expected_routes is not None
         assert contract.expected_candidate_count is not None
@@ -502,7 +627,6 @@ def validate_g1_registry_contract(
             raise ValueError(
                 "G1 expected route model(s) missing from registry: " + ", ".join(missing_models)
             )
-        runtime = resolve_llm_runtime_config(config)
         pin_mismatches = {
             model: {
                 "expected": expected_provider,
@@ -525,9 +649,9 @@ def validate_g1_registry_contract(
         policy = "all_registry_models"
         runtime_pin_policy = "optional_auto"
         runtime_pins_match = None
-    if expected_count < contract.expected_proposer_count_max:
+    if expected_count < actual_proposer_max:
         raise ValueError("G1 registry has fewer candidates than the proposer maximum")
-    return {
+    resolved_contract = {
         **contract.model_dump(mode="json", exclude_none=True),
         "candidate_scope": contract.candidate_scope,
         "policy": policy,
@@ -539,7 +663,31 @@ def validate_g1_registry_contract(
         "available_registry_candidate_count": len(available),
         "runtime_pin_policy": runtime_pin_policy,
         "runtime_pins_match": runtime_pins_match,
+        "task_analyzer": dict(analyzer_policy),
     }
+    if ranking_resolution["override"] is not None:
+        resolved_contract.update(
+            {
+                "baseline_expected_ranking_config_schema_version": (
+                    contract.expected_ranking_config_schema_version
+                ),
+                "baseline_expected_ranking_config_version": (
+                    contract.expected_ranking_config_version
+                ),
+                "baseline_expected_ranking_config_sha256": (
+                    contract.expected_ranking_config_sha256
+                ),
+                "baseline_expected_proposer_count_max": (
+                    contract.expected_proposer_count_max
+                ),
+                "expected_ranking_config_schema_version": actual_ranking_schema,
+                "expected_ranking_config_version": actual_ranking_version,
+                "expected_ranking_config_sha256": actual_ranking_hash,
+                "expected_proposer_count_max": actual_proposer_max,
+                "ranking_config_resolution": ranking_resolution,
+            }
+        )
+    return resolved_contract
 
 
 def aggregator_recovery_policy(
@@ -560,12 +708,14 @@ def aggregator_recovery_policy(
 
 def proposer_recovery_policy(
     experiment: DracoExperimentConfig,
+    *,
+    ranking_config: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Return the frozen, provider-owned proposer recovery settings."""
 
     ensemble = experiment.ensemble
     return {
-        "proposer_backup_count": ensemble.proposer_backup_count,
+        "proposer_backup_count": ranking_proposer_backup_count(ranking_config),
         "proposer_recovery_max_additional_calls": (
             ensemble.proposer_recovery_max_additional_calls
         ),
@@ -616,22 +766,38 @@ def enforce_formal_draco_runtime_config(
 
     if experiment is None:
         return {}
+    validate_formal_draco_credential_bindings(experiment)
+    validate_formal_draco_gateway_credential_binding(
+        provider=str(getattr(config.llm, "provider", "") or ""),
+        base_url=str(getattr(config.llm, "base_url", "") or ""),
+        api_key_env=str(getattr(config.llm, "api_key_env", "") or ""),
+    )
+    if experiment.judge.model != "google/gemini-3.1-pro-preview":
+        raise ValueError(
+            "formal DRACO currently requires the frozen Gemini Judge model"
+        )
+    if experiment.tools.mode != TOOL_MODE_LOCAL_WEB_TOOLS:
+        raise ValueError("formal DRACO requires tools.mode=local_web_tools")
+    if tuple(experiment.tools.contamination_blocked_domains) != tuple(
+        DEFAULT_CONTAMINATION_BLOCKED_DOMAINS
+    ):
+        raise ValueError(
+            "formal DRACO requires the frozen contamination-blocked domain set"
+        )
     if experiment.tools.sandbox_enabled is not False:
         raise ValueError("formal DRACO requires tools.sandbox_enabled=false")
     config.sandbox.sandbox = False
     config.sandbox.security_grading = False
     recovery_policy = aggregator_recovery_policy(experiment)
-    proposer_policy = proposer_recovery_policy(experiment)
-    if (
-        "G1" in groups
-        and proposer_recovery_plan_policy(proposer_policy)
-        != FORMAL_PROPOSER_RECOVERY_POLICY
-    ):
-        raise ValueError(
-            "formal G1 requires the frozen provider-owned proposer "
-            "recovery policy"
-        )
     apply_aggregator_recovery_policy(config.llm_ensemble, recovery_policy)
+    config.llm_ensemble.ranking_config_override = copy.deepcopy(
+        experiment.router_dynamic_ranking_override
+    )
+    ranking_resolution = config.llm_ensemble.freeze_ranking_config()
+    proposer_policy = proposer_recovery_policy(
+        experiment,
+        ranking_config=ranking_resolution["effective_config"],
+    )
     apply_aggregator_recovery_policy(config.llm_ensemble, proposer_policy)
     freeze: dict[str, Any] = {
         "source": "experiment_config",
@@ -640,16 +806,33 @@ def enforce_formal_draco_runtime_config(
         **recovery_policy,
         **proposer_policy,
     }
+    if experiment.router_dynamic_ranking_override:
+        freeze["ranking_config_override_present"] = True
+        freeze["ranking_config_override_sha256"] = ranking_resolution[
+            "override_sha256"
+        ]
+        freeze["ranking_config_effective_sha256"] = ranking_resolution[
+            "effective_sha256"
+        ]
     if "G1" in groups:
+        from opensquilla.provider.ranking_router import task_analyzer_policy
+
         g1_routing = experiment.g1_routing
         if g1_routing is None or g1_routing.user_profile_enabled is not False:
             raise ValueError("formal G1 requires g1_routing.user_profile_enabled=false")
         config.llm_ensemble.ranking_user_profile_generation_enabled = False
         config.llm_ensemble.ranking_user_profile_enabled = False
+        analyzer_policy = task_analyzer_policy(
+            ranking_resolution["effective_config"]
+        )
+        config.llm.provider_routing[str(analyzer_policy["model"])] = str(
+            analyzer_policy["upstream_provider"]
+        )
         freeze.update(
             {
                 "g1_user_profile_generation_enabled": False,
                 "g1_user_profile_enabled": False,
+                "task_analyzer": dict(analyzer_policy),
             }
         )
     return freeze
@@ -700,6 +883,7 @@ def apply_b2_g12_argument_alignment(
     config_requested = bool(
         getattr(args, "experiment_config", None)
         or getattr(args, "experiment_config_override", None)
+        or getattr(args, "experiment_config_override_json", None) is not None
         or getattr(args, "experiment_config_set", None)
     )
     uses_global_profile = bool(GLOBAL_EXPERIMENT_PROFILE_GROUPS.intersection(groups))
@@ -710,6 +894,7 @@ def apply_b2_g12_argument_alignment(
     bundle = load_draco_experiment_config(
         base_path,
         override_paths=list(getattr(args, "experiment_config_override", []) or []),
+        inline_overlay_json=getattr(args, "experiment_config_override_json", None),
         inline_sets=list(getattr(args, "experiment_config_set", []) or []),
     )
     config = bundle.config
@@ -761,10 +946,14 @@ def apply_b2_g12_argument_alignment(
     args._draco_experiment_config_bundle = bundle
     record = {
         "id": config.profile_id,
-        "reference": config.reference.model_dump(mode="json"),
+        "reference_sha256": canonical_json_sha256(
+            config.reference.model_dump(mode="json")
+        ),
         "scope": "Shared DRACO execution profile; B2 ensemble mapping remains B2-only",
         "config_provenance": bundle.provenance(),
-        "effective_config": config.model_dump(mode="json"),
+        "effective_config_sha256": canonical_json_sha256(
+            config.model_dump(mode="json")
+        ),
         "requested_args": requested,
         "effective_args": dict(overrides),
         "effective_arg_sources": {key: "experiment_config" for key in overrides},
@@ -1044,10 +1233,13 @@ class DryEnsembleProvider:
         recovery_policy = self.selection_plan.get(
             "proposer_recovery_policy"
         )
+        expected_recovery_policy = formal_proposer_recovery_policy_for_plan(
+            self.selection_plan
+        )
         formal_recovery = (
             isinstance(recovery_policy, Mapping)
-            and dict(recovery_policy)
-            == FORMAL_PROPOSER_RECOVERY_POLICY
+            and expected_recovery_policy is not None
+            and dict(recovery_policy) == expected_recovery_policy
         )
         expanded_selected_identities = list(
             expanded_proposer_slot_identities(self.selection_plan)
@@ -2674,21 +2866,26 @@ def _experiment_member_provider_config(
     *,
     templates: list[ProviderConfig],
 ) -> ProviderConfig:
+    validate_formal_draco_ensemble_member_binding(member)
     provider_id = member.provider.strip().lower()
+    spec = get_provider_spec(provider_id)
     template = next(
         (item for item in templates if str(item.provider or "").strip().lower() == provider_id),
         None,
     )
-    api_key = str(os.environ.get(member.api_key_env, "") or "").strip()
+    api_key = (
+        str(os.environ.get(member.api_key_env, "") or "").strip()
+        if member.api_key_env
+        else ""
+    )
     if template is not None:
         return replace(
             template,
             provider=provider_id,
             model=member.model,
             api_key=api_key or template.api_key,
-            base_url=member.base_url or template.base_url,
+            base_url=member.base_url or spec.default_base_url,
         )
-    spec = get_provider_spec(provider_id)
     env_name = member.api_key_env or spec.env_key
     api_key = api_key or str(os.environ.get(env_name, "") or "").strip()
     return ProviderConfig(
@@ -2838,10 +3035,13 @@ def enforce_draco_legal_proposer_quorum(provider: Any) -> Any:
     provider_native_policy = selection_plan.get(
         "proposer_recovery_policy"
     )
+    expected_provider_native_policy = formal_proposer_recovery_policy_for_plan(
+        selection_plan
+    )
     formal_provider_native = bool(
         isinstance(provider_native_policy, Mapping)
-        and dict(provider_native_policy)
-        == FORMAL_PROPOSER_RECOVERY_POLICY
+        and expected_provider_native_policy is not None
+        and dict(provider_native_policy) == expected_provider_native_policy
     )
     required = (
         2
@@ -3382,13 +3582,22 @@ def build_task_analyzer_provider(
     *,
     provider_id: str,
     model_id: str,
+    upstream_provider: str,
 ):
     """Resolve the analyzer without dropping routing or replay-safety fields."""
 
+    normalized_provider = provider_id.strip().casefold()
+    if normalized_provider != "openrouter":
+        raise ValueError("task analyzer provider currently must be openrouter")
+    if str(routed_config.provider or "").strip().casefold() != normalized_provider:
+        raise ValueError("task analyzer cannot reuse a different provider credential")
+    provider_routing = dict(routed_config.provider_routing)
+    provider_routing[model_id] = upstream_provider
     analyzer_cfg = replace(
         routed_config,
-        provider=provider_id,
+        provider=normalized_provider,
         model=model_id,
+        provider_routing=provider_routing,
         replay_provider_state=False,
     )
     return ModelSelector(SelectorConfig(primary=analyzer_cfg)).resolve()
@@ -3782,7 +3991,12 @@ async def build_experiment_provider(
         }
     )
     proposer_policy = (
-        proposer_recovery_policy(experiment_config)
+        proposer_recovery_policy(
+            experiment_config,
+            ranking_config=config.llm_ensemble.ranking_config_resolution_snapshot()[
+                "effective_config"
+            ],
+        )
         if experiment_config is not None
         else {
             "proposer_backup_count": config.llm_ensemble.proposer_backup_count,
@@ -3902,15 +4116,15 @@ async def build_experiment_provider(
                 build_request_context,
                 dynamic_output_token_budgets,
                 fallback_task_profile,
-                ranking_config_snapshot,
             )
 
+            ranking_resolution = (
+                config.llm_ensemble.ranking_config_resolution_snapshot()
+            )
             thinking_assignment_enabled = (
-                config.llm_ensemble.ranking_thinking_assignment_enabled is True
+                ranking_resolution.get("thinking_assignment_enabled") is True
             )
-            ranking_config = ranking_config_snapshot(
-                thinking_assignment_enabled=thinking_assignment_enabled,
-            )
+            ranking_config = ranking_resolution["effective_config"]
             dry_config = config.model_copy(deep=True)
             dry_ensemble = dry_config.llm_ensemble
             dry_ensemble.enabled = True
@@ -3999,11 +4213,14 @@ async def build_experiment_provider(
             provider_native_policy = plan.get(
                 "proposer_recovery_policy"
             )
+            expected_provider_native_policy = (
+                formal_proposer_recovery_policy_for_plan(plan)
+            )
             dry_provider.min_successful_proposers = (
                 2
                 if isinstance(provider_native_policy, Mapping)
-                and dict(provider_native_policy)
-                == FORMAL_PROPOSER_RECOVERY_POLICY
+                and expected_provider_native_policy is not None
+                and dict(provider_native_policy) == expected_provider_native_policy
                 else legal_proposer_quorum(len(proposer_models))
             )
             dry_routing_trace.update(
@@ -4183,22 +4400,25 @@ async def build_experiment_provider(
     setup_usage: list[dict[str, Any]] = []
     if selection_mode == "router_dynamic":
         from opensquilla.provider.ranking_router import (
-            TASK_ANALYZER_MODEL_ID,
-            TASK_ANALYZER_PROVIDER_ID,
             TaskAnalyzerStreamCleanupError,
             analyze_task_with_provider,
             build_request_context,
             dynamic_output_token_budgets,
             mock_user_profile,
-            ranking_config_snapshot,
+            task_analyzer_policy,
         )
 
+        ranking_resolution = (
+            group_config.llm_ensemble.ranking_config_resolution_snapshot()
+        )
         thinking_assignment_enabled = (
-            group_config.llm_ensemble.ranking_thinking_assignment_enabled is True
+            ranking_resolution.get("thinking_assignment_enabled") is True
         )
-        ranking_config = ranking_config_snapshot(
-            thinking_assignment_enabled=thinking_assignment_enabled,
-        )
+        ranking_config = ranking_resolution["effective_config"]
+        analyzer_policy = task_analyzer_policy(ranking_config)
+        analyzer_provider_id = str(analyzer_policy["provider"])
+        analyzer_model_id = str(analyzer_policy["model"])
+        analyzer_upstream_provider = str(analyzer_policy["upstream_provider"])
         routing_extra = turn.metadata.get("routing_extra")
         routing_extra_map = routing_extra if isinstance(routing_extra, Mapping) else {}
         routed_tier = str(
@@ -4255,6 +4475,8 @@ async def build_experiment_provider(
                 or not isinstance(raw_profile, Mapping)
                 or not isinstance(request_context, Mapping)
                 or not isinstance(analyzer, Mapping)
+                or str(analyzer.get("provider") or "") != analyzer_provider_id
+                or str(analyzer.get("model") or "") != analyzer_model_id
                 or ranking_trace_replay_reasons(initial_plan)
                 or ranking_trace_replay_reasons(target_plan)
             ):
@@ -4383,8 +4605,9 @@ async def build_experiment_provider(
             )
             analyzer_provider = build_task_analyzer_provider(
                 routed_config,
-                provider_id=TASK_ANALYZER_PROVIDER_ID,
-                model_id=TASK_ANALYZER_MODEL_ID,
+                provider_id=analyzer_provider_id,
+                model_id=analyzer_model_id,
+                upstream_provider=analyzer_upstream_provider,
             )
             try:
                 task_analysis = await analyze_task_with_provider(
@@ -4394,8 +4617,8 @@ async def build_experiment_provider(
                     request_context=request_context,
                     routed_tier=routed_tier,
                     routing_confidence=routing_confidence,
-                    analyzer_provider_id=TASK_ANALYZER_PROVIDER_ID,
-                    analyzer_model_id=TASK_ANALYZER_MODEL_ID,
+                    analyzer_provider_id=analyzer_provider_id,
+                    analyzer_model_id=analyzer_model_id,
                     ranking_config=ranking_config,
                     decision_id=decision_id,
                 )
@@ -4403,15 +4626,15 @@ async def build_experiment_provider(
                 setup_usage.extend(
                     task_analyzer_usage_rows(
                         exc.usage or {"attempt_count": 1},
-                        provider_id=TASK_ANALYZER_PROVIDER_ID,
-                        model_id=TASK_ANALYZER_MODEL_ID,
+                        provider_id=analyzer_provider_id,
+                        model_id=analyzer_model_id,
                         source="analyzer_stream_cleanup_failed",
                         fallback_reason=type(exc).__name__,
                     )
                 )
                 routing_trace["task_analyzer"] = {
-                    "provider": TASK_ANALYZER_PROVIDER_ID,
-                    "model": TASK_ANALYZER_MODEL_ID,
+                    "provider": analyzer_provider_id,
+                    "model": analyzer_model_id,
                     "source": "analyzer_stream_cleanup_failed",
                     "schema_valid": False,
                     "fallback_reason": type(exc).__name__,
@@ -4466,8 +4689,8 @@ async def build_experiment_provider(
                                 )
                                 else analyzer_usage
                             ),
-                            provider_id=TASK_ANALYZER_PROVIDER_ID,
-                            model_id=TASK_ANALYZER_MODEL_ID,
+                            provider_id=analyzer_provider_id,
+                            model_id=analyzer_model_id,
                             source="analyzer_postprocess_failed",
                             fallback_reason=type(
                                 analyzer_postprocess_error
@@ -4477,8 +4700,8 @@ async def build_experiment_provider(
                 else:
                     analyzer_usage_rows = task_analyzer_usage_rows(
                         analyzer_usage,
-                        provider_id=TASK_ANALYZER_PROVIDER_ID,
-                        model_id=TASK_ANALYZER_MODEL_ID,
+                        provider_id=analyzer_provider_id,
+                        model_id=analyzer_model_id,
                         source=analyzer_source,
                         fallback_reason=analyzer_fallback_reason,
                     )
@@ -4492,16 +4715,16 @@ async def build_experiment_provider(
                         if isinstance(raw_analyzer_usage, Mapping)
                         else analyzer_usage
                     ),
-                    provider_id=TASK_ANALYZER_PROVIDER_ID,
-                    model_id=TASK_ANALYZER_MODEL_ID,
+                    provider_id=analyzer_provider_id,
+                    model_id=analyzer_model_id,
                     source="analyzer_postprocess_failed",
                     fallback_reason=type(exc).__name__,
                 )
             setup_usage.extend(analyzer_usage_rows)
             if analyzer_postprocess_error is not None:
                 routing_trace["task_analyzer"] = {
-                    "provider": TASK_ANALYZER_PROVIDER_ID,
-                    "model": TASK_ANALYZER_MODEL_ID,
+                    "provider": analyzer_provider_id,
+                    "model": analyzer_model_id,
                     "source": "analyzer_postprocess_failed",
                     "schema_valid": False,
                     "fallback_reason": type(
@@ -4539,8 +4762,8 @@ async def build_experiment_provider(
                 if thinking_assignment_enabled:
                     ranking_inputs["request_tools_present"] = bool(tools)
                 routing_trace["task_analyzer"] = {
-                    "provider": TASK_ANALYZER_PROVIDER_ID,
-                    "model": TASK_ANALYZER_MODEL_ID,
+                    "provider": analyzer_provider_id,
+                    "model": analyzer_model_id,
                     "source": analyzer_source,
                     "schema_valid": task_analysis.schema_valid,
                     "confidence": task_analysis.confidence,
@@ -4554,8 +4777,8 @@ async def build_experiment_provider(
                 if not setup_usage:
                     raise
                 routing_trace["task_analyzer"] = {
-                    "provider": TASK_ANALYZER_PROVIDER_ID,
-                    "model": TASK_ANALYZER_MODEL_ID,
+                    "provider": analyzer_provider_id,
+                    "model": analyzer_model_id,
                     "source": "analyzer_postprocess_failed",
                     "schema_valid": False,
                     "fallback_reason": type(exc).__name__,
@@ -4586,8 +4809,8 @@ async def build_experiment_provider(
             if not setup_usage:
                 raise
             routing_trace["task_analyzer"] = {
-                "provider": TASK_ANALYZER_PROVIDER_ID,
-                "model": TASK_ANALYZER_MODEL_ID,
+                "provider": analyzer_provider_id,
+                "model": analyzer_model_id,
                 "source": "analyzer_postprocess_failed",
                 "schema_valid": False,
                 "fallback_reason": type(exc).__name__,
@@ -7500,6 +7723,24 @@ def bounded_generation_attempts(value: int | None) -> int:
     return max(1, min(GENERATION_MAX_ATTEMPTS, attempts))
 
 
+def generation_attempt_budget_limit_from_contract(
+    contract: Mapping[str, Any] | None,
+) -> int:
+    """Return an authenticated dynamic budget, defaulting legacy contracts to 3."""
+
+    generation = contract.get("generation") if isinstance(contract, Mapping) else None
+    if not isinstance(generation, Mapping) or "max_attempts" not in generation:
+        return GENERATION_MAX_ATTEMPTS
+    value = generation.get("max_attempts")
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 1 <= value <= GENERATION_MAX_ATTEMPTS
+    ):
+        raise ValueError("run compatibility generation.max_attempts is invalid")
+    return value
+
+
 def bounded_generation_retry_backoff(value: Any) -> float:
     try:
         backoff = float(value)
@@ -7512,15 +7753,10 @@ def remaining_generation_attempts(
     prior_attempts_used: int,
     requested_attempts: int | None,
 ) -> int:
-    """Apply one cumulative three-attempt budget across every resume cycle."""
+    """Apply the configured cumulative budget across every resume cycle."""
 
-    remaining = max(
-        0,
-        GENERATION_MAX_ATTEMPTS - max(0, int(prior_attempts_used)),
-    )
-    if remaining <= 0:
-        return 0
-    return min(remaining, bounded_generation_attempts(requested_attempts))
+    budget_limit = bounded_generation_attempts(requested_attempts)
+    return max(0, budget_limit - max(0, int(prior_attempts_used)))
 
 
 def g1_cross_wave_lifecycle_requires_reconstruction(
@@ -9667,14 +9903,16 @@ def g1_provider_native_recovery_policy_reason(
         return ""
     if not isinstance(policy, Mapping):
         return "invalid_g1_proposer_recovery_policy"
-    if dict(policy) != FORMAL_PROPOSER_RECOVERY_POLICY:
+    expected_policy = formal_proposer_recovery_policy_for_plan(plan)
+    if expected_policy is None or dict(policy) != expected_policy:
         return "invalid_g1_proposer_recovery_policy"
+    expected_backup_count = expected_policy["configured_backup_count"]
     backups = plan.get("backup_P")
     selected = plan.get("selected_P")
     aggregator_candidates = plan.get("aggregator_candidates")
     if (
         not isinstance(backups, list)
-        or len(backups) != 2
+        or len(backups) != expected_backup_count
         or not isinstance(selected, list)
         or not selected
         or not isinstance(aggregator_candidates, list)
@@ -9694,6 +9932,8 @@ def g1_provider_native_recovery_policy_reason(
         or len(set(backups)) != len(backups)
         or bool(set(backups).intersection(selected))
         or bool(set(backups).intersection(aggregator_candidates))
+        or plan.get("configured_proposer_backup_count") != expected_backup_count
+        or plan.get("effective_proposer_backup_count") != expected_backup_count
         or plan.get("effective_min_successful_proposers") != 2
     ):
         return "invalid_g1_proposer_recovery_roster"
@@ -9736,6 +9976,7 @@ async def collect_generation_with_retries(
     finalization_policy: Mapping[str, Any] | None = None,
     max_attempts: int = GENERATION_MAX_ATTEMPTS,
     attempt_offset: int = 0,
+    attempt_budget_limit: int = GENERATION_MAX_ATTEMPTS,
     retry_backoff_seconds: float = 0.0,
     expected_model: str = "",
     expected_provider: str = "",
@@ -10052,15 +10293,20 @@ async def collect_generation_with_retries(
         for plan in raw_thinking_history
         if isinstance(plan, Mapping)
     ]
+    total_attempt_budget_limit = bounded_generation_attempts(
+        attempt_budget_limit
+    )
     if (
         not isinstance(attempt_offset, int)
         or isinstance(attempt_offset, bool)
-        or not 0 <= attempt_offset < GENERATION_MAX_ATTEMPTS
+        or not 0 <= attempt_offset < total_attempt_budget_limit
     ):
-        raise ValueError("generation attempt offset must be an integer within the formal budget")
+        raise ValueError(
+            "generation attempt offset must be an integer within the configured budget"
+        )
     attempt_limit = min(
         bounded_generation_attempts(max_attempts),
-        GENERATION_MAX_ATTEMPTS - attempt_offset,
+        total_attempt_budget_limit - attempt_offset,
     )
     for local_attempt_index in range(1, attempt_limit + 1):
         attempt_index = attempt_offset + local_attempt_index
@@ -10345,7 +10591,7 @@ async def collect_generation_with_retries(
             and reason
             and not retry_suppressed_reason
             and deterministic_failures
-            and attempt_index < GENERATION_MAX_ATTEMPTS
+            and attempt_index < total_attempt_budget_limit
             and not will_retry
         )
         if paid_attempt_sink is not None:
@@ -11419,12 +11665,17 @@ async def run_one(
         g1_registry_contract if group == "G1" else None,
     )
     started = time.time()
+    generation_attempt_budget_limit = bounded_generation_attempts(
+        generation_max_attempts
+    )
     if (
         not isinstance(generation_attempt_offset, int)
         or isinstance(generation_attempt_offset, bool)
-        or not 0 <= generation_attempt_offset < GENERATION_MAX_ATTEMPTS
+        or not 0 <= generation_attempt_offset < generation_attempt_budget_limit
     ):
-        raise ValueError("generation attempt offset must be an integer within the formal budget")
+        raise ValueError(
+            "generation attempt offset must be an integer within the configured budget"
+        )
     provider = None
     build: ProviderBuildResult | None = None
     effective_prompt = str(task["prompt"])
@@ -11433,10 +11684,6 @@ async def run_one(
     failed_build_setup_usage: list[dict[str, Any]] = []
     failed_build_routing_trace: dict[str, Any] = {}
     frozen_build_routing_trace: dict[str, Any] = {}
-    generation_attempt_limit = min(
-        bounded_generation_attempts(generation_max_attempts),
-        GENERATION_MAX_ATTEMPTS - generation_attempt_offset,
-    )
     generation_retry_backoff_s = bounded_generation_retry_backoff(generation_retry_backoff)
     finalization_policy = normalized_agent_finalization_policy(agent_finalization_policy)
     effective_timeout = group_timeout_seconds(
@@ -11547,8 +11794,12 @@ async def run_one(
                 output_dir=output_dir,
                 agent_max_iterations=agent_max_iterations,
                 finalization_policy=finalization_policy,
-                max_attempts=generation_attempt_limit,
+                max_attempts=(
+                    generation_attempt_budget_limit
+                    - generation_attempt_offset
+                ),
                 attempt_offset=generation_attempt_offset,
+                attempt_budget_limit=generation_attempt_budget_limit,
                 retry_backoff_seconds=generation_retry_backoff_s,
                 expected_model=expected_generation_model,
                 expected_provider=expected_generation_provider,
@@ -11918,9 +12169,9 @@ async def run_one(
         "actual_spend_billed_cost_usd": generation_attempt_total_billed_cost,
         "generation_attempt_count": len(generation_attempts),
         "generation_attempt_evidence_schema": GENERATION_ATTEMPT_EVIDENCE_SCHEMA,
-        "generation_attempt_budget_limit": GENERATION_MAX_ATTEMPTS,
+        "generation_attempt_budget_limit": generation_attempt_budget_limit,
         "generation_attempt_budget_used": (generation_attempt_offset + len(generation_attempts)),
-        "generation_max_attempts": generation_attempt_limit,
+        "generation_max_attempts": generation_attempt_budget_limit,
         "generation_retry_backoff_s": generation_retry_backoff_s,
         "generation_attempt_total_billed_cost": generation_attempt_total_billed_cost,
         "generation_retry_reasons": generation_retry_reasons,
@@ -11972,7 +12223,7 @@ async def run_one(
             "llm_request_count": selected_llm_request_count,
             "usage_unknown_count": selected_usage_unknown_count,
             "generation_attempt_count": len(generation_attempts),
-            "generation_max_attempts": generation_attempt_limit,
+            "generation_max_attempts": generation_attempt_budget_limit,
             "generation_retry_backoff_s": generation_retry_backoff_s,
             "selected_generation_attempt": selected_generation_attempt_index,
             "generation_retry_reasons": generation_retry_reasons,
@@ -11982,7 +12233,9 @@ async def run_one(
             "metadata_repair_attempted": False,
             "generation_attempt_budget_remaining": max(
                 0,
-                GENERATION_MAX_ATTEMPTS - generation_attempt_offset - len(generation_attempts),
+                generation_attempt_budget_limit
+                - generation_attempt_offset
+                - len(generation_attempts),
             ),
         },
         "run_trace": {
@@ -14453,6 +14706,12 @@ def manifest_args(args: argparse.Namespace) -> dict[str, Any]:
     payload: dict[str, Any] = {}
     for key in keys:
         payload[key] = _json_value(getattr(args, key, None))
+    bundle = getattr(args, "_draco_experiment_config_bundle", None)
+    if isinstance(bundle, DracoExperimentConfigBundle):
+        effective_path = getattr(args, "_effective_experiment_config_path", None)
+        payload["experiment_config"] = str(effective_path or bundle.base_path)
+        payload["experiment_config_override"] = []
+        payload["experiment_config_set"] = []
     return payload
 
 
@@ -14473,14 +14732,20 @@ def reconstructed_cli_args(args: argparse.Namespace) -> list[str]:
 
 
 def command_argv(args: argparse.Namespace) -> list[str]:
-    raw_argv = getattr(args, "command_argv", None)
-    if raw_argv:
-        return [str(item) for item in raw_argv]
     return [
         sys.executable,
         str(Path(__file__).resolve()),
         *reconstructed_cli_args(args),
     ]
+
+
+def gateway_replay_validation_contract() -> dict[str, Any]:
+    return {
+        "replay_scope": "experiment_config_and_cli_args",
+        "gateway_config_materialization": "external",
+        "required_post_run_validation": "compare_run_compatibility_fingerprint",
+        "contract_fields": ["gateway_execution", "resolved_llm_runtime"],
+    }
 
 
 def command_payload(args: argparse.Namespace) -> dict[str, Any]:
@@ -14496,6 +14761,7 @@ def command_payload(args: argparse.Namespace) -> dict[str, Any]:
         "shell": shell,
         "pythonpath": pythonpath,
         "parsed_args": manifest_args(args),
+        "replay_validation": gateway_replay_validation_contract(),
     }
 
 
@@ -14565,6 +14831,140 @@ def gateway_execution_contract(config: GatewayConfig) -> dict[str, Any]:
         )
     }
     return _sanitize_fingerprint_config(relevant)
+
+
+def validate_formal_openrouter_runtime_transport(
+    config: GatewayConfig,
+) -> dict[str, Any]:
+    """Fail before a formal run can send an OpenRouter key through a redirect."""
+
+    failures: list[str] = []
+    configured_proxy = str(getattr(config.llm, "proxy", "") or "")
+    if configured_proxy:
+        failures.append("config.llm.proxy must be empty")
+
+    base_url_override_names = (
+        "OPENROUTER_BASE_URL",
+        "OPENSQUILLA_LLM_BASE_URL",
+    )
+    active_base_url_overrides = [
+        name for name in base_url_override_names if os.environ.get(name, "").strip()
+    ]
+    if active_base_url_overrides:
+        failures.append(
+            "OpenRouter base URL environment override(s) forbidden: "
+            + ", ".join(sorted(active_base_url_overrides))
+        )
+
+    if os.environ.get("OPENSQUILLA_LLM_PROXY", "").strip():
+        failures.append("OPENSQUILLA_LLM_PROXY environment override is forbidden")
+
+    generic_credential_override_names = (
+        "OPENSQUILLA_LLM_API_KEY_ENV",
+        "OPENSQUILLA_LLM_API_KEY",
+    )
+    active_generic_credential_overrides = [
+        name
+        for name in generic_credential_override_names
+        if os.environ.get(name, "").strip()
+    ]
+    if active_generic_credential_overrides:
+        failures.append(
+            "generic OpenRouter credential environment override(s) forbidden: "
+            + ", ".join(sorted(active_generic_credential_overrides))
+        )
+
+    trust_env = os.environ.get("OPENSQUILLA_TRUST_ENV", "").strip().casefold() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if trust_env:
+        failures.append("OPENSQUILLA_TRUST_ENV must be disabled for formal OpenRouter calls")
+        ambient_proxy_names = (
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+        )
+        active_ambient_proxies = [
+            name for name in ambient_proxy_names if os.environ.get(name, "").strip()
+        ]
+        if active_ambient_proxies:
+            failures.append(
+                "ambient proxy environment variable(s) would be trusted: "
+                + ", ".join(sorted(active_ambient_proxies))
+            )
+
+    if failures:
+        raise ValueError(
+            "formal OpenRouter runtime transport validation failed: " + "; ".join(failures)
+        )
+
+    runtime = resolve_llm_runtime_config(config)
+    official_base_url = str(get_provider_spec("openrouter").default_base_url or "")
+    if runtime.provider != "openrouter":
+        failures.append("resolved provider must be openrouter")
+    if str(runtime.base_url or "") != official_base_url:
+        failures.append("resolved OpenRouter base URL must exactly match the official endpoint")
+    if bool(runtime.base_url_from_env):
+        failures.append("resolved OpenRouter base URL must not come from the environment")
+    if str(runtime.proxy or ""):
+        failures.append("resolved OpenRouter proxy must be empty")
+    if bool(getattr(runtime, "api_key_from_env", False)) and (
+        str(getattr(runtime, "api_key_env_name", "") or "") != "OPENROUTER_API_KEY"
+    ):
+        failures.append(
+            "resolved OpenRouter environment credential must come from OPENROUTER_API_KEY"
+        )
+    if bool(getattr(runtime, "trust_env", False)):
+        failures.append("resolved OpenRouter transport must not trust ambient environment")
+    runtime_ambient_proxies = getattr(runtime, "ambient_proxies", None)
+    if runtime_ambient_proxies:
+        failures.append("resolved OpenRouter transport has ambient proxy settings")
+    if failures:
+        raise ValueError(
+            "formal OpenRouter runtime transport validation failed: " + "; ".join(failures)
+        )
+    return {
+        "validated": True,
+        "provider": "openrouter",
+        "base_url": official_base_url,
+        "base_url_from_env": False,
+        "proxy_configured": False,
+        "trust_env": False,
+    }
+
+
+def validate_formal_web_search_transport(
+    config: GatewayConfig,
+    experiment_config: DracoExperimentConfig,
+) -> dict[str, Any]:
+    """Keep a formal Brave credential off explicit and ambient proxies."""
+
+    provider = experiment_config.tools.web_search.provider.strip().casefold()
+    if provider != "brave":
+        return {"validated": True, "provider": provider, "credential_proxy_safe": True}
+
+    failures: list[str] = []
+    if str(getattr(config, "search_proxy", "") or "").strip():
+        failures.append("config.search_proxy must be empty for formal Brave search")
+    if bool(getattr(config, "search_use_env_proxy", False)):
+        failures.append("config.search_use_env_proxy must be false for formal Brave search")
+    if failures:
+        raise ValueError(
+            "formal Brave search transport validation failed: " + "; ".join(failures)
+        )
+    return {
+        "validated": True,
+        "provider": "brave",
+        "credential_proxy_safe": True,
+        "proxy_configured": False,
+        "use_env_proxy": False,
+    }
 
 
 def validate_strict_openrouter_non_byok_environment(
@@ -14809,6 +15209,13 @@ def build_run_compatibility(
         else None
     )
     if isinstance(effective_experiment_config, dict):
+        if not effective_experiment_config.get("router_dynamic_ranking_override"):
+            effective_experiment_config.pop("router_dynamic_ranking_override", None)
+        ensemble_config = effective_experiment_config.get("ensemble")
+        if isinstance(ensemble_config, dict):
+            # Legacy compatibility input only; the frozen ranking JSON owns
+            # the router_dynamic backup roster size.
+            ensemble_config.pop("proposer_backup_count", None)
         # Scheduling-only concurrency may change between a canary, a full run,
         # and retry waves without changing any model, prompt, or scoring semantics.
         runner_config = effective_experiment_config.get("runner")
@@ -14890,7 +15297,10 @@ def build_run_compatibility(
             },
             "global_experiment_profile": global_experiment_profile,
             "experiment_config": (
-                effective_experiment_config if GROUP_SPECS[group].get("experiment_config") else None
+                {"sha256": canonical_json_sha256(effective_experiment_config)}
+                if GROUP_SPECS[group].get("experiment_config")
+                and isinstance(effective_experiment_config, dict)
+                else None
             ),
             "g1_registry_contract": (
                 dict(getattr(args, "_g1_registry_contract", {}) or {}) if group == "G1" else None
@@ -15081,6 +15491,7 @@ def repair_only_resume_classification_audit(
     *,
     selected_keys: set[tuple[str, str]],
     resume_states: Mapping[tuple[str, str], Mapping[str, Any]],
+    generation_max_attempts: int = GENERATION_MAX_ATTEMPTS,
 ) -> dict[str, Any]:
     """Describe whether a repair-only wave can proceed without generation."""
 
@@ -15115,7 +15526,9 @@ def repair_only_resume_classification_audit(
                     else "unsupported_resume_action"
                     if action != "regenerate"
                     else "generation_budget_exhausted"
-                    if attempts_used >= GENERATION_MAX_ATTEMPTS
+                    if attempts_used >= bounded_generation_attempts(
+                        generation_max_attempts
+                    )
                     else "generation_invalid"
                 ),
                 "prior_generation_attempts_used": attempts_used,
@@ -15162,6 +15575,9 @@ def write_command_file(
             "# Parsed args",
             json.dumps(payload["parsed_args"], ensure_ascii=False, indent=2, sort_keys=True),
             "",
+            "# Replay validation",
+            json.dumps(payload["replay_validation"], ensure_ascii=False, sort_keys=True),
+            "",
         ]
     )
     path.write_text("\n".join(lines), encoding="utf-8")
@@ -15178,34 +15594,114 @@ def write_experiment_config_artifacts(
     if not isinstance(bundle, DracoExperimentConfigBundle):
         return {}
 
-    def _write(name: str, payload: Any) -> Path:
-        path = output_dir / f"draco_run_{stamp}.experiment-config.{name}.json"
-        path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-        return path
-
-    artifacts = {
-        "experiment_config_base_json": str(_write("base", bundle.base_document)),
-        "experiment_config_effective_json": str(
-            _write("effective", bundle.config.model_dump(mode="json"))
-        ),
-    }
-    for index, (_, document) in enumerate(bundle.override_documents, start=1):
-        key = f"experiment_config_override_{index:02d}_json"
-        artifacts[key] = str(_write(f"override-{index:02d}", document))
-    if bundle.inline_overrides:
-        artifacts["experiment_config_inline_overrides_json"] = str(
-            _write("inline-overrides", list(bundle.inline_overrides))
-        )
+    effective_config = bundle.config.model_dump(mode="json")
+    effective_path = output_dir / f"draco_run_{stamp}.experiment-config.effective.json"
+    effective_resolved_path = effective_path.expanduser().resolve()
+    artifacts = {"experiment_config_effective_json": str(effective_path)}
+    artifact_payloads: list[tuple[Path, Any]] = [(effective_path, effective_config)]
+    g1_contract = getattr(args, "_g1_registry_contract", None)
+    ranking_resolution = (
+        g1_contract.get("ranking_config_resolution")
+        if isinstance(g1_contract, Mapping)
+        else None
+    )
+    if isinstance(ranking_resolution, Mapping):
+        ranking_effective = ranking_resolution.get("effective_config")
+        if isinstance(ranking_effective, Mapping):
+            ranking_path = output_dir / (
+                f"draco_run_{stamp}.experiment-config.ranking-effective.json"
+            )
+            artifacts["ranking_config_effective_json"] = str(ranking_path)
+            artifact_payloads.append((ranking_path, dict(ranking_effective)))
+    ranking_hashes = (
+        {
+            str(key): value
+            for key, value in ranking_resolution.items()
+            if isinstance(key, str)
+            and "sha256" in key.casefold()
+            and isinstance(value, str)
+        }
+        if isinstance(ranking_resolution, Mapping)
+        else {}
+    )
     resolution = {
         "profile_id": bundle.config.profile_id,
         "provenance": bundle.provenance(),
+        "effective_config": {
+            "path": str(effective_resolved_path),
+            "sha256": canonical_json_sha256(effective_config),
+        },
+        "ranking_config_hashes": ranking_hashes,
         "input_validation": getattr(args, "_draco_input_validation", None),
         "artifact_keys": sorted([*artifacts, "experiment_config_resolution_json"]),
+        "replay_validation": gateway_replay_validation_contract(),
     }
-    artifacts["experiment_config_resolution_json"] = str(_write("resolution", resolution))
+    resolution_path = output_dir / f"draco_run_{stamp}.experiment-config.resolution.json"
+    artifacts["experiment_config_resolution_json"] = str(resolution_path)
+    artifact_payloads.append((resolution_path, resolution))
+
+    staged: list[tuple[Path, Path]] = []
+    published: list[tuple[Path, Path]] = []
+    try:
+        for path, payload in artifact_payloads:
+            document = json.dumps(
+                payload,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            ) + "\n"
+            temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+            flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
+            fd: int | None = None
+            created = False
+            try:
+                fd = os.open(temporary, flags, 0o600)
+                created = True
+                if hasattr(os, "fchmod"):
+                    os.fchmod(fd, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    fd = None
+                    handle.write(document)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            except BaseException:
+                if fd is not None:
+                    os.close(fd)
+                if created:
+                    try:
+                        os.unlink(temporary)
+                    except FileNotFoundError:
+                        pass
+                raise
+            staged.append((path, temporary))
+
+        for path, temporary in staged:
+            os.link(temporary, path, follow_symlinks=False)
+            published.append((path, temporary))
+    except BaseException:
+        for path, temporary in reversed(published):
+            try:
+                published_stat = os.stat(path, follow_symlinks=False)
+                temporary_stat = os.stat(temporary, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if (
+                published_stat.st_dev == temporary_stat.st_dev
+                and published_stat.st_ino == temporary_stat.st_ino
+            ):
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+        raise
+    finally:
+        for _, temporary in staged:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+
+    args._effective_experiment_config_path = effective_resolved_path
     return artifacts
 
 
@@ -15588,8 +16084,7 @@ def _g1_lifecycle_plan_field(plan: Mapping[str, Any], field: str) -> Any:
 
 def _g1_plans_match(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
     return all(
-        _g1_lifecycle_plan_field(left, field)
-        == _g1_lifecycle_plan_field(right, field)
+        _g1_lifecycle_plan_field(left, field) == _g1_lifecycle_plan_field(right, field)
         for field in _G1_LIFECYCLE_PLAN_MATCH_FIELDS
     )
 
@@ -16130,10 +16625,7 @@ def g1_provider_lifecycle_routing_evidence(
 def g1_provider_lifecycle_analyzer_reasons(row: Mapping[str, Any]) -> list[str]:
     """Require one valid analyzer in the setup-bearing attempt of each G1 lifecycle."""
 
-    from opensquilla.provider.ranking_router import (
-        TASK_ANALYZER_MODEL_ID,
-        TASK_ANALYZER_PROVIDER_ID,
-    )
+    from opensquilla.provider.ranking_router import task_analyzer_policy
 
     if str(row.get("group") or "") != "G1":
         return []
@@ -16152,6 +16644,25 @@ def g1_provider_lifecycle_analyzer_reasons(row: Mapping[str, Any]) -> list[str]:
     ]
     if not request_attempts:
         return ["missing_g1_provider_lifecycle_attempt"]
+    first_routing = request_attempts[0]["run"].get("routing_trace")
+    first_plan = (
+        first_routing.get("selection_plan")
+        if isinstance(first_routing, Mapping)
+        else None
+    )
+    ranking_parameters = (
+        first_plan.get("ranking_parameters")
+        if isinstance(first_plan, Mapping)
+        else None
+    )
+    try:
+        analyzer_policy = task_analyzer_policy(
+            ranking_parameters if isinstance(ranking_parameters, Mapping) else None
+        )
+    except Exception:  # noqa: BLE001 - malformed lifecycle evidence fails closed
+        return ["invalid_g1_task_analyzer_policy"]
+    analyzer_provider_id = str(analyzer_policy["provider"])
+    analyzer_model_id = str(analyzer_policy["model"])
     first_units = (
         request_attempts[0]["run"].get("usage", {}).get("model_usage_breakdown")
         if isinstance(request_attempts[0]["run"].get("usage"), Mapping)
@@ -16172,16 +16683,16 @@ def g1_provider_lifecycle_analyzer_reasons(row: Mapping[str, Any]) -> list[str]:
     for analyzer in analyzers:
         if (
             str(analyzer.get("provider") or "").strip().casefold()
-            != TASK_ANALYZER_PROVIDER_ID.casefold()
+            != analyzer_provider_id.casefold()
             or str(analyzer.get("requested_provider") or "").strip().casefold()
-            != TASK_ANALYZER_PROVIDER_ID.casefold()
+            != analyzer_provider_id.casefold()
             or not _formal_openrouter_models_equivalent(
                 analyzer.get("model"),
-                TASK_ANALYZER_MODEL_ID,
+                analyzer_model_id,
             )
             or not _formal_openrouter_models_equivalent(
                 analyzer.get("requested_model"),
-                TASK_ANALYZER_MODEL_ID,
+                analyzer_model_id,
             )
         ):
             return ["wrong_g1_task_analyzer_route"]
@@ -16233,10 +16744,7 @@ def _g1_frozen_lifecycle_analyzer_reasons(
 ) -> list[str]:
     """Require analyzer receipts only on the first paid lifecycle attempt."""
 
-    from opensquilla.provider.ranking_router import (
-        TASK_ANALYZER_MODEL_ID,
-        TASK_ANALYZER_PROVIDER_ID,
-    )
+    from opensquilla.provider.ranking_router import task_analyzer_policy
 
     if not attempts:
         return ["missing_g1_provider_lifecycle_attempt"]
@@ -16309,6 +16817,14 @@ def _g1_frozen_lifecycle_analyzer_reasons(
     attempt_ordinals = [unit.get("attempt") for unit in first_units]
     attempt_ids = [str(unit.get("physical_attempt_id") or "") for unit in first_units]
     ranking_parameters = initial_plan.get("ranking_parameters")
+    try:
+        analyzer_policy = task_analyzer_policy(
+            ranking_parameters if isinstance(ranking_parameters, Mapping) else None
+        )
+    except Exception:  # noqa: BLE001 - malformed frozen evidence fails closed
+        return ["invalid_g1_task_analyzer_policy"]
+    analyzer_provider_id = str(analyzer_policy["provider"])
+    analyzer_model_id = str(analyzer_policy["model"])
     analyzer_config = (
         ranking_parameters.get("task_analyzer")
         if isinstance(ranking_parameters, Mapping)
@@ -16339,16 +16855,16 @@ def _g1_frozen_lifecycle_analyzer_reasons(
         if (
             str(unit.get("role") or "").strip().casefold() != "task_analyzer"
             or str(unit.get("provider") or "").strip().casefold()
-            != TASK_ANALYZER_PROVIDER_ID.casefold()
+            != analyzer_provider_id.casefold()
             or str(unit.get("requested_provider") or "").strip().casefold()
-            != TASK_ANALYZER_PROVIDER_ID.casefold()
+            != analyzer_provider_id.casefold()
             or not _formal_openrouter_models_equivalent(
                 unit.get("model"),
-                TASK_ANALYZER_MODEL_ID,
+                analyzer_model_id,
             )
             or not _formal_openrouter_models_equivalent(
                 unit.get("requested_model"),
-                TASK_ANALYZER_MODEL_ID,
+                analyzer_model_id,
             )
         ):
             return ["wrong_g1_task_analyzer_route"]
@@ -18683,6 +19199,14 @@ def load_resume_group_task_states(
         "complete",
     )
 
+    def _generation_attempt_limit(group: str) -> int:
+        contract = (
+            run_compatibility_contracts.get(group)
+            if run_compatibility_contracts is not None
+            else None
+        )
+        return generation_attempt_budget_limit_from_contract(contract)
+
     def _repairability_rank(state: Mapping[str, Any]) -> tuple[int, int, int]:
         # Exact generation cost metadata is not reconstructible by merely
         # replaying Judge. Prefer a cost-complete generation whose missing
@@ -18965,15 +19489,16 @@ def load_resume_group_task_states(
             raise ValueError(
                 f"actual-spend generation attempt count contradicts evidence at {location}"
             )
+        expected_budget_limit = _generation_attempt_limit(key[0])
         budget_limit = row.get("generation_attempt_budget_limit")
-        if budget_limit != GENERATION_MAX_ATTEMPTS:
+        if budget_limit != expected_budget_limit:
             raise ValueError(f"generation attempt budget limit differs at {location}")
         declared_budget = row.get("generation_attempt_budget_used")
         if (
             not isinstance(declared_budget, int)
             or isinstance(declared_budget, bool)
             or declared_budget < 0
-            or declared_budget > GENERATION_MAX_ATTEMPTS
+            or declared_budget > expected_budget_limit
         ):
             raise ValueError(f"generation attempt budget declaration is invalid at {location}")
 
@@ -19016,7 +19541,7 @@ def load_resume_group_task_states(
             if (
                 not isinstance(attempt_index, int)
                 or isinstance(attempt_index, bool)
-                or not 1 <= attempt_index <= GENERATION_MAX_ATTEMPTS
+                or not 1 <= attempt_index <= expected_budget_limit
             ):
                 raise ValueError(f"generation attempt ordinal is invalid at {location}")
             attempt_started_at = attempt.get("started_at")
@@ -19092,7 +19617,7 @@ def load_resume_group_task_states(
         if (
             not isinstance(budget_remaining, int)
             or isinstance(budget_remaining, bool)
-            or budget_remaining != GENERATION_MAX_ATTEMPTS - declared_budget
+            or budget_remaining != expected_budget_limit - declared_budget
         ):
             raise ValueError(f"generation attempt budget remainder is invalid at {location}")
         generation_reused = execution.get("generation_reused")
@@ -19211,7 +19736,7 @@ def load_resume_group_task_states(
                             f"{_attempt_evidence_location(path, line_number)}"
                         )
                     cumulative_attempt_count = coerce_metric_int(raw_cumulative_attempt_count)
-                    if cumulative_attempt_count > GENERATION_MAX_ATTEMPTS:
+                    if cumulative_attempt_count > _generation_attempt_limit(key[0]):
                         raise ValueError(
                             "generation attempt budget exceeds the formal limit "
                             f"for {key[0]}/{key[1]} at "
@@ -19296,7 +19821,7 @@ def load_resume_group_task_states(
         declared = declared_attempt_budget_used.get(key, 0)
         legacy = sum(legacy_generation_attempts.get(key, {}).values())
         prior_used = max(declared, legacy)
-        if prior_used > GENERATION_MAX_ATTEMPTS:
+        if prior_used > _generation_attempt_limit(key[0]):
             raise ValueError(
                 "observable generation attempts exceed the formal limit for "
                 f"{key[0]}/{key[1]}: {prior_used}"
@@ -19424,6 +19949,7 @@ async def amain(args: argparse.Namespace) -> int:
     args.generation_max_attempts = bounded_generation_attempts(
         getattr(args, "generation_max_attempts", GENERATION_MAX_ATTEMPTS)
     )
+    generation_attempt_budget_limit = args.generation_max_attempts
     args.generation_retry_backoff = bounded_generation_retry_backoff(
         getattr(
             args,
@@ -19444,6 +19970,19 @@ async def amain(args: argparse.Namespace) -> int:
     )
     generation_policy = generation_thinking_policy(args)
     config = GatewayConfig.load(args.config)
+    args._formal_runtime_freeze = enforce_formal_draco_runtime_config(
+        config,
+        experiment_config,
+        groups,
+    )
+    if experiment_config is not None:
+        args._formal_web_search_transport = validate_formal_web_search_transport(
+            config,
+            experiment_config,
+        )
+        args._formal_openrouter_runtime_transport = (
+            validate_formal_openrouter_runtime_transport(config)
+        )
     # Process-local credentials take precedence over any inline value in the
     # reference config. Only an irreversible key fingerprint enters the run
     # compatibility contract.
@@ -19451,11 +19990,6 @@ async def amain(args: argparse.Namespace) -> int:
     process_api_key = os.environ.get(api_key_env or "OPENROUTER_API_KEY", "").strip()
     if process_api_key:
         config.llm.api_key = process_api_key
-    args._formal_runtime_freeze = enforce_formal_draco_runtime_config(
-        config,
-        experiment_config,
-        groups,
-    )
     if getattr(args, "require_openrouter_non_byok", False) and not getattr(args, "dry_run", False):
         args._strict_openrouter_non_byok_environment = (
             validate_strict_openrouter_non_byok_environment(config)
@@ -19556,7 +20090,7 @@ async def amain(args: argparse.Namespace) -> int:
         for key in regenerate_keys
         if key in resume_states
         and coerce_metric_int(resume_states[key].get("prior_generation_attempts_used"))
-        >= GENERATION_MAX_ATTEMPTS
+        >= generation_attempt_budget_limit
     }
     generation_auto_retry_blocked_keys = {
         key
@@ -19617,6 +20151,7 @@ async def amain(args: argparse.Namespace) -> int:
         repair_action_audit = repair_only_resume_classification_audit(
             selected_keys=selected_keys,
             resume_states=resume_states,
+            generation_max_attempts=args.generation_max_attempts,
         )
         args._repair_compatibility_audit["classification_gate"] = repair_action_audit
         if repair_action_audit["regenerate_pair_count"]:
@@ -19661,6 +20196,14 @@ async def amain(args: argparse.Namespace) -> int:
                 failure_manifest = output_dir / (
                     f"draco_run_{failure_stamp}.preflight-failed.manifest.json"
                 )
+                failure_artifacts = {"manifest_json": str(failure_manifest)}
+                failure_artifacts.update(
+                    write_experiment_config_artifacts(
+                        output_dir,
+                        args=args,
+                        stamp=failure_stamp,
+                    )
+                )
                 write_manifest(
                     failure_manifest,
                     args=args,
@@ -19670,7 +20213,7 @@ async def amain(args: argparse.Namespace) -> int:
                     finished_at=time.time(),
                     tasks=tasks,
                     groups=groups,
-                    artifacts={"manifest_json": str(failure_manifest)},
+                    artifacts=failure_artifacts,
                     tool_policy=tool_policy,
                     command=command_payload(args),
                     failure={
@@ -19780,7 +20323,7 @@ async def amain(args: argparse.Namespace) -> int:
             legacy_completed_at = row.get("completed_at")
             if isinstance(legacy_completed_at, int | float):
                 row["generation_completed_at"] = float(legacy_completed_at)
-        row["generation_attempt_budget_limit"] = GENERATION_MAX_ATTEMPTS
+        row["generation_attempt_budget_limit"] = generation_attempt_budget_limit
         row["generation_attempt_budget_used"] = prior_used
         row["error"] = "generation_attempt_budget_exhausted"
         row["completed_at"] = time.time()
@@ -19833,7 +20376,7 @@ async def amain(args: argparse.Namespace) -> int:
         del task, group
         row = json.loads(json.dumps(state["row"], ensure_ascii=False))
         prior_used = coerce_metric_int(state.get("prior_generation_attempts_used"))
-        row["generation_attempt_budget_limit"] = GENERATION_MAX_ATTEMPTS
+        row["generation_attempt_budget_limit"] = generation_attempt_budget_limit
         row["generation_attempt_budget_used"] = prior_used
         row["error"] = "g1_cross_wave_lifecycle_reconstruction_required"
         row["completed_at"] = time.time()
@@ -19846,7 +20389,7 @@ async def amain(args: argparse.Namespace) -> int:
                 "prior_generation_attempts_used": prior_used,
                 "generation_attempt_budget_remaining": max(
                     0,
-                    GENERATION_MAX_ATTEMPTS - prior_used,
+                    generation_attempt_budget_limit - prior_used,
                 ),
                 "g1_cross_wave_resume_blocked": True,
                 "g1_cross_wave_resume_block_reason": (
@@ -19902,9 +20445,7 @@ async def amain(args: argparse.Namespace) -> int:
             "provider_native_proposer_recovery_terminal"
         )
         reason = str(row.get("error") or "")
-        row["generation_attempt_budget_limit"] = (
-            GENERATION_MAX_ATTEMPTS
-        )
+        row["generation_attempt_budget_limit"] = generation_attempt_budget_limit
         row["generation_attempt_budget_used"] = prior_used
         row["completed_at"] = time.time()
         execution = dict(row.get("execution") or {})
@@ -19916,7 +20457,7 @@ async def amain(args: argparse.Namespace) -> int:
                 "prior_generation_attempts_used": prior_used,
                 "generation_attempt_budget_remaining": max(
                     0,
-                    GENERATION_MAX_ATTEMPTS - prior_used,
+                    generation_attempt_budget_limit - prior_used,
                 ),
                 "generation_auto_retry_blocked": True,
                 "generation_postprocessing_terminal": (
@@ -19982,11 +20523,7 @@ async def amain(args: argparse.Namespace) -> int:
             )
         remaining_attempts = remaining_generation_attempts(
             prior_used,
-            getattr(
-                args,
-                "generation_max_attempts",
-                GENERATION_MAX_ATTEMPTS,
-            ),
+            generation_attempt_budget_limit,
         )
         if remaining_attempts <= 0 and isinstance(state, Mapping):
             return _generation_budget_exhausted_row(task, group, state)
@@ -20052,11 +20589,7 @@ async def amain(args: argparse.Namespace) -> int:
                 output_dir=output_dir,
                 agent_max_iterations=args.agent_max_iterations,
                 agent_finalization_policy=agent_finalization_policy,
-                generation_max_attempts=getattr(
-                    args, "generation_max_attempts", GENERATION_MAX_ATTEMPTS
-                )
-                if state is None
-                else remaining_attempts,
+                generation_max_attempts=generation_attempt_budget_limit,
                 generation_attempt_offset=prior_used,
                 generation_retry_backoff=getattr(
                     args,
@@ -20076,7 +20609,7 @@ async def amain(args: argparse.Namespace) -> int:
             )
         current_attempts = coerce_metric_int(row.get("generation_attempt_count"))
         budget_used = prior_used + current_attempts
-        row["generation_attempt_budget_limit"] = GENERATION_MAX_ATTEMPTS
+        row["generation_attempt_budget_limit"] = generation_attempt_budget_limit
         row["generation_attempt_budget_used"] = budget_used
         execution = dict(row.get("execution") or {})
         execution.update(
@@ -20084,7 +20617,7 @@ async def amain(args: argparse.Namespace) -> int:
                 "prior_generation_attempts_used": prior_used,
                 "generation_attempt_budget_remaining": max(
                     0,
-                    GENERATION_MAX_ATTEMPTS - budget_used,
+                    generation_attempt_budget_limit - budget_used,
                 ),
             }
         )
@@ -20276,7 +20809,7 @@ async def amain(args: argparse.Namespace) -> int:
                     ),
                     "generation_attempt_budget_remaining": max(
                         0,
-                        GENERATION_MAX_ATTEMPTS
+                        generation_attempt_budget_limit
                         - coerce_metric_int(state.get("prior_generation_attempts_used")),
                     ),
                 }
@@ -20321,7 +20854,7 @@ async def amain(args: argparse.Namespace) -> int:
             else:
                 execution.setdefault("metadata_repair_attempted", False)
             row["execution"] = execution
-            row["generation_attempt_budget_limit"] = GENERATION_MAX_ATTEMPTS
+            row["generation_attempt_budget_limit"] = generation_attempt_budget_limit
             row["generation_attempt_budget_used"] = coerce_metric_int(
                 state.get("prior_generation_attempts_used")
             )
@@ -20722,6 +21255,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         help="JSON overlay applied after the base experiment config; repeatable.",
+    )
+    parser.add_argument(
+        "--experiment-config-override-json",
+        default=None,
+        metavar="JSON_OBJECT",
+        help=(
+            "One sparse JSON object applied after override files and before "
+            "--experiment-config-set. The effective object is validated and frozen "
+            "for the run."
+        ),
     )
     parser.add_argument(
         "--experiment-config-set",

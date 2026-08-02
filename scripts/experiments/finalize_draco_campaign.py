@@ -35,6 +35,12 @@ from typing import Any
 from opensquilla.provider.protocol import (
     provider_retry_expanded_proposer_identities,
 )
+from opensquilla.provider.ranking_router import (
+    canonical_json_bytes as ranking_canonical_json_bytes,
+)
+from opensquilla.provider.ranking_router import (
+    canonical_json_sha256 as ranking_canonical_json_sha256,
+)
 from opensquilla.provider.types import REASONING_ONLY_LENGTH_STOP_REASONS
 from opensquilla.usage_evidence import (
     MISSING_USAGE_PLACEHOLDER_ROLES,
@@ -61,15 +67,11 @@ RESOLUTION_SCHEMA = "opensquilla.draco.openrouter-non-byok-resolution/v1"
 GENERATION_ATTEMPT_EVIDENCE_SCHEMA = "opensquilla.draco-generation-attempt/v1"
 JUDGE_ATTEMPT_EVIDENCE_SCHEMA = "opensquilla.draco-judge-attempt/v1"
 ENSEMBLE_OUTPUT_BINDING_SCHEMA = "opensquilla.ensemble-output-binding/v1"
-THINKING_PHYSICAL_EVIDENCE_SCHEMA = (
-    "opensquilla.router-dynamic-thinking-physical-evidence/v1"
-)
+THINKING_PHYSICAL_EVIDENCE_SCHEMA = "opensquilla.router-dynamic-thinking-physical-evidence/v1"
 LEGACY_THINKING_RANKING_VERSION = "step2-ranking-v3"
 LEGACY_MANAGED_V3_SOURCE_IDENTITY = {
     "git_head": "f39f7d5e529ce42a6149fc8af6be5a7d6e23ea6b",
-    "source_tree_sha256": (
-        "f44c3edc6db511639c6f7e8a411a47d5eff057eb4911ecc3aa6335967b2a993e"
-    ),
+    "source_tree_sha256": ("f44c3edc6db511639c6f7e8a411a47d5eff057eb4911ecc3aa6335967b2a993e"),
 }
 JUDGE_ATTEMPT_BUDGET_SCOPE = "criterion_repeat_campaign"
 JUDGE_ATTEMPT_BUDGET_LIMIT = 3
@@ -81,12 +83,110 @@ FORMAL_REQUIRED_STABLE_POLL_COUNT = 6
 FORMAL_POLL_INTERVAL_SECONDS = 15
 FORMAL_MINIMUM_SETTLEMENT_SECONDS = 180
 FORMAL_MINIMUM_STABLE_TAIL_SECONDS = 75
-FORMAL_G1_SOURCE_REGISTRY_SNAPSHOT_SHA256 = (
+FORMAL_G1_LEGACY_SOURCE_REGISTRY_SNAPSHOT_SHA256 = (
     "bd2e6632ad09e84619cf497eb266c45faaa8716eff4d870ba930c3f4eae4b473"
 )
+# Backwards-compatible public name used by historical fixtures and callers.
+FORMAL_G1_SOURCE_REGISTRY_SNAPSHOT_SHA256 = (
+    FORMAL_G1_LEGACY_SOURCE_REGISTRY_SNAPSHOT_SHA256
+)
+FORMAL_G1_FULL_REGISTRY_SNAPSHOT_VERSION = "curated-openrouter-step2-2026-07-30.2"
+FORMAL_G1_FULL_REGISTRY_SNAPSHOT_SHA256 = (
+    "8680e55997e22a029c8708abd77a4ede638a32d92638af44c45a61b8fe689eae"
+)
+# Serving aliases are part of the authenticated historical/full registry
+# identities above. Keep this projection immutable so finalization never
+# consults a newer packaged model profile when replaying paid runs.
+FORMAL_OPENROUTER_SERVING_ALIASES = {
+    "anthropic/claude-fable-5": "anthropic/claude-5-fable-20260609",
+    "anthropic/claude-haiku-4.5": "anthropic/claude-4.5-haiku-20251001",
+    "anthropic/claude-opus-4.8": "anthropic/claude-4.8-opus-20260528",
+    "anthropic/claude-sonnet-5": "anthropic/claude-sonnet-5-20260630",
+    "bytedance-seed/seed-2.0-lite": "bytedance-seed/seed-2.0-lite-20260309",
+    "deepseek/deepseek-v3.2": "deepseek/deepseek-v3.2-20251201",
+    "deepseek/deepseek-v4-flash": "deepseek/deepseek-v4-flash-20260423",
+    "deepseek/deepseek-v4-pro": "deepseek/deepseek-v4-pro-20260423",
+    "google/gemini-3-flash-preview": "google/gemini-3-flash-preview-20251217",
+    "google/gemini-3.1-pro-preview": "google/gemini-3.1-pro-preview-20260219",
+    "google/gemini-3.5-flash": "google/gemini-3.5-flash-20260519",
+    "google/gemini-3.6-flash": "google/gemini-3.6-flash-20260721",
+    "google/gemma-4-26b-a4b-it": "google/gemma-4-26b-a4b-it-20260403",
+    "google/gemma-4-31b-it": "google/gemma-4-31b-it-20260402",
+    "ibm-granite/granite-4.1-8b": "ibm-granite/granite-4.1-8b-20260429",
+    "inclusionai/ling-2.6-1t": "inclusionai/ling-2.6-1t-20260423",
+    "inclusionai/ring-2.6-1t": "inclusionai/ring-2.6-1t-20260508",
+    "kwaipilot/kat-coder-air-v2.5": "kwaipilot/kat-coder-air-v2.5-20260710",
+    "kwaipilot/kat-coder-pro-v2.5": "kwaipilot/kat-coder-pro-v2.5-20260710",
+    "meituan/longcat-2.0": "meituan/longcat-2.0-20260720",
+    "meta/muse-spark-1.1": "meta/muse-spark-1.1-20260709",
+    "meta-llama/llama-4-maverick": "meta-llama/llama-4-maverick-17b-128e-instruct",
+    "meta-llama/llama-4-scout": "meta-llama/llama-4-scout-17b-16e-instruct",
+    "minimax/minimax-m2.7": "minimax/minimax-m2.7-20260318",
+    "minimax/minimax-m3": "minimax/minimax-m3-20260531",
+    "mistralai/mistral-medium-3-5": "mistralai/mistral-medium-3.5-20260430",
+    "moonshotai/kimi-k2-thinking": "moonshotai/kimi-k2-thinking-20251106",
+    "moonshotai/kimi-k2.5": "moonshotai/kimi-k2.5-0127",
+    "moonshotai/kimi-k2.6": "moonshotai/kimi-k2.6-20260420",
+    "moonshotai/kimi-k2.7-code": "moonshotai/kimi-k2.7-code-20260612",
+    "moonshotai/kimi-k3": "moonshotai/kimi-k3-20260715",
+    "nvidia/nemotron-3-super-120b-a12b": "nvidia/nemotron-3-super-120b-a12b-20230311",
+    "nvidia/nemotron-3-ultra-550b-a55b": "nvidia/nemotron-3-ultra-550b-a55b-20260604",
+    "openai/gpt-5.3-codex": "openai/gpt-5.3-codex-20260224",
+    "openai/gpt-5.5": "openai/gpt-5.5-20260423",
+    "openai/gpt-5.6-luna": "openai/gpt-5.6-luna-20260709",
+    "openai/gpt-5.6-sol": "openai/gpt-5.6-sol-20260709",
+    "openai/gpt-5.6-terra": "openai/gpt-5.6-terra-20260709",
+    "poolside/laguna-s-2.1": "poolside/laguna-s-2.1-20260720",
+    "poolside/laguna-xs-2.1": "poolside/laguna-xs-2.1-20260625",
+    "qwen/qwen3-coder": "qwen/qwen3-coder-480b-a35b-07-25",
+    "qwen/qwen3-coder-next": "qwen/qwen3-coder-next-2025-02-03",
+    "qwen/qwen3-next-80b-a3b-thinking": "qwen/qwen3-next-80b-a3b-thinking-2509",
+    "qwen/qwen3.5-122b-a10b": "qwen/qwen3.5-122b-a10b-20260224",
+    "qwen/qwen3.5-397b-a17b": "qwen/qwen3.5-397b-a17b-20260216",
+    "qwen/qwen3.6-27b": "qwen/qwen3.6-27b-20260422",
+    "qwen/qwen3.6-35b-a3b": "qwen/qwen3.6-35b-a3b-20260415",
+    "qwen/qwen3.7-max": "qwen/qwen3.7-max-20260520",
+    "qwen/qwen3.7-plus": "qwen/qwen3.7-plus-20260602",
+    "stepfun/step-3.7-flash": "stepfun/step-3.7-flash-20260528",
+    "tencent/hy3": "tencent/hy3-20260706",
+    "tencent/hy3-preview": "tencent/hy3-preview-20260421",
+    "thinkingmachines/inkling": "thinkingmachines/inkling-20260715",
+    "x-ai/grok-4.20": "x-ai/grok-4.20-20260309",
+    "x-ai/grok-4.5": "x-ai/grok-4.5-20260708",
+    "xiaomi/mimo-v2.5": "xiaomi/mimo-v2.5-20260422",
+    "xiaomi/mimo-v2.5-pro": "xiaomi/mimo-v2.5-pro-20260422",
+    "z-ai/glm-4.6v": "z-ai/glm-4.6-20251208",
+    "z-ai/glm-4.7-flash": "z-ai/glm-4.7-flash-20260119",
+    "z-ai/glm-5": "z-ai/glm-5-20260211",
+    "z-ai/glm-5.1": "z-ai/glm-5.1-20260406",
+    "z-ai/glm-5.2": "z-ai/glm-5.2-20260616",
+}
 FORMAL_G1_RANKING_CONFIG_SCHEMA_VERSION = "step2-ranking-config-v3"
-FORMAL_G1_RANKING_CONFIG_VERSION = "step2-ranking-2026-07-22.1"
-FORMAL_G1_RANKING_CONFIG_SHA256 = "a8addcdefa04349209c20e97ca5851ed0f5ca55646c9d0c5badc5d32dd7ef10c"
+FORMAL_G1_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-02.2"
+FORMAL_G1_RANKING_CONFIG_SHA256 = "71be283f94095bc3ced34d39ae9ed58abbaa7e4d273b0a074e7e8a4a6e4b5fc6"
+HISTORICAL_G1_RANKING_CONFIG_IDENTITIES = frozenset(
+    {
+        (
+            "step2-ranking-config-v3",
+            "step2-ranking-2026-07-22.1",
+            "a8addcdefa04349209c20e97ca5851ed0f5ca55646c9d0c5badc5d32dd7ef10c",
+        ),
+        (
+            "step2-ranking-config-v3",
+            "step2-ranking-2026-08-02.1",
+            "d2a14525e11943ef98ebe3f08e99dfb64f6f5011e498770d3b54a50aba02188c",
+        ),
+    }
+)
+FORMAL_TASK_ANALYZER_EXECUTION_POLICY = {
+    "protocol_version": "opus-4.8-json-v3",
+    "provider": "openrouter",
+    "model": "anthropic/claude-opus-4.8",
+    "upstream_provider": "anthropic",
+    "stream_close_timeout_seconds": 1.0,
+    "timeout_seconds": 20.0,
+    "max_retries": 3,
+}
 FORMAL_G1_PROPOSER_COUNT_MAX = 5
 FORMAL_G1_REGISTRY_ALL_CANDIDATE_COUNT = 80
 FORMAL_TASK_CONCURRENCY = 5
@@ -98,16 +198,13 @@ FORMAL_AGENT_MAX_ITERATIONS = 20
 FORMAL_GENERATION_MAX_ATTEMPTS = 3
 FORMAL_GENERATION_RETRY_BACKOFF_SECONDS = Decimal("2")
 FORMAL_GENERATION_MAX_TOKENS = 16_384
-FORMAL_G1_TASK_ANALYZER_MAX_RETRIES = 3
 FORMAL_AGGREGATOR_RECOVERY_POLICY = {
     "aggregator_recovery_mode": "experiment",
     "aggregator_recovery_top_k": 3,
     "aggregator_max_tokens_cap": 65_536,
     "aggregator_visible_answer_reserve_tokens": 8_192,
 }
-FORMAL_PROPOSER_RECOVERY_SCHEMA = (
-    "opensquilla.router-dynamic-proposer-recovery/v1"
-)
+FORMAL_PROPOSER_RECOVERY_SCHEMA = "opensquilla.router-dynamic-proposer-recovery/v1"
 FORMAL_PROPOSER_RECOVERY_POLICY = {
     "schema": FORMAL_PROPOSER_RECOVERY_SCHEMA,
     "configured_backup_count": 2,
@@ -273,8 +370,7 @@ def explicit_degraded_call_attempt(call: Mapping[str, Any]) -> Mapping[str, Any]
             (
                 attempt
                 for attempt in attempts
-                if isinstance(attempt, Mapping)
-                and attempt.get("attempt") == selected_attempt
+                if isinstance(attempt, Mapping) and attempt.get("attempt") == selected_attempt
             ),
             None,
         )
@@ -405,6 +501,8 @@ def partition_execution_and_audit_reasons(
         else:
             blocking.append(reason)
     return blocking, warnings
+
+
 USAGE_CONTRACT_KEYS = (
     "provider",
     "model",
@@ -493,51 +591,455 @@ class LedgerEntry:
     response_ids: set[str] = field(default_factory=set)
 
 
+@dataclass(frozen=True)
+class FinalizerExperimentPolicy:
+    """Authenticated, cross-group experiment semantics used by finalization.
+
+    The source manifests already authenticate each compatibility contract.  This
+    projection makes the shared ``global_experiment_profile`` the authority for
+    tunable experiment semantics and keeps operational trace fields as a
+    reverse-checked projection rather than a second, hard-coded configuration.
+    """
+
+    profile: dict[str, Any]
+    timeouts: dict[str, Any]
+    runner: dict[str, Any]
+    generation: dict[str, Any]
+    judge: dict[str, Any]
+    tools: dict[str, Any]
+    aggregator_recovery: dict[str, Any]
+    proposer_recovery: dict[str, Any]
+    judge_provider_pin: str
+
+    @property
+    def generation_max_attempts(self) -> int:
+        return int(self.generation["max_attempts"])
+
+    @property
+    def judge_model(self) -> str:
+        return str(self.judge["model"])
+
+    @property
+    def judge_repeats(self) -> int:
+        return int(self.judge["repeats"])
+
+    @property
+    def judge_max_attempts(self) -> int:
+        return int(self.judge["max_attempts"])
+
+
+def authenticated_generation_attempt_limit(
+    requested: Any,
+    policy: FinalizerExperimentPolicy,
+) -> int:
+    """Resolve an optional CLI assertion against authenticated run policy."""
+
+    expected = policy.generation_max_attempts
+    if requested is None:
+        return expected
+    if (
+        isinstance(requested, bool)
+        or not isinstance(requested, int)
+        or requested < 1
+        or requested != expected
+    ):
+        raise FinalizationError(
+            "max generation attempts CLI assertion differs from authenticated "
+            f"experiment policy: requested={requested!r}, expected={expected}"
+        )
+    return expected
+
+
 def canonical_json_bytes(value: Any) -> bytes:
-    return json.dumps(
-        value,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).encode("utf-8")
+    """Use the runtime's canonical JSON encoding for offline verification."""
+
+    return ranking_canonical_json_bytes(value)
 
 
 def canonical_sha256(value: Any, *, prefix: bool = False) -> str:
-    digest = hashlib.sha256(canonical_json_bytes(value)).hexdigest()
+    digest = ranking_canonical_json_sha256(value)
     return f"sha256:{digest}" if prefix else digest
 
 
-@cache
-def formal_registry_all_routes() -> dict[str, str]:
-    """Return the exact projected packaged OpenRouter pool for ``registry_all``."""
+G1_RANKING_CONFIG_RESOLUTION_FIELDS = frozenset(
+    {
+        "base_config",
+        "override",
+        "effective_config",
+        "base_sha256",
+        "override_sha256",
+        "effective_sha256",
+        "thinking_assignment_enabled",
+    }
+)
+G1_BASELINE_RANKING_CONFIG_CONTRACT_FIELDS = (
+    "baseline_expected_ranking_config_schema_version",
+    "baseline_expected_ranking_config_version",
+    "baseline_expected_ranking_config_sha256",
+)
 
-    from opensquilla.provider.ranking_router import (
-        _legacy_registry_snapshot_projection,
-        load_model_registry_snapshot,
+
+def _deep_merge_frozen_ranking_config(
+    base: Mapping[str, Any],
+    override: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Merge frozen public JSON without consulting packaged config state."""
+
+    merged = copy.deepcopy(dict(base))
+    for key, value in override.items():
+        current = merged.get(key)
+        if isinstance(current, Mapping) and isinstance(value, Mapping):
+            merged[key] = _deep_merge_frozen_ranking_config(current, value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
+def _validated_frozen_ranking_config(value: Any) -> dict[str, Any] | None:
+    """Validate one supplied full config without loading packaged config data."""
+
+    if not isinstance(value, Mapping):
+        return None
+    try:
+        from opensquilla.provider.ranking_router import _validate_ranking_config
+
+        validated = _validate_ranking_config(value)
+    except (KeyError, TypeError, ValueError):
+        return None
+    payload = copy.deepcopy(dict(validated))
+    return payload if canonical_json_bytes(payload) == canonical_json_bytes(value) else None
+
+
+def _mapping_projection_matches(value: Any, projection: Any) -> bool:
+    """Require every sparse override leaf in the frozen effective value."""
+
+    if isinstance(projection, Mapping):
+        return isinstance(value, Mapping) and all(
+            key in value and _mapping_projection_matches(value[key], child)
+            for key, child in projection.items()
+        )
+    return value == projection
+
+
+def _frozen_task_analyzer_policy(config: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Project analyzer policy from an already frozen full ranking config."""
+
+    validated = _validated_frozen_ranking_config(config)
+    analyzer = validated.get("task_analyzer") if isinstance(validated, Mapping) else None
+    if not isinstance(analyzer, Mapping):
+        return None
+    public_fields = (
+        "provider",
+        "model",
+        "upstream_provider",
+        "stream_close_timeout_seconds",
     )
+    has_public_policy = all(field in analyzer for field in public_fields)
+    if any(field in analyzer for field in public_fields) and not has_public_policy:
+        return None
+    policy = dict(FORMAL_TASK_ANALYZER_EXECUTION_POLICY)
+    if has_public_policy:
+        policy.update({field: analyzer[field] for field in public_fields})
+    policy.update(
+        {
+            "timeout_seconds": analyzer.get("timeout_seconds"),
+            "max_retries": analyzer.get("max_retries"),
+        }
+    )
+    return policy
 
-    snapshot = _legacy_registry_snapshot_projection(load_model_registry_snapshot())
-    if canonical_sha256(snapshot) != FORMAL_G1_SOURCE_REGISTRY_SNAPSHOT_SHA256:
-        raise FinalizationError("formal OpenRouter model registry snapshot changed")
-    rows = snapshot.get("models")
-    if not isinstance(rows, list):
-        raise FinalizationError("formal OpenRouter model registry snapshot is malformed")
-    routes: dict[str, str] = {}
-    for row in rows:
-        facts = row.get("registry_facts") if isinstance(row, Mapping) else None
-        if not isinstance(facts, Mapping):
-            raise FinalizationError("formal OpenRouter model registry row is malformed")
-        provider = str(facts.get("provider") or "").strip().casefold()
-        if provider != "openrouter":
-            continue
-        model = str(facts.get("model_id") or "").strip().casefold()
-        if not model or "/" not in model or model in routes:
-            raise FinalizationError("formal OpenRouter model registry identity is malformed")
-        routes[model] = "auto"
-    if len(routes) != FORMAL_G1_REGISTRY_ALL_CANDIDATE_COUNT:
-        raise FinalizationError("formal OpenRouter registry-all candidate count changed")
-    return routes
+
+def g1_ranking_config_identity(
+    contract: Mapping[str, Any] | None,
+) -> tuple[str, str, str] | None:
+    """Authenticate the frozen G1 ranking resolution and return its identity.
+
+    Historical manifests did not carry a resolution object and remain bound
+    to the formal baseline constants. New manifests must make the base,
+    sparse override, and effective object independently hash-verifiable, then
+    reproduce the exact resolution with the runtime's canonical resolver.
+    """
+
+    if not isinstance(contract, Mapping):
+        return None
+    expected = (
+        str(contract.get("expected_ranking_config_schema_version") or ""),
+        str(contract.get("expected_ranking_config_version") or ""),
+        str(contract.get("expected_ranking_config_sha256") or ""),
+    )
+    baseline = (
+        FORMAL_G1_RANKING_CONFIG_SCHEMA_VERSION,
+        FORMAL_G1_RANKING_CONFIG_VERSION,
+        FORMAL_G1_RANKING_CONFIG_SHA256,
+    )
+    declared_baseline = tuple(
+        str(contract.get(field) or "") for field in G1_BASELINE_RANKING_CONFIG_CONTRACT_FIELDS
+    )
+    resolution = contract.get("ranking_config_resolution")
+    if resolution is None:
+        if any(field in contract for field in G1_BASELINE_RANKING_CONFIG_CONTRACT_FIELDS):
+            if declared_baseline not in {
+                baseline,
+                *HISTORICAL_G1_RANKING_CONFIG_IDENTITIES,
+            }:
+                return None
+        return (
+            expected
+            if expected == baseline or expected in HISTORICAL_G1_RANKING_CONFIG_IDENTITIES
+            else None
+        )
+    if (
+        not isinstance(resolution, Mapping)
+        or set(resolution) != G1_RANKING_CONFIG_RESOLUTION_FIELDS
+        or declared_baseline != baseline
+    ):
+        return None
+
+    base = resolution.get("base_config")
+    override = resolution.get("override")
+    effective = resolution.get("effective_config")
+    if (
+        not isinstance(base, Mapping)
+        or not isinstance(effective, Mapping)
+        or (override is not None and not isinstance(override, Mapping))
+        or type(resolution.get("thinking_assignment_enabled")) is not bool
+    ):
+        return None
+    base_sha256 = str(resolution.get("base_sha256") or "")
+    raw_override_sha256 = resolution.get("override_sha256")
+    override_sha256 = str(raw_override_sha256 or "")
+    effective_sha256 = str(resolution.get("effective_sha256") or "")
+    if (
+        not HEX64.fullmatch(base_sha256)
+        or not HEX64.fullmatch(effective_sha256)
+        or canonical_sha256(base) != base_sha256
+        or (override is None and raw_override_sha256 is not None)
+        or (
+            isinstance(override, Mapping)
+            and (
+                not HEX64.fullmatch(override_sha256)
+                or canonical_sha256(override) != override_sha256
+            )
+        )
+        or canonical_sha256(effective) != effective_sha256
+        or base.get("schema_version") != baseline[0]
+        or base.get("config_version") != baseline[1]
+        or base_sha256 != baseline[2]
+        or effective.get("schema_version") != expected[0]
+        or effective.get("config_version") != expected[1]
+        or effective_sha256 != expected[2]
+        or not HEX64.fullmatch(expected[2])
+    ):
+        return None
+
+    if (
+        _validated_frozen_ranking_config(base) is None
+        or _validated_frozen_ranking_config(effective) is None
+    ):
+        return None
+    thinking_enabled = resolution["thinking_assignment_enabled"]
+    effective_thinking = effective.get("thinking_assignment")
+    if thinking_enabled:
+        if (
+            effective.get("schema_version") != "step2-ranking-config-v4"
+            or not isinstance(effective_thinking, Mapping)
+            or effective_thinking.get("enabled") is not True
+        ):
+            return None
+    elif effective.get("schema_version") != FORMAL_G1_RANKING_CONFIG_SCHEMA_VERSION or (
+        "thinking_assignment" in effective
+    ):
+        return None
+
+    if override is None:
+        if (
+            raw_override_sha256 is not None
+            or thinking_enabled
+            or canonical_json_bytes(base) != canonical_json_bytes(effective)
+            or base_sha256 != effective_sha256
+        ):
+            return None
+    else:
+        if not override or "schema_version" in override or "config_version" in override:
+            return None
+        expected_version = f"{base['config_version']}+override.{override_sha256[:12]}"
+        if effective.get("config_version") != expected_version:
+            return None
+        nonthinking_override = {
+            key: value for key, value in override.items() if key != "thinking_assignment"
+        }
+        expected_nonthinking = _deep_merge_frozen_ranking_config(
+            base,
+            nonthinking_override,
+        )
+        expected_nonthinking["config_version"] = expected_version
+        effective_nonthinking = copy.deepcopy(dict(effective))
+        if thinking_enabled:
+            effective_nonthinking["schema_version"] = FORMAL_G1_RANKING_CONFIG_SCHEMA_VERSION
+            effective_nonthinking.pop("thinking_assignment", None)
+        if canonical_json_bytes(expected_nonthinking) != canonical_json_bytes(
+            effective_nonthinking
+        ):
+            return None
+        thinking_override = override.get("thinking_assignment")
+        if thinking_override is not None:
+            if not isinstance(thinking_override, Mapping):
+                return None
+            if thinking_enabled:
+                if not _mapping_projection_matches(effective_thinking, thinking_override):
+                    return None
+            elif thinking_override.get("enabled") is not False:
+                return None
+    return expected
+
+
+def g1_task_analyzer_execution_policy(
+    contract: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Return the analyzer policy authenticated by a G1 ranking contract.
+
+    Historical no-resolution contracts predate explicit analyzer identity and
+    replay with the original OpenRouter/Opus/Anthropic policy. Current configs
+    and sparse overrides must carry a policy exactly matching the authenticated
+    effective ranking config.
+    """
+
+    identity = g1_ranking_config_identity(contract)
+    if identity is None or not isinstance(contract, Mapping):
+        return None
+    resolution = contract.get("ranking_config_resolution")
+    if isinstance(resolution, Mapping):
+        effective = resolution.get("effective_config")
+        if not isinstance(effective, Mapping):
+            return None
+        policy = _frozen_task_analyzer_policy(effective)
+        requires_declared_policy = True
+    else:
+        policy = dict(FORMAL_TASK_ANALYZER_EXECUTION_POLICY)
+        requires_declared_policy = identity == (
+            FORMAL_G1_RANKING_CONFIG_SCHEMA_VERSION,
+            FORMAL_G1_RANKING_CONFIG_VERSION,
+            FORMAL_G1_RANKING_CONFIG_SHA256,
+        )
+    if policy is None:
+        return None
+    declared = contract.get("task_analyzer")
+    if declared is None:
+        return None if requires_declared_policy else policy
+    if not isinstance(declared, Mapping) or dict(declared) != policy:
+        return None
+    return policy
+
+
+def g1_ranking_proposer_max(contract: Mapping[str, Any] | None) -> int | None:
+    """Return the authenticated effective proposer ceiling for a G1 arm."""
+
+    if g1_ranking_config_identity(contract) is None or not isinstance(contract, Mapping):
+        return None
+    resolution = contract.get("ranking_config_resolution")
+    if resolution is None:
+        return (
+            FORMAL_G1_PROPOSER_COUNT_MAX
+            if contract.get("expected_proposer_count_max") == FORMAL_G1_PROPOSER_COUNT_MAX
+            else None
+        )
+    if (
+        not isinstance(resolution, Mapping)
+        or contract.get("baseline_expected_proposer_count_max") != FORMAL_G1_PROPOSER_COUNT_MAX
+    ):
+        return None
+    effective = resolution.get("effective_config")
+    proposer_count = effective.get("proposer_count") if isinstance(effective, Mapping) else None
+    by_tier = proposer_count.get("by_tier") if isinstance(proposer_count, Mapping) else None
+    high_risk = proposer_count.get("high_risk") if isinstance(proposer_count, Mapping) else None
+    if not isinstance(by_tier, Mapping) or not isinstance(high_risk, Mapping):
+        return None
+    raw_maxima = [row.get("max") for row in by_tier.values() if isinstance(row, Mapping)]
+    raw_maxima.append(high_risk.get("max"))
+    if not raw_maxima or any(
+        isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in raw_maxima
+    ):
+        return None
+    effective_max = max(raw_maxima)
+    return effective_max if contract.get("expected_proposer_count_max") == effective_max else None
+
+
+def authenticated_registry_all_routes(
+    contract: Mapping[str, Any] | None,
+) -> dict[str, str] | None:
+    """Validate the registry-all route projection frozen in a run contract."""
+
+    if not isinstance(contract, Mapping):
+        return None
+    source_identity = g1_registry_source_identity(contract)
+    routes = contract.get("expected_routes")
+    routes_hash = str(contract.get("expected_routes_sha256") or "")
+    expected_count = contract.get("expected_candidate_count")
+    if (
+        contract.get("candidate_scope") != "registry_all"
+        or contract.get("policy") != "all_registry_models"
+        or not str(contract.get("profile_id") or "").strip()
+        or source_identity is None
+        or (
+            str(contract.get("source_registry_snapshot_version") or ""),
+            str(contract.get("expected_source_registry_snapshot_sha256") or ""),
+        )
+        != source_identity
+        or not isinstance(routes, Mapping)
+        or isinstance(expected_count, bool)
+        or expected_count != FORMAL_G1_REGISTRY_ALL_CANDIDATE_COUNT
+        or len(routes) != expected_count
+        or not HEX64.fullmatch(routes_hash)
+        or canonical_sha256(routes) != routes_hash
+    ):
+        return None
+    normalized: dict[str, str] = {}
+    for raw_model, raw_provider in routes.items():
+        model = str(raw_model)
+        provider = str(raw_provider)
+        if (
+            model != model.strip().casefold()
+            or "/" not in model
+            or any(not segment for segment in model.split("/"))
+            or provider != "auto"
+            or model in normalized
+        ):
+            return None
+        normalized[model] = provider
+    return normalized
+
+
+def g1_registry_source_identity(
+    contract: Mapping[str, Any] | None,
+) -> tuple[str, str] | None:
+    """Return the immutable source identity selected by frozen ranking policy.
+
+    Thinking-v4 campaigns were launched against the authenticated full-registry
+    projection. Historical/no-resolution and thinking-disabled campaigns remain
+    bound to the legacy projection. The decision is made solely from the frozen,
+    self-validated ranking resolution carried by the run contract.
+    """
+
+    if g1_ranking_config_identity(contract) is None or not isinstance(contract, Mapping):
+        return None
+    resolution = contract.get("ranking_config_resolution")
+    thinking_enabled = (
+        isinstance(resolution, Mapping)
+        and resolution.get("thinking_assignment_enabled") is True
+    )
+    source_version = str(contract.get("source_registry_snapshot_version") or "")
+    return (
+        (
+            FORMAL_G1_FULL_REGISTRY_SNAPSHOT_VERSION
+            if contract.get("candidate_scope") == "registry_all"
+            else source_version
+        ),
+        (
+            FORMAL_G1_FULL_REGISTRY_SNAPSHOT_SHA256
+            if thinking_enabled
+            else FORMAL_G1_LEGACY_SOURCE_REGISTRY_SNAPSHOT_SHA256
+        ),
+    )
 
 
 def file_sha256(path: Path) -> str:
@@ -642,6 +1144,7 @@ def validate_formal_manifest_command(
     path: Path,
     groups: Sequence[str] = GROUPS,
     expected_task_concurrency: int = FORMAL_TASK_CONCURRENCY,
+    expected_judge_concurrency: int = FORMAL_JUDGE_CONCURRENCY,
 ) -> dict[str, int]:
     """Validate scheduling fields intentionally excluded from compatibility."""
 
@@ -651,6 +1154,12 @@ def validate_formal_manifest_command(
         or expected_task_concurrency < 1
     ):
         raise FinalizationError("expected task concurrency must be a positive integer")
+    if (
+        isinstance(expected_judge_concurrency, bool)
+        or not isinstance(expected_judge_concurrency, int)
+        or expected_judge_concurrency < 1
+    ):
+        raise FinalizationError("expected judge concurrency must be a positive integer")
     command = payload.get("command")
     parsed_args = command.get("parsed_args") if isinstance(command, Mapping) else None
     require_formal_fields(
@@ -659,7 +1168,7 @@ def validate_formal_manifest_command(
             "groups": ",".join(groups),
             "max_tasks": FROZEN_DRACO_MINI_TASK_COUNT,
             "concurrency": expected_task_concurrency,
-            "judge_concurrency": FORMAL_JUDGE_CONCURRENCY,
+            "judge_concurrency": expected_judge_concurrency,
             "require_clean_source": True,
             "dry_run": False,
         },
@@ -667,7 +1176,7 @@ def validate_formal_manifest_command(
     )
     return {
         "task_concurrency": expected_task_concurrency,
-        "judge_concurrency": FORMAL_JUDGE_CONCURRENCY,
+        "judge_concurrency": expected_judge_concurrency,
     }
 
 
@@ -912,6 +1421,7 @@ def load_manifest_contracts(
     result_paths: Sequence[Path],
     groups: Sequence[str],
     expected_task_concurrency: int = FORMAL_TASK_CONCURRENCY,
+    expected_judge_concurrency: int = FORMAL_JUDGE_CONCURRENCY,
 ) -> tuple[dict[str, str], dict[str, dict[str, Any]], str, list[dict[str, Any]]]:
     if not paths:
         raise FinalizationError("at least one --manifest source is required")
@@ -947,6 +1457,7 @@ def load_manifest_contracts(
             path=path,
             groups=groups,
             expected_task_concurrency=expected_task_concurrency,
+            expected_judge_concurrency=expected_judge_concurrency,
         )
         status = str(payload.get("status") or "")
         if status not in allowed_statuses:
@@ -1045,11 +1556,8 @@ def load_manifest_contracts(
                                 row["execution"].get("audit_only_summary"),
                                 Mapping,
                             )
-                            or row["execution"]["audit_only_summary"].get("status")
-                            != "recorded"
-                            or row["execution"]["audit_only_summary"].get(
-                                "generation_called"
-                            )
+                            or row["execution"]["audit_only_summary"].get("status") != "recorded"
+                            or row["execution"]["audit_only_summary"].get("generation_called")
                             is not False
                             or row["execution"]["audit_only_summary"].get("judge_called")
                             is not False
@@ -1164,8 +1672,7 @@ def load_manifest_contracts(
                 declared_keys = set(declared_action_counts)
                 counter_contract_valid = bool(
                     declared_keys == expected_resume_actions
-                    or declared_keys
-                    == expected_resume_actions - {"policy_violation"}
+                    or declared_keys == expected_resume_actions - {"policy_violation"}
                 )
                 for action in expected_resume_actions:
                     raw_count = declared_action_counts.get(action)
@@ -1184,9 +1691,7 @@ def load_manifest_contracts(
 
             selected_pair_count = raw_resume_selection.get("selected_pair_count")
             best_pair_count = raw_resume_selection.get("best_pair_count")
-            strict_valid_pair_count = raw_resume_selection.get(
-                "strict_valid_pair_count"
-            )
+            strict_valid_pair_count = raw_resume_selection.get("strict_valid_pair_count")
             if (
                 isinstance(selected_pair_count, bool)
                 or not isinstance(selected_pair_count, int)
@@ -1202,8 +1707,7 @@ def load_manifest_contracts(
             elif counter_contract_valid:
                 completed_pair_count = normalized_resume_counts["complete"]
                 counter_contract_valid = bool(
-                    selected_pair_count
-                    == len(resume_scheduled_pairs) + strict_valid_pair_count
+                    selected_pair_count == len(resume_scheduled_pairs) + strict_valid_pair_count
                     and completed_pair_count == strict_valid_pair_count
                     and best_pair_count
                     == sum(
@@ -1223,34 +1727,24 @@ def load_manifest_contracts(
                     <= scheduled_action_counts["regenerate"]
                 )
 
-            model_regenerate_count = raw_resume_selection.get(
-                "model_regenerate_pair_count"
-            )
+            model_regenerate_count = raw_resume_selection.get("model_regenerate_pair_count")
             regenerate_count = scheduled_action_counts["regenerate"]
             explicit_model_regenerate_count = sum(
-                scheduled["action"] == "model_regenerate"
-                for scheduled in resume_scheduled_pairs
+                scheduled["action"] == "model_regenerate" for scheduled in resume_scheduled_pairs
             )
             if (
                 isinstance(model_regenerate_count, bool)
                 or not isinstance(model_regenerate_count, int)
-                or not explicit_model_regenerate_count
-                <= model_regenerate_count
-                <= regenerate_count
+                or not explicit_model_regenerate_count <= model_regenerate_count <= regenerate_count
             ):
                 counter_contract_valid = False
             else:
-                exhausted = raw_resume_selection.get(
-                    "generation_budget_exhausted_pair_count"
-                )
-                blocked = raw_resume_selection.get(
-                    "generation_auto_retry_blocked_pair_count"
-                )
+                exhausted = raw_resume_selection.get("generation_budget_exhausted_pair_count")
+                blocked = raw_resume_selection.get("generation_auto_retry_blocked_pair_count")
                 if exhausted is None and blocked is None:
                     # Legacy manifests did not expose the non-model subsets.
                     counter_contract_valid = bool(
-                        counter_contract_valid
-                        and model_regenerate_count == regenerate_count
+                        counter_contract_valid and model_regenerate_count == regenerate_count
                     )
                 elif (
                     isinstance(exhausted, bool)
@@ -1262,9 +1756,7 @@ def load_manifest_contracts(
                 ):
                     counter_contract_valid = False
                 else:
-                    non_model_regenerate_count = (
-                        regenerate_count - model_regenerate_count
-                    )
+                    non_model_regenerate_count = regenerate_count - model_regenerate_count
                     counter_contract_valid = bool(
                         counter_contract_valid
                         and max(exhausted, blocked)
@@ -1362,56 +1854,521 @@ def load_manifest_contracts(
     )
 
 
+_THINKING_SETTINGS = frozenset(
+    {"off", "minimal", "low", "medium", "high", "xhigh", "max", "adaptive"}
+)
+_AGENT_FINALIZATION_POLICY_FIELDS = (
+    "deadline_wrapup_margin_seconds",
+    "deadline_wrapup_disable_tools",
+    "deadline_thinking_off_margin_seconds",
+    "max_iterations_includes_finalization",
+    "retrieval_loop_finalization_threshold",
+    "finalization_aggregator_only",
+    "finalization_disable_thinking",
+)
+_AGGREGATOR_RECOVERY_FIELDS = tuple(FORMAL_AGGREGATOR_RECOVERY_POLICY)
+_PROPOSER_RECOVERY_FREEZE_FIELDS = (
+    "proposer_backup_count",
+    "proposer_recovery_max_additional_calls",
+    "proposer_max_tokens_cap",
+    "proposer_visible_answer_reserve_tokens",
+)
+
+
+def _require_exact_mapping_keys(
+    value: Any,
+    expected: set[str],
+    *,
+    label: str,
+) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != expected:
+        raise FinalizationError(f"{label} fields differ from the experiment schema")
+    return value
+
+
+def _require_policy_int(
+    value: Any,
+    *,
+    label: str,
+    minimum: int = 0,
+    maximum: int | None = None,
+) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < minimum
+        or (maximum is not None and value > maximum)
+    ):
+        bounds = f">= {minimum}" if maximum is None else f"between {minimum} and {maximum}"
+        raise FinalizationError(f"{label} must be an integer {bounds}")
+    return value
+
+
+def _require_policy_decimal(
+    value: Any,
+    *,
+    label: str,
+    minimum: Decimal = Decimal(0),
+    positive: bool = False,
+) -> Decimal:
+    parsed = required_decimal(value, label=label)
+    if parsed < minimum or (positive and parsed <= 0):
+        comparator = "> 0" if positive else f">= {minimum}"
+        raise FinalizationError(f"{label} must be {comparator}")
+    return parsed
+
+
+def _derive_finalizer_experiment_policy(
+    contracts: Mapping[str, Mapping[str, Any]],
+    *,
+    groups: Sequence[str],
+) -> FinalizerExperimentPolicy:
+    """Derive one tunable policy from authenticated, cross-group contracts."""
+
+    profiles: list[tuple[str, Mapping[str, Any]]] = []
+    freezes: list[tuple[str, Mapping[str, Any]]] = []
+    for group in groups:
+        contract = contracts[group]
+        profile = contract.get("global_experiment_profile")
+        freeze = contract.get("formal_runtime_freeze")
+        if not isinstance(profile, Mapping):
+            raise FinalizationError(f"{group} global_experiment_profile is missing")
+        if not isinstance(freeze, Mapping):
+            raise FinalizationError(f"{group} formal_runtime_freeze is missing")
+        profiles.append((group, profile))
+        freezes.append((group, freeze))
+    baseline_profile = profiles[0][1]
+    baseline_freeze = freezes[0][1]
+    for group, profile in profiles[1:]:
+        if canonical_sha256(profile) != canonical_sha256(baseline_profile):
+            raise FinalizationError(
+                f"{group} global_experiment_profile differs across active groups"
+            )
+    recovery_freeze_fields = {
+        field_name: baseline_freeze.get(field_name)
+        for field_name in (*_AGGREGATOR_RECOVERY_FIELDS, *_PROPOSER_RECOVERY_FREEZE_FIELDS)
+    }
+    for group, freeze in freezes[1:]:
+        candidate = {
+            field_name: freeze.get(field_name)
+            for field_name in (*_AGGREGATOR_RECOVERY_FIELDS, *_PROPOSER_RECOVERY_FREEZE_FIELDS)
+        }
+        if candidate != recovery_freeze_fields:
+            raise FinalizationError(f"{group} recovery policy differs across active groups")
+
+    profile = copy.deepcopy(dict(baseline_profile))
+    if profile.get("schema_version") != 1 or not str(profile.get("profile_id") or "").strip():
+        raise FinalizationError("global_experiment_profile identity is invalid")
+    benchmark_input = profile.get("benchmark_input")
+    require_formal_fields(
+        benchmark_input,
+        {
+            "sha256": FROZEN_DRACO_MINI_SHA256,
+            "task_count": FROZEN_DRACO_MINI_TASK_COUNT,
+            "enforce_reference_input": True,
+        },
+        label="global_experiment_profile.benchmark_input",
+    )
+
+    raw_timeouts = _require_exact_mapping_keys(
+        profile.get("timeouts"),
+        {"task_seconds", "proposer_seconds", "aggregator_seconds", "task_margin_seconds"},
+        label="global_experiment_profile.timeouts",
+    )
+    timeouts = {
+        field_name: _require_policy_decimal(
+            raw_timeouts.get(field_name),
+            label=f"global_experiment_profile.timeouts.{field_name}",
+            positive=field_name != "task_margin_seconds",
+        )
+        for field_name in raw_timeouts
+    }
+    if (
+        timeouts["proposer_seconds"]
+        + timeouts["aggregator_seconds"]
+        + timeouts["task_margin_seconds"]
+        > timeouts["task_seconds"]
+    ):
+        raise FinalizationError("global experiment timeout budgets exceed task_seconds")
+
+    raw_runner = _require_exact_mapping_keys(
+        profile.get("runner"),
+        {"mode", "agent_max_iterations", *_AGENT_FINALIZATION_POLICY_FIELDS},
+        label="global_experiment_profile.runner",
+    )
+    runner_mode = str(raw_runner.get("mode") or "")
+    if runner_mode not in {"agent_loop", "provider"}:
+        raise FinalizationError("global_experiment_profile.runner.mode is invalid")
+    runner: dict[str, Any] = {
+        "mode": runner_mode,
+        "agent_max_iterations": _require_policy_int(
+            raw_runner.get("agent_max_iterations"),
+            label="global_experiment_profile.runner.agent_max_iterations",
+        ),
+    }
+    boolean_runner_fields = {
+        "deadline_wrapup_disable_tools",
+        "max_iterations_includes_finalization",
+        "finalization_aggregator_only",
+        "finalization_disable_thinking",
+    }
+    for field_name in _AGENT_FINALIZATION_POLICY_FIELDS:
+        value = raw_runner.get(field_name)
+        if field_name in boolean_runner_fields:
+            if type(value) is not bool:
+                raise FinalizationError(
+                    f"global_experiment_profile.runner.{field_name} must be boolean"
+                )
+            runner[field_name] = value
+        else:
+            runner[field_name] = _require_policy_int(
+                value,
+                label=f"global_experiment_profile.runner.{field_name}",
+            )
+
+    raw_generation = _require_exact_mapping_keys(
+        profile.get("generation"),
+        {
+            "thinking_enabled",
+            "thinking_budget_tokens",
+            "default_thinking_level",
+            "model_thinking_levels",
+            "require_highest_thinking",
+            "temperature",
+            "max_tokens",
+            "max_attempts",
+            "retry_backoff_seconds",
+        },
+        label="global_experiment_profile.generation",
+    )
+    if type(raw_generation.get("thinking_enabled")) is not bool:
+        raise FinalizationError("generation.thinking_enabled must be boolean")
+    if type(raw_generation.get("require_highest_thinking")) is not bool:
+        raise FinalizationError("generation.require_highest_thinking must be boolean")
+    default_thinking = str(raw_generation.get("default_thinking_level") or "")
+    thinking_levels = raw_generation.get("model_thinking_levels")
+    if (
+        default_thinking not in _THINKING_SETTINGS
+        or not isinstance(thinking_levels, Mapping)
+        or any(
+            not isinstance(model, str) or not model or level not in _THINKING_SETTINGS
+            for model, level in thinking_levels.items()
+        )
+    ):
+        raise FinalizationError("global generation thinking policy is invalid")
+    raw_temperature = raw_generation.get("temperature")
+    temperature = (
+        None
+        if raw_temperature is None
+        else required_decimal(raw_temperature, label="global generation temperature")
+    )
+    generation = {
+        "thinking_enabled": raw_generation["thinking_enabled"],
+        "thinking_budget_tokens": _require_policy_int(
+            raw_generation.get("thinking_budget_tokens"),
+            label="global generation thinking_budget_tokens",
+            minimum=1,
+        ),
+        "default_thinking_level": default_thinking,
+        "model_thinking_levels": copy.deepcopy(dict(thinking_levels)),
+        "require_highest_thinking": raw_generation["require_highest_thinking"],
+        "temperature": temperature,
+        "max_tokens": _require_policy_int(
+            raw_generation.get("max_tokens"),
+            label="global generation max_tokens",
+            minimum=1,
+        ),
+        "max_attempts": _require_policy_int(
+            raw_generation.get("max_attempts"),
+            label="global generation max_attempts",
+            minimum=1,
+            maximum=3,
+        ),
+        "retry_backoff_seconds": _require_policy_decimal(
+            raw_generation.get("retry_backoff_seconds"),
+            label="global generation retry_backoff_seconds",
+        ),
+    }
+
+    raw_judge = _require_exact_mapping_keys(
+        profile.get("judge"),
+        {"model", "repeats", "max_attempts", "judge_candidates"},
+        label="global_experiment_profile.judge",
+    )
+    judge_model = str(raw_judge.get("model") or "")
+    if (
+        not judge_model
+        or judge_model != JUDGE_MODEL
+        or judge_model != judge_model.strip().lower()
+        or "/" not in judge_model
+        or any(character.isspace() for character in judge_model)
+        or type(raw_judge.get("judge_candidates")) is not bool
+    ):
+        raise FinalizationError("global Judge policy is invalid")
+    judge = {
+        "model": judge_model,
+        "repeats": _require_policy_int(
+            raw_judge.get("repeats"), label="global Judge repeats", minimum=1
+        ),
+        "max_attempts": _require_policy_int(
+            raw_judge.get("max_attempts"),
+            label="global Judge max_attempts",
+            minimum=1,
+            maximum=3,
+        ),
+        "judge_candidates": raw_judge["judge_candidates"],
+    }
+
+    raw_tools = _require_exact_mapping_keys(
+        profile.get("tools"),
+        {
+            "mode",
+            "sandbox_enabled",
+            "contamination_blocked_domains",
+            "web_search",
+            "web_fetch",
+        },
+        label="global_experiment_profile.tools",
+    )
+    if raw_tools.get("mode") != "local_web_tools":
+        raise FinalizationError("formal campaign requires local_web_tools")
+    if raw_tools.get("sandbox_enabled") is not False:
+        raise FinalizationError("formal campaign requires sandbox_enabled=false")
+    if raw_tools.get("contamination_blocked_domains") != list(FORMAL_BLOCKED_DOMAINS):
+        raise FinalizationError("formal contamination blocked domains differ")
+    raw_search = _require_exact_mapping_keys(
+        raw_tools.get("web_search"),
+        {"provider", "api_key_env", "max_results"},
+        label="global_experiment_profile.tools.web_search",
+    )
+    raw_fetch = _require_exact_mapping_keys(
+        raw_tools.get("web_fetch"),
+        {"max_content_tokens"},
+        label="global_experiment_profile.tools.web_fetch",
+    )
+    search_provider = str(raw_search.get("provider") or "")
+    search_api_key_env = str(raw_search.get("api_key_env") or "")
+    if search_provider not in {"brave", "duckduckgo"}:
+        raise FinalizationError("global web_search provider is invalid")
+    if search_provider == "brave" and re.fullmatch(
+        r"[A-Za-z_][A-Za-z0-9_]*",
+        search_api_key_env,
+    ) is None:
+        raise FinalizationError("global web_search api_key_env is invalid")
+    if search_provider == "duckduckgo" and search_api_key_env:
+        raise FinalizationError(
+            "global DuckDuckGo web_search api_key_env must be empty"
+        )
+    tools = {
+        "mode": "local_web_tools",
+        "sandbox_enabled": False,
+        "contamination_blocked_domains": list(FORMAL_BLOCKED_DOMAINS),
+        "web_search": {
+            "provider": search_provider,
+            "api_key_env": search_api_key_env,
+            "max_results": _require_policy_int(
+                raw_search.get("max_results"),
+                label="global web_search max_results",
+                minimum=1,
+            ),
+        },
+        "web_fetch": {
+            "max_content_tokens": _require_policy_int(
+                raw_fetch.get("max_content_tokens"),
+                label="global web_fetch max_content_tokens",
+                minimum=1,
+            )
+        },
+    }
+
+    aggregator_recovery = {
+        field_name: baseline_freeze.get(field_name) for field_name in _AGGREGATOR_RECOVERY_FIELDS
+    }
+    if aggregator_recovery["aggregator_recovery_mode"] not in {
+        "off",
+        "serving",
+        "experiment",
+    }:
+        raise FinalizationError("aggregator recovery mode is invalid")
+    _require_policy_int(
+        aggregator_recovery["aggregator_recovery_top_k"],
+        label="aggregator recovery top_k",
+        minimum=1,
+        maximum=3,
+    )
+    aggregator_cap = _require_policy_int(
+        aggregator_recovery["aggregator_max_tokens_cap"],
+        label="aggregator recovery max_tokens_cap",
+        minimum=2,
+    )
+    aggregator_reserve = _require_policy_int(
+        aggregator_recovery["aggregator_visible_answer_reserve_tokens"],
+        label="aggregator recovery visible_answer_reserve_tokens",
+        minimum=1,
+    )
+    if aggregator_reserve >= aggregator_cap:
+        raise FinalizationError("aggregator recovery reserve must be below max_tokens_cap")
+
+    backup_count = _require_policy_int(
+        baseline_freeze.get("proposer_backup_count"),
+        label="proposer recovery backup_count",
+        maximum=2,
+    )
+    proposer_cap = _require_policy_int(
+        baseline_freeze.get("proposer_max_tokens_cap"),
+        label="proposer recovery max_tokens_cap",
+        minimum=2,
+    )
+    proposer_reserve = _require_policy_int(
+        baseline_freeze.get("proposer_visible_answer_reserve_tokens"),
+        label="proposer recovery visible_answer_reserve_tokens",
+        minimum=1,
+    )
+    if proposer_reserve >= proposer_cap:
+        raise FinalizationError("proposer recovery reserve must be below max_tokens_cap")
+    proposer_recovery = {
+        "schema": FORMAL_PROPOSER_RECOVERY_SCHEMA,
+        "configured_backup_count": backup_count,
+        "effective_backup_count": backup_count,
+        "max_additional_physical_requests": _require_policy_int(
+            baseline_freeze.get("proposer_recovery_max_additional_calls"),
+            label="proposer recovery max_additional_calls",
+            maximum=3,
+        ),
+        "quorum_required": 2,
+        "max_tokens_cap": proposer_cap,
+        "visible_answer_reserve_tokens": proposer_reserve,
+        "thinking_downgrade_order": ["one_strictly_lower"],
+        "transient_same_model_retries": 1,
+        "backup_reasoning_downgrades": 1,
+    }
+
+    judge_pins: set[str] = set()
+    for group in groups:
+        runtime = contracts[group].get("resolved_llm_runtime")
+        pins = runtime.get("provider_routing") if isinstance(runtime, Mapping) else None
+        judge_pin = (
+            str(pins.get(judge_model) or "").strip().casefold() if isinstance(pins, Mapping) else ""
+        )
+        if not judge_pin or judge_pin == "auto":
+            raise FinalizationError(f"{group} lacks a strict Judge upstream provider pin")
+        judge_pins.add(judge_pin)
+    if len(judge_pins) != 1:
+        raise FinalizationError("Judge upstream provider pin differs across active groups")
+
+    return FinalizerExperimentPolicy(
+        profile=profile,
+        timeouts=timeouts,
+        runner=runner,
+        generation=generation,
+        judge=judge,
+        tools=tools,
+        aggregator_recovery=aggregator_recovery,
+        proposer_recovery=proposer_recovery,
+        judge_provider_pin=next(iter(judge_pins)),
+    )
+
+
+def contract_recovery_policies(
+    contract: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Project authenticated runtime-freeze recovery fields for row audits."""
+
+    freeze = contract.get("formal_runtime_freeze")
+    if not isinstance(freeze, Mapping):
+        return dict(FORMAL_AGGREGATOR_RECOVERY_POLICY), dict(FORMAL_PROPOSER_RECOVERY_POLICY)
+    aggregator = {field_name: freeze.get(field_name) for field_name in _AGGREGATOR_RECOVERY_FIELDS}
+    if any(value is None for value in aggregator.values()):
+        aggregator = dict(FORMAL_AGGREGATOR_RECOVERY_POLICY)
+    proposer_fields_present = all(
+        field_name in freeze for field_name in _PROPOSER_RECOVERY_FREEZE_FIELDS
+    )
+    if not proposer_fields_present:
+        return aggregator, dict(FORMAL_PROPOSER_RECOVERY_POLICY)
+    backup_count = freeze["proposer_backup_count"]
+    proposer = {
+        "schema": FORMAL_PROPOSER_RECOVERY_SCHEMA,
+        "configured_backup_count": backup_count,
+        "effective_backup_count": backup_count,
+        "max_additional_physical_requests": freeze["proposer_recovery_max_additional_calls"],
+        "quorum_required": 2,
+        "max_tokens_cap": freeze["proposer_max_tokens_cap"],
+        "visible_answer_reserve_tokens": freeze["proposer_visible_answer_reserve_tokens"],
+        "thinking_downgrade_order": ["one_strictly_lower"],
+        "transient_same_model_retries": 1,
+        "backup_reasoning_downgrades": 1,
+    }
+    return aggregator, proposer
+
+
 def validate_formal_campaign_contracts(
     contracts: Mapping[str, Mapping[str, Any]],
     *,
     groups: Sequence[str] = GROUPS,
-) -> None:
-    """Pin the formal group definitions independently of source manifests."""
+) -> FinalizerExperimentPolicy:
+    """Authenticate tunable semantics and pin non-negotiable safety contracts."""
 
     active_groups = tuple(groups)
     if (
         not active_groups
-        or active_groups
-        != tuple(group for group in SUPPORTED_GROUPS if group in active_groups)
+        or active_groups != tuple(group for group in SUPPORTED_GROUPS if group in active_groups)
         or set(contracts) != set(active_groups)
     ):
         raise FinalizationError(
             "formal compatibility contracts must cover exactly the active groups "
             f"{','.join(active_groups)}"
         )
+    policy = _derive_finalizer_experiment_policy(
+        contracts,
+        groups=active_groups,
+    )
     expected_timeouts = {
-        "task_seconds": FORMAL_TASK_TIMEOUT_SECONDS,
-        "proposer_seconds": FORMAL_PROPOSER_TIMEOUT_SECONDS,
-        "aggregator_seconds": FORMAL_AGGREGATOR_TIMEOUT_SECONDS,
+        field_name: policy.timeouts[field_name]
+        for field_name in ("task_seconds", "proposer_seconds", "aggregator_seconds")
     }
-    expected_generation = {
-        "thinking_enabled": True,
-        "thinking_budget_tokens": 50_000,
-        "default_thinking_level": "xhigh",
-        "model_thinking_levels": FORMAL_MODEL_THINKING_LEVELS,
-        "require_highest_thinking": True,
-        "temperature": Decimal("0"),
-        "max_tokens": FORMAL_GENERATION_MAX_TOKENS,
-        "max_attempts": FORMAL_GENERATION_MAX_ATTEMPTS,
-        "retry_backoff_seconds": FORMAL_GENERATION_RETRY_BACKOFF_SECONDS,
+    expected_judge = dict(policy.judge)
+    runner_finalization_policy = {
+        field_name: policy.runner[field_name] for field_name in _AGENT_FINALIZATION_POLICY_FIELDS
     }
-    expected_tools = {
-        "mode": "local_web_tools",
-        "sandbox_enabled": False,
-        "contamination_blocked_domains": FORMAL_BLOCKED_DOMAINS,
-        "web_search": {
-            "provider": "brave",
-            "api_key_env": "BRAVE_SEARCH_API_KEY",
-            "max_results": 5,
+    expected_operational_generation_policy = {
+        "generation_thinking": "model_max",
+        "temperature": policy.generation["temperature"],
+        "thinking_enabled": policy.generation["thinking_enabled"],
+        "thinking_level": "model-specific",
+        "default_thinking_level": policy.generation["default_thinking_level"],
+        "thinking_budget_tokens": policy.generation["thinking_budget_tokens"],
+        "max_thinking_budget_tokens": policy.generation["thinking_budget_tokens"],
+        "max_tokens": policy.generation["max_tokens"],
+        "max_tokens_overridden": True,
+        "model_thinking_levels": policy.generation["model_thinking_levels"],
+        "require_highest_thinking": policy.generation["require_highest_thinking"],
+        "applies_to": "single baselines and ensemble members",
+    }
+    expected_operational_tools = {
+        "tool_mode": policy.tools["mode"],
+        "tools_enabled": True,
+        "tool_names": ["web_search", "web_fetch"],
+        "local_web_tools": {
+            "web_search": {
+                "excluded_domains": FORMAL_BLOCKED_DOMAINS,
+                **policy.tools["web_search"],
+            },
+            "web_fetch": {
+                "blocked_domains": FORMAL_BLOCKED_DOMAINS,
+                "max_content_tokens": policy.tools["web_fetch"]["max_content_tokens"],
+                "max_content_chars": max(
+                    100,
+                    int(policy.tools["web_fetch"]["max_content_tokens"]) * 4,
+                ),
+                "allow_firecrawl": False,
+            },
         },
-        "web_fetch": {"max_content_tokens": 50_000},
-    }
-    expected_judge = {
-        "model": JUDGE_MODEL,
-        "repeats": JUDGE_REPEATS,
-        "max_attempts": FORMAL_JUDGE_MAX_ATTEMPTS,
-        "judge_candidates": False,
+        "contamination_blocked_domains": FORMAL_BLOCKED_DOMAINS,
+        "contamination_controls": {
+            "status": "enforced_by_local_web_tools",
+            "web_search_field": "excluded_domains_query_and_result_filter",
+            "web_fetch_field": "blocked_domains",
+        },
     }
     for group in active_groups:
         contract = contracts[group]
@@ -1422,52 +2379,15 @@ def validate_formal_campaign_contracts(
                 "benchmark": "DRACO",
                 "group": group,
                 "runner": {
-                    "mode": "agent_loop",
-                    "agent_max_iterations": FORMAL_AGENT_MAX_ITERATIONS,
-                    "finalization_policy": FORMAL_AGENT_FINALIZATION_POLICY,
+                    "mode": policy.runner["mode"],
+                    "agent_max_iterations": policy.runner["agent_max_iterations"],
+                    "finalization_policy": runner_finalization_policy,
                 },
-                "tools": {
-                    "tool_mode": "local_web_tools",
-                    "tools_enabled": True,
-                    "tool_names": ["web_search", "web_fetch"],
-                    "local_web_tools": {
-                        "web_search": {
-                            "excluded_domains": FORMAL_BLOCKED_DOMAINS,
-                            "max_results": 5,
-                            "provider": "brave",
-                            "api_key_env": "BRAVE_SEARCH_API_KEY",
-                        },
-                        "web_fetch": {
-                            "blocked_domains": FORMAL_BLOCKED_DOMAINS,
-                            "max_content_tokens": 50_000,
-                            "max_content_chars": 200_000,
-                            "allow_firecrawl": False,
-                        },
-                    },
-                    "contamination_blocked_domains": FORMAL_BLOCKED_DOMAINS,
-                    "contamination_controls": {
-                        "status": "enforced_by_local_web_tools",
-                        "web_search_field": "excluded_domains_query_and_result_filter",
-                        "web_fetch_field": "blocked_domains",
-                    },
-                },
+                "tools": expected_operational_tools,
                 "generation": {
-                    "policy": {
-                        "generation_thinking": "model_max",
-                        "temperature": Decimal("0"),
-                        "thinking_enabled": True,
-                        "thinking_level": "model-specific",
-                        "default_thinking_level": "xhigh",
-                        "thinking_budget_tokens": 50_000,
-                        "max_thinking_budget_tokens": 50_000,
-                        "max_tokens": FORMAL_GENERATION_MAX_TOKENS,
-                        "max_tokens_overridden": True,
-                        "model_thinking_levels": FORMAL_MODEL_THINKING_LEVELS,
-                        "require_highest_thinking": True,
-                        "applies_to": "single baselines and ensemble members",
-                    },
-                    "max_attempts": FORMAL_GENERATION_MAX_ATTEMPTS,
-                    "retry_backoff_seconds": FORMAL_GENERATION_RETRY_BACKOFF_SECONDS,
+                    "policy": expected_operational_generation_policy,
+                    "max_attempts": policy.generation["max_attempts"],
+                    "retry_backoff_seconds": policy.generation["retry_backoff_seconds"],
                 },
                 "judge": expected_judge,
                 "timeouts": {
@@ -1495,31 +2415,21 @@ def validate_formal_campaign_contracts(
                 },
                 "cost_policy": {"require_openrouter_non_byok": True},
                 "global_experiment_profile": {
-                    "schema_version": 1,
-                    "profile_id": "opensquilla_b2_quality_first_v2",
-                    "benchmark_input": {
-                        "sha256": FROZEN_DRACO_MINI_SHA256,
-                        "task_count": FROZEN_DRACO_MINI_TASK_COUNT,
-                        "enforce_reference_input": True,
-                    },
-                    "timeouts": {
-                        **expected_timeouts,
-                        "task_margin_seconds": Decimal("30"),
-                    },
-                    "runner": {
-                        "mode": "agent_loop",
-                        "agent_max_iterations": FORMAL_AGENT_MAX_ITERATIONS,
-                        **FORMAL_AGENT_FINALIZATION_POLICY,
-                    },
-                    "generation": expected_generation,
-                    "tools": expected_tools,
-                    "judge": expected_judge,
+                    **policy.profile,
                 },
                 "formal_runtime_freeze": {
                     "source": "experiment_config",
                     "sandbox_enabled": False,
                     "sandbox_security_grading_enabled": False,
-                    **FORMAL_AGGREGATOR_RECOVERY_POLICY,
+                    **policy.aggregator_recovery,
+                    "proposer_backup_count": policy.proposer_recovery["configured_backup_count"],
+                    "proposer_recovery_max_additional_calls": policy.proposer_recovery[
+                        "max_additional_physical_requests"
+                    ],
+                    "proposer_max_tokens_cap": policy.proposer_recovery["max_tokens_cap"],
+                    "proposer_visible_answer_reserve_tokens": policy.proposer_recovery[
+                        "visible_answer_reserve_tokens"
+                    ],
                     "g1_user_profile_generation_enabled": False,
                     "g1_user_profile_enabled": False,
                 },
@@ -1567,6 +2477,7 @@ def validate_formal_campaign_contracts(
         ):
             raise FinalizationError("B2 formal contract must use static_openrouter_b5")
     routes: Mapping[str, Any] = {}
+    g1_analyzer_policy: Mapping[str, Any] = {}
     if "G1" in active_groups:
         g1 = contracts.get("G1")
         g1_spec = g1.get("group_spec") if isinstance(g1, Mapping) else None
@@ -1587,11 +2498,20 @@ def validate_formal_campaign_contracts(
             if candidate_scope == "registry_all"
             else "exact_openrouter_routes"
         )
+        ranking_config_identity = (
+            g1_ranking_config_identity(registry) if isinstance(registry, Mapping) else None
+        )
+        ranking_proposer_max = (
+            g1_ranking_proposer_max(registry) if isinstance(registry, Mapping) else None
+        )
+        g1_analyzer_policy = (
+            g1_task_analyzer_execution_policy(registry) if isinstance(registry, Mapping) else None
+        ) or {}
+        registry_source_identity = (
+            g1_registry_source_identity(registry) if isinstance(registry, Mapping) else None
+        )
         registry_all_routes_valid = candidate_scope != "registry_all" or (
-            isinstance(routes, Mapping)
-            and dict(routes) == formal_registry_all_routes()
-            and nonnegative_int(registry.get("expected_candidate_count"))
-            == FORMAL_G1_REGISTRY_ALL_CANDIDATE_COUNT
+            authenticated_registry_all_routes(registry) is not None
         )
         if (
             not isinstance(g1_spec, Mapping)
@@ -1611,13 +2531,18 @@ def validate_formal_campaign_contracts(
             or not str(registry.get("source_registry_snapshot_version") or "").strip()
             or not HEX64.fullmatch(str(registry.get("expected_routes_sha256") or ""))
             or canonical_sha256(routes) != str(registry.get("expected_routes_sha256") or "")
-            or registry.get("expected_source_registry_snapshot_sha256")
-            != FORMAL_G1_SOURCE_REGISTRY_SNAPSHOT_SHA256
-            or registry.get("expected_ranking_config_schema_version")
-            != FORMAL_G1_RANKING_CONFIG_SCHEMA_VERSION
-            or registry.get("expected_ranking_config_version") != FORMAL_G1_RANKING_CONFIG_VERSION
-            or registry.get("expected_ranking_config_sha256") != FORMAL_G1_RANKING_CONFIG_SHA256
-            or registry.get("expected_proposer_count_max") != FORMAL_G1_PROPOSER_COUNT_MAX
+            or registry_source_identity is None
+            or (
+                str(registry.get("source_registry_snapshot_version") or ""),
+                str(registry.get("expected_source_registry_snapshot_sha256") or ""),
+            )
+            != registry_source_identity
+            or ranking_config_identity is None
+            or ranking_proposer_max is None
+            or not g1_analyzer_policy
+            or str(g1_analyzer_policy.get("provider") or "") != "openrouter"
+            or str(g1_analyzer_policy.get("upstream_provider") or "").strip().casefold()
+            in {"", "auto"}
             or registry.get("user_profile_enabled") is not False
         ):
             raise FinalizationError(
@@ -1630,7 +2555,7 @@ def validate_formal_campaign_contracts(
             raise FinalizationError(f"{group} formal contract lacks gateway llm_ensemble")
         require_formal_fields(
             ensemble,
-            FORMAL_AGGREGATOR_RECOVERY_POLICY,
+            policy.aggregator_recovery,
             label=f"{group} gateway llm_ensemble",
         )
         runtime = contract.get("resolved_llm_runtime")
@@ -1646,7 +2571,7 @@ def validate_formal_campaign_contracts(
             if group == "B1"
             else {*B2_PROPOSERS, B2_AGGREGATOR, B0_MODEL}
             if group == "B2"
-            else {*routes, B0_MODEL}
+            else {*routes, str(g1_analyzer_policy["model"])}
         )
         for model in required_models:
             route_pin = (
@@ -1657,13 +2582,21 @@ def validate_formal_campaign_contracts(
                 # selection to OpenRouter.  The fixed task analyzer remains
                 # independently pinned below.
                 continue
-            expected_pin = route_pin or FORMAL_UPSTREAM_PINS.get(model)
+            expected_pin = (
+                str(g1_analyzer_policy["upstream_provider"])
+                if group == "G1" and model == str(g1_analyzer_policy["model"])
+                else route_pin or FORMAL_UPSTREAM_PINS.get(model)
+            )
             if not expected_pin or str(pins.get(model) or "").strip().casefold() != expected_pin:
                 raise FinalizationError(f"{group} upstream provider pin differs for {model}")
         if group == "G1" and (
-            str(pins.get(B0_MODEL) or "").strip().casefold() != FORMAL_UPSTREAM_PINS[B0_MODEL]
+            str(runtime.get("provider") or "").strip().casefold()
+            != str(g1_analyzer_policy["provider"])
+            or str(pins.get(str(g1_analyzer_policy["model"])) or "").strip().casefold()
+            != str(g1_analyzer_policy["upstream_provider"]).strip().casefold()
         ):
             raise FinalizationError("G1 task analyzer upstream provider pin differs")
+    return policy
 
 
 def usage_generation_contract(value: Any) -> Any:
@@ -1830,9 +2763,7 @@ def immutable_attempt_payload(attempt: Mapping[str, Any]) -> dict[str, Any]:
                 # shapes and their reconciled physical identities so a later
                 # wave cannot hide retries by changing only setup_usage.
                 "run_task_analyzer_setup_usage_evidence": (
-                    _task_analyzer_setup_usage_contract(run)
-                    if isinstance(run, Mapping)
-                    else None
+                    _task_analyzer_setup_usage_contract(run) if isinstance(run, Mapping) else None
                 ),
             }
         )
@@ -1870,31 +2801,52 @@ def validate_generation_attempt_evidence(
             raise FinalizationError(
                 f"formal result lacks a generation attempt list: {record.path}:{record.line}"
             )
-        declared_count = nonnegative_int(row.get("generation_attempt_count"))
+        location = f"{record.path}:{record.line}"
+        declared_count = _require_policy_int(
+            row.get("generation_attempt_count"),
+            label=f"generation_attempt_count at {location}",
+        )
         if declared_count != len(attempts):
             raise FinalizationError(
                 "generation_attempt_count differs from v1 attempt evidence at "
                 f"{record.path}:{record.line}"
             )
         actual_spend_metrics = row.get("actual_spend_metrics")
-        if not isinstance(actual_spend_metrics, Mapping) or nonnegative_int(
-            actual_spend_metrics.get("generation_attempt_count")
-        ) != len(attempts):
+        if not isinstance(actual_spend_metrics, Mapping):
+            raise FinalizationError(
+                "actual-spend generation attempt metrics are missing "
+                f"at {location}"
+            )
+        actual_spend_attempt_count = _require_policy_int(
+            actual_spend_metrics.get("generation_attempt_count"),
+            label=f"actual-spend generation_attempt_count at {location}",
+        )
+        if actual_spend_attempt_count != len(attempts):
             raise FinalizationError(
                 "actual-spend generation attempt count differs from v1 evidence "
                 f"at {record.path}:{record.line}"
             )
-        if nonnegative_int(row.get("generation_attempt_budget_limit")) != max_attempts:
+        budget_limit = _require_policy_int(
+            row.get("generation_attempt_budget_limit"),
+            label=f"generation_attempt_budget_limit at {location}",
+            minimum=1,
+        )
+        if budget_limit != max_attempts:
             raise FinalizationError(
                 f"generation attempt budget limit differs at {record.path}:{record.line}"
             )
         key_state = state[record.key]
         new_ids: list[str] = []
         row_ids: set[str] = set()
-        prior_budget = nonnegative_int(
-            execution.get("prior_generation_attempts_used") if isinstance(execution, Mapping) else 0
+        prior_budget = _require_policy_int(
+            execution.get("prior_generation_attempts_used"),
+            label=f"prior_generation_attempts_used at {location}",
         )
-        declared_budget = nonnegative_int(row.get("generation_attempt_budget_used"))
+        declared_budget = _require_policy_int(
+            row.get("generation_attempt_budget_used"),
+            label=f"generation_attempt_budget_used at {location}",
+            maximum=max_attempts,
+        )
         if prior_budget != key_state["budget_used"]:
             raise FinalizationError(
                 f"{record.key} prior generation attempt declaration is non-monotonic"
@@ -1906,9 +2858,12 @@ def validate_generation_attempt_evidence(
             if not HEX32.fullmatch(attempt_id) or attempt_id in row_ids:
                 raise FinalizationError("generation attempt id is invalid or duplicated")
             row_ids.add(attempt_id)
-            attempt_ordinal = nonnegative_int(attempt.get("attempt"))
-            if not 1 <= attempt_ordinal <= max_attempts:
-                raise FinalizationError("generation attempt ordinal is invalid")
+            attempt_ordinal = _require_policy_int(
+                attempt.get("attempt"),
+                label=f"generation attempt ordinal at {location}",
+                minimum=1,
+                maximum=max_attempts,
+            )
             if attempt.get("attempt_kind") not in {
                 "generation",
                 "generation_pre_call_guard",
@@ -2064,15 +3019,20 @@ def contract_provider_pins(contract: Mapping[str, Any]) -> dict[str, str]:
     return pins
 
 
-def _is_unknown_task_analyzer_placeholder(unit: Mapping[str, Any]) -> bool:
+def _is_unknown_task_analyzer_placeholder(
+    unit: Mapping[str, Any],
+    *,
+    expected_provider: str = "openrouter",
+    expected_model: str = B0_MODEL,
+) -> bool:
     provider_usage = unit.get("provider_usage")
     return (
         str(unit.get("role") or "").strip().casefold() == "unknown_request"
         and str(unit.get("label") or "").strip().casefold() == "task_analyzer"
         and str(unit.get("provider") or "").strip() == ""
         and str(unit.get("model") or "").strip() == ""
-        and str(unit.get("requested_provider") or "").strip().casefold() == "openrouter"
-        and str(unit.get("requested_model") or "").strip() == B0_MODEL
+        and str(unit.get("requested_provider") or "").strip().casefold() == expected_provider
+        and str(unit.get("requested_model") or "").strip() == expected_model
         and isinstance(unit.get("attempt"), int)
         and not isinstance(unit.get("attempt"), bool)
         and int(unit["attempt"]) >= 1
@@ -2095,8 +3055,7 @@ def _is_task_analyzer_evidence(unit: Mapping[str, Any]) -> bool:
     role = str(unit.get("role") or "").strip().casefold()
     return role == "task_analyzer" or (
         role == "unknown_request"
-        and str(unit.get("label") or "").strip().casefold()
-        == "task_analyzer"
+        and str(unit.get("label") or "").strip().casefold() == "task_analyzer"
     )
 
 
@@ -2129,9 +3088,7 @@ def _task_analyzer_physical_attempt_id(unit: Mapping[str, Any]) -> str:
         else ""
     )
     if direct and nested and direct != nested:
-        raise FinalizationError(
-            "task analyzer evidence has conflicting physical_attempt_id fields"
-        )
+        raise FinalizationError("task analyzer evidence has conflicting physical_attempt_id fields")
     return direct or nested
 
 
@@ -2167,21 +3124,12 @@ def _merge_task_analyzer_mirrors(
     for field_name in _TASK_ANALYZER_MIRROR_FIELDS:
         setup_value = _task_analyzer_present_value(setup, field_name)
         usage_value = _task_analyzer_present_value(usage, field_name)
-        if (
-            setup_value is not None
-            and usage_value is not None
-            and setup_value != usage_value
-        ):
-            raise FinalizationError(
-                "task analyzer setup/usage evidence conflicts on "
-                f"{field_name}"
-            )
+        if setup_value is not None and usage_value is not None and setup_value != usage_value:
+            raise FinalizationError(f"task analyzer setup/usage evidence conflicts on {field_name}")
     setup_ids = response_ids(setup)
     usage_ids = response_ids(usage)
     if setup_ids and usage_ids and setup_ids != usage_ids:
-        raise FinalizationError(
-            "task analyzer setup/usage evidence conflicts on response_id"
-        )
+        raise FinalizationError("task analyzer setup/usage evidence conflicts on response_id")
     merged = copy.deepcopy(dict(setup))
     for key, value in usage.items():
         if _task_analyzer_present_value(merged, str(key)) is None:
@@ -2251,18 +3199,14 @@ def _reconciled_task_analyzer_units(
                         usage_by_id[physical_id],
                     )
                     if physical_id in setup_by_id and physical_id in usage_by_id
-                    else copy.deepcopy(
-                        setup_by_id.get(physical_id)
-                        or usage_by_id[physical_id]
-                    )
+                    else copy.deepcopy(setup_by_id.get(physical_id) or usage_by_id[physical_id])
                 )
                 for physical_id in set(setup_by_id) | set(usage_by_id)
             ]
         else:
             if len(setup_without_id) != len(usage_without_id):
                 raise FinalizationError(
-                    "task analyzer setup/usage evidence has different "
-                    "physical-request multiplicity"
+                    "task analyzer setup/usage evidence has different physical-request multiplicity"
                 )
             reconciled = [
                 _merge_task_analyzer_mirrors(setup, usage)
@@ -2303,11 +3247,7 @@ def _task_analyzer_immutable_unit(unit: Mapping[str, Any]) -> dict[str, Any]:
         "cache_read_tokens",
         "cache_write_tokens",
     )
-    projected = {
-        field: copy.deepcopy(unit.get(field))
-        for field in fields
-        if field in unit
-    }
+    projected = {field: copy.deepcopy(unit.get(field)) for field in fields if field in unit}
     physical_id = _task_analyzer_physical_attempt_id(unit)
     if physical_id:
         projected["physical_attempt_id"] = physical_id
@@ -2319,18 +3259,9 @@ def _task_analyzer_setup_usage_contract(
 ) -> dict[str, Any]:
     reconciled, setup_rows, usage_rows = _reconciled_task_analyzer_units(run)
     return {
-        "setup": [
-            _task_analyzer_immutable_unit(row)
-            for row in setup_rows
-        ],
-        "usage": [
-            _task_analyzer_immutable_unit(row)
-            for row in usage_rows
-        ],
-        "unique_physical": [
-            _task_analyzer_immutable_unit(row)
-            for row in reconciled
-        ],
+        "setup": [_task_analyzer_immutable_unit(row) for row in setup_rows],
+        "usage": [_task_analyzer_immutable_unit(row) for row in usage_rows],
+        "unique_physical": [_task_analyzer_immutable_unit(row) for row in reconciled],
     }
 
 
@@ -2346,7 +3277,11 @@ def _canonical_task_analyzer_setup_units(
     return reconciled
 
 
-def _is_unknown_judge_placeholder(unit: Mapping[str, Any]) -> bool:
+def _is_unknown_judge_placeholder(
+    unit: Mapping[str, Any],
+    *,
+    judge_model: str = JUDGE_MODEL,
+) -> bool:
     """Return whether *unit* is a fail-closed unknown Judge request.
 
     A transiently failed OpenRouter request has no actual serving identity or
@@ -2373,7 +3308,7 @@ def _is_unknown_judge_placeholder(unit: Mapping[str, Any]) -> bool:
         and str(unit.get("provider") or "").strip() == ""
         and str(unit.get("model") or "").strip() == ""
         and str(unit.get("requested_provider") or "").strip().casefold() == "openrouter"
-        and str(unit.get("requested_model") or "").strip() == JUDGE_MODEL
+        and str(unit.get("requested_model") or "").strip() == judge_model
         and explicit_zero("input_tokens")
         and explicit_zero("output_tokens")
         and explicit_zero("reasoning_tokens")
@@ -2408,6 +3343,7 @@ def usage_route_reasons(
     role_provider_pins: Mapping[str, str] | None = None,
     allow_unknown_task_analyzer_attempts: bool = False,
     allow_unknown_judge_attempts: bool = False,
+    unknown_judge_model: str = JUDGE_MODEL,
 ) -> list[str]:
     reasons: list[str] = []
     units = usage_units(usage)
@@ -2446,10 +3382,16 @@ def usage_route_reasons(
 
         if role in MISSING_USAGE_PLACEHOLDER_ROLES:
             unknown_analyzer_allowed = (
-                allow_unknown_task_analyzer_attempts and _is_unknown_task_analyzer_placeholder(unit)
+                allow_unknown_task_analyzer_attempts
+                and _is_unknown_task_analyzer_placeholder(
+                    unit,
+                    expected_provider="openrouter",
+                    expected_model=str((role_model_pins or {}).get("task_analyzer") or B0_MODEL),
+                )
             )
             unknown_judge_allowed = allow_unknown_judge_attempts and _is_unknown_judge_placeholder(
-                unit
+                unit,
+                judge_model=unknown_judge_model,
             )
             provider = str(unit.get("provider") or "").strip().casefold()
             requested_provider = str(unit.get("requested_provider") or "").strip().casefold()
@@ -2681,31 +3623,14 @@ def _normalize_openrouter_provider_identity(value: Any) -> str:
 @cache
 def _formal_openrouter_model_aliases() -> dict[str, frozenset[str]]:
     """Bind requested model ids to the frozen registry's serving-model aliases."""
-    from opensquilla.provider.ranking_router import (
-        _legacy_registry_snapshot_projection,
-        load_model_registry_snapshot,
-    )
-
     aliases: dict[str, set[str]] = {
         str(model).strip().casefold(): {str(model).strip().casefold()}
         for model in FORMAL_UPSTREAM_PINS
         if str(model).strip()
     }
-    snapshot = _legacy_registry_snapshot_projection(load_model_registry_snapshot())
-    if canonical_sha256(snapshot) != FORMAL_G1_SOURCE_REGISTRY_SNAPSHOT_SHA256:
-        raise FinalizationError("formal OpenRouter model registry snapshot changed")
-    rows = snapshot.get("models")
-    if not isinstance(rows, list):
-        raise FinalizationError("formal OpenRouter model registry snapshot is malformed")
-    for row in rows:
-        facts = row.get("registry_facts") if isinstance(row, Mapping) else None
-        if not isinstance(facts, Mapping):
-            continue
-        model = str(facts.get("model_id") or "").strip().casefold()
-        version = str(facts.get("version") or "").strip().casefold()
-        provider = str(facts.get("provider") or "").strip().casefold()
-        if not model or provider != "openrouter":
-            continue
+    for raw_model, raw_version in FORMAL_OPENROUTER_SERVING_ALIASES.items():
+        model = str(raw_model).strip().casefold()
+        version = str(raw_version).strip().casefold()
         aliases.setdefault(model, {model})
         if version:
             aliases[model].add(version)
@@ -2934,6 +3859,8 @@ def canonical_judge_run_route_reasons(
     run: Mapping[str, Any],
     *,
     attempt_id: str,
+    judge_model: str = JUDGE_MODEL,
+    judge_provider_pin: str | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     """Canonicalize one Judge run and apply the frozen route contract."""
 
@@ -2941,7 +3868,7 @@ def canonical_judge_run_route_reasons(
         run,
         identity_seed=f"judge-attempt:{attempt_id}",
         requested_provider="openrouter",
-        requested_model=JUDGE_MODEL,
+        requested_model=judge_model,
         role="unknown_request",
     )
     has_unknown_placeholders = any(
@@ -2957,15 +3884,22 @@ def canonical_judge_run_route_reasons(
     reasons.extend(
         usage_route_reasons(
             canonical_run.get("usage"),
-            allowed_models={JUDGE_MODEL},
-            provider_pins={JUDGE_MODEL: FORMAL_UPSTREAM_PINS[JUDGE_MODEL]},
+            allowed_models={judge_model},
+            provider_pins={
+                judge_model: (judge_provider_pin or FORMAL_UPSTREAM_PINS.get(judge_model, ""))
+            },
             allow_unknown_judge_attempts=has_unknown_placeholders,
+            unknown_judge_model=judge_model,
         )
     )
     return canonical_run, list(dict.fromkeys(reasons))
 
 
-def immutable_judge_attempt_payload(attempt: Mapping[str, Any]) -> dict[str, Any]:
+def immutable_judge_attempt_payload(
+    attempt: Mapping[str, Any],
+    *,
+    judge_model: str = JUDGE_MODEL,
+) -> dict[str, Any]:
     run = attempt.get("run")
     attempt_id = str(attempt.get("attempt_id") or "")
     canonical_run = (
@@ -2973,7 +3907,7 @@ def immutable_judge_attempt_payload(attempt: Mapping[str, Any]) -> dict[str, Any
             run,
             identity_seed=f"judge-attempt:{attempt_id}",
             requested_provider="openrouter",
-            requested_model=JUDGE_MODEL,
+            requested_model=judge_model,
             role="unknown_request",
         )
         if isinstance(run, Mapping)
@@ -3010,6 +3944,10 @@ def _judge_run_binding(value: Mapping[str, Any]) -> dict[str, Any]:
 
 def validate_judge_attempt_evidence(
     records: Sequence[SourceRecord],
+    *,
+    judge_model: str = JUDGE_MODEL,
+    judge_max_attempts: int = JUDGE_ATTEMPT_BUDGET_LIMIT,
+    judge_provider_pin: str | None = None,
 ) -> dict[str, Any]:
     """Validate cumulative Judge budgets and every physical Judge attempt."""
 
@@ -3045,7 +3983,7 @@ def validate_judge_attempt_evidence(
             if (
                 judge.get("judge_attempt_evidence_schema") != JUDGE_ATTEMPT_EVIDENCE_SCHEMA
                 or judge.get("judge_attempt_budget_scope") != JUDGE_ATTEMPT_BUDGET_SCOPE
-                or judge.get("judge_attempt_budget_limit_per_unit") != JUDGE_ATTEMPT_BUDGET_LIMIT
+                or judge.get("judge_attempt_budget_limit_per_unit") != judge_max_attempts
                 or judge.get("prior_judge_attempts")
             ):
                 raise FinalizationError(
@@ -3086,8 +4024,8 @@ def validate_judge_attempt_evidence(
                         f"{record.key} {scope_name}/{criterion_id}/{repeat_index} "
                         "lacks cumulative Judge attempts"
                     )
-                if len(attempts) > JUDGE_ATTEMPT_BUDGET_LIMIT:
-                    raise FinalizationError("Judge attempt budget exceeds 3")
+                if len(attempts) > judge_max_attempts:
+                    raise FinalizationError(f"Judge attempt budget exceeds {judge_max_attempts}")
                 attempt_ids: list[str] = []
                 for ordinal, attempt in enumerate(attempts, start=1):
                     if not isinstance(attempt, Mapping):
@@ -3100,7 +4038,12 @@ def validate_judge_attempt_evidence(
                         raise FinalizationError(
                             f"Judge attempt id {attempt_id} is reused by another unit"
                         )
-                    payload = canonical_sha256(immutable_judge_attempt_payload(attempt))
+                    payload = canonical_sha256(
+                        immutable_judge_attempt_payload(
+                            attempt,
+                            judge_model=judge_model,
+                        )
+                    )
                     if attempt_id in payloads and payloads[attempt_id] != payload:
                         raise FinalizationError(
                             f"Judge attempt id {attempt_id} has conflicting payloads"
@@ -3136,8 +4079,8 @@ def validate_judge_attempt_evidence(
                     or judgment.get("judge_attempt_count") != len(current_ids)
                     or judgment.get("judge_attempt_budget_used") != len(current_ids)
                     or judgment.get("judge_attempt_budget_remaining")
-                    != JUDGE_ATTEMPT_BUDGET_LIMIT - len(current_ids)
-                    or judgment.get("judge_attempt_budget_limit") != JUDGE_ATTEMPT_BUDGET_LIMIT
+                    != judge_max_attempts - len(current_ids)
+                    or judgment.get("judge_attempt_budget_limit") != judge_max_attempts
                     or judgment.get("judge_attempt_evidence_schema")
                     != JUDGE_ATTEMPT_EVIDENCE_SCHEMA
                     or judgment.get("judge_attempt_budget_scope") != JUDGE_ATTEMPT_BUDGET_SCOPE
@@ -3150,7 +4093,7 @@ def validate_judge_attempt_evidence(
                 if (
                     exhausted != (judgment.get("error") == JUDGE_ATTEMPT_BUDGET_EXHAUSTED_ERROR)
                     or exhausted
-                    and len(current_ids) != JUDGE_ATTEMPT_BUDGET_LIMIT
+                    and len(current_ids) != judge_max_attempts
                 ):
                     raise FinalizationError(
                         f"{record.key} {scope_name}/{criterion_id}/{repeat_index} "
@@ -3208,12 +4151,14 @@ def validate_judge_attempt_evidence(
             label=f"Judge attempt {attempt_id}",
             identity_seed=f"judge-attempt:{attempt_id}",
             requested_provider="openrouter",
-            requested_model=JUDGE_MODEL,
+            requested_model=judge_model,
             role="unknown_request",
         )
         _, route_failures = canonical_judge_run_route_reasons(
             run,
             attempt_id=attempt_id,
+            judge_model=judge_model,
+            judge_provider_pin=judge_provider_pin,
         )
         if route_failures:
             raise FinalizationError(
@@ -3222,7 +4167,7 @@ def validate_judge_attempt_evidence(
     return {
         "schema": JUDGE_ATTEMPT_EVIDENCE_SCHEMA,
         "budget_scope": JUDGE_ATTEMPT_BUDGET_SCOPE,
-        "budget_limit_per_unit": JUDGE_ATTEMPT_BUDGET_LIMIT,
+        "budget_limit_per_unit": judge_max_attempts,
         "judge_scope_source_count": scope_count,
         "criterion_repeat_unit_count": len(state),
         "unique_physical_judge_attempt_count": len(payloads),
@@ -3391,13 +4336,9 @@ def _legacy_excluded_zero_request_candidate(
         or execution.get("stream_closed") is not True
         or execution.get("blocked_reason") != "scope_failed_identity"
         or "physical_attempts" in execution
-        or candidate.get("error_code")
-        != "proposer_recovery_identity_excluded"
+        or candidate.get("error_code") != "proposer_recovery_identity_excluded"
         or candidate.get("error")
-        != (
-            "proposer identity was excluded after an earlier failure in this "
-            "retry scope"
-        )
+        != ("proposer identity was excluded after an earlier failure in this retry scope")
         or candidate.get("ok") is not False
         or candidate.get("usable_for_aggregation") is not False
         or candidate.get("completion_outcome") != "failed"
@@ -3724,15 +4665,13 @@ def _request_identity_reasons(
             and source_name == "usage"
             and not actual_provider
             and not actual_model
-            and str(source.get("role") or "").strip().casefold()
-            in MISSING_USAGE_PLACEHOLDER_ROLES
+            and str(source.get("role") or "").strip().casefold() in MISSING_USAGE_PLACEHOLDER_ROLES
             and source.get("usage_unknown") is True
             and isinstance(provider_usage, Mapping)
             and provider_usage.get("usage_unknown") is True
         )
-        if (
-            not explicit_unknown_usage
-            and (actual_provider != expected_provider.casefold() or actual_model != expected_model)
+        if not explicit_unknown_usage and (
+            actual_provider != expected_provider.casefold() or actual_model != expected_model
         ):
             reasons.append(f"wrong_{label}_{source_name}_actual_identity")
     return reasons
@@ -3742,6 +4681,7 @@ def aggregator_recovery_execution_reasons(
     call: Mapping[str, Any],
     *,
     expected_aggregator: str,
+    expected_policy: Mapping[str, Any] = FORMAL_AGGREGATOR_RECOVERY_POLICY,
 ) -> tuple[str, list[str]]:
     """Validate recovery evidence and return the physically executed model."""
 
@@ -3786,16 +4726,12 @@ def aggregator_recovery_execution_reasons(
 
     if recovery.get("schema") != "opensquilla.ensemble-aggregator-recovery/v1":
         reasons.append("wrong_aggregator_recovery_schema")
-    if recovery.get("mode") != "experiment":
+    if recovery.get("mode") != expected_policy.get("aggregator_recovery_mode"):
         reasons.append("wrong_aggregator_recovery_mode")
-    if (
-        recovery.get("max_tokens_cap")
-        != FORMAL_AGGREGATOR_RECOVERY_POLICY["aggregator_max_tokens_cap"]
-    ):
+    if recovery.get("max_tokens_cap") != expected_policy.get("aggregator_max_tokens_cap"):
         reasons.append("wrong_aggregator_recovery_max_tokens_cap")
-    if (
-        recovery.get("visible_answer_reserve_tokens")
-        != FORMAL_AGGREGATOR_RECOVERY_POLICY["aggregator_visible_answer_reserve_tokens"]
+    if recovery.get("visible_answer_reserve_tokens") != expected_policy.get(
+        "aggregator_visible_answer_reserve_tokens"
     ):
         reasons.append("wrong_aggregator_recovery_visible_answer_reserve_tokens")
     recovery_candidates = recovery.get("candidate_ids")
@@ -3824,8 +4760,7 @@ def aggregator_recovery_execution_reasons(
     if recovery.get("degraded") is True and not degraded_visible_answer:
         reasons.append("degraded_aggregator_recovery_not_formal")
     if delivery_outcome != "complete" and not (
-        degraded_visible_answer
-        and delivery_outcome in {"partial_usable", "degraded_success"}
+        degraded_visible_answer and delivery_outcome in {"partial_usable", "degraded_success"}
     ):
         reasons.append("aggregator_delivery_not_complete")
 
@@ -3888,8 +4823,7 @@ def aggregator_recovery_execution_reasons(
     if (
         selected_kind != "primary"
         and not (
-            degraded_visible_answer
-            and selected_kind in {"partial_salvage", "degraded_delivery"}
+            degraded_visible_answer and selected_kind in {"partial_salvage", "degraded_delivery"}
         )
         and not structural_aggregator_recovery_trigger(fallback_reason)
     ):
@@ -4001,20 +4935,14 @@ def aggregator_recovery_execution_reasons(
         if isinstance(attempt, Mapping)
         and attempt.get("attempt") == selected_attempt
         and nonnegative_int(attempt.get("fallback_index")) == fallback_index
-        and (
-            attempt.get("outcome") == "succeeded"
-            or explicit_degraded_attempt is attempt
-        )
+        and (attempt.get("outcome") == "succeeded" or explicit_degraded_attempt is attempt)
         and attempt.get("request_started") is True
     ]
     usable_physical_rows = [
         attempt
         for attempt in attempts
         if isinstance(attempt, Mapping)
-        and (
-            attempt.get("outcome") == "succeeded"
-            or explicit_degraded_attempt is attempt
-        )
+        and (attempt.get("outcome") == "succeeded" or explicit_degraded_attempt is attempt)
         and attempt.get("request_started") is True
     ]
     if len(usable_physical_rows) != 1:
@@ -4108,25 +5036,28 @@ def proposer_recovery_execution_reasons(
     call: Mapping[str, Any],
     *,
     executed_plan: Mapping[str, Any],
+    expected_policy: Mapping[str, Any] = FORMAL_PROPOSER_RECOVERY_POLICY,
 ) -> tuple[dict[int, str], set[str], list[str]]:
     """Validate one self-contained provider-owned recovery receipt."""
 
     policy = executed_plan.get("proposer_recovery_policy")
     receipt = call.get("proposer_recovery")
+    expected_backup_count = nonnegative_int(
+        expected_policy.get("effective_backup_count")
+    )
+    expected_max_additional_requests = nonnegative_int(
+        expected_policy.get("max_additional_physical_requests")
+    )
+    expected_quorum = nonnegative_int(expected_policy.get("quorum_required"))
     if policy is None:
         return (
             {},
             set(),
-            ["unexpected_proposer_recovery_receipt"]
-            if receipt is not None
-            else [],
+            ["unexpected_proposer_recovery_receipt"] if receipt is not None else [],
         )
 
     reasons: list[str] = []
-    if (
-        not isinstance(policy, Mapping)
-        or dict(policy) != FORMAL_PROPOSER_RECOVERY_POLICY
-    ):
+    if not isinstance(policy, Mapping) or dict(policy) != dict(expected_policy):
         reasons.append("invalid_proposer_recovery_policy")
     selected = executed_plan.get("selected_P")
     backups = executed_plan.get("backup_P")
@@ -4142,10 +5073,7 @@ def proposer_recovery_execution_reasons(
         else []
     )
     aggregator_identities = (
-        [
-            _canonical_proposer_recovery_identity(value)
-            for value in aggregators
-        ]
+        [_canonical_proposer_recovery_identity(value) for value in aggregators]
         if isinstance(aggregators, list)
         else []
     )
@@ -4153,16 +5081,16 @@ def proposer_recovery_execution_reasons(
         not selected_identities
         or any(not identity for identity in selected_identities)
         or len(set(selected_identities)) != len(selected_identities)
-        or len(backup_identities) != 2
+        or len(backup_identities) != expected_backup_count
         or any(not identity for identity in backup_identities)
-        or len(set(backup_identities)) != 2
+        or len(set(backup_identities)) != expected_backup_count
         or bool(set(selected_identities).intersection(backup_identities))
         or bool(set(aggregator_identities).intersection(backup_identities))
-        or executed_plan.get("effective_min_successful_proposers") != 2
+        or executed_plan.get("effective_min_successful_proposers") != expected_quorum
     ):
         reasons.append("invalid_proposer_recovery_roster")
-    expanded_slot_identities, expanded_slot_reasons = (
-        expanded_proposer_slot_identities(executed_plan)
+    expanded_slot_identities, expanded_slot_reasons = expanded_proposer_slot_identities(
+        executed_plan
     )
     reasons.extend(expanded_slot_reasons)
 
@@ -4171,9 +5099,7 @@ def proposer_recovery_execution_reasons(
             provider_retry_roster_fingerprint,
         )
 
-        expected_fingerprint = provider_retry_roster_fingerprint(
-            executed_plan
-        )
+        expected_fingerprint = provider_retry_roster_fingerprint(executed_plan)
     except (TypeError, ValueError):
         expected_fingerprint = ""
     if HEX64.fullmatch(expected_fingerprint) is None:
@@ -4187,35 +5113,31 @@ def proposer_recovery_execution_reasons(
     receipt_attempts = receipt.get("attempts")
     if (
         receipt.get("schema") != FORMAL_PROPOSER_RECOVERY_SCHEMA
-        or receipt.get("selection_plan_fingerprint")
-        != expected_fingerprint
+        or receipt.get("selection_plan_fingerprint") != expected_fingerprint
         or receipt.get("scope") != "run_turn"
         or not str(receipt.get("scope_id") or "").strip()
-        or receipt.get("max_additional_physical_requests") != 3
+        or receipt.get("max_additional_physical_requests")
+        != expected_max_additional_requests
         or receipt.get("external_physical_requests_reserved") != 0
         or isinstance(started_count, bool)
         or not isinstance(started_count, int)
-        or not 0 <= started_count <= 3
+        or not 0 <= started_count <= expected_max_additional_requests
         or isinstance(remaining_count, bool)
         or not isinstance(remaining_count, int)
-        or remaining_count != 3 - started_count
-        or receipt.get("quorum_required") != 2
+        or remaining_count != expected_max_additional_requests - started_count
+        or receipt.get("quorum_required") != expected_quorum
         or type(receipt.get("quorum_reached")) is not bool
         or not isinstance(receipt_attempts, list)
     ):
         reasons.append("invalid_proposer_recovery_receipt")
-        receipt_attempts = (
-            receipt_attempts if isinstance(receipt_attempts, list) else []
-        )
+        receipt_attempts = receipt_attempts if isinstance(receipt_attempts, list) else []
 
     cleanup_bypass = receipt.get("cleanup_quorum_bypass")
     cleanup_bypass_indexes: set[int] = set()
     cleanup_bypass_physical_ids: set[str] = set()
     if cleanup_bypass is not None:
         raw_indexes = (
-            cleanup_bypass.get("candidate_indexes")
-            if isinstance(cleanup_bypass, Mapping)
-            else None
+            cleanup_bypass.get("candidate_indexes") if isinstance(cleanup_bypass, Mapping) else None
         )
         raw_physical_ids = (
             cleanup_bypass.get("physical_attempt_ids")
@@ -4226,9 +5148,7 @@ def proposer_recovery_execution_reasons(
             set(raw_indexes)
             if isinstance(raw_indexes, list)
             and all(
-                isinstance(value, int)
-                and not isinstance(value, bool)
-                and value >= 0
+                isinstance(value, int) and not isinstance(value, bool) and value >= 0
                 for value in raw_indexes
             )
             else set()
@@ -4237,8 +5157,7 @@ def proposer_recovery_execution_reasons(
             set(raw_physical_ids)
             if isinstance(raw_physical_ids, list)
             and all(
-                isinstance(value, str)
-                and HEX32.fullmatch(value) is not None
+                isinstance(value, str) and HEX32.fullmatch(value) is not None
                 for value in raw_physical_ids
             )
             else set()
@@ -4248,7 +5167,7 @@ def proposer_recovery_execution_reasons(
             or cleanup_bypass.get("schema")
             != "opensquilla.router-dynamic-proposer-cleanup-quorum-bypass/v1"
             or cleanup_bypass.get("applied") is not True
-            or cleanup_bypass.get("quorum_required") != 2
+            or cleanup_bypass.get("quorum_required") != expected_quorum
             or not isinstance(
                 cleanup_bypass.get("successful_proposers"),
                 int,
@@ -4257,13 +5176,12 @@ def proposer_recovery_execution_reasons(
                 cleanup_bypass.get("successful_proposers"),
                 bool,
             )
-            or cleanup_bypass.get("successful_proposers") < 2
+            or cleanup_bypass.get("successful_proposers") < expected_quorum
             or not isinstance(raw_indexes, list)
             or raw_indexes != sorted(cleanup_bypass_indexes)
             or not cleanup_bypass_indexes
             or not isinstance(raw_physical_ids, list)
-            or raw_physical_ids
-            != list(dict.fromkeys(raw_physical_ids))
+            or raw_physical_ids != list(dict.fromkeys(raw_physical_ids))
             or not cleanup_bypass_physical_ids
             or cleanup_bypass.get("recovery_skipped") is not True
             or cleanup_bypass.get("aggregator_tools_disabled") is not True
@@ -4292,10 +5210,7 @@ def proposer_recovery_execution_reasons(
     )
     observed_unclosed_indexes: set[int] = set()
     observed_unclosed_physical_ids: set[str] = set()
-    if (
-        not isinstance(candidates, list)
-        or len(candidates) != len(expanded_slot_identities)
-    ):
+    if not isinstance(candidates, list) or len(candidates) != len(expanded_slot_identities):
         reasons.append("invalid_proposer_recovery_candidate_slots")
         candidates = candidates if isinstance(candidates, list) else []
     for slot_index, candidate in enumerate(candidates):
@@ -4316,18 +5231,14 @@ def proposer_recovery_execution_reasons(
         )
         execution = candidate.get("execution")
         physical_attempts = (
-            execution.get("physical_attempts")
-            if isinstance(execution, Mapping)
-            else None
+            execution.get("physical_attempts") if isinstance(execution, Mapping) else None
         )
         physical_count = candidate.get("physical_request_count")
         request_started = candidate.get("request_started")
         if not isinstance(physical_attempts, list) and _legacy_excluded_zero_request_candidate(
             candidate,
             expected_identity=requested_identity,
-            excluded_identities=excluded_identities.intersection(
-                allowed_slot_identities
-            ),
+            excluded_identities=excluded_identities.intersection(allowed_slot_identities),
         ):
             physical_attempts = []
         if (
@@ -4350,28 +5261,20 @@ def proposer_recovery_execution_reasons(
                 else ""
             )
             identity = (
-                _canonical_proposer_recovery_identity(
-                    physical.get("identity")
-                )
+                _canonical_proposer_recovery_identity(physical.get("identity"))
                 if isinstance(physical, Mapping)
                 else ""
             )
-            stream_closed = (
-                physical.get("stream_closed")
-                if isinstance(physical, Mapping)
-                else None
-            )
+            stream_closed = physical.get("stream_closed") if isinstance(physical, Mapping) else None
             quarantined_unclosed = bool(
                 isinstance(physical, Mapping)
                 and stream_closed is not True
                 and slot_index in cleanup_bypass_indexes
                 and physical_id in cleanup_bypass_physical_ids
                 and not successful_candidate(candidate)
-                and candidate.get("error_code")
-                == "ensemble_proposer_close_timeout"
+                and candidate.get("error_code") == "ensemble_proposer_close_timeout"
                 and candidate.get("stream_closed") is False
-                and physical.get("outcome")
-                in {"interrupted", "failed", "cleanup_unproven"}
+                and physical.get("outcome") in {"interrupted", "failed", "cleanup_unproven"}
             )
             if stream_closed is not True and not quarantined_unclosed:
                 reasons.append("proposer_recovery_stream_not_closed")
@@ -4393,45 +5296,30 @@ def proposer_recovery_execution_reasons(
             all_candidate_ids.append(physical_id)
             physical_identity_by_id[physical_id] = identity
             valid_slot_attempts.append(physical)
-        candidate_physical_attempts_by_slot[slot_index] = (
-            valid_slot_attempts
-        )
+        candidate_physical_attempts_by_slot[slot_index] = valid_slot_attempts
         actual_identity = _canonical_proposer_recovery_identity(
-            f"{str(candidate.get('provider') or '')}:"
-            f"{str(candidate.get('model') or '')}"
+            f"{str(candidate.get('provider') or '')}:{str(candidate.get('model') or '')}"
         )
         strict_candidate = successful_candidate(candidate)
         partial_candidate = partial_usable_candidate(candidate)
         if (
             not requested_identity
             or requested_identity not in allowed_slot_identities
-            or (
-                strict_candidate
-                and actual_identity != requested_identity
-            )
-            or (
-                partial_candidate
-                and actual_identity
-                and actual_identity != requested_identity
-            )
+            or (strict_candidate and actual_identity != requested_identity)
+            or (partial_candidate and actual_identity and actual_identity != requested_identity)
             or (partial_candidate and not actual_identity and not slot_identities)
-            or (
-                slot_identities
-                and slot_identities[-1] != requested_identity
-            )
+            or (slot_identities and slot_identities[-1] != requested_identity)
         ):
             reasons.append("wrong_proposer_recovery_final_identity")
         elif slot_index < len(expanded_slot_identities):
             final_identity_by_slot[slot_index] = requested_identity
-    if (
-        len(all_candidate_ids) != len(set(all_candidate_ids))
-        or len(physical_identity_by_id) != len(all_candidate_ids)
+    if len(all_candidate_ids) != len(set(all_candidate_ids)) or len(physical_identity_by_id) != len(
+        all_candidate_ids
     ):
         reasons.append("duplicate_proposer_recovery_physical_attempt_id")
     if cleanup_bypass is not None and (
         observed_unclosed_indexes != cleanup_bypass_indexes
-        or observed_unclosed_physical_ids
-        != cleanup_bypass_physical_ids
+        or observed_unclosed_physical_ids != cleanup_bypass_physical_ids
     ):
         reasons.append("proposer_cleanup_quorum_bypass_mismatch")
 
@@ -4446,12 +5334,8 @@ def proposer_recovery_execution_reasons(
         normalized_attempts.append(attempt)
         slot_index = attempt.get("slot_index")
         kind = str(attempt.get("kind") or "")
-        source_identity = _canonical_proposer_recovery_identity(
-            attempt.get("source_identity")
-        )
-        target_identity = _canonical_proposer_recovery_identity(
-            attempt.get("target_identity")
-        )
+        source_identity = _canonical_proposer_recovery_identity(attempt.get("source_identity"))
+        target_identity = _canonical_proposer_recovery_identity(attempt.get("target_identity"))
         request_started = attempt.get("request_started")
         physical_count = attempt.get("physical_request_count")
         physical_id = str(attempt.get("physical_attempt_id") or "")
@@ -4501,19 +5385,14 @@ def proposer_recovery_execution_reasons(
                 reasons.append("invalid_proposer_recovery_attempt")
             else:
                 receipt_physical_ids.append(physical_id)
-        elif (
-            physical_count != 0
-            or physical_id
-            or outcome != "not_started"
-        ):
+        elif physical_count != 0 or physical_id or outcome != "not_started":
             reasons.append("invalid_proposer_recovery_unstarted_attempt")
         if kind == "thinking_downgrade":
             if (
                 target_identity != source_identity
                 or not str(attempt.get("thinking_before") or "")
                 or not str(attempt.get("thinking_after") or "")
-                or attempt.get("thinking_before")
-                == attempt.get("thinking_after")
+                or attempt.get("thinking_before") == attempt.get("thinking_after")
             ):
                 reasons.append("invalid_proposer_thinking_downgrade")
         elif kind == "transient_retry":
@@ -4537,9 +5416,8 @@ def proposer_recovery_execution_reasons(
         ):
             reasons.append("proposer_recovery_physical_identity_mismatch")
 
-    if (
-        receipt_started_total != started_count
-        or len(receipt_physical_ids) != len(set(receipt_physical_ids))
+    if receipt_started_total != started_count or len(receipt_physical_ids) != len(
+        set(receipt_physical_ids)
     ):
         reasons.append("invalid_proposer_recovery_budget")
 
@@ -4553,17 +5431,12 @@ def proposer_recovery_execution_reasons(
         if successful_candidate(candidate)
     }
     final_physical_id_by_slot: dict[int, str] = {}
-    for slot_index, physical_attempts in (
-        candidate_physical_attempts_by_slot.items()
-    ):
+    for slot_index, physical_attempts in candidate_physical_attempts_by_slot.items():
         candidate_ids = [
-            str(physical.get("physical_attempt_id") or "")
-            for physical in physical_attempts
+            str(physical.get("physical_attempt_id") or "") for physical in physical_attempts
         ]
         candidate_recovery_ids = [
-            physical_id
-            for physical_id in candidate_ids
-            if physical_id in receipt_physical_id_set
+            physical_id for physical_id in candidate_ids if physical_id in receipt_physical_id_set
         ]
         if candidate_ids:
             final_physical_id_by_slot[slot_index] = candidate_ids[-1]
@@ -4571,20 +5444,12 @@ def proposer_recovery_execution_reasons(
         primary_rows = [
             physical
             for physical in physical_attempts
-            if str(physical.get("physical_attempt_id") or "")
-            not in receipt_physical_id_set
+            if str(physical.get("physical_attempt_id") or "") not in receipt_physical_id_set
         ]
-        if (
-            len(primary_rows) > 1
-            or (
-                primary_rows
-                and physical_attempts
-                and primary_rows[0] is not physical_attempts[0]
-            )
+        if len(primary_rows) > 1 or (
+            primary_rows and physical_attempts and primary_rows[0] is not physical_attempts[0]
         ):
-            reasons.append(
-                "invalid_proposer_recovery_primary_physical_ledger"
-            )
+            reasons.append("invalid_proposer_recovery_primary_physical_ledger")
         elif primary_rows:
             primary_identity = _canonical_proposer_recovery_identity(
                 primary_rows[0].get("identity")
@@ -4601,21 +5466,15 @@ def proposer_recovery_execution_reasons(
             for attempt in normalized_attempts
             if attempt.get("request_started") is True
             and attempt.get("slot_index") == slot_index
-            and str(attempt.get("physical_attempt_id") or "")
-            in set(candidate_ids)
+            and str(attempt.get("physical_attempt_id") or "") in set(candidate_ids)
         ]
         if candidate_recovery_ids != expected_slot_recovery_ids:
-            reasons.append(
-                "proposer_recovery_candidate_receipt_order_mismatch"
-            )
+            reasons.append("proposer_recovery_candidate_receipt_order_mismatch")
 
     if backup_targets != backup_identities[: len(backup_targets)]:
         reasons.append("proposer_recovery_skipped_ordered_backup")
     visited = receipt.get("visited_identities")
-    if (
-        not isinstance(visited, list)
-        or visited != sorted(set(backup_targets))
-    ):
+    if not isinstance(visited, list) or visited != sorted(set(backup_targets)):
         reasons.append("wrong_proposer_recovery_visited_identities")
     exclusions = receipt.get("cumulative_excluded_identities")
     if (
@@ -4642,8 +5501,7 @@ def proposer_recovery_execution_reasons(
         else []
     )
     allowed_identities_by_slot = [
-        {slot_identity, *backup_identities}
-        for slot_identity in expanded_slot_identities
+        {slot_identity, *backup_identities} for slot_identity in expanded_slot_identities
     ]
 
     def valid_executed_roster(roster: list[str]) -> bool:
@@ -4669,10 +5527,8 @@ def proposer_recovery_execution_reasons(
             and not isinstance(slot_index, bool)
             and 0 <= slot_index < len(derived_after)
         ):
-            derived_after[slot_index] = (
-                _canonical_proposer_recovery_identity(
-                    attempt.get("target_identity")
-                )
+            derived_after[slot_index] = _canonical_proposer_recovery_identity(
+                attempt.get("target_identity")
             )
     if (
         not valid_executed_roster(normalized_before)
@@ -4680,27 +5536,21 @@ def proposer_recovery_execution_reasons(
         or normalized_after != derived_after
         or any(
             primary_identity != normalized_before[slot_index]
-            for slot_index, primary_identity in (
-                primary_identity_by_slot.items()
-            )
+            for slot_index, primary_identity in (primary_identity_by_slot.items())
             if slot_index < len(normalized_before)
         )
     ):
         reasons.append("invalid_proposer_recovery_executed_roster")
 
     if any(
-        Counter(receipt_physical_ids)[physical_id]
-        != Counter(current_recovery_ids)[physical_id]
+        Counter(receipt_physical_ids)[physical_id] != Counter(current_recovery_ids)[physical_id]
         for physical_id in current_recovery_ids
     ):
         reasons.append("proposer_recovery_candidate_receipt_mismatch")
     successful_slots = set(primary_success_slots)
     for attempt in normalized_attempts:
         physical_id = str(attempt.get("physical_attempt_id") or "")
-        if (
-            attempt.get("request_started") is not True
-            or physical_id not in current_recovery_set
-        ):
+        if attempt.get("request_started") is not True or physical_id not in current_recovery_set:
             continue
         if len(successful_slots) >= 2:
             reasons.append("proposer_recovery_continued_after_quorum")
@@ -4723,8 +5573,7 @@ def proposer_recovery_execution_reasons(
     )
     if (
         isinstance(cleanup_bypass, Mapping)
-        and cleanup_bypass.get("successful_proposers")
-        != actual_strict_successful
+        and cleanup_bypass.get("successful_proposers") != actual_strict_successful
     ):
         reasons.append("proposer_cleanup_quorum_bypass_success_mismatch")
     if (
@@ -4734,8 +5583,7 @@ def proposer_recovery_execution_reasons(
         reasons.append("proposer_cleanup_quorum_bypass_usable_mismatch")
     if (
         call.get("successful_proposers") != actual_strict_successful
-        or receipt.get("strict_successful_proposers")
-        != actual_strict_successful
+        or receipt.get("strict_successful_proposers") != actual_strict_successful
         or receipt.get("usable_proposers") != actual_usable
         or receipt.get("quorum_reached") is not (actual_usable >= 2)
         or len(successful_slots) != actual_strict_successful
@@ -4755,6 +5603,8 @@ def ensemble_physical_call_reasons(
     expected_aggregator: str,
     final_text: str,
     require_output_binding: bool,
+    aggregator_recovery_policy: Mapping[str, Any] = FORMAL_AGGREGATOR_RECOVERY_POLICY,
+    proposer_recovery_policy: Mapping[str, Any] = FORMAL_PROPOSER_RECOVERY_POLICY,
 ) -> list[str]:
     """Validate one physical ensemble call from candidate evidence."""
 
@@ -4785,9 +5635,8 @@ def ensemble_physical_call_reasons(
     )
     if not isinstance(total, int) or isinstance(total, bool) or total != expected_total:
         reasons.append("wrong_executed_proposer_count")
-    if (
-        not successful_count_valid
-        or (not dynamic_partial_quorum and successful < required_successful_proposers)
+    if not successful_count_valid or (
+        not dynamic_partial_quorum and successful < required_successful_proposers
     ):
         reasons.append("proposer_quorum_not_met")
     if dynamic_partial_quorum:
@@ -4803,12 +5652,9 @@ def ensemble_physical_call_reasons(
             or not usable_count_valid
             or successful > usable
             or call.get("partial_proposers") != usable - successful
-            or call.get("execution_quorum_required")
-            != required_successful_proposers
-            or call.get("execution_quorum_met")
-            is not (usable >= required_successful_proposers)
-            or call.get("strict_quorum_met")
-            is not (successful >= required_successful_proposers)
+            or call.get("execution_quorum_required") != required_successful_proposers
+            or call.get("execution_quorum_met") is not (usable >= required_successful_proposers)
+            or call.get("strict_quorum_met") is not (successful >= required_successful_proposers)
         ):
             reasons.append("invalid_dynamic_proposer_usable_quorum")
 
@@ -4819,9 +5665,7 @@ def ensemble_physical_call_reasons(
     if not isinstance(executed_plan, Mapping):
         reasons.append("missing_executed_selection_plan")
     else:
-        physical_schema = executed_plan.get(
-            "thinking_physical_evidence_schema"
-        )
+        physical_schema = executed_plan.get("thinking_physical_evidence_schema")
         if physical_schema is not None:
             if physical_schema != THINKING_PHYSICAL_EVIDENCE_SCHEMA:
                 reasons.append("unknown_thinking_physical_evidence_schema")
@@ -4849,6 +5693,7 @@ def ensemble_physical_call_reasons(
             ) = proposer_recovery_execution_reasons(
                 call,
                 executed_plan=executed_plan,
+                expected_policy=proposer_recovery_policy,
             )
             reasons.extend(proposer_recovery_reasons)
         elif call.get("proposer_recovery") is not None:
@@ -4856,6 +5701,7 @@ def ensemble_physical_call_reasons(
     executed_aggregator, recovery_reasons = aggregator_recovery_execution_reasons(
         call,
         expected_aggregator=expected_aggregator,
+        expected_policy=aggregator_recovery_policy,
     )
     reasons.extend(recovery_reasons)
 
@@ -4905,9 +5751,7 @@ def ensemble_physical_call_reasons(
                     else f"openrouter:{expected_model}"
                 ),
             )
-            expected_provider, _, expected_candidate_model = (
-                expected_identity.partition(":")
-            )
+            expected_provider, _, expected_candidate_model = expected_identity.partition(":")
             execution = candidate.get("execution")
             actual_provider = (
                 str(
@@ -4942,15 +5786,11 @@ def ensemble_physical_call_reasons(
                 or ""
             ).strip()
             attempts = (
-                execution.get("physical_attempts")
-                if isinstance(execution, Mapping)
-                else None
+                execution.get("physical_attempts") if isinstance(execution, Mapping) else None
             )
             physical_count = candidate.get("physical_request_count")
             final_physical_identity = (
-                _canonical_proposer_recovery_identity(
-                    attempts[-1].get("identity")
-                )
+                _canonical_proposer_recovery_identity(attempts[-1].get("identity"))
                 if isinstance(attempts, list)
                 and isinstance(physical_count, int)
                 and not isinstance(physical_count, bool)
@@ -4978,10 +5818,7 @@ def ensemble_physical_call_reasons(
                 reasons.append("wrong_actual_proposer_provider")
             if (
                 requested_model != expected_candidate_model
-                or (
-                    actual_model
-                    and actual_model != expected_candidate_model
-                )
+                or (actual_model and actual_model != expected_candidate_model)
                 or (
                     candidate_proven
                     and not actual_model
@@ -5019,55 +5856,36 @@ def ensemble_physical_call_reasons(
                                 if isinstance(execution, Mapping)
                                 else None
                             )
-                            if (
-                                not isinstance(attempts, list)
-                                or len(attempts) != physical_count
-                            ):
-                                reasons.append(
-                                    "invalid_proposer_physical_attempt_ledger"
-                                )
+                            if not isinstance(attempts, list) or len(attempts) != physical_count:
+                                reasons.append("invalid_proposer_physical_attempt_ledger")
                             else:
                                 for ordinal, attempt in enumerate(
                                     attempts,
                                     start=1,
                                 ):
                                     attempt_id = (
-                                        str(
-                                            attempt.get(
-                                                "physical_attempt_id"
-                                            )
-                                            or ""
-                                        )
+                                        str(attempt.get("physical_attempt_id") or "")
                                         if isinstance(attempt, Mapping)
                                         else ""
                                     )
                                     if (
                                         not isinstance(attempt, Mapping)
                                         or attempt.get("attempt") != ordinal
-                                        or attempt.get("request_started")
-                                        is not True
+                                        or attempt.get("request_started") is not True
                                         or HEX32.fullmatch(attempt_id) is None
                                     ):
-                                        reasons.append(
-                                            "invalid_proposer_physical_attempt"
-                                        )
+                                        reasons.append("invalid_proposer_physical_attempt")
                                     else:
-                                        strict_physical_ids.append(
-                                            attempt_id
-                                        )
+                                        strict_physical_ids.append(attempt_id)
                 elif physical_count not in {None, 0}:
                     reasons.append("unstarted_proposer_has_physical_request")
                 elif strict_physical_evidence:
                     execution = candidate.get("execution")
                     attempts = (
-                        execution.get("physical_attempts")
-                        if isinstance(execution, Mapping)
-                        else []
+                        execution.get("physical_attempts") if isinstance(execution, Mapping) else []
                     )
                     if attempts not in (None, []):
-                        reasons.append(
-                            "unstarted_proposer_has_physical_attempt"
-                        )
+                        reasons.append("unstarted_proposer_has_physical_attempt")
         recovery = call.get("aggregator_recovery")
         recovery_attempts = recovery.get("attempts") if isinstance(recovery, Mapping) else []
         aggregator_physical_count = (
@@ -5092,23 +5910,17 @@ def ensemble_physical_call_reasons(
                 if not isinstance(recovery_attempt, Mapping):
                     continue
                 started = recovery_attempt.get("request_started") is True
-                attempt_id = str(
-                    recovery_attempt.get("physical_attempt_id") or ""
-                )
+                attempt_id = str(recovery_attempt.get("physical_attempt_id") or "")
                 if started:
                     if (
                         recovery_attempt.get("physical_request_count") != 1
                         or HEX32.fullmatch(attempt_id) is None
                     ):
-                        reasons.append(
-                            "invalid_aggregator_physical_attempt_identity"
-                        )
+                        reasons.append("invalid_aggregator_physical_attempt_identity")
                     else:
                         strict_physical_ids.append(attempt_id)
                 elif attempt_id:
-                    reasons.append(
-                        "unstarted_aggregator_attempt_has_physical_identity"
-                    )
+                    reasons.append("unstarted_aggregator_attempt_has_physical_identity")
         raw_llm_request_count = call.get("llm_request_count")
         raw_physical_request_count = call.get("physical_request_count")
         if (
@@ -5127,32 +5939,19 @@ def ensemble_physical_call_reasons(
             reasons.append("ensemble_request_count_mismatch")
         minimum_request_count = proposer_physical_count + aggregator_physical_count
         if isinstance(raw_physical_request_count, int):
-            if (
-                strict_physical_evidence
-                and raw_physical_request_count != minimum_request_count
-            ):
-                reasons.append(
-                    "ensemble_physical_request_count_not_exact"
-                )
+            if strict_physical_evidence and raw_physical_request_count != minimum_request_count:
+                reasons.append("ensemble_physical_request_count_not_exact")
             elif raw_physical_request_count < minimum_request_count:
                 reasons.append("ensemble_physical_request_count_undercounted")
         if strict_physical_evidence:
             if len(strict_physical_ids) != len(set(strict_physical_ids)):
                 reasons.append("duplicate_ensemble_physical_attempt_id")
-            if not recovery_physical_ids.issubset(
-                set(strict_physical_ids)
+            if not recovery_physical_ids.issubset(set(strict_physical_ids)):
+                reasons.append("proposer_recovery_physical_attempt_set_mismatch")
+            if isinstance(raw_physical_request_count, int) and raw_physical_request_count != len(
+                strict_physical_ids
             ):
-                reasons.append(
-                    "proposer_recovery_physical_attempt_set_mismatch"
-                )
-            if (
-                isinstance(raw_physical_request_count, int)
-                and raw_physical_request_count
-                != len(strict_physical_ids)
-            ):
-                reasons.append(
-                    "ensemble_physical_attempt_set_count_mismatch"
-                )
+                reasons.append("ensemble_physical_attempt_set_count_mismatch")
             selected_id = ""
             if isinstance(recovery, Mapping):
                 selected_attempt = recovery.get("selected_attempt")
@@ -5165,19 +5964,11 @@ def ensemble_physical_call_reasons(
                     and row.get("outcome") == "succeeded"
                 ]
                 if len(selected_rows) == 1:
-                    selected_id = str(
-                        selected_rows[0].get("physical_attempt_id") or ""
-                    )
+                    selected_id = str(selected_rows[0].get("physical_attempt_id") or "")
             final_request = call.get("final_request")
-            final_usage = (
-                final_request.get("usage")
-                if isinstance(final_request, Mapping)
-                else None
-            )
+            final_usage = final_request.get("usage") if isinstance(final_request, Mapping) else None
             final_provider_usage = (
-                final_usage.get("provider_usage")
-                if isinstance(final_usage, Mapping)
-                else None
+                final_usage.get("provider_usage") if isinstance(final_usage, Mapping) else None
             )
             final_id = (
                 str(final_usage.get("physical_attempt_id") or "")
@@ -5185,20 +5976,12 @@ def ensemble_physical_call_reasons(
                 else ""
             )
             nested_final_id = (
-                str(
-                    final_provider_usage.get("physical_attempt_id") or ""
-                )
+                str(final_provider_usage.get("physical_attempt_id") or "")
                 if isinstance(final_provider_usage, Mapping)
                 else ""
             )
-            if (
-                not selected_id
-                or final_id != selected_id
-                or nested_final_id != selected_id
-            ):
-                reasons.append(
-                    "final_aggregator_physical_attempt_id_mismatch"
-                )
+            if not selected_id or final_id != selected_id or nested_final_id != selected_id:
+                reasons.append("final_aggregator_physical_attempt_id_mismatch")
 
     final_request = call.get("final_request")
     if (
@@ -5436,6 +6219,8 @@ def ensemble_gate(
     expected_proposers: Sequence[str] | None = None,
     expected_aggregator: str | None = None,
     allowed_models: set[str] | None = None,
+    aggregator_recovery_policy: Mapping[str, Any] = FORMAL_AGGREGATOR_RECOVERY_POLICY,
+    proposer_recovery_policy: Mapping[str, Any] = FORMAL_PROPOSER_RECOVERY_POLICY,
 ) -> list[str]:
     trace = row.get("ensemble_trace")
     if not isinstance(trace, Mapping):
@@ -5483,6 +6268,8 @@ def ensemble_gate(
                 expected_aggregator=aggregator,
                 final_text=str(row.get("final_text") or ""),
                 require_output_binding=index == len(calls) - 1,
+                aggregator_recovery_policy=aggregator_recovery_policy,
+                proposer_recovery_policy=proposer_recovery_policy,
             )
             if index < len(calls) - 1 and call.get("fallback_used") is True:
                 fallback_reasons = admissible_empty_nonterminal_fallback_reasons(
@@ -5563,9 +6350,7 @@ def g1_recomputed_proposer_bounds(
         reasons.append("cost_or_latency_constrained")
     proposer_policy = plan.get("proposer_recovery_policy")
     explicit_quorum = (
-        proposer_policy.get("quorum_required")
-        if isinstance(proposer_policy, Mapping)
-        else None
+        proposer_policy.get("quorum_required") if isinstance(proposer_policy, Mapping) else None
     )
     if (
         isinstance(explicit_quorum, int)
@@ -5584,11 +6369,7 @@ def legacy_managed_v3_source_authenticated(
 ) -> bool:
     """Authorize the historical managed-v3 shape only for its exact source."""
 
-    source_identity = (
-        contract.get("source_identity")
-        if isinstance(contract, Mapping)
-        else None
-    )
+    source_identity = contract.get("source_identity") if isinstance(contract, Mapping) else None
     return (
         isinstance(source_identity, Mapping)
         and dict(source_identity) == LEGACY_MANAGED_V3_SOURCE_IDENTITY
@@ -5600,6 +6381,8 @@ def g1_registry_plan_reasons(
     *,
     contract: Mapping[str, Any],
     allow_legacy_managed_v3: bool = False,
+    aggregator_recovery_policy: Mapping[str, Any] = FORMAL_AGGREGATOR_RECOVERY_POLICY,
+    proposer_recovery_policy: Mapping[str, Any] = FORMAL_PROPOSER_RECOVERY_POLICY,
 ) -> tuple[list[str], tuple[str, ...], str]:
     """Bind a G1 physical plan to its frozen registry and exact P/A choice."""
 
@@ -5609,11 +6392,16 @@ def g1_registry_plan_reasons(
     profile_id = str(contract.get("profile_id") or "").strip()
     source_version = str(contract.get("source_registry_snapshot_version") or "").strip()
     routes_hash = str(contract.get("expected_routes_sha256") or "").strip()
-    ranking_config_hash = str(contract.get("expected_ranking_config_sha256") or "").strip()
+    ranking_config_identity = g1_ranking_config_identity(contract)
+    ranking_config_schema_version, ranking_config_version, ranking_config_hash = (
+        ranking_config_identity if ranking_config_identity is not None else ("", "", "")
+    )
     source_registry_snapshot_hash = str(
         contract.get("expected_source_registry_snapshot_sha256") or ""
     ).strip()
-    formal_n_max = contract.get("expected_proposer_count_max")
+    registry_source_identity = g1_registry_source_identity(contract)
+    analyzer_policy = g1_task_analyzer_execution_policy(contract)
+    formal_n_max = g1_ranking_proposer_max(contract)
     routes = contract.get("expected_routes")
     expected_count = nonnegative_int(contract.get("expected_candidate_count"))
     candidate_scope = str(contract.get("candidate_scope") or "exact_routes")
@@ -5634,12 +6422,11 @@ def g1_registry_plan_reasons(
         or not source_version
         or not HEX64.fullmatch(routes_hash)
         or canonical_sha256(routes) != routes_hash
-        or ranking_config_hash != FORMAL_G1_RANKING_CONFIG_SHA256
-        or source_registry_snapshot_hash != FORMAL_G1_SOURCE_REGISTRY_SNAPSHOT_SHA256
-        or contract.get("expected_ranking_config_schema_version")
-        != FORMAL_G1_RANKING_CONFIG_SCHEMA_VERSION
-        or contract.get("expected_ranking_config_version") != FORMAL_G1_RANKING_CONFIG_VERSION
-        or formal_n_max != FORMAL_G1_PROPOSER_COUNT_MAX
+        or ranking_config_identity is None
+        or analyzer_policy is None
+        or registry_source_identity is None
+        or (source_version, source_registry_snapshot_hash) != registry_source_identity
+        or formal_n_max is None
         or contract.get("user_profile_enabled") is not False
         or expected_count <= 0
         or len(expected_identities) != expected_count
@@ -5650,11 +6437,7 @@ def g1_registry_plan_reasons(
         )
         or (
             candidate_scope == "registry_all"
-            and (
-                not isinstance(routes, Mapping)
-                or dict(routes) != formal_registry_all_routes()
-                or expected_count != FORMAL_G1_REGISTRY_ALL_CANDIDATE_COUNT
-            )
+            and authenticated_registry_all_routes(contract) is None
         )
     ):
         return ["invalid_g1_registry_contract"], (), ""
@@ -5702,12 +6485,33 @@ def g1_registry_plan_reasons(
         reasons.append("wrong_g1_registry_snapshot_hash")
     if (
         plan.get("ranking_config_hash") != ranking_config_hash
-        or plan.get("ranking_config_schema_version") != FORMAL_G1_RANKING_CONFIG_SCHEMA_VERSION
-        or plan.get("ranking_config_version") != FORMAL_G1_RANKING_CONFIG_VERSION
+        or plan.get("ranking_config_schema_version") != ranking_config_schema_version
+        or plan.get("ranking_config_version") != ranking_config_version
         or not isinstance(plan.get("ranking_parameters"), Mapping)
         or canonical_sha256(plan.get("ranking_parameters")) != ranking_config_hash
     ):
         reasons.append("wrong_g1_ranking_config")
+    ranking_parameters = plan.get("ranking_parameters")
+    ranking_parameters = ranking_parameters if isinstance(ranking_parameters, Mapping) else {}
+    proposer_count_policy = ranking_parameters.get("proposer_count")
+    proposer_count_policy = (
+        proposer_count_policy if isinstance(proposer_count_policy, Mapping) else {}
+    )
+    aggregator_policy = ranking_parameters.get("aggregator")
+    aggregator_policy = aggregator_policy if isinstance(aggregator_policy, Mapping) else {}
+    configured_backup_count = proposer_count_policy.get("backup_count")
+    configured_aggregator_candidate_count = aggregator_policy.get("candidate_count")
+    if (
+        isinstance(configured_backup_count, bool)
+        or not isinstance(configured_backup_count, int)
+        or not 0 <= configured_backup_count <= 2
+        or isinstance(configured_aggregator_candidate_count, bool)
+        or not isinstance(configured_aggregator_candidate_count, int)
+        or not 1 <= configured_aggregator_candidate_count <= 3
+    ):
+        reasons.append("wrong_g1_ranking_roster_policy")
+        configured_backup_count = -1
+        configured_aggregator_candidate_count = -1
     n_min = plan.get("N_min")
     n_max = plan.get("N_max")
     recomputed_bounds = g1_recomputed_proposer_bounds(plan)
@@ -5735,9 +6539,7 @@ def g1_registry_plan_reasons(
         reasons.append("wrong_g1_selected_proposers")
         selected_proposer_models: tuple[str, ...] = ()
     else:
-        selected_proposer_models = tuple(
-            str(identity).partition(":")[2] for identity in selected_p
-        )
+        selected_proposer_models = tuple(str(identity).partition(":")[2] for identity in selected_p)
         if not (
             isinstance(n_min, int)
             and not isinstance(n_min, bool)
@@ -5746,31 +6548,24 @@ def g1_registry_plan_reasons(
             and n_min <= len(selected_proposer_models) <= n_max
         ):
             reasons.append("g1_selected_proposer_count_outside_bounds")
-    expanded_slot_identities, expanded_slot_reasons = (
-        expanded_proposer_slot_identities(plan)
-    )
+    expanded_slot_identities, expanded_slot_reasons = expanded_proposer_slot_identities(plan)
     reasons.extend(expanded_slot_reasons)
-    proposer_models = tuple(
-        identity.partition(":")[2]
-        for identity in expanded_slot_identities
-    )
+    proposer_models = tuple(identity.partition(":")[2] for identity in expanded_slot_identities)
     selected_a = str(plan.get("selected_A") or "")
     aggregator_model = selected_a.partition(":")[2] if selected_a in expected_identities else ""
     if not aggregator_model:
         reasons.append("wrong_g1_selected_aggregator")
     backup_p = plan.get("backup_P")
-    proposer_recovery_policy = plan.get("proposer_recovery_policy")
-    if backup_p is None and proposer_recovery_policy is None:
+    plan_proposer_recovery_policy = plan.get("proposer_recovery_policy")
+    if backup_p is None and plan_proposer_recovery_policy is None:
         # Historical plans predate provider-owned proposer recovery.  They
         # remain auditable under their original frozen contract.
         pass
-    elif not isinstance(proposer_recovery_policy, Mapping):
+    elif not isinstance(plan_proposer_recovery_policy, Mapping):
         reasons.append("invalid_g1_proposer_recovery_policy")
     else:
         normalized_backups = (
-            [str(identity or "") for identity in backup_p]
-            if isinstance(backup_p, list)
-            else []
+            [str(identity or "") for identity in backup_p] if isinstance(backup_p, list) else []
         )
         aggregator_candidates = plan.get("aggregator_candidates")
         normalized_aggregators = (
@@ -5778,17 +6573,22 @@ def g1_registry_plan_reasons(
             if isinstance(aggregator_candidates, list)
             else []
         )
-        if dict(proposer_recovery_policy) != FORMAL_PROPOSER_RECOVERY_POLICY:
+        expected_proposer_recovery_policy = {
+            **proposer_recovery_policy,
+            "configured_backup_count": configured_backup_count,
+            "effective_backup_count": configured_backup_count,
+        }
+        if dict(plan_proposer_recovery_policy) != expected_proposer_recovery_policy:
             reasons.append("wrong_g1_proposer_recovery_policy")
         if (
             not isinstance(backup_p, list)
-            or len(normalized_backups) != 2
-            or len(set(normalized_backups)) != 2
+            or len(normalized_backups) != configured_backup_count
+            or len(set(normalized_backups)) != configured_backup_count
             or any(identity not in expected_identities for identity in normalized_backups)
             or bool(set(normalized_backups).intersection(str(value) for value in selected_p or []))
             or bool(set(normalized_backups).intersection(normalized_aggregators))
-            or plan.get("configured_proposer_backup_count") != 2
-            or plan.get("effective_proposer_backup_count") != 2
+            or plan.get("configured_proposer_backup_count") != configured_backup_count
+            or plan.get("effective_proposer_backup_count") != configured_backup_count
             or plan.get("effective_min_successful_proposers") != 2
         ):
             reasons.append("wrong_g1_proposer_recovery_roster")
@@ -5806,13 +6606,13 @@ def g1_registry_plan_reasons(
         field in plan
         for field in (
             "aggregator_candidates",
-            *FORMAL_AGGREGATOR_RECOVERY_POLICY,
+            *aggregator_recovery_policy,
         )
     )
     if not recovery_fields_present:
         reasons.append("missing_g1_aggregator_recovery_policy")
     if recovery_fields_present:
-        for field, expected in FORMAL_AGGREGATOR_RECOVERY_POLICY.items():
+        for field, expected in aggregator_recovery_policy.items():
             if plan.get(field) != expected:
                 reasons.append(f"wrong_g1_{field}")
         aggregator_trace = plan.get("aggregator")
@@ -5824,11 +6624,9 @@ def g1_registry_plan_reasons(
             if isinstance(score_rows, list)
             else []
         )
-        expected_chain = frozen_score_identities[
-            : FORMAL_AGGREGATOR_RECOVERY_POLICY["aggregator_recovery_top_k"]
-        ]
+        expected_chain = frozen_score_identities[:configured_aggregator_candidate_count]
         candidate_chain = plan.get("aggregator_candidates")
-        required_candidate_count = FORMAL_AGGREGATOR_RECOVERY_POLICY["aggregator_recovery_top_k"]
+        required_candidate_count = configured_aggregator_candidate_count
         if (
             len(expected_chain) != required_candidate_count
             or not isinstance(candidate_chain, list)
@@ -5836,6 +6634,9 @@ def g1_registry_plan_reasons(
             or candidate_chain != expected_chain
             or len(set(str(value) for value in candidate_chain)) != len(candidate_chain)
             or str(candidate_chain[0] if candidate_chain else "") != selected_a
+            or plan.get("configured_aggregator_candidate_count")
+            != configured_aggregator_candidate_count
+            or plan.get("effective_aggregator_candidate_count") != required_candidate_count
         ):
             reasons.append("wrong_g1_aggregator_candidate_chain")
     if (
@@ -5909,6 +6710,8 @@ _G1_LIFECYCLE_PLAN_MATCH_FIELDS = (
     "task_analysis_reuse",
     "retry_routing",
 )
+
+
 def matching_saved_generation_attempts(
     row: Mapping[str, Any],
 ) -> list[Mapping[str, Any]]:
@@ -6087,8 +6890,7 @@ def _g1_lifecycle_plan_field(plan: Mapping[str, Any], field: str) -> Any:
 
 def _g1_plans_match(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
     return all(
-        _g1_lifecycle_plan_field(left, field)
-        == _g1_lifecycle_plan_field(right, field)
+        _g1_lifecycle_plan_field(left, field) == _g1_lifecycle_plan_field(right, field)
         for field in _G1_LIFECYCLE_PLAN_MATCH_FIELDS
     )
 
@@ -6104,9 +6906,9 @@ def _g1_full_plans_match(
             immutable_selection_plan_payload,
         )
 
-        return canonical_sha256(
-            immutable_selection_plan_payload(left)
-        ) == canonical_sha256(immutable_selection_plan_payload(right))
+        return canonical_sha256(immutable_selection_plan_payload(left)) == canonical_sha256(
+            immutable_selection_plan_payload(right)
+        )
     except (TypeError, ValueError):
         return False
 
@@ -6129,6 +6931,7 @@ def _g1_execution_plan_mutation_reasons(
         )
         else []
     )
+
 
 def _g1_retry_plan_provenance_reasons(
     plan: Mapping[str, Any],
@@ -6204,6 +7007,8 @@ def _adaptive_g1_lifecycle_routing(
     physical_plans: Sequence[Mapping[str, Any]],
     initial_reasons: Sequence[str],
     allow_legacy_managed_v3: bool = False,
+    aggregator_recovery_policy: Mapping[str, Any] = FORMAL_AGGREGATOR_RECOVERY_POLICY,
+    proposer_recovery_policy: Mapping[str, Any] = FORMAL_PROPOSER_RECOVERY_POLICY,
 ) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
     """Validate per-attempt G1 retry plans without requiring identical rosters."""
 
@@ -6252,13 +7057,8 @@ def _adaptive_g1_lifecycle_routing(
         previous_ordinal = ordinal
         run = attempt.get("run")
         run_map = run if isinstance(run, Mapping) else {}
-        attempt_has_ensemble_requests = (
-            run_expected_ensemble_request_count(run_map) > 0
-        )
-        if (
-            provider_native_terminal_seen
-            and attempt_has_ensemble_requests
-        ):
+        attempt_has_ensemble_requests = run_expected_ensemble_request_count(run_map) > 0
+        if provider_native_terminal_seen and attempt_has_ensemble_requests:
             reasons.append("g1_provider_native_outer_retry_forbidden")
         routing = run_map.get("routing_trace")
         routing_map = routing if isinstance(routing, Mapping) else {}
@@ -6275,6 +7075,8 @@ def _adaptive_g1_lifecycle_routing(
             plan,
             contract=registry,
             allow_legacy_managed_v3=allow_legacy_managed_v3,
+            aggregator_recovery_policy=aggregator_recovery_policy,
+            proposer_recovery_policy=proposer_recovery_policy,
         )
         reasons.extend(plan_reasons)
         if isinstance(routed_plan, Mapping):
@@ -6282,6 +7084,8 @@ def _adaptive_g1_lifecycle_routing(
                 routed_plan,
                 contract=registry,
                 allow_legacy_managed_v3=allow_legacy_managed_v3,
+                aggregator_recovery_policy=aggregator_recovery_policy,
+                proposer_recovery_policy=proposer_recovery_policy,
             )
             reasons.extend(routed_reasons)
             if not _g1_full_plans_match(declared_plan, routed_plan):
@@ -6293,9 +7097,7 @@ def _adaptive_g1_lifecycle_routing(
                 )
             )
 
-        provider_native_policy = (
-            plan.get("proposer_recovery_policy") is not None
-        )
+        provider_native_policy = plan.get("proposer_recovery_policy") is not None
         if provider_native_policy:
             if attempt.get("proposer_recovery_owner") != "provider":
                 reasons.append("missing_g1_provider_native_recovery_owner")
@@ -6374,9 +7176,7 @@ def _adaptive_g1_lifecycle_routing(
             if not attempt_calls:
                 reasons.append("missing_g1_attempt_physical_selection_plan")
             decision_key = str(plan.get("decision_id") or "")
-            previous_thinking_plan = thinking_plan_prefix_by_decision.get(
-                decision_key
-            )
+            previous_thinking_plan = thinking_plan_prefix_by_decision.get(decision_key)
             if previous_thinking_plan is None:
                 previous_thinking_plan = plan
             for call in attempt_calls:
@@ -6385,6 +7185,8 @@ def _adaptive_g1_lifecycle_routing(
                     physical_plan,
                     contract=registry,
                     allow_legacy_managed_v3=allow_legacy_managed_v3,
+                    aggregator_recovery_policy=aggregator_recovery_policy,
+                    proposer_recovery_policy=proposer_recovery_policy,
                 )
                 reasons.extend(physical_reasons)
                 if not isinstance(physical_plan, Mapping):
@@ -6403,11 +7205,9 @@ def _adaptive_g1_lifecycle_routing(
                     validate_thinking_execution_call,
                 )
 
-                validated_thinking_plan, execution_reason = (
-                    validate_thinking_execution_call(
-                        previous_thinking_plan,
-                        call,
-                    )
+                validated_thinking_plan, execution_reason = validate_thinking_execution_call(
+                    previous_thinking_plan,
+                    call,
                 )
                 if execution_reason:
                     reasons.append("invalid_g1_physical_thinking_execution")
@@ -6428,35 +7228,23 @@ def _adaptive_g1_lifecycle_routing(
                         )
                     )
                 if provider_native_policy:
-                    _, _, provider_recovery_reasons = (
-                        proposer_recovery_execution_reasons(
-                            call,
-                            executed_plan=physical_plan,
-                        )
+                    _, _, provider_recovery_reasons = proposer_recovery_execution_reasons(
+                        call,
+                        executed_plan=physical_plan,
+                        expected_policy=proposer_recovery_policy,
                     )
                     reasons.extend(provider_recovery_reasons)
                     validated_provider_native_receipt_count += 1
-                thinking_execution_history.append(
-                    copy.deepcopy(dict(physical_plan))
-                )
-            thinking_plan_prefix_by_decision[decision_key] = (
-                previous_thinking_plan
-            )
+                thinking_execution_history.append(copy.deepcopy(dict(physical_plan)))
+            thinking_plan_prefix_by_decision[decision_key] = previous_thinking_plan
         elif attempt_has_ensemble_requests:
             reasons.append("missing_g1_attempt_ensemble_trace")
 
         if provider_native_policy:
             if attempt.get("deterministic_proposer_failures") != []:
-                reasons.append(
-                    "unexpected_g1_provider_native_outer_failure_evidence"
-                )
-            if (
-                attempt.get("excluded_proposer_identities") != []
-                or current_exclusions
-            ):
-                reasons.append(
-                    "unexpected_g1_provider_native_outer_exclusions"
-                )
+                reasons.append("unexpected_g1_provider_native_outer_failure_evidence")
+            if attempt.get("excluded_proposer_identities") != [] or current_exclusions:
+                reasons.append("unexpected_g1_provider_native_outer_exclusions")
             if any(
                 field in attempt
                 for field in (
@@ -6466,9 +7254,7 @@ def _adaptive_g1_lifecycle_routing(
                     "thinking_execution_projection",
                 )
             ):
-                reasons.append(
-                    "unexpected_g1_provider_native_outer_retry_plan"
-                )
+                reasons.append("unexpected_g1_provider_native_outer_retry_plan")
             retry_backoff = attempt.get("retry_backoff_s")
             if (
                 attempt.get("will_retry") is not False
@@ -6476,29 +7262,17 @@ def _adaptive_g1_lifecycle_routing(
                 or not isinstance(retry_backoff, int | float)
                 or float(retry_backoff) != 0.0
             ):
-                reasons.append(
-                    "g1_provider_native_outer_retry_not_suppressed"
-                )
+                reasons.append("g1_provider_native_outer_retry_not_suppressed")
             if (
                 attempt.get("retry_reason")
-                and not str(
-                    attempt.get("retry_suppressed_reason") or ""
-                ).strip()
+                and not str(attempt.get("retry_suppressed_reason") or "").strip()
             ):
-                reasons.append(
-                    "g1_provider_native_terminal_reason_not_suppressed"
-                )
+                reasons.append("g1_provider_native_terminal_reason_not_suppressed")
             if attempt_has_ensemble_requests:
                 provider_native_terminal_seen = True
-                reasons.extend(
-                    g1_thinking_physical_usage_binding_reasons(run_map)
-                )
+                reasons.extend(g1_thinking_physical_usage_binding_reasons(run_map))
             expected_exclusions = current_exclusions
-            if (
-                selected is not None
-                and str(attempt.get("attempt_id") or "")
-                == selected_attempt_id
-            ):
+            if selected is not None and str(attempt.get("attempt_id") or "") == selected_attempt_id:
                 selected_plan = plan
                 selected_routing = routing_map
             previous_plan = plan
@@ -6525,16 +7299,9 @@ def _adaptive_g1_lifecycle_routing(
         if retry_deferred is not None and type(retry_deferred) is not bool:
             reasons.append("invalid_g1_retry_deferred_marker")
         if isinstance(retry_selection_plan, Mapping):
-            if (
-                (initial_plan or plan).get(
-                    "ranking_thinking_assignment_enabled"
-                )
-                is True
-                or retry_selection_plan.get(
-                    "ranking_thinking_assignment_enabled"
-                )
-                is True
-            ):
+            if (initial_plan or plan).get(
+                "ranking_thinking_assignment_enabled"
+            ) is True or retry_selection_plan.get("ranking_thinking_assignment_enabled") is True:
                 from opensquilla.provider.thinking_execution import (
                     validate_thinking_execution_history_closure,
                 )
@@ -6546,16 +7313,14 @@ def _adaptive_g1_lifecycle_routing(
                     )
                 )
                 if projection_reason:
-                    reasons.append(
-                        "invalid_g1_thinking_execution_projection:"
-                        + projection_reason
-                    )
-                elif (
-                    retry_selection_plan.get("executed_thinking_assignment")
-                    != projected_retry_plan.get("executed_thinking_assignment")
-                    or retry_selection_plan.get("thinking_execution_fallbacks", [])
-                    != projected_retry_plan.get("thinking_execution_fallbacks", [])
-                ):
+                    reasons.append("invalid_g1_thinking_execution_projection:" + projection_reason)
+                elif retry_selection_plan.get(
+                    "executed_thinking_assignment"
+                ) != projected_retry_plan.get(
+                    "executed_thinking_assignment"
+                ) or retry_selection_plan.get(
+                    "thinking_execution_fallbacks", []
+                ) != projected_retry_plan.get("thinking_execution_fallbacks", []):
                     reasons.append("g1_retry_thinking_execution_projection_differs")
                 if attempt.get("thinking_execution_projection") != projection_audit:
                     reasons.append("wrong_g1_thinking_execution_projection_audit")
@@ -6563,6 +7328,8 @@ def _adaptive_g1_lifecycle_routing(
                 retry_selection_plan,
                 contract=registry,
                 allow_legacy_managed_v3=allow_legacy_managed_v3,
+                aggregator_recovery_policy=aggregator_recovery_policy,
+                proposer_recovery_policy=proposer_recovery_policy,
             )
             reasons.extend(retry_plan_reasons)
             retry_exclusions, retry_exclusions_valid = _normalized_g1_retry_identities(
@@ -6588,11 +7355,9 @@ def _adaptive_g1_lifecycle_routing(
                     exclusions=retry_exclusions,
                 )
             )
-            if (
-                (attempt.get("will_retry") is True)
-                == (retry_deferred is True)
-                or not derived_failures
-            ):
+            if (attempt.get("will_retry") is True) == (
+                retry_deferred is True
+            ) or not derived_failures:
                 reasons.append("unexpected_g1_retry_selection_plan")
             pending_retry_plan = retry_selection_plan
             pending_retry_exclusions = retry_exclusions
@@ -6637,6 +7402,8 @@ def _adaptive_g1_lifecycle_routing(
             top_plan,
             contract=registry,
             allow_legacy_managed_v3=allow_legacy_managed_v3,
+            aggregator_recovery_policy=aggregator_recovery_policy,
+            proposer_recovery_policy=proposer_recovery_policy,
         )
         reasons.extend(top_reasons)
         if not _g1_full_plans_match(selected_plan, top_plan):
@@ -6667,9 +7434,7 @@ def _adaptive_g1_lifecycle_routing(
         "ranking_config_hash": str(selected_plan.get("ranking_config_hash") or ""),
         "validated_attempt_plan_count": validated_plan_count,
         "validated_attempt_physical_plan_count": validated_physical_plan_count,
-        "validated_provider_native_receipt_count": (
-            validated_provider_native_receipt_count
-        ),
+        "validated_provider_native_receipt_count": (validated_provider_native_receipt_count),
     }
     return effective_routing, evidence, list(dict.fromkeys(reasons))
 
@@ -6681,12 +7446,11 @@ def effective_g1_lifecycle_routing(
 ) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
     """Resolve one G1 plan from the same row/provider lifecycle."""
 
-    allow_legacy_managed_v3 = (
-        legacy_managed_v3_source_authenticated(contract)
-    )
+    allow_legacy_managed_v3 = legacy_managed_v3_source_authenticated(contract)
     registry = contract.get("g1_registry_contract")
     if not isinstance(registry, Mapping):
         return {}, {}, ["invalid_g1_registry_contract"]
+    aggregator_recovery_policy, proposer_recovery_policy = contract_recovery_policies(contract)
     reasons: list[str] = []
     trace = row.get("ensemble_trace")
     calls, sequence_reasons = ensemble_call_trace_sequence(
@@ -6700,6 +7464,8 @@ def effective_g1_lifecycle_routing(
             plan,
             contract=registry,
             allow_legacy_managed_v3=allow_legacy_managed_v3,
+            aggregator_recovery_policy=aggregator_recovery_policy,
+            proposer_recovery_policy=proposer_recovery_policy,
         )
         reasons.extend(plan_reasons)
         if isinstance(plan, Mapping):
@@ -6730,6 +7496,8 @@ def effective_g1_lifecycle_routing(
             physical_plans=physical_plans,
             initial_reasons=reasons,
             allow_legacy_managed_v3=allow_legacy_managed_v3,
+            aggregator_recovery_policy=aggregator_recovery_policy,
+            proposer_recovery_policy=proposer_recovery_policy,
         )
     physical = physical_plans[0]
     for plan in physical_plans[1:]:
@@ -6744,6 +7512,8 @@ def effective_g1_lifecycle_routing(
             top_plan,
             contract=registry,
             allow_legacy_managed_v3=allow_legacy_managed_v3,
+            aggregator_recovery_policy=aggregator_recovery_policy,
+            proposer_recovery_policy=proposer_recovery_policy,
         )
         reasons.extend(top_reasons)
         if not _g1_plans_match(top_plan, physical):
@@ -6778,6 +7548,8 @@ def effective_g1_lifecycle_routing(
             plan,
             contract=registry,
             allow_legacy_managed_v3=allow_legacy_managed_v3,
+            aggregator_recovery_policy=aggregator_recovery_policy,
+            proposer_recovery_policy=proposer_recovery_policy,
         )
         if plan_reasons:
             if isinstance(plan, Mapping):
@@ -6818,14 +7590,17 @@ def validate_g1_paid_attempt_plan_history(
     """Make every paid adaptive G1 attempt auditable across all source waves."""
 
     group_contract = contracts.get("G1")
-    allow_legacy_managed_v3 = (
-        legacy_managed_v3_source_authenticated(group_contract)
-    )
+    allow_legacy_managed_v3 = legacy_managed_v3_source_authenticated(group_contract)
     registry = (
         group_contract.get("g1_registry_contract") if isinstance(group_contract, Mapping) else None
     )
     if not isinstance(registry, Mapping):
         raise FinalizationError("G1 paid-attempt audit lacks a registry contract")
+    analyzer_policy = g1_task_analyzer_execution_policy(registry)
+    if analyzer_policy is None:
+        raise FinalizationError("G1 paid-attempt audit lacks an authenticated analyzer policy")
+    analyzer_provider = str(analyzer_policy["provider"])
+    analyzer_model = str(analyzer_policy["model"])
     violations: list[dict[str, Any]] = []
     selected_only_reasons = {
         "ambiguous_g1_selected_generation_attempt",
@@ -6858,23 +7633,14 @@ def validate_g1_paid_attempt_plan_history(
                 run_map = run if isinstance(run, Mapping) else {}
                 trace_events = run_map.get("trace_events")
                 routing = run_map.get("routing_trace")
-                if (
-                    any(
-                        isinstance(event, Mapping)
-                        and event.get("code")
-                        == "g1_pre_call_guard_failed"
-                        for event in (
-                            trace_events
-                            if isinstance(trace_events, list)
-                            else []
-                        )
-                    )
-                    or (
-                        isinstance(routing, Mapping)
-                        and isinstance(
-                            routing.get("pre_call_guard"),
-                            Mapping,
-                        )
+                if any(
+                    isinstance(event, Mapping) and event.get("code") == "g1_pre_call_guard_failed"
+                    for event in (trace_events if isinstance(trace_events, list) else [])
+                ) or (
+                    isinstance(routing, Mapping)
+                    and isinstance(
+                        routing.get("pre_call_guard"),
+                        Mapping,
                     )
                 ):
                     violations.append(
@@ -6882,57 +7648,42 @@ def validate_g1_paid_attempt_plan_history(
                         | {
                             "group": task_key[0],
                             "task_id": task_key[1],
-                            "attempt_id": str(
-                                attempt.get("attempt_id") or ""
-                            ),
+                            "attempt_id": str(attempt.get("attempt_id") or ""),
                             "reasons": ["g1_pre_call_guard_failed"],
                         }
                     )
                     duplicate_conflict = True
                     continue
                 routed_plan = (
-                    routing.get("selection_plan")
-                    if isinstance(routing, Mapping)
-                    else None
+                    routing.get("selection_plan") if isinstance(routing, Mapping) else None
                 )
                 trace = run_map.get("ensemble_trace")
                 physical_calls, _ = ensemble_call_trace_sequence(
                     trace if isinstance(trace, Mapping) else {}
                 )
                 paid_analyzer_setup = bool(
-                    attempt.get("attempt_kind")
-                    == "provider_build_after_paid_setup"
+                    attempt.get("attempt_kind") == "provider_build_after_paid_setup"
                 )
                 managed_runtime_plans = [
                     plan
                     for plan in (
                         routed_plan,
-                        *(
-                            call.get("selection_plan")
-                            for call in physical_calls
-                        ),
+                        *(call.get("selection_plan") for call in physical_calls),
                     )
                     if isinstance(plan, Mapping)
-                    and plan.get(
-                        "ranking_thinking_assignment_enabled"
-                    )
-                    is True
+                    and plan.get("ranking_thinking_assignment_enabled") is True
                 ]
                 current_adaptive_runtime_plans = [
                     plan
                     for plan in managed_runtime_plans
                     if not (
                         allow_legacy_managed_v3
-                        and plan.get("ranking_version")
-                        == LEGACY_THINKING_RANKING_VERSION
-                        and not plan.get(
-                            "thinking_physical_evidence_schema"
-                        )
+                        and plan.get("ranking_version") == LEGACY_THINKING_RANKING_VERSION
+                        and not plan.get("thinking_physical_evidence_schema")
                     )
                 ]
                 runtime_requires_adaptive = bool(
-                    paid_analyzer_setup
-                    or current_adaptive_runtime_plans
+                    paid_analyzer_setup or current_adaptive_runtime_plans
                 )
                 adaptive = any(
                     field in attempt
@@ -6944,11 +7695,7 @@ def validate_g1_paid_attempt_plan_history(
                         "retry_excluded_proposer_identities",
                     )
                 )
-                history_is_adaptive = (
-                    history_is_adaptive
-                    or adaptive
-                    or runtime_requires_adaptive
-                )
+                history_is_adaptive = history_is_adaptive or adaptive or runtime_requires_adaptive
                 if runtime_requires_adaptive and not all(
                     field in attempt
                     for field in (
@@ -6963,9 +7710,7 @@ def validate_g1_paid_attempt_plan_history(
                             "group": task_key[0],
                             "task_id": task_key[1],
                             "attempt_id": str(attempt.get("attempt_id") or ""),
-                            "reasons": [
-                                "missing_adaptive_g1_attempt_evidence"
-                            ],
+                            "reasons": ["missing_adaptive_g1_attempt_evidence"],
                         }
                     )
                     duplicate_conflict = True
@@ -6986,9 +7731,7 @@ def validate_g1_paid_attempt_plan_history(
                     duplicate_conflict = True
                     continue
                 normalized = copy.deepcopy(dict(attempt))
-                payload_hash = canonical_sha256(
-                    immutable_attempt_payload(normalized)
-                )
+                payload_hash = canonical_sha256(immutable_attempt_payload(normalized))
                 previous_hash = attempt_payload_hashes.get(attempt_id)
                 if previous_hash is not None and previous_hash != payload_hash:
                     violations.append(
@@ -6997,9 +7740,7 @@ def validate_g1_paid_attempt_plan_history(
                             "group": task_key[0],
                             "task_id": task_key[1],
                             "attempt_id": attempt_id,
-                            "reasons": [
-                                "conflicting_cross_wave_g1_attempt_evidence"
-                            ],
+                            "reasons": ["conflicting_cross_wave_g1_attempt_evidence"],
                         }
                     )
                     duplicate_conflict = True
@@ -7059,64 +7800,49 @@ def validate_g1_paid_attempt_plan_history(
             if any(ordinal != 1 for ordinal, _ in analyzer_occurrences):
                 analyzer_reasons.append("g1_task_analyzer_not_in_first_attempt")
             analyzer_attempts = [
-                nonnegative_int(analyzer.get("attempt"))
-                for _, analyzer in analyzer_occurrences
+                nonnegative_int(analyzer.get("attempt")) for _, analyzer in analyzer_occurrences
             ]
-            if analyzer_attempts != list(
-                range(1, len(analyzer_occurrences) + 1)
-            ):
-                analyzer_reasons.append(
-                    "invalid_g1_task_analyzer_retry_sequence"
-                )
-            if len(analyzer_occurrences) > (
-                FORMAL_G1_TASK_ANALYZER_MAX_RETRIES + 1
-            ):
-                analyzer_reasons.append(
-                    "g1_task_analyzer_retry_budget_exceeded"
-                )
+            if analyzer_attempts != list(range(1, len(analyzer_occurrences) + 1)):
+                analyzer_reasons.append("invalid_g1_task_analyzer_retry_sequence")
+            if len(analyzer_occurrences) > (int(analyzer_policy["max_retries"]) + 1):
+                analyzer_reasons.append("g1_task_analyzer_retry_budget_exceeded")
             physical_attempt_ids = [
                 str(analyzer.get("physical_attempt_id") or "")
                 for _, analyzer in analyzer_occurrences
             ]
-            if (
-                any(not HEX32.fullmatch(value) for value in physical_attempt_ids)
-                or len(physical_attempt_ids) != len(set(physical_attempt_ids))
-            ):
-                analyzer_reasons.append(
-                    "invalid_g1_task_analyzer_physical_attempt_identity"
-                )
+            if any(not HEX32.fullmatch(value) for value in physical_attempt_ids) or len(
+                physical_attempt_ids
+            ) != len(set(physical_attempt_ids)):
+                analyzer_reasons.append("invalid_g1_task_analyzer_physical_attempt_identity")
             requested_routes = {
                 (
-                    str(analyzer.get("requested_provider") or "")
-                    .strip()
-                    .casefold(),
+                    str(analyzer.get("requested_provider") or "").strip().casefold(),
                     str(analyzer.get("requested_model") or "").strip(),
                 )
                 for _, analyzer in analyzer_occurrences
             }
             if (
                 len(requested_routes) != 1
-                or next(iter(requested_routes))[0] != "openrouter"
+                or next(iter(requested_routes))[0] != analyzer_provider
                 or not _formal_openrouter_models_equivalent(
                     next(iter(requested_routes))[1],
-                    B0_MODEL,
+                    analyzer_model,
                 )
             ):
                 analyzer_reasons.append("wrong_g1_task_analyzer_route")
             for _, analyzer in analyzer_occurrences:
-                if not _is_unknown_task_analyzer_placeholder(analyzer) and (
-                    str(analyzer.get("provider") or "")
-                    .strip()
-                    .casefold()
-                    != "openrouter"
+                if not _is_unknown_task_analyzer_placeholder(
+                    analyzer,
+                    expected_provider=analyzer_provider,
+                    expected_model=analyzer_model,
+                ) and (
+                    str(analyzer.get("provider") or "").strip().casefold() != analyzer_provider
                     or not _formal_openrouter_models_equivalent(
                         analyzer.get("model"),
-                        B0_MODEL,
+                        analyzer_model,
                     )
                 ):
-                    analyzer_reasons.append(
-                        "wrong_g1_task_analyzer_route"
-                    )
+                    analyzer_reasons.append("wrong_g1_task_analyzer_route")
                     break
         if analyzer_reasons:
             violations.append(
@@ -7141,9 +7867,7 @@ def validate_g1_paid_attempt_plan_history(
         )
         audit_execution["generation_attempts"] = ordered_attempts
         audit_row["execution"] = audit_execution
-        audit_row["final_text_sha256"] = (
-            "__campaign_paid_g1_history_has_no_selected_answer__"
-        )
+        audit_row["final_text_sha256"] = "__campaign_paid_g1_history_has_no_selected_answer__"
         _, _, audit_reasons = _adaptive_g1_lifecycle_routing(
             audit_row,
             registry=registry,
@@ -7151,9 +7875,7 @@ def validate_g1_paid_attempt_plan_history(
             initial_reasons=(),
             allow_legacy_managed_v3=allow_legacy_managed_v3,
         )
-        fatal_reasons = [
-            reason for reason in audit_reasons if reason not in selected_only_reasons
-        ]
+        fatal_reasons = [reason for reason in audit_reasons if reason not in selected_only_reasons]
         if fatal_reasons:
             violations.append(
                 task_history[-1].reference
@@ -7162,8 +7884,7 @@ def validate_g1_paid_attempt_plan_history(
                     "task_id": task_key[1],
                     "paid_attempt_count": paid_attempt_count,
                     "attempt_ids": [
-                        str(attempt.get("attempt_id") or "")
-                        for attempt in ordered_attempts
+                        str(attempt.get("attempt_id") or "") for attempt in ordered_attempts
                     ],
                     "reasons": fatal_reasons,
                 }
@@ -7179,9 +7900,12 @@ def g1_provider_lifecycle_analyzer_reasons(
     row: Mapping[str, Any],
     *,
     allow_unknown_placeholder: bool = False,
+    analyzer_policy: Mapping[str, Any] | None = None,
 ) -> list[str]:
     """Require the setup-bearing attempt to contain one frozen task analyzer."""
 
+    analyzer_provider = str((analyzer_policy or {}).get("provider") or "openrouter")
+    analyzer_model = str((analyzer_policy or {}).get("model") or B0_MODEL)
     execution = row.get("execution")
     attempts = (
         execution.get("generation_attempts")
@@ -7213,22 +7937,28 @@ def g1_provider_lifecycle_analyzer_reasons(
     placeholders = [
         unit
         for unit in first_units
-        if allow_unknown_placeholder and _is_unknown_task_analyzer_placeholder(unit)
+        if allow_unknown_placeholder
+        and _is_unknown_task_analyzer_placeholder(
+            unit,
+            expected_provider=analyzer_provider,
+            expected_model=analyzer_model,
+        )
     ]
     if not analyzers and not placeholders:
         return ["missing_g1_task_analyzer_request"]
     if analyzers:
         for analyzer in analyzers:
             if (
-                str(analyzer.get("provider") or "").strip().casefold() != "openrouter"
-                or str(analyzer.get("requested_provider") or "").strip().casefold() != "openrouter"
+                str(analyzer.get("provider") or "").strip().casefold() != analyzer_provider
+                or str(analyzer.get("requested_provider") or "").strip().casefold()
+                != analyzer_provider
                 or not _formal_openrouter_models_equivalent(
                     analyzer.get("model"),
-                    B0_MODEL,
+                    analyzer_model,
                 )
                 or not _formal_openrouter_models_equivalent(
                     analyzer.get("requested_model"),
-                    B0_MODEL,
+                    analyzer_model,
                 )
             ):
                 return ["wrong_g1_task_analyzer_route"]
@@ -7243,7 +7973,11 @@ def g1_provider_lifecycle_analyzer_reasons(
             return ["inconsistent_g1_task_analyzer_setup_usage_evidence"]
         if any(
             str(unit.get("role") or "").strip().casefold() == "task_analyzer"
-            or _is_unknown_task_analyzer_placeholder(unit)
+            or _is_unknown_task_analyzer_placeholder(
+                unit,
+                expected_provider=analyzer_provider,
+                expected_model=analyzer_model,
+            )
             for unit in later_units
         ):
             return ["repeated_g1_task_analyzer_request"]
@@ -7257,6 +7991,7 @@ def route_reasons(
     contract: Mapping[str, Any],
 ) -> list[str]:
     reasons: list[str] = []
+    aggregator_recovery_policy, proposer_recovery_policy = contract_recovery_policies(contract)
     routing = row.get("routing_trace")
     routing = routing if isinstance(routing, Mapping) else {}
     models = selected_usage_models(row)
@@ -7282,7 +8017,8 @@ def route_reasons(
             routing.get("routing_applied") is not True
             or not applied
             or applied not in allowed
-            or models and models != {applied}
+            or models
+            and models != {applied}
         ):
             reasons.append("wrong_router_single_model")
         if applied:
@@ -7312,12 +8048,12 @@ def route_reasons(
                 row,
                 expected_proposers=B2_PROPOSERS,
                 expected_aggregator=B2_AGGREGATOR,
+                aggregator_recovery_policy=aggregator_recovery_policy,
+                proposer_recovery_policy=proposer_recovery_policy,
             )
         )
     elif group == "G1":
-        allow_legacy_managed_v3 = (
-            legacy_managed_v3_source_authenticated(contract)
-        )
+        allow_legacy_managed_v3 = legacy_managed_v3_source_authenticated(contract)
         registry = contract.get("g1_registry_contract")
         if not isinstance(registry, Mapping):
             profile = contract.get("global_experiment_profile")
@@ -7328,7 +8064,12 @@ def route_reasons(
             )
         routes = registry.get("expected_routes")
         allowed = set(routes) if isinstance(routes, Mapping) else set()
-        if registry.get("selection_mode") != "router_dynamic" or not allowed:
+        analyzer_policy = g1_task_analyzer_execution_policy(registry)
+        if (
+            registry.get("selection_mode") != "router_dynamic"
+            or not allowed
+            or analyzer_policy is None
+        ):
             reasons.append("invalid_g1_registry_contract")
         effective_routing, _, lifecycle_routing_reasons = effective_g1_lifecycle_routing(
             row,
@@ -7336,15 +8077,17 @@ def route_reasons(
         )
         reasons.extend(lifecycle_routing_reasons)
         routing = effective_routing
-        if allowed:
+        if allowed and analyzer_policy is not None:
             reasons.extend(
                 usage_route_reasons(
                     row.get("usage"),
                     allowed_models=allowed,
                     provider_pins=provider_pins,
-                    role_model_pins={"task_analyzer": B0_MODEL},
+                    role_model_pins={
+                        "task_analyzer": str(analyzer_policy["model"]),
+                    },
                     role_provider_pins={
-                        "task_analyzer": FORMAL_UPSTREAM_PINS[B0_MODEL],
+                        "task_analyzer": str(analyzer_policy["upstream_provider"]),
                     },
                     allow_unknown_task_analyzer_attempts=True,
                 )
@@ -7354,6 +8097,8 @@ def route_reasons(
             row_plan,
             contract=registry,
             allow_legacy_managed_v3=allow_legacy_managed_v3,
+            aggregator_recovery_policy=aggregator_recovery_policy,
+            proposer_recovery_policy=proposer_recovery_policy,
         )
         reasons.extend(plan_reasons)
         if proposers and aggregator:
@@ -7368,6 +8113,8 @@ def route_reasons(
                     call.get("selection_plan"),
                     contract=registry,
                     allow_legacy_managed_v3=allow_legacy_managed_v3,
+                    aggregator_recovery_policy=aggregator_recovery_policy,
+                    proposer_recovery_policy=proposer_recovery_policy,
                 )
                 reasons.extend(physical_reasons)
                 if physical_p != proposers or physical_a != aggregator:
@@ -7388,6 +8135,8 @@ def route_reasons(
                     expected_proposers=proposers,
                     expected_aggregator=aggregator,
                     allowed_models=allowed,
+                    aggregator_recovery_policy=aggregator_recovery_policy,
+                    proposer_recovery_policy=proposer_recovery_policy,
                 )
             )
     return reasons
@@ -7401,20 +8150,13 @@ def _strict_g1_physical_generation_usage_ids(
     """Return generation IDs for every strict G1 physical ledger."""
 
     trace = run.get("ensemble_trace")
-    calls, _ = ensemble_call_trace_sequence(
-        trace if isinstance(trace, Mapping) else {}
-    )
+    calls, _ = ensemble_call_trace_sequence(trace if isinstance(trace, Mapping) else {})
     if not any(
         isinstance(call.get("selection_plan"), Mapping)
         and (
-            call["selection_plan"].get(
-                "thinking_physical_evidence_schema"
-            )
+            call["selection_plan"].get("thinking_physical_evidence_schema")
             == THINKING_PHYSICAL_EVIDENCE_SCHEMA
-            or call["selection_plan"].get(
-                "proposer_recovery_policy"
-            )
-            is not None
+            or call["selection_plan"].get("proposer_recovery_policy") is not None
         )
         for call in calls
     ):
@@ -7443,14 +8185,10 @@ def register_physical_attempt_owners(
     """Reject one physical request identity owned by two logical request legs."""
 
     reasons: list[str] = []
-    for physical_attempt_id in dict.fromkeys(
-        physical_attempt_ids
-    ):
+    for physical_attempt_id in dict.fromkeys(physical_attempt_ids):
         previous_owner = owners.get(physical_attempt_id)
         if previous_owner is not None and previous_owner != owner:
-            reasons.append(
-                "physical_attempt_id_reused_across_generation_attempts"
-            )
+            reasons.append("physical_attempt_id_reused_across_generation_attempts")
             continue
         owners[physical_attempt_id] = owner
     return list(dict.fromkeys(reasons))
@@ -7500,11 +8238,14 @@ def validate_physical_generation_routes(
             allowed: set[str] = set()
             registry = contract.get("g1_registry_contract")
             routes = registry.get("expected_routes") if isinstance(registry, Mapping) else None
-            if isinstance(routes, Mapping):
+            analyzer_policy = g1_task_analyzer_execution_policy(registry)
+            if isinstance(routes, Mapping) and analyzer_policy is not None:
                 allowed.update(str(model) for model in routes)
-                role_model_pins = {"task_analyzer": B0_MODEL}
+                role_model_pins = {
+                    "task_analyzer": str(analyzer_policy["model"]),
+                }
                 role_provider_pins = {
-                    "task_analyzer": FORMAL_UPSTREAM_PINS[B0_MODEL],
+                    "task_analyzer": str(analyzer_policy["upstream_provider"]),
                 }
         allowed.discard("")
         execution = record.row.get("execution")
@@ -7536,9 +8277,7 @@ def validate_physical_generation_routes(
     for (attempt_owner_key, attempt_id), versions in attempt_versions.items():
         record, run = validate_and_select_monotonic_run_version(
             [(version[0], version[1]) for version in versions],
-            label=(
-                f"generation attempt {attempt_owner_key}:{attempt_id}"
-            ),
+            label=(f"generation attempt {attempt_owner_key}:{attempt_id}"),
             identity_seed=f"generation-attempt:{attempt_id}",
         )
         selected_versions = [version for version in versions if version[0] is record]
@@ -7567,9 +8306,7 @@ def validate_physical_generation_routes(
             identity_seed=f"generation-attempt:{attempt_id}",
         )
         if record.key[0] == "G1":
-            reasons.extend(
-                g1_thinking_physical_usage_binding_reasons(run)
-            )
+            reasons.extend(g1_thinking_physical_usage_binding_reasons(run))
             analyzer_ids = [
                 _task_analyzer_physical_attempt_id(unit)
                 for unit in _canonical_task_analyzer_setup_units(
@@ -7598,10 +8335,7 @@ def validate_physical_generation_routes(
                 str(unit.get("physical_attempt_id") or "")
                 for unit in canonical_units
                 if not _is_task_analyzer_evidence(unit)
-                and HEX32.fullmatch(
-                    str(unit.get("physical_attempt_id") or "")
-                )
-                is not None
+                and HEX32.fullmatch(str(unit.get("physical_attempt_id") or "")) is not None
             ]
             generation_role = "generation"
         reasons.extend(
@@ -7680,11 +8414,7 @@ def generation_reason_assessment(
             else "generation_error"
         )
     execution = row.get("execution")
-    run_error = (
-        str(execution.get("run_error") or "")
-        if isinstance(execution, Mapping)
-        else ""
-    )
+    run_error = str(execution.get("run_error") or "") if isinstance(execution, Mapping) else ""
     if run_error:
         reasons.append(
             f"audit:run_error:{run_error}"
@@ -7793,6 +8523,10 @@ def judge_reasons(
     row: Mapping[str, Any],
     *,
     task: Mapping[str, Any] | None = None,
+    judge_model: str = JUDGE_MODEL,
+    judge_repeats: int = JUDGE_REPEATS,
+    judge_max_attempts: int = JUDGE_ATTEMPT_BUDGET_LIMIT,
+    judge_provider_pin: str | None = None,
 ) -> list[str]:
     judge = row.get("judge")
     if not isinstance(judge, Mapping):
@@ -7808,7 +8542,7 @@ def judge_reasons(
     if (
         judge.get("judge_attempt_evidence_schema") != JUDGE_ATTEMPT_EVIDENCE_SCHEMA
         or judge.get("judge_attempt_budget_scope") != JUDGE_ATTEMPT_BUDGET_SCOPE
-        or judge.get("judge_attempt_budget_limit_per_unit") != JUDGE_ATTEMPT_BUDGET_LIMIT
+        or judge.get("judge_attempt_budget_limit_per_unit") != judge_max_attempts
         or judge.get("judge_attempt_budget_exhausted") is not False
         or nonnegative_int(judge.get("judge_attempt_budget_exhausted_count")) != 0
     ):
@@ -7822,11 +8556,11 @@ def judge_reasons(
         if isinstance(judgments, list)
         else []
     )
-    expected_count = len(rubric_criteria) * JUDGE_REPEATS
+    expected_count = len(rubric_criteria) * judge_repeats
     if (
         judge.get("mode") != "draco_criterion_judgments"
-        or str(judge.get("judge_model") or "") != JUDGE_MODEL
-        or nonnegative_int(judge.get("judge_repeats")) != JUDGE_REPEATS
+        or str(judge.get("judge_model") or "") != judge_model
+        or nonnegative_int(judge.get("judge_repeats")) != judge_repeats
         or str(judge.get("rubric_id") or "") != rubric_id
         or nonnegative_int(judge.get("rubric_criteria_count")) != len(rubric_criteria)
         or nonnegative_int(judge.get("criteria_count")) != expected_count
@@ -7838,7 +8572,7 @@ def judge_reasons(
     expected_occurrences = Counter(
         (criterion["id"], repeat)
         for criterion in rubric_criteria
-        for repeat in range(JUDGE_REPEATS)
+        for repeat in range(judge_repeats)
     )
     observed_occurrences = Counter(
         (str(item.get("id") or ""), nonnegative_int(item.get("repeat_index"))) for item in judgments
@@ -7869,14 +8603,12 @@ def judge_reasons(
             _, route_failures = canonical_judge_run_route_reasons(
                 run,
                 attempt_id=attempt_id,
+                judge_model=judge_model,
+                judge_provider_pin=judge_provider_pin,
             )
-            blocking_route_failures, _ = partition_execution_and_audit_reasons(
-                route_failures
-            )
+            blocking_route_failures, _ = partition_execution_and_audit_reasons(route_failures)
             reasons.extend(
-                "wrong_judge_model_route"
-                for reason in blocking_route_failures
-                if reason
+                "wrong_judge_model_route" for reason in blocking_route_failures if reason
             )
         final_attempt = attempts[-1] if attempts and isinstance(attempts[-1], Mapping) else {}
         final_run = final_attempt.get("run")
@@ -8124,6 +8856,7 @@ def select_results(
     fingerprints: Mapping[str, str],
     contracts: Mapping[str, Mapping[str, Any]],
     max_attempts: int,
+    experiment_policy: FinalizerExperimentPolicy | None = None,
     manifest_sources: Sequence[Mapping[str, Any]] = (),
 ) -> tuple[list[SourceRecord], dict[str, Any]]:
     expected_keys = {(group, str(task["id"])) for task in tasks for group in groups}
@@ -8186,9 +8919,7 @@ def select_results(
                         if attempt_id in g1_generation_attempt_ids:
                             continue
                         g1_generation_attempt_ids.add(attempt_id)
-                        g1_generation_attempt_prefix.append(
-                            copy.deepcopy(dict(attempt))
-                        )
+                        g1_generation_attempt_prefix.append(copy.deepcopy(dict(attempt)))
                     validation_row = copy.deepcopy(record.row)
                     validation_execution = (
                         dict(validation_row.get("execution"))
@@ -8198,8 +8929,8 @@ def select_results(
                         )
                         else {}
                     )
-                    validation_execution["generation_attempts"] = (
-                        copy.deepcopy(g1_generation_attempt_prefix)
+                    validation_execution["generation_attempts"] = copy.deepcopy(
+                        g1_generation_attempt_prefix
                     )
                     validation_row["execution"] = validation_execution
                     validation_record = SourceRecord(
@@ -8221,9 +8952,7 @@ def select_results(
                     contract=contracts[group],
                 )
                 if audit_reasons:
-                    audit_warning_rows.append(
-                        record.reference | {"reasons": audit_reasons}
-                    )
+                    audit_warning_rows.append(record.reference | {"reasons": audit_reasons})
                 if accepted_generation_seen and new_attempt_ids:
                     if not reasons:
                         raise FinalizationError(
@@ -8323,7 +9052,26 @@ def select_results(
                         f"{group}/{task_id} started a new generation attempt after "
                         "an already valid generation"
                     )
-            judge_failures = judge_reasons(repaired.row, task=task)
+            judge_failures = judge_reasons(
+                repaired.row,
+                task=task,
+                judge_model=(
+                    experiment_policy.judge_model if experiment_policy is not None else JUDGE_MODEL
+                ),
+                judge_repeats=(
+                    experiment_policy.judge_repeats
+                    if experiment_policy is not None
+                    else JUDGE_REPEATS
+                ),
+                judge_max_attempts=(
+                    experiment_policy.judge_max_attempts
+                    if experiment_policy is not None
+                    else JUDGE_ATTEMPT_BUDGET_LIMIT
+                ),
+                judge_provider_pin=(
+                    experiment_policy.judge_provider_pin if experiment_policy is not None else None
+                ),
+            )
             if judge_failures:
                 raise FinalizationError(
                     f"{group}/{task_id} latest repair lacks a complete Judge: {judge_failures}"
@@ -8475,9 +9223,7 @@ def bind_selected_generation_attempts(
                     run_error
                     and not audit_only_error_text(
                         run_error,
-                        degraded_success=explicit_degraded_success(
-                            selected_record.row
-                        ),
+                        degraded_success=explicit_degraded_success(selected_record.row),
                     )
                     and not selected_legacy_attempt_error_is_reclassified(
                         selected_record.row,
@@ -8542,22 +9288,15 @@ def g1_thinking_physical_usage_binding_reasons(
     """Bind every managed/recovered physical request to one usage unit."""
 
     trace = run.get("ensemble_trace")
-    calls, call_reasons = ensemble_call_trace_sequence(
-        trace if isinstance(trace, Mapping) else {}
-    )
+    calls, call_reasons = ensemble_call_trace_sequence(trace if isinstance(trace, Mapping) else {})
     strict_calls = [
         call
         for call in calls
         if isinstance(call.get("selection_plan"), Mapping)
         and (
-            call["selection_plan"].get(
-                "thinking_physical_evidence_schema"
-            )
+            call["selection_plan"].get("thinking_physical_evidence_schema")
             == THINKING_PHYSICAL_EVIDENCE_SCHEMA
-            or call["selection_plan"].get(
-                "proposer_recovery_policy"
-            )
-            is not None
+            or call["selection_plan"].get("proposer_recovery_policy") is not None
         )
     ]
     if not strict_calls:
@@ -8575,45 +9314,31 @@ def g1_thinking_physical_usage_binding_reasons(
     for call in strict_calls:
         plan = call.get("selection_plan")
         provider_recovery_policy = (
-            plan.get("proposer_recovery_policy")
-            if isinstance(plan, Mapping)
-            else None
+            plan.get("proposer_recovery_policy") if isinstance(plan, Mapping) else None
         )
         candidates = call.get("candidates")
         current_candidate_ids: list[str] = []
         if isinstance(candidates, list):
             for candidate in candidates:
-                execution = (
-                    candidate.get("execution")
-                    if isinstance(candidate, Mapping)
-                    else None
-                )
+                execution = candidate.get("execution") if isinstance(candidate, Mapping) else None
                 attempts = (
-                    execution.get("physical_attempts")
-                    if isinstance(execution, Mapping)
-                    else None
+                    execution.get("physical_attempts") if isinstance(execution, Mapping) else None
                 )
                 if isinstance(attempts, list):
                     candidate_ids = [
                         str(attempt.get("physical_attempt_id") or "")
                         for attempt in attempts
-                        if isinstance(attempt, Mapping)
-                        and attempt.get("request_started") is True
+                        if isinstance(attempt, Mapping) and attempt.get("request_started") is True
                     ]
                     ledger_ids.extend(candidate_ids)
                     current_candidate_ids.extend(candidate_ids)
         recovery = call.get("aggregator_recovery")
-        attempts = (
-            recovery.get("attempts")
-            if isinstance(recovery, Mapping)
-            else None
-        )
+        attempts = recovery.get("attempts") if isinstance(recovery, Mapping) else None
         if isinstance(attempts, list):
             ledger_ids.extend(
                 str(attempt.get("physical_attempt_id") or "")
                 for attempt in attempts
-                if isinstance(attempt, Mapping)
-                and attempt.get("request_started") is True
+                if isinstance(attempt, Mapping) and attempt.get("request_started") is True
             )
 
         if provider_recovery_policy is None:
@@ -8621,11 +9346,7 @@ def g1_thinking_physical_usage_binding_reasons(
                 reasons.append("unexpected_proposer_recovery_receipt")
             continue
         receipt = call.get("proposer_recovery")
-        receipt_attempts = (
-            receipt.get("attempts")
-            if isinstance(receipt, Mapping)
-            else None
-        )
+        receipt_attempts = receipt.get("attempts") if isinstance(receipt, Mapping) else None
         if not isinstance(receipt, Mapping) or not isinstance(
             receipt_attempts,
             list,
@@ -8633,9 +9354,7 @@ def g1_thinking_physical_usage_binding_reasons(
             reasons.append("missing_proposer_recovery_receipt")
             continue
         normalized_receipts = [
-            dict(attempt)
-            for attempt in receipt_attempts
-            if isinstance(attempt, Mapping)
+            dict(attempt) for attempt in receipt_attempts if isinstance(attempt, Mapping)
         ]
         if len(normalized_receipts) != len(receipt_attempts):
             reasons.append("invalid_proposer_recovery_attempt")
@@ -8652,13 +9371,10 @@ def g1_thinking_physical_usage_binding_reasons(
             or started != started_total
             or started < prior_recovery_started
             or len(normalized_receipts) < len(prior_recovery_attempts)
-            or normalized_receipts[: len(prior_recovery_attempts)]
-            != prior_recovery_attempts
+            or normalized_receipts[: len(prior_recovery_attempts)] != prior_recovery_attempts
         ):
             reasons.append("proposer_recovery_receipt_prefix_mismatch")
-        new_receipts = normalized_receipts[
-            len(prior_recovery_attempts) :
-        ]
+        new_receipts = normalized_receipts[len(prior_recovery_attempts) :]
         new_recovery_ids = [
             str(attempt.get("physical_attempt_id") or "")
             for attempt in new_receipts
@@ -8671,13 +9387,9 @@ def g1_thinking_physical_usage_binding_reasons(
             if physical_id in new_recovery_id_set
         ]
         if Counter(new_recovery_ids) != Counter(current_recovery_ids):
-            reasons.append(
-                "proposer_recovery_incremental_physical_set_mismatch"
-            )
+            reasons.append("proposer_recovery_incremental_physical_set_mismatch")
         scope_id = str(receipt.get("scope_id") or "")
-        fingerprint = str(
-            receipt.get("selection_plan_fingerprint") or ""
-        )
+        fingerprint = str(receipt.get("selection_plan_fingerprint") or "")
         roster_before = receipt.get("executed_proposer_roster_before")
         roster_after = receipt.get("executed_proposer_roster_after")
         normalized_before = (
@@ -8700,10 +9412,8 @@ def g1_thinking_physical_usage_binding_reasons(
             else ((), ["invalid_expanded_proposer_sample_roster"])
         )
         reasons.extend(initial_slot_reasons)
-        if (
-            prior_recovery_roster_after is None
-            and normalized_before
-            != list(initial_slot_identities)
+        if prior_recovery_roster_after is None and normalized_before != list(
+            initial_slot_identities
         ):
             reasons.append("proposer_recovery_roster_prefix_changed")
         elif (
@@ -8717,10 +9427,9 @@ def g1_thinking_physical_usage_binding_reasons(
         prior_recovery_started = nonnegative_int(started)
         prior_recovery_roster_after = normalized_after
 
-    if (
-        any(HEX32.fullmatch(attempt_id) is None for attempt_id in ledger_ids)
-        or len(ledger_ids) != len(set(ledger_ids))
-    ):
+    if any(HEX32.fullmatch(attempt_id) is None for attempt_id in ledger_ids) or len(
+        ledger_ids
+    ) != len(set(ledger_ids)):
         reasons.append("invalid_g1_thinking_physical_attempt_set")
 
     try:
@@ -8760,13 +9469,8 @@ def g1_thinking_physical_usage_binding_reasons(
             if isinstance(provider_usage, Mapping)
             else ""
         )
-        if (
-            HEX32.fullmatch(attempt_id) is None
-            or nested_id != attempt_id
-        ):
-            reasons.append(
-                "invalid_g1_thinking_usage_physical_attempt_id"
-            )
+        if HEX32.fullmatch(attempt_id) is None or nested_id != attempt_id:
+            reasons.append("invalid_g1_thinking_usage_physical_attempt_id")
             continue
         usage_ids.append(attempt_id)
 
@@ -8775,9 +9479,7 @@ def g1_thinking_physical_usage_binding_reasons(
     try:
         expected = run_expected_ensemble_request_count(run)
     except FinalizationError:
-        reasons.append(
-            "g1_thinking_physical_usage_multiplicity_mismatch"
-        )
+        reasons.append("g1_thinking_physical_usage_multiplicity_mismatch")
         return list(dict.fromkeys(reasons))
     if len(ledger_ids) != expected or len(generation_units) != expected:
         reasons.append("g1_thinking_physical_usage_multiplicity_mismatch")
@@ -8818,7 +9520,12 @@ def iter_judge_runs(judge: Any) -> Iterable[tuple[str, Mapping[str, Any]]]:
                 yield f"attempt/{index}", run
 
 
-def proof_only_usage_evidence_reasons(row: Mapping[str, Any]) -> list[str]:
+def proof_only_usage_evidence_reasons(
+    row: Mapping[str, Any],
+    *,
+    judge_model: str = JUDGE_MODEL,
+    judge_provider_pin: str | None = None,
+) -> list[str]:
     """Check that a campaign-proof-only row can enter canonical finalization.
 
     This deliberately uses the same canonicalizer and strict Judge route
@@ -8881,6 +9588,8 @@ def proof_only_usage_evidence_reasons(row: Mapping[str, Any]) -> list[str]:
                 _, route_reasons = canonical_judge_run_route_reasons(
                     run,
                     attempt_id=attempt_id,
+                    judge_model=judge_model,
+                    judge_provider_pin=judge_provider_pin,
                 )
             except (FinalizationError, UsageEvidenceError, TypeError) as exc:
                 reasons.append(f"{scope}/{path}/{type(exc).__name__}")
@@ -8981,6 +9690,7 @@ def build_actual_spend_ledger(
     *,
     selected: Sequence[SourceRecord] = (),
     selected_attempt_bindings: Mapping[str, str] | None = None,
+    judge_model: str = JUDGE_MODEL,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Rebuild physical spend from every wave; never trust a row-level total."""
 
@@ -9102,7 +9812,7 @@ def build_actual_spend_ledger(
             label=identity,
             identity_seed=f"judge-attempt:{attempt_id}",
             requested_provider="openrouter",
-            requested_model=JUDGE_MODEL,
+            requested_model=judge_model,
             role="unknown_request",
         )
         matching_versions = [version for version in versions if version[0] is record]
@@ -9808,9 +10518,7 @@ def ledger_entry_payload(entry: LedgerEntry) -> dict[str, Any]:
             # would silently erase unknown cost from reconciliation.
             continue
         cost_candidates: list[tuple[Any, str]] = [(reported, "provider_reported")]
-        estimated_source = (
-            "estimate" in cost_source or cost_source.startswith("opensquilla_")
-        )
+        estimated_source = "estimate" in cost_source or cost_source.startswith("opensquilla_")
         if estimated_source:
             # Missing provider dollars retain the normalized billed_cost=0
             # placeholder.  Once token pricing marks the row estimated, that
@@ -9823,9 +10531,7 @@ def ledger_entry_payload(entry: LedgerEntry) -> dict[str, Any]:
             )
         else:
             if cost_source not in {"none", "unavailable"}:
-                cost_candidates.append(
-                    (unit.get("billed_cost"), cost_source or "recorded")
-                )
+                cost_candidates.append((unit.get("billed_cost"), cost_source or "recorded"))
             cost_candidates.append((unit.get("estimated_cost_usd"), "estimated"))
         for value, source in cost_candidates:
             if value is None or isinstance(value, bool):
@@ -10078,8 +10784,7 @@ def validate_stable_observations(
     # not an execution-integrity error and therefore must not prevent reading
     # the stable tail.
     if normalized[0][1] < before_byok or any(
-        later[1] < earlier[1]
-        for earlier, later in zip(normalized, normalized[1:], strict=False)
+        later[1] < earlier[1] for earlier, later in zip(normalized, normalized[1:], strict=False)
     ):
         raise FinalizationError("stable observation BYOK usage is not monotonic")
     if normalized[-1][0] != after_usage or normalized[-1][1] != after_byok:
@@ -10342,10 +11047,7 @@ def reconcile_ledger_campaign_windows(
         gap = delta - recorded
         status = (
             "conflict"
-            if exact > delta + tolerance
-            or abs(gap) > tolerance
-            and unknown == 0
-            and non_exact == 0
+            if exact > delta + tolerance or abs(gap) > tolerance and unknown == 0 and non_exact == 0
             else "exact"
             if abs(gap) <= tolerance and unknown == 0 and non_exact == 0
             else "account_exact_per_request_incomplete"
@@ -10619,9 +11321,7 @@ def validate_account_proof(
         if actual != expected:
             raise FinalizationError(f"reconciliation {field_name} differs from account snapshots")
     if byok_delta != Decimal(0):
-        policy_warnings.append(
-            f"campaign account BYOK delta is not exactly zero: {byok_delta}"
-        )
+        policy_warnings.append(f"campaign account BYOK delta is not exactly zero: {byok_delta}")
 
     reconciliation_runtime = str(reconciliation.get("runtime_environment_sha256") or "")
     if reconciliation_runtime != runtime_fingerprint:
@@ -10688,8 +11388,7 @@ def validate_account_proof(
     )
     if campaign_byok_delta != Decimal(0) and byok_delta == Decimal(0):
         policy_warnings.append(
-            "campaign account windows contain a non-zero BYOK delta: "
-            f"{campaign_byok_delta}"
+            f"campaign account windows contain a non-zero BYOK delta: {campaign_byok_delta}"
         )
 
     local_counts = Counter(str(row.get("non_byok_evidence") or "") for row in ledger_rows)
@@ -10704,9 +11403,7 @@ def validate_account_proof(
     exact = local_counts["exact"]
     unverified = local_counts["unverified"]
     if request_count <= 0 or exact + unverified + explicit + conflicts != request_count:
-        reconciliation_warnings.append(
-            "campaign request evidence accounting is inconsistent"
-        )
+        reconciliation_warnings.append("campaign request evidence accounting is inconsistent")
 
     recorded_ledger_cost = required_decimal(
         ledger_summary.get("recorded_cost_usd"), label="ledger recorded cost"
@@ -10719,9 +11416,7 @@ def validate_account_proof(
         label="cost reconciliation tolerance",
     )
     if tolerance > Decimal("0.000001"):
-        reconciliation_warnings.append(
-            "cost reconciliation tolerance exceeds 0.000001 USD"
-        )
+        reconciliation_warnings.append("cost reconciliation tolerance exceeds 0.000001 USD")
         tolerance = Decimal("0.000001")
     if exact_ledger_cost > campaign_usage_delta + tolerance:
         reconciliation_warnings.append(
@@ -10735,9 +11430,7 @@ def validate_account_proof(
             "physical receipt ledger exceeds the settled account usage delta"
         )
     if abs(gap) > tolerance and unknown_cost_count == 0 and non_exact_cost_count == 0:
-        reconciliation_warnings.append(
-            f"unexplained OpenRouter account/ledger cost delta: {gap}"
-        )
+        reconciliation_warnings.append(f"unexplained OpenRouter account/ledger cost delta: {gap}")
     cost_reconciliation_status = (
         "conflict"
         if reconciliation_warnings
@@ -10776,8 +11469,7 @@ def validate_account_proof(
         )
         if prior_byok_delta != Decimal(0):
             policy_warnings.append(
-                "prior aborted account window contains a non-zero BYOK delta: "
-                f"{prior_byok_delta}"
+                f"prior aborted account window contains a non-zero BYOK delta: {prior_byok_delta}"
             )
     prior_windows = [*prior_aborted_windows, *prior_campaign_windows]
     ordered_windows = sorted(
@@ -11102,12 +11794,8 @@ def failed_account_proof(
             "reconciliation_gap_usd": None,
             "reconciliation_tolerance_usd": None,
             "reconciliation_status": "audit_conflict",
-            "unknown_cost_request_count": ledger_summary.get(
-                "unknown_cost_request_count"
-            ),
-            "non_exact_cost_request_count": ledger_summary.get(
-                "non_exact_cost_request_count"
-            ),
+            "unknown_cost_request_count": ledger_summary.get("unknown_cost_request_count"),
+            "non_exact_cost_request_count": ledger_summary.get("non_exact_cost_request_count"),
             "attribution_precision": "unverified",
             "campaign_attributable_exact": False,
             "current_window_campaign_attributable_exact": False,
@@ -11294,8 +11982,7 @@ def selected_generation_costs_from_ledger(
                 label=f"{key} selected exact ledger cost",
             )
             for item in physical
-            if item.get("recorded_cost_usd") is not None
-            and item.get("cost_precision") == "exact"
+            if item.get("recorded_cost_usd") is not None and item.get("cost_precision") == "exact"
         ]
         estimated_known = [
             required_decimal(
@@ -11366,13 +12053,9 @@ def selected_generation_costs_from_ledger(
             and declared["value"].quantize(Decimal("0.000000001"))
             != value.quantize(Decimal("0.000000001"))
         ):
-            cost_warnings.append(
-                f"{key} selected generation row cost conflicts with ledger"
-            )
+            cost_warnings.append(f"{key} selected generation row cost conflicts with ledger")
         if declared.get("exact") is True and not exact:
-            cost_warnings.append(
-                f"{key} selected generation row falsely declares exact cost"
-            )
+            cost_warnings.append(f"{key} selected generation row falsely declares exact cost")
         summaries[key] = summary
     counted_values = [
         summary["value"]
@@ -11412,9 +12095,7 @@ def selected_generation_costs_from_ledger(
             "ignored_cost_requests_are_zero": False,
         },
         "warnings": [
-            warning
-            for summary in summaries.values()
-            for warning in summary.get("warnings") or []
+            warning for summary in summaries.values() for warning in summary.get("warnings") or []
         ],
         "pairs": {
             key: {field: value for field, value in summary.items() if field != "value"}
@@ -11685,9 +12366,7 @@ def finalize_rows(
             selection_warnings = [
                 str(reason)
                 for warning_row in (
-                    selection_warning_rows
-                    if isinstance(selection_warning_rows, list)
-                    else []
+                    selection_warning_rows if isinstance(selection_warning_rows, list) else []
                 )
                 if isinstance(warning_row, Mapping)
                 for reason in warning_row.get("reasons") or []
@@ -11972,6 +12651,63 @@ def repair_action_details(
     return details
 
 
+def experiment_policy_report_values(
+    policy: FinalizerExperimentPolicy | None,
+    *,
+    task_concurrency: int,
+    judge_concurrency: int,
+) -> dict[str, Any]:
+    """Render the exact policy values printed in ``EXPERIMENT_RESULTS.md``."""
+
+    def display_number(value: Any) -> str:
+        rendered = format(value, "f") if isinstance(value, Decimal) else str(value)
+        return rendered.rstrip("0").rstrip(".") if "." in rendered else rendered
+
+    runner_mode = policy.runner["mode"] if policy is not None else "agent_loop"
+    web_search = (
+        policy.tools["web_search"]
+        if policy is not None
+        else {"provider": "brave", "max_results": 5}
+    )
+    web_fetch = policy.tools["web_fetch"] if policy is not None else {"max_content_tokens": 50_000}
+    return {
+        "runner_label": "Agent Loop" if runner_mode == "agent_loop" else runner_mode,
+        "task_timeout": display_number(
+            policy.timeouts["task_seconds"] if policy is not None else FORMAL_TASK_TIMEOUT_SECONDS
+        ),
+        "max_iterations": (
+            policy.runner["agent_max_iterations"]
+            if policy is not None
+            else FORMAL_AGENT_MAX_ITERATIONS
+        ),
+        "task_concurrency": task_concurrency,
+        "generation_temperature": display_number(
+            policy.generation["temperature"] if policy is not None else Decimal("0")
+        ),
+        "generation_max_tokens": (
+            policy.generation["max_tokens"] if policy is not None else FORMAL_GENERATION_MAX_TOKENS
+        ),
+        "generation_max_attempts": (
+            policy.generation_max_attempts if policy is not None else FORMAL_GENERATION_MAX_ATTEMPTS
+        ),
+        "judge_model": policy.judge_model if policy is not None else JUDGE_MODEL,
+        "judge_repeats": policy.judge_repeats if policy is not None else JUDGE_REPEATS,
+        "judge_concurrency": judge_concurrency,
+        "judge_max_attempts": (
+            policy.judge_max_attempts if policy is not None else FORMAL_JUDGE_MAX_ATTEMPTS
+        ),
+        "web_search_provider": web_search["provider"],
+        "web_search_max_results": web_search["max_results"],
+        "web_fetch_max_content_tokens": web_fetch["max_content_tokens"],
+        "proposer_recovery": (
+            policy.proposer_recovery if policy is not None else FORMAL_PROPOSER_RECOVERY_POLICY
+        ),
+        "aggregator_recovery": (
+            policy.aggregator_recovery if policy is not None else FORMAL_AGGREGATOR_RECOVERY_POLICY
+        ),
+    }
+
+
 def experiment_results_markdown(
     *,
     task_count: int,
@@ -11985,14 +12721,15 @@ def experiment_results_markdown(
     model_metrics: Sequence[Mapping[str, Any]],
     rubric_metrics: Sequence[Mapping[str, Any]],
     repair_details: Sequence[Mapping[str, Any]],
+    experiment_policy: FinalizerExperimentPolicy | None = None,
+    expected_task_concurrency: int = FORMAL_TASK_CONCURRENCY,
+    expected_judge_concurrency: int = FORMAL_JUDGE_CONCURRENCY,
 ) -> str:
     account = proof["account"]
     evidence = proof["local_physical_request_evidence"]
     cost_scope = proof["cost_scope"]
     policy_pass = proof.get("policy_pass") is True
-    reconciliation_status = str(
-        (proof.get("reconciliation") or {}).get("status") or "unknown"
-    )
+    reconciliation_status = str((proof.get("reconciliation") or {}).get("status") or "unknown")
     result_window_scope = str(proof.get("result_row_account_window_scope") or "")
     account_windows = list(cost_scope["account_windows"])
     campaign_windows = [
@@ -12057,8 +12794,7 @@ def experiment_results_markdown(
     )
     disposition_costs = ledger_summary["generation_disposition_recorded_cost_usd"]
     selected_cost_request_count = sum(
-        nonnegative_int(metric.get("selected_generation_cost_request_count"))
-        for metric in metrics
+        nonnegative_int(metric.get("selected_generation_cost_request_count")) for metric in metrics
     )
     selected_cost_exact_request_count = sum(
         nonnegative_int(metric.get("selected_generation_cost_exact_request_count"))
@@ -12069,9 +12805,7 @@ def experiment_results_markdown(
         for metric in metrics
     )
     selected_cost_recorded_non_exact_request_count = sum(
-        nonnegative_int(
-            metric.get("selected_generation_cost_recorded_non_exact_request_count")
-        )
+        nonnegative_int(metric.get("selected_generation_cost_recorded_non_exact_request_count"))
         for metric in metrics
     )
     selected_cost_ignored_request_count = sum(
@@ -12098,6 +12832,13 @@ def experiment_results_markdown(
         "G1": "| G1 | selection_mode | frozen-registry `router_dynamic` |",
     }
     ensemble_groups = [group for group in active_groups if group in {"B2", "G1"}]
+    rendered_policy = experiment_policy_report_values(
+        experiment_policy,
+        task_concurrency=expected_task_concurrency,
+        judge_concurrency=expected_judge_concurrency,
+    )
+    proposer_recovery = rendered_policy["proposer_recovery"]
+    aggregator_recovery = rendered_policy["aggregator_recovery"]
     lines = [
         f"# DRACO Mini {'/'.join(active_groups)} 实验结果",
         "",
@@ -12114,12 +12855,21 @@ def experiment_results_markdown(
         "",
         f"- 任务集：DRACO Mini（{task_count} 题）",
         f"- 实验组：{'、'.join(active_groups)}",
-        f"- 执行：Agent Loop，单任务超时 10800 秒，最多 "
-        f"{FORMAL_AGENT_MAX_ITERATIONS} 轮；任务并发 5",
-        "- 生成：temperature=0，max_tokens=16384；每个 `(group, task)` "
-        "最多 3 次 generation attempt",
-        f"- Judge：`{JUDGE_MODEL}`，3 repeats，Judge 并发 6，单 criterion/repeat 最多 3 次 attempt",
-        "- Web：本地 `web_search`/`web_fetch`，Brave Search；严格屏蔽 "
+        f"- 执行：{rendered_policy['runner_label']}，单任务超时 "
+        f"{rendered_policy['task_timeout']} 秒，最多 "
+        f"{rendered_policy['max_iterations']} 轮；任务并发 "
+        f"{rendered_policy['task_concurrency']}",
+        f"- 生成：temperature={rendered_policy['generation_temperature']}，max_tokens="
+        f"{rendered_policy['generation_max_tokens']}；每个 `(group, task)` 最多 "
+        f"{rendered_policy['generation_max_attempts']} 次 generation attempt",
+        f"- Judge：`{rendered_policy['judge_model']}`，"
+        f"{rendered_policy['judge_repeats']} repeats，Judge 并发 "
+        f"{rendered_policy['judge_concurrency']}，单 criterion/repeat 最多 "
+        f"{rendered_policy['judge_max_attempts']} 次 attempt",
+        f"- Web：本地 `web_search`/`web_fetch`，provider="
+        f"`{rendered_policy['web_search_provider']}`，search max_results="
+        f"{rendered_policy['web_search_max_results']}，fetch max_content_tokens="
+        f"{rendered_policy['web_fetch_max_content_tokens']}；严格屏蔽 "
         "`hf.co`、`huggingface.co`、`datasets-server.huggingface.co`、"
         "`github.com`、`raw.githubusercontent.com`、`openrouter.ai`、"
         "`perplexity.ai`、`research.perplexity.ai`",
@@ -12128,16 +12878,17 @@ def experiment_results_markdown(
         "- 结果选择：最后一个严格有效 generation，并采用该 generation 的最新兼容修复行",
         "- 完成标准：Judge 必须 `score_status=complete`、无 Judge error、存在 `quality_total`",
         *(
-            [
-                "- B2：至少 2 个 usable/degraded proposer，最终答案必须由 "
-                "aggregator 请求绑定"
-            ]
+            ["- B2：至少 2 个 usable/degraded proposer，最终答案必须由 aggregator 请求绑定"]
             if "B2" in ensemble_groups
             else []
         ),
         *(
             [
                 "- G1：正式 provider-native recovery quorum 固定为 2，"
+                f"backup={proposer_recovery['configured_backup_count']}，"
+                f"最多追加 {proposer_recovery['max_additional_physical_requests']} 个物理请求；"
+                f"aggregator recovery={aggregator_recovery['aggregator_recovery_mode']}/"
+                f"top-{aggregator_recovery['aggregator_recovery_top_k']}；"
                 "最终答案必须由 aggregator 请求绑定"
             ]
             if "G1" in ensemble_groups
@@ -12614,6 +13365,7 @@ def final_audit(
     selected_cost_reconciliation: Mapping[str, Any],
     judge_attempt_evidence_audit: Mapping[str, Any],
     max_attempts: int,
+    experiment_policy: FinalizerExperimentPolicy | None = None,
     warnings: Sequence[Any] = (),
 ) -> dict[str, Any]:
     expected = {(group, str(task["id"])) for task in tasks for group in groups}
@@ -12635,6 +13387,20 @@ def final_audit(
         if judge_reasons(
             row,
             task=tasks_by_id.get(str(row.get("task_id") or "")),
+            judge_model=(
+                experiment_policy.judge_model if experiment_policy is not None else JUDGE_MODEL
+            ),
+            judge_repeats=(
+                experiment_policy.judge_repeats if experiment_policy is not None else JUDGE_REPEATS
+            ),
+            judge_max_attempts=(
+                experiment_policy.judge_max_attempts
+                if experiment_policy is not None
+                else JUDGE_ATTEMPT_BUDGET_LIMIT
+            ),
+            judge_provider_pin=(
+                experiment_policy.judge_provider_pin if experiment_policy is not None else None
+            ),
         )
     ]
     execution_pass = (
@@ -12662,9 +13428,7 @@ def final_audit(
     published_warnings: list[str] = []
     for warning in warnings:
         if isinstance(warning, Mapping):
-            published_warnings.append(
-                json.dumps(warning, ensure_ascii=False, sort_keys=True)
-            )
+            published_warnings.append(json.dumps(warning, ensure_ascii=False, sort_keys=True))
         else:
             published_warnings.append(str(warning))
     published_warnings.extend(str(value) for value in proof.get("warnings") or [])
@@ -12683,13 +13447,10 @@ def final_audit(
         published_warnings.append("OpenRouter non-BYOK policy proof did not pass")
     if not reconciliation_pass:
         published_warnings.append(
-            "cost/account reconciliation is not exact: "
-            f"{reconciliation.get('status') or 'unknown'}"
+            f"cost/account reconciliation is not exact: {reconciliation.get('status') or 'unknown'}"
         )
     if strict_judge_failures:
-        published_warnings.append(
-            f"Judge contract failures: {strict_judge_failures}"
-        )
+        published_warnings.append(f"Judge contract failures: {strict_judge_failures}")
     published_warnings = list(dict.fromkeys(published_warnings))
     audit = {
         "schema": AUDIT_SCHEMA,
@@ -12823,20 +13584,32 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lock-fd", type=int, default=9)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--groups", default=",".join(GROUPS))
-    parser.add_argument("--max-generation-attempts", type=int, default=3)
+    parser.add_argument(
+        "--max-generation-attempts",
+        type=int,
+        default=None,
+        help=(
+            "Optional assertion; when supplied it must equal the generation "
+            "attempt limit authenticated by the run contracts."
+        ),
+    )
     parser.add_argument(
         "--expected-task-concurrency",
         type=int,
         default=FORMAL_TASK_CONCURRENCY,
         help="Expected generation task concurrency recorded by every source manifest.",
     )
+    parser.add_argument(
+        "--expected-judge-concurrency",
+        type=int,
+        default=FORMAL_JUDGE_CONCURRENCY,
+        help="Expected Judge concurrency recorded by every source manifest.",
+    )
     return parser
 
 
 def run_finalization(args: argparse.Namespace) -> dict[str, Any]:
     groups = normalize_groups(args.groups)
-    if args.max_generation_attempts != 3:
-        raise FinalizationError("formal campaign generation limit must be exactly 3")
     expected_task_concurrency = getattr(
         args,
         "expected_task_concurrency",
@@ -12848,16 +13621,23 @@ def run_finalization(args: argparse.Namespace) -> dict[str, Any]:
         or expected_task_concurrency < 1
     ):
         raise FinalizationError("expected task concurrency must be a positive integer")
+    expected_judge_concurrency = getattr(
+        args,
+        "expected_judge_concurrency",
+        FORMAL_JUDGE_CONCURRENCY,
+    )
+    if (
+        isinstance(expected_judge_concurrency, bool)
+        or not isinstance(expected_judge_concurrency, int)
+        or expected_judge_concurrency < 1
+    ):
+        raise FinalizationError("expected judge concurrency must be a positive integer")
     input_path = require_regular_file(args.input, owner_only=False)
     tasks = read_tasks(input_path)
     frozen_input_sha256 = validate_frozen_draco_input(input_path, tasks)
     source_records, source_snapshots = read_source_rows(args.result)
     unexpected_source_groups = sorted(
-        {
-            record.key[0]
-            for record in source_records
-            if record.key[0] not in set(groups)
-        }
+        {record.key[0] for record in source_records if record.key[0] not in set(groups)}
     )
     if unexpected_source_groups:
         raise FinalizationError(
@@ -12866,8 +13646,7 @@ def run_finalization(args: argparse.Namespace) -> dict[str, Any]:
         )
     source_policy_findings = validate_source_policy_history(source_records)
     finalization_warnings: list[Any] = [
-        {"kind": "source_policy_finding", **finding}
-        for finding in source_policy_findings
+        {"kind": "source_policy_finding", **finding} for finding in source_policy_findings
     ]
     critical_source_snapshots = dict(source_snapshots)
     for raw_path in (
@@ -12893,15 +13672,12 @@ def run_finalization(args: argparse.Namespace) -> dict[str, Any]:
         ):
             source_path = require_regular_file(Path(prior_dir) / name, owner_only=True)
             critical_source_snapshots[str(source_path)] = file_sha256(source_path)
-    attempt_evidence_audit = validate_generation_attempt_evidence(
-        source_records,
-        max_attempts=args.max_generation_attempts,
-    )
     fingerprints, contracts, runtime_key, manifest_sources = load_manifest_contracts(
         args.manifest,
         result_paths=args.result,
         groups=groups,
         expected_task_concurrency=expected_task_concurrency,
+        expected_judge_concurrency=expected_judge_concurrency,
     )
     finalization_warnings.extend(
         {
@@ -12912,7 +13688,18 @@ def run_finalization(args: argparse.Namespace) -> dict[str, Any]:
         for source in manifest_sources
         for warning in source.get("audit_warnings") or []
     )
-    validate_formal_campaign_contracts(contracts, groups=groups)
+    experiment_policy = validate_formal_campaign_contracts(
+        contracts,
+        groups=groups,
+    )
+    max_generation_attempts = authenticated_generation_attempt_limit(
+        getattr(args, "max_generation_attempts", None),
+        experiment_policy,
+    )
+    attempt_evidence_audit = validate_generation_attempt_evidence(
+        source_records,
+        max_attempts=max_generation_attempts,
+    )
     if "G1" in groups:
         validate_g1_paid_attempt_plan_history(
             source_records,
@@ -12929,7 +13716,12 @@ def run_finalization(args: argparse.Namespace) -> dict[str, Any]:
         )
     )
     try:
-        judge_attempt_evidence_audit = validate_judge_attempt_evidence(source_records)
+        judge_attempt_evidence_audit = validate_judge_attempt_evidence(
+            source_records,
+            judge_model=experiment_policy.judge_model,
+            judge_max_attempts=experiment_policy.judge_max_attempts,
+            judge_provider_pin=experiment_policy.judge_provider_pin,
+        )
     except FinalizationError as exc:
         if not judge_evidence_error_is_audit_only(exc):
             raise
@@ -12938,16 +13730,15 @@ def run_finalization(args: argparse.Namespace) -> dict[str, Any]:
             "pass": False,
             "warning": str(exc),
         }
-        finalization_warnings.append(
-            {"kind": "judge_attempt_audit_conflict", "warning": str(exc)}
-        )
+        finalization_warnings.append({"kind": "judge_attempt_audit_conflict", "warning": str(exc)})
     selected, pair_audit = select_results(
         source_records,
         tasks=tasks,
         groups=groups,
         fingerprints=fingerprints,
         contracts=contracts,
-        max_attempts=args.max_generation_attempts,
+        max_attempts=max_generation_attempts,
+        experiment_policy=experiment_policy,
         manifest_sources=manifest_sources,
     )
     selected_attempt_bindings = bind_selected_generation_attempts(
@@ -12960,6 +13751,7 @@ def run_finalization(args: argparse.Namespace) -> dict[str, Any]:
         source_records,
         selected=selected,
         selected_attempt_bindings=selected_attempt_bindings,
+        judge_model=experiment_policy.judge_model,
     )
     attach_retrospective_recovery_spend(pair_audit, ledger_rows)
     model_metrics = ledger_model_metrics(ledger_rows)
@@ -12992,9 +13784,7 @@ def run_finalization(args: argparse.Namespace) -> dict[str, Any]:
             ledger_rows=ledger_rows,
             ledger_summary=ledger_summary,
         )
-        finalization_warnings.append(
-            {"kind": "account_proof_audit_conflict", "warning": str(exc)}
-        )
+        finalization_warnings.append({"kind": "account_proof_audit_conflict", "warning": str(exc)})
     inherited_policy_warnings = [
         *(
             "source history policy finding: "
@@ -13085,7 +13875,8 @@ def run_finalization(args: argparse.Namespace) -> dict[str, Any]:
         selected_attempt_bindings=selected_attempt_bindings,
         selected_cost_reconciliation=selected_cost_reconciliation,
         judge_attempt_evidence_audit=judge_attempt_evidence_audit,
-        max_attempts=args.max_generation_attempts,
+        max_attempts=max_generation_attempts,
+        experiment_policy=experiment_policy,
         warnings=finalization_warnings,
     )
     audit["generation_attempt_evidence_schema"] = GENERATION_ATTEMPT_EVIDENCE_SCHEMA
@@ -13109,6 +13900,9 @@ def run_finalization(args: argparse.Namespace) -> dict[str, Any]:
         model_metrics=model_metrics,
         rubric_metrics=rubric_metrics,
         repair_details=repair_details,
+        experiment_policy=experiment_policy,
+        expected_task_concurrency=expected_task_concurrency,
+        expected_judge_concurrency=expected_judge_concurrency,
     )
     manifest_base = {
         "schema": MANIFEST_SCHEMA,
@@ -13140,7 +13934,15 @@ def run_finalization(args: argparse.Namespace) -> dict[str, Any]:
         ],
         "source_manifests": manifest_sources,
         "run_compatibility_fingerprints": fingerprints,
-        "max_generation_attempts": args.max_generation_attempts,
+        "max_generation_attempts": max_generation_attempts,
+        "experiment_policy": {
+            "global_experiment_profile": experiment_policy.profile,
+            "aggregator_recovery": experiment_policy.aggregator_recovery,
+            "proposer_recovery": experiment_policy.proposer_recovery,
+            "judge_provider_pin": experiment_policy.judge_provider_pin,
+            "task_concurrency": expected_task_concurrency,
+            "judge_concurrency": expected_judge_concurrency,
+        },
         "generation_attempt_evidence_schema": GENERATION_ATTEMPT_EVIDENCE_SCHEMA,
         "judge_attempt_evidence_schema": JUDGE_ATTEMPT_EVIDENCE_SCHEMA,
         "judge_attempt_evidence": judge_attempt_evidence_audit,

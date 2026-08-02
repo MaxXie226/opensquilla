@@ -9,6 +9,7 @@ import json
 import os
 import re
 import tempfile
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -30,7 +31,7 @@ ROUTE_PREFLIGHT_SCHEMAS = frozenset(
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_EXPERIMENT_CONFIG_PATH = ROOT / "configs" / "benchmarks" / "draco_b2_g12.json"
 FORMAL_GROUP_ORDER = ("B0", "B1", "B2", "B4", "G1")
-TASK_ANALYZER_MODEL = "anthropic/claude-opus-4.8"
+B0_MODEL = "anthropic/claude-opus-4.8"
 B2_EXPECTED_ROUTES = {
     "deepseek/deepseek-v4-pro": "deepseek",
     "z-ai/glm-5.2": "z-ai",
@@ -39,7 +40,7 @@ B2_EXPECTED_ROUTES = {
     "google/gemini-3.1-pro-preview": "google-ai-studio",
 }
 FIXED_GROUP_ROUTES = {
-    "B0": {TASK_ANALYZER_MODEL: "anthropic"},
+    "B0": {B0_MODEL: "anthropic"},
     "B4": {"openai/gpt-5.5": "openai"},
 }
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
@@ -240,8 +241,15 @@ def _formal_registry_snapshot(contract: Any) -> dict[str, Any]:
     raise ValueError("experiment config G1 registry snapshot hash differs")
 
 
-def _resolved_g1_contract(config_path: Path) -> tuple[Any, dict[str, Any]]:
-    experiment = load_draco_experiment_config(config_path).config
+def _resolved_g1_contract(
+    config_path: Path,
+    *,
+    inline_overlay_json: str | None = None,
+) -> tuple[Any, dict[str, Any]]:
+    experiment = load_draco_experiment_config(
+        config_path,
+        inline_overlay_json=inline_overlay_json,
+    ).config
     contract = experiment.g1_routing
     if contract is None:
         raise ValueError("experiment config lacks the G1 contract")
@@ -278,6 +286,72 @@ def _resolved_g1_contract(config_path: Path) -> tuple[Any, dict[str, Any]]:
         "expected_routes_sha256": canonical_sha256(routes),
         "reasoning_ineligible_models": sorted(reasoning_ineligible_models),
     }
+
+
+def _effective_proposer_max(ranking_config: Mapping[str, Any]) -> int:
+    proposer_count = ranking_config.get("proposer_count")
+    by_tier = proposer_count.get("by_tier") if isinstance(proposer_count, Mapping) else None
+    high_risk = proposer_count.get("high_risk") if isinstance(proposer_count, Mapping) else None
+    try:
+        return max(
+            *(int(row["max"]) for row in by_tier.values() if isinstance(row, Mapping)),
+            int(high_risk["max"]),
+        )
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        raise ValueError("frozen ranking proposer bounds are malformed") from exc
+
+
+def _effective_backup_count(ranking_config: Mapping[str, Any]) -> int:
+    proposer_count = ranking_config.get("proposer_count")
+    raw = proposer_count.get("backup_count") if isinstance(proposer_count, Mapping) else None
+    if isinstance(raw, bool) or not isinstance(raw, int) or not 0 <= raw <= 2:
+        raise ValueError("frozen ranking proposer backup_count must be between 0 and 2")
+    return raw
+
+
+def _effective_ranking_resolution(experiment: Any) -> dict[str, Any]:
+    """Resolve and authenticate the ranking policy used by runner/finalizer."""
+
+    from opensquilla.provider.ranking_router import ranking_config_resolution
+
+    resolution = ranking_config_resolution(
+        override=(experiment.router_dynamic_ranking_override or None),
+    )
+    contract = experiment.g1_routing
+    if contract is None:
+        return resolution
+    base = resolution.get("base_config")
+    if not isinstance(base, Mapping):
+        raise ValueError("route preflight lacks a frozen baseline ranking config")
+    if (
+        base.get("schema_version") != contract.expected_ranking_config_schema_version
+        or base.get("config_version") != contract.expected_ranking_config_version
+        or resolution.get("base_sha256") != contract.expected_ranking_config_sha256
+    ):
+        raise ValueError("baseline ranking config differs from the G1 contract")
+    if _effective_proposer_max(base) != contract.expected_proposer_count_max:
+        raise ValueError("baseline proposer maximum differs from the G1 contract")
+    return resolution
+
+
+def _resolved_task_analyzer_policy(
+    ranking_resolution: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Derive analyzer identity from the authenticated effective ranking policy."""
+
+    from opensquilla.provider.ranking_router import task_analyzer_policy
+
+    effective = ranking_resolution.get("effective_config")
+    if not isinstance(effective, Mapping):
+        raise ValueError("route preflight lacks a frozen effective ranking config")
+    policy = task_analyzer_policy(effective)
+    if policy.get("provider") != "openrouter":
+        raise ValueError("route preflight task analyzer must use OpenRouter")
+    if policy.get("upstream_provider") == "auto":
+        raise ValueError(
+            "route preflight task analyzer upstream provider must be explicitly pinned"
+        )
+    return dict(policy)
 
 
 _, _DEFAULT_RESOLVED_G1_CONTRACT = _resolved_g1_contract(DEFAULT_EXPERIMENT_CONFIG_PATH)
@@ -419,6 +493,7 @@ def _required_fixed_route_specs(
     experiment: Any,
     groups: tuple[str, ...],
     proposer_required_parameters: dict[str, list[str]],
+    ranking_resolution: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, str], dict[str, list[str]]]:
     routes: dict[str, str] = {}
     parameters: dict[str, set[str]] = {}
@@ -440,8 +515,11 @@ def _required_fixed_route_specs(
             add(model, provider, B2_REQUIRED_PARAMETERS[model])
     if "G1" in groups:
         judge_model = str(experiment.judge.model).strip().lower()
+        analyzer_policy = _resolved_task_analyzer_policy(
+            ranking_resolution or _effective_ranking_resolution(experiment)
+        )
         for model, provider in {
-            TASK_ANALYZER_MODEL: "anthropic",
+            str(analyzer_policy["model"]): str(analyzer_policy["upstream_provider"]),
             judge_model: "google-ai-studio",
         }.items():
             if model not in proposer_required_parameters:
@@ -452,15 +530,28 @@ def _required_fixed_route_specs(
     }
 
 
-def _required_role_capacity(experiment: Any, groups: tuple[str, ...]) -> tuple[int, int]:
+def _required_role_capacity(
+    experiment: Any,
+    groups: tuple[str, ...],
+    *,
+    ranking_resolution: Mapping[str, Any] | None = None,
+) -> tuple[int, int]:
     if "G1" not in groups:
         return 0, 0
     g1 = experiment.g1_routing
     if g1 is None:
         raise ValueError("route preflight v3 requires a G1 routing contract")
+    resolution = (
+        dict(ranking_resolution)
+        if ranking_resolution is not None
+        else _effective_ranking_resolution(experiment)
+    )
+    ranking_config = resolution.get("effective_config")
+    if not isinstance(ranking_config, Mapping):
+        raise ValueError("route preflight lacks a frozen effective ranking config")
     return (
-        int(g1.expected_proposer_count_max)
-        + int(experiment.ensemble.proposer_backup_count)
+        _effective_proposer_max(ranking_config)
+        + _effective_backup_count(ranking_config)
         + int(experiment.ensemble.aggregator_recovery_top_k),
         int(experiment.ensemble.aggregator_recovery_top_k),
     )
@@ -583,11 +674,112 @@ def validate_route_preflight_payload(
         raise ValueError(f"{label} route preflight v2 experiment config is unavailable")
     if file_sha256(config_path) != experiment_config_sha256:
         raise ValueError(f"{label} route preflight v2 experiment config changed")
+    inline_overlay = experiment_evidence.get("inline_overlay")
+    inline_overlay_sha256 = experiment_evidence.get("inline_overlay_sha256")
+    effective_evidence = experiment_evidence.get("effective_config")
+    effective_config_path: Path | None = None
+    if effective_evidence is not None:
+        if not isinstance(effective_evidence, dict):
+            raise ValueError(f"{label} route preflight effective config evidence is invalid")
+        effective_path_raw = effective_evidence.get("path")
+        effective_sha256 = effective_evidence.get("sha256")
+        if (
+            not isinstance(effective_path_raw, str)
+            or not Path(effective_path_raw).is_absolute()
+            or not isinstance(effective_sha256, str)
+            or not HEX64.fullmatch(effective_sha256)
+        ):
+            raise ValueError(f"{label} route preflight effective config evidence is invalid")
+        effective_config_path = Path(effective_path_raw)
+        if effective_config_path.is_symlink() or not effective_config_path.is_file():
+            raise ValueError(f"{label} route preflight effective config is unavailable")
+        if effective_config_path.stat().st_mode & 0o077:
+            raise ValueError(f"{label} route preflight effective config is not private")
+        try:
+            effective_document = json.loads(effective_config_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"{label} route preflight effective config is invalid"
+            ) from exc
+        if (
+            not isinstance(effective_document, dict)
+            or canonical_sha256(effective_document) != effective_sha256
+        ):
+            raise ValueError(f"{label} route preflight effective config hash differs")
+    if inline_overlay is None:
+        if inline_overlay_sha256 is not None and (
+            not isinstance(inline_overlay_sha256, str)
+            or not HEX64.fullmatch(inline_overlay_sha256)
+        ):
+            raise ValueError(f"{label} route preflight experiment overlay hash differs")
+        inline_overlay_json = None
+    else:
+        if not isinstance(inline_overlay, dict):
+            raise ValueError(f"{label} route preflight experiment overlay is invalid")
+        if (
+            not isinstance(inline_overlay_sha256, str)
+            or not HEX64.fullmatch(inline_overlay_sha256)
+            or canonical_sha256(inline_overlay) != inline_overlay_sha256
+        ):
+            raise ValueError(f"{label} route preflight experiment overlay hash differs")
+        inline_overlay_json = json.dumps(
+            inline_overlay,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    if (
+        inline_overlay is None
+        and inline_overlay_sha256 is not None
+        and effective_config_path is None
+    ):
+        raise ValueError(f"{label} route preflight effective config evidence is missing")
+    experiment_source_path = effective_config_path or config_path
     try:
-        experiment = load_draco_experiment_config(config_path).config
-        g1_contract, resolved_contract = _resolved_g1_contract(config_path)
+        experiment = load_draco_experiment_config(
+            experiment_source_path,
+            inline_overlay_json=(inline_overlay_json if effective_config_path is None else None),
+        ).config
+        g1_contract, resolved_contract = _resolved_g1_contract(
+            experiment_source_path,
+            inline_overlay_json=(inline_overlay_json if effective_config_path is None else None),
+        )
+        ranking_resolution = _effective_ranking_resolution(experiment)
+        analyzer_policy = _resolved_task_analyzer_policy(ranking_resolution)
     except (OSError, ValueError) as exc:
         raise ValueError(f"{label} route preflight v2 experiment config is invalid: {exc}") from exc
+    frozen_ranking_resolution = payload.get("ranking_config_resolution")
+    requires_frozen_ranking_resolution = bool(
+        inline_overlay_sha256 is not None or experiment.router_dynamic_ranking_override
+    )
+    if frozen_ranking_resolution is None:
+        if requires_frozen_ranking_resolution:
+            raise ValueError(f"{label} route preflight lacks frozen ranking resolution")
+    elif (
+        not isinstance(frozen_ranking_resolution, dict)
+        or frozen_ranking_resolution != ranking_resolution
+    ):
+        raise ValueError(f"{label} route preflight frozen ranking resolution differs")
+    effective_ranking_config = ranking_resolution.get("effective_config")
+    effective_task_analyzer = (
+        effective_ranking_config.get("task_analyzer")
+        if isinstance(effective_ranking_config, Mapping)
+        else None
+    )
+    current_analyzer_policy = isinstance(effective_task_analyzer, Mapping) and all(
+        field in effective_task_analyzer
+        for field in ("provider", "model", "upstream_provider", "stream_close_timeout_seconds")
+    )
+    frozen_analyzer_policy = payload.get("task_analyzer")
+    if frozen_analyzer_policy is None:
+        if current_analyzer_policy:
+            raise ValueError(f"{label} route preflight lacks frozen task analyzer policy")
+    elif (
+        not isinstance(frozen_analyzer_policy, dict)
+        or frozen_analyzer_policy != analyzer_policy
+    ):
+        raise ValueError(f"{label} route preflight frozen task analyzer policy differs")
     if g1_contract.selection_mode != "router_dynamic":
         raise ValueError(f"{label} route preflight v2 G1 selection mode differs")
     candidate_scope = str(resolved_contract["candidate_scope"])
@@ -791,7 +983,9 @@ def validate_route_preflight_payload(
             raise ValueError(f"{label} route preflight v3 availability summary differs")
 
         required_proposer_count, required_aggregator_count = _required_role_capacity(
-            experiment, groups
+            experiment,
+            groups,
+            ranking_resolution=ranking_resolution,
         )
         if candidate_scope == "exact_routes":
             required_proposer_count = len(expected_routes)
@@ -814,6 +1008,7 @@ def validate_route_preflight_payload(
             experiment=experiment,
             groups=groups,
             proposer_required_parameters=proposer_required_parameters,
+            ranking_resolution=ranking_resolution,
         )
         fixed_contract = {
             model: {
@@ -899,6 +1094,7 @@ def validate_route_preflight_payload(
             raise ValueError(f"{label} route preflight v3 fixed routes did not pass")
         v3_contract = {
             "groups": list(groups),
+            **({"task_analyzer": analyzer_policy} if frozen_analyzer_policy is not None else {}),
             "availability_policy": expected_availability_policy,
             "required_fixed_routes_sha256": fixed_routes_sha256,
             "required_proposer_compatible_candidate_count": required_proposer_count,
@@ -913,6 +1109,8 @@ def validate_route_preflight_payload(
         "expected_routes_sha256": expected_routes_sha256,
         "expected_candidate_count": candidate_count,
         "experiment_config_sha256": experiment_config_sha256,
+        "experiment_config_inline_overlay_sha256": inline_overlay_sha256,
+        "ranking_config_effective_sha256": ranking_resolution["effective_sha256"],
         "g1_routing_profile_id": profile_id,
         "source_registry_snapshot_version": source_version,
         **v3_contract,

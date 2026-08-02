@@ -19,6 +19,7 @@ from opensquilla.provider.ranking_router import (
     TaskAnalysisResult,
     TaskAnalyzerStreamCleanupError,
     fallback_task_profile,
+    ranking_config_snapshot,
 )
 from opensquilla.provider.selector import ProviderConfig
 from opensquilla.provider.tree_baseline_router import TreeBaselineError
@@ -771,9 +772,94 @@ def test_router_dynamic_task_analyzer_resolution_failure_uses_local_fallback(
     provider = runner._router_dynamic_task_analyzer_provider(
         ProviderConfig(provider="groq", model="base-model", api_key="fake"),
         session_key="agent:main:analyzer-resolution-failure",
+        ranking_config=ranking_config_snapshot(),
     )
 
     assert provider is None
+
+
+def test_router_dynamic_task_analyzer_rejects_misbound_resolver_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "opensquilla.engine.selector_override.resolve_tier_provider_config",
+        lambda *_args, **_kwargs: ProviderConfig(
+            provider="anthropic",
+            model=TASK_ANALYZER_MODEL_ID,
+            api_key="anthropic-key",
+        ),
+    )
+    runner = TurnRunner(
+        provider_selector=None,
+        config=GatewayConfig(
+            llm={"provider": "groq", "model": "base-model", "api_key": "groq-key"},
+            squilla_router=SquillaRouterConfig(enabled=False),
+            llm_ensemble={"enabled": True, "selection_mode": "router_dynamic"},
+        ),
+    )
+
+    provider = runner._router_dynamic_task_analyzer_provider(
+        ProviderConfig(provider="groq", model="base-model", api_key="groq-key"),
+        session_key="agent:main:misbound-analyzer-credential",
+        ranking_config=ranking_config_snapshot(),
+    )
+
+    assert provider is None
+
+
+def test_router_dynamic_task_analyzer_uses_frozen_override_and_upstream_pin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[ProviderConfig] = []
+    sentinel = object()
+
+    def capture_resolution(selector: Any) -> object:
+        captured.append(selector.current_config)
+        return sentinel
+
+    monkeypatch.setattr(
+        "opensquilla.provider.selector.ModelSelector.resolve",
+        capture_resolution,
+    )
+    config = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "deepseek/deepseek-v4-pro",
+            "api_key": "openrouter-key",
+            "base_url": "https://openrouter.ai/api/v1",
+        },
+        llm_ensemble={
+            "enabled": True,
+            "selection_mode": "router_dynamic",
+            "ranking_config_override": {
+                "task_analyzer": {
+                    "model": "openai/gpt-5.5",
+                    "upstream_provider": "openai",
+                }
+            },
+        },
+    )
+    ranking_config = config.llm_ensemble.ranking_config_effective_snapshot()
+    runner = TurnRunner(provider_selector=None, config=config)
+
+    provider = runner._router_dynamic_task_analyzer_provider(
+        ProviderConfig(
+            provider="openrouter",
+            model="deepseek/deepseek-v4-pro",
+            api_key="openrouter-key",
+            base_url="https://openrouter.ai/api/v1",
+        ),
+        session_key="agent:main:analyzer-override",
+        ranking_config=ranking_config,
+    )
+
+    assert provider is sentinel
+    assert len(captured) == 1
+    assert captured[0].provider == "openrouter"
+    assert captured[0].model == "openai/gpt-5.5"
+    assert captured[0].api_key == "openrouter-key"
+    assert captured[0].provider_routing["openai/gpt-5.5"] == "openai"
+    assert captured[0].replay_provider_state is False
 
 
 async def test_router_dynamic_carries_the_previous_route_into_the_next_turn(
@@ -1125,15 +1211,14 @@ async def test_router_dynamic_unbounded_candidates_fail_open_before_analysis(
 async def test_router_dynamic_config_load_failure_fails_open_before_analysis(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def fail_config_load(
-        *,
-        thinking_assignment_enabled: bool = True,
-    ) -> dict[str, Any]:
-        del thinking_assignment_enabled
+    def fail_config_load(_self: Any) -> dict[str, Any]:
         raise DynamicRankingError("ranking config is malformed")
 
     monkeypatch.setattr(
-        "opensquilla.provider.ranking_router.ranking_config_snapshot",
+        (
+            "opensquilla.gateway.config.LlmEnsembleConfig."
+            "ranking_config_resolution_snapshot"
+        ),
         fail_config_load,
     )
     runner = TurnRunner(

@@ -5,15 +5,29 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+FORMAL_DRACO_OPENROUTER_PROVIDER = "openrouter"
+FORMAL_DRACO_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+FORMAL_DRACO_OPENROUTER_API_KEY_ENV = "OPENROUTER_API_KEY"
+FORMAL_DRACO_WEB_SEARCH_API_KEY_ENVS = {
+    "brave": "BRAVE_SEARCH_API_KEY",
+    "duckduckgo": "",
+}
+
 
 class _StrictConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        allow_inf_nan=False,
+        hide_input_in_errors=True,
+    )
 
 
 class DracoReferenceConfig(_StrictConfig):
@@ -132,7 +146,10 @@ class DracoEnsembleMemberConfig(_StrictConfig):
     label: str = Field(min_length=1)
     provider: str = Field(min_length=1)
     model: str = Field(min_length=1)
-    api_key_env: str = ""
+    api_key_env: str = Field(
+        default="",
+        pattern=r"^(?:[A-Za-z_][A-Za-z0-9_]*)?$",
+    )
     base_url: str = ""
     temperature: float | None
     max_tokens: int = Field(gt=0)
@@ -155,7 +172,10 @@ class DracoEnsembleConfig(_StrictConfig):
     aggregator_recovery_top_k: int = Field(default=3, ge=1, le=3)
     aggregator_max_tokens_cap: int = Field(default=65_536, ge=2)
     aggregator_visible_answer_reserve_tokens: int = Field(default=8_192, ge=1)
-    proposer_backup_count: int = Field(default=0, ge=0, le=2)
+    # Read-only compatibility for archived experiment overlays. The effective
+    # proposer backup roster now comes exclusively from ranking config and this
+    # legacy input must not reappear in frozen experiment artifacts.
+    proposer_backup_count: int = Field(default=0, ge=0, le=2, exclude=True)
     proposer_recovery_max_additional_calls: int = Field(default=0, ge=0, le=3)
     proposer_max_tokens_cap: int = Field(default=65_536, ge=2)
     proposer_visible_answer_reserve_tokens: int = Field(default=4_096, ge=1)
@@ -232,7 +252,10 @@ class DracoGenerationConfig(_StrictConfig):
 
 class DracoWebSearchConfig(_StrictConfig):
     provider: Literal["brave", "duckduckgo"]
-    api_key_env: str
+    api_key_env: str = Field(
+        default="",
+        pattern=r"^(?:[A-Za-z_][A-Za-z0-9_]*)?$",
+    )
     max_results: int = Field(gt=0)
 
 
@@ -264,12 +287,63 @@ class DracoExperimentConfig(_StrictConfig):
     benchmark_input: DracoBenchmarkInputConfig
     routing: DracoRoutingConfig
     g1_routing: DracoG1RoutingConfig | None = None
+    router_dynamic_ranking_override: dict[str, Any] = Field(default_factory=dict)
     ensemble: DracoEnsembleConfig
     timeouts: DracoTimeoutConfig
     runner: DracoRunnerConfig
     generation: DracoGenerationConfig
     tools: DracoToolsConfig
     judge: DracoJudgeConfig
+
+    @model_validator(mode="after")
+    def _validate_ranking_config_override(self) -> DracoExperimentConfig:
+        """Keep only a detached override that passed the full ranking schema."""
+
+        if not self.router_dynamic_ranking_override:
+            return self
+        from opensquilla.provider.ranking_router import ranking_config_resolution
+
+        resolution = ranking_config_resolution(
+            override=self.router_dynamic_ranking_override,
+        )
+        normalized = resolution.get("override")
+        if not isinstance(normalized, dict) or not normalized:
+            raise ValueError(
+                "router_dynamic_ranking_override did not resolve to a non-empty object"
+            )
+        object.__setattr__(
+            self,
+            "router_dynamic_ranking_override",
+            copy.deepcopy(normalized),
+        )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_legacy_proposer_backup_count(self) -> DracoExperimentConfig:
+        """Reject a legacy backup value that disagrees with ranking policy."""
+
+        if "proposer_backup_count" not in self.ensemble.model_fields_set:
+            return self
+        from opensquilla.provider.ranking_router import ranking_config_resolution
+
+        resolution = ranking_config_resolution(
+            override=(self.router_dynamic_ranking_override or None),
+        )
+        effective = resolution.get("effective_config")
+        proposer_count = (
+            effective.get("proposer_count") if isinstance(effective, dict) else None
+        )
+        ranking_backup_count = (
+            proposer_count.get("backup_count")
+            if isinstance(proposer_count, dict)
+            else None
+        )
+        if self.ensemble.proposer_backup_count != ranking_backup_count:
+            raise ValueError(
+                "ensemble.proposer_backup_count is a legacy compatibility input and "
+                "must match router_dynamic_ranking_override.proposer_count.backup_count"
+            )
+        return self
 
     @model_validator(mode="after")
     def _validate_thinking_policy(self) -> DracoExperimentConfig:
@@ -289,13 +363,90 @@ class DracoExperimentConfig(_StrictConfig):
         return self
 
 
+def validate_formal_draco_ensemble_member_binding(
+    member: DracoEnsembleMemberConfig,
+    *,
+    field_path: str = "ensemble member",
+) -> None:
+    """Reject provider settings that could redirect a formal DRACO credential."""
+
+    if member.provider.strip().casefold() != FORMAL_DRACO_OPENROUTER_PROVIDER:
+        raise ValueError(f"formal DRACO requires {field_path}.provider=openrouter")
+    allowed_base_urls = {
+        "",
+        FORMAL_DRACO_OPENROUTER_BASE_URL,
+        f"{FORMAL_DRACO_OPENROUTER_BASE_URL}/",
+    }
+    if member.base_url not in allowed_base_urls:
+        raise ValueError(
+            f"formal DRACO requires {field_path}.base_url to be empty or the official "
+            "OpenRouter endpoint"
+        )
+    if member.api_key_env not in {"", FORMAL_DRACO_OPENROUTER_API_KEY_ENV}:
+        raise ValueError(
+            f"formal DRACO requires {field_path}.api_key_env to be empty or "
+            f"{FORMAL_DRACO_OPENROUTER_API_KEY_ENV}"
+        )
+
+
+def validate_formal_draco_credential_bindings(config: DracoExperimentConfig) -> None:
+    """Fail closed before formal DRACO resolves any member or search credential."""
+
+    for index, member in enumerate(config.ensemble.proposers):
+        validate_formal_draco_ensemble_member_binding(
+            member,
+            field_path=f"ensemble.proposers.{index}",
+        )
+    validate_formal_draco_ensemble_member_binding(
+        config.ensemble.aggregator,
+        field_path="ensemble.aggregator",
+    )
+
+    search = config.tools.web_search
+    expected_env = FORMAL_DRACO_WEB_SEARCH_API_KEY_ENVS[search.provider]
+    if search.api_key_env != expected_env:
+        requirement = expected_env or "an empty api_key_env"
+        raise ValueError(
+            "formal DRACO requires tools.web_search.api_key_env=" + requirement
+        )
+
+
+def validate_formal_draco_gateway_credential_binding(
+    *,
+    provider: str,
+    base_url: str,
+    api_key_env: str,
+) -> None:
+    """Validate the root provider before its configured credential env is read."""
+
+    if provider.strip().casefold() != FORMAL_DRACO_OPENROUTER_PROVIDER:
+        raise ValueError("formal DRACO requires config.llm.provider=openrouter")
+    if base_url not in {
+        FORMAL_DRACO_OPENROUTER_BASE_URL,
+        f"{FORMAL_DRACO_OPENROUTER_BASE_URL}/",
+    }:
+        raise ValueError(
+            "formal DRACO requires config.llm.base_url to be the official "
+            "OpenRouter endpoint"
+        )
+    if api_key_env not in {"", FORMAL_DRACO_OPENROUTER_API_KEY_ENV}:
+        raise ValueError(
+            "formal DRACO requires config.llm.api_key_env to be empty or "
+            f"{FORMAL_DRACO_OPENROUTER_API_KEY_ENV}"
+        )
+
+
 @dataclass(frozen=True)
 class DracoExperimentConfigBundle:
     config: DracoExperimentConfig
     base_path: Path
+    base_sha256: str
     base_document: dict[str, Any]
     override_documents: tuple[tuple[Path, dict[str, Any]], ...]
+    override_sha256s: tuple[str, ...]
     inline_overrides: tuple[dict[str, Any], ...]
+    inline_overlay_document: dict[str, Any] | None
+    inline_overlay_sha256: str | None
     merged_document: dict[str, Any]
 
     def provenance(self) -> dict[str, Any]:
@@ -303,32 +454,82 @@ class DracoExperimentConfigBundle:
             "precedence": [
                 "base_json",
                 "override_json_in_cli_order",
+                "inline_json_object",
                 "inline_path_overrides_in_cli_order",
             ],
-            "base": _path_provenance(self.base_path),
-            "overrides": [_path_provenance(path) for path, _ in self.override_documents],
-            "inline_overrides": list(self.inline_overrides),
+            "base": {
+                "path": str(self.base_path),
+                "sha256": self.base_sha256,
+            },
+            "overrides": [
+                {
+                    "path": str(path),
+                    "sha256": self.override_sha256s[index],
+                }
+                for index, (path, _) in enumerate(self.override_documents)
+            ],
+            "effective_config_sha256": _canonical_json_sha256(
+                self.config.model_dump(mode="json")
+            ),
+            "inline_overlay": {
+                "present": self.inline_overlay_document is not None,
+                "field_paths": _document_field_paths(self.inline_overlay_document),
+            },
+            "inline_overrides": {
+                "count": len(self.inline_overrides),
+                "paths": [str(item["path"]) for item in self.inline_overrides],
+            },
         }
 
 
-def _path_provenance(path: Path) -> dict[str, Any]:
-    resolved = path.expanduser().resolve()
-    return {
-        "path": str(resolved),
-        "sha256": hashlib.sha256(resolved.read_bytes()).hexdigest(),
-    }
+def _document_field_paths(value: Any, *, prefix: str = "") -> list[str]:
+    if isinstance(value, dict):
+        if not value:
+            return [prefix] if prefix else []
+        paths: list[str] = []
+        for key in sorted(value):
+            child = f"{prefix}.{key}" if prefix else str(key)
+            paths.extend(_document_field_paths(value[key], prefix=child))
+        return paths
+    if isinstance(value, list):
+        if not value:
+            return [prefix] if prefix else []
+        paths = []
+        for index, item in enumerate(value):
+            child = f"{prefix}.{index}" if prefix else str(index)
+            paths.extend(_document_field_paths(item, prefix=child))
+        return paths
+    return [prefix] if prefix else []
 
 
-def load_json_object(path: Path) -> dict[str, Any]:
+def _load_json_object_snapshot(path: Path) -> tuple[dict[str, Any], Path, str]:
     resolved = path.expanduser().resolve()
+    fd: int | None = None
     try:
-        value = json.loads(resolved.read_text(encoding="utf-8"))
+        fd = os.open(resolved, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(fd, "rb") as handle:
+            fd = None
+            raw = handle.read()
     except FileNotFoundError as exc:
         raise ValueError(f"experiment config does not exist: {resolved}") from exc
+    finally:
+        if fd is not None:
+            os.close(fd)
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"experiment config is not valid UTF-8: {resolved}") from exc
+    try:
+        value = json.loads(text)
     except json.JSONDecodeError as exc:
         raise ValueError(f"invalid experiment config JSON {resolved}: {exc}") from exc
     if not isinstance(value, dict):
         raise ValueError(f"experiment config must contain a JSON object: {resolved}")
+    return value, resolved, hashlib.sha256(raw).hexdigest()
+
+
+def load_json_object(path: Path) -> dict[str, Any]:
+    value, _, _ = _load_json_object_snapshot(path)
     return value
 
 
@@ -340,6 +541,16 @@ def _deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]
         else:
             merged[key] = copy.deepcopy(value)
     return merged
+
+
+def _inline_overlay_object(raw: str) -> dict[str, Any]:
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError("--experiment-config-override-json must contain valid JSON") from exc
+    if not isinstance(value, dict):
+        raise ValueError("--experiment-config-override-json must contain a JSON object")
+    return value
 
 
 def _inline_value(raw: str) -> Any:
@@ -381,15 +592,27 @@ def load_draco_experiment_config(
     base_path: Path,
     *,
     override_paths: list[Path] | None = None,
+    inline_overlay_json: str | None = None,
     inline_sets: list[str] | None = None,
 ) -> DracoExperimentConfigBundle:
-    base_document = load_json_object(base_path)
+    base_document, resolved_base_path, base_sha256 = _load_json_object_snapshot(base_path)
     merged = copy.deepcopy(base_document)
     override_documents: list[tuple[Path, dict[str, Any]]] = []
+    override_sha256s: list[str] = []
     for override_path in override_paths or []:
-        document = load_json_object(override_path)
+        document, resolved_override_path, override_sha256 = _load_json_object_snapshot(
+            override_path
+        )
         merged = _deep_merge(merged, document)
-        override_documents.append((override_path.expanduser().resolve(), document))
+        override_documents.append((resolved_override_path, document))
+        override_sha256s.append(override_sha256)
+
+    inline_overlay_document: dict[str, Any] | None = None
+    inline_overlay_sha256: str | None = None
+    if inline_overlay_json is not None:
+        inline_overlay_document = _inline_overlay_object(inline_overlay_json)
+        inline_overlay_sha256 = _canonical_json_sha256(inline_overlay_document)
+        merged = _deep_merge(merged, inline_overlay_document)
 
     inline_overrides: list[dict[str, Any]] = []
     for raw in inline_sets or []:
@@ -403,10 +626,14 @@ def load_draco_experiment_config(
     config = DracoExperimentConfig.model_validate(merged)
     return DracoExperimentConfigBundle(
         config=config,
-        base_path=base_path.expanduser().resolve(),
+        base_path=resolved_base_path,
+        base_sha256=base_sha256,
         base_document=base_document,
         override_documents=tuple(override_documents),
+        override_sha256s=tuple(override_sha256s),
         inline_overrides=tuple(inline_overrides),
+        inline_overlay_document=inline_overlay_document,
+        inline_overlay_sha256=inline_overlay_sha256,
         merged_document=merged,
     )
 

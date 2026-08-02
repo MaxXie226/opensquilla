@@ -7,6 +7,7 @@ import logging
 import os
 import threading
 import warnings
+from collections.abc import Mapping
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -488,9 +489,18 @@ class LlmEnsembleConfig(BaseSettings):
     # router_dynamic only: assign proposer/aggregator thinking levels after
     # ranking. Kept opt-in so existing dynamic-routing behavior is unchanged.
     ranking_thinking_assignment_enabled: bool = False
+    # Sparse, process-local overlay for router_dynamic's packaged ranking
+    # policy.  The ranking layer validates, fingerprints, and freezes the
+    # merged effective configuration before any model call.
+    ranking_config_override: dict[str, Any] = Field(default_factory=dict)
+    _ranking_config_resolution_frozen: dict[str, Any] | None = PrivateAttr(
+        default=None
+    )
     proposer_tools: bool = False
     aggregator_tools: bool = True
     min_successful_proposers: int = Field(default=1, ge=1)
+    # Legacy input retained for config compatibility. router_dynamic selection
+    # now reads proposer_count.backup_count from the frozen ranking config.
     proposer_backup_count: int = Field(default=2, ge=0)
     proposer_recovery_max_additional_calls: int = Field(default=3, ge=0, le=3)
     proposer_max_tokens_cap: int = Field(default=65_536, ge=2)
@@ -597,6 +607,136 @@ class LlmEnsembleConfig(BaseSettings):
                 f"custom_b5 proposer count ({len(proposers)})"
             )
         return self
+
+    @model_validator(mode="after")
+    def _freeze_ranking_config_at_load(self) -> LlmEnsembleConfig:
+        if self.selection_mode == "router_dynamic" or self.ranking_config_override:
+            self.freeze_ranking_config()
+        return self
+
+    def freeze_ranking_config(self) -> dict[str, Any]:
+        """Validate and detach the effective router policy for this config."""
+
+        from opensquilla.provider.ranking_router import ranking_config_resolution
+
+        legacy_thinking_switch = (
+            self.ranking_thinking_assignment_enabled
+            if "ranking_thinking_assignment_enabled" in self.model_fields_set
+            else None
+        )
+        resolution = ranking_config_resolution(
+            thinking_assignment_enabled=legacy_thinking_switch,
+            override=(self.ranking_config_override or None),
+        )
+        if "proposer_backup_count" in self.model_fields_set:
+            effective = resolution.get("effective_config")
+            proposer_count = (
+                effective.get("proposer_count")
+                if isinstance(effective, dict)
+                else None
+            )
+            ranking_backup_count = (
+                proposer_count.get("backup_count")
+                if isinstance(proposer_count, dict)
+                else None
+            )
+            if self.proposer_backup_count != ranking_backup_count:
+                raise ValueError(
+                    "llm_ensemble.proposer_backup_count is a legacy compatibility "
+                    "input and must match "
+                    "llm_ensemble.ranking_config_override.proposer_count.backup_count"
+                )
+        normalized = resolution.get("override")
+        self.validate_router_dynamic_recovery_chain(
+            effective_config=resolution.get("effective_config"),
+        )
+        self.ranking_config_override = (
+            copy.deepcopy(normalized) if isinstance(normalized, dict) else {}
+        )
+        object.__setattr__(
+            self,
+            "ranking_thinking_assignment_enabled",
+            resolution.get("thinking_assignment_enabled") is True,
+        )
+        self._ranking_config_resolution_frozen = copy.deepcopy(resolution)
+        return copy.deepcopy(resolution)
+
+    def validate_router_dynamic_recovery_chain(
+        self,
+        *,
+        effective_config: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Reject a ranked aggregator chain the runtime would silently truncate.
+
+        The ranking policy owns which aggregator candidates are selected.  The
+        execution recovery policy may cap that chain, but it must not be
+        shorter than the frozen selection: doing so used to surface only after
+        provider construction as a misleading route-plan drift.
+        """
+
+        if self.selection_mode != "router_dynamic":
+            return
+        effective = effective_config
+        if not isinstance(effective, Mapping):
+            resolution = self._ranking_config_resolution_frozen
+            effective = (
+                resolution.get("effective_config")
+                if isinstance(resolution, Mapping)
+                else None
+            )
+        aggregator = (
+            effective.get("aggregator")
+            if isinstance(effective, Mapping)
+            else None
+        )
+        candidate_count = (
+            aggregator.get("candidate_count")
+            if isinstance(aggregator, Mapping)
+            else None
+        )
+        if isinstance(candidate_count, bool) or not isinstance(
+            candidate_count,
+            int,
+        ):
+            raise ValueError(
+                "router_dynamic ranking aggregator.candidate_count is invalid"
+            )
+        execution_top_k = (
+            1
+            if self.aggregator_recovery_mode == "off"
+            else self.aggregator_recovery_top_k
+        )
+        if candidate_count > execution_top_k:
+            raise ValueError(
+                "router_dynamic ranking aggregator.candidate_count "
+                f"({candidate_count}) exceeds the executable aggregator "
+                f"recovery chain ({execution_top_k}); increase "
+                "llm_ensemble.aggregator_recovery_top_k or lower "
+                "ranking_config_override.aggregator.candidate_count"
+            )
+
+    def ranking_config_resolution_snapshot(self) -> dict[str, Any]:
+        """Return the startup-frozen ranking resolution as a detached copy."""
+
+        if self._ranking_config_resolution_frozen is None:
+            return self.freeze_ranking_config()
+        return copy.deepcopy(self._ranking_config_resolution_frozen)
+
+    def ranking_config_override_snapshot(self) -> dict[str, Any]:
+        """Return the validated sparse override captured at config freeze time."""
+
+        resolution = self.ranking_config_resolution_snapshot()
+        override = resolution.get("override")
+        return copy.deepcopy(override) if isinstance(override, dict) else {}
+
+    def ranking_config_effective_snapshot(self) -> dict[str, Any]:
+        """Return the validated effective policy captured at config freeze time."""
+
+        resolution = self.ranking_config_resolution_snapshot()
+        effective = resolution.get("effective_config")
+        if not isinstance(effective, dict):
+            raise ValueError("frozen router_dynamic ranking config is unavailable")
+        return copy.deepcopy(effective)
 
 
 STATIC_OPENROUTER_B5_SELECTION_MODE = "static_openrouter_b5"

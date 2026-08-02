@@ -78,6 +78,131 @@ def test_llm_ensemble_defaults_to_disabled_for_model_router_first_install() -> N
     assert provider.quorum_grace_seconds == 10.0
 
 
+def test_router_dynamic_legacy_backup_count_must_match_ranking_config() -> None:
+    with pytest.raises(
+        ValueError,
+        match="legacy compatibility input.*must match",
+    ):
+        GatewayConfig(
+            llm_ensemble={
+                "enabled": True,
+                "selection_mode": "router_dynamic",
+                "proposer_backup_count": 1,
+            }
+        )
+
+    cfg = GatewayConfig(
+        llm_ensemble={
+            "enabled": True,
+            "selection_mode": "router_dynamic",
+            "proposer_backup_count": 1,
+            "ranking_config_override": {
+                "proposer_count": {"backup_count": 1}
+            },
+        }
+    )
+    assert cfg.llm_ensemble.ranking_config_effective_snapshot()["proposer_count"][
+        "backup_count"
+    ] == 1
+
+
+@pytest.mark.parametrize(
+    ("recovery_mode", "recovery_top_k", "candidate_count"),
+    [
+        ("serving", 2, 3),
+        ("off", 3, 2),
+    ],
+)
+def test_router_dynamic_rejects_ranked_aggregator_chain_runtime_would_truncate(
+    recovery_mode: str,
+    recovery_top_k: int,
+    candidate_count: int,
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match=r"aggregator\.candidate_count.*exceeds the executable",
+    ):
+        GatewayConfig(
+            llm_ensemble={
+                "enabled": True,
+                "selection_mode": "router_dynamic",
+                "aggregator_recovery_mode": recovery_mode,
+                "aggregator_recovery_top_k": recovery_top_k,
+                "ranking_config_override": {
+                    "aggregator": {"candidate_count": candidate_count}
+                },
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("recovery_mode", "recovery_top_k", "candidate_count"),
+    [
+        ("serving", 2, 2),
+        ("off", 3, 1),
+    ],
+)
+def test_router_dynamic_accepts_fully_executable_ranked_aggregator_chain(
+    recovery_mode: str,
+    recovery_top_k: int,
+    candidate_count: int,
+) -> None:
+    cfg = GatewayConfig(
+        llm_ensemble={
+            "enabled": True,
+            "selection_mode": "router_dynamic",
+            "aggregator_recovery_mode": recovery_mode,
+            "aggregator_recovery_top_k": recovery_top_k,
+            "ranking_config_override": {
+                "aggregator": {"candidate_count": candidate_count}
+            },
+        }
+    )
+
+    assert cfg.llm_ensemble.ranking_config_effective_snapshot()["aggregator"][
+        "candidate_count"
+    ] == candidate_count
+
+
+def test_router_dynamic_runtime_validates_actual_ranking_input_chain() -> None:
+    cfg = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "deepseek/deepseek-v4-pro",
+            "api_key": "fake",
+        },
+        llm_ensemble={
+            "enabled": True,
+            "selection_mode": "router_dynamic",
+            "aggregator_recovery_top_k": 3,
+            "ranking_config_override": {
+                "aggregator": {"candidate_count": 3}
+            },
+        },
+    )
+    actual_ranking_config = cfg.llm_ensemble.ranking_config_effective_snapshot()
+    actual_ranking_config["aggregator"]["candidate_count"] = 2
+    # The request carries a narrower authenticated ranking input than the
+    # startup snapshot.  Runtime validation must inspect this actual input,
+    # rather than falsely rejecting against the superseded count of three.
+    cfg.llm_ensemble.aggregator_recovery_top_k = 2
+
+    provider = build_ensemble_provider_from_config(
+        config=cfg,
+        inherited_provider_config=ProviderConfig(
+            provider="openrouter",
+            model="deepseek/deepseek-v4-pro",
+            api_key="fake",
+        ),
+        fallback_provider=None,
+        turn_metadata={"routed_tier": "c1", "routing_confidence": 0.9},
+        ranking_inputs={"ranking_config": actual_ranking_config},
+    )
+
+    assert provider.selection_plan["aggregator_recovery_top_k"] == 2
+    assert len(provider.selection_plan["aggregator_candidates"]) == 2
+
+
 def test_llm_ensemble_proposer_recovery_can_be_explicitly_disabled() -> None:
     cfg = GatewayConfig(
         llm_ensemble={
@@ -137,6 +262,38 @@ def test_llm_ensemble_thinking_assignment_switch_is_opt_in_and_serialized() -> N
     assert cfg.llm_ensemble.ranking_thinking_assignment_enabled is True
     serialized = cfg.to_toml_dict()["llm_ensemble"]
     assert serialized["ranking_thinking_assignment_enabled"] is True
+
+
+def test_llm_ensemble_ranking_override_enables_thinking_and_freezes_resolution() -> None:
+    cfg = GatewayConfig(
+        llm_ensemble={
+            "selection_mode": "router_dynamic",
+            "ranking_config_override": {
+                "thinking_assignment": {"enabled": True}
+            },
+        }
+    )
+
+    ensemble = cfg.llm_ensemble
+    resolution = ensemble.ranking_config_resolution_snapshot()
+    assert ensemble.ranking_thinking_assignment_enabled is True
+    assert resolution["thinking_assignment_enabled"] is True
+    assert resolution["base_config"]["schema_version"] == "step2-ranking-config-v3"
+    assert resolution["effective_config"]["schema_version"] == "step2-ranking-config-v4"
+    assert resolution["effective_config"]["thinking_assignment"]["enabled"] is True
+
+
+def test_llm_ensemble_explicit_legacy_thinking_switch_conflict_fails_closed() -> None:
+    with pytest.raises(ValueError, match="conflicts with the legacy"):
+        GatewayConfig(
+            llm_ensemble={
+                "selection_mode": "router_dynamic",
+                "ranking_thinking_assignment_enabled": False,
+                "ranking_config_override": {
+                    "thinking_assignment": {"enabled": True}
+                },
+            }
+        )
 
 
 def test_llm_ensemble_serving_chain_timeout_serializes_and_reaches_provider() -> None:

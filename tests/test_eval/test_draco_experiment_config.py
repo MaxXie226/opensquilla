@@ -8,8 +8,11 @@ import pytest
 from pydantic import ValidationError
 
 from opensquilla.eval.draco_experiment_config import (
+    FORMAL_DRACO_OPENROUTER_BASE_URL,
     DracoRunnerConfig,
     load_draco_experiment_config,
+    validate_formal_draco_credential_bindings,
+    validate_formal_draco_gateway_credential_binding,
     validate_reference_input,
 )
 from opensquilla.provider.ranking_router import load_model_registry_snapshot
@@ -32,6 +35,7 @@ def test_default_b2_config_is_g12_derived_quality_first_profile() -> None:
     assert config.routing.selection_mode == "static_openrouter_b5"
     assert config.routing.skip_single_model_router is True
     assert config.g1_routing is not None
+    assert config.router_dynamic_ranking_override == {}
     assert config.g1_routing.profile_id == "draco_g1_formal_registry_all_20260729"
     assert config.g1_routing.selection_mode == "router_dynamic"
     assert config.g1_routing.user_profile_enabled is False
@@ -40,9 +44,9 @@ def test_default_b2_config_is_g12_derived_quality_first_profile() -> None:
         "bd2e6632ad09e84619cf497eb266c45faaa8716eff4d870ba930c3f4eae4b473"
     )
     assert config.g1_routing.expected_ranking_config_schema_version == "step2-ranking-config-v3"
-    assert config.g1_routing.expected_ranking_config_version == "step2-ranking-2026-07-22.1"
+    assert config.g1_routing.expected_ranking_config_version == "step2-ranking-2026-08-02.2"
     assert config.g1_routing.expected_ranking_config_sha256 == (
-        "a8addcdefa04349209c20e97ca5851ed0f5ca55646c9d0c5badc5d32dd7ef10c"
+        "71be283f94095bc3ced34d39ae9ed58abbaa7e4d273b0a074e7e8a4a6e4b5fc6"
     )
     assert config.g1_routing.expected_proposer_count_max == 5
     assert config.g1_routing.expected_candidate_count is None
@@ -101,7 +105,8 @@ def test_default_b2_config_is_g12_derived_quality_first_profile() -> None:
     assert config.ensemble.record_candidates is True
     assert config.ensemble.proposer_tools is False
     assert config.ensemble.aggregator_tools is True
-    assert config.ensemble.proposer_backup_count == 2
+    assert config.ensemble.proposer_backup_count == 0
+    assert "proposer_backup_count" not in config.ensemble.model_dump(mode="json")
     assert config.ensemble.proposer_recovery_max_additional_calls == 3
     assert config.ensemble.proposer_max_tokens_cap == 65_536
     assert config.ensemble.proposer_visible_answer_reserve_tokens == 4_096
@@ -167,6 +172,166 @@ def test_draco_ensemble_rejects_invalid_proposer_recovery_budget() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("path", "secret_value"),
+    [
+        ("ensemble.proposers.0.api_key_env", "sk-live-secret"),
+        ("ensemble.aggregator.api_key_env", "actual secret"),
+        ("tools.web_search.api_key_env", "brave-api-key-value"),
+    ],
+)
+def test_api_key_env_fields_accept_only_environment_variable_names(
+    path: str,
+    secret_value: str,
+) -> None:
+    with pytest.raises(ValidationError) as error:
+        load_draco_experiment_config(
+            DEFAULT_CONFIG,
+            inline_sets=[f"{path}={json.dumps(secret_value)}"],
+        )
+
+    assert secret_value not in str(error.value)
+
+
+def test_api_key_env_fields_accept_lowercase_environment_variable_names() -> None:
+    bundle = load_draco_experiment_config(
+        DEFAULT_CONFIG,
+        inline_sets=[
+            'tools.web_search.api_key_env="brave_search_key"',
+            'ensemble.proposers.0.api_key_env="openrouter_key"',
+        ],
+    )
+
+    assert bundle.config.tools.web_search.api_key_env == "brave_search_key"
+    assert bundle.config.ensemble.proposers[0].api_key_env == "openrouter_key"
+
+
+@pytest.mark.parametrize(
+    ("inline_sets", "message"),
+    [
+        (
+            ['ensemble.proposers.0.provider="anthropic"'],
+            r"ensemble\.proposers\.0\.provider=openrouter",
+        ),
+        (
+            ['ensemble.proposers.0.base_url="https://attacker.invalid/v1"'],
+            r"ensemble\.proposers\.0\.base_url",
+        ),
+        (
+            ['ensemble.proposers.0.api_key_env="UNRELATED_AMBIENT_SECRET"'],
+            r"ensemble\.proposers\.0\.api_key_env",
+        ),
+        (
+            ['ensemble.aggregator.api_key_env="UNRELATED_AMBIENT_SECRET"'],
+            r"ensemble\.aggregator\.api_key_env",
+        ),
+        (
+            ['tools.web_search.api_key_env="UNRELATED_AMBIENT_SECRET"'],
+            r"tools\.web_search\.api_key_env=BRAVE_SEARCH_API_KEY",
+        ),
+        (
+            [
+                'tools.web_search.provider="duckduckgo"',
+                'tools.web_search.api_key_env="BRAVE_SEARCH_API_KEY"',
+            ],
+            r"tools\.web_search\.api_key_env=an empty api_key_env",
+        ),
+    ],
+)
+def test_formal_credential_bindings_reject_redirects_without_echoing_values(
+    inline_sets: list[str],
+    message: str,
+) -> None:
+    experiment = load_draco_experiment_config(
+        DEFAULT_CONFIG,
+        inline_sets=inline_sets,
+    ).config
+
+    with pytest.raises(ValueError, match=message) as error:
+        validate_formal_draco_credential_bindings(experiment)
+
+    assert "attacker.invalid" not in str(error.value)
+    assert "UNRELATED_AMBIENT_SECRET" not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "inline_sets",
+    [
+        [],
+        [
+            f'ensemble.proposers.0.base_url="{FORMAL_DRACO_OPENROUTER_BASE_URL}/"',
+            'ensemble.proposers.0.api_key_env=""',
+        ],
+        [
+            'tools.web_search.provider="duckduckgo"',
+            'tools.web_search.api_key_env=""',
+        ],
+    ],
+    ids=["frozen-default", "official-url-and-inherited-key", "keyless-search"],
+)
+def test_formal_credential_bindings_accept_only_frozen_safe_alternatives(
+    inline_sets: list[str],
+) -> None:
+    experiment = load_draco_experiment_config(
+        DEFAULT_CONFIG,
+        inline_sets=inline_sets,
+    ).config
+
+    validate_formal_draco_credential_bindings(experiment)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        (
+            {
+                "provider": "anthropic",
+                "base_url": FORMAL_DRACO_OPENROUTER_BASE_URL,
+                "api_key_env": "OPENROUTER_API_KEY",
+            },
+            r"config\.llm\.provider=openrouter",
+        ),
+        (
+            {
+                "provider": "openrouter",
+                "base_url": "https://attacker.invalid/v1",
+                "api_key_env": "OPENROUTER_API_KEY",
+            },
+            r"config\.llm\.base_url",
+        ),
+        (
+            {
+                "provider": "openrouter",
+                "base_url": FORMAL_DRACO_OPENROUTER_BASE_URL,
+                "api_key_env": "UNRELATED_AMBIENT_SECRET",
+            },
+            r"config\.llm\.api_key_env",
+        ),
+    ],
+    ids=["provider", "base-url", "api-key-env"],
+)
+def test_formal_gateway_credential_binding_rejects_redirects_without_echoing_values(
+    kwargs: dict[str, str],
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message) as error:
+        validate_formal_draco_gateway_credential_binding(**kwargs)
+
+    assert "attacker.invalid" not in str(error.value)
+    assert "UNRELATED_AMBIENT_SECRET" not in str(error.value)
+
+
+@pytest.mark.parametrize("api_key_env", ["", "OPENROUTER_API_KEY"])
+def test_formal_gateway_credential_binding_accepts_only_approved_key_sources(
+    api_key_env: str,
+) -> None:
+    validate_formal_draco_gateway_credential_binding(
+        provider="openrouter",
+        base_url=FORMAL_DRACO_OPENROUTER_BASE_URL,
+        api_key_env=api_key_env,
+    )
+
+
 def test_runner_finalization_fields_default_off_for_legacy_configs() -> None:
     config = DracoRunnerConfig(
         mode="agent_loop",
@@ -208,6 +373,201 @@ def test_override_files_and_inline_paths_apply_in_documented_order(tmp_path: Pat
     assert bundle.config.ensemble.candidate_max_chars == 32_000
     assert bundle.config.ensemble.proposers[0].max_tokens == 8192
     assert bundle.provenance()["overrides"][0]["path"] == str(override_path.resolve())
+
+
+def test_file_provenance_is_frozen_from_the_bytes_loaded_through_symlinks(
+    tmp_path: Path,
+) -> None:
+    base_bytes = DEFAULT_CONFIG.read_bytes()
+    base_target = tmp_path / "base-target.json"
+    base_target.write_bytes(base_bytes)
+    base_link = tmp_path / "base-link.json"
+    base_link.symlink_to(base_target)
+    override_bytes = b'{\n  "runner": {"concurrency": 3}\n}\n'
+    override_target = tmp_path / "override-target.json"
+    override_target.write_bytes(override_bytes)
+    override_link = tmp_path / "override-link.json"
+    override_link.symlink_to(override_target)
+
+    bundle = load_draco_experiment_config(
+        base_link,
+        override_paths=[override_link],
+    )
+    frozen = bundle.provenance()
+
+    assert frozen["base"] == {
+        "path": str(base_target.resolve()),
+        "sha256": hashlib.sha256(base_bytes).hexdigest(),
+    }
+    assert frozen["overrides"] == [
+        {
+            "path": str(override_target.resolve()),
+            "sha256": hashlib.sha256(override_bytes).hexdigest(),
+        }
+    ]
+
+    replacement_base = tmp_path / "replacement-base.json"
+    replacement_base.write_bytes(DEFAULT_CONFIG.read_bytes())
+    replacement_override = tmp_path / "replacement-override.json"
+    replacement_override.write_text('{"runner":{"concurrency":9}}\n', encoding="utf-8")
+    base_link.unlink()
+    base_link.symlink_to(replacement_base)
+    override_link.unlink()
+    override_link.symlink_to(replacement_override)
+    base_target.write_text('{"changed":true}\n', encoding="utf-8")
+    override_target.write_text('{"runner":{"concurrency":8}}\n', encoding="utf-8")
+
+    assert bundle.provenance() == frozen
+
+
+def test_inline_json_overlay_precedes_dotted_sets_and_records_canonical_sha(
+    tmp_path: Path,
+) -> None:
+    override_path = tmp_path / "override.json"
+    override_path.write_text(
+        json.dumps({"runner": {"concurrency": 3}}),
+        encoding="utf-8",
+    )
+    inline_overlay = {
+        "runner": {"concurrency": 4},
+        "ensemble": {"candidate_max_chars": 36_000},
+        "reference": {"repository": "overlay-private-marker"},
+        "router_dynamic_ranking_override": {"penalties": {"task_cost_weights": {"high": 0.5}}},
+    }
+    dotted_marker = "dotted-private-marker"
+
+    bundle = load_draco_experiment_config(
+        DEFAULT_CONFIG,
+        override_paths=[override_path],
+        inline_overlay_json=json.dumps(inline_overlay),
+        inline_sets=[
+            "runner.concurrency=5",
+            f"reference.run_directory={json.dumps(dotted_marker)}",
+        ],
+    )
+
+    expected_sha = hashlib.sha256(
+        json.dumps(
+            inline_overlay,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    assert bundle.config.runner.concurrency == 5
+    assert bundle.config.ensemble.candidate_max_chars == 36_000
+    assert bundle.config.reference.repository == "overlay-private-marker"
+    assert bundle.config.reference.run_directory == dotted_marker
+    assert bundle.config.router_dynamic_ranking_override == {
+        "penalties": {"task_cost_weights": {"high": 0.5}}
+    }
+    assert bundle.inline_overlay_document == inline_overlay
+    assert bundle.inline_overlay_sha256 == expected_sha
+    assert bundle.provenance()["precedence"] == [
+        "base_json",
+        "override_json_in_cli_order",
+        "inline_json_object",
+        "inline_path_overrides_in_cli_order",
+    ]
+    assert bundle.provenance()["inline_overlay"] == {
+        "present": True,
+        "field_paths": [
+            "ensemble.candidate_max_chars",
+            "reference.repository",
+            "router_dynamic_ranking_override.penalties.task_cost_weights.high",
+            "runner.concurrency",
+        ],
+    }
+    assert bundle.provenance()["inline_overrides"] == {
+        "count": 2,
+        "paths": ["runner.concurrency", "reference.run_directory"],
+    }
+    dotted_hash = hashlib.sha256(
+        json.dumps(
+            dotted_marker,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    serialized_provenance = json.dumps(bundle.provenance(), ensure_ascii=False)
+    assert "overlay-private-marker" not in serialized_provenance
+    assert dotted_marker not in serialized_provenance
+    assert expected_sha not in serialized_provenance
+    assert dotted_hash not in serialized_provenance
+
+
+def test_public_provenance_omits_inline_values_and_per_value_hashes() -> None:
+    overlay_marker = "public-provenance-overlay-marker"
+    dotted_marker = "public-provenance-dotted-marker"
+    bundle = load_draco_experiment_config(
+        DEFAULT_CONFIG,
+        inline_overlay_json=json.dumps(
+            {"reference": {"repository": overlay_marker}}
+        ),
+        inline_sets=[f"reference.run_directory={json.dumps(dotted_marker)}"],
+    )
+
+    provenance = bundle.provenance()
+    serialized = json.dumps(provenance, ensure_ascii=False)
+    assert provenance["inline_overlay"] == {
+        "present": True,
+        "field_paths": ["reference.repository"],
+    }
+    assert provenance["inline_overrides"] == {
+        "count": 1,
+        "paths": ["reference.run_directory"],
+    }
+    assert overlay_marker not in serialized
+    assert dotted_marker not in serialized
+    assert bundle.inline_overlay_sha256 not in serialized
+    dotted_hash = hashlib.sha256(
+        json.dumps(
+            dotted_marker,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    assert dotted_hash not in serialized
+
+
+@pytest.mark.parametrize("raw", ["[]", "null", "42", '"value"'])
+def test_inline_json_overlay_requires_an_object(raw: str) -> None:
+    with pytest.raises(ValueError, match="must contain a JSON object"):
+        load_draco_experiment_config(DEFAULT_CONFIG, inline_overlay_json=raw)
+
+
+def test_inline_json_overlay_rejects_invalid_json_without_echoing_value() -> None:
+    raw = '{"private_token":"do-not-repeat"'
+    with pytest.raises(ValueError, match="must contain valid JSON") as exc_info:
+        load_draco_experiment_config(DEFAULT_CONFIG, inline_overlay_json=raw)
+    assert "do-not-repeat" not in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"api_key": "do-not-record"}, "secret-like field"),
+        (
+            {"penalties": {"not_a_real_weight": 0.5}},
+            "unknown or missing keys",
+        ),
+    ],
+)
+def test_ranking_override_fails_during_config_load_before_any_artifact(
+    override: dict[str, object],
+    message: str,
+) -> None:
+    raw = json.dumps({"router_dynamic_ranking_override": override})
+
+    with pytest.raises(ValidationError, match=message) as exc_info:
+        load_draco_experiment_config(DEFAULT_CONFIG, inline_overlay_json=raw)
+
+    assert "do-not-record" not in str(exc_info.value)
 
 
 def test_unknown_override_path_fails_instead_of_silently_missing() -> None:

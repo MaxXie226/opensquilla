@@ -210,14 +210,10 @@ def _bind_g1_retry_plan(
     if initial_plan.get("ranking_thinking_assignment_enabled") is True:
         selected_p = [str(identity) for identity in retry_plan.get("selected_P", [])]
         selected_a = str(
-            retry_plan.get("selected_A")
-            or initial_plan.get("selected_A")
-            or "openrouter:model-a"
+            retry_plan.get("selected_A") or initial_plan.get("selected_A") or "openrouter:model-a"
         )
         initial_details = initial_plan.get("thinking_assignment_details")
-        initial_details = (
-            initial_details if isinstance(initial_details, dict) else {}
-        )
+        initial_details = initial_details if isinstance(initial_details, dict) else {}
         initial_proposer_details = {
             str(detail.get("identity") or ""): deepcopy(detail)
             for detail in initial_details.get("proposers", [])
@@ -229,9 +225,8 @@ def _bind_g1_retry_plan(
             if isinstance(detail, dict) and str(detail.get("identity") or "")
         }
         initial_primary_aggregator = initial_details.get("aggregator")
-        if (
-            isinstance(initial_primary_aggregator, dict)
-            and str(initial_primary_aggregator.get("identity") or "")
+        if isinstance(initial_primary_aggregator, dict) and str(
+            initial_primary_aggregator.get("identity") or ""
         ):
             initial_aggregator_details.setdefault(
                 str(initial_primary_aggregator["identity"]),
@@ -258,10 +253,7 @@ def _bind_g1_retry_plan(
                 "provider_rejection_fallbacks": [],
             }
 
-        proposer_details = [
-            retry_detail(identity, role="proposer")
-            for identity in selected_p
-        ]
+        proposer_details = [retry_detail(identity, role="proposer") for identity in selected_p]
         aggregator_detail = retry_detail(selected_a, role="aggregator")
         initial_assignment = initial_plan.get("executed_thinking_assignment")
         policy_version = (
@@ -276,9 +268,7 @@ def _bind_g1_retry_plan(
                 "ranking_thinking_assignment_enabled": True,
                 "executed_thinking_assignment": {
                     "proposers": {
-                        str(detail["identity"]): str(
-                            detail["effective_level"]
-                        )
+                        str(detail["identity"]): str(detail["effective_level"])
                         for detail in proposer_details
                     },
                     "aggregator": str(aggregator_detail["effective_level"]),
@@ -473,9 +463,7 @@ def _k21_router_dynamic_plan() -> dict[str, object]:
         "selected_A": "openrouter:agg",
         "aggregator_candidates": ["openrouter:agg"],
         "effective_min_successful_proposers": 2,
-        "proposer_recovery_policy": deepcopy(
-            runner.FORMAL_PROPOSER_RECOVERY_POLICY
-        ),
+        "proposer_recovery_policy": deepcopy(runner.FORMAL_PROPOSER_RECOVERY_POLICY),
     }
 
 
@@ -491,9 +479,7 @@ def _k21_ensemble_trace(
         successful_proposers=3,
     )
     expanded = ("openrouter:p0", "openrouter:p0", "openrouter:p1")
-    for index, (candidate, identity) in enumerate(
-        zip(trace["candidates"], expanded, strict=True)
-    ):
+    for index, (candidate, identity) in enumerate(zip(trace["candidates"], expanded, strict=True)):
         assert isinstance(candidate, dict)
         provider, model = identity.split(":", 1)
         candidate["sample_index"] = 1 if index == 1 else 0
@@ -789,19 +775,19 @@ async def test_judge_http_failure_then_success_persists_route_bound_unknown_usag
     assert units[0]["requested_provider"] == "openrouter"
     assert units[0]["requested_model"] == judge_model
     assert units[0]["usage_unknown"] is True
-    assert sum(
-        attempt["run"]["llm_request_count"]
-        for attempt in judgment["judge_attempts"]
-    ) == 2
-    assert sum(
-        len(
-            attempt["run"]["usage"].get(
-                "model_usage_breakdown",
-                [],
+    assert sum(attempt["run"]["llm_request_count"] for attempt in judgment["judge_attempts"]) == 2
+    assert (
+        sum(
+            len(
+                attempt["run"]["usage"].get(
+                    "model_usage_breakdown",
+                    [],
+                )
             )
+            for attempt in judgment["judge_attempts"]
         )
-        for attempt in judgment["judge_attempts"]
-    ) == 2
+        == 2
+    )
 
     finalizer = _load_finalizer()
     _, route_reasons = finalizer.canonical_judge_run_route_reasons(
@@ -1032,28 +1018,17 @@ def _experiment_with_current_g1_contract(
     payload = experiment.model_dump(mode="json")
     payload["g1_routing"].update(
         {
-            "source_registry_snapshot_version": registry[
-                "snapshot_version"
-            ],
+            "source_registry_snapshot_version": registry["snapshot_version"],
             "expected_source_registry_snapshot_sha256": (
-                module.canonical_json_sha256(registry).removeprefix(
-                    "sha256:"
-                )
+                module.canonical_json_sha256(registry).removeprefix("sha256:")
             ),
-            "expected_ranking_config_schema_version": ranking[
-                "schema_version"
-            ],
+            "expected_ranking_config_schema_version": ranking["schema_version"],
             "expected_ranking_config_version": ranking["config_version"],
             "expected_ranking_config_sha256": (
-                module.canonical_json_sha256(ranking).removeprefix(
-                    "sha256:"
-                )
+                module.canonical_json_sha256(ranking).removeprefix("sha256:")
             ),
             "expected_proposer_count_max": max(
-                *(
-                    int(row["max"])
-                    for row in proposer_count["by_tier"].values()
-                ),
+                *(int(row["max"]) for row in proposer_count["by_tier"].values()),
                 int(proposer_count["high_risk"]["max"]),
             ),
         }
@@ -1062,6 +1037,18 @@ def _experiment_with_current_g1_contract(
 
 
 def _resolved_g1_registry_contract(module, experiment, config: GatewayConfig) -> dict[str, object]:
+    from opensquilla.provider.ranking_router import (
+        ranking_config_resolution,
+        task_analyzer_policy,
+    )
+
+    resolution = ranking_config_resolution(
+        override=(experiment.router_dynamic_ranking_override or None),
+    )
+    analyzer_policy = task_analyzer_policy(resolution["effective_config"])
+    config.llm.provider_routing[str(analyzer_policy["model"])] = str(
+        analyzer_policy["upstream_provider"]
+    )
     contract = module.validate_g1_registry_contract(experiment, config)
     assert contract["candidate_scope"] == "registry_all"
     assert contract["policy"] == "all_registry_models"
@@ -1133,13 +1120,34 @@ def test_task_analyzer_provider_preserves_routing_and_disables_replay(
         routed,
         provider_id="openrouter",
         model_id="openai/gpt-analyzer",
+        upstream_provider="openai",
     )
     primary = captured["primary"]
 
     assert resolved is sentinel
-    assert primary.provider_routing == routed.provider_routing
+    assert primary.provider_routing == {
+        **routed.provider_routing,
+        "openai/gpt-analyzer": "openai",
+    }
     assert primary.replay_provider_state is False
     assert primary.model == "openai/gpt-analyzer"
+
+
+@pytest.mark.parametrize("module", [runner, _load_resume_runner()], ids=["main", "resume"])
+def test_task_analyzer_provider_never_reuses_another_provider_credential(module) -> None:
+    routed = ProviderConfig(
+        provider="anthropic",
+        model="anthropic/claude-sonnet-5",
+        api_key="anthropic-key",
+    )
+
+    with pytest.raises(ValueError, match="cannot reuse a different provider credential"):
+        module.build_task_analyzer_provider(
+            routed,
+            provider_id="openrouter",
+            model_id="anthropic/claude-opus-4.8",
+            upstream_provider="anthropic",
+        )
 
 
 @pytest.mark.parametrize("module", [runner, _load_resume_runner()], ids=["main", "resume"])
@@ -1348,6 +1356,54 @@ def test_b2_argument_alignment_applies_g12_derived_quality_first_envelope() -> N
     assert args.judge_repeats == 3
     assert args.judge_concurrency == 6
     assert args.judge_max_attempts == 3
+
+
+@pytest.mark.parametrize("module", [runner, _load_resume_runner()], ids=["main", "resume"])
+def test_inline_experiment_json_controls_runtime_args_without_launcher_sets(module) -> None:
+    args = module.build_parser().parse_args(
+        [
+            "--input",
+            "tasks.jsonl",
+            "--groups",
+            "G1",
+            # Deliberately conflicting top-level values model parser defaults or
+            # legacy launchers. The effective experiment JSON remains the
+            # runtime authority.
+            "--concurrency",
+            "9",
+            "--timeout",
+            "180",
+            "--judge-concurrency",
+            "1",
+            "--generation-max-attempts",
+            "3",
+            "--experiment-config-override-json",
+            json.dumps(
+                {
+                    "runner": {"concurrency": 4},
+                    "timeouts": {"task_seconds": 7_200},
+                    "judge": {"concurrency": 2},
+                    "generation": {"max_attempts": 2},
+                }
+            ),
+        ]
+    )
+
+    record = module.apply_b2_g12_argument_alignment(args, ["G1"])
+
+    assert record is not None
+    assert args.concurrency == 4
+    assert args.timeout == 7_200
+    assert args.judge_concurrency == 2
+    assert args.generation_max_attempts == 2
+    assert record["effective_args"]["concurrency"] == 4
+    assert record["effective_args"]["timeout"] == 7_200
+    assert record["effective_args"]["judge_concurrency"] == 2
+    assert record["effective_args"]["generation_max_attempts"] == 2
+    assert record["config_provenance"]["inline_overrides"] == {
+        "count": 0,
+        "paths": [],
+    }
 
 
 @pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
@@ -1601,6 +1657,56 @@ async def test_generation_attempt_offset_uses_cumulative_ordinal(
     assert len(attempts) == 1
     assert attempts[0]["attempt"] == 3
     assert selected_attempt == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+async def test_generation_attempt_offset_obeys_dynamic_total_budget(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    async def fake_collect_run(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return module.RunResult(
+            final_text="accepted",
+            done=DoneEvent(
+                provider="openrouter",
+                model="model-a",
+                requested_provider="openrouter",
+                requested_model="model-a",
+                stop_reason="stop",
+            ),
+        )
+
+    monkeypatch.setattr(module, "collect_run", fake_collect_run)
+
+    result, attempts, selected_attempt = await module.collect_generation_with_retries(
+        object(),
+        "prompt",
+        timeout=30,
+        max_attempts=1,
+        attempt_offset=1,
+        attempt_budget_limit=2,
+        expected_model="model-a",
+        expected_provider="openrouter",
+    )
+
+    assert calls == 1
+    assert result.final_text == "accepted"
+    assert [attempt["attempt"] for attempt in attempts] == [2]
+    assert selected_attempt == 2
+    with pytest.raises(ValueError, match="configured budget"):
+        await module.collect_generation_with_retries(
+            object(),
+            "prompt",
+            timeout=30,
+            max_attempts=1,
+            attempt_offset=2,
+            attempt_budget_limit=2,
+        )
 
 
 @pytest.mark.asyncio
@@ -1862,9 +1968,7 @@ async def test_g1_default_off_reasoning_only_length_rebuilds_router_dynamic_rost
         module,
         "generation_retry_reason",
         lambda result, **_kwargs: (
-            "ensemble_insufficient_proposers"
-            if not result.final_text
-            else ""
+            "ensemble_insufficient_proposers" if not result.final_text else ""
         ),
     )
 
@@ -1876,9 +1980,7 @@ async def test_g1_default_off_reasoning_only_length_rebuilds_router_dynamic_rost
         max_attempts=2,
     )
 
-    deterministic_failures = module._reasoning_only_length_failures_from_trace(
-        failed_trace
-    )
+    deterministic_failures = module._reasoning_only_length_failures_from_trace(failed_trace)
     assert len(deterministic_failures) == 2
     assert result.final_text == "accepted"
     assert selected_attempt == 2
@@ -1900,11 +2002,7 @@ async def test_g1_default_off_reasoning_only_length_rebuilds_router_dynamic_rost
     assert module.legal_proposer_quorum(3) == 2
     assert replacement.min_successful_proposers == 2
     assert all("thinking_execution_projection" not in attempt for attempt in attempts)
-    assert all(
-        field not in plan
-        for plan in (initial_plan, retry_plan)
-        for field in managed_fields
-    )
+    assert all(field not in plan for plan in (initial_plan, retry_plan) for field in managed_fields)
 
 
 @pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
@@ -1937,7 +2035,7 @@ def test_unmanaged_reasoning_usage_drives_deterministic_g1_roster_retry(module) 
                 include_text=True,
                 content_max_chars=8_000,
             )
-        ]
+        ],
     }
 
     failures = module._reasoning_only_length_failures_from_trace(trace)
@@ -2165,17 +2263,13 @@ async def test_provider_native_g1_recovery_never_enters_outer_generation_retry(
     assert len(calls) == 1
     assert len(attempts) == 1
     assert attempts[0]["will_retry"] is False
-    assert attempts[0]["retry_suppressed_reason"] == (
-        "provider_native_proposer_recovery_terminal"
-    )
+    assert attempts[0]["retry_suppressed_reason"] == ("provider_native_proposer_recovery_terminal")
     assert attempts[0]["proposer_recovery_owner"] == "provider"
     assert attempts[0]["selection_plan"] == plan
     assert attempts[0]["deterministic_proposer_failures"] == []
     assert attempts[0]["excluded_proposer_identities"] == []
     assert "ensemble_trace" in attempts[0]["run"]
-    assert (
-        paid_attempt_sink["provider_native_g1_recovery"] is True
-    )
+    assert paid_attempt_sink["provider_native_g1_recovery"] is True
 
 
 @pytest.mark.asyncio
@@ -2201,13 +2295,13 @@ async def test_reasoning_only_length_retry_rebuilds_roster_and_tracks_each_plan(
             "ranking_thinking_assignment_enabled": True,
             "selected_A": "openrouter:model-a",
             "aggregator_candidates": ["openrouter:model-a"],
-                "executed_thinking_assignment": {
-                    "proposers": {identity: "highest" for identity in initial_plan["selected_P"]},
-                    "aggregator": "highest",
-                    "thinking_policy_version": "test-thinking-policy/v1",
-                },
-                "thinking_execution_fallbacks": [],
-                "thinking_assignment_details": {
+            "executed_thinking_assignment": {
+                "proposers": {identity: "highest" for identity in initial_plan["selected_P"]},
+                "aggregator": "highest",
+                "thinking_policy_version": "test-thinking-policy/v1",
+            },
+            "thinking_execution_fallbacks": [],
+            "thinking_assignment_details": {
                 "proposers": [
                     {
                         "identity": identity,
@@ -2450,9 +2544,7 @@ async def test_reasoning_only_length_retry_rebuilds_roster_and_tracks_each_plan(
     ]
     upward_expected["executed_thinking_assignment"]["proposers"][failed_identity] = "high"
     upward_fallback_plan = deepcopy(upward_expected)
-    upward_fallback_plan["executed_thinking_assignment"]["proposers"][
-        failed_identity
-    ] = "highest"
+    upward_fallback_plan["executed_thinking_assignment"]["proposers"][failed_identity] = "highest"
     upward_fallback_plan["thinking_execution_fallbacks"] = [
         {
             **physical_initial_plan["thinking_execution_fallbacks"][0],
@@ -2472,9 +2564,7 @@ async def test_reasoning_only_length_retry_rebuilds_roster_and_tracks_each_plan(
     )
 
     skipped_upward_plan = deepcopy(upward_fallback_plan)
-    skipped_upward_plan["thinking_execution_fallbacks"][0][
-        "effective_thinking_level"
-    ] = "low"
+    skipped_upward_plan["thinking_execution_fallbacks"][0]["effective_thinking_level"] = "low"
     assert (
         module.g1_execution_plan_mutation_reason(
             upward_expected,
@@ -2484,9 +2574,7 @@ async def test_reasoning_only_length_retry_rebuilds_roster_and_tracks_each_plan(
     )
 
     arbitrary_reason_plan = deepcopy(physical_initial_plan)
-    arbitrary_reason_plan["thinking_execution_fallbacks"][0]["reason"] = (
-        "forged_reason"
-    )
+    arbitrary_reason_plan["thinking_execution_fallbacks"][0]["reason"] = "forged_reason"
     assert (
         module.g1_execution_plan_mutation_reason(
             initial_plan,
@@ -2505,9 +2593,7 @@ def test_default_off_provider_setup_remains_exactly_one_shot(module) -> None:
         }
 
         def selection_plan_execution_snapshot(self):
-            raise AssertionError(
-                "default-off setup must not inspect execution snapshots"
-            )
+            raise AssertionError("default-off setup must not inspect execution snapshots")
 
     provider = Provider()
     provider._draco_frozen_routing_trace = {"stale": "managed-route"}
@@ -2778,9 +2864,9 @@ def _g1_lifecycle_receipt_serialization_plans() -> tuple[
     assert isinstance(routing_plan, dict)
     assert isinstance(physical_plan, dict)
     physical_plan["task_analyzer"]["usage"]["billing_receipt"] = str(receipt)
-    physical_plan["task_analyzer"]["usage"]["physical_attempts"][0][
-        "billing_receipt"
-    ] = str(receipt)
+    physical_plan["task_analyzer"]["usage"]["physical_attempts"][0]["billing_receipt"] = str(
+        receipt
+    )
     return routing_plan, physical_plan
 
 
@@ -2910,10 +2996,13 @@ def test_g1_attempt_consistency_ignores_only_analyzer_receipt_serialization(
         lambda _trace: ([{"selection_plan": tampered_physical}], []),
     )
     result.done.ensemble_trace = {"selection_plan": tampered_physical}
-    assert module.g1_attempt_plan_consistency_reason(
-        routing_plan,
-        result,
-    ) == "g1_attempt_plan_provenance_invalid"
+    assert (
+        module.g1_attempt_plan_consistency_reason(
+            routing_plan,
+            result,
+        )
+        == "g1_attempt_plan_provenance_invalid"
+    )
 
 
 @pytest.mark.parametrize("implementation", ["finalizer", "resume"])
@@ -2932,10 +3021,13 @@ def test_g1_lifecycle_plan_ignores_real_analyzer_receipt_serialization(
     assert isinstance(physical_usage["physical_attempts"][0]["billing_receipt"], str)
     assert module._g1_plans_match(routing_plan, physical_plan)
     assert module._g1_full_plans_match(routing_plan, physical_plan)
-    assert module._g1_execution_plan_mutation_reasons(
-        routing_plan,
-        physical_plan,
-    ) == []
+    assert (
+        module._g1_execution_plan_mutation_reasons(
+            routing_plan,
+            physical_plan,
+        )
+        == []
+    )
     assert (
         _g1_lifecycle_plan_reasons(
             module,
@@ -3005,17 +3097,15 @@ def test_g1_lifecycle_plan_rejects_analyzer_decision_binding_tamper(
     elif tamper == "usage_route":
         routing_plan["task_analyzer"]["usage"]["model"] = "tampered/model"
     elif tamper == "usage_physical_id":
-        routing_plan["task_analyzer"]["usage"]["physical_attempts"][0][
-            "physical_attempt_id"
-        ] = "b" * 32
+        routing_plan["task_analyzer"]["usage"]["physical_attempts"][0]["physical_attempt_id"] = (
+            "b" * 32
+        )
     elif tamper == "usage_response_id":
         routing_plan["task_analyzer"]["usage"]["provider_usage"]["response_ids"] = [
             "tampered-response"
         ]
     elif tamper == "usage_physical_tokens":
-        routing_plan["task_analyzer"]["usage"]["physical_attempts"][0][
-            "input_tokens"
-        ] += 1
+        routing_plan["task_analyzer"]["usage"]["physical_attempts"][0]["input_tokens"] += 1
     else:
         routing_plan[tamper] = "0" * 64
 
@@ -3140,13 +3230,9 @@ def test_resume_g1_analyzer_only_paid_attempt_does_not_require_ensemble_trace() 
         "llm_request_count": 1,
         "usage_unknown_count": 1,
         "setup_usage": [deepcopy(unknown_analyzer)],
-        "usage": {
-            "model_usage_breakdown": [deepcopy(unknown_analyzer)]
-        },
+        "usage": {"model_usage_breakdown": [deepcopy(unknown_analyzer)]},
     }
-    assert (
-        resume_runner.g1_run_expected_ensemble_request_count(unknown_run) == 0
-    )
+    assert resume_runner.g1_run_expected_ensemble_request_count(unknown_run) == 0
     unknown_then_generation = deepcopy(unknown_run)
     unknown_then_generation["llm_request_count"] = 2
     unknown_then_generation["usage"]["model_usage_breakdown"].append(
@@ -3159,12 +3245,7 @@ def test_resume_g1_analyzer_only_paid_attempt_does_not_require_ensemble_trace() 
             "request_count": 1,
         }
     )
-    assert (
-        resume_runner.g1_run_expected_ensemble_request_count(
-            unknown_then_generation
-        )
-        == 1
-    )
+    assert resume_runner.g1_run_expected_ensemble_request_count(unknown_then_generation) == 1
 
 
 @pytest.mark.asyncio
@@ -3458,9 +3539,7 @@ async def test_g1_deterministic_then_transient_then_success_reuses_route_not_set
 
         def selection_plan_execution_snapshot(self):
             return deepcopy(
-                self.selection_plan
-                if self.reset_execution_snapshot
-                else self.execution_plan
+                self.selection_plan if self.reset_execution_snapshot else self.execution_plan
             )
 
     initial = Provider(initial_plan)
@@ -3589,9 +3668,7 @@ async def test_g1_deterministic_then_transient_then_success_reuses_route_not_set
             if not reset_before_third:
                 active_provider.execution_plan = deepcopy(executed_plan)
                 if immutable_drift_before_third:
-                    active_provider.execution_plan[
-                        "test_immutable_drift"
-                    ] = True
+                    active_provider.execution_plan["test_immutable_drift"] = True
         elif call_number == 3:
             recovery_attempts = [
                 {
@@ -3624,9 +3701,7 @@ async def test_g1_deterministic_then_transient_then_success_reuses_route_not_set
                     ensemble_trace={
                         "selection_plan": executed_plan,
                         "candidates": [],
-                        "aggregator_recovery": {
-                            "attempts": recovery_attempts
-                        },
+                        "aggregator_recovery": {"attempts": recovery_attempts},
                         "final_request": {
                             "role": "aggregator",
                             "request_started": True,
@@ -3646,9 +3721,7 @@ async def test_g1_deterministic_then_transient_then_success_reuses_route_not_set
                 ensemble_trace={
                     "selection_plan": executed_plan,
                     "candidates": [],
-                    "aggregator_recovery": {
-                        "attempts": recovery_attempts
-                    },
+                    "aggregator_recovery": {"attempts": recovery_attempts},
                     "final_request": {
                         "role": "aggregator",
                         "request_started": True,
@@ -3686,26 +3759,17 @@ async def test_g1_deterministic_then_transient_then_success_reuses_route_not_set
         assert selected_attempt == 0
         assert call_number == 2
         assert len(attempts) == 3
-        assert attempts[-1]["attempt_kind"] == (
-            "generation_pre_call_guard"
-        )
+        assert attempts[-1]["attempt_kind"] == ("generation_pre_call_guard")
         assert attempts[-1]["will_retry"] is False
-        assert (
-            attempts[-1]["retry_suppressed_reason"]
-            == result.error
-        )
-        assert attempts[-1]["run"]["trace_events"][0][
-            "code"
-        ] == "g1_pre_call_guard_failed"
+        assert attempts[-1]["retry_suppressed_reason"] == result.error
+        assert attempts[-1]["run"]["trace_events"][0]["code"] == "g1_pre_call_guard_failed"
     elif immutable_drift_before_third:
         assert result.error == "HTTP 429"
         assert selected_attempt == 0
         assert call_number == 2
         assert len(attempts) == 2
         assert attempts[-1]["will_retry"] is False
-        assert attempts[-1]["retry_suppressed_reason"] == (
-            "g1_attempt_plan_provenance_invalid"
-        )
+        assert attempts[-1]["retry_suppressed_reason"] == ("g1_attempt_plan_provenance_invalid")
     else:
         assert result.final_text == "accepted"
         assert selected_attempt == 3
@@ -3715,17 +3779,17 @@ async def test_g1_deterministic_then_transient_then_success_reuses_route_not_set
             retry_plan_baseline,
             replacement.execution_plan,
         ]
-        assert [
-            attempt["run"]["routing_trace"]["selection_plan"]
-            for attempt in attempts
-        ] == [
+        assert [attempt["run"]["routing_trace"]["selection_plan"] for attempt in attempts] == [
             initial_plan,
             replacement.execution_plan,
             replacement.execution_plan,
         ]
-    assert attempts[1]["run"]["ensemble_trace"]["selection_plan"][
-        "thinking_execution_fallbacks"
-    ][0]["fallback_result"] == "succeeded"
+    assert (
+        attempts[1]["run"]["ensemble_trace"]["selection_plan"]["thinking_execution_fallbacks"][0][
+            "fallback_result"
+        ]
+        == "succeeded"
+    )
     expected_setup_latencies = (
         [11, 7, 0]
         if reset_before_third
@@ -3733,10 +3797,7 @@ async def test_g1_deterministic_then_transient_then_success_reuses_route_not_set
         if immutable_drift_before_third
         else [11, 7, 0]
     )
-    assert [
-        attempt["run"]["setup_latency_ms"]
-        for attempt in attempts
-    ] == expected_setup_latencies
+    assert [attempt["run"]["setup_latency_ms"] for attempt in attempts] == expected_setup_latencies
     analyzer_units = [
         unit
         for attempt in attempts
@@ -3776,30 +3837,22 @@ async def test_managed_mode_downgrade_is_blocked_before_first_paid_call(
 
     monkeypatch.setattr(module, "collect_run", unexpected_collect_run)
 
-    result, attempts, selected_attempt = (
-        await module.collect_generation_with_retries(
-            Provider(),
-            "prompt",
-            timeout=30,
-            group="G1",
-            max_attempts=2,
-        )
+    result, attempts, selected_attempt = await module.collect_generation_with_retries(
+        Provider(),
+        "prompt",
+        timeout=30,
+        group="G1",
+        max_attempts=2,
     )
 
     assert calls == 0
     assert selected_attempt == 0
-    assert result.error == (
-        "g1_thinking_execution_managed_mode_changed_before_call"
-    )
+    assert result.error == ("g1_thinking_execution_managed_mode_changed_before_call")
     assert len(attempts) == 1
-    assert attempts[0]["attempt_kind"] == (
-        "generation_pre_call_guard"
-    )
+    assert attempts[0]["attempt_kind"] == ("generation_pre_call_guard")
     assert attempts[0]["attempt"] == 1
     assert attempts[0]["run"]["llm_request_count"] == 0
-    assert attempts[0]["run"]["trace_events"][0][
-        "code"
-    ] == "g1_pre_call_guard_failed"
+    assert attempts[0]["run"]["trace_events"][0]["code"] == "g1_pre_call_guard_failed"
 
 
 @pytest.mark.parametrize(
@@ -3819,9 +3872,7 @@ def test_attach_provider_setup_wraps_paid_snapshot_failure_without_text(
         selection_plan = deepcopy(plan)
 
         def selection_plan_execution_snapshot(self):
-            raise RuntimeError(
-                "private upstream diagnostic must not be persisted"
-            )
+            raise RuntimeError("private upstream diagnostic must not be persisted")
 
     paid_usage = {
         "role": "task_analyzer",
@@ -3849,16 +3900,12 @@ def test_attach_provider_setup_wraps_paid_snapshot_failure_without_text(
                 prompt="prompt",
                 setup_latency_ms=29,
                 setup_usage=[paid_usage],
-                routing_trace={
-                    "selection_plan": deepcopy(plan)
-                },
+                routing_trace={"selection_plan": deepcopy(plan)},
             ),
         )
 
     error = exc_info.value
-    assert str(error) == (
-        "provider_build_failed_after_setup:RuntimeError"
-    )
+    assert str(error) == ("provider_build_failed_after_setup:RuntimeError")
     assert "private upstream diagnostic" not in str(error)
     assert error.setup_latency_ms == 29
     assert error.setup_usage == [paid_usage]
@@ -3875,23 +3922,17 @@ def test_attach_provider_setup_wraps_paid_snapshot_failure_without_text(
 def test_paid_provider_build_post_setup_initialization_is_protected(
     module,
 ) -> None:
-    tree = ast.parse(
-        inspect.getsource(module.build_experiment_provider)
-    )
+    tree = ast.parse(inspect.getsource(module.build_experiment_provider))
     protected = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Try):
             continue
-        body_source = "\n".join(
-            ast.unparse(statement) for statement in node.body
-        )
+        body_source = "\n".join(ast.unparse(statement) for statement in node.body)
         if "attach_provider_setup(provider, result)" in body_source:
             protected.append(node)
 
     assert len(protected) == 1
-    handlers_source = "\n".join(
-        ast.unparse(handler) for handler in protected[0].handlers
-    )
+    handlers_source = "\n".join(ast.unparse(handler) for handler in protected[0].handlers)
     assert "except ProviderBuildError" in handlers_source
     assert "if setup_usage" in handlers_source
     assert "raise ProviderBuildError" in handlers_source
@@ -3955,21 +3996,17 @@ async def test_managed_pre_call_guard_preserves_paid_setup_evidence(
 
     monkeypatch.setattr(module, "collect_run", unexpected_collect_run)
 
-    result, attempts, selected_attempt = (
-        await module.collect_generation_with_retries(
-            provider,
-            "prompt",
-            timeout=30,
-            group="G1",
-            max_attempts=2,
-        )
+    result, attempts, selected_attempt = await module.collect_generation_with_retries(
+        provider,
+        "prompt",
+        timeout=30,
+        group="G1",
+        max_attempts=2,
     )
 
     assert calls == 0
     assert selected_attempt == 0
-    assert result.error == (
-        "g1_thinking_execution_managed_mode_changed_before_call"
-    )
+    assert result.error == ("g1_thinking_execution_managed_mode_changed_before_call")
     assert result.setup_latency_ms == 17
     assert result.setup_usage == [paid_usage]
     assert module.consume_provider_setup(provider)["usage"] == []
@@ -3986,12 +4023,7 @@ async def test_managed_pre_call_guard_preserves_paid_setup_evidence(
     guard_trace = attempts[0]["run"]["routing_trace"]["pre_call_guard"]
     assert guard_trace["error"] == result.error
     assert guard_trace["expected_selection_plan"] == plan
-    assert (
-        guard_trace["observed_selection_plan"][
-            "ranking_thinking_assignment_enabled"
-        ]
-        is False
-    )
+    assert guard_trace["observed_selection_plan"]["ranking_thinking_assignment_enabled"] is False
     assert guard_trace["request_started"] is False
     assert guard_trace["physical_request_count"] == 0
     assert attempts[0]["run"]["usage"]["model_usage_breakdown"] == [paid_usage]
@@ -4053,21 +4085,18 @@ async def test_managed_pre_call_guard_snapshot_exception_preserves_paid_setup(
 
     monkeypatch.setattr(module, "collect_run", unexpected_collect_run)
 
-    result, attempts, selected_attempt = (
-        await module.collect_generation_with_retries(
-            provider,
-            "prompt",
-            timeout=30,
-            group="G1",
-            max_attempts=2,
-        )
+    result, attempts, selected_attempt = await module.collect_generation_with_retries(
+        provider,
+        "prompt",
+        timeout=30,
+        group="G1",
+        max_attempts=2,
     )
 
     assert calls == 0
     assert selected_attempt == 0
     assert result.error == (
-        "g1_thinking_execution_pre_call_guard_exception:"
-        "selection_plan_snapshot:RuntimeError"
+        "g1_thinking_execution_pre_call_guard_exception:selection_plan_snapshot:RuntimeError"
     )
     assert result.setup_latency_ms == 17
     assert result.setup_usage == [paid_usage]
@@ -4157,9 +4186,7 @@ async def test_managed_pre_call_guard_capture_failure_preserves_paid_receipt(
         monkeypatch.setattr(
             module,
             "json_safe",
-            lambda *_args, **_kwargs: (_ for _ in ()).throw(
-                RuntimeError(private_detail)
-            ),
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError(private_detail)),
         )
     generation_calls = 0
 
@@ -4170,23 +4197,19 @@ async def test_managed_pre_call_guard_capture_failure_preserves_paid_receipt(
 
     monkeypatch.setattr(module, "collect_run", unexpected_collect_run)
 
-    result, attempts, selected_attempt = (
-        await module.collect_generation_with_retries(
-            provider,
-            "prompt",
-            timeout=30,
-            group="G1",
-            max_attempts=2,
-        )
+    result, attempts, selected_attempt = await module.collect_generation_with_retries(
+        provider,
+        "prompt",
+        timeout=30,
+        group="G1",
+        max_attempts=2,
     )
 
     assert generation_calls == 0
     assert selected_attempt == 0
     assert len(attempts) == 1
     assert attempts[0]["attempt_kind"] == "provider_build_after_paid_setup"
-    assert result.error == (
-        "g1_thinking_execution_managed_mode_changed_before_call"
-    )
+    assert result.error == ("g1_thinking_execution_managed_mode_changed_before_call")
     assert len(result.setup_usage) == 1
     receipt = result.setup_usage[0]
     assert receipt["request_count"] == 1
@@ -4256,32 +4279,24 @@ async def test_managed_pre_call_guard_summary_failure_keeps_paid_setup_until_com
     monkeypatch.setattr(
         module,
         "run_result_summary",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            RuntimeError("private summary detail")
-        ),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("private summary detail")),
     )
 
-    result, attempts, selected_attempt = (
-        await module.collect_generation_with_retries(
-            provider,
-            "prompt",
-            timeout=30,
-            group="G1",
-            max_attempts=2,
-        )
+    result, attempts, selected_attempt = await module.collect_generation_with_retries(
+        provider,
+        "prompt",
+        timeout=30,
+        group="G1",
+        max_attempts=2,
     )
 
     assert selected_attempt == 0
-    assert result.error == (
-        "g1_thinking_execution_managed_mode_changed_before_call"
-    )
+    assert result.error == ("g1_thinking_execution_managed_mode_changed_before_call")
     assert len(attempts) == 1
     run = attempts[0]["run"]
     assert run["llm_request_count"] == 1
     assert run["usage"]["model_usage_breakdown"] == [paid_usage]
-    assert run["generation_postprocessing_failure"][
-        "stage"
-    ] == "g1_pre_call_guard_evidence"
+    assert run["generation_postprocessing_failure"]["stage"] == "g1_pre_call_guard_evidence"
     assert "private summary detail" not in json.dumps(attempts)
     assert module.consume_provider_setup(provider)["usage"] == []
 
@@ -4334,8 +4349,7 @@ async def test_managed_pre_call_guard_closure_exception_preserves_paid_setup(
         raise RuntimeError("private closure failure text")
 
     monkeypatch.setattr(
-        "opensquilla.provider.thinking_execution."
-        "validate_thinking_execution_history_closure",
+        "opensquilla.provider.thinking_execution.validate_thinking_execution_history_closure",
         fail_closure,
     )
     calls = 0
@@ -4347,27 +4361,22 @@ async def test_managed_pre_call_guard_closure_exception_preserves_paid_setup(
 
     monkeypatch.setattr(module, "collect_run", unexpected_collect_run)
 
-    result, attempts, selected_attempt = (
-        await module.collect_generation_with_retries(
-            provider,
-            "prompt",
-            timeout=30,
-            group="G1",
-            max_attempts=2,
-        )
+    result, attempts, selected_attempt = await module.collect_generation_with_retries(
+        provider,
+        "prompt",
+        timeout=30,
+        group="G1",
+        max_attempts=2,
     )
 
     assert calls == 0
     assert selected_attempt == 0
     assert result.error == (
-        "g1_thinking_execution_pre_call_guard_exception:"
-        "history_closure:RuntimeError"
+        "g1_thinking_execution_pre_call_guard_exception:history_closure:RuntimeError"
     )
     assert result.setup_usage == [paid_usage]
     assert len(attempts) == 1
-    assert attempts[0]["attempt_kind"] == (
-        "provider_build_after_paid_setup"
-    )
+    assert attempts[0]["attempt_kind"] == ("provider_build_after_paid_setup")
     assert "private closure failure text" not in str(attempts)
 
 
@@ -4429,14 +4438,9 @@ async def test_managed_pre_call_guard_hash_exception_preserves_paid_setup(
                 }
             ),
             error="transient",
-            setup_latency_ms=module.coerce_metric_int(
-                setup.get("latency_ms")
-            ),
+            setup_latency_ms=module.coerce_metric_int(setup.get("latency_ms")),
             setup_usage=deepcopy(setup.get("usage") or []),
-            routing_trace=deepcopy(
-                setup.get("routing")
-                or {"selection_plan": deepcopy(plan)}
-            ),
+            routing_trace=deepcopy(setup.get("routing") or {"selection_plan": deepcopy(plan)}),
         )
 
     monkeypatch.setattr(module, "collect_run", retrying_collect_run)
@@ -4458,38 +4462,29 @@ async def test_managed_pre_call_guard_hash_exception_preserves_paid_setup(
 
     monkeypatch.setattr(module, "canonical_json_sha256", fail_hash)
 
-    result, attempts, selected_attempt = (
-        await module.collect_generation_with_retries(
-            provider,
-            "prompt",
-            timeout=30,
-            group="G1",
-            max_attempts=2,
-        )
+    result, attempts, selected_attempt = await module.collect_generation_with_retries(
+        provider,
+        "prompt",
+        timeout=30,
+        group="G1",
+        max_attempts=2,
     )
 
     assert calls == 1
     assert selected_attempt == 0
     assert result.error == (
-        "g1_thinking_execution_pre_call_guard_exception:"
-        "immutable_hash:RuntimeError"
+        "g1_thinking_execution_pre_call_guard_exception:immutable_hash:RuntimeError"
     )
     assert result.setup_usage == []
     assert [attempt["attempt_kind"] for attempt in attempts] == [
         "generation",
         "generation_pre_call_guard",
     ]
-    assert paid_usage in attempts[0]["run"]["usage"][
-        "model_usage_breakdown"
-    ]
+    assert paid_usage in attempts[0]["run"]["usage"]["model_usage_breakdown"]
     assert attempts[1]["attempt"] == 2
     assert attempts[1]["run"]["llm_request_count"] == 0
-    assert attempts[1]["run"]["routing_trace"]["pre_call_guard"][
-        "error"
-    ] == result.error
-    assert attempts[1]["run"]["trace_events"][0][
-        "code"
-    ] == "g1_pre_call_guard_failed"
+    assert attempts[1]["run"]["routing_trace"]["pre_call_guard"]["error"] == result.error
+    assert attempts[1]["run"]["trace_events"][0]["code"] == "g1_pre_call_guard_failed"
     assert "private hash failure text" not in str(attempts)
 
 
@@ -4535,23 +4530,19 @@ async def test_successful_managed_result_with_tampered_plan_is_not_accepted(
         lambda *_args, **_kwargs: "",
     )
 
-    result, attempts, selected_attempt = (
-        await module.collect_generation_with_retries(
-            Provider(),
-            "prompt",
-            timeout=30,
-            group="G1",
-            max_attempts=2,
-        )
+    result, attempts, selected_attempt = await module.collect_generation_with_retries(
+        Provider(),
+        "prompt",
+        timeout=30,
+        group="G1",
+        max_attempts=2,
     )
 
     assert calls == 1
     assert selected_attempt == 0
     assert len(attempts) == 1
     assert attempts[0]["will_retry"] is False
-    assert attempts[0]["retry_suppressed_reason"] == (
-        "g1_attempt_plan_provenance_invalid"
-    )
+    assert attempts[0]["retry_suppressed_reason"] == ("g1_attempt_plan_provenance_invalid")
     assert result.error == "g1_attempt_plan_provenance_invalid"
 
 
@@ -4576,14 +4567,10 @@ async def test_transient_generation_failure_retries_same_roster_without_rebuild(
 
         @property
         def _draco_reasoning_only_retry_factory(self):
-            raise AssertionError(
-                "default-off retries must not inspect the managed factory"
-            )
+            raise AssertionError("default-off retries must not inspect the managed factory")
 
         def selection_plan_execution_snapshot(self):
-            raise AssertionError(
-                "default-off retries must use the frozen legacy plan"
-            )
+            raise AssertionError("default-off retries must use the frozen legacy plan")
 
     provider = Provider()
     if switch_value is not None:
@@ -4712,9 +4699,7 @@ async def test_g1_physical_counter_mismatch_blocks_next_paid_call(
             "decision_id": "strict-physical-binding",
             "selected_P": ["openrouter:model-a"],
             "proposer_sample_count": 1,
-            "thinking_physical_evidence_schema": (
-                THINKING_PHYSICAL_EVIDENCE_SCHEMA
-            ),
+            "thinking_physical_evidence_schema": (THINKING_PHYSICAL_EVIDENCE_SCHEMA),
         }
     )
 
@@ -4728,9 +4713,7 @@ async def test_g1_physical_counter_mismatch_blocks_next_paid_call(
         nonlocal paid_calls
         paid_calls += 1
         if paid_calls > 1:
-            raise AssertionError(
-                "physical Counter mismatch must block a second paid call"
-            )
+            raise AssertionError("physical Counter mismatch must block a second paid call")
         return module.RunResult(
             final_text="",
             done=DoneEvent(
@@ -4797,8 +4780,7 @@ async def test_g1_physical_counter_mismatch_blocks_next_paid_call(
     assert selected_attempt == 0
     assert attempts[0]["will_retry"] is False
     assert attempts[0]["retry_suppressed_reason"] == (
-        "g1_physical_usage_binding_failed:"
-        "g1_thinking_physical_usage_set_mismatch"
+        "g1_physical_usage_binding_failed:g1_thinking_physical_usage_set_mismatch"
     )
 
 
@@ -4844,9 +4826,7 @@ async def test_managed_g1_audits_success_before_judge_or_acceptance(
         plan = _with_g1_task_analysis_invariants(
             {
                 **plan,
-                "thinking_physical_evidence_schema": (
-                    THINKING_PHYSICAL_EVIDENCE_SCHEMA
-                ),
+                "thinking_physical_evidence_schema": (THINKING_PHYSICAL_EVIDENCE_SCHEMA),
             }
         )
 
@@ -4894,9 +4874,7 @@ async def test_managed_g1_audits_success_before_judge_or_acceptance(
                                 "physical_attempts": [
                                     {
                                         "request_started": True,
-                                        "physical_attempt_id": (
-                                            ledger_attempt_id
-                                        ),
+                                        "physical_attempt_id": (ledger_attempt_id),
                                     }
                                 ]
                             },
@@ -4920,23 +4898,18 @@ async def test_managed_g1_audits_success_before_judge_or_acceptance(
         lambda *_args, **_kwargs: "",
     )
 
-    result, attempts, selected_attempt = (
-        await module.collect_generation_with_retries(
-            Provider(),
-            "prompt",
-            timeout=30,
-            group="G1",
-            max_attempts=1,
-        )
+    result, attempts, selected_attempt = await module.collect_generation_with_retries(
+        Provider(),
+        "prompt",
+        timeout=30,
+        group="G1",
+        max_attempts=1,
     )
 
     assert selected_attempt == expected_selected
     assert len(attempts) == 1
     if managed and usage_attempt_id != ledger_attempt_id:
-        expected_error = (
-            "g1_physical_usage_binding_failed:"
-            "g1_thinking_physical_usage_set_mismatch"
-        )
+        expected_error = "g1_physical_usage_binding_failed:g1_thinking_physical_usage_set_mismatch"
         assert result.error == expected_error
         assert attempts[0]["retry_reason"] == expected_error
         assert attempts[0]["retry_suppressed_reason"] == expected_error
@@ -4972,33 +4945,21 @@ async def test_g1_provider_native_recovery_runs_task_analysis_once(
     experiment = _experiment_config()
     current_registry = load_model_registry_snapshot()
     if not thinking_assignment_enabled:
-        current_registry = _legacy_registry_snapshot_projection(
-            current_registry
-        )
+        current_registry = _legacy_registry_snapshot_projection(current_registry)
     current_ranking = ranking_config_snapshot(
         thinking_assignment_enabled=thinking_assignment_enabled,
     )
     experiment_payload = experiment.model_dump(mode="json")
     experiment_payload["g1_routing"].update(
         {
-            "source_registry_snapshot_version": current_registry[
-                "snapshot_version"
-            ],
+            "source_registry_snapshot_version": current_registry["snapshot_version"],
             "expected_source_registry_snapshot_sha256": (
-                module.canonical_json_sha256(current_registry).removeprefix(
-                    "sha256:"
-                )
+                module.canonical_json_sha256(current_registry).removeprefix("sha256:")
             ),
-            "expected_ranking_config_schema_version": current_ranking[
-                "schema_version"
-            ],
-            "expected_ranking_config_version": current_ranking[
-                "config_version"
-            ],
+            "expected_ranking_config_schema_version": current_ranking["schema_version"],
+            "expected_ranking_config_version": current_ranking["config_version"],
             "expected_ranking_config_sha256": (
-                module.canonical_json_sha256(current_ranking).removeprefix(
-                    "sha256:"
-                )
+                module.canonical_json_sha256(current_ranking).removeprefix("sha256:")
             ),
         }
     )
@@ -5058,6 +5019,8 @@ async def test_g1_provider_native_recovery_runs_task_analysis_once(
                 "output_tokens": 2,
                 "attempt_count": 1,
             },
+            provider_id=str(kwargs["analyzer_provider_id"]),
+            model_id=str(kwargs["analyzer_model_id"]),
         )
 
     monkeypatch.setattr(module, "run_pipeline", fake_run_pipeline)
@@ -5099,9 +5062,7 @@ async def test_g1_provider_native_recovery_runs_task_analysis_once(
         build.provider,
         "_draco_reasoning_only_retry_factory",
     )
-    assert plan["proposer_recovery_policy"] == (
-        module.FORMAL_PROPOSER_RECOVERY_POLICY
-    )
+    assert plan["proposer_recovery_policy"] == (module.FORMAL_PROPOSER_RECOVERY_POLICY)
     assert len(plan["backup_P"]) == 2
     assert plan["configured_proposer_backup_count"] == 2
     assert plan["effective_proposer_backup_count"] == 2
@@ -5110,10 +5071,7 @@ async def test_g1_provider_native_recovery_runs_task_analysis_once(
 
     setup = module.consume_provider_setup(build.provider)
     assert setup["usage"] == build.setup_usage
-    assert (
-        sum(int(unit.get("request_count") or 0) for unit in setup["usage"])
-        == 1
-    )
+    assert sum(int(unit.get("request_count") or 0) for unit in setup["usage"]) == 1
     assert module.consume_provider_setup(build.provider).get("usage", []) == []
     if not thinking_assignment_enabled:
         assert "thinking_execution_projection" not in setup["routing"]
@@ -5249,17 +5207,14 @@ async def test_task_analyzer_post_return_failure_preserves_paid_receipts(
 
     monkeypatch.setattr(module, "run_pipeline", fake_run_pipeline)
     monkeypatch.setattr(
-        "opensquilla.provider.ranking_router."
-        "analyze_task_with_provider",
+        "opensquilla.provider.ranking_router.analyze_task_with_provider",
         fake_analyze_task_with_provider,
     )
     if failure_mode == "usage_materialization":
         monkeypatch.setattr(
             module,
             "task_analyzer_usage_rows",
-            lambda *_args, **_kwargs: (_ for _ in ()).throw(
-                RuntimeError(private_detail)
-            ),
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError(private_detail)),
         )
     monkeypatch.setenv("OPENSQUILLA_PROVIDER_ROUTING_STRICT", "1")
     monkeypatch.setenv(
@@ -5284,35 +5239,22 @@ async def test_task_analyzer_post_return_failure_preserves_paid_receipts(
 
     assert analyzer_calls == 1
     error = captured.value
-    assert str(error) == (
-        "provider_build_failed_after_setup:RuntimeError"
-    )
+    assert str(error) == ("provider_build_failed_after_setup:RuntimeError")
     assert private_detail not in str(error)
-    expected_count = (
-        3 if failure_mode != "trace" else 1
-    )
+    expected_count = 3 if failure_mode != "trace" else 1
     assert len(error.setup_usage) == expected_count
-    assert [usage["attempt"] for usage in error.setup_usage] == list(
-        range(1, expected_count + 1)
-    )
-    assert {
-        usage["physical_attempt_id"]
-        for usage in error.setup_usage
-    } == {
-        str(ordinal) * 32
-        for ordinal in range(1, expected_count + 1)
+    assert [usage["attempt"] for usage in error.setup_usage] == list(range(1, expected_count + 1))
+    assert {usage["physical_attempt_id"] for usage in error.setup_usage} == {
+        str(ordinal) * 32 for ordinal in range(1, expected_count + 1)
     }
     assert all(
         usage["role"] == "task_analyzer"
         and usage["request_count"] == 1
         and usage["requested_provider"] == "openrouter"
-        and usage["requested_model"]
-        == "anthropic/claude-opus-4.8"
+        and usage["requested_model"] == "anthropic/claude-opus-4.8"
         for usage in error.setup_usage
     )
-    assert error.routing_trace["task_analyzer"]["source"] == (
-        "analyzer_postprocess_failed"
-    )
+    assert error.routing_trace["task_analyzer"]["source"] == ("analyzer_postprocess_failed")
     assert private_detail not in json.dumps(error.routing_trace)
 
 
@@ -5453,6 +5395,73 @@ async def test_run_one_records_and_forwards_agent_finalization_policy(
     assert captured["finalization_policy"] == policy
     assert row["agent_finalization_policy"] == policy
     assert row["execution"]["agent_finalization_policy"] == policy
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+async def test_run_one_records_dynamic_cumulative_generation_budget(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, inherited = _openrouter_config()
+    expected_model = str(module.GROUP_SPECS["B0"]["model"])
+    calls = 0
+
+    async def fake_build_experiment_provider(**_kwargs):
+        return module.ProviderBuildResult(provider=object(), prompt="prompt")
+
+    async def fake_collect_run(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return module.RunResult(
+            final_text="accepted",
+            done=DoneEvent(
+                provider="openrouter",
+                model=expected_model,
+                requested_provider="openrouter",
+                requested_model=expected_model,
+                stop_reason="stop",
+            ),
+        )
+
+    monkeypatch.setattr(
+        module,
+        "build_experiment_provider",
+        fake_build_experiment_provider,
+    )
+    monkeypatch.setattr(module, "collect_run", fake_collect_run)
+
+    row = await module.run_one(
+        task={"id": "task-1", "prompt": "prompt"},
+        group="B0",
+        config=config,
+        inherited=inherited,
+        dry_run=False,
+        judge_provider=None,
+        judge_candidates=False,
+        judge_repeats=1,
+        judge_concurrency=1,
+        judge_max_attempts=1,
+        judge_semaphore=None,
+        timeout=30,
+        ensemble_proposer_timeout=None,
+        ensemble_aggregator_timeout=None,
+        ensemble_proposer_early_stop_success_count=None,
+        ensemble_proposer_early_stop_after=None,
+        expand_ensemble_timeouts_to_task_timeout=False,
+        tool_policy={"tools_enabled": False, "tool_mode": "provider_only"},
+        generation_policy={},
+        generation_max_attempts=2,
+        generation_attempt_offset=1,
+    )
+
+    assert calls == 1
+    assert row["generation_attempt_budget_limit"] == 2
+    assert row["generation_attempt_budget_used"] == 2
+    assert row["generation_max_attempts"] == 2
+    assert row["execution"]["generation_max_attempts"] == 2
+    assert row["execution"]["generation_attempt_budget_remaining"] == 0
+    assert row["execution"]["generation_attempts"][0]["attempt"] == 2
 
 
 @pytest.mark.asyncio
@@ -7373,10 +7382,7 @@ async def test_collect_run_preserves_partial_receipts_from_terminal_error() -> N
     ids=["main", "resume"],
 )
 async def test_collect_run_persists_only_stable_exception_type(module) -> None:
-    private_detail = (
-        "private prompt api_key=secret-value "
-        "Bearer private-upstream-token"
-    )
+    private_detail = "private prompt api_key=secret-value Bearer private-upstream-token"
 
     class ExplodingProvider:
         def chat(self, *_args, **_kwargs):
@@ -9330,9 +9336,7 @@ def test_resume_byok_violation_is_audit_only_and_never_overrides_execution(
         ],
     }
     resume_runner._frozen_openrouter_registry_price_index.cache_clear()
-    request.addfinalizer(
-        resume_runner._frozen_openrouter_registry_price_index.cache_clear
-    )
+    request.addfinalizer(resume_runner._frozen_openrouter_registry_price_index.cache_clear)
     monkeypatch.setattr(
         resume_runner,
         "_load_frozen_model_registry_snapshot",
@@ -10397,6 +10401,9 @@ def test_resume_generation_attempt_budget_is_cumulative() -> None:
     assert resume_runner.remaining_generation_attempts(2, 3) == 1
     assert resume_runner.remaining_generation_attempts(3, 3) == 0
     assert resume_runner.remaining_generation_attempts(8, 3) == 0
+    assert resume_runner.remaining_generation_attempts(0, 2) == 2
+    assert resume_runner.remaining_generation_attempts(1, 2) == 1
+    assert resume_runner.remaining_generation_attempts(2, 2) == 0
 
 
 def test_resume_paid_adaptive_g1_requires_frozen_lifecycle_reconstruction() -> None:
@@ -10462,9 +10469,7 @@ def test_resume_paid_adaptive_g1_requires_frozen_lifecycle_reconstruction() -> N
     )
 
     paid_setup_failure = deepcopy(legacy_state)
-    failed_attempt = paid_setup_failure["row"]["execution"][
-        "generation_attempts"
-    ][0]
+    failed_attempt = paid_setup_failure["row"]["execution"]["generation_attempts"][0]
     failed_attempt["attempt_kind"] = "provider_build_after_paid_setup"
     failed_attempt["run"] = {
         "llm_request_count": 1,
@@ -10659,6 +10664,60 @@ def _strict_attempt_resume_row(
     }
 
 
+def test_resume_strict_attempt_evidence_uses_contract_generation_budget(
+    tmp_path: Path,
+) -> None:
+    contract = {"generation": {"max_attempts": 2}}
+    paths: list[Path] = []
+    for index, attempt_id in enumerate(("a" * 32, "b" * 32), start=1):
+        row = _strict_attempt_resume_row(
+            attempt_id=attempt_id,
+            cumulative_budget=index,
+            generation_completed_at=float(index),
+        )
+        row["generation_attempt_budget_limit"] = 2
+        row["execution"]["generation_attempt_budget_remaining"] = 2 - index
+        path = tmp_path / f"dynamic-wave-{index}.jsonl"
+        path.write_text(
+            json.dumps(resume_runner.seal_result_row(row)) + "\n",
+            encoding="utf-8",
+        )
+        paths.append(path)
+
+    states, _ = resume_runner.load_resume_group_task_states(
+        resume_paths=paths,
+        selected_keys={("B1", "task-1")},
+        prompt_hashes={"task-1": resume_runner.text_sha256("same prompt")},
+        task_input_hashes={"task-1": "sha256:task-input"},
+        run_compatibility_fingerprints={"B1": "sha256:run-contract"},
+        run_compatibility_contracts={"B1": contract},
+    )
+
+    assert states[("B1", "task-1")]["prior_generation_attempts_used"] == 2
+
+    tampered = _strict_attempt_resume_row(
+        attempt_id="c" * 32,
+        cumulative_budget=1,
+        generation_completed_at=3.0,
+    )
+    tampered["generation_attempt_budget_limit"] = 3
+    tampered["execution"]["generation_attempt_budget_remaining"] = 2
+    tampered_path = tmp_path / "tampered-budget.jsonl"
+    tampered_path.write_text(
+        json.dumps(resume_runner.seal_result_row(tampered)) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="budget limit differs"):
+        resume_runner.load_resume_group_task_states(
+            resume_paths=[tampered_path],
+            selected_keys={("B1", "task-1")},
+            prompt_hashes={"task-1": resume_runner.text_sha256("same prompt")},
+            task_input_hashes={"task-1": "sha256:task-input"},
+            run_compatibility_fingerprints={"B1": "sha256:run-contract"},
+            run_compatibility_contracts={"B1": contract},
+        )
+
+
 def _enabled_g1_frozen_lifecycle_contract() -> dict[str, object]:
     return {
         "gateway_execution": {
@@ -10671,10 +10730,7 @@ def _enabled_g1_frozen_lifecycle_contract() -> dict[str, object]:
 
 
 def test_resume_blocks_automatic_resend_after_paid_postprocessing_failure() -> None:
-    reason = (
-        "generation_postprocessing_failed:"
-        "run_result_summary:RuntimeError"
-    )
+    reason = "generation_postprocessing_failed:run_result_summary:RuntimeError"
     row = _strict_attempt_resume_row(
         attempt_id="1" * 32,
         cumulative_budget=1,
@@ -10713,23 +10769,16 @@ def test_resume_blocks_automatic_resend_after_paid_postprocessing_failure() -> N
 
     state = resume_runner.resume_row_completion_state(
         row,
-        expected_prompt_sha256=resume_runner.text_sha256(
-            "same prompt"
-        ),
+        expected_prompt_sha256=resume_runner.text_sha256("same prompt"),
         expected_task_input_sha256="sha256:task-input",
-        expected_run_compatibility_fingerprint=(
-            "sha256:run-contract"
-        ),
+        expected_run_compatibility_fingerprint=("sha256:run-contract"),
         judge_required=False,
     )
 
     assert state["action"] == "regenerate"
     assert state["generation_auto_retry_blocked"] is True
     assert state["generation_postprocessing_terminal"] == {
-        "schema": (
-            "opensquilla.draco."
-            "generation-postprocessing-terminal/v1"
-        ),
+        "schema": ("opensquilla.draco.generation-postprocessing-terminal/v1"),
         "reason": reason,
         "stage": "run_result_summary",
         "exception_type": "RuntimeError",
@@ -10743,25 +10792,20 @@ def test_resume_blocks_automatic_resend_after_paid_postprocessing_failure() -> N
     guarded = next(
         node
         for node in ast.walk(tree)
-        if isinstance(node, ast.AsyncFunctionDef)
-        and node.name == "_guarded"
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_guarded"
     )
     terminal_branch = next(
         node
         for node in ast.walk(guarded)
-        if isinstance(node, ast.If)
-        and "generation_auto_retry_blocked" in ast.unparse(node.test)
+        if isinstance(node, ast.If) and "generation_auto_retry_blocked" in ast.unparse(node.test)
     )
     terminal_return = next(
-        node
-        for node in ast.walk(terminal_branch)
-        if isinstance(node, ast.Return)
+        node for node in ast.walk(terminal_branch) if isinstance(node, ast.Return)
     )
     model_call = next(
         node
         for node in ast.walk(guarded)
-        if isinstance(node, ast.Await)
-        and "run_one" in ast.unparse(node)
+        if isinstance(node, ast.Await) and "run_one" in ast.unparse(node)
     )
     assert terminal_return.lineno < model_call.lineno
 
@@ -10790,9 +10834,7 @@ def _provider_native_exhausted_resume_row() -> dict[str, object]:
             "openrouter:model-g",
             "openrouter:model-h",
         ],
-        "proposer_recovery_policy": deepcopy(
-            resume_runner.FORMAL_PROPOSER_RECOVERY_POLICY
-        ),
+        "proposer_recovery_policy": deepcopy(resume_runner.FORMAL_PROPOSER_RECOVERY_POLICY),
     }
     from opensquilla.provider.protocol import (
         provider_retry_roster_fingerprint,
@@ -10967,16 +11009,11 @@ def _provider_native_exhausted_resume_row() -> dict[str, object]:
                     "attempt_kind": "generation",
                     "attempt": 1,
                     "will_retry": False,
-                    "retry_suppressed_reason": (
-                        "provider_native_proposer_recovery_terminal"
-                    ),
+                    "retry_suppressed_reason": ("provider_native_proposer_recovery_terminal"),
                     "proposer_recovery_owner": "provider",
                     "selection_plan": deepcopy(plan),
                     "run": {
-                        "error": (
-                            "llm ensemble had 1 successful proposer(s), "
-                            "requires 2"
-                        ),
+                        "error": ("llm ensemble had 1 successful proposer(s), requires 2"),
                         "ensemble_trace": call,
                     },
                 }
@@ -10988,11 +11025,7 @@ def _provider_native_exhausted_resume_row() -> dict[str, object]:
 def test_resume_provider_native_exhaustion_is_terminal_across_waves() -> None:
     row = _provider_native_exhausted_resume_row()
 
-    evidence = (
-        resume_runner.provider_native_proposer_recovery_terminal_evidence(
-            row
-        )
-    )
+    evidence = resume_runner.provider_native_proposer_recovery_terminal_evidence(row)
 
     assert evidence is not None
     assert evidence["status"] == "budget_exhausted"
@@ -11009,9 +11042,7 @@ def test_resume_provider_native_exhaustion_is_terminal_across_waves() -> None:
             group="G1",
             prior_attempts_used=1,
             state=state,
-            current_run_compatibility_contract=(
-                _enabled_g1_frozen_lifecycle_contract()
-            ),
+            current_run_compatibility_contract=(_enabled_g1_frozen_lifecycle_contract()),
         )
         is False
     )
@@ -11023,18 +11054,12 @@ def test_resume_provider_native_malformed_receipt_fails_closed() -> None:
     receipt = attempt["run"]["ensemble_trace"]["proposer_recovery"]
     receipt["selection_plan_fingerprint"] = "0" * 64
 
-    evidence = (
-        resume_runner.provider_native_proposer_recovery_terminal_evidence(
-            row
-        )
-    )
+    evidence = resume_runner.provider_native_proposer_recovery_terminal_evidence(row)
 
     assert evidence is not None
     assert evidence["status"] == "receipt_invalid"
     assert evidence["receipt_valid"] is False
-    assert "invalid_provider_native_recovery_receipt" in evidence[
-        "receipt_reasons"
-    ]
+    assert "invalid_provider_native_recovery_receipt" in evidence["receipt_reasons"]
     assert evidence["automatic_generation_retry_allowed"] is False
 
 
@@ -11044,18 +11069,12 @@ def test_resume_provider_native_external_replay_reservation_fails_closed() -> No
     receipt = attempt["run"]["ensemble_trace"]["proposer_recovery"]
     receipt["external_physical_requests_reserved"] = 1
 
-    evidence = (
-        resume_runner.provider_native_proposer_recovery_terminal_evidence(
-            row
-        )
-    )
+    evidence = resume_runner.provider_native_proposer_recovery_terminal_evidence(row)
 
     assert evidence is not None
     assert evidence["status"] == "receipt_invalid"
     assert evidence["receipt_valid"] is False
-    assert "invalid_provider_native_recovery_receipt" in evidence[
-        "receipt_reasons"
-    ]
+    assert "invalid_provider_native_recovery_receipt" in evidence["receipt_reasons"]
     assert evidence["automatic_generation_retry_allowed"] is False
 
 
@@ -11073,18 +11092,12 @@ def test_resume_provider_native_scope_must_be_stable_run_turn(
     receipt["scope"] = scope
     receipt["scope_id"] = scope_id
 
-    evidence = (
-        resume_runner.provider_native_proposer_recovery_terminal_evidence(
-            row
-        )
-    )
+    evidence = resume_runner.provider_native_proposer_recovery_terminal_evidence(row)
 
     assert evidence is not None
     assert evidence["status"] == "receipt_invalid"
     assert evidence["receipt_valid"] is False
-    assert "invalid_provider_native_recovery_scope" in evidence[
-        "receipt_reasons"
-    ]
+    assert "invalid_provider_native_recovery_scope" in evidence["receipt_reasons"]
     assert evidence["automatic_generation_retry_allowed"] is False
 
 
@@ -11149,19 +11162,19 @@ def _frozen_g1_plan(
     decision_id: str,
     proposers: list[str],
 ) -> dict[str, object]:
+    from opensquilla.provider.ranking_router import load_ranking_config
+
     plan = _with_g1_task_analysis_invariants(
         {
             "decision_id": decision_id,
             "selected_P": proposers,
-            "proposer_models": [
-                identity.partition(":")[2] for identity in proposers
-            ],
+            "proposer_models": [identity.partition(":")[2] for identity in proposers],
             "proposer_sample_count": len(proposers),
         }
     )
-    plan["ranking_parameters"] = {
-        "task_analyzer": {"max_retries": 2},
-    }
+    ranking_parameters = load_ranking_config()
+    ranking_parameters["task_analyzer"]["max_retries"] = 2
+    plan["ranking_parameters"] = ranking_parameters
     return plan
 
 
@@ -11177,10 +11190,7 @@ def _frozen_g1_failure_run(
     if failed_identity is not None:
         provider, _, model = failed_identity.partition(":")
         physical_attempt_id = hashlib.sha256(
-            (
-                f"{plan.get('decision_id')}:{failed_identity}:"
-                "reasoning-only-length"
-            ).encode()
+            (f"{plan.get('decision_id')}:{failed_identity}:reasoning-only-length").encode()
         ).hexdigest()[:32]
         execution = _test_proposer_execution(failed_identity)
         execution["physical_attempts"] = [
@@ -11265,10 +11275,7 @@ def _frozen_g1_failure_result(
 ):
     provider, _, model = failed_identity.partition(":")
     physical_attempt_id = hashlib.sha256(
-        (
-            f"{plan.get('decision_id')}:{failed_identity}:"
-            "reasoning-only-length-result"
-        ).encode()
+        (f"{plan.get('decision_id')}:{failed_identity}:reasoning-only-length-result").encode()
     ).hexdigest()[:32]
     execution = _test_proposer_execution(failed_identity)
     execution["physical_attempts"] = [
@@ -11417,21 +11424,17 @@ async def test_resume_frozen_g1_b_to_c_retry_uses_original_a_parent(
         resume_runner,
         "generation_retry_reason",
         lambda result, **_kwargs: (
-            "ensemble_insufficient_proposers"
-            if not result.final_text
-            else ""
+            "ensemble_insufficient_proposers" if not result.final_text else ""
         ),
     )
 
-    result, attempts, selected_attempt = (
-        await resume_runner.collect_generation_with_retries(
-            resumed_b,
-            "prompt",
-            timeout=30,
-            group="G1",
-            max_attempts=2,
-            attempt_offset=1,
-        )
+    result, attempts, selected_attempt = await resume_runner.collect_generation_with_retries(
+        resumed_b,
+        "prompt",
+        timeout=30,
+        group="G1",
+        max_attempts=2,
+        attempt_offset=1,
     )
 
     assert result.final_text == "accepted"
@@ -11486,12 +11489,10 @@ async def test_resume_frozen_g1_wave_boundary_seals_pending_retry_plan(
     resumed_b = Provider(plan_b)
     resumed_b._draco_g1_initial_selection_plan = deepcopy(plan_a)
     resumed_b._draco_prior_excluded_proposer_identities = [failed_a]
-    resumed_b._draco_reasoning_only_retry_factory = (
-        lambda exclusions: (
-            Provider(plan_c)
-            if exclusions == [failed_a, failed_b]
-            else (_ for _ in ()).throw(AssertionError(exclusions))
-        )
+    resumed_b._draco_reasoning_only_retry_factory = lambda exclusions: (
+        Provider(plan_c)
+        if exclusions == [failed_a, failed_b]
+        else (_ for _ in ()).throw(AssertionError(exclusions))
     )
     paid_calls = 0
 
@@ -11511,15 +11512,13 @@ async def test_resume_frozen_g1_wave_boundary_seals_pending_retry_plan(
         lambda *_args, **_kwargs: "ensemble_insufficient_proposers",
     )
 
-    _, attempts, selected_attempt = (
-        await resume_runner.collect_generation_with_retries(
-            resumed_b,
-            "prompt",
-            timeout=30,
-            group="G1",
-            max_attempts=1,
-            attempt_offset=1,
-        )
+    _, attempts, selected_attempt = await resume_runner.collect_generation_with_retries(
+        resumed_b,
+        "prompt",
+        timeout=30,
+        group="G1",
+        max_attempts=1,
+        attempt_offset=1,
     )
 
     assert paid_calls == 1
@@ -11576,9 +11575,7 @@ def test_resume_restores_only_validated_physical_thinking_prefix() -> None:
         "fallback_result": "failed",
     }
     physical_prefix = deepcopy(target_plan)
-    physical_prefix["executed_thinking_assignment"]["proposers"][
-        identity
-    ] = "medium"
+    physical_prefix["executed_thinking_assignment"]["proposers"][identity] = "medium"
     physical_prefix["thinking_execution_fallbacks"] = [deepcopy(frozen_row)]
     assert (
         resume_runner.g1_execution_plan_mutation_reason(
@@ -11624,29 +11621,22 @@ def test_resume_restores_only_validated_physical_thinking_prefix() -> None:
                 "trigger_stage": f"{role}_execution",
                 "fallback_type": "thinking_level_neighbor",
                 "reason": reason,
-                "identity": (
-                    f"{member.provider_config.provider}:"
-                    f"{member.provider_config.model}"
-                ),
-                "requested_thinking_level": (
-                    member.requested_thinking_level
-                ),
+                "identity": (f"{member.provider_config.provider}:{member.provider_config.model}"),
+                "requested_thinking_level": (member.requested_thinking_level),
                 "rejected_unified_level": rejected_unified_level,
                 "rejected_provider_level": rejected_provider_level,
                 "effective_thinking_level": effective_unified_level,
                 "effective_provider_level": effective_provider_level,
                 "thinking_policy_version": (
-                    self.selection_plan["executed_thinking_assignment"][
-                        "thinking_policy_version"
-                    ]
+                    self.selection_plan["executed_thinking_assignment"]["thinking_policy_version"]
                 ),
                 "fallback_result": fallback_result,
             }
             member.effective_thinking_level = effective_unified_level
             member.thinking = effective_provider_level
-            self.selection_plan["executed_thinking_assignment"][
-                "proposers"
-            ][row["identity"]] = effective_unified_level
+            self.selection_plan["executed_thinking_assignment"]["proposers"][row["identity"]] = (
+                effective_unified_level
+            )
             self.selection_plan.setdefault(
                 "thinking_execution_fallbacks",
                 [],
@@ -11745,6 +11735,8 @@ async def test_resume_frozen_g1_provider_build_does_not_repeat_analyzer_or_cost(
                 "output_tokens": 2,
                 "attempt_count": 1,
             },
+            provider_id=str(kwargs["analyzer_provider_id"]),
+            model_id=str(kwargs["analyzer_model_id"]),
         )
 
     monkeypatch.setattr(
@@ -11782,9 +11774,7 @@ async def test_resume_frozen_g1_provider_build_does_not_repeat_analyzer_or_cost(
     )
     assert projection_reason == ""
     lifecycle = {
-        "schema": (
-            resume_runner.G1_CROSS_WAVE_FROZEN_LIFECYCLE_SCHEMA
-        ),
+        "schema": (resume_runner.G1_CROSS_WAVE_FROZEN_LIFECYCLE_SCHEMA),
         "initial_plan": deepcopy(initial_plan),
         "target_plan": deepcopy(initial_plan),
         "cumulative_excluded_proposer_identities": [],
@@ -11811,33 +11801,14 @@ async def test_resume_frozen_g1_provider_build_does_not_repeat_analyzer_or_cost(
 
     assert analyzer_calls == 1
     assert resumed.setup_usage == []
-    assert resume_runner.consume_provider_setup(resumed.provider)[
-        "usage"
-    ] == []
-    assert (
-        resumed.provider._draco_g1_initial_selection_plan
-        == initial_plan
-    )
-    assert (
-        resumed.routing_trace["task_analyzer_reuse"][
-            "physical_request_count"
-        ]
-        == 0
-    )
-    assert (
-        resumed.routing_trace["task_analyzer_reuse"][
-            "historical_physical_request_count"
-        ]
-        == 1
-    )
+    assert resume_runner.consume_provider_setup(resumed.provider)["usage"] == []
+    assert resumed.provider._draco_g1_initial_selection_plan == initial_plan
+    assert resumed.routing_trace["task_analyzer_reuse"]["physical_request_count"] == 0
+    assert resumed.routing_trace["task_analyzer_reuse"]["historical_physical_request_count"] == 1
 
     drifted_lifecycle = deepcopy(lifecycle)
-    drifted_lifecycle["initial_plan"]["ranking_parameters"][
-        "trace"
-    ]["profile_decimal_places"] += 1
-    drifted_lifecycle["target_plan"] = deepcopy(
-        drifted_lifecycle["initial_plan"]
-    )
+    drifted_lifecycle["initial_plan"]["ranking_parameters"]["trace"]["profile_decimal_places"] += 1
+    drifted_lifecycle["target_plan"] = deepcopy(drifted_lifecycle["initial_plan"])
     with pytest.raises(
         ValueError,
         match="ranker evidence differs from the current registry/config",
@@ -11890,9 +11861,7 @@ async def test_resume_frozen_g1_provider_build_does_not_repeat_analyzer_or_cost(
         "effective_thinking_level": selected_level,
         "provider_thinking_level": selected_provider_level,
         "thinking_override": selected_provider_level,
-        "effective_thinking": (
-            selected_provider_level not in {"off", "none", "false"}
-        ),
+        "effective_thinking": (selected_provider_level not in {"off", "none", "false"}),
         "effective_provider_thinking_level": selected_provider_level,
         "thinking_policy_managed": True,
         "thinking_fallback_attempts": [],
@@ -11940,9 +11909,7 @@ async def test_resume_frozen_g1_provider_build_does_not_repeat_analyzer_or_cost(
                         "request_started": True,
                         "physical_request_count": 1,
                         "effective_thinking_level": selected_level,
-                        "provider_thinking_level": (
-                            selected_provider_level
-                        ),
+                        "provider_thinking_level": (selected_provider_level),
                         "execution": proposer_execution,
                     }
                 ],
@@ -11960,9 +11927,7 @@ async def test_resume_frozen_g1_provider_build_does_not_repeat_analyzer_or_cost(
         "g1_registry_contract": deepcopy(contract),
     }
     guarded_attempt = deepcopy(historical_attempt)
-    guarded_attempt["attempt_kind"] = (
-        "provider_build_after_paid_setup"
-    )
+    guarded_attempt["attempt_kind"] = "provider_build_after_paid_setup"
     guarded_attempt["run"]["trace_events"] = [
         {
             "kind": "error",
@@ -11976,21 +11941,15 @@ async def test_resume_frozen_g1_provider_build_does_not_repeat_analyzer_or_cost(
             attempts=[guarded_attempt],
             current_run_compatibility_contract=compatibility,
         )
-    reconstructed = (
-        resume_runner.reconstruct_g1_cross_wave_frozen_lifecycle(
-            attempts=[historical_attempt],
-            current_run_compatibility_contract=compatibility,
-        )
+    reconstructed = resume_runner.reconstruct_g1_cross_wave_frozen_lifecycle(
+        attempts=[historical_attempt],
+        current_run_compatibility_contract=compatibility,
     )
     assert reconstructed["target_plan"] == initial_plan
     mismatched_physical_usage = deepcopy(historical_attempt)
-    mismatched_usage_unit = mismatched_physical_usage["run"][
-        "usage"
-    ]["model_usage_breakdown"][-1]
+    mismatched_usage_unit = mismatched_physical_usage["run"]["usage"]["model_usage_breakdown"][-1]
     mismatched_usage_unit["physical_attempt_id"] = "9" * 32
-    mismatched_usage_unit["provider_usage"][
-        "physical_attempt_id"
-    ] = "9" * 32
+    mismatched_usage_unit["provider_usage"]["physical_attempt_id"] = "9" * 32
     with pytest.raises(
         ValueError,
         match="g1_thinking_physical_usage_set_mismatch",
@@ -12004,18 +11963,13 @@ async def test_resume_frozen_g1_provider_build_does_not_repeat_analyzer_or_cost(
     duplicate_physical_attempt["attempt_id"] = "2" * 32
     duplicate_physical_attempt["attempt"] = 2
     duplicate_physical_attempt["run"]["setup_usage"] = []
-    duplicate_physical_attempt["run"]["usage"][
-        "model_usage_breakdown"
-    ] = [
+    duplicate_physical_attempt["run"]["usage"]["model_usage_breakdown"] = [
         deepcopy(generation_usage)
     ]
     duplicate_physical_attempt["run"]["llm_request_count"] = 1
     with pytest.raises(
         ValueError,
-        match=(
-            "duplicate_cross_attempt_g1_thinking_"
-            "physical_attempt_id"
-        ),
+        match=("duplicate_cross_attempt_g1_thinking_physical_attempt_id"),
     ):
         resume_runner.reconstruct_g1_cross_wave_frozen_lifecycle(
             attempts=[
@@ -12025,9 +11979,7 @@ async def test_resume_frozen_g1_provider_build_does_not_repeat_analyzer_or_cost(
             current_run_compatibility_contract=compatibility,
         )
     drifted_compatibility = deepcopy(compatibility)
-    drifted_compatibility["g1_registry_contract"][
-        "expected_candidate_count"
-    ] += 1
+    drifted_compatibility["g1_registry_contract"]["expected_candidate_count"] += 1
     with pytest.raises(ValueError, match="invalid cross-Wave frozen G1"):
         resume_runner.reconstruct_g1_cross_wave_frozen_lifecycle(
             attempts=[historical_attempt],
@@ -12059,9 +12011,7 @@ async def test_resume_frozen_g1_provider_build_does_not_repeat_analyzer_or_cost(
             "run_compatibility_fingerprint": "sha256:run-contract",
             "error": "provider_error",
             "final_text": "",
-            "llm_request_count": source_attempt["run"][
-                "llm_request_count"
-            ],
+            "llm_request_count": source_attempt["run"]["llm_request_count"],
             "generation_attempt_count": 1,
             "generation_attempt_evidence_schema": (
                 resume_runner.GENERATION_ATTEMPT_EVIDENCE_SCHEMA
@@ -12121,20 +12071,14 @@ async def test_resume_frozen_g1_provider_build_does_not_repeat_analyzer_or_cost(
     async def fake_collect_run(active_provider, *_args, **_kwargs):
         paid_providers.append(active_provider)
         active_plan = deepcopy(active_provider.selection_plan)
-        active_trace = deepcopy(
-            historical_attempt["run"]["ensemble_trace"]
-        )
+        active_trace = deepcopy(historical_attempt["run"]["ensemble_trace"])
         active_trace["selection_plan"] = active_plan
         active_candidate = active_trace["candidates"][0]
-        active_physical_attempt = active_candidate["execution"][
-            "physical_attempts"
-        ][0]
+        active_physical_attempt = active_candidate["execution"]["physical_attempts"][0]
         active_physical_attempt["physical_attempt_id"] = "e" * 32
         active_usage = deepcopy(generation_usage)
         active_usage["physical_attempt_id"] = "e" * 32
-        active_usage["provider_usage"][
-            "physical_attempt_id"
-        ] = "e" * 32
+        active_usage["provider_usage"]["physical_attempt_id"] = "e" * 32
         return resume_runner.RunResult(
             final_text="accepted",
             done=DoneEvent(
@@ -12154,15 +12098,13 @@ async def test_resume_frozen_g1_provider_build_does_not_repeat_analyzer_or_cost(
         "generation_retry_reason",
         lambda *_args, **_kwargs: "",
     )
-    result, attempts, selected_attempt = (
-        await resume_runner.collect_generation_with_retries(
-            attached_build.provider,
-            "test prompt",
-            timeout=30,
-            group="G1",
-            max_attempts=2,
-            attempt_offset=1,
-        )
+    result, attempts, selected_attempt = await resume_runner.collect_generation_with_retries(
+        attached_build.provider,
+        "test prompt",
+        timeout=30,
+        group="G1",
+        max_attempts=2,
+        attempt_offset=1,
     )
     assert result.final_text == "accepted"
     assert selected_attempt == 2
@@ -12210,8 +12152,8 @@ def test_resume_reconstructs_frozen_g1_a_to_b_to_c_pending_lifecycle(
         project_thinking_execution_history,
     )
 
-    projected_b, projection_audit_b, projection_reason_b = (
-        project_thinking_execution_history([plan_a], plan_b)
+    projected_b, projection_audit_b, projection_reason_b = project_thinking_execution_history(
+        [plan_a], plan_b
     )
     assert projection_reason_b == ""
     plan_b = projected_b
@@ -12220,8 +12162,8 @@ def test_resume_reconstructs_frozen_g1_a_to_b_to_c_pending_lifecycle(
         plan=plan_b,
         failed_identity=failed_b,
     )
-    projected_c, projection_audit_c, projection_reason_c = (
-        project_thinking_execution_history([plan_a, plan_b], plan_c)
+    projected_c, projection_audit_c, projection_reason_c = project_thinking_execution_history(
+        [plan_a, plan_b], plan_c
     )
     assert projection_reason_c == ""
     plan_c = projected_c
@@ -12262,9 +12204,7 @@ def test_resume_reconstructs_frozen_g1_a_to_b_to_c_pending_lifecycle(
 
     lifecycle = resume_runner.reconstruct_g1_cross_wave_frozen_lifecycle(
         attempts=attempts,
-        current_run_compatibility_contract=(
-            _enabled_g1_frozen_lifecycle_contract()
-        ),
+        current_run_compatibility_contract=(_enabled_g1_frozen_lifecycle_contract()),
     )
 
     assert lifecycle["initial_parent_decision_id"] == "decision-a"
@@ -12288,9 +12228,7 @@ def test_resume_reconstructs_frozen_g1_a_to_b_to_c_pending_lifecycle(
     ):
         resume_runner.reconstruct_g1_cross_wave_frozen_lifecycle(
             attempts=tampered,
-            current_run_compatibility_contract=(
-                _enabled_g1_frozen_lifecycle_contract()
-            ),
+            current_run_compatibility_contract=(_enabled_g1_frozen_lifecycle_contract()),
         )
 
 
@@ -12349,9 +12287,7 @@ def test_resume_frozen_g1_retry_deferred_marker_is_exact_boolean(
                     "run": run,
                 }
             ],
-            current_run_compatibility_contract=(
-                _enabled_g1_frozen_lifecycle_contract()
-            ),
+            current_run_compatibility_contract=(_enabled_g1_frozen_lifecycle_contract()),
         )
 
 
@@ -12401,9 +12337,7 @@ def test_resume_frozen_g1_accepts_unknown_then_successful_analyzer(
                 "run": run,
             }
         ],
-        current_run_compatibility_contract=(
-            _enabled_g1_frozen_lifecycle_contract()
-        ),
+        current_run_compatibility_contract=(_enabled_g1_frozen_lifecycle_contract()),
     )
 
     assert lifecycle["task_analyzer_physical_request_count"] == 2
@@ -12464,9 +12398,7 @@ def test_resume_frozen_g1_rejects_analyzer_evidence_contradictions(
         run["usage"]["model_usage_breakdown"][1]["attempt"] = 3
         run["setup_usage"][1]["attempt"] = 3
     elif mutation == "analyzer_duplicate_id":
-        run["usage"]["model_usage_breakdown"][1][
-            "physical_attempt_id"
-        ] = "a" * 32
+        run["usage"]["model_usage_breakdown"][1]["physical_attempt_id"] = "a" * 32
         run["setup_usage"][1]["physical_attempt_id"] = "a" * 32
     monkeypatch.setattr(
         resume_runner,
@@ -12488,9 +12420,7 @@ def test_resume_frozen_g1_rejects_analyzer_evidence_contradictions(
                     "run": run,
                 }
             ],
-            current_run_compatibility_contract=(
-                _enabled_g1_frozen_lifecycle_contract()
-            ),
+            current_run_compatibility_contract=(_enabled_g1_frozen_lifecycle_contract()),
         )
 
 
@@ -12531,9 +12461,7 @@ def test_resume_frozen_g1_rejects_tail_deterministic_failure_without_pending(
                     "run": run,
                 }
             ],
-            current_run_compatibility_contract=(
-                _enabled_g1_frozen_lifecycle_contract()
-            ),
+            current_run_compatibility_contract=(_enabled_g1_frozen_lifecycle_contract()),
         )
 
 
@@ -12635,14 +12563,10 @@ def test_resume_strict_g1_terminal_history_cannot_be_washed_by_later_complete(
             "error": None,
             "final_text": "later successful answer",
             "quality_total": 80.0,
-            "judge": _complete_legacy_judge(
-                "later-complete-after-terminal-history"
-            ),
+            "judge": _complete_legacy_judge("later-complete-after-terminal-history"),
         }
     )
-    later_attempt = later_complete["execution"][
-        "generation_attempts"
-    ][0]
+    later_attempt = later_complete["execution"]["generation_attempts"][0]
     later_attempt.update(
         {
             "retryable": False,
@@ -12672,9 +12596,7 @@ def test_resume_strict_g1_terminal_history_cannot_be_washed_by_later_complete(
         resume_runner.load_resume_group_task_states(
             resume_paths=paths,
             selected_keys={("G1", "task-1")},
-            prompt_hashes={
-                "task-1": resume_runner.text_sha256("same prompt")
-            },
+            prompt_hashes={"task-1": resume_runner.text_sha256("same prompt")},
             task_input_hashes={"task-1": "sha256:task-input"},
             run_compatibility_fingerprints={"G1": fingerprint},
             run_compatibility_contracts={"G1": compatibility},
@@ -12700,13 +12622,9 @@ def test_resume_legacy_attempt_schema_does_not_use_strict_guard_scan(
     states, _ = resume_runner.load_resume_group_task_states(
         resume_paths=[path],
         selected_keys={("B1", "task-1")},
-        prompt_hashes={
-            "task-1": resume_runner.text_sha256("same prompt")
-        },
+        prompt_hashes={"task-1": resume_runner.text_sha256("same prompt")},
         task_input_hashes={"task-1": "sha256:task-input"},
-        run_compatibility_fingerprints={
-            "B1": "sha256:run-contract"
-        },
+        run_compatibility_fingerprints={"B1": "sha256:run-contract"},
     )
 
     assert states[("B1", "task-1")]["action"] == "regenerate"
@@ -12747,13 +12665,9 @@ def test_resume_strict_attempt_source_rows_are_bound_before_aggregation(
         resume_runner.load_resume_group_task_states(
             resume_paths=[path],
             selected_keys={("B1", "task-1")},
-            prompt_hashes={
-                "task-1": resume_runner.text_sha256("same prompt")
-            },
+            prompt_hashes={"task-1": resume_runner.text_sha256("same prompt")},
             task_input_hashes={"task-1": "sha256:task-input"},
-            run_compatibility_fingerprints={
-                "B1": "sha256:run-contract"
-            },
+            run_compatibility_fingerprints={"B1": "sha256:run-contract"},
         )
 
 
@@ -12762,19 +12676,15 @@ def test_resume_budget_exhaustion_returns_before_provider_construction() -> None
     guarded = next(
         node
         for node in ast.walk(tree)
-        if isinstance(node, ast.AsyncFunctionDef)
-        and node.name == "_guarded"
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_guarded"
     )
     exhausted_branch = next(
         node
         for node in guarded.body
-        if isinstance(node, ast.If)
-        and "remaining_attempts <= 0" in ast.unparse(node.test)
+        if isinstance(node, ast.If) and "remaining_attempts <= 0" in ast.unparse(node.test)
     )
     exhausted_return = next(
-        node
-        for node in ast.walk(exhausted_branch)
-        if isinstance(node, ast.Return)
+        node for node in ast.walk(exhausted_branch) if isinstance(node, ast.Return)
     )
     run_one_await = next(
         node
@@ -12785,9 +12695,7 @@ def test_resume_budget_exhaustion_returns_before_provider_construction() -> None
         and node.value.func.id == "run_one"
     )
 
-    assert "_generation_budget_exhausted_row" in ast.unparse(
-        exhausted_return.value
-    )
+    assert "_generation_budget_exhausted_row" in ast.unparse(exhausted_return.value)
     assert exhausted_return.lineno < run_one_await.lineno
 
 
@@ -13310,9 +13218,7 @@ def test_resume_verifies_b2_runtime_lineup_against_current_contract() -> None:
     )
     ensemble = experiment["ensemble"]
     expected_models = [member["model"] for member in ensemble["proposers"]]
-    expected_quorum = resume_runner.legal_proposer_quorum(
-        len(expected_models)
-    )
+    expected_quorum = resume_runner.legal_proposer_quorum(len(expected_models))
     selection_plan = {
         "strategy": experiment["routing"]["selection_mode"],
         "selection_mode": experiment["routing"]["selection_mode"],
@@ -13349,14 +13255,8 @@ def test_resume_verifies_b2_runtime_lineup_against_current_contract() -> None:
                 "usage_reported": index < expected_quorum,
                 "stop_reason": ("stop" if index < expected_quorum else ""),
                 "content": {
-                    "text": (
-                        f"candidate-{index}" if index < expected_quorum else ""
-                    ),
-                    "chars": (
-                        len(f"candidate-{index}")
-                        if index < expected_quorum
-                        else 0
-                    ),
+                    "text": (f"candidate-{index}" if index < expected_quorum else ""),
+                    "chars": (len(f"candidate-{index}") if index < expected_quorum else 0),
                     "truncated": False,
                 },
                 **(
@@ -13887,9 +13787,7 @@ def test_terminal_policy_allows_only_empty_nonterminal_fallback(module) -> None:
     formal_plan["proposer_models"].append("p5")
     formal_plan["selected_P"].append("openrouter:p5")
     formal_plan["proposer_sample_count"] = 5
-    formal_plan["proposer_recovery_policy"] = deepcopy(
-        module.FORMAL_PROPOSER_RECOVERY_POLICY
-    )
+    formal_plan["proposer_recovery_policy"] = deepcopy(module.FORMAL_PROPOSER_RECOVERY_POLICY)
     formal_fallback = _terminal_policy_call(
         index=1,
         plan=formal_plan,
@@ -14169,10 +14067,7 @@ def test_g1_registry_contract_is_manifested_and_fingerprinted(
     assert config.llm_ensemble.proposer_backup_count == 2
     assert config.llm_ensemble.proposer_recovery_max_additional_calls == 3
     assert config.llm_ensemble.proposer_max_tokens_cap == 65_536
-    assert (
-        config.llm_ensemble.proposer_visible_answer_reserve_tokens
-        == 4_096
-    )
+    assert config.llm_ensemble.proposer_visible_answer_reserve_tokens == 4_096
     assert config.sandbox.sandbox is False
     assert config.sandbox.security_grading is False
     args._g1_registry_contract = module.validate_g1_registry_contract(
@@ -14223,6 +14118,15 @@ def test_g1_registry_contract_is_manifested_and_fingerprinted(
         "proposer_visible_answer_reserve_tokens": 4_096,
         "g1_user_profile_generation_enabled": False,
         "g1_user_profile_enabled": False,
+        "task_analyzer": {
+            "protocol_version": "opus-4.8-json-v3",
+            "provider": "openrouter",
+            "model": "anthropic/claude-opus-4.8",
+            "upstream_provider": "anthropic",
+            "stream_close_timeout_seconds": 1.0,
+            "timeout_seconds": 20.0,
+            "max_retries": 3,
+        },
     }
     assert (
         contract["gateway_execution"]["llm_ensemble"]["ranking_user_profile_generation_enabled"]
@@ -14482,6 +14386,591 @@ def test_g1_registry_all_contract_does_not_require_runtime_pins(module) -> None:
         if model not in {"x-ai/grok-4.5", "anthropic/claude-opus-4.8"}
     )
     assert audited[missing_model] == "auto"
+
+
+@pytest.mark.parametrize("module", [runner, _load_resume_runner()], ids=["main", "resume"])
+def test_g1_runtime_ranking_override_rebinds_effective_contract(module) -> None:
+    experiment = _experiment_with_current_g1_contract(
+        module,
+        thinking_assignment_enabled=False,
+    )
+    payload = experiment.model_dump(mode="json")
+    payload["router_dynamic_ranking_override"] = {
+        "penalties": {"task_cost_weights": {"medium": 0.17}},
+        "proposer_count": {"backup_count": 1},
+        "task_analyzer": {
+            "model": "openai/gpt-5.5",
+            "upstream_provider": "openai",
+            "stream_close_timeout_seconds": 2.0,
+        },
+    }
+    experiment = type(experiment).model_validate(payload)
+    config = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "deepseek/deepseek-v4-pro",
+            "api_key": "fake",
+            "provider_routing": {"openai/gpt-5.5": "openai"},
+        },
+        llm_ensemble={"enabled": True, "selection_mode": "router_dynamic"},
+    )
+
+    freeze = module.enforce_formal_draco_runtime_config(config, experiment, ["G1"])
+    assert config.llm_ensemble.ranking_config_override == (
+        experiment.router_dynamic_ranking_override
+    )
+    # The public experiment/runtime dictionaries may still be inspected or
+    # changed by callers, but execution and audit remain bound to the detached
+    # startup resolution.
+    experiment.router_dynamic_ranking_override["penalties"]["task_cost_weights"]["medium"] = 0.91
+    config.llm_ensemble.ranking_config_override["penalties"]["task_cost_weights"]["medium"] = 0.92
+    config.llm_ensemble.ranking_thinking_assignment_enabled = True
+    contract = module.validate_g1_registry_contract(experiment, config)
+    resolution = contract["ranking_config_resolution"]
+
+    assert freeze["ranking_config_override_present"] is True
+    assert freeze["ranking_config_override_sha256"] == resolution["override_sha256"]
+    assert freeze["ranking_config_effective_sha256"] == resolution["effective_sha256"]
+    assert contract["baseline_expected_ranking_config_sha256"] == (
+        experiment.g1_routing.expected_ranking_config_sha256
+    )
+    assert contract["expected_ranking_config_sha256"] == resolution["effective_sha256"]
+    assert contract["expected_ranking_config_version"].endswith(
+        f"+override.{resolution['override_sha256'][:12]}"
+    )
+    assert resolution["effective_config"]["penalties"]["task_cost_weights"][
+        "medium"
+    ] == pytest.approx(0.17)
+    assert contract["task_analyzer"]["model"] == "openai/gpt-5.5"
+    assert contract["task_analyzer"]["upstream_provider"] == "openai"
+    assert contract["task_analyzer"]["stream_close_timeout_seconds"] == 2.0
+    assert resolution["thinking_assignment_enabled"] is False
+    provider = build_ensemble_provider_from_config(
+        config=config,
+        inherited_provider_config=ProviderConfig(
+            provider="openrouter",
+            model="deepseek/deepseek-v4-pro",
+            api_key="fake",
+        ),
+        fallback_provider=None,
+        turn_metadata={"routed_tier": "c1", "routing_confidence": 0.9},
+        ranking_inputs={"registry_allowlist": contract},
+    )
+    assert (
+        provider._router_dynamic_retry_context.frozen_ranking_inputs["ranking_config"]
+        == resolution["effective_config"]
+    )
+    assert provider.selection_plan.get("ranking_thinking_assignment_enabled") is not True
+    assert provider.selection_plan["configured_proposer_backup_count"] == 1
+    assert provider.selection_plan["effective_proposer_backup_count"] == 1
+    assert len(provider.selection_plan["backup_P"]) == 1
+    assert provider.selection_plan["proposer_recovery_policy"]["configured_backup_count"] == 1
+    assert provider.selection_plan["proposer_recovery_policy"]["effective_backup_count"] == 1
+
+
+@pytest.mark.parametrize("module", [runner, _load_resume_runner()], ids=["main", "resume"])
+def test_formal_g1_rejects_auto_task_analyzer_upstream_before_model_calls(module) -> None:
+    experiment = _experiment_with_current_g1_contract(
+        module,
+        thinking_assignment_enabled=False,
+    )
+    payload = experiment.model_dump(mode="json")
+    payload["router_dynamic_ranking_override"] = {
+        "task_analyzer": {"upstream_provider": "auto"}
+    }
+    experiment = type(experiment).model_validate(payload)
+    config = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "deepseek/deepseek-v4-pro",
+            "api_key": "fake",
+            "provider_routing": {"anthropic/claude-opus-4.8": "auto"},
+        },
+        llm_ensemble={"enabled": True, "selection_mode": "router_dynamic"},
+    )
+
+    module.enforce_formal_draco_runtime_config(config, experiment, ["G1"])
+    with pytest.raises(ValueError, match="must be explicitly pinned"):
+        module.validate_g1_registry_contract(experiment, config)
+
+
+@pytest.mark.parametrize("module", [runner, _load_resume_runner()], ids=["main", "resume"])
+def test_formal_runtime_rejects_unpinned_custom_judge_before_model_calls(module) -> None:
+    experiment = _experiment_with_current_g1_contract(
+        module,
+        thinking_assignment_enabled=False,
+    )
+    payload = experiment.model_dump(mode="json")
+    payload["judge"]["model"] = "openai/gpt-5.5"
+    experiment = type(experiment).model_validate(payload)
+    config = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "deepseek/deepseek-v4-pro",
+            "api_key": "fake",
+        },
+        llm_ensemble={"enabled": True, "selection_mode": "router_dynamic"},
+    )
+
+    with pytest.raises(ValueError, match="frozen Gemini Judge model"):
+        module.enforce_formal_draco_runtime_config(config, experiment, ["G1"])
+
+
+@pytest.mark.parametrize("module", [runner, _load_resume_runner()], ids=["main", "resume"])
+@pytest.mark.parametrize(
+    ("tools_patch", "message"),
+    [
+        ({"mode": "provider_only"}, "tools.mode=local_web_tools"),
+        (
+            {"contamination_blocked_domains": ["example.com"]},
+            "frozen contamination-blocked domain set",
+        ),
+    ],
+    ids=["tool-mode", "blocked-domains"],
+)
+def test_formal_runtime_rejects_unsafe_tool_policy_before_model_calls(
+    module,
+    tools_patch: dict[str, object],
+    message: str,
+) -> None:
+    experiment = _experiment_with_current_g1_contract(
+        module,
+        thinking_assignment_enabled=False,
+    )
+    payload = experiment.model_dump(mode="json")
+    payload["tools"].update(tools_patch)
+    experiment = type(experiment).model_validate(payload)
+    config = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "deepseek/deepseek-v4-pro",
+            "api_key": "fake",
+        },
+        llm_ensemble={"enabled": True, "selection_mode": "router_dynamic"},
+    )
+
+    with pytest.raises(ValueError, match=message):
+        module.enforce_formal_draco_runtime_config(config, experiment, ["G1"])
+
+
+@pytest.mark.parametrize("module", [runner, _load_resume_runner()], ids=["main", "resume"])
+@pytest.mark.parametrize(
+    ("overlay", "gateway_patch", "message"),
+    [
+        (
+            {"ensemble": {"aggregator": {"provider": "anthropic"}}},
+            {},
+            r"ensemble\.aggregator\.provider=openrouter",
+        ),
+        (
+            {
+                "ensemble": {
+                    "aggregator": {"base_url": "https://attacker.invalid/v1"}
+                }
+            },
+            {},
+            r"ensemble\.aggregator\.base_url",
+        ),
+        (
+            {
+                "ensemble": {
+                    "aggregator": {"api_key_env": "UNRELATED_AMBIENT_SECRET"}
+                }
+            },
+            {},
+            r"ensemble\.aggregator\.api_key_env",
+        ),
+        (
+            {"tools": {"web_search": {"api_key_env": "UNRELATED_AMBIENT_SECRET"}}},
+            {},
+            r"tools\.web_search\.api_key_env=BRAVE_SEARCH_API_KEY",
+        ),
+        (
+            {},
+            {"provider": "anthropic"},
+            r"config\.llm\.provider=openrouter",
+        ),
+        (
+            {},
+            {"base_url": "https://attacker.invalid/v1"},
+            r"config\.llm\.base_url",
+        ),
+        (
+            {},
+            {"api_key_env": "UNRELATED_AMBIENT_SECRET"},
+            r"config\.llm\.api_key_env",
+        ),
+    ],
+    ids=[
+        "member-provider",
+        "member-base-url",
+        "member-api-key-env",
+        "search-api-key-env",
+        "root-provider",
+        "root-base-url",
+        "root-api-key-env",
+    ],
+)
+def test_formal_amain_rejects_credential_redirects_before_any_env_or_provider_read(
+    module,
+    overlay: dict[str, object],
+    gateway_patch: dict[str, str],
+    message: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = tmp_path / "tasks.jsonl"
+    input_path.write_text(
+        json.dumps({"id": "task-1", "prompt": "must fail before providers"}) + "\n",
+        encoding="utf-8",
+    )
+    overlay = deepcopy(overlay)
+    overlay["benchmark_input"] = {"enforce_reference_input": False}
+    args = module.build_parser().parse_args(
+        [
+            "--input",
+            str(input_path),
+            "--output-dir",
+            str(tmp_path / "output"),
+            "--groups",
+            "B2",
+            "--dry-run",
+            "--experiment-config",
+            str(module.DEFAULT_B2_EXPERIMENT_CONFIG_PATH),
+            "--experiment-config-override-json",
+            json.dumps(overlay),
+        ]
+    )
+    ambient_secret_env = "UNRELATED_AMBIENT_SECRET"
+    gateway_payload = {
+        "provider": "openrouter",
+        "model": "deepseek/deepseek-v4-pro",
+        "api_key_env": "OPENROUTER_API_KEY",
+        "base_url": "https://openrouter.ai/api/v1",
+        **gateway_patch,
+    }
+    gateway = GatewayConfig(llm=gateway_payload)
+
+    class GuardedEnvironment(dict[str, str]):
+        def get(self, key: str, default=None):
+            if key in {ambient_secret_env, "OPENROUTER_API_KEY", "BRAVE_SEARCH_API_KEY"}:
+                raise AssertionError("formal validation did not precede credential env access")
+            return super().get(key, default)
+
+    monkeypatch.setattr(module, "source_provenance", lambda: {"git_dirty": False})
+    monkeypatch.setattr(module.GatewayConfig, "load", lambda _path: gateway)
+    monkeypatch.setattr(module.os, "environ", GuardedEnvironment(module.os.environ))
+
+    def unexpected_provider_read(*_args, **_kwargs):
+        raise AssertionError("provider/search setup ran before formal credential validation")
+
+    monkeypatch.setattr(module, "configure_local_web_search_runtime", unexpected_provider_read)
+    monkeypatch.setattr(module, "_experiment_member_provider_config", unexpected_provider_read)
+
+    with pytest.raises(ValueError, match=message):
+        asyncio.run(module.amain(args))
+
+
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+@pytest.mark.parametrize(
+    ("gateway_patch", "runtime_patch", "environment_patch", "message"),
+    [
+        (
+            {},
+            {},
+            {"OPENROUTER_BASE_URL": "https://attacker.invalid/v1"},
+            "OPENROUTER_BASE_URL",
+        ),
+        (
+            {},
+            {},
+            {"OPENSQUILLA_LLM_API_KEY_ENV": "UNRELATED_AMBIENT_SECRET"},
+            "OPENSQUILLA_LLM_API_KEY_ENV",
+        ),
+        (
+            {},
+            {},
+            {"OPENSQUILLA_LLM_API_KEY": "generic-secret"},
+            "OPENSQUILLA_LLM_API_KEY",
+        ),
+        (
+            {"llm_proxy": "http://proxy.invalid:8080"},
+            {},
+            {},
+            r"config\.llm\.proxy",
+        ),
+        (
+            {},
+            {"provider": "anthropic"},
+            {},
+            "resolved provider must be openrouter",
+        ),
+        (
+            {},
+            {"base_url": "https://attacker.invalid/v1"},
+            {},
+            "base URL must exactly match",
+        ),
+        (
+            {},
+            {"base_url_from_env": True},
+            {},
+            "base URL must not come from the environment",
+        ),
+        (
+            {},
+            {"proxy": "http://proxy.invalid:8080"},
+            {},
+            "resolved OpenRouter proxy must be empty",
+        ),
+        (
+            {},
+            {},
+            {
+                "OPENSQUILLA_TRUST_ENV": "1",
+                "HTTPS_PROXY": "http://proxy.invalid:8080",
+            },
+            "OPENSQUILLA_TRUST_ENV must be disabled",
+        ),
+        (
+            {},
+            {"trust_env": True},
+            {},
+            "resolved OpenRouter transport must not trust ambient environment",
+        ),
+        (
+            {},
+            {
+                "api_key_from_env": True,
+                "api_key_env_name": "UNRELATED_AMBIENT_SECRET",
+            },
+            {},
+            "environment credential must come from OPENROUTER_API_KEY",
+        ),
+        (
+            {"search_proxy": "http://proxy.invalid:8080"},
+            {},
+            {},
+            r"config\.search_proxy",
+        ),
+        (
+            {"search_use_env_proxy": True},
+            {},
+            {},
+            r"config\.search_use_env_proxy",
+        ),
+    ],
+    ids=[
+        "openrouter-base-url-env",
+        "generic-api-key-env-name",
+        "generic-api-key",
+        "configured-llm-proxy",
+        "resolved-provider",
+        "resolved-base-url",
+        "resolved-base-url-from-env",
+        "resolved-proxy",
+        "trusted-ambient-proxy",
+        "resolved-trust-env",
+        "resolved-credential-source",
+        "brave-search-proxy",
+        "brave-search-env-proxy",
+    ],
+)
+def test_formal_amain_rejects_unsafe_resolved_transports_before_any_call(
+    module,
+    gateway_patch: dict[str, object],
+    runtime_patch: dict[str, object],
+    environment_patch: dict[str, str],
+    message: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = tmp_path / "tasks.jsonl"
+    input_path.write_text(
+        json.dumps({"id": "task-1", "prompt": "must fail before transport use"}) + "\n",
+        encoding="utf-8",
+    )
+    args = module.build_parser().parse_args(
+        [
+            "--input",
+            str(input_path),
+            "--output-dir",
+            str(tmp_path / "output"),
+            "--groups",
+            "B2",
+            "--dry-run",
+            "--experiment-config",
+            str(module.DEFAULT_B2_EXPERIMENT_CONFIG_PATH),
+            "--experiment-config-override-json",
+            json.dumps({"benchmark_input": {"enforce_reference_input": False}}),
+        ]
+    )
+
+    isolated_names = (
+        "OPENROUTER_BASE_URL",
+        "OPENSQUILLA_LLM_BASE_URL",
+        "OPENSQUILLA_LLM_PROXY",
+        "OPENSQUILLA_LLM_API_KEY_ENV",
+        "OPENSQUILLA_LLM_API_KEY",
+        "OPENSQUILLA_SEARCH_PROXY",
+        "OPENSQUILLA_SEARCH_USE_ENV_PROXY",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    )
+    for name in isolated_names:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("OPENSQUILLA_TRUST_ENV", "0")
+
+    gateway = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "deepseek/deepseek-v4-pro",
+            "api_key": "test-openrouter-key",
+            "api_key_env": "",
+            "base_url": "https://openrouter.ai/api/v1",
+            "proxy": gateway_patch.get("llm_proxy", ""),
+        },
+        search_proxy=gateway_patch.get("search_proxy", ""),
+        search_use_env_proxy=gateway_patch.get("search_use_env_proxy", False),
+    )
+    monkeypatch.setattr(
+        type(gateway.llm_ensemble),
+        "freeze_ranking_config",
+        lambda _self: {
+            "effective_config": {"proposer_count": {"backup_count": 2}},
+        },
+    )
+    for name, value in environment_patch.items():
+        monkeypatch.setenv(name, value)
+
+    runtime = SimpleNamespace(
+        provider="openrouter",
+        base_url="https://openrouter.ai/api/v1",
+        base_url_from_env=False,
+        proxy="",
+        api_key_from_env=False,
+        api_key_env_name="",
+    )
+    for name, value in runtime_patch.items():
+        setattr(runtime, name, value)
+
+    monkeypatch.setattr(module, "source_provenance", lambda: {"git_dirty": False})
+    monkeypatch.setattr(module.GatewayConfig, "load", lambda _path: gateway)
+    monkeypatch.setattr(module, "resolve_llm_runtime_config", lambda _config: runtime)
+    calls = {"search_setup": 0, "member_provider": 0, "preflight": 0}
+
+    def forbidden_search_setup(*_args, **_kwargs):
+        calls["search_setup"] += 1
+        raise AssertionError("search setup must not run")
+
+    def forbidden_member_provider(*_args, **_kwargs):
+        calls["member_provider"] += 1
+        raise AssertionError("member provider resolution must not run")
+
+    async def forbidden_preflight(*_args, **_kwargs):
+        calls["preflight"] += 1
+        raise AssertionError("web preflight must not run")
+
+    monkeypatch.setattr(module, "configure_local_web_search_runtime", forbidden_search_setup)
+    monkeypatch.setattr(module, "_experiment_member_provider_config", forbidden_member_provider)
+    monkeypatch.setattr(module, "run_local_web_tools_preflight", forbidden_preflight)
+
+    with pytest.raises(ValueError, match=message):
+        asyncio.run(module.amain(args))
+    assert calls == {"search_setup": 0, "member_provider": 0, "preflight": 0}
+
+
+@pytest.mark.parametrize("module", [runner, _load_resume_runner()], ids=["main", "resume"])
+def test_formal_runtime_accepts_frozen_proposer_recovery_overrides(module) -> None:
+    experiment = _experiment_with_current_g1_contract(
+        module,
+        thinking_assignment_enabled=False,
+    )
+    payload = experiment.model_dump(mode="json")
+    payload["ensemble"].update(
+        {
+            "proposer_recovery_max_additional_calls": 2,
+            "proposer_max_tokens_cap": 32_768,
+            "proposer_visible_answer_reserve_tokens": 2_048,
+        }
+    )
+    experiment = type(experiment).model_validate(payload)
+    config = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "deepseek/deepseek-v4-pro",
+            "api_key": "fake",
+        },
+        llm_ensemble={
+            "enabled": True,
+            "selection_mode": "router_dynamic",
+            "min_successful_proposers": 2,
+        },
+    )
+
+    freeze = module.enforce_formal_draco_runtime_config(config, experiment, ["G1"])
+
+    assert config.llm_ensemble.proposer_recovery_max_additional_calls == 2
+    assert config.llm_ensemble.proposer_max_tokens_cap == 32_768
+    assert config.llm_ensemble.proposer_visible_answer_reserve_tokens == 2_048
+    assert freeze["proposer_recovery_max_additional_calls"] == 2
+    assert freeze["proposer_max_tokens_cap"] == 32_768
+    assert freeze["proposer_visible_answer_reserve_tokens"] == 2_048
+
+    contract = module.validate_g1_registry_contract(experiment, config)
+    provider = build_ensemble_provider_from_config(
+        config=config,
+        inherited_provider_config=ProviderConfig(
+            provider="openrouter",
+            model="deepseek/deepseek-v4-pro",
+            api_key="fake",
+        ),
+        fallback_provider=None,
+        turn_metadata={"routed_tier": "c1", "routing_confidence": 0.9},
+        ranking_inputs={"registry_allowlist": contract},
+    )
+    provider = module.enforce_draco_legal_proposer_quorum(provider)
+
+    assert provider.proposer_recovery_max_additional_calls == 2
+    assert provider.proposer_max_tokens_cap == 32_768
+    assert provider.proposer_visible_answer_reserve_tokens == 2_048
+    assert provider.selection_plan["proposer_recovery_policy"] == {
+        **provider.selection_plan["proposer_recovery_policy"],
+        "max_additional_physical_requests": 2,
+        "max_tokens_cap": 32_768,
+        "visible_answer_reserve_tokens": 2_048,
+    }
+    assert module.formal_proposer_recovery_policy_for_plan(
+        provider.selection_plan
+    ) == provider.selection_plan["proposer_recovery_policy"]
+    assert module.g1_provider_native_recovery_policy_reason(
+        provider.selection_plan
+    ) == ""
+
+
+def test_gateway_ranking_override_effective_snapshot_is_detached() -> None:
+    original = {"penalties": {"task_cost_weights": {"medium": 0.17}}}
+    config = GatewayConfig(
+        llm_ensemble={
+            "enabled": True,
+            "selection_mode": "router_dynamic",
+            "ranking_config_override": original,
+        }
+    )
+    expected = config.llm_ensemble.ranking_config_effective_snapshot()
+
+    original["penalties"]["task_cost_weights"]["medium"] = 0.81
+    config.llm_ensemble.ranking_config_override["penalties"]["task_cost_weights"]["medium"] = 0.82
+    config.llm_ensemble.ranking_thinking_assignment_enabled = True
+
+    assert config.llm_ensemble.ranking_config_override_snapshot()["penalties"]["task_cost_weights"][
+        "medium"
+    ] == pytest.approx(0.17)
+    assert config.llm_ensemble.ranking_config_effective_snapshot() == expected
 
 
 @pytest.mark.parametrize("module", [runner, _load_resume_runner()], ids=["main", "resume"])
@@ -15010,8 +15499,8 @@ def test_b2_compatibility_excludes_effective_scheduling_concurrency() -> None:
 
     assert canary["fingerprints"]["B2"] == full["fingerprints"]["B2"]
     experiment = canary["contracts"]["B2"]["experiment_config"]
-    assert "concurrency" not in experiment["runner"]
-    assert "concurrency" not in experiment["judge"]
+    assert set(experiment) == {"sha256"}
+    assert experiment["sha256"].startswith("sha256:")
     provider_routing = canary["contracts"]["B2"]["resolved_llm_runtime"]["provider_routing"]
     assert provider_routing["deepseek/deepseek-v4-pro"] == "deepseek"
     assert provider_routing["google/gemini-3.1-pro-preview"] == "google-ai-studio"
@@ -15973,13 +16462,16 @@ def test_dynamic_partial_proposer_quorum_is_usable_but_not_strict_success(module
         }
     )
 
-    assert module.ensemble_call_core_reasons(
-        trace,
-        expected_selection_mode="router_dynamic",
-        expected_selection_plan=plan,
-        final_text="final answer",
-        require_output_binding=True,
-    ) == []
+    assert (
+        module.ensemble_call_core_reasons(
+            trace,
+            expected_selection_mode="router_dynamic",
+            expected_selection_plan=plan,
+            final_text="final answer",
+            require_output_binding=True,
+        )
+        == []
+    )
 
     tampered = deepcopy(trace)
     tampered["usable_proposers"] = 1
@@ -16123,13 +16615,16 @@ def test_dynamic_aggregator_fallback_requires_frozen_physical_identity(module) -
         "degraded": False,
     }
 
-    assert module.ensemble_call_core_reasons(
-        trace,
-        expected_selection_mode="router_dynamic",
-        expected_selection_plan=plan,
-        final_text="fallback answer",
-        require_output_binding=True,
-    ) == []
+    assert (
+        module.ensemble_call_core_reasons(
+            trace,
+            expected_selection_mode="router_dynamic",
+            expected_selection_plan=plan,
+            final_text="fallback answer",
+            require_output_binding=True,
+        )
+        == []
+    )
     status = module.execution_status_payload(
         generation_accepted=True,
         final_text="fallback answer",
@@ -16215,9 +16710,7 @@ def test_dynamic_aggregator_fallback_requires_frozen_physical_identity(module) -
         )
     )
     conflicting_actual_identity = deepcopy(trace)
-    conflicting_actual_identity["final_request"]["execution"]["actual_model"] = (
-        "outside-roster"
-    )
+    conflicting_actual_identity["final_request"]["execution"]["actual_model"] = "outside-roster"
     assert "unauthorized_aggregator_fallback_identity" in (
         module.ensemble_call_core_reasons(
             conflicting_actual_identity,
@@ -16236,9 +16729,7 @@ def test_dynamic_aggregator_fallback_requires_frozen_physical_identity(module) -
     )
 
     mismatched_physical = deepcopy(trace)
-    mismatched_physical["aggregator_recovery"]["attempts"][1][
-        "physical_attempt_id"
-    ] = "3" * 32
+    mismatched_physical["aggregator_recovery"]["attempts"][1]["physical_attempt_id"] = "3" * 32
     assert "invalid_aggregator_fallback_physical_evidence" in (
         module.ensemble_call_core_reasons(
             mismatched_physical,
@@ -16547,9 +17038,7 @@ async def test_provider_build_failure_preserves_already_billed_setup_receipt(
         require_openrouter_non_byok=True,
     )
 
-    assert row["error"] == (
-        "provider_build_failed_after_setup:RuntimeError"
-    )
+    assert row["error"] == ("provider_build_failed_after_setup:RuntimeError")
     assert "strict dynamic selection failed" not in row["error"]
     assert row["selected_generation_succeeded"] is False
     assert row["llm_request_count"] == 0
@@ -16617,9 +17106,7 @@ async def test_run_one_post_build_failure_preserves_paid_setup_and_blocks_genera
     async def forbidden_collect_generation(*_args, **_kwargs):
         nonlocal collector_calls
         collector_calls += 1
-        raise AssertionError(
-            "post-build failure must block generation"
-        )
+        raise AssertionError("post-build failure must block generation")
 
     monkeypatch.setattr(
         module,
@@ -16642,9 +17129,7 @@ async def test_run_one_post_build_failure_preserves_paid_setup_and_blocks_genera
 
         monkeypatch.setattr(module, "json_safe", fail_build_routing_only)
     else:
-        original_capabilities = (
-            module.with_openrouter_model_capabilities
-        )
+        original_capabilities = module.with_openrouter_model_capabilities
 
         def fail_post_build_capabilities(config_value, model):
             if model == "post-build-model":
@@ -16683,20 +17168,13 @@ async def test_run_one_post_build_failure_preserves_paid_setup_and_blocks_genera
     )
 
     assert collector_calls == 0
-    assert row["execution"]["provider_error"] == (
-        "provider_build_failed_after_setup:RuntimeError"
-    )
+    assert row["execution"]["provider_error"] == ("provider_build_failed_after_setup:RuntimeError")
     assert private_detail not in json.dumps(row)
     assert row["generation_attempt_count"] == 1
     assert row["generation_attempt_budget_used"] == 1
     failed_attempt = row["execution"]["generation_attempts"][0]
-    assert (
-        failed_attempt["attempt_kind"]
-        == "provider_build_after_paid_setup"
-    )
-    assert failed_attempt["run"]["usage"][
-        "model_usage_breakdown"
-    ] == [setup_usage]
+    assert failed_attempt["attempt_kind"] == "provider_build_after_paid_setup"
+    assert failed_attempt["run"]["usage"]["model_usage_breakdown"] == [setup_usage]
     assert row["actual_spend_metrics"]["llm_request_count"] == 1
 
 
@@ -16767,9 +17245,7 @@ async def test_paid_generation_postprocess_failure_commits_once_and_blocks_more_
         nonlocal paid_calls
         paid_calls += 1
         if paid_calls > 1:
-            raise AssertionError(
-                "postprocessing failure must not trigger another paid call"
-            )
+            raise AssertionError("postprocessing failure must not trigger another paid call")
         return paid_result
 
     judge_calls = 0
@@ -16791,25 +17267,19 @@ async def test_paid_generation_postprocess_failure_commits_once_and_blocks_more_
         monkeypatch.setattr(
             module,
             "backfill_result_requested_identity",
-            lambda *_args, **_kwargs: (_ for _ in ()).throw(
-                RuntimeError(private_detail)
-            ),
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError(private_detail)),
         )
     elif failure_stage == "generation_retry_reason":
         monkeypatch.setattr(
             module,
             "generation_retry_reason",
-            lambda *_args, **_kwargs: (_ for _ in ()).throw(
-                RuntimeError(private_detail)
-            ),
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError(private_detail)),
         )
     else:
         monkeypatch.setattr(
             module,
             "run_result_summary",
-            lambda *_args, **_kwargs: (_ for _ in ()).throw(
-                RuntimeError(private_detail)
-            ),
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError(private_detail)),
         )
 
     row = await module.run_one(
@@ -16838,18 +17308,14 @@ async def test_paid_generation_postprocess_failure_commits_once_and_blocks_more_
         generation_max_attempts=3,
     )
 
-    expected_reason = (
-        f"generation_postprocessing_failed:{failure_stage}:RuntimeError"
-    )
+    expected_reason = f"generation_postprocessing_failed:{failure_stage}:RuntimeError"
     assert paid_calls == 1
     assert judge_calls == 0
     assert row["error"] == expected_reason
     assert private_detail not in json.dumps(row)
     assert row["selected_generation_succeeded"] is False
     assert row["generation_attempt_count"] == 1
-    assert row["selected_attempt_metrics"][
-        "generation_attempt"
-    ] == 0
+    assert row["selected_attempt_metrics"]["generation_attempt"] == 0
     assert row["execution"]["selected_generation_attempt"] == 0
     attempt = row["execution"]["generation_attempts"][0]
     assert attempt["attempt"] == 1
@@ -16859,24 +17325,15 @@ async def test_paid_generation_postprocess_failure_commits_once_and_blocks_more_
     assert attempt["retry_suppressed_reason"] == expected_reason
     assert attempt["will_retry"] is False
     assert attempt["run"]["llm_request_count"] == 1
-    assert len(
-        attempt["run"]["usage"]["model_usage_breakdown"]
-    ) == 1
+    assert len(attempt["run"]["usage"]["model_usage_breakdown"]) == 1
     assert attempt["generation_postprocessing_failure"] == {
         "stage": failure_stage,
         "exception_type": "RuntimeError",
     }
-    terminal_evidence = (
-        resume_runner.generation_postprocessing_terminal_evidence(
-            row
-        )
-    )
+    terminal_evidence = resume_runner.generation_postprocessing_terminal_evidence(row)
     assert terminal_evidence is not None
     assert terminal_evidence["attempt_id"] == attempt["attempt_id"]
-    assert (
-        terminal_evidence["automatic_generation_retry_allowed"]
-        is False
-    )
+    assert terminal_evidence["automatic_generation_retry_allowed"] is False
 
 
 @pytest.mark.asyncio
@@ -16985,10 +17442,7 @@ async def test_terminal_generation_validation_failure_rewrites_existing_attempt_
         generation_policy={},
     )
 
-    expected_reason = (
-        "generation_postprocessing_failed:"
-        "terminal_generation_validation:RuntimeError"
-    )
+    expected_reason = "generation_postprocessing_failed:terminal_generation_validation:RuntimeError"
     assert paid_calls == 1
     assert judge_calls == 0
     assert reason_calls == 2
@@ -16997,10 +17451,7 @@ async def test_terminal_generation_validation_failure_rewrites_existing_attempt_
     attempt = row["execution"]["generation_attempts"][0]
     assert attempt["retry_reason"] == expected_reason
     assert attempt["will_retry"] is False
-    assert (
-        attempt["generation_postprocessing_failure"]["stage"]
-        == "terminal_generation_validation"
-    )
+    assert attempt["generation_postprocessing_failure"]["stage"] == "terminal_generation_validation"
 
 
 @pytest.mark.parametrize(
@@ -17057,17 +17508,12 @@ def test_emergency_generation_summary_counts_setup_and_generation_once(
     monkeypatch.setattr(
         module,
         "run_result_summary",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            RuntimeError("summary failed")
-        ),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("summary failed")),
     )
 
     summary = module.emergency_generation_run_summary(
         result,
-        reason=(
-            "generation_postprocessing_failed:"
-            "run_result_summary:RuntimeError"
-        ),
+        reason=("generation_postprocessing_failed:run_result_summary:RuntimeError"),
         stage="run_result_summary",
         exception_type="RuntimeError",
         identity_seed="generation-attempt:" + "3" * 32,
@@ -17078,10 +17524,10 @@ def test_emergency_generation_summary_counts_setup_and_generation_once(
     assert summary["llm_request_count"] == 2
     units = summary["usage"]["model_usage_breakdown"]
     assert len(units) == 2
-    assert {
-        str(unit.get("physical_attempt_id") or "")
-        for unit in units
-    } == {primary_id, analyzer_id}
+    assert {str(unit.get("physical_attempt_id") or "") for unit in units} == {
+        primary_id,
+        analyzer_id,
+    }
 
 
 @pytest.mark.parametrize(
@@ -17109,23 +17555,17 @@ def test_paid_generation_recovery_survives_broken_summary_and_canonicalizer(
     monkeypatch.setattr(
         module,
         "run_result_summary",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            RuntimeError("summary boom")
-        ),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("summary boom")),
     )
     monkeypatch.setattr(
         module,
         "canonicalize_run_usage",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            RuntimeError("canonicalizer boom")
-        ),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("canonicalizer boom")),
     )
     monkeypatch.setattr(
         module,
         "json_safe",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            RuntimeError("serializer boom")
-        ),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("serializer boom")),
     )
     pending = {
         "result": result,
@@ -17138,26 +17578,22 @@ def test_paid_generation_recovery_survives_broken_summary_and_canonicalizer(
         "stage": "run_result_summary",
     }
 
-    recovered, attempts, selected, reason = (
-        module.recover_paid_generation_postprocessing_failure(
-            pending,
-            RuntimeError("outer boom"),
-        )
+    recovered, attempts, selected, reason = module.recover_paid_generation_postprocessing_failure(
+        pending,
+        RuntimeError("outer boom"),
     )
 
     assert recovered is result
     assert selected == 0
-    assert reason == (
-        "generation_postprocessing_failed:"
-        "run_result_summary:RuntimeError"
-    )
+    assert reason == ("generation_postprocessing_failed:run_result_summary:RuntimeError")
     assert len(attempts) == 1
     run = attempts[0]["run"]
     assert run["llm_request_count"] == 1
     assert run["usage_unknown_count"] == 1
-    assert run["generation_postprocessing_failure"][
-        "evidence_precision"
-    ] == "unvalidated_raw_plus_primitive_unknown"
+    assert (
+        run["generation_postprocessing_failure"]["evidence_precision"]
+        == "unvalidated_raw_plus_primitive_unknown"
+    )
     units = run["usage"]["model_usage_breakdown"]
     assert len(units) == 1
     assert units[0]["role"] == "usage_missing"
@@ -17193,9 +17629,7 @@ def test_provider_native_paid_postprocessing_recovery_preserves_plan_and_owner(
         ],
         "aggregator_candidates": ["openrouter:model-e"],
         "effective_min_successful_proposers": 2,
-        "proposer_recovery_policy": deepcopy(
-            module.FORMAL_PROPOSER_RECOVERY_POLICY
-        ),
+        "proposer_recovery_policy": deepcopy(module.FORMAL_PROPOSER_RECOVERY_POLICY),
     }
     result = module.RunResult(
         final_text="",
@@ -17223,11 +17657,9 @@ def test_provider_native_paid_postprocessing_recovery_preserves_plan_and_owner(
         "stage": "run_result_summary",
     }
 
-    _, attempts, selected, _ = (
-        module.recover_paid_generation_postprocessing_failure(
-            pending,
-            RuntimeError("postprocessing failed"),
-        )
+    _, attempts, selected, _ = module.recover_paid_generation_postprocessing_failure(
+        pending,
+        RuntimeError("postprocessing failed"),
     )
 
     assert selected == 0
@@ -17509,9 +17941,7 @@ def test_provider_native_formal_quorum_stays_two_for_five_proposers(
         proposers = [Member() for _ in range(5)]
         min_successful_proposers = 4
         selection_plan = {
-            "proposer_recovery_policy": deepcopy(
-                module.FORMAL_PROPOSER_RECOVERY_POLICY
-            ),
+            "proposer_recovery_policy": deepcopy(module.FORMAL_PROPOSER_RECOVERY_POLICY),
             "configured_min_successful_proposers": 4,
         }
 
@@ -17520,10 +17950,7 @@ def test_provider_native_formal_quorum_stays_two_for_five_proposers(
     assert provider.min_successful_proposers == 2
     assert provider.selection_plan["effective_min_successful_proposers"] == 2
     assert provider.selection_plan["legal_min_successful_proposers"] == 2
-    assert (
-        provider.selection_plan["legal_quorum_policy"]
-        == "fixed_2_provider_native"
-    )
+    assert provider.selection_plan["legal_quorum_policy"] == "fixed_2_provider_native"
 
     legacy = Provider()
     legacy.selection_plan = {}
@@ -17586,9 +18013,7 @@ def test_enforced_proposer_quorum_above_sample_count_fails_before_mutation(
     provider.proposers = [Member()]
     provider.min_successful_proposers = 1
     provider.selection_plan = {
-        "proposer_recovery_policy": deepcopy(
-            module.FORMAL_PROPOSER_RECOVERY_POLICY
-        ),
+        "proposer_recovery_policy": deepcopy(module.FORMAL_PROPOSER_RECOVERY_POLICY),
         "configured_min_successful_proposers": 1,
         "sentinel": {"unchanged": True},
     }
@@ -17607,12 +18032,25 @@ def test_enforced_proposer_quorum_above_sample_count_fails_before_mutation(
 
 
 @pytest.mark.parametrize("module", [runner, _load_resume_runner()], ids=["main", "resume"])
-def test_formal_g1_rejects_nonfrozen_proposer_recovery_policy(
+def test_formal_g1_requires_legacy_proposer_backup_count_to_match_ranking(
     module,
 ) -> None:
+    with pytest.raises(
+        ValueError,
+        match="legacy compatibility input.*must match",
+    ):
+        module.load_draco_experiment_config(
+            module.DEFAULT_B2_EXPERIMENT_CONFIG_PATH,
+            inline_overlay_json='{"ensemble":{"proposer_backup_count":1}}',
+        )
+
     experiment = module.load_draco_experiment_config(
         module.DEFAULT_B2_EXPERIMENT_CONFIG_PATH,
-        inline_sets=["ensemble.proposer_backup_count=1"],
+        inline_overlay_json=(
+            '{"ensemble":{"proposer_backup_count":1},'
+            '"router_dynamic_ranking_override":'
+            '{"proposer_count":{"backup_count":1}}}'
+        ),
     ).config
     config = GatewayConfig(
         llm={
@@ -17622,15 +18060,15 @@ def test_formal_g1_rejects_nonfrozen_proposer_recovery_policy(
         }
     )
 
-    with pytest.raises(
-        ValueError,
-        match="frozen provider-owned proposer recovery policy",
-    ):
-        module.enforce_formal_draco_runtime_config(
-            config,
-            experiment,
-            ["G1"],
-        )
+    freeze = module.enforce_formal_draco_runtime_config(
+        config,
+        experiment,
+        ["G1"],
+    )
+
+    assert experiment.ensemble.proposer_backup_count == 1
+    assert config.llm_ensemble.proposer_backup_count == 1
+    assert freeze["proposer_backup_count"] == 1
 
 
 def test_b2_provider_alignment_rebuilds_trace_after_lineup_override() -> None:
@@ -17803,8 +18241,10 @@ def test_manifest_records_effective_and_requested_b2_alignment(tmp_path: Path) -
     alignment = manifest["benchmark_alignments"]["B2"]
     assert alignment["requested_args"]["concurrency"] == 8
     assert alignment["effective_args"]["concurrency"] == 2
-    assert alignment["effective_config"]["ensemble"]["wait_for_all_proposers"] is True
-    assert alignment["reference"]["source_commit"] == ("153e5ff267950b0e285efcdb180cea8724c0471d")
+    assert "effective_config" not in alignment
+    assert "reference" not in alignment
+    assert alignment["effective_config_sha256"].startswith("sha256:")
+    assert alignment["reference_sha256"].startswith("sha256:")
     assert len(manifest["source_provenance"]["runner_sha256"]) == 64
     assert "git_head" in manifest["source_provenance"]
 
@@ -17890,7 +18330,7 @@ def test_source_provenance_detects_tracked_changes_against_head(
     assert provenance["git_dirty"] is True
 
 
-def test_experiment_config_artifacts_save_source_effective_and_resolution(
+def test_experiment_config_artifacts_publish_only_private_effective_and_safe_resolution(
     tmp_path: Path,
 ) -> None:
     override_path = tmp_path / "override.json"
@@ -17917,30 +18357,215 @@ def test_experiment_config_artifacts_save_source_effective_and_resolution(
     )
 
     assert set(artifacts) == {
-        "experiment_config_base_json",
         "experiment_config_effective_json",
-        "experiment_config_override_01_json",
-        "experiment_config_inline_overrides_json",
         "experiment_config_resolution_json",
     }
-    effective = json.loads(
-        Path(artifacts["experiment_config_effective_json"]).read_text(encoding="utf-8")
-    )
-    inline = json.loads(
-        Path(artifacts["experiment_config_inline_overrides_json"]).read_text(encoding="utf-8")
-    )
+    effective_path = Path(artifacts["experiment_config_effective_json"])
+    resolution_path = Path(artifacts["experiment_config_resolution_json"])
+    effective = json.loads(effective_path.read_text(encoding="utf-8"))
     resolution = json.loads(
-        Path(artifacts["experiment_config_resolution_json"]).read_text(encoding="utf-8")
+        resolution_path.read_text(encoding="utf-8")
     )
     assert effective["runner"]["concurrency"] == 4
     assert effective["judge"]["repeats"] == 2
-    copied_override = json.loads(
-        Path(artifacts["experiment_config_override_01_json"]).read_text(encoding="utf-8")
+    assert effective_path.stat().st_mode & 0o777 == 0o600
+    assert resolution_path.stat().st_mode & 0o777 == 0o600
+    assert args._effective_experiment_config_path == effective_path.resolve()
+    inline = resolution["provenance"]["inline_overrides"]
+    assert inline == {"count": 1, "paths": ["runner.concurrency"]}
+    assert hashlib.sha256(b"4").hexdigest() not in resolution_path.read_text(
+        encoding="utf-8"
     )
-    assert copied_override == {"judge": {"repeats": 2}}
-    assert inline == [{"path": "runner.concurrency", "value": 4}]
     assert resolution["input_validation"]["status"] == "matched"
     assert resolution["artifact_keys"] == sorted(artifacts)
+    assert resolution["replay_validation"] == runner.gateway_replay_validation_contract()
+    assert not list(tmp_path.glob("*.experiment-config.base.json"))
+    assert not list(tmp_path.glob("*.experiment-config.override-*.json"))
+    assert not list(tmp_path.glob("*.experiment-config.inline-*.json"))
+
+
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+def test_experiment_config_artifacts_refuse_to_overwrite_existing_path(
+    module,
+    tmp_path: Path,
+) -> None:
+    args = module.build_parser().parse_args(
+        [
+            "--input",
+            "tasks.jsonl",
+            "--groups",
+            "B2",
+        ]
+    )
+    module.apply_b2_g12_argument_alignment(args, ["B2"])
+    stamp = "collision"
+    effective_path = (
+        tmp_path / f"draco_run_{stamp}.experiment-config.effective.json"
+    )
+    sentinel = b"preexisting-sentinel\n"
+    effective_path.write_bytes(sentinel)
+
+    with pytest.raises(FileExistsError):
+        module.write_experiment_config_artifacts(
+            tmp_path,
+            args=args,
+            stamp=stamp,
+        )
+
+    assert effective_path.read_bytes() == sentinel
+    assert not (tmp_path / f"draco_run_{stamp}.experiment-config.resolution.json").exists()
+
+
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+def test_experiment_config_artifacts_roll_back_when_later_publish_fails(
+    module,
+    tmp_path: Path,
+) -> None:
+    args = module.build_parser().parse_args(
+        [
+            "--input",
+            "tasks.jsonl",
+            "--groups",
+            "B2",
+        ]
+    )
+    module.apply_b2_g12_argument_alignment(args, ["B2"])
+    stamp = "rollback"
+    effective_path = (
+        tmp_path / f"draco_run_{stamp}.experiment-config.effective.json"
+    )
+    resolution_path = (
+        tmp_path / f"draco_run_{stamp}.experiment-config.resolution.json"
+    )
+    sentinel = b"preexisting-resolution\n"
+    resolution_path.write_bytes(sentinel)
+
+    with pytest.raises(FileExistsError):
+        module.write_experiment_config_artifacts(
+            tmp_path,
+            args=args,
+            stamp=stamp,
+        )
+
+    assert not effective_path.exists()
+    assert resolution_path.read_bytes() == sentinel
+    assert not list(tmp_path.glob(".*.tmp"))
+    assert not hasattr(args, "_effective_experiment_config_path")
+
+
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+def test_recorded_command_replays_private_effective_config_without_overlay_values(
+    module,
+    tmp_path: Path,
+) -> None:
+    inline_marker = "inline-secret-marker"
+    dotted_marker = "dotted-secret-marker"
+    args = module.build_parser().parse_args(
+        [
+            "--input",
+            "tasks.jsonl",
+            "--groups",
+            "B2",
+            "--experiment-config-override-json",
+            json.dumps(
+                {
+                    "reference": {"repository": inline_marker},
+                    "generation": {"max_attempts": 2},
+                }
+            ),
+            "--experiment-config-set",
+            f'reference.run_directory="{dotted_marker}"',
+            "--experiment-config-set",
+            "runner.concurrency=1",
+        ]
+    )
+    module.apply_b2_g12_argument_alignment(args, ["B2"])
+    original_effective = args._draco_experiment_config_bundle.config.model_dump(mode="json")
+    args._source_provenance = {
+        "git_head": "a" * 40,
+        "source_tree_sha256": "b" * 64,
+    }
+
+    def compatibility(current_args: object) -> dict[str, object]:
+        config = GatewayConfig(
+            llm={
+                "provider": "openrouter",
+                "model": "deepseek/deepseek-v4-pro",
+                "api_key": "fake",
+            }
+        )
+        current_args._formal_runtime_freeze = {}
+        policy = module.benchmark_tool_policy(current_args)
+        return module.build_run_compatibility(
+            args=current_args,
+            config=config,
+            groups=["B2"],
+            group_tool_policies=module.benchmark_tool_policies_for_groups(
+                policy,
+                ["B2"],
+                args=current_args,
+            ),
+            generation_policy=module.generation_thinking_policy(current_args),
+        )
+
+    original_compatibility = compatibility(args)
+    args._run_compatibility = original_compatibility
+    artifacts = module.write_experiment_config_artifacts(
+        tmp_path,
+        args=args,
+        stamp=module.__name__.rsplit("_", 1)[-1],
+    )
+    command_path = tmp_path / f"{module.__name__}.command.txt"
+    command = module.write_command_file(command_path, args=args, stamp="test")
+    manifest_path = tmp_path / f"{module.__name__}.manifest.json"
+    module.write_manifest(
+        manifest_path,
+        args=args,
+        stamp="test",
+        status="complete",
+        started_at=1.0,
+        tasks=[{"id": "task-1"}],
+        groups=["B2"],
+        artifacts=artifacts,
+        command=command,
+    )
+
+    effective_path = Path(artifacts["experiment_config_effective_json"])
+    assert effective_path.stat().st_mode & 0o777 == 0o600
+    assert inline_marker in effective_path.read_text(encoding="utf-8")
+    assert dotted_marker in effective_path.read_text(encoding="utf-8")
+    public_payload = "\n".join(
+        [
+            command_path.read_text(encoding="utf-8"),
+            manifest_path.read_text(encoding="utf-8"),
+            Path(artifacts["experiment_config_resolution_json"]).read_text(
+                encoding="utf-8"
+            ),
+            json.dumps(args._benchmark_alignments, ensure_ascii=False),
+        ]
+    )
+    assert inline_marker not in public_payload
+    assert dotted_marker not in public_payload
+    assert args._draco_experiment_config_bundle.inline_overlay_sha256 not in public_payload
+    assert _canonical_digest(dotted_marker) not in public_payload
+    assert "--experiment-config-override-json" not in command["argv"]
+    assert "--experiment-config-set" not in command["argv"]
+    assert command["parsed_args"]["experiment_config_override"] == []
+    assert command["parsed_args"]["experiment_config_set"] == []
+    assert command["parsed_args"]["experiment_config"] == str(effective_path.resolve())
+    assert command["replay_validation"] == module.gateway_replay_validation_contract()
+    assert "# Replay validation" in command_path.read_text(encoding="utf-8")
+
+    replayed_args = module.build_parser().parse_args(command["argv"][2:])
+    module.apply_b2_g12_argument_alignment(replayed_args, ["B2"])
+    replayed_args._source_provenance = dict(args._source_provenance)
+    replayed_effective = (
+        replayed_args._draco_experiment_config_bundle.config.model_dump(mode="json")
+    )
+    replayed_compatibility = compatibility(replayed_args)
+
+    assert replayed_effective == original_effective
+    assert replayed_compatibility["fingerprints"] == original_compatibility["fingerprints"]
 
 
 @pytest.mark.parametrize(
@@ -17983,12 +18608,7 @@ async def test_dry_ensemble_emits_expanded_k21_proposer_identity_roster(
     )
     provider.selection_plan = deepcopy(plan)
 
-    events = [
-        event
-        async for event in provider.chat(
-            [module.Message(role="user", content="task")]
-        )
-    ]
+    events = [event async for event in provider.chat([module.Message(role="user", content="task")])]
     done = next(event for event in events if isinstance(event, DoneEvent))
     trace = done.ensemble_trace
     assert isinstance(trace, dict)
@@ -18068,12 +18688,8 @@ def test_resume_completion_accepts_k21_plan_and_rejects_ambiguous_slots() -> Non
     ambiguous = deepcopy(row)
     ambiguous_plan = ambiguous["routing_trace"]["selection_plan"]
     ambiguous_plan["proposer_models"] = ["p0", "p1", "p0"]
-    ambiguous["ensemble_trace"]["calls"][0]["selection_plan"] = deepcopy(
-        ambiguous_plan
-    )
-    reasons = resume_runner.ensemble_generation_completion_reasons(
-        ambiguous
-    )
+    ambiguous["ensemble_trace"]["calls"][0]["selection_plan"] = deepcopy(ambiguous_plan)
+    reasons = resume_runner.ensemble_generation_completion_reasons(ambiguous)
     assert "invalid_expected_selection_plan" in reasons
     assert "invalid_expected_proposer_slot_roster" in reasons
 
@@ -18167,8 +18783,7 @@ def test_g1_registry_audit_distinguishes_member_and_sample_counts(
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     routes = {
-        str(row["registry_facts"]["model_id"]).strip().lower(): "auto"
-        for row in registry["models"]
+        str(row["registry_facts"]["model_id"]).strip().lower(): "auto" for row in registry["models"]
     }
     contract = {
         "profile_id": "test-k21-registry",
@@ -18279,10 +18894,7 @@ def test_ensemble_call_core_uses_frozen_provider_quorum(module) -> None:
         "selection_plan": deepcopy(plan),
         "total_candidates": 5,
         "successful_proposers": 2,
-        "candidates": [
-            candidate(index, ok=index < 2)
-            for index in range(5)
-        ],
+        "candidates": [candidate(index, ok=index < 2) for index in range(5)],
         "final_request": {
             "request_started": True,
             "role": "aggregator",
@@ -18321,8 +18933,4 @@ def test_ensemble_call_core_uses_frozen_provider_quorum(module) -> None:
     }
     assert module.frozen_proposer_quorum(invalid_policy, 5) == 2
     invalid_policy.pop("effective_min_successful_proposers")
-    assert (
-        module.frozen_proposer_quorum(invalid_policy, 5)
-        == module.legal_proposer_quorum(5)
-        == 4
-    )
+    assert module.frozen_proposer_quorum(invalid_policy, 5) == module.legal_proposer_quorum(5) == 4

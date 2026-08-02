@@ -8,6 +8,7 @@ import json
 import os
 import sys
 from copy import deepcopy
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,38 @@ from opensquilla.eval.draco_experiment_config import load_draco_experiment_confi
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "experiments" / "finalize_draco_campaign.py"
 TEST_G1_RUNTIME_REGISTRY_HASH = "d" * 64
+
+
+def _frozen_registry_all_routes(module) -> dict[str, str]:
+    return {
+        f"test-vendor/model-{index:02d}": "auto"
+        for index in range(module.FORMAL_G1_REGISTRY_ALL_CANDIDATE_COUNT)
+    }
+
+
+def _registry_all_contract(module) -> dict[str, object]:
+    routes = _frozen_registry_all_routes(module)
+    return {
+        "profile_id": "test-registry-all",
+        "selection_mode": "router_dynamic",
+        "candidate_scope": "registry_all",
+        "policy": "all_registry_models",
+        "user_profile_enabled": False,
+        "source_registry_snapshot_version": (
+            module.FORMAL_G1_FULL_REGISTRY_SNAPSHOT_VERSION
+        ),
+        "expected_routes": routes,
+        "expected_routes_sha256": module.canonical_sha256(routes),
+        "expected_candidate_count": len(routes),
+        "expected_source_registry_snapshot_sha256": (
+            module.FORMAL_G1_SOURCE_REGISTRY_SNAPSHOT_SHA256
+        ),
+        "expected_ranking_config_schema_version": (
+            module.FORMAL_G1_RANKING_CONFIG_SCHEMA_VERSION
+        ),
+        "expected_ranking_config_version": module.FORMAL_G1_RANKING_CONFIG_VERSION,
+        "expected_ranking_config_sha256": module.FORMAL_G1_RANKING_CONFIG_SHA256,
+    }
 
 
 def _load():
@@ -46,7 +79,7 @@ def test_formal_model_thinking_levels_match_campaign_config(module) -> None:
     resolved = load_draco_experiment_config(config_path).config.g1_routing
     assert resolved is not None
     if getattr(resolved, "candidate_scope", "exact_routes") == "registry_all":
-        assert set(module.formal_registry_all_routes().values()) == {"auto"}
+        assert resolved.expected_routes is None
     else:
         assert resolved.expected_routes is not None
         assert set(resolved.expected_routes) <= set(module.FORMAL_MODEL_THINKING_LEVELS)
@@ -60,9 +93,7 @@ def test_legacy_managed_v3_source_requires_exact_external_identity(
     module,
 ) -> None:
     identity = deepcopy(module.LEGACY_MANAGED_V3_SOURCE_IDENTITY)
-    assert module.legacy_managed_v3_source_authenticated(
-        {"source_identity": identity}
-    )
+    assert module.legacy_managed_v3_source_authenticated({"source_identity": identity})
     assert not module.legacy_managed_v3_source_authenticated(
         {"source_identity": {**identity, "unexpected": True}}
     )
@@ -91,9 +122,7 @@ def test_g1_thinking_physical_usage_requires_exact_id_multiset(
     aggregator_id = "b" * 32
     call = {
         "selection_plan": {
-            "thinking_physical_evidence_schema": (
-                module.THINKING_PHYSICAL_EVIDENCE_SCHEMA
-            )
+            "thinking_physical_evidence_schema": (module.THINKING_PHYSICAL_EVIDENCE_SCHEMA)
         },
         "candidates": [
             {
@@ -157,34 +186,26 @@ def test_g1_thinking_physical_usage_requires_exact_id_multiset(
     assert module.g1_thinking_physical_usage_binding_reasons(run) == []
 
     duplicate_usage = deepcopy(run)
-    duplicate_usage["usage"]["model_usage_breakdown"][1][
+    duplicate_usage["usage"]["model_usage_breakdown"][1]["physical_attempt_id"] = proposer_id
+    duplicate_usage["usage"]["model_usage_breakdown"][1]["provider_usage"][
         "physical_attempt_id"
     ] = proposer_id
-    duplicate_usage["usage"]["model_usage_breakdown"][1][
-        "provider_usage"
-    ]["physical_attempt_id"] = proposer_id
     assert (
         "g1_thinking_physical_usage_set_mismatch"
-        in module.g1_thinking_physical_usage_binding_reasons(
-            duplicate_usage
-        )
+        in module.g1_thinking_physical_usage_binding_reasons(duplicate_usage)
     )
 
     duplicate_ledger = deepcopy(run)
-    duplicate_ledger["ensemble_trace"]["aggregator_recovery"][
-        "attempts"
-    ][0]["physical_attempt_id"] = proposer_id
+    duplicate_ledger["ensemble_trace"]["aggregator_recovery"]["attempts"][0][
+        "physical_attempt_id"
+    ] = proposer_id
     assert (
         "invalid_g1_thinking_physical_attempt_set"
-        in module.g1_thinking_physical_usage_binding_reasons(
-            duplicate_ledger
-        )
+        in module.g1_thinking_physical_usage_binding_reasons(duplicate_ledger)
     )
 
     cross_role_collision = deepcopy(run)
-    cross_role_collision["setup_usage"] = [
-        usage_unit(proposer_id, role="task_analyzer")
-    ]
+    cross_role_collision["setup_usage"] = [usage_unit(proposer_id, role="task_analyzer")]
     generation_ids = module._strict_g1_physical_generation_usage_ids(
         cross_role_collision,
         identity_seed="cross-role-collision",
@@ -206,9 +227,7 @@ def test_g1_thinking_physical_usage_requires_exact_id_multiset(
         generation_ids,
         owner=(("G1", "task-1"), "1" * 32, "managed_generation"),
         owners=owners,
-    ) == [
-        "physical_attempt_id_reused_across_generation_attempts"
-    ]
+    ) == ["physical_attempt_id_reused_across_generation_attempts"]
 
 
 def test_physical_attempt_ids_are_unique_across_request_owners(
@@ -240,16 +259,12 @@ def test_physical_attempt_ids_are_unique_across_request_owners(
         [attempt_id],
         owner=(("G1", "task-1"), "1" * 32, "managed_generation"),
         owners=owners,
-    ) == [
-        "physical_attempt_id_reused_across_generation_attempts"
-    ]
+    ) == ["physical_attempt_id_reused_across_generation_attempts"]
     assert module.register_physical_attempt_owners(
         [attempt_id],
         owner=(("G1", "task-2"), "2" * 32, "task_analyzer"),
         owners=owners,
-    ) == [
-        "physical_attempt_id_reused_across_generation_attempts"
-    ]
+    ) == ["physical_attempt_id_reused_across_generation_attempts"]
 
 
 def test_provider_native_physical_ids_are_unique_without_thinking_schema(
@@ -294,28 +309,20 @@ def test_provider_native_physical_ids_are_unique_without_thinking_schema(
         plan = call["selection_plan"]
         plan.pop("thinking_physical_evidence_schema", None)
         assert plan.get("proposer_recovery_policy") is not None
-        physical = call["candidates"][0]["execution"][
-            "physical_attempts"
-        ][0]
+        physical = call["candidates"][0]["execution"]["physical_attempts"][0]
         prior_physical_attempt_id = physical["physical_attempt_id"]
         physical["physical_attempt_id"] = shared_physical_attempt_id
         usage_units = run["usage"]["model_usage_breakdown"]
         matching_units = [
             unit
             for unit in usage_units
-            if unit.get("physical_attempt_id")
-            == prior_physical_attempt_id
+            if unit.get("physical_attempt_id") == prior_physical_attempt_id
         ]
         assert len(matching_units) == 1
         usage_unit = matching_units[0]
         usage_unit["physical_attempt_id"] = shared_physical_attempt_id
-        usage_unit["provider_usage"]["physical_attempt_id"] = (
-            shared_physical_attempt_id
-        )
-        assert (
-            module.g1_thinking_physical_usage_binding_reasons(run)
-            == []
-        )
+        usage_unit["provider_usage"]["physical_attempt_id"] = shared_physical_attempt_id
+        assert module.g1_thinking_physical_usage_binding_reasons(run) == []
         records.append(
             module.SourceRecord(
                 path=Path(f"wave-{source_index}.jsonl"),
@@ -701,12 +708,62 @@ def test_frozen_g1_serving_aliases_bind_router_receipts(
     )
 
 
-def test_registry_all_contract_resolves_the_complete_packaged_pool(module) -> None:
-    routes = module.formal_registry_all_routes()
+def test_registry_all_contract_authenticates_its_frozen_route_projection(module) -> None:
+    contract = _registry_all_contract(module)
+    routes = module.authenticated_registry_all_routes(contract)
 
+    assert routes is not None
     assert len(routes) == module.FORMAL_G1_REGISTRY_ALL_CANDIDATE_COUNT == 80
     assert set(routes.values()) == {"auto"}
     assert all(model == model.strip().lower() and "/" in model for model in routes)
+
+
+def test_registry_all_contract_never_loads_the_mutable_packaged_profile(
+    module,
+    monkeypatch,
+) -> None:
+    import opensquilla.provider.ranking_router as ranking_router
+
+    monkeypatch.setattr(
+        ranking_router,
+        "load_model_registry_snapshot",
+        lambda: (_ for _ in ()).throw(AssertionError("mutable profile was loaded")),
+    )
+
+    assert module.authenticated_registry_all_routes(_registry_all_contract(module)) is not None
+    module._formal_openrouter_model_aliases.cache_clear()
+    assert module._formal_openrouter_models_equivalent(
+        "anthropic/claude-sonnet-5",
+        "anthropic/claude-sonnet-5-20260630",
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["count", "routes_hash", "source_hash", "provider", "model_identity"],
+)
+def test_registry_all_contract_rejects_frozen_route_tampering(module, mutation: str) -> None:
+    contract = _registry_all_contract(module)
+    if mutation == "count":
+        contract["expected_candidate_count"] = 79
+    elif mutation == "routes_hash":
+        contract["expected_routes_sha256"] = "0" * 64
+    elif mutation == "source_hash":
+        contract["expected_source_registry_snapshot_sha256"] = "0" * 64
+    elif mutation == "provider":
+        contract["expected_routes"]["test-vendor/model-00"] = "some-provider"
+        contract["expected_routes_sha256"] = module.canonical_sha256(
+            contract["expected_routes"]
+        )
+    else:
+        contract["expected_routes"]["TEST-VENDOR/model-00"] = contract[
+            "expected_routes"
+        ].pop("test-vendor/model-00")
+        contract["expected_routes_sha256"] = module.canonical_sha256(
+            contract["expected_routes"]
+        )
+
+    assert module.authenticated_registry_all_routes(contract) is None
 
 
 def test_auto_candidate_provider_accepts_any_successful_upstream_but_role_pin_remains(
@@ -822,10 +879,10 @@ def test_registry_all_auto_preserves_concrete_runtime_provider_pins(module) -> N
 
 
 def test_registry_all_plan_requires_all_registry_models_policy_and_pool(module) -> None:
-    routes = module.formal_registry_all_routes()
+    routes = _frozen_registry_all_routes(module)
     routes_hash = module.canonical_sha256(routes)
     profile_id = "test-registry-all"
-    source_version = "curated-openrouter-step2-2026-07-24.3"
+    source_version = module.FORMAL_G1_FULL_REGISTRY_SNAPSHOT_VERSION
     filtered_version = f"{source_version}+{profile_id}+{routes_hash[:12]}"
     identities = sorted(f"openrouter:{model}" for model in routes)
     contract = {
@@ -845,6 +902,7 @@ def test_registry_all_plan_requires_all_registry_models_policy_and_pool(module) 
         "expected_ranking_config_version": module.FORMAL_G1_RANKING_CONFIG_VERSION,
         "expected_ranking_config_sha256": module.FORMAL_G1_RANKING_CONFIG_SHA256,
         "expected_proposer_count_max": module.FORMAL_G1_PROPOSER_COUNT_MAX,
+        "task_analyzer": _default_task_analyzer_policy(),
     }
     plan = {
         "candidate_allowlist": {
@@ -888,9 +946,7 @@ def _assert_account_audit_conflict(
     warning: str,
 ) -> dict[str, object]:
     manifest = module.run_finalization(args)
-    proof = json.loads(
-        (args.output_dir / "openrouter-non-byok-campaign-proof.json").read_text()
-    )
+    proof = json.loads((args.output_dir / "openrouter-non-byok-campaign-proof.json").read_text())
     audit = json.loads((args.output_dir / "audit.json").read_text())
 
     assert manifest["status"] == "complete"
@@ -918,9 +974,12 @@ def _assert_account_audit_conflict(
 
 
 def test_account_proof_allowlist_is_closed(module) -> None:
-    assert module.account_proof_error_is_audit_only(
-        module.FinalizationError("account reconciliation is not stable")
-    ) is True
+    assert (
+        module.account_proof_error_is_audit_only(
+            module.FinalizationError("account reconciliation is not stable")
+        )
+        is True
+    )
     for message in (
         "runtime/account evidence uses different API keys",
         "reconciliation runtime file hash differs",
@@ -929,9 +988,7 @@ def test_account_proof_allowlist_is_closed(module) -> None:
         "stable observation usage is not monotonic",
         "campaign account counters are not continuous between windows",
     ):
-        assert module.account_proof_error_is_audit_only(
-            module.FinalizationError(message)
-        ) is False
+        assert module.account_proof_error_is_audit_only(module.FinalizationError(message)) is False
 
 
 def _receipt(
@@ -1346,10 +1403,7 @@ def _ranked_aggregator_fallback_call(
             module,
             call,
             plan,
-            scope_id=(
-                "ranked-fallback-"
-                f"{fallback_index}-{module.text_sha256(final_text)[:16]}"
-            ),
+            scope_id=(f"ranked-fallback-{fallback_index}-{module.text_sha256(final_text)[:16]}"),
         )
     return call
 
@@ -1379,9 +1433,7 @@ def _provider_native_recovery_call(
             "openrouter:model-g",
             "openrouter:model-h",
         ],
-        "proposer_recovery_policy": deepcopy(
-            module.FORMAL_PROPOSER_RECOVERY_POLICY
-        ),
+        "proposer_recovery_policy": deepcopy(module.FORMAL_PROPOSER_RECOVERY_POLICY),
     }
     from opensquilla.provider.protocol import (
         provider_retry_roster_fingerprint,
@@ -1541,11 +1593,9 @@ def test_provider_native_proposer_recovery_binds_receipt_and_fingerprint(
 ) -> None:
     call, plan = _provider_native_recovery_call(module)
 
-    final_identities, recovery_ids, reasons = (
-        module.proposer_recovery_execution_reasons(
-            call,
-            executed_plan=plan,
-        )
+    final_identities, recovery_ids, reasons = module.proposer_recovery_execution_reasons(
+        call,
+        executed_plan=plan,
     )
 
     assert reasons == []
@@ -1555,6 +1605,37 @@ def test_provider_native_proposer_recovery_binds_receipt_and_fingerprint(
         2: "openrouter:model-c",
     }
     assert recovery_ids == {"b" * 32}
+
+
+def test_provider_native_proposer_recovery_uses_authenticated_dynamic_policy(
+    module,
+) -> None:
+    call, plan = _provider_native_recovery_call(module)
+    policy = {
+        **deepcopy(module.FORMAL_PROPOSER_RECOVERY_POLICY),
+        "configured_backup_count": 1,
+        "effective_backup_count": 1,
+        "max_additional_physical_requests": 2,
+    }
+    plan["backup_P"] = plan["backup_P"][:1]
+    plan["configured_proposer_backup_count"] = 1
+    plan["effective_proposer_backup_count"] = 1
+    plan["proposer_recovery_policy"] = policy
+
+    from opensquilla.provider.protocol import provider_retry_roster_fingerprint
+
+    receipt = call["proposer_recovery"]
+    receipt["selection_plan_fingerprint"] = provider_retry_roster_fingerprint(plan)
+    receipt["max_additional_physical_requests"] = 2
+    receipt["remaining_additional_physical_requests"] = 1
+
+    _, _, reasons = module.proposer_recovery_execution_reasons(
+        call,
+        executed_plan=plan,
+        expected_policy=policy,
+    )
+
+    assert reasons == []
 
 
 def test_provider_shaped_dynamic_partial_quorum_separates_strict_and_usable(
@@ -1629,9 +1710,7 @@ def test_proposer_transport_success_does_not_promote_semantic_failure(
 ) -> None:
     call, plan = _provider_native_recovery_call(module)
     failed_candidate = call["candidates"][2]
-    failed_candidate["execution"]["physical_attempts"][0]["outcome"] = (
-        "succeeded"
-    )
+    failed_candidate["execution"]["physical_attempts"][0]["outcome"] = "succeeded"
 
     _, _, reasons = module.proposer_recovery_execution_reasons(
         call,
@@ -1669,10 +1748,7 @@ def _legacy_excluded_zero_request_recovery_call(module):
         "billed_cost": 0.0,
         "cost_source": "none",
         "content": {"text": "", "chars": 0, "truncated": False},
-        "error": (
-            "proposer identity was excluded after an earlier failure in this "
-            "retry scope"
-        ),
+        "error": ("proposer identity was excluded after an earlier failure in this retry scope"),
         "error_code": "proposer_recovery_identity_excluded",
         "execution": {
             "request_started": False,
@@ -1787,9 +1863,7 @@ def _provider_native_cleanup_quorum_bypass_call(
         "openrouter:model-c",
     ]
     receipt["cleanup_quorum_bypass"] = {
-        "schema": (
-            "opensquilla.router-dynamic-proposer-cleanup-quorum-bypass/v1"
-        ),
+        "schema": ("opensquilla.router-dynamic-proposer-cleanup-quorum-bypass/v1"),
         "applied": True,
         "quorum_required": 2,
         "successful_proposers": 2,
@@ -1807,11 +1881,9 @@ def test_provider_native_cleanup_quorum_bypass_is_auditable(
 ) -> None:
     call, plan = _provider_native_cleanup_quorum_bypass_call(module)
 
-    final_identities, recovery_ids, reasons = (
-        module.proposer_recovery_execution_reasons(
-            call,
-            executed_plan=plan,
-        )
+    final_identities, recovery_ids, reasons = module.proposer_recovery_execution_reasons(
+        call,
+        executed_plan=plan,
     )
 
     assert reasons == []
@@ -1872,23 +1944,14 @@ def test_proposer_recovery_identity_accepts_valid_model_suffixes(
     module,
 ) -> None:
     assert (
-        module._canonical_proposer_recovery_identity(
-            "openrouter:model:free"
-        )
+        module._canonical_proposer_recovery_identity("openrouter:model:free")
         == "openrouter:model:free"
     )
     assert (
-        module._canonical_proposer_recovery_identity(
-            "openrouter:Vendor/Model-X"
-        )
+        module._canonical_proposer_recovery_identity("openrouter:Vendor/Model-X")
         == "openrouter:Vendor/Model-X"
     )
-    assert (
-        module._canonical_proposer_recovery_identity(
-            "openrouter:model::free"
-        )
-        == ""
-    )
+    assert module._canonical_proposer_recovery_identity("openrouter:model::free") == ""
 
 
 def test_expanded_proposer_slots_allow_positional_cross_provider_model(
@@ -1955,18 +2018,14 @@ def test_provider_native_proposer_recovery_binds_expanded_k_slots(
 
     receipt = call["proposer_recovery"]
     assert isinstance(receipt, dict)
-    receipt["selection_plan_fingerprint"] = provider_retry_roster_fingerprint(
-        plan
-    )
+    receipt["selection_plan_fingerprint"] = provider_retry_roster_fingerprint(plan)
     receipt["executed_proposer_roster_before"] = [
         selected[0],
         selected[0],
         selected[1],
         selected[2],
     ]
-    receipt["executed_proposer_roster_after"] = list(
-        receipt["executed_proposer_roster_before"]
-    )
+    receipt["executed_proposer_roster_after"] = list(receipt["executed_proposer_roster_before"])
 
     candidates = call["candidates"]
     assert isinstance(candidates, list)
@@ -2018,11 +2077,9 @@ def test_provider_native_proposer_recovery_binds_expanded_k_slots(
     failed_b_attempts[0]["outcome"] = "failed"
     call["successful_proposers"] = 2
 
-    final_identities, recovery_ids, reasons = (
-        module.proposer_recovery_execution_reasons(
-            call,
-            executed_plan=plan,
-        )
+    final_identities, recovery_ids, reasons = module.proposer_recovery_execution_reasons(
+        call,
+        executed_plan=plan,
     )
 
     assert reasons == []
@@ -2064,9 +2121,7 @@ def test_provider_native_backup_roster_is_reused_by_the_next_agent_call(
             "model": backup_model,
         }
     )
-    first_candidate["execution"]["physical_attempts"][1][
-        "identity"
-    ] = backup_identity
+    first_candidate["execution"]["physical_attempts"][1]["identity"] = backup_identity
     first_attempt.update(
         {
             "kind": "backup_replacement",
@@ -2079,11 +2134,9 @@ def test_provider_native_backup_roster_is_reused_by_the_next_agent_call(
     first_receipt["visited_identities"] = [backup_identity]
     first_receipt["executed_proposer_roster_after"][0] = backup_identity
 
-    first_final, _, first_reasons = (
-        module.proposer_recovery_execution_reasons(
-            first,
-            executed_plan=plan,
-        )
+    first_final, _, first_reasons = module.proposer_recovery_execution_reasons(
+        first,
+        executed_plan=plan,
     )
     assert first_reasons == []
     assert first_final[0] == backup_identity
@@ -2095,12 +2148,8 @@ def test_provider_native_backup_roster_is_reused_by_the_next_agent_call(
         "openrouter:model-b",
         "openrouter:model-c",
     ]
-    second_receipt["executed_proposer_roster_before"] = list(
-        effective_roster
-    )
-    second_receipt["executed_proposer_roster_after"] = list(
-        effective_roster
-    )
+    second_receipt["executed_proposer_roster_before"] = list(effective_roster)
+    second_receipt["executed_proposer_roster_after"] = list(effective_roster)
     for candidate, attempt_id, identity, outcome in zip(
         second["candidates"],
         ("e" * 32, "f" * 32, "1" * 32),
@@ -2129,11 +2178,9 @@ def test_provider_native_backup_roster_is_reused_by_the_next_agent_call(
             }
         ]
 
-    second_final, second_recovery_ids, second_reasons = (
-        module.proposer_recovery_execution_reasons(
-            second,
-            executed_plan=plan,
-        )
+    second_final, second_recovery_ids, second_reasons = module.proposer_recovery_execution_reasons(
+        second,
+        executed_plan=plan,
     )
     assert second_reasons == []
     assert second_final[0] == backup_identity
@@ -2186,33 +2233,28 @@ def test_provider_native_backup_roster_is_reused_by_the_next_agent_call(
         },
         "usage": {
             "model_usage_breakdown": [
-                usage_unit(attempt_id, model)
-                for attempt_id, model in physical_models
+                usage_unit(attempt_id, model) for attempt_id, model in physical_models
             ]
         },
     }
     assert module.g1_thinking_physical_usage_binding_reasons(run) == []
 
     tampered_continuity = deepcopy(run)
-    tampered_continuity["ensemble_trace"]["calls"][1][
-        "proposer_recovery"
-    ]["executed_proposer_roster_before"] = list(plan["selected_P"])
+    tampered_continuity["ensemble_trace"]["calls"][1]["proposer_recovery"][
+        "executed_proposer_roster_before"
+    ] = list(plan["selected_P"])
     assert (
         "proposer_recovery_roster_prefix_changed"
-        in module.g1_thinking_physical_usage_binding_reasons(
-            tampered_continuity
-        )
+        in module.g1_thinking_physical_usage_binding_reasons(tampered_continuity)
     )
 
     tampered_first_prefix = deepcopy(run)
-    tampered_first_prefix["ensemble_trace"]["calls"][0][
-        "proposer_recovery"
-    ]["executed_proposer_roster_before"] = list(effective_roster)
+    tampered_first_prefix["ensemble_trace"]["calls"][0]["proposer_recovery"][
+        "executed_proposer_roster_before"
+    ] = list(effective_roster)
     assert (
         "proposer_recovery_roster_prefix_changed"
-        in module.g1_thinking_physical_usage_binding_reasons(
-            tampered_first_prefix
-        )
+        in module.g1_thinking_physical_usage_binding_reasons(tampered_first_prefix)
     )
 
 
@@ -2261,9 +2303,7 @@ def test_provider_native_proposer_recovery_fails_closed(
         candidate["requested_model"] = "model-e"
         candidate["provider"] = "openrouter"
         candidate["model"] = "model-e"
-        candidate["execution"]["physical_attempts"][1][
-            "identity"
-        ] = "openrouter:model-e"
+        candidate["execution"]["physical_attempts"][1]["identity"] = "openrouter:model-e"
         attempts[0].update(
             {
                 "kind": "backup_replacement",
@@ -2273,9 +2313,7 @@ def test_provider_native_proposer_recovery_fails_closed(
         attempts[0].pop("thinking_before")
         attempts[0].pop("thinking_after")
         receipt["visited_identities"] = ["openrouter:model-e"]
-        receipt["executed_proposer_roster_after"][0] = (
-            "openrouter:model-e"
-        )
+        receipt["executed_proposer_roster_after"][0] = "openrouter:model-e"
     else:
         candidate = candidates[2]
         physical_rows = candidate["execution"]["physical_attempts"]
@@ -2355,11 +2393,9 @@ def test_provider_native_recovery_allows_unstarted_primary_then_backup(
     receipt["visited_identities"] = [backup_identity]
     receipt["executed_proposer_roster_after"][0] = backup_identity
 
-    final_identities, recovery_ids, reasons = (
-        module.proposer_recovery_execution_reasons(
-            call,
-            executed_plan=plan,
-        )
+    final_identities, recovery_ids, reasons = module.proposer_recovery_execution_reasons(
+        call,
+        executed_plan=plan,
     )
 
     assert reasons == []
@@ -2409,9 +2445,7 @@ def test_provider_native_formal_quorum_is_two_for_five_proposers(
         "openrouter:model-j",
     ]
     plan["selected_P"] = selected
-    plan["proposer_models"] = [
-        identity.partition(":")[2] for identity in selected
-    ]
+    plan["proposer_models"] = [identity.partition(":")[2] for identity in selected]
     plan["proposer_sample_count"] = len(selected)
     receipt = call["proposer_recovery"]
     receipt["executed_proposer_roster_before"] = list(selected)
@@ -2420,9 +2454,7 @@ def test_provider_native_formal_quorum_is_two_for_five_proposers(
         provider_retry_roster_fingerprint,
     )
 
-    receipt["selection_plan_fingerprint"] = (
-        provider_retry_roster_fingerprint(plan)
-    )
+    receipt["selection_plan_fingerprint"] = provider_retry_roster_fingerprint(plan)
     for index, (model, attempt_id) in enumerate(
         (("model-i", "e" * 32), ("model-j", "f" * 32)),
         start=3,
@@ -2512,9 +2544,7 @@ def test_provider_native_formal_quorum_is_two_for_five_proposers(
             "content": {"text": "", "chars": 0, "truncated": False},
         }
     )
-    failed_second["execution"]["physical_attempts"][0][
-        "outcome"
-    ] = "failed"
+    failed_second["execution"]["physical_attempts"][0]["outcome"] = "failed"
     one_success_reasons = module.ensemble_physical_call_reasons(
         one_success,
         expected_proposers=plan["proposer_models"],
@@ -2574,9 +2604,7 @@ def test_provider_native_recovery_usage_is_bound_exactly_once(
     missing_recovery_usage["usage"]["model_usage_breakdown"].pop(1)
     assert (
         "g1_thinking_physical_usage_set_mismatch"
-        in module.g1_thinking_physical_usage_binding_reasons(
-            missing_recovery_usage
-        )
+        in module.g1_thinking_physical_usage_binding_reasons(missing_recovery_usage)
     )
 
     duplicate_recovery_usage = deepcopy(run)
@@ -2585,9 +2613,7 @@ def test_provider_native_recovery_usage_is_bound_exactly_once(
     )
     assert (
         "g1_thinking_physical_usage_set_mismatch"
-        in module.g1_thinking_physical_usage_binding_reasons(
-            duplicate_recovery_usage
-        )
+        in module.g1_thinking_physical_usage_binding_reasons(duplicate_recovery_usage)
     )
 
 
@@ -2666,8 +2692,15 @@ def test_provider_native_lifecycle_forbids_outer_generation_replay(
         *,
         contract,
         allow_legacy_managed_v3=False,
+        aggregator_recovery_policy=None,
+        proposer_recovery_policy=None,
     ):
-        del contract, allow_legacy_managed_v3
+        del (
+            contract,
+            allow_legacy_managed_v3,
+            aggregator_recovery_policy,
+            proposer_recovery_policy,
+        )
         return (
             [],
             tuple(value.get("proposer_models") or []),
@@ -2717,6 +2750,15 @@ def _g1_routes() -> dict[str, str]:
         "google/gemini-3.1-pro-preview": "google-ai-studio",
         "deepseek/deepseek-v4-flash": "deepseek",
     }
+
+
+def _default_task_analyzer_policy() -> dict[str, object]:
+    from opensquilla.provider.ranking_router import (
+        ranking_config_resolution,
+        task_analyzer_policy,
+    )
+
+    return dict(task_analyzer_policy(ranking_config_resolution()["effective_config"]))
 
 
 def _contract(module, group: str, key_hash: str) -> dict[str, object]:
@@ -2879,6 +2921,10 @@ def _contract(module, group: str, key_hash: str) -> dict[str, object]:
             "sandbox_enabled": False,
             "sandbox_security_grading_enabled": False,
             **module.FORMAL_AGGREGATOR_RECOVERY_POLICY,
+            "proposer_backup_count": 2,
+            "proposer_recovery_max_additional_calls": 3,
+            "proposer_max_tokens_cap": 65_536,
+            "proposer_visible_answer_reserve_tokens": 4_096,
             "g1_user_profile_generation_enabled": False,
             "g1_user_profile_enabled": False,
         },
@@ -2928,6 +2974,7 @@ def _contract(module, group: str, key_hash: str) -> dict[str, object]:
             "expected_ranking_config_version": (module.FORMAL_G1_RANKING_CONFIG_VERSION),
             "expected_ranking_config_sha256": (module.FORMAL_G1_RANKING_CONFIG_SHA256),
             "expected_proposer_count_max": (module.FORMAL_G1_PROPOSER_COUNT_MAX),
+            "task_analyzer": _default_task_analyzer_policy(),
         }
     return contract
 
@@ -2940,6 +2987,384 @@ def _test_ranking_config(module) -> dict[str, object]:
     # exercising the complete production ranking configuration.
     config["proposer_count"]["by_tier"]["3"] = {"min": 3, "max": 3}
     return config
+
+
+def _runtime_override_ranking_contract(
+    module,
+    *,
+    override: dict[str, object] | None,
+) -> dict[str, object]:
+    from opensquilla.provider.ranking_router import (
+        ranking_config_resolution,
+        task_analyzer_policy,
+    )
+
+    thinking_override = override.get("thinking_assignment") if isinstance(override, dict) else None
+    resolution = ranking_config_resolution(
+        thinking_assignment_enabled=(
+            None
+            if isinstance(thinking_override, dict) and "enabled" in thinking_override
+            else False
+        ),
+        override=override,
+    )
+    effective = resolution["effective_config"]
+    proposer_count = effective["proposer_count"]
+    effective_proposer_max = max(
+        *(int(row["max"]) for row in proposer_count["by_tier"].values()),
+        int(proposer_count["high_risk"]["max"]),
+    )
+    contract = _contract(module, "G1", "a" * 64)["g1_registry_contract"]
+    contract.update(
+        {
+            "baseline_expected_ranking_config_schema_version": (
+                module.FORMAL_G1_RANKING_CONFIG_SCHEMA_VERSION
+            ),
+            "baseline_expected_ranking_config_version": (module.FORMAL_G1_RANKING_CONFIG_VERSION),
+            "baseline_expected_ranking_config_sha256": (module.FORMAL_G1_RANKING_CONFIG_SHA256),
+            "baseline_expected_proposer_count_max": (module.FORMAL_G1_PROPOSER_COUNT_MAX),
+            "expected_ranking_config_schema_version": effective["schema_version"],
+            "expected_ranking_config_version": effective["config_version"],
+            "expected_ranking_config_sha256": resolution["effective_sha256"],
+            "expected_proposer_count_max": effective_proposer_max,
+            "ranking_config_resolution": resolution,
+            "task_analyzer": dict(task_analyzer_policy(effective)),
+        }
+    )
+    return contract
+
+
+def _thinking_registry_all_contract(module) -> dict[str, object]:
+    contract = _runtime_override_ranking_contract(
+        module,
+        override={"thinking_assignment": {"enabled": True}},
+    )
+    routes = _frozen_registry_all_routes(module)
+    contract.update(
+        {
+            "candidate_scope": "registry_all",
+            "policy": "all_registry_models",
+            "source_registry_snapshot_version": (
+                module.FORMAL_G1_FULL_REGISTRY_SNAPSHOT_VERSION
+            ),
+            "expected_routes": routes,
+            "expected_routes_sha256": module.canonical_sha256(routes),
+            "expected_candidate_count": len(routes),
+            "expected_source_registry_snapshot_sha256": (
+                module.FORMAL_G1_FULL_REGISTRY_SNAPSHOT_SHA256
+            ),
+        }
+    )
+    return contract
+
+
+def test_thinking_v4_full_registry_contract_uses_frozen_source_identity(module) -> None:
+    registry = _thinking_registry_all_contract(module)
+
+    assert module.g1_registry_source_identity(registry) == (
+        module.FORMAL_G1_FULL_REGISTRY_SNAPSHOT_VERSION,
+        module.FORMAL_G1_FULL_REGISTRY_SNAPSHOT_SHA256,
+    )
+    assert module.authenticated_registry_all_routes(registry) == registry["expected_routes"]
+    reasons, _, _ = module.g1_registry_plan_reasons({}, contract=registry)
+    assert "invalid_g1_registry_contract" not in reasons
+
+    contracts = {group: _contract(module, group, "a" * 64) for group in module.GROUPS}
+    contracts["G1"]["g1_registry_contract"] = registry
+    assert module.validate_formal_campaign_contracts(contracts).generation_max_attempts == 3
+
+
+def test_thinking_v4_full_registry_contract_rejects_legacy_source_hash(module) -> None:
+    registry = _thinking_registry_all_contract(module)
+    registry["expected_source_registry_snapshot_sha256"] = (
+        module.FORMAL_G1_LEGACY_SOURCE_REGISTRY_SNAPSHOT_SHA256
+    )
+
+    assert module.authenticated_registry_all_routes(registry) is None
+    reasons, _, _ = module.g1_registry_plan_reasons({}, contract=registry)
+    assert "invalid_g1_registry_contract" in reasons
+
+
+def test_g1_ranking_proposer_max_uses_authenticated_effective_config(module) -> None:
+    contract = _runtime_override_ranking_contract(
+        module,
+        override={
+            "proposer_count": {
+                "by_tier": {"4": {"max": 4}},
+                "high_risk": {"max": 4},
+            }
+        },
+    )
+
+    assert contract["expected_proposer_count_max"] == 4
+    assert module.g1_ranking_proposer_max(contract) == 4
+    contract["expected_proposer_count_max"] = 5
+    assert module.g1_ranking_proposer_max(contract) is None
+
+
+def test_g1_ranking_config_identity_accepts_legacy_and_runtime_override(module) -> None:
+    legacy = _contract(module, "G1", "a" * 64)["g1_registry_contract"]
+    assert module.g1_ranking_config_identity(legacy) == (
+        module.FORMAL_G1_RANKING_CONFIG_SCHEMA_VERSION,
+        module.FORMAL_G1_RANKING_CONFIG_VERSION,
+        module.FORMAL_G1_RANKING_CONFIG_SHA256,
+    )
+
+    resolved_baseline = _runtime_override_ranking_contract(
+        module,
+        override=None,
+    )
+    assert module.g1_ranking_config_identity(resolved_baseline) == (
+        module.FORMAL_G1_RANKING_CONFIG_SCHEMA_VERSION,
+        module.FORMAL_G1_RANKING_CONFIG_VERSION,
+        module.FORMAL_G1_RANKING_CONFIG_SHA256,
+    )
+
+    contract = _runtime_override_ranking_contract(
+        module,
+        override={
+            "penalties": {
+                "task_cost_weights": {
+                    "low": 0.17,
+                    "medium": 0.08,
+                    "high": 0.03,
+                    "hard_limit": 0.24,
+                }
+            }
+        },
+    )
+    resolution = contract["ranking_config_resolution"]
+    assert module.g1_ranking_config_identity(contract) == (
+        resolution["effective_config"]["schema_version"],
+        resolution["effective_config"]["config_version"],
+        resolution["effective_sha256"],
+    )
+
+    thinking_contract = _runtime_override_ranking_contract(
+        module,
+        override={"thinking_assignment": {"enabled": True}},
+    )
+    thinking_resolution = thinking_contract["ranking_config_resolution"]
+    assert thinking_resolution["base_config"]["schema_version"] == (
+        module.FORMAL_G1_RANKING_CONFIG_SCHEMA_VERSION
+    )
+    assert thinking_resolution["effective_config"]["schema_version"] == ("step2-ranking-config-v4")
+    assert module.g1_ranking_config_identity(thinking_contract) == (
+        thinking_resolution["effective_config"]["schema_version"],
+        thinking_resolution["effective_config"]["config_version"],
+        thinking_resolution["effective_sha256"],
+    )
+
+
+def test_g1_ranking_resolution_replay_never_loads_packaged_config(
+    module,
+    monkeypatch,
+) -> None:
+    import opensquilla.provider.ranking_router as ranking_router
+
+    contract = _runtime_override_ranking_contract(
+        module,
+        override={"penalties": {"task_cost_weights": {"medium": 0.09}}},
+    )
+    expected = (
+        contract["expected_ranking_config_schema_version"],
+        contract["expected_ranking_config_version"],
+        contract["expected_ranking_config_sha256"],
+    )
+    monkeypatch.setattr(
+        ranking_router,
+        "ranking_config_resolution",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("packaged config was loaded")),
+    )
+    monkeypatch.setattr(
+        ranking_router,
+        "task_analyzer_policy",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("packaged analyzer policy was loaded")
+        ),
+    )
+
+    assert module.g1_ranking_config_identity(contract) == expected
+    assert module.g1_task_analyzer_execution_policy(contract) == contract["task_analyzer"]
+
+
+def test_g1_historical_no_resolution_analyzer_uses_frozen_policy(
+    module,
+    monkeypatch,
+) -> None:
+    import opensquilla.provider.ranking_router as ranking_router
+
+    contract = _contract(module, "G1", "a" * 64)["g1_registry_contract"]
+    historical = next(iter(module.HISTORICAL_G1_RANKING_CONFIG_IDENTITIES))
+    contract.update(
+        {
+            "expected_ranking_config_schema_version": historical[0],
+            "expected_ranking_config_version": historical[1],
+            "expected_ranking_config_sha256": historical[2],
+        }
+    )
+    contract.pop("task_analyzer", None)
+    monkeypatch.setattr(
+        ranking_router,
+        "ranking_config_resolution",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("packaged config was loaded")),
+    )
+    monkeypatch.setattr(
+        ranking_router,
+        "task_analyzer_policy",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("packaged analyzer policy was loaded")
+        ),
+    )
+
+    assert module.g1_task_analyzer_execution_policy(contract) == (
+        module.FORMAL_TASK_ANALYZER_EXECUTION_POLICY
+    )
+
+
+def test_g1_ranking_config_identity_accepts_2026_07_22_historical_replay(
+    module,
+) -> None:
+    contract = _contract(module, "G1", "a" * 64)["g1_registry_contract"]
+    historical = (
+        "step2-ranking-config-v3",
+        "step2-ranking-2026-07-22.1",
+        "a8addcdefa04349209c20e97ca5851ed0f5ca55646c9d0c5badc5d32dd7ef10c",
+    )
+    contract["expected_ranking_config_schema_version"] = historical[0]
+    contract["expected_ranking_config_version"] = historical[1]
+    contract["expected_ranking_config_sha256"] = historical[2]
+
+    assert module.g1_ranking_config_identity(contract) == historical
+
+
+def test_g1_ranking_config_identity_accepts_unicode_runtime_override(
+    module,
+    monkeypatch,
+) -> None:
+    from opensquilla.provider.ranking_router import ranking_config_resolution
+
+    baseline = ranking_config_resolution(thinking_assignment_enabled=False)
+    monkeypatch.setattr(
+        module,
+        "FORMAL_G1_RANKING_CONFIG_SCHEMA_VERSION",
+        baseline["effective_config"]["schema_version"],
+    )
+    monkeypatch.setattr(
+        module,
+        "FORMAL_G1_RANKING_CONFIG_VERSION",
+        baseline["effective_config"]["config_version"],
+    )
+    monkeypatch.setattr(
+        module,
+        "FORMAL_G1_RANKING_CONFIG_SHA256",
+        baseline["effective_sha256"],
+    )
+    contract = _runtime_override_ranking_contract(
+        module,
+        override={"mock_user_profile": {"profile_source": "实验-中文"}},
+    )
+    resolution = contract["ranking_config_resolution"]
+
+    assert resolution["override_sha256"] == module.canonical_sha256(resolution["override"])
+    assert module.g1_ranking_config_identity(contract) == (
+        resolution["effective_config"]["schema_version"],
+        resolution["effective_config"]["config_version"],
+        resolution["effective_sha256"],
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "baseline_hash",
+        "base_hash",
+        "override_hash",
+        "effective_hash",
+        "effective_version",
+        "thinking_switch",
+        "extra_resolution_field",
+        "undeclared_effective_change",
+        "override_not_applied",
+    ],
+)
+def test_g1_ranking_config_identity_rejects_resolution_tampering(
+    module,
+    mutation: str,
+) -> None:
+    contract = _runtime_override_ranking_contract(
+        module,
+        override={"penalties": {"task_cost_weights": {"medium": 0.09}}},
+    )
+    resolution = contract["ranking_config_resolution"]
+    if mutation == "baseline_hash":
+        contract["baseline_expected_ranking_config_sha256"] = "0" * 64
+    elif mutation == "base_hash":
+        resolution["base_sha256"] = "0" * 64
+    elif mutation == "override_hash":
+        resolution["override_sha256"] = "0" * 64
+    elif mutation == "effective_hash":
+        resolution["effective_sha256"] = "0" * 64
+    elif mutation == "effective_version":
+        resolution["effective_config"]["config_version"] = "tampered"
+    elif mutation == "thinking_switch":
+        resolution["thinking_assignment_enabled"] = True
+    elif mutation == "undeclared_effective_change":
+        resolution["effective_config"]["penalties"]["default_cost_weight"] = 0.123
+        resolution["effective_sha256"] = module.canonical_sha256(
+            resolution["effective_config"]
+        )
+        contract["expected_ranking_config_sha256"] = resolution["effective_sha256"]
+    elif mutation == "override_not_applied":
+        resolution["override"]["penalties"]["task_cost_weights"]["medium"] = 0.11
+        resolution["override_sha256"] = module.canonical_sha256(resolution["override"])
+        resolution["effective_config"]["config_version"] = (
+            f"{resolution['base_config']['config_version']}+override."
+            f"{resolution['override_sha256'][:12]}"
+        )
+        resolution["effective_sha256"] = module.canonical_sha256(
+            resolution["effective_config"]
+        )
+        contract["expected_ranking_config_version"] = resolution["effective_config"][
+            "config_version"
+        ]
+        contract["expected_ranking_config_sha256"] = resolution["effective_sha256"]
+    else:
+        resolution["unexpected"] = True
+
+    assert module.g1_ranking_config_identity(contract) is None
+
+
+def test_g1_plan_is_bound_to_runtime_effective_ranking_identity(module) -> None:
+    contract = _runtime_override_ranking_contract(
+        module,
+        override={"penalties": {"task_cost_weights": {"medium": 0.09}}},
+    )
+    resolution = contract["ranking_config_resolution"]
+    plan = _g1_plan(
+        module,
+        [
+            "deepseek/deepseek-v4-pro",
+            "qwen/qwen3.7-max",
+            "z-ai/glm-5.2",
+        ],
+        "z-ai/glm-5.2",
+    )
+    plan.update(
+        {
+            "ranking_config_schema_version": contract["expected_ranking_config_schema_version"],
+            "ranking_config_version": contract["expected_ranking_config_version"],
+            "ranking_config_hash": contract["expected_ranking_config_sha256"],
+            "ranking_parameters": deepcopy(resolution["effective_config"]),
+        }
+    )
+    reasons, _, _ = module.g1_registry_plan_reasons(plan, contract=contract)
+    assert "invalid_g1_registry_contract" not in reasons
+    assert "wrong_g1_ranking_config" not in reasons
+
+    plan["ranking_config_hash"] = module.FORMAL_G1_RANKING_CONFIG_SHA256
+    reasons, _, _ = module.g1_registry_plan_reasons(plan, contract=contract)
+    assert "wrong_g1_ranking_config" in reasons
 
 
 def _g1_registry_row(
@@ -3065,7 +3490,6 @@ def _g1_plan(module, proposers: list[str], aggregator: str) -> dict[str, object]
         routing_confidence=0.9,
         ranking_config=ranking_config,
         decision_id="test-g1-decision",
-        proposer_backup_count=2,
         proposer_recovery_max_additional_calls=3,
         proposer_max_tokens_cap=65_536,
         proposer_visible_answer_reserve_tokens=4_096,
@@ -3176,15 +3600,11 @@ def _formalize_provider_native_call(
     assert isinstance(candidates, list)
     assert len(candidates) == len(selected)
     physical_units: list[tuple[str, str, str]] = []
-    for index, (candidate, identity) in enumerate(
-        zip(candidates, selected, strict=True)
-    ):
+    for index, (candidate, identity) in enumerate(zip(candidates, selected, strict=True)):
         assert isinstance(candidate, dict)
         provider, separator, model = identity.partition(":")
         assert separator and provider and model
-        physical_id = _physical_attempt_id(
-            f"{scope_id}:proposer:{index}:{identity}"
-        )
+        physical_id = _physical_attempt_id(f"{scope_id}:proposer:{index}:{identity}")
         candidate.update(
             {
                 "index": index,
@@ -3195,9 +3615,7 @@ def _formalize_provider_native_call(
                 "usage_reported": True,
                 "usage_missing_count": 0,
                 "usable_for_aggregation": candidate.get("ok") is True,
-                "completion_outcome": (
-                    "complete" if candidate.get("ok") is True else "failed"
-                ),
+                "completion_outcome": ("complete" if candidate.get("ok") is True else "failed"),
                 "execution": {
                     "actual_provider": provider,
                     "actual_model": model,
@@ -3218,9 +3636,7 @@ def _formalize_provider_native_call(
         )
         physical_units.append((physical_id, model, "proposer"))
 
-    strict_successful = sum(
-        module.successful_candidate(candidate) for candidate in candidates
-    )
+    strict_successful = sum(module.successful_candidate(candidate) for candidate in candidates)
     usable = sum(module.usable_candidate(candidate) for candidate in candidates)
     call.update(
         {
@@ -3264,9 +3680,7 @@ def _formalize_provider_native_call(
             continue
         provider = str(attempt["requested_provider"])
         model = str(attempt["requested_model"])
-        physical_id = _physical_attempt_id(
-            f"{scope_id}:aggregator:{position}:{provider}:{model}"
-        )
+        physical_id = _physical_attempt_id(f"{scope_id}:aggregator:{position}:{provider}:{model}")
         attempt.update(
             {
                 "physical_request_count": 1,
@@ -3392,9 +3806,7 @@ def _row(
             plan,
             scope_id=f"{response_prefix}-run-turn",
         )
-        analyzer_id = _physical_attempt_id(
-            f"{response_prefix}:task-analyzer"
-        )
+        analyzer_id = _physical_attempt_id(f"{response_prefix}:task-analyzer")
         analyzer_receipt = _receipt(
             f"{response_prefix}-task-analyzer",
             module.B0_MODEL,
@@ -3410,9 +3822,7 @@ def _row(
         assert isinstance(analyzer_provider_usage, dict)
         analyzer_provider_usage["physical_attempt_id"] = analyzer_id
         generation_units.append(analyzer_receipt)
-        for index, (physical_id, physical_model, role) in enumerate(
-            physical_units
-        ):
+        for index, (physical_id, physical_model, role) in enumerate(physical_units):
             receipt = _receipt(
                 f"{response_prefix}-generation-{index}",
                 physical_model,
@@ -3429,10 +3839,7 @@ def _row(
             provider_usage["physical_attempt_id"] = physical_id
             generation_units.append(receipt)
     generation_request_count = len(generation_units)
-    generation_cost = sum(
-        float(unit.get("billed_cost") or 0.0)
-        for unit in generation_units
-    )
+    generation_cost = sum(float(unit.get("billed_cost") or 0.0) for unit in generation_units)
     rubric = task["rubric"]
     criteria = rubric["sections"][0]["criteria"]
     judgments = []
@@ -3749,9 +4156,7 @@ def test_nonterminal_fallback_uses_the_executed_recovery_quorum(
     )
 
     formal_plan = deepcopy(legacy_plan)
-    formal_plan["proposer_recovery_policy"] = deepcopy(
-        module.FORMAL_PROPOSER_RECOVERY_POLICY
-    )
+    formal_plan["proposer_recovery_policy"] = deepcopy(module.FORMAL_PROPOSER_RECOVERY_POLICY)
     assert (
         "invalid_intermediate_fallback_quorum"
         in module.admissible_empty_nonterminal_fallback_reasons(
@@ -4439,6 +4844,39 @@ def test_g1_candidate_chain_must_equal_unique_frozen_aggregator_top3(
     assert "missing_g1_aggregator_recovery_policy" in reasons
 
 
+def test_g1_plan_uses_authenticated_dynamic_proposer_recovery_policy(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        module,
+        "FORMAL_G1_RANKING_CONFIG_SHA256",
+        module.canonical_sha256(_test_ranking_config(module)),
+    )
+    plan = _g1_plan(
+        module,
+        [
+            "deepseek/deepseek-v4-pro",
+            "qwen/qwen3.7-max",
+            "z-ai/glm-5.2",
+        ],
+        "z-ai/glm-5.2",
+    )
+    contract = _contract(module, "G1", "a" * 64)["g1_registry_contract"]
+    expected_policy = {
+        **deepcopy(module.FORMAL_PROPOSER_RECOVERY_POLICY),
+        "max_additional_physical_requests": 2,
+    }
+
+    reasons, _, _ = module.g1_registry_plan_reasons(
+        plan,
+        contract=contract,
+        proposer_recovery_policy=expected_policy,
+    )
+
+    assert "wrong_g1_proposer_recovery_policy" in reasons
+
+
 def test_g1_route_gate_reuses_one_provider_lifecycle_plan_and_analyzer(
     module,
     monkeypatch: pytest.MonkeyPatch,
@@ -4453,9 +4891,7 @@ def test_g1_route_gate_reuses_one_provider_lifecycle_plan_and_analyzer(
     legacy_replay_flags: list[bool] = []
 
     def replay_reasons(_plan, **kwargs):
-        legacy_replay_flags.append(
-            kwargs.get("allow_legacy_managed_v3") is True
-        )
+        legacy_replay_flags.append(kwargs.get("allow_legacy_managed_v3") is True)
         return []
 
     monkeypatch.setattr(
@@ -4535,14 +4971,15 @@ def test_g1_route_gate_reuses_one_provider_lifecycle_plan_and_analyzer(
 
     legacy_replay_flags.clear()
     authenticated_contract = deepcopy(contract)
-    authenticated_contract["source_identity"] = deepcopy(
-        module.LEGACY_MANAGED_V3_SOURCE_IDENTITY
+    authenticated_contract["source_identity"] = deepcopy(module.LEGACY_MANAGED_V3_SOURCE_IDENTITY)
+    assert (
+        module.route_reasons(
+            row,
+            group="G1",
+            contract=authenticated_contract,
+        )
+        == []
     )
-    assert module.route_reasons(
-        row,
-        group="G1",
-        contract=authenticated_contract,
-    ) == []
     assert legacy_replay_flags and all(legacy_replay_flags)
 
     conflicting = deepcopy(row)
@@ -4676,9 +5113,7 @@ def test_adaptive_g1_lifecycle_audits_serialized_prior_attempt_trace(
             "ranking_thinking_assignment_enabled": True,
             "aggregator_candidates": ["openrouter:model-a"],
             "executed_thinking_assignment": {
-                "proposers": {
-                    identity: "high" for identity in plan_1["selected_P"]
-                },
+                "proposers": {identity: "high" for identity in plan_1["selected_P"]},
                 "aggregator": "high",
                 "thinking_policy_version": "test-thinking-policy/v1",
             },
@@ -4686,9 +5121,7 @@ def test_adaptive_g1_lifecycle_audits_serialized_prior_attempt_trace(
                 **deepcopy(plan_2["thinking_assignment_details"]),
                 "proposers": [
                     {
-                        **deepcopy(
-                            plan_2["thinking_assignment_details"]["proposers"][0]
-                        ),
+                        **deepcopy(plan_2["thinking_assignment_details"]["proposers"][0]),
                         "identity": identity,
                         "model_id": identity.partition(":")[2],
                     }
@@ -4751,8 +5184,8 @@ def test_adaptive_g1_lifecycle_audits_serialized_prior_attempt_trace(
         project_thinking_execution_history,
     )
 
-    projected_plan_2, projection_audit, projection_reason = (
-        project_thinking_execution_history([plan_1], plan_2)
+    projected_plan_2, projection_audit, projection_reason = project_thinking_execution_history(
+        [plan_1], plan_2
     )
     assert projection_reason == ""
     plan_2 = projected_plan_2
@@ -4837,8 +5270,15 @@ def test_adaptive_g1_lifecycle_audits_serialized_prior_attempt_trace(
         *,
         contract,
         allow_legacy_managed_v3=False,
+        aggregator_recovery_policy=None,
+        proposer_recovery_policy=None,
     ):
-        del contract, allow_legacy_managed_v3
+        del (
+            contract,
+            allow_legacy_managed_v3,
+            aggregator_recovery_policy,
+            proposer_recovery_policy,
+        )
         decision_id = str(plan.get("decision_id") or "")
         validated_decisions.append(decision_id)
         reasons = ["invalid_prior_g1_plan"] if decision_id == "invalid-prior" else []
@@ -4882,27 +5322,18 @@ def test_adaptive_g1_lifecycle_audits_serialized_prior_attempt_trace(
                 disable_managed_thinking(child)
 
     disable_managed_thinking(default_off_retry)
-    default_off_retry["execution"]["generation_attempts"][0].pop(
-        "thinking_execution_projection"
-    )
-    default_off_routing, _, default_off_reasons = (
-        module.effective_g1_lifecycle_routing(
-            default_off_retry,
-            contract={"g1_registry_contract": {}},
-        )
+    default_off_retry["execution"]["generation_attempts"][0].pop("thinking_execution_projection")
+    default_off_routing, _, default_off_reasons = module.effective_g1_lifecycle_routing(
+        default_off_retry,
+        contract={"g1_registry_contract": {}},
     )
     assert default_off_reasons == []
-    assert (
-        default_off_routing["selection_plan"][
-            "ranking_thinking_assignment_enabled"
-        ]
-        is False
-    )
+    assert default_off_routing["selection_plan"]["ranking_thinking_assignment_enabled"] is False
 
     managed_retry_downgrade = deepcopy(serialized)
-    managed_retry_downgrade["execution"]["generation_attempts"][0][
-        "retry_selection_plan"
-    ]["ranking_thinking_assignment_enabled"] = False
+    managed_retry_downgrade["execution"]["generation_attempts"][0]["retry_selection_plan"][
+        "ranking_thinking_assignment_enabled"
+    ] = False
     assert any(
         reason.startswith("invalid_g1_thinking_execution_projection:")
         for reason in module.effective_g1_lifecycle_routing(
@@ -4912,9 +5343,9 @@ def test_adaptive_g1_lifecycle_audits_serialized_prior_attempt_trace(
     )
 
     default_off_reuse_tamper = deepcopy(default_off_retry)
-    default_off_reuse_tamper["execution"]["generation_attempts"][0][
-        "retry_selection_plan"
-    ].pop("task_analysis_reuse")
+    default_off_reuse_tamper["execution"]["generation_attempts"][0]["retry_selection_plan"].pop(
+        "task_analysis_reuse"
+    )
     assert (
         "missing_g1_retry_task_analysis_binding"
         in module.effective_g1_lifecycle_routing(
@@ -4936,11 +5367,9 @@ def test_adaptive_g1_lifecycle_audits_serialized_prior_attempt_trace(
     )
 
     default_off_physical_plan_tamper = deepcopy(default_off_retry)
-    default_off_physical_plan_tamper["execution"]["generation_attempts"][0][
-        "run"
-    ]["ensemble_trace"]["selection_plan"]["decision_id"] = (
-        "default-off-tampered-physical"
-    )
+    default_off_physical_plan_tamper["execution"]["generation_attempts"][0]["run"][
+        "ensemble_trace"
+    ]["selection_plan"]["decision_id"] = "default-off-tampered-physical"
     assert (
         "g1_attempt_selection_plan_differs_from_physical_plan"
         in module.effective_g1_lifecycle_routing(
@@ -5014,13 +5443,9 @@ def test_adaptive_g1_lifecycle_audits_serialized_prior_attempt_trace(
 
     cross_attempt_receipt = deepcopy(fallback_success)
     receipt_attempt = cross_attempt_receipt["execution"]["generation_attempts"][1]
-    receipt_plan = deepcopy(
-        receipt_attempt["run"]["ensemble_trace"]["selection_plan"]
-    )
+    receipt_plan = deepcopy(receipt_attempt["run"]["ensemble_trace"]["selection_plan"])
     # consume_provider_setup() must snapshot this post-call receipt prefix.
-    receipt_attempt["run"]["routing_trace"]["selection_plan"] = deepcopy(
-        receipt_plan
-    )
+    receipt_attempt["run"]["routing_trace"]["selection_plan"] = deepcopy(receipt_plan)
     receipt_attempt["run"]["final_text_sha256"] = "transient-attempt"
     receipt_attempt["run"]["error"] = "HTTP 429"
     receipt_attempt["will_retry"] = True
@@ -5036,21 +5461,13 @@ def test_adaptive_g1_lifecycle_audits_serialized_prior_attempt_trace(
     )
     final_attempt["run"]["error"] = ""
     final_attempt["run"]["final_text_sha256"] = "selected-answer"
-    final_attempt["run"]["routing_trace"]["selection_plan"] = deepcopy(
-        receipt_plan
-    )
+    final_attempt["run"]["routing_trace"]["selection_plan"] = deepcopy(receipt_plan)
     final_candidate = final_attempt["run"]["ensemble_trace"]["candidates"][0]
     final_candidate["physical_request_count"] = 1
     final_candidate["execution"]["thinking_fallback_attempts"] = []
-    cross_attempt_receipt["execution"]["generation_attempts"].append(
-        final_attempt
-    )
-    cross_attempt_receipt["routing_trace"]["selection_plan"] = deepcopy(
-        receipt_plan
-    )
-    cross_attempt_receipt["ensemble_trace"] = deepcopy(
-        final_attempt["run"]["ensemble_trace"]
-    )
+    cross_attempt_receipt["execution"]["generation_attempts"].append(final_attempt)
+    cross_attempt_receipt["routing_trace"]["selection_plan"] = deepcopy(receipt_plan)
+    cross_attempt_receipt["ensemble_trace"] = deepcopy(final_attempt["run"]["ensemble_trace"])
     assert (
         module.effective_g1_lifecycle_routing(
             cross_attempt_receipt,
@@ -5060,9 +5477,9 @@ def test_adaptive_g1_lifecycle_audits_serialized_prior_attempt_trace(
     )
 
     stale_cross_attempt_routing = deepcopy(cross_attempt_receipt)
-    stale_cross_attempt_routing["execution"]["generation_attempts"][2][
-        "run"
-    ]["routing_trace"]["selection_plan"] = deepcopy(plan_2)
+    stale_cross_attempt_routing["execution"]["generation_attempts"][2]["run"]["routing_trace"][
+        "selection_plan"
+    ] = deepcopy(plan_2)
     assert (
         "invalid_g1_thinking_execution_plan_mutation"
         in module.effective_g1_lifecycle_routing(
@@ -5209,6 +5626,7 @@ def test_adaptive_g1_lifecycle_audits_serialized_prior_attempt_trace(
     )
     assert module.immutable_attempt_payload(physical_plan_tampered_attempt) != immutable_payload
 
+    paid_attempt_contracts = {"G1": _contract(module, "G1", "a" * 64)}
     source_record = module.SourceRecord(
         path=Path("wave-1.jsonl"),
         source_index=0,
@@ -5217,16 +5635,12 @@ def test_adaptive_g1_lifecycle_audits_serialized_prior_attempt_trace(
     )
     module.validate_g1_paid_attempt_plan_history(
         [source_record],
-        contracts={"G1": {"g1_registry_contract": {}}},
+        contracts=paid_attempt_contracts,
     )
 
     pre_call_guard_then_success = deepcopy(serialized)
-    guarded_attempt = pre_call_guard_then_success["execution"][
-        "generation_attempts"
-    ][0]
-    guarded_attempt["attempt_kind"] = (
-        "provider_build_after_paid_setup"
-    )
+    guarded_attempt = pre_call_guard_then_success["execution"]["generation_attempts"][0]
+    guarded_attempt["attempt_kind"] = "provider_build_after_paid_setup"
     guarded_attempt["run"]["trace_events"] = [
         {
             "kind": "error",
@@ -5248,13 +5662,11 @@ def test_adaptive_g1_lifecycle_audits_serialized_prior_attempt_trace(
                     row=pre_call_guard_then_success,
                 )
             ],
-            contracts={"G1": {"g1_registry_contract": {}}},
+            contracts=paid_attempt_contracts,
         )
 
     analyzer_retry = deepcopy(serialized)
-    analyzer_retry_run = analyzer_retry["execution"]["generation_attempts"][0][
-        "run"
-    ]
+    analyzer_retry_run = analyzer_retry["execution"]["generation_attempts"][0]["run"]
     analyzer_retry_rows = [
         {
             "role": "task_analyzer",
@@ -5270,9 +5682,7 @@ def test_adaptive_g1_lifecycle_audits_serialized_prior_attempt_trace(
     ]
     analyzer_retry_run["llm_request_count"] = 2
     analyzer_retry_run["setup_usage"] = deepcopy(analyzer_retry_rows)
-    analyzer_retry_run["usage"] = {
-        "model_usage_breakdown": deepcopy(analyzer_retry_rows)
-    }
+    analyzer_retry_run["usage"] = {"model_usage_breakdown": deepcopy(analyzer_retry_rows)}
     module.validate_g1_paid_attempt_plan_history(
         [
             module.SourceRecord(
@@ -5282,15 +5692,13 @@ def test_adaptive_g1_lifecycle_audits_serialized_prior_attempt_trace(
                 row=analyzer_retry,
             )
         ],
-        contracts={"G1": {"g1_registry_contract": {}}},
+        contracts=paid_attempt_contracts,
     )
     reconciled_analyzers = module._canonical_task_analyzer_setup_units(
         analyzer_retry_run,
         identity_seed="legal-duplicate-mirror",
     )
-    assert [
-        row["physical_attempt_id"] for row in reconciled_analyzers
-    ] == ["1" * 32, "2" * 32]
+    assert [row["physical_attempt_id"] for row in reconciled_analyzers] == ["1" * 32, "2" * 32]
 
     setup_one_usage_five = deepcopy(analyzer_retry_run)
     five_analyzers = [
@@ -5301,24 +5709,18 @@ def test_adaptive_g1_lifecycle_audits_serialized_prior_attempt_trace(
         }
         for attempt in range(1, 6)
     ]
-    setup_one_usage_five["setup_usage"] = [
-        deepcopy(five_analyzers[0])
-    ]
-    setup_one_usage_five["usage"] = {
-        "model_usage_breakdown": deepcopy(five_analyzers)
-    }
+    setup_one_usage_five["setup_usage"] = [deepcopy(five_analyzers[0])]
+    setup_one_usage_five["usage"] = {"model_usage_breakdown": deepcopy(five_analyzers)}
     reconciled_five = module._canonical_task_analyzer_setup_units(
         setup_one_usage_five,
         identity_seed="setup-one-usage-five",
     )
-    assert {
-        row["physical_attempt_id"] for row in reconciled_five
-    } == {f"{attempt:x}" * 32 for attempt in range(1, 6)}
+    assert {row["physical_attempt_id"] for row in reconciled_five} == {
+        f"{attempt:x}" * 32 for attempt in range(1, 6)
+    }
 
     usage_only_extra = deepcopy(analyzer_retry_run)
-    usage_only_extra["setup_usage"] = [
-        deepcopy(analyzer_retry_rows[0])
-    ]
+    usage_only_extra["setup_usage"] = [deepcopy(analyzer_retry_rows[0])]
     usage_only_extra["usage"] = {
         "model_usage_breakdown": [
             deepcopy(analyzer_retry_rows[0]),
@@ -5329,22 +5731,15 @@ def test_adaptive_g1_lifecycle_audits_serialized_prior_attempt_trace(
         usage_only_extra,
         identity_seed="usage-only-extra",
     )
-    assert [
-        row["physical_attempt_id"] for row in reconciled_usage_extra
-    ] == ["1" * 32, "2" * 32]
+    assert [row["physical_attempt_id"] for row in reconciled_usage_extra] == ["1" * 32, "2" * 32]
 
     analyzer_attempt = analyzer_retry["execution"]["generation_attempts"][0]
     analyzer_immutable = module.immutable_attempt_payload(analyzer_attempt)
     changed_analyzer_identity = deepcopy(analyzer_attempt)
     changed_analyzer_run = changed_analyzer_identity["run"]
     changed_analyzer_run["setup_usage"][0]["physical_attempt_id"] = "f" * 32
-    changed_analyzer_run["usage"]["model_usage_breakdown"][0][
-        "physical_attempt_id"
-    ] = "f" * 32
-    assert (
-        module.immutable_attempt_payload(changed_analyzer_identity)
-        != analyzer_immutable
-    )
+    changed_analyzer_run["usage"]["model_usage_breakdown"][0]["physical_attempt_id"] = "f" * 32
+    assert module.immutable_attempt_payload(changed_analyzer_identity) != analyzer_immutable
 
     wave_1 = deepcopy(serialized)
     wave_1["final_text_sha256"] = "wave-1-not-selected"
@@ -5371,13 +5766,11 @@ def test_adaptive_g1_lifecycle_audits_serialized_prior_attempt_trace(
     ]
     module.validate_g1_paid_attempt_plan_history(
         cross_wave_records,
-        contracts={"G1": {"g1_registry_contract": {}}},
+        contracts=paid_attempt_contracts,
     )
 
     duplicate_analyzer_wave_2 = deepcopy(wave_2)
-    duplicate_analyzer_run = duplicate_analyzer_wave_2["execution"][
-        "generation_attempts"
-    ][0]["run"]
+    duplicate_analyzer_run = duplicate_analyzer_wave_2["execution"]["generation_attempts"][0]["run"]
     duplicate_analyzer_run["setup_usage"] = [
         {
             "role": "task_analyzer",
@@ -5391,9 +5784,7 @@ def test_adaptive_g1_lifecycle_audits_serialized_prior_attempt_trace(
         }
     ]
     duplicate_analyzer_run["usage"] = {
-        "model_usage_breakdown": deepcopy(
-            duplicate_analyzer_run["setup_usage"]
-        )
+        "model_usage_breakdown": deepcopy(duplicate_analyzer_run["setup_usage"])
     }
     with pytest.raises(
         module.FinalizationError,
@@ -5409,7 +5800,7 @@ def test_adaptive_g1_lifecycle_audits_serialized_prior_attempt_trace(
                     row=duplicate_analyzer_wave_2,
                 ),
             ],
-            contracts={"G1": {"g1_registry_contract": {}}},
+            contracts=paid_attempt_contracts,
         )
 
     reset_wave_2 = deepcopy(wave_2)
@@ -5434,7 +5825,7 @@ def test_adaptive_g1_lifecycle_audits_serialized_prior_attempt_trace(
                     row=reset_wave_2,
                 ),
             ],
-            contracts={"G1": {"g1_registry_contract": {}}},
+            contracts=paid_attempt_contracts,
         )
 
     paid_then_zero_request = deepcopy(serialized)
@@ -5468,7 +5859,7 @@ def test_adaptive_g1_lifecycle_audits_serialized_prior_attempt_trace(
                 row=paid_then_zero_request,
             )
         ],
-        contracts={"G1": {"g1_registry_contract": {}}},
+        contracts=paid_attempt_contracts,
     )
 
     analyzer_only_run = {
@@ -5520,13 +5911,9 @@ def test_adaptive_g1_lifecycle_audits_serialized_prior_attempt_trace(
         "llm_request_count": 1,
         "usage_unknown_count": 1,
         "setup_usage": [deepcopy(unknown_analyzer)],
-        "usage": {
-            "model_usage_breakdown": [deepcopy(unknown_analyzer)]
-        },
+        "usage": {"model_usage_breakdown": [deepcopy(unknown_analyzer)]},
     }
-    assert (
-        module.run_expected_ensemble_request_count(unknown_analyzer_run) == 0
-    )
+    assert module.run_expected_ensemble_request_count(unknown_analyzer_run) == 0
     unknown_then_generation = deepcopy(unknown_analyzer_run)
     unknown_then_generation["llm_request_count"] = 2
     unknown_then_generation["usage"]["model_usage_breakdown"].append(
@@ -5539,12 +5926,7 @@ def test_adaptive_g1_lifecycle_audits_serialized_prior_attempt_trace(
             "request_count": 1,
         }
     )
-    assert (
-        module.run_expected_ensemble_request_count(
-            unknown_then_generation
-        )
-        == 1
-    )
+    assert module.run_expected_ensemble_request_count(unknown_then_generation) == 1
 
     paid_history_tamper = deepcopy(serialized)
     paid_history_tamper["execution"]["generation_attempts"][0]["run"]["ensemble_trace"][
@@ -5563,7 +5945,7 @@ def test_adaptive_g1_lifecycle_audits_serialized_prior_attempt_trace(
                     row=paid_history_tamper,
                 )
             ],
-            contracts={"G1": {"g1_registry_contract": {}}},
+            contracts=paid_attempt_contracts,
         )
 
     adaptive_downgrade = deepcopy(serialized)
@@ -5589,13 +5971,11 @@ def test_adaptive_g1_lifecycle_audits_serialized_prior_attempt_trace(
                     row=adaptive_downgrade,
                 )
             ],
-            contracts={"G1": {"g1_registry_contract": {}}},
+            contracts=paid_attempt_contracts,
         )
 
     v3_downgrade = deepcopy(serialized)
-    for attempt in v3_downgrade["execution"][
-        "generation_attempts"
-    ]:
+    for attempt in v3_downgrade["execution"]["generation_attempts"]:
         for field in (
             "selection_plan",
             "excluded_proposer_identities",
@@ -5609,15 +5989,11 @@ def test_adaptive_g1_lifecycle_audits_serialized_prior_attempt_trace(
             run["routing_trace"]["selection_plan"],
             *[
                 call["selection_plan"]
-                for call in module.ensemble_call_trace_sequence(
-                    run["ensemble_trace"]
-                )[0]
+                for call in module.ensemble_call_trace_sequence(run["ensemble_trace"])[0]
             ],
         ]
         for runtime_plan in runtime_plans:
-            runtime_plan["ranking_version"] = (
-                module.LEGACY_THINKING_RANKING_VERSION
-            )
+            runtime_plan["ranking_version"] = module.LEGACY_THINKING_RANKING_VERSION
             runtime_plan.pop(
                 "thinking_physical_evidence_schema",
                 None,
@@ -5635,15 +6011,13 @@ def test_adaptive_g1_lifecycle_audits_serialized_prior_attempt_trace(
                     row=v3_downgrade,
                 )
             ],
-            contracts={"G1": {"g1_registry_contract": {}}},
+            contracts=paid_attempt_contracts,
         )
 
-    authenticated_contract = {
-        "source_identity": deepcopy(
-            module.LEGACY_MANAGED_V3_SOURCE_IDENTITY
-        ),
-        "g1_registry_contract": {},
-    }
+    authenticated_contract = deepcopy(paid_attempt_contracts["G1"])
+    authenticated_contract["source_identity"] = deepcopy(
+        module.LEGACY_MANAGED_V3_SOURCE_IDENTITY
+    )
     module.validate_g1_paid_attempt_plan_history(
         [
             module.SourceRecord(
@@ -5675,12 +6049,8 @@ def test_adaptive_g1_lifecycle_audits_serialized_prior_attempt_trace(
         )
 
     paid_setup_build_failure = deepcopy(serialized)
-    paid_setup_attempt = paid_setup_build_failure["execution"][
-        "generation_attempts"
-    ][0]
-    paid_setup_attempt["attempt_kind"] = (
-        "provider_build_after_paid_setup"
-    )
+    paid_setup_attempt = paid_setup_build_failure["execution"]["generation_attempts"][0]
+    paid_setup_attempt["attempt_kind"] = "provider_build_after_paid_setup"
     for field in (
         "selection_plan",
         "excluded_proposer_identities",
@@ -5691,9 +6061,7 @@ def test_adaptive_g1_lifecycle_audits_serialized_prior_attempt_trace(
         paid_setup_attempt.pop(field, None)
     paid_setup_attempt["run"].pop("routing_trace", None)
     paid_setup_attempt["run"].pop("ensemble_trace", None)
-    paid_setup_build_failure["execution"]["generation_attempts"] = [
-        paid_setup_attempt
-    ]
+    paid_setup_build_failure["execution"]["generation_attempts"] = [paid_setup_attempt]
     with pytest.raises(
         module.FinalizationError,
         match="invalid paid G1 attempt",
@@ -5707,7 +6075,7 @@ def test_adaptive_g1_lifecycle_audits_serialized_prior_attempt_trace(
                     row=paid_setup_build_failure,
                 )
             ],
-            contracts={"G1": {"g1_registry_contract": {}}},
+            contracts=paid_attempt_contracts,
         )
 
     early_best = deepcopy(serialized)
@@ -6192,9 +6560,7 @@ def _g1_only_campaign(
     for result_path in args.result:
         source_rows = [
             row
-            for row in (
-                json.loads(line) for line in result_path.read_text().splitlines()
-            )
+            for row in (json.loads(line) for line in result_path.read_text().splitlines())
             if row["group"] == "G1"
         ]
         result_path.write_text("".join(json.dumps(row) + "\n" for row in source_rows))
@@ -6685,8 +7051,7 @@ def test_g1_only_finalization_scopes_all_formal_outputs(
     output = args.output_dir
     rows = [json.loads(line) for line in (output / "results.jsonl").read_text().splitlines()]
     ledger = [
-        json.loads(line)
-        for line in (output / "actual-spend-ledger.jsonl").read_text().splitlines()
+        json.loads(line) for line in (output / "actual-spend-ledger.jsonl").read_text().splitlines()
     ]
     audit = json.loads((output / "audit.json").read_text())
     proof = json.loads((output / "openrouter-non-byok-campaign-proof.json").read_text())
@@ -6701,9 +7066,7 @@ def test_g1_only_finalization_scopes_all_formal_outputs(
     assert [row["group"] for row in rows] == ["G1"]
     assert len(ledger) == 11
     assert {
-        reference["group"]
-        for ledger_row in ledger
-        for reference in ledger_row["source_references"]
+        reference["group"] for ledger_row in ledger for reference in ledger_row["source_references"]
     } == {"G1"}
     assert audit["pass"] is True
     assert audit["groups"] == ["G1"]
@@ -7406,9 +7769,7 @@ def test_explicit_byok_fails_policy_but_preserves_execution(module, tmp_path: Pa
         manifest = module.run_finalization(args)
     finally:
         os.close(lock_fd)
-    proof = json.loads(
-        (args.output_dir / "openrouter-non-byok-campaign-proof.json").read_text()
-    )
+    proof = json.loads((args.output_dir / "openrouter-non-byok-campaign-proof.json").read_text())
     audit = json.loads((args.output_dir / "audit.json").read_text())
     assert manifest["status"] == "complete"
     assert manifest["execution_pass"] is True
@@ -7441,7 +7802,10 @@ def test_generation_attempt_budget_over_three_is_fatal(module, tmp_path: Path) -
     path.write_text("".join(json.dumps(value) + "\n" for value in rows))
     path.chmod(0o600)
     try:
-        with pytest.raises(module.FinalizationError, match="ordinal is invalid|exceeds 3"):
+        with pytest.raises(
+            module.FinalizationError,
+            match="ordinal is invalid|exceeds 3|between 0 and 3",
+        ):
             module.run_finalization(args)
     finally:
         os.close(lock_fd)
@@ -7650,14 +8014,15 @@ def test_degraded_generation_requires_closed_explicit_evidence(module) -> None:
     }
 
     assert module.explicit_degraded_success(row) is True
-    assert module.audit_only_error_text(
-        "ensemble_aggregator_close_timeout",
-        degraded_success=True,
-    ) is True
+    assert (
+        module.audit_only_error_text(
+            "ensemble_aggregator_close_timeout",
+            degraded_success=True,
+        )
+        is True
+    )
 
-    row["ensemble_trace"]["aggregator_recovery"]["attempts"][0][
-        "delivery_selected"
-    ] = False
+    row["ensemble_trace"]["aggregator_recovery"]["attempts"][0]["delivery_selected"] = False
     assert module.explicit_degraded_success(row) is False
     assert module.audit_only_error_text("stream_protocol_identity_conflict") is False
     assert module.audit_only_error_text("usage_receipt_tampered") is False
@@ -7676,20 +8041,21 @@ def test_unaccepted_generation_is_blocking_without_degraded_receipt(module) -> N
 
 
 def test_judge_audit_demotion_is_closed_to_missing_usage(module) -> None:
-    assert module.judge_evidence_error_is_audit_only(
-        module.FinalizationError(
-            "Judge attempt abc does not represent every physical request in usage"
+    assert (
+        module.judge_evidence_error_is_audit_only(
+            module.FinalizationError(
+                "Judge attempt abc does not represent every physical request in usage"
+            )
         )
-    ) is True
+        is True
+    )
     for message in (
         "Judge attempt id abc is reused by another unit",
         "Judge attempt budget exceeds 3",
         "Judge attempt abc receipt repair conflicts on exact cost",
         "Judge attempt abc violates the frozen route",
     ):
-        assert module.judge_evidence_error_is_audit_only(
-            module.FinalizationError(message)
-        ) is False
+        assert module.judge_evidence_error_is_audit_only(module.FinalizationError(message)) is False
 
 
 def test_nonzero_decimal_byok_delta_fails_policy_not_execution(module, tmp_path: Path) -> None:
@@ -7707,9 +8073,7 @@ def test_nonzero_decimal_byok_delta_fails_policy_not_execution(module, tmp_path:
         manifest = module.run_finalization(args)
     finally:
         os.close(lock_fd)
-    proof = json.loads(
-        (args.output_dir / "openrouter-non-byok-campaign-proof.json").read_text()
-    )
+    proof = json.loads((args.output_dir / "openrouter-non-byok-campaign-proof.json").read_text())
     assert manifest["status"] == "complete"
     assert manifest["execution_pass"] is True
     assert manifest["policy_pass"] is False
@@ -7734,17 +8098,13 @@ def test_incomplete_settlement_publishes_explicit_account_audit_conflict(
     finally:
         os.close(lock_fd)
 
-    proof = json.loads(
-        (args.output_dir / "openrouter-non-byok-campaign-proof.json").read_text()
-    )
+    proof = json.loads((args.output_dir / "openrouter-non-byok-campaign-proof.json").read_text())
     assert manifest["account_windows"] == []
     assert manifest["cost_attribution"]["account_windows"] == []
     assert proof["account_windows"] == []
 
 
-def test_prior_campaign_byok_delta_preserves_actual_account_cost(
-    module, tmp_path: Path
-) -> None:
+def test_prior_campaign_byok_delta_preserves_actual_account_cost(module, tmp_path: Path) -> None:
     args, _, lock_fd = _campaign(module, tmp_path)
     prior = _bind_prior_campaign_window(module, args, tmp_path)
     prior_after_path = prior / "openrouter-account-after.json"
@@ -7784,9 +8144,7 @@ def test_prior_campaign_byok_delta_preserves_actual_account_cost(
     finally:
         os.close(lock_fd)
 
-    proof = json.loads(
-        (args.output_dir / "openrouter-non-byok-campaign-proof.json").read_text()
-    )
+    proof = json.loads((args.output_dir / "openrouter-non-byok-campaign-proof.json").read_text())
     assert manifest["status"] == "complete"
     assert manifest["execution_pass"] is True
     assert manifest["policy_pass"] is False
@@ -7812,9 +8170,7 @@ def test_unexplained_account_to_exact_ledger_delta_is_a_reconciliation_warning(
         manifest = module.run_finalization(args)
     finally:
         os.close(lock_fd)
-    proof = json.loads(
-        (args.output_dir / "openrouter-non-byok-campaign-proof.json").read_text()
-    )
+    proof = json.loads((args.output_dir / "openrouter-non-byok-campaign-proof.json").read_text())
     assert manifest["status"] == "complete"
     assert manifest["execution_pass"] is True
     assert manifest["policy_pass"] is True
@@ -7835,9 +8191,7 @@ def test_invalid_settlement_or_lock_fails_audit_without_erasing_execution(
         manifest = module.run_finalization(args)
     finally:
         os.close(lock_fd)
-    proof = json.loads(
-        (args.output_dir / "openrouter-non-byok-campaign-proof.json").read_text()
-    )
+    proof = json.loads((args.output_dir / "openrouter-non-byok-campaign-proof.json").read_text())
     assert manifest["status"] == "complete"
     assert manifest["execution_pass"] is True
     assert manifest["policy_pass"] is False
@@ -7852,9 +8206,7 @@ def test_invalid_settlement_or_lock_fails_audit_without_erasing_execution(
             module.run_finalization(args2)
     finally:
         os.close(lock_fd2)
-    assert not (
-        args2.output_dir / "openrouter-non-byok-campaign-proof.json"
-    ).exists()
+    assert not (args2.output_dir / "openrouter-non-byok-campaign-proof.json").exists()
 
 
 def test_source_hash_recheck_detects_mutation(module, tmp_path: Path) -> None:
@@ -7909,6 +8261,67 @@ def test_attempt_budget_must_be_monotonic_across_repair_wave(module, tmp_path: P
     try:
         with pytest.raises(module.FinalizationError, match="non-monotonic"):
             module.run_finalization(args)
+    finally:
+        os.close(lock_fd)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "row_count",
+        "actual_spend_count",
+        "budget_limit",
+        "budget_used",
+        "prior_used",
+        "attempt_ordinal",
+    ],
+)
+@pytest.mark.parametrize("invalid_kind", ["string", "float", "boolean"])
+def test_generation_attempt_v1_integer_fields_reject_nonintegers(
+    module,
+    tmp_path: Path,
+    field: str,
+    invalid_kind: str,
+) -> None:
+    args, _, lock_fd = _campaign(module, tmp_path, with_repair=False)
+    try:
+        path = args.result[0]
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        row = rows[0]
+        expected = {
+            "row_count": 1,
+            "actual_spend_count": 1,
+            "budget_limit": 3,
+            "budget_used": 1,
+            "prior_used": 0,
+            "attempt_ordinal": 1,
+        }[field]
+        invalid_value: object
+        if invalid_kind == "string":
+            invalid_value = str(expected)
+        elif invalid_kind == "float":
+            invalid_value = float(expected) + 0.5
+        else:
+            invalid_value = True
+        if field == "row_count":
+            row["generation_attempt_count"] = invalid_value
+        elif field == "actual_spend_count":
+            row["actual_spend_metrics"]["generation_attempt_count"] = invalid_value
+        elif field == "budget_limit":
+            row["generation_attempt_budget_limit"] = invalid_value
+        elif field == "budget_used":
+            row["generation_attempt_budget_used"] = invalid_value
+        elif field == "prior_used":
+            row["execution"]["prior_generation_attempts_used"] = invalid_value
+        else:
+            row["execution"]["generation_attempts"][0]["attempt"] = invalid_value
+        rows[0] = module.seal_result_row(row)
+        path.write_text("".join(json.dumps(item) + "\n" for item in rows))
+        path.chmod(0o600)
+        records, _ = module.read_source_rows([path])
+
+        with pytest.raises(module.FinalizationError, match="must be an integer"):
+            module.validate_generation_attempt_evidence(records, max_attempts=3)
     finally:
         os.close(lock_fd)
 
@@ -8064,8 +8477,7 @@ def test_static_estimate_takes_precedence_over_normalized_billed_zero(
             row
             for row in ledger
             if "generation" in row["scopes"]
-            and {"group": "B0", "task_id": "task-1"}
-            in row["group_task_pairs"]
+            and {"group": "B0", "task_id": "task-1"} in row["group_task_pairs"]
         )
 
         assert generation["recorded_cost_usd"] == "0.42"
@@ -8533,7 +8945,14 @@ def test_formal_execution_contract_tampering_fails_closed(
     with pytest.raises(module.FinalizationError) as error:
         module.validate_formal_campaign_contracts(contracts)
 
-    assert f"B2 formal execution contract.{'.'.join(path)}" in str(error.value)
+    if path[0] == "global_experiment_profile":
+        assert "B2 global_experiment_profile differs across active groups" in str(error.value)
+    elif path[:2] == ("formal_runtime_freeze", "aggregator_recovery_mode") or (
+        path[0] == "formal_runtime_freeze" and path[1] in module.FORMAL_AGGREGATOR_RECOVERY_POLICY
+    ):
+        assert "B2 recovery policy differs across active groups" in str(error.value)
+    else:
+        assert f"B2 formal execution contract.{'.'.join(path)}" in str(error.value)
 
 
 @pytest.mark.parametrize(
@@ -8557,6 +8976,220 @@ def test_formal_gateway_aggregator_recovery_tampering_fails_closed(
         module.validate_formal_campaign_contracts(contracts)
 
     assert f"G1 gateway llm_ensemble.{field}" in str(error.value)
+
+
+def _apply_dynamic_experiment_policy(contract: dict[str, object]) -> None:
+    profile = contract["global_experiment_profile"]
+    profile["timeouts"].update(
+        {
+            "task_seconds": 7_200.0,
+            "proposer_seconds": 600.0,
+            "aggregator_seconds": 1_200.0,
+            "task_margin_seconds": 45.0,
+        }
+    )
+    profile["runner"].update(
+        {
+            "agent_max_iterations": 17,
+            "deadline_wrapup_margin_seconds": 240,
+        }
+    )
+    profile["generation"].update(
+        {
+            "max_tokens": 12_288,
+            "max_attempts": 2,
+            "retry_backoff_seconds": 1.5,
+        }
+    )
+    profile["judge"].update({"repeats": 2, "max_attempts": 2})
+    profile["tools"]["web_search"]["max_results"] = 7
+    profile["tools"]["web_fetch"]["max_content_tokens"] = 12_000
+
+    contract["timeouts"].update(
+        {
+            "task_seconds": 7_200.0,
+            "proposer_seconds": 600.0,
+            "aggregator_seconds": 1_200.0,
+        }
+    )
+    contract["runner"].update(
+        {
+            "agent_max_iterations": 17,
+            "finalization_policy": {
+                **contract["runner"]["finalization_policy"],
+                "deadline_wrapup_margin_seconds": 240,
+            },
+        }
+    )
+    contract["generation"]["policy"]["max_tokens"] = 12_288
+    contract["generation"].update({"max_attempts": 2, "retry_backoff_seconds": 1.5})
+    contract["judge"].update({"repeats": 2, "max_attempts": 2})
+    local_tools = contract["tools"]["local_web_tools"]
+    local_tools["web_search"]["max_results"] = 7
+    local_tools["web_fetch"].update({"max_content_tokens": 12_000, "max_content_chars": 48_000})
+    freeze = contract["formal_runtime_freeze"]
+    freeze.update(
+        {
+            "aggregator_recovery_top_k": 2,
+            "aggregator_max_tokens_cap": 32_768,
+            "aggregator_visible_answer_reserve_tokens": 4_096,
+            "proposer_recovery_max_additional_calls": 2,
+            "proposer_max_tokens_cap": 32_768,
+            "proposer_visible_answer_reserve_tokens": 2_048,
+        }
+    )
+    contract["gateway_execution"]["llm_ensemble"].update(
+        {
+            "aggregator_recovery_top_k": 2,
+            "aggregator_max_tokens_cap": 32_768,
+            "aggregator_visible_answer_reserve_tokens": 4_096,
+        }
+    )
+
+
+def test_formal_contract_derives_coherent_dynamic_experiment_policy(module) -> None:
+    contracts = {group: _contract(module, group, "a" * 64) for group in module.GROUPS}
+    for contract in contracts.values():
+        _apply_dynamic_experiment_policy(contract)
+
+    policy = module.validate_formal_campaign_contracts(contracts)
+
+    assert policy.timeouts["task_seconds"] == Decimal("7200.0")
+    assert policy.runner["agent_max_iterations"] == 17
+    assert policy.generation_max_attempts == 2
+    assert policy.judge_repeats == 2
+    assert policy.judge_max_attempts == 2
+    assert policy.tools["web_search"]["max_results"] == 7
+    assert policy.tools["web_fetch"]["max_content_tokens"] == 12_000
+    assert policy.aggregator_recovery["aggregator_recovery_top_k"] == 2
+    assert policy.proposer_recovery["max_additional_physical_requests"] == 2
+
+
+def test_max_generation_attempts_cli_is_only_an_authenticated_policy_assertion(
+    module,
+) -> None:
+    parser = module.build_parser()
+    action = next(
+        action for action in parser._actions if action.dest == "max_generation_attempts"
+    )
+    assert action.default is None
+
+    policy = module.FinalizerExperimentPolicy(
+        profile={},
+        timeouts={},
+        runner={},
+        generation={"max_attempts": 2},
+        judge={},
+        tools={},
+        aggregator_recovery={},
+        proposer_recovery={},
+        judge_provider_pin="",
+    )
+    assert module.authenticated_generation_attempt_limit(None, policy) == 2
+    assert module.authenticated_generation_attempt_limit(2, policy) == 2
+    for invalid in (0, 3, True, "2"):
+        with pytest.raises(module.FinalizationError):
+            module.authenticated_generation_attempt_limit(invalid, policy)
+
+
+def test_formal_contract_accepts_lowercase_api_key_env_name(module) -> None:
+    contracts = {group: _contract(module, group, "a" * 64) for group in module.GROUPS}
+    for contract in contracts.values():
+        contract["global_experiment_profile"]["tools"]["web_search"][
+            "api_key_env"
+        ] = "brave_search_key"
+        contract["tools"]["local_web_tools"]["web_search"][
+            "api_key_env"
+        ] = "brave_search_key"
+
+    policy = module.validate_formal_campaign_contracts(contracts)
+
+    assert policy.tools["web_search"]["api_key_env"] == "brave_search_key"
+
+
+def test_formal_contract_accepts_keyless_duckduckgo_search(module) -> None:
+    contracts = {group: _contract(module, group, "a" * 64) for group in module.GROUPS}
+    for contract in contracts.values():
+        contract["global_experiment_profile"]["tools"]["web_search"].update(
+            provider="duckduckgo",
+            api_key_env="",
+        )
+        contract["tools"]["local_web_tools"]["web_search"].update(
+            provider="duckduckgo",
+            api_key_env="",
+        )
+
+    policy = module.validate_formal_campaign_contracts(contracts)
+
+    assert policy.tools["web_search"] == {
+        "provider": "duckduckgo",
+        "api_key_env": "",
+        "max_results": 5,
+    }
+
+
+def test_report_values_use_authenticated_dynamic_experiment_policy(module) -> None:
+    contracts = {group: _contract(module, group, "a" * 64) for group in module.GROUPS}
+    for contract in contracts.values():
+        _apply_dynamic_experiment_policy(contract)
+    policy = module.validate_formal_campaign_contracts(contracts)
+
+    rendered = module.experiment_policy_report_values(
+        policy,
+        task_concurrency=4,
+        judge_concurrency=5,
+    )
+
+    assert rendered == {
+        **rendered,
+        "runner_label": "Agent Loop",
+        "task_timeout": "7200",
+        "max_iterations": 17,
+        "task_concurrency": 4,
+        "generation_temperature": "0",
+        "generation_max_tokens": 12_288,
+        "generation_max_attempts": 2,
+        "judge_model": module.JUDGE_MODEL,
+        "judge_repeats": 2,
+        "judge_concurrency": 5,
+        "judge_max_attempts": 2,
+        "web_search_provider": "brave",
+        "web_search_max_results": 7,
+        "web_fetch_max_content_tokens": 12_000,
+    }
+
+
+def test_formal_contract_rejects_cross_group_dynamic_profile_drift(module) -> None:
+    contracts = {group: _contract(module, group, "a" * 64) for group in module.GROUPS}
+    for contract in contracts.values():
+        _apply_dynamic_experiment_policy(contract)
+    contracts["B2"]["global_experiment_profile"]["generation"]["max_tokens"] = 8_192
+
+    with pytest.raises(module.FinalizationError, match="differs across active groups"):
+        module.validate_formal_campaign_contracts(contracts)
+
+
+@pytest.mark.parametrize(
+    ("path", "value", "message"),
+    [
+        (("tools", "sandbox_enabled"), True, "sandbox_enabled=false"),
+        (("tools", "contamination_blocked_domains"), ["example.com"], "blocked domains"),
+        (("tools", "web_search", "api_key_env"), "bad-name", "api_key_env"),
+        (("judge", "model"), "openai/gpt-5.5", "Judge policy"),
+    ],
+)
+def test_formal_contract_keeps_security_and_judge_model_hard_constraints(
+    module,
+    path: tuple[str, ...],
+    value: object,
+    message: str,
+) -> None:
+    contracts = {group: _contract(module, group, "a" * 64) for group in module.GROUPS}
+    for contract in contracts.values():
+        _set_nested_value(contract["global_experiment_profile"], path, value)
+
+    with pytest.raises(module.FinalizationError, match=message):
+        module.validate_formal_campaign_contracts(contracts)
 
 
 @pytest.mark.parametrize(
@@ -8919,6 +9552,7 @@ def test_g1_proposer_count_above_frozen_ranking_bound_is_rejected(module) -> Non
         "expected_ranking_config_version": (module.FORMAL_G1_RANKING_CONFIG_VERSION),
         "expected_ranking_config_sha256": (module.FORMAL_G1_RANKING_CONFIG_SHA256),
         "expected_proposer_count_max": 5,
+        "task_analyzer": _default_task_analyzer_policy(),
     }
     identities = [f"openrouter:{model}" for model in routes]
     version = f"test-registry-v1+test-g1+{routes_hash[:12]}"
@@ -9266,8 +9900,7 @@ def test_select_results_validates_each_g1_wave_against_only_its_cumulative_prefi
 
     def fake_generation_reasons(record, **_kwargs):
         attempt_ids = [
-            attempt["attempt_id"]
-            for attempt in record.row["execution"]["generation_attempts"]
+            attempt["attempt_id"] for attempt in record.row["execution"]["generation_attempts"]
         ]
         observed_prefixes.append(attempt_ids)
         return [] if attempt_ids == ["a" * 32, "b" * 32] else ["deferred"]
@@ -9464,9 +10097,7 @@ def test_manifest_resume_schedule_rejects_nonzero_or_boolean_policy_counter(
     args, _, lock_fd = _campaign(module, tmp_path)
     try:
         manifest = _install_complete_metadata_schedule(module, args)
-        manifest["resume_selection"]["resume_action_counts"][
-            "policy_violation"
-        ] = bad_value
+        manifest["resume_selection"]["resume_action_counts"]["policy_violation"] = bad_value
         _owner_json(args.manifest[1], manifest)
         with pytest.raises(
             module.FinalizationError,
@@ -9501,14 +10132,10 @@ def _install_audit_only_schedule(module, args: argparse.Namespace) -> None:
         )
         row["execution"] = execution
         completion = dict(row.get("resume_completion") or {})
-        completion.update(
-            {"action": "audit_only", "generation_reused": True}
-        )
+        completion.update({"action": "audit_only", "generation_reused": True})
         row["resume_completion"] = completion
     rows = [module.seal_result_row(row) for row in rows]
-    args.result[1].write_text(
-        "".join(json.dumps(row) + "\n" for row in rows)
-    )
+    args.result[1].write_text("".join(json.dumps(row) + "\n" for row in rows))
     args.result[1].chmod(0o600)
 
     resume = manifest["resume_selection"]
@@ -9532,18 +10159,13 @@ def test_audit_only_no_generation_wave_contract(
     try:
         _install_audit_only_schedule(module, args)
         if tamper is not None:
-            rows = [
-                json.loads(line)
-                for line in args.result[1].read_text().splitlines()
-            ]
+            rows = [json.loads(line) for line in args.result[1].read_text().splitlines()]
             if tamper == "missing_marker":
                 rows[0]["execution"].pop("audit_only_recorded")
             else:
                 rows[0]["execution"]["judge_reran"] = True
             rows[0] = module.seal_result_row(rows[0])
-            args.result[1].write_text(
-                "".join(json.dumps(row) + "\n" for row in rows)
-            )
+            args.result[1].write_text("".join(json.dumps(row) + "\n" for row in rows))
             args.result[1].chmod(0o600)
 
         if tamper is None:

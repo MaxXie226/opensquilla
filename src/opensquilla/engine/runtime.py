@@ -3258,13 +3258,13 @@ class TurnRunner:
         inherited_provider_config: Any,
         *,
         session_key: str,
+        ranking_config: Mapping[str, Any],
     ) -> Any | None:
-        """Build the fixed Opus task analyzer without reusing the routed model."""
+        """Build the frozen task analyzer without reusing another credential."""
 
         from opensquilla.engine.selector_override import resolve_tier_provider_config
         from opensquilla.provider.ranking_router import (
-            TASK_ANALYZER_MODEL_ID,
-            TASK_ANALYZER_PROVIDER_ID,
+            task_analyzer_policy,
         )
         from opensquilla.provider.registry import get_provider_spec
         from opensquilla.provider.selector import (
@@ -3273,20 +3273,26 @@ class TurnRunner:
             SelectorConfig,
         )
 
+        analyzer_provider_id = "openrouter"
+        analyzer_model_id = "unknown"
         try:
-            spec = get_provider_spec(TASK_ANALYZER_PROVIDER_ID)
+            analyzer_policy = task_analyzer_policy(ranking_config)
+            analyzer_provider_id = str(analyzer_policy["provider"])
+            analyzer_model_id = str(analyzer_policy["model"])
+            analyzer_upstream_provider = str(analyzer_policy["upstream_provider"])
+            spec = get_provider_spec(analyzer_provider_id)
             turn_config = self._turn_config()
             inherited_provider = str(
                 getattr(inherited_provider_config, "provider", "") or ""
             ).strip().lower()
             analyzer_config: ProviderConfig | None = None
-            if inherited_provider == TASK_ANALYZER_PROVIDER_ID:
+            if inherited_provider == analyzer_provider_id:
                 inherited_api_key = str(
                     getattr(inherited_provider_config, "api_key", "") or ""
                 ).strip() or os.environ.get(spec.env_key, "").strip()
                 analyzer_config = replace(
                     inherited_provider_config,
-                    model=TASK_ANALYZER_MODEL_ID,
+                    model=analyzer_model_id,
                     api_key=inherited_api_key,
                     base_url=str(
                         getattr(inherited_provider_config, "base_url", "") or ""
@@ -3299,7 +3305,7 @@ class TurnRunner:
                 primary_provider = str(
                     getattr(primary, "provider", "") or ""
                 ).strip().lower()
-                if primary_provider == TASK_ANALYZER_PROVIDER_ID:
+                if primary_provider == analyzer_provider_id:
                     api_key = str(getattr(primary, "api_key", "") or "").strip()
                     if not api_key:
                         env_name = str(
@@ -3307,8 +3313,8 @@ class TurnRunner:
                         ).strip()
                         api_key = os.environ.get(env_name or spec.env_key, "").strip()
                     analyzer_config = ProviderConfig(
-                        provider=TASK_ANALYZER_PROVIDER_ID,
-                        model=TASK_ANALYZER_MODEL_ID,
+                        provider=analyzer_provider_id,
+                        model=analyzer_model_id,
                         api_key=api_key,
                         base_url=str(getattr(primary, "base_url", "") or "").strip()
                         or spec.default_base_url,
@@ -3321,18 +3327,36 @@ class TurnRunner:
                 else:
                     analyzer_config = resolve_tier_provider_config(
                         turn_config,
-                        TASK_ANALYZER_PROVIDER_ID,
-                        TASK_ANALYZER_MODEL_ID,
+                        analyzer_provider_id,
+                        analyzer_model_id,
                         session_key=session_key,
                     )
+
+            if analyzer_config is not None and (
+                str(analyzer_config.provider or "").strip().casefold()
+                != analyzer_provider_id
+            ):
+                raise ValueError(
+                    "task analyzer credential resolver returned a different provider"
+                )
+            if analyzer_config is not None:
+                analyzer_routing = dict(analyzer_config.provider_routing)
+                analyzer_routing[analyzer_model_id] = analyzer_upstream_provider
+                analyzer_config = replace(
+                    analyzer_config,
+                    provider=analyzer_provider_id,
+                    model=analyzer_model_id,
+                    provider_routing=analyzer_routing,
+                    replay_provider_state=False,
+                )
 
             if analyzer_config is None or (
                 spec.requires_api_key() and not analyzer_config.api_key.strip()
             ):
                 log.warning(
                     "llm_ensemble.router_dynamic.task_analyzer_provider_unavailable",
-                    provider=TASK_ANALYZER_PROVIDER_ID,
-                    model=TASK_ANALYZER_MODEL_ID,
+                    provider=analyzer_provider_id,
+                    model=analyzer_model_id,
                     reason="credential_unavailable",
                 )
                 return None
@@ -3344,8 +3368,8 @@ class TurnRunner:
         except Exception as exc:  # noqa: BLE001 - task analysis has a local fallback
             log.warning(
                 "llm_ensemble.router_dynamic.task_analyzer_provider_unavailable",
-                provider=TASK_ANALYZER_PROVIDER_ID,
-                model=TASK_ANALYZER_MODEL_ID,
+                provider=analyzer_provider_id,
+                model=analyzer_model_id,
                 reason=type(exc).__name__,
             )
             return None
@@ -6637,27 +6661,58 @@ class TurnRunner:
                     ranking_inputs: dict[str, Any] | None = None
                     if selection_mode == "router_dynamic":
                         from opensquilla.provider.ranking_router import (
-                            TASK_ANALYZER_MODEL_ID,
-                            TASK_ANALYZER_PROVIDER_ID,
                             DynamicRankingError,
                             analyze_task_with_provider,
                             build_request_context,
                             dynamic_output_token_budgets,
                             ranking_config_snapshot,
+                            task_analyzer_policy,
                         )
 
-                        thinking_assignment_enabled = bool(
-                            getattr(
-                                ensemble_cfg,
-                                "ranking_thinking_assignment_enabled",
-                                False,
-                            )
+                        frozen_resolution_snapshot = getattr(
+                            ensemble_cfg,
+                            "ranking_config_resolution_snapshot",
+                            None,
                         )
-                        ranking_config = ranking_config_snapshot(
-                            thinking_assignment_enabled=(
-                                thinking_assignment_enabled
+                        if callable(frozen_resolution_snapshot):
+                            frozen_resolution = frozen_resolution_snapshot()
+                            ranking_config = frozen_resolution.get(
+                                "effective_config"
                             )
-                        )
+                            if not isinstance(ranking_config, Mapping):
+                                raise DynamicRankingError(
+                                    "frozen router_dynamic ranking config is unavailable"
+                                )
+                            thinking_assignment_enabled = (
+                                frozen_resolution.get(
+                                    "thinking_assignment_enabled"
+                                )
+                                is True
+                            )
+                        else:
+                            thinking_assignment_enabled = bool(
+                                getattr(
+                                    ensemble_cfg,
+                                    "ranking_thinking_assignment_enabled",
+                                    False,
+                                )
+                            )
+                            ranking_config = ranking_config_snapshot(
+                                thinking_assignment_enabled=(
+                                    thinking_assignment_enabled
+                                ),
+                                override=(
+                                    getattr(
+                                        ensemble_cfg,
+                                        "ranking_config_override",
+                                        None,
+                                    )
+                                    or None
+                                ),
+                            )
+                        analyzer_policy = task_analyzer_policy(ranking_config)
+                        analyzer_provider_id = str(analyzer_policy["provider"])
+                        analyzer_model_id = str(analyzer_policy["model"])
                         routing_extra = turn.metadata.get("routing_extra")
                         routing_extra_map = (
                             routing_extra if isinstance(routing_extra, Mapping) else {}
@@ -6718,6 +6773,7 @@ class TurnRunner:
                         analyzer_provider = self._router_dynamic_task_analyzer_provider(
                             current_provider_config,
                             session_key=turn.session_key,
+                            ranking_config=ranking_config,
                         )
                         task_analysis = await analyze_task_with_provider(
                             provider=analyzer_provider,
@@ -6728,8 +6784,8 @@ class TurnRunner:
                             routing_confidence=routing_confidence,
                             usage_tracker=self._usage_tracker,
                             session_key=turn.session_key,
-                            analyzer_provider_id=TASK_ANALYZER_PROVIDER_ID,
-                            analyzer_model_id=TASK_ANALYZER_MODEL_ID,
+                            analyzer_provider_id=analyzer_provider_id,
+                            analyzer_model_id=analyzer_model_id,
                             ranking_config=ranking_config,
                             decision_id=ensemble_decision_id,
                         )

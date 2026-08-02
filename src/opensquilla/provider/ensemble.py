@@ -15317,7 +15317,6 @@ def _build_router_dynamic_members(
     session_key: str = "",
     aggregator_fallbacks_out: list[EnsembleMemberConfig] | None = None,
     proposer_backups_out: list[EnsembleMemberConfig] | None = None,
-    aggregator_fallback_limit: int = 2,
     retry_context_inputs_out: dict[str, Any] | None = None,
 ) -> tuple[str, list[EnsembleMemberConfig], EnsembleMemberConfig, dict[str, Any]]:
     """Build members from the profile-driven Step2 ranking decision."""
@@ -15358,8 +15357,24 @@ def _build_router_dynamic_members(
         ensemble_cfg
     )
     min_success_explicit = "min_successful_proposers" in ensemble_fields_set
+    frozen_resolution_snapshot = getattr(
+        ensemble_cfg,
+        "ranking_config_resolution_snapshot",
+        None,
+    )
+    frozen_resolution = (
+        frozen_resolution_snapshot()
+        if callable(frozen_resolution_snapshot)
+        else None
+    )
     thinking_assignment_enabled = (
-        getattr(ensemble_cfg, "ranking_thinking_assignment_enabled", False)
+        frozen_resolution.get("thinking_assignment_enabled") is True
+        if isinstance(frozen_resolution, Mapping)
+        else getattr(
+            ensemble_cfg,
+            "ranking_thinking_assignment_enabled",
+            False,
+        )
         is True
     )
     inputs = dict(ranking_inputs or {})
@@ -15372,11 +15387,50 @@ def _build_router_dynamic_members(
     registry_allowlist = inputs.get("registry_allowlist")
     ranking_config = inputs.get("ranking_config")
     if not isinstance(ranking_config, Mapping):
-        ranking_config = ranking_config_snapshot(
-            thinking_assignment_enabled=thinking_assignment_enabled,
+        frozen_effective = (
+            frozen_resolution.get("effective_config")
+            if isinstance(frozen_resolution, Mapping)
+            else None
         )
+        if isinstance(frozen_effective, Mapping):
+            ranking_config = deepcopy(dict(frozen_effective))
+        else:
+            override_snapshot = getattr(
+                ensemble_cfg,
+                "ranking_config_override_snapshot",
+                None,
+            )
+            frozen_override = (
+                override_snapshot()
+                if callable(override_snapshot)
+                else getattr(ensemble_cfg, "ranking_config_override", None)
+            )
+            ranking_config = ranking_config_snapshot(
+                thinking_assignment_enabled=thinking_assignment_enabled,
+                override=frozen_override or None,
+            )
     if not thinking_assignment_enabled:
         ranking_config = _legacy_ranking_config_projection(ranking_config)
+    aggregator_policy = ranking_config.get("aggregator")
+    ranked_aggregator_count = (
+        aggregator_policy.get("candidate_count")
+        if isinstance(aggregator_policy, Mapping)
+        else None
+    )
+    recovery_mode, recovery_top_k = _normalize_aggregator_recovery_policy(
+        getattr(ensemble_cfg, "aggregator_recovery_mode", "serving"),
+        getattr(ensemble_cfg, "aggregator_recovery_top_k", 3),
+    )
+    executable_aggregator_count = 1 if recovery_mode == "off" else recovery_top_k
+    if (
+        isinstance(ranked_aggregator_count, bool)
+        or not isinstance(ranked_aggregator_count, int)
+        or ranked_aggregator_count > executable_aggregator_count
+    ):
+        raise DynamicRankingError(
+            "router_dynamic ranking aggregator.candidate_count exceeds the "
+            "executable aggregator recovery chain"
+        )
     llm_cfg = getattr(config, "llm", None)
     if thinking_assignment_enabled:
         configured_output_tokens, configured_temperature = (
@@ -15664,9 +15718,6 @@ def _build_router_dynamic_members(
         ranking_config=ranking_config,
         decision_id=decision_id,
         ranking_thinking_assignment_enabled=thinking_assignment_enabled,
-        proposer_backup_count=int(
-            getattr(ensemble_cfg, "proposer_backup_count", 2) or 0
-        ),
         proposer_recovery_max_additional_calls=int(
             getattr(
                 ensemble_cfg,
@@ -15861,10 +15912,7 @@ def _build_router_dynamic_members(
             credential_pool_acquirer=credential_pool_acquirer,
             session_key=session_key,
         )
-        for index, model in enumerate(
-            decision.aggregator_candidates[1 : 1 + max(0, int(aggregator_fallback_limit))],
-            start=1,
-        )
+        for index, model in enumerate(decision.aggregator_candidates[1:], start=1)
     ]
     if aggregator_fallbacks_out is not None:
         aggregator_fallbacks_out.extend(aggregator_fallbacks)
@@ -16526,7 +16574,6 @@ def build_ensemble_provider_from_config(
             session_key=_session_key,
             aggregator_fallbacks_out=aggregator_fallbacks,
             proposer_backups_out=proposer_backups,
-            aggregator_fallback_limit=recovery_top_k - 1,
             retry_context_inputs_out=materialized_retry_inputs,
         )
     else:
@@ -16683,7 +16730,8 @@ def build_ensemble_provider_from_config(
                     "opensquilla.router-dynamic-proposer-recovery/v1"
                 ),
                 "configured_backup_count": int(
-                    getattr(ensemble_cfg, "proposer_backup_count", 2) or 0
+                    selection_plan.get("configured_proposer_backup_count", 0)
+                    or 0
                 ),
                 "effective_backup_count": len(proposer_backups),
                 "max_additional_physical_requests": (
