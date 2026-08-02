@@ -1,6 +1,6 @@
 {
   "schema_version": "step2-model-registry-v2",
-  "snapshot_version": "curated-openrouter-step2-2026-07-30.2",
+  "snapshot_version": "curated-openrouter-step2-2026-07-31.1",
   "models": [
     {
       "source": "curated_openrouter_profile",
@@ -8021,109 +8021,6 @@
           "format_error": 0.05,
           "tool_error": 0.08,
           "timeout": 0.01
-        },
-        "source": "curated_estimate"
-      }
-    },
-    {
-      "source": "curated_openrouter_profile",
-      "runtime": {
-        "thinking": "off"
-      },
-      "registry_facts": {
-        "model_id": "mistralai/devstral-2512",
-        "version": "mistralai/devstral-2512",
-        "provider": "openrouter",
-        "vendor": "mistralai",
-        "family": "devstral",
-        "status": "enabled",
-        "roles": [
-          "proposer",
-          "aggregator"
-        ],
-        "context_window": 262144,
-        "effective_context_bucket": "extra_long",
-        "modalities": [
-          "text",
-          "file"
-        ],
-        "tools": [
-          "code_execution",
-          "file_system",
-          "api_call"
-        ],
-        "price": {
-          "input_per_million": 0.4,
-          "output_per_million": 2.0
-        },
-        "latency_p50_ms": 1040,
-        "latency_p95_ms": 3040,
-        "catalog_verified_at": "2026-07-24",
-        "latency_source": "curated_estimate",
-        "quota": "available",
-        "rate_limit": "available",
-        "health": "healthy",
-        "is_open_source": true,
-        "is_chinese_model": false,
-        "supports_reasoning": false,
-        "supports_tools": true,
-        "supported_thinking_levels": [
-          "off"
-        ],
-        "thinking_levels": [],
-        "thinking_level_mapping": {}
-      },
-      "static_profile": {
-        "capability_dist_prior": {
-          "reasoning": 0.84,
-          "code_generation": 0.99,
-          "code_review": 0.99,
-          "tool_use": 0.96,
-          "planning": 0.89,
-          "retrieval": 0.62,
-          "summarization": 0.68,
-          "writing": 0.6,
-          "math": 0.78,
-          "data_analysis": 0.73,
-          "visual_understanding": 0.05,
-          "audio_understanding": 0.05,
-          "long_context": 0.78,
-          "format_following": 0.89,
-          "safety_judgment": 0.62
-        },
-        "domain_dist_prior": {
-          "software_engineering": 0.96,
-          "data_science": 0.83,
-          "document_processing": 0.67,
-          "business_analysis": 0.71,
-          "creative_writing": 0.72,
-          "education": 0.69,
-          "research": 0.73,
-          "customer_support": 0.68,
-          "legal": 0.63,
-          "finance": 0.67,
-          "medical": 0.59,
-          "technical_writing": 0.79,
-          "general": 0.81
-        },
-        "tier_dist_prior": {
-          "1": 0.97,
-          "2": 0.92,
-          "3": 0.85,
-          "4": 0.72
-        },
-        "role_fit_prior": {
-          "proposer": 0.97,
-          "aggregator": 0.52
-        }
-      },
-      "online_profile": {
-        "error_rates": {
-          "hallucination": 0.07,
-          "omission": 0.07,
-          "format_error": 0.02,
-          "tool_error": 0.02,
-          "timeout": 0.06
         },
         "source": "curated_estimate"
       }
