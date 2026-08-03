@@ -30,9 +30,10 @@ from opensquilla.profile_import_io import (
     BoundProfileReadError,
     capture_bound_profile_directory,
     capture_bound_profile_file,
+    is_path_redirecting_stat,
     native_io_path,
+    reparse_tag_redirects,
 )
-from opensquilla.recovery.atomic import is_path_redirecting_stat, reparse_tag_redirects
 
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 _FILE_ATTRIBUTE_DIRECTORY = 0x10

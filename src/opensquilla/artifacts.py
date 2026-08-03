@@ -24,7 +24,7 @@ from urllib.parse import unquote, urlsplit
 
 from opensquilla.attachment_refs import _atomic_write_bytes, _link_or_copy, _validate_sha256
 from opensquilla.paths import native_io_path
-from opensquilla.recovery.atomic import reparse_tag_redirects
+from opensquilla.profile_import_io import reparse_tag_redirects
 
 _log = logging.getLogger(__name__)
 
