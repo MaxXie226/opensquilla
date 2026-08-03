@@ -513,6 +513,16 @@ def tool_context_from_envelope(
             denied_tools = set(CRON_AGENT_DENY)
     elif caller_kind is CallerKind.SUBAGENT:
         denied_tools = set(SUBAGENT_TOOL_DENY)
+    guest_safe = bool(envelope.metadata.get("guest_safe"))
+    if guest_safe:
+        from opensquilla.tools.visibility import guest_safe_tool_allowlist
+
+        guest_allowlist = set(guest_safe_tool_allowlist())
+        allowed_tools = (
+            guest_allowlist
+            if allowed_tools is None
+            else allowed_tools & guest_allowlist
+        )
     source_kind = envelope.metadata.get("tool_source_kind") or envelope.source_kind.value
     source_name = envelope.metadata.get("tool_source_name") or envelope.source_name
     legacy_elevated = envelope.metadata.get("elevated")
@@ -570,7 +580,7 @@ def tool_context_from_envelope(
         subagent_depth=int(envelope.metadata.get("spawn_depth") or 0),
         agent_id=envelope.agent_id,
         workspace_dir=effective_workspace_dir,
-        guest_safe=bool(envelope.metadata.get("guest_safe")),
+        guest_safe=guest_safe,
         environment=(
             {
                 str(key): str(value)

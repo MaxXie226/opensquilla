@@ -23,6 +23,7 @@ from opensquilla.sandbox.guest_profile import (
 )
 from opensquilla.tools.builtin.shell import _base_shell_environment
 from opensquilla.tools.types import ToolContext, current_tool_context
+from opensquilla.tools.visibility import guest_safe_tool_allowlist
 
 
 def _guest_principal(*, invalid: bool = False) -> Principal:
@@ -150,6 +151,35 @@ def test_missing_and_invalid_token_materialize_the_same_guest_boundary(
     assert profile.temp == profile.root / "tmp"
     assert profile.host_home_mounted is False
     profile.cleanup()
+
+
+def test_guest_route_envelope_receives_the_hard_tool_allowlist(tmp_path: Path) -> None:
+    profile = _guest_profile_for_principal(
+        _guest_principal(),
+        "turn",
+        state_dir=tmp_path / "state",
+    )
+    assert profile is not None
+    envelope = build_web_route_envelope(session_key="agent:main:webchat:guest")
+    envelope.metadata.update(
+        {
+            "guest_safe": True,
+            "guest_environment": dict(profile.environment),
+            "run_mode": "safe",
+            "sandbox_run_context": profile.run_context().to_origin_payload(),
+        }
+    )
+    try:
+        context = tool_context_from_envelope(envelope, is_owner=False)
+    finally:
+        profile.cleanup()
+
+    assert context.allowed_tools == set(guest_safe_tool_allowlist())
+    assert "sessions_send" not in context.allowed_tools
+    assert "sessions_spawn" not in context.allowed_tools
+    assert "skill_view" not in context.allowed_tools
+    assert "memory_search" not in context.allowed_tools
+    assert "exec_command" not in context.allowed_tools
 
 
 @pytest.mark.parametrize(

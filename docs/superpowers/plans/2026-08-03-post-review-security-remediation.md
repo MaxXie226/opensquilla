@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - Missing and invalid named Tokens must have identical restricted Safe-mode authority.
-- Guest session keys are invisible and can never grant host execution, setup, configuration, approval authority, or file access beyond the guest's managed temporary workspace. Bundled read/execute runtimes are available only on platforms whose native backend enforces explicit read and write mounts; Windows guest process execution is unavailable.
+- Guest session keys are invisible and can never grant host execution, setup, configuration, approval authority, or file access beyond the guest's managed temporary workspace. Their model-visible tool surface contains only reviewed managed-workspace file and guarded network tools; process tools are unavailable on every platform.
 - Desktop startup and remote Web access must never trigger UAC.
 - Existing owner/token sessions and direct-update data remain compatible.
 - Every security denial is enforced server-side; hiding UI is not authorization.
@@ -91,7 +91,7 @@
 - Test: `tests/test_sandbox/test_windows_default_process_smoke.py`
 
 **Interfaces:**
-- Produces a fresh guest-managed temporary workspace per runtime task, bundled runtime mounts only on native backends with explicit read isolation, and an early stable Windows guest-process rejection while retaining confined trusted filesystem-worker operations.
+- Produces a fresh guest-managed temporary workspace per runtime task, a hard default-deny guest tool surface without process tools, and an early stable Windows guest-process rejection as defense in depth while retaining confined trusted filesystem-worker operations.
 
 - [ ] Write failing profile/payload tests proving the managed guest workspace is RW, Windows guest profiles contain no runtime mounts or runtime `PATH`, guest process requests are rejected before launch, and arbitrary host/user paths are DENY.
 - [ ] Scrub execution-scoped guest roots, HOME/temp, mounts, and environment from reusable route envelopes; materialize and clean a distinct profile for every internal follow-up task.

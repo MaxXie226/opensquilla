@@ -50,6 +50,7 @@ from opensquilla.sandbox.run_context import RUN_CONTEXT_ORIGIN_KEY
 from opensquilla.session import storage as session_storage
 from opensquilla.session.compaction import CompactionConfig
 from opensquilla.session.models import TranscriptEntry
+from opensquilla.tools.visibility import guest_safe_tool_allowlist
 
 _DEFAULT_PRINCIPAL = Principal(
     role="operator", scopes=frozenset(["operator.admin"]), is_owner=True, authenticated=True
@@ -1736,10 +1737,12 @@ class TestSessionsSend:
         assert raised.value.code == "SANDBOX_UNAVAILABLE"
 
     @pytest.mark.asyncio
-    async def test_guest_send_ingress_uses_managed_workspace_not_configured_agent_workspace(
+    @pytest.mark.parametrize("auth_state", ["guest", "invalid"])
+    async def test_unauthenticated_ingress_uses_guest_workspace_and_hard_tool_allowlist(
         self,
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
+        auth_state: str,
     ) -> None:
         available = CapabilityReport(
             available=True,
@@ -1786,7 +1789,7 @@ class TestSessionsSend:
             scopes=frozenset(["operator.read", "operator.write"]),
             is_owner=False,
             authenticated=False,
-            auth_state="guest",
+            auth_state=auth_state,
         )
         ctx = make_ctx(
             session_manager=FakeSessionManager([session]),
@@ -1811,6 +1814,10 @@ class TestSessionsSend:
         assert effective_workspace != configured_workspace.resolve()
         assert effective_workspace.parent.parent == managed_root.resolve()
         assert effective_workspace.name == "workspace"
+        assert tool_context.guest_safe is True
+        assert tool_context.allowed_tools == set(guest_safe_tool_allowlist())
+        assert "sessions_send" not in tool_context.allowed_tools
+        assert "exec_command" not in tool_context.allowed_tools
 
         cleanup_guest_profile_root(
             envelope.metadata["guest_profile_root"],

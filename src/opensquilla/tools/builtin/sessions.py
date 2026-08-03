@@ -41,6 +41,14 @@ _SUBAGENT_SYSTEM_PROMPT = (
 )
 
 
+def _reject_guest_session_tool(tool_name: str) -> None:
+    ctx = current_tool_context.get()
+    if ctx is not None and ctx.guest_safe:
+        raise ToolError(
+            f"GUEST_TOOL_UNAVAILABLE: {tool_name} is unavailable to anonymous guests"
+        )
+
+
 def _is_bare_sentinel_task(task: str) -> bool:
     stripped = task.strip()
     if stripped != task or not (4 <= len(stripped) <= 120):
@@ -304,6 +312,7 @@ def evict_spawn_lock(parent_session_key: str) -> bool:
     required=["session_key", "message"],
 )
 async def sessions_send(session_key: str, message: str) -> str:
+    _reject_guest_session_tool("sessions_send")
     if not message:
         raise SafeToolError("Message must not be empty")
 
@@ -392,6 +401,7 @@ async def sessions_spawn(
     task: str = "",
     model: str | None = None,
 ) -> str:
+    _reject_guest_session_tool("sessions_spawn")
     if not task:
         raise ToolError("Task must not be empty")
 
@@ -639,6 +649,7 @@ async def sessions_list(
     status: str | None = None,
     limit: int = 50,
 ) -> str:
+    _reject_guest_session_tool("sessions_list")
     if status is not None and status not in _VALID_STATUSES:
         raise ToolError(f"Invalid status: {status}. Must be running|done|failed|killed|timeout")
     if not (1 <= limit <= 200):
@@ -677,6 +688,7 @@ async def sessions_list(
     plan_access=PlanAccess.READ_ONLY,
 )
 async def sessions_history(session_key: str, limit: int = 20) -> str:
+    _reject_guest_session_tool("sessions_history")
     if not (1 <= limit <= 100):
         raise ToolError("Limit must be between 1 and 100")
 
@@ -735,6 +747,7 @@ async def sessions_yield(
     timeout_seconds: int = 300,
     message: str | None = None,
 ) -> str:
+    _reject_guest_session_tool("sessions_yield")
     if not (0 <= timeout_seconds <= 3600):
         raise ToolError("Timeout must be between 0 and 3600 seconds")
     if not session_key:
@@ -887,6 +900,7 @@ async def sessions_yield(
     plan_access=PlanAccess.READ_ONLY,
 )
 async def session_status() -> str:
+    _reject_guest_session_tool("session_status")
     try:
         mgr = _get_session_manager()
         ctx = current_tool_context.get()
