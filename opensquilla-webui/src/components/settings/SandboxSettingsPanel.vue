@@ -79,10 +79,6 @@
           </button>
         </nav>
 
-        <button type="button" class="sandbox-advanced-row" data-testid="sandbox-open-advanced" @click="activeView = 'advanced'">
-          <span><strong>{{ t('settings.sandbox.lan.title') }}</strong><small>{{ t('settings.sandbox.lan.description') }}</small></span>
-          <span class="sandbox-list__chevron" aria-hidden="true">›</span>
-        </button>
       </article>
 
       <header v-else class="sandbox-detail-header" data-testid="sandbox-detail">
@@ -252,64 +248,6 @@
         />
       </article>
 
-      <article v-if="activeView === 'advanced'" class="sandbox-card">
-        <div class="sandbox-advanced-status">
-          <div>
-            <strong>{{ capability?.available ? t('settings.sandbox.available') : t('settings.sandbox.unavailable') }}</strong>
-            <p v-if="capability">{{ capability.reason }}</p>
-          </div>
-          <button type="button" class="btn" :disabled="loading" @click="void refreshCapability()">
-            {{ t('settings.sandbox.actions.redetect') }}
-          </button>
-        </div>
-        <button
-          v-if="desktopWarningPreferenceAvailable && sandboxWarningSuppressed"
-          type="button"
-          class="btn btn--ghost sandbox-reset-warning"
-          :disabled="desktopPreferencePending"
-          @click="void resetSandboxUnavailableWarning()"
-        >
-          {{ t('settings.sandbox.mode.resetWarning') }}
-        </button>
-        <div class="sandbox-lan-rules">
-          <p><strong>{{ t('settings.sandbox.lan.guest') }}</strong>{{ t('settings.sandbox.lan.guestDescription') }}</p>
-          <p><strong>{{ t('settings.sandbox.lan.authenticated') }}</strong>{{ t('settings.sandbox.lan.authenticatedDescription') }}</p>
-        </div>
-        <div class="sandbox-token-create">
-          <input v-model="tokenName" :placeholder="t('settings.sandbox.lan.tokenName')" />
-          <label>
-            <input v-model="tokenHostExecute" type="checkbox" />
-            {{ t('settings.sandbox.lan.hostExecute') }}
-          </label>
-          <button
-            type="button"
-            class="btn btn--primary"
-            :disabled="tokenPending || !tokenName.trim()"
-            data-testid="create-sandbox-token"
-            @click="createNamedToken"
-          >
-            {{ t('settings.sandbox.lan.createToken') }}
-          </button>
-        </div>
-        <div v-if="revealedToken" class="sandbox-token-secret" data-testid="revealed-sandbox-token">
-          <strong>{{ t('settings.sandbox.lan.copyNow') }}</strong>
-          <code>{{ revealedToken }}</code>
-          <button type="button" class="btn" @click="copyToken">{{ t('settings.sandbox.actions.copy') }}</button>
-        </div>
-        <div class="sandbox-token-list">
-          <div v-for="token in tokens" :key="token.publicId" class="sandbox-token-row">
-            <div>
-              <strong>{{ token.name }}</strong>
-              <code>{{ token.publicId }}</code>
-              <small>{{ token.capabilities.includes('host.execute') ? t('settings.sandbox.lan.fullCapable') : t('settings.sandbox.lan.safeOnly') }}</small>
-            </div>
-            <button type="button" class="btn btn--ghost" :disabled="tokenPending" @click="void revokeToken(token.publicId)">
-              {{ t('settings.sandbox.lan.revoke') }}
-            </button>
-          </div>
-        </div>
-        <p v-if="tokenError" class="sandbox-error" role="alert">{{ tokenError }}</p>
-      </article>
     </template>
   </section>
 </template>
@@ -333,25 +271,14 @@ const {
   defaultRunModeBaseline,
   defaultRunModePending,
   defaultRunModeError,
-  sandboxWarningSuppressed,
-  desktopWarningPreferenceAvailable,
-  desktopPreferencePending,
-  tokens,
-  revealedToken,
   sectionPending,
   sectionError,
-  tokenPending,
-  tokenError,
   sectionDirty,
   load,
-  refreshCapability,
   saveDefaultRunMode,
   discardDefaultRunMode,
-  resetSandboxUnavailableWarning,
   saveSection,
   discardSection,
-  createToken,
-  revokeToken,
 } = useSandboxSettings()
 
 const newFilePath = ref('')
@@ -359,9 +286,7 @@ const approvalPrefix = ref('')
 const autoPrefix = ref('')
 const allowDomain = ref('')
 const denyDomain = ref('')
-const tokenName = ref('')
-const tokenHostExecute = ref(true)
-type SandboxView = 'overview' | 'files' | 'commands' | 'network' | 'runtimes' | 'advanced'
+type SandboxView = 'overview' | 'files' | 'commands' | 'network' | 'runtimes'
 const activeView = ref<SandboxView>('overview')
 
 const backupQuotaGiB = computed({
@@ -408,7 +333,6 @@ const activeViewTitle = computed(() => ({
   commands: t('settings.sandbox.commands.title'),
   network: t('settings.sandbox.network.title'),
   runtimes: t('settings.sandbox.runtimes.title'),
-  advanced: t('settings.sandbox.lan.title'),
 })[activeView.value])
 
 const activeViewDescription = computed(() => ({
@@ -417,7 +341,6 @@ const activeViewDescription = computed(() => ({
   commands: t('settings.sandbox.commands.description'),
   network: t('settings.sandbox.network.description'),
   runtimes: t('settings.sandbox.runtimes.description'),
-  advanced: t('settings.sandbox.lan.description'),
 })[activeView.value])
 
 function createLineIcon(paths: string[]) {
@@ -457,22 +380,6 @@ function addPrefix(values: string[][], raw: string, clear: (value: string) => vo
     values.push(prefix)
   }
   clear('')
-}
-
-async function createNamedToken(): Promise<void> {
-  const name = tokenName.value.trim()
-  if (!name) return
-  try {
-    await createToken(name, tokenHostExecute.value)
-    tokenName.value = ''
-  } catch {
-    // The composable exposes the error next to the token controls.
-  }
-}
-
-async function copyToken(): Promise<void> {
-  if (!revealedToken.value) return
-  await navigator.clipboard?.writeText(revealedToken.value)
 }
 
 const SectionActions = defineComponent({

@@ -70,6 +70,7 @@ from opensquilla.sandbox.run_mode import (
 )
 from opensquilla.sandbox.run_mode_policy import (
     coerce_run_mode_for_principal,
+    default_run_mode_for_principal,
     run_mode_allowed_for_principal,
 )
 from opensquilla.sandbox.runtime_launcher import ChildRole, internal_child_argv
@@ -928,8 +929,20 @@ async def _handle_run_mode_preference_get(
         raise ValueError("params must be an object")
     storage = _runtime_preference_storage(ctx)
     stored = await storage.get_runtime_preference(_RUN_MODE_PREFERENCE_KEY)
-    source = "preference" if stored is not None else "config"
-    mode = normalize_run_mode(stored, default=config_run_mode(ctx.config))
+    sandbox = getattr(ctx.config, "sandbox", None)
+    fields_set = getattr(sandbox, "model_fields_set", None)
+    if fields_set is None:
+        fields_set = getattr(sandbox, "__fields_set__", ())
+    configured = "run_mode" in fields_set
+    if stored is not None:
+        source = "preference"
+        mode = normalize_run_mode(stored)
+    elif configured:
+        source = "config"
+        mode = config_run_mode(ctx.config)
+    else:
+        source = "default"
+        mode = default_run_mode_for_principal(ctx.principal)
     mode = coerce_run_mode_for_principal(mode, ctx.principal)
     return {"runMode": mode.value, "source": source}
 

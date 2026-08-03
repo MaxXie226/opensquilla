@@ -188,9 +188,12 @@ onMounted(() => rootRef.value?.focus())
 }
 
 .composer-run-mode__option-desc {
+  overflow: hidden;
   color: var(--text-muted);
   font-size: 0.75rem;
   line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 @media (max-width: 520px) {

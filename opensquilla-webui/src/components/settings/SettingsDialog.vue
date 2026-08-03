@@ -97,8 +97,10 @@
 
           <!-- Config-backed sections wait for readiness so their baselines are
                final before any field can be edited. -->
-          <div v-else-if="!loaded" class="settings-loading">
+          <div v-else-if="!loaded" class="settings-loading" role="status">
             <LoadingSpinner />
+            <strong>{{ t('settings.rail.' + section) }}</strong>
+            <span>{{ t('shared.loading') }}</span>
           </div>
           <template v-else>
             <SetupProviderPanel
@@ -815,7 +817,16 @@ onUnmounted(() => {
   align-items: center;
   display: flex;
   flex: 1;
+  flex-direction: column;
+  gap: var(--sp-2);
   justify-content: center;
+  color: var(--text-muted);
+  font-size: var(--fs-sm);
+}
+
+.settings-loading strong {
+  color: var(--text);
+  font-size: var(--fs-md);
 }
 
 /* Body: rail + active section */

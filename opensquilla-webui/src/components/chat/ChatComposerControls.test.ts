@@ -47,7 +47,7 @@ describe('ChatComposer control hierarchy', () => {
     expect(runModeSource).not.toContain("value: 'on'")
     expect(runModeSource).not.toContain("value: 'bypass'")
     expect(zhHans.chat.composer.runModeSafeDesc)
-      .toBe('使用沙箱，并遵循你配置的文件、命令与网络安全规则。')
+      .toBe('在沙箱中运行，并遵循你的安全规则。')
   })
 
   it('moves visual effects to Appearance settings', () => {

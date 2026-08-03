@@ -1669,6 +1669,78 @@ def test_allow_acl_state_sync_is_noop_when_effective_grants_are_unchanged(
     mod._sync_allow_acl_state(state, "S", {current: "RX"})
 
 
+def test_allow_acl_state_drops_missing_retained_rx_entries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default_runner as mod
+
+    state = tmp_path / "allow_acl_state.json"
+    stale = tmp_path / "deleted-capability-probe"
+    current = tmp_path / "current-capability-probe"
+    current.mkdir()
+    state.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "principals": {
+                    "S": [{"path": str(stale), "access": "RX"}],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    revoked: list[Path] = []
+    monkeypatch.setattr(
+        mod,
+        "_revoke_allow_path_for_sid",
+        lambda path, _sid: revoked.append(path),
+    )
+    monkeypatch.setattr(mod, "_grant_path_to_sid", lambda *_args: None)
+
+    mod._sync_allow_acl_state(state, "S", {current: "RX"})
+
+    saved = json.loads(state.read_text(encoding="utf-8"))
+    assert saved["principals"]["S"] == [
+        {"access": "RX", "path": str(current)},
+    ]
+    assert stale not in revoked
+
+
+def test_deny_acl_state_drops_principals_with_only_missing_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default_runner as mod
+
+    state = tmp_path / "deny_acl_state.json"
+    stale = tmp_path / "deleted-capability-probe"
+    current = tmp_path / "current"
+    current.mkdir()
+    state.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "principals": {
+                    "STALE": [{"path": str(stale), "mask": 1}],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(mod, "_materialize_deny_paths", lambda *_args: None)
+    monkeypatch.setattr(mod, "_deny_path_to_sid", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(mod, "_revoke_path_for_sid", lambda *_args: None)
+
+    mod._sync_deny_acl_state(state, "CURRENT", {current: 1}, revalidate_live=False)
+
+    saved = json.loads(state.read_text(encoding="utf-8"))
+    assert "STALE" not in saved["principals"]
+    assert saved["principals"]["CURRENT"] == [
+        {"mask": 1, "path": str(current)},
+    ]
+
+
 def test_frozen_offline_helper_argv_uses_internal_child_role(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1747,7 +1819,12 @@ def test_allow_taint_recovery_prunes_deleted_ephemeral_roots(
     )
     mod._mark_acl_state_tainted(state, kind="allow", sid="S", paths=(stale,))
     grants: list[Path] = []
-    monkeypatch.setattr(mod, "_revoke_allow_path_for_sid", lambda *_args: None)
+    revoked: list[Path] = []
+    monkeypatch.setattr(
+        mod,
+        "_revoke_allow_path_for_sid",
+        lambda path, _sid: revoked.append(path),
+    )
     monkeypatch.setattr(
         mod,
         "_grant_path_to_sid",
@@ -1757,6 +1834,7 @@ def test_allow_taint_recovery_prunes_deleted_ephemeral_roots(
     mod._sync_allow_acl_state(state, "S", {current: "RWX"})
 
     assert stale not in grants
+    assert stale not in revoked
     assert current in grants
     assert not mod._acl_state_taint_path(state).exists()
 

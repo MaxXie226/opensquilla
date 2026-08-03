@@ -23,8 +23,8 @@
 ### Task 1: Full Access Default and Compatibility
 
 **Files:**
-- Modify: `src/opensquilla/sandbox/config.py`
 - Modify: `src/opensquilla/sandbox/run_mode_policy.py`
+- Modify: `src/opensquilla/gateway/rpc_sandbox.py`
 - Modify: `opensquilla-webui/src/composables/chat/useChatRunModePreference.ts`
 - Modify: `opensquilla-webui/src/composables/settings/useSandboxSettings.ts`
 - Test: `tests/test_sandbox/test_run_mode_policy.py`
@@ -47,7 +47,7 @@ def test_guest_principal_still_defaults_to_safe() -> None:
     assert default_run_mode_for_principal(principal) is RunMode.SAFE
 ```
 
-Add a fresh `SandboxSettings()` assertion for `run_mode == 'full'`, plus Web composable assertions that missing policy/preference data falls back to `full` when both modes are allowed and that an RPC response with `source: 'preference', runMode: 'safe'` remains Safe.
+Add RPC assertions that a fresh `SandboxSettings()` with no explicitly configured run mode returns `full` for a host-capable principal, while `SandboxSettings(run_mode='safe')` and an RPC response with `source: 'preference', runMode: 'safe'` remain Safe.
 
 - [ ] **Step 2: Run the focused tests and confirm RED**
 
@@ -64,7 +64,7 @@ def default_run_mode_for_principal(principal: Any) -> RunMode:
     return RunMode.FULL if principal_has_host_execute(principal) else RunMode.SAFE
 ```
 
-Set `SandboxSettings.run_mode` to `"full"`. Change only in-memory frontend fallbacks to `full`; continue trusting the persisted RPC result when its source is `preference`.
+Return `FULL` from `default_run_mode_for_principal` only when the principal has `host.execute`. In `sandbox.run_mode.preference.get`, use an explicit stored preference first, an explicitly configured run mode second, and the principal default only when neither exists. Keep the pre-auth frontend state fail-safe until the principal policy arrives.
 
 - [ ] **Step 4: Re-run focused tests and confirm GREEN**
 

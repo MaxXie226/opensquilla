@@ -34,6 +34,22 @@ _CAPABILITY_PROBE_TIMEOUT_SECONDS = 30.0
 # churns Windows ACL state; one successful check per app session is sufficient,
 # with the explicit refresh RPC available for diagnostics.
 _CAPABILITY_CACHE_TTL_SECONDS = 3600.0
+_CAPABILITY_FAILURE_CACHE_TTL_SECONDS = 10.0
+
+
+def _capability_cache_ttl(report: CapabilityReport) -> float:
+    return (
+        _CAPABILITY_CACHE_TTL_SECONDS
+        if report.available
+        else _CAPABILITY_FAILURE_CACHE_TTL_SECONDS
+    )
+
+
+def _capability_cache_is_fresh(
+    cached: tuple[float, CapabilityReport],
+) -> bool:
+    cached_at, report = cached
+    return time.monotonic() - cached_at < _capability_cache_ttl(report)
 
 
 async def current_sandbox_setup_runtime_status(config: Any) -> SetupResult:
@@ -78,13 +94,13 @@ async def current_sandbox_capability_report(
     if force_refresh:
         _CAPABILITY_CACHE.pop(fingerprint, None)
     cached = _CAPABILITY_CACHE.get(fingerprint)
-    if cached is not None and time.monotonic() - cached[0] < _CAPABILITY_CACHE_TTL_SECONDS:
+    if cached is not None and _capability_cache_is_fresh(cached):
         return cached[1]
     async with _CAPABILITY_LOCK:
         if force_refresh:
             _CAPABILITY_CACHE.pop(fingerprint, None)
         cached = _CAPABILITY_CACHE.get(fingerprint)
-        if cached is not None and time.monotonic() - cached[0] < _CAPABILITY_CACHE_TTL_SECONDS:
+        if cached is not None and _capability_cache_is_fresh(cached):
             return cached[1]
         try:
             report = await asyncio.wait_for(

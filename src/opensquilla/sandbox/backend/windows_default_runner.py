@@ -1618,7 +1618,7 @@ def _sync_allow_acl_state(
         retained_read = {
             key: item
             for key, item in previous_by_key.items()
-            if item[1] == "RX" and key not in desired_by_key
+            if item[1] == "RX" and key not in desired_by_key and item[0].exists()
         }
         # The offline account's allow ACL is only the first half of the
         # access check. Every untrusted child also carries this request's
@@ -1648,7 +1648,11 @@ def _sync_allow_acl_state(
                 if old is None or old[1] != access:
                     _grant_path_to_sid(path, access, sid)
             for key, (path, _access) in previous_by_key.items():
-                if key not in desired_by_key and previous_by_key[key][1] == "RWX":
+                if (
+                    key not in desired_by_key
+                    and previous_by_key[key][1] == "RWX"
+                    and path.exists()
+                ):
                     _revoke_allow_path_for_sid(path, sid)
             updated = dict(principals)
             updated[sid] = [
@@ -1757,7 +1761,12 @@ def _sync_deny_acl_state_locked(
     state = _read_deny_acl_state(state_path)
     _recover_deny_acl_taint(state_path, state)
     _materialize_deny_paths(tuple(normalized_desired))
-    principals = state["principals"]
+    principals = {
+        principal_sid: entries
+        for principal_sid, entries in state["principals"].items()
+        if principal_sid == sid
+        or any(Path(str(item["path"])).expanduser().absolute().exists() for item in entries)
+    }
     previous = _principal_deny_acl_entries(principals.get(sid, []), sid=sid)
     previous_by_key = {_acl_path_key(path): (path, mask) for path, mask in previous.items()}
     desired_by_key = {
@@ -2045,7 +2054,7 @@ def _recover_allow_acl_taint(state_path: Path, state: dict[str, Any]) -> None:
         # tearing all of them down and rebuilding them turns one cancellation
         # into a minute-long restart loop on Windows.
         for path in intent_paths:
-            if _acl_path_key(path) not in persisted_by_key:
+            if _acl_path_key(path) not in persisted_by_key and path.exists():
                 _revoke_allow_path_for_sid(path, sid)
         for path, access in persisted.items():
             if access != "RWX" or not path.exists():

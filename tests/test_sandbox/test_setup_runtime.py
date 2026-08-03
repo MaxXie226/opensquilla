@@ -266,6 +266,64 @@ async def test_capability_report_force_refresh_bypasses_cached_probe(
 
 
 @pytest.mark.asyncio
+async def test_failed_capability_report_expires_before_successful_report(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.sandbox import setup_runtime
+
+    config = SimpleNamespace(sandbox=SimpleNamespace(backend="windows_default"))
+
+    async def current_probe(_config: object) -> SetupResult:
+        return SetupResult(
+            state=SandboxSetupState.READY,
+            platform="win32",
+            message="ready",
+        )
+
+    clock = [100.0]
+    calls = 0
+
+    async def live_probe(*_args: object, **_kwargs: object) -> CapabilityReport:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return CapabilityReport(
+                available=False,
+                backend="windows_default",
+                platform="win32",
+                code="probe_timeout",
+                reason="timed out",
+                setup_supported=True,
+                restart_required=False,
+                probe_version=1,
+                capabilities=frozenset(),
+            )
+        return CapabilityReport.available_for(
+            backend="windows_default",
+            platform="win32",
+            reason="ready",
+        )
+
+    monkeypatch.setattr(setup_runtime, "current_sandbox_setup_status", current_probe)
+    monkeypatch.setattr(setup_runtime, "_probe_runtime_capabilities", live_probe)
+    monkeypatch.setattr(setup_runtime.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        "opensquilla.sandbox.integration.get_runtime",
+        lambda: SimpleNamespace(backend=SimpleNamespace(name="windows_default")),
+    )
+
+    first = await setup_runtime.current_sandbox_capability_report(config)
+    clock[0] += 11.0
+    second = await setup_runtime.current_sandbox_capability_report(config)
+    clock[0] += 11.0
+    cached = await setup_runtime.current_sandbox_capability_report(config)
+
+    assert first.available is False
+    assert second.available is cached.available is True
+    assert calls == 2
+
+
+@pytest.mark.asyncio
 async def test_live_capability_probe_scopes_file_profile_to_canary_workspace(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

@@ -1,4 +1,4 @@
-import { computed, reactive, ref } from 'vue'
+import { computed, onScopeDispose, reactive, ref } from 'vue'
 
 import { usePlatform } from '@/platform'
 import { useRpcStore } from '@/stores/rpc'
@@ -7,7 +7,6 @@ import type {
   SandboxPolicy,
   SandboxPolicyDefaults,
   SandboxRunMode,
-  SandboxTokenRecord,
 } from '@/types/sandbox'
 
 export type SandboxPolicySection = 'files' | 'commands' | 'network' | 'runtimes'
@@ -24,6 +23,7 @@ export function useSandboxSettings() {
   const rpc = useRpcStore()
   const platform = usePlatform()
   const loading = ref(false)
+  const capabilityLoading = ref(false)
   const loadError = ref('')
   const capability = ref<SandboxCapabilityReport | null>(null)
   const baseline = ref<SandboxPolicy | null>(null)
@@ -38,8 +38,6 @@ export function useSandboxSettings() {
   const sandboxWarningSuppressed = ref(false)
   const desktopWarningPreferenceAvailable = ref(false)
   const desktopPreferencePending = ref(false)
-  const tokens = ref<SandboxTokenRecord[]>([])
-  const revealedToken = ref('')
   const sectionPending = reactive<Record<SandboxPolicySection, boolean>>({
     files: false,
     commands: false,
@@ -52,9 +50,8 @@ export function useSandboxSettings() {
     network: '',
     runtimes: '',
   })
-  const tokenPending = ref(false)
-  const tokenError = ref('')
   let saveQueue = Promise.resolve()
+  let capabilityRetryTimer: ReturnType<typeof setTimeout> | null = null
 
   const ready = computed(() => Boolean(baseline.value && draft.value))
 
@@ -68,14 +65,11 @@ export function useSandboxSettings() {
     loadError.value = ''
     try {
       await rpc.waitForConnection()
-      const [capabilityPayload, policyPayload, defaultsPayload, tokenPayload, runModePayload] = await Promise.all([
-        rpc.call<SandboxCapabilityReport>('sandbox.capability.status'),
+      const [policyPayload, defaultsPayload, runModePayload] = await Promise.all([
         rpc.call<SandboxPolicy>('sandbox.policy.get'),
         rpc.call<Partial<SandboxPolicyDefaults>>('sandbox.policy.defaults'),
-        rpc.call<{ tokens?: unknown }>('sandbox.tokens.list'),
         rpc.call<{ runMode?: unknown }>('sandbox.run_mode.preference.get'),
       ])
-      capability.value = capabilityPayload
       baseline.value = clonePolicy(policyPayload)
       draft.value = clonePolicy(policyPayload)
       builtinDenyWritePaths.value = Array.isArray(defaultsPayload.builtinDenyWritePaths)
@@ -88,21 +82,8 @@ export function useSandboxSettings() {
       const loadedRunMode: SandboxRunMode = runModePayload.runMode === 'full' ? 'full' : 'safe'
       defaultRunModeBaseline.value = loadedRunMode
       defaultRunMode.value = loadedRunMode
-      tokens.value = Array.isArray(tokenPayload.tokens)
-        ? tokenPayload.tokens as SandboxTokenRecord[]
-        : []
-      const desktop = platform.settings
-      if (typeof desktop.getDesktopPreferences === 'function') {
-        desktopWarningPreferenceAvailable.value = true
-        try {
-          const preferences = await desktop.getDesktopPreferences()
-          sandboxWarningSuppressed.value = Boolean(
-            preferences.sandboxUnavailableWarningSuppressed,
-          )
-        } catch {
-          desktopWarningPreferenceAvailable.value = false
-        }
-      }
+      void loadCapability()
+      void loadDesktopPreference()
     } catch (error) {
       loadError.value = errorMessage(error)
     } finally {
@@ -110,12 +91,48 @@ export function useSandboxSettings() {
     }
   }
 
-  async function refreshCapability(): Promise<void> {
-    await rpc.waitForConnection()
-    capability.value = await rpc.call<SandboxCapabilityReport>(
-      'sandbox.capability.status',
-      { refresh: true },
-    )
+  async function loadCapability(options: { refresh?: boolean } = {}): Promise<void> {
+    capabilityLoading.value = true
+    try {
+      await rpc.waitForConnection()
+      const report = await rpc.call<SandboxCapabilityReport>(
+        'sandbox.capability.status',
+        options.refresh ? { refresh: true } : undefined,
+      )
+      capability.value = report
+      if (!report.available) scheduleCapabilityRetry()
+    } catch {
+      capability.value = null
+      scheduleCapabilityRetry()
+    } finally {
+      capabilityLoading.value = false
+    }
+  }
+
+  function scheduleCapabilityRetry(): void {
+    if (capabilityRetryTimer !== null) clearTimeout(capabilityRetryTimer)
+    capabilityRetryTimer = setTimeout(() => {
+      capabilityRetryTimer = null
+      void loadCapability({ refresh: true })
+    }, 10_000)
+  }
+
+  onScopeDispose(() => {
+    if (capabilityRetryTimer !== null) clearTimeout(capabilityRetryTimer)
+  })
+
+  async function loadDesktopPreference(): Promise<void> {
+    const desktop = platform.settings
+    if (typeof desktop.getDesktopPreferences !== 'function') return
+    desktopWarningPreferenceAvailable.value = true
+    try {
+      const preferences = await desktop.getDesktopPreferences()
+      sandboxWarningSuppressed.value = Boolean(
+        preferences.sandboxUnavailableWarningSuppressed,
+      )
+    } catch {
+      desktopWarningPreferenceAvailable.value = false
+    }
   }
 
   async function saveDefaultRunMode(): Promise<void> {
@@ -196,50 +213,9 @@ export function useSandboxSettings() {
     sectionError[section] = ''
   }
 
-  async function createToken(name: string, hostExecute: boolean): Promise<void> {
-    const cleanName = name.trim()
-    if (!cleanName) return
-    tokenPending.value = true
-    tokenError.value = ''
-    revealedToken.value = ''
-    try {
-      const payload = await rpc.call<{
-        token: string
-        record: SandboxTokenRecord
-      }>('sandbox.tokens.create', {
-        name: cleanName,
-        hostExecute,
-      })
-      revealedToken.value = payload.token
-      tokens.value = [payload.record, ...tokens.value]
-    } catch (error) {
-      tokenError.value = errorMessage(error)
-      throw error
-    } finally {
-      tokenPending.value = false
-    }
-  }
-
-  async function revokeToken(publicId: string): Promise<void> {
-    tokenPending.value = true
-    tokenError.value = ''
-    try {
-      const payload = await rpc.call<{ revoked: boolean }>('sandbox.tokens.revoke', {
-        publicId,
-      })
-      if (payload.revoked) {
-        tokens.value = tokens.value.filter(token => token.publicId !== publicId)
-      }
-    } catch (error) {
-      tokenError.value = errorMessage(error)
-      throw error
-    } finally {
-      tokenPending.value = false
-    }
-  }
-
   return {
     loading,
+    capabilityLoading,
     loadError,
     capability,
     baseline,
@@ -255,21 +231,15 @@ export function useSandboxSettings() {
     sandboxWarningSuppressed,
     desktopWarningPreferenceAvailable,
     desktopPreferencePending,
-    tokens,
-    revealedToken,
     sectionPending,
     sectionError,
-    tokenPending,
-    tokenError,
     sectionDirty,
     load,
-    refreshCapability,
+    loadCapability,
     saveDefaultRunMode,
     discardDefaultRunMode,
     resetSandboxUnavailableWarning,
     saveSection,
     discardSection,
-    createToken,
-    revokeToken,
   }
 }

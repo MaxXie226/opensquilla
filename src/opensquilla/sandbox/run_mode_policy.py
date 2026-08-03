@@ -26,7 +26,7 @@ def allowed_run_modes_for_principal(principal: Any) -> tuple[RunMode, ...]:
 
 
 def default_run_mode_for_principal(principal: Any) -> RunMode:
-    return RunMode.SAFE
+    return RunMode.FULL if principal_has_host_execute(principal) else RunMode.SAFE
 
 
 def run_mode_allowed_for_principal(mode: Any, principal: Any) -> bool:

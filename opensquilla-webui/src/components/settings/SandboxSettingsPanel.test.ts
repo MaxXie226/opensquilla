@@ -34,11 +34,15 @@ async function settle() {
   for (let index = 0; index < 8; index++) await Promise.resolve()
 }
 
-async function mountPanel() {
+async function mountPanel(options: {
+  capability?: Promise<unknown> | (() => unknown)
+} = {}) {
   vi.resetModules()
   document.body.innerHTML = ''
   const call = vi.fn(async (method: string, params?: Record<string, unknown>) => {
     if (method === 'sandbox.capability.status') {
+      if (typeof options.capability === 'function') return options.capability()
+      if (options.capability) return options.capability
       return {
         available: true,
         backend: 'windows_default',
@@ -123,6 +127,7 @@ afterEach(() => {
   while (mounted.length) mounted.pop()!.unmount()
   vi.doUnmock('@/stores/rpc')
   vi.restoreAllMocks()
+  vi.useRealTimers()
   document.body.innerHTML = ''
 })
 
@@ -131,9 +136,10 @@ describe('SandboxSettingsPanel', () => {
     const { el } = await mountPanel()
 
     expect(el.querySelector('[data-testid="sandbox-overview"]')).toBeTruthy()
-    expect(el.querySelectorAll('[data-testid^="sandbox-open-"]')).toHaveLength(5)
+    expect(el.querySelectorAll('[data-testid^="sandbox-open-"]')).toHaveLength(4)
     expect(el.querySelector('[data-testid="builtin-file-rules"]')).toBeNull()
     expect(el.querySelector('[data-testid="create-sandbox-token"]')).toBeNull()
+    expect(el.querySelector('[data-testid="sandbox-open-advanced"]')).toBeNull()
   })
 
   it('opens focused details and returns without saving', async () => {
@@ -150,10 +156,8 @@ describe('SandboxSettingsPanel', () => {
     expect(el.querySelector('[data-testid="sandbox-overview"]')).toBeTruthy()
     expect(call.mock.calls.some(([method]) => method === 'sandbox.policy.update')).toBe(false)
 
-    el.querySelector<HTMLButtonElement>('[data-testid="sandbox-open-advanced"]')!.click()
-    await settle()
-    expect(el.querySelector('[data-testid="create-sandbox-token"]')).toBeTruthy()
-    expect(el.querySelector('[data-testid="builtin-file-rules"]')).toBeNull()
+    expect(call.mock.calls.some(([method]) => String(method).startsWith('sandbox.tokens.')))
+      .toBe(false)
   })
 
   it('loads immutable file rules and saves a versioned custom rule', async () => {
@@ -210,23 +214,52 @@ describe('SandboxSettingsPanel', () => {
     }))
   })
 
-  it('shows a newly-created named token only in the create response', async () => {
+  it('does not expose or load named-token management', async () => {
     const { el, call } = await mountPanel()
-    el.querySelector<HTMLButtonElement>('[data-testid="sandbox-open-advanced"]')!.click()
-    await settle()
-    const name = el.querySelector<HTMLInputElement>('input[placeholder^="Token name"]')!
-    name.value = 'Laptop'
-    name.dispatchEvent(new Event('input', { bubbles: true }))
-    await settle()
-    el.querySelector<HTMLButtonElement>('[data-testid="create-sandbox-token"]')!.click()
+
+    expect(el.textContent).not.toContain('Named Token')
+    expect(el.querySelector('[data-testid="create-sandbox-token"]')).toBeNull()
+    expect(call.mock.calls.some(([method]) => String(method).startsWith('sandbox.tokens.')))
+      .toBe(false)
+  })
+
+  it('renders policy controls without waiting for live capability verification', async () => {
+    const capability = new Promise<unknown>(() => {})
+    const { el } = await mountPanel({ capability })
+
+    expect(el.querySelector('[data-testid="sandbox-overview"]')).toBeTruthy()
+    expect(el.querySelector<HTMLButtonElement>('[data-testid="sandbox-default-mode"] button')?.disabled)
+      .toBe(true)
+    expect(el.querySelector<HTMLButtonElement>('[data-testid="sandbox-open-files"]')?.disabled)
+      .toBe(false)
+  })
+
+  it('retries an unavailable live capability in the background', async () => {
+    vi.useFakeTimers()
+    let attempts = 0
+    const { call } = await mountPanel({
+      capability: () => {
+        attempts += 1
+        return {
+          available: attempts > 1,
+          backend: 'windows_default',
+          platform: 'win32',
+          code: attempts > 1 ? 'ready' : 'probe_timeout',
+          reason: attempts > 1 ? 'ready' : 'timed out',
+          setupSupported: true,
+          restartRequired: false,
+          probeVersion: 1,
+          capabilities: attempts > 1 ? ['process'] : [],
+        }
+      },
+    })
+
+    expect(attempts).toBe(1)
+    await vi.advanceTimersByTimeAsync(10_000)
     await settle()
 
-    expect(call).toHaveBeenCalledWith('sandbox.tokens.create', {
-      name: 'Laptop',
-      hostExecute: true,
-    })
-    expect(el.querySelector('[data-testid="revealed-sandbox-token"]')?.textContent)
-      .toContain('osq_public_secret-once')
+    expect(attempts).toBe(2)
+    expect(call).toHaveBeenCalledWith('sandbox.capability.status', { refresh: true })
   })
 
   it('does not expose desktop listener or CIDR configuration', async () => {

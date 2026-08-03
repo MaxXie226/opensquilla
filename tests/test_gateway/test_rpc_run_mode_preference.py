@@ -7,6 +7,7 @@ import pytest
 from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError
 from opensquilla.gateway.scopes import METHOD_SCOPES, READ_SCOPE, WRITE_SCOPE
+from opensquilla.sandbox.config import SandboxSettings
 from opensquilla.session.storage import SessionStorage
 
 
@@ -21,7 +22,7 @@ def _principal(*, owner: bool) -> Principal:
 
 def _config(mode: str = "full") -> SimpleNamespace:
     return SimpleNamespace(
-        sandbox=SimpleNamespace(run_mode=mode),
+        sandbox=SimpleNamespace(run_mode=mode, model_fields_set={"run_mode"}),
         permissions=SimpleNamespace(default_mode="off"),
     )
 
@@ -52,6 +53,38 @@ async def test_run_mode_preference_get_uses_configured_fallback() -> None:
         await storage.close()
 
     assert payload == {"runMode": "full", "source": "config"}
+
+
+@pytest.mark.asyncio
+async def test_run_mode_preference_get_defaults_fresh_host_capable_profile_to_full() -> None:
+    from opensquilla.gateway import rpc_sandbox
+
+    storage = SessionStorage(":memory:")
+    await storage.connect()
+    ctx = _ctx(storage)
+    ctx.config.sandbox = SandboxSettings()
+    try:
+        payload = await rpc_sandbox._handle_run_mode_preference_get({}, ctx)
+    finally:
+        await storage.close()
+
+    assert payload == {"runMode": "full", "source": "default"}
+
+
+@pytest.mark.asyncio
+async def test_run_mode_preference_get_preserves_explicit_safe_config() -> None:
+    from opensquilla.gateway import rpc_sandbox
+
+    storage = SessionStorage(":memory:")
+    await storage.connect()
+    ctx = _ctx(storage)
+    ctx.config.sandbox = SandboxSettings(run_mode="safe")
+    try:
+        payload = await rpc_sandbox._handle_run_mode_preference_get({}, ctx)
+    finally:
+        await storage.close()
+
+    assert payload == {"runMode": "safe", "source": "config"}
 
 
 @pytest.mark.asyncio
