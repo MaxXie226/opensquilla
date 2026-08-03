@@ -95,6 +95,7 @@ def test_tokenrhythm_correlation_accepts_official_https_origins(
     [
         ("openrouter", "https://tokenrhythm.studio/v1"),
         ("tokenrhythm", "http://tokenrhythm.studio/v1"),
+        ("tokenrhythm", "https://api-tokenrhythm.example/v1"),
         ("tokenrhythm", "https://tokenrhythm.studio.example.com/v1"),
         ("tokenrhythm", "https://eviltokenrhythm.studio/v1"),
         ("tokenrhythm", "https://user@tokenrhythm.studio/v1"),

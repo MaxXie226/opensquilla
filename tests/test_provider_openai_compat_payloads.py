@@ -18,6 +18,9 @@ from opensquilla.provider.openai import (
     _tool_schema_accepts_arguments,
 )
 from opensquilla.provider.selector import build_provider
+from opensquilla.provider.tokenrhythm_correlation import (
+    is_tokenrhythm_correlation_target,
+)
 from opensquilla.provider.types import (
     ChatConfig,
     ContentBlockToolResult,
@@ -560,15 +563,17 @@ def test_dashscope_stream_timeout_emits_heartbeat_before_non_stream_fallback(
 
 
 @pytest.mark.parametrize(
-    ("base_url", "expected_url"),
+    ("base_url", "expected_url", "expects_install_id"),
     [
         (
             "https://tokenrhythm.studio/v1",
             "https://tokenrhythm.studio/v1/chat/completions",
+            True,
         ),
         (
             "https://api-tokenrhythm.example/v1",
             "https://api-tokenrhythm.example/v1/chat/completions",
+            False,
         ),
     ],
 )
@@ -576,14 +581,17 @@ def test_tokenrhythm_chat_adds_app_attribution_headers(
     monkeypatch: Any,
     base_url: str,
     expected_url: str,
+    expects_install_id: bool,
 ) -> None:
     captured: dict[str, Any] = {}
     _patch_transport(monkeypatch, captured)
     monkeypatch.setattr(
         "opensquilla.provider.openai.tokenrhythm_install_id_headers",
-        lambda _provider_kind, _base_url, **_kwargs: {
-            "X-OpenSquilla-Install-Id": "synthetic-install-id"
-        },
+        lambda provider_kind, request_base_url, **_kwargs: (
+            {"X-OpenSquilla-Install-Id": "synthetic-install-id"}
+            if is_tokenrhythm_correlation_target(provider_kind, request_base_url)
+            else {}
+        ),
     )
     provider = OpenAIProvider(
         api_key="test",
@@ -597,10 +605,13 @@ def test_tokenrhythm_chat_adds_app_attribution_headers(
     assert captured["url"] == expected_url
     assert captured["headers"].get("HTTP-Referer") == "https://opensquilla.ai"
     assert captured["headers"].get("X-Title") == "OpenSquilla"
-    assert (
-        captured["headers"].get("X-OpenSquilla-Install-Id")
-        == "synthetic-install-id"
-    )
+    if expects_install_id:
+        assert (
+            captured["headers"].get("X-OpenSquilla-Install-Id")
+            == "synthetic-install-id"
+        )
+    else:
+        assert "X-OpenSquilla-Install-Id" not in captured["headers"]
     assert "synthetic-install-id" not in json.dumps(captured["payload"], sort_keys=True)
 
 
