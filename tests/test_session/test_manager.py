@@ -1837,9 +1837,14 @@ async def test_compact_with_result_returns_source_and_persists(manager):
     assert [entry.content for entry in transcript] == original_contents[-len(transcript) :]
 
 
-def test_compaction_singleflight_target_fingerprint_uses_deployment_not_credentials():
+def test_compaction_singleflight_target_fingerprint_is_credential_aware():
     first = CompactionConfig(provider="provider-a", model="model-a", api_key="secret-a")
-    same_deployment = CompactionConfig(
+    same_deployment_and_credentials = CompactionConfig(
+        provider="provider-a",
+        model="model-a",
+        api_key="secret-a",
+    )
+    other_credentials = CompactionConfig(
         provider="provider-a",
         model="model-a",
         api_key="secret-b",
@@ -1849,14 +1854,21 @@ def test_compaction_singleflight_target_fingerprint_uses_deployment_not_credenti
     first_fingerprint = session_manager_module._compaction_target_fingerprint(first)
 
     assert (
-        session_manager_module._compaction_target_fingerprint(same_deployment)
+        session_manager_module._compaction_target_fingerprint(same_deployment_and_credentials)
         == first_fingerprint
+    )
+    assert (
+        session_manager_module._compaction_target_fingerprint(other_credentials)
+        != first_fingerprint
     )
     assert (
         session_manager_module._compaction_target_fingerprint(other_model)
         != first_fingerprint
     )
     assert "secret-a" not in first_fingerprint
+    assert "secret-b" not in session_manager_module._compaction_target_fingerprint(
+        other_credentials
+    )
 
 
 @pytest.mark.asyncio

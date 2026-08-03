@@ -6,7 +6,7 @@ import hashlib
 import hmac
 import json
 import secrets
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -37,21 +37,31 @@ def _default_deployment_fingerprint(provider_id: str, model: str) -> str:
     return hashlib.sha256(safe_identity.encode("utf-8")).hexdigest()[:24]
 
 
-def _provider_config_fingerprint(config: ProviderConfig) -> str:
-    """Return a process-local opaque identity for one physical deployment."""
+def compaction_deployment_fingerprint(
+    *,
+    provider: str,
+    model: str,
+    api_key: str = "",
+    base_url: str = "",
+    org_id: str = "",
+    proxy: str = "",
+    provider_routing: Mapping[str, str] | None = None,
+    replay_provider_state: bool = False,
+) -> str:
+    """Return a process-local opaque identity for one compaction deployment."""
 
     identity = {
-        "provider": str(config.provider or "").strip().lower(),
-        "model": str(config.model or "").strip(),
-        "api_key": str(config.api_key or ""),
-        "base_url": str(config.base_url or "").strip(),
-        "org_id": str(config.org_id or "").strip(),
-        "proxy": str(config.proxy or "").strip(),
+        "provider": str(provider or "").strip().lower(),
+        "model": str(model or "").strip(),
+        "api_key": str(api_key or ""),
+        "base_url": str(base_url or "").strip(),
+        "org_id": str(org_id or "").strip(),
+        "proxy": str(proxy or "").strip(),
         "provider_routing": sorted(
             (str(key), str(value))
-            for key, value in config.provider_routing.items()
+            for key, value in (provider_routing or {}).items()
         ),
-        "replay_provider_state": bool(config.replay_provider_state),
+        "replay_provider_state": bool(replay_provider_state),
     }
     canonical = json.dumps(
         identity,
@@ -64,6 +74,21 @@ def _provider_config_fingerprint(config: ProviderConfig) -> str:
         canonical.encode("utf-8"),
         hashlib.sha256,
     ).hexdigest()[:24]
+
+
+def _provider_config_fingerprint(config: ProviderConfig) -> str:
+    """Return a process-local opaque identity for one physical deployment."""
+
+    return compaction_deployment_fingerprint(
+        provider=config.provider,
+        model=config.model,
+        api_key=config.api_key,
+        base_url=config.base_url,
+        org_id=config.org_id,
+        proxy=config.proxy,
+        provider_routing=config.provider_routing,
+        replay_provider_state=config.replay_provider_state,
+    )
 
 
 @dataclass(frozen=True, slots=True)

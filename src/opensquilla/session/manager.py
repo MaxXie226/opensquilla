@@ -31,6 +31,7 @@ from opensquilla.session.compaction import (
     compaction_remaining_seconds,
     require_compaction_time,
 )
+from opensquilla.session.compaction_deployment import compaction_deployment_fingerprint
 from opensquilla.session.compaction_lifecycle import new_compaction_id
 from opensquilla.session.compaction_state import (
     StructuredCompactionSummary,
@@ -393,9 +394,12 @@ def _compaction_target_fingerprint(config: CompactionConfig) -> str:
         }
     else:
         target_payload = {
-            "provider": config.provider,
-            "model": config.model,
-            "base_url": config.base_url,
+            "deployment": compaction_deployment_fingerprint(
+                provider=config.provider,
+                model=str(config.model or ""),
+                api_key=config.api_key,
+                base_url=config.base_url,
+            ),
         }
     return hashlib.sha256(_stable_json(target_payload).encode("utf-8")).hexdigest()
 
