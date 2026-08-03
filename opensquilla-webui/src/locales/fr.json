@@ -463,7 +463,7 @@
       },
       "setup": {
         "title": "Configurer le mode sûr", "description": "OpenSquilla a besoin d’une autorisation administrateur pour créer un compte isolé et configurer la protection des fichiers et du réseau.",
-        "continue": "Continuer", "configuring": "Configuration…", "requestingApproval": "Demande d’autorisation administrateur…", "configuringProtection": "Configuration de la protection des fichiers et du réseau…", "takingLonger": "La configuration est toujours en cours. Cela peut prendre quelques minutes.", "cancelled": "Configuration annulée. L’accès complet reste inchangé ; vous pouvez réessayer.",
+        "continue": "Continuer", "configuring": "Configuration…", "requestingApproval": "Confirmez l’invite Windows pour continuer.", "configuringProtection": "OpenSquilla termine la configuration du mode sûr. Gardez l’application ouverte.", "takingLonger": "La première configuration peut prendre quelques minutes. La vérification se lancera automatiquement.", "cancelled": "Configuration annulée. L’accès complet reste inchangé ; vous pouvez réessayer.",
         "failed": "Le mode sûr n’a pas pu être configuré. L’accès complet reste inchangé.", "verificationFailed": "La configuration est terminée, mais la vérification de sécurité a échoué. L’accès complet reste inchangé."
       },
       "files": {

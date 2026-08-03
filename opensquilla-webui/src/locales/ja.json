@@ -463,7 +463,7 @@
       },
       "setup": {
         "title": "Safe モードを設定", "description": "OpenSquilla は、分離アカウントとファイル・ネットワーク保護を設定するために、一度だけ管理者の承認を必要とします。",
-        "continue": "続ける", "configuring": "設定中…", "requestingApproval": "管理者の承認を求めています…", "configuringProtection": "ファイルとネットワークの保護を設定しています…", "takingLonger": "設定を続行しています。数分かかる場合があります。", "cancelled": "設定をキャンセルしました。完全アクセスは変更されていません。いつでも再試行できます。",
+        "continue": "続ける", "configuring": "設定中…", "requestingApproval": "続行するには、Windows の確認画面で承認してください。", "configuringProtection": "OpenSquilla が Safe モードの設定を完了しています。アプリは開いたままにしてください。", "takingLonger": "初回設定には数分かかる場合があります。確認は自動的に実行されます。", "cancelled": "設定をキャンセルしました。完全アクセスは変更されていません。いつでも再試行できます。",
         "failed": "Safe モードを設定できませんでした。完全アクセスは変更されていません。", "verificationFailed": "設定は完了しましたが、安全性の確認に失敗しました。完全アクセスは変更されていません。"
       },
       "files": {

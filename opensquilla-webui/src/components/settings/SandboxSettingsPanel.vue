@@ -400,6 +400,7 @@ function cancelSandboxSetup(): void {
 }
 
 async function continueSandboxSetup(): Promise<void> {
+  if (sandboxSetupPending.value) return
   startSandboxSetupProgress()
   try {
     const ready = await ensureSandboxSetupForSafeMode()

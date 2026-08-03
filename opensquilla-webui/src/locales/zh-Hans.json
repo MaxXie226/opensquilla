@@ -477,9 +477,9 @@
         "description": "OpenSquilla 需要一次管理员授权，以创建隔离账户并配置文件与网络保护。仅首次配置或修复时需要。",
         "continue": "继续",
         "configuring": "正在配置…",
-        "requestingApproval": "正在请求管理员批准…",
-        "configuringProtection": "正在配置文件和网络保护…",
-        "takingLonger": "仍在配置中，可能需要几分钟。",
+        "requestingApproval": "请确认 Windows 提示以继续。",
+        "configuringProtection": "OpenSquilla 正在完成安全模式设置。请保持应用打开。",
+        "takingLonger": "首次设置可能需要几分钟。验证将自动运行。",
         "cancelled": "已取消配置。完全访问没有变化，你可以随时重试。",
         "failed": "暂时无法配置安全模式。完全访问没有变化，请稍后重试。",
         "verificationFailed": "配置已完成，但实时安全检测未通过。完全访问没有变化，请重试。"

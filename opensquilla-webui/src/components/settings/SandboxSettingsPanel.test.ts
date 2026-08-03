@@ -354,7 +354,7 @@ describe('SandboxSettingsPanel', () => {
     expect(call.mock.calls.some(([method]) => method === 'sandbox.setup.ensure')).toBe(false)
   })
 
-  it('shows elapsed setup guidance while administrator approval is pending', async () => {
+  it('shows neutral elapsed setup guidance while administrator approval is pending', async () => {
     vi.useFakeTimers()
     let resolveEnsure!: (value: unknown) => void
     const ensure = new Promise<unknown>((resolve) => {
@@ -368,7 +368,7 @@ describe('SandboxSettingsPanel', () => {
     await settle()
 
     expect(document.body.querySelector('[data-testid="sandbox-setup-progress"]')?.textContent)
-      .toContain('Requesting administrator approval')
+      .toContain('Confirm the Windows prompt to continue.')
     expect(document.body.querySelector<HTMLButtonElement>('[data-testid="sandbox-setup-continue"]')?.disabled)
       .toBe(true)
 
@@ -376,7 +376,54 @@ describe('SandboxSettingsPanel', () => {
     await settle()
 
     expect(document.body.querySelector('[data-testid="sandbox-setup-progress"]')?.textContent)
-      .toContain('Setting up file and network protection')
+      .toContain('OpenSquilla is completing Safe mode setup. Keep the app open.')
+    expect(document.body.querySelector('[data-testid="sandbox-setup-confirm"]')).toBeTruthy()
+
+    await vi.advanceTimersByTimeAsync(10_000)
+    await settle()
+
+    expect(document.body.querySelector('[data-testid="sandbox-setup-progress"]')?.textContent)
+      .toContain('First-time setup can take a few minutes. Verification will run automatically.')
+
+    resolveEnsure({
+      state: 'ready',
+      platform: 'win32',
+      message: 'Sandbox setup is ready.',
+      requiresAdmin: false,
+    })
+    await settle()
+
+    expect(document.body.querySelector('[data-testid="sandbox-setup-progress"]')).toBeNull()
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('keeps the original setup progress active after same-tick repeated Continue clicks', async () => {
+    vi.useFakeTimers()
+    let resolveEnsure!: (value: unknown) => void
+    const ensure = new Promise<unknown>((resolve) => {
+      resolveEnsure = resolve
+    })
+    const { el } = await mountPanel({ setupState: 'not_setup', ensure })
+
+    el.querySelector<HTMLButtonElement>('[data-testid="sandbox-safe-mode"]')!.click()
+    await settle()
+    const continueButton = document.body.querySelector<HTMLButtonElement>(
+      '[data-testid="sandbox-setup-continue"]',
+    )!
+    continueButton.click()
+    continueButton.click()
+    await settle()
+
+    expect(document.body.querySelector('[data-testid="sandbox-setup-progress"]')?.textContent)
+      .toContain('Confirm the Windows prompt to continue.')
+    expect(document.body.querySelector('[data-testid="sandbox-setup-confirm"]')).toBeTruthy()
+    expect(vi.getTimerCount()).toBe(1)
+
+    await vi.advanceTimersByTimeAsync(5_000)
+    await settle()
+
+    expect(document.body.querySelector('[data-testid="sandbox-setup-progress"]')?.textContent)
+      .toContain('OpenSquilla is completing Safe mode setup. Keep the app open.')
     expect(document.body.querySelector('[data-testid="sandbox-setup-confirm"]')).toBeTruthy()
 
     resolveEnsure({

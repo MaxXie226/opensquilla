@@ -477,9 +477,9 @@
         "description": "OpenSquilla needs one administrator approval to create an isolated account and configure file and network protection. This is only needed for first-time setup or repair.",
         "continue": "Continue",
         "configuring": "Configuring…",
-        "requestingApproval": "Requesting administrator approval…",
-        "configuringProtection": "Setting up file and network protection…",
-        "takingLonger": "Still working — this can take a few minutes.",
+        "requestingApproval": "Confirm the Windows prompt to continue.",
+        "configuringProtection": "OpenSquilla is completing Safe mode setup. Keep the app open.",
+        "takingLonger": "First-time setup can take a few minutes. Verification will run automatically.",
         "cancelled": "Setup was cancelled. Full Access is unchanged; you can try again anytime.",
         "failed": "Safe mode could not be configured. Full Access is unchanged; please try again.",
         "verificationFailed": "Setup finished, but the live safety check did not pass. Full Access is unchanged; please try again."
