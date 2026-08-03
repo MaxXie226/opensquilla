@@ -1,7 +1,11 @@
 <template>
   <div
     class="chat"
-    :class="{ 'chat--new-landing': isNewChatLanding, 'chat--drag-over': threadDragOver }"
+    :class="{
+      'chat--new-landing': isNewChatLanding,
+      'chat--drag-over': threadDragOver,
+      'chat--plan-questionnaire-open': Boolean(dockedPlanQuestionnaire),
+    }"
     @dragenter="onChatDragEnter"
     @dragover="onChatDragOver"
     @dragleave="onChatDragLeave"
@@ -207,16 +211,16 @@
           />
         </template>
 
-        <!-- Streaming AI message: activity stays open and flat while the turn
-             is live. The trailing text segment is rendered below it as the
-             current answer candidate; if a later tool starts, that text moves
-             back into the chronological activity transcript. -->
+        <!-- Streaming AI message: activity stays open while the turn is live.
+             Gateway-marked intermediate text remains in the transcript, while
+             gateway-marked answer text streams below the activity boundary. -->
         <!-- No blanket aria-live here: the phase label inside ActivityDisclosure
              is the single live announcement point, so streaming DOM churn (tool
              rows, answer tokens) is not read out mutation-by-mutation. -->
         <div v-if="isStreaming && streamBubble && answerRevealOpen" class="msg-ai" data-history-role="assistant">
           <div class="msg-ai-main">
             <ActivityDisclosure
+              default-open
               :lifecycle="liveAnswerPart ? 'answering' : 'working'"
               :step-count="executionDockRun?.status === 'running' ? 0 : liveActivityStepCount"
               :failure-count="liveActivityFailureCount"
@@ -263,19 +267,15 @@
               </AssistantActivityTimeline>
             </ActivityDisclosure>
 
-            <!-- Provisional answer candidate: the left rule + draft tag mark
-                 it as not-final, because a later tool start moves this text
-                 back into the activity transcript. The tag sits outside the
-                 candidate box so the candidate's own text stays the answer. -->
-            <template v-if="liveAnswerPart">
-              <span class="live-answer-candidate-tag">{{ t('chat.metaRuns.draft') }}</span>
-              <div class="live-answer-candidate">
-                <TextPart
-                  :part="liveAnswerPart"
-                  :sources="[]"
-                />
-              </div>
-            </template>
+            <!-- The gateway marks text as intermediate or answer. Only the
+                 semantic answer span streams below the activity boundary; no
+                 timeout or draft heuristic is involved. -->
+            <div v-if="liveAnswerPart" class="live-answer">
+              <TextPart
+                :part="liveAnswerPart"
+                :sources="[]"
+              />
+            </div>
             <span
               v-if="liveAnswerPart && !streamActivityStale"
               class="stream-caret"
@@ -449,7 +449,7 @@
         :key="cmd.cmd"
         class="chat-slash-item"
         :class="{ 'chat-slash-item--active': i === slashIdx }"
-        @click="selectSlashCmd(cmd)"
+        @click="completeSlashCmd(cmd)"
       >
         <span class="chat-slash-cmd">{{ cmd.cmd }}</span>
         <span class="chat-slash-desc" :title="cmd.desc">{{ cmd.desc }}</span>
@@ -467,6 +467,21 @@
       @steer="steerPendingMessage"
     />
 
+    <div
+      v-if="dockedPlanQuestionnaire"
+      class="plan-questionnaire-dock"
+      @wheel="handlePlanQuestionnaireWheel"
+    >
+      <ClarifyCard
+        :request="dockedPlanQuestionnaire"
+        :submitted="clarifySubmitted"
+        :busy="clarifyBusy"
+        :error="clarifyError"
+        :docked="true"
+        @submit="submitClarify"
+      />
+    </div>
+
     <ChatComposer
       ref="composerRef"
       v-model="inputText"
@@ -480,12 +495,15 @@
       :placeholder="composerPlaceholder"
       :send-button-title="sendButtonTitle"
       :send-blocked-message="composerSendBlockedMessage"
+      :input-disabled="Boolean(dockedPlanQuestionnaire)"
       :run-mode="runMode"
       :allowed-run-modes="allowedRunModes"
       :run-mode-locked="runModeLocked"
       :run-mode-lock-message="t('chat.composer.runModeLocked')"
       :model-routing-mode="modelRoutingMode"
       :model-routing-settings-busy="modelRoutingSettingsBusy"
+      :coding-mode-enabled="codingModeEnabled"
+      :coding-mode-settings-busy="codingModeSettingsBusy"
       :voice-busy="voiceBusy"
       :voice-recording="voiceRecording"
       :voice-ready="voiceReady"
@@ -510,6 +528,7 @@
       @set-busy-send-mode="busySendMode = $event"
       @set-run-mode="setComposerRunMode"
       @set-model-routing-mode="setComposerModelRoutingMode"
+      @set-coding-mode-enabled="setComposerCodingModeEnabled"
       @set-collaboration-mode="setCollaborationMode"
       @cancel-replan="cancelPlanRevision"
       @voice-input="onVoiceInput"
@@ -739,6 +758,7 @@ import {
 import { isShareableChatMessage } from '@/utils/chat/messageIdentity'
 import { agentIdFromSessionKey } from '@/utils/chat/sessionKeys'
 import { shouldDisableLandingSuggestions } from '@/utils/chat/landingSuggestions'
+import { handoffPlanQuestionnaireWheel } from '@/utils/chat/planQuestionnaireWheel'
 import { clearAssistantActivityExpansionState } from '@/utils/chat/activityDisclosureState'
 import {
   resolveChatHistoryRecoveryState,
@@ -1175,6 +1195,7 @@ const {
   routerVisualEffectsEnabled,
   routerVisualMode,
   codingModeEnabled,
+  codingModeSettingsBusy,
   routerTierConfigs,
   loadFeatureToggles,
   setModelRoutingMode,
@@ -1764,7 +1785,8 @@ const {
   loadSlashCommands,
   handleSlashInput,
   closeSlashMenu,
-  selectSlashCmd,
+  completeSlashCmd,
+  activateSlashCmd,
   executeSlashCommand,
 } = chatSlashCommands
 
@@ -1781,7 +1803,8 @@ const chatComposerShortcuts = useChatComposerShortcuts({
   autoResizeTextarea,
   handleSlashInput,
   closeSlashMenu,
-  selectSlashCmd,
+  completeSlashCmd,
+  activateSlashCmd,
   popPendingTail,
   enqueuePendingInput,
   sendCurrentInput: () => sendCurrentInput(),
@@ -2007,6 +2030,16 @@ const {
 } = chatApprovals
 applyPendingUserInputSnapshot = applyUserInputBootstrap
 
+const dockedPlanQuestionnaire = computed(() => (
+  pendingClarify.value?.presentation === 'plan_questionnaire_v1'
+    ? pendingClarify.value
+    : null
+))
+
+function handlePlanQuestionnaireWheel(event: WheelEvent) {
+  handoffPlanQuestionnaireWheel(event, threadRef.value)
+}
+
 const rpcEventHandlers = useChatRpcEventHandlers({
   sessionKey,
   currentEpoch,
@@ -2062,7 +2095,9 @@ watchEffect(() => assertLiveParity(streamThinkingText))
 const liveTimelineItems = computed(() =>
   foldLiveTurnMode.value === true ? foldedTurn.value.timelineItems : streamTimelineItems.value,
 )
-const liveTimelineSplit = computed(() => splitLiveAssistantTimeline(liveTimelineItems.value))
+const liveTimelineSplit = computed(() => splitLiveAssistantTimeline(liveTimelineItems.value, {
+  keepToolTurnTextInActivity: true,
+}))
 const liveAnswerPart = computed<Extract<ChatPart, { type: 'text' }> | null>(() => {
   const candidate = liveTimelineSplit.value.answerItem
   if (!candidate) return null
@@ -2377,6 +2412,7 @@ const showConfirmedEmptySession = computed(() => shouldShowConfirmedEmptySession
 }))
 
 const composerPlaceholder = computed(() => {
+  if (dockedPlanQuestionnaire.value) return t('chat.clarify.answerPlanQuestionnaire')
   if (replanActive.value) return t('chat.plan.revisePromptPlaceholder')
   if (collaboration.value.mode === 'plan') return t('chat.planMode.placeholder')
   if (isNewChatLanding.value) return t('chat.placeholderLanding')
@@ -2621,6 +2657,15 @@ async function setComposerRunMode(mode: SandboxRunMode) {
 async function setComposerModelRoutingMode(mode: ModelRoutingMode) {
   await setModelRoutingMode(mode)
   scheduleHistorySync()
+}
+
+async function setComposerCodingModeEnabled(enabled: boolean) {
+  const updated = await setCodingModeEnabled(enabled)
+  pushToast(t(
+    updated
+      ? (enabled ? 'chat.codingMode.enabled' : 'chat.codingMode.disabled')
+      : 'chat.codingMode.updateFailed',
+  ))
 }
 
 // A suggestion chip is an explicit task choice. Route it through the same
