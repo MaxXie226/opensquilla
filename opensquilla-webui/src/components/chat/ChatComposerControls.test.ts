@@ -50,6 +50,11 @@ describe('ChatComposer control hierarchy', () => {
       .toBe('在沙箱中运行，并遵循你的安全规则。')
   })
 
+  it('offers Safe from the composer only after sandbox setup is ready', () => {
+    expect(viewSource).toContain("status.state !== 'ready'")
+    expect(viewSource).toContain("allowedRunModes.value.filter((mode) => mode !== 'safe')")
+  })
+
   it('moves visual effects to Appearance settings', () => {
     expect(appearanceSource).toContain('settings.appearance.visualEffectsLabel')
     expect(appearanceSource).toContain('name="appearance_visual_effects"')

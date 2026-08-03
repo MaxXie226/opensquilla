@@ -953,7 +953,7 @@ const composerAllowedRunModes = computed<SandboxRunMode[]>(() => {
   const status = sandboxSetupStatus.value
   if (
     status !== null
-    && (status.state === 'failed' || status.state === 'unavailable')
+    && status.state !== 'ready'
   ) {
     return allowedRunModes.value.filter((mode) => mode !== 'safe')
   }
