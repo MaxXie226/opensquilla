@@ -7,6 +7,7 @@ import hashlib
 import inspect
 import json
 import time
+import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -16,6 +17,7 @@ import structlog
 
 from opensquilla.env import trust_env as _trust_env
 from opensquilla.provider.app_attribution import provider_app_headers
+from opensquilla.provider.failures import classify_provider_error
 from opensquilla.provider.protocol import provider_connection_config
 from opensquilla.provider.tokenrhythm_correlation import (
     tokenrhythm_correlation_headers,
@@ -27,6 +29,7 @@ from opensquilla.provider.types import (
     Message,
     ReasoningDeltaEvent,
     TextDeltaEvent,
+    derive_provider_request_correlation,
 )
 from opensquilla.redaction import redact_error_text
 from opensquilla.session.compaction_deployment import (
@@ -1390,6 +1393,37 @@ class _CompactionProviderError(RuntimeError):
     """Internal marker for a provider ErrorEvent."""
 
 
+def _report_compaction_credential_failure(
+    deployment: CompactionExecutionTarget,
+    event: ErrorEvent,
+) -> None:
+    reporter = deployment.credential_pool_failure_reporter
+    if (
+        reporter is None
+        or not deployment.credential_pool_provider
+        or not deployment.credential_pool_session_key
+    ):
+        return
+    try:
+        code = str(event.code or "")
+        kind = classify_provider_error(
+            provider_name=deployment.provider_id,
+            status_code=int(code) if code.isdigit() else None,
+            raw_code=code,
+            message=str(event.message or ""),
+        )
+        reporter(
+            deployment.credential_pool_provider,
+            deployment.credential_pool_session_key,
+            kind,
+        )
+    except Exception:  # noqa: BLE001 - credential bookkeeping only
+        log.debug(
+            "compaction.credential_pool_report_failed",
+            provider=deployment.credential_pool_provider,
+        )
+
+
 async def call_compaction_provider(
     chunk_text: str,
     identifier_instruction: str,
@@ -1495,6 +1529,8 @@ async def call_compaction_provider(
             async for event in accounted_stream:
                 if isinstance(event, ErrorEvent) or getattr(event, "kind", "") == "error":
                     message = str(getattr(event, "message", "") or "provider error")
+                    if isinstance(event, ErrorEvent):
+                        _report_compaction_credential_failure(deployment, event)
                     raise _CompactionProviderError(message)
                 if isinstance(event, TextDeltaEvent) or getattr(event, "kind", "") == "text_delta":
                     text = str(getattr(event, "text", "") or "")
@@ -2030,7 +2066,10 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
                 llm_kwargs: dict[str, Any] = {}
                 if request.provider_request_correlation is not None:
                     llm_kwargs["provider_request_correlation"] = (
-                        request.provider_request_correlation
+                        derive_provider_request_correlation(
+                            request.provider_request_correlation,
+                            execution_id=uuid.uuid4().hex,
+                        )
                     )
                 require_compaction_time(cfg, phase="summarizing")
                 remaining = compaction_remaining_seconds(cfg)
@@ -2062,7 +2101,10 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
             legacy_llm_kwargs: dict[str, Any] = {}
             if request.provider_request_correlation is not None:
                 legacy_llm_kwargs["provider_request_correlation"] = (
-                    request.provider_request_correlation
+                    derive_provider_request_correlation(
+                        request.provider_request_correlation,
+                        execution_id=uuid.uuid4().hex,
+                    )
                 )
             require_compaction_time(cfg, phase="summarizing")
             remaining = compaction_remaining_seconds(cfg)

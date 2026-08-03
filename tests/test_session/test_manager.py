@@ -2963,6 +2963,74 @@ async def test_inline_compaction_preserves_queued_append_only_suffix(manager):
 
 
 @pytest.mark.asyncio
+async def test_inline_compaction_preserves_metadata_from_concurrent_suffix_append(
+    manager,
+    monkeypatch,
+):
+    node = await manager.create("agent:main:inline-concurrent-metadata")
+    old_user = await manager.append_message(node.session_key, "user", "old question")
+    await manager.append_message(node.session_key, "assistant", "old answer")
+    active_user = await manager.append_message(node.session_key, "user", "active request")
+    source = await manager.capture_compaction_source(
+        node.session_key,
+        boundary_message_id=active_user.message_id,
+    )
+    before = await manager._storage.get_session(node.session_key)
+    assert before is not None
+    before.total_tokens = 100
+    before.total_tokens_fresh = True
+    await manager._storage.upsert_session(before)
+
+    original_rewrite = manager._storage.rewrite_compacted_session
+    append_metadata: dict[str, Any] = {}
+
+    async def rewrite_after_concurrent_append(**kwargs):
+        appended = await manager.append_message(
+            node.session_key,
+            "user",
+            "queued after compaction snapshot",
+            token_count=17,
+        )
+        concurrent = await manager._storage.get_session(node.session_key)
+        assert concurrent is not None
+        append_metadata["updated_at"] = concurrent.updated_at
+        append_metadata["message_id"] = appended.message_id
+        return await original_rewrite(**kwargs)
+
+    monkeypatch.setattr(
+        manager._storage,
+        "rewrite_compacted_session",
+        rewrite_after_concurrent_append,
+    )
+
+    installed = await manager.persist_compaction_result(
+        node.session_key,
+        "summary of the old exchange",
+        [{"role": "user", "content": "active request"}],
+        compaction_id="cmp-inline-concurrent-metadata",
+        removed_count=2,
+        source_entries=source.entries,
+        source_preimage=source.preimage,
+        source_boundary_message_id=source.boundary_message_id,
+        source_boundary_entry_id=source.boundary_entry_id,
+    )
+
+    assert installed is True
+    current = await manager._storage.get_session(node.session_key)
+    assert current is not None
+    assert current.total_tokens == 117
+    assert current.total_tokens_fresh is False
+    assert current.updated_at >= append_metadata["updated_at"]
+    assert current.compaction_count == 1
+    transcript = await manager.get_transcript(node.session_key)
+    assert [entry.message_id for entry in transcript] == [
+        active_user.message_id,
+        append_metadata["message_id"],
+    ]
+    assert old_user.message_id not in {entry.message_id for entry in transcript}
+
+
+@pytest.mark.asyncio
 async def test_inline_compaction_rejects_stale_source_without_partial_install(manager):
     node = await manager.create("agent:main:inline-stale-source")
     old_user = await manager.append_message(node.session_key, "user", "old question")

@@ -6,7 +6,7 @@ import hashlib
 import hmac
 import json
 import secrets
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -105,6 +105,13 @@ class CompactionExecutionTarget:
     deployment_fingerprint: str = ""
     portable: bool = True
     source: str = "active_provider"
+    credential_pool_provider: str = field(default="", repr=False)
+    credential_pool_session_key: str = field(default="", repr=False)
+    credential_pool_failure_reporter: Callable[[str, str, Any], None] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         if not callable(getattr(self.provider, "chat", None)):
@@ -386,6 +393,7 @@ def resolve_compaction_execution_plan(
     context_window_tokens: int = 0,
     session_key: str = "",
     credential_pool_acquirer: CredentialPoolAcquirer | None = None,
+    credential_pool_failure_reporter: Callable[[str, str, Any], None] | None = None,
 ) -> CompactionExecutionPlan | None:
     """Freeze the ordered physical targets for one compaction operation.
 
@@ -398,7 +406,12 @@ def resolve_compaction_execution_plan(
     candidates: list[CompactionExecutionTarget] = []
     seen: set[str] = set()
 
-    def add_config(config: ProviderConfig | None, *, source: str) -> None:
+    def add_config(
+        config: ProviderConfig | None,
+        *,
+        source: str,
+        credential_pool: object | None = None,
+    ) -> None:
         if config is None:
             return
         try:
@@ -414,40 +427,64 @@ def resolve_compaction_execution_plan(
         except Exception:
             return
         target = plan.primary
+        if isinstance(credential_pool, Mapping):
+            pool_provider = str(credential_pool.get("provider") or "").strip()
+            pool_session_key = str(credential_pool.get("session_key") or "").strip()
+            if pool_provider and pool_session_key:
+                target = replace(
+                    target,
+                    credential_pool_provider=pool_provider,
+                    credential_pool_session_key=pool_session_key,
+                    credential_pool_failure_reporter=(
+                        credential_pool_failure_reporter
+                    ),
+                )
         if target.deployment_fingerprint in seen:
             return
         seen.add(target.deployment_fingerprint)
         candidates.append(target)
 
     def add_identity(identity: CompactionDeploymentIdentity) -> None:
+        resolution_metadata: dict[str, Any] = {}
         resolution = resolve_provider_deployment(
             app_config,
             identity.provider_id,
             identity.model,
             inherited_provider_config=active_provider_config,
             session_key=session_key,
+            turn_metadata=resolution_metadata,
             replay_provider_state=False,
             credential_pool_acquirer=credential_pool_acquirer,
         )
         if resolution.ready:
-            add_config(resolution.provider_config, source=identity.source)
+            add_config(
+                resolution.provider_config,
+                source=identity.source,
+                credential_pool=resolution_metadata.get("credential_pool"),
+            )
 
     explicit_provider = str(
         getattr(compaction_config, "provider", "") or ""
     ).strip()
     explicit_model = str(getattr(compaction_config, "model", "") or "").strip()
     if explicit_provider and explicit_model:
+        resolution_metadata: dict[str, Any] = {}
         resolution = resolve_provider_deployment(
             app_config,
             explicit_provider,
             explicit_model,
             inherited_provider_config=active_provider_config,
             session_key=session_key,
+            turn_metadata=resolution_metadata,
             replay_provider_state=False,
             credential_pool_acquirer=credential_pool_acquirer,
         )
         if resolution.ready:
-            add_config(resolution.provider_config, source="explicit")
+            add_config(
+                resolution.provider_config,
+                source="explicit",
+                credential_pool=resolution_metadata.get("credential_pool"),
+            )
     elif explicit_model and active_provider_config is not None:
         add_config(
             replace(

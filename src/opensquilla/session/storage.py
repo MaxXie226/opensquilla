@@ -8123,23 +8123,49 @@ class SessionStorage:
                         entry_values,
                     )
 
-            node_data = node.model_dump()
-            node_cols = list(node_data.keys())
-            node_placeholders = ", ".join("?" for _ in node_cols)
-            node_updates: list[str] = []
-            for col in node_cols:
-                if col == "session_key":
-                    continue
-                if col == "epoch":
-                    node_updates.append("epoch = MAX(sessions.epoch, excluded.epoch)")
-                else:
-                    node_updates.append(f"{col}=excluded.{col}")
-            node_values = [_serialize(node_data[c]) for c in node_cols]
-            await conn.execute(
-                f"INSERT INTO sessions ({', '.join(node_cols)}) VALUES ({node_placeholders}) "
-                f"ON CONFLICT(session_key) DO UPDATE SET {', '.join(node_updates)}",
-                node_values,
-            )
+            if preserve_surviving_rows:
+                # A suffix append is allowed after the frozen source boundary.
+                # Its transaction has already advanced token totals/freshness
+                # and updated_at, so never replace those fields from the stale
+                # node snapshot captured before compaction began.
+                async with conn.execute(
+                    """
+                    UPDATE sessions
+                    SET compaction_count = MAX(compaction_count, ?),
+                        updated_at = MAX(updated_at, ?)
+                    WHERE session_key = ? AND session_id = ? AND epoch = ?
+                    """,
+                    (
+                        node.compaction_count,
+                        node.updated_at,
+                        node.session_key,
+                        node.session_id,
+                        node.epoch,
+                    ),
+                ) as cur:
+                    if (cur.rowcount or 0) != 1:
+                        raise RuntimeError(
+                            "session changed while committing compaction metadata"
+                        )
+            else:
+                node_data = node.model_dump()
+                node_cols = list(node_data.keys())
+                node_placeholders = ", ".join("?" for _ in node_cols)
+                node_updates: list[str] = []
+                for col in node_cols:
+                    if col == "session_key":
+                        continue
+                    if col == "epoch":
+                        node_updates.append("epoch = MAX(sessions.epoch, excluded.epoch)")
+                    else:
+                        node_updates.append(f"{col}=excluded.{col}")
+                node_values = [_serialize(node_data[c]) for c in node_cols]
+                await conn.execute(
+                    f"INSERT INTO sessions ({', '.join(node_cols)}) "
+                    f"VALUES ({node_placeholders}) "
+                    f"ON CONFLICT(session_key) DO UPDATE SET {', '.join(node_updates)}",
+                    node_values,
+                )
         return True
 
     @_serialized_read

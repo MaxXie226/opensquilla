@@ -3967,6 +3967,7 @@ class TurnRunner:
             )
             from opensquilla.engine.selector_override import (
                 acquire_profile_credential,
+                report_profile_credential_failure,
             )
 
             previous_deployment_identities: list[CompactionDeploymentIdentity] = []
@@ -4067,6 +4068,7 @@ class TurnRunner:
                 context_window_tokens=compaction_context_window_tokens,
                 session_key=session_key,
                 credential_pool_acquirer=acquire_profile_credential,
+                credential_pool_failure_reporter=report_profile_credential_failure,
             )
 
             def _refresh_compaction_plan_for_operation() -> Any | None:
@@ -4114,6 +4116,9 @@ class TurnRunner:
                     context_window_tokens=fresh_window,
                     session_key=session_key,
                     credential_pool_acquirer=acquire_profile_credential,
+                    credential_pool_failure_reporter=(
+                        report_profile_credential_failure
+                    ),
                 )
 
             stable_consumer_window_tokens = compaction_context_window_tokens

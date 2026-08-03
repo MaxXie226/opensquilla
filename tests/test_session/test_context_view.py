@@ -282,3 +282,52 @@ def test_rolling_context_state_supersedes_older_checkpoint_chain() -> None:
     assert "replacement checkpoint" in rendered
     assert "obsolete checkpoint" not in rendered
     assert "obsolete summary fallback" not in rendered
+
+
+def test_invalid_replacement_state_preserves_prior_context_and_text_fallback() -> None:
+    older = SessionContextState(
+        session_id="session",
+        session_key="agent:main:ctx",
+        provider="portable",
+        state_kind="structured_summary_v1",
+        payload={
+            "schema_version": 1,
+            "current_status": "still usable prior checkpoint",
+        },
+        covered_through_id=5,
+        created_at=1000,
+        portable=True,
+        cacheable=True,
+    )
+    invalid_replacement = SessionContextState(
+        session_id="session",
+        session_key="agent:main:ctx",
+        provider="portable",
+        state_kind="structured_summary_v1",
+        payload={
+            "schema_version": {"invalid": True},
+            "current_status": "must not suppress fallbacks",
+            "source_coverage": {"replaces_prior_context": True},
+        },
+        covered_through_id=9,
+        created_at=2000,
+        portable=True,
+        cacheable=True,
+    )
+    replacement_text_fallback = SessionSummary(
+        session_id="session",
+        session_key="agent:main:ctx",
+        summary_text="usable replacement text fallback",
+        covered_through_id=9,
+    )
+
+    items = build_compaction_context_items(
+        context_states=[older, invalid_replacement],
+        summaries=[replacement_text_fallback],
+        now_ms=3000,
+    )
+
+    rendered = "\n".join(items)
+    assert "still usable prior checkpoint" in rendered
+    assert "usable replacement text fallback" in rendered
+    assert "must not suppress fallbacks" not in rendered

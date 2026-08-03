@@ -6,6 +6,9 @@ from typing import Any
 
 import pytest
 
+from opensquilla.gateway.config import GatewayConfig, LlmProviderProfile
+from opensquilla.gateway.llm_runtime import ProfileCredentialPools
+from opensquilla.provider.failures import ProviderFailureKind
 from opensquilla.provider.selector import ProviderConfig
 from opensquilla.session.compaction_deployment import (
     CompactionDeploymentIdentity,
@@ -112,6 +115,9 @@ def test_explicit_target_uses_runtime_credential_pool_acquirer(
         observed.append((provider, pool, session_key))
         return object()
 
+    def report_failure(provider: str, session_key: str, failure_kind: object) -> None:
+        observed.append((provider, session_key, failure_kind))
+
     def resolve(
         _app_config: object,
         _provider: str,
@@ -119,6 +125,14 @@ def test_explicit_target_uses_runtime_credential_pool_acquirer(
         **kwargs: Any,
     ) -> SimpleNamespace:
         observed.append(kwargs.get("credential_pool_acquirer"))
+        metadata = kwargs.get("turn_metadata")
+        assert isinstance(metadata, dict)
+        metadata["credential_pool"] = {
+            "provider": "openai",
+            "session_key": "session-pinned",
+            "env_name": "TEST_POOL_KEY",
+            "key_id": "masked-key-id",
+        }
         return SimpleNamespace(ready=True, provider_config=explicit)
 
     monkeypatch.setattr(
@@ -133,11 +147,70 @@ def test_explicit_target_uses_runtime_credential_pool_acquirer(
         compaction_config=SimpleNamespace(provider="openai", model="summary-model"),
         session_key="session-pinned",
         credential_pool_acquirer=acquire,
+        credential_pool_failure_reporter=report_failure,
     )
 
     assert plan is not None
     assert observed == [acquire]
     assert built_configs[0].api_key == "pooled-secret"
+    assert plan.primary.credential_pool_provider == "openai"
+    assert plan.primary.credential_pool_session_key == "session-pinned"
+    assert plan.primary.credential_pool_failure_reporter is report_failure
+    assert "session-pinned" not in repr(plan.primary)
+    assert "masked-key-id" not in repr(plan.primary)
+
+
+def test_pooled_compaction_failure_rotates_key_on_next_plan(
+    monkeypatch: pytest.MonkeyPatch,
+    built_configs: list[ProviderConfig],
+) -> None:
+    env_a = "OPENSQUILLA_TEST_COMPACTION_POOL_A"
+    env_b = "OPENSQUILLA_TEST_COMPACTION_POOL_B"
+    secret_a = "sk-test-compaction-pool-a"
+    secret_b = "sk-test-compaction-pool-b"
+    monkeypatch.setenv(env_a, secret_a)
+    monkeypatch.setenv(env_b, secret_b)
+    config = GatewayConfig()
+    config.llm_profiles = {
+        "openai": LlmProviderProfile(api_key_env_pool=[env_a, env_b])
+    }
+    pools = ProfileCredentialPools()
+
+    def acquire(provider: str, names: list[str], session_key: str):
+        return pools.acquire_for_session(provider, names, session_key)
+
+    first = resolve_compaction_execution_plan(
+        app_config=config,
+        active_provider=None,
+        active_provider_config=None,
+        compaction_config=SimpleNamespace(provider="openai", model="gpt-5.4-nano"),
+        session_key="session-pinned",
+        credential_pool_acquirer=acquire,
+        credential_pool_failure_reporter=pools.report_failure,
+    )
+    assert first is not None
+    first_key = built_configs[-1].api_key
+    assert first_key in {secret_a, secret_b}
+    assert first.primary.credential_pool_failure_reporter is not None
+
+    first.primary.credential_pool_failure_reporter(
+        first.primary.credential_pool_provider,
+        first.primary.credential_pool_session_key,
+        ProviderFailureKind.AUTH_INVALID,
+    )
+    second = resolve_compaction_execution_plan(
+        app_config=config,
+        active_provider=None,
+        active_provider_config=None,
+        compaction_config=SimpleNamespace(provider="openai", model="gpt-5.4-nano"),
+        session_key="session-pinned",
+        credential_pool_acquirer=acquire,
+        credential_pool_failure_reporter=pools.report_failure,
+    )
+
+    assert second is not None
+    assert built_configs[-1].api_key in {secret_a, secret_b}
+    assert built_configs[-1].api_key != first_key
 
 
 def test_model_only_override_stays_on_current_provider(

@@ -11,6 +11,7 @@ from opensquilla.engine.usage_accounting import (
     UsageExecutionContext,
     bind_usage_accounting_scope,
 )
+from opensquilla.provider.failures import ProviderFailureKind
 from opensquilla.provider.protocol import ProviderConnectionConfig, ProviderMetadata
 from opensquilla.provider.selector import ProviderConfig, build_provider_from_config
 from opensquilla.provider.types import (
@@ -371,6 +372,42 @@ async def test_provider_error_returns_none_and_closes_stream() -> None:
     result = await call_compaction_provider("old", "", plan)
 
     assert result is None
+    assert provider.streams[0].closed is True
+
+
+@pytest.mark.asyncio
+async def test_pooled_provider_auth_failure_is_reported_for_rotation() -> None:
+    provider = _Provider(
+        lambda: _Stream([ErrorEvent(message="invalid API key", code="401")])
+    )
+    reported: list[tuple[str, str, ProviderFailureKind]] = []
+
+    def report_failure(
+        provider_id: str,
+        session_key: str,
+        failure_kind: ProviderFailureKind,
+    ) -> None:
+        reported.append((provider_id, session_key, failure_kind))
+
+    plan = CompactionExecutionPlan(
+        candidates=(
+            CompactionExecutionTarget(
+                provider=provider,
+                provider_id="openai",
+                model="provider/model",
+                credential_pool_provider="openai",
+                credential_pool_session_key="session-pinned",
+                credential_pool_failure_reporter=report_failure,
+            ),
+        )
+    )
+
+    result = await call_compaction_provider("old", "", plan)
+
+    assert result is None
+    assert reported == [
+        ("openai", "session-pinned", ProviderFailureKind.AUTH_INVALID)
+    ]
     assert provider.streams[0].closed is True
 
 

@@ -231,7 +231,7 @@ async def test_message_count_compaction_uses_exact_forced_prefix_within_token_bu
 
 
 @pytest.mark.asyncio
-async def test_compaction_request_passes_explicit_correlation_to_every_chunk(
+async def test_compaction_request_derives_unique_correlation_for_every_physical_call(
     monkeypatch,
 ) -> None:
     observed: list[ProviderRequestCorrelation | None] = []
@@ -261,8 +261,15 @@ async def test_compaction_request_passes_explicit_correlation_to_every_chunk(
         )
     )
 
-    assert observed
-    assert all(item is correlation for item in observed)
+    assert len(observed) == 2
+    assert all(item is not None for item in observed)
+    physical = [item for item in observed if item is not None]
+    assert all(item is not correlation for item in physical)
+    assert all(item.session_id == correlation.session_id for item in physical)
+    assert all(item.turn_id == correlation.turn_id for item in physical)
+    assert all(item.call_kind == correlation.call_kind for item in physical)
+    assert all(item.execution_id != correlation.execution_id for item in physical)
+    assert len({item.execution_id for item in physical}) == len(physical)
 
 
 @pytest.mark.asyncio

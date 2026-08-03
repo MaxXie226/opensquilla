@@ -518,43 +518,47 @@ def build_compaction_context_records(
     selected_states = latest_context_states_by_covered_through_id(
         structured_states
     )
-    replacement_index = next(
-        (
-            index
-            for index in range(len(selected_states) - 1, -1, -1)
-            if _replaces_prior_context(selected_states[index].payload)
-        ),
-        None,
-    )
-    replacement_active = replacement_index is not None
-    replacement_floor = 0
-    if replacement_index is not None:
-        selected_states = selected_states[replacement_index:]
-        replacement_floor = selected_states[0].covered_through_id
-
+    validated_states: list[tuple[SessionContextState, StructuredCompactionSummary, str]] = []
     for state in selected_states:
-        if state.covered_through_id in state_covered_ids:
-            continue
         try:
             structured = StructuredCompactionSummary.model_validate(state.payload)
         except Exception:
             continue
         rendered = render_structured_summary(structured)
         if rendered.strip():
-            compaction_id = None
-            if isinstance(state.payload, dict):
-                raw_compaction_id = state.payload.get("compaction_id")
-                if isinstance(raw_compaction_id, str) and raw_compaction_id.strip():
-                    compaction_id = raw_compaction_id.strip()
-            items.append(
-                CompactionContextItem(
-                    text=rendered,
-                    compaction_id=compaction_id,
-                    source="context_state",
-                    covered_through_id=state.covered_through_id,
-                )
+            validated_states.append((state, structured, rendered))
+
+    replacement_index = next(
+        (
+            index
+            for index in range(len(validated_states) - 1, -1, -1)
+            if _replaces_prior_context(validated_states[index][0].payload)
+        ),
+        None,
+    )
+    replacement_active = replacement_index is not None
+    replacement_floor = 0
+    if replacement_index is not None:
+        validated_states = validated_states[replacement_index:]
+        replacement_floor = validated_states[0][0].covered_through_id
+
+    for state, _structured, rendered in validated_states:
+        if state.covered_through_id in state_covered_ids:
+            continue
+        compaction_id = None
+        if isinstance(state.payload, dict):
+            raw_compaction_id = state.payload.get("compaction_id")
+            if isinstance(raw_compaction_id, str) and raw_compaction_id.strip():
+                compaction_id = raw_compaction_id.strip()
+        items.append(
+            CompactionContextItem(
+                text=rendered,
+                compaction_id=compaction_id,
+                source="context_state",
+                covered_through_id=state.covered_through_id,
             )
-            state_covered_ids.add(state.covered_through_id)
+        )
+        state_covered_ids.add(state.covered_through_id)
 
     for summary in summaries:
         if summary.covered_through_id in state_covered_ids:
