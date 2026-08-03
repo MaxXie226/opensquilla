@@ -7947,7 +7947,7 @@ async function startGateway(): Promise<GatewayState> {
 
   const child = spawn(
     runtime.command,
-    [...runtime.args, '--port', String(port), '--bind', '127.0.0.1', '--config', desktopConfigPath()],
+    [...runtime.args, '--port', String(port), '--listen', '127.0.0.1', '--config', desktopConfigPath()],
     {
       cwd: runtime.cwd,
       env: childEnv,

@@ -80,7 +80,12 @@ def test_desktop_owned_gateway_is_unconditionally_loopback_bound() -> None:
         "async function startGatewayWithPortRecovery",
     )
 
-    assert "'--bind', '127.0.0.1'" in start_gateway
+    # ``gateway run`` treats the default-looking ``--bind 127.0.0.1`` as
+    # unspecified so CLI users can inherit the TOML host.  Desktop must use
+    # the higher-precedence ``--listen`` flag; otherwise a legacy
+    # ``host = \"0.0.0.0\"`` silently makes the desktop-owned Gateway public.
+    assert "'--listen', '127.0.0.1'" in start_gateway
+    assert "'--bind', '127.0.0.1'" not in start_gateway
     assert "OPENSQUILLA_GATEWAY_HOST" not in start_gateway
     assert "OPENSQUILLA_LISTEN" not in start_gateway
     assert "'0.0.0.0'" not in start_gateway

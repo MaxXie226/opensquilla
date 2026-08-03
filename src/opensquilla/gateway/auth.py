@@ -265,6 +265,12 @@ def _private_or_unknown_peer(
         # Starlette's in-process test transport uses a symbolic peer name.
         # Real socket peers are always parsed IP literals at this boundary.
         return True
+    # ``allowed_client_cidrs`` is a remote-client allowlist.  It must not lock
+    # the desktop app out of its own loopback gateway.  Authority is still
+    # decided separately from the configured bind address below, so a
+    # loopback peer on a wildcard-bound gateway does not become an owner.
+    if address.is_loopback:
+        return True
     networks = (
         tuple(ipaddress.ip_network(value) for value in allowed_cidrs)
         if allowed_cidrs
