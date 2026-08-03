@@ -56,4 +56,3 @@ def test_staging_content_is_not_counted_as_committed_backup(tmp_path: Path) -> N
     assert vault.list_receipts() == ()
     staged.discard()
     assert not staged.staging_path.exists()
-

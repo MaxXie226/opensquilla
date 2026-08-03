@@ -90,4 +90,3 @@ def test_explicit_full_with_capability_does_not_probe_or_fallback() -> None:
 
     assert resolved.effective_mode is RunMode.FULL
     assert resolved.confirmation_required is False
-
