@@ -44,20 +44,22 @@ _WINDOWS_DENIAL_CANARY_SCRIPT = (
     'set "operation=%~1"\r\n'
     'set "target=%~2"\r\n'
     'set "marker=%~3"\r\n'
-    'if "%operation%"=="write" (\r\n'
-    '  >"%target%" echo changed\r\n'
-    ') else if "%operation%"=="read" (\r\n'
-    '  type "%target%" >nul 2>&1\r\n'
-    ") else (\r\n"
-    "  exit /b 90\r\n"
-    ")\r\n"
-    "if errorlevel 1 (\r\n"
-    "  echo %marker%\r\n"
-    "  exit /b 0\r\n"
-    ")\r\n"
-    "echo unexpected-%operation%\r\n"
-    'if "%operation%"=="write" exit /b 41\r\n'
+    'if "%operation%"=="write" goto try_write\r\n'
+    'if "%operation%"=="read" goto try_read\r\n'
+    "exit /b 90\r\n"
+    ":try_write\r\n"
+    'copy /y nul "%target%" >nul 2>&1\r\n'
+    "if errorlevel 1 goto denied\r\n"
+    "echo unexpected-write\r\n"
+    "exit /b 41\r\n"
+    ":try_read\r\n"
+    'type "%target%" >nul 2>&1\r\n'
+    "if errorlevel 1 goto denied\r\n"
+    "echo unexpected-read\r\n"
     "exit /b 42\r\n"
+    ":denied\r\n"
+    "echo %marker%\r\n"
+    "exit /b 0\r\n"
 )
 
 
@@ -245,6 +247,11 @@ def _exact_process_result(result: Any, marker: str) -> bool:
     )
 
 
+def _filesystem_probe_read_succeeded(message: object) -> bool:
+    normalized = str(message).rstrip("\r\n")
+    return normalized in {"worker-ok", "1\tworker-ok"}
+
+
 async def _probe_runtime_capabilities(
     config: Any,
     *,
@@ -292,7 +299,7 @@ async def _probe_runtime_capabilities(
         root = Path(raw_root)
         workspace = root / "workspace"
         authority = root / "authority"
-        protected = root / "protected"
+        protected = workspace / "protected"
         workspace.mkdir()
         authority.mkdir()
         protected.mkdir()
@@ -308,8 +315,14 @@ async def _probe_runtime_capabilities(
                 encoding="ascii",
                 newline="",
             )
+        # Capability probes run under a restricted token for the current user
+        # so they cannot disturb the shared offline account's ACL journal. A
+        # deny ACE added to a directory is inherited by new children, but
+        # Windows does not retroactively copy it to this pre-existing canary.
+        # Target the canary itself so this check measures live deny enforcement
+        # instead of directory inheritance timing.
         stored_policy = StoredSandboxPolicy(
-            files=FilePolicySettings(custom_deny_write_paths=[str(protected)])
+            files=FilePolicySettings(custom_deny_write_paths=[str(protected_target)])
         )
         profile = compile_safe_file_profile(
             stored_policy,
@@ -387,7 +400,7 @@ async def _probe_runtime_capabilities(
                 operation_id="capability-probe",
             )
         )
-        if read_result.message == "worker-ok":
+        if _filesystem_probe_read_succeeded(read_result.message):
             capabilities.add("filesystem-worker")
 
         deny_write = await backend_object.run(

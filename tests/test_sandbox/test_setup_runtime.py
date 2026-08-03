@@ -33,9 +33,11 @@ class _CapabilityBackend:
         *,
         transport_error_for: str | None = None,
         result_overrides: dict[str, tuple[int, str, str]] | None = None,
+        worker_read_message: str = "worker-ok",
     ) -> None:
         self.transport_error_for = transport_error_for
         self.result_overrides = result_overrides or {}
+        self.worker_read_message = worker_read_message
         self.process_actions: list[str] = []
         self.operation_paths: list[str] = []
 
@@ -96,7 +98,7 @@ class _CapabilityBackend:
             if self.transport_error_for == action:
                 raise RuntimeError(f"transport failed for {action}")
             raise PermissionError(f"legacy broker denial for {action}")
-        return SandboxOperationResult(message="worker-ok")
+        return SandboxOperationResult(message=self.worker_read_message)
 
 
 async def _live_report_for_backend(
@@ -201,6 +203,43 @@ def test_native_denial_canary_never_marks_an_allowed_windows_target_as_denied(
     assert setup_runtime._exact_process_result(result, marker) is False
     assert result.returncode == unexpected_exit
     assert result.stdout.strip() == f"unexpected-{operation}"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows ACL denial regression")
+def test_native_denial_canary_preserves_a_windows_write_failure(
+    tmp_path: Path,
+) -> None:
+    from opensquilla.sandbox import setup_runtime
+
+    target = tmp_path / "protected.txt"
+    target.write_text("unchanged", encoding="utf-8")
+    target.chmod(0o444)
+    launcher = tmp_path / "opensquilla-capability-canary.cmd"
+    launcher.write_text(
+        setup_runtime._WINDOWS_DENIAL_CANARY_SCRIPT,
+        encoding="ascii",
+        newline="",
+    )
+    argv = setup_runtime._native_denial_canary_argv(
+        target,
+        operation="write",
+        marker="opensquilla-deny-write-ok",
+        windows_launcher=launcher,
+    )
+
+    try:
+        result = subprocess.run(
+            argv,
+            cwd=tmp_path,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    finally:
+        target.chmod(0o666)
+
+    assert setup_runtime._exact_process_result(result, "opensquilla-deny-write-ok")
+    assert target.read_text(encoding="utf-8") == "unchanged"
 
 
 @pytest.mark.asyncio
@@ -696,6 +735,7 @@ async def test_live_capability_probe_scopes_file_profile_to_canary_workspace(
     captured: dict[str, object] = {}
 
     def compile_profile(*args: object, **kwargs: object) -> FileSystemPermissionProfile:
+        captured["stored_policy"] = args[0]
         captured.update(kwargs)
         return FileSystemPermissionProfile(entries=())
 
@@ -722,9 +762,27 @@ async def test_live_capability_probe_scopes_file_profile_to_canary_workspace(
     assert captured["home"] == captured["writable_roots"][0]
     assert captured["env"]["USERPROFILE"] == str(captured["home"])
     assert captured["env"]["HOME"] == str(captured["home"])
+    stored_policy = captured["stored_policy"]
+    deny_paths = getattr(getattr(stored_policy, "files"), "custom_deny_write_paths")
+    assert len(deny_paths) == 1
+    assert Path(deny_paths[0]).name == "must-remain.txt"
+    assert Path(deny_paths[0]).is_relative_to(Path(captured["home"]))
     assert backend.process_actions == [
         "capability.probe",
         "capability.probe.deny-write",
         "capability.probe.deny-read",
     ]
     assert backend.operation_paths == ["worker.txt", "worker.txt"]
+
+
+@pytest.mark.asyncio
+async def test_live_capability_probe_accepts_numbered_filesystem_worker_output(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    backend = _CapabilityBackend(worker_read_message="1\tworker-ok")
+
+    report = await _live_report_for_backend(monkeypatch, tmp_path, backend)
+
+    assert report.available is True
+    assert "filesystem-worker" in report.capabilities
