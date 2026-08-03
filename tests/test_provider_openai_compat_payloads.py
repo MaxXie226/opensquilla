@@ -396,6 +396,12 @@ def test_stream_timeout_fallback_preserves_tokenrhythm_correlation_headers(
             yield DoneEvent(model="deepseek-v4-flash")
 
     monkeypatch.setattr("opensquilla.provider.openai.httpx.AsyncClient", TimeoutClient)
+    monkeypatch.setattr(
+        "opensquilla.provider.openai.tokenrhythm_install_id_headers",
+        lambda _provider_kind, _base_url, **_kwargs: {
+            "X-OpenSquilla-Install-Id": "synthetic-install-id"
+        },
+    )
     provider = CapturingFallbackProvider(
         api_key="test",
         model="deepseek-v4-flash",
@@ -426,6 +432,78 @@ def test_stream_timeout_fallback_preserves_tokenrhythm_correlation_headers(
     }
     assert {name: stream_headers[name] for name in expected} == expected
     assert {name: fallback_headers[name] for name in expected} == expected
+    assert stream_headers["X-OpenSquilla-Install-Id"] == "synthetic-install-id"
+    assert fallback_headers["X-OpenSquilla-Install-Id"] == "synthetic-install-id"
+
+
+def test_stream_timeout_fallback_drops_stale_install_id_after_hot_disable(
+    monkeypatch: Any,
+) -> None:
+    captured_headers: dict[str, str] = {}
+    install_header_checks = 0
+
+    class FailingResponse:
+        status_code = 503
+        text = "synthetic fallback failure"
+        headers: dict[str, str] = {}
+
+    class CapturingClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> CapturingClient:
+            return self
+
+        async def __aexit__(self, *_exc: Any) -> None:
+            return None
+
+        async def post(self, _url: str, *, headers: dict[str, str], json: Any):
+            captured_headers.update(headers)
+            return FailingResponse()
+
+    monkeypatch.setattr("opensquilla.provider.openai.httpx.AsyncClient", CapturingClient)
+    def install_headers(
+        _provider_kind: str,
+        _base_url: str,
+        **_kwargs: Any,
+    ) -> dict[str, str]:
+        nonlocal install_header_checks
+        install_header_checks += 1
+        if install_header_checks == 1:
+            return {"X-OpenSquilla-Install-Id": "stale-install-id"}
+        return {}
+
+    monkeypatch.setattr(
+        "opensquilla.provider.openai.tokenrhythm_install_id_headers",
+        install_headers,
+    )
+    provider = OpenAIProvider(
+        api_key="test",
+        model="deepseek-v4-flash",
+        base_url="https://tokenrhythm.studio/v1",
+        provider_kind="tokenrhythm",
+    )
+
+    async def collect_fallback() -> list[Any]:
+        return [
+            event
+            async for event in provider._complete_non_stream(
+                payload={"model": "deepseek-v4-flash", "messages": [], "stream": True},
+                headers={
+                    "Authorization": "Bearer test",
+                    "X-OpenSquilla-Install-Id": "stale-install-id",
+                },
+                cfg=ChatConfig(timeout=1.0),
+                tools=None,
+                timeout_exc=httpx.ReadTimeout("synthetic timeout"),
+            )
+        ]
+
+    events = asyncio.run(collect_fallback())
+
+    assert install_header_checks == 2
+    assert "X-OpenSquilla-Install-Id" not in captured_headers
+    assert any(isinstance(event, ErrorEvent) for event in events)
 
 
 def test_dashscope_stream_timeout_emits_heartbeat_before_non_stream_fallback(
@@ -501,6 +579,12 @@ def test_tokenrhythm_chat_adds_app_attribution_headers(
 ) -> None:
     captured: dict[str, Any] = {}
     _patch_transport(monkeypatch, captured)
+    monkeypatch.setattr(
+        "opensquilla.provider.openai.tokenrhythm_install_id_headers",
+        lambda _provider_kind, _base_url, **_kwargs: {
+            "X-OpenSquilla-Install-Id": "synthetic-install-id"
+        },
+    )
     provider = OpenAIProvider(
         api_key="test",
         model="deepseek-v4-flash",
@@ -513,6 +597,67 @@ def test_tokenrhythm_chat_adds_app_attribution_headers(
     assert captured["url"] == expected_url
     assert captured["headers"].get("HTTP-Referer") == "https://opensquilla.ai"
     assert captured["headers"].get("X-Title") == "OpenSquilla"
+    assert (
+        captured["headers"].get("X-OpenSquilla-Install-Id")
+        == "synthetic-install-id"
+    )
+    assert "synthetic-install-id" not in json.dumps(captured["payload"], sort_keys=True)
+
+
+def test_tokenrhythm_chat_omits_install_id_with_explicit_proxy(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    helper_proxies: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["headers"] = request.headers
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_sse_body(),
+        )
+
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+
+    def patched_async_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        captured["client_proxy"] = kwargs.pop("proxy", None)
+        kwargs["transport"] = transport
+        return real_async_client(*args, **kwargs)
+
+    def install_headers(
+        _provider_kind: str,
+        _base_url: str,
+        *,
+        proxy: str | None = None,
+        **_kwargs: Any,
+    ) -> dict[str, str]:
+        helper_proxies.append(proxy)
+        return {} if proxy else {"X-OpenSquilla-Install-Id": "must-not-send"}
+
+    monkeypatch.setattr(
+        "opensquilla.provider.openai.httpx.AsyncClient",
+        patched_async_client,
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.openai.tokenrhythm_install_id_headers",
+        install_headers,
+    )
+    provider = OpenAIProvider(
+        api_key="test",
+        model="deepseek-v4-flash",
+        base_url="https://tokenrhythm.studio/v1",
+        provider_kind="tokenrhythm",
+        proxy="http://company-proxy.example:8080",
+    )
+
+    _collect(provider, ChatConfig())
+
+    assert captured["client_proxy"] == "http://company-proxy.example:8080"
+    assert helper_proxies
+    assert set(helper_proxies) == {"http://company-proxy.example:8080"}
+    assert "X-OpenSquilla-Install-Id" not in captured["headers"]
 
 
 def test_tokenrhythm_chat_adds_session_correlation_headers_only(
@@ -581,6 +726,12 @@ def test_tokenrhythm_chat_never_forwards_correlation_across_redirects(
         "opensquilla.provider.openai.httpx.AsyncClient",
         patched_async_client,
     )
+    monkeypatch.setattr(
+        "opensquilla.provider.openai.tokenrhythm_install_id_headers",
+        lambda _provider_kind, _base_url, **_kwargs: {
+            "X-OpenSquilla-Install-Id": "synthetic-install-id"
+        },
+    )
     provider = OpenAIProvider(
         api_key="test",
         model="deepseek-v4-flash",
@@ -611,6 +762,7 @@ def test_tokenrhythm_chat_never_forwards_correlation_across_redirects(
     assert client_options["follow_redirects"] is False
     assert len(requests) == 1
     assert requests[0].url.host == "tokenrhythm.studio"
+    assert requests[0].headers["X-OpenSquilla-Install-Id"] == "synthetic-install-id"
     assert requests[0].headers["X-OpenSquilla-Session-Id"] == "session-1"
     assert any(isinstance(event, ErrorEvent) for event in events)
 
@@ -667,6 +819,12 @@ def test_tokenrhythm_list_models_adds_app_attribution_headers(
             request=httpx.Request("GET", "https://tokenrhythm.studio/v1/models"),
         ),
     )
+    monkeypatch.setattr(
+        "opensquilla.provider.openai.tokenrhythm_install_id_headers",
+        lambda _provider_kind, _base_url, **_kwargs: {
+            "X-OpenSquilla-Install-Id": "synthetic-install-id"
+        },
+    )
     provider = OpenAIProvider(
         api_key="test",
         model="deepseek-v4-flash",
@@ -679,6 +837,10 @@ def test_tokenrhythm_list_models_adds_app_attribution_headers(
     assert captured["url"] == "https://tokenrhythm.studio/v1/models"
     assert captured["headers"].get("HTTP-Referer") == "https://opensquilla.ai"
     assert captured["headers"].get("X-Title") == "OpenSquilla"
+    assert (
+        captured["headers"].get("X-OpenSquilla-Install-Id")
+        == "synthetic-install-id"
+    )
 
 
 def test_openrouter_list_models_reports_openrouter_provider(monkeypatch: Any) -> None:

@@ -1447,7 +1447,7 @@
       "statusDisabled": "Los informes de red están desactivados.",
       "statusDisabledByEnv": "Los informes de red están desactivados por una variable de entorno.",
       "disableNetworkObservabilityLabel": "Desactivar los informes de red",
-      "disableNetworkObservabilityDesc": "Detiene la telemetría de instalación, las comprobaciones de actualizaciones en segundo plano y los identificadores anónimos que vinculan las solicitudes de una misma sesión — esos identificadores solo se envían a la API oficial de TokenRhythm. Tus propias solicitudes de modelo siguen funcionando.",
+      "disableNetworkObservabilityDesc": "Detiene la telemetría de instalación y de uso diario, las comprobaciones de actualizaciones en segundo plano, los identificadores seudónimos de sesión y la cabecera opcional X-OpenSquilla-Install-Id entre sesiones, enviada de forma predeterminada solo a la API HTTPS oficial de TokenRhythm. El ID de instalación persistente puede derivarse de datos MAC/IP locales; nunca se envían las direcciones originales. Los entornos CI/pruebas y la exclusión heredada de telemetría también lo suprimen; desactivar solo las actualizaciones no. Tus propias solicitudes de modelo siguen funcionando.",
       "memoryAutoCaptureLabel": "Captura automática de memoria",
       "memoryAutoCaptureDesc": "Permite que OpenSquilla guarde información útil de las conversaciones en la memoria a largo plazo.",
       "save": "Guardar privacidad"

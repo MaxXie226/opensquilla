@@ -1447,7 +1447,7 @@
       "statusDisabled": "Network reporting is off.",
       "statusDisabledByEnv": "Network reporting is off because an environment setting disables it.",
       "disableNetworkObservabilityLabel": "Turn off network reporting",
-      "disableNetworkObservabilityDesc": "Stops install telemetry, background update checks, and the anonymous identifiers that link requests from one session together — those identifiers are only ever sent to the official TokenRhythm API. Your own model requests keep working.",
+      "disableNetworkObservabilityDesc": "Stops install and daily usage telemetry, background update checks, pseudonymous session identifiers, and the optional cross-session X-OpenSquilla-Install-Id header sent by default only to the official TokenRhythm HTTPS API. That persisted ID may be derived from local MAC/IP data; raw addresses are never sent. CI/tests and the legacy telemetry opt-out also suppress it; the update-check opt-out alone does not. Your own model requests keep working.",
       "memoryAutoCaptureLabel": "Automatic memory capture",
       "memoryAutoCaptureDesc": "Allow OpenSquilla to save useful conversation highlights into long-term memory.",
       "save": "Save privacy"

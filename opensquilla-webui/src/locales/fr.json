@@ -1447,7 +1447,7 @@
       "statusDisabled": "Les rapports réseau sont désactivés.",
       "statusDisabledByEnv": "Les rapports réseau sont désactivés par une variable d'environnement.",
       "disableNetworkObservabilityLabel": "Désactiver les rapports réseau",
-      "disableNetworkObservabilityDesc": "Arrête la télémétrie d'installation, les vérifications de mise à jour en arrière-plan et les identifiants anonymes qui relient les requêtes d'une même session — ces identifiants ne sont envoyés qu'à l'API officielle TokenRhythm. Vos propres requêtes de modèle continuent de fonctionner.",
+      "disableNetworkObservabilityDesc": "Arrête la télémétrie d'installation et d'usage quotidien, les vérifications de mise à jour en arrière-plan, les identifiants pseudonymes de session et l'en-tête intersession facultatif X-OpenSquilla-Install-Id, envoyé par défaut uniquement à l'API HTTPS officielle de TokenRhythm. L'identifiant d'installation persistant peut être dérivé de données MAC/IP locales ; les adresses brutes ne sont jamais envoyées. Les environnements CI/test et l'ancien refus de télémétrie le suppriment aussi ; le refus des seules mises à jour ne le fait pas. Vos propres requêtes de modèle continuent de fonctionner.",
       "memoryAutoCaptureLabel": "Capture automatique de la mémoire",
       "memoryAutoCaptureDesc": "Autorise OpenSquilla à enregistrer les informations utiles des conversations dans la mémoire à long terme.",
       "save": "Enregistrer la confidentialité"

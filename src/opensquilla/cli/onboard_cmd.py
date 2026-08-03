@@ -450,8 +450,12 @@ def _probe_saved_provider(cfg) -> bool:
     import asyncio
 
     from opensquilla.onboarding.probe import probe_llm_provider
+    from opensquilla.provider.tokenrhythm_correlation import (
+        prewarm_tokenrhythm_install_id,
+    )
 
     llm = cfg.llm
+    prewarm_tokenrhythm_install_id(config=cfg)
     console.print(f"[{ACCENT_SOFT}]◆[/] Checking the connection…")
     try:
         result = asyncio.run(

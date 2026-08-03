@@ -16,7 +16,9 @@ from opensquilla.env import trust_env as _trust_env
 from opensquilla.provider.app_attribution import provider_app_headers
 from opensquilla.provider.protocol import provider_connection_config
 from opensquilla.provider.tokenrhythm_correlation import (
+    redact_tokenrhythm_install_ids,
     tokenrhythm_correlation_headers,
+    tokenrhythm_install_id_headers,
 )
 from opensquilla.session.compaction_state import (
     build_structured_summary_from_text,
@@ -648,12 +650,17 @@ async def call_compaction_llm(
         base_url=url,
     )
 
+    cancelled = False
+    client: httpx.AsyncClient | None = None
+    resp: httpx.Response | None = None
+    data: Any = None
     try:
         async with httpx.AsyncClient(
             timeout=timeout,
             trust_env=_trust_env(),
             follow_redirects=False,
         ) as client:
+            headers.update(tokenrhythm_install_id_headers(provider, url))
             resp = await client.post(url, json=payload, headers=headers)
             resp.raise_for_status()
             data = resp.json()
@@ -661,14 +668,47 @@ async def call_compaction_llm(
                 data,
                 raw_json=str(getattr(resp, "text", "") or ""),
             )
-            return cast(str, data["choices"][0]["message"]["content"])
+            return redact_tokenrhythm_install_ids(
+                cast(str, data["choices"][0]["message"]["content"])
+            )
     except asyncio.CancelledError:
-        await usage.mark_unknown("cancelled")
-        raise
+        # A propagated cancellation retains this frame. Scrub request state before
+        # accounting and raise a fresh exception outside the handler so neither the
+        # original traceback nor its context can expose the installation header.
+        headers.clear()
+        client = None
+        resp = None
+        data = None
+        cancelled = True
+        try:
+            await usage.mark_unknown("cancelled")
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
     except Exception as exc:
-        await usage.mark_unknown("direct_request_failed")
-        log.warning("compaction.llm_call_failed", model=model, error=str(exc))
-        return None
+        safe_error = redact_tokenrhythm_install_ids(str(exc))
+        headers.clear()
+        client = None
+        resp = None
+        data = None
+        try:
+            await usage.mark_unknown("direct_request_failed")
+        except asyncio.CancelledError:
+            cancelled = True
+        except Exception:
+            pass
+        if not cancelled:
+            log.warning(
+                "compaction.llm_call_failed",
+                model=model,
+                error=safe_error,
+            )
+            return None
+
+    if cancelled:
+        raise asyncio.CancelledError from None
+    return None
 
 
 def _merge_summaries(summaries: list[str]) -> str:

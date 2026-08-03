@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+
+- Official TokenRhythm HTTPS API requests can now include the optional
+  `X-OpenSquilla-Install-Id` header by default. It carries the existing
+  pseudonymous, cross-session installation identifier without exposing raw
+  MAC/IP values, is restricted to the two exact official hosts on port 443,
+  fails open when unavailable, and is suppressed by the unified privacy
+  control, the legacy telemetry opt-out, and CI/test detection. The update-check
+  opt-out alone does not suppress it. TokenRhythm must treat the value as
+  optional and untrusted, never as an authentication, authorization, billing,
+  rate-limiting, or anti-abuse signal.
+
 ## [0.5.2] - 2026-07-30
 
 ### Added

@@ -1447,7 +1447,7 @@
       "statusDisabled": "网络上报已关闭。",
       "statusDisabledByEnv": "网络上报已被环境变量设置关闭。",
       "disableNetworkObservabilityLabel": "关闭网络上报",
-      "disableNetworkObservabilityDesc": "停止安装遥测、后台更新检查，以及用于串联同一次会话请求的匿名标识——这些标识只会发送给官方 TokenRhythm API。你主动发起的模型请求不受影响。",
+      "disableNetworkObservabilityDesc": "停止安装与每日用量遥测、后台更新检查，以及仅发往官方 TokenRhythm HTTPS API 的会话级伪匿名标识和默认发送的可选跨会话 X-OpenSquilla-Install-Id 请求头。该持久化安装 ID 可能由本机 MAC/IP 派生，但绝不发送原始地址；CI/测试环境与旧遥测退出开关也会抑制它，单独关闭更新检查则不会。你主动发起的模型请求不受影响。",
       "memoryAutoCaptureLabel": "自动记忆",
       "memoryAutoCaptureDesc": "允许 OpenSquilla 将对话中有用的信息保存到长期记忆。",
       "save": "保存隐私设置"

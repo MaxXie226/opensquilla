@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import math
@@ -68,7 +69,12 @@ from .text_tool_normalizer import (
     classify_text_tool_segments,
     warn_for_unauthorized_plain_candidate,
 )
-from .tokenrhythm_correlation import tokenrhythm_correlation_headers
+from .tokenrhythm_correlation import (
+    TOKENRHYTHM_INSTALL_ID_HEADER,
+    redact_tokenrhythm_install_ids,
+    tokenrhythm_correlation_headers,
+    tokenrhythm_install_id_headers,
+)
 from .trace_recorder import LLMTraceRecorder
 from .types import (
     ChatConfig,
@@ -2889,7 +2895,30 @@ class OpenAIProvider:
         config: ChatConfig | None = None,
     ) -> AsyncIterator[StreamEvent]:
         cfg = config or ChatConfig()
-        return self._stream(messages, tools, cfg)
+        return self._stream_with_detached_cancellation(messages, tools, cfg)
+
+    async def _stream_with_detached_cancellation(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition] | None,
+        cfg: ChatConfig,
+    ) -> AsyncIterator[StreamEvent]:
+        """Preserve cancellation without retaining the physical request frame."""
+
+        cancelled = False
+        event: StreamEvent | None = None
+        try:
+            async for event in self._stream(messages, tools, cfg):
+                yield event
+        except asyncio.CancelledError:
+            # The inner stream owns request headers and HTTPX response state.
+            # Drop its cancellation traceback and any last echoed event before
+            # propagating a fresh cancellation from this metadata-only frame.
+            event = None
+            cancelled = True
+
+        if cancelled:
+            raise asyncio.CancelledError from None
 
     async def _stream(
         self,
@@ -3148,6 +3177,13 @@ class OpenAIProvider:
             headers["Authorization"] = f"Bearer {self._api_key}"
         headers.update(provider_app_headers(self._base_url))
         headers.update(
+            tokenrhythm_install_id_headers(
+                self._provider_kind,
+                self._base_url,
+                proxy=self._proxy,
+            )
+        )
+        headers.update(
             tokenrhythm_correlation_headers(
                 self._provider_kind,
                 self._base_url,
@@ -3310,6 +3346,14 @@ class OpenAIProvider:
                 proxy=self._proxy,
                 follow_redirects=False,
             ) as client:
+                headers.pop(TOKENRHYTHM_INSTALL_ID_HEADER, None)
+                headers.update(
+                    tokenrhythm_install_id_headers(
+                        self._provider_kind,
+                        self._base_url,
+                        proxy=self._proxy,
+                    )
+                )
                 async with client.stream(
                     "POST",
                     endpoint,
@@ -4807,6 +4851,14 @@ class OpenAIProvider:
         cache_shape = _payload_cache_shape(fallback_payload, tools=tools)
         fallback_headers = dict(headers)
         fallback_headers["Accept"] = "application/json"
+        fallback_headers.pop(TOKENRHYTHM_INSTALL_ID_HEADER, None)
+        fallback_headers.update(
+            tokenrhythm_install_id_headers(
+                self._provider_kind,
+                self._base_url,
+                proxy=self._proxy,
+            )
+        )
         endpoint = self._api_url("/v1/chat/completions")
         trace = LLMTraceRecorder(
             provider=self._provider_kind,
@@ -4838,6 +4890,17 @@ class OpenAIProvider:
                 proxy=self._proxy,
                 follow_redirects=False,
             ) as client:
+                # ``AsyncClient.__aenter__`` is an await boundary. Refresh at
+                # the final send point so a privacy toggle that lands while
+                # the fallback client is opening cannot forward a stale id.
+                fallback_headers.pop(TOKENRHYTHM_INSTALL_ID_HEADER, None)
+                fallback_headers.update(
+                    tokenrhythm_install_id_headers(
+                        self._provider_kind,
+                        self._base_url,
+                        proxy=self._proxy,
+                    )
+                )
                 response = await client.post(
                     endpoint,
                     headers=fallback_headers,
@@ -5461,12 +5524,30 @@ class OpenAIProvider:
             else {}
         )
         headers.update(provider_app_headers(self._base_url))
+        safe_request_error: Exception | None = None
+        cancelled_request_error: asyncio.CancelledError | None = None
+        client: Any = None
+        resp: Any = None
+        data: Any = None
+        rows: Any = None
+        excluded_model_ids: Any = None
+        models: list[ModelInfo] | None = None
+        raw_message = ""
+        raw_state = ""
         try:
             async with httpx.AsyncClient(
                 timeout=10.0,
                 trust_env=_trust_env(),
                 proxy=self._proxy,
+                follow_redirects=False,
             ) as client:
+                headers.update(
+                    tokenrhythm_install_id_headers(
+                        self._provider_kind,
+                        self._base_url,
+                        proxy=self._proxy,
+                    )
+                )
                 resp = await client.get(self._api_url("/v1/models"), headers=headers)
                 resp.raise_for_status()
                 data = resp.json()
@@ -5481,7 +5562,7 @@ class OpenAIProvider:
                         for row in rows
                         if str(row.get("id", "")).lower() not in excluded_model_ids
                     ]
-                return [
+                models = [
                     ModelInfo(
                         provider=self._provider_kind,
                         model_id=m["id"],
@@ -5492,11 +5573,61 @@ class OpenAIProvider:
                     )
                     for m in rows
                 ]
+        except asyncio.CancelledError:
+            cancelled_request_error = asyncio.CancelledError()
         except httpx.HTTPError as exc:
             if raise_on_error:
-                raise redacted_httpx_error(exc, api_key=self._api_key) from None
-            return []
-        except Exception:
+                safe_request_error = redacted_httpx_error(
+                    exc,
+                    api_key=self._api_key,
+                )
+        except Exception as exc:
             if raise_on_error:
-                raise
-            return []
+                if isinstance(exc, json.JSONDecodeError):
+                    safe_document = redact_tokenrhythm_install_ids(exc.doc)
+                    if safe_document != exc.doc:
+                        safe_request_error = RuntimeError(
+                            "Provider model catalog returned invalid JSON"
+                        )
+                if safe_request_error is None:
+                    raw_message = str(exc)
+                    safe_message = redact_tokenrhythm_install_ids(raw_message)
+                    raw_state = repr(getattr(exc, "__dict__", {}))
+                    if (
+                        safe_message != raw_message
+                        or redact_tokenrhythm_install_ids(raw_state) != raw_state
+                    ):
+                        safe_request_error = RuntimeError(
+                            safe_message
+                            if safe_message != raw_message
+                            else "Provider model catalog parsing failed"
+                        )
+                    else:
+                        exc.__cause__ = None
+                        exc.__context__ = None
+                        exc.__traceback__ = None
+                        safe_request_error = exc
+
+        if cancelled_request_error is not None:
+            headers.clear()
+            client = None
+            resp = None
+            data = None
+            rows = None
+            excluded_model_ids = None
+            models = None
+            raw_message = ""
+            raw_state = ""
+            raise cancelled_request_error
+        if safe_request_error is not None:
+            headers.clear()
+            client = None
+            resp = None
+            data = None
+            rows = None
+            excluded_model_ids = None
+            models = None
+            raw_message = ""
+            raw_state = ""
+            raise safe_request_error
+        return models or []

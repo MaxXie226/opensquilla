@@ -19,6 +19,8 @@ corrections ladder (a relay's streaming dialect is not listing data).
 
 from __future__ import annotations
 
+import asyncio
+import json
 import math
 from collections.abc import Callable, Iterable, Mapping
 from decimal import Decimal, InvalidOperation
@@ -30,9 +32,14 @@ import structlog
 from opensquilla.env import trust_env as _trust_env
 
 from .app_attribution import provider_app_headers
+from .error_redaction import redacted_httpx_error
 from .fx import TOKENRHYTHM_CNY_PER_USD
 from .model_catalog import DEFAULT_MAX_TOKENS as _NEAR_WINDOW_MARGIN
 from .registry import UnknownProviderError, get_provider_spec
+from .tokenrhythm_correlation import (
+    redact_tokenrhythm_install_ids,
+    tokenrhythm_install_id_headers,
+)
 
 if TYPE_CHECKING:
     from .model_catalog import ModelCatalog
@@ -221,13 +228,86 @@ async def fetch_live_catalog_entries(
     parser = _LIVE_CATALOG_PARSERS.get(shape)
     if parser is None:
         raise ValueError(f"unknown live catalog shape: {shape!r}")
-    async with httpx.AsyncClient(
-        timeout=timeout, trust_env=_trust_env(), proxy=proxy or None
-    ) as client:
-        resp = await client.get(url, headers=provider_app_headers(url))
-        resp.raise_for_status()
-        payload = resp.json()
-    return parser(payload if isinstance(payload, Mapping) else {})
+    safe_request_error: Exception | None = None
+    cancelled_request_error: asyncio.CancelledError | None = None
+    headers: dict[str, str] = {}
+    client: Any = None
+    resp: Any = None
+    payload: Any = None
+    parsed: dict[str, dict[str, Any]] | None = None
+    raw_message = ""
+    raw_state = ""
+    try:
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            trust_env=_trust_env(),
+            proxy=proxy or None,
+            follow_redirects=False,
+        ) as client:
+            headers = provider_app_headers(url)
+            headers.update(
+                tokenrhythm_install_id_headers(shape, url, proxy=proxy or None)
+            )
+            resp = await client.get(url, headers=headers)
+            resp.raise_for_status()
+            payload = resp.json()
+            parsed = parser(payload if isinstance(payload, Mapping) else {})
+    except asyncio.CancelledError:
+        cancelled_request_error = asyncio.CancelledError()
+    except httpx.HTTPError as exc:
+        safe_request_error = redacted_httpx_error(exc, api_key="")
+    except json.JSONDecodeError as exc:
+        if redact_tokenrhythm_install_ids(exc.doc) == exc.doc:
+            exc.__cause__ = None
+            exc.__context__ = None
+            exc.__traceback__ = None
+            safe_request_error = exc
+        else:
+            safe_request_error = RuntimeError(
+                "Live provider catalog returned invalid JSON"
+            )
+    except Exception as exc:
+        raw_message = str(exc)
+        safe_message = redact_tokenrhythm_install_ids(raw_message)
+        raw_state = repr(getattr(exc, "__dict__", {}))
+        if (
+            safe_message != raw_message
+            or redact_tokenrhythm_install_ids(raw_state) != raw_state
+        ):
+            safe_request_error = RuntimeError(
+                safe_message
+                if safe_message != raw_message
+                else "Live provider catalog parsing failed"
+            )
+        else:
+            exc.__cause__ = None
+            exc.__context__ = None
+            exc.__traceback__ = None
+            safe_request_error = exc
+
+    if cancelled_request_error is not None:
+        headers.clear()
+        client = None
+        resp = None
+        payload = None
+        parsed = None
+        raw_message = ""
+        raw_state = ""
+        url = redact_tokenrhythm_install_ids(url)
+        proxy = redact_tokenrhythm_install_ids(proxy)
+        raise cancelled_request_error
+    if safe_request_error is not None:
+        headers.clear()
+        client = None
+        resp = None
+        payload = None
+        parsed = None
+        raw_message = ""
+        raw_state = ""
+        url = redact_tokenrhythm_install_ids(url)
+        proxy = redact_tokenrhythm_install_ids(proxy)
+        raise safe_request_error
+    return parsed or {}
 
 
 async def warm_live_provider_catalogs(
@@ -261,5 +341,9 @@ async def warm_live_provider_catalogs(
             counts[provider_id] = len(entries)
             log.info("live_catalog.ready", provider=provider_id, count=len(entries))
         except Exception as exc:  # noqa: BLE001 - a live listing degrades, never blocks boot
-            log.warning("live_catalog.failed", provider=provider_id, error=str(exc))
+            log.warning(
+                "live_catalog.failed",
+                provider=provider_id,
+                error=redact_tokenrhythm_install_ids(str(exc)),
+            )
     return counts

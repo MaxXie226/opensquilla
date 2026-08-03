@@ -117,6 +117,22 @@ def _start_background_install_telemetry(config: GatewayConfig) -> None:
         log.debug("gateway.install_telemetry_skipped", exc_info=True)
 
 
+def _prewarm_tokenrhythm_install_id(config: GatewayConfig) -> None:
+    """Prime the optional TokenRhythm install header without delaying boot."""
+
+    try:
+        from opensquilla.provider.tokenrhythm_correlation import (
+            prewarm_tokenrhythm_install_id,
+        )
+
+        prewarm_tokenrhythm_install_id(config=config)
+    except Exception:
+        # Install identity is best-effort request metadata.  A resolver or
+        # thread-start failure must never make the gateway/standalone runtime
+        # unavailable.
+        log.debug("gateway.tokenrhythm_install_id_prewarm_skipped", exc_info=True)
+
+
 def _auto_propose_usage_execution_context(
     agent_id: str,
     usage_event_sink: Any | None,
@@ -2405,6 +2421,7 @@ async def build_services(
         config = GatewayConfig.load(os.environ.get("OPENSQUILLA_GATEWAY_CONFIG_PATH"))
         if config.config_path:
             log.info("build_services.config_loaded", path=config.config_path)
+    _prewarm_tokenrhythm_install_id(config)
     deferred_warmups: list[Callable[[], Any]] = []
     sandbox_setup_task: asyncio.Task[Any] | None = None
     _warn_workspace_state_mismatch(config)

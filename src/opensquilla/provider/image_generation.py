@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import os
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from io import BytesIO
-from typing import Protocol
+from typing import Any, Protocol
 from urllib.parse import urljoin, urlsplit
 
 import httpx
@@ -22,6 +23,7 @@ from opensquilla.provider.correlation_context import (
     bind_provider_request_correlation,
     current_provider_request_correlation,
 )
+from opensquilla.provider.error_redaction import redacted_httpx_error
 from opensquilla.provider.image_generation_credentials import (
     ImageGenerationCredentialResolution,
     report_image_generation_pool_failure,
@@ -38,7 +40,10 @@ from opensquilla.provider.qwen_token_plan import (
     QWEN_TOKEN_PLAN_IMAGE_BASE_URL,
 )
 from opensquilla.provider.tokenrhythm_correlation import (
+    is_tokenrhythm_correlation_target,
+    redact_tokenrhythm_install_ids,
     tokenrhythm_correlation_headers,
+    tokenrhythm_install_id_headers,
 )
 from opensquilla.provider.types import (
     ProviderRequestCorrelation,
@@ -114,6 +119,46 @@ def _api_key_for_request(provider: object, request: ImageGenerationRequest) -> s
     return str(fallback() if callable(fallback) else "")
 
 
+def _install_id_safe_exception(
+    exc: Exception,
+    *,
+    api_key: str,
+) -> Exception | None:
+    """Return a safe replacement when an exception may retain provider secrets."""
+
+    if isinstance(exc, httpx.HTTPError):
+        # HTTPX errors retain their request and, for status errors, response
+        # objects. The install id may therefore be present even when str(exc)
+        # contains no echo of it.
+        return redacted_httpx_error(exc, api_key=api_key)
+
+    if isinstance(exc, json.JSONDecodeError):
+        safe_document = redact_tokenrhythm_install_ids(exc.doc)
+        if safe_document != exc.doc:
+            # JSONDecodeError retains the complete response body in ``doc``
+            # even though its normal string form only reports line/column.
+            return RuntimeError("Image generation provider returned invalid JSON")
+
+    raw_error = str(exc)
+    safe_error = redact_tokenrhythm_install_ids(raw_error)
+    if safe_error != raw_error:
+        return RuntimeError(safe_error)
+
+    retained_state = repr(getattr(exc, "__dict__", {}))
+    if redact_tokenrhythm_install_ids(retained_state) != retained_state:
+        return RuntimeError("Image generation provider request failed")
+    return None
+
+
+def _detach_exception(exc: Exception) -> Exception:
+    """Detach traceback links before re-raising from a scrubbed boundary."""
+
+    exc.__cause__ = None
+    exc.__context__ = None
+    exc.__traceback__ = None
+    return exc
+
+
 class OpenAIImageGenerationProvider:
     provider_id = "openai"
     default_model = "gpt-image-1"
@@ -148,6 +193,10 @@ class OpenAIImageGenerationProvider:
         api_key = _api_key_for_request(self, request)
         if not api_key:
             raise RuntimeError(f"{self._api_key_env} is not set")
+        protect_install_id = is_tokenrhythm_correlation_target(
+            self._provider_kind,
+            self._base_url,
+        )
 
         payload = {
             "model": request.model,
@@ -163,6 +212,11 @@ class OpenAIImageGenerationProvider:
             model=request.model,
             base_url=self._base_url,
         )
+        safe_request_error: Exception | None = None
+        cancelled_request_error: asyncio.CancelledError | None = None
+        client: Any = None
+        response: Any = None
+        data: Any = None
         try:
             async with httpx.AsyncClient(
                 timeout=request.timeout_seconds,
@@ -173,6 +227,10 @@ class OpenAIImageGenerationProvider:
                     self._api_url("/v1/images/generations"),
                     headers={
                         "Authorization": f"Bearer {api_key}",
+                        **tokenrhythm_install_id_headers(
+                            self._provider_kind,
+                            self._base_url,
+                        ),
                         **tokenrhythm_correlation_headers(
                             self._provider_kind,
                             self._base_url,
@@ -188,28 +246,127 @@ class OpenAIImageGenerationProvider:
                     raw_json=str(getattr(response, "text", "") or ""),
                 )
         except asyncio.CancelledError:
-            await usage.mark_unknown("cancelled")
-            raise
-        except Exception:
-            await usage.mark_unknown("direct_request_failed")
-            raise
+            if not protect_install_id:
+                await usage.mark_unknown("cancelled")
+                raise
+            client = None
+            response = None
+            data = None
+            payload = {}
+            try:
+                await usage.mark_unknown("cancelled")
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+            cancelled_request_error = asyncio.CancelledError()
+        except Exception as exc:
+            if not protect_install_id:
+                await usage.mark_unknown("direct_request_failed")
+                raise
+            safe_error = _install_id_safe_exception(exc, api_key=api_key)
+            if safe_error is None:
+                safe_error = _detach_exception(exc)
+            client = None
+            response = None
+            data = None
+            payload = {}
+            try:
+                await usage.mark_unknown("direct_request_failed")
+            except asyncio.CancelledError:
+                cancelled_request_error = asyncio.CancelledError()
+            except Exception:
+                safe_request_error = safe_error
+            else:
+                safe_request_error = safe_error
 
-        items = data.get("data") or []
-        if not items:
-            raise RuntimeError("Image generation provider returned no images")
-        first = items[0]
-        b64_json = first.get("b64_json")
-        if not b64_json:
-            raise RuntimeError("Image generation provider returned no b64_json")
-        image_bytes = base64.b64decode(b64_json)
+        if cancelled_request_error is not None:
+            client = None
+            response = None
+            data = None
+            payload = {}
+            raise cancelled_request_error
+        if safe_request_error is not None:
+            client = None
+            response = None
+            data = None
+            payload = {}
+            # Raise outside the exception handler so the original exception is
+            # not retained as a secret-bearing ``__context__``.
+            raise safe_request_error
+
+        if not protect_install_id:
+            items = data.get("data") or []
+            if not items:
+                raise RuntimeError("Image generation provider returned no images")
+            first = items[0]
+            b64_json = first.get("b64_json")
+            if not b64_json:
+                raise RuntimeError(
+                    "Image generation provider returned no b64_json"
+                )
+            image_bytes = base64.b64decode(b64_json)
+            output_format = request.output_format.lower()
+            mime_type = (
+                "image/jpeg"
+                if output_format in {"jpg", "jpeg"}
+                else f"image/{output_format}"
+            )
+            return ImageGenerationResult(
+                image_bytes=image_bytes,
+                mime_type=mime_type,
+                model=request.model,
+                provider=self.provider_id,
+                revised_prompt=first.get("revised_prompt"),
+            )
+
+        postprocess_error: Exception | None = None
+        safe_items: Any = None
+        safe_first: Any = None
+        safe_b64_json: Any = None
+        raw_revised_prompt: Any = None
+        revised_prompt: str | None = None
+        try:
+            safe_items = data.get("data") or []
+            if not safe_items:
+                raise RuntimeError("Image generation provider returned no images")
+            safe_first = safe_items[0]
+            safe_b64_json = safe_first.get("b64_json")
+            if not safe_b64_json:
+                raise RuntimeError(
+                    "Image generation provider returned no b64_json"
+                )
+            image_bytes = base64.b64decode(safe_b64_json)
+            raw_revised_prompt = safe_first.get("revised_prompt")
+            if isinstance(raw_revised_prompt, str):
+                revised_prompt = redact_tokenrhythm_install_ids(raw_revised_prompt)
+        except Exception as exc:
+            safe_error = _install_id_safe_exception(exc, api_key=api_key)
+            postprocess_error = safe_error or _detach_exception(exc)
+
+        client = None
+        response = None
+        data = None
+        payload = {}
+        safe_items = None
+        safe_first = None
+        safe_b64_json = None
+        raw_revised_prompt = None
+        if postprocess_error is not None:
+            raise postprocess_error
+
         output_format = request.output_format.lower()
-        mime_type = "image/jpeg" if output_format in {"jpg", "jpeg"} else f"image/{output_format}"
+        mime_type = (
+            "image/jpeg"
+            if output_format in {"jpg", "jpeg"}
+            else f"image/{output_format}"
+        )
         return ImageGenerationResult(
             image_bytes=image_bytes,
             mime_type=mime_type,
             model=request.model,
             provider=self.provider_id,
-            revised_prompt=first.get("revised_prompt"),
+            revised_prompt=revised_prompt,
         )
 
 
@@ -256,6 +413,10 @@ class OpenRouterImageGenerationProvider:
         api_key = _api_key_for_request(self, request)
         if not api_key:
             raise RuntimeError(f"{self._api_key_env} is not set")
+        protect_install_id = is_tokenrhythm_correlation_target(
+            self._provider_kind,
+            self._base_url,
+        )
 
         payload = {
             "model": request.model,
@@ -271,6 +432,11 @@ class OpenRouterImageGenerationProvider:
             model=request.model,
             base_url=self._base_url,
         )
+        safe_request_error: Exception | None = None
+        cancelled_request_error: asyncio.CancelledError | None = None
+        client: Any = None
+        response: Any = None
+        data: Any = None
         try:
             async with httpx.AsyncClient(
                 timeout=request.timeout_seconds,
@@ -283,6 +449,10 @@ class OpenRouterImageGenerationProvider:
                         "Authorization": f"Bearer {api_key}",
                         "Content-Type": "application/json",
                         **provider_app_headers(self._base_url),
+                        **tokenrhythm_install_id_headers(
+                            self._provider_kind,
+                            self._base_url,
+                        ),
                         **tokenrhythm_correlation_headers(
                             self._provider_kind,
                             self._base_url,
@@ -298,16 +468,84 @@ class OpenRouterImageGenerationProvider:
                     raw_json=str(getattr(response, "text", "") or ""),
                 )
         except asyncio.CancelledError:
-            await usage.mark_unknown("cancelled")
-            raise
-        except Exception:
-            await usage.mark_unknown("direct_request_failed")
-            raise
+            if not protect_install_id:
+                await usage.mark_unknown("cancelled")
+                raise
+            client = None
+            response = None
+            data = None
+            payload = {}
+            try:
+                await usage.mark_unknown("cancelled")
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+            cancelled_request_error = asyncio.CancelledError()
+        except Exception as exc:
+            if not protect_install_id:
+                await usage.mark_unknown("direct_request_failed")
+                raise
+            safe_error = _install_id_safe_exception(exc, api_key=api_key)
+            if safe_error is None:
+                safe_error = _detach_exception(exc)
+            client = None
+            response = None
+            data = None
+            payload = {}
+            try:
+                await usage.mark_unknown("direct_request_failed")
+            except asyncio.CancelledError:
+                cancelled_request_error = asyncio.CancelledError()
+            except Exception:
+                safe_request_error = safe_error
+            else:
+                safe_request_error = safe_error
 
-        image_url = _extract_openrouter_image_url(data)
-        if not image_url:
-            raise RuntimeError("Image generation provider returned no images")
-        mime_type, image_bytes = _decode_data_url(image_url)
+        if cancelled_request_error is not None:
+            client = None
+            response = None
+            data = None
+            payload = {}
+            raise cancelled_request_error
+        if safe_request_error is not None:
+            client = None
+            response = None
+            data = None
+            payload = {}
+            raise safe_request_error
+
+        if not protect_install_id:
+            image_url = _extract_openrouter_image_url(data)
+            if not image_url:
+                raise RuntimeError("Image generation provider returned no images")
+            mime_type, image_bytes = _decode_data_url(image_url)
+            return ImageGenerationResult(
+                image_bytes=image_bytes,
+                mime_type=mime_type,
+                model=request.model,
+                provider=self.provider_id,
+            )
+
+        postprocess_error: Exception | None = None
+        safe_image_url: str | None = None
+        try:
+            safe_image_url = _extract_openrouter_image_url(data)
+            if not safe_image_url:
+                raise RuntimeError("Image generation provider returned no images")
+            mime_type, image_bytes = _decode_data_url(safe_image_url)
+        except Exception as exc:
+            safe_error = _install_id_safe_exception(exc, api_key=api_key)
+            postprocess_error = safe_error or _detach_exception(exc)
+
+        client = None
+        response = None
+        data = None
+        payload = {}
+        safe_image_url = None
+        if postprocess_error is not None:
+            raise postprocess_error
+
         return ImageGenerationResult(
             image_bytes=image_bytes,
             mime_type=mime_type,
@@ -364,6 +602,11 @@ class TokenRhythmImageGenerationProvider:
             model=request.model,
             base_url=self._base_url,
         )
+        safe_request_error: Exception | None = None
+        cancelled_request_error: asyncio.CancelledError | None = None
+        client: Any = None
+        response: Any = None
+        data: Any = None
         try:
             async with httpx.AsyncClient(
                 timeout=request.timeout_seconds,
@@ -376,6 +619,10 @@ class TokenRhythmImageGenerationProvider:
                         "Authorization": f"Bearer {api_key}",
                         "Content-Type": "application/json",
                         **provider_app_headers(self._base_url),
+                        **tokenrhythm_install_id_headers(
+                            "tokenrhythm",
+                            self._base_url,
+                        ),
                         **tokenrhythm_correlation_headers(
                             "tokenrhythm",
                             self._base_url,
@@ -392,24 +639,83 @@ class TokenRhythmImageGenerationProvider:
                     allow_billing_only=True,
                 )
         except asyncio.CancelledError:
-            await usage.mark_unknown("cancelled")
-            raise
-        except Exception:
-            await usage.mark_unknown("direct_request_failed")
-            raise
+            client = None
+            response = None
+            data = None
+            payload = {}
+            try:
+                await usage.mark_unknown("cancelled")
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+            cancelled_request_error = asyncio.CancelledError()
+        except Exception as exc:
+            safe_error = _install_id_safe_exception(exc, api_key=api_key)
+            if safe_error is None:
+                safe_error = _detach_exception(exc)
+            client = None
+            response = None
+            data = None
+            payload = {}
+            try:
+                await usage.mark_unknown("direct_request_failed")
+            except asyncio.CancelledError:
+                cancelled_request_error = asyncio.CancelledError()
+            except Exception:
+                safe_request_error = safe_error
+            else:
+                safe_request_error = safe_error
+
+        if cancelled_request_error is not None:
+            client = None
+            response = None
+            data = None
+            payload = {}
+            raise cancelled_request_error
+        if safe_request_error is not None:
+            client = None
+            response = None
+            data = None
+            payload = {}
+            raise safe_request_error
 
         items = data.get("data") if isinstance(data, dict) else None
         if not isinstance(items, list) or not items or not isinstance(items[0], dict):
+            client = None
+            response = None
+            data = None
+            payload = {}
+            items = None
             raise RuntimeError("Image generation provider returned no images")
-        first = items[0]
-        b64_json = first.get("b64_json")
+        first: Any = items[0]
+        b64_json: Any = first.get("b64_json")
+        image_url: Any = first.get("url")
+        raw_revised_prompt = first.get("revised_prompt")
+        revised_prompt = (
+            redact_tokenrhythm_install_ids(raw_revised_prompt)
+            if isinstance(raw_revised_prompt, str)
+            else None
+        )
+        client = None
+        response = None
+        data = None
+        payload = {}
+        items = None
+        first = None
+        raw_revised_prompt = None
         if isinstance(b64_json, str) and b64_json:
+            invalid_b64_json = False
             try:
                 image_bytes = base64.b64decode(b64_json)
-            except (ValueError, TypeError) as exc:
+            except (ValueError, TypeError):
+                invalid_b64_json = True
+            b64_json = None
+            image_url = None
+            if invalid_b64_json:
                 raise RuntimeError(
                     "Image generation provider returned invalid b64_json"
-                ) from exc
+                )
             output_format = request.output_format.lower()
             mime_type = (
                 "image/jpeg"
@@ -417,29 +723,44 @@ class TokenRhythmImageGenerationProvider:
                 else f"image/{output_format}"
             )
         else:
-            image_url = first.get("url")
             if not isinstance(image_url, str) or not image_url:
+                b64_json = None
+                image_url = None
                 raise RuntimeError(
                     "Image generation provider returned neither b64_json nor url"
                 )
+            download_error: Exception | None = None
+            download_cancelled: asyncio.CancelledError | None = None
             if image_url.startswith("data:"):
-                mime_type, image_bytes = _decode_data_url(image_url)
+                try:
+                    mime_type, image_bytes = _decode_data_url(image_url)
+                except Exception as exc:
+                    safe_error = _install_id_safe_exception(exc, api_key=api_key)
+                    download_error = safe_error or _detach_exception(exc)
             else:
-                mime_type, image_bytes = await _download_tokenrhythm_image(
-                    image_url,
-                    timeout_seconds=request.timeout_seconds,
-                )
+                try:
+                    mime_type, image_bytes = await _download_tokenrhythm_image(
+                        image_url,
+                        timeout_seconds=request.timeout_seconds,
+                    )
+                except asyncio.CancelledError:
+                    download_cancelled = asyncio.CancelledError()
+                except Exception as exc:
+                    safe_error = _install_id_safe_exception(exc, api_key=api_key)
+                    download_error = safe_error or _detach_exception(exc)
+            b64_json = None
+            image_url = None
+            if download_cancelled is not None:
+                raise download_cancelled
+            if download_error is not None:
+                raise download_error
 
         return ImageGenerationResult(
             image_bytes=image_bytes,
             mime_type=mime_type,
             model=request.model,
             provider=self.provider_id,
-            revised_prompt=(
-                first.get("revised_prompt")
-                if isinstance(first.get("revised_prompt"), str)
-                else None
-            ),
+            revised_prompt=revised_prompt,
         )
 
 
@@ -1092,10 +1413,12 @@ async def generate_with_fallbacks(
         try:
             provider_id, model = parse_image_generation_model_ref(candidate)
         except ValueError as exc:
+            raw_error = str(exc)
+            safe_error = redact_tokenrhythm_install_ids(raw_error)
             attempts.append(
-                ImageGenerationAttempt(provider="", model=candidate, error=str(exc))
+                ImageGenerationAttempt(provider="", model=candidate, error=safe_error)
             )
-            last_error = exc
+            last_error = exc if safe_error == raw_error else RuntimeError(safe_error)
             continue
         provider = get_image_generation_provider(provider_id)
         if provider is None:
@@ -1131,15 +1454,20 @@ async def generate_with_fallbacks(
             return result
         except Exception as exc:  # noqa: BLE001 - failures are summarized for fallback
             report_image_generation_pool_failure(credential_resolution, exc)
-            attempts.append(ImageGenerationAttempt(provider_id, model, str(exc)))
-            last_error = exc if isinstance(exc, Exception) else RuntimeError(str(exc))
+            raw_error = str(exc)
+            safe_error = redact_tokenrhythm_install_ids(raw_error)
+            attempts.append(ImageGenerationAttempt(provider_id, model, safe_error))
+            last_error = exc if safe_error == raw_error else RuntimeError(safe_error)
 
     if len(attempts) <= 1 and last_error is not None:
         raise last_error
     summary = " | ".join(
         f"{attempt.provider}/{attempt.model}: {attempt.error}" for attempt in attempts
     )
-    raise RuntimeError(f"All image generation models failed ({len(attempts)}): {summary}")
+    message = redact_tokenrhythm_install_ids(
+        f"All image generation models failed ({len(attempts)}): {summary}"
+    )
+    raise RuntimeError(message)
 
 
 reset_image_generation_providers()

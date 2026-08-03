@@ -1447,7 +1447,7 @@
       "statusDisabled": "Netzwerkberichte sind ausgeschaltet.",
       "statusDisabledByEnv": "Netzwerkberichte sind ausgeschaltet, weil eine Umgebungsvariable sie deaktiviert.",
       "disableNetworkObservabilityLabel": "Netzwerkberichte ausschalten",
-      "disableNetworkObservabilityDesc": "Stoppt Installationstelemetrie, Updateprüfungen im Hintergrund und die anonymen Kennungen, die Anfragen einer Sitzung miteinander verknüpfen — diese Kennungen gehen ausschließlich an die offizielle TokenRhythm-API. Ihre eigenen Modellanfragen funktionieren weiterhin.",
+      "disableNetworkObservabilityDesc": "Stoppt Installations- und tägliche Nutzungstelemetrie, Updateprüfungen im Hintergrund sowie pseudonyme Sitzungskennungen und den standardmäßig gesendeten optionalen sitzungsübergreifenden Header X-OpenSquilla-Install-Id, die ausschließlich an die offizielle TokenRhythm-HTTPS-API gesendet werden. Die persistierte Installationskennung kann aus lokalen MAC-/IP-Daten abgeleitet werden; Rohadressen werden nie gesendet. CI/Tests und der alte Telemetrie-Opt-out unterdrücken sie ebenfalls, der reine Update-Opt-out dagegen nicht. Ihre eigenen Modellanfragen funktionieren weiterhin.",
       "memoryAutoCaptureLabel": "Automatisches Speichern",
       "memoryAutoCaptureDesc": "OpenSquilla darf nützliche Gesprächsinhalte im Langzeitspeicher sichern.",
       "save": "Datenschutz speichern"
