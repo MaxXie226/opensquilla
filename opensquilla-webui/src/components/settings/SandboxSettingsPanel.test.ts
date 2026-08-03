@@ -274,7 +274,7 @@ describe('SandboxSettingsPanel', () => {
       .toBe(false)
   })
 
-  it('retries an unavailable live capability in the background', async () => {
+  it('does not retry an unavailable live capability in the background', async () => {
     vi.useFakeTimers()
     let attempts = 0
     const { call } = await mountPanel({
@@ -295,10 +295,11 @@ describe('SandboxSettingsPanel', () => {
     })
 
     expect(attempts).toBe(1)
-    await vi.advanceTimersByTimeAsync(10_000)
-    await settle()
-
-    expect(attempts).toBe(2)
+    for (const elapsed of [10_000, 20_000, 30_000]) {
+      await vi.advanceTimersByTimeAsync(elapsed)
+      await settle()
+      expect(attempts).toBe(1)
+    }
     expect(call).toHaveBeenLastCalledWith('sandbox.capability.status', undefined)
   })
 

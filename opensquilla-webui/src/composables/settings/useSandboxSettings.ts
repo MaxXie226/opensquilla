@@ -72,7 +72,6 @@ export function useSandboxSettings() {
     runtimes: '',
   })
   let saveQueue = Promise.resolve()
-  let capabilityRetryTimer: ReturnType<typeof setTimeout> | null = null
   let disposed = false
   let capabilityRequestGeneration = 0
 
@@ -135,13 +134,11 @@ export function useSandboxSettings() {
       )
       if (disposed || requestGeneration !== capabilityRequestGeneration) return null
       capability.value = report
-      if (!report.available) scheduleCapabilityRetry()
       return report
     } catch {
       if (disposed || requestGeneration !== capabilityRequestGeneration) return null
       capability.value = null
       capabilityCheckFailed.value = true
-      scheduleCapabilityRetry()
       return null
     } finally {
       if (!disposed && requestGeneration === capabilityRequestGeneration) {
@@ -204,20 +201,9 @@ export function useSandboxSettings() {
     }
   }
 
-  function scheduleCapabilityRetry(): void {
-    if (disposed) return
-    if (capabilityRetryTimer !== null) clearTimeout(capabilityRetryTimer)
-    capabilityRetryTimer = setTimeout(() => {
-      capabilityRetryTimer = null
-      void loadCapability()
-    }, 10_000)
-  }
-
   onScopeDispose(() => {
     disposed = true
     capabilityRequestGeneration += 1
-    if (capabilityRetryTimer !== null) clearTimeout(capabilityRetryTimer)
-    capabilityRetryTimer = null
   })
 
   async function loadDesktopPreference(): Promise<void> {
