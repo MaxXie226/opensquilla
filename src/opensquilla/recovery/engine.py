@@ -1943,6 +1943,23 @@ def inspect_profile(
     candidates = _candidate_set(home_path, config)
     canonical = next(candidate for candidate in candidates if candidate.kind == "canonical")
     effective = config.workspace
+    if config.error_code == "config_schema_too_new" or (
+        config.error_code == "config_unsafe_path" and _elevated_windows_context()
+    ):
+        # The two hard startup gates outrank every pending-journal warning: a
+        # config authored by a newer build must not be reinterpreted, and an
+        # elevated Windows process must not follow a link-shaped config path,
+        # no matter what interrupted transaction is also waiting.
+        return _report(
+            home=home_path,
+            config=config,
+            candidates=candidates,
+            outcome="recovery_required",
+            stable_code=config.error_code,
+            effective_workspace=None,
+            allowed_actions=_RECOVERY_ACTIONS,
+            detail=config.error_detail,
+        )
     top_level_entries = _profile_top_level_entries(home_path)
     if top_level_entries is None:
         return _report(
@@ -2005,13 +2022,8 @@ def inspect_profile(
             allowed_actions=_RECOVERY_ACTIONS,
         )
     if config.error_code is not None:
-        # Startup gates are deliberately narrow: a config authored by a newer
-        # build must not be reinterpreted, and an elevated Windows process
-        # must not follow a link-shaped config path. Everything else is a
-        # warning with a repair action.
-        blocks = config.error_code == "config_schema_too_new" or (
-            config.error_code == "config_unsafe_path" and _elevated_windows_context()
-        )
+        # The hard gates were handled before the journal checks above;
+        # everything reaching this branch is a warning with a repair action.
         actions: tuple[str, ...] = _RECOVERY_ACTIONS
         if config.error_code in ("config_invalid", "config_unreadable"):
             # The repair restores the newest valid sibling backup or, failing
@@ -2022,7 +2034,7 @@ def inspect_profile(
             home=home_path,
             config=config,
             candidates=candidates,
-            outcome="recovery_required" if blocks else "attention",
+            outcome="attention",
             stable_code=config.error_code,
             effective_workspace=None,
             allowed_actions=actions,

@@ -428,7 +428,6 @@ def test_primary_repair_ui_is_accessible_without_profile_choices() -> None:
         "chooseWorkspace",
         "browseWorkspace",
         "recoverTransaction",
-        "abandonCleanup",
         "revealProfile",
         "revealBackups",
         "copyDiagnostics",
@@ -444,12 +443,15 @@ def test_primary_repair_ui_is_accessible_without_profile_choices() -> None:
         "onRecoveryState",
         "chooseRecoveryWorkspace",
         "recoverProfileTransaction",
-        "abandonCleanupTransaction",
         "revealRecoveryPath",
         "copyRecoveryDiagnostics",
     ):
         assert bridge_name in boot_html
     assert "abandonPartialCleanup" not in boot_html
+    # Interrupted cleanups are abandoned automatically during startup (the
+    # journal is archived, nothing further is deleted), so the boot page no
+    # longer carries a manual cleanup surface.
+    assert "abandonCleanup" not in boot_html
     for removed_name in (
         "recoveryProfiles",
         "copyCredential",
@@ -473,10 +475,6 @@ def test_primary_repair_ui_scaffold_has_all_six_locales() -> None:
         "chooseWorkspace",
         "browseWorkspace",
         "recoverTransaction",
-        "cleanupRecoveryTitle",
-        "cleanupRecoveryIntro",
-        "abandonCleanup",
-        "abandonCleanupHelp",
         "revealProfile",
         "revealBackups",
         "copyDiagnostics",
@@ -489,6 +487,10 @@ def test_primary_repair_ui_scaffold_has_all_six_locales() -> None:
     for removed_key in (
         "recoveryConfirmationTitle",
         "recoveryConfirmationIntro",
+        "cleanupRecoveryTitle",
+        "cleanupRecoveryIntro",
+        "abandonCleanup",
+        "abandonCleanupHelp",
         "recoveryProfileUnsafeTitle",
         "recoveryProfileUnsafeIntro",
         "existingRecoveryLabel",
@@ -535,8 +537,10 @@ def test_desktop_runtime_is_primary_only_with_safe_legacy_enumeration() -> None:
     assert "desktop:recovery" in main_ts
     assert "desktop:recovery" in preload
     assert "onRecoveryState" in preload
-    assert "desktop:recovery:abandon-cleanup" in main_ts
-    assert "abandonCleanupTransaction" in preload
+    # Interrupted cleanups are auto-abandoned in the startup chain; there is
+    # no renderer-reachable manual abandon surface anymore.
+    assert "desktop:recovery:abandon-cleanup" not in main_ts
+    assert "abandonCleanupTransaction" not in preload
     assert "abandonPartialCleanup" not in preload
     assert "launchSafeProfile" not in preload
     assert "retryPrimaryProfile" not in preload
@@ -3145,6 +3149,13 @@ def test_blocked_consolidation_defers_only_after_primary_is_bootable() -> None:
     # severe blocking UI is considered.
     assert "inspection.allowed_actions.includes('recover-transaction')" in startup
     assert "'profile_transaction_auto_recovery_failed'" in startup
+
+    # An interrupted cleanup is abandoned automatically: the journal record is
+    # archived and every surviving file is preserved, so startup continues on
+    # the remaining profile without a manual confirmation.
+    assert "inspection.allowed_actions.includes('abandon-cleanup')" in startup
+    assert "inspection.stable_code === 'cleanup_transaction_incomplete'" in startup
+    assert "'cleanup_auto_abandon_failed'" in startup
 
     # A corrupt config is repaired automatically from its newest valid backup
     # (defaults otherwise) after the corrupt file is preserved beside itself.

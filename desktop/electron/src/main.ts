@@ -2988,10 +2988,6 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'cleanup.deleteAllConfirm': 'Delete all data',
     'cleanup.deleteAllTitle': 'Delete all OpenSquilla user data?',
     'cleanup.deleteAllMessage': 'OpenSquilla will close first. The deletion starts only after the app and local runtime have fully exited.',
-    'cleanup.abandonConfirm': 'Preserve and continue',
-    'cleanup.abandonTitle': 'Leave the interrupted cleanup?',
-    'cleanup.abandonMessage': 'OpenSquilla will preserve every surviving file and archive only the cleanup transaction record.',
-    'cleanup.abandonDetail': 'Nothing else will be deleted. Review the remaining profile before continuing to use it.',
     'migration.overwriteTitle': 'Replace conflicting desktop data?',
     'migration.overwriteMessage': 'The selected installation will replace the current Desktop data.',
     'migration.overwriteDetail': 'A complete timestamped backup will be retained. Confirm the source below before continuing.',
@@ -3124,10 +3120,6 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'cleanup.deleteAllConfirm': '删除全部数据',
     'cleanup.deleteAllTitle': '删除全部 OpenSquilla 用户数据？',
     'cleanup.deleteAllMessage': 'OpenSquilla 会先退出。只有应用和本地运行时完全退出后，删除才会开始。',
-    'cleanup.abandonConfirm': '保留并继续',
-    'cleanup.abandonTitle': '结束未完成的清理？',
-    'cleanup.abandonMessage': 'OpenSquilla 会保留所有仍存在的文件，仅归档清理事务记录。',
-    'cleanup.abandonDetail': '不会继续删除任何内容。继续使用前请检查剩余的配置文件。',
     'migration.overwriteTitle': '替换冲突的桌面数据？',
     'migration.overwriteMessage': '所选安装的数据将替换当前桌面数据。',
     'migration.overwriteDetail': '系统会保留完整的时间戳备份。继续前请确认下方的数据来源。',
@@ -3258,10 +3250,6 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'cleanup.deleteAllConfirm': 'すべてのデータを削除',
     'cleanup.deleteAllTitle': 'OpenSquilla のすべてのユーザーデータを削除しますか？',
     'cleanup.deleteAllMessage': 'OpenSquilla を先に終了します。アプリとローカルランタイムが完全に終了した後にのみ削除を開始します。',
-    'cleanup.abandonConfirm': '保持して続行',
-    'cleanup.abandonTitle': '中断したクリーンアップを終了しますか？',
-    'cleanup.abandonMessage': '残っているすべてのファイルを保持し、クリーンアップのトランザクション記録だけをアーカイブします。',
-    'cleanup.abandonDetail': 'これ以上は削除しません。使用を続ける前に残りのプロファイルを確認してください。',
     'migration.overwriteTitle': '競合するデスクトップデータを置き換えますか？',
     'migration.overwriteMessage': '選択したインストールのデータで現在の Desktop データを置き換えます。',
     'migration.overwriteDetail': 'タイムスタンプ付きの完全なバックアップが保持されます。続行する前に以下の移行元を確認してください。',
@@ -3392,10 +3380,6 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'cleanup.deleteAllConfirm': 'Supprimer toutes les données',
     'cleanup.deleteAllTitle': 'Supprimer toutes les données utilisateur OpenSquilla ?',
     'cleanup.deleteAllMessage': 'OpenSquilla va d’abord se fermer. La suppression ne commence qu’après l’arrêt complet de l’application et de l’environnement local.',
-    'cleanup.abandonConfirm': 'Conserver et continuer',
-    'cleanup.abandonTitle': 'Quitter le nettoyage interrompu ?',
-    'cleanup.abandonMessage': 'OpenSquilla conserve tous les fichiers restants et archive uniquement l’enregistrement de transaction du nettoyage.',
-    'cleanup.abandonDetail': 'Aucun autre élément ne sera supprimé. Vérifiez le profil restant avant de continuer à l’utiliser.',
     'migration.overwriteTitle': 'Remplacer les données de bureau en conflit ?',
     'migration.overwriteMessage': 'L’installation sélectionnée remplacera les données Desktop actuelles.',
     'migration.overwriteDetail': 'Une sauvegarde complète horodatée sera conservée. Vérifiez la source ci-dessous avant de continuer.',
@@ -3526,10 +3510,6 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'cleanup.deleteAllConfirm': 'Alle Daten löschen',
     'cleanup.deleteAllTitle': 'Alle OpenSquilla-Benutzerdaten löschen?',
     'cleanup.deleteAllMessage': 'OpenSquilla wird zuerst beendet. Die Löschung beginnt erst, wenn App und lokale Laufzeit vollständig beendet sind.',
-    'cleanup.abandonConfirm': 'Behalten und fortfahren',
-    'cleanup.abandonTitle': 'Unterbrochene Bereinigung verlassen?',
-    'cleanup.abandonMessage': 'OpenSquilla behält alle verbliebenen Dateien und archiviert nur den Transaktionsdatensatz der Bereinigung.',
-    'cleanup.abandonDetail': 'Es wird nichts weiter gelöscht. Prüfen Sie das verbleibende Profil, bevor Sie es weiter verwenden.',
     'migration.overwriteTitle': 'Konfliktierende Desktop-Daten ersetzen?',
     'migration.overwriteMessage': 'Die ausgewählte Installation ersetzt die aktuellen Desktop-Daten.',
     'migration.overwriteDetail': 'Eine vollständige Sicherung mit Zeitstempel bleibt erhalten. Prüfen Sie vor dem Fortfahren die Quelle unten.',
@@ -3660,10 +3640,6 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'cleanup.deleteAllConfirm': 'Eliminar todos los datos',
     'cleanup.deleteAllTitle': '¿Eliminar todos los datos de usuario de OpenSquilla?',
     'cleanup.deleteAllMessage': 'OpenSquilla se cerrará primero. La eliminación solo comienza cuando la app y el entorno local hayan terminado por completo.',
-    'cleanup.abandonConfirm': 'Conservar y continuar',
-    'cleanup.abandonTitle': '¿Salir de la limpieza interrumpida?',
-    'cleanup.abandonMessage': 'OpenSquilla conserva todos los archivos restantes y archiva únicamente el registro de transacción de limpieza.',
-    'cleanup.abandonDetail': 'No se eliminará nada más. Revisa el perfil restante antes de seguir usándolo.',
     'migration.overwriteTitle': '¿Reemplazar los datos de escritorio en conflicto?',
     'migration.overwriteMessage': 'La instalación seleccionada reemplazará los datos actuales de Desktop.',
     'migration.overwriteDetail': 'Se conservará una copia de seguridad completa con marca de tiempo. Confirma la fuente indicada abajo antes de continuar.',
@@ -8224,6 +8200,33 @@ async function inspectActiveProfileBeforeStartup(): Promise<boolean> {
   // startup continues. Only a failed automatic repair, a config authored by
   // a newer build, or an elevated-Windows unsafe path reaches the manual
   // recovery page.
+  if (
+    inspection.allowed_actions.includes('abandon-cleanup')
+    && inspection.stable_code === 'cleanup_transaction_incomplete'
+    && inspection.transaction_id
+  ) {
+    if (gatewayProcess && gatewayState.owned) await stopOwnedGatewayAndWait()
+    try {
+      // Abandoning archives only the cleanup journal record; every surviving
+      // file is preserved, so no confirmation is needed before startup
+      // continues on the remaining profile.
+      inspection = await runRecoveryCli(active, [
+        'abandon-cleanup',
+        '--user-data', app.getPath('userData'),
+        '--home', active.home,
+        '--profile-kind', 'desktop-primary',
+        '--transaction-id', inspection.transaction_id,
+        '--expected-revision', String(inspection.revision),
+        '--json',
+      ])
+    } catch (error) {
+      desktopLog('cleanup_auto_abandon_failed', {
+        error: error instanceof Error ? error.message : 'unknown error',
+      })
+      inspection = recoveryFailureResult(active.home, 'cleanup_auto_abandon_failed')
+    }
+  }
+
   if (inspection.allowed_actions.includes('recover-settings')) {
     if (gatewayProcess && gatewayState.owned) await stopOwnedGatewayAndWait()
     try {
@@ -12028,71 +12031,6 @@ async function recoverPrimaryProfileTransaction(): Promise<RecoveryProtocolResul
   return result
 }
 
-async function abandonActiveCleanupTransaction(): Promise<RecoveryProtocolResult> {
-  const profile = activeDesktopProfile()
-  let inspection = recoveryInspection
-  if (!inspection || inspection.stable_code !== 'cleanup_transaction_incomplete') {
-    inspection = await inspectDesktopProfile(profile)
-  }
-  if (
-    inspection.stable_code !== 'cleanup_transaction_incomplete'
-    || !inspection.allowed_actions.includes('abandon-cleanup')
-    || !inspection.transaction_id
-  ) {
-    throw new Error('No interrupted cleanup is available to preserve and leave.')
-  }
-  const options: Electron.MessageBoxOptions = {
-    type: 'warning',
-    buttons: [desktopT('cleanup.cancel'), desktopT('cleanup.abandonConfirm')],
-    defaultId: 0,
-    cancelId: 0,
-    noLink: true,
-    title: desktopT('cleanup.abandonTitle'),
-    message: desktopT('cleanup.abandonMessage'),
-    detail: desktopT('cleanup.abandonDetail'),
-  }
-  const window = currentMainWindow()
-  const choice = window
-    ? await dialog.showMessageBox(window, options)
-    : await dialog.showMessageBox(options)
-  if (choice.response !== 1) return inspection
-
-  await stopOwnedGatewayAndWait()
-  // Stopping the runtime can legitimately change state metadata. Refresh the
-  // cleanup authority after every writer is gone so a retry never reuses a
-  // cached transaction/revision.
-  inspection = await inspectDesktopProfile(profile)
-  recoveryInspection = inspection
-  primaryRecoveryInspection = inspection
-  publishRecoveryState()
-  if (
-    inspection.stable_code !== 'cleanup_transaction_incomplete'
-    || !inspection.allowed_actions.includes('abandon-cleanup')
-    || !inspection.transaction_id
-  ) {
-    throw new Error('The interrupted cleanup changed. Review the current recovery state.')
-  }
-  const result = await runRecoveryCli(profile, [
-    'abandon-cleanup',
-    '--user-data', app.getPath('userData'),
-    '--home', profile.home,
-    '--profile-kind', 'desktop-primary',
-    '--transaction-id', inspection.transaction_id,
-    '--expected-revision', String(inspection.revision),
-    '--json',
-  ])
-  recoveryInspection = result
-  primaryRecoveryInspection = result
-  publishRecoveryState()
-  if (result.outcome !== 'recovery_required') {
-    clearReusableGatewayState()
-    bootError = null
-    await currentMainWindow()?.loadFile(bootPagePath()).catch(() => null)
-    void openOrResumeDesktopApp()
-  }
-  return result
-}
-
 async function choosePrimaryWorkspace(
   requestedWorkspace: unknown,
   presentation: 'workspace' | 'legacy-agent-data' = 'workspace',
@@ -12206,12 +12144,6 @@ ipcMain.handle('desktop:recovery:recover-transaction', async (event) => {
     return { ok: false, error: 'Recovery actions are available only from the recovery page.' }
   }
   return withRecoveryOperation(recoverPrimaryProfileTransaction)
-})
-ipcMain.handle('desktop:recovery:abandon-cleanup', async (event) => {
-  if (!trustedRecoveryIpc(event)) {
-    return { ok: false, error: 'Recovery actions are available only from the recovery page.' }
-  }
-  return withRecoveryOperation(abandonActiveCleanupTransaction)
 })
 ipcMain.handle('desktop:recovery:reveal-path', async (
   event,

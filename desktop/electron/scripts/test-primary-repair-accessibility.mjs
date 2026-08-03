@@ -77,6 +77,7 @@ const REMOVED_PROFILE_CONTROLS = [
   'createRecovery',
   'retryPrimary',
   'returnPrimary',
+  'abandonCleanup',
 ]
 
 async function waitFor(check, label, timeoutMs = 90_000) {
@@ -278,7 +279,7 @@ for (const [locale, expected] of Object.entries(LOCALES)) {
     assert.equal(bridgeShape.state, 'function')
     assert.equal(bridgeShape.chooseWorkspace, 'function')
     assert.equal(bridgeShape.recoverTransaction, 'function')
-    assert.equal(bridgeShape.abandonCleanup, 'function')
+    assert.equal(bridgeShape.abandonCleanup, 'undefined')
     assert.equal(bridgeShape.retryStartup, 'function')
     assert.equal(bridgeShape.launchSafeProfile, 'undefined')
     assert.equal(bridgeShape.retryPrimaryProfile, 'undefined')

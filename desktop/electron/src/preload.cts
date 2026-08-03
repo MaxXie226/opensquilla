@@ -64,7 +64,6 @@ contextBridge.exposeInMainWorld('opensquillaDesktop', {
   recoverProfileTransaction: () => ipcRenderer.invoke('desktop:recovery:recover-transaction'),
   revealRecoveryPath: (payload: unknown) => ipcRenderer.invoke('desktop:recovery:reveal-path', payload),
   copyRecoveryDiagnostics: () => ipcRenderer.invoke('desktop:recovery:copy-diagnostics'),
-  abandonCleanupTransaction: () => ipcRenderer.invoke('desktop:recovery:abandon-cleanup'),
   inspectDesktopCleanup: (payload: unknown) => ipcRenderer.invoke('desktop:cleanup:inspect', payload),
   discardDesktopCleanup: (payload: unknown) => ipcRenderer.invoke('desktop:cleanup:discard', payload),
   applyDesktopCleanup: (payload: unknown) => ipcRenderer.invoke('desktop:cleanup:apply', payload),

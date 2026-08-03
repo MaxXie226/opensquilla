@@ -1233,16 +1233,40 @@ def test_profile_root_dangling_link_warns_without_blocking(
     assert report.candidates == ()
 
 
-def test_unsafe_profile_root_still_blocks_with_pending_transaction(tmp_path: Path) -> None:
+def test_unsafe_profile_root_warns_even_with_pending_transaction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import opensquilla.recovery.engine as recovery_engine
+
     profile = tmp_path / "opensquilla"
     profile.write_text("not a profile directory\n", encoding="utf-8")
     journal = tmp_path / f".{profile.name}.profile-replace.json"
     journal.write_text('{"schema_version":1,"phase":"prepared"}\n', encoding="utf-8")
+    monkeypatch.setattr(recovery_engine, "_elevated_windows_context", lambda: False)
 
     report = inspect_profile(profile)
 
     assert report.outcome == "attention"
     assert report.stable_code == "profile_unsafe_path"
+
+
+def test_future_config_gate_outranks_pending_cleanup_journal(
+    tmp_path: Path,
+) -> None:
+    """A pending journal must never soften the schema-too-new hard gate."""
+    user_data = tmp_path / "user-data"
+    home = user_data / "opensquilla"
+    _desktop_config(home, workspace=home / "workspace", extra="config_version = 999")
+    (user_data / ".opensquilla.profile-cleanup.json").write_text(
+        "synthetic interrupted cleanup authority\n",
+        encoding="utf-8",
+    )
+
+    report = inspect_profile(home, profile_kind="desktop-primary")
+
+    assert report.outcome == "recovery_required"
+    assert report.stable_code == "config_schema_too_new"
 
 
 def test_unsafe_profile_root_still_blocks_when_elevated(
