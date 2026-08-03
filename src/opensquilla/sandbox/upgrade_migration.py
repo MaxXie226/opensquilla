@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import base64
+import csv
 import hashlib
 import json
 import os
 import shutil
+import stat
+import subprocess
 import tempfile
 import time
 import tomllib
@@ -23,6 +27,200 @@ from opensquilla.sandbox.legacy_codec import (
 MIGRATION_VERSION = 2
 JOURNAL_NAME = ".sandbox-upgrade-v2.json"
 SNAPSHOT_NAME = ".sandbox-upgrade-snapshot"
+
+_WINDOWS_PRIVATE_ACL_SCRIPT = r"""
+$ErrorActionPreference = "Stop"
+$target = $env:OPENSQUILLA_UPGRADE_ACL_TARGET
+$userSid = $env:OPENSQUILLA_UPGRADE_ACL_USER_SID
+$isDirectory = $env:OPENSQUILLA_UPGRADE_ACL_IS_DIRECTORY -eq "1"
+$acl = if ($isDirectory) {
+    [System.Security.AccessControl.DirectorySecurity]::new()
+} else {
+    [System.Security.AccessControl.FileSecurity]::new()
+}
+$acl.SetAccessRuleProtection($true, $false)
+$inheritance = [System.Security.AccessControl.InheritanceFlags]::None
+if ($isDirectory) {
+    $inheritance = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
+        [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+}
+$propagation = [System.Security.AccessControl.PropagationFlags]::None
+$fullControl = [System.Security.AccessControl.FileSystemRights]::FullControl
+$allowed = @($userSid, "S-1-5-18", "S-1-5-32-544") | Select-Object -Unique
+foreach ($sidText in $allowed) {
+    $sid = [System.Security.Principal.SecurityIdentifier]::new($sidText)
+    $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+        $sid,
+        $fullControl,
+        $inheritance,
+        $propagation,
+        [System.Security.AccessControl.AccessControlType]::Allow
+    )
+    [void]$acl.AddAccessRule($rule)
+}
+if ($isDirectory) {
+    [System.IO.Directory]::SetAccessControl($target, $acl)
+} else {
+    [System.IO.File]::SetAccessControl($target, $acl)
+}
+$verified = Get-Acl -LiteralPath $target
+if (-not $verified.AreAccessRulesProtected) {
+    throw "DACL inheritance remains enabled"
+}
+$rules = @($verified.Access)
+if ($rules.Count -ne $allowed.Count) {
+    throw "DACL contains an unexpected rule count"
+}
+foreach ($rule in $rules) {
+    $identity = $rule.IdentityReference.Translate(
+        [System.Security.Principal.SecurityIdentifier]
+    ).Value
+    if ($allowed -notcontains $identity -or
+        $rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow -or
+        $rule.IsInherited -or
+        ($rule.FileSystemRights -band $fullControl) -ne $fullControl -or
+        $rule.InheritanceFlags -ne $inheritance -or
+        $rule.PropagationFlags -ne $propagation) {
+        throw "DACL verification failed"
+    }
+}
+foreach ($sidText in $allowed) {
+    $matches = @($rules | Where-Object {
+        $_.IdentityReference.Translate(
+            [System.Security.Principal.SecurityIdentifier]
+        ).Value -eq $sidText
+    })
+    if ($matches.Count -ne 1) {
+        throw "DACL principal verification failed"
+    }
+}
+"""
+_WINDOWS_PRIVATE_ACL_ENCODED = base64.b64encode(
+    _WINDOWS_PRIVATE_ACL_SCRIPT.encode("utf-16-le")
+).decode("ascii")
+
+
+def _running_on_windows() -> bool:
+    return os.name == "nt"
+
+
+def _current_windows_user_sid() -> str:
+    completed = subprocess.run(
+        ["whoami", "/user", "/fo", "csv", "/nh"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise OSError("cannot resolve the current Windows user SID")
+    try:
+        row = next(csv.reader(completed.stdout.splitlines()))
+        sid = row[1].strip()
+    except (IndexError, StopIteration) as exc:
+        raise OSError("cannot resolve the current Windows user SID") from exc
+    if not sid.startswith("S-"):
+        raise OSError("cannot resolve the current Windows user SID")
+    return sid
+
+
+def _protect_private_path(
+    path: Path,
+    *,
+    directory: bool,
+    windows_user_sid: str | None,
+) -> None:
+    value = path.lstat()
+    attributes = int(getattr(value, "st_file_attributes", 0))
+    expected_type = stat.S_ISDIR if directory else stat.S_ISREG
+    if stat.S_ISLNK(value.st_mode) or attributes & 0x400 or not expected_type(value.st_mode):
+        raise OSError(f"snapshot path has an unsafe type: {path}")
+
+    if _running_on_windows():
+        if windows_user_sid is None:
+            raise OSError("current Windows user SID is unavailable")
+        environment = {
+            **os.environ,
+            "OPENSQUILLA_UPGRADE_ACL_TARGET": str(path),
+            "OPENSQUILLA_UPGRADE_ACL_USER_SID": windows_user_sid,
+            "OPENSQUILLA_UPGRADE_ACL_IS_DIRECTORY": "1" if directory else "0",
+        }
+        completed = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-NonInteractive",
+                "-EncodedCommand",
+                _WINDOWS_PRIVATE_ACL_ENCODED,
+            ],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise OSError(f"cannot protect upgrade snapshot path: {path}")
+        return
+
+    mode = 0o700 if directory else 0o600
+    path.chmod(mode)
+    if stat.S_IMODE(path.stat().st_mode) != mode:
+        raise OSError(f"cannot protect upgrade snapshot path: {path}")
+
+
+def _create_private_directory(path: Path, *, windows_user_sid: str | None) -> None:
+    path.mkdir(mode=0o700)
+    _protect_private_path(
+        path,
+        directory=True,
+        windows_user_sid=windows_user_sid,
+    )
+
+
+def _copy_private_file(
+    source: Path,
+    destination: Path,
+    *,
+    windows_user_sid: str | None,
+) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    descriptor = os.open(destination, flags, 0o600)
+    try:
+        with source.open("rb") as source_handle, os.fdopen(descriptor, "wb") as target_handle:
+            descriptor = -1
+            shutil.copyfileobj(source_handle, target_handle)
+            target_handle.flush()
+            os.fsync(target_handle.fileno())
+            if not _running_on_windows():
+                os.fchmod(target_handle.fileno(), 0o600)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    _protect_private_path(
+        destination,
+        directory=False,
+        windows_user_sid=windows_user_sid,
+    )
+
+
+def _protect_private_tree(root: Path, *, windows_user_sid: str | None) -> None:
+    _protect_private_path(root, directory=True, windows_user_sid=windows_user_sid)
+    entries = sorted(root.rglob("*"), key=lambda item: item.as_posix())
+    for entry in entries:
+        _protect_private_path(
+            entry,
+            directory=entry.is_dir(),
+            windows_user_sid=windows_user_sid,
+        )
+
+
+def _remove_failed_snapshot(path: Path, *, original_error: Exception) -> None:
+    try:
+        if path.exists():
+            shutil.rmtree(path)
+        if path.exists():
+            raise OSError("path still exists after cleanup")
+    except Exception:
+        raise OSError(f"upgrade snapshot failed and cleanup failed: {path}") from original_error
 
 
 @dataclass(frozen=True)
@@ -163,18 +361,71 @@ class SandboxUpgradeCoordinator:
             raise ValueError("unsupported sandbox upgrade journal")
         return payload
 
+    def _manual_recovery_report(
+        self,
+        *,
+        store_names: tuple[str, ...],
+        error: Exception,
+    ) -> UpgradeMigrationReport:
+        failed = {
+            "migrationVersion": MIGRATION_VERSION,
+            "status": "prepared",
+            "stores": store_names,
+            "snapshot": str(self.snapshot_path),
+            "error": f"{type(error).__name__}: {error}",
+        }
+        _write_json(self.journal_path, failed)
+        return UpgradeMigrationReport(
+            ok=False,
+            status="manual_recovery_required",
+            canonical_mode=None,
+            journal_path=self.journal_path,
+            snapshot_path=self.snapshot_path if self.snapshot_path.exists() else None,
+            stores=store_names,
+            error=str(failed["error"]),
+        )
+
     def _snapshot(self, stores: tuple[Path, ...]) -> None:
+        windows_user_sid = _current_windows_user_sid() if _running_on_windows() else None
         if self.snapshot_path.exists():
+            _protect_private_tree(
+                self.snapshot_path,
+                windows_user_sid=windows_user_sid,
+            )
             return
-        staging = self.home / f".{SNAPSHOT_NAME}.{os.getpid()}.tmp"
-        staging.mkdir(parents=True)
+        staging = Path(
+            tempfile.mkdtemp(
+                prefix=f".{SNAPSHOT_NAME}.",
+                suffix=".tmp",
+                dir=self.home,
+            )
+        )
+        promoted = False
         try:
+            _protect_private_path(
+                staging,
+                directory=True,
+                windows_user_sid=windows_user_sid,
+            )
+            if next(staging.iterdir(), None) is not None:
+                raise OSError("upgrade snapshot staging is not empty after hardening")
             manifest: list[dict[str, object]] = []
             for source in stores:
                 relative = source.relative_to(self.home)
                 destination = staging / relative
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(source, destination)
+                current = staging
+                for part in relative.parts[:-1]:
+                    current = current / part
+                    if not current.exists():
+                        _create_private_directory(
+                            current,
+                            windows_user_sid=windows_user_sid,
+                        )
+                _copy_private_file(
+                    source,
+                    destination,
+                    windows_user_sid=windows_user_sid,
+                )
                 manifest.append(
                     {
                         "path": relative.as_posix(),
@@ -182,10 +433,23 @@ class SandboxUpgradeCoordinator:
                         "size": destination.stat().st_size,
                     }
                 )
-            _write_json(staging / "manifest.json", {"stores": manifest})
+            manifest_path = staging / "manifest.json"
+            _write_json(manifest_path, {"stores": manifest})
+            _protect_private_path(
+                manifest_path,
+                directory=False,
+                windows_user_sid=windows_user_sid,
+            )
+            _protect_private_tree(staging, windows_user_sid=windows_user_sid)
             os.replace(staging, self.snapshot_path)
-        except Exception:
-            shutil.rmtree(staging, ignore_errors=True)
+            promoted = True
+            _protect_private_tree(
+                self.snapshot_path,
+                windows_user_sid=windows_user_sid,
+            )
+        except Exception as exc:
+            cleanup = self.snapshot_path if promoted else staging
+            _remove_failed_snapshot(cleanup, original_error=exc)
             raise
 
     def run(self) -> UpgradeMigrationReport:
@@ -201,6 +465,14 @@ class SandboxUpgradeCoordinator:
         store_names = tuple(path.relative_to(self.home).as_posix() for path in stores)
         journal = self._load_journal()
         if journal is not None and journal.get("status") == "committed":
+            try:
+                if self.snapshot_path.exists():
+                    self._snapshot(())
+            except Exception as exc:
+                return self._manual_recovery_report(
+                    store_names=store_names,
+                    error=exc,
+                )
             return UpgradeMigrationReport(
                 ok=True,
                 status="committed",
@@ -251,22 +523,9 @@ class SandboxUpgradeCoordinator:
                 stores=store_names,
             )
         except Exception as exc:
-            failed = {
-                "migrationVersion": MIGRATION_VERSION,
-                "status": "prepared",
-                "stores": store_names,
-                "snapshot": str(self.snapshot_path),
-                "error": f"{type(exc).__name__}: {exc}",
-            }
-            _write_json(self.journal_path, failed)
-            return UpgradeMigrationReport(
-                ok=False,
-                status="manual_recovery_required",
-                canonical_mode=None,
-                journal_path=self.journal_path,
-                snapshot_path=self.snapshot_path if self.snapshot_path.exists() else None,
-                stores=store_names,
-                error=str(failed["error"]),
+            return self._manual_recovery_report(
+                store_names=store_names,
+                error=exc,
             )
 
 
