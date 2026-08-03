@@ -1473,6 +1473,46 @@ def test_capability_probe_does_not_project_host_tool_path_acl_roots(
     payload = mod._payload_for_request(request)
 
     assert payload["argv"]
+    assert payload["policy"]["capabilityProbe"] is True
+
+
+def test_capability_filesystem_worker_keeps_probe_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default as mod
+    from opensquilla.sandbox.operation_runtime import SandboxOperation
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "notes.txt"
+    runtime_scripts = tmp_path / "runtime" / "Scripts"
+    runtime_scripts.mkdir(parents=True)
+    python_exe = runtime_scripts / "python.exe"
+    python_exe.write_text("", encoding="utf-8")
+    source_root = tmp_path / "src" / "opensquilla"
+    source_root.mkdir(parents=True)
+    monkeypatch.setattr(mod, "_python_executable", lambda: python_exe)
+    monkeypatch.setattr(mod, "_opensquilla_import_roots", lambda: (source_root,))
+
+    operation = replace(
+        SandboxOperation.filesystem(
+            kind="write_text",
+            workspace=workspace,
+            run_mode=RunMode.SAFE.value,
+            path=target,
+            paths=(target,),
+            content="hello",
+            file_system_profile=FileSystemPermissionProfile(
+                entries=(FileSystemPermissionEntry(workspace, FileSystemAccess.WRITE),)
+            ),
+        ),
+        operation_id="capability-probe",
+    )
+
+    request = mod._filesystem_operation_request(operation)
+
+    assert request.action_kind == "capability.probe.fs.worker.write_text"
 
 
 def test_payload_skips_windows_reserved_device_expansion_roots(

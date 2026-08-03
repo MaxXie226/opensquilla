@@ -287,25 +287,31 @@ async def _probe_runtime_capabilities(
             capabilities.add("process")
 
         await backend_object.run_operation(
-            SandboxOperation.filesystem(
-                kind="write_text",
-                workspace=workspace,
-                run_mode="safe",
-                path=worker_target,
-                paths=(worker_target,),
-                content="worker-ok",
-                file_system_profile=profile,
+            replace(
+                SandboxOperation.filesystem(
+                    kind="write_text",
+                    workspace=workspace,
+                    run_mode="safe",
+                    path=worker_target,
+                    paths=(worker_target,),
+                    content="worker-ok",
+                    file_system_profile=profile,
+                ),
+                operation_id="capability-probe",
             )
         )
         read_result = await backend_object.run_operation(
-            SandboxOperation.filesystem(
-                kind="read_file",
-                workspace=workspace,
-                run_mode="safe",
-                path=worker_target,
-                paths=(worker_target,),
-                display_path=str(worker_target),
-                file_system_profile=profile,
+            replace(
+                SandboxOperation.filesystem(
+                    kind="read_file",
+                    workspace=workspace,
+                    run_mode="safe",
+                    path=worker_target,
+                    paths=(worker_target,),
+                    display_path=str(worker_target),
+                    file_system_profile=profile,
+                ),
+                operation_id="capability-probe",
             )
         )
         if "worker-ok" in read_result.message:
@@ -313,14 +319,17 @@ async def _probe_runtime_capabilities(
 
         try:
             await backend_object.run_operation(
-                SandboxOperation.filesystem(
-                    kind="write_text",
-                    workspace=workspace,
-                    run_mode="safe",
-                    path=protected_target,
-                    paths=(protected_target,),
-                    content="changed",
-                    file_system_profile=profile,
+                replace(
+                    SandboxOperation.filesystem(
+                        kind="write_text",
+                        workspace=workspace,
+                        run_mode="safe",
+                        path=protected_target,
+                        paths=(protected_target,),
+                        content="changed",
+                        file_system_profile=profile,
+                    ),
+                    operation_id="capability-probe",
                 )
             )
         except Exception:  # noqa: BLE001 - denial is the expected result
@@ -329,14 +338,17 @@ async def _probe_runtime_capabilities(
 
         try:
             await backend_object.run_operation(
-                SandboxOperation.filesystem(
-                    kind="read_file",
-                    workspace=workspace,
-                    run_mode="safe",
-                    path=authority_secret,
-                    paths=(authority_secret,),
-                    display_path=str(authority_secret),
-                    file_system_profile=profile,
+                replace(
+                    SandboxOperation.filesystem(
+                        kind="read_file",
+                        workspace=workspace,
+                        run_mode="safe",
+                        path=authority_secret,
+                        paths=(authority_secret,),
+                        display_path=str(authority_secret),
+                        file_system_profile=profile,
+                    ),
+                    operation_id="capability-probe",
                 )
             )
         except Exception:  # noqa: BLE001 - denial is the expected result

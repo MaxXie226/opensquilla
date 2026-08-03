@@ -263,6 +263,8 @@ def _parse_payload(args: Sequence[str]) -> HelperPayload:
 
 
 def _validate_policy_is_enforceable(policy: dict[str, Any]) -> None:
+    if "capabilityProbe" in policy and not isinstance(policy["capabilityProbe"], bool):
+        raise SystemExit("windows_default capabilityProbe marker must be boolean")
     network = policy.get("network")
     if network not in {"none", "host", "proxy_allowlist"}:
         raise SystemExit(f"windows_default runner received unknown network mode: {network!r}")
@@ -320,7 +322,11 @@ def _run_windows_default(payload: HelperPayload) -> int:
 
         offline_identity_from_boundary(boundary)
         return _run_windows_default_with_acl_lease(payload, acl_plan, credentials=None)
-    credentials = _resolve_offline_launch_credentials(payload)
+    credentials = (
+        None
+        if payload.policy.get("capabilityProbe") is True
+        else _resolve_offline_launch_credentials(payload)
+    )
     with _windows_acl_execution_lease():
         return _run_windows_default_with_acl_lease(
             payload,
@@ -674,6 +680,7 @@ def _should_reexec_as_offline_identity(payload: HelperPayload) -> bool:
         not payload.offline_child
         and str(payload.run_mode).strip().lower() != "full"
         and _network_boundary(payload.policy) is not None
+        and payload.policy.get("capabilityProbe") is not True
     )
 
 

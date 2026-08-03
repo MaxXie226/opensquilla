@@ -391,6 +391,7 @@ async def test_live_capability_probe_scopes_file_profile_to_canary_workspace(
     from opensquilla.sandbox.types import SandboxResult
 
     captured: dict[str, object] = {}
+    operation_ids: list[str] = []
 
     def compile_profile(*args: object, **kwargs: object) -> FileSystemPermissionProfile:
         captured.update(kwargs)
@@ -404,6 +405,7 @@ async def test_live_capability_probe_scopes_file_profile_to_canary_workspace(
             return frozenset({"filesystem"})
 
         async def run(self, request: object) -> SandboxResult:
+            captured["processActionKind"] = getattr(request, "action_kind", None)
             return SandboxResult(
                 returncode=0,
                 stdout="opensquilla-safe-probe",
@@ -413,6 +415,7 @@ async def test_live_capability_probe_scopes_file_profile_to_canary_workspace(
             )
 
         async def run_operation(self, operation: object) -> SandboxOperationResult:
+            operation_ids.append(str(getattr(operation, "operation_id", "")))
             path = Path(str(getattr(getattr(operation, "request", None), "path", "")))
             if path.name in {"must-remain.txt", "authority.txt"}:
                 raise PermissionError("expected canary denial")
@@ -440,3 +443,5 @@ async def test_live_capability_probe_scopes_file_profile_to_canary_workspace(
     assert captured["home"] == captured["writable_roots"][0]
     assert captured["env"]["USERPROFILE"] == str(captured["home"])
     assert captured["env"]["HOME"] == str(captured["home"])
+    assert captured["processActionKind"] == "capability.probe"
+    assert operation_ids == ["capability-probe"] * 4

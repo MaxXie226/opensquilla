@@ -2362,6 +2362,64 @@ def test_proxy_allowlist_reexecs_helper_under_offline_identity(monkeypatch, tmp_
     assert calls == [payload]
 
 
+def test_capability_probe_uses_restricted_token_without_shared_offline_acl(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default_runner as mod
+
+    payload = mod.HelperPayload(
+        argv=("cmd", "/c", "echo", "probe"),
+        cwd=tmp_path,
+        env={},
+        policy={
+            "network": "none",
+            "capabilityProbe": True,
+            "windowsAclPlan": {
+                "autoGrants": [],
+                "capabilitySids": [],
+                "denyWritePaths": [],
+                "denyReadPaths": [],
+                "grantCurrentUserAccess": True,
+            },
+            "windowsNetworkBoundary": {
+                "offlineUserSid": "S-1-5-21-100-200-300-400",
+                "offlineUsername": "OpenSquillaSandbox",
+                "protectedPassword": "base64-dpapi-payload",
+                "allowedProxyPorts": [48123],
+                "allowLocalBinding": False,
+            },
+        },
+        run_mode="safe",
+        timeout=5,
+    )
+    events: list[str] = []
+    monkeypatch.setattr(
+        mod,
+        "_resolve_offline_launch_credentials",
+        lambda _payload: pytest.fail("capability probe must not resolve offline credentials"),
+    )
+    monkeypatch.setattr(mod, "_prepare_deny_acl_targets", lambda _plan: None)
+    monkeypatch.setattr(
+        mod,
+        "_apply_acl_refresh",
+        lambda _plan, **_kwargs: events.append("refresh"),
+    )
+    monkeypatch.setattr(
+        mod,
+        "_run_payload_as_offline_identity",
+        lambda *_args, **_kwargs: pytest.fail("capability probe must not re-exec offline"),
+    )
+    monkeypatch.setattr(
+        mod,
+        "_run_restricted_process_native",
+        lambda *_args: events.append("restricted") or 0,
+    )
+
+    assert mod._run_windows_default(payload) == 0
+    assert events == ["refresh", "restricted"]
+
+
 @pytest.mark.parametrize("failure_stage", ["identity", "decrypt"])
 def test_offline_identity_preflight_fails_before_any_acl_mutation(
     monkeypatch: pytest.MonkeyPatch,

@@ -265,6 +265,12 @@ def _payload_for_request(
         request,
         private_mounts_are_required=private_mounts_are_required,
     )
+    if _is_capability_probe_request(request):
+        # Capability canaries use their own short-lived capability SIDs. They
+        # must not switch the shared offline account's allow journal away from
+        # the user's real Safe profile, which can trigger expensive inherited
+        # ACL churn on a large home directory.
+        policy["capabilityProbe"] = True
     network_boundary = _windows_network_boundary_payload(request)
     if network_boundary is not None:
         policy["windowsNetworkBoundary"] = network_boundary
@@ -286,6 +292,12 @@ def _payload_for_request(
 
 def _new_helper_nonce() -> str:
     return secrets.token_hex(16)
+
+
+def _is_capability_probe_request(request: SandboxRequest) -> bool:
+    return request.action_kind == "capability.probe" or request.action_kind.startswith(
+        "capability.probe.fs.worker."
+    )
 
 
 def _authenticated_helper_error(
@@ -402,10 +414,13 @@ def _filesystem_operation_request(
             "defaultAccess": profile.default_access.value,
         },
     }
+    action_kind = f"fs.worker.{operation.kind}"
+    if operation.operation_id == "capability-probe":
+        action_kind = f"capability.probe.{action_kind}"
     return SandboxRequest(
         argv=internal_child_argv(ChildRole.FILESYSTEM_WORKER, args=("-",)),
         cwd=workspace,
-        action_kind=f"fs.worker.{operation.kind}",
+        action_kind=action_kind,
         policy=policy,
         stdin=json.dumps(worker_payload, ensure_ascii=False).encode("utf-8"),
         env=env,
