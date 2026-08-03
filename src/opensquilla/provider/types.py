@@ -255,7 +255,13 @@ StreamEvent = (
 # Tool definition (Pydantic BaseModel — external API boundary)
 # ---------------------------------------------------------------------------
 
-from pydantic import BaseModel, ConfigDict, Field  # noqa: E402
+from pydantic import (  # noqa: E402
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    model_serializer,
+)
 
 
 class ToolParam(BaseModel):
@@ -310,6 +316,21 @@ class ModelInfo(BaseModel):
     supports_vision: bool = False
     input_cost_per_1k: float = 0.0
     output_cost_per_1k: float = 0.0
+    # Additive, normalized provider facts for discovery/RPC projection.
+    # Never contains an upstream raw row. Providers without a typed metadata
+    # contract leave it as None.
+    metadata: dict[str, Any] | None = None
+
+    @model_serializer(mode="wrap")
+    def _serialize_without_absent_metadata(
+        self,
+        handler: SerializerFunctionWrapHandler,
+    ):
+        """Preserve the pre-metadata dump shape on every supported Pydantic 2.x."""
+        serialized = cast(dict[str, Any], handler(self))
+        if self.metadata is None:
+            serialized.pop("metadata", None)
+        return serialized
 
 
 # ---------------------------------------------------------------------------

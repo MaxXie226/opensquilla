@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import inspect
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 
 from opensquilla.redaction import redact_error_text
@@ -23,6 +23,7 @@ from .registry import (
     UnknownProviderError,
     get_provider_spec,
 )
+from .types import ModelInfo
 
 
 @dataclass
@@ -646,7 +647,12 @@ class ModelSelector:
         """Aggregate models from all configured providers in the chain."""
         return (await self.list_models_detailed()).models
 
-    async def list_models_detailed(self) -> ModelListResult:
+    async def list_models_detailed(
+        self,
+        *,
+        snapshot_resolver: Callable[[ProviderConfig], Sequence[ModelInfo] | None]
+        | None = None,
+    ) -> ModelListResult:
         """Aggregate models across the chain, keeping per-provider failures.
 
         Walks the chain exactly like :meth:`list_models`, but instead of
@@ -654,10 +660,21 @@ class ModelSelector:
         :func:`classify_provider_error` and records a redacted
         :class:`ProviderListError`, so model pickers can distinguish
         "provider has no models" from "wrong key / URL".
+
+        ``snapshot_resolver`` is an additive gateway boundary for providers
+        whose ordinary model listing must be network-free. Returning ``None``
+        keeps the provider's normal listing path; returning a sequence --
+        including an empty one -- makes that sequence authoritative for the
+        individual chain link. Other links continue through their adapters,
+        so a cached provider neither suppresses their rows nor their errors.
         """
         result = ModelListResult()
         for cfg in self._chain:
             try:
+                snapshot = snapshot_resolver(cfg) if snapshot_resolver is not None else None
+                if snapshot is not None:
+                    result.models.extend(model.model_dump() for model in snapshot)
+                    continue
                 provider = _build_provider(cfg)
                 provider_models = await _list_provider_models_detailed(provider)
                 result.models.extend(m.model_dump() for m in provider_models)

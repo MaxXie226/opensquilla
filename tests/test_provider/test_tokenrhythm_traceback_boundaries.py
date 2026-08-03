@@ -11,7 +11,12 @@ import httpx
 import pytest
 
 from opensquilla.onboarding import image_generation_model_discovery as image_discovery
-from opensquilla.provider import image_generation, live_catalog, openai
+from opensquilla.provider import (
+    image_generation,
+    live_catalog,
+    openai,
+    tokenrhythm_catalog,
+)
 from opensquilla.provider.image_generation import (
     ImageGenerationRequest,
     OpenAIImageGenerationProvider,
@@ -113,6 +118,8 @@ def _patch_install_header(monkeypatch: pytest.MonkeyPatch, case: str) -> None:
         "live": live_catalog,
         "discovery": image_discovery,
         "models": openai,
+        "catalog-published": tokenrhythm_catalog,
+        "catalog-declared": tokenrhythm_catalog,
     }[case]
     monkeypatch.setattr(
         module,
@@ -174,6 +181,12 @@ async def _call_boundary(case: str) -> object:
         )
     if case == "discovery":
         return await image_discovery._fetch_tokenrhythm_image_models()
+    if case == "catalog-published":
+        return await tokenrhythm_catalog.fetch_tokenrhythm_published()
+    if case == "catalog-declared":
+        return await tokenrhythm_catalog.fetch_tokenrhythm_declared(
+            api_key="synthetic-provider-key"
+        )
     provider = OpenAIProvider(
         api_key="synthetic-provider-key",
         model="deepseek-v4-flash",
@@ -203,6 +216,18 @@ _BOUNDARIES = (
         "onboarding/image_generation_model_discovery.py",
         "_fetch_tokenrhythm_image_models",
         id="image-model-discovery",
+    ),
+    pytest.param(
+        "catalog-published",
+        "provider/tokenrhythm_catalog.py",
+        "fetch_tokenrhythm_published",
+        id="typed-catalog-published",
+    ),
+    pytest.param(
+        "catalog-declared",
+        "provider/tokenrhythm_catalog.py",
+        "fetch_tokenrhythm_declared",
+        id="typed-catalog-declared",
     ),
     pytest.param("models", "provider/openai.py", "list_models", id="models"),
 )
@@ -272,6 +297,8 @@ async def test_http_error_scrubs_production_traceback_locals(
         function_name=function_name,
     )
     assert _INSTALL_ID not in state
+    if case == "catalog-declared":
+        assert "synthetic-provider-key" not in state
     assert raised.value.__context__ is None
     assert client_options[-1]["follow_redirects"] is False
 
@@ -325,6 +352,8 @@ async def test_cancellation_scrubs_production_traceback_locals(
         function_name=function_name,
     )
     assert _INSTALL_ID not in state
+    if case == "catalog-declared":
+        assert "synthetic-provider-key" not in state
     assert raised.value.__context__ is None
     assert client_options[-1]["follow_redirects"] is False
 
@@ -382,6 +411,8 @@ async def test_invalid_json_scrubs_response_and_payload_traceback_locals(
         function_name=function_name,
     )
     assert _INSTALL_ID not in state
+    if case == "catalog-declared":
+        assert "synthetic-provider-key" not in state
     assert raised.value.__context__ is None
 
 

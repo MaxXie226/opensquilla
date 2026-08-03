@@ -143,12 +143,28 @@ function compactTokens(count: number | null): string {
 
 function rowMeta(model: DiscoveredModel): string {
   const parts: string[] = []
-  const ctx = compactTokens(model.contextWindow)
-  if (ctx) parts.push(ctx)
-  const maxOutput = compactTokens(model.maxOutputTokens)
-  if (maxOutput) {
-    parts.push(t('setup.provider.modelMaxOutput', { tokens: maxOutput }))
+  const published = model.metadata?.schemaVersion === 1 ? model.metadata.published : null
+  const publishedContext = compactTokens(published?.contextWindow ?? null)
+  const ctx = publishedContext || compactTokens(model.contextWindow)
+  if (ctx) {
+    parts.push(t(
+      publishedContext
+        ? 'setup.provider.modelPublishedContext'
+        : 'setup.provider.modelCatalogContext',
+      { tokens: ctx },
+    ))
   }
+  const publishedMaxOutput = compactTokens(published?.maxOutputTokens ?? null)
+  const maxOutput = publishedMaxOutput || compactTokens(model.maxOutputTokens)
+  if (maxOutput) {
+    parts.push(t(
+      publishedMaxOutput
+        ? 'setup.provider.modelPublishedMaxOutput'
+        : 'setup.provider.modelCatalogMaxOutput',
+      { tokens: maxOutput },
+    ))
+  }
+  if (published?.status) parts.push(t('setup.provider.modelPublishedStatus', { status: published.status }))
   parts.push(...model.capabilities.filter(cap => cap !== 'chat').slice(0, 3))
   return parts.join(' · ')
 }

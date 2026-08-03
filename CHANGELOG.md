@@ -17,6 +17,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   opt-out alone does not suppress it. TokenRhythm must treat the value as
   optional and untrusted, never as an authentication, authorization, billing,
   rate-limiting, or anti-abuse signal.
+- TokenRhythm model discovery now combines the official published catalog with
+  the current credential's declared model entitlements, exposes versioned
+  `metadata.published` / `metadata.declared` fields, and reports stale catalog
+  state without blocking normal model listing or turns.
+
+### Fixed
+
+- TokenRhythm maximum-output limits now prefer the authenticated top-level
+  declaration, preserve the published value separately from the runtime-safe
+  value, and clamp fallback requests to each physical model's known limit.
+- TokenRhythm catalog refreshes now use bounded lazy caching, last-good
+  snapshots, authority isolation, credential-safe persistence, and explicit
+  refresh/credential lifecycle invalidation without a background timer.
+
+### Changed
+
+- `onboarding.models.discover`, profile model discovery, and `models.list` add
+  optional catalog metadata and maximum-output fields. Existing clients may
+  ignore them; external decoders using `additionalProperties: false` must allow
+  the new additive fields before upgrading.
 
 ## [0.5.2] - 2026-07-30
 

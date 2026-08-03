@@ -52,6 +52,7 @@ OFFLINE_MARKER_EXCLUSIONS = {
     "tests/live/test_search_api_matrix_live.py",
     "tests/live/test_multi_provider_matrix_live.py",
     "tests/live/test_search_retrieval_live.py",
+    "tests/live/test_tokenrhythm_catalog_live.py",
     "tests/live/test_web_search_agent_e2e.py",
     "tests/test_skills/test_meta_router_live.py",
     "tests/test_skills/test_meta_skill_creator_smoke_live.py",

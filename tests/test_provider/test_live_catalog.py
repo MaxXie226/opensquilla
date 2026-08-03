@@ -8,6 +8,7 @@ payloads are synthetic mirrors of the platform shape.
 
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -20,7 +21,7 @@ from opensquilla.provider.live_catalog import (
     parse_tokenrhythm_models,
     warm_live_provider_catalogs,
 )
-from opensquilla.provider.model_catalog import ModelCatalog
+from opensquilla.provider.model_catalog import DEFAULT_MAX_TOKENS, ModelCatalog
 
 
 def _tokenrhythm_row(**overrides: Any) -> dict[str, Any]:
@@ -221,10 +222,10 @@ def test_parse_tokenrhythm_qwen_max_output_is_exact_128_kib_tokens() -> None:
     assert catalog.resolve_max_tokens("qwen3.7-max", provider="tokenrhythm") == 131_072
 
 
-def test_parse_tokenrhythm_models_halves_near_window_output_caps() -> None:
-    # A published output cap at/near the whole window (input and output
-    # share it) would trip resolve_max_tokens' request-safety clamp down to
-    # 8192; the parser halves it to the engine's output-reserve ceiling.
+def test_parse_tokenrhythm_models_preserves_near_window_output_caps_raw() -> None:
+    # Published metadata remains byte-for-byte meaningful for discovery.
+    # The provider-scoped runtime resolver, not the parser, derives the
+    # engine's half-window execution ceiling.
     entries = parse_tokenrhythm_models(
         {
             "code": 0,
@@ -237,13 +238,12 @@ def test_parse_tokenrhythm_models_halves_near_window_output_caps() -> None:
         }
     )
 
-    assert entries["minimax-m2.5"]["max_output_tokens"] == 100_000
-    assert entries["minimax-m2.7"]["max_output_tokens"] == 100_000
+    assert entries["minimax-m2.5"]["max_output_tokens"] == 200_000
+    assert entries["minimax-m2.7"]["max_output_tokens"] == 192_000
 
     catalog = ModelCatalog()
     catalog.set_live_provider_entries("tokenrhythm", entries)
-    # The resolved value survives resolve_max_tokens un-clamped — the whole
-    # point of halving at ingest time.
+    # Runtime keeps real input room without falsifying the website field.
     assert catalog.resolve_max_tokens("minimax-m2.5", provider="tokenrhythm") == 100_000
 
 
@@ -259,6 +259,22 @@ def test_refreshed_corrections_rows_do_not_trip_the_near_window_clamp() -> None:
         ("mimo-v2.5-pro", 128_000),
     ):
         assert catalog.resolve_max_tokens(model, provider="tokenrhythm") == expected
+
+
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [("minimax-m2.7", 131_072), ("mimo-v2.5-pro", DEFAULT_MAX_TOKENS)],
+)
+def test_tokenrhythm_raw_policy_inputs_never_leak_to_generic_budget_fallback(
+    model: str,
+    expected: int,
+) -> None:
+    catalog = ModelCatalog()
+
+    # Those exact ids have no provider-agnostic runtime budget. In particular,
+    # the TokenRhythm website's raw 192K/256K values must not flow through and
+    # trigger another provider's legacy near-window 8K reduction.
+    assert catalog.resolve_max_tokens(model, provider="unrelated-cloud") == expected
 
 
 def test_tokenrhythm_offline_corrections_use_effective_prices() -> None:
@@ -405,6 +421,7 @@ async def test_fetch_live_catalog_entries_uses_url_verbatim_without_auth() -> No
         "X-OpenSquilla-Install-Id": "synthetic-install-id",
     }
     assert "Authorization" not in headers
+    mock_response.json.assert_called_once_with(parse_float=Decimal)
     assert entries["deepseek-v4-pro"]["context_window"] == 900_000
 
 

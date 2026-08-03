@@ -27,6 +27,34 @@ const MODELS: DiscoveredModel[] = [
   },
 ]
 
+const PUBLISHED_METADATA: NonNullable<DiscoveredModel['metadata']> = {
+  schemaVersion: 1,
+  published: {
+    name: 'Alpha Official',
+    providerDisplayName: 'Test Vendor',
+    modelType: 'chat',
+    status: 'available',
+    modalities: ['text'],
+    contextWindow: 1048576,
+    maxOutputTokens: 131072,
+    reasoningMode: 'hybrid',
+    reasoningDefault: 'provider',
+    reasoningSupportedEfforts: [],
+    reasoningSupportsMaxTokens: false,
+    capabilities: {
+      tools: true,
+      reasoning: true,
+      vision: false,
+      anthropic: false,
+      responses: true,
+      streaming: true,
+    },
+    responses: null,
+    pricing: null,
+  },
+  declared: null,
+}
+
 const FIELD = { name: 'model', label: 'Model' }
 
 function makeModel(id: string, capabilitySource = 'provider'): DiscoveredModel {
@@ -163,13 +191,30 @@ describe('SetupModelCombobox', () => {
     expect(rows).toHaveLength(2)
     expect(rows[0].textContent).toContain('test-vendor/alpha')
     expect(rows[0].textContent).toContain('Alpha')
-    expect(rows[0].textContent).toContain('262k')
-    expect(rows[0].textContent).toContain('Max output 16k')
+    expect(rows[0].textContent).toContain('Catalog context 262k')
+    expect(rows[0].textContent).toContain('Catalog max output 16k')
     expect(rows[0].textContent).toContain('tools')
     expect(rows[0].textContent).not.toContain('chat') // baseline capability is noise
-    expect(rows[1].textContent).toContain('128k')
-    expect(rows[1].textContent).not.toContain('Max output')
+    expect(rows[1].textContent).toContain('Catalog context 128k')
+    expect(rows[1].textContent).not.toContain('max output')
     expect(rows[1].textContent).toContain('vision')
+  })
+
+  it('prefers published limits and status while labeling catalog fallbacks', async () => {
+    const { el } = await mountCombobox({
+      models: [
+        { ...MODELS[0], metadata: PUBLISHED_METADATA },
+        MODELS[1],
+      ],
+    })
+    await openList(el)
+
+    const rows = optionRows()
+    expect(rows[0].textContent).toContain('Official context 1M')
+    expect(rows[0].textContent).toContain('Official max output 131k')
+    expect(rows[0].textContent).toContain('Status available')
+    expect(rows[0].textContent).not.toContain('Catalog context 262k')
+    expect(rows[1].textContent).toContain('Catalog context 128k')
   })
 
   it('keeps the model count in the catalog header instead of the input chrome', async () => {

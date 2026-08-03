@@ -121,6 +121,73 @@ class _RecordingModelCatalog:
 
 
 @dataclass
+class _PerModelCatalog:
+    rows: dict[tuple[str, str], _ResolvedCatalog]
+    calls: list[tuple[str, str]] = field(default_factory=list)
+
+    def lookup(self, model_id: str, provider: str = "") -> _ResolvedCatalog:
+        identity = (provider, model_id)
+        self.calls.append((model_id, provider))
+        return self.rows[identity]
+
+
+@dataclass
+class _FallbackLimitProvider:
+    limits: dict[tuple[str, str], tuple[int, int]] = field(default_factory=dict)
+
+    def configure_fallback_limits(
+        self,
+        limits: dict[tuple[str, str], tuple[int, int]],
+    ) -> None:
+        self.limits = dict(limits)
+
+
+@dataclass
+class _DeploymentAwareCatalog:
+    deployment_calls: list[tuple[str, bool]] = field(default_factory=list)
+    generic_calls: list[tuple[str, str]] = field(default_factory=list)
+
+    def lookup(self, model_id: str, provider: str = "") -> _ResolvedCatalog:
+        self.generic_calls.append((model_id, provider))
+        return _ResolvedCatalog(
+            max_tokens=131_072,
+            context_window=1_000_000,
+            capabilities=None,
+        )
+
+    def lookup_deployment(
+        self,
+        deployment: Any,
+        *,
+        include_global_overrides: bool = False,
+    ) -> _ResolvedCatalog:
+        self.deployment_calls.append(
+            (str(getattr(deployment, "api_key", "")), include_global_overrides)
+        )
+        return _ResolvedCatalog(
+            max_tokens=8_192,
+            context_window=64_000,
+            capabilities=None,
+            auto_max_tokens=8_192,
+            auto_max_tokens_known=True,
+        )
+
+
+@dataclass
+class _DeploymentAwareProvider:
+    active: Any
+
+    def active_deployment_config(self) -> Any:
+        return self.active
+
+    def fallback_deployment_configs(self) -> tuple[Any, ...]:
+        return ()
+
+    def configure_fallback_deployment_limits(self, _limits: Any) -> None:
+        return None
+
+
+@dataclass
 class _RecordingAgentConfigBuilder:
     aux: _AgentConfigAuxiliaries = field(default_factory=_default_aux)
     last_kwargs: dict[str, Any] = field(default_factory=dict)
@@ -448,6 +515,92 @@ async def test_lookup_receives_active_provider_name() -> None:
     inp = _make_input(active_provider_id="ollama", resolved_model="qwen3:4b")
     await stage.run(inp)
     assert catalog.calls[-1] == ("qwen3:4b", "ollama")
+
+
+@pytest.mark.asyncio
+async def test_routed_primary_uses_exact_private_deployment_lookup() -> None:
+    catalog = _DeploymentAwareCatalog()
+    deployment = SimpleNamespace(
+        provider="tokenrhythm",
+        model="shared/model",
+        api_key="synthetic-routed-key-b",
+        base_url="https://tokenrhythm.studio/v1",
+        proxy="",
+    )
+    provider = _DeploymentAwareProvider(active=deployment)
+    stage = _make_stage(catalog=catalog)
+
+    out = await stage.run(
+        _make_input(
+            provider=provider,
+            resolved_model="shared/model",
+            active_provider_id="tokenrhythm",
+        )
+    )
+
+    assert out.output.agent_config.max_tokens == 8_192
+    assert out.output.agent_config.context_window_tokens == 64_000
+    assert catalog.deployment_calls == [("synthetic-routed-key-b", True)]
+    assert catalog.generic_calls == []
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_installs_known_fallback_limits_on_provider_wrapper() -> None:
+    catalog = _PerModelCatalog(
+        rows={
+            ("provider-a", "primary/model"): _ResolvedCatalog(
+                max_tokens=131_072,
+                context_window=1_000_000,
+                capabilities=None,
+                auto_max_tokens=131_072,
+                auto_max_tokens_known=True,
+            ),
+            ("provider-b", "fallback/model"): _ResolvedCatalog(
+                max_tokens=131_072,
+                context_window=32_000,
+                capabilities=None,
+                auto_max_tokens=8_192,
+                auto_max_tokens_known=True,
+            ),
+            ("provider-b", "unknown/model"): _ResolvedCatalog(
+                max_tokens=131_072,
+                context_window=200_000,
+                capabilities=None,
+                auto_max_tokens=16_384,
+                auto_max_tokens_known=False,
+            ),
+        }
+    )
+    provider = _FallbackLimitProvider()
+    turn = _make_turn(
+        metadata={
+            "routed_tier": "c2",
+            "routed_provider": "provider-a",
+            "routed_model": "primary/model",
+            "selector_execution_chain": [
+                {"provider": "provider-b", "model": "fallback/model"},
+                {"provider": "provider-b", "model": "unknown/model"},
+            ],
+        }
+    )
+    stage = _make_stage(catalog=catalog)
+
+    await stage.run(
+        _make_input(
+            provider=provider,
+            turn=turn,
+            resolved_model="primary/model",
+            active_provider_id="provider-a",
+        )
+    )
+
+    assert provider.limits == {
+        ("provider-b", "fallback/model"): (32_000, 8_192),
+        ("provider-b", "unknown/model"): (200_000, 0),
+    }
+    assert turn.metadata["route_plan"]["fallback_chain"][0]["capabilities"][
+        "effective_max_tokens"
+    ] == 8_192
 
 
 @pytest.mark.asyncio

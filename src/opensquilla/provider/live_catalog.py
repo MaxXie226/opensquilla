@@ -21,9 +21,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-import math
 from collections.abc import Callable, Iterable, Mapping
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -34,8 +33,11 @@ from opensquilla.env import trust_env as _trust_env
 from .app_attribution import provider_app_headers
 from .error_redaction import redacted_httpx_error
 from .fx import TOKENRHYTHM_CNY_PER_USD
-from .model_catalog import DEFAULT_MAX_TOKENS as _NEAR_WINDOW_MARGIN
 from .registry import UnknownProviderError, get_provider_spec
+from .tokenrhythm_catalog import (
+    parse_tokenrhythm_published,
+    tokenrhythm_published_catalog_entries,
+)
 from .tokenrhythm_correlation import (
     redact_tokenrhythm_install_ids,
     tokenrhythm_install_id_headers,
@@ -54,73 +56,6 @@ LIVE_CATALOG_TIMEOUT_SECONDS = 5.0
 # corrections rows use (catalog_overrides.toml) and the billing receipts
 # record — one canonical rate in ``provider/fx.py``.
 _TOKENRHYTHM_CNY_PER_USD = float(TOKENRHYTHM_CNY_PER_USD)
-_TOKENRHYTHM_CNY_PER_USD_DECIMAL = TOKENRHYTHM_CNY_PER_USD
-_TOKENS_PER_MTOK = Decimal("1000000")
-
-
-def _coerce_positive_int(value: object) -> int:
-    """Positive int from listing data; 0 for anything unusable.
-
-    Listings serve numbers loosely (TokenRhythm already serves prices as
-    strings), so integral floats and digit strings coerce rather than
-    silently zeroing the platform's published budget fields.
-    """
-    if isinstance(value, bool):
-        return 0
-    if isinstance(value, float):
-        if not value.is_integer():
-            return 0
-        value = int(value)
-    elif isinstance(value, str):
-        try:
-            value = int(value.strip())
-        except ValueError:
-            return 0
-    if not isinstance(value, int):
-        return 0
-    return value if value > 0 else 0
-
-
-def _tokenrhythm_cost_per_mtok(value: object, billing_unit: object) -> float | None:
-    """CNY-per-``billing_unit``-tokens (string or number) → USD per-Mtok."""
-    if not isinstance(value, (str, int, float)) or isinstance(value, bool):
-        return None
-    if not isinstance(billing_unit, (str, int, float)) or isinstance(billing_unit, bool):
-        return None
-    try:
-        price = Decimal(str(value).strip())
-        unit = Decimal(str(billing_unit).strip())
-    except (InvalidOperation, ValueError):
-        return None
-    if not price.is_finite() or not unit.is_finite() or price < 0 or unit <= 0:
-        return None
-    converted = (price * (_TOKENS_PER_MTOK / unit)) / _TOKENRHYTHM_CNY_PER_USD_DECIMAL
-    try:
-        result = float(converted)
-    except (OverflowError, ValueError):
-        return None
-    return result if math.isfinite(result) else None
-
-
-def _tokenrhythm_bucket_cost(
-    row: Mapping[str, Any],
-    *,
-    effective_key: str,
-    discount_key: str,
-    standard_key: str,
-    billing_unit: object,
-) -> float | None:
-    keys = [effective_key]
-    if row.get("hasDiscount") is True:
-        keys.append(discount_key)
-    keys.append(standard_key)
-    for key in keys:
-        if key not in row:
-            continue
-        cost = _tokenrhythm_cost_per_mtok(row.get(key), billing_unit)
-        if cost is not None:
-            return cost
-    return None
 
 
 def parse_tokenrhythm_models(payload: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
@@ -130,84 +65,13 @@ def parse_tokenrhythm_models(payload: Mapping[str, Any]) -> dict[str, dict[str, 
     ``context_window`` (``contextWindow``), ``max_output_tokens``
     (``maxOutputTokens``), ``display_name``, ``supports_tools`` /
     ``supports_vision`` (the listing's capability booleans are
-    authoritative both ways), and CNY→USD converted costs. Models not
-    ``online`` and malformed rows are skipped — live data degrades, it
-    never crashes resolution or grants fields it does not know.
+    authoritative both ways), and CNY→USD converted costs. Public ``testing``
+    rows are retained as metadata (only the authenticated listing grants
+    entitlement); offline, non-chat, and malformed rows do not enter the
+    runtime compatibility table.
     """
-    entries: dict[str, dict[str, Any]] = {}
-    data = payload.get("data")
-    if not isinstance(data, list):
-        return entries
-    for row in data:
-        if not isinstance(row, Mapping):
-            continue
-        model_id = str(row.get("id") or "").strip()
-        if not model_id:
-            continue
-        status = str(row.get("status") or "").strip().lower()
-        if status not in ("", "online"):
-            continue
-        fields: dict[str, Any] = {}
-        context_window = _coerce_positive_int(row.get("contextWindow"))
-        if context_window:
-            fields["context_window"] = context_window
-        max_output = _coerce_positive_int(row.get("maxOutputTokens"))
-        # The platform publishes near-window output caps for some models
-        # (input + output share the window). Passing such a cap through as
-        # max_tokens would trip resolve_max_tokens' request-safety clamp
-        # straight down to 8192; halving to the engine's own output-reserve
-        # ceiling (ContextBudgetGovernor reserves at most window/2 for
-        # output) keeps the budget generous AND leaves genuine input room.
-        if max_output and context_window and max_output >= context_window - _NEAR_WINDOW_MARGIN:
-            max_output = context_window // 2
-        if max_output:
-            fields["max_output_tokens"] = max_output
-        display_name = row.get("name")
-        if isinstance(display_name, str) and display_name.strip():
-            fields["display_name"] = display_name.strip()
-        capabilities = row.get("capabilities")
-        if isinstance(capabilities, Mapping):
-            for listing_key, field_name in (
-                ("tools", "supports_tools"),
-                ("vision", "supports_vision"),
-            ):
-                flag = capabilities.get(listing_key)
-                if isinstance(flag, bool):
-                    fields[field_name] = flag
-        if str(row.get("currency") or "").strip().upper() == "CNY":
-            billing_unit = row.get("billingUnit")
-            for effective_key, discount_key, listing_key, field_name in (
-                (
-                    "effectiveInputPrice",
-                    "discountInputPrice",
-                    "inputPrice",
-                    "input_cost_per_mtok",
-                ),
-                (
-                    "effectiveOutputPrice",
-                    "discountOutputPrice",
-                    "outputPrice",
-                    "output_cost_per_mtok",
-                ),
-                (
-                    "effectiveCacheReadPrice",
-                    "discountCacheReadPrice",
-                    "cacheReadPrice",
-                    "cache_read_cost_per_mtok",
-                ),
-            ):
-                cost = _tokenrhythm_bucket_cost(
-                    row,
-                    effective_key=effective_key,
-                    discount_key=discount_key,
-                    standard_key=listing_key,
-                    billing_unit=billing_unit,
-                )
-                if cost is not None:
-                    fields[field_name] = cost
-        if fields:
-            entries[model_id] = fields
-    return entries
+    published = parse_tokenrhythm_published(payload)
+    return tokenrhythm_published_catalog_entries(published)
 
 
 LiveCatalogParser = Callable[[Mapping[str, Any]], dict[str, dict[str, Any]]]
@@ -250,7 +114,11 @@ async def fetch_live_catalog_entries(
             )
             resp = await client.get(url, headers=headers)
             resp.raise_for_status()
-            payload = resp.json()
+            payload = (
+                resp.json(parse_float=Decimal)
+                if shape == "tokenrhythm"
+                else resp.json()
+            )
             parsed = parser(payload if isinstance(payload, Mapping) else {})
     except asyncio.CancelledError:
         cancelled_request_error = asyncio.CancelledError()
