@@ -2838,12 +2838,11 @@ async def build_services(
                 ),
             },
         )
-        await cron_scheduler.start()
         # Inject into admin tool so `cron` tool can dispatch to the scheduler
         from opensquilla.tools.builtin.admin import set_scheduler
 
         set_scheduler(cron_scheduler)
-        log.info("build_services.cron_scheduler_started")
+        log.info("build_services.cron_scheduler_initialized")
     except Exception as e:
         log.warning("build_services.cron_scheduler_failed", error=str(e))
 
@@ -3815,9 +3814,19 @@ async def start_gateway_server(
         # FailureDestination at runtime. Without this wire the dispatch
         # plumbing is dead in production even though unit tests cover the
         # hook directly.
-        from opensquilla.scheduler.jobs import set_failure_dispatcher
+        from opensquilla.scheduler.jobs import set_failure_dispatcher, set_terminal_notifier
 
         set_failure_dispatcher(delivery_chain.dispatch_failure_alert)
+        set_terminal_notifier(
+            lambda job, execution: delivery_chain.notify_finished(
+                job,
+                success=execution.success,
+                summary=execution.summary,
+                session_key=execution.session_key,
+                run_id=execution.id,
+                error=execution.error,
+            )
+        )
 
         def _cron_workspace_resolver(agent_id: str) -> tuple[str | None, bool]:
             workspace_dir = resolve_agent_workspace_dir(agent_id, config)
@@ -4150,6 +4159,11 @@ async def start_gateway_server(
             await _register_auto_propose_runtime_crons()
         else:
             await _pause_auto_propose_runtime_crons()
+
+        # Startup catch-up can execute overdue jobs immediately. Start only
+        # after delivery, terminal notifications, and every handler are ready.
+        await svc.cron_scheduler.start()
+        log.info("build_services.cron_scheduler_started")
 
     # Build channel adapters (don't start yet -- app doesn't exist)
     webhook_routes: list = []

@@ -89,8 +89,10 @@ const TASK_ATTENTION_LABEL_KEYS: Record<Exclude<SessionTaskAttention, 'none'>, s
   failed: 'shared.sidebar.taskUnfinishedUnread',
 }
 
-function taskAttentionLabel(attention: SessionTaskAttention): string {
-  return attention === 'none' ? '' : t(TASK_ATTENTION_LABEL_KEYS[attention])
+function taskAttentionLabel(attention: SessionTaskAttention | undefined): string {
+  if (!attention || attention === 'none') return ''
+  const key = TASK_ATTENTION_LABEL_KEYS[attention]
+  return key ? t(key) : ''
 }
 
 /* ── Agent filter (lives within the Chats section) ─────────────────── */
@@ -1062,7 +1064,7 @@ function onSelectRow(row: SidebarConversationItem) {
             <div
               v-if="
                 row.rowKind === 'session'
-                && row.sessionKind === 'chat'
+                && (row.sessionKind === 'chat' || row.sessionKind === 'cron')
                 && !row.provisional
                 && renamingKey !== row.key
                 && !selectionMode
