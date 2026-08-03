@@ -6,7 +6,7 @@ import functools
 import json
 import time
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, TypeVar
 
 import structlog
 from starlette.applications import Starlette
@@ -41,6 +41,9 @@ from opensquilla.gateway.websocket import handle_ws_connection
 log = structlog.get_logger(__name__)
 
 _start_time = time.time()
+_HTTP_GUEST_COOKIE = "opensquilla_guest_session"
+_HTTP_GUEST_COOKIE_MAX_AGE = 365 * 24 * 60 * 60
+_ResponseT = TypeVar("_ResponseT", bound=Response)
 
 
 def _human_actionable_approvals(pending: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -118,6 +121,20 @@ def create_gateway_app(
             return 503
         return default
 
+    def _with_http_guest_cookie(request: Request, response: _ResponseT) -> _ResponseT:
+        guest_session_key = getattr(request.state, "guest_session_key", None)
+        if isinstance(guest_session_key, str) and guest_session_key:
+            response.set_cookie(
+                _HTTP_GUEST_COOKIE,
+                guest_session_key,
+                max_age=_HTTP_GUEST_COOKIE_MAX_AGE,
+                path="/",
+                secure=request.url.scheme == "https",
+                httponly=True,
+                samesite="strict",
+            )
+        return response
+
     def _same_origin(
         handler: Callable[[Request], Awaitable[Response]],
     ) -> Callable[[Request], Awaitable[Response]]:
@@ -177,9 +194,15 @@ def create_gateway_app(
             params["view"] = view
         result = await dispatcher.dispatch("_http", "sessions.list", params or None, ctx)
         if result.ok:
-            return JSONResponse(result.payload or {"sessions": []})
+            return _with_http_guest_cookie(
+                request,
+                JSONResponse(result.payload or {"sessions": []}),
+            )
         msg = result.error.message if result.error else "error"
-        return JSONResponse({"error": msg}, status_code=_rpc_status_code(result))
+        return _with_http_guest_cookie(
+            request,
+            JSONResponse({"error": msg}, status_code=_rpc_status_code(result)),
+        )
 
     async def api_chat(request: Request) -> JSONResponse:
         try:
@@ -189,15 +212,21 @@ def create_gateway_app(
         ctx = _make_ctx(request)
         result = await dispatcher.dispatch("_http", "chat.send", body, ctx)
         if result.ok:
-            return JSONResponse({"ok": True, **(result.payload or {})})
+            return _with_http_guest_cookie(
+                request,
+                JSONResponse({"ok": True, **(result.payload or {})}),
+            )
         error = result.error
         error_payload = error.model_dump(exclude_none=True) if error is not None else {}
-        return JSONResponse(
-            {
-                "error": error.message if error is not None else "error",
-                **error_payload,
-            },
-            status_code=_rpc_status_code(result, default=400),
+        return _with_http_guest_cookie(
+            request,
+            JSONResponse(
+                {
+                    "error": error.message if error is not None else "error",
+                    **error_payload,
+                },
+                status_code=_rpc_status_code(result, default=400),
+            ),
         )
 
     async def api_system_status(request: Request) -> JSONResponse:
@@ -413,6 +442,10 @@ def create_gateway_app(
             token = extract_http_token(request)
             if token:
                 auth_params["token"] = token
+            if request is not None:
+                guest_session_key = request.cookies.get(_HTTP_GUEST_COOKIE)
+                if guest_session_key:
+                    auth_params["guestSessionKey"] = guest_session_key
             peer_ip = request.client.host if request is not None and request.client else None
             principal = resolve_auth(
                 config,
@@ -427,6 +460,10 @@ def create_gateway_app(
                 is_owner=False,
                 authenticated=False,
             )
+        if request is not None:
+            guest_session_key = getattr(principal, "guest_session_key", None)
+            if isinstance(guest_session_key, str) and guest_session_key:
+                request.state.guest_session_key = guest_session_key
         return RpcContext(
             conn_id="http",
             principal=principal,
@@ -676,10 +713,16 @@ def create_gateway_app(
             "_http", "chat.history", {"sessionKey": session_key}, ctx
         )
         if result.ok:
-            return JSONResponse(result.payload or {"messages": []})
-        return JSONResponse(
-            {"error": result.error.message if result.error else "error"},
-            status_code=_rpc_status_code(result),
+            return _with_http_guest_cookie(
+                request,
+                JSONResponse(result.payload or {"messages": []}),
+            )
+        return _with_http_guest_cookie(
+            request,
+            JSONResponse(
+                {"error": result.error.message if result.error else "error"},
+                status_code=_rpc_status_code(result),
+            ),
         )
 
     async def ws_endpoint(ws: WebSocket) -> None:

@@ -21,10 +21,12 @@ access remains ungranted until a deliberate token is configured.
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
+import re
 import secrets
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
@@ -60,6 +62,8 @@ _PRIVATE_CLIENT_NETWORKS = tuple(
     )
 )
 
+_GUEST_SESSION_KEY_RE = re.compile(r"^osqg_[A-Za-z0-9_-]{43}$")
+
 
 @dataclass(frozen=True)
 class Principal:
@@ -80,6 +84,8 @@ class Principal:
     capabilities: frozenset[str] = frozenset()
     auth_state: Literal["authenticated", "guest", "invalid"] | None = None
     token_public_id: str | None = None
+    guest_owner_id: str | None = None
+    guest_session_key: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if self.auth_state is None:
@@ -133,7 +139,10 @@ class TokenScopeResolver:
 
         provided = str((auth_params or {}).get("token") or "")
         if not provided:
-            return _guest_principal(auth_state="guest")
+            return _guest_principal(
+                auth_state="guest",
+                guest_session_key=_resolve_guest_session_key(auth_params),
+            )
 
         named_record = _verify_named_token(config, provided, peer_ip=peer_ip)
         if named_record is not None:
@@ -141,6 +150,7 @@ class TokenScopeResolver:
                 return _guest_principal(
                     auth_state="invalid",
                     public_id=named_record.public_id,
+                    guest_session_key=_resolve_guest_session_key(auth_params),
                 )
             scopes = (
                 NODE_DEFAULT_SCOPES
@@ -163,6 +173,7 @@ class TokenScopeResolver:
             return _guest_principal(
                 auth_state="invalid",
                 public_id=token_public_id(provided),
+                guest_session_key=_resolve_guest_session_key(auth_params),
             )
 
         if role_claim == "node":
@@ -239,6 +250,11 @@ class OpenScopeResolver:
             scopes = CLI_DEFAULT_OPERATOR_SCOPES
         else:
             scopes = REMOTE_OPERATOR_SCOPES
+        guest_session_key = None
+        guest_owner_id = None
+        if not local_owner:
+            guest_session_key = _resolve_guest_session_key(auth_params)
+            guest_owner_id = _guest_owner_id(guest_session_key)
 
         return Principal(
             role=role_claim,
@@ -249,6 +265,8 @@ class OpenScopeResolver:
                 LOCAL_OWNER_CAPABILITIES if local_owner else GUEST_SAFE_CAPABILITIES
             ),
             auth_state="authenticated" if local_owner else "guest",
+            guest_owner_id=guest_owner_id,
+            guest_session_key=guest_session_key,
         )
 
 
@@ -286,7 +304,9 @@ def _guest_principal(
     *,
     auth_state: Literal["guest", "invalid"],
     public_id: str | None = None,
+    guest_session_key: str | None = None,
 ) -> Principal:
+    resolved_guest_key = guest_session_key or _new_guest_session_key()
     return Principal(
         role="operator",
         scopes=REMOTE_OPERATOR_SCOPES,
@@ -295,7 +315,24 @@ def _guest_principal(
         capabilities=GUEST_SAFE_CAPABILITIES,
         auth_state=auth_state,
         token_public_id=public_id,
+        guest_owner_id=_guest_owner_id(resolved_guest_key),
+        guest_session_key=resolved_guest_key,
     )
+
+
+def _new_guest_session_key() -> str:
+    return f"osqg_{secrets.token_urlsafe(32)}"
+
+
+def _resolve_guest_session_key(auth_params: dict | None) -> str:
+    candidate = str((auth_params or {}).get("guestSessionKey") or "")
+    if _GUEST_SESSION_KEY_RE.fullmatch(candidate):
+        return candidate
+    return _new_guest_session_key()
+
+
+def _guest_owner_id(guest_session_key: str) -> str:
+    return hashlib.sha256(guest_session_key.encode("utf-8")).hexdigest()
 
 
 def _verify_named_token(

@@ -29,6 +29,7 @@ from opensquilla.gateway.attachment_ingest import (
 )
 from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.config import AgentEntryConfig, GatewayConfig, LlmProviderProfile
+from opensquilla.gateway.guest_rpc_policy import guest_owned_session_key
 from opensquilla.gateway.input_normalization import LARGE_PASTE_CHARS, estimate_text_tokens
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.gateway.rpc_sessions import _normalize_terminal_event_payload
@@ -1689,7 +1690,6 @@ class TestSessionsSend:
     )
     async def test_guest_safe_send_never_soft_lands_to_host(
         self,
-        dispatcher,
         monkeypatch: pytest.MonkeyPatch,
         source_hint: dict[str, str] | None,
     ):
@@ -1726,20 +1726,14 @@ class TestSessionsSend:
         params: dict[str, Any] = {"key": session.session_key, "message": "hello"}
         if source_hint is not None:
             params["_source"] = source_hint
-        res = await dispatcher.dispatch(
-            "r-guest-no-fallback",
-            "sessions.send",
-            params,
-            ctx,
-        )
+        with pytest.raises(rpc_sessions.RpcHandlerError) as raised:
+            await rpc_sessions._handle_sessions_send(params, ctx)
 
-        assert res.ok is False
-        assert res.error.code == "SANDBOX_UNAVAILABLE"
+        assert raised.value.code == "SANDBOX_UNAVAILABLE"
 
     @pytest.mark.asyncio
     async def test_guest_scratch_boundary_failure_is_a_stable_rpc_error(
         self,
-        dispatcher,
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
     ):
@@ -1785,15 +1779,13 @@ class TestSessionsSend:
             ),
         )
 
-        res = await dispatcher.dispatch(
-            "r-guest-boundary",
-            "sessions.send",
-            {"key": session.session_key, "message": "hello"},
-            ctx,
-        )
+        with pytest.raises(rpc_sessions.RpcHandlerError) as raised:
+            await rpc_sessions._handle_sessions_send(
+                {"key": session.session_key, "message": "hello"},
+                ctx,
+            )
 
-        assert res.ok is False
-        assert res.error.code == "GUEST_DEFAULT_WORKSPACE_UNSAFE"
+        assert raised.value.code == "GUEST_DEFAULT_WORKSPACE_UNSAFE"
 
     @pytest.mark.asyncio
     async def test_legacy_direct_send_holds_registry_admission_through_register(
@@ -3905,6 +3897,51 @@ class TestSessionsAbort:
             }
         ]
         assert runtime.wait_calls == ["task-old"]
+
+    @pytest.mark.asyncio
+    async def test_guest_chat_abort_never_cancels_unbound_task_id(self, dispatcher):
+        owner_id = "a" * 64
+        session = FakeSession(session_key=guest_owned_session_key(owner_id, "mine"))
+
+        class Runtime:
+            def __init__(self) -> None:
+                self.cancel_calls: list[dict[str, Any]] = []
+
+            async def list(self, session_key: str | None = None):
+                assert session_key == session.session_key
+                return []
+
+            async def cancel(self, **kwargs) -> int:
+                self.cancel_calls.append(kwargs)
+                return 1 if len(self.cancel_calls) == 1 else 0
+
+        runtime = Runtime()
+        guest = Principal(
+            role="operator",
+            scopes=frozenset({"operator.read", "operator.write"}),
+            is_owner=False,
+            authenticated=False,
+            auth_state="guest",
+            guest_owner_id=owner_id,
+            guest_session_key="osqg_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        )
+        ctx = make_ctx(
+            session_manager=FakeSessionManager([session]),
+            task_runtime=runtime,
+            principal=guest,
+        )
+
+        response = await dispatcher.dispatch(
+            "guest-abort",
+            "chat.abort",
+            {"sessionKey": session.session_key, "taskId": "victim-task"},
+            ctx,
+        )
+
+        assert response.ok is True
+        assert runtime.cancel_calls
+        assert all(call.get("task_id") is None for call in runtime.cancel_calls)
+        assert all(call.get("session_key") == session.session_key for call in runtime.cancel_calls)
 
     @pytest.mark.asyncio
     async def test_chat_user_stop_cancels_the_whole_session_even_with_a_stale_task_id(

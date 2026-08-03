@@ -902,8 +902,6 @@ async def handle_ws_connection(
             token_public_id=principal.token_public_id,
         )
 
-    from opensquilla.sandbox.run_mode_policy import hello_auth_payload
-
     # Step 5: Negotiate protocol version
     min_proto = params_raw.get("minProtocol", 1)
     max_proto = params_raw.get("maxProtocol", PROTOCOL_VERSION)
@@ -958,7 +956,7 @@ async def handle_ws_connection(
                 * 1000
             ),
         ),
-        auth=hello_auth_payload(principal),
+        auth=_websocket_hello_auth_payload(principal),
     )
     try:
         await conn.send_raw_text(hello.model_dump_json())
@@ -1029,6 +1027,23 @@ async def handle_ws_connection(
         if subscription_manager is not None:
             subscription_manager.remove_connection(conn_id)
         log.info("ws.disconnected", conn_id=conn_id)
+
+
+def _websocket_hello_auth_payload(principal: Any) -> dict[str, Any]:
+    """Add the browser guest credential only to anonymous WebSocket hellos."""
+
+    from opensquilla.sandbox.run_mode_policy import hello_auth_payload
+
+    payload = hello_auth_payload(principal)
+    payload["principal"]["guestOwnerId"] = getattr(principal, "guest_owner_id", None)
+    guest_session_key = getattr(principal, "guest_session_key", None)
+    if guest_session_key and not getattr(principal, "authenticated", False):
+        # Preserve ``invalid`` and the public id internally for rate limiting,
+        # but expose exactly the same anonymous authority as a missing token.
+        payload["principal"]["authState"] = "guest"
+        payload["principal"]["tokenPublicId"] = None
+        payload["guestSessionKey"] = guest_session_key
+    return payload
 
 
 async def _tick_loop(conn: WsConnection, tick_interval_ms: int) -> None:
