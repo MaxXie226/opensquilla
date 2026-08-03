@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make anonymous Web access session-isolated and make Safe-mode readiness fail closed while preserving Full-by-default owner behavior, Windows guest reads, responsive Settings, and private upgrades.
+**Goal:** Make anonymous Web access session-isolated and make Safe-mode readiness fail closed while preserving Full-by-default owner behavior, confined Windows guest file operations, responsive Settings, and private upgrades.
 
 **Architecture:** A central guest RPC policy combines an invisible per-browser guest key with server-owned session namespaces. Native capability probes exercise the sandbox identity directly. Preference, Windows ACL projection, UI retry, and migration hardening changes are independent, testable tasks.
 
@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - Missing and invalid named Tokens must have identical restricted Safe-mode authority.
-- Guest session keys are invisible and can never grant host execution, setup, configuration, approval authority, or file access beyond the guest's managed temporary workspace and bundled read/execute runtime dependencies.
+- Guest session keys are invisible and can never grant host execution, setup, configuration, approval authority, or file access beyond the guest's managed temporary workspace. Bundled read/execute runtimes are available only on platforms whose native backend enforces explicit read and write mounts; Windows guest process execution is unavailable.
 - Desktop startup and remote Web access must never trigger UAC.
 - Existing owner/token sessions and direct-update data remain compatible.
 - Every security denial is enforced server-side; hiding UI is not authorization.
@@ -73,7 +73,7 @@
 - [ ] Set the fresh config default to Full and resolve storage preference before config fallback.
 - [ ] Run run-mode/routing/migration tests, request review, and commit `fix: unify default run mode preference`.
 
-### Task 4: Guest temporary-workspace and runtime ACL boundary
+### Task 4: Guest temporary-workspace and fail-closed Windows process boundary
 
 **Files:**
 - Modify: `src/opensquilla/sandbox/guest_profile.py`
@@ -91,11 +91,12 @@
 - Test: `tests/test_sandbox/test_windows_default_process_smoke.py`
 
 **Interfaces:**
-- Produces RW grants only for the guest-managed temporary workspace and RX grants only for bundled runtime/system dependencies required to execute approved tools.
+- Produces a fresh guest-managed temporary workspace per runtime task, bundled runtime mounts only on native backends with explicit read isolation, and an early stable Windows guest-process rejection while retaining confined trusted filesystem-worker operations.
 
-- [ ] Write failing profile/payload tests proving the managed guest workspace is RW, bundled Python/Node.js/Git Bash roots are RX, and arbitrary host/user paths are DENY.
-- [ ] Remove the Windows guest default host-read baseline and project only the managed workspace plus required runtime dependencies.
-- [ ] Run a native sandbox-account managed-workspace/runtime test versus arbitrary host/sensitive-file denial, request review, and commit `fix: confine anonymous guest files`.
+- [ ] Write failing profile/payload tests proving the managed guest workspace is RW, Windows guest profiles contain no runtime mounts or runtime `PATH`, guest process requests are rejected before launch, and arbitrary host/user paths are DENY.
+- [ ] Scrub execution-scoped guest roots, HOME/temp, mounts, and environment from reusable route envelopes; materialize and clean a distinct profile for every internal follow-up task.
+- [ ] Prevent guest `sessions.bootstrap` from resolving or returning configured workspace, workspace id, or project snapshot data.
+- [ ] Run the opt-in Windows smoke proving guest processes never launch while trusted filesystem-worker writes remain inside the managed workspace and arbitrary host reads are rejected; request review and commit the fail-closed boundary.
 
 ### Task 5: Stop automatic capability retry churn
 

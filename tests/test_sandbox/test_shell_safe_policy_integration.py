@@ -14,12 +14,17 @@ from opensquilla.sandbox.integration import (
     reset_runtime,
 )
 from opensquilla.sandbox.operation_profile import OperationProfile
+from opensquilla.sandbox.operation_runtime import SandboxOperationResult
 from opensquilla.sandbox.path_validation import decide_path_access
-from opensquilla.sandbox.permissions import FileSystemAccess
+from opensquilla.sandbox.permissions import (
+    FileSystemAccess,
+    FileSystemPermissionEntry,
+    FileSystemPermissionProfile,
+)
 from opensquilla.sandbox.policy_models import FilePolicySettings, SandboxPolicy
 from opensquilla.sandbox.run_context import MountGrant, RunContext
 from opensquilla.sandbox.run_mode import RunMode
-from opensquilla.tools.builtin import filesystem, shell
+from opensquilla.tools.builtin import code_exec, filesystem, git, shell
 from opensquilla.tools.types import ToolContext, current_tool_context
 
 
@@ -35,6 +40,135 @@ class _PendingGate:
     @staticmethod
     def to_envelope() -> dict[str, object]:
         return {"status": "approval_required", "approval_id": "pending"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "process_call",
+    [
+        lambda workspace: shell.exec_command(
+            "Write-Output must-not-run",
+            workdir=str(workspace),
+            env={"OPENSQUILLA_GUEST_SAFE": "0"},
+        ),
+        lambda workspace: shell.background_process(
+            "Write-Output must-not-run",
+            workdir=str(workspace),
+        ),
+        lambda _workspace: code_exec.execute_code("print('must-not-run')"),
+        lambda _workspace: git.git_status(),
+    ],
+    ids=("shell-env-override", "background", "python-code", "git"),
+)
+async def test_windows_guest_process_tools_fail_before_runtime_enrichment(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    process_call,
+) -> None:
+    """Guest authority, not a caller-controlled environment marker, denies launch."""
+
+    runtime = configure_runtime(
+        SandboxSettings(
+            run_mode="standard",
+            backend="noop",
+            allow_legacy_mode=True,
+        ),
+        workspace=tmp_path,
+    )
+    runtime.backend = SimpleNamespace(name="windows_default")
+
+    def enrichment_must_not_run(*_args, **_kwargs):
+        raise AssertionError("Windows guest denial must precede runtime enrichment")
+
+    monkeypatch.setattr(shell, "_runtime_shell_environment", enrichment_must_not_run)
+    monkeypatch.setattr(
+        shell,
+        "_policy_with_windows_shell_runtime_mounts",
+        enrichment_must_not_run,
+    )
+    token = current_tool_context.set(
+        ToolContext(
+            guest_safe=True,
+            run_mode="safe",
+            workspace_dir=str(tmp_path),
+            environment={"PATH": "", "OPENSQUILLA_GUEST_SAFE": "1"},
+        )
+    )
+    try:
+        with pytest.raises(
+            Exception,
+            match="GUEST_WINDOWS_PROCESS_UNAVAILABLE",
+        ):
+            await process_call(tmp_path)
+    finally:
+        current_tool_context.reset(token)
+        reset_runtime()
+
+
+@pytest.mark.asyncio
+async def test_windows_guest_file_tools_still_use_filesystem_worker(
+    tmp_path,
+) -> None:
+    """The process fallback must not disable managed-workspace file operations."""
+
+    calls: list[str] = []
+
+    class FilesystemWorkerBackend:
+        name = "windows_default"
+
+        @staticmethod
+        def operation_domains_supported() -> tuple[str, ...]:
+            return ("filesystem",)
+
+        async def run_operation(self, operation):
+            calls.append(operation.kind)
+            request = operation.request
+            assert request.path is not None
+            if operation.kind == "write_text":
+                request.path.write_text(request.content, encoding="utf-8")
+                return SandboxOperationResult(message="written", created=True)
+            if operation.kind == "read_file":
+                return SandboxOperationResult(
+                    message=request.path.read_text(encoding="utf-8")
+                )
+            raise AssertionError(f"unexpected filesystem operation: {operation.kind}")
+
+        async def run(self, _request):
+            raise AssertionError("file tools must not use the process runner")
+
+    runtime = configure_runtime(
+        SandboxSettings(
+            run_mode="standard",
+            backend="noop",
+            allow_legacy_mode=True,
+        ),
+        workspace=tmp_path,
+    )
+    runtime.backend = FilesystemWorkerBackend()
+    target = tmp_path / "guest.txt"
+    token = current_tool_context.set(
+        ToolContext(
+            guest_safe=True,
+            run_mode="safe",
+            workspace_dir=str(tmp_path),
+            sandbox_file_system_profile=FileSystemPermissionProfile(
+                entries=(
+                    FileSystemPermissionEntry(
+                        tmp_path,
+                        FileSystemAccess.WRITE,
+                    ),
+                )
+            ),
+        )
+    )
+    try:
+        assert await filesystem.write_file(str(target), "guest data") == "written"
+        assert await filesystem.read_file(str(target)) == "guest data"
+    finally:
+        current_tool_context.reset(token)
+        reset_runtime()
+
+    assert calls == ["write_text", "read_file"]
 
 
 def test_active_policy_comes_from_turn_snapshot() -> None:

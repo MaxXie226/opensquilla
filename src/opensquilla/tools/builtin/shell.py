@@ -84,6 +84,7 @@ from opensquilla.sandbox.integration import (
     get_runtime,
     preflight_subprocess_managed_network,
     prepare_subprocess_managed_network_proxy,
+    reject_windows_guest_process,
     run_under_backend,
 )
 from opensquilla.sandbox.managed_proxy_env import (
@@ -5869,6 +5870,8 @@ async def exec_command(
     justification: str = "",
     prefix_rule: list[str] | None = None,
 ) -> str:
+    runtime = get_runtime()
+    reject_windows_guest_process(runtime)
     if full_host_access_active():
         cwd = _effective_workdir(workdir)
         mutation_before = snapshot_current_workspace_mutations()
@@ -5899,7 +5902,6 @@ async def exec_command(
         )
         return output
 
-    runtime = get_runtime()
     windows_process_sandbox = _windows_sandbox_backend_active(runtime)
     runtime_readonly_block = _runtime_readonly_shell_block(
         "exec_command", command, workdir, stdin=stdin, runtime=runtime
@@ -6136,7 +6138,7 @@ async def exec_command(
                     action_kind=request.action_kind,
                     policy=backend_policy,
                     stdin=stdin_bytes,
-                    env=dict(merged_env),
+                    env=dict(request.env),
                     reason=getattr(request, "reason", ""),
                     session_id=getattr(request, "session_id", ""),
                     run_mode=getattr(request, "run_mode", ""),
@@ -6366,6 +6368,8 @@ async def background_process(
     justification: str = "",
     prefix_rule: list[str] | None = None,
 ) -> str:
+    runtime = get_runtime()
+    reject_windows_guest_process(runtime)
     if full_host_access_active():
         return await _start_host_background_process(
             command,
@@ -6374,7 +6378,6 @@ async def background_process(
             runtime=get_runtime(),
         )
 
-    runtime = get_runtime()
     windows_process_sandbox = _windows_sandbox_backend_active(runtime)
     runtime_readonly_block = _runtime_readonly_shell_block(
         "background_process", command, workdir, runtime=runtime
@@ -6551,7 +6554,7 @@ async def background_process(
                 cwd=cwd,
                 effective_timeout=effective_timeout,
                 runtime=runtime,
-                env=merged_env,
+                env=dict(request.env),
             )
         retry_gate = consume_backend_denial_retry(
             approval_id,
@@ -6576,7 +6579,7 @@ async def background_process(
                 cwd=backend_cwd,
                 action_kind=request.action_kind,
                 policy=backend_policy,
-                env=merged_env,
+                env=dict(request.env),
                 session_id=getattr(request, "session_id", ""),
                 run_mode=getattr(request, "run_mode", ""),
             )

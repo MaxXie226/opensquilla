@@ -14,7 +14,7 @@ This identity is intentionally called a guest session key, not a named Token. It
 
 Guest turns are stateless with respect to owner-private context. They do not automatically load host workspace bootstrap instructions or private `MEMORY.md`, and they never write to the shared long-term memory capture path.
 
-Each unauthenticated guest turn receives a fresh managed temporary workspace beneath a deterministic OpenSquilla guest root derived as a sibling of `config.state_dir`. It never adopts the configured agent workspace or a browser-supplied path, and it is deliberately outside the private state authority root. The workspace, guest HOME, and guest temp directories are read/write. Bundled Python, Node.js, Git Bash, and only the operating-system/runtime dependencies required to start them are read/execute. All user directories, real projects, OpenSquilla configuration, memory, credentials, and other host files are denied. A valid named Token may widen this according to its capabilities.
+Each unauthenticated guest turn receives a fresh managed temporary workspace beneath a deterministic OpenSquilla guest root derived as a sibling of `config.state_dir`. It never adopts the configured agent workspace or a browser-supplied path, and it is deliberately outside the private state authority root. The workspace, guest HOME, and guest temp directories are read/write. On Linux and macOS, bundled runtimes may be mounted read/execute only when the selected native backend enforces those explicit mounts for both reads and writes. On Windows, anonymous guest process execution is fail-closed: Shell, Python, Node.js, Git Bash, and every other process request are rejected before support checks, ACL projection, or launch. Windows guests retain trusted filesystem-worker operations confined by the deny-by-default managed-workspace profile. A valid named Token may widen this according to its capabilities.
 
 ## Fail-closed live capability verification
 
@@ -22,11 +22,11 @@ Capability verification must exercise the selected native backend, not count a P
 
 On Windows the report additionally requires the current setup support probe to confirm identity, persistent storage, and proxy/WFP marker compatibility. A future filter-enumeration API may strengthen this further, but marker-only state never substitutes for the native deny canaries.
 
-## Runtime preference and Windows guest reads
+## Runtime preference and Windows guest filesystem operations
 
 Fresh owner installs default to Full Access in the configuration model. `get_run_context` resolves the persisted `sandbox.run_mode` preference from session storage before falling back to explicit config and then the Full default. Guest principals are still coerced to Safe at ingress.
 
-For Windows guest filesystem-worker operations, the managed temporary workspace receives the required read/write ACL and bundled runtime roots receive read/execute ACLs. No default host-read ACL is projected. DENY targets and denied globs are rejected before any projection; write operations outside the managed workspace receive no grant.
+Windows restricted-token `WRITE_RESTRICTED` semantics do not constrain reads, while the broad SIDs needed to initialize general-purpose processes also admit baseline-readable Program Files and ProgramData content. OpenSquilla therefore does not claim a native Windows guest process boundary. Guest profiles project no runtime mounts or runtime `PATH` on Windows, and the trusted guest authority gate returns `GUEST_WINDOWS_PROCESS_UNAVAILABLE` before any process-side enrichment, setup, ACL work, or launch. Trusted filesystem-worker operations remain available: the managed temporary workspace receives the required read/write ACL, DENY targets and denied globs are rejected before projection, and operations outside that profile receive no grant.
 
 ## Responsiveness and migration privacy
 
@@ -41,4 +41,4 @@ Upgrade snapshots are private before any credential-bearing file is copied. POSI
 - Add a complete guest RPC deny matrix covering sessions, logs, memory, agent files, configuration, setup, and capability refresh.
 - Add guest ownership tests for create, reconnect, list, read, abort, delete denial, invalid Token parity, and attempted adoption of an owner session.
 - Add fake-backend transport-failure tests plus packaged Windows native deny canaries.
-- Add owner/guest/CLI no-hint run-mode tests, Windows native managed-workspace/runtime-read versus host-file denial tests, bounded capability-loading tests, and private snapshot permission tests.
+- Add owner/guest/CLI no-hint run-mode tests, Windows native guest-process rejection plus managed-workspace filesystem-worker confinement tests, bounded capability-loading tests, and private snapshot permission tests.

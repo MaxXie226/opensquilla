@@ -121,6 +121,10 @@ _ACTIVE_SANDBOX_POLICY: contextvars.ContextVar[StoredSandboxPolicy | None] = (
 _MANAGED_PROXY_ENV_NAMES_UPPER = managed_proxy_env_names_upper(
     include_windows_git=True,
 )
+GUEST_WINDOWS_PROCESS_UNAVAILABLE = (
+    "GUEST_WINDOWS_PROCESS_UNAVAILABLE: unauthenticated Windows guests cannot "
+    "launch processes; use managed-workspace file tools instead"
+)
 
 _IN_PROCESS_NETWORK_TAGS: frozenset[str] = frozenset(
     {"network.fetch", "network.http", "web.fetch"}
@@ -639,6 +643,54 @@ def _backend_name(runtime: SandboxRuntime | object | None) -> str:
     return str(name or "")
 
 
+def reject_windows_guest_process(
+    runtime: SandboxRuntime | object | None = None,
+    *,
+    action_kind: str | None = None,
+) -> None:
+    """Fail closed for a guest process using trusted request authority.
+
+    ``ToolContext.guest_safe`` is set by authenticated gateway routing and is
+    not part of the caller-controlled child environment.  The environment
+    marker remains useful to downstream policy compilation, but it is never
+    the authority for this denial.
+    """
+
+    if action_kind is not None and not action_kind.startswith(
+        ("shell.", "code.", "git.", "sandbox.command", "capability.probe")
+    ):
+        return
+    rt = runtime or get_runtime()
+    if not _backend_name(rt).lower().startswith("windows_"):
+        return
+    try:
+        from opensquilla.tools.types import current_tool_context
+
+        context = current_tool_context.get()
+    except Exception:  # pragma: no cover - defensive against import cycles
+        context = None
+    if context is not None and bool(getattr(context, "guest_safe", False)):
+        raise SandboxBackendError(GUEST_WINDOWS_PROCESS_UNAVAILABLE)
+
+
+def _reserve_guest_environment_marker(
+    env: dict[str, str] | None,
+) -> dict[str, str] | None:
+    """Prevent tool arguments from overriding the routed guest marker."""
+
+    try:
+        from opensquilla.tools.types import current_tool_context
+
+        context = current_tool_context.get()
+    except Exception:  # pragma: no cover - defensive against import cycles
+        context = None
+    if context is None or not bool(getattr(context, "guest_safe", False)):
+        return env
+    reserved = dict(env or {})
+    reserved["OPENSQUILLA_GUEST_SAFE"] = "1"
+    return reserved
+
+
 def _windows_proxy_allowlist_enforced(
     runtime: SandboxRuntime | object | None,
     *,
@@ -919,6 +971,9 @@ async def gate_action(
         )
         return denial, policy, req
 
+    reject_windows_guest_process(rt, action_kind=action_kind)
+    env = _reserve_guest_environment_marker(env)
+
     workspace = _resolve_workspace(rt, str(cwd) if cwd else None)
     level = (
         select_level(action_kind, hints)
@@ -996,6 +1051,7 @@ async def run_under_backend(
         raise SandboxBackendError(
             "Sandbox runtime is not configured; refusing to run backend request"
         )
+    reject_windows_guest_process(rt)
     if (
         request.policy.network == NetworkMode.PROXY_ALLOWLIST
         and request.policy.network_proxy is None
@@ -1170,14 +1226,13 @@ async def prepare_subprocess_managed_network_proxy(
     returns a request with ``network_proxy`` populated and an async cleanup
     callback that must run after the subprocess exits or spawn fails.
     """
-    if (
-        request.policy.network != NetworkMode.PROXY_ALLOWLIST
-    ):
+    rt = runtime or get_runtime()
+    reject_windows_guest_process(rt)
+    if request.policy.network != NetworkMode.PROXY_ALLOWLIST:
         return ManagedNetworkSubprocess(
             request=request,
             cleanup=_noop_managed_network_cleanup,
         )
-    rt = runtime or get_runtime()
     backend_name = _backend_name(rt)
     if request.policy.network_proxy is not None:
         return ManagedNetworkSubprocess(

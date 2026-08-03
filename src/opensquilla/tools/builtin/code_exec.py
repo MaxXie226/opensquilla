@@ -27,6 +27,7 @@ from opensquilla.sandbox.integration import (
     get_runtime,
     preflight_subprocess_managed_network,
     prepare_subprocess_managed_network_proxy,
+    reject_windows_guest_process,
     run_under_backend,
 )
 from opensquilla.sandbox.operation_runtime import SandboxToolDescriptor
@@ -927,6 +928,9 @@ async def execute_code(
     if not code.strip():
         raise ToolError("Code must not be empty")
 
+    runtime = get_runtime()
+    reject_windows_guest_process(runtime)
+
     full_host = full_host_access_active()
     external_transfer = None if full_host else _check_code_sensitive_external_transfer(code)
     if external_transfer is not None:
@@ -963,7 +967,6 @@ async def execute_code(
     timeout = max(1.0, min(float(timeout), _MAX_TIMEOUT))
 
     ctx = current_tool_context.get()
-    runtime = get_runtime()
     from opensquilla.tools.builtin.shell import (
         _apply_windows_session_tmp_env,
         _host_execution_allowed,
@@ -1100,7 +1103,7 @@ async def execute_code(
                     cwd=request.cwd,
                     action_kind=request.action_kind,
                     policy=_trusted_managed_network_policy(request.policy, runtime),
-                    env=safe_env,
+                    env=dict(request.env),
                     reason=getattr(request, "reason", ""),
                     session_id=getattr(request, "session_id", ""),
                     run_mode=getattr(request, "run_mode", ""),

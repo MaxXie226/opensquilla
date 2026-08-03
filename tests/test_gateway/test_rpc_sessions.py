@@ -8152,6 +8152,81 @@ class TestSessionsResolve:
 
 class TestSessionsBootstrap:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("auth_state", ["guest", "invalid"])
+    async def test_guest_bootstrap_never_resolves_or_returns_host_workspace(
+        self,
+        dispatcher,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        auth_state: str,
+    ) -> None:
+        owner_id = "b" * 64
+        key = guest_owned_session_key(owner_id, "bootstrap")
+        session = FakeSession(
+            session_key=key,
+            session_id="guest-bootstrap",
+            workspace_id="real-workspace-id",
+        )
+        host_workspace = tmp_path / "real-project"
+        calls: list[str] = []
+
+        from opensquilla.agents import scope as agent_scope
+
+        def resolve_workspace(*_args, **_kwargs):
+            calls.append("resolve_agent_workspace_dir")
+            return host_workspace
+
+        async def project_snapshot(*_args, **_kwargs):
+            calls.append("project_workspace_snapshot")
+            return {"id": "real-workspace-id", "path": str(host_workspace)}
+
+        async def authoritative_context(*_args, **_kwargs):
+            calls.append("authoritative_project_run_context")
+            raise AssertionError("guest bootstrap must not resolve project authority")
+
+        monkeypatch.setattr(agent_scope, "resolve_agent_workspace_dir", resolve_workspace)
+        monkeypatch.setattr(rpc_sessions, "project_workspace_snapshot", project_snapshot)
+        monkeypatch.setattr(
+            rpc_sessions,
+            "authoritative_project_run_context",
+            authoritative_context,
+        )
+        principal = Principal(
+            role="operator",
+            scopes=frozenset({"operator.read", "operator.write"}),
+            is_owner=False,
+            authenticated=False,
+            capabilities=frozenset({"guest.safe"}),
+            auth_state=auth_state,
+            guest_owner_id=owner_id,
+            guest_session_key="osqg_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        )
+        ctx = make_ctx(
+            session_manager=FakeSessionManager([session]),
+            principal=principal,
+            config=GatewayConfig(
+                workspace_dir=str(host_workspace),
+                state_dir=str(tmp_path / "state"),
+            ),
+        )
+
+        res = await dispatcher.dispatch(
+            "guest-bootstrap",
+            "sessions.bootstrap",
+            {"key": key},
+            ctx,
+        )
+
+        assert res.ok is True
+        assert calls == []
+        assert "workspace" not in res.payload["session"]
+        assert "workspace_id" not in res.payload["session"]
+        assert "workspaceId" not in res.payload["session"]
+        assert "projectWorkspace" not in res.payload["session"]
+        assert str(host_workspace) not in json.dumps(res.payload)
+        assert "real-workspace-id" not in json.dumps(res.payload)
+
+    @pytest.mark.asyncio
     async def test_bootstrap_composes_history_tasks_epoch_and_stream_cursor(
         self, dispatcher, tmp_path
     ):

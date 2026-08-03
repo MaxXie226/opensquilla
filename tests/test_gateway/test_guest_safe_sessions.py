@@ -221,6 +221,22 @@ def test_guest_profile_projects_managed_rw_and_bundled_runtime_roots(
     profile.cleanup()
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows guest runtime policy")
+def test_windows_guest_profile_does_not_project_process_runtimes(
+    tmp_path: Path,
+) -> None:
+    profile = _guest_profile_for_principal(
+        _guest_principal(),
+        "turn",
+        state_dir=tmp_path / "state",
+    )
+
+    assert profile is not None
+    assert all(mount.kind != "bundled-runtime" for mount in profile.mounts)
+    assert profile.environment["PATH"] == ""
+    profile.cleanup()
+
+
 def test_guest_cleanup_rejects_alias_and_outside_factory_shape(tmp_path: Path) -> None:
     state_dir = tmp_path / "state"
     profile = GuestProfileFactory.create("turn", state_dir=state_dir)

@@ -7,6 +7,7 @@ import subprocess
 import sys
 from dataclasses import replace
 from pathlib import Path, PureWindowsPath
+from types import SimpleNamespace
 
 import pytest
 
@@ -77,6 +78,34 @@ def _request(tmp_path: Path) -> SandboxRequest:
         env={"PATH": r"C:\Windows\System32"},
         run_mode=RunMode.SAFE.value,
     )
+
+
+@pytest.mark.asyncio
+async def test_windows_guest_process_is_rejected_before_support_or_acl_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default as mod
+    from opensquilla.sandbox.integration import run_under_backend
+    from opensquilla.tools.types import ToolContext, current_tool_context
+
+    request = replace(_request(tmp_path), env={"OPENSQUILLA_GUEST_SAFE": "0"})
+    runtime = SimpleNamespace(backend=mod.WindowsDefaultBackend())
+
+    def unexpected_support_probe() -> bool:
+        raise AssertionError("guest process rejection must precede native setup checks")
+
+    monkeypatch.setattr(mod, "_support_ready", unexpected_support_probe)
+
+    token = current_tool_context.set(ToolContext(guest_safe=True))
+    try:
+        with pytest.raises(
+            SandboxBackendError,
+            match="GUEST_WINDOWS_PROCESS_UNAVAILABLE",
+        ):
+            await run_under_backend(request, runtime=runtime)
+    finally:
+        current_tool_context.reset(token)
 
 
 def test_windows_acl_plan_compiles_profile_reads_writes_and_denies(

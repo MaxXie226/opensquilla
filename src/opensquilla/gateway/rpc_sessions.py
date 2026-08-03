@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
+import os
 import re
 import sqlite3
 import time
@@ -385,11 +386,14 @@ def _guest_profile_for_principal(
 ):
     has_capability = getattr(principal, "has", lambda _capability: False)
     if has_capability("guest.safe") and not principal_has_host_execute(principal):
-        from opensquilla.sandbox.runtime_launcher import bundled_runtime_resolver
+        runtime_roots: tuple[Path, ...] = ()
+        runtime_path: tuple[Path, ...] = ()
+        if os.name != "nt":
+            from opensquilla.sandbox.runtime_launcher import bundled_runtime_resolver
 
-        resolver = bundled_runtime_resolver()
-        runtime_roots = resolver.runtime_roots() if resolver is not None else ()
-        runtime_path = resolver.bundled_path() if resolver is not None else ()
+            resolver = bundled_runtime_resolver()
+            runtime_roots = resolver.runtime_roots() if resolver is not None else ()
+            runtime_path = resolver.bundled_path() if resolver is not None else ()
         return GuestProfileFactory.create(
             task_id,
             state_dir=state_dir,
@@ -2864,6 +2868,13 @@ async def _handle_sessions_send(
         route_envelope.metadata["guest_managed_root"] = str(guest_profile.managed_root)
         route_envelope.metadata["guest_environment"] = dict(
             guest_profile.environment
+        )
+        route_envelope.runtime_services["guest_profile_factory"] = (
+            lambda task_id: _guest_profile_for_principal(
+                ctx.principal,
+                task_id,
+                state_dir=ctx.config.state_dir,
+            )
         )
     elevated_hint = _trusted_elevated_hint(ctx, source_hint)
     if elevated_hint is not None:
@@ -7925,42 +7936,55 @@ async def _handle_sessions_bootstrap(params: dict | None, ctx: RpcContext) -> di
     agent_id = _effective_agent_id_for_session(session, session_key)
     agent_identity = await _bootstrap_agent_identity(ctx, agent_id)
     effective_model = _session_turn_model(ctx, session, agent_id)
-    from opensquilla.agents.scope import resolve_agent_workspace_dir
+    guest_safe = _is_remote_web_guest(ctx.principal, {})
+    workspace: str | None = None
+    project_snapshot: dict[str, Any] | None = None
+    if not guest_safe:
+        from opensquilla.agents.scope import resolve_agent_workspace_dir
 
-    workspace_path = resolve_agent_workspace_dir(agent_id, ctx.config)
-    default_workspace = str(workspace_path) if workspace_path is not None else None
-    project_snapshot = await project_workspace_snapshot(storage, session)
-    try:
-        bootstrap_run_context, _workspace_guard = await authoritative_project_run_context(
-            storage=storage,
-            session_manager=ctx.session_manager,
-            session=session,
-            config=ctx.config,
-            default_workspace=default_workspace,
-        )
-        workspace: str | None = bootstrap_run_context.workspace or default_workspace
-    except ProjectWorkspaceStateError:
-        snapshot_path = project_snapshot.get("path") if project_snapshot is not None else None
-        workspace = str(snapshot_path) if isinstance(snapshot_path, str) else default_workspace
+        workspace_path = resolve_agent_workspace_dir(agent_id, ctx.config)
+        default_workspace = str(workspace_path) if workspace_path is not None else None
+        project_snapshot = await project_workspace_snapshot(storage, session)
+        try:
+            bootstrap_run_context, _workspace_guard = await authoritative_project_run_context(
+                storage=storage,
+                session_manager=ctx.session_manager,
+                session=session,
+                config=ctx.config,
+                default_workspace=default_workspace,
+            )
+            workspace = bootstrap_run_context.workspace or default_workspace
+        except ProjectWorkspaceStateError:
+            snapshot_path = (
+                project_snapshot.get("path") if project_snapshot is not None else None
+            )
+            workspace = (
+                str(snapshot_path) if isinstance(snapshot_path, str) else default_workspace
+            )
     from opensquilla.gateway.model_routing import model_routing_snapshot
 
-    metadata = {
+    metadata: dict[str, Any] = {
         "session_key": session_key,
         "session_id": session.session_id,
         "status": session.status,
         "agent_id": session.agent_id,
         "model": getattr(session, "model", None),
         "effective_model": effective_model,
-        "workspace": workspace,
-        "workspace_id": getattr(session, "workspace_id", None),
-        "workspaceId": getattr(session, "workspace_id", None),
-        "projectWorkspace": project_snapshot,
         "created_at": session.created_at,
         "updated_at": session.updated_at,
         "display_name": getattr(session, "display_name", None),
         "queue_mode": getattr(session, "queue_mode", None),
         **_derive_source_metadata(session),
     }
+    if not guest_safe:
+        metadata.update(
+            {
+                "workspace": workspace,
+                "workspace_id": getattr(session, "workspace_id", None),
+                "workspaceId": getattr(session, "workspace_id", None),
+                "projectWorkspace": project_snapshot,
+            }
+        )
     get_current_plan = getattr(storage, "get_current_plan_revision", None)
     get_active_run = getattr(storage, "get_active_plan_run", None)
     current_plan = (
