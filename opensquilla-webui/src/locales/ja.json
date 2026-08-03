@@ -831,6 +831,11 @@
       "modelPublishedMaxOutput": "公式最大出力 {tokens}",
       "modelCatalogMaxOutput": "カタログ最大出力 {tokens}",
       "modelPublishedStatus": "ステータス {status}",
+      "modelContextShort": "コンテキスト",
+      "modelOutputShort": "出力",
+      "modelStatusTesting": "テスト中",
+      "modelStatusOffline": "オフライン",
+      "modelCatalogValue": "カタログ値",
       "refreshModels": "モデルを更新",
       "modelCatalogSynced": "モデルメタデータを同期済み {ago}",
       "modelCatalogStaleSince": "{ago} に同期したモデルメタデータを使用中",
@@ -845,7 +850,8 @@
       "modelUseTyped": "「{value}」を使用",
       "modelNoMatches": "一致するモデルがありません — 入力した値をそのまま使えます。",
       "modelListTruncated": "{total} 件中 {shown} 件を表示 — 入力を続けると絞り込めます。",
-      "modelProvenance": "プロバイダーからのライブ一覧 · 詳細情報: {sources}"
+      "modelProvenance": "プロバイダーのライブ一覧 · 機能情報の出典：{sources}",
+      "modelMetadataProvenance": "プロバイダーのライブ一覧 · 公式値を優先し、ない場合はカタログ値を使用"
     },
     "preset": {
       "summary": "ルーティングテンプレート: {label}",

@@ -831,6 +831,11 @@
       "modelPublishedMaxOutput": "Sortie maximale officielle {tokens}",
       "modelCatalogMaxOutput": "Sortie maximale du catalogue {tokens}",
       "modelPublishedStatus": "Statut {status}",
+      "modelContextShort": "Contexte",
+      "modelOutputShort": "Sortie",
+      "modelStatusTesting": "En test",
+      "modelStatusOffline": "Hors ligne",
+      "modelCatalogValue": "Valeur catalogue",
       "refreshModels": "Actualiser les modèles",
       "modelCatalogSynced": "Métadonnées du modèle synchronisées {ago}",
       "modelCatalogStaleSince": "Métadonnées du modèle synchronisées {ago} utilisées",
@@ -845,7 +850,8 @@
       "modelUseTyped": "Utiliser « {value} »",
       "modelNoMatches": "Aucun modèle correspondant — vous pouvez garder votre saisie.",
       "modelListTruncated": "{shown} modèles sur {total} — continuez à taper pour affiner.",
-      "modelProvenance": "Liste en direct du fournisseur · détails de {sources}"
+      "modelProvenance": "Liste fournisseur en direct · source des capacités : {sources}",
+      "modelMetadataProvenance": "Liste fournisseur en direct · valeurs officielles prioritaires, sinon valeurs catalogue"
     },
     "preset": {
       "summary": "Modèle de routage : {label}",

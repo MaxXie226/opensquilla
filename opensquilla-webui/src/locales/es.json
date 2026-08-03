@@ -831,6 +831,11 @@
       "modelPublishedMaxOutput": "Salida máxima oficial {tokens}",
       "modelCatalogMaxOutput": "Salida máxima del catálogo {tokens}",
       "modelPublishedStatus": "Estado {status}",
+      "modelContextShort": "Contexto",
+      "modelOutputShort": "Salida",
+      "modelStatusTesting": "En pruebas",
+      "modelStatusOffline": "Sin conexión",
+      "modelCatalogValue": "Valor del catálogo",
       "refreshModels": "Actualizar modelos",
       "modelCatalogSynced": "Metadatos del modelo sincronizados {ago}",
       "modelCatalogStaleSince": "Usando metadatos del modelo sincronizados {ago}",
@@ -845,7 +850,8 @@
       "modelUseTyped": "Usar \"{value}\"",
       "modelNoMatches": "No hay modelos coincidentes — puedes usar lo que escribiste.",
       "modelListTruncated": "Mostrando {shown} de {total} modelos — sigue escribiendo para acotar.",
-      "modelProvenance": "Lista en vivo del proveedor · detalles de {sources}"
+      "modelProvenance": "Lista del proveedor en vivo · fuente de capacidades: {sources}",
+      "modelMetadataProvenance": "Lista del proveedor en vivo · valores oficiales si están disponibles; si no, valores del catálogo"
     },
     "preset": {
       "summary": "Plantilla de enrutamiento: {label}",

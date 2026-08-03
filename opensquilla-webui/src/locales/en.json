@@ -831,6 +831,11 @@
       "modelPublishedMaxOutput": "Official max output {tokens}",
       "modelCatalogMaxOutput": "Catalog max output {tokens}",
       "modelPublishedStatus": "Status {status}",
+      "modelContextShort": "Context",
+      "modelOutputShort": "Output",
+      "modelStatusTesting": "Testing",
+      "modelStatusOffline": "Offline",
+      "modelCatalogValue": "Catalog value",
       "refreshModels": "Refresh models",
       "modelCatalogSynced": "Model metadata synced {ago}",
       "modelCatalogStaleSince": "Using model metadata synced {ago}",
@@ -845,7 +850,8 @@
       "modelUseTyped": "Use \"{value}\"",
       "modelNoMatches": "No matching models — you can keep what you typed.",
       "modelListTruncated": "Showing {shown} of {total} models — keep typing to narrow the list.",
-      "modelProvenance": "Live list from the provider · details from {sources}"
+      "modelProvenance": "Live provider list · capability source: {sources}",
+      "modelMetadataProvenance": "Live provider list · official values when available, catalog fallback otherwise"
     },
     "preset": {
       "summary": "Routing template: {label}",

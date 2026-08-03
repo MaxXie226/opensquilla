@@ -831,6 +831,11 @@
       "modelPublishedMaxOutput": "Offizielle max. Ausgabe {tokens}",
       "modelCatalogMaxOutput": "Katalog max. Ausgabe {tokens}",
       "modelPublishedStatus": "Status {status}",
+      "modelContextShort": "Kontext",
+      "modelOutputShort": "Ausgabe",
+      "modelStatusTesting": "Testphase",
+      "modelStatusOffline": "Offline",
+      "modelCatalogValue": "Katalogwert",
       "refreshModels": "Modelle aktualisieren",
       "modelCatalogSynced": "Modellmetadaten synchronisiert {ago}",
       "modelCatalogStaleSince": "Modellmetadaten von {ago} werden verwendet",
@@ -845,7 +850,8 @@
       "modelUseTyped": "\"{value}\" verwenden",
       "modelNoMatches": "Keine passenden Modelle — die Eingabe kann trotzdem verwendet werden.",
       "modelListTruncated": "{shown} von {total} Modellen — weitertippen zum Eingrenzen.",
-      "modelProvenance": "Live-Liste vom Anbieter · Details aus {sources}"
+      "modelProvenance": "Live-Anbieterliste · Funktionsquelle: {sources}",
+      "modelMetadataProvenance": "Live-Anbieterliste · offizielle Werte bevorzugt, sonst Katalogwerte"
     },
     "preset": {
       "summary": "Routing-Vorlage: {label}",
