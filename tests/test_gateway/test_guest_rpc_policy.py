@@ -13,6 +13,8 @@ from opensquilla.gateway.guest_rpc_policy import (
 )
 from opensquilla.gateway.rpc import RpcContext, RpcRegistry
 from opensquilla.gateway.rpc_sessions import _handle_sessions_list
+from opensquilla.session.models import SessionNode, SessionStatus
+from opensquilla.session.storage import SessionStorage
 
 GUEST_KEY = "osqg_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 
@@ -151,6 +153,30 @@ def test_guest_chat_send_preserves_own_server_session_key() -> None:
     assert normalized["sessionKey"] == owned
 
 
+def test_guest_chat_send_forces_every_memory_capture_alias_true() -> None:
+    ctx = _ctx()
+
+    normalized = GuestRpcPolicy.authorize(
+        "chat.send",
+        {
+            "sessionKey": "mine",
+            "message": "do not retain this",
+            "noMemoryCapture": False,
+            "no_memory_capture": False,
+            "_source": {
+                "noMemoryCapture": False,
+                "no_memory_capture": False,
+            },
+        },
+        ctx,
+    )
+
+    assert normalized["noMemoryCapture"] is True
+    assert normalized["no_memory_capture"] is True
+    assert normalized["_source"]["noMemoryCapture"] is True
+    assert normalized["_source"]["no_memory_capture"] is True
+
+
 def test_guest_policy_normalizes_verified_chat_key_alias_for_handler() -> None:
     ctx = _ctx()
     owned = guest_owned_session_key(ctx.principal.guest_owner_id, "mine")
@@ -217,9 +243,13 @@ async def test_registry_applies_same_policy_to_missing_and_invalid_token_guests(
 class _ListStorage:
     def __init__(self, sessions: list[SimpleNamespace]) -> None:
         self.sessions = sessions
+        self.last_limit: int | None = None
 
-    async def list_sessions(self, *, limit: int):
-        return self.sessions[:limit]
+    async def list_sessions(self, *, limit: int, guest_owner_id: str | None = None):
+        assert guest_owner_id is not None
+        self.last_limit = limit
+        prefix = f":webchat:guest:{guest_owner_id}:"
+        return [session for session in self.sessions if prefix in session.session_key][:limit]
 
     async def get_transcript(self, session_id: str, *, limit: int):
         return []
@@ -250,3 +280,69 @@ async def test_sessions_list_only_returns_guest_owned_rows() -> None:
 
     assert [row["key"] for row in result["sessions"]] == [own_key]
     assert result["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_guest_sessions_list_filters_owner_before_limit(tmp_path) -> None:
+    owner_id = "a" * 64
+    own_key = guest_owned_session_key(owner_id, "old-owned")
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    try:
+        await storage.upsert_session(
+            SessionNode(
+                session_key=own_key,
+                session_id="old-owned",
+                agent_id="main",
+                created_at=1,
+                updated_at=1,
+                started_at=1,
+                status=SessionStatus.DONE,
+            )
+        )
+        await storage.upsert_session(
+            SessionNode(
+                session_key=(
+                    f"agent:spoof:extra:webchat:guest:{owner_id}:malformed-collision"
+                ),
+                session_id="malformed-collision",
+                agent_id="spoof",
+                created_at=10_000,
+                updated_at=10_000,
+                started_at=10_000,
+                status=SessionStatus.DONE,
+            )
+        )
+        for index in range(75):
+            await storage.upsert_session(
+                SessionNode(
+                    session_key=f"agent:main:webchat:global-{index}",
+                    session_id=f"global-{index}",
+                    agent_id="main",
+                    created_at=1000 + index,
+                    updated_at=1000 + index,
+                    started_at=1000 + index,
+                    status=SessionStatus.DONE,
+                )
+            )
+
+        result = await _handle_sessions_list(
+            {"limit": 1},
+            _ctx(owner_id=owner_id, session_manager=SimpleNamespace(storage=storage)),
+        )
+    finally:
+        await storage.close()
+
+    assert [row["key"] for row in result["sessions"]] == [own_key]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("requested", "expected"), [(-99, 1), (100_000, 100)])
+async def test_guest_sessions_list_clamps_limit(requested: int, expected: int) -> None:
+    storage = _ListStorage([])
+
+    await _handle_sessions_list(
+        {"limit": requested},
+        _ctx(session_manager=SimpleNamespace(storage=storage)),
+    )
+
+    assert storage.last_limit == expected

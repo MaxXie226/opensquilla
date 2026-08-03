@@ -134,6 +134,13 @@ class GuestRpcPolicy:
                 params.get("sessionKey") or params.get("key"),
             )
             normalized.pop("key", None)
+            normalized["noMemoryCapture"] = True
+            normalized["no_memory_capture"] = True
+            source = normalized.get("_source")
+            normalized_source = dict(source) if isinstance(source, dict) else {}
+            normalized_source["noMemoryCapture"] = True
+            normalized_source["no_memory_capture"] = True
+            normalized["_source"] = normalized_source
             return normalized
 
         if not isinstance(params, dict):

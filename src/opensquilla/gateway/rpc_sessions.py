@@ -1569,16 +1569,23 @@ async def _handle_sessions_list(params: dict | None, ctx: RpcContext) -> dict:
         return {"sessions": [], "count": 0, "ts": now_ms}
 
     limit = (params or {}).get("limit", 50)
-    sessions = await storage.list_sessions(limit=limit)
     from opensquilla.gateway.guest_rpc_policy import GuestRpcPolicy, guest_owns_session_key
 
     if GuestRpcPolicy.is_guest(ctx):
         owner_id = getattr(ctx.principal, "guest_owner_id", None)
+        try:
+            guest_limit = int(limit)
+        except (TypeError, ValueError):
+            guest_limit = 50
+        limit = max(1, min(guest_limit, 100))
+        sessions = await storage.list_sessions(limit=limit, guest_owner_id=owner_id)
         sessions = [
             session
             for session in sessions
             if guest_owns_session_key(owner_id, getattr(session, "session_key", None))
         ]
+    else:
+        sessions = await storage.list_sessions(limit=limit)
     task_rows_by_session = await _list_task_rows_by_session(
         ctx,
         storage,
