@@ -280,6 +280,14 @@
         >
           <h4 id="sandbox-setup-dialog-title">{{ t('settings.sandbox.setup.title') }}</h4>
           <p id="sandbox-setup-dialog-description">{{ t('settings.sandbox.setup.description') }}</p>
+          <p
+            v-if="sandboxSetupProgressMessage"
+            class="sandbox-setup-progress"
+            data-testid="sandbox-setup-progress"
+            role="status"
+          >
+            {{ sandboxSetupProgressMessage }}
+          </p>
           <div class="sandbox-setup-dialog__actions">
             <button type="button" class="btn" @click="cancelSandboxSetup">
               {{ t('common.cancel') }}
@@ -303,7 +311,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, defineComponent, h, onMounted, ref } from 'vue'
+import { computed, defineComponent, h, onMounted, onUnmounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 
 import { useSandboxSettings } from '@/composables/settings/useSandboxSettings'
@@ -345,6 +353,8 @@ const denyDomain = ref('')
 type SandboxView = 'overview' | 'files' | 'commands' | 'network' | 'runtimes'
 const activeView = ref<SandboxView>('overview')
 const sandboxSetupConfirmOpen = ref(false)
+const sandboxSetupElapsedSeconds = ref(0)
+let sandboxSetupProgressInterval: ReturnType<typeof setInterval> | null = null
 
 const sandboxSetupOutcomeMessage = computed(() => {
   if (sandboxSetupOutcome.value === 'cancelled') return t('settings.sandbox.setup.cancelled')
@@ -354,6 +364,26 @@ const sandboxSetupOutcomeMessage = computed(() => {
   }
   return ''
 })
+
+const sandboxSetupProgressMessage = computed(() => {
+  if (!sandboxSetupPending.value) return ''
+  if (sandboxSetupElapsedSeconds.value >= 15) return t('settings.sandbox.setup.takingLonger')
+  if (sandboxSetupElapsedSeconds.value >= 5) return t('settings.sandbox.setup.configuringProtection')
+  return t('settings.sandbox.setup.requestingApproval')
+})
+
+function startSandboxSetupProgress(): void {
+  clearSandboxSetupProgress()
+  sandboxSetupProgressInterval = setInterval(() => {
+    sandboxSetupElapsedSeconds.value += 1
+  }, 1_000)
+}
+
+function clearSandboxSetupProgress(): void {
+  if (sandboxSetupProgressInterval !== null) clearInterval(sandboxSetupProgressInterval)
+  sandboxSetupProgressInterval = null
+  sandboxSetupElapsedSeconds.value = 0
+}
 
 function selectSafeMode(): void {
   sandboxSetupOutcome.value = 'idle'
@@ -370,10 +400,17 @@ function cancelSandboxSetup(): void {
 }
 
 async function continueSandboxSetup(): Promise<void> {
-  const ready = await ensureSandboxSetupForSafeMode()
-  sandboxSetupConfirmOpen.value = false
-  if (ready) defaultRunMode.value = 'safe'
+  startSandboxSetupProgress()
+  try {
+    const ready = await ensureSandboxSetupForSafeMode()
+    sandboxSetupConfirmOpen.value = false
+    if (ready) defaultRunMode.value = 'safe'
+  } finally {
+    clearSandboxSetupProgress()
+  }
 }
+
+onUnmounted(clearSandboxSetupProgress)
 
 const backupQuotaGiB = computed({
   get: () => Number(((draft.value?.files.backupQuotaBytes ?? 3 * 1024 ** 3) / 1024 ** 3).toFixed(2)),
@@ -675,6 +712,10 @@ onMounted(() => void load())
 .sandbox-setup-dialog h4,
 .sandbox-setup-dialog p {
   margin: 0;
+}
+
+.sandbox-setup-progress {
+  min-height: 1.25rem;
 }
 
 .sandbox-setup-dialog p {

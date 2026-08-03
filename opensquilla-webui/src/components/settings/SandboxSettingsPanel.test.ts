@@ -40,6 +40,7 @@ async function mountPanel(options: {
   setupState?: 'not_setup' | 'setting_up' | 'ready' | 'failed' | 'unavailable'
   ensureState?: 'ready' | 'failed'
   ensureDetail?: string
+  ensure?: Promise<unknown>
 } = {}) {
   vi.resetModules()
   document.body.innerHTML = ''
@@ -71,6 +72,7 @@ async function mountPanel(options: {
       }
     }
     if (method === 'sandbox.setup.ensure') {
+      if (options.ensure) return options.ensure
       const state = options.ensureState ?? 'ready'
       return {
         state,
@@ -350,6 +352,43 @@ describe('SandboxSettingsPanel', () => {
 
     expect(document.body.querySelector('[data-testid="sandbox-setup-confirm"]')).toBeNull()
     expect(call.mock.calls.some(([method]) => method === 'sandbox.setup.ensure')).toBe(false)
+  })
+
+  it('shows elapsed setup guidance while administrator approval is pending', async () => {
+    vi.useFakeTimers()
+    let resolveEnsure!: (value: unknown) => void
+    const ensure = new Promise<unknown>((resolve) => {
+      resolveEnsure = resolve
+    })
+    const { el } = await mountPanel({ setupState: 'not_setup', ensure })
+
+    el.querySelector<HTMLButtonElement>('[data-testid="sandbox-safe-mode"]')!.click()
+    await settle()
+    document.body.querySelector<HTMLButtonElement>('[data-testid="sandbox-setup-continue"]')!.click()
+    await settle()
+
+    expect(document.body.querySelector('[data-testid="sandbox-setup-progress"]')?.textContent)
+      .toContain('Requesting administrator approval')
+    expect(document.body.querySelector<HTMLButtonElement>('[data-testid="sandbox-setup-continue"]')?.disabled)
+      .toBe(true)
+
+    await vi.advanceTimersByTimeAsync(5_000)
+    await settle()
+
+    expect(document.body.querySelector('[data-testid="sandbox-setup-progress"]')?.textContent)
+      .toContain('Setting up file and network protection')
+    expect(document.body.querySelector('[data-testid="sandbox-setup-confirm"]')).toBeTruthy()
+
+    resolveEnsure({
+      state: 'ready',
+      platform: 'win32',
+      message: 'Sandbox setup is ready.',
+      requiresAdmin: false,
+    })
+    await settle()
+
+    expect(document.body.querySelector('[data-testid="sandbox-setup-progress"]')).toBeNull()
+    expect(vi.getTimerCount()).toBe(0)
   })
 
   it('forces live verification after setup and selects only the unsaved safe draft', async () => {
