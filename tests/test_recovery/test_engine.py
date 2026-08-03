@@ -1054,8 +1054,8 @@ def test_workspace_choice_resolves_linked_profile_home(tmp_path: Path) -> None:
         workspace=selected,
     )
     assert linked_home.is_symlink()
-    config_after = (real_home / "config.toml").read_text(encoding="utf-8")
-    assert str(selected) in config_after
+    config_after = tomllib.loads((real_home / "config.toml").read_text(encoding="utf-8"))
+    assert config_after["workspace_dir"] == str(selected)
 
 
 @pytest.mark.parametrize(
@@ -1176,9 +1176,15 @@ def test_legacy_import_journal_prevents_missing_target_from_looking_fresh(
     assert journal.read_bytes() == before
 
 
-def test_profile_root_special_path_warns_without_blocking(tmp_path: Path) -> None:
+def test_profile_root_special_path_warns_without_blocking(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import opensquilla.recovery.engine as recovery_engine
+
     profile = tmp_path / "opensquilla"
     profile.write_text("not a profile directory\n", encoding="utf-8")
+    monkeypatch.setattr(recovery_engine, "_elevated_windows_context", lambda: False)
 
     report = inspect_profile(profile)
 
@@ -1204,12 +1210,18 @@ def test_profile_root_link_resolves_to_target(tmp_path: Path) -> None:
     assert Path(report.primary_home) == real
 
 
-def test_profile_root_dangling_link_warns_without_blocking(tmp_path: Path) -> None:
+def test_profile_root_dangling_link_warns_without_blocking(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import opensquilla.recovery.engine as recovery_engine
+
     profile = tmp_path / "opensquilla"
     try:
         profile.symlink_to(tmp_path / "does-not-exist", target_is_directory=True)
     except OSError:
         pytest.skip("symlink creation is unavailable")
+    monkeypatch.setattr(recovery_engine, "_elevated_windows_context", lambda: False)
 
     report = inspect_profile(profile)
 
@@ -1259,6 +1271,9 @@ def test_config_link_warns_without_blocking_desktop_guard(
         (home / "config.toml").symlink_to(outside)
     except OSError:
         pytest.skip("symlink creation is unavailable")
+    import opensquilla.recovery.engine as recovery_engine
+
+    monkeypatch.setattr(recovery_engine, "_elevated_windows_context", lambda: False)
 
     report = inspect_profile(home)
 
