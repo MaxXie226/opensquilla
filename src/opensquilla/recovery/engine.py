@@ -897,39 +897,6 @@ def _elevated_windows_context() -> bool:
         return False
 
 
-def _unsafe_path_blocks_startup(
-    home: Path,
-    *,
-    profile_kind: str,
-    ignore_transaction: bool,
-    ignore_settings_transaction: bool,
-) -> bool:
-    """Return whether an unsafe-path finding must still block startup.
-
-    A path-shape finding alone is a warning: startup proceeds and every
-    recovery mutation still fails closed on its own no-follow checks. The
-    hard gate remains for an elevated Windows process, where following an
-    attacker-planted link would write with administrative rights, and for
-    any pending crash-recovery journal, whose repair must be surfaced
-    before a gateway may touch the half-mutated profile.
-    """
-
-    if _elevated_windows_context():
-        return True
-    if not ignore_transaction and (
-        _unfinished_replace_transaction(home)
-        or _unfinished_cleanup_transaction(home, profile_kind=profile_kind)
-    ):
-        return True
-    if _legacy_import_transaction_present(home):
-        return True
-    if ignore_settings_transaction:
-        return False
-    from opensquilla.recovery.settings_transaction import settings_transaction_exists
-
-    return settings_transaction_exists(home)
-
-
 def _legacy_layout_is_proven(home: Path, config: _ConfigView) -> bool:
     """Recognize the released nested Desktop shape using filesystem evidence.
 
@@ -1961,12 +1928,7 @@ def inspect_profile(
             state_dir=None,
             error_code="profile_unsafe_path",
         )
-        blocks = _unsafe_path_blocks_startup(
-            home_path,
-            profile_kind=kind,
-            ignore_transaction=_ignore_transaction,
-            ignore_settings_transaction=_ignore_settings_transaction,
-        )
+        blocks = _elevated_windows_context()
         return _report(
             home=home_path,
             config=config,
@@ -1987,7 +1949,7 @@ def inspect_profile(
             home=home_path,
             config=config,
             candidates=candidates,
-            outcome="recovery_required",
+            outcome="attention",
             stable_code="unknown_layout",
             effective_workspace=effective,
             allowed_actions=_RECOVERY_ACTIONS,
@@ -2003,7 +1965,7 @@ def inspect_profile(
             home=home_path,
             config=config,
             candidates=candidates,
-            outcome="recovery_required",
+            outcome="attention",
             stable_code="cleanup_transaction_incomplete",
             effective_workspace=effective,
             allowed_actions=_CLEANUP_RECOVERY_ACTIONS,
@@ -2014,7 +1976,7 @@ def inspect_profile(
             home=home_path,
             config=config,
             candidates=candidates,
-            outcome="recovery_required",
+            outcome="attention",
             stable_code="workspace_patch_incomplete",
             effective_workspace=effective,
             allowed_actions=("reconcile", *_RECOVERY_ACTIONS),
@@ -2027,7 +1989,7 @@ def inspect_profile(
                 home=home_path,
                 config=config,
                 candidates=candidates,
-                outcome="recovery_required",
+                outcome="attention",
                 stable_code="settings_transaction_incomplete",
                 effective_workspace=effective,
                 allowed_actions=("recover-settings", *_RECOVERY_ACTIONS),
@@ -2037,17 +1999,18 @@ def inspect_profile(
             home=home_path,
             config=config,
             candidates=candidates,
-            outcome="recovery_required",
+            outcome="attention",
             stable_code="legacy_import_transaction_incomplete",
             effective_workspace=effective,
             allowed_actions=_RECOVERY_ACTIONS,
         )
     if config.error_code is not None:
-        blocks = config.error_code != "config_unsafe_path" or _unsafe_path_blocks_startup(
-            home_path,
-            profile_kind=kind,
-            ignore_transaction=_ignore_transaction,
-            ignore_settings_transaction=_ignore_settings_transaction,
+        # Startup gates are deliberately narrow: a config authored by a newer
+        # build must not be reinterpreted, and an elevated Windows process
+        # must not follow a link-shaped config path. Everything else is a
+        # warning with a repair action.
+        blocks = config.error_code == "config_schema_too_new" or (
+            config.error_code == "config_unsafe_path" and _elevated_windows_context()
         )
         actions: tuple[str, ...] = _RECOVERY_ACTIONS
         if config.error_code in ("config_invalid", "config_unreadable"):
@@ -2072,7 +2035,7 @@ def inspect_profile(
                 home=home_path,
                 config=config,
                 candidates=candidates,
-                outcome="recovery_required",
+                outcome="attention",
                 stable_code=isolation_code,
                 effective_workspace=None,
                 allowed_actions=_UNSAFE_RECOVERY_PROFILE_ACTIONS,
@@ -2089,7 +2052,7 @@ def inspect_profile(
             home=home_path,
             config=config,
             candidates=candidates,
-            outcome="recovery_required",
+            outcome="attention",
             stable_code="transaction_incomplete",
             effective_workspace=effective,
             allowed_actions=transaction_actions,
@@ -2129,7 +2092,7 @@ def inspect_profile(
             home=home_path,
             config=config,
             candidates=candidates,
-            outcome="recovery_required",
+            outcome="attention",
             stable_code="unknown_layout",
             effective_workspace=effective,
             allowed_actions=_RECOVERY_ACTIONS,
@@ -2144,7 +2107,7 @@ def inspect_profile(
             home=home_path,
             config=config,
             candidates=candidates,
-            outcome="recovery_required",
+            outcome="attention",
             stable_code=(
                 "effective_state_missing"
                 if state_candidate is None or not state_candidate.exists
@@ -2159,7 +2122,7 @@ def inspect_profile(
             home=home_path,
             config=config,
             candidates=candidates,
-            outcome="recovery_required",
+            outcome="attention",
             stable_code=state_code,
             effective_workspace=effective,
             allowed_actions=_RECOVERY_ACTIONS,
@@ -2192,7 +2155,7 @@ def inspect_profile(
             home=home_path,
             config=config,
             candidates=candidates,
-            outcome="recovery_required",
+            outcome="attention",
             stable_code=code,
             effective_workspace=effective,
             allowed_actions=_role_actions(roles),
@@ -2204,7 +2167,7 @@ def inspect_profile(
             home=home_path,
             config=config,
             candidates=candidates,
-            outcome="recovery_required",
+            outcome="attention",
             stable_code="unknown_legacy_layout",
             effective_workspace=effective,
             allowed_actions=_RECOVERY_ACTIONS,
@@ -2215,7 +2178,7 @@ def inspect_profile(
             home=home_path,
             config=config,
             candidates=candidates,
-            outcome="recovery_required",
+            outcome="attention",
             stable_code="legacy_layout_reconcile_available",
             effective_workspace=effective,
             allowed_actions=("reconcile", *_RECOVERY_ACTIONS),
@@ -2267,7 +2230,7 @@ def inspect_profile(
             home=home_path,
             config=config,
             candidates=candidates,
-            outcome="recovery_required",
+            outcome="attention",
             stable_code="effective_workspace_missing",
             effective_workspace=effective,
             allowed_actions=_WORKSPACE_RECOVERY_ACTIONS,
@@ -2412,9 +2375,12 @@ def reconcile_profile(
                 _ignore_transaction=_ignore_replace_transaction,
             )
             if atomic_state_unknown:
+                # The native rename may already have succeeded. Never
+                # reinterpret an unverifiable post-move tree as ready; startup
+                # proceeds with a warning and mutations keep failing closed.
                 return replace(
                     final,
-                    outcome="recovery_required",
+                    outcome="attention",
                     stable_code="atomic_state_unknown",
                     allowed_actions=_RECOVERY_ACTIONS,
                 )
@@ -2425,7 +2391,7 @@ def reconcile_profile(
             if (
                 role_operation_failure
                 and effective_is_valid
-                and final.outcome == "recovery_required"
+                and final.outcome == "attention"
             ):
                 # A failure confined to an ancillary legacy role must not take
                 # a valid identity/session profile offline. Leave the source in
@@ -2437,10 +2403,10 @@ def reconcile_profile(
                     stable_code="layout_reconcile_deferred",
                     allowed_actions=_ATTENTION_ACTIONS,
                 )
-            if raw_operation_failure and final.outcome == "recovery_required":
+            if raw_operation_failure and final.outcome == "attention":
                 return replace(
                     final,
-                    outcome="recovery_required",
+                    outcome="attention",
                     stable_code="layout_reconcile_failed",
                     allowed_actions=tuple(
                         dict.fromkeys(("reconcile", *final.allowed_actions, *_RECOVERY_ACTIONS))
@@ -2507,11 +2473,13 @@ def choose_workspace(
 
 
 def guard_desktop_profile(home: str | Path | None = None) -> RecoveryReport | None:
-    """Fail before runtime writes when a Desktop-owned profile is unsafe.
+    """Fail before runtime writes only for the two hard startup gates.
 
-    Ordinary CLI profiles are intentionally outside this reconciler. Desktop
-    must run ``reconcile`` while the gateway is stopped before invoking guarded
-    runtime entry points.
+    After the recovery-governance downgrade, ``inspect_profile`` returns
+    ``recovery_required`` only for a config authored by a newer build and for
+    unsafe path shapes in an elevated Windows process. Every other finding is
+    a warning: the profile starts and individual mutations fail closed on
+    their own checks. Ordinary CLI profiles are outside this reconciler.
     """
 
     home_path = _resolved_home_path(home)
@@ -2547,20 +2515,12 @@ def guarded_desktop_profile(
         if kind in _DESKTOP_PROFILE_KINDS:
             # The profile lock lives outside H and is therefore safe to take
             # before inspection.  LegacyGatewayLock may create
-            # state/gateway.pid.lock, so an unsafe Desktop profile must be
+            # state/gateway.pid.lock, so a hard-gated Desktop profile must be
             # rejected before that compatibility write can happen.
             report = inspect_profile(home_path, profile_kind=kind)
             if report.outcome == "recovery_required":
                 raise RecoveryRequiredError(report)
         with LegacyGatewayLock(home_path, timeout=lock_timeout):
-            if kind in _DESKTOP_PROFILE_KINDS:
-                # Close the race between the read-only inspection and taking
-                # the old-gateway lease.  A concurrent external mutation can
-                # make a formerly-safe profile unsafe even though RC4 writers
-                # obey the external profile lock.
-                report = inspect_profile(home_path, profile_kind=kind)
-                if report.outcome == "recovery_required":
-                    raise RecoveryRequiredError(report)
             yield report
 
 

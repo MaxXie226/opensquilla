@@ -400,7 +400,11 @@ def test_foreign_migration_blocks_unsafe_desktop_before_any_write(
     target.mkdir()
     missing_workspace = tmp_path / "missing-workspace"
     config = target / "config.toml"
-    config_bytes = f"workspace_dir = {json.dumps(str(missing_workspace))}\n".encode()
+    # config_version = 999 is the remaining hard startup gate.
+    config_bytes = (
+        "config_version = 999\n"
+        f"workspace_dir = {json.dumps(str(missing_workspace))}\n"
+    ).encode()
     config.write_bytes(config_bytes)
     _set_fake_home(monkeypatch, fake_home)
     monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(target))
@@ -421,7 +425,7 @@ def test_foreign_migration_blocks_unsafe_desktop_before_any_write(
 
     assert result.exit_code != 0
     assert isinstance(result.exception, RecoveryRequiredError)
-    assert result.exception.report.stable_code == "effective_state_missing"
+    assert result.exception.report.stable_code == "config_schema_too_new"
     assert config.read_bytes() == config_bytes
     assert not missing_workspace.exists()
     assert not (target / "workspace").exists()

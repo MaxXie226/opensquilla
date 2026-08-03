@@ -139,7 +139,7 @@ def test_unknown_only_profile_is_never_seeded_as_fresh(
 
     report = inspect_profile(home, profile_kind="desktop-primary")
 
-    assert report.outcome == "recovery_required"
+    assert report.outcome == "attention"
     assert report.stable_code == "unknown_layout"
     assert sorted(path.relative_to(home) for path in home.rglob("*")) == before
     assert not (home / "workspace").exists()
@@ -161,7 +161,7 @@ def test_unknown_profile_symlink_is_not_followed_or_seeded(tmp_path: Path) -> No
 
     report = inspect_profile(home, profile_kind="desktop-primary")
 
-    assert report.outcome == "recovery_required"
+    assert report.outcome == "attention"
     assert report.stable_code == "unknown_layout"
     assert linked.is_symlink()
     assert sentinel.read_text(encoding="utf-8") == "synthetic preserved identity\n"
@@ -189,7 +189,7 @@ def test_unknown_profile_junction_is_not_followed_or_seeded(tmp_path: Path) -> N
 
     report = inspect_profile(home, profile_kind="desktop-primary")
 
-    assert report.outcome == "recovery_required"
+    assert report.outcome == "attention"
     assert report.stable_code == "unknown_layout"
     assert sentinel.read_text(encoding="utf-8") == "synthetic preserved identity\n"
     assert not (home / "workspace").exists()
@@ -215,7 +215,7 @@ def test_empty_primary_with_missing_environment_override_is_not_fresh(
 
     report = inspect_profile(home, profile_kind="desktop-primary")
 
-    assert report.outcome == "recovery_required"
+    assert report.outcome == "attention"
     assert report.stable_code == stable_code
     assert not home.exists()
     assert not missing.exists()
@@ -251,7 +251,7 @@ def test_recovery_profile_rejects_external_primary_data_roots(
 
     report = inspect_profile(recovery_home, profile_kind="desktop-recovery")
 
-    assert report.outcome == "recovery_required"
+    assert report.outcome == "attention"
     assert report.stable_code == stable_code
     assert report.effective_workspace is None
     assert "continue-recovery-profile" not in report.allowed_actions
@@ -301,7 +301,7 @@ def test_empty_recovery_profile_rejects_ambient_primary_override(
 
     report = inspect_profile(recovery_home, profile_kind="desktop-recovery")
 
-    assert report.outcome == "recovery_required"
+    assert report.outcome == "attention"
     assert report.stable_code == "recovery_profile_external_workspace"
     assert not recovery_home.exists()
 
@@ -325,7 +325,7 @@ def test_recovery_profile_canonical_symlink_cannot_escape_to_primary(
 
     report = inspect_profile(recovery_home, profile_kind="desktop-recovery")
 
-    assert report.outcome == "recovery_required"
+    assert report.outcome == "attention"
     assert report.stable_code == "recovery_profile_unsafe_workspace"
     assert (primary_workspace / "SOUL.md").read_text(encoding="utf-8") == "synthetic\n"
 
@@ -369,7 +369,7 @@ def test_clean_proven_legacy_workspace_moves_only_during_reconcile(tmp_path: Pat
 
     inspected = inspect_profile(home)
 
-    assert inspected.outcome == "recovery_required"
+    assert inspected.outcome == "attention"
     assert inspected.stable_code == "legacy_workspace_reconcile_available"
     assert legacy.is_dir()
     assert not (home / "workspace").exists()
@@ -424,7 +424,7 @@ def test_recovery_or_required_profile_never_writes_primary_compatibility_marker(
     unsafe_home = tmp_path / "unsafe"
     _desktop_config(unsafe_home, workspace=tmp_path / "missing")
     required = reconcile_profile(unsafe_home, profile_kind="desktop-primary")
-    assert required.outcome == "recovery_required"
+    assert required.outcome == "attention"
     assert not (unsafe_home / "desktop-layout-v2.json").exists()
 
 
@@ -502,7 +502,7 @@ def test_unproven_legacy_directory_is_never_guessed_or_moved(tmp_path: Path) -> 
 
     report = reconcile_profile(home)
 
-    assert report.outcome == "recovery_required"
+    assert report.outcome == "attention"
     assert report.stable_code == "unknown_legacy_layout"
     assert legacy.is_dir()
     assert not (home / "workspace").exists()
@@ -575,7 +575,7 @@ def test_post_move_verification_failure_never_becomes_ready(
 
     report = reconcile_profile(home, profile_kind="desktop-primary")
 
-    assert report.outcome == "recovery_required"
+    assert report.outcome == "attention"
     assert report.stable_code == "atomic_state_unknown"
     assert not legacy_env.exists()
     assert (home / ".env").is_file()
@@ -650,7 +650,7 @@ def test_existing_profile_with_missing_effective_workspace_requires_recovery(
 
     report = inspect_profile(home)
 
-    assert report.outcome == "recovery_required"
+    assert report.outcome == "attention"
     assert report.stable_code == "effective_workspace_missing"
     assert "choose-workspace" in report.allowed_actions
 
@@ -670,7 +670,7 @@ def test_missing_external_state_blocks_before_a_new_chat_database_can_be_created
 
     report = inspect_profile(home, profile_kind="desktop-primary")
 
-    assert report.outcome == "recovery_required"
+    assert report.outcome == "attention"
     assert report.stable_code == "effective_state_missing"
     assert not missing_state.exists(), "inspection must never seed a replacement state root"
     state = next(candidate for candidate in report.candidates if candidate.kind == "state")
@@ -846,7 +846,7 @@ def test_unsafe_session_database_blocks_before_gateway_migrations(
 
     report = inspect_profile(home, profile_kind="desktop-primary")
 
-    assert report.outcome == "recovery_required"
+    assert report.outcome == "attention"
     assert report.stable_code == stable_code
 
 
@@ -973,7 +973,7 @@ def test_database_snapshot_source_change_fails_closed_without_mutating_source(
 
     report = inspect_profile(home, profile_kind="desktop-primary")
 
-    assert report.outcome == "recovery_required"
+    assert report.outcome == "attention"
     assert report.stable_code == "state_database_changed"
     assert database.read_bytes() == before
 
@@ -995,7 +995,7 @@ def test_database_wal_symlink_is_never_followed(tmp_path: Path) -> None:
 
     report = inspect_profile(home, profile_kind="desktop-primary")
 
-    assert report.outcome == "recovery_required"
+    assert report.outcome == "attention"
     assert report.stable_code == "state_database_unsafe_path"
     assert outside.read_bytes() == b"synthetic outside bytes"
 
@@ -1018,7 +1018,8 @@ def test_workspace_choice_is_blocked_when_config_mutation_is_not_safe(
     config_before = (home / "config.toml").read_bytes()
     report = inspect_profile(home)
 
-    assert report.outcome == "recovery_required"
+    expected = "recovery_required" if unsafe_state == "future-config" else "attention"
+    assert report.outcome == expected
     assert "choose-workspace" not in report.allowed_actions
     with pytest.raises(InvalidWorkspaceError):
         choose_workspace(
@@ -1059,19 +1060,21 @@ def test_workspace_choice_resolves_linked_profile_home(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    ("config", "stable_code"),
+    ("config", "stable_code", "outcome"),
     [
         (
             'workspace_dir = "unterminated\n',
             "config_invalid",
+            "attention",
         ),
-        ("config_version = 999\n", "config_schema_too_new"),
+        ("config_version = 999\n", "config_schema_too_new", "recovery_required"),
     ],
 )
 def test_invalid_or_future_config_requires_recovery(
     tmp_path: Path,
     config: str,
     stable_code: str,
+    outcome: str,
 ) -> None:
     home = tmp_path / "opensquilla"
     home.mkdir()
@@ -1079,7 +1082,7 @@ def test_invalid_or_future_config_requires_recovery(
 
     report = inspect_profile(home)
 
-    assert report.outcome == "recovery_required"
+    assert report.outcome == outcome
     assert report.stable_code == stable_code
 
 
@@ -1123,7 +1126,7 @@ def test_replacement_journal_symlink_is_never_followed(tmp_path: Path) -> None:
 
     report = inspect_profile(home)
 
-    assert report.outcome == "recovery_required"
+    assert report.outcome == "attention"
     assert report.stable_code == "transaction_incomplete"
     assert outside.read_text(encoding="utf-8") == '{"phase":"committed"}\n'
 
@@ -1152,7 +1155,7 @@ def test_legacy_import_journal_blocks_without_automatic_mutation(tmp_path: Path)
 
     report = inspect_profile(home, profile_kind="desktop-primary")
 
-    assert report.outcome == "recovery_required"
+    assert report.outcome == "attention"
     assert report.stable_code == "legacy_import_transaction_incomplete"
     assert "recover-transaction" not in report.allowed_actions
     assert (home / "config.toml").read_bytes() == config_before
@@ -1170,7 +1173,7 @@ def test_legacy_import_journal_prevents_missing_target_from_looking_fresh(
 
     report = inspect_profile(home, profile_kind="desktop-primary")
 
-    assert report.outcome == "recovery_required"
+    assert report.outcome == "attention"
     assert report.stable_code == "legacy_import_transaction_incomplete"
     assert not home.exists()
     assert journal.read_bytes() == before
@@ -1238,7 +1241,7 @@ def test_unsafe_profile_root_still_blocks_with_pending_transaction(tmp_path: Pat
 
     report = inspect_profile(profile)
 
-    assert report.outcome == "recovery_required"
+    assert report.outcome == "attention"
     assert report.stable_code == "profile_unsafe_path"
 
 
@@ -1547,7 +1550,7 @@ def test_config_publication_preserves_a_mutation_in_the_final_cas_window(
     assert backup.read_text(encoding="utf-8") == concurrent_text
     assert staged.is_file()
     blocked = inspect_profile(home)
-    assert blocked.outcome == "recovery_required"
+    assert blocked.outcome == "attention"
     assert blocked.stable_code == "workspace_patch_incomplete"
     with pytest.raises(AtomicStateUnknownError):
         reconcile_profile(home)
@@ -1593,7 +1596,7 @@ def test_crashed_workspace_config_park_is_recovered_without_overwrite(
 
     assert crashed
     blocked = inspect_profile(home)
-    assert blocked.outcome == "recovery_required"
+    assert blocked.outcome == "attention"
     assert blocked.stable_code == "workspace_patch_incomplete"
     recovered = reconcile_profile(home)
 
@@ -1610,7 +1613,7 @@ def test_crashed_workspace_config_park_is_recovered_without_overwrite(
 
 def test_bootstrap_guard_is_desktop_only(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     home = tmp_path / "opensquilla"
-    _desktop_config(home, workspace=tmp_path / "missing")
+    _desktop_config(home, workspace=tmp_path / "missing", extra="config_version = 999")
     monkeypatch.delenv("OPENSQUILLA_PROFILE_KIND", raising=False)
     monkeypatch.delenv("OPENSQUILLA_DESKTOP", raising=False)
     assert guard_desktop_profile(home) is None
@@ -1618,7 +1621,22 @@ def test_bootstrap_guard_is_desktop_only(monkeypatch: pytest.MonkeyPatch, tmp_pa
     monkeypatch.setenv("OPENSQUILLA_PROFILE_KIND", "desktop-primary")
     with pytest.raises(RecoveryRequiredError) as caught:
         guard_desktop_profile(home)
-    assert caught.value.report.stable_code == "effective_workspace_missing"
+    assert caught.value.report.stable_code == "config_schema_too_new"
+
+
+def test_bootstrap_guard_warns_but_starts_on_missing_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "opensquilla"
+    _desktop_config(home, workspace=tmp_path / "missing")
+    monkeypatch.setenv("OPENSQUILLA_PROFILE_KIND", "desktop-primary")
+
+    report = guard_desktop_profile(home)
+
+    assert report is not None
+    assert report.outcome == "attention"
+    assert report.stable_code == "effective_workspace_missing"
 
 
 def test_legacy_profile_dotenv_pin_prevents_workspace_move(tmp_path: Path) -> None:
@@ -1633,7 +1651,7 @@ def test_legacy_profile_dotenv_pin_prevents_workspace_move(tmp_path: Path) -> No
 
     before = inspect_profile(home, profile_kind="desktop-primary")
     assert before.effective_workspace == legacy
-    assert before.outcome == "recovery_required"
+    assert before.outcome == "attention"
 
     after = reconcile_profile(home, profile_kind="desktop-primary")
 
@@ -1658,7 +1676,7 @@ def test_interpolated_profile_dotenv_override_fails_closed(tmp_path: Path) -> No
 
     report = reconcile_profile(home, profile_kind="desktop-primary")
 
-    assert report.outcome == "recovery_required"
+    assert report.outcome == "attention"
     assert report.stable_code == "workspace_env_override_unsafe"
     assert legacy.is_dir()
     assert legacy_env.is_file()

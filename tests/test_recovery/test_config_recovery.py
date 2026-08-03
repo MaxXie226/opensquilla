@@ -47,7 +47,7 @@ def test_recover_config_restores_newest_valid_backup_and_preserves_corrupt_file(
     (home / "config.toml").write_text("workspace_dir = [\n", encoding="utf-8")
 
     before = inspect_profile(home)
-    assert before.outcome == "recovery_required"
+    assert before.outcome == "attention"
     assert before.stable_code == "config_invalid"
     assert "recover-config" in before.allowed_actions
 

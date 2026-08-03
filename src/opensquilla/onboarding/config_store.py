@@ -41,6 +41,7 @@ from opensquilla.gateway.config import (
 )
 from opensquilla.gateway.config_migration import (
     ConfigParseError,
+    atomic_write_config,
     backup_and_write_migrated_config,
     make_config_backup,
     migrate_config_payload,
@@ -339,26 +340,6 @@ def _remove_backup_paths(payload: Any, remove_paths: tuple[tuple[str, ...], ...]
         _remove_path(payload, path)
         changed = True
     return changed
-
-
-def _atomic_write_toml(target: Path, payload: dict[str, Any]) -> None:
-    """Replace one TOML file atomically with owner-only permissions."""
-
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=f".{target.name}.",
-        suffix=".tmp",
-        dir=os.fspath(native_io_path(target.parent)),
-    )
-    try:
-        with os.fdopen(fd, "wb") as fh:
-            tomli_w.dump(payload, fh)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.chmod(tmp_name, 0o600)
-        os.replace(tmp_name, native_io_path(target))
-    except Exception:
-        _remove_staged_path(Path(tmp_name))
-        raise
 
 
 def _toml_bytes(payload: dict[str, Any]) -> bytes:
@@ -991,7 +972,7 @@ def persist_config(
         else:
             if backup and target_io.exists():
                 backup_path = make_config_backup(target)
-            _atomic_write_toml(target, merged)
+            atomic_write_config(target, merged)
 
         config.consume_force_persist_path_segments(force_paths)
 

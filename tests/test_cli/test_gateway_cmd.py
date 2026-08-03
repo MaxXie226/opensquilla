@@ -90,7 +90,10 @@ def _unsafe_desktop_profile(home: Path, *, port: int = 0) -> None:
     lifecycle = state / "gateway"
     lifecycle.mkdir(parents=True)
     missing_workspace = home.parent / "missing-workspace"
+    # config_version = 999 is the remaining hard startup gate: a config
+    # authored by a newer build must never be reinterpreted by this one.
     (home / "config.toml").write_text(
+        "config_version = 999\n"
         f"state_dir = {json.dumps(str(state))}\n"
         f"workspace_dir = {json.dumps(str(missing_workspace))}\n",
         encoding="utf-8",
@@ -318,7 +321,7 @@ def test_unsafe_desktop_gateway_lifecycle_blocks_before_spawn_or_write(
     assert result.ok is False
     assert result.state == "recovery_required"
     assert result.code == "DESKTOP_PROFILE_RECOVERY_REQUIRED"
-    assert result.details["stableCode"] == "effective_workspace_missing"
+    assert result.details["stableCode"] == "config_schema_too_new"
     assert _profile_tree_snapshot(home) == before
     assert not user_state.exists()
 

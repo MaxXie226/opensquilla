@@ -161,6 +161,40 @@ def test_migrated_config_write_syncs_before_publication(
     assert list(tmp_path.glob("config.toml.backup.*"))
 
 
+def test_config_backups_keep_only_the_newest_n(tmp_path: Path) -> None:
+    toml_path = _write_toml(tmp_path / "config.toml", {"config_version": 1})
+    keep = migration_module._CONFIG_BACKUP_KEEP
+    stale = [
+        tmp_path / f"config.toml.backup.2025010100000000{index:04d}"
+        for index in range(keep + 3)
+    ]
+    for path in stale:
+        path.write_text("stale backup\n", encoding="utf-8")
+
+    migration_module.make_config_backup(toml_path)
+
+    survivors = sorted(tmp_path.glob("config.toml.backup.*"))
+    assert len(survivors) == keep
+    # Name order is timestamp order; the oldest names are the ones removed.
+    assert survivors == sorted(stale)[4:] + survivors[-1:]
+
+
+def test_config_backup_pruning_skips_non_files(tmp_path: Path) -> None:
+    toml_path = _write_toml(tmp_path / "config.toml", {"config_version": 1})
+    keep = migration_module._CONFIG_BACKUP_KEEP
+    for index in range(keep + 2):
+        (tmp_path / f"config.toml.backup.2025010100000000{index:04d}").write_text(
+            "stale backup\n", encoding="utf-8"
+        )
+    decoy = tmp_path / "config.toml.backup.00000000000000000000"
+    decoy.mkdir()
+
+    migration_module.make_config_backup(toml_path)
+
+    assert decoy.is_dir()
+    assert len([p for p in tmp_path.glob("config.toml.backup.*") if p.is_file()]) == keep
+
+
 # ---------------------------------------------------------------------------
 # Version-gated migration: llm_ensemble legacy timeout bump
 # ---------------------------------------------------------------------------

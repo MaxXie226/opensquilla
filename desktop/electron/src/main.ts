@@ -8219,10 +8219,12 @@ async function inspectActiveProfileBeforeStartup(): Promise<boolean> {
   }
   recoveryOperationError = null
   let inspection = await inspectDesktopProfile(active)
-  if (
-    inspection.outcome === 'recovery_required'
-    && inspection.allowed_actions.includes('recover-settings')
-  ) {
+  // Findings below are warnings (`attention`), not startup blockers: the
+  // repair action advertised by the inspector is run automatically and
+  // startup continues. Only a failed automatic repair, a config authored by
+  // a newer build, or an elevated-Windows unsafe path reaches the manual
+  // recovery page.
+  if (inspection.allowed_actions.includes('recover-settings')) {
     if (gatewayProcess && gatewayState.owned) await stopOwnedGatewayAndWait()
     try {
       inspection = await runRecoveryCli(active, [
@@ -8237,8 +8239,7 @@ async function inspectActiveProfileBeforeStartup(): Promise<boolean> {
   }
 
   if (
-    inspection.outcome === 'recovery_required'
-    && inspection.allowed_actions.includes('recover-transaction')
+    inspection.allowed_actions.includes('recover-transaction')
     && inspection.transaction_id
   ) {
     if (gatewayProcess && gatewayState.owned) await stopOwnedGatewayAndWait()
@@ -8252,10 +8253,7 @@ async function inspectActiveProfileBeforeStartup(): Promise<boolean> {
     }
   }
 
-  if (
-    inspection.outcome === 'recovery_required'
-    && inspection.allowed_actions.includes('recover-config')
-  ) {
+  if (inspection.allowed_actions.includes('recover-config')) {
     if (gatewayProcess && gatewayState.owned) await stopOwnedGatewayAndWait()
     try {
       // The CLI preserves the corrupt config.toml beside itself before it
@@ -8272,7 +8270,7 @@ async function inspectActiveProfileBeforeStartup(): Promise<boolean> {
     }
   }
 
-  const provenReconcile = inspection.outcome === 'recovery_required'
+  const provenReconcile = inspection.outcome !== 'recovery_required'
     && inspection.allowed_actions.includes('reconcile')
   const safeLayoutFinalize = inspection.outcome === 'ready'
     && inspection.allowed_actions.includes('finalize-layout')

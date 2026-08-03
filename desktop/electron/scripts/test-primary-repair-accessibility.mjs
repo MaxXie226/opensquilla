@@ -24,57 +24,51 @@ const LOCALES = {
     title: 'Starting OpenSquilla',
     bootAria: 'OpenSquilla startup',
     repairTitle: 'Your primary profile needs recovery',
-    cleanupTitle: 'A data cleanup stopped partway through',
     retry: 'Retry',
   },
   'zh-Hans': {
     title: '正在启动 OpenSquilla',
     bootAria: 'OpenSquilla 启动',
     repairTitle: '主配置需要恢复',
-    cleanupTitle: '数据清理在中途停止',
     retry: '重试',
   },
   ja: {
     title: 'OpenSquilla を起動しています',
     bootAria: 'OpenSquilla の起動',
     repairTitle: 'プライマリプロファイルの復旧が必要です',
-    cleanupTitle: 'データのクリーンアップが途中で停止しました',
     retry: '再試行',
   },
   fr: {
     title: "Démarrage d'OpenSquilla",
     bootAria: "Démarrage d'OpenSquilla",
     repairTitle: 'Le profil principal doit être récupéré',
-    cleanupTitle: 'Un nettoyage des données s’est arrêté en cours de route',
     retry: 'Réessayer',
   },
   de: {
     title: 'OpenSquilla wird gestartet',
     bootAria: 'OpenSquilla-Start',
     repairTitle: 'Das Hauptprofil muss wiederhergestellt werden',
-    cleanupTitle: 'Eine Datenbereinigung wurde unterbrochen',
     retry: 'Wiederholen',
   },
   es: {
     title: 'Iniciando OpenSquilla',
     bootAria: 'Inicio de OpenSquilla',
     repairTitle: 'El perfil principal necesita recuperación',
-    cleanupTitle: 'Una limpieza de datos se detuvo a mitad de camino',
     retry: 'Reintentar',
   },
 }
 
-const BLOCKING_CASES = {
-  en: { fixture: 'missing-workspace', stableCode: 'effective_workspace_missing' },
-  // config_invalid no longer reaches the repair page: the desktop runs the
-  // recover-config CLI automatically. The pre-RC4 import journal is the
-  // remaining config-adjacent authority that must stay manual.
-  'zh-Hans': { fixture: 'legacy-import-transaction', stableCode: 'legacy_import_transaction_incomplete' },
-  ja: { fixture: 'future-config', stableCode: 'config_schema_too_new' },
-  fr: { fixture: 'unfinished-transaction', stableCode: 'transaction_incomplete' },
-  de: { fixture: 'unsafe-database', stableCode: 'state_database_invalid' },
-  es: { fixture: 'cleanup-transaction', stableCode: 'cleanup_transaction_incomplete' },
-}
+// After the recovery-governance downgrade, the only fixture-synthesizable
+// hard startup gate is a config authored by a newer build. Every other
+// historical blocking code now starts with a warning (or is repaired
+// automatically), so each locale exercises the repair page with the same
+// schema-too-new authority.
+const BLOCKING_CASES = Object.fromEntries(
+  Object.keys(LOCALES).map((locale) => [
+    locale,
+    { fixture: 'future-config', stableCode: 'config_schema_too_new' },
+  ]),
+)
 
 const REMOVED_PROFILE_CONTROLS = [
   'recoveryProfiles',
@@ -167,7 +161,6 @@ async function createFixture(locale, blockingCase) {
   const primaryHome = join(userData, 'opensquilla')
   const primaryWorkspace = join(primaryHome, 'workspace')
   const primaryState = join(primaryHome, 'state')
-  const missingWorkspace = join(root, 'missing-external-workspace')
 
   await mkdir(primaryWorkspace, { recursive: true })
   await mkdir(primaryState, { recursive: true })
@@ -182,36 +175,8 @@ async function createFixture(locale, blockingCase) {
   }
   await writeFile(join(primaryState, 'primary-must-not-change.txt'), 'unchanged\n', 'utf8')
 
-  let config = `state_dir = ${JSON.stringify(primaryState)}\n`
-  if (blockingCase.fixture === 'missing-workspace') {
-    config = [
-      `state_dir = ${JSON.stringify(primaryState)}`,
-      `workspace_dir = ${JSON.stringify(missingWorkspace)}`,
-      '',
-    ].join('\n')
-  } else if (blockingCase.fixture === 'future-config') {
-    config = 'config_version = 999\n'
-  }
-  await writeFile(join(primaryHome, 'config.toml'), config, 'utf8')
-  if (blockingCase.fixture === 'unsafe-database') {
-    await writeFile(join(primaryState, 'sessions.db'), 'not a sqlite database', 'utf8')
-  }
-
-  let journalPath = null
-  let journalBytes = null
-  if (blockingCase.fixture === 'unfinished-transaction') {
-    journalPath = join(userData, '.opensquilla.profile-replace.json')
-    journalBytes = '{"schema_version":1,"phase":"prepared"}\n'
-    await writeFile(journalPath, journalBytes, 'utf8')
-  } else if (blockingCase.fixture === 'cleanup-transaction') {
-    journalPath = join(userData, '.opensquilla.profile-cleanup.json')
-    journalBytes = 'synthetic interrupted cleanup authority\n'
-    await writeFile(journalPath, journalBytes, 'utf8')
-  } else if (blockingCase.fixture === 'legacy-import-transaction') {
-    journalPath = join(userData, '.opensquilla.import-commit.json')
-    journalBytes = 'synthetic legacy import authority\n'
-    await writeFile(journalPath, journalBytes, 'utf8')
-  }
+  assert.equal(blockingCase.fixture, 'future-config')
+  await writeFile(join(primaryHome, 'config.toml'), 'config_version = 999\n', 'utf8')
   await writeFile(join(userData, 'desktop-locale'), locale, 'utf8')
 
   return {
@@ -219,8 +184,6 @@ async function createFixture(locale, blockingCase) {
     userData,
     isolatedHome,
     primaryHome,
-    journalPath,
-    journalBytes,
     primaryBefore: await snapshotTree(primaryHome),
   }
 }
@@ -289,12 +252,7 @@ for (const [locale, expected] of Object.entries(LOCALES)) {
     assert.equal(await page.title(), expected.title)
     assert.equal(await page.locator('main.boot').getAttribute('aria-label'), expected.bootAria)
     assert.equal(await page.locator('#recoveryCode').innerText(), blockingCase.stableCode)
-    assert.equal(
-      await page.locator('#recoveryTitle').innerText(),
-      blockingCase.fixture === 'cleanup-transaction'
-        ? expected.cleanupTitle
-        : expected.repairTitle,
-    )
+    assert.equal(await page.locator('#recoveryTitle').innerText(), expected.repairTitle)
     assert.equal(await page.locator('#recoveryPanel').getAttribute('role'), 'region')
     assert.equal(await page.locator('#recoveryPanel').getAttribute('aria-labelledby'), 'recoveryTitle')
     assert.equal(await page.locator('#recoveryStatus').getAttribute('role'), 'status')
@@ -340,9 +298,6 @@ for (const [locale, expected] of Object.entries(LOCALES)) {
     assert.equal('activeProfile' in recoveryState, false)
     assert.equal('recoveryProfiles' in recoveryState, false)
     assert.deepEqual(await snapshotTree(fixture.primaryHome), fixture.primaryBefore)
-    if (fixture.journalPath) {
-      assert.equal(await readFile(fixture.journalPath, 'utf8'), fixture.journalBytes)
-    }
     if (locale === 'en') await assertReducedMotion(page)
     completedLocales.push(locale)
     completedBlockingCodes.push(blockingCase.stableCode)
