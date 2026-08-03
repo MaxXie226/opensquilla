@@ -2049,7 +2049,7 @@ def inspect_profile(
             ignore_transaction=_ignore_transaction,
             ignore_settings_transaction=_ignore_settings_transaction,
         )
-        actions = _RECOVERY_ACTIONS
+        actions: tuple[str, ...] = _RECOVERY_ACTIONS
         if config.error_code in ("config_invalid", "config_unreadable"):
             # The repair restores the newest valid sibling backup or, failing
             # that, preserves the corrupt file and starts with defaults, so it

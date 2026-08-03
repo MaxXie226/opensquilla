@@ -858,12 +858,13 @@ def _validate_directory_chain_binding(binding: object) -> None:
             value = os.lstat(_native_io_path(current))
         except OSError as exc:
             raise UnsafePathError(f"external directory ancestor changed: {current}") from exc
+        observed_attributes = int(getattr(value, "st_file_attributes", 0))
         observed = {
             "path": str(current),
             "device": int(value.st_dev),
             "inode": int(value.st_ino),
             "mode": stat.S_IFMT(value.st_mode),
-            "file_attributes": int(getattr(value, "st_file_attributes", 0)),
+            "file_attributes": observed_attributes,
         }
         # Cloud-sync attribute bits (hydration, pinning) toggle at will, so
         # only the stable directory bit participates in the comparison; the
@@ -874,7 +875,9 @@ def _validate_directory_chain_binding(binding: object) -> None:
                 **expected,
                 "file_attributes": expected_attributes & _WINDOWS_FILE_ATTRIBUTE_DIRECTORY,
             }
-            observed["file_attributes"] &= _WINDOWS_FILE_ATTRIBUTE_DIRECTORY
+            observed["file_attributes"] = (
+                observed_attributes & _WINDOWS_FILE_ATTRIBUTE_DIRECTORY
+            )
         if _is_link_or_reparse(value) or not stat.S_ISDIR(value.st_mode) or observed != expected:
             raise UnsafePathError(f"external directory ancestor identity changed: {current}")
     existing_path = Path(str(binding.get("existing_path")))
