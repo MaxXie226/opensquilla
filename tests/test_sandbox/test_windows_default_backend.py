@@ -244,6 +244,40 @@ def test_windows_filesystem_worker_uses_cached_deny_acl_validation(
     assert mod._acl_plan_payload(_request(workspace))["revalidateDenyAcl"] is True
 
 
+def test_capability_filesystem_worker_uses_worker_acl_and_path_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default as mod
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    request = replace(
+        _request(workspace),
+        action_kind="capability.probe.fs.worker.write_text",
+    )
+    monkeypatch.setattr(
+        mod,
+        "capability_sids_for_command",
+        lambda store, roots, **kwargs: tuple(f"S-{i}" for i, _ in enumerate(roots)),
+    )
+    monkeypatch.setattr(mod, "_runtime_readonly_roots", lambda: ())
+    monkeypatch.setattr(mod, "runtime_rx_roots", lambda executable: ())
+    monkeypatch.setattr(mod, "process_executable_rx_roots", lambda argv, env: ())
+    monkeypatch.setattr(
+        mod,
+        "_windows_tool_path_roots",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("filesystem workers must not project host tool paths")
+        ),
+    )
+
+    payload = mod._payload_for_request(request)
+
+    assert payload["policy"]["capabilityProbe"] is True
+    assert payload["policy"]["windowsAclPlan"]["revalidateDenyAcl"] is False
+
+
 def test_windows_acl_filter_resolves_parent_segments_before_root_check(
     tmp_path: Path,
 ) -> None:

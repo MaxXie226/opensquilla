@@ -876,7 +876,7 @@ def _acl_plan_payload(
         "denyWritePaths": [str(path) for path in deny_write_paths],
         "denyReadPaths": [str(path) for path in deny_read_paths],
         "denyAclStatePath": str(_deny_acl_state_path()),
-        "revalidateDenyAcl": not request.action_kind.startswith("fs.worker."),
+        "revalidateDenyAcl": not _is_filesystem_worker_request(request),
         "grantCurrentUserAccess": True,
     }
 
@@ -1155,7 +1155,9 @@ def _process_base_env(request: SandboxRequest) -> dict[str, str]:
 
 
 def _is_filesystem_worker_request(request: SandboxRequest) -> bool:
-    return request.action_kind.startswith("fs.worker.")
+    return request.action_kind.startswith(
+        ("fs.worker.", "capability.probe.fs.worker.")
+    )
 
 
 def _request_needs_host_tool_paths(request: SandboxRequest) -> bool:
