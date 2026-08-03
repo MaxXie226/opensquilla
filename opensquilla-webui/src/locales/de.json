@@ -461,6 +461,11 @@
         "title": "Standardzugriffsmodus", "description": "Startmodus für neue Aufgaben. Safe bleibt bei fehlgeschlagener Prüfung nicht auswählbar.",
         "default": "Standardmodus", "safe": "Safe", "full": "Vollzugriff", "resetWarning": "Warnung beim Start wieder anzeigen"
       },
+      "setup": {
+        "title": "Safe-Modus einrichten", "description": "OpenSquilla benötigt einmalig eine Administratorfreigabe, um ein isoliertes Konto sowie Datei- und Netzwerkschutz einzurichten.",
+        "continue": "Weiter", "configuring": "Wird eingerichtet…", "cancelled": "Einrichtung abgebrochen. Der Vollzugriff bleibt unverändert; Sie können es jederzeit erneut versuchen.",
+        "failed": "Safe-Modus konnte nicht eingerichtet werden. Der Vollzugriff bleibt unverändert.", "verificationFailed": "Die Einrichtung ist fertig, aber die Sicherheitsprüfung ist fehlgeschlagen. Der Vollzugriff bleibt unverändert."
+      },
       "files": {
         "title": "Dateisicherheit", "description": "Normale Dateien sind lesbar. Änderungen an geschützten Pfaden erfordern eine Freigabe.", "readsAllowed": "Lesen erlaubt",
         "customPath": "Eigener geschützter Pfad", "pathPlaceholder": "Geschützten Pfad hinzufügen", "backupTitle": "Vor rekursivem Löschen sichern",

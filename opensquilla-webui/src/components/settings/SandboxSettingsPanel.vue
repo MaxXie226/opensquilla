@@ -38,14 +38,16 @@
             <button
               type="button"
               :class="{ 'is-selected': defaultRunMode === 'safe' }"
-              :disabled="!capability?.available"
-              @click="defaultRunMode = 'safe'"
+              :disabled="(!capability?.available && !canRequestSandboxSetup) || sandboxSetupPending"
+              data-testid="sandbox-safe-mode"
+              @click="selectSafeMode"
             >
               {{ t('settings.sandbox.mode.safe') }}
             </button>
             <button
               type="button"
               :class="{ 'is-selected': defaultRunMode === 'full' }"
+              data-testid="sandbox-full-mode"
               @click="defaultRunMode = 'full'"
             >
               {{ t('settings.sandbox.mode.full') }}
@@ -59,6 +61,14 @@
           @save="void saveDefaultRunMode()"
           @discard="discardDefaultRunMode"
         />
+        <p
+          v-if="sandboxSetupOutcomeMessage"
+          class="sandbox-setup-result"
+          data-testid="sandbox-setup-result"
+          role="status"
+        >
+          {{ sandboxSetupOutcomeMessage }}
+        </p>
 
         <nav class="sandbox-list" :aria-label="t('settings.sandbox.title')">
           <button type="button" class="sandbox-list__row" data-testid="sandbox-open-files" @click="activeView = 'files'">
@@ -253,6 +263,42 @@
       </article>
 
     </template>
+
+    <Teleport to="body">
+      <div
+        v-if="sandboxSetupConfirmOpen"
+        class="sandbox-setup-overlay"
+        data-testid="sandbox-setup-confirm"
+        @click.self="cancelSandboxSetup"
+      >
+        <div
+          class="sandbox-setup-dialog"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="sandbox-setup-dialog-title"
+          aria-describedby="sandbox-setup-dialog-description"
+        >
+          <h4 id="sandbox-setup-dialog-title">{{ t('settings.sandbox.setup.title') }}</h4>
+          <p id="sandbox-setup-dialog-description">{{ t('settings.sandbox.setup.description') }}</p>
+          <div class="sandbox-setup-dialog__actions">
+            <button type="button" class="btn" @click="cancelSandboxSetup">
+              {{ t('common.cancel') }}
+            </button>
+            <button
+              type="button"
+              class="btn btn--primary"
+              data-testid="sandbox-setup-continue"
+              :disabled="sandboxSetupPending"
+              @click="void continueSandboxSetup()"
+            >
+              {{ sandboxSetupPending
+                ? t('settings.sandbox.setup.configuring')
+                : t('settings.sandbox.setup.continue') }}
+            </button>
+          </div>
+        </div>
+      </div>
+    </Teleport>
   </section>
 </template>
 
@@ -269,6 +315,9 @@ const {
   capabilityCheckFailed,
   loadError,
   capability,
+  sandboxSetupPending,
+  sandboxSetupOutcome,
+  canRequestSandboxSetup,
   draft,
   builtinDenyWritePaths,
   runtimeTarget,
@@ -281,6 +330,7 @@ const {
   sectionError,
   sectionDirty,
   load,
+  ensureSandboxSetupForSafeMode,
   saveDefaultRunMode,
   discardDefaultRunMode,
   saveSection,
@@ -294,6 +344,36 @@ const allowDomain = ref('')
 const denyDomain = ref('')
 type SandboxView = 'overview' | 'files' | 'commands' | 'network' | 'runtimes'
 const activeView = ref<SandboxView>('overview')
+const sandboxSetupConfirmOpen = ref(false)
+
+const sandboxSetupOutcomeMessage = computed(() => {
+  if (sandboxSetupOutcome.value === 'cancelled') return t('settings.sandbox.setup.cancelled')
+  if (sandboxSetupOutcome.value === 'failed') return t('settings.sandbox.setup.failed')
+  if (sandboxSetupOutcome.value === 'verification_failed') {
+    return t('settings.sandbox.setup.verificationFailed')
+  }
+  return ''
+})
+
+function selectSafeMode(): void {
+  sandboxSetupOutcome.value = 'idle'
+  if (capability.value?.available) {
+    defaultRunMode.value = 'safe'
+    return
+  }
+  if (canRequestSandboxSetup.value) sandboxSetupConfirmOpen.value = true
+}
+
+function cancelSandboxSetup(): void {
+  if (sandboxSetupPending.value) return
+  sandboxSetupConfirmOpen.value = false
+}
+
+async function continueSandboxSetup(): Promise<void> {
+  const ready = await ensureSandboxSetupForSafeMode()
+  sandboxSetupConfirmOpen.value = false
+  if (ready) defaultRunMode.value = 'safe'
+}
 
 const backupQuotaGiB = computed({
   get: () => Number(((draft.value?.files.backupQuotaBytes ?? 3 * 1024 ** 3) / 1024 ** 3).toFixed(2)),
@@ -564,6 +644,51 @@ onMounted(() => void load())
 .sandbox-settings__status.is-ready {
   border-color: color-mix(in srgb, var(--ok) 45%, var(--border));
   color: var(--ok);
+}
+
+.sandbox-setup-result {
+  padding: 0 0.2rem;
+  color: var(--text-muted);
+  font-size: 0.76rem;
+  line-height: 1.45;
+}
+
+.sandbox-setup-overlay {
+  position: fixed;
+  z-index: 1200;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 1.5rem;
+  background: var(--scrim);
+}
+
+.sandbox-setup-dialog {
+  width: min(420px, 100%);
+  padding: 1.25rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-modal);
+  background: var(--bg-surface);
+  box-shadow: 0 18px 48px color-mix(in srgb, var(--scrim) 26%, transparent);
+}
+
+.sandbox-setup-dialog h4,
+.sandbox-setup-dialog p {
+  margin: 0;
+}
+
+.sandbox-setup-dialog p {
+  margin-top: 0.6rem;
+  color: var(--text-muted);
+  font-size: 0.82rem;
+  line-height: 1.55;
+}
+
+.sandbox-setup-dialog__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.65rem;
+  margin-top: 1.15rem;
 }
 
 .sandbox-settings__state,

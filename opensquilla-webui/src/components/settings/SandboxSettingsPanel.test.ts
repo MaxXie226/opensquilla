@@ -35,24 +35,49 @@ async function settle() {
 }
 
 async function mountPanel(options: {
-  capability?: Promise<unknown> | (() => unknown)
+  capability?: Promise<unknown> | ((params?: Record<string, unknown>) => unknown)
+  desktop?: boolean
+  setupState?: 'not_setup' | 'setting_up' | 'ready' | 'failed' | 'unavailable'
+  ensureState?: 'ready' | 'failed'
+  ensureDetail?: string
 } = {}) {
   vi.resetModules()
   document.body.innerHTML = ''
   const call = vi.fn(async (method: string, params?: Record<string, unknown>) => {
     if (method === 'sandbox.capability.status') {
-      if (typeof options.capability === 'function') return options.capability()
+      if (typeof options.capability === 'function') return options.capability(params)
       if (options.capability) return options.capability
+      const setupReady = (options.setupState ?? 'ready') === 'ready'
+        || (params?.refresh === true && (options.ensureState ?? 'ready') === 'ready')
       return {
-        available: true,
+        available: setupReady,
         backend: 'windows_default',
         platform: 'win32',
-        code: 'ready',
-        reason: 'ready',
+        code: setupReady ? 'ready' : 'setup_required',
+        reason: setupReady ? 'ready' : 'setup required',
         setupSupported: true,
         restartRequired: false,
         probeVersion: 1,
-        capabilities: ['process'],
+        capabilities: setupReady ? ['process'] : [],
+      }
+    }
+    if (method === 'sandbox.setup.status') {
+      const state = options.setupState ?? 'ready'
+      return {
+        state,
+        platform: 'win32',
+        message: state === 'ready' ? 'Sandbox setup is ready.' : 'Sandbox setup is required.',
+        requiresAdmin: state !== 'ready',
+      }
+    }
+    if (method === 'sandbox.setup.ensure') {
+      const state = options.ensureState ?? 'ready'
+      return {
+        state,
+        platform: 'win32',
+        message: state === 'ready' ? 'Sandbox setup is ready.' : 'Sandbox setup failed.',
+        requiresAdmin: state !== 'ready',
+        ...(options.ensureDetail ? { detail: options.ensureDetail } : {}),
       }
     }
     if (method === 'sandbox.policy.get') return JSON.parse(JSON.stringify(policy))
@@ -69,7 +94,7 @@ async function mountPanel(options: {
     }
     if (method === 'sandbox.tokens.list') return { tokens: [] }
     if (method === 'sandbox.run_mode.preference.get') {
-      return { runMode: 'safe', source: 'preference' }
+      return { runMode: 'full', source: 'default' }
     }
     if (method === 'config.get') {
       return {
@@ -108,6 +133,13 @@ async function mountPanel(options: {
       call,
     }),
   }))
+  vi.doMock('@/platform', () => ({
+    usePlatform: () => ({
+      id: options.desktop === false ? 'web' : 'desktop',
+      capabilities: { isDesktop: options.desktop !== false },
+      settings: {},
+    }),
+  }))
 
   const { createApp } = await import('vue')
   const i18n = (await import('@/i18n')).default
@@ -131,6 +163,7 @@ async function mountPanel(options: {
 afterEach(() => {
   while (mounted.length) mounted.pop()!.unmount()
   vi.doUnmock('@/stores/rpc')
+  vi.doUnmock('@/platform')
   vi.restoreAllMocks()
   vi.useRealTimers()
   document.body.innerHTML = ''
@@ -293,5 +326,67 @@ describe('SandboxSettingsPanel', () => {
     expect(el.querySelector('[data-testid="sandbox-listen-lan"]')).toBeNull()
     expect(el.querySelector('input[placeholder="192.168.1.0/24"]')).toBeNull()
     expect(call.mock.calls.some(([method]) => String(method).startsWith('config.'))).toBe(false)
+  })
+
+  it('does not request setup until the local desktop user confirms', async () => {
+    const { el, call } = await mountPanel({ setupState: 'not_setup' })
+
+    expect(call.mock.calls.some(([method]) => method === 'sandbox.capability.status')).toBe(false)
+
+    el.querySelector<HTMLButtonElement>('[data-testid="sandbox-safe-mode"]')!.click()
+    await settle()
+
+    expect(document.body.querySelector('[data-testid="sandbox-setup-confirm"]')).toBeTruthy()
+    expect(call.mock.calls.some(([method]) => method === 'sandbox.setup.ensure')).toBe(false)
+  })
+
+  it('does not offer the setup action to a remote web client', async () => {
+    const { el, call } = await mountPanel({ desktop: false, setupState: 'not_setup' })
+    const safeButton = el.querySelector<HTMLButtonElement>('[data-testid="sandbox-safe-mode"]')!
+
+    expect(safeButton.disabled).toBe(true)
+    safeButton.click()
+    await settle()
+
+    expect(document.body.querySelector('[data-testid="sandbox-setup-confirm"]')).toBeNull()
+    expect(call.mock.calls.some(([method]) => method === 'sandbox.setup.ensure')).toBe(false)
+  })
+
+  it('forces live verification after setup and selects only the unsaved safe draft', async () => {
+    const { el, call } = await mountPanel({ setupState: 'not_setup' })
+
+    el.querySelector<HTMLButtonElement>('[data-testid="sandbox-safe-mode"]')!.click()
+    await settle()
+    document.body.querySelector<HTMLButtonElement>('[data-testid="sandbox-setup-continue"]')!.click()
+    await settle()
+
+    expect(call.mock.calls.some(([method]) => method === 'sandbox.setup.ensure')).toBe(true)
+    expect(call.mock.calls.some(([method, params]) => (
+      method === 'sandbox.capability.status' && params?.refresh === true
+    ))).toBe(true)
+    expect(el.querySelector('[data-testid="sandbox-safe-mode"]')?.classList.contains('is-selected'))
+      .toBe(true)
+    expect(call.mock.calls.some(([method]) => method === 'sandbox.run_mode.preference.set'))
+      .toBe(false)
+  })
+
+  it('soft-lands a cancelled UAC request without exposing helper details', async () => {
+    const { el, call } = await mountPanel({
+      setupState: 'not_setup',
+      ensureState: 'failed',
+      ensureDetail: 'windows_setup_helper_cancelled',
+    })
+
+    el.querySelector<HTMLButtonElement>('[data-testid="sandbox-safe-mode"]')!.click()
+    await settle()
+    document.body.querySelector<HTMLButtonElement>('[data-testid="sandbox-setup-continue"]')!.click()
+    await settle()
+
+    expect(el.querySelector('[data-testid="sandbox-full-mode"]')?.classList.contains('is-selected'))
+      .toBe(true)
+    expect(el.querySelector('[data-testid="sandbox-setup-result"]')?.textContent)
+      .not.toContain('windows_setup_helper_cancelled')
+    expect(call.mock.calls.some(([method]) => method === 'sandbox.run_mode.preference.set'))
+      .toBe(false)
   })
 })

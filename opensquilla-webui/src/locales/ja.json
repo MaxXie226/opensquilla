@@ -461,6 +461,11 @@
         "title": "既定のアクセスモード", "description": "新しいタスクの開始モードを選びます。能力検証に失敗した場合、Safe は選択できません。",
         "default": "既定モード", "safe": "Safe", "full": "完全アクセス", "resetWarning": "起動時の警告を再表示"
       },
+      "setup": {
+        "title": "Safe モードを設定", "description": "OpenSquilla は、分離アカウントとファイル・ネットワーク保護を設定するために、一度だけ管理者の承認を必要とします。",
+        "continue": "続ける", "configuring": "設定中…", "cancelled": "設定をキャンセルしました。完全アクセスは変更されていません。いつでも再試行できます。",
+        "failed": "Safe モードを設定できませんでした。完全アクセスは変更されていません。", "verificationFailed": "設定は完了しましたが、安全性の確認に失敗しました。完全アクセスは変更されていません。"
+      },
       "files": {
         "title": "ファイル保護", "description": "通常のファイルは読み取り可能です。保護パスの変更には承認が必要です。", "readsAllowed": "読み取り許可",
         "customPath": "カスタム保護パス", "pathPlaceholder": "保護パスを追加", "backupTitle": "再帰削除の前にバックアップ",

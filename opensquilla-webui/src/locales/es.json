@@ -461,6 +461,11 @@
         "title": "Modo de acceso predeterminado", "description": "Elige el modo inicial de las tareas nuevas. Seguro no se puede seleccionar si falla la comprobación.",
         "default": "Modo predeterminado", "safe": "Seguro", "full": "Acceso completo", "resetWarning": "Volver a mostrar el aviso al iniciar"
       },
+      "setup": {
+        "title": "Configurar el modo Seguro", "description": "OpenSquilla necesita una autorización de administrador para crear una cuenta aislada y configurar la protección de archivos y red.",
+        "continue": "Continuar", "configuring": "Configurando…", "cancelled": "Configuración cancelada. El acceso completo no cambia; puedes volver a intentarlo.",
+        "failed": "No se pudo configurar el modo Seguro. El acceso completo no cambia.", "verificationFailed": "La configuración terminó, pero falló la comprobación de seguridad. El acceso completo no cambia."
+      },
       "files": {
         "title": "Seguridad de archivos", "description": "Los archivos normales son legibles. Los cambios en rutas protegidas requieren aprobación.", "readsAllowed": "Lectura permitida",
         "customPath": "Ruta protegida personalizada", "pathPlaceholder": "Añadir ruta protegida", "backupTitle": "Crear copia antes del borrado recursivo",

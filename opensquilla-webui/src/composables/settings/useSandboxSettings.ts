@@ -7,9 +7,12 @@ import type {
   SandboxPolicy,
   SandboxPolicyDefaults,
   SandboxRunMode,
+  SandboxSetupState,
+  SandboxSetupStatusPayload,
 } from '@/types/sandbox'
 
 export type SandboxPolicySection = 'files' | 'commands' | 'network' | 'runtimes'
+export type SandboxSetupOutcome = 'idle' | 'ready' | 'cancelled' | 'failed' | 'verification_failed'
 
 function clonePolicy(policy: SandboxPolicy): SandboxPolicy {
   return JSON.parse(JSON.stringify(policy)) as SandboxPolicy
@@ -19,12 +22,29 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
+function normalizeSetupStatus(payload: unknown): SandboxSetupStatusPayload | null {
+  if (!payload || typeof payload !== 'object') return null
+  const raw = payload as Record<string, unknown>
+  const state = String(raw.state || '') as SandboxSetupState
+  if (!['not_setup', 'setting_up', 'ready', 'failed', 'unavailable'].includes(state)) return null
+  return {
+    state,
+    platform: String(raw.platform || ''),
+    message: String(raw.message || ''),
+    requiresAdmin: raw.requiresAdmin === true || raw.requires_admin === true,
+    detail: typeof raw.detail === 'string' ? raw.detail : undefined,
+  }
+}
+
 export function useSandboxSettings() {
   const rpc = useRpcStore()
   const platform = usePlatform()
   const loading = ref(false)
   const capabilityLoading = ref(false)
   const capabilityCheckFailed = ref(false)
+  const sandboxSetupStatus = ref<SandboxSetupStatusPayload | null>(null)
+  const sandboxSetupPending = ref(false)
+  const sandboxSetupOutcome = ref<SandboxSetupOutcome>('idle')
   const loadError = ref('')
   const capability = ref<SandboxCapabilityReport | null>(null)
   const baseline = ref<SandboxPolicy | null>(null)
@@ -32,8 +52,8 @@ export function useSandboxSettings() {
   const builtinDenyWritePaths = ref<string[]>([])
   const runtimeTarget = ref<string | null>(null)
   const runtimeVersions = ref<SandboxPolicyDefaults['runtimeVersions']>({})
-  const defaultRunModeBaseline = ref<SandboxRunMode>('safe')
-  const defaultRunMode = ref<SandboxRunMode>('safe')
+  const defaultRunModeBaseline = ref<SandboxRunMode>('full')
+  const defaultRunMode = ref<SandboxRunMode>('full')
   const defaultRunModePending = ref(false)
   const defaultRunModeError = ref('')
   const sandboxWarningSuppressed = ref(false)
@@ -57,6 +77,14 @@ export function useSandboxSettings() {
   let capabilityRequestGeneration = 0
 
   const ready = computed(() => Boolean(baseline.value && draft.value))
+  const canRequestSandboxSetup = computed(() => (
+    platform.capabilities.isDesktop
+    && capability.value?.setupSupported !== false
+    && (
+      sandboxSetupStatus.value?.state === 'not_setup'
+      || sandboxSetupStatus.value?.state === 'failed'
+    )
+  ))
 
   function sectionDirty(section: SandboxPolicySection): boolean {
     if (!baseline.value || !draft.value) return false
@@ -85,7 +113,7 @@ export function useSandboxSettings() {
       const loadedRunMode: SandboxRunMode = runModePayload.runMode === 'full' ? 'full' : 'safe'
       defaultRunModeBaseline.value = loadedRunMode
       defaultRunMode.value = loadedRunMode
-      void loadCapability()
+      void loadSandboxReadiness()
       void loadDesktopPreference()
     } catch (error) {
       loadError.value = errorMessage(error)
@@ -94,8 +122,8 @@ export function useSandboxSettings() {
     }
   }
 
-  async function loadCapability(): Promise<void> {
-    if (disposed) return
+  async function loadCapability(forceRefresh = false): Promise<SandboxCapabilityReport | null> {
+    if (disposed) return null
     const requestGeneration = ++capabilityRequestGeneration
     capabilityLoading.value = true
     capabilityCheckFailed.value = false
@@ -103,20 +131,76 @@ export function useSandboxSettings() {
       await rpc.waitForConnection()
       const report = await rpc.call<SandboxCapabilityReport>(
         'sandbox.capability.status',
-        undefined,
+        forceRefresh ? { refresh: true } : undefined,
       )
-      if (disposed || requestGeneration !== capabilityRequestGeneration) return
+      if (disposed || requestGeneration !== capabilityRequestGeneration) return null
       capability.value = report
       if (!report.available) scheduleCapabilityRetry()
+      return report
     } catch {
-      if (disposed || requestGeneration !== capabilityRequestGeneration) return
+      if (disposed || requestGeneration !== capabilityRequestGeneration) return null
       capability.value = null
       capabilityCheckFailed.value = true
       scheduleCapabilityRetry()
+      return null
     } finally {
       if (!disposed && requestGeneration === capabilityRequestGeneration) {
         capabilityLoading.value = false
       }
+    }
+  }
+
+  async function loadSetupStatus(): Promise<SandboxSetupStatusPayload | null> {
+    if (!platform.capabilities.isDesktop || disposed) return null
+    try {
+      await rpc.waitForConnection()
+      const status = normalizeSetupStatus(await rpc.call('sandbox.setup.status'))
+      if (!disposed && status) sandboxSetupStatus.value = status
+      return status
+    } catch {
+      // Capability status remains the visible fallback for old Gateways.
+      return null
+    }
+  }
+
+  async function loadSandboxReadiness(): Promise<void> {
+    if (!platform.capabilities.isDesktop) {
+      await loadCapability()
+      return
+    }
+    const status = await loadSetupStatus()
+    if (status === null || status.state === 'ready') await loadCapability()
+  }
+
+  async function ensureSandboxSetupForSafeMode(): Promise<boolean> {
+    if (!canRequestSandboxSetup.value || sandboxSetupPending.value) return false
+    sandboxSetupPending.value = true
+    sandboxSetupOutcome.value = 'idle'
+    try {
+      const status = normalizeSetupStatus(await rpc.call('sandbox.setup.ensure'))
+      if (!status) {
+        sandboxSetupOutcome.value = 'failed'
+        return false
+      }
+      sandboxSetupStatus.value = status
+      if (status.state !== 'ready') {
+        sandboxSetupOutcome.value = status.detail?.toLowerCase().includes('cancel')
+          ? 'cancelled'
+          : 'failed'
+        return false
+      }
+      const report = await loadCapability(true)
+      if (!report?.available) {
+        sandboxSetupOutcome.value = 'verification_failed'
+        return false
+      }
+      sandboxSetupOutcome.value = 'ready'
+      return true
+    } catch {
+      sandboxSetupOutcome.value = 'failed'
+      return false
+    } finally {
+      sandboxSetupPending.value = false
     }
   }
 
@@ -232,6 +316,10 @@ export function useSandboxSettings() {
     loading,
     capabilityLoading,
     capabilityCheckFailed,
+    sandboxSetupStatus,
+    sandboxSetupPending,
+    sandboxSetupOutcome,
+    canRequestSandboxSetup,
     loadError,
     capability,
     baseline,
@@ -252,6 +340,8 @@ export function useSandboxSettings() {
     sectionDirty,
     load,
     loadCapability,
+    loadSetupStatus,
+    ensureSandboxSetupForSafeMode,
     saveDefaultRunMode,
     discardDefaultRunMode,
     resetSandboxUnavailableWarning,
