@@ -327,7 +327,11 @@ async def test_rpc_run_context_set_decodes_non_owner_legacy_trusted_mode(
     from opensquilla.gateway.auth import Principal
     from opensquilla.gateway.rpc import RpcContext
     from opensquilla.gateway.rpc_sandbox import _handle_sandbox_run_context_set
-    from opensquilla.sandbox.capability_service import CapabilityReport
+    from opensquilla.sandbox.capability_service import (
+        REQUIRED_SAFE_CAPABILITIES,
+        WINDOWS_REQUIRED_SAFE_CAPABILITIES,
+        CapabilityReport,
+    )
 
     manager = _SessionManager()
     config = SimpleNamespace(
@@ -352,6 +356,7 @@ async def test_rpc_run_context_set_decodes_non_owner_legacy_trusted_mode(
         return CapabilityReport.available_for(
             backend="windows_native",
             platform="win32",
+            capabilities=REQUIRED_SAFE_CAPABILITIES | WINDOWS_REQUIRED_SAFE_CAPABILITIES,
         )
 
     monkeypatch.setattr(rpc_sandbox, "current_sandbox_capability_report", ready_status)
@@ -408,7 +413,11 @@ async def test_rpc_run_context_set_creates_owner_new_webchat_session(
     from opensquilla.gateway import rpc_sandbox
     from opensquilla.gateway.auth import Principal
     from opensquilla.gateway.rpc import RpcContext
-    from opensquilla.sandbox.capability_service import CapabilityReport
+    from opensquilla.sandbox.capability_service import (
+        REQUIRED_SAFE_CAPABILITIES,
+        WINDOWS_REQUIRED_SAFE_CAPABILITIES,
+        CapabilityReport,
+    )
 
     manager = _SessionManager()
     session_key = "agent:main:webchat:dkkwi6so"
@@ -434,6 +443,7 @@ async def test_rpc_run_context_set_creates_owner_new_webchat_session(
         return CapabilityReport.available_for(
             backend="windows_native",
             platform="win32",
+            capabilities=REQUIRED_SAFE_CAPABILITIES | WINDOWS_REQUIRED_SAFE_CAPABILITIES,
         )
 
     monkeypatch.setattr(rpc_sandbox, "current_sandbox_capability_report", fake_status)

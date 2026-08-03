@@ -82,7 +82,11 @@ async def test_sandbox_setup_status_returns_setting_up_payload(monkeypatch) -> N
 @pytest.mark.asyncio
 async def test_sandbox_capability_status_forwards_explicit_refresh(monkeypatch) -> None:
     from opensquilla.gateway import rpc_sandbox
-    from opensquilla.sandbox.capability_service import CapabilityReport
+    from opensquilla.sandbox.capability_service import (
+        REQUIRED_SAFE_CAPABILITIES,
+        WINDOWS_REQUIRED_SAFE_CAPABILITIES,
+        CapabilityReport,
+    )
 
     refresh_values: list[bool] = []
 
@@ -91,6 +95,7 @@ async def test_sandbox_capability_status_forwards_explicit_refresh(monkeypatch) 
         return CapabilityReport.available_for(
             backend="windows_native",
             platform="win32",
+            capabilities=REQUIRED_SAFE_CAPABILITIES | WINDOWS_REQUIRED_SAFE_CAPABILITIES,
         )
 
     monkeypatch.setattr(rpc_sandbox, "current_sandbox_capability_report", fake_status)

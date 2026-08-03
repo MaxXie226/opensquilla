@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from opensquilla.sandbox.capability_service import CapabilityReport
+from opensquilla.sandbox.capability_service import (
+    REQUIRED_SAFE_CAPABILITIES,
+    WINDOWS_REQUIRED_SAFE_CAPABILITIES,
+    CapabilityReport,
+)
 from opensquilla.sandbox.setup_state import SandboxSetupState, SetupResult
 
 
@@ -19,14 +25,309 @@ def reset_setup_runtime_state():
     reset_sandbox_setup_runtime_state()
 
 
+class _CapabilityBackend:
+    name = "fake_native"
+
+    def __init__(
+        self,
+        *,
+        transport_error_for: str | None = None,
+        result_overrides: dict[str, tuple[int, str, str]] | None = None,
+    ) -> None:
+        self.transport_error_for = transport_error_for
+        self.result_overrides = result_overrides or {}
+        self.process_actions: list[str] = []
+        self.operation_paths: list[str] = []
+
+    def available(self) -> bool:
+        return True
+
+    def operation_domains_supported(self) -> frozenset[str]:
+        return frozenset({"filesystem"})
+
+    async def run(self, request: object):
+        from opensquilla.sandbox.types import SandboxResult
+
+        action_kind = str(getattr(request, "action_kind", ""))
+        argv_text = " ".join(str(item) for item in getattr(request, "argv", ()))
+        if "opensquilla-deny-write-ok" in argv_text:
+            action_kind = "capability.probe.deny-write"
+        elif "opensquilla-deny-read-ok" in argv_text:
+            action_kind = "capability.probe.deny-read"
+        self.process_actions.append(action_kind)
+        if self.transport_error_for == action_kind:
+            raise RuntimeError(f"transport failed for {action_kind}")
+        defaults = {
+            "capability.probe": (0, "opensquilla-safe-probe", ""),
+            "capability.probe.deny-write": (
+                0,
+                "opensquilla-deny-write-ok",
+                "",
+            ),
+            "capability.probe.deny-read": (
+                0,
+                "opensquilla-deny-read-ok",
+                "",
+            ),
+        }
+        returncode, stdout, stderr = self.result_overrides.get(
+            action_kind,
+            defaults[action_kind],
+        )
+        return SandboxResult(
+            returncode=returncode,
+            stdout=stdout,
+            stderr=stderr,
+            wall_time_s=0.0,
+            backend_used=self.name,
+        )
+
+    async def run_operation(self, operation: object):
+        from opensquilla.sandbox.operation_runtime import SandboxOperationResult
+
+        path = Path(str(getattr(getattr(operation, "request", None), "path", "")))
+        self.operation_paths.append(path.name)
+        if path.name in {"must-remain.txt", "authority.txt"}:
+            action = (
+                "capability.probe.deny-write"
+                if path.name == "must-remain.txt"
+                else "capability.probe.deny-read"
+            )
+            if self.transport_error_for == action:
+                raise RuntimeError(f"transport failed for {action}")
+            raise PermissionError(f"legacy broker denial for {action}")
+        return SandboxOperationResult(message="worker-ok")
+
+
+async def _live_report_for_backend(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    backend: _CapabilityBackend,
+    *,
+    platform: str = "linux",
+) -> CapabilityReport:
+    from opensquilla.sandbox import setup_runtime
+    from opensquilla.sandbox.config import SandboxSettings
+
+    async def current_probe(_config: object) -> SetupResult:
+        return SetupResult(
+            state=SandboxSetupState.READY,
+            platform=platform,
+            message="ready",
+        )
+
+    monkeypatch.setattr(setup_runtime, "current_sandbox_setup_status", current_probe)
+    monkeypatch.setattr(
+        "opensquilla.sandbox.integration.get_runtime",
+        lambda: SimpleNamespace(backend=backend),
+    )
+    config = SimpleNamespace(
+        sandbox=SandboxSettings(),
+        state_dir=str(tmp_path),
+    )
+    return await setup_runtime.current_sandbox_capability_report(
+        config,
+        force_refresh=True,
+    )
+
+
 def test_live_capability_budget_covers_native_windows_canary_startup() -> None:
     from opensquilla.sandbox import setup_runtime
 
-    assert setup_runtime._CAPABILITY_PROBE_TIMEOUT_SECONDS >= 20
+    assert setup_runtime._CAPABILITY_PROBE_TIMEOUT_SECONDS == 30.0
     assert (
         setup_runtime._CAPABILITY_CACHE_TTL_SECONDS
         > setup_runtime._CAPABILITY_PROBE_TIMEOUT_SECONDS
     )
+
+
+def test_windows_available_report_requires_current_readiness_capabilities() -> None:
+    missing_readiness = CapabilityReport.available_for(
+        backend="windows_default",
+        platform="win32",
+        capabilities=REQUIRED_SAFE_CAPABILITIES,
+    )
+    ready = CapabilityReport.available_for(
+        backend="windows_default",
+        platform="win32",
+        capabilities=REQUIRED_SAFE_CAPABILITIES | WINDOWS_REQUIRED_SAFE_CAPABILITIES,
+    )
+
+    assert missing_readiness.available is False
+    assert ready.available is True
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows command-line parsing regression")
+@pytest.mark.parametrize(
+    ("operation", "marker", "unexpected_exit"),
+    [
+        ("write", "opensquilla-deny-write-ok", 41),
+        ("read", "opensquilla-deny-read-ok", 42),
+    ],
+)
+@pytest.mark.parametrize("target_name", ["ordinary.txt", "ordinary target.txt"])
+def test_native_denial_canary_never_marks_an_allowed_windows_target_as_denied(
+    tmp_path: Path,
+    operation: str,
+    marker: str,
+    unexpected_exit: int,
+    target_name: str,
+) -> None:
+    from opensquilla.sandbox import setup_runtime
+
+    target = tmp_path / target_name
+    target.write_text("unchanged", encoding="utf-8")
+    launcher = tmp_path / "opensquilla-capability-canary.cmd"
+    launcher.write_text(
+        setup_runtime._WINDOWS_DENIAL_CANARY_SCRIPT,
+        encoding="ascii",
+        newline="",
+    )
+    argv = setup_runtime._native_denial_canary_argv(
+        target,
+        operation=operation,
+        marker=marker,
+        windows_launcher=launcher,
+    )
+
+    result = subprocess.run(
+        argv,
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert setup_runtime._exact_process_result(result, marker) is False
+    assert result.returncode == unexpected_exit
+    assert result.stdout.strip() == f"unexpected-{operation}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "action_kind",
+    ["capability.probe.deny-write", "capability.probe.deny-read"],
+)
+async def test_protected_canary_transport_errors_fail_capability_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    action_kind: str,
+) -> None:
+    report = await _live_report_for_backend(
+        monkeypatch,
+        tmp_path,
+        _CapabilityBackend(transport_error_for=action_kind),
+    )
+
+    assert report.available is False
+    assert report.code == "probe_failed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action_kind", "result"),
+    [
+        (
+            "capability.probe.deny-write",
+            (0, "opensquilla-deny-write-ok extra", ""),
+        ),
+        (
+            "capability.probe.deny-read",
+            (1, "opensquilla-deny-read-ok", ""),
+        ),
+    ],
+)
+async def test_protected_canary_requires_the_exact_native_process_result(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    action_kind: str,
+    result: tuple[int, str, str],
+) -> None:
+    report = await _live_report_for_backend(
+        monkeypatch,
+        tmp_path,
+        _CapabilityBackend(result_overrides={action_kind: result}),
+    )
+
+    assert report.available is False
+    assert report.code == "capability_missing"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("support_overrides", "missing_capability"),
+    [
+        ({"identity_ready": False}, "windowsIdentity"),
+        ({"storage_ready": False}, "windowsStorage"),
+        ({"proxy_allowlist_enforced": False}, "windowsProxyWfp"),
+    ],
+)
+async def test_windows_capability_requires_current_setup_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    support_overrides: dict[str, bool],
+    missing_capability: str,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default_support
+
+    support = {
+        "identity_ready": True,
+        "storage_ready": True,
+        "proxy_allowlist_enforced": True,
+    }
+    support.update(support_overrides)
+    monkeypatch.setattr(
+        windows_default_support,
+        "probe_windows_default_support",
+        lambda: SimpleNamespace(**support),
+    )
+    backend = _CapabilityBackend()
+    backend.name = "windows_default"
+
+    report = await _live_report_for_backend(
+        monkeypatch,
+        tmp_path,
+        backend,
+        platform="win32",
+    )
+
+    assert report.available is False
+    assert report.code == "capability_missing"
+    assert missing_capability not in report.capabilities
+
+
+@pytest.mark.asyncio
+async def test_windows_capability_includes_current_setup_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default_support
+
+    monkeypatch.setattr(
+        windows_default_support,
+        "probe_windows_default_support",
+        lambda: SimpleNamespace(
+            identity_ready=True,
+            storage_ready=True,
+            proxy_allowlist_enforced=True,
+        ),
+    )
+    backend = _CapabilityBackend()
+    backend.name = "windows_default"
+
+    report = await _live_report_for_backend(
+        monkeypatch,
+        tmp_path,
+        backend,
+        platform="win32",
+    )
+
+    assert report.available is True
+    assert {
+        "windowsIdentity",
+        "windowsStorage",
+        "windowsProxyWfp",
+    }.issubset(report.capabilities)
 
 
 @pytest.mark.asyncio
@@ -197,6 +498,7 @@ async def test_capability_report_uses_live_setup_and_configured_backend(
         backend="windows_default",
         platform="win32",
         reason="probe",
+        capabilities=REQUIRED_SAFE_CAPABILITIES | WINDOWS_REQUIRED_SAFE_CAPABILITIES,
     )
 
     async def live_probe(*_args: object, **_kwargs: object) -> CapabilityReport:
@@ -358,6 +660,9 @@ async def test_failed_capability_report_expires_before_successful_report(
             backend="windows_default",
             platform="win32",
             reason="ready",
+            capabilities=(
+                REQUIRED_SAFE_CAPABILITIES | WINDOWS_REQUIRED_SAFE_CAPABILITIES
+            ),
         )
 
     monkeypatch.setattr(setup_runtime, "current_sandbox_setup_status", current_probe)
@@ -386,45 +691,18 @@ async def test_live_capability_probe_scopes_file_profile_to_canary_workspace(
 ) -> None:
     from opensquilla.sandbox import file_policy, setup_runtime
     from opensquilla.sandbox.config import SandboxSettings
-    from opensquilla.sandbox.operation_runtime import SandboxOperationResult
     from opensquilla.sandbox.permissions import FileSystemPermissionProfile
-    from opensquilla.sandbox.types import SandboxResult
 
     captured: dict[str, object] = {}
-    operation_ids: list[str] = []
 
     def compile_profile(*args: object, **kwargs: object) -> FileSystemPermissionProfile:
         captured.update(kwargs)
         return FileSystemPermissionProfile(entries=())
 
-    class _Backend:
-        def available(self) -> bool:
-            return True
-
-        def operation_domains_supported(self) -> frozenset[str]:
-            return frozenset({"filesystem"})
-
-        async def run(self, request: object) -> SandboxResult:
-            captured["processActionKind"] = getattr(request, "action_kind", None)
-            return SandboxResult(
-                returncode=0,
-                stdout="opensquilla-safe-probe",
-                stderr="",
-                wall_time_s=0.0,
-                backend_used="windows_default",
-            )
-
-        async def run_operation(self, operation: object) -> SandboxOperationResult:
-            operation_ids.append(str(getattr(operation, "operation_id", "")))
-            path = Path(str(getattr(getattr(operation, "request", None), "path", "")))
-            if path.name in {"must-remain.txt", "authority.txt"}:
-                raise PermissionError("expected canary denial")
-            return SandboxOperationResult(message="worker-ok")
-
     monkeypatch.setattr(file_policy, "compile_safe_file_profile", compile_profile)
     setup = SetupResult(
         state=SandboxSetupState.READY,
-        platform="win32",
+        platform="linux",
         message="ready",
     )
     config = SimpleNamespace(
@@ -432,16 +710,21 @@ async def test_live_capability_probe_scopes_file_profile_to_canary_workspace(
         state_dir=str(tmp_path),
     )
 
+    backend = _CapabilityBackend()
     report = await setup_runtime._probe_runtime_capabilities(
         config,
         setup=setup,
-        backend="windows_default",
-        backend_object=_Backend(),
+        backend=backend.name,
+        backend_object=backend,
     )
 
     assert report.available is True
     assert captured["home"] == captured["writable_roots"][0]
     assert captured["env"]["USERPROFILE"] == str(captured["home"])
     assert captured["env"]["HOME"] == str(captured["home"])
-    assert captured["processActionKind"] == "capability.probe"
-    assert operation_ids == ["capability-probe"] * 4
+    assert backend.process_actions == [
+        "capability.probe",
+        "capability.probe.deny-write",
+        "capability.probe.deny-read",
+    ]
+    assert backend.operation_paths == ["worker.txt", "worker.txt"]

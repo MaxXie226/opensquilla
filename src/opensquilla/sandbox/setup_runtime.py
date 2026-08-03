@@ -12,9 +12,9 @@ from pathlib import Path
 from typing import Any
 
 from opensquilla.sandbox.capability_service import (
-    REQUIRED_SAFE_CAPABILITIES,
     CapabilityReport,
     capability_report_from_setup,
+    required_safe_capabilities,
 )
 from opensquilla.sandbox.setup_state import (
     SandboxSetupState,
@@ -35,6 +35,30 @@ _CAPABILITY_PROBE_TIMEOUT_SECONDS = 30.0
 # with the explicit refresh RPC available for diagnostics.
 _CAPABILITY_CACHE_TTL_SECONDS = 3600.0
 _CAPABILITY_FAILURE_CACHE_TTL_SECONDS = 10.0
+_PROCESS_CANARY_MARKER = "opensquilla-safe-probe"
+_DENY_WRITE_CANARY_MARKER = "opensquilla-deny-write-ok"
+_DENY_READ_CANARY_MARKER = "opensquilla-deny-read-ok"
+_WINDOWS_DENIAL_CANARY_SCRIPT = (
+    "@echo off\r\n"
+    "setlocal DisableDelayedExpansion\r\n"
+    'set "operation=%~1"\r\n'
+    'set "target=%~2"\r\n'
+    'set "marker=%~3"\r\n'
+    'if "%operation%"=="write" (\r\n'
+    '  >"%target%" echo changed\r\n'
+    ') else if "%operation%"=="read" (\r\n'
+    '  type "%target%" >nul 2>&1\r\n'
+    ") else (\r\n"
+    "  exit /b 90\r\n"
+    ")\r\n"
+    "if errorlevel 1 (\r\n"
+    "  echo %marker%\r\n"
+    "  exit /b 0\r\n"
+    ")\r\n"
+    "echo unexpected-%operation%\r\n"
+    'if "%operation%"=="write" exit /b 41\r\n'
+    "exit /b 42\r\n"
+)
 
 
 def _capability_cache_ttl(report: CapabilityReport) -> float:
@@ -179,6 +203,48 @@ def _unavailable_capability_report(
     )
 
 
+def _native_denial_canary_argv(
+    target: Path,
+    *,
+    operation: str,
+    marker: str,
+    windows_launcher: Path | None = None,
+) -> tuple[str, ...]:
+    if os.name == "nt":
+        if windows_launcher is None:
+            raise ValueError("Windows capability canary launcher is required")
+        return (
+            "cmd.exe",
+            "/d",
+            "/c",
+            "call",
+            str(windows_launcher),
+            operation,
+            str(target),
+            marker,
+        )
+    if operation == "write":
+        attempt = 'printf changed > "$1" 2>/dev/null'
+        unexpected_exit = 41
+    else:
+        attempt = 'cat -- "$1" >/dev/null 2>&1'
+        unexpected_exit = 42
+    script = (
+        f"if {attempt}; then "
+        f"printf unexpected-{operation}; exit {unexpected_exit}; "
+        f"else printf {marker}; fi"
+    )
+    return ("/bin/sh", "-c", script, "opensquilla-capability-probe", str(target))
+
+
+def _exact_process_result(result: Any, marker: str) -> bool:
+    return (
+        getattr(result, "returncode", None) == 0
+        and str(getattr(result, "stdout", "")).strip() == marker
+        and str(getattr(result, "stderr", "")).strip() == ""
+    )
+
+
 async def _probe_runtime_capabilities(
     config: Any,
     *,
@@ -235,6 +301,13 @@ async def _probe_runtime_capabilities(
         protected_target = protected / "must-remain.txt"
         protected_target.write_text("unchanged", encoding="utf-8")
         worker_target = workspace / "worker.txt"
+        windows_canary_launcher = workspace / "opensquilla-capability-canary.cmd"
+        if os.name == "nt":
+            windows_canary_launcher.write_text(
+                _WINDOWS_DENIAL_CANARY_SCRIPT,
+                encoding="ascii",
+                newline="",
+            )
         stored_policy = StoredSandboxPolicy(
             files=FilePolicySettings(custom_deny_write_paths=[str(protected)])
         )
@@ -269,9 +342,9 @@ async def _probe_runtime_capabilities(
             network=NetworkMode.NONE,
         )
         process_argv = (
-            ("cmd.exe", "/d", "/c", "echo", "opensquilla-safe-probe")
+            ("cmd.exe", "/d", "/c", "echo", _PROCESS_CANARY_MARKER)
             if os.name == "nt"
-            else ("/bin/sh", "-c", "printf opensquilla-safe-probe")
+            else ("/bin/sh", "-c", f"printf {_PROCESS_CANARY_MARKER}")
         )
         process = await backend_object.run(
             SandboxRequest(
@@ -283,7 +356,7 @@ async def _probe_runtime_capabilities(
             )
         )
         capabilities: set[str] = set()
-        if process.returncode == 0 and "opensquilla-safe-probe" in process.stdout:
+        if _exact_process_result(process, _PROCESS_CANARY_MARKER):
             capabilities.add("process")
 
         await backend_object.run_operation(
@@ -314,49 +387,63 @@ async def _probe_runtime_capabilities(
                 operation_id="capability-probe",
             )
         )
-        if "worker-ok" in read_result.message:
+        if read_result.message == "worker-ok":
             capabilities.add("filesystem-worker")
 
-        try:
-            await backend_object.run_operation(
-                replace(
-                    SandboxOperation.filesystem(
-                        kind="write_text",
-                        workspace=workspace,
-                        run_mode="safe",
-                        path=protected_target,
-                        paths=(protected_target,),
-                        content="changed",
-                        file_system_profile=profile,
-                    ),
-                    operation_id="capability-probe",
-                )
+        deny_write = await backend_object.run(
+            SandboxRequest(
+                argv=_native_denial_canary_argv(
+                    protected_target,
+                    operation="write",
+                    marker=_DENY_WRITE_CANARY_MARKER,
+                    windows_launcher=windows_canary_launcher,
+                ),
+                cwd=workspace,
+                action_kind="capability.probe",
+                policy=process_policy,
+                run_mode="safe",
             )
-        except Exception:  # noqa: BLE001 - denial is the expected result
-            if protected_target.read_text(encoding="utf-8") == "unchanged":
-                capabilities.add("denyWriteCarveout")
+        )
+        if (
+            _exact_process_result(deny_write, _DENY_WRITE_CANARY_MARKER)
+            and protected_target.read_text(encoding="utf-8") == "unchanged"
+        ):
+            capabilities.add("denyWriteCarveout")
 
-        try:
-            await backend_object.run_operation(
-                replace(
-                    SandboxOperation.filesystem(
-                        kind="read_file",
-                        workspace=workspace,
-                        run_mode="safe",
-                        path=authority_secret,
-                        paths=(authority_secret,),
-                        display_path=str(authority_secret),
-                        file_system_profile=profile,
-                    ),
-                    operation_id="capability-probe",
-                )
+        deny_read = await backend_object.run(
+            SandboxRequest(
+                argv=_native_denial_canary_argv(
+                    authority_secret,
+                    operation="read",
+                    marker=_DENY_READ_CANARY_MARKER,
+                    windows_launcher=windows_canary_launcher,
+                ),
+                cwd=workspace,
+                action_kind="capability.probe",
+                policy=process_policy,
+                run_mode="safe",
             )
-        except Exception:  # noqa: BLE001 - denial is the expected result
+        )
+        if _exact_process_result(deny_read, _DENY_READ_CANARY_MARKER):
             capabilities.add("authorityDenyRead")
 
+        required_capabilities = required_safe_capabilities(setup.platform)
+        if str(setup.platform).lower().startswith("win"):
+            from opensquilla.sandbox.backend.windows_default_support import (
+                probe_windows_default_support,
+            )
+
+            support = probe_windows_default_support()
+            if support.identity_ready:
+                capabilities.add("windowsIdentity")
+            if support.storage_ready:
+                capabilities.add("windowsStorage")
+            if support.proxy_allowlist_enforced:
+                capabilities.add("windowsProxyWfp")
+
     frozen = frozenset(capabilities)
-    if not REQUIRED_SAFE_CAPABILITIES.issubset(frozen):
-        missing = sorted(REQUIRED_SAFE_CAPABILITIES - frozen)
+    if not required_capabilities.issubset(frozen):
+        missing = sorted(required_capabilities - frozen)
         return _unavailable_capability_report(
             setup,
             backend=backend,

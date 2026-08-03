@@ -29,7 +29,11 @@ from opensquilla.project_workspaces import ProjectWorkspaceStateError
 from opensquilla.sandbox.backend.bubblewrap import BubblewrapBackend
 from opensquilla.sandbox.backend.seatbelt import SeatbeltBackend
 from opensquilla.sandbox.backend.unavailable import UnavailableBackend
-from opensquilla.sandbox.capability_service import CapabilityReport
+from opensquilla.sandbox.capability_service import (
+    REQUIRED_SAFE_CAPABILITIES,
+    WINDOWS_REQUIRED_SAFE_CAPABILITIES,
+    CapabilityReport,
+)
 from opensquilla.sandbox.config import SandboxSettings
 from opensquilla.sandbox.integration import configure_runtime, reset_runtime
 from opensquilla.sandbox.run_context import (
@@ -64,6 +68,11 @@ def _stable_safe_capability(monkeypatch: pytest.MonkeyPatch) -> None:
         return CapabilityReport.available_for(
             backend="test",
             platform=sys.platform,
+            capabilities=(
+                REQUIRED_SAFE_CAPABILITIES | WINDOWS_REQUIRED_SAFE_CAPABILITIES
+                if sys.platform.startswith("win")
+                else REQUIRED_SAFE_CAPABILITIES
+            ),
         )
 
     monkeypatch.setattr(rpc_sessions, "current_sandbox_capability_report", report)

@@ -16,6 +16,20 @@ REQUIRED_SAFE_CAPABILITIES = frozenset(
         "authorityDenyRead",
     }
 )
+WINDOWS_REQUIRED_SAFE_CAPABILITIES = frozenset(
+    {
+        "windowsIdentity",
+        "windowsStorage",
+        "windowsProxyWfp",
+    }
+)
+
+
+def required_safe_capabilities(platform: str) -> frozenset[str]:
+    required = REQUIRED_SAFE_CAPABILITIES
+    if str(platform).lower().startswith("win"):
+        required |= WINDOWS_REQUIRED_SAFE_CAPABILITIES
+    return required
 
 
 @dataclass(frozen=True)
@@ -40,7 +54,7 @@ class CapabilityReport:
         capabilities: frozenset[str] = REQUIRED_SAFE_CAPABILITIES,
     ) -> CapabilityReport:
         return cls(
-            available=REQUIRED_SAFE_CAPABILITIES.issubset(capabilities),
+            available=required_safe_capabilities(platform).issubset(capabilities),
             backend=backend,
             platform=platform,
             code="ready",
@@ -126,7 +140,9 @@ class CapabilityService:
 
 __all__ = [
     "REQUIRED_SAFE_CAPABILITIES",
+    "WINDOWS_REQUIRED_SAFE_CAPABILITIES",
     "CapabilityReport",
     "CapabilityService",
     "capability_report_from_setup",
+    "required_safe_capabilities",
 ]
