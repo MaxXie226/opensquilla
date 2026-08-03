@@ -1741,6 +1741,59 @@ def test_deny_acl_state_drops_principals_with_only_missing_paths(
     ]
 
 
+def test_deny_acl_state_prunes_missing_entries_during_noop_sync(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default_runner as mod
+
+    state = tmp_path / "deny_acl_state.json"
+    current = tmp_path / "current"
+    mixed_live = tmp_path / "mixed-live"
+    current.mkdir()
+    mixed_live.mkdir()
+    mixed_missing = tmp_path / "mixed-missing"
+    stale_missing = tmp_path / "stale-missing"
+    state.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "principals": {
+                    "CURRENT": [{"path": str(current), "mask": 1}],
+                    "MIXED": [
+                        {"path": str(mixed_live), "mask": 2},
+                        {"path": str(mixed_missing), "mask": 4},
+                    ],
+                    "STALE": [{"path": str(stale_missing), "mask": 8}],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    denied: list[Path] = []
+    revoked: list[Path] = []
+    monkeypatch.setattr(
+        mod,
+        "_deny_path_to_sid",
+        lambda path, *_args, **_kwargs: denied.append(path),
+    )
+    monkeypatch.setattr(
+        mod,
+        "_revoke_path_for_sid",
+        lambda path, *_args: revoked.append(path),
+    )
+
+    mod._sync_deny_acl_state(state, "CURRENT", {current: 1}, revalidate_live=False)
+
+    saved = json.loads(state.read_text(encoding="utf-8"))
+    assert saved["principals"] == {
+        "CURRENT": [{"mask": 1, "path": str(current)}],
+        "MIXED": [{"mask": 2, "path": str(mixed_live)}],
+    }
+    assert denied == []
+    assert revoked == []
+
+
 def test_frozen_offline_helper_argv_uses_internal_child_role(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

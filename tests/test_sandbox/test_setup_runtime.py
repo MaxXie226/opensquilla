@@ -266,6 +266,62 @@ async def test_capability_report_force_refresh_bypasses_cached_probe(
 
 
 @pytest.mark.asyncio
+async def test_concurrent_force_refreshes_share_one_live_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.sandbox import setup_runtime
+
+    config = SimpleNamespace(sandbox=SimpleNamespace(backend="windows_default"))
+
+    async def current_probe(_config: object) -> SetupResult:
+        return SetupResult(
+            state=SandboxSetupState.READY,
+            platform="win32",
+            message="ready",
+        )
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def live_probe(*_args: object, **_kwargs: object) -> CapabilityReport:
+        nonlocal calls
+        calls += 1
+        entered.set()
+        await release.wait()
+        return CapabilityReport.available_for(
+            backend="windows_default",
+            platform="win32",
+            reason=f"probe-{calls}",
+        )
+
+    monkeypatch.setattr(setup_runtime, "current_sandbox_setup_status", current_probe)
+    monkeypatch.setattr(setup_runtime, "_probe_runtime_capabilities", live_probe)
+    monkeypatch.setattr(
+        "opensquilla.sandbox.integration.get_runtime",
+        lambda: SimpleNamespace(
+            backend=SimpleNamespace(name="windows_default"),
+        ),
+    )
+    setup_runtime.reset_sandbox_setup_runtime_state()
+
+    first = asyncio.create_task(
+        setup_runtime.current_sandbox_capability_report(config, force_refresh=True)
+    )
+    await entered.wait()
+    second = asyncio.create_task(
+        setup_runtime.current_sandbox_capability_report(config, force_refresh=True)
+    )
+    await asyncio.sleep(0)
+    release.set()
+
+    first_report, second_report = await asyncio.gather(first, second)
+
+    assert calls == 1
+    assert first_report.reason == second_report.reason == "probe-1"
+
+
+@pytest.mark.asyncio
 async def test_failed_capability_report_expires_before_successful_report(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

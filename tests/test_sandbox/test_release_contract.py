@@ -72,9 +72,9 @@ def test_settings_exposes_all_sandbox_sections() -> None:
         "requireApprovalPrefixes",
         "blockAllNetwork",
         "runtimeVersions",
-        "create-sandbox-token",
     ):
         assert marker in panel
+    assert "create-sandbox-token" not in panel
     assert 'data-testid="sandbox-listen-lan"' not in panel
     assert "allowedClientCidrs" not in panel
 

@@ -97,8 +97,10 @@ async def current_sandbox_capability_report(
     if cached is not None and _capability_cache_is_fresh(cached):
         return cached[1]
     async with _CAPABILITY_LOCK:
-        if force_refresh:
-            _CAPABILITY_CACHE.pop(fingerprint, None)
+        # A force refresh invalidates once before waiting for the single-flight
+        # lock. A concurrent waiter then consumes the result produced by the
+        # first caller instead of invalidating it again and running a second
+        # expensive native canary.
         cached = _CAPABILITY_CACHE.get(fingerprint)
         if cached is not None and _capability_cache_is_fresh(cached):
             return cached[1]

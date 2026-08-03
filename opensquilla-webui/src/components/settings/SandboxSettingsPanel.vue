@@ -7,11 +7,15 @@
         <p>{{ t('settings.sandbox.subtitle') }}</p>
       </div>
       <span
-        v-if="capability"
+        v-if="capability || capabilityLoading || capabilityCheckFailed"
         class="sandbox-settings__status"
-        :class="{ 'is-ready': capability.available }"
+        :class="{ 'is-ready': capability?.available }"
       >
-        {{ capability.available ? t('settings.sandbox.available') : t('settings.sandbox.unavailable') }}
+        {{ capabilityLoading
+          ? t('shared.loading')
+          : capability?.available
+            ? t('settings.sandbox.available')
+            : t('settings.sandbox.unavailable') }}
       </span>
     </header>
 
@@ -261,6 +265,8 @@ import { useSandboxSettings } from '@/composables/settings/useSandboxSettings'
 const { t } = useI18n()
 const {
   loading,
+  capabilityLoading,
+  capabilityCheckFailed,
   loadError,
   capability,
   draft,

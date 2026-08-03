@@ -120,7 +120,12 @@ async function mountPanel(options: {
   app.mount(el)
   mounted.push(app)
   await settle()
-  return { el, call }
+  const unmount = () => {
+    const index = mounted.indexOf(app)
+    if (index >= 0) mounted.splice(index, 1)
+    app.unmount()
+  }
+  return { el, call, unmount }
 }
 
 afterEach(() => {
@@ -259,7 +264,27 @@ describe('SandboxSettingsPanel', () => {
     await settle()
 
     expect(attempts).toBe(2)
-    expect(call).toHaveBeenCalledWith('sandbox.capability.status', { refresh: true })
+    expect(call).toHaveBeenLastCalledWith('sandbox.capability.status', undefined)
+  })
+
+  it('does not retry capability verification after the panel is unmounted', async () => {
+    vi.useFakeTimers()
+    let rejectCapability!: (reason?: unknown) => void
+    const capability = new Promise<unknown>((_resolve, reject) => {
+      rejectCapability = reject
+    })
+    const { call, unmount } = await mountPanel({ capability })
+
+    expect(call.mock.calls.filter(([method]) => method === 'sandbox.capability.status'))
+      .toHaveLength(1)
+    unmount()
+    rejectCapability(new Error('connection closed'))
+    await settle()
+    await vi.advanceTimersByTimeAsync(20_000)
+    await settle()
+
+    expect(call.mock.calls.filter(([method]) => method === 'sandbox.capability.status'))
+      .toHaveLength(1)
   })
 
   it('does not expose desktop listener or CIDR configuration', async () => {

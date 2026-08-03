@@ -120,11 +120,11 @@ def test_truthy_non_boolean_owner_flag_does_not_grant_owner_policy() -> None:
     }
 
 
-def test_invalid_run_mode_is_not_allowed_and_coerces_to_principal_default() -> None:
+def test_invalid_run_mode_is_not_allowed_and_fails_closed() -> None:
     owner = _principal(is_owner=True)
     non_owner = _principal(is_owner=False)
 
     assert run_mode_allowed_for_principal("nonsense", owner) is False
-    assert coerce_run_mode_for_principal("nonsense", owner) == RunMode.FULL
+    assert coerce_run_mode_for_principal("nonsense", owner) == RunMode.SAFE
     assert run_mode_allowed_for_principal("nonsense", non_owner) is False
     assert coerce_run_mode_for_principal("nonsense", non_owner) == RunMode.SAFE

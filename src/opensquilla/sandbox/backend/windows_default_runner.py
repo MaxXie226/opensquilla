@@ -1761,12 +1761,17 @@ def _sync_deny_acl_state_locked(
     state = _read_deny_acl_state(state_path)
     _recover_deny_acl_taint(state_path, state)
     _materialize_deny_paths(tuple(normalized_desired))
-    principals = {
-        principal_sid: entries
-        for principal_sid, entries in state["principals"].items()
-        if principal_sid == sid
-        or any(Path(str(item["path"])).expanduser().absolute().exists() for item in entries)
-    }
+    stored_principals = state["principals"]
+    principals: dict[str, list[dict[str, object]]] = {}
+    for principal_sid, entries in stored_principals.items():
+        live_entries = [
+            item
+            for item in entries
+            if Path(str(item["path"])).expanduser().absolute().exists()
+        ]
+        if live_entries:
+            principals[principal_sid] = live_entries
+    journal_pruned = principals != stored_principals
     previous = _principal_deny_acl_entries(principals.get(sid, []), sid=sid)
     previous_by_key = {_acl_path_key(path): (path, mask) for path, mask in previous.items()}
     desired_by_key = {
@@ -1783,6 +1788,11 @@ def _sync_deny_acl_state_locked(
                     mask=mask,
                     label="desired-state-verify",
                 )
+        if journal_pruned:
+            _write_deny_acl_state(
+                state_path,
+                {"version": 1, "principals": principals},
+            )
         return
 
     _mark_acl_state_tainted(

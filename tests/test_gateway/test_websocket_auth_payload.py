@@ -24,7 +24,7 @@ def test_owner_hello_auth_payload_allows_full_by_default() -> None:
         },
         "runModePolicy": {
             "allowedRunModes": ["safe", "full"],
-            "defaultRunMode": "safe",
+            "defaultRunMode": "full",
             "fullHostAccessDisabledReason": None,
         },
     }

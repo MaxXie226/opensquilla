@@ -24,6 +24,7 @@ export function useSandboxSettings() {
   const platform = usePlatform()
   const loading = ref(false)
   const capabilityLoading = ref(false)
+  const capabilityCheckFailed = ref(false)
   const loadError = ref('')
   const capability = ref<SandboxCapabilityReport | null>(null)
   const baseline = ref<SandboxPolicy | null>(null)
@@ -52,6 +53,8 @@ export function useSandboxSettings() {
   })
   let saveQueue = Promise.resolve()
   let capabilityRetryTimer: ReturnType<typeof setTimeout> | null = null
+  let disposed = false
+  let capabilityRequestGeneration = 0
 
   const ready = computed(() => Boolean(baseline.value && draft.value))
 
@@ -91,34 +94,46 @@ export function useSandboxSettings() {
     }
   }
 
-  async function loadCapability(options: { refresh?: boolean } = {}): Promise<void> {
+  async function loadCapability(): Promise<void> {
+    if (disposed) return
+    const requestGeneration = ++capabilityRequestGeneration
     capabilityLoading.value = true
+    capabilityCheckFailed.value = false
     try {
       await rpc.waitForConnection()
       const report = await rpc.call<SandboxCapabilityReport>(
         'sandbox.capability.status',
-        options.refresh ? { refresh: true } : undefined,
+        undefined,
       )
+      if (disposed || requestGeneration !== capabilityRequestGeneration) return
       capability.value = report
       if (!report.available) scheduleCapabilityRetry()
     } catch {
+      if (disposed || requestGeneration !== capabilityRequestGeneration) return
       capability.value = null
+      capabilityCheckFailed.value = true
       scheduleCapabilityRetry()
     } finally {
-      capabilityLoading.value = false
+      if (!disposed && requestGeneration === capabilityRequestGeneration) {
+        capabilityLoading.value = false
+      }
     }
   }
 
   function scheduleCapabilityRetry(): void {
+    if (disposed) return
     if (capabilityRetryTimer !== null) clearTimeout(capabilityRetryTimer)
     capabilityRetryTimer = setTimeout(() => {
       capabilityRetryTimer = null
-      void loadCapability({ refresh: true })
+      void loadCapability()
     }, 10_000)
   }
 
   onScopeDispose(() => {
+    disposed = true
+    capabilityRequestGeneration += 1
     if (capabilityRetryTimer !== null) clearTimeout(capabilityRetryTimer)
+    capabilityRetryTimer = null
   })
 
   async function loadDesktopPreference(): Promise<void> {
@@ -216,6 +231,7 @@ export function useSandboxSettings() {
   return {
     loading,
     capabilityLoading,
+    capabilityCheckFailed,
     loadError,
     capability,
     baseline,

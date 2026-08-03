@@ -42,7 +42,9 @@ def coerce_run_mode_for_principal(mode: Any, principal: Any) -> RunMode:
     try:
         normalized = normalize_run_mode(mode, default=default)
     except ValueError:
-        return default
+        # Missing values inherit the principal default through normalize_run_mode,
+        # but malformed values are never allowed to fail open for host owners.
+        return RunMode.SAFE
     if normalized in allowed_run_modes_for_principal(principal):
         return normalized
     return default
