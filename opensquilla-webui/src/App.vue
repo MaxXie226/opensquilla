@@ -460,6 +460,7 @@ import {
   optionalSessionRpcAllowed,
   optionalSessionRpcCallOptions,
 } from './composables/chat/sessionBootstrapAdmission'
+import { markCronFinishNotified } from './utils/cron/notifications'
 
 const appStore = useAppStore()
 const rpcStore = useRpcStore()
@@ -555,6 +556,34 @@ watch(
 // Settings → Appearance and the command palette.
 const { enabled: bgmEnabled } = useBgm()
 const webConfigEnabled = getPlatform().capabilities.hasWebConfig
+
+interface AppCronRunFinishedPayload {
+  jobId?: string
+  jobName?: string
+  runId?: string
+  success?: boolean
+}
+
+let unsubscribeCronFinished: (() => void) | null = null
+
+function handleCronRunFinished(payload: unknown) {
+  if (!payload || typeof payload !== 'object') return
+  const event = payload as AppCronRunFinishedPayload
+  const runId = typeof event.runId === 'string' ? event.runId : ''
+  const jobName = event.jobName?.trim() || t('cronSkills.jobs.unnamedTask')
+  markCronFinishNotified(runId)
+  if (event.success === false) {
+    pushToast(t('cronSkills.jobs.toastBackgroundFailed', { name: jobName }), {
+      tone: 'danger',
+      duration: 9_000,
+    })
+    return
+  }
+  pushToast(t('cronSkills.jobs.toastBackgroundComplete', { name: jobName }), {
+    tone: 'ok',
+    duration: 7_000,
+  })
+}
 
 installSessionNavigationDiagConsole()
 
@@ -1268,9 +1297,26 @@ async function onProjectRemove(workspaceId: string) {
   if (!rpcStore.canManageProjectWorkspaces) return
   const project = projectWorkspaces.byId.value.get(workspaceId)
   if (!project) return
+  let affectedCronJobs = 0
+  try {
+    const jobs = await rpcStore.call<Array<{ workspaceId?: string }>>(
+      'cron.list',
+      {},
+    )
+    affectedCronJobs = (jobs || []).filter(
+      job => job.workspaceId === workspaceId,
+    ).length
+  } catch {
+    // The backend still enforces the pause atomically during removal.
+  }
   const approved = await confirm({
     title: t('workspaces.removeTitle'),
-    body: t('workspaces.removeBody', { name: project.name }),
+    body: affectedCronJobs > 0
+      ? t('workspaces.removeBodyWithCronJobs', {
+          name: project.name,
+          count: affectedCronJobs,
+        })
+      : t('workspaces.removeBody', { name: project.name }),
     primaryLabel: t('workspaces.removeConfirm'),
   })
   if (!approved) return
@@ -1530,8 +1576,18 @@ const sessionListSubscription = useSessionListSubscription({
   warn: (message, error) => console.warn(`[App] ${message}:`, errorMessage(error)),
 })
 
+function subscribeCronEventsWhenAdmitted() {
+  if (
+    !appAutomaticRpcMounted
+    || !optionalSessionRpcAllowed.value
+    || !rpcStore.isConnected
+  ) return
+  void rpcStore.call('cron.subscribe', {}).catch(() => undefined)
+}
+
 function resumeAutomaticAppRpc() {
   if (!appAutomaticRpcMounted || !optionalSessionRpcAllowed.value) return
+  subscribeCronEventsWhenAdmitted()
   sessionListSubscription.resume()
   if (!appAutomaticRpcStarted) {
     appAutomaticRpcStarted = true
@@ -1544,6 +1600,13 @@ function resumeAutomaticAppRpc() {
 watch(optionalSessionRpcAllowed, admitted => {
   if (admitted) resumeAutomaticAppRpc()
 }, { flush: 'sync' })
+
+watch(
+  () => rpcStore.state,
+  state => {
+    if (state === 'connected') subscribeCronEventsWhenAdmitted()
+  },
+)
 
 function handleKeydown(e: KeyboardEvent) {
   // Chord bindings carry the primary modifier as Cmd on Apple platforms and Ctrl
@@ -1763,6 +1826,7 @@ onMounted(() => {
   resumeAutomaticAppRpc()
   // Keep the approval badge/count live app-wide, not just on the Approvals page.
   subscribeApprovals()
+  unsubscribeCronFinished = rpcStore.on('cron.run.finished', handleCronRunFinished)
   // Seed now in case the socket is already connected (the `_state` listener
   // covers later reconnects); recovers a request pending before mount.
   if (rpcStore.isConnected) void seedPendingApprovals()
@@ -1777,6 +1841,9 @@ onUnmounted(() => {
   if (sessionRefreshTimer) clearTimeout(sessionRefreshTimer)
   sessionListSubscription.cleanup()
   unsubscribeApprovals()
+  unsubscribeCronFinished?.()
+  unsubscribeCronFinished = null
+  void rpcStore.call('cron.unsubscribe', {}).catch(() => undefined)
   if (titleDebounce) {
     clearTimeout(titleDebounce)
     titleDebounce = null
