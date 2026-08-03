@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import datetime
 import os
-import re
 import tomllib
 from pathlib import Path
 
@@ -33,7 +32,7 @@ from opensquilla.recovery.models import RecoveryReport
 
 _RECOVERABLE_CONFIG_CODES = frozenset({"config_invalid", "config_unreadable"})
 _DEFAULT_CONFIG = b"config_version = 1\n"
-_BACKUP_NAME_RE = re.compile(r"^config\.toml\.backup\.(\d+)(?:\.(\d+))?$")
+_BACKUP_PREFIX = "config.toml.backup."
 
 
 def _fsync_directory(path: Path) -> None:
@@ -50,47 +49,43 @@ def _fsync_directory(path: Path) -> None:
         os.close(fd)
 
 
-def _config_error_code(data: bytes) -> str | None:
-    """Classify config bytes with the inspector's validation semantics."""
+def _backup_is_restorable(data: bytes) -> bool:
+    """Restoring bytes the inspector would reject only trades one bad config
+    for another (or, worse, raises the schema-too-new startup gate), so a
+    backup must pass the inspector's validation before it is trusted.
+    """
     from opensquilla.recovery.engine import SUPPORTED_CONFIG_VERSION
 
     try:
         payload = tomllib.loads(data.decode("utf-8"))
     except (UnicodeDecodeError, tomllib.TOMLDecodeError):
-        return "config_invalid"
+        return False
     config_version = payload.get("config_version", 0)
     if isinstance(config_version, bool) or not isinstance(config_version, int):
-        return "config_invalid"
+        return False
     if config_version > SUPPORTED_CONFIG_VERSION:
-        return "config_schema_too_new"
-    for key in ("state_dir", "workspace_dir"):
-        value = payload.get(key)
-        if value is not None and not isinstance(value, str):
-            return "config_invalid"
-    return None
+        return False
+    return all(
+        payload.get(key) is None or isinstance(payload.get(key), str)
+        for key in ("state_dir", "workspace_dir")
+    )
 
 
 def _newest_valid_backup_bytes(home_path: Path) -> bytes | None:
+    # Backup names embed a lexically sortable timestamp, so reverse name order
+    # is newest-first (the same rule ``make_config_backup`` prunes by).
     try:
         with os.scandir(_native_io_path(home_path)) as iterator:
-            names = [entry.name for entry in iterator]
+            names = [entry.name for entry in iterator if entry.name.startswith(_BACKUP_PREFIX)]
     except OSError:
         return None
-    stamped: list[tuple[str, int, str]] = []
-    for name in names:
-        match = _BACKUP_NAME_RE.match(name)
-        if match is None:
-            continue
-        stamped.append((match.group(1), int(match.group(2) or 0), name))
-    for _stamp, _attempt, name in sorted(stamped, reverse=True):
+    for name in sorted(names, reverse=True):
         try:
             snapshot = ConfigSnapshot.capture(home_path / name)
         except RecoveryError:
             # A link-shaped or concurrently changing backup is never trusted.
             continue
-        if snapshot.identity is None:
-            continue
-        if _config_error_code(snapshot.data) is None:
+        if snapshot.identity is not None and _backup_is_restorable(snapshot.data):
             return snapshot.data
     return None
 
@@ -156,19 +151,19 @@ def _legacy_gateway_lock(home_path: Path, lock_timeout: float) -> LegacyGatewayL
 def recover_config(home: str | Path, *, lock_timeout: float = 0.0) -> RecoveryReport:
     """Replace a corrupt ``config.toml`` after preserving it beside itself.
 
-    The inspection report gates the repair so pending crash-recovery journals
-    keep their priority: only ``config_invalid``/``config_unreadable`` may
-    proceed, and the live bytes are re-validated inside the profile locks
-    before anything is touched. ``config_schema_too_new`` is a downgrade
-    scenario, not corruption, and is never rewritten.
+    Inspection runs inside the profile locks and gates the repair, so pending
+    crash-recovery journals keep their priority and only
+    ``config_invalid``/``config_unreadable`` may proceed.
+    ``config_schema_too_new`` is a downgrade scenario, not corruption, and is
+    never rewritten.
     """
+
+    from opensquilla.recovery.engine import inspect_profile
 
     home_path = resolve_home_link(Path(home).expanduser().absolute())
     config_path = home_path / "config.toml"
     with ProfileOperationLock(home_path, timeout=lock_timeout):
         with _legacy_gateway_lock(home_path, lock_timeout):
-            from opensquilla.recovery.engine import inspect_profile
-
             report = inspect_profile(home_path)
             if report.stable_code not in _RECOVERABLE_CONFIG_CODES:
                 if report.outcome == "recovery_required":
@@ -177,29 +172,10 @@ def recover_config(home: str | Path, *, lock_timeout: float = 0.0) -> RecoveryRe
                         stable_code="config_recovery_not_applicable",
                     )
                 return report
-            snapshot = ConfigSnapshot.capture(config_path)
-            if snapshot.identity is None:
-                raise RecoveryError(
-                    "config disappeared before it could be recovered",
-                    stable_code="config_recovery_not_applicable",
-                )
-            code = _config_error_code(snapshot.data)
-            if code is None:
-                # A concurrent repair already produced valid bytes; report the
-                # profile as it stands instead of rewriting a healthy config.
-                return inspect_profile(home_path)
-            if code != "config_invalid":
-                raise RecoveryError(
-                    "config recovery does not apply to this profile state",
-                    stable_code="config_recovery_not_applicable",
-                )
             restored = _newest_valid_backup_bytes(home_path)
             _park_corrupt_config(config_path)
             _write_config_no_replace(
                 config_path,
                 restored if restored is not None else _DEFAULT_CONFIG,
             )
-
-    from opensquilla.recovery.engine import inspect_profile
-
     return inspect_profile(home_path)
