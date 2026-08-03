@@ -16,7 +16,10 @@ import pytest_asyncio
 
 from opensquilla.session import manager as session_manager_module
 from opensquilla.session.compaction import CompactionConfig
-from opensquilla.session.context_view import format_compaction_summary_context
+from opensquilla.session.context_view import (
+    build_compaction_context_records,
+    format_compaction_summary_context,
+)
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import (
     PlanRunRecord,
@@ -1662,6 +1665,95 @@ async def test_storage_migrates_legacy_summary_metadata_columns(tmp_path):
         assert summary.flush_receipt_status == "unknown"
     finally:
         await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_summary_database_compacts_and_replays_after_restart(tmp_path):
+    """A pre-metadata summary survives upgrade, replacement, and a cold restart."""
+    db_path = tmp_path / "legacy-summary-upgrade.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE session_summaries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                session_key TEXT NOT NULL,
+                compaction_index INTEGER NOT NULL DEFAULT 0,
+                summary_text TEXT NOT NULL,
+                covered_through_id INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                schema_version INTEGER NOT NULL DEFAULT 1
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO session_summaries (
+                session_id, session_key, compaction_index, summary_text,
+                covered_through_id, created_at, schema_version
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "legacy-session-placeholder",
+                "agent:main:legacy-upgrade",
+                0,
+                "legacy checkpoint before metadata columns",
+                0,
+                123,
+                1,
+            ),
+        )
+
+    storage = SessionStorage(str(db_path))
+    await storage.connect()
+    manager = SessionManager(storage, inject_time_prefix=False)
+    node = await manager.create("agent:main:legacy-upgrade")
+    await storage.conn.execute(
+        "UPDATE session_summaries SET session_id = ? WHERE session_key = ?",
+        (node.session_id, node.session_key),
+    )
+    await storage.conn.commit()
+    for index in range(20):
+        await manager.append_message(
+            node.session_key,
+            "user",
+            f"legacy-upgrade message {index} " + ("x" * 500),
+            token_count=200,
+        )
+
+    result = await manager.compact_with_result(
+        node.session_key,
+        context_window_tokens=1000,
+        compaction_id="cmp-legacy-upgrade-replacement",
+    )
+    assert result.removed_count > 0
+    assert result.summary_payload is not None
+    assert result.summary_payload["source_coverage"]["replaces_prior_context"] is True
+    replacement_compaction_id = "cmp-legacy-upgrade-replacement"
+    await storage.close()
+
+    reopened = SessionStorage(str(db_path))
+    await reopened.connect()
+    try:
+        restarted = SessionManager(reopened, inject_time_prefix=False)
+        summaries = await restarted.get_summaries(node.session_key)
+        states = await restarted.get_context_states(node.session_key)
+
+        assert len(summaries) == 2
+        assert summaries[0].summary_format == "text"
+        assert summaries[0].summary_payload is None
+        assert summaries[1].summary_payload is not None
+        assert summaries[1].summary_payload["source_coverage"]["replaces_prior_context"] is True
+
+        active_records = build_compaction_context_records(
+            context_states=states,
+            summaries=summaries,
+        )
+        assert len(active_records) == 1
+        assert active_records[0].compaction_id == replacement_compaction_id
+        assert active_records[0].covered_through_id == summaries[1].covered_through_id
+    finally:
+        await reopened.close()
 
 
 @pytest.mark.asyncio

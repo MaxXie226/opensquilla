@@ -1,5 +1,7 @@
 """Tests for context window compaction logic."""
 
+import json
+
 import pytest
 
 from opensquilla.provider.types import ProviderRequestCorrelation
@@ -1095,6 +1097,7 @@ async def test_call_compaction_llm_adds_tokenrhythm_app_attribution(monkeypatch)
 
         async def post(self, url, *, json, headers):
             captured["url"] = url
+            captured["json"] = json
             captured["headers"] = headers
             return FakeResponse()
 
@@ -1122,12 +1125,107 @@ async def test_call_compaction_llm_adds_tokenrhythm_app_attribution(monkeypatch)
     assert captured["url"] == "https://tokenrhythm.studio/v1/chat/completions"
     headers = captured["headers"]
     assert isinstance(headers, dict)
-    assert headers["HTTP-Referer"] == "https://opensquilla.ai"
-    assert headers["X-OpenSquilla-Session-Id"] == "session-1"
-    assert headers["X-OpenSquilla-Turn-Id"] == "turn-1"
-    assert headers["X-OpenSquilla-Execution-Id"] == "compaction-1"
-    assert headers["X-OpenSquilla-Call-Kind"] == "auxiliary.compaction"
-    assert headers["X-Title"] == "OpenSquilla"
+    assert headers == {
+        "Authorization": "Bearer test-key",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://opensquilla.ai",
+        "X-OpenSquilla-Session-Id": "session-1",
+        "X-OpenSquilla-Turn-Id": "turn-1",
+        "X-OpenSquilla-Execution-Id": "compaction-1",
+        "X-OpenSquilla-Call-Kind": "auxiliary.compaction",
+        "X-Title": "OpenSquilla",
+    }
+    payload = captured["json"]
+    assert isinstance(payload, dict)
+    assert payload == {
+        "model": "deepseek-v4-flash",
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are a conversation compactor. Summarize the conversation "
+                    "concisely, preserving key facts, decisions, open questions, and "
+                    "action items. Write in the same language as the conversation. "
+                    "Focus on recent context over older history."
+                ),
+            },
+            {
+                "role": "user",
+                "content": "Summarize this conversation:\n\nold conversation",
+            },
+        ],
+        "max_tokens": 1024,
+        "temperature": 0,
+        "stream": False,
+    }
+    serialized_payload = json.dumps(payload, sort_keys=True)
+    for internal_field in (
+        "target_fingerprint",
+        "request_proof",
+        "quality_report",
+        "provider_request_correlation",
+    ):
+        assert internal_field not in serialized_payload
+
+
+@pytest.mark.asyncio
+async def test_call_compaction_llm_privacy_switch_removes_correlation_on_wire(
+    monkeypatch,
+) -> None:
+    captured_headers: dict[str, str] = {}
+
+    class FakeResponse:
+        text = ""
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {"choices": [{"message": {"content": "summary"}}]}
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+        async def post(self, url, *, json, headers):
+            captured_headers.update(headers)
+            return FakeResponse()
+
+    monkeypatch.setenv(
+        "OPENSQUILLA_PRIVACY_DISABLE_NETWORK_OBSERVABILITY",
+        "true",
+    )
+    monkeypatch.setattr(
+        "opensquilla.session.compaction.httpx.AsyncClient",
+        lambda **kwargs: FakeClient(),
+    )
+
+    result = await call_compaction_llm(
+        chunk_text="old conversation",
+        identifier_instruction="",
+        model="deepseek-v4-flash",
+        api_key="test-key",
+        base_url="https://tokenrhythm.studio/v1",
+        provider="tokenrhythm",
+        provider_request_correlation=ProviderRequestCorrelation(
+            session_id="session-1",
+            turn_id="turn-1",
+            execution_id="compaction-1",
+            call_kind="auxiliary.compaction",
+        ),
+    )
+
+    assert result == "summary"
+    assert not any(name.startswith("X-OpenSquilla-") for name in captured_headers)
+    assert captured_headers == {
+        "Authorization": "Bearer test-key",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://opensquilla.ai",
+        "X-Title": "OpenSquilla",
+    }
 
 
 @pytest.mark.asyncio
