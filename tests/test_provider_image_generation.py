@@ -145,6 +145,63 @@ def test_image_generation_reports_an_exhausted_profile_key_pool(monkeypatch) -> 
     assert exhausted.reason == "credential_pool_unavailable"
 
 
+def test_image_generation_reports_pool_failure_through_gateway_capability(
+    monkeypatch,
+) -> None:
+    import httpx
+
+    from opensquilla.gateway.config import GatewayConfig
+    from opensquilla.gateway.llm_runtime import reset_profile_credential_pools
+    from opensquilla.provider.image_generation_credentials import (
+        report_image_generation_pool_failure,
+        resolve_image_generation_credential,
+    )
+
+    monkeypatch.setenv("TOKENRHYTHM_POOL_A", "synthetic-pool-key-a")
+    monkeypatch.setenv("TOKENRHYTHM_POOL_B", "synthetic-pool-key-b")
+    reset_profile_credential_pools()
+    config = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "openrouter/auto",
+            "api_key": "synthetic-primary-key",
+            "base_url": "https://openrouter.ai/api/v1",
+        },
+        llm_profiles={
+            "tokenrhythm": {
+                "model": "deepseek-v4-flash",
+                "api_key_env_pool": ["TOKENRHYTHM_POOL_A", "TOKENRHYTHM_POOL_B"],
+                "base_url": "https://tokenrhythm.studio/v1",
+            }
+        },
+    )
+
+    def resolve():
+        return resolve_image_generation_credential(
+            provider_id="tokenrhythm",
+            provider_config=config.image_generation.providers.tokenrhythm,
+            default_env_key="TOKENRHYTHM_API_KEY",
+            default_base_url="https://tokenrhythm.studio/v1",
+            effective_base_url="https://tokenrhythm.studio/v1/images",
+            gateway_config=config,
+            runtime=True,
+            session_key="session-failure",
+        )
+
+    first = resolve()
+    request = httpx.Request("POST", "https://tokenrhythm.studio/v1/images")
+    response = httpx.Response(401, request=request)
+    report_image_generation_pool_failure(
+        first,
+        httpx.HTTPStatusError("invalid credential", request=request, response=response),
+    )
+    rotated = resolve()
+    reset_profile_credential_pools()
+
+    assert first.kind == "pool"
+    assert first.api_key != rotated.api_key
+
+
 def _clear_vision_provider_env(monkeypatch) -> None:
     for name in (
         "OPENSQUILLA_VISION_PROVIDER",

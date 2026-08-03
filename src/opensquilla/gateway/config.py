@@ -2214,6 +2214,50 @@ class GatewayConfig(BaseSettings):
 
         return config_run_mode(self).value
 
+    def _resolve_image_generation_llm_runtime(self) -> object:
+        """Expose primary LLM resolution through a provider-safe capability."""
+
+        from opensquilla.gateway.llm_runtime import resolve_llm_runtime_config
+
+        return resolve_llm_runtime_config(self)
+
+    def _acquire_image_generation_profile_credential(
+        self,
+        provider_id: str,
+        env_pool: list[str],
+        session_key: str,
+    ) -> object | None:
+        """Acquire from the shared profile pool without provider back-imports."""
+
+        from opensquilla.gateway.llm_runtime import profile_credential_pools
+
+        return profile_credential_pools().acquire_for_session(
+            provider_id,
+            env_pool,
+            session_key,
+        )
+
+    def _report_image_generation_profile_credential_failure(
+        self,
+        provider_id: str,
+        session_key: str,
+        kind: object,
+        retry_after_seconds: float | None,
+    ) -> None:
+        """Report an Image request failure to the shared profile pool."""
+
+        from typing import cast
+
+        from opensquilla.gateway.llm_runtime import profile_credential_pools
+        from opensquilla.provider.failures import ProviderFailureKind
+
+        profile_credential_pools().report_failure(
+            provider_id,
+            session_key,
+            cast(ProviderFailureKind, kind),
+            retry_after_seconds=retry_after_seconds,
+        )
+
     @model_validator(mode="after")
     def _resolve_default_llm_provider(self) -> GatewayConfig:
         """Resolve the built-in provider default for configs that never chose one.

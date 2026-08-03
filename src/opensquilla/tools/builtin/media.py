@@ -26,9 +26,6 @@ from opensquilla.engine.usage_accounting import (
     provider_accounts_physical_usage,
 )
 from opensquilla.env import trust_env as _trust_env
-from opensquilla.onboarding.image_generation_specs import (
-    get_image_generation_provider_setup_spec,
-)
 from opensquilla.provider.audio import (
     AudioGenerationResult,
     DubbingDownloadRequest,
@@ -57,6 +54,9 @@ from opensquilla.provider.image_generation import (
     list_image_generation_providers,
     parse_image_generation_model_ref,
     reset_image_generation_providers,
+)
+from opensquilla.provider.image_generation_catalog import (
+    get_image_generation_provider_catalog_entry,
 )
 from opensquilla.provider.image_generation_credentials import (
     resolve_image_generation_credential,
@@ -674,7 +674,7 @@ def _image_generation_binding_is_active(config: Any) -> bool:
     if provider is None:
         return False
     try:
-        spec = get_image_generation_provider_setup_spec(provider_id)
+        spec = get_image_generation_provider_catalog_entry(provider_id)
         provider_config = getattr(
             getattr(config, "providers", None),
             provider_id,

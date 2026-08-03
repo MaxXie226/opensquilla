@@ -8,7 +8,7 @@ callers must never copy a borrowed secret into the image configuration.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Literal, Protocol, cast
 
@@ -17,6 +17,7 @@ from opensquilla.endpoint_identity import (
     credential_env_for_endpoint,
 )
 from opensquilla.provider.environment import environment_value
+from opensquilla.provider.failures import ProviderFailureKind
 
 ImageCredentialSource = Literal[
     "explicit",
@@ -27,6 +28,10 @@ ImageCredentialSource = Literal[
 ]
 ImageCredentialOwner = Literal["image", "primary", "profile", "none"]
 ImageCredentialKind = Literal["direct", "env", "pool", "none"]
+PoolFailureReporter = Callable[
+    [str, str, ProviderFailureKind, float | None],
+    None,
+]
 
 
 class _ModelCopyConfig(Protocol):
@@ -47,6 +52,11 @@ class ImageGenerationCredentialResolution:
     endpoint: str = ""
     api_key: str = field(default="", repr=False)
     pool_session_key: str = field(default="", repr=False)
+    pool_failure_reporter: PoolFailureReporter | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     def public_payload(self) -> dict[str, object]:
         return {
@@ -200,18 +210,32 @@ def _model_service_resolution(
     active_provider = _text(getattr(active, "provider", "")).lower()
     if active_provider:
         try:
-            from opensquilla.gateway.llm_runtime import resolve_llm_runtime_config
-
             scratch = cast(_ModelCopyConfig, gateway_config).model_copy(deep=True)
-            resolved = resolve_llm_runtime_config(scratch)
-            inherited = ProviderConfig(
-                provider=_text(getattr(resolved, "provider", "")),
-                model=model,
-                api_key=_text(getattr(resolved, "api_key", "")),
-                base_url=_text(getattr(resolved, "base_url", "")),
-                proxy=_text(getattr(resolved, "proxy", "")),
-                provider_routing=dict(getattr(resolved, "provider_routing", {}) or {}),
+            runtime_resolver = getattr(
+                scratch,
+                "_resolve_image_generation_llm_runtime",
+                None,
             )
+            if callable(runtime_resolver):
+                resolved = runtime_resolver()
+                inherited = ProviderConfig(
+                    provider=_text(getattr(resolved, "provider", "")),
+                    model=model,
+                    api_key=_text(getattr(resolved, "api_key", "")),
+                    base_url=_text(getattr(resolved, "base_url", "")),
+                    proxy=_text(getattr(resolved, "proxy", "")),
+                    provider_routing=dict(
+                        getattr(resolved, "provider_routing", {}) or {}
+                    ),
+                )
+            else:
+                inherited = ProviderConfig(
+                    provider=active_provider,
+                    model=model,
+                    api_key=_text(getattr(active, "api_key", "")),
+                    base_url=_text(getattr(active, "base_url", "")),
+                    proxy=_text(getattr(active, "proxy", "")),
+                )
         except (KeyError, TypeError, ValueError):
             inherited = ProviderConfig(
                 provider=active_provider,
@@ -224,27 +248,35 @@ def _model_service_resolution(
     turn_metadata: dict[str, object] = {}
     pool_acquirer = None
     if runtime:
-        from opensquilla.gateway.llm_runtime import profile_credential_pools
         from opensquilla.provider.credentials import NoCredentialsAvailable
         from opensquilla.provider.deployment import CredentialPoolExhaustedError
 
-        pool_manager = profile_credential_pools()
+        gateway_pool_acquirer = getattr(
+            gateway_config,
+            "_acquire_image_generation_profile_credential",
+            None,
+        )
 
         def acquire_pool_credential(
             requested_provider: str,
             env_pool: list[str],
             requested_session_key: str,
         ) -> object | None:
+            if not callable(gateway_pool_acquirer):
+                return None
             try:
-                return pool_manager.acquire_for_session(
-                    requested_provider,
-                    env_pool,
-                    requested_session_key,
+                return cast(
+                    object | None,
+                    gateway_pool_acquirer(
+                        requested_provider,
+                        env_pool,
+                        requested_session_key,
+                    ),
                 )
             except NoCredentialsAvailable as exc:
                 raise CredentialPoolExhaustedError from exc
-
-        pool_acquirer = acquire_pool_credential
+        if callable(gateway_pool_acquirer):
+            pool_acquirer = acquire_pool_credential
 
     resolution = resolve_provider_deployment(
         gateway_config,
@@ -405,6 +437,11 @@ def resolve_image_generation_credential(
         kind: ImageCredentialKind = (
             "pool" if is_pool else ("env" if env_key else "direct")
         )
+        pool_failure_reporter = getattr(
+            gateway_config,
+            "_report_image_generation_profile_credential_failure",
+            None,
+        )
         return ImageGenerationCredentialResolution(
             provider_id=provider,
             source="llm_fallback",
@@ -416,6 +453,9 @@ def resolve_image_generation_credential(
             endpoint=endpoint,
             api_key=api_key,
             pool_session_key=session_key if is_pool else "",
+            pool_failure_reporter=(
+                pool_failure_reporter if callable(pool_failure_reporter) else None
+            ),
         )
 
     llm = llm_config
@@ -512,7 +552,6 @@ def report_image_generation_pool_failure(
     try:
         import httpx
 
-        from opensquilla.gateway.llm_runtime import profile_credential_pools
         from opensquilla.provider.failures import (
             classify_provider_error,
             retry_after_from_headers,
@@ -528,11 +567,14 @@ def report_image_generation_pool_failure(
             status_code=status_code,
             message=str(exc),
         )
-        profile_credential_pools().report_failure(
+        reporter = resolution.pool_failure_reporter
+        if reporter is None:
+            return
+        reporter(
             resolution.provider_id,
             resolution.pool_session_key,
             kind,
-            retry_after_seconds=(
+            (
                 retry_after_from_headers(status_code, headers)
                 if status_code is not None
                 else None
