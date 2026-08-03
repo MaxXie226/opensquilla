@@ -807,7 +807,7 @@ def test_gateway_home_falls_back_to_config_path_parent(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_boot_sandbox_setup_runs_by_default(
+async def test_boot_sandbox_setup_prewarms_an_existing_ready_setup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from opensquilla.gateway import boot
@@ -823,8 +823,8 @@ async def test_boot_sandbox_setup_runs_by_default(
         },
     )
 
-    async def fake_ensure(setup_config: GatewayConfig) -> SetupResult:
-        calls.append("setup")
+    async def fake_status(setup_config: GatewayConfig) -> SetupResult:
+        calls.append("status")
         assert setup_config is config
         return SetupResult(
             state=SandboxSetupState.READY,
@@ -840,8 +840,8 @@ async def test_boot_sandbox_setup_runs_by_default(
         return object()
 
     monkeypatch.setattr(
-        "opensquilla.sandbox.setup_runtime.ensure_sandbox_setup_auto",
-        fake_ensure,
+        "opensquilla.sandbox.setup_runtime.current_sandbox_setup_runtime_status",
+        fake_status,
     )
     monkeypatch.setattr(
         "opensquilla.sandbox.setup_runtime.current_sandbox_capability_report",
@@ -852,7 +852,7 @@ async def test_boot_sandbox_setup_runs_by_default(
 
     assert result is not None
     assert result.state is SandboxSetupState.READY
-    assert calls == ["setup", "capability"]
+    assert calls == ["status", "capability"]
 
 
 @pytest.mark.asyncio
@@ -862,10 +862,10 @@ async def test_boot_sandbox_setup_can_be_disabled(
     from opensquilla.gateway import boot
 
     async def fail_if_called(config: GatewayConfig) -> object:
-        raise AssertionError("sandbox.auto_setup=false must not trigger setup")
+        raise AssertionError("sandbox.auto_setup=false must not inspect setup")
 
     monkeypatch.setattr(
-        "opensquilla.sandbox.setup_runtime.ensure_sandbox_setup_auto",
+        "opensquilla.sandbox.setup_runtime.current_sandbox_setup_runtime_status",
         fail_if_called,
     )
 
@@ -884,7 +884,7 @@ async def test_boot_sandbox_setup_can_be_disabled(
 
 
 @pytest.mark.asyncio
-async def test_boot_sandbox_setup_runs_for_full_host_access_by_default(
+async def test_boot_sandbox_setup_defers_incomplete_setup_for_full_host_access(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from opensquilla.gateway import boot
@@ -899,14 +899,14 @@ async def test_boot_sandbox_setup_runs_for_full_host_access_by_default(
         },
     )
 
-    async def fake_ensure(setup_config: GatewayConfig) -> SetupResult:
-        calls.append("setup")
+    async def fake_status(setup_config: GatewayConfig) -> SetupResult:
+        calls.append("status")
         assert setup_config is config
         return SetupResult(
-            state=SandboxSetupState.READY,
+            state=SandboxSetupState.NOT_SETUP,
             platform="auto",
-            message="Sandbox setup is ready.",
-            requires_admin=False,
+            message="Sandbox setup requires administrator approval.",
+            requires_admin=True,
         )
 
     async def fake_capability(setup_config: GatewayConfig) -> object:
@@ -915,8 +915,8 @@ async def test_boot_sandbox_setup_runs_for_full_host_access_by_default(
         return object()
 
     monkeypatch.setattr(
-        "opensquilla.sandbox.setup_runtime.ensure_sandbox_setup_auto",
-        fake_ensure,
+        "opensquilla.sandbox.setup_runtime.current_sandbox_setup_runtime_status",
+        fake_status,
     )
     monkeypatch.setattr(
         "opensquilla.sandbox.setup_runtime.current_sandbox_capability_report",
@@ -926,8 +926,8 @@ async def test_boot_sandbox_setup_runs_for_full_host_access_by_default(
     result = await boot._ensure_sandbox_setup_on_boot(config)
 
     assert result is not None
-    assert result.state is SandboxSetupState.READY
-    assert calls == ["setup", "capability"]
+    assert result.state is SandboxSetupState.NOT_SETUP
+    assert calls == ["status"]
 
 
 @pytest.mark.asyncio

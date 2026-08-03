@@ -1130,7 +1130,7 @@ def _desktop_ownership_profile_home(config: GatewayConfig) -> Path:
 
 
 async def _ensure_sandbox_setup_on_boot(config: GatewayConfig) -> Any | None:
-    """Run automatic sandbox setup when enabled."""
+    """Inspect sandbox readiness without elevating during gateway startup."""
 
     if not config.sandbox.auto_setup:
         log.info("boot.sandbox_setup_auto_disabled")
@@ -1138,12 +1138,12 @@ async def _ensure_sandbox_setup_on_boot(config: GatewayConfig) -> Any | None:
 
     from opensquilla.sandbox.setup_runtime import (
         current_sandbox_capability_report,
-        ensure_sandbox_setup_auto,
+        current_sandbox_setup_runtime_status,
     )
 
-    result = await ensure_sandbox_setup_auto(config)
+    result = await current_sandbox_setup_runtime_status(config)
     log.info(
-        "boot.sandbox_setup_auto_completed",
+        "boot.sandbox_setup_status_completed",
         state=result.state.value,
         platform=result.platform,
         requires_admin=result.requires_admin,
@@ -1163,6 +1163,12 @@ async def _ensure_sandbox_setup_on_boot(config: GatewayConfig) -> Any | None:
                 "boot.sandbox_capability_prewarm_failed",
                 error=str(exc),
             )
+    else:
+        log.info(
+            "boot.sandbox_setup_deferred",
+            state=result.state.value,
+            platform=result.platform,
+        )
     return result
 
 
