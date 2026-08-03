@@ -560,7 +560,7 @@ async def cron(
             else ""
         )
         context_run_mode = str(getattr(ctx, "run_mode", "") or "") if ctx is not None else ""
-        from opensquilla.sandbox.run_mode import RunMode, normalize_run_mode
+        from opensquilla.run_mode import RunMode, normalize_run_mode
 
         try:
             creator_run_mode = normalize_run_mode(

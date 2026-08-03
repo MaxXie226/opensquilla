@@ -173,6 +173,9 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("router_control.py", "engine"),
     ("sandbox", "application"),
     ("sandbox", "gateway"),
+    # Direct-update migration reuses the profile lock implementation owned by
+    # recovery. Recovery no longer imports sandbox back, so this stays one-way.
+    ("sandbox", "recovery"),
     ("sandbox", "safety"),
     ("sandbox", "tools"),
     ("scheduler", "agents"),
@@ -180,6 +183,9 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("scheduler", "compat"),
     ("scheduler", "engine"),
     ("scheduler", "gateway"),
+    # Persisted cron jobs decode legacy run-mode names through the sandbox
+    # compatibility codec; the package-neutral vocabulary avoids wider edges.
+    ("scheduler", "sandbox"),
     ("scheduler", "session"),
     ("scheduler", "skills"),
     ("scheduler", "tools"),

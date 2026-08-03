@@ -11,12 +11,12 @@ from opensquilla.channels.admission import (
     has_verified_channel_admin_stamp,
 )
 from opensquilla.channels.types import IncomingMessage
+from opensquilla.run_mode import RunMode, execution_target, normalize_run_mode
 from opensquilla.sandbox.run_context import (
     normalize_scope,
     run_context_for_subagent,
     run_context_from_origin_payload,
 )
-from opensquilla.sandbox.run_mode import RunMode, execution_target, normalize_run_mode
 from opensquilla.session.keys import normalize_agent_id, parse_agent_id
 from opensquilla.tools.policy import apply_tool_policy_layer
 from opensquilla.tools.types import (

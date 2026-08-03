@@ -650,10 +650,10 @@ async def test_collect_mode_atomically_merges_message_and_receipt_into_queued_ta
             "disposition": "queued",
             "revision": 1,
             "sandbox_mode_resolution": {
-                "desiredMode": "safe",
+                "desiredMode": "full",
                 "effectiveMode": "full",
-                "fallbackReason": "not_setup",
-                "confirmationRequired": True,
+                "fallbackReason": None,
+                "confirmationRequired": False,
             },
         }
         assert entries[-1].turn_context == {
@@ -665,10 +665,10 @@ async def test_collect_mode_atomically_merges_message_and_receipt_into_queued_ta
             "target_turn_id": first.payload["task_id"],
             "revision": 2,
             "sandbox_mode_resolution": {
-                "desiredMode": "safe",
+                "desiredMode": "full",
                 "effectiveMode": "full",
-                "fallbackReason": "not_setup",
-                "confirmationRequired": True,
+                "fallbackReason": None,
+                "confirmationRequired": False,
             },
         }
         assert _table_counts(stack.db_path) == {

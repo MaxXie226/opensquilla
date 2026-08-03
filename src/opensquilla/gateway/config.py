@@ -2290,7 +2290,7 @@ class GatewayConfig(BaseSettings):
     def effective_run_mode(self) -> str:
         """Return the canonical sandbox run mode for this validated config."""
 
-        from opensquilla.sandbox.run_mode import config_run_mode
+        from opensquilla.run_mode import config_run_mode
 
         return config_run_mode(self).value
 

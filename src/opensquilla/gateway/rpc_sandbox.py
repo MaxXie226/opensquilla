@@ -32,6 +32,12 @@ from opensquilla.project_workspaces import (
     ProjectWorkspaceGuard,
     ProjectWorkspaceStateError,
 )
+from opensquilla.run_mode import (
+    RunMode,
+    display_name,
+    execution_target,
+    normalize_run_mode,
+)
 from opensquilla.sandbox.domain_validation import validate_domain_pattern
 from opensquilla.sandbox.escalation import remember_resolved_run_context
 from opensquilla.sandbox.file_policy import builtin_deny_write_paths
@@ -62,12 +68,6 @@ from opensquilla.sandbox.run_context_service import (
     remove_domain_grant,
     remove_mount_grant,
     set_workspace,
-)
-from opensquilla.sandbox.run_mode import (
-    RunMode,
-    display_name,
-    execution_target,
-    normalize_run_mode,
 )
 from opensquilla.sandbox.run_mode_policy import (
     coerce_run_mode_for_principal,

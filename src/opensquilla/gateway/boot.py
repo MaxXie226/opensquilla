@@ -1175,7 +1175,7 @@ async def _ensure_sandbox_setup_on_boot(config: GatewayConfig) -> Any | None:
 def _sandbox_settings_for_runtime(config: GatewayConfig) -> Any:
     """Return sandbox settings normalized to the config-level run mode."""
 
-    from opensquilla.sandbox.run_mode import (
+    from opensquilla.run_mode import (
         RunMode,
         config_run_mode,
         run_mode_config_patch,
@@ -2550,8 +2550,8 @@ async def build_services(
     # assembles the backend + gate + ledger so tool handlers can call
     # through the ``@sandboxed`` decorator.
     try:
+        from opensquilla.run_mode import config_run_mode
         from opensquilla.sandbox.integration import configure_runtime
-        from opensquilla.sandbox.run_mode import config_run_mode
 
         sandbox_settings = _sandbox_settings_for_runtime(config)
         effective = configure_runtime(

@@ -83,7 +83,7 @@ def _agent_access_arguments(bundle: AgentConfigBundle) -> list[str]:
     """Return child CLI access flags matching the effective sandbox run mode."""
 
     from opensquilla.gateway.config import GatewayConfig
-    from opensquilla.sandbox.run_mode import RunMode, normalize_run_mode
+    from opensquilla.run_mode import RunMode, normalize_run_mode
 
     config = GatewayConfig(**copy.deepcopy(bundle.payload))
     run_mode = normalize_run_mode(config.effective_run_mode)

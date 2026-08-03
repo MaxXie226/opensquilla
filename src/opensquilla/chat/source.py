@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from opensquilla.sandbox.run_mode import normalize_run_mode
+from opensquilla.run_mode import normalize_run_mode
 
 
 def chat_source_metadata(

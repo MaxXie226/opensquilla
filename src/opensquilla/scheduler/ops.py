@@ -6,12 +6,12 @@ from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from opensquilla.run_mode import RunMode
 from opensquilla.sandbox.legacy_codec import (
     LegacyModeContext,
     LegacyModeDecodeError,
     decode_legacy_run_mode,
 )
-from opensquilla.sandbox.run_mode import RunMode
 from opensquilla.session.keys import normalize_agent_id
 
 from .delivery import validate_webhook_url

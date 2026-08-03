@@ -83,6 +83,12 @@ from opensquilla.provider.types import (
     ProviderRequestCorrelation,
     derive_provider_request_correlation,
 )
+from opensquilla.run_mode import (
+    RunMode,
+    config_run_mode,
+    normalize_run_mode,
+    project_default_run_mode,
+)
 from opensquilla.sandbox.guest_profile import (
     GuestProfileBoundaryError,
     GuestProfileFactory,
@@ -92,12 +98,6 @@ from opensquilla.sandbox.run_context import (
     RUN_CONTEXT_ORIGIN_KEY,
     RunContext,
     run_context_from_origin_payload,
-)
-from opensquilla.sandbox.run_mode import (
-    RunMode,
-    config_run_mode,
-    normalize_run_mode,
-    project_default_run_mode,
 )
 from opensquilla.sandbox.run_mode_policy import (
     coerce_run_mode_for_principal,

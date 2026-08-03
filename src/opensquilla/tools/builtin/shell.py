@@ -2661,6 +2661,8 @@ def _trusted_managed_network_policy(
         ctx is None or getattr(ctx, "sandbox_run_context", None) is None
     ):
         return policy
+    if not isinstance(policy, SandboxPolicy):
+        return policy
     return dataclasses.replace(policy, network=NetworkMode.PROXY_ALLOWLIST, network_proxy=None)
 
 
@@ -6138,7 +6140,7 @@ async def exec_command(
                     action_kind=request.action_kind,
                     policy=backend_policy,
                     stdin=stdin_bytes,
-                    env=dict(request.env),
+                    env=dict(getattr(request, "env", None) or merged_env),
                     reason=getattr(request, "reason", ""),
                     session_id=getattr(request, "session_id", ""),
                     run_mode=getattr(request, "run_mode", ""),
@@ -6554,7 +6556,7 @@ async def background_process(
                 cwd=cwd,
                 effective_timeout=effective_timeout,
                 runtime=runtime,
-                env=dict(request.env),
+                env=dict(getattr(request, "env", None) or merged_env),
             )
         retry_gate = consume_backend_denial_retry(
             approval_id,
@@ -6579,7 +6581,7 @@ async def background_process(
                 cwd=backend_cwd,
                 action_kind=request.action_kind,
                 policy=backend_policy,
-                env=dict(request.env),
+                env=dict(getattr(request, "env", None) or merged_env),
                 session_id=getattr(request, "session_id", ""),
                 run_mode=getattr(request, "run_mode", ""),
             )
@@ -6804,7 +6806,7 @@ async def _spawn_sandboxed_background_process(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             cwd=str(request.cwd),
-            env=request.env,
+            env=getattr(request, "env", None) or {},
             start_new_session=True,
         )
         return _SpawnedBackgroundProcess(process=process)
@@ -6836,7 +6838,11 @@ async def _spawn_sandboxed_background_process(
                 profile_file.flush()
                 profile_path = Path(profile_file.name)
             argv = build_seatbelt_argv(request, profile_path)
-            env = seatbelt_env_for_policy(request.policy, request.env, tmp_dir=tmp_dir)
+            env = seatbelt_env_for_policy(
+                request.policy,
+                getattr(request, "env", None) or {},
+                tmp_dir=tmp_dir,
+            )
             process = await asyncio.create_subprocess_exec(
                 *argv,
                 stdin=asyncio.subprocess.PIPE,

@@ -229,8 +229,8 @@ from opensquilla.router_control import (
     render_router_control_prompt_block,
 )
 from opensquilla.router_tiers import HIGHEST_TEXT_TIER, normalize_text_tier, tier_index
+from opensquilla.run_mode import RunMode, display_name, execution_target, normalize_run_mode
 from opensquilla.safety import injection_guard, permission_matrix, sandbox, tool_tiers
-from opensquilla.sandbox.run_mode import RunMode, display_name, execution_target, normalize_run_mode
 from opensquilla.session.compaction_lifecycle import (
     COMPACTION_CHUNK_SUMMARIZED_EVENT,
     COMPACTION_PERSISTED_EVENT,

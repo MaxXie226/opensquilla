@@ -6,7 +6,7 @@ import contextlib
 import os
 from typing import cast
 
-from opensquilla.sandbox.run_mode import RunMode, normalize_run_mode
+from opensquilla.run_mode import RunMode, normalize_run_mode
 from opensquilla.tools.types import current_tool_context
 
 _VALID_RUN_MODES = frozenset({"safe", "full"})

@@ -995,7 +995,7 @@ class ApprovalQueue:
         if mode in (None, "", "off"):
             self._session_run_modes.pop(key, None)
             return
-        from opensquilla.sandbox.run_mode import normalize_run_mode
+        from opensquilla.run_mode import normalize_run_mode
 
         try:
             normalized = normalize_run_mode(mode).value

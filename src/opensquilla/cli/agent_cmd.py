@@ -164,7 +164,7 @@ async def run_agent_once(
     from opensquilla.gateway.routing import build_cli_route_envelope, tool_context_from_envelope
     from opensquilla.paths import media_root_from_config
     from opensquilla.permissions import configured_default_run_mode
-    from opensquilla.sandbox.run_mode import normalize_run_mode
+    from opensquilla.run_mode import normalize_run_mode
     from opensquilla.session.keys import canonicalize_session_key, normalize_agent_id
     from opensquilla.tools.types import InteractionMode
 

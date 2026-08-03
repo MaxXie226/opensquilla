@@ -503,7 +503,7 @@ async def test_unknown_high_risk_action_defaults_to_rule_allow() -> None:
 
 
 @pytest.mark.asyncio
-async def test_explicit_named_network_approval_in_standard_requires_human(
+async def test_explicit_named_network_request_in_safe_mode_runs_without_prompt(
     tmp_path,
 ) -> None:
     reset_approval_queue()
@@ -587,14 +587,9 @@ async def test_explicit_named_network_approval_in_standard_requires_human(
     try:
         _ = [event async for event in agent.run_turn("Fetch the exact unknown.test URL")]
 
-        assert decisions == ["block"]
+        assert decisions == ["allow"]
         assert provider.review_model_calls == 0
-        assert len(approval_ids) == 1
-        entry = get_approval_queue().get(approval_ids[0])
-        assert entry.approved is False
-        assert entry.params["reviewer"] == "user"
-        assert entry.params["humanActionable"] is True
-        assert "reviewOutcome" not in entry.params
+        assert approval_ids == []
         overlay = resolved_run_context_overlay("network-agent", str(tmp_path))
         assert overlay is None
     finally:

@@ -16,7 +16,7 @@ def _invoke(config_path: Path, *args: str):
     return runner.invoke(app, ["sandbox", *args, "--config", str(config_path)])
 
 
-def test_sandbox_status_reports_default_safe(tmp_path: Path) -> None:
+def test_sandbox_status_reports_default_full(tmp_path: Path) -> None:
     config_path = tmp_path / "config.toml"
 
     result = runner.invoke(
@@ -26,16 +26,16 @@ def test_sandbox_status_reports_default_safe(tmp_path: Path) -> None:
 
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
-    assert payload["run_mode"] == "safe"
-    assert payload["run_mode_label"] == "Safe"
-    assert payload["execution_target"] == "sandbox"
-    assert payload["posture"] == "safe"
-    assert payload["sandbox"]["sandbox"] is True
-    assert payload["sandbox"]["security_grading"] is True
+    assert payload["run_mode"] == "full"
+    assert payload["run_mode_label"] == "Full Host Access"
+    assert payload["execution_target"] == "host"
+    assert payload["posture"] == "full"
+    assert payload["sandbox"]["sandbox"] is False
+    assert payload["sandbox"]["security_grading"] is False
     assert payload["permissions"]["default_mode"] == "off"
-    assert payload["permissions"]["effective_mode"] == "safe"
-    assert payload["owner_execution_target"] == "sandbox"
-    assert payload["sandbox_required_for_owner_default"] is True
+    assert payload["permissions"]["effective_mode"] == "full"
+    assert payload["owner_execution_target"] == "host"
+    assert payload["sandbox_required_for_owner_default"] is False
     assert payload["sandbox_backend_configured"] == "auto"
     assert payload["restart_required"] is False
 

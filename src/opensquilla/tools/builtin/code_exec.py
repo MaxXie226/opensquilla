@@ -37,6 +37,7 @@ from opensquilla.sandbox.types import (
     DenialResult,
     NetworkMode,
     SandboxBackendError,
+    SandboxPolicy,
     SandboxRequest,
 )
 from opensquilla.subprocess_encoding import apply_utf8_child_env, decode_subprocess_output
@@ -704,7 +705,10 @@ def _windows_sandbox_backend_active(runtime: object | None) -> bool:
     return backend_name.startswith("windows_")
 
 
-def _trusted_managed_network_policy(policy, runtime: object | None):
+def _trusted_managed_network_policy(
+    policy: SandboxPolicy,
+    runtime: object | None,
+) -> SandboxPolicy:
     if getattr(policy, "network", None) is NetworkMode.PROXY_ALLOWLIST:
         return policy
     settings = getattr(runtime, "settings", None) if runtime is not None else None
@@ -716,6 +720,8 @@ def _trusted_managed_network_policy(policy, runtime: object | None):
     if getattr(policy, "network", None) is NetworkMode.NONE and (
         ctx is None or getattr(ctx, "sandbox_run_context", None) is None
     ):
+        return policy
+    if not isinstance(policy, SandboxPolicy):
         return policy
     return dataclasses.replace(policy, network=NetworkMode.PROXY_ALLOWLIST, network_proxy=None)
 
@@ -1103,7 +1109,7 @@ async def execute_code(
                     cwd=request.cwd,
                     action_kind=request.action_kind,
                     policy=_trusted_managed_network_policy(request.policy, runtime),
-                    env=dict(request.env),
+                    env=dict(getattr(request, "env", None) or safe_env),
                     reason=getattr(request, "reason", ""),
                     session_id=getattr(request, "session_id", ""),
                     run_mode=getattr(request, "run_mode", ""),

@@ -23,7 +23,7 @@ from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.routing import RouteEnvelope, SourceKind
 from opensquilla.gateway.rpc import RpcContext
 from opensquilla.gateway.scopes import READ_SCOPE, WRITE_SCOPE
-from opensquilla.sandbox.run_mode import normalize_run_mode
+from opensquilla.run_mode import normalize_run_mode
 
 
 class CommandRegistry:

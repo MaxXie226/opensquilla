@@ -20,7 +20,6 @@ from opensquilla.recovery import (
     choose_workspace,
     consolidate_recovery_profiles,
     inspect_profile,
-    inspect_sandbox_upgrade,
     reconcile_profile,
 )
 from opensquilla.recovery.cleanup import (
@@ -36,6 +35,7 @@ from opensquilla.recovery.settings_transaction import (
     apply_desktop_settings,
     recover_desktop_settings,
 )
+from opensquilla.sandbox.upgrade_migration import inspect_sandbox_upgrade
 
 recovery_app = typer.Typer(
     help="Inspect and repair Desktop profiles without starting the runtime.",

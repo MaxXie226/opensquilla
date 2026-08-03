@@ -19032,7 +19032,7 @@ class Agent:
             parent_run_mode = getattr(run_context_mode, "value", run_context_mode)
         parent_elevated = getattr(parent_ctx, "elevated", None)
         if parent_run_mode is not None:
-            from opensquilla.sandbox.run_mode import normalize_run_mode
+            from opensquilla.run_mode import normalize_run_mode
 
             try:
                 parent_run_mode = normalize_run_mode(parent_run_mode).value

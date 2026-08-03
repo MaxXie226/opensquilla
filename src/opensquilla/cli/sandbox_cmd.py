@@ -12,7 +12,7 @@ from opensquilla.onboarding.config_store import (
     persist_config,
     resolve_config_path,
 )
-from opensquilla.sandbox.run_mode import RunMode, run_mode_config_patch
+from opensquilla.run_mode import RunMode, run_mode_config_patch
 from opensquilla.sandbox.status import status_payload as _status_payload
 
 sandbox_app = typer.Typer(help="Show or change the default sandbox posture.")
