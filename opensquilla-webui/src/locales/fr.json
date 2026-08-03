@@ -56,6 +56,7 @@
     "deleteHistoryFailed": "Impossible de supprimer l’historique des tâches : {error}",
     "removeTitle": "Retirer ce projet ?",
     "removeBody": "{name} disparaîtra de la barre latérale. Son historique et ses fichiers seront conservés.",
+    "removeBodyWithCronJobs": "{name} disparaîtra de la barre latérale. {count} tâche(s) planifiée(s) liée(s) seront suspendues et conservées jusqu’à leur réassociation ou suppression. L’historique et les fichiers seront conservés.",
     "removeConfirm": "Retirer le projet",
     "removeFailed": "Impossible de retirer le projet : {error}"
   },
@@ -690,6 +691,7 @@
       "removeConfirmTitle": "Supprimer le fournisseur ?",
       "removeConfirmBody": "Supprimer {provider} des fournisseurs configurés ? Un fournisseur utilisé ne peut pas être supprimé.",
       "removeActiveConfirmBody": "Supprimer {provider} et définir {replacement} comme fournisseur actif ? Un fournisseur utilisé ne peut pas être supprimé.",
+      "removeConfirmImageCredentialImpact": "La génération d’images réutilise actuellement l’identifiant de ce fournisseur. Le fournisseur, le modèle et l’état d’activation seront conservés ; une variable d’environnement correspondante sera utilisée si elle est disponible, sinon une configuration sera nécessaire.",
       "removeConfirmPrimary": "Supprimer le fournisseur",
       "saveChanges": "Enregistrer les modifications",
       "verifyAndConnect": "Vérifier et se connecter",
@@ -714,6 +716,8 @@
         "stepReplaceAndPaste": "Sélectionner « Remplacer la clé » ci-dessous, puis coller votre clé API"
       },
       "recommendationScope": "Recommandation OpenSquilla · Facultative",
+      "imageGenerationOptInLabel": "Activer aussi la génération d’images (recommandé)",
+      "imageGenerationOptInDesc": "Utilise le même identifiant OpenRouter avec un modèle d’image recommandé. Les réglages d’image personnalisés ou désactivés restent inchangés.",
       "advanced": "Options avancées du fournisseur",
       "providerOptions": "Point d’accès et options avancées de {provider}",
       "endpointTitle": "Point d’accès de {provider}",
@@ -1141,6 +1145,20 @@
       "memoryCustomDesc": "Ce fournisseur est géré via CLI ou TOML. Restaurez ici pour revenir à la recherche locale intégrée.",
       "imageModelSummary": "ID du modèle",
       "imageModelHint": "Choisissez un modèle dans le catalogue d’images du fournisseur ou saisissez un autre identifiant compatible.",
+      "imageProviderSelectLabel": "Fournisseur de génération d’images",
+      "imageProviderPlaceholder": "Choisir un fournisseur d’images",
+      "imageRecommendedGroup": "Recommandé",
+      "imageConfiguredProvidersGroup": "Configurés dans les services de modèles",
+      "imageOtherProvidersGroup": "Autres fournisseurs",
+      "imageEnabledTitle": "Activer la génération d’images",
+      "imageEnabledHint": "La désactivation conserve le fournisseur, le modèle et la référence d’identifiants.",
+      "imageRecommendedBadge": "Recommandé",
+      "imageRecommendationTitle": "Recommandé : {provider}",
+      "imageRecommendationDesc": "Un fournisseur d’images autonome et simple lorsque le fournisseur de modèles actuel ne propose pas cette configuration.",
+      "imageRecommendationRegister": "S’inscrire et obtenir une clé API",
+      "imageRecommendationRegisterExternal": "S’inscrire et obtenir une clé API — {provider} (s’ouvre dans un nouvel onglet)",
+      "imageRecommendationUse": "Utiliser {provider}",
+      "imageRecommendationSelected": "Sélectionné",
       "resetConfirmTitle": "Réinitialiser {capability} ?",
       "resetConfirmBody": "OpenSquilla supprimera la configuration enregistrée de cette capacité. Les variables d'environnement système et les identifiants de modèle partagés ne changent pas.",
       "resetConfirmBodyWithDraft": "OpenSquilla supprimera la configuration enregistrée et abandonnera les modifications non enregistrées. Les variables d'environnement système et les identifiants de modèle partagés ne changent pas.",
@@ -1443,6 +1461,8 @@
       "providerProfileSaved": "{provider} a été enregistré pour le routage.",
       "providerActiveRemoveNeedsReplacement": "Ajoutez et vérifiez un autre fournisseur avant de supprimer le fournisseur actif.",
       "providerProfileRemoved": "{provider} a été supprimé.",
+      "providerProfileRemovedImageEnv": "{provider} a été supprimé du service de modèles. La génération d’images reste disponible via {envKey}.",
+      "providerProfileRemovedImageNeedsCredential": "{provider} a été supprimé. La génération d’images a conservé son fournisseur et son modèle, mais nécessite désormais un identifiant.",
       "providerCredentialRemoved": "Les identifiants de {provider} ont été supprimés.",
       "providerCredentialExternalStillActive": "La référence aux identifiants de {provider} enregistrée dans OpenSquilla a été supprimée, mais la variable d’environnement système {envKey} fournit toujours des identifiants.",
       "providerActivated": "{provider} est maintenant actif.",
@@ -2350,6 +2370,13 @@
       "colKind": "Type",
       "colTarget": "Cible",
       "colSchedule": "Planification",
+      "colWorkspace": "Projet",
+      "defaultWorkspace": "Espace de travail par défaut",
+      "noWorkspace": "Aucun espace de projet",
+      "workspaceUnavailable": "{name} (indisponible)",
+      "rebindWorkspace": "Réassocier",
+      "rebindBeforeRun": "Réassociez l’espace de projet avant l’exécution",
+      "retry": "Réessayer",
       "colStatus": "État",
       "colLastRun": "Dernière exécution",
       "colNextRun": "Prochaine exécution",
@@ -2450,6 +2477,12 @@
       ,"moreRuntimeSettings": "Autres paramètres d’exécution (facultatif)"
       ,"advancedTimeHint": "À utiliser uniquement si le sélecteur ci-dessus ne suffit pas."
       ,"timezoneSimpleHint": "Il n’est généralement pas nécessaire de modifier ce réglage."
+      ,"projectWorkspace": "Espace de travail du projet"
+      ,"defaultWorkspace": "Utiliser l’espace de travail par défaut"
+      ,"noWorkspace": "Aucun espace de projet"
+      ,"workspaceUnavailable": "{name} (indisponible)"
+      ,"workspaceRequiredHint": "Choisissez le projet à examiner. La tâche travaillera uniquement dans ce projet."
+      ,"workspaceOptionalHint": "Facultatif. Choisissez « Aucun espace de projet » pour une tâche générale, ou un projet si ses fichiers sont nécessaires."
     },
     "form": {
       "cronPreviewPlaceholder": "Saisissez une expression cron à 5 champs pour la prévisualiser",
@@ -2482,6 +2515,7 @@
         "agentTurn": "Invite de la tâche"
       },
       "toastNameRequired": "Le nom est requis",
+      "toastWorkspaceRequired": "Choisissez un espace de travail de projet pour cette tâche",
       "toastIntervalInvalid": "L'intervalle doit être un nombre entier de secondes",
       "toastIsoTimeRequired": "L'heure ISO est requise",
       "toastCurrentSessionRequired": "L’ID de session actuel est requis",
@@ -2499,6 +2533,11 @@
       "toastRunFailed": "Échec de l'exécution : {error}",
       "toastRunComplete": "Exécution terminée : {reply}",
       "toastTriggered": "Tâche déclenchée",
+      "toastConnectionRecovered": "Connexion rétablie et état des tâches actualisé",
+      "toastConnectionRetry": "La connexion n’est pas encore rétablie. Actualisez bientôt la page.",
+      "toastBackgroundComplete": "La tâche « {name} » est terminée. Consultez le résultat dans l’historique.",
+      "toastBackgroundFailed": "La tâche « {name} » a échoué. Utilisez le bouton Réessayer de sa carte.",
+      "unnamedTask": "Tâche sans nom",
       "toastDeleted": "Tâche supprimée",
       "running": "en cours",
       "awaitingUpdate": "en attente de mise à jour",

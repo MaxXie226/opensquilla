@@ -2918,12 +2918,9 @@ watch(sessionArtifacts, artifacts => {
 })
 
 function openArtifact(artifact: ArtifactPayload): boolean {
-  if (
-    isInlineMediaArtifact(artifact)
-    || artifactWorkbenchPreviewKind(artifact) === 'unsupported'
-  ) {
-    return focusInlineDeliverable(artifact)
-  }
+  // Generated images are also inline media. Route every visual artifact to
+  // the authenticated lightbox before the inline-focus fallback so clicking
+  // either the thumbnail or its open affordance actually previews it.
   if (artifactCategory(artifact) === 'visual' && sessionKey.value) {
     artifactImageLightbox.open({
       artifact,
@@ -2931,6 +2928,12 @@ function openArtifact(artifact: ArtifactPayload): boolean {
       sessionKey: sessionKey.value,
     })
     return true
+  }
+  if (
+    isInlineMediaArtifact(artifact)
+    || artifactWorkbenchPreviewKind(artifact) === 'unsupported'
+  ) {
+    return focusInlineDeliverable(artifact)
   }
   if (!workbenchEnabled.value || !sessionKey.value) return false
   const opened = workbenchStore.openItem(createArtifactPreviewWorkbenchItem({
