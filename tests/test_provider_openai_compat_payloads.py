@@ -481,19 +481,36 @@ def test_dashscope_stream_timeout_emits_heartbeat_before_non_stream_fallback(
     )
 
 
-def test_tokenrhythm_chat_adds_app_attribution_headers(monkeypatch: Any) -> None:
+@pytest.mark.parametrize(
+    ("base_url", "expected_url"),
+    [
+        (
+            "https://tokenrhythm.studio/v1",
+            "https://tokenrhythm.studio/v1/chat/completions",
+        ),
+        (
+            "https://api-tokenrhythm.example/v1",
+            "https://api-tokenrhythm.example/v1/chat/completions",
+        ),
+    ],
+)
+def test_tokenrhythm_chat_adds_app_attribution_headers(
+    monkeypatch: Any,
+    base_url: str,
+    expected_url: str,
+) -> None:
     captured: dict[str, Any] = {}
     _patch_transport(monkeypatch, captured)
     provider = OpenAIProvider(
         api_key="test",
         model="deepseek-v4-flash",
-        base_url="https://tokenrhythm.studio/v1",
+        base_url=base_url,
         provider_kind="tokenrhythm",
     )
 
     _collect(provider, ChatConfig())
 
-    assert captured["url"] == "https://tokenrhythm.studio/v1/chat/completions"
+    assert captured["url"] == expected_url
     assert captured["headers"].get("HTTP-Referer") == "https://opensquilla.ai"
     assert captured["headers"].get("X-Title") == "OpenSquilla"
 
@@ -1360,6 +1377,40 @@ def test_deepseek_v4_non_thinking_replays_prior_reasoning_content(
         captured["payload"]["messages"][0]["reasoning_content"]
         == "prior thinking from earlier deepseek turn"
     )
+
+
+@pytest.mark.parametrize(
+    "model",
+    ["deepseek-v4-flash-0731", "tokenrhythm/deepseek-v4-flash-0731"],
+)
+def test_tokenrhythm_deepseek_v4_flash_0731_requires_reasoning_content(
+    monkeypatch: Any,
+    model: str,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="test",
+        model=model,
+        base_url="https://tokenrhythm.studio/v1",
+        provider_kind="tokenrhythm",
+    )
+    messages = [
+        Message(role="assistant", content="Prior assistant turn."),
+        Message(role="user", content="continue"),
+    ]
+
+    async def _run() -> None:
+        async for _ in provider.chat(messages, config=ChatConfig(thinking=True)):
+            pass
+
+    asyncio.run(_run())
+
+    assert captured["payload"]["messages"][0] == {
+        "role": "assistant",
+        "content": "Prior assistant turn.",
+        "reasoning_content": "",
+    }
 
 
 def test_deepseek_v4_replays_reasoning_content_without_catalog_capabilities(
