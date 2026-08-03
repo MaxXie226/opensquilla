@@ -1,7 +1,11 @@
 <template>
   <div
     class="chat"
-    :class="{ 'chat--new-landing': isNewChatLanding, 'chat--drag-over': threadDragOver }"
+    :class="{
+      'chat--new-landing': isNewChatLanding,
+      'chat--drag-over': threadDragOver,
+      'chat--plan-questionnaire-open': Boolean(dockedPlanQuestionnaire),
+    }"
     @dragenter="onChatDragEnter"
     @dragover="onChatDragOver"
     @dragleave="onChatDragLeave"
@@ -489,6 +493,21 @@
       @steer="steerPendingMessage"
     />
 
+    <div
+      v-if="dockedPlanQuestionnaire"
+      class="plan-questionnaire-dock"
+      @wheel="handlePlanQuestionnaireWheel"
+    >
+      <ClarifyCard
+        :request="dockedPlanQuestionnaire"
+        :submitted="clarifySubmitted"
+        :busy="clarifyBusy"
+        :error="clarifyError"
+        :docked="true"
+        @submit="submitClarify"
+      />
+    </div>
+
     <ChatComposer
       ref="composerRef"
       v-model="inputText"
@@ -502,6 +521,7 @@
       :placeholder="composerPlaceholder"
       :send-button-title="sendButtonTitle"
       :send-blocked-message="composerSendBlockedMessage"
+      :input-disabled="Boolean(dockedPlanQuestionnaire)"
       :run-mode="runMode"
       :allowed-run-modes="allowedRunModes"
       :run-mode-locked="runModeLocked"
@@ -764,6 +784,7 @@ import {
 import { isShareableChatMessage } from '@/utils/chat/messageIdentity'
 import { agentIdFromSessionKey } from '@/utils/chat/sessionKeys'
 import { shouldDisableLandingSuggestions } from '@/utils/chat/landingSuggestions'
+import { handoffPlanQuestionnaireWheel } from '@/utils/chat/planQuestionnaireWheel'
 import { clearAssistantActivityExpansionState } from '@/utils/chat/activityDisclosureState'
 import {
   resolveChatHistoryRecoveryState,
@@ -2037,6 +2058,16 @@ const {
 } = chatApprovals
 applyPendingUserInputSnapshot = applyUserInputBootstrap
 
+const dockedPlanQuestionnaire = computed(() => (
+  pendingClarify.value?.presentation === 'plan_questionnaire_v1'
+    ? pendingClarify.value
+    : null
+))
+
+function handlePlanQuestionnaireWheel(event: WheelEvent) {
+  handoffPlanQuestionnaireWheel(event, threadRef.value)
+}
+
 const rpcEventHandlers = useChatRpcEventHandlers({
   sessionKey,
   currentEpoch,
@@ -2409,6 +2440,7 @@ const showConfirmedEmptySession = computed(() => shouldShowConfirmedEmptySession
 }))
 
 const composerPlaceholder = computed(() => {
+  if (dockedPlanQuestionnaire.value) return t('chat.clarify.answerPlanQuestionnaire')
   if (replanActive.value) return t('chat.plan.revisePromptPlaceholder')
   if (collaboration.value.mode === 'plan') return t('chat.planMode.placeholder')
   if (isNewChatLanding.value) return t('chat.placeholderLanding')
