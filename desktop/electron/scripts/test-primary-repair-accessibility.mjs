@@ -66,7 +66,10 @@ const LOCALES = {
 
 const BLOCKING_CASES = {
   en: { fixture: 'missing-workspace', stableCode: 'effective_workspace_missing' },
-  'zh-Hans': { fixture: 'corrupt-config', stableCode: 'config_invalid' },
+  // config_invalid no longer reaches the repair page: the desktop runs the
+  // recover-config CLI automatically. The pre-RC4 import journal is the
+  // remaining config-adjacent authority that must stay manual.
+  'zh-Hans': { fixture: 'legacy-import-transaction', stableCode: 'legacy_import_transaction_incomplete' },
   ja: { fixture: 'future-config', stableCode: 'config_schema_too_new' },
   fr: { fixture: 'unfinished-transaction', stableCode: 'transaction_incomplete' },
   de: { fixture: 'unsafe-database', stableCode: 'state_database_invalid' },
@@ -186,8 +189,6 @@ async function createFixture(locale, blockingCase) {
       `workspace_dir = ${JSON.stringify(missingWorkspace)}`,
       '',
     ].join('\n')
-  } else if (blockingCase.fixture === 'corrupt-config') {
-    config = 'workspace_dir = "unterminated\n'
   } else if (blockingCase.fixture === 'future-config') {
     config = 'config_version = 999\n'
   }
@@ -205,6 +206,10 @@ async function createFixture(locale, blockingCase) {
   } else if (blockingCase.fixture === 'cleanup-transaction') {
     journalPath = join(userData, '.opensquilla.profile-cleanup.json')
     journalBytes = 'synthetic interrupted cleanup authority\n'
+    await writeFile(journalPath, journalBytes, 'utf8')
+  } else if (blockingCase.fixture === 'legacy-import-transaction') {
+    journalPath = join(userData, '.opensquilla.import-commit.json')
+    journalBytes = 'synthetic legacy import authority\n'
     await writeFile(journalPath, journalBytes, 'utf8')
   }
   await writeFile(join(userData, 'desktop-locale'), locale, 'utf8')
