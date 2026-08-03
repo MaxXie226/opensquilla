@@ -78,6 +78,36 @@
 
   Commit the Vue, tests, and locale changes with `feat: show Windows sandbox setup progress`.
 
+### Task 2A: Batch persistent child ACL resets
+
+**Files:**
+- Modify: `tests/test_sandbox/test_windows_default_network.py`
+- Modify: `src/opensquilla/sandbox/backend/windows_default_setup.py`
+
+**Interfaces:**
+- Consumes: the existing validated persistent roots and their current direct children.
+- Produces: one recursive `icacls <root>\* /reset /t /L` call per non-empty root, with the root ACL and existing failure contract unchanged.
+
+- [x] **Step 1: Write a failing batching test**
+
+  Create two existing sandbox children, record `subprocess.run` calls, and require one wildcard reset command instead of one reset per child.
+
+- [x] **Step 2: Verify native wildcard behavior**
+
+  Exercise `icacls <temporary-root>\* /reset /t /L` on a disposable tree and require success, recursive processing, and an unchanged root SDDL.
+
+- [x] **Step 3: Implement the minimal batch**
+
+  Keep the initial inheritance removal, trusted root grant, offline-SID removal, `/L`, lease checks, and error handling unchanged. Replace only the per-child reset command list with one wildcard reset for non-empty roots.
+
+- [x] **Step 4: Verify green**
+
+  Run the focused lock tests and the full Windows firewall/network/setup-state regression set.
+
+- [ ] **Step 5: Commit**
+
+  Commit the implementation, regression test, and updated performance documents with `perf: batch Windows sandbox ACL reset`.
+
 ### Task 3: Rebuild and end-to-end verification
 
 **Files:**

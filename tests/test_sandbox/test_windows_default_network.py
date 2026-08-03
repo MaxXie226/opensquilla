@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import inspect
 import json
+import subprocess
+import sys
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -781,6 +783,146 @@ def test_lock_revalidates_tree_before_each_recursive_acl_mutation(monkeypatch, t
     assert len(validations) >= len(commands)
     assert commands
     assert all("/L" in command for command in commands)
+
+
+def test_lock_batches_existing_child_acl_resets(monkeypatch, tmp_path) -> None:
+    from opensquilla.sandbox.backend import windows_default_setup as mod
+
+    profile = tmp_path / "profile"
+    sandbox_root = profile / ".opensquilla" / "sandbox"
+    (sandbox_root / "workspace-a").mkdir(parents=True)
+    (sandbox_root / "workspace-b").mkdir()
+    secrets_root = profile / ".opensquilla" / "sandbox-secrets"
+    (secrets_root / "provider-a").mkdir(parents=True)
+    bin_root = profile / ".opensquilla" / "sandbox-bin"
+    (bin_root / "runtime-a").mkdir(parents=True)
+    marker = sandbox_root / "setup_marker.json"
+    commands = []
+
+    class Completed:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(
+        mod.subprocess,
+        "run",
+        lambda command, **_kwargs: commands.append(command) or Completed(),
+    )
+    monkeypatch.setattr(mod, "_current_windows_user_sid", lambda: "S-1-real")
+
+    mod.lock_persistent_sandbox_dirs(marker, offline_sid="S-1-offline")
+
+    reset_commands = [command for command in commands if "/reset" in command]
+    assert reset_commands == [
+        ["icacls", str(sandbox_root / "*"), "/reset", "/t", "/L"],
+        ["icacls", str(secrets_root / "*"), "/reset", "/t", "/L"],
+        ["icacls", str(bin_root / "*"), "/reset", "/t", "/L"],
+    ]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="requires Windows icacls")
+def test_icacls_wildcard_reset_is_recursive_without_touching_root_or_link_target(
+    tmp_path,
+    request,
+) -> None:
+    root = tmp_path / "root"
+    nested = root / "child" / "nested"
+    outside = tmp_path / "outside"
+    nested.mkdir(parents=True)
+    outside.mkdir()
+
+    def icacls(*arguments: str) -> None:
+        completed = subprocess.run(
+            ["icacls", *arguments],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stderr or completed.stdout
+
+    def restore_outside_acl() -> None:
+        subprocess.run(
+            ["icacls", str(outside), "/inheritance:e", "/L"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        subprocess.run(
+            ["icacls", str(outside), "/reset", "/t", "/L"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    request.addfinalizer(restore_outside_acl)
+
+    def acl_state(path: Path) -> dict[str, object]:
+        script = (
+            "& { param($itemPath) $acl = Get-Acl -LiteralPath $itemPath; "
+            "[pscustomobject]@{ "
+            "Sddl = $acl.Sddl; Protected = $acl.AreAccessRulesProtected "
+            "} | ConvertTo-Json -Compress }"
+        )
+        completed = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                script,
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stderr or completed.stdout
+        return json.loads(completed.stdout)
+
+    icacls(str(nested), "/inheritance:r", "/L")
+    icacls(str(outside), "/inheritance:d", "/L")
+    root_before = acl_state(root)
+    outside_before = acl_state(outside)
+    assert acl_state(nested)["Protected"] is True
+
+    icacls(str(root / "*"), "/reset", "/t", "/L")
+
+    assert acl_state(root) == root_before
+    assert acl_state(nested)["Protected"] is False
+    assert acl_state(outside) == outside_before
+
+    link = root / "outside-link"
+    junction = subprocess.run(
+        [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            (
+                "& { param($linkPath, $targetPath) "
+                "New-Item -ItemType Junction -Path $linkPath "
+                "-Target $targetPath | Out-Null }"
+            ),
+            str(link),
+            str(outside),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert junction.returncode == 0, junction.stderr or junction.stdout
+    linked_reset = subprocess.run(
+        ["icacls", str(root / "*"), "/reset", "/t", "/L"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert linked_reset.returncode in {0, 5}
+    assert acl_state(root) == root_before
+    assert acl_state(outside) == outside_before
 
 
 def test_elevated_setup_does_not_write_failure_report_after_lease_race(

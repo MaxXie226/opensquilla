@@ -996,19 +996,21 @@ def lock_persistent_sandbox_dirs(
                     "/t",
                 ],
             ]
-            commands.extend(
-                ["icacls", str(child), "/reset", "/t"] for child in children
-            )
-            commands.append(
-                ["icacls", str(root), "/remove:g", f"*{offline_sid}", "/t"]
-            )
+            if children:
+                # icacls expands this wildcard itself, so all existing children
+                # can be reset in one process without changing the root ACL.
+                commands.append(["icacls", str(root / "*"), "/reset", "/t"])
+            commands.append(["icacls", str(root), "/remove:g", f"*{offline_sid}", "/t"])
+            skip_revalidation_indices = {1}
+            if children:
+                skip_revalidation_indices.add(2)
             for command_index, command in enumerate(commands):
                 # Root inheritance is removed first.  The next command
                 # immediately establishes the trusted explicit ACL; reopening
                 # the tree in between would fail for legacy roots that had no
                 # explicit owner ACE.  Existing children are then reset so
                 # they inherit only that trusted root ACL.
-                if command_index not in {1, *range(2, 2 + len(children))}:
+                if command_index not in skip_revalidation_indices:
                     _validate_setup_directory_lease(active_lease, recursive=True)
                 command.append("/L")
                 completed = subprocess.run(command, capture_output=True, text=True, check=False)
