@@ -866,6 +866,7 @@
       "tests/test_provider_text_tool_normalization.py",
       "tests/test_recovery/test_atomic_and_locking.py",
       "tests/test_recovery/test_cleanup.py",
+      "tests/test_recovery/test_config_recovery.py",
       "tests/test_recovery/test_consolidate.py",
       "tests/test_recovery/test_engine.py",
       "tests/test_recovery/test_fixture_contracts.py",
