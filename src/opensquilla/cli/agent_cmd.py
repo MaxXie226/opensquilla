@@ -177,24 +177,22 @@ async def run_agent_once(
     permissions_override = (
         permissions is not None or os.environ.get("OPENSQUILLA_AGENT_PERMISSIONS") is not None
     )
-    sandbox_settings = getattr(cfg, "sandbox", None)
-    explicit_run_mode = getattr(sandbox_settings, "run_mode", None)
-    run_mode = None
-    if not permissions_override:
-        if explicit_run_mode:
-            run_mode = normalize_run_mode(explicit_run_mode).value
-        elif permissions_profile == "restricted":
-            run_mode = configured_default_run_mode(cfg).value
+    run_mode = configured_default_run_mode(cfg).value
     accepted_run_mode_override = None
-    if explicit_run_mode and run_mode is not None:
+    if permissions_override:
         from opensquilla.gateway.project_workspace_runtime import (
             AcceptedRunModeOverride,
         )
 
+        run_mode = (
+            "full"
+            if permissions_profile in {"bypass", "full"}
+            else "safe"
+        )
         accepted_run_mode_override = AcceptedRunModeOverride(
             run_mode=normalize_run_mode(run_mode),
-            run_mode_source="operator_default",
-            source="config",
+            run_mode_source="user",
+            source="request",
         )
     run_attachments: list[dict[str, Any]] = list(attachments or [])
     if attachment_paths:

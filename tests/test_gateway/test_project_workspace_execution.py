@@ -175,7 +175,7 @@ def create_windows_junction(link: Path, target: Path) -> subprocess.CompletedPro
 
 
 @pytest.mark.asyncio
-async def test_new_owner_project_uses_safe_with_operator_default_provenance(
+async def test_new_owner_project_uses_full_with_operator_default_provenance(
     tmp_path: Path,
 ) -> None:
     async with open_stack(tmp_path / "sessions.db") as stack:
@@ -203,7 +203,7 @@ async def test_new_owner_project_uses_safe_with_operator_default_provenance(
         assert session.origin is not None
         saved_context = session.origin[RUN_CONTEXT_ORIGIN_KEY]
         assert saved_context["workspace"] == project.path
-        assert saved_context["run_mode"] == "safe"
+        assert saved_context["run_mode"] == "full"
         assert saved_context["run_mode_source"] == "operator_default"
 
 

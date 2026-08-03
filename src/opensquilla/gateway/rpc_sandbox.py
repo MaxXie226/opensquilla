@@ -47,9 +47,11 @@ from opensquilla.sandbox.policy_store import (
 )
 from opensquilla.sandbox.run_context import (
     RUN_CONTEXT_ORIGIN_KEY,
+    RUN_MODE_PREFERENCE_KEY,
     RunContext,
     get_run_context,
     normalize_workspace_path,
+    resolve_default_run_mode,
     set_run_mode,
 )
 from opensquilla.sandbox.run_context_service import (
@@ -63,14 +65,12 @@ from opensquilla.sandbox.run_context_service import (
 )
 from opensquilla.sandbox.run_mode import (
     RunMode,
-    config_run_mode,
     display_name,
     execution_target,
     normalize_run_mode,
 )
 from opensquilla.sandbox.run_mode_policy import (
     coerce_run_mode_for_principal,
-    default_run_mode_for_principal,
     run_mode_allowed_for_principal,
 )
 from opensquilla.sandbox.runtime_launcher import ChildRole, internal_child_argv
@@ -83,7 +83,6 @@ from opensquilla.sandbox.status import status_payload
 from opensquilla.session.keys import parse_agent_id
 
 _d = get_dispatcher()
-_RUN_MODE_PREFERENCE_KEY = "sandbox.run_mode"
 _RUN_MODE_PREFERENCE_CHANGED_EVENT = "sandbox.run_mode.preference.changed"
 _WINDOWS_CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -927,22 +926,7 @@ async def _handle_run_mode_preference_get(
 ) -> dict[str, str]:
     if params is not None and not isinstance(params, dict):
         raise ValueError("params must be an object")
-    storage = _runtime_preference_storage(ctx)
-    stored = await storage.get_runtime_preference(_RUN_MODE_PREFERENCE_KEY)
-    sandbox = getattr(ctx.config, "sandbox", None)
-    fields_set = getattr(sandbox, "model_fields_set", None)
-    if fields_set is None:
-        fields_set = getattr(sandbox, "__fields_set__", ())
-    configured = "run_mode" in fields_set
-    if stored is not None:
-        source = "preference"
-        mode = normalize_run_mode(stored)
-    elif configured:
-        source = "config"
-        mode = config_run_mode(ctx.config)
-    else:
-        source = "default"
-        mode = default_run_mode_for_principal(ctx.principal)
+    mode, source = await resolve_default_run_mode(ctx.session_manager, ctx.config)
     mode = coerce_run_mode_for_principal(mode, ctx.principal)
     return {"runMode": mode.value, "source": source}
 
@@ -958,7 +942,7 @@ async def _handle_run_mode_preference_set(
     await _require_sandbox_setup_ready_for_mode(ctx, mode)
     storage = _runtime_preference_storage(ctx)
     confirmed = await storage.set_runtime_preference(
-        _RUN_MODE_PREFERENCE_KEY,
+        RUN_MODE_PREFERENCE_KEY,
         mode.value,
     )
     payload = {"runMode": confirmed, "source": "preference"}

@@ -1039,7 +1039,7 @@ async def test_service_container_close_cancels_profile_import_maintenance() -> N
 
 
 @pytest.mark.asyncio
-async def test_bare_full_default_boots_safe_capability(
+async def test_bare_full_default_boots_full_capability(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1079,7 +1079,7 @@ async def test_bare_full_default_boots_safe_capability(
         assert settings.sandbox is True
         assert settings.security_grading is True
         assert settings.network_default == "proxy_allowlist"
-        assert default_mode is RunMode.SAFE
+        assert default_mode is RunMode.FULL
     finally:
         await services.close()
 
@@ -2891,6 +2891,7 @@ async def test_task_runtime_turn_uses_owner_boundary_for_owner_cron_job() -> Non
         name="Owner",
         payload={"kind": "agent_turn", "agent_id": "ops"},
         creator_is_owner=True,
+        creator_host_execute=True,
         run_mode="full",
         elevated="full",
         execution_target="host",

@@ -255,7 +255,7 @@ async def test_sandbox_context_get_uses_bound_project_not_agent_default(
 
 
 @pytest.mark.asyncio
-async def test_sandbox_context_get_defaults_bound_owner_project_to_safe(
+async def test_sandbox_context_get_defaults_fresh_bound_owner_project_to_full(
     project_sandbox_ctx: tuple[RpcContext, SessionNode, ProjectWorkspace],
 ) -> None:
     from opensquilla.gateway.rpc_sandbox import _handle_sandbox_run_context_get
@@ -269,7 +269,7 @@ async def test_sandbox_context_get_defaults_bound_owner_project_to_safe(
     )
 
     assert payload["workspace"] == project.path
-    assert payload["runMode"] == "safe"
+    assert payload["runMode"] == "full"
 
 
 @pytest.mark.asyncio

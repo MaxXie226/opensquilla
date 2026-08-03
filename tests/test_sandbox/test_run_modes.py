@@ -44,13 +44,13 @@ def test_legacy_aliases_normalize_to_canonical_modes(
     assert normalize_run_mode(legacy_value).value == expected
 
 
-def test_fresh_gateway_defaults_to_safe() -> None:
+def test_fresh_gateway_defaults_to_full() -> None:
     config = GatewayConfig()
 
     assert config.permissions.default_mode == "off"
-    assert config.sandbox.run_mode == "safe"
-    assert config_run_mode(config) is RunMode.SAFE
-    assert project_default_run_mode(config) is RunMode.SAFE
+    assert config.sandbox.run_mode == "full"
+    assert config_run_mode(config) is RunMode.FULL
+    assert project_default_run_mode(config) is RunMode.FULL
     assert sandbox_runtime_capability_mode(config) is RunMode.SAFE
 
 
@@ -108,7 +108,7 @@ def test_legacy_bypass_state_maps_to_full_host_access() -> None:
     assert mode == RunMode.FULL
 
 
-def test_default_sandbox_settings_resolve_to_safe_run_mode() -> None:
+def test_default_sandbox_settings_resolve_to_full_run_mode() -> None:
     settings = SandboxSettings()
     config = types.SimpleNamespace(
         sandbox=settings,
@@ -117,9 +117,9 @@ def test_default_sandbox_settings_resolve_to_safe_run_mode() -> None:
 
     effective = settings.validate_combination()
 
-    assert effective.sandbox_enabled is True
-    assert effective.grading_enabled is True
-    assert config_run_mode(config) == RunMode.SAFE
+    assert effective.sandbox_enabled is False
+    assert effective.grading_enabled is False
+    assert config_run_mode(config) == RunMode.FULL
 
 
 def test_legacy_off_state_maps_to_safe() -> None:
@@ -218,14 +218,14 @@ def test_normalize_run_mode_accepts_user_facing_spellings() -> None:
     assert normalize_run_mode("bypass") == RunMode.FULL
 
 
-def test_bare_fresh_config_uses_safe_for_ordinary_and_project_execution() -> None:
+def test_bare_fresh_config_uses_full_for_ordinary_and_project_execution() -> None:
     config = types.SimpleNamespace(
         sandbox=SandboxSettings(),
         permissions=PermissionsConfig(),
     )
 
-    assert config_run_mode(config) is RunMode.SAFE
-    assert project_default_run_mode(config) is RunMode.SAFE
+    assert config_run_mode(config) is RunMode.FULL
+    assert project_default_run_mode(config) is RunMode.FULL
     assert sandbox_runtime_capability_mode(config) is RunMode.SAFE
 
 
@@ -285,7 +285,7 @@ def test_status_payload_distinguishes_default_policy_from_runtime_capability(
     ) == expected
 
 
-def test_bare_config_status_reports_safe_default_and_capability() -> None:
+def test_bare_config_status_reports_full_default_and_safe_capability() -> None:
     config = types.SimpleNamespace(
         sandbox=SandboxSettings(),
         permissions=PermissionsConfig(),
@@ -293,15 +293,15 @@ def test_bare_config_status_reports_safe_default_and_capability() -> None:
 
     payload = status_payload(config)
 
-    assert payload["run_mode"] == "safe"
-    assert payload["execution_target"] == "sandbox"
-    assert payload["owner_execution_target"] == "sandbox"
-    assert payload["sandbox_required_for_owner_default"] is True
+    assert payload["run_mode"] == "full"
+    assert payload["execution_target"] == "host"
+    assert payload["owner_execution_target"] == "host"
+    assert payload["sandbox_required_for_owner_default"] is False
     assert payload["sandbox_backend_configured"] == "auto"
-    assert payload["project_default_run_mode"] == "safe"
+    assert payload["project_default_run_mode"] == "full"
     assert payload["runtime_capability_run_mode"] == "safe"
     assert payload["runtime_sandbox_required"] is True
     assert payload["permissions"] == {
         "default_mode": "off",
-        "effective_mode": "safe",
+        "effective_mode": "full",
     }

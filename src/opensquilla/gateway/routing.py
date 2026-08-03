@@ -281,9 +281,14 @@ def build_cron_route_envelope(
     sender_id = f"cron-job-{job_id}"
     metadata: dict[str, Any] = {"job_id": job_id, "job_name": job_name}
     creator_is_owner = bool(getattr(job, "creator_is_owner", False))
-    if creator_is_owner:
+    creator_host_execute = bool(getattr(job, "creator_host_execute", False))
+    trusted_creator_owner = creator_is_owner and creator_host_execute
+    if trusted_creator_owner:
         metadata["principal_is_owner"] = True
         metadata["cron_trusted_owner"] = True
+    if creator_host_execute:
+        metadata[PRINCIPAL_HOST_EXECUTE_METADATA_KEY] = True
+        metadata["cron_trusted_host"] = True
     job_run_mode = getattr(job, "run_mode", "")
     if job_run_mode:
         try:
@@ -291,9 +296,14 @@ def build_cron_route_envelope(
         except ValueError:
             normalized_job_run_mode = None
         if normalized_job_run_mode is not None:
+            if (
+                normalized_job_run_mode is RunMode.FULL
+                and not creator_host_execute
+            ):
+                normalized_job_run_mode = RunMode.SAFE
             metadata["run_mode"] = normalized_job_run_mode.value
             metadata["execution_target"] = execution_target(normalized_job_run_mode)
-            if normalized_job_run_mode is RunMode.FULL and creator_is_owner:
+            if normalized_job_run_mode is RunMode.FULL and creator_host_execute:
                 metadata["elevated"] = "full"
     tool_policy = getattr(job, "tool_policy", None)
     if isinstance(tool_policy, dict) and tool_policy:
@@ -507,8 +517,14 @@ def tool_context_from_envelope(
         and bool(envelope.metadata.get("cron_trusted_owner"))
         and is_owner
     )
+    cron_trusted_host = (
+        caller_kind is CallerKind.CRON
+        and bool(envelope.metadata.get("cron_trusted_host"))
+        and host_execute_allowed
+    )
+    cron_trusted = cron_trusted_owner or cron_trusted_host
     if caller_kind is CallerKind.CRON:
-        if not cron_trusted_owner:
+        if not cron_trusted:
             allowed_tools = set(CRON_AGENT_ALLOW)
             denied_tools = set(CRON_AGENT_DENY)
     elif caller_kind is CallerKind.SUBAGENT:
@@ -603,7 +619,7 @@ def tool_context_from_envelope(
         denied_tools=denied_tools,
         elevated=elevated,
         tool_policy=(
-            envelope.metadata.get("tool_policy") if cron_trusted_owner else None
+            envelope.metadata.get("tool_policy") if cron_trusted else None
         ),
         task_id=(
             str(envelope.metadata["task_id"])
@@ -638,7 +654,7 @@ def tool_context_from_envelope(
         # the only ingress that sets this field for ordinary turns.
         setattr(ctx, "_sandbox_run_context_fresh", True)
     if caller_kind is CallerKind.CRON:
-        if not cron_trusted_owner:
+        if not cron_trusted:
             ctx = apply_tool_policy_layer(
                 ctx,
                 envelope.metadata.get("tool_policy"),

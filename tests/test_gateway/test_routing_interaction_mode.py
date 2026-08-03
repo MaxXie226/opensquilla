@@ -127,6 +127,7 @@ def test_cron_default_elevated_resolves_at_context_build_time() -> None:
         name="owner",
         session_target=SessionTarget.ISOLATED,
         creator_is_owner=True,
+        creator_host_execute=True,
     )
     default_mode = {"value": "full"}
 
@@ -243,7 +244,12 @@ def test_channel_route_strips_forged_host_execution_authority() -> None:
 
 
 def test_owner_cron_route_carries_owner_principal_for_task_runtime() -> None:
-    cron_job = SimpleNamespace(id="job-owner", name="owner", creator_is_owner=True)
+    cron_job = SimpleNamespace(
+        id="job-owner",
+        name="owner",
+        creator_is_owner=True,
+        creator_host_execute=True,
+    )
 
     envelope = build_cron_route_envelope(cron_job, session_key="cron:job-owner")
 
@@ -256,6 +262,7 @@ def test_owner_cron_route_uses_owner_grade_tool_boundary() -> None:
         id="job-owner",
         name="owner",
         creator_is_owner=True,
+        creator_host_execute=True,
         run_mode="full",
         elevated="full",
         execution_target="host",
@@ -289,3 +296,37 @@ def test_non_owner_cron_route_keeps_restricted_tool_boundary() -> None:
     assert ctx.allowed_tools is not None
     assert "exec_command" not in ctx.allowed_tools
     assert "exec_command" in ctx.denied_tools
+
+
+def test_host_capable_cron_route_keeps_non_owner_identity_with_host_tools() -> None:
+    cron_job = SimpleNamespace(
+        id="job-host-token",
+        name="host token",
+        creator_is_owner=False,
+        creator_host_execute=True,
+        run_mode="full",
+        elevated="full",
+        execution_target="host",
+    )
+    envelope = build_cron_route_envelope(cron_job, session_key="cron:job-host-token")
+
+    assert _task_runtime_envelope_owner(envelope) is False
+    assert _task_runtime_envelope_host_execute(envelope) is True
+    ctx = tool_context_from_envelope(
+        envelope,
+        is_owner=_task_runtime_envelope_owner(envelope),
+        host_execute_allowed=_task_runtime_envelope_host_execute(envelope),
+    )
+
+    assert ctx.caller_kind is CallerKind.CRON
+    assert ctx.is_owner is False
+    assert ctx.allowed_tools is None
+    assert "exec_command" not in ctx.denied_tools
+    assert ctx.run_mode == "full"
+    assert ctx.elevated == "full"
+
+    handler_ctx = _build_cron_tool_context("main", CronJob(**vars(cron_job)))
+    assert handler_ctx.is_owner is False
+    assert handler_ctx.allowed_tools is None
+    assert "exec_command" not in handler_ctx.denied_tools
+    assert handler_ctx.run_mode == "full"

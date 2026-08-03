@@ -78,10 +78,11 @@ class SandboxSettings(BaseSettings):
       active. When false, the system uses a fixed ``STANDARD`` policy with no
       dynamic escalation.
 
-    Both default to ``True`` so fresh local/operator installs start in Safe.
-    Invalid combinations are coerced with an explicit
-    warning via :meth:`validate_combination`; the coercion is deliberate so
-    upgrades of existing deployments do not hard-fail.
+    Fresh local/operator installs default to Full host access. Safe remains
+    available as an explicit persisted preference. Invalid combinations are
+    coerced with an explicit warning via :meth:`validate_combination`; the
+    coercion is deliberate so upgrades of existing deployments do not
+    hard-fail.
     """
 
     model_config = SettingsConfigDict(env_prefix="OPENSQUILLA_SANDBOX_")
@@ -91,7 +92,7 @@ class SandboxSettings(BaseSettings):
     default_level: SecurityLevel = SecurityLevel.STANDARD
     backend: BackendName = "auto"
     allow_legacy_mode: bool = False
-    run_mode: RunModeName = "safe"
+    run_mode: RunModeName = "full"
     auto_setup: bool = True
     host_root_readonly: bool = True
     exclude_slash_tmp: bool = False

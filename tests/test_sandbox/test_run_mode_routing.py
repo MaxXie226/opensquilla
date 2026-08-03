@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from opensquilla.channels.admission import CHANNEL_ADMIN_VERIFIED_METADATA_KEY
@@ -62,21 +64,57 @@ def test_saved_route_run_mode_wins_over_later_global_full_default() -> None:
     assert ctx.elevated is None
 
 
-def test_host_execute_capability_preserves_full_without_owner_authority() -> None:
+@pytest.mark.asyncio
+async def test_valid_named_token_preserves_persisted_full_without_owner_authority() -> None:
+    from opensquilla.sandbox.run_context import get_run_context
+    from opensquilla.sandbox.run_mode_policy import principal_has_host_execute
+
+    async def get_runtime_preference(key: str) -> str:
+        assert key == "sandbox.run_mode"
+        return "full"
+
+    async def get_session(_session_key: str) -> None:
+        return None
+
+    manager = SimpleNamespace(
+        storage=SimpleNamespace(get_runtime_preference=get_runtime_preference),
+        get_session=get_session,
+    )
+    run_context = await get_run_context(
+        manager,
+        "agent:main:webchat:host-token",
+        config=SimpleNamespace(
+            sandbox=SimpleNamespace(
+                run_mode="safe",
+                model_fields_set={"run_mode"},
+            ),
+            permissions=SimpleNamespace(default_mode="off"),
+        ),
+        workspace=None,
+    )
+    principal = Principal(
+        role="operator",
+        scopes=frozenset({"operator.write", "operator.read"}),
+        is_owner=False,
+        authenticated=True,
+        capabilities=frozenset({"host.execute"}),
+        auth_state="authenticated",
+        token_public_id="host-token",
+    )
     envelope = build_web_route_envelope(
         session_key="agent:main:webchat:host-token",
         principal_is_owner=False,
     )
     _apply_run_context_route_metadata(
         envelope,
-        RunContext(run_mode=RunMode.FULL, source="user"),
+        run_context,
         principal_is_owner=False,
     )
 
     ctx = tool_context_from_envelope(
         envelope,
         is_owner=False,
-        host_execute_allowed=True,
+        host_execute_allowed=principal_has_host_execute(principal),
     )
 
     assert ctx.run_mode == "full"
