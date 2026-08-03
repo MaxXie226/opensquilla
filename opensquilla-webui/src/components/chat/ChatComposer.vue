@@ -869,6 +869,7 @@ defineExpose<ChatComposerExpose>({
   gap: var(--sp-2);
   padding: var(--sp-2) var(--sp-3);
   border-bottom: 1px solid color-mix(in srgb, var(--accent) 24%, var(--border));
+  border-radius: var(--radius-modal) var(--radius-modal) 0 0;
   background: color-mix(in srgb, var(--accent) 6%, transparent);
   color: var(--text-muted);
   font-size: var(--fs-xs);

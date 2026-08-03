@@ -1399,6 +1399,12 @@ class ImageGenerationOpenRouterProviderConfig(BaseModel):
     api_key_env: str = "OPENROUTER_API_KEY"
 
 
+class ImageGenerationTokenRhythmProviderConfig(BaseModel):
+    base_url: str = "https://tokenrhythm.studio/v1"
+    api_key: str = ""
+    api_key_env: str = "TOKENRHYTHM_API_KEY"
+
+
 class ImageGenerationQwenTokenPlanProviderConfig(BaseModel):
     base_url: str = "https://token-plan.cn-beijing.maas.aliyuncs.com/api/v1"
     api_key: str = ""
@@ -1412,6 +1418,9 @@ class ImageGenerationProvidersConfig(BaseModel):
     openrouter: ImageGenerationOpenRouterProviderConfig = Field(
         default_factory=ImageGenerationOpenRouterProviderConfig
     )
+    tokenrhythm: ImageGenerationTokenRhythmProviderConfig = Field(
+        default_factory=ImageGenerationTokenRhythmProviderConfig
+    )
     qwen_token_plan: ImageGenerationQwenTokenPlanProviderConfig = Field(
         default_factory=ImageGenerationQwenTokenPlanProviderConfig
     )
@@ -1424,6 +1433,10 @@ class ImageGenerationConfig(BaseSettings):
     )
 
     enabled: bool = False
+    # ``follow_llm`` is written only by an explicit provider-configuration
+    # intent. Existing image sections load as ``custom`` so upgrades never
+    # silently replace an operator-owned route or re-enable a disabled tool.
+    binding: Literal["custom", "follow_llm"] = "custom"
     primary: str = "openai/gpt-image-1"
     fallbacks: list[str] = Field(default_factory=list)
     size: str = "1024x1024"

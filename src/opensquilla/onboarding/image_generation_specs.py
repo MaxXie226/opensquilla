@@ -57,6 +57,16 @@ _IMAGE_PROVIDER_DATA: dict[str, dict[str, Any]] = {
         "default_model": "openrouter/google/gemini-3.1-flash-image-preview",
         "suggested_models": ("openrouter/google/gemini-3.1-flash-image-preview",),
     },
+    "tokenrhythm": {
+        "label": "TokenRhythm Images",
+        "env_key": "TOKENRHYTHM_API_KEY",
+        "default_base_url": IMAGE_GENERATION_OFFICIAL_BASE_URLS["tokenrhythm"],
+        "default_model": "tokenrhythm/qwen-image-2.0",
+        "suggested_models": (
+            "tokenrhythm/qwen-image-2.0",
+            "tokenrhythm/wan2.7-image",
+        ),
+    },
     "qwen_token_plan": {
         "label": "Qwen Token Plan Images",
         "env_key": "QWEN_TOKEN_PLAN_API_KEY",
