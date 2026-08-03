@@ -110,6 +110,7 @@
       "tests/test_provider/test_failure_injection.py",
       "tests/test_provider/test_live_catalog.py",
       "tests/test_provider/test_preset_registry.py",
+      "tests/test_provider/test_tokenrhythm_traceback_boundaries.py",
       "tests/test_provider_anthropic_sse_nospace.py",
       "tests/test_provider_app_attribution.py",
       "tests/test_provider_execution_status_projection.py",

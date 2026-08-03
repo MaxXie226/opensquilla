@@ -688,6 +688,7 @@
     "tests/test_provider/test_shared_catalog.py": 0.01,
     "tests/test_provider/test_spec_substrate.py": 0.01,
     "tests/test_provider/test_stream_goldens.py": 0.057,
+    "tests/test_provider/test_tokenrhythm_traceback_boundaries.py": 0.01,
     "tests/test_provider/test_trace_recorder.py": 0.011,
     "tests/test_provider_anthropic_sse_nospace.py": 0.01,
     "tests/test_provider_anthropic_usage.py": 0.05,
