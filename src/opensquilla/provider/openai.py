@@ -44,6 +44,7 @@ from .error_redaction import (
 )
 from .failures import retry_after_from_headers
 from .fx import TOKENRHYTHM_CNY_PER_USD, TOKENRHYTHM_CNY_PER_USD_NANOS
+from .model_identity import model_basename
 from .protocol import ProviderConnectionConfig, ProviderMetadata
 from .reasoning_dialects import (
     ReasoningDisableArgs,
@@ -603,10 +604,6 @@ def _strip_think_tags(text: str) -> str:
     return result.strip()
 
 
-def _model_basename(model: str) -> str:
-    return model.rsplit("/", 1)[-1].strip().lower()
-
-
 def _on_official_host(policy: OpenAICompatPolicy, base_url: str) -> bool:
     return bool(policy.official_host) and policy.official_host in base_url.lower()
 
@@ -620,7 +617,7 @@ def _uses_max_completion_tokens(
         return False
     if not _on_official_host(policy, base_url):
         return False
-    return _model_basename(model).startswith(policy.max_completion_tokens_model_prefixes)
+    return model_basename(model).startswith(policy.max_completion_tokens_model_prefixes)
 
 
 def _should_use_max_completion_tokens(
@@ -681,7 +678,7 @@ def _should_send_temperature(
 ) -> bool:
     if cfg.temperature is None:
         return False
-    model_name = _model_basename(model)
+    model_name = model_basename(model)
     if (
         policy.fixed_sampling_model_prefixes
         and model_name.startswith(policy.fixed_sampling_model_prefixes)
@@ -709,7 +706,7 @@ def _apply_compat_request_constraints(
 ) -> None:
     """Apply declarative endpoint constraints after generic payload assembly."""
 
-    model_name = _model_basename(model)
+    model_name = model_basename(model)
     force_thinking = model_name in policy.force_thinking_model_ids
     if force_thinking:
         payload["enable_thinking"] = True
@@ -2445,8 +2442,8 @@ def _requires_assistant_reasoning_content(
     *,
     thinking: bool = False,
 ) -> bool:
-    model_name = _model_basename(model)
-    return model.strip().lower() in policy.require_reasoning_content_model_ids or (
+    model_name = model_basename(model)
+    return model_name in policy.require_reasoning_content_model_ids or (
         thinking
         and model_name
         in policy.require_reasoning_content_when_thinking_model_ids
@@ -2459,7 +2456,7 @@ def _effective_policy_thinking(
     *,
     thinking: bool,
 ) -> bool:
-    return thinking or _model_basename(model) in policy.force_thinking_model_ids
+    return thinking or model_basename(model) in policy.force_thinking_model_ids
 
 
 def _requires_tool_call_reasoning_content(
@@ -2470,7 +2467,7 @@ def _requires_tool_call_reasoning_content(
 ) -> bool:
     return (
         thinking
-        and _model_basename(model)
+        and model_basename(model)
         in policy.require_tool_call_reasoning_content_when_thinking_model_ids
     )
 
@@ -2482,7 +2479,7 @@ def _should_replay_reasoning_content(
     caps: ModelCapabilities | None,
     thinking: bool = False,
 ) -> bool:
-    model_name = _model_basename(model)
+    model_name = model_basename(model)
     effective_thinking = _effective_policy_thinking(
         policy, model, thinking=thinking
     )
@@ -2938,7 +2935,7 @@ class OpenAIProvider:
             }
         if (
             include_reasoning_content
-            and _model_basename(self._model)
+            and model_basename(self._model)
             in self._compat.preserve_thinking_model_ids
         ) or (
             self._provider_kind == "dashscope" and include_reasoning_content
@@ -3052,7 +3049,7 @@ class OpenAIProvider:
                 elif not cfg.thinking_budget_explicit:
                     payload.pop("thinking_budget", None)
         elif (
-            _model_basename(self._model) in self._compat.force_thinking_model_ids
+            model_basename(self._model) in self._compat.force_thinking_model_ids
             or (
                 self._compat.thinking_required_model_prefixes
                 and self._model.strip().lower().startswith(

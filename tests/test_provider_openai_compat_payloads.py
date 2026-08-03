@@ -1362,6 +1362,40 @@ def test_deepseek_v4_non_thinking_replays_prior_reasoning_content(
     )
 
 
+@pytest.mark.parametrize(
+    "model",
+    ["deepseek-v4-flash-0731", "tokenrhythm/deepseek-v4-flash-0731"],
+)
+def test_tokenrhythm_deepseek_v4_flash_0731_requires_reasoning_content(
+    monkeypatch: Any,
+    model: str,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="test",
+        model=model,
+        base_url="https://tokenrhythm.studio/v1",
+        provider_kind="tokenrhythm",
+    )
+    messages = [
+        Message(role="assistant", content="Prior assistant turn."),
+        Message(role="user", content="continue"),
+    ]
+
+    async def _run() -> None:
+        async for _ in provider.chat(messages, config=ChatConfig(thinking=True)):
+            pass
+
+    asyncio.run(_run())
+
+    assert captured["payload"]["messages"][0] == {
+        "role": "assistant",
+        "content": "Prior assistant turn.",
+        "reasoning_content": "",
+    }
+
+
 def test_deepseek_v4_replays_reasoning_content_without_catalog_capabilities(
     monkeypatch: Any,
 ) -> None:

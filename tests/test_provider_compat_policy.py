@@ -95,6 +95,9 @@ def test_tokenrhythm_never_toggles_thinking_but_replays_v4_reasoning() -> None:
     assert _should_replay_reasoning_content(
         policy=policy, model="deepseek-v4-flash", caps=None
     )
+    assert _should_replay_reasoning_content(
+        policy=policy, model="deepseek-v4-flash-0731", caps=None
+    )
     assert not _should_replay_reasoning_content(
         policy=policy, model="glm-5", caps=None
     )
