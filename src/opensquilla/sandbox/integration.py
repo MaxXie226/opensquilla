@@ -381,9 +381,16 @@ def active_file_system_profile(
                 raise ValueError(
                     "GUEST_DEFAULT_WORKSPACE_UNSAFE: guest workspace is unavailable"
                 )
+            guest_mounts = _session_mounts_for_policy(effective_workspace)
             return compile_web_guest_file_profile(
                 stored_policy,
                 workspace=effective_workspace,
+                writable_roots=tuple(
+                    mount.host_path for mount in guest_mounts if mount.mode == "rw"
+                ),
+                runtime_roots=tuple(
+                    mount.host_path for mount in guest_mounts if mount.mode == "ro"
+                ),
                 authority_roots=authority_roots,
             )
         writable_roots: tuple[Path, ...] = ()

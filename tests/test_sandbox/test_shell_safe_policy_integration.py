@@ -17,6 +17,8 @@ from opensquilla.sandbox.operation_profile import OperationProfile
 from opensquilla.sandbox.path_validation import decide_path_access
 from opensquilla.sandbox.permissions import FileSystemAccess
 from opensquilla.sandbox.policy_models import FilePolicySettings, SandboxPolicy
+from opensquilla.sandbox.run_context import MountGrant, RunContext
+from opensquilla.sandbox.run_mode import RunMode
 from opensquilla.tools.builtin import filesystem, shell
 from opensquilla.tools.types import ToolContext, current_tool_context
 
@@ -109,8 +111,12 @@ def test_guest_safe_profile_keeps_workspace_boundary_and_protected_carveouts(
     tmp_path,
 ) -> None:
     workspace = tmp_path / "workspace"
+    guest_home = tmp_path / "guest-home"
+    guest_temp = tmp_path / "guest-temp"
+    runtime_root = tmp_path / "runtime"
     protected = workspace / "protected"
-    protected.mkdir(parents=True)
+    for directory in (protected, guest_home, guest_temp, runtime_root):
+        directory.mkdir(parents=True)
     runtime = configure_runtime(
         SandboxSettings(
             run_mode="standard",
@@ -129,6 +135,15 @@ def test_guest_safe_profile_keeps_workspace_boundary_and_protected_carveouts(
             run_mode="safe",
             guest_safe=True,
             workspace_dir=str(workspace),
+            sandbox_run_context=RunContext(
+                run_mode=RunMode.SAFE,
+                workspace=str(workspace),
+                mounts=(
+                    MountGrant(path=str(guest_home), access="rw", scope="once"),
+                    MountGrant(path=str(guest_temp), access="rw", scope="once"),
+                    MountGrant(path=str(runtime_root), access="ro", scope="once"),
+                ),
+            ),
             sandbox_policy=snapshot,
             sandbox_gateway_config=SimpleNamespace(state_dir=str(tmp_path / "state")),
         )
@@ -171,11 +186,36 @@ def test_guest_safe_profile_keeps_workspace_boundary_and_protected_carveouts(
         write=False,
         profile=profile,
     )
+    home_write = decide_path_access(
+        guest_home / "notes.txt",
+        workspace=workspace,
+        write=True,
+        profile=profile,
+    )
+    temp_write = decide_path_access(
+        guest_temp / "scratch.txt",
+        workspace=workspace,
+        write=True,
+        profile=profile,
+    )
+    runtime_read = decide_path_access(
+        runtime_root / "python.exe",
+        workspace=workspace,
+        write=False,
+        profile=profile,
+    )
     assert protected_write.status != "allowed"
     assert ordinary_write.status == "allowed"
     assert outside_write.status != "allowed"
     assert sensitive_read.status == "blocked"
-    assert ordinary_read.status == "allowed"
+    assert ordinary_read.status != "allowed"
+    assert (
+        profile.resolve(tmp_path / "ordinary-host-file.txt")
+        is FileSystemAccess.DENY
+    )
+    assert home_write.status == "allowed"
+    assert temp_write.status == "allowed"
+    assert runtime_read.status == "allowed"
 
 
 @pytest.mark.asyncio

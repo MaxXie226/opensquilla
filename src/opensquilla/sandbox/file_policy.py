@@ -465,18 +465,16 @@ def compile_web_guest_file_profile(
     policy: SandboxPolicy,
     *,
     workspace: str | os.PathLike[str] | PurePath,
+    writable_roots: Sequence[str | os.PathLike[str] | PurePath] = (),
+    runtime_roots: Sequence[str | os.PathLike[str] | PurePath] = (),
     authority_roots: Sequence[str | os.PathLike[str] | PurePath] = (),
     platform: str | None = None,
     env: Mapping[str, str] | None = None,
     home: str | PurePath | None = None,
 ) -> FileSystemPermissionProfile:
-    """Compile remote Web guest access: host-readable, one write root."""
+    """Compile remote Web guest access with an explicit deny-by-default profile."""
 
-    from opensquilla.sandbox.permissions import (
-        FileSystemAccess,
-        FileSystemPermissionEntry,
-        FileSystemPermissionProfile,
-    )
+    from opensquilla.sandbox.permissions import FileSystemPermissionProfile
     from opensquilla.sandbox.platform_permissions import FileSystemPlatformContext
 
     target_platform = _platform_name(platform)
@@ -496,18 +494,6 @@ def compile_web_guest_file_profile(
         home=pure_home,
     )
 
-    custom_roots: list[PurePath] = []
-    for raw in policy.files.custom_deny_write_paths:
-        expanded = _expand_pattern(
-            raw,
-            platform=target_platform,
-            env=environment,
-            home=pure_home,
-        )
-        custom_roots.append(
-            _pure_path(_pattern_root(expanded), platform=target_platform)
-        )
-
     sensitive_roots = builtin_deny_write_paths(
         target_platform,
         env=environment,
@@ -524,31 +510,68 @@ def compile_web_guest_file_profile(
             )
         )
     )
-    base = FileSystemPermissionProfile.workspace(
+    writable_paths = tuple(
+        validate_web_guest_workspace(
+            root,
+            authority_roots=authority_roots,
+            platform=target_platform,
+            env=environment,
+            home=pure_home,
+        )
+        for root in writable_roots
+    )
+    writable_scope = (workspace_path, *writable_paths)
+    writable_text = tuple(
+        _normalized_text(root, platform=target_platform) for root in writable_scope
+    )
+    custom_paths: list[PurePath] = []
+    for raw in policy.files.custom_deny_write_paths:
+        expanded = _expand_pattern(
+            raw,
+            platform=target_platform,
+            env=environment,
+            home=pure_home,
+        )
+        custom_path = _pure_path(_pattern_root(expanded), platform=target_platform)
+        custom_text = _normalized_text(custom_path, platform=target_platform)
+        if any(
+            custom_text == root or custom_text.startswith(f"{root}/")
+            for root in writable_text
+        ):
+            custom_paths.append(custom_path)
+    runtime_paths = tuple(
+        _pure_path(str(root), platform=target_platform) for root in runtime_roots
+    )
+    denied_text = tuple(
+        _normalized_text(root, platform=target_platform) for root in denied_roots
+    )
+    for runtime_path in runtime_paths:
+        runtime_text = _normalized_text(runtime_path, platform=target_platform)
+        if any(
+            runtime_text == denied or runtime_text.startswith(f"{denied}/")
+            for denied in denied_text
+        ):
+            raise GuestWorkspacePolicyError(
+                f"{GuestWorkspacePolicyError.code}: runtime root overlaps protected data"
+            )
+
+    return FileSystemPermissionProfile.workspace(
         workspace=workspace_path,
+        readable_roots=(*runtime_paths, *custom_paths),
+        writable_roots=writable_paths,
         denied_read_roots=denied_roots,
-        host_root_readonly=True,
+        host_root_readonly=False,
         tmp_writable=False,
         tmpdir_env_writable=False,
+        protect_metadata=False,
         platform_context=FileSystemPlatformContext(
             platform=target_platform,
             cwd=workspace_path,
             home=pure_home,
-            writable_roots=(workspace_path,),
+            writable_roots=(workspace_path, *writable_paths),
             user_profile_children=(),
             env=environment,
         ),
-    )
-    return FileSystemPermissionProfile(
-        entries=(
-            *base.entries,
-            *(
-                FileSystemPermissionEntry(root, FileSystemAccess.READ)
-                for root in dict.fromkeys(custom_roots)
-            ),
-        ),
-        denied_read_globs=base.denied_read_globs,
-        default_access=base.default_access,
     )
 
 

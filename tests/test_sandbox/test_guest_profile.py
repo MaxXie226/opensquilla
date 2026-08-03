@@ -16,23 +16,24 @@ from opensquilla.sandbox.run_mode import RunMode
 def test_guest_profile_mounts_default_workspace_and_bundled_runtime(tmp_path: Path) -> None:
     runtime = tmp_path / "runtime"
     runtime.mkdir()
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
+    state_dir = tmp_path / "state"
     profile = GuestProfileFactory.create(
         "task/unsafe",
-        workspace=workspace,
+        state_dir=state_dir,
         runtime_roots=(runtime,),
     )
 
     assert profile.host_home_mounted is False
     assert {mount.kind for mount in profile.mounts} == {
         "workspace",
+        "home",
+        "temp",
         "bundled-runtime",
     }
     assert profile.run_context().run_mode is RunMode.SAFE
-    assert profile.run_context().workspace == str(workspace.resolve())
-    assert profile.home.is_relative_to(workspace.resolve())
-    assert profile.temp.is_relative_to(workspace.resolve())
+    assert profile.run_context().workspace == str(profile.workspace)
+    assert profile.home.parent == profile.root
+    assert profile.temp.parent == profile.root
 
     profile.cleanup()
 
@@ -44,9 +45,7 @@ def test_guest_environment_does_not_inherit_host_secrets(
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "secret")
     monkeypatch.setenv("OPENAI_API_KEY", "secret")
 
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    profile = GuestProfileFactory.create("task", workspace=workspace)
+    profile = GuestProfileFactory.create("task", state_dir=tmp_path / "state")
 
     assert "AWS_SECRET_ACCESS_KEY" not in profile.environment
     assert "OPENAI_API_KEY" not in profile.environment
@@ -57,9 +56,8 @@ def test_guest_environment_does_not_inherit_host_secrets(
 
 
 def test_guest_cleanup_removes_entire_task_root(tmp_path: Path) -> None:
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    profile = GuestProfileFactory.create("task", workspace=workspace)
+    state_dir = tmp_path / "state"
+    profile = GuestProfileFactory.create("task", state_dir=state_dir)
     marker = profile.root / "result.txt"
     marker.write_text("guest", encoding="utf-8")
     root = profile.root
@@ -68,23 +66,26 @@ def test_guest_cleanup_removes_entire_task_root(tmp_path: Path) -> None:
     profile.cleanup()
 
     assert not root.exists()
-    assert workspace.exists()
+    assert profile.managed_root.exists()
 
 
 def test_guest_cleanup_rejects_non_guest_directory(tmp_path: Path) -> None:
     ordinary = tmp_path / "ordinary"
     ordinary.mkdir()
 
-    assert cleanup_guest_profile_root(ordinary) is False
+    assert cleanup_guest_profile_root(
+        ordinary,
+        managed_root=tmp_path / "state-guest-workspaces",
+    ) is False
     assert ordinary.exists()
 
 
 def test_guest_profile_rejects_retargeted_scratch_parent(tmp_path: Path) -> None:
-    workspace = tmp_path / "workspace"
+    state_dir = tmp_path / "state"
     outside = tmp_path / "outside"
-    workspace.mkdir()
+    state_dir.mkdir()
     outside.mkdir()
-    scratch_parent = workspace / ".opensquilla-guest"
+    scratch_parent = tmp_path / "state-guest-workspaces"
     try:
         scratch_parent.symlink_to(outside, target_is_directory=True)
     except OSError as exc:
@@ -100,6 +101,6 @@ def test_guest_profile_rejects_retargeted_scratch_parent(tmp_path: Path) -> None
             pytest.skip(f"directory aliases unavailable: {result.stderr or result.stdout}")
 
     with pytest.raises(RuntimeError, match="GUEST_DEFAULT_WORKSPACE_UNSAFE"):
-        GuestProfileFactory.create("task", workspace=workspace)
+        GuestProfileFactory.create("task", state_dir=state_dir)
 
     assert list(outside.iterdir()) == []

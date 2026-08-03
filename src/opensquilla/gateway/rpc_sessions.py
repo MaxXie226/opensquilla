@@ -381,7 +381,7 @@ def _guest_profile_for_principal(
     principal: Any,
     task_id: str,
     *,
-    workspace: str | Path,
+    state_dir: str | Path,
 ):
     has_capability = getattr(principal, "has", lambda _capability: False)
     if has_capability("guest.safe") and not principal_has_host_execute(principal):
@@ -389,10 +389,12 @@ def _guest_profile_for_principal(
 
         resolver = bundled_runtime_resolver()
         runtime_roots = resolver.runtime_roots() if resolver is not None else ()
+        runtime_path = resolver.bundled_path() if resolver is not None else ()
         return GuestProfileFactory.create(
             task_id,
-            workspace=workspace,
+            state_dir=state_dir,
             runtime_roots=runtime_roots,
+            runtime_path=runtime_path,
         )
     return None
 
@@ -2734,32 +2736,16 @@ async def _handle_sessions_send(
                 "Safe mode is unavailable for this unauthenticated request.",
                 details={"reason": exc.code, **capability_report.to_payload()},
             ) from exc
-        from opensquilla.sandbox.file_policy import (
-            GuestWorkspacePolicyError,
-            authority_roots_for_state,
-            validate_web_guest_workspace,
-        )
-
-        try:
-            validate_web_guest_workspace(
-                workspace_path,
-                authority_roots=authority_roots_for_state(ctx.config.state_dir),
-            )
-        except GuestWorkspacePolicyError as exc:
-            raise RpcHandlerError(
-                exc.code,
-                "The configured default workspace is not safe for a Web guest.",
-            ) from exc
         try:
             guest_profile = _guest_profile_for_principal(
                 ctx.principal,
                 turn_id,
-                workspace=workspace_path,
+                state_dir=ctx.config.state_dir,
             )
         except GuestProfileBoundaryError as exc:
             raise RpcHandlerError(
                 exc.code,
-                "The configured default workspace is not safe for a Web guest.",
+                "The managed Web guest workspace is unavailable.",
             ) from exc
         run_context = guest_profile.run_context()
         authoritative_guard = None
@@ -2875,6 +2861,7 @@ async def _handle_sessions_send(
     if guest_profile is not None:
         route_envelope.metadata["guest_safe"] = True
         route_envelope.metadata["guest_profile_root"] = str(guest_profile.root)
+        route_envelope.metadata["guest_managed_root"] = str(guest_profile.managed_root)
         route_envelope.metadata["guest_environment"] = dict(
             guest_profile.environment
         )

@@ -1769,6 +1769,82 @@ def test_payload_grants_process_runtime_roots_rx(
     assert grants[str(tmp_path)] == "RWX"
 
 
+def test_guest_request_never_discovers_host_tool_paths(tmp_path: Path) -> None:
+    from opensquilla.sandbox.backend import windows_default as mod
+
+    request = _request(tmp_path)
+    request = SandboxRequest(
+        argv=request.argv,
+        cwd=request.cwd,
+        action_kind=request.action_kind,
+        policy=request.policy,
+        env={
+            **request.env,
+            "OPENSQUILLA_GUEST_SAFE": "1",
+            "PATH": str(tmp_path / "bundled-runtime"),
+        },
+        run_mode=request.run_mode,
+    )
+
+    assert mod._request_needs_host_tool_paths(request) is False
+
+
+def test_guest_acl_plan_keeps_only_system_and_explicit_runtime_rx_roots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default as mod
+
+    workspace = tmp_path / "guest-workspace"
+    bundled_runtime = tmp_path / "bundled-runtime"
+    windows_root = tmp_path / "Windows"
+    program_files = tmp_path / "Program Files"
+    program_data = tmp_path / "ProgramData"
+    for root in (workspace, bundled_runtime, windows_root, program_files, program_data):
+        root.mkdir()
+    profile = FileSystemPermissionProfile.workspace(
+        workspace=workspace,
+        readable_roots=(bundled_runtime,),
+        host_root_readonly=False,
+        tmp_writable=False,
+        tmpdir_env_writable=False,
+        protect_metadata=False,
+    )
+    request = _request(workspace).with_policy(replace(_policy(), file_system=profile))
+    request = SandboxRequest(
+        argv=(str(bundled_runtime / "python.exe"), "-c", "print('ok')"),
+        cwd=request.cwd,
+        action_kind=request.action_kind,
+        policy=request.policy,
+        env={
+            **request.env,
+            "OPENSQUILLA_GUEST_SAFE": "1",
+            "SystemRoot": str(windows_root),
+        },
+        run_mode=request.run_mode,
+    )
+    monkeypatch.setattr(
+        mod,
+        "process_executable_rx_roots",
+        lambda argv, env: (bundled_runtime, windows_root, program_files, program_data),
+    )
+    monkeypatch.setattr(mod, "runtime_rx_roots", lambda executable: ())
+    monkeypatch.setattr(mod, "_runtime_readonly_roots", lambda: ())
+    monkeypatch.setattr(
+        mod,
+        "capability_sids_for_command",
+        lambda store, roots, **kwargs: tuple(f"S-{i}" for i, _ in enumerate(roots)),
+    )
+
+    plan = mod._acl_plan_payload(request)
+    grants = {item["path"]: item["access"] for item in plan["autoGrants"]}
+
+    assert grants[str(workspace)] == "RWX"
+    assert grants[str(bundled_runtime)] == "RX"
+    assert str(program_files) not in grants
+    assert str(program_data) not in grants
+
+
 def test_payload_does_not_acl_grant_windows_platform_roots(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - Missing and invalid named Tokens must have identical restricted Safe-mode authority.
-- Guest session keys are invisible and can never grant host execution, host read, setup, configuration, or approval authority.
+- Guest session keys are invisible and can never grant host execution, setup, configuration, approval authority, or file access beyond the guest's managed temporary workspace and bundled read/execute runtime dependencies.
 - Desktop startup and remote Web access must never trigger UAC.
 - Existing owner/token sessions and direct-update data remain compatible.
 - Every security denial is enforced server-side; hiding UI is not authorization.
@@ -73,19 +73,29 @@
 - [ ] Set the fresh config default to Full and resolve storage preference before config fallback.
 - [ ] Run run-mode/routing/migration tests, request review, and commit `fix: unify default run mode preference`.
 
-### Task 4: Windows exact-read ACL projection
+### Task 4: Guest temporary-workspace and runtime ACL boundary
 
 **Files:**
+- Modify: `src/opensquilla/sandbox/guest_profile.py`
+- Modify: `src/opensquilla/sandbox/file_policy.py`
+- Modify: `src/opensquilla/sandbox/integration.py`
+- Modify: `src/opensquilla/gateway/rpc_sessions.py`
+- Modify: `src/opensquilla/gateway/task_runtime.py`
 - Modify: `src/opensquilla/sandbox/backend/windows_default.py`
+- Test: `tests/test_gateway/test_guest_safe_sessions.py`
+- Test: `tests/test_gateway/test_rpc_sessions.py`
+- Test: `tests/test_sandbox/test_guest_profile.py`
+- Test: `tests/test_sandbox/test_file_policy.py`
+- Test: `tests/test_sandbox/test_shell_safe_policy_integration.py`
 - Test: `tests/test_sandbox/test_windows_default_backend.py`
 - Test: `tests/test_sandbox/test_windows_default_process_smoke.py`
 
 **Interfaces:**
-- Produces temporary RX grants only for already-authorized filesystem-worker read targets.
+- Produces RW grants only for the guest-managed temporary workspace and RX grants only for bundled runtime/system dependencies required to execute approved tools.
 
-- [ ] Write failing payload tests for default-READ ordinary targets and DENY sensitive targets.
-- [ ] Project canonical/logical exact targets after policy authorization, with no projection for writes or denied reads.
-- [ ] Run a native sandbox-account ordinary-file read versus sensitive-file denial test, request review, and commit `fix: project authorized Windows guest reads`.
+- [ ] Write failing profile/payload tests proving the managed guest workspace is RW, bundled Python/Node.js/Git Bash roots are RX, and arbitrary host/user paths are DENY.
+- [ ] Remove the Windows guest default host-read baseline and project only the managed workspace plus required runtime dependencies.
+- [ ] Run a native sandbox-account managed-workspace/runtime test versus arbitrary host/sensitive-file denial, request review, and commit `fix: confine anonymous guest files`.
 
 ### Task 5: Stop automatic capability retry churn
 

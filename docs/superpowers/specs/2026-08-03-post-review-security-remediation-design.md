@@ -10,7 +10,11 @@ An anonymous browser receives a random, non-user-facing guest session key. The W
 
 Guest-created Web chat session keys are server-normalized to include the current guest owner id. A central guest RPC policy has a small allowlist for connection metadata, model discovery, capability availability, chat submission, and session-scoped chat operations. Every session-scoped guest call must target a key carrying the caller's owner id. `sessions.list` returns only matching sessions. Existing owner/token sessions are never adopted: submitting an unowned key creates a new guest-namespaced session instead. Invalid named Tokens enter this exact path.
 
-This identity is intentionally called a guest session key, not a named Token. It is invisible in Settings and cannot enable Full Access. Without TLS it has the same LAN eavesdropping limitation as all other Web traffic, which matches the already-approved HTTP deployment decision.
+This identity is intentionally called a guest session key, not a named Token. It is invisible in Settings and cannot enable Full Access or widen the guest Safe file profile. The guest key adds only session ownership. Without TLS it has the same LAN eavesdropping limitation as all other Web traffic, which matches the already-approved HTTP deployment decision.
+
+Guest turns are stateless with respect to owner-private context. They do not automatically load host workspace bootstrap instructions or private `MEMORY.md`, and they never write to the shared long-term memory capture path.
+
+Each unauthenticated guest turn receives a fresh managed temporary workspace beneath a deterministic OpenSquilla guest root derived as a sibling of `config.state_dir`. It never adopts the configured agent workspace or a browser-supplied path, and it is deliberately outside the private state authority root. The workspace, guest HOME, and guest temp directories are read/write. Bundled Python, Node.js, Git Bash, and only the operating-system/runtime dependencies required to start them are read/execute. All user directories, real projects, OpenSquilla configuration, memory, credentials, and other host files are denied. A valid named Token may widen this according to its capabilities.
 
 ## Fail-closed live capability verification
 
@@ -22,7 +26,7 @@ On Windows the report additionally requires the current setup support probe to c
 
 Fresh owner installs default to Full Access in the configuration model. `get_run_context` resolves the persisted `sandbox.run_mode` preference from session storage before falling back to explicit config and then the Full default. Guest principals are still coerced to Safe at ingress.
 
-For Windows filesystem-worker read operations, an already-authorized exact read target is projected as a temporary RX ACL grant when the profile's default READ produced no explicit entry. DENY targets and denied globs are rejected before projection; write operations receive no new grant. This makes ordinary host reads work for the isolated account while the built-in sensitive paths remain unreadable.
+For Windows guest filesystem-worker operations, the managed temporary workspace receives the required read/write ACL and bundled runtime roots receive read/execute ACLs. No default host-read ACL is projected. DENY targets and denied globs are rejected before any projection; write operations outside the managed workspace receive no grant.
 
 ## Responsiveness and migration privacy
 
@@ -37,4 +41,4 @@ Upgrade snapshots are private before any credential-bearing file is copied. POSI
 - Add a complete guest RPC deny matrix covering sessions, logs, memory, agent files, configuration, setup, and capability refresh.
 - Add guest ownership tests for create, reconnect, list, read, abort, delete denial, invalid Token parity, and attempted adoption of an owner session.
 - Add fake-backend transport-failure tests plus packaged Windows native deny canaries.
-- Add owner/guest/CLI no-hint run-mode tests, Windows native ordinary-read versus sensitive-read tests, bounded capability-loading tests, and private snapshot permission tests.
+- Add owner/guest/CLI no-hint run-mode tests, Windows native managed-workspace/runtime-read versus host-file denial tests, bounded capability-loading tests, and private snapshot permission tests.

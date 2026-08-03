@@ -35,6 +35,7 @@ from opensquilla.sandbox.backend.windows_default_roots import (
     runtime_rx_roots,
     windows_platform_rx_roots,
     windows_sensitive_marker,
+    windows_system_root,
     workspace_cache_root,
 )
 from opensquilla.sandbox.backend.windows_default_setup import (
@@ -781,6 +782,14 @@ def _acl_plan_payload(
     process_rx_roots = tuple(
         root for root in process_executable_rx_roots(request.argv, request.env) if root.exists()
     )
+    if request.env.get("OPENSQUILLA_GUEST_SAFE") == "1":
+        system_root = windows_system_root(request.env).resolve(strict=False)
+        process_rx_roots = tuple(
+            root
+            for root in process_rx_roots
+            if _is_relative_to_casefold(root.resolve(strict=False), system_root)
+            or profile.resolve(root) is not FileSystemAccess.DENY
+        )
     tool_rx_roots = (
         ()
         if not _request_needs_host_tool_paths(request)
@@ -1162,7 +1171,8 @@ def _is_filesystem_worker_request(request: SandboxRequest) -> bool:
 
 def _request_needs_host_tool_paths(request: SandboxRequest) -> bool:
     return (
-        not _is_filesystem_worker_request(request)
+        request.env.get("OPENSQUILLA_GUEST_SAFE") != "1"
+        and not _is_filesystem_worker_request(request)
         and request.action_kind != "capability.probe"
     )
 

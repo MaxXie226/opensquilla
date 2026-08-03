@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -15,7 +17,10 @@ from opensquilla.gateway.rpc_sessions import (
     _is_remote_web_guest,
     _trusted_run_mode_hint,
 )
-from opensquilla.sandbox.guest_profile import GuestProfileFactory
+from opensquilla.sandbox.guest_profile import (
+    GuestProfileFactory,
+    cleanup_guest_profile_root,
+)
 from opensquilla.tools.builtin.shell import _base_shell_environment
 from opensquilla.tools.types import ToolContext, current_tool_context
 
@@ -29,6 +34,23 @@ def _guest_principal(*, invalid: bool = False) -> Principal:
         capabilities=frozenset({"guest.safe"}),
         auth_state="invalid" if invalid else "guest",
     )
+
+
+def _directory_alias(alias: Path, target: Path) -> None:
+    try:
+        alias.symlink_to(target, target_is_directory=True)
+        return
+    except OSError as exc:
+        if os.name != "nt":
+            pytest.skip(f"directory aliases unavailable: {exc}")
+    result = subprocess.run(
+        ["cmd", "/d", "/c", "mklink", "/J", str(alias), str(target)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        pytest.skip(f"directory aliases unavailable: {result.stderr or result.stdout}")
 
 
 def test_guest_boundary_cannot_be_bypassed_by_spoofing_source_kind() -> None:
@@ -54,9 +76,10 @@ def test_guest_and_invalid_token_reject_explicit_full_before_materialization(
 def test_guest_route_uses_ephemeral_workspace_and_scrubbed_environment(
     tmp_path: Path,
 ) -> None:
-    workspace = tmp_path / "configured-workspace"
-    workspace.mkdir()
-    profile = GuestProfileFactory.create("turn", workspace=workspace)
+    state_dir = tmp_path / "opensquilla-state"
+    configured_workspace = tmp_path / "configured-workspace"
+    configured_workspace.mkdir()
+    profile = GuestProfileFactory.create("turn", state_dir=state_dir)
     envelope = build_web_route_envelope(session_key="agent:main:web:guest")
     envelope.metadata["guest_safe"] = True
     envelope.metadata["guest_environment"] = dict(profile.environment)
@@ -66,16 +89,21 @@ def test_guest_route_uses_ephemeral_workspace_and_scrubbed_environment(
     context = tool_context_from_envelope(
         envelope,
         is_owner=False,
-        workspace_dir=str(workspace),
+        workspace_dir=str(configured_workspace),
     )
 
     assert context.guest_safe is True
     assert context.run_mode == "safe"
-    assert Path(context.workspace_dir or "").resolve() == workspace.resolve()
+    assert Path(context.workspace_dir or "").resolve() == profile.workspace.resolve()
+    assert profile.workspace != configured_workspace.resolve()
+    assert profile.managed_root == tmp_path / "opensquilla-state-guest-workspaces"
+    assert profile.workspace == profile.root / "workspace"
+    assert profile.home == profile.root / "home"
+    assert profile.temp == profile.root / "tmp"
     assert context.environment == profile.environment
     scratch_root = profile.root
     profile.cleanup()
-    assert workspace.is_dir()
+    assert configured_workspace.is_dir()
     assert not scratch_root.exists()
 
 
@@ -84,9 +112,8 @@ def test_guest_shell_environment_never_inherits_host_secret(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "host-secret")
-    workspace = tmp_path / "configured-workspace"
-    workspace.mkdir()
-    profile = GuestProfileFactory.create("turn", workspace=workspace)
+    state_dir = tmp_path / "opensquilla-state"
+    profile = GuestProfileFactory.create("turn", state_dir=state_dir)
     token = current_tool_context.set(
         ToolContext(
             guest_safe=True,
@@ -108,18 +135,118 @@ def test_missing_and_invalid_token_materialize_the_same_guest_boundary(
     invalid: bool,
     tmp_path: Path,
 ) -> None:
-    workspace = tmp_path / "configured-workspace"
-    workspace.mkdir()
+    state_dir = tmp_path / "opensquilla-state"
     profile = _guest_profile_for_principal(
         _guest_principal(invalid=invalid),
         "turn",
-        workspace=workspace,
+        state_dir=state_dir,
     )
 
     assert profile is not None
     assert profile.run_context().run_mode.value == "safe"
-    assert profile.workspace == workspace.resolve()
-    assert profile.home.is_relative_to(profile.workspace)
-    assert profile.temp.is_relative_to(profile.workspace)
+    assert profile.managed_root == tmp_path / "opensquilla-state-guest-workspaces"
+    assert profile.workspace == profile.root / "workspace"
+    assert profile.home == profile.root / "home"
+    assert profile.temp == profile.root / "tmp"
     assert profile.host_home_mounted is False
     profile.cleanup()
+
+
+@pytest.mark.parametrize(
+    "principal",
+    [
+        Principal(
+            role="operator",
+            scopes=frozenset({"operator.read"}),
+            is_owner=False,
+            authenticated=True,
+            auth_state="authenticated",
+        ),
+        Principal(
+            role="operator",
+            scopes=frozenset({"operator.admin"}),
+            is_owner=True,
+            authenticated=True,
+            auth_state="authenticated",
+        ),
+    ],
+)
+def test_authenticated_token_and_owner_do_not_materialize_guest_profile(
+    principal: Principal,
+    tmp_path: Path,
+) -> None:
+    assert (
+        _guest_profile_for_principal(
+            principal,
+            "turn",
+            state_dir=tmp_path / "state",
+        )
+        is None
+    )
+
+
+def test_guest_profile_projects_managed_rw_and_bundled_runtime_roots(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "state"
+    python_root = tmp_path / "runtime" / "python"
+    node_root = tmp_path / "runtime" / "node"
+    git_bash_root = tmp_path / "runtime" / "git-bash"
+    for root in (python_root, node_root, git_bash_root):
+        (root / "bin").mkdir(parents=True)
+
+    profile = GuestProfileFactory.create(
+        "turn",
+        state_dir=state_dir,
+        runtime_roots=(python_root, node_root, git_bash_root),
+        runtime_path=(python_root / "bin", node_root / "bin", git_bash_root / "bin"),
+    )
+    mounts = {mount.path: mount.access for mount in profile.mounts}
+    run_mounts = {Path(mount.path): mount.access for mount in profile.run_context().mounts}
+
+    assert mounts[profile.workspace] == "rw"
+    assert mounts[profile.home] == "rw"
+    assert mounts[profile.temp] == "rw"
+    assert mounts[python_root] == "ro"
+    assert mounts[node_root] == "ro"
+    assert mounts[git_bash_root] == "ro"
+    assert run_mounts[profile.home] == "rw"
+    assert run_mounts[profile.temp] == "rw"
+    assert run_mounts[python_root] == "ro"
+    assert profile.environment["PATH"].split(os.pathsep) == [
+        str(python_root / "bin"),
+        str(node_root / "bin"),
+        str(git_bash_root / "bin"),
+    ]
+    profile.cleanup()
+
+
+def test_guest_cleanup_rejects_alias_and_outside_factory_shape(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    profile = GuestProfileFactory.create("turn", state_dir=state_dir)
+    alias = tmp_path / "guest-alias"
+    _directory_alias(alias, profile.root)
+    outside = tmp_path / profile.root.name
+    outside.mkdir()
+    forged = profile.managed_root / "opensquilla-guest-forged-12345678"
+    forged.mkdir()
+
+    assert cleanup_guest_profile_root(alias, managed_root=profile.managed_root) is False
+    assert cleanup_guest_profile_root(outside, managed_root=profile.managed_root) is False
+    assert cleanup_guest_profile_root(forged, managed_root=profile.managed_root) is False
+    assert profile.root.exists()
+    assert outside.exists()
+    assert forged.exists()
+    assert profile.cleanup() is None
+    assert not profile.root.exists()
+    assert outside.exists()
+
+
+def test_guest_factory_rejects_managed_root_alias_to_authority(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    managed_root = tmp_path / "state-guest-workspaces"
+    _directory_alias(managed_root, state_dir)
+
+    with pytest.raises(Exception, match="guest workspace root is retargeted"):
+        GuestProfileFactory.create("turn", state_dir=state_dir)

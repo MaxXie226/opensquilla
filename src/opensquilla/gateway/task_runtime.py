@@ -1234,7 +1234,14 @@ class TaskRuntime:
         if isinstance(guest_profile_root, str) and guest_profile_root:
             from opensquilla.sandbox.guest_profile import cleanup_guest_profile_root
 
-            cleanup_guest_profile_root(guest_profile_root)
+            guest_managed_root = reservation.runtime_task.envelope.metadata.get(
+                "guest_managed_root"
+            )
+            if isinstance(guest_managed_root, str) and guest_managed_root:
+                cleanup_guest_profile_root(
+                    guest_profile_root,
+                    managed_root=guest_managed_root,
+                )
 
     async def _emit_queued_activation(
         self,
@@ -2659,7 +2666,12 @@ class TaskRuntime:
             if isinstance(guest_profile_root, str) and guest_profile_root:
                 from opensquilla.sandbox.guest_profile import cleanup_guest_profile_root
 
-                cleanup_guest_profile_root(guest_profile_root)
+                guest_managed_root = task.envelope.metadata.get("guest_managed_root")
+                if isinstance(guest_managed_root, str) and guest_managed_root:
+                    cleanup_guest_profile_root(
+                        guest_profile_root,
+                        managed_root=guest_managed_root,
+                    )
 
     async def _freeze_collaboration_context(self, task: _RuntimeTask) -> None:
         """Snapshot session collaboration state at the actual turn boundary.

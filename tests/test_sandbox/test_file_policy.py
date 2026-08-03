@@ -129,12 +129,17 @@ def test_windows_web_guest_profile_denies_credentials_and_writes_only_workspace(
     home = PureWindowsPath(r"C:\Users\alice")
     workspace = PureWindowsPath(r"D:\OpenSquilla\workspace")
     authority = PureWindowsPath(r"C:\Users\alice\.opensquilla\state")
+    guest_home = workspace.parent / "guest-home"
+    guest_temp = workspace.parent / "guest-temp"
+    runtime = PureWindowsPath(r"C:\Program Files\OpenSquilla\runtime\python")
     custom = PureWindowsPath(r"C:\Company\protected")
     profile = compile_web_guest_file_profile(
         SandboxPolicy.model_validate(
             {"files": {"customDenyWritePaths": [rf"{custom}\**"]}}
         ),
         workspace=workspace,
+        writable_roots=(guest_home, guest_temp),
+        runtime_roots=(runtime,),
         authority_roots=(authority,),
         platform="win32",
         home=home,
@@ -145,13 +150,16 @@ def test_windows_web_guest_profile_denies_credentials_and_writes_only_workspace(
         },
     )
 
-    assert profile.default_access is FileSystemAccess.READ
-    assert profile.resolve(home / "Documents" / "ordinary.txt") is FileSystemAccess.READ
+    assert profile.default_access is FileSystemAccess.DENY
+    assert profile.resolve(home / "Documents" / "ordinary.txt") is FileSystemAccess.DENY
     assert profile.resolve(workspace / "nested" / "new.txt") is FileSystemAccess.WRITE
-    assert profile.resolve(PureWindowsPath(r"D:\outside.txt")) is FileSystemAccess.READ
+    assert profile.resolve(guest_home / "notes.txt") is FileSystemAccess.WRITE
+    assert profile.resolve(guest_temp / "scratch.txt") is FileSystemAccess.WRITE
+    assert profile.resolve(runtime / "python.exe") is FileSystemAccess.READ
+    assert profile.resolve(PureWindowsPath(r"D:\outside.txt")) is FileSystemAccess.DENY
     assert profile.resolve(home / ".ssh" / "id_ed25519") is FileSystemAccess.DENY
     assert profile.resolve(authority / "sessions.db") is FileSystemAccess.DENY
-    assert profile.resolve(custom / "file.txt") is FileSystemAccess.READ
+    assert profile.resolve(custom / "file.txt") is FileSystemAccess.DENY
 
 
 def test_posix_web_guest_profile_denies_credentials_and_writes_only_workspace(
@@ -159,24 +167,33 @@ def test_posix_web_guest_profile_denies_credentials_and_writes_only_workspace(
     home = PurePosixPath("/home/alice")
     workspace = PurePosixPath("/srv/opensquilla/workspace")
     authority = PurePosixPath("/srv/opensquilla/state")
+    guest_home = workspace.parent / "guest-home"
+    guest_temp = workspace.parent / "guest-temp"
+    runtime = PurePosixPath("/opt/opensquilla/runtime/python")
     custom = PurePosixPath("/srv/company/protected")
     profile = compile_web_guest_file_profile(
         SandboxPolicy.model_validate(
             {"files": {"customDenyWritePaths": [f"{custom}/**"]}}
         ),
         workspace=workspace,
+        writable_roots=(guest_home, guest_temp),
+        runtime_roots=(runtime,),
         authority_roots=(authority,),
         platform="linux",
         home=home,
         env={"HOME": str(home)},
     )
 
-    assert profile.resolve(home / "Documents" / "ordinary.txt") is FileSystemAccess.READ
+    assert profile.default_access is FileSystemAccess.DENY
+    assert profile.resolve(home / "Documents" / "ordinary.txt") is FileSystemAccess.DENY
     assert profile.resolve(workspace / "nested" / "new.txt") is FileSystemAccess.WRITE
-    assert profile.resolve(PurePosixPath("/srv/outside.txt")) is FileSystemAccess.READ
+    assert profile.resolve(guest_home / "notes.txt") is FileSystemAccess.WRITE
+    assert profile.resolve(guest_temp / "scratch.txt") is FileSystemAccess.WRITE
+    assert profile.resolve(runtime / "bin" / "python") is FileSystemAccess.READ
+    assert profile.resolve(PurePosixPath("/srv/outside.txt")) is FileSystemAccess.DENY
     assert profile.resolve(home / ".ssh" / "id_ed25519") is FileSystemAccess.DENY
     assert profile.resolve(authority / "sessions.db") is FileSystemAccess.DENY
-    assert profile.resolve(custom / "file.txt") is FileSystemAccess.READ
+    assert profile.resolve(custom / "file.txt") is FileSystemAccess.DENY
 
 
 def test_web_guest_workspace_beneath_sensitive_root_is_rejected(tmp_path: Path) -> None:
@@ -225,3 +242,41 @@ def test_web_guest_workspace_alias_to_sensitive_root_is_rejected(tmp_path: Path)
         )
 
     assert raised.value.code == "GUEST_DEFAULT_WORKSPACE_UNSAFE"
+
+
+@pytest.mark.parametrize("grant_kind", ["workspace", "writable", "runtime"])
+def test_web_guest_grant_alias_to_authority_root_is_rejected(
+    tmp_path: Path,
+    grant_kind: str,
+) -> None:
+    authority = tmp_path / "state"
+    authority.mkdir()
+    alias = tmp_path / f"{grant_kind}-alias"
+    try:
+        alias.symlink_to(authority, target_is_directory=True)
+    except OSError as exc:
+        if os.name != "nt":
+            pytest.skip(f"directory aliases unavailable: {exc}")
+        result = subprocess.run(
+            ["cmd", "/d", "/c", "mklink", "/J", str(alias), str(authority)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            pytest.skip(f"directory aliases unavailable: {result.stderr or result.stdout}")
+    workspace = tmp_path / "guest" / "workspace"
+    workspace.mkdir(parents=True)
+    kwargs: dict[str, object] = {
+        "workspace": workspace,
+        "authority_roots": (authority,),
+    }
+    if grant_kind == "workspace":
+        kwargs["workspace"] = alias
+    elif grant_kind == "writable":
+        kwargs["writable_roots"] = (alias,)
+    else:
+        kwargs["runtime_roots"] = (alias,)
+
+    with pytest.raises(GuestWorkspacePolicyError):
+        compile_web_guest_file_profile(SandboxPolicy(), **kwargs)

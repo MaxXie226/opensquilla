@@ -31,6 +31,7 @@ from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.config import AgentEntryConfig, GatewayConfig, LlmProviderProfile
 from opensquilla.gateway.guest_rpc_policy import guest_owned_session_key
 from opensquilla.gateway.input_normalization import LARGE_PASTE_CHARS, estimate_text_tokens
+from opensquilla.gateway.routing import tool_context_from_envelope
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.gateway.rpc_sessions import _normalize_terminal_event_payload
 from opensquilla.gateway.scopes import METHOD_SCOPES, READ_SCOPE, WRITE_SCOPE
@@ -41,7 +42,10 @@ from opensquilla.project_workspaces import ProjectWorkspaceStateError
 from opensquilla.provider.selector import ProviderConfig
 from opensquilla.provider.types import ProviderRequestCorrelation
 from opensquilla.sandbox.capability_service import CapabilityReport
-from opensquilla.sandbox.guest_profile import GuestProfileBoundaryError
+from opensquilla.sandbox.guest_profile import (
+    GuestProfileBoundaryError,
+    cleanup_guest_profile_root,
+)
 from opensquilla.sandbox.run_context import RUN_CONTEXT_ORIGIN_KEY
 from opensquilla.session import storage as session_storage
 from opensquilla.session.compaction import CompactionConfig
@@ -1730,6 +1734,88 @@ class TestSessionsSend:
             await rpc_sessions._handle_sessions_send(params, ctx)
 
         assert raised.value.code == "SANDBOX_UNAVAILABLE"
+
+    @pytest.mark.asyncio
+    async def test_guest_send_ingress_uses_managed_workspace_not_configured_agent_workspace(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        available = CapabilityReport(
+            available=True,
+            backend="windows_default",
+            platform="win32",
+            code="ready",
+            reason="ready",
+            setup_supported=True,
+            restart_required=False,
+            probe_version=1,
+            capabilities=frozenset(
+                {"process", "filesystem-worker", "denyWriteCarveout", "authorityDenyRead"}
+            ),
+        )
+
+        async def report(_config):
+            return available
+
+        class RecordingTaskRuntime:
+            def __init__(self) -> None:
+                self.enqueue_calls: list[dict[str, Any]] = []
+
+            async def enqueue(self, envelope, message: str, **kwargs: Any):
+                self.enqueue_calls.append({"envelope": envelope, "message": message, **kwargs})
+                return SimpleNamespace(
+                    task_id="task-guest-managed-workspace",
+                    session_key=envelope.session_key,
+                    status="queued",
+                )
+
+        monkeypatch.setattr(rpc_sessions, "current_sandbox_capability_report", report)
+        configured_workspace = tmp_path / "real-project"
+        configured_workspace.mkdir()
+        state_dir = tmp_path / "state"
+        config = GatewayConfig(
+            workspace_dir=str(configured_workspace),
+            state_dir=str(state_dir),
+            memory={"flush_enabled": False},
+        )
+        session = FakeSession(session_key="agent:main:webchat:guest-ingress")
+        runtime = RecordingTaskRuntime()
+        guest = Principal(
+            role="operator",
+            scopes=frozenset(["operator.read", "operator.write"]),
+            is_owner=False,
+            authenticated=False,
+            auth_state="guest",
+        )
+        ctx = make_ctx(
+            session_manager=FakeSessionManager([session]),
+            task_runtime=runtime,
+            principal=guest,
+            config=config,
+        )
+
+        await rpc_sessions._handle_sessions_send(
+            {"key": session.session_key, "message": "hello"},
+            ctx,
+        )
+
+        envelope = runtime.enqueue_calls[0]["envelope"]
+        tool_context = tool_context_from_envelope(
+            envelope,
+            is_owner=False,
+            workspace_dir=str(configured_workspace),
+        )
+        managed_root = state_dir.with_name(f"{state_dir.name}-guest-workspaces")
+        effective_workspace = Path(tool_context.workspace_dir or "")
+        assert effective_workspace != configured_workspace.resolve()
+        assert effective_workspace.parent.parent == managed_root.resolve()
+        assert effective_workspace.name == "workspace"
+
+        cleanup_guest_profile_root(
+            envelope.metadata["guest_profile_root"],
+            managed_root=managed_root,
+        )
 
     @pytest.mark.asyncio
     async def test_guest_scratch_boundary_failure_is_a_stable_rpc_error(
