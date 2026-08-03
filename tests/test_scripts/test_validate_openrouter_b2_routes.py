@@ -675,7 +675,7 @@ def test_g1_fixed_analyzer_route_uses_effective_policy_and_b0_stays_fixed() -> N
     }
     assert g1_routes["z-ai/glm-5.2"] == "z-ai"
     assert "anthropic/claude-opus-4.8" not in g1_routes
-    assert b0_routes == {"anthropic/claude-opus-4.8": "anthropic"}
+    assert b0_routes == {validator.B0_MODEL: "amazonbedrock"}
 
 
 def test_formal_route_preflight_rejects_auto_task_analyzer_upstream() -> None:

@@ -15946,10 +15946,10 @@ def test_openrouter_non_byok_audit_fails_closed() -> None:
     [
         (
             "B0",
-            "anthropic/claude-opus-4.8",
-            "anthropic",
-            "Anthropic",
-            "anthropic/claude-4.8-opus-20260528",
+            "anthropic/claude-fable-5",
+            "amazonbedrock",
+            "Amazon Bedrock",
+            "anthropic/claude-5-fable-20260609",
         ),
         (
             "B1",
@@ -15967,10 +15967,10 @@ def test_openrouter_non_byok_audit_fails_closed() -> None:
         ),
         (
             "B4",
-            "openai/gpt-5.5",
-            "openai",
-            "OpenAI",
-            "openai/gpt-5.5-20260423",
+            "openai/gpt-5.6-sol",
+            "azure",
+            "Azure",
+            "openai/gpt-5.6-sol-20260709",
         ),
         (
             "G1",

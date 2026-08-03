@@ -145,16 +145,17 @@ from opensquilla.usage_evidence import (
 )
 
 DEFAULT_B2_EXPERIMENT_CONFIG_PATH = ROOT / "configs/benchmarks/draco_b2_g12.json"
+TASK_ANALYZER_MODEL = "anthropic/claude-opus-4.8"
 
 
 GROUP_SPECS: dict[str, dict[str, Any]] = {
     # B0/B1 remain the summary baselines, so the reference report's delta
-    # columns compare every multi-model strategy against fixed Opus 4.8 and
+    # columns compare every multi-model strategy against fixed Claude Fable 5 and
     # SquillaRouter-selected single-model execution respectively.
     "B0": {
         "kind": "single",
-        "model": "anthropic/claude-opus-4.8",
-        "label": "fixed_opus48",
+        "model": "anthropic/claude-fable-5",
+        "label": "fixed_claude_fable5",
     },
     "B1": {"kind": "router_single", "label": "single_model_routing"},
     "B2": {
@@ -170,8 +171,8 @@ GROUP_SPECS: dict[str, dict[str, Any]] = {
     },
     "B4": {
         "kind": "single",
-        "model": "openai/gpt-5.5",
-        "label": "fixed_gpt55",
+        "model": "openai/gpt-5.6-sol",
+        "label": "fixed_gpt56_sol",
     },
     "G1": {
         "kind": "selection_mode",
@@ -9710,7 +9711,7 @@ async def collect_generation_with_retries(
                     "physical_attempts": raw_setup_usage,
                 },
                 provider_id="openrouter",
-                model_id="anthropic/claude-opus-4.8",
+                model_id=TASK_ANALYZER_MODEL,
                 source="g1_pre_call_guard_setup_recovery",
                 fallback_reason=type(exc).__name__,
             )

@@ -31,7 +31,8 @@ ROUTE_PREFLIGHT_SCHEMAS = frozenset(
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_EXPERIMENT_CONFIG_PATH = ROOT / "configs" / "benchmarks" / "draco_b2_g12.json"
 FORMAL_GROUP_ORDER = ("B0", "B1", "B2", "B4", "G1")
-B0_MODEL = "anthropic/claude-opus-4.8"
+B0_MODEL = "anthropic/claude-fable-5"
+B4_MODEL = "openai/gpt-5.6-sol"
 B2_EXPECTED_ROUTES = {
     "deepseek/deepseek-v4-pro": "deepseek",
     "z-ai/glm-5.2": "z-ai",
@@ -40,13 +41,15 @@ B2_EXPECTED_ROUTES = {
     "google/gemini-3.1-pro-preview": "google-ai-studio",
 }
 FIXED_GROUP_ROUTES = {
-    "B0": {B0_MODEL: "anthropic"},
-    "B4": {"openai/gpt-5.5": "openai"},
+    "B0": {B0_MODEL: "amazonbedrock"},
+    "B4": {B4_MODEL: "azure"},
 }
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 EXPECTED_PROVIDER_NAMES = {
+    "amazonbedrock": "Amazon Bedrock",
     "anthropic": "Anthropic",
+    "azure": "Azure",
     "deepseek": "DeepSeek",
     "z-ai": "Z.AI",
     "moonshotai": "Moonshot AI",

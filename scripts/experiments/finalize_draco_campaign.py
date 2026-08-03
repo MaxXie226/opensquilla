@@ -274,8 +274,9 @@ B2_PROPOSERS = (
     "qwen/qwen3.7-max",
 )
 B2_AGGREGATOR = "z-ai/glm-5.2"
-B0_MODEL = "anthropic/claude-opus-4.8"
-B4_MODEL = "openai/gpt-5.5"
+B0_MODEL = "anthropic/claude-fable-5"
+B4_MODEL = "openai/gpt-5.6-sol"
+TASK_ANALYZER_MODEL = "anthropic/claude-opus-4.8"
 B1_TEXT_TIER_MODELS = {
     "c0": "deepseek/deepseek-v4-flash",
     "c1": "deepseek/deepseek-v4-pro",
@@ -287,8 +288,9 @@ B1_TIER_MODELS = {
     "image_model": "moonshotai/kimi-k2.6",
 }
 FORMAL_UPSTREAM_PINS = {
-    B0_MODEL: "anthropic",
-    B4_MODEL: "openai",
+    B0_MODEL: "amazonbedrock",
+    B4_MODEL: "azure",
+    TASK_ANALYZER_MODEL: "anthropic",
     "deepseek/deepseek-v4-flash": "deepseek",
     "deepseek/deepseek-v4-pro": "deepseek",
     "z-ai/glm-5.2": "z-ai",
@@ -2569,7 +2571,7 @@ def validate_formal_campaign_contracts(
             if group == "B4"
             else set(B1_TIER_MODELS.values())
             if group == "B1"
-            else {*B2_PROPOSERS, B2_AGGREGATOR, B0_MODEL}
+            else {*B2_PROPOSERS, B2_AGGREGATOR, TASK_ANALYZER_MODEL}
             if group == "B2"
             else {*routes, str(g1_analyzer_policy["model"])}
         )
@@ -3023,7 +3025,7 @@ def _is_unknown_task_analyzer_placeholder(
     unit: Mapping[str, Any],
     *,
     expected_provider: str = "openrouter",
-    expected_model: str = B0_MODEL,
+    expected_model: str = TASK_ANALYZER_MODEL,
 ) -> bool:
     provider_usage = unit.get("provider_usage")
     return (
@@ -3386,7 +3388,9 @@ def usage_route_reasons(
                 and _is_unknown_task_analyzer_placeholder(
                     unit,
                     expected_provider="openrouter",
-                    expected_model=str((role_model_pins or {}).get("task_analyzer") or B0_MODEL),
+                    expected_model=str(
+                        (role_model_pins or {}).get("task_analyzer") or TASK_ANALYZER_MODEL
+                    ),
                 )
             )
             unknown_judge_allowed = allow_unknown_judge_attempts and _is_unknown_judge_placeholder(
@@ -7905,7 +7909,7 @@ def g1_provider_lifecycle_analyzer_reasons(
     """Require the setup-bearing attempt to contain one frozen task analyzer."""
 
     analyzer_provider = str((analyzer_policy or {}).get("provider") or "openrouter")
-    analyzer_model = str((analyzer_policy or {}).get("model") or B0_MODEL)
+    analyzer_model = str((analyzer_policy or {}).get("model") or TASK_ANALYZER_MODEL)
     execution = row.get("execution")
     attempts = (
         execution.get("generation_attempts")

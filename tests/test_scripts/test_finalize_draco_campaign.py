@@ -573,8 +573,8 @@ def test_selected_endpoint_receipt_binds_serving_alias_and_provider(module) -> N
                 "endpoints": {
                     "available": [
                         {
-                            "provider": "Anthropic",
-                            "model": "anthropic/claude-4.8-opus-20260528",
+                            "provider": "Amazon Bedrock",
+                            "model": "anthropic/claude-5-fable-20260609",
                             "selected": True,
                         }
                     ]
@@ -592,14 +592,16 @@ def test_selected_endpoint_receipt_binds_serving_alias_and_provider(module) -> N
                 ]
             },
             allowed_models={module.B0_MODEL},
-            provider_pins={module.B0_MODEL: "anthropic"},
+            provider_pins={
+                module.B0_MODEL: module.FORMAL_UPSTREAM_PINS[module.B0_MODEL]
+            },
         )
         == []
     )
     assert module.unit_exact_non_byok(unit) is True
     assert module._formal_openrouter_models_equivalent(
         module.B0_MODEL,
-        "anthropic/claude-4.8-opus-20260528",
+        "anthropic/claude-5-fable-20260609",
     )
     assert module._formal_openrouter_models_equivalent(
         "anthropic/claude-sonnet-5",
@@ -617,14 +619,14 @@ def test_selected_endpoint_receipt_binds_serving_alias_and_provider(module) -> N
     reasons = module.usage_route_reasons(
         {"model_usage_breakdown": [unit, bad_placeholder]},
         allowed_models={module.B0_MODEL},
-        provider_pins={module.B0_MODEL: "anthropic"},
+        provider_pins={module.B0_MODEL: module.FORMAL_UPSTREAM_PINS[module.B0_MODEL]},
     )
     assert "wrong_generation_provider_route" in reasons
     assert "wrong_generation_model_route" in reasons
 
     unit["provider_usage"]["router_metadata"]["endpoints"]["available"].append(
         {
-            "provider": "OpenAI",
+            "provider": "Azure",
             "model": module.B4_MODEL,
             "selected": True,
         }
@@ -632,7 +634,7 @@ def test_selected_endpoint_receipt_binds_serving_alias_and_provider(module) -> N
     reasons = module.usage_route_reasons(
         {"model_usage_breakdown": [unit]},
         allowed_models={module.B0_MODEL},
-        provider_pins={module.B0_MODEL: "anthropic"},
+        provider_pins={module.B0_MODEL: module.FORMAL_UPSTREAM_PINS[module.B0_MODEL]},
     )
     assert "conflicting_successful_router_receipt" in reasons
     assert module.unit_exact_non_byok(unit) is False
@@ -806,20 +808,22 @@ def test_auto_candidate_provider_accepts_any_successful_upstream_but_role_pin_re
     analyzer.update(
         {
             "role": "task_analyzer",
-            "model": module.B0_MODEL,
-            "requested_model": module.B0_MODEL,
+            "model": module.TASK_ANALYZER_MODEL,
+            "requested_model": module.TASK_ANALYZER_MODEL,
         }
     )
-    analyzer["provider_usage"]["requested_model"] = module.B0_MODEL
-    analyzer["provider_usage"]["router_metadata"]["requested"] = module.B0_MODEL
-    analyzer["provider_usage"]["router_metadata"]["attempts"][0]["model"] = module.B0_MODEL
+    analyzer["provider_usage"]["requested_model"] = module.TASK_ANALYZER_MODEL
+    analyzer["provider_usage"]["router_metadata"]["requested"] = module.TASK_ANALYZER_MODEL
+    analyzer["provider_usage"]["router_metadata"]["attempts"][0][
+        "model"
+    ] = module.TASK_ANALYZER_MODEL
     reasons = module.usage_route_reasons(
         {"model_usage_breakdown": [analyzer]},
         allowed_models={requested_model},
-        provider_pins={module.B0_MODEL: "auto"},
-        role_model_pins={"task_analyzer": module.B0_MODEL},
+        provider_pins={module.TASK_ANALYZER_MODEL: "auto"},
+        role_model_pins={"task_analyzer": module.TASK_ANALYZER_MODEL},
         role_provider_pins={
-            "task_analyzer": module.FORMAL_UPSTREAM_PINS[module.B0_MODEL],
+            "task_analyzer": module.FORMAL_UPSTREAM_PINS[module.TASK_ANALYZER_MODEL],
         },
     )
     assert "router_receipt_provider_not_bound_to_formal_route" in reasons
@@ -1000,7 +1004,11 @@ def _receipt(
     is_byok: bool = False,
 ) -> dict[str, object]:
     upstream_provider = (
-        "deepseek"
+        "amazonbedrock"
+        if model == "anthropic/claude-fable-5"
+        else "azure"
+        if model == "openai/gpt-5.6-sol"
+        else "deepseek"
         if model.startswith("deepseek/")
         else "z-ai"
         if model.startswith("z-ai/")
@@ -2763,8 +2771,8 @@ def _default_task_analyzer_policy() -> dict[str, object]:
 
 def _contract(module, group: str, key_hash: str) -> dict[str, object]:
     fixed = {
-        "B0": "anthropic/claude-opus-4.8",
-        "B4": "openai/gpt-5.5",
+        "B0": module.B0_MODEL,
+        "B4": module.B4_MODEL,
     }
     blocked_domains = list(module.FORMAL_BLOCKED_DOMAINS)
     finalization_policy = dict(module.FORMAL_AGENT_FINALIZATION_POLICY)
@@ -3481,7 +3489,7 @@ def _g1_plan(module, proposers: list[str], aggregator: str) -> dict[str, object]
             schema_valid=True,
             confidence=0.9,
             provider_id="openrouter",
-            model_id=module.B0_MODEL,
+            model_id=module.TASK_ANALYZER_MODEL,
         ),
         user_profile=None,
         request_context=request_context,
@@ -3726,10 +3734,10 @@ def _row(
     exact: bool = True,
 ) -> dict[str, object]:
     model = {
-        "B0": "anthropic/claude-opus-4.8",
+        "B0": module.B0_MODEL,
         "B1": "deepseek/deepseek-v4-pro",
         "B2": "z-ai/glm-5.2",
-        "B4": "openai/gpt-5.5",
+        "B4": module.B4_MODEL,
         "G1": "z-ai/glm-5.2",
     }[group]
     generation_receipt = _receipt(
@@ -3809,7 +3817,7 @@ def _row(
         analyzer_id = _physical_attempt_id(f"{response_prefix}:task-analyzer")
         analyzer_receipt = _receipt(
             f"{response_prefix}-task-analyzer",
-            module.B0_MODEL,
+            module.TASK_ANALYZER_MODEL,
             exact=exact,
         )
         analyzer_receipt.update(
@@ -7474,7 +7482,7 @@ def test_unknown_failed_analyzer_attempt_is_preserved_without_rerun(
         "provider": "",
         "model": "",
         "requested_provider": "openrouter",
-        "requested_model": module.B0_MODEL,
+        "requested_model": module.TASK_ANALYZER_MODEL,
         "input_tokens": 0,
         "output_tokens": 0,
         "reasoning_tokens": 0,
@@ -7654,7 +7662,7 @@ def test_cleanup_failure_setup_attempt_blocks_unreconstructed_later_success(
         "provider": "",
         "model": "",
         "requested_provider": "openrouter",
-        "requested_model": module.B0_MODEL,
+        "requested_model": module.TASK_ANALYZER_MODEL,
         "input_tokens": 0,
         "output_tokens": 0,
         "reasoning_tokens": 0,
@@ -8773,7 +8781,7 @@ def test_same_attempt_metadata_repair_replaces_estimate_with_exact_receipt(
         old_unit["cost_source"] = "opensquilla_static_estimate"
         new_unit = _receipt(
             "b0-repaired-exact",
-            "anthropic/claude-opus-4.8",
+            module.B0_MODEL,
             cost=0.1,
             exact=True,
         )
@@ -9500,7 +9508,7 @@ def test_b2_rejects_analyzer_and_g1_requires_it(module, tmp_path: Path) -> None:
     args, _, lock_fd = _campaign(module, tmp_path / "b2", with_repair=False)
     rows = [json.loads(line) for line in args.result[0].read_text().splitlines()]
     b2 = next(row for row in rows if row["group"] == "B2")
-    analyzer = _receipt("evil-b2-analyzer", module.B0_MODEL)
+    analyzer = _receipt("evil-b2-analyzer", module.TASK_ANALYZER_MODEL)
     analyzer["role"] = "task_analyzer"
     attempt_run = b2["execution"]["generation_attempts"][0]["run"]
     attempt_run["usage"]["model_usage_breakdown"].append(analyzer)

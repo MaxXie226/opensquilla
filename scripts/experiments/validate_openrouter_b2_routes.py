@@ -32,10 +32,11 @@ ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_EXPERIMENT_CONFIG_PATH = ROOT / "configs" / "benchmarks" / "draco_b2_g12.json"
 ROUTE_PREFLIGHT_SCHEMA = "opensquilla.openrouter-route-preflight/v3"
 FORMAL_GROUP_ORDER = ("B0", "B1", "B2", "B4", "G1")
-B0_MODEL = "anthropic/claude-opus-4.8"
+B0_MODEL = "anthropic/claude-fable-5"
+B4_MODEL = "openai/gpt-5.6-sol"
 FIXED_GROUP_ROUTES = {
-    "B0": {B0_MODEL: "anthropic"},
-    "B4": {"openai/gpt-5.5": "openai"},
+    "B0": {B0_MODEL: "amazonbedrock"},
+    "B4": {B4_MODEL: "azure"},
 }
 B2_EXPECTED_ROUTES = {
     "deepseek/deepseek-v4-pro": "deepseek",
@@ -142,7 +143,9 @@ FORMAL_REASONING_INELIGIBLE_MODELS = frozenset(
     and facts.get("supports_reasoning") is not True
 )
 EXPECTED_PROVIDER_NAMES = {
+    "amazonbedrock": "Amazon Bedrock",
     "anthropic": "Anthropic",
+    "azure": "Azure",
     "deepseek": "DeepSeek",
     "z-ai": "Z.AI",
     "moonshotai": "Moonshot AI",

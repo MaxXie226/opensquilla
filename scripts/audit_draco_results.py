@@ -14,8 +14,8 @@ from opensquilla.eval.draco_artifact_integrity import verify_result_row_evidence
 
 GROUPS = ("B0", "B1", "B2", "B3", "B4", "G1")
 FIXED_MODELS = {
-    "B0": "anthropic/claude-opus-4.8",
-    "B4": "openai/gpt-5.5",
+    "B0": "anthropic/claude-fable-5",
+    "B4": "openai/gpt-5.6-sol",
 }
 
 
