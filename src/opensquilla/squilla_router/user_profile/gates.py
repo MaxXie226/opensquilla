@@ -20,6 +20,7 @@ NO_SESSIONS = "no_sessions"
 AGENT_ACTIVE = "agent_active"
 COOLDOWN = "cooldown"
 INSUFFICIENT_SESSIONS = "insufficient_sessions"
+INSUFFICIENT_READABLE_SESSIONS = "insufficient_readable_sessions"
 
 # Independent kill-switch, parallel to ``self_learning``'s env disable.
 ENV_DISABLE = "OPENSQUILLA_USER_PROFILE_DISABLED"
@@ -122,6 +123,7 @@ __all__ = [
     "COOLDOWN_HOURS",
     "IDLE_HOURS",
     "INSUFFICIENT_SESSIONS",
+    "INSUFFICIENT_READABLE_SESSIONS",
     "MIN_SESSIONS",
     "NO_SESSIONS",
     "READY",

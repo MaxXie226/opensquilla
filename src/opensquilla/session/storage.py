@@ -98,6 +98,14 @@ class CanonicalTranscriptCoverage:
     inherited_compactions: bool
 
 
+@dataclass(frozen=True, slots=True)
+class ProfileTranscriptRow:
+    """Minimal canonical transcript row used by offline profile generation."""
+
+    role: str
+    content: str | None
+
+
 class StorageBusyError(RuntimeError):
     """Raised when a session-storage operation outlives its bounded busy budget."""
 
@@ -3711,6 +3719,7 @@ class SessionStorage:
             rows = await cur.fetchall()
         return [SessionNode(**_deserialize_row(dict(r))) for r in rows]
 
+    @_serialized_read
     async def list_session_ids_updated_since(
         self,
         since_ms: int,
@@ -6568,6 +6577,87 @@ class SessionStorage:
             limit=limit,
             offset=offset,
         )
+
+    @_serialized_read
+    async def get_canonical_transcript_window(
+        self,
+        session_id: str,
+        *,
+        head_rows: int,
+        tail_rows: int,
+        per_entry_max_chars: int,
+    ) -> list[ProfileTranscriptRow]:
+        """Return a bounded canonical head/tail window for profile generation."""
+
+        head_limit = max(0, int(head_rows))
+        tail_limit = max(0, int(tail_rows))
+        max_chars = max(0, int(per_entry_max_chars))
+        marker = "\n[transcript truncated]\n"
+        if max_chars <= len(marker):
+            truncated_marker = marker[:max_chars]
+            head_chars = 0
+            tail_chars = 0
+        else:
+            truncated_marker = marker
+            content_budget = max_chars - len(marker)
+            head_chars = content_budget // 2
+            tail_chars = content_budget - head_chars
+
+        sql = """
+            WITH canonical AS (
+                SELECT
+                    original_entry_id AS entry_id,
+                    role,
+                    content,
+                    created_at
+                FROM compacted_transcript_entries
+                WHERE session_id = ?
+                UNION ALL
+                SELECT
+                    id AS entry_id,
+                    role,
+                    content,
+                    created_at
+                FROM transcript_entries
+                WHERE session_id = ?
+            ),
+            numbered AS (
+                SELECT
+                    role,
+                    CASE
+                        WHEN content IS NULL OR length(content) <= ? THEN content
+                        WHEN ? = 0 THEN ''
+                        WHEN ? = 1 THEN ?
+                        ELSE substr(content, 1, ?) || ? || substr(content, -?)
+                    END AS content,
+                    row_number() OVER (ORDER BY created_at ASC, entry_id ASC) AS rn,
+                    count(*) OVER () AS total_rows
+                FROM canonical
+            )
+            SELECT role, content
+            FROM numbered
+            WHERE rn <= ? OR rn > total_rows - ?
+            ORDER BY rn ASC
+        """
+        params = (
+            session_id,
+            session_id,
+            max_chars,
+            max_chars,
+            int(max_chars <= len(marker)),
+            truncated_marker,
+            head_chars,
+            truncated_marker,
+            tail_chars,
+            head_limit,
+            tail_limit,
+        )
+        async with self.conn.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+        return [
+            ProfileTranscriptRow(role=str(row["role"]), content=row["content"])
+            for row in rows
+        ]
 
     @_serialized_read
     async def get_canonical_transcript_entry(

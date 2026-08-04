@@ -10,12 +10,14 @@ per-row N+1 against count_transcript_entries. Behaviour requirements:
 
 from __future__ import annotations
 
+import asyncio
 import tempfile
 from pathlib import Path
 
 import pytest
 
-from opensquilla.session.storage import SessionStorage
+from opensquilla.session.models import SessionNode, TranscriptEntry
+from opensquilla.session.storage import ProfileTranscriptRow, SessionStorage
 
 
 @pytest.fixture
@@ -32,8 +34,6 @@ async def storage():
 
 async def _seed_session(storage: SessionStorage, session_id: str, entry_count: int) -> None:
     """Create a session row and append `entry_count` transcript entries."""
-    from opensquilla.session.models import SessionNode, TranscriptEntry
-
     node = SessionNode(
         session_key=f"agent:test:{session_id}",
         session_id=session_id,
@@ -52,6 +52,66 @@ async def _seed_session(storage: SessionStorage, session_id: str, entry_count: i
             created_at=i + 1,
         )
         await storage.append_transcript_entry(entry)
+
+
+async def _seed_profile_window_session(
+    storage: SessionStorage,
+    session_id: str,
+    contents: list[str],
+) -> SessionNode:
+    node = SessionNode(
+        session_key=f"agent:test:{session_id}",
+        session_id=session_id,
+        agent_id="test",
+        status="idle",
+        created_at=1,
+        updated_at=1,
+    )
+    await storage.upsert_session(node)
+    archived_count = len(contents) - 3
+    for index, content in enumerate(contents[:archived_count]):
+        await storage.conn.execute(
+            """
+            INSERT INTO compacted_transcript_entries (
+                session_id,
+                session_key,
+                compaction_id,
+                compaction_index,
+                original_entry_id,
+                message_id,
+                role,
+                content,
+                created_at,
+                archived_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                node.session_id,
+                node.session_key,
+                "cmp-profile-window",
+                0,
+                index + 1,
+                f"{session_id}-archived-{index}",
+                "assistant" if index % 2 else "user",
+                content,
+                1_000 + index,
+                2_000,
+            ),
+        )
+    await storage.conn.commit()
+    for index, content in enumerate(contents[archived_count:], start=archived_count):
+        await storage.append_transcript_entry(
+            TranscriptEntry(
+                session_id=node.session_id,
+                session_key=node.session_key,
+                message_id=f"{session_id}-active-{index}",
+                role="assistant" if index % 2 else "user",
+                content=content,
+                created_at=1_000 + index,
+            )
+        )
+    return node
 
 
 async def test_batch_count_empty_list_returns_empty_dict(storage: SessionStorage) -> None:
@@ -104,8 +164,6 @@ async def test_list_session_ids_updated_since_defaults_to_unlimited(
 ) -> None:
     """Profile selection must not silently truncate its history window."""
 
-    from opensquilla.session.models import SessionNode
-
     for i in range(2005):
         await storage.upsert_session(
             SessionNode(
@@ -129,3 +187,127 @@ async def test_list_session_ids_updated_since_defaults_to_unlimited(
     assert rows[0] == ("sid-0", 1)
     assert rows[-1] == ("sid-2004", 2005)
     assert len(limited) == 2000
+
+
+async def test_list_session_ids_updated_since_waits_for_serialized_read_lock(
+    storage: SessionStorage,
+) -> None:
+    await storage.upsert_session(
+        SessionNode(
+            session_key="agent:test:serialized",
+            session_id="serialized",
+            agent_id="test",
+            status="idle",
+            created_at=1,
+            updated_at=1,
+        )
+    )
+
+    await storage._operation_lock.acquire()
+    task = asyncio.create_task(storage.list_session_ids_updated_since(0, agent_id="test"))
+    try:
+        await asyncio.sleep(0)
+        assert task.done() is False
+    finally:
+        storage._operation_lock.release()
+
+    assert await asyncio.wait_for(task, timeout=1) == [("serialized", 1)]
+
+
+async def test_canonical_transcript_window_is_bounded_ordered_and_deduped(
+    storage: SessionStorage,
+) -> None:
+    long_content = "A" * 80
+    node = await _seed_profile_window_session(
+        storage,
+        "profile-window",
+        [
+            long_content,
+            "message 1",
+            "message 2",
+            "message 3",
+            "message 4",
+            "message 5",
+        ],
+    )
+
+    rows = await storage.get_canonical_transcript_window(
+        node.session_id,
+        head_rows=4,
+        tail_rows=4,
+        per_entry_max_chars=40,
+    )
+
+    assert len(rows) == 6
+    assert [row.role for row in rows] == [
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+    ]
+    assert [row.content for row in rows[1:]] == [
+        "message 1",
+        "message 2",
+        "message 3",
+        "message 4",
+        "message 5",
+    ]
+    assert rows[0].content == "AAAAAAAA\n[transcript truncated]\nAAAAAAAA"
+    assert len(rows[0].content or "") == 40
+    assert isinstance(rows[0], ProfileTranscriptRow)
+
+    active_rows = await storage.get_transcript(node.session_id)
+    assert [row.content for row in active_rows] == ["message 3", "message 4", "message 5"]
+
+
+async def test_canonical_transcript_window_respects_disjoint_head_tail_bounds(
+    storage: SessionStorage,
+) -> None:
+    node = await _seed_profile_window_session(
+        storage,
+        "profile-window-bounds",
+        [f"message {index}" for index in range(8)],
+    )
+
+    rows = await storage.get_canonical_transcript_window(
+        node.session_id,
+        head_rows=2,
+        tail_rows=3,
+        per_entry_max_chars=100,
+    )
+
+    assert [row.content for row in rows] == [
+        "message 0",
+        "message 1",
+        "message 5",
+        "message 6",
+        "message 7",
+    ]
+
+
+async def test_canonical_transcript_window_small_budgets_never_return_source_content(
+    storage: SessionStorage,
+) -> None:
+    node = await _seed_profile_window_session(
+        storage,
+        "profile-window-small-budget",
+        ["A" * 80, "message 1", "message 2"],
+    )
+
+    zero_rows = await storage.get_canonical_transcript_window(
+        node.session_id,
+        head_rows=1,
+        tail_rows=0,
+        per_entry_max_chars=0,
+    )
+    short_rows = await storage.get_canonical_transcript_window(
+        node.session_id,
+        head_rows=1,
+        tail_rows=0,
+        per_entry_max_chars=5,
+    )
+
+    assert zero_rows == [ProfileTranscriptRow(role="user", content="")]
+    assert short_rows == [ProfileTranscriptRow(role="user", content="\n[tra")]

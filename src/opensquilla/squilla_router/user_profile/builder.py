@@ -10,6 +10,7 @@ must reproduce exactly; see ``test_user_profile_builder``.
 from __future__ import annotations
 
 import copy
+import json
 from collections import Counter
 from typing import Any
 
@@ -273,6 +274,7 @@ def build_profile(
         "batches": len(batches),
         "fields": fields,
     }
+    json.dumps(payload, allow_nan=False)
     return payload
 
 

@@ -97,6 +97,22 @@ def test_env_kill_switch_disables(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result.reason == DISABLED
 
 
+@pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "Yes", "on", " ON "])
+def test_env_kill_switch_truthy_values(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_USER_PROFILE_DISABLED", value)
+    assert user_profile_disabled_by_env() is True
+
+
+@pytest.mark.parametrize("value", ["", "0", "false", "no", "off", "disabled"])
+def test_env_kill_switch_non_truthy_values(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_USER_PROFILE_DISABLED", value)
+    assert user_profile_disabled_by_env() is False
+
+
 def test_stats_are_reported_for_telemetry() -> None:
     result = _eval(state=_State(), sessions=25, latest_hours_ago=5)
     assert result.stats["session_count"] == 25

@@ -13,9 +13,7 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from opensquilla.squilla_router.user_profile.store import profiles_dir
-
-_STATE_FILENAME = ".profile_state.json"
+from opensquilla.squilla_router.user_profile.store import profile_state_path, write_text_atomic
 
 
 def utc_now_ts() -> str:
@@ -38,7 +36,7 @@ class ProfileRunState:
 
 
 def _state_path(agent_id: str, home: Path | None = None) -> Path:
-    return profiles_dir(agent_id, home) / _STATE_FILENAME
+    return profile_state_path(agent_id, home)
 
 
 def load_run_state(agent_id: str, home: Path | None = None) -> ProfileRunState:
@@ -57,8 +55,7 @@ def load_run_state(agent_id: str, home: Path | None = None) -> ProfileRunState:
 
 def save_run_state(state: ProfileRunState, agent_id: str, home: Path | None = None) -> Path:
     path = _state_path(agent_id, home)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(state.to_json(), ensure_ascii=False, indent=2), encoding="utf-8")
+    write_text_atomic(path, json.dumps(state.to_json(), ensure_ascii=False, indent=2))
     return path
 
 

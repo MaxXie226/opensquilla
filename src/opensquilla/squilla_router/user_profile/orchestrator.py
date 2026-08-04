@@ -8,6 +8,7 @@ hook is never poisoned and no half-written profile ships.
 
 from __future__ import annotations
 
+import asyncio
 import copy
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -18,7 +19,12 @@ from typing import Any
 import structlog
 
 from opensquilla.squilla_router.user_profile import builder, extractor, store
-from opensquilla.squilla_router.user_profile.gates import evaluate_profile_gates
+from opensquilla.squilla_router.user_profile.gates import (
+    INSUFFICIENT_READABLE_SESSIONS,
+    MIN_SESSIONS,
+    evaluate_profile_gates,
+    user_profile_disabled_by_env,
+)
 from opensquilla.squilla_router.user_profile.schema import BatchAnalysis
 from opensquilla.squilla_router.user_profile.state import (
     ProfileRunState,
@@ -31,6 +37,9 @@ log = structlog.get_logger(__name__)
 _TS_FMT = "%Y-%m-%dT%H:%M:%SZ"
 WINDOW_DAYS = 90
 PER_SESSION_MAX_CHARS = 6000
+PROFILE_TRANSCRIPT_HEAD_ROWS = 64
+PROFILE_TRANSCRIPT_TAIL_ROWS = 64
+PROFILE_TRANSCRIPT_ENTRY_MAX_CHARS = 6000
 BATCH_SIZE = 10
 BATCH_INPUT_MAX_CHARS = 48000
 # Some Dream-selected reasoning models consume a substantial part of
@@ -52,6 +61,7 @@ class ProfileRunResult:
     version: str | None = None
     sessions_read: int = 0
     batches: int = 0
+    state_committed: bool | None = None
 
 
 def _ms_to_ts(ms: int) -> str:
@@ -71,12 +81,16 @@ async def maybe_produce_user_profile(
 ) -> ProfileRunResult:
     """Produce one user-profile version if the gates allow. Never raises.
 
-    ``storage`` exposes ``list_session_ids_updated_since`` and ``get_transcript``;
+    ``storage`` exposes ``list_session_ids_updated_since`` and
+    ``get_canonical_transcript_window``;
     ``build_provider`` is a zero-arg callable returning a resolved provider (or
     ``None``), invoked only after the gates pass so a gated run costs nothing.
     ``stream_factory`` adapts that provider to the provider-neutral extractor.
     """
 
+    if user_profile_disabled_by_env():
+        log.info("user_profile.gated", agent_id=agent_id, reason="disabled")
+        return ProfileRunResult(ran=False, reason="disabled")
     try:
         return await _run(
             agent_id,
@@ -89,7 +103,11 @@ async def maybe_produce_user_profile(
             now=now or datetime.now(UTC),
         )
     except Exception as exc:  # noqa: BLE001 — the producer must never poison the hook
-        log.warning("user_profile.produce_error", agent_id=agent_id, error=str(exc))
+        log.warning(
+            "user_profile.produce_error",
+            agent_id=agent_id,
+            error_category=type(exc).__name__,
+        )
         _bump_failure(agent_id, home)
         return ProfileRunResult(ran=False, reason="error")
 
@@ -101,13 +119,6 @@ def _bump_failure(agent_id: str, home: Path | None) -> None:
         save_run_state(state, agent_id, home)
     except Exception:  # noqa: BLE001 — bookkeeping is best-effort
         pass
-
-
-def _record_attempt(
-    state: ProfileRunState, agent_id: str, home: Path | None, now: datetime
-) -> None:
-    state.last_attempt_ts = now.strftime(_TS_FMT)
-    save_run_state(state, agent_id, home)
 
 
 async def _run(
@@ -141,16 +152,15 @@ async def _run(
         log.info("user_profile.gated", agent_id=agent_id, reason=gate.reason, **gate.stats)
         return ProfileRunResult(ran=False, reason=gate.reason)
 
-    _record_attempt(state, agent_id, home, now)
-    provider = build_provider()
-    if provider is None:
-        log.info("user_profile.no_provider", agent_id=agent_id)
-        return ProfileRunResult(ran=False, reason="no_provider")
-
     rendered = []
     for session_id, _updated in rows:
         try:
-            entries = await storage.get_transcript(session_id)
+            entries = await storage.get_canonical_transcript_window(
+                session_id,
+                head_rows=PROFILE_TRANSCRIPT_HEAD_ROWS,
+                tail_rows=PROFILE_TRANSCRIPT_TAIL_ROWS,
+                per_entry_max_chars=PROFILE_TRANSCRIPT_ENTRY_MAX_CHARS,
+            )
         except Exception:  # noqa: BLE001 — one unreadable session must not abort
             continue
         session = extractor.render_transcript(
@@ -165,32 +175,59 @@ async def _run(
         batch_input_max_chars=BATCH_INPUT_MAX_CHARS,
     )
     sessions_read = sum(len(batch) for batch in batches_input)
-    if sessions_read <= 0:
-        log.info("user_profile.no_readable_sessions", agent_id=agent_id)
-        return ProfileRunResult(ran=False, reason="no_readable_sessions")
+    if sessions_read < MIN_SESSIONS:
+        log.info(
+            "user_profile.insufficient_readable_sessions",
+            agent_id=agent_id,
+            reason=INSUFFICIENT_READABLE_SESSIONS,
+            sessions_read=sessions_read,
+            min_sessions=MIN_SESSIONS,
+        )
+        return ProfileRunResult(
+            ran=False,
+            reason=INSUFFICIENT_READABLE_SESSIONS,
+            sessions_read=sessions_read,
+        )
+
+    state.last_attempt_ts = now.strftime(_TS_FMT)
+    save_run_state(state, agent_id, home)
+    provider = build_provider()
+    if provider is None:
+        log.info("user_profile.no_provider", agent_id=agent_id)
+        return ProfileRunResult(ran=False, reason="no_provider")
 
     analyses: list[BatchAnalysis] = []
     for batch in batches_input:
-        analyses.append(
-            await extractor.extract_batch(
-                provider=provider,
-                stream_factory=stream_factory,
-                batch=batch,
-                max_output_tokens=MAX_OUTPUT_TOKENS,
-                temperature=TEMPERATURE,
-                timeout=TIMEOUT_SECONDS,
-                response_max_chars=RESPONSE_MAX_CHARS,
-            )
+        analysis = await extractor.extract_batch(
+            provider=provider,
+            stream_factory=stream_factory,
+            batch=batch,
+            max_output_tokens=MAX_OUTPUT_TOKENS,
+            temperature=TEMPERATURE,
+            timeout=TIMEOUT_SECONDS,
+            response_max_chars=RESPONSE_MAX_CHARS,
         )
+        analyses.append(analysis)
+        if not analysis.ok:
+            log.warning(
+                "user_profile.batch_failed",
+                agent_id=agent_id,
+                sessions_in_batch=len(analysis.session_ids),
+            )
 
     if not any(analysis.ok for analysis in analyses):
-        log.warning("user_profile.all_batches_failed", agent_id=agent_id)
+        log.warning(
+            "user_profile.all_batches_failed",
+            agent_id=agent_id,
+            failed_batches=len(analyses),
+            sessions_read=sessions_read,
+        )
         state.consecutive_failures += 1
         save_run_state(state, agent_id, home)
         return ProfileRunResult(ran=False, reason="all_batches_failed")
+    dropped_model_mentions = sum(analysis.dropped_model_mentions for analysis in analyses)
 
     day = now.strftime("%Y-%m-%d")
-    version = store.next_version(day, agent_id, home)
     successful_sessions_read = sum(
         len(analysis.session_ids) for analysis in analyses if analysis.ok
     )
@@ -206,26 +243,41 @@ async def _run(
             }
         )
         profile_base["permission"] = permission
-    payload = builder.build_profile(
-        batches=analyses,
-        base_profile=profile_base,
-        sessions_read=successful_sessions_read,
-        day=day,
-        version=version,
-        top_n=TOP_N_CAPABILITIES,
-        window_days=WINDOW_DAYS,
-    )
-
-    store.write_profile_version(payload, version, agent_id, home=home)
-    store.write_active_atomic(version, agent_id, home=home)
-
-    state = ProfileRunState(
+    published_state = ProfileRunState(
         last_attempt_ts=state.last_attempt_ts,
         last_run_ts=now.strftime(_TS_FMT),
-        last_version=version,
+        last_version=None,
         consecutive_failures=0,
     )
-    save_run_state(state, agent_id, home)
+
+    def build_payload(version: str) -> Mapping[str, Any]:
+        return builder.build_profile(
+            batches=analyses,
+            base_profile=profile_base,
+            sessions_read=successful_sessions_read,
+            day=day,
+            version=version,
+            top_n=TOP_N_CAPABILITIES,
+            window_days=WINDOW_DAYS,
+        )
+
+    def state_for_version(version: str) -> Mapping[str, Any]:
+        published_state.last_version = version
+        return published_state.to_json()
+
+    try:
+        publication = await asyncio.to_thread(
+            store.publish_profile,
+            agent_id=agent_id,
+            day=day,
+            build_payload=build_payload,
+            state_payload=state_for_version,
+            home=home,
+        )
+    except store.ProfilePublicationBusyError:
+        log.info("user_profile.publication_busy", agent_id=agent_id)
+        return ProfileRunResult(ran=False, reason="publication_busy")
+    version = publication.version
 
     log.info(
         "user_profile.produced",
@@ -233,6 +285,8 @@ async def _run(
         version=version,
         sessions_read=successful_sessions_read,
         batches=len(analyses),
+        dropped_model_mentions=dropped_model_mentions,
+        state_committed=publication.state_committed,
     )
     return ProfileRunResult(
         ran=True,
@@ -240,6 +294,7 @@ async def _run(
         version=version,
         sessions_read=successful_sessions_read,
         batches=len(analyses),
+        state_committed=publication.state_committed,
     )
 
 

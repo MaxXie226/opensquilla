@@ -142,6 +142,82 @@ def _auto_propose_usage_execution_context(
     )
 
 
+def _user_profile_usage_execution_context(
+    agent_id: str,
+    usage_event_sink: Any | None,
+) -> Any | None:
+    """Create one run identity for gateway-owned user-profile production."""
+
+    if usage_event_sink is None:
+        return None
+    from opensquilla.engine.usage_accounting import UsageExecutionContext
+
+    execution_id = uuid.uuid4().hex
+    return UsageExecutionContext(
+        execution_id=execution_id,
+        agent_run_id=execution_id,
+        turn_id=execution_id,
+        session_id=uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"opensquilla:system:user-profile-generation:{agent_id}",
+        ).hex,
+        session_epoch=0,
+        agent_id=agent_id,
+        run_kind="user_profile_generation",
+    )
+
+
+def _user_profile_stream_factory(
+    *,
+    provider: Any,
+    user_prompt: str,
+    system_prompt: str,
+    max_output_tokens: int,
+    temperature: float,
+    timeout: float,
+    account_usage: bool = True,
+) -> Any:
+    """Build the post-Dream profile stream under physical-call accounting."""
+
+    from opensquilla.engine.usage_accounting import (
+        account_provider_stream,
+        current_usage_accounting_scope,
+        provider_accounts_physical_usage,
+    )
+    from opensquilla.provider.protocol import provider_metadata
+    from opensquilla.provider.types import ChatConfig, Message
+
+    messages = [Message(role="user", content=user_prompt)]
+    config = ChatConfig(
+        max_tokens=max_output_tokens,
+        temperature=temperature,
+        system=system_prompt,
+        thinking=False,
+        timeout=timeout,
+    )
+
+    def raw_stream() -> Any:
+        return provider.chat(
+            messages,
+            tools=None,
+            config=config,
+        )
+
+    if (
+        not account_usage
+        or current_usage_accounting_scope() is None
+        or provider_accounts_physical_usage(provider)
+    ):
+        return raw_stream()
+
+    metadata = provider_metadata(provider)
+    return account_provider_stream(
+        raw_stream,
+        provider=metadata.provider_id or metadata.provider_name or metadata.provider_kind,
+        model=metadata.model,
+    )
+
+
 def gateway_graceful_timeout() -> float:
     """Per-phase graceful drain budget in seconds, env-overridable and bounded.
 
@@ -218,6 +294,100 @@ def _user_profile_permission_snapshot(
         live_override=None,
         allowed_tools=allowed_tools,
     )
+
+
+async def _produce_user_profile_after_dream(
+    agent_id: str,
+    *,
+    config: GatewayConfig,
+    session_manager: Any,
+    tool_registry: Any,
+    usage_event_sink: Any | None,
+) -> None:
+    """Run the opt-in profile producer after a successful Dream cycle.
+
+    This adapter owns the gateway-only provider selection and usage scope. It
+    stays fail-open to Dream and logs only stable, privacy-safe fields.
+    """
+
+    if not _user_profile_generation_enabled(config):
+        return
+    from opensquilla.squilla_router.user_profile.gates import (
+        user_profile_disabled_by_env,
+    )
+
+    if user_profile_disabled_by_env():
+        return
+    started_at = time.monotonic()
+    try:
+        from opensquilla.engine.usage_accounting import (
+            UsageAccountingScope,
+            bind_usage_accounting_scope,
+        )
+        from opensquilla.memory.dream_factory import (
+            build_dream_provider_selector,
+        )
+        from opensquilla.squilla_router.user_profile.defaults import (
+            default_user_profile,
+        )
+        from opensquilla.squilla_router.user_profile.orchestrator import (
+            maybe_produce_user_profile,
+        )
+
+        storage = get_session_storage(session_manager)
+        if storage is None:
+            return
+
+        def build_provider() -> Any | None:
+            selector = build_dream_provider_selector(config)
+            resolve = getattr(selector, "resolve", None)
+            return resolve() if callable(resolve) else None
+
+        context = _user_profile_usage_execution_context(agent_id, usage_event_sink)
+        usage_scope = (
+            UsageAccountingScope(
+                sink=cast(Any, usage_event_sink),
+                context=context,
+            )
+            if context is not None
+            else None
+        )
+
+        def stream_factory(**kwargs: Any) -> Any:
+            return _user_profile_stream_factory(
+                **kwargs,
+                account_usage=context is not None,
+            )
+
+        with bind_usage_accounting_scope(usage_scope):
+            result = await maybe_produce_user_profile(
+                agent_id,
+                base_profile=default_user_profile(),
+                permission_snapshot=_user_profile_permission_snapshot(
+                    config,
+                    tool_registry,
+                    agent_id,
+                ),
+                storage=storage,
+                build_provider=build_provider,
+                stream_factory=stream_factory,
+            )
+        log.info(
+            "user_profile.post_dream",
+            agent_id=agent_id,
+            ran=result.ran,
+            reason=result.reason,
+            version=result.version,
+            sessions_read=result.sessions_read,
+            elapsed_ms=_elapsed_monotonic_ms(started_at),
+        )
+    except Exception as exc:  # never poison the dream hook
+        log.warning(
+            "user_profile.post_dream_error",
+            agent_id=agent_id,
+            error_category=type(exc).__name__,
+            elapsed_ms=_elapsed_monotonic_ms(started_at),
+        )
 
 
 class _FlushReceiptSessionStorage(Protocol):
@@ -4074,76 +4244,13 @@ async def start_gateway_server(
             into the Dream hook.
             """
 
-            if not _user_profile_generation_enabled(config):
-                return
-            try:
-                from opensquilla.memory.dream_factory import (
-                    build_dream_provider_selector,
-                )
-                from opensquilla.provider.types import ChatConfig, Message
-                from opensquilla.squilla_router.user_profile.defaults import (
-                    default_user_profile,
-                )
-                from opensquilla.squilla_router.user_profile.orchestrator import (
-                    maybe_produce_user_profile,
-                )
-
-                storage = get_session_storage(svc.session_manager)
-                if storage is None:
-                    return
-
-                def build_provider() -> Any | None:
-                    selector = build_dream_provider_selector(config)
-                    resolve = getattr(selector, "resolve", None)
-                    return resolve() if callable(resolve) else None
-
-                def stream_factory(
-                    *,
-                    provider: Any,
-                    user_prompt: str,
-                    system_prompt: str,
-                    max_output_tokens: int,
-                    temperature: float,
-                    timeout: float,
-                ) -> Any:
-                    return provider.chat(
-                        [Message(role="user", content=user_prompt)],
-                        tools=None,
-                        config=ChatConfig(
-                            max_tokens=max_output_tokens,
-                            temperature=temperature,
-                            system=system_prompt,
-                            thinking=False,
-                            timeout=timeout,
-                        ),
-                    )
-
-                result = await maybe_produce_user_profile(
-                    agent_id,
-                    base_profile=default_user_profile(),
-                    permission_snapshot=_user_profile_permission_snapshot(
-                        config,
-                        svc.tool_registry,
-                        agent_id,
-                    ),
-                    storage=storage,
-                    build_provider=build_provider,
-                    stream_factory=stream_factory,
-                )
-                log.info(
-                    "user_profile.post_dream",
-                    agent_id=agent_id,
-                    ran=result.ran,
-                    reason=result.reason,
-                    version=result.version,
-                    sessions_read=result.sessions_read,
-                )
-            except Exception as exc:  # never poison the dream hook
-                log.warning(
-                    "user_profile.post_dream_error",
-                    agent_id=agent_id,
-                    error=str(exc),
-                )
+            await _produce_user_profile_after_dream(
+                agent_id,
+                config=config,
+                session_manager=svc.session_manager,
+                tool_registry=svc.tool_registry,
+                usage_event_sink=usage_event_sink,
+            )
 
         async def _post_dream_auto_propose(
             agent_id: str,

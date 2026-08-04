@@ -96,6 +96,7 @@ class BatchAnalysis:
     )
     cost_sensitivity_confidence: float = 0.0
     model_mentions: tuple[ModelMention, ...] = ()
+    dropped_model_mentions: int = 0
     # Session ids actually sent in this batch — the honest denominator anchor
     # even when the LLM forgets to label one.
     session_ids: tuple[str, ...] = ()

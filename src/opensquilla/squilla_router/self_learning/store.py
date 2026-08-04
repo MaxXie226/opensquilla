@@ -23,14 +23,17 @@ from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 
-from opensquilla.paths import default_opensquilla_home
+from opensquilla.squilla_router.data_paths import (  # noqa: F401
+    _safe_agent_id,
+    agent_data_dir,
+    router_data_root,
+)
 from opensquilla.squilla_router.self_learning.schema import RouterTrainSample
 
 # One env switch disables both capture and training (mirrors the Dream switch
 # OPENSQUILLA_MEMORY_DREAM_DISABLED).
 ENV_DISABLE = "OPENSQUILLA_ROUTER_SELFLEARN_DISABLED"
 
-_SAFE_AGENT_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _TRUTHY = {"1", "true", "yes", "on"}
 
 
@@ -38,28 +41,6 @@ def self_learning_disabled_by_env() -> bool:
     """Return True when the global kill-switch env var is set truthy."""
 
     return os.environ.get(ENV_DISABLE, "").strip().lower() in _TRUTHY
-
-
-def _safe_agent_id(agent_id: str) -> str:
-    cleaned = _SAFE_AGENT_RE.sub("_", (agent_id or "default").strip()) or "default"
-    # A pure-dot segment ("." / "..") would escape the data root; everything
-    # else is a harmless single path segment (no separators survive the regex).
-    if set(cleaned) <= {"."}:
-        cleaned = "default"
-    return cleaned[:128]
-
-
-def router_data_root(home: Path | None = None) -> Path:
-    """Resolve the single root holding all self-learning artifacts."""
-
-    base = home or default_opensquilla_home()
-    return base / "router"
-
-
-def agent_data_dir(agent_id: str, home: Path | None = None) -> Path:
-    """Resolve the per-agent captured-sample directory."""
-
-    return router_data_root(home) / "data" / _safe_agent_id(agent_id)
 
 
 def _samples_path(agent_id: str, day: str, home: Path | None = None) -> Path:

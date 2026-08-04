@@ -9,6 +9,10 @@ specifies.
 
 from __future__ import annotations
 
+import math
+
+import pytest
+
 from opensquilla.squilla_router.user_profile.builder import build_profile
 from opensquilla.squilla_router.user_profile.defaults import default_user_profile
 from opensquilla.squilla_router.user_profile.schema import (
@@ -262,3 +266,22 @@ def test_failed_batches_do_not_contribute() -> None:
         window_days=90,
     )
     assert profile["history"]["capability_prior"] == {"reasoning": 1.0}
+
+
+def test_profile_builder_rejects_nonfinite_profile_json() -> None:
+    batches = [
+        BatchAnalysis(
+            ok=True,
+            session_labels=(SessionLabel("a", "reasoning", math.nan),),
+        )
+    ]
+    with pytest.raises(ValueError):
+        build_profile(
+            batches=batches,
+            base_profile=default_user_profile(),
+            sessions_read=1,
+            day="2026-07-20",
+            version="2026-07-20.1",
+            top_n=3,
+            window_days=90,
+        )

@@ -11,8 +11,8 @@ mid-way — keeping every ``session_id`` the LLM sees honest.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import math
+from collections import deque
 from collections.abc import AsyncIterator, Sequence
 from typing import Any, Protocol
 
@@ -70,7 +70,14 @@ def render_transcript(
 ) -> SessionTranscript:
     """Render one session to a role-prefixed, truncated plain-text blob."""
 
-    lines: list[str] = []
+    head_budget = max(0, per_session_max_chars // 2)
+    tail_budget = max(0, per_session_max_chars - head_budget - len(_TRUNCATION_MARKER))
+    head_parts: list[str] = []
+    tail_parts: deque[str] = deque()
+    full_parts: list[str] | None = []
+    head_chars = 0
+    tail_chars = 0
+    total_chars = 0
     for row in rows:
         role = getattr(row, "role", "") or ""
         if not role:
@@ -78,8 +85,35 @@ def render_transcript(
         content = getattr(row, "content", None)
         if not content:
             continue
-        lines.append(f"{role}: {content}")
-    text = _truncate("\n".join(lines), per_session_max_chars)
+        line = f"{role}: {content}"
+        chunk = line if total_chars == 0 else "\n" + line
+        total_chars += len(chunk)
+        if full_parts is not None:
+            full_parts.append(chunk)
+            if total_chars > per_session_max_chars:
+                full_parts = None
+        if head_chars < head_budget:
+            keep = chunk[: head_budget - head_chars]
+            head_parts.append(keep)
+            head_chars += len(keep)
+        if tail_budget > 0:
+            tail_parts.append(chunk)
+            tail_chars += len(chunk)
+            while tail_chars > tail_budget and tail_parts:
+                overflow = tail_chars - tail_budget
+                first = tail_parts[0]
+                if overflow >= len(first):
+                    tail_chars -= len(first)
+                    tail_parts.popleft()
+                else:
+                    tail_parts[0] = first[overflow:]
+                    tail_chars -= overflow
+                    break
+    if total_chars <= per_session_max_chars:
+        text = "".join(full_parts or [])
+    else:
+        text = "".join(head_parts) + _TRUNCATION_MARKER + "".join(tail_parts)
+        text = _truncate(text, per_session_max_chars)
     return SessionTranscript(session_id=session_id, text=text)
 
 
@@ -98,20 +132,24 @@ def batch_sessions(
 
     batches: list[list[SessionTranscript]] = []
     current: list[SessionTranscript] = []
-    current_chars = 0
     for session in sessions:
-        size = len(session.text)
-        if batch_input_max_chars > 0 and size > batch_input_max_chars:
+        candidate = [session]
+        candidate_size = len(SYSTEM_PROMPT) + len(build_batch_prompt(candidate))
+        if batch_input_max_chars > 0 and candidate_size > batch_input_max_chars:
             continue  # too big even alone -> drop
+        current_candidate = [*current, session]
+        current_candidate_size = len(SYSTEM_PROMPT) + len(
+            build_batch_prompt(current_candidate)
+        )
         would_overflow = (
-            batch_input_max_chars > 0 and current and current_chars + size > batch_input_max_chars
+            batch_input_max_chars > 0
+            and current
+            and current_candidate_size > batch_input_max_chars
         )
         if current and (len(current) >= batch_size or would_overflow):
             batches.append(current)
             current = []
-            current_chars = 0
         current.append(session)
-        current_chars += size
     if current:
         batches.append(current)
     return batches
@@ -138,20 +176,21 @@ async def extract_batch(
     session_ids = tuple(s.session_id for s in batch)
     if not batch:
         return BatchAnalysis.failed(session_ids)
+    stream: Any | None = None
     try:
-        stream = stream_factory(
-            provider=provider,
-            user_prompt=build_batch_prompt(batch),
-            system_prompt=SYSTEM_PROMPT,
-            max_output_tokens=max_output_tokens,
-            temperature=temperature,
-            timeout=timeout,
-        )
         text_parts: list[str] = []
         total_chars = 0
         got_done = False
-        try:
-            async with asyncio.timeout(timeout):
+        async with asyncio.timeout(timeout):
+            stream = stream_factory(
+                provider=provider,
+                user_prompt=build_batch_prompt(batch),
+                system_prompt=SYSTEM_PROMPT,
+                max_output_tokens=max_output_tokens,
+                temperature=temperature,
+                timeout=timeout,
+            )
+            try:
                 async for event in stream:
                     kind = getattr(event, "kind", None)
                     if kind == "text_delta":
@@ -166,14 +205,15 @@ async def extract_batch(
                     elif kind == "error":
                         code = getattr(event, "code", None) or "unknown"
                         raise RuntimeError(f"provider_error:{code}")
-        finally:
-            aclose = getattr(stream, "aclose", None)
-            if callable(aclose):
-                with contextlib.suppress(Exception):
+            finally:
+                aclose = getattr(stream, "aclose", None)
+                if callable(aclose):
                     await aclose()
         if not got_done:
             raise RuntimeError("profile analyst stream ended before DoneEvent")
         return parse_batch_response("".join(text_parts), session_ids)
+    except asyncio.CancelledError:
+        raise
     except Exception:  # noqa: BLE001 — a bad batch must not abort the run
         return BatchAnalysis.failed(session_ids)
 
