@@ -194,6 +194,85 @@ def test_finance_progress_narration_is_not_a_deliverable_answer() -> None:
         assert _visible_answer_is_progress_only(substantive) is False
 
 
+def test_progress_heavy_failed_proposer_does_not_count_toward_quorum() -> None:
+    progress = "\n\n".join(
+        [
+            *(
+                "I’m checking the quarterly footnotes before finalizing."
+                for _ in range(8)
+            ),
+            '{"url":"https://example.com/filing","max_chars":100000}',
+            '{"query":"site:example.com exact filing language","max_results":10}',
+            "## Overall assessment",
+            "The evidence suggests a generally rational allocation strategy but",
+        ]
+    )
+    candidate = _CandidateResult(
+        index=0,
+        sample_index=0,
+        label="partial",
+        provider="",
+        model="",
+        requested_provider="openrouter",
+        requested_model="openai/gpt-5.6-sol",
+        text=progress,
+        error="upstream 502",
+        error_code="502",
+        request_started=True,
+        stream_closed=True,
+        physical_request_count=1,
+    )
+
+    assert candidate.ok is False
+    assert candidate.usable_for_aggregation is False
+    assert candidate.completion_outcome == "failed"
+
+    completed = replace(candidate, error="", error_code="")
+    assert completed.ok is True
+    assert completed.usable_for_aggregation is True
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "The filed Core operating margin was 32.5%.",
+        (
+            "I’m checking the quarterly footnotes directly to avoid "
+            "double-counting debt and reconcile the reported segments.\n"
+            "The filed Core margin was 32.5%, versus 17.0% for Funds."
+        ),
+        (
+            "Checking the filing now.\n"
+            "The filed Core operating margin was 32.5%, while the Funds "
+            "segment margin was 17.0%; the 15.5 percentage-point gap supports "
+            "the conclusion that Core remained the higher-quality business. "
+            "The $250 million term loan less the $50 million mortgage paydown "
+            "increased net debt by $200 million."
+        ),
+    ],
+)
+def test_substantive_failed_proposer_partial_remains_usable(text: str) -> None:
+    candidate = _CandidateResult(
+        index=0,
+        sample_index=0,
+        label="partial",
+        provider="openrouter",
+        model="openai/gpt-5.6-sol",
+        requested_provider="openrouter",
+        requested_model="openai/gpt-5.6-sol",
+        text=text,
+        error="upstream 502",
+        error_code="502",
+        request_started=True,
+        stream_closed=True,
+        physical_request_count=1,
+    )
+
+    assert candidate.ok is False
+    assert candidate.usable_for_aggregation is True
+    assert candidate.completion_outcome == "partial_usable"
+
+
 def test_managed_completion_keeps_physical_id_in_usage_evidence() -> None:
     physical_attempt_id = "a" * 32
     event = _done_event_with_physical_attempt_id(
@@ -11284,6 +11363,17 @@ async def test_proposer_recovery_transient_then_backup_is_serial_and_bounded(
         _slot_candidate(
             index=1,
             model="p1",
+            text="\n\n".join(
+                [
+                    *(
+                        "I’m checking the primary filing before finalizing."
+                        for _ in range(8)
+                    ),
+                    '{"query":"site:example.com filing","max_results":10}',
+                    "## Overall assessment",
+                    "The available evidence suggests but",
+                ]
+            ),
             error="HTTP 503 upstream unavailable",
             error_code="503",
             usage_reported=False,
@@ -11331,6 +11421,8 @@ async def test_proposer_recovery_transient_then_backup_is_serial_and_bounded(
 
     monkeypatch.setattr(provider, "_collect_candidate", fake_collect_candidate)
     monkeypatch.setattr(asyncio, "sleep", no_wait)
+    assert candidates[1].usable_for_aggregation is False
+    assert candidates[1].completion_outcome == "failed"
     state = provider._chat_proposer_recovery_state()
     recovered = await provider._recover_proposers_serially(
         candidates,

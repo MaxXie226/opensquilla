@@ -1084,7 +1084,7 @@ class _CandidateResult:
             *_PROPOSER_LOCAL_SCHEDULING_CANCELLATION_CODES,
         }:
             return False
-        return _visible_answer_looks_usable(self.text)
+        return _partial_proposer_draft_looks_usable(self.text)
 
     @property
     def completion_outcome(self) -> str:
@@ -2222,7 +2222,9 @@ def _visible_answer_is_progress_only(text: str) -> bool:
         return False
 
     def is_progress_segment(segment: str) -> bool:
-        normalized = segment.casefold()
+        normalized = (
+            segment.casefold().replace("\u2018", "'").replace("\u2019", "'")
+        )
         has_substantive_marker = any(
             marker in normalized for marker in _PROGRESS_SUBSTANTIVE_MARKERS
         )
@@ -2268,6 +2270,59 @@ def _visible_answer_looks_usable(
     if len(candidate) >= max(1, int(minimum_chars)):
         return True
     return candidate.endswith((".", "!", "?", "。", "！", "？", "}", "]", "```"))
+
+
+def _looks_like_retrieval_tool_payload(text: str) -> bool:
+    """Recognize a bare web retrieval argument object, not ordinary prose."""
+
+    candidate = str(text or "").strip()
+    if not (candidate.startswith("{") and candidate.endswith("}")):
+        return False
+    try:
+        payload = json.loads(candidate)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, Mapping):
+        return False
+    keys = {str(key).casefold() for key in payload}
+    retrieval_keys = {
+        "url",
+        "query",
+        "max_results",
+        "max_chars",
+        "extract_mode",
+    }
+    return bool(keys & {"url", "query"}) and keys <= retrieval_keys
+
+
+def _partial_proposer_draft_looks_usable(text: str) -> bool:
+    """Reject only progress-heavy failed drafts so bounded backup can run.
+
+    A short factual answer is still accepted.  A mixed partial is rejected
+    only when progress/tool chatter clearly overwhelms substantive text.  This
+    avoids turning the recovery gate into a broad quality scorer.
+    """
+
+    candidate = str(text or "").strip()
+    if not _visible_answer_looks_usable(
+        candidate,
+        reject_progress_only=True,
+    ):
+        return False
+
+    progress_chars = 0
+    substantive_chars = 0
+    for line in (part.strip() for part in candidate.splitlines()):
+        if not line:
+            continue
+        if _visible_answer_is_progress_only(line) or (
+            _looks_like_retrieval_tool_payload(line)
+        ):
+            progress_chars += len(line)
+        else:
+            substantive_chars += len(line)
+
+    return substantive_chars * 4 >= progress_chars
 
 
 def _usable_proposer_candidates(
@@ -7782,7 +7837,7 @@ class EnsembleProvider:
             "physical_request_count": result.physical_request_count,
             "represented_usage_rows": represented_usage_rows,
             "usage_unknown_count": result.usage_missing_count,
-            "usable_text": _visible_answer_looks_usable(result.text),
+            "usable_text": result.usable_for_aggregation,
         }
         result.execution["proposer_evidence_warning"] = deepcopy(warning)
         warnings = trace.setdefault("evidence_warnings", [])
