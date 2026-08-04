@@ -1183,7 +1183,7 @@ def _sandbox_settings_for_runtime(config: GatewayConfig) -> Any:
     )
 
     configured = config_run_mode(config)
-    if configured is RunMode.SAFE:
+    if configured in {RunMode.SAFE, RunMode.SAFE}:
         return config.sandbox
 
     patch = run_mode_config_patch(sandbox_runtime_capability_mode(config))
