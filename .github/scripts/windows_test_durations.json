@@ -1196,6 +1196,7 @@
     "tests/test_engine/test_route_plan.py": 0.01,
     "tests/test_gateway/test_steer_restart_recovery.py": 0.01,
     "tests/test_gateway/test_rpc_capability_reset.py": 0.01,
-    "tests/test_onboarding/test_image_generation_model_discovery.py": 0.01
+    "tests/test_onboarding/test_image_generation_model_discovery.py": 0.01,
+    "tests/test_gateway/test_python_client_transport_limits.py": 0.01
   }
 }

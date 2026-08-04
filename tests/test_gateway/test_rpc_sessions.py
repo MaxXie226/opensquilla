@@ -6883,6 +6883,45 @@ class TestSessionsBootstrap:
         assert res.payload["stream_cursor"] == stream["stream_seq"]
 
     @pytest.mark.asyncio
+    async def test_legacy_bootstrap_preserves_transcript_larger_than_one_mib(
+        self, dispatcher
+    ):
+        key = "agent:main:webchat:synthetic-large-bootstrap"
+        session = FakeSession(
+            session_key=key,
+            session_id="synthetic-large-bootstrap",
+            status="running",
+        )
+        manager = FakeSessionManager([session])
+        manager.transcript = [
+            TranscriptEntry(
+                id=index + 1,
+                session_id=session.session_id,
+                session_key=key,
+                role="user",
+                content=f"{index:02d}:" + "x" * 17_997,
+                created_at=100 + index,
+                message_id=f"synthetic-message-{index:02d}",
+            )
+            for index in range(64)
+        ]
+        ctx = make_ctx(session_manager=manager)
+
+        res = await dispatcher.dispatch(
+            "large-bootstrap",
+            "sessions.bootstrap",
+            {"key": key, "limit": 64},
+            ctx,
+        )
+
+        assert res.ok is True
+        assert len(res.model_dump_json().encode("utf-8")) > 1024 * 1024
+        assert res.payload["history"]["loaded_count"] == 64
+        messages = res.payload["history"]["messages"]
+        assert messages[0]["message_id"] == "synthetic-message-00"
+        assert messages[-1]["message_id"] == "synthetic-message-63"
+
+    @pytest.mark.asyncio
     async def test_bootstrap_includes_only_sanitized_agent_identity_display_fields(
         self, dispatcher, session, tmp_path
     ):

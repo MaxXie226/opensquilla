@@ -390,6 +390,7 @@
       "tests/test_gateway/test_plan_rpc.py",
       "tests/test_gateway/test_project_workspace_execution.py",
       "tests/test_gateway/test_provider_stats.py",
+      "tests/test_gateway/test_python_client_transport_limits.py",
       "tests/test_gateway/test_rate_limit_approvals.py",
       "tests/test_gateway/test_readiness.py",
       "tests/test_gateway/test_root_control_ui_security.py",
