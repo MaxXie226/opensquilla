@@ -8273,7 +8273,7 @@ async def test_static_openrouter_b5_quorum_cancels_slow_proposer(
 
 
 @pytest.mark.asyncio
-async def test_cancel_resistant_straggler_stops_before_aggregator(
+async def test_static_cancel_resistant_straggler_is_quarantined_after_quorum(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A straggler that outlives the cancel window still issued a real request."""
@@ -8338,11 +8338,13 @@ async def test_cancel_resistant_straggler_stops_before_aggregator(
     try:
         events = await asyncio.wait_for(_collect(provider), timeout=2.0)
         retry_events = await asyncio.wait_for(_collect(provider), timeout=0.2)
-        retry_error = next(event for event in retry_events if isinstance(event, ErrorEvent))
+        retry_error = next(
+            event for event in retry_events if isinstance(event, ErrorEvent)
+        )
         assert retry_error.code == "ensemble_cleanup_in_progress"
         assert retry_error.request_started is False
         assert retry_error.physical_request_count == 0
-        assert all(call["model"] != "agg" for call in registry.calls)
+        assert [call["model"] for call in registry.calls] == ["p1", "agg"]
     finally:
         release.set()
     await asyncio.wait_for(closed.wait(), timeout=1.0)
@@ -8352,21 +8354,33 @@ async def test_cancel_resistant_straggler_stops_before_aggregator(
             break
     assert provider._cleanup_is_pending() is False
 
-    assert not any(isinstance(event, DoneEvent) for event in events)
-    assert all(call["model"] != "agg" for call in registry.calls)
-    error = next(event for event in events if isinstance(event, ErrorEvent))
-    assert error.code == "ensemble_proposer_close_timeout"
-    assert error.ensemble_trace is not None
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    [aggregator_call] = [
+        call for call in registry.calls if call["model"] == "agg"
+    ]
+    assert aggregator_call["tools"] is None
+    assert aggregator_call["config"].allow_provider_stream_fallback is False
     straggler_row = next(
-        row for row in error.ensemble_trace["candidates"] if row["requested_model"] == "straggler"
+        row
+        for row in done.ensemble_trace["candidates"]
+        if row["requested_model"] == "straggler"
     )
     assert straggler_row["ok"] is False
     assert straggler_row["error_code"] == "ensemble_proposer_close_timeout"
     assert straggler_row["request_started"] is True
-    assert error.usage_missing_count == 1
-    # p1 + the still-closing straggler. No aggregator/fallback may overlap it.
-    assert error.ensemble_trace["llm_request_count"] == 2
-    assert error.ensemble_trace["physical_request_count"] == 2
+    assert done.usage_missing_count == 1
+    marker = done.ensemble_trace["proposer_cleanup_quorum_bypass"]
+    assert marker["schema"] == "opensquilla.proposer-cleanup-quorum-bypass/v1"
+    assert marker["quorum_required"] == 1
+    assert marker["successful_proposers"] == 1
+    assert marker["candidate_indexes"] == [1]
+    assert marker["physical_attempt_ids"] == []
+    assert marker["usage_evidence_unverified_candidate_indexes"] == [1]
+    assert marker["aggregator_tools_disabled"] is True
+    # p1 + the quarantined straggler + the isolated aggregator.
+    assert done.ensemble_trace["llm_request_count"] == 3
+    assert done.ensemble_trace["physical_request_count"] == 3
 
 
 @pytest.mark.asyncio
@@ -10539,6 +10553,103 @@ async def test_router_dynamic_quarantines_unclosed_proposer_after_quorum(
 
 
 @pytest.mark.asyncio
+async def test_router_dynamic_initial_evidence_warning_keeps_usable_quorum(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _RecoveryScriptRegistry(
+        {
+            "agg": [
+                [
+                    TextDeltaEvent(text="Fused final answer."),
+                    _billed_done("agg", cost=0.2),
+                ]
+            ],
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    proposers = [_member("p0"), _member("p1")]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        proposer_backups=[_member("backup-must-not-run")],
+        aggregator=_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        shuffle_candidates=False,
+        aggregator_tools=True,
+        aggregator_recovery_mode="experiment",
+        selection_plan=_slot_recovery_plan(
+            proposers,
+            [_member("backup-must-not-run")],
+        ),
+    )
+    scope_id = "router-dynamic-initial-evidence-warning"
+    assert provider.begin_provider_retry_scope(
+        scope_id,
+        max_additional_physical_requests=3,
+    )
+    evidence_warning = _slot_candidate(
+        index=1,
+        model="p1",
+        text="This draft remains useful despite incomplete usage evidence.",
+        physical_attempt_id="b" * 32,
+    )
+    # The provider says two requests occurred but can represent only one.
+    evidence_warning.physical_request_count = 2
+
+    async def fake_run_proposers(*args: Any, **kwargs: Any) -> list[_CandidateResult]:
+        del args, kwargs
+        return [
+            _slot_candidate(
+                index=0,
+                model="p0",
+                text="Complete draft.",
+                physical_attempt_id="a" * 32,
+            ),
+            evidence_warning,
+        ]
+
+    monkeypatch.setattr(provider, "_run_proposers", fake_run_proposers)
+
+    events = await _collect(provider)
+
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert registry.call_counts == {"agg": 1}
+    [aggregator_call] = registry.calls
+    assert aggregator_call["tools"] is None
+    [partial] = [
+        candidate
+        for candidate in done.ensemble_trace["candidates"]
+        if candidate["index"] == 1
+    ]
+    assert partial["ok"] is False
+    assert partial["error_code"] == "proposer_evidence_unverified"
+    assert partial["usable_for_aggregation"] is True
+    assert partial["selected_for_aggregation"] is True
+    warnings = done.ensemble_trace["proposer_recovery"]["evidence_warnings"]
+    assert warnings == [
+        {
+            "schema": "opensquilla.proposer-evidence-warning/v1",
+            "status": "warning",
+            "phase": "initial_candidate",
+            "candidate_index": 1,
+            "request_started": True,
+            "physical_request_count": 2,
+            "represented_usage_rows": 1,
+            "usage_unknown_count": 1,
+            "usable_text": True,
+        }
+    ]
+    assert done.ensemble_trace["proposer_recovery"]["attempts"] == []
+    assert done.usage_missing_count == 1
+    assert provider.end_provider_retry_scope(scope_id)
+
+
+@pytest.mark.asyncio
 async def test_router_dynamic_uses_partial_unclosed_draft_for_two_draft_quorum(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -11257,12 +11368,6 @@ async def test_proposer_recovery_transient_then_backup_is_serial_and_bounded(
             "cleanup_unproven",
         ),
         (
-            "evidence",
-            3,
-            "proposer_recovery_evidence_unproven",
-            "evidence_unproven",
-        ),
-        (
             "budget",
             1,
             "proposer_recovery_budget_overrun",
@@ -11349,6 +11454,122 @@ async def test_proposer_recovery_terminal_attempt_stops_all_later_dispatch(
     assert trace["terminal_code"] == expected_code
     assert trace["terminal_reason"] == expected_reason
     assert trace["attempts"][-1]["terminal_code"] == expected_code
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    (
+        "evidence_text",
+        "expected_calls",
+        "expected_strict_successes",
+        "expected_effective_model",
+    ),
+    [
+        (
+            "A usable partial recovery draft with incomplete evidence.",
+            ["b0"],
+            1,
+            "p1",
+        ),
+        ("", ["b0", "b1"], 2, "b1"),
+    ],
+)
+async def test_recovery_evidence_warning_uses_text_or_next_frozen_backup(
+    monkeypatch: pytest.MonkeyPatch,
+    evidence_text: str,
+    expected_calls: list[str],
+    expected_strict_successes: int,
+    expected_effective_model: str,
+) -> None:
+    proposers = [_member("p0"), _member("p1")]
+    backups = [_member("b0"), _member("b1")]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        proposer_backups=backups,
+        aggregator=_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        proposer_recovery_max_additional_calls=2,
+        selection_plan=_slot_recovery_plan(
+            proposers,
+            backups,
+            max_additional=2,
+        ),
+    )
+    candidates = [
+        _slot_candidate(
+            index=0,
+            model="p0",
+            text="existing draft",
+            physical_attempt_id="0" * 32,
+        ),
+        _slot_candidate(
+            index=1,
+            model="p1",
+            error="invalid api key",
+            error_code="401",
+            physical_attempt_id="1" * 32,
+        ),
+    ]
+    calls: list[str] = []
+
+    async def fake_collect_candidate(**kwargs: Any) -> _CandidateResult:
+        model = kwargs["member"].provider_config.model
+        calls.append(model)
+        if model == "b0":
+            attempt = _slot_candidate(
+                index=kwargs["index"],
+                model=model,
+                text=evidence_text,
+                error="failed recovery",
+                error_code="503",
+                physical_attempt_id="a" * 32,
+            )
+            attempt.model_usage_breakdown[0]["provider_usage"][
+                "physical_attempt_id"
+            ] = "f" * 32
+            return attempt
+        return _slot_candidate(
+            index=kwargs["index"],
+            model=model,
+            text="backup draft",
+            physical_attempt_id="b" * 32,
+        )
+
+    monkeypatch.setattr(provider, "_collect_candidate", fake_collect_candidate)
+    state = provider._chat_proposer_recovery_state()
+
+    recovered = await provider._recover_proposers_serially(
+        candidates,
+        state=state,
+        messages=[Message(role="user", content="task")],
+        tools=None,
+        config=ChatConfig(),
+    )
+
+    assert calls == expected_calls
+    assert sum(candidate.ok for candidate in recovered) == expected_strict_successes
+    assert sum(candidate.usable_for_aggregation for candidate in recovered) == 2
+    assert state.additional_physical_requests_started == len(expected_calls)
+    assert state.terminal_code == ""
+    assert state.terminal_reason == ""
+    assert (
+        state.effective_members[1].provider_config.model
+        == expected_effective_model
+    )
+    trace = provider._current_proposer_recovery_trace
+    expected_outcomes = ["evidence_unproven"]
+    if len(expected_calls) == 2:
+        expected_outcomes.append("succeeded")
+        assert trace["attempts"][1]["source_identity"] == "fake:b0"
+    assert [
+        attempt["outcome"] for attempt in trace["attempts"]
+    ] == expected_outcomes
+    [warning] = trace["evidence_warnings"]
+    assert warning["phase"] == "recovery_attempt"
+    assert warning["candidate_index"] == 1
+    assert warning["usage_unknown_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -12126,11 +12347,6 @@ async def test_router_dynamic_aggregator_only_accepts_prior_full_quorum_in_scope
 @pytest.mark.parametrize(
     ("terminal_kind", "max_additional", "expected_code"),
     [
-        (
-            "evidence",
-            3,
-            "proposer_recovery_evidence_unproven",
-        ),
         (
             "budget",
             1,

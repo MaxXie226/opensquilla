@@ -1005,6 +1005,7 @@ class RunResult:
     setup_latency_ms: int = 0
     setup_usage: list[dict[str, Any]] = field(default_factory=list)
     routing_trace: dict[str, Any] = field(default_factory=dict)
+    audit_warnings: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -6991,6 +6992,7 @@ def run_result_summary(
         "llm_request_count": llm_request_count,
         "usage_unknown_count": usage_unknown_count,
         "error": result.error,
+        "audit_warnings": list(result.audit_warnings),
         "final_text_chars": len(result.final_text),
         "final_text_sha256": text_sha256(result.final_text),
         "usage": usage,
@@ -7466,6 +7468,60 @@ _ENSEMBLE_METADATA_ONLY_REASONS = frozenset(
     }
 )
 _ENSEMBLE_METADATA_REPAIR_STATUSES = frozenset({"backfilled", "unavailable"})
+
+# Once a provider returned a Done event and visible answer text, post-call
+# validation is primarily evidence/audit work.  Missing quorum evidence,
+# answer-content binding failures, and an invalid terminal-call shape may still
+# invalidate execution.  Identity/usage metadata defects remain recorded but
+# must not erase an otherwise usable answer or prevent Judge from running.
+_ENSEMBLE_EXECUTION_BLOCKING_REASONS = frozenset(
+    {
+        "aggregator_fallback_used_or_unknown",
+        "incomplete_agent_call_output_binding",
+        "intermediate_fallback_visible_output",
+        "invalid_agent_call_output_binding",
+        "invalid_intermediate_fallback_flag",
+        "invalid_intermediate_fallback_outcome",
+        "invalid_intermediate_fallback_quorum",
+        "invalid_intermediate_fallback_request",
+        "invalid_intermediate_fallback_role",
+        "missing_ensemble_trace",
+        "missing_ensemble_call_trace",
+        "missing_actual_proposer_candidates",
+        "missing_agent_call_output_binding",
+        "missing_aggregator_output_binding",
+        "insufficient_actual_proposer_quorum",
+        "insufficient_selected_proposer_quorum",
+        "wrong_agent_call_output_binding",
+        "wrong_aggregator_output_binding",
+        "wrong_aggregator_output_length",
+        "wrong_intermediate_fallback_execution_role",
+        "wrong_intermediate_fallback_model",
+        "wrong_intermediate_fallback_provider",
+    }
+)
+
+
+def ensemble_execution_blocking_reason(reason: str) -> bool:
+    """Return whether one post-call reason proves execution unusable."""
+
+    return reason in _ENSEMBLE_EXECUTION_BLOCKING_REASONS
+
+
+def record_generation_audit_warnings(
+    result: RunResult,
+    reasons: Sequence[str],
+) -> None:
+    """Retain post-call evidence defects without turning them into errors."""
+
+    result.audit_warnings = list(
+        dict.fromkeys(
+            [
+                *result.audit_warnings,
+                *(str(reason).strip() for reason in reasons if str(reason).strip()),
+            ]
+        )
+    )
 
 
 def ensemble_metadata_only_reason(reason: str) -> bool:
@@ -8047,7 +8103,7 @@ def ensemble_call_core_reasons(
                 ):
                     reasons.append(f"wrong_executed_{field}")
 
-    if not isinstance(candidate_rows, list):
+    if not isinstance(candidate_rows, list) or not candidate_rows:
         reasons.append("missing_actual_proposer_candidates")
     else:
         if isinstance(total, int) and not isinstance(total, bool) and len(candidate_rows) != total:
@@ -8183,20 +8239,25 @@ def ensemble_call_core_reasons(
             elif len(candidate_rows) != len(expected_slot_identities):
                 reasons.append("wrong_actual_proposer_count")
             else:
+                # Recovery may legally replace any initial slot with a member
+                # from the frozen backup roster.  Candidate identity is
+                # therefore a roster-membership audit, not a positional
+                # equality check against the original selected_P array.
+                allowed_proposer_identities = set(expected_slot_identities)
+                raw_backup_p = expected_plan.get("backup_P")
+                if isinstance(raw_backup_p, list):
+                    allowed_proposer_identities.update(
+                        identity.strip()
+                        for identity in raw_backup_p
+                        if isinstance(identity, str)
+                        and identity.strip()
+                        and ":" in identity
+                    )
                 requested_identity_missing = False
                 requested_identity_wrong = False
                 actual_identity_missing = False
                 actual_identity_wrong = False
-                for candidate_index, (candidate, identity) in enumerate(
-                    zip(
-                        candidate_rows,
-                        expected_slot_identities,
-                        strict=True,
-                    )
-                ):
-                    expected_provider, separator, expected_model = (
-                        identity.partition(":") if isinstance(identity, str) else ("", "", "")
-                    )
+                for candidate_index, candidate in enumerate(candidate_rows):
                     execution = (
                         candidate.get("execution") if isinstance(candidate, Mapping) else None
                     )
@@ -8219,21 +8280,22 @@ def ensemble_call_core_reasons(
                         candidate.get("model") if isinstance(candidate, Mapping) else None
                     )
                     if (
-                        separator != ":"
-                        or not expected_provider.strip()
-                        or not expected_model.strip()
-                    ):
-                        requested_identity_wrong = True
-                    elif (
                         not isinstance(requested_provider, str)
                         or not requested_provider.strip()
                         or not isinstance(requested_model, str)
                         or not requested_model.strip()
                     ):
                         requested_identity_missing = True
-                    elif (
-                        requested_provider.strip() != expected_provider.strip()
-                        or requested_model.strip() != expected_model.strip()
+                        requested_identity = ""
+                    else:
+                        requested_identity = (
+                            requested_provider.strip()
+                            + ":"
+                            + requested_model.strip()
+                        )
+                    if (
+                        requested_identity
+                        and requested_identity not in allowed_proposer_identities
                     ):
                         requested_identity_wrong = True
                     provider_missing = (
@@ -8262,11 +8324,26 @@ def ensemble_call_core_reasons(
                     elif (
                         isinstance(candidate_provider, str)
                         and candidate_provider.strip()
-                        and candidate_provider.strip() != expected_provider.strip()
-                    ) or (
-                        isinstance(candidate_model, str)
+                        and isinstance(candidate_model, str)
                         and candidate_model.strip()
-                        and candidate_model.strip() != expected_model.strip()
+                        and (
+                            candidate_provider.strip()
+                            + ":"
+                            + candidate_model.strip()
+                        )
+                        not in allowed_proposer_identities
+                    ) or (
+                        requested_identity
+                        and isinstance(candidate_provider, str)
+                        and candidate_provider.strip()
+                        and isinstance(candidate_model, str)
+                        and candidate_model.strip()
+                        and (
+                            candidate_provider.strip()
+                            != requested_provider.strip()
+                            or candidate_model.strip()
+                            != requested_model.strip()
+                        )
                     ):
                         actual_identity_wrong = True
                 if requested_identity_missing:
@@ -8675,10 +8752,23 @@ def admissible_empty_nonterminal_fallback_reasons(
     ):
         reasons.append("wrong_intermediate_fallback_provider")
     selected_p = plan.get("selected_P")
+    backup_p = plan.get("backup_P")
+    allowed_identities = [
+        *(
+            selected_p
+            if isinstance(selected_p, list)
+            else []
+        ),
+        *(
+            backup_p
+            if isinstance(backup_p, list)
+            else []
+        ),
+    ]
     allowed_models = (
         [
             str(identity).partition(":")[2].strip()
-            for identity in selected_p
+            for identity in allowed_identities
             if isinstance(identity, str)
             and identity.partition(":")[1] == ":"
             and identity.partition(":")[0].strip().casefold() == "openrouter"
@@ -8765,23 +8855,49 @@ def ensemble_generation_retry_reason(
     expected_selection_plan: Mapping[str, Any] | None = None,
     expected_g1_registry_contract: Mapping[str, Any] | None = None,
 ) -> str:
-    """Reject a fallback or sub-quorum ensemble result before Judge is called."""
+    """Return only a reason that proves the ensemble answer is unusable."""
 
     done = result.done
     if done is None or not isinstance(done.ensemble_trace, dict):
         return "missing_ensemble_trace"
     trace = done.ensemble_trace
     call_traces, sequence_reasons = ensemble_call_trace_sequence(trace)
-    if sequence_reasons:
-        return sequence_reasons[0]
     if not call_traces:
         return "missing_ensemble_call_trace"
+    record_generation_audit_warnings(
+        result,
+        [
+            reason
+            for reason in sequence_reasons
+            if not ensemble_execution_blocking_reason(reason)
+        ],
+    )
+    blocking_sequence_reasons = [
+        reason
+        for reason in sequence_reasons
+        if ensemble_execution_blocking_reason(reason)
+    ]
+    if blocking_sequence_reasons:
+        return blocking_sequence_reasons[0]
     output_sequence_reasons = agent_call_output_sequence_reasons(
         call_traces,
         final_text=result.final_text,
     )
-    if output_sequence_reasons:
-        return output_sequence_reasons[0]
+    blocking_output_sequence_reasons = [
+        reason
+        for reason in output_sequence_reasons
+        if ensemble_execution_blocking_reason(reason)
+    ]
+    record_generation_audit_warnings(
+        result,
+        [
+            reason
+            for reason in output_sequence_reasons
+            if reason not in blocking_output_sequence_reasons
+        ],
+    )
+    if blocking_output_sequence_reasons:
+        return blocking_output_sequence_reasons[0]
     for index, call_trace in enumerate(call_traces):
         reasons = ensemble_call_core_reasons(
             call_trace,
@@ -8791,23 +8907,42 @@ def ensemble_generation_retry_reason(
             final_text=result.final_text,
             require_output_binding=index == len(call_traces) - 1,
         )
-        generation_reasons = [
-            reason for reason in reasons if not ensemble_metadata_only_reason(reason)
-        ]
         if index < len(call_traces) - 1 and call_trace.get("fallback_used") is True:
             fallback_reasons = admissible_empty_nonterminal_fallback_reasons(
                 call_trace,
                 expected_selection_plan=expected_selection_plan,
             )
-            if fallback_reasons:
-                return fallback_reasons[0]
-            generation_reasons = [
+            blocking_fallback_reasons = [
                 reason
-                for reason in generation_reasons
+                for reason in fallback_reasons
+                if ensemble_execution_blocking_reason(reason)
+            ]
+            record_generation_audit_warnings(
+                result,
+                [
+                    reason
+                    for reason in fallback_reasons
+                    if reason not in blocking_fallback_reasons
+                ],
+            )
+            if blocking_fallback_reasons:
+                return blocking_fallback_reasons[0]
+            reasons = [
+                reason
+                for reason in reasons
                 if reason not in _ADMISSIBLE_NONTERMINAL_FALLBACK_CORE_REASONS
             ]
-        if generation_reasons:
-            return generation_reasons[0]
+        blocking_reasons = [
+            reason
+            for reason in reasons
+            if ensemble_execution_blocking_reason(reason)
+        ]
+        record_generation_audit_warnings(
+            result,
+            [reason for reason in reasons if reason not in blocking_reasons],
+        )
+        if blocking_reasons:
+            return blocking_reasons[0]
     return ""
 
 
@@ -8980,7 +9115,17 @@ def generation_retry_reason(
     expected_provider: str = "",
 ) -> str:
     if result.error:
-        return result.error
+        if (
+            expected_selection_mode
+            and result.done is not None
+            and result.final_text.strip()
+        ):
+            record_generation_audit_warnings(
+                result,
+                ["provider_error_after_visible_ensemble_output"],
+            )
+        else:
+            return result.error
     if result.done is None:
         return GENERATION_MISSING_DONE_ERROR
     if not result.final_text.strip():
@@ -11783,7 +11928,13 @@ async def run_one(
         "generation_retry_backoff_s": generation_retry_backoff_s,
         "generation_attempt_total_billed_cost": generation_attempt_total_billed_cost,
         "generation_retry_reasons": generation_retry_reasons,
-        "error": run.error or None,
+        "error": (
+            None
+            if generation_accepted
+            and isinstance(ensemble_trace, Mapping)
+            and ensemble_trace
+            else run.error or None
+        ),
         "final_text": run.final_text,
         "final_text_chars": len(run.final_text),
         "final_text_sha256": final_text_sha,
@@ -11852,6 +12003,7 @@ async def run_one(
         },
         "usage": usage_payload,
         "ensemble_trace": ensemble_trace,
+        "generation_audit_warnings": list(run.audit_warnings),
         "judge": judge,
         "candidate_judges": candidate_judges,
         "quality_total": fused_total,
@@ -12926,7 +13078,14 @@ def execution_status_payload(
 ) -> dict[str, Any]:
     """Project model execution independently from policy and billing audits."""
 
-    if not generation_accepted or not str(final_text or "").strip() or str(run_error or ""):
+    if (
+        not generation_accepted
+        or not str(final_text or "").strip()
+        or (
+            run_error
+            and not (isinstance(ensemble_trace, Mapping) and ensemble_trace)
+        )
+    ):
         return {
             "status": "execution_failed",
             "success": False,
@@ -12934,6 +13093,8 @@ def execution_status_payload(
         }
     unclosed = _unclosed_stream_count(ensemble_trace)
     degraded_reasons = _ensemble_execution_degraded_reasons(ensemble_trace)
+    if run_error and isinstance(ensemble_trace, Mapping) and ensemble_trace:
+        degraded_reasons.append("provider_error_after_visible_ensemble_output")
     if unclosed:
         degraded_reasons.append("unclosed_physical_stream")
     degraded_reasons = list(dict.fromkeys(degraded_reasons))
@@ -12994,6 +13155,13 @@ def row_audit_status(
         else None
     )
     warnings: list[str] = []
+    stored_generation_warnings = row.get("generation_audit_warnings")
+    if isinstance(stored_generation_warnings, list):
+        warnings.extend(
+            str(reason).strip()
+            for reason in stored_generation_warnings
+            if str(reason).strip()
+        )
     if policy_compliant is False:
         warnings.append(f"openrouter_non_byok_{policy_status}")
     if not complete:

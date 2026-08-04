@@ -320,9 +320,7 @@ POLICY_VIOLATION_ERRORS = frozenset(
 # These failures describe policy, receipt, metering, or stream-finalization
 # confidence.  They must remain visible in the published audit, but they do
 # not erase a response that is already bound to a real request and has a
-# non-empty, integrity-checked answer.  Requested/actual provider and model
-# mismatches deliberately are not in this set: those are execution-contract
-# failures, not audit uncertainty.
+# non-empty, integrity-checked answer.
 AUDIT_ONLY_GENERATION_REASONS = frozenset(
     {
         "openrouter_policy_violation",
@@ -333,6 +331,83 @@ AUDIT_ONLY_GENERATION_REASONS = frozenset(
         "successful_judge_has_unknown_usage",
         "aggregator_recovery_selected_stream_not_closed",
         "proposer_recovery_stream_not_closed",
+    }
+)
+
+# The finalizer used to treat every route/identity/recovery discrepancy as if
+# the model had produced no answer.  That conflates two independent questions:
+# whether an ensemble produced a usable answer with quorum, and whether every
+# piece of forensic metadata is exact.  These markers are deliberately applied
+# only after ``row_has_bound_answer_and_proposer_quorum`` succeeds and the
+# caller has verified task/prompt/compatibility integrity.  Missing candidates,
+# sub-quorum execution, empty output, and request/answer integrity failures
+# therefore remain blocking.
+AUDIT_ONLY_EVIDENCE_REASON_MARKERS = (
+    "identity",
+    "model",
+    "provider",
+    "route",
+    "routing",
+    "selection",
+    "ranker",
+    "ranking",
+    "registry",
+    "recovery",
+    "physical",
+    "usage",
+    "cost",
+    "byok",
+    "stream",
+    "receipt",
+    "output_binding",
+    "output_component",
+    "request_count",
+    "cleanup",
+    "provenance",
+)
+AUDIT_ONLY_EVIDENCE_REASONS = frozenset(
+    {
+        "selected_generation_not_successful",
+        "generation_not_accepted",
+        "wrong_executed_proposer_count",
+        "successful_proposer_count_mismatch",
+        "usable_proposer_count_mismatch",
+        "invalid_successful_proposer_evidence",
+        "invalid_dynamic_proposer_usable_quorum",
+        "wrong_agent_llm_call_count",
+        "untraced_agent_llm_calls",
+        "invalid_agent_call_index_sequence",
+    }
+)
+
+EXECUTION_BLOCKING_GENERATION_REASONS = frozenset(
+    {
+        "empty_final_text",
+        "final_text_hash_mismatch",
+        "final_text_length_mismatch",
+        "prompt_hash_mismatch",
+        "task_input_hash_mismatch",
+        "run_compatibility_fingerprint_mismatch",
+        "missing_ensemble_trace",
+        "missing_ensemble_call_trace",
+        "invalid_ensemble_call_trace",
+        "missing_actual_proposer_candidates",
+        "proposer_quorum_not_met",
+        "insufficient_actual_proposer_quorum",
+        "insufficient_selected_proposer_quorum",
+        "final_request_not_aggregator",
+        "generation_error",
+        "generation_run_error",
+        "physical_attempt_id_reused_across_generation_attempts",
+        "duplicate_ensemble_physical_attempt_id",
+        "duplicate_proposer_recovery_physical_attempt_id",
+        "wrong_g1_registry_snapshot_hash",
+        "g1_replay_registry_snapshot_hash_mismatch",
+        "g1_physical_registry_snapshot_hash_differs_from_routing_trace",
+        "g1_routing_plan_differs_from_physical_plan",
+        "router_receipt_provider_not_bound_to_formal_route",
+        "router_receipt_model_not_bound_to_formal_route",
+        "router_receipt_request_not_bound_to_formal_route",
     }
 )
 
@@ -442,7 +517,66 @@ def explicit_degraded_success(row: Mapping[str, Any]) -> bool:
     return any(explicit_degraded_call_attempt(call) is not None for call in traces)
 
 
-def audit_only_error_text(value: Any, *, degraded_success: bool = False) -> bool:
+def evidence_reason_is_audit_only(reason: Any) -> bool:
+    """Classify forensic discrepancies without weakening execution gates."""
+
+    normalized = str(reason or "").strip().casefold()
+    if not normalized or normalized in EXECUTION_BLOCKING_GENERATION_REASONS:
+        return False
+    return bool(
+        normalized in AUDIT_ONLY_GENERATION_REASONS
+        or normalized in AUDIT_ONLY_EVIDENCE_REASONS
+        or any(marker in normalized for marker in AUDIT_ONLY_EVIDENCE_REASON_MARKERS)
+    )
+
+
+def row_has_bound_answer_and_proposer_quorum(row: Mapping[str, Any]) -> bool:
+    """Prove the minimum execution facts needed to demote forensic failures.
+
+    This intentionally does not trust declared proposer counters.  Every
+    physical ensemble call must expose at least two independently usable
+    candidate records and a started aggregator request.  Prompt/task/source
+    bindings are checked by ``generation_reason_assessment`` before it enables
+    audit demotion.
+    """
+
+    final_text = str(row.get("final_text") or "")
+    if (
+        not final_text.strip()
+        or row.get("final_text_sha256") != text_sha256(final_text)
+        or nonnegative_int(row.get("final_text_chars")) != len(final_text)
+    ):
+        return False
+    trace = row.get("ensemble_trace")
+    if not isinstance(trace, Mapping):
+        return False
+    calls, _ = ensemble_call_trace_sequence(trace)
+    if not calls:
+        return False
+    # Earlier Agent-loop calls may legitimately be empty tool/fallback turns.
+    # Execution is determined by the terminal call that supplied final_text.
+    terminal = calls[-1]
+    candidates = terminal.get("candidates")
+    if not isinstance(candidates, list) or len(candidates) < 2:
+        return False
+    if sum(1 for candidate in candidates if usable_candidate(candidate)) < 2:
+        return False
+    final_request = terminal.get("final_request")
+    if not (
+        isinstance(final_request, Mapping)
+        and final_request.get("request_started") is True
+        and str(final_request.get("role") or "") == "aggregator"
+    ):
+        return False
+    return True
+
+
+def audit_only_error_text(
+    value: Any,
+    *,
+    degraded_success: bool = False,
+    evidence_proven: bool = False,
+) -> bool:
     """Match only closed, explicit audit/degraded error codes.
 
     In particular, words such as ``usage``, ``receipt`` and ``stream`` are not
@@ -453,7 +587,9 @@ def audit_only_error_text(value: Any, *, degraded_success: bool = False) -> bool
     normalized = str(value or "").strip().casefold()
     if normalized in AUDIT_ONLY_ERROR_CODES:
         return True
-    return degraded_success and normalized in DEGRADED_DELIVERY_ERROR_CODES
+    if degraded_success and normalized in DEGRADED_DELIVERY_ERROR_CODES:
+        return True
+    return evidence_proven and evidence_reason_is_audit_only(normalized)
 
 
 def judge_evidence_error_is_audit_only(error: FinalizationError) -> bool:
@@ -492,13 +628,22 @@ def account_proof_error_is_audit_only(error: FinalizationError) -> bool:
 
 def partition_execution_and_audit_reasons(
     reasons: Iterable[str],
+    *,
+    evidence_proven: bool = False,
 ) -> tuple[list[str], list[str]]:
     """Split hard execution failures from publishable audit warnings."""
 
     blocking: list[str] = []
     warnings: list[str] = []
     for reason in dict.fromkeys(str(value) for value in reasons if str(value)):
-        if reason in AUDIT_ONLY_GENERATION_REASONS or reason.startswith("audit:"):
+        if (
+            reason in AUDIT_ONLY_GENERATION_REASONS
+            or reason.startswith("audit:")
+            or (
+                evidence_proven
+                and evidence_reason_is_audit_only(reason)
+            )
+        ):
             warnings.append(reason)
         else:
             blocking.append(reason)
@@ -8352,7 +8497,10 @@ def validate_physical_generation_routes(
         roles = {str(unit.get("role") or "").strip().casefold() for unit in canonical_units}
         if record.key[0] == "B2" and "task_analyzer" in roles:
             reasons.append("unexpected_b2_task_analyzer_request")
-        blocking_reasons, audit_reasons = partition_execution_and_audit_reasons(reasons)
+        blocking_reasons, audit_reasons = partition_execution_and_audit_reasons(
+            reasons,
+            evidence_proven=row_has_bound_answer_and_proposer_quorum(record.row),
+        )
         if audit_reasons:
             warnings.append(
                 record.reference
@@ -8404,6 +8552,12 @@ def generation_reason_assessment(
         reasons.append("task_input_hash_mismatch")
     if row.get("run_compatibility_fingerprint") != expected_fingerprint:
         reasons.append("run_compatibility_fingerprint_mismatch")
+    execution_evidence_proven = bool(
+        row_has_bound_answer_and_proposer_quorum(row)
+        and row.get("prompt_sha256") == text_sha256(prompt)
+        and row.get("task_input_sha256") == canonical_sha256(task, prefix=True)
+        and row.get("run_compatibility_fingerprint") == expected_fingerprint
+    )
     error = str(row.get("error") or "")
     if error in POLICY_VIOLATION_ERRORS:
         reasons.append("openrouter_policy_violation")
@@ -8414,6 +8568,7 @@ def generation_reason_assessment(
             and audit_only_error_text(
                 error,
                 degraded_success=degraded_success,
+                evidence_proven=execution_evidence_proven,
             )
             else "generation_error"
         )
@@ -8426,6 +8581,7 @@ def generation_reason_assessment(
             and audit_only_error_text(
                 run_error,
                 degraded_success=degraded_success,
+                evidence_proven=execution_evidence_proven,
             )
             else "generation_run_error"
         )
@@ -8449,7 +8605,10 @@ def generation_reason_assessment(
             contract=contract,
         )
     )
-    return partition_execution_and_audit_reasons(reasons)
+    return partition_execution_and_audit_reasons(
+        reasons,
+        evidence_proven=execution_evidence_proven,
+    )
 
 
 def generation_reasons(

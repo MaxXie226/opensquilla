@@ -7820,7 +7820,10 @@ def test_generation_attempt_budget_over_three_is_fatal(module, tmp_path: Path) -
     assert not args.output_dir.exists()
 
 
-def test_b2_illegal_quorum_leaves_no_partial_output(module, tmp_path: Path) -> None:
+def test_b2_declared_quorum_mismatch_is_audit_only_when_candidates_prove_quorum(
+    module,
+    tmp_path: Path,
+) -> None:
     args, _, lock_fd = _campaign(module, tmp_path, with_repair=False)
     path = args.result[0]
     rows = [json.loads(line) for line in path.read_text().splitlines()]
@@ -7830,11 +7833,15 @@ def test_b2_illegal_quorum_leaves_no_partial_output(module, tmp_path: Path) -> N
     path.write_text("".join(json.dumps(value) + "\n" for value in rows))
     path.chmod(0o600)
     try:
-        with pytest.raises(module.FinalizationError, match="no valid generation"):
-            module.run_finalization(args)
+        manifest = module.run_finalization(args)
     finally:
         os.close(lock_fd)
-    assert not args.output_dir.exists()
+    assert manifest["status"] == "complete"
+    assert manifest["execution_pass"] is True
+    assert any(
+        "successful_proposer_count_mismatch" in warning
+        for warning in manifest["warnings"]
+    )
 
 
 def _b2_physical_call(
@@ -8046,6 +8053,76 @@ def test_unaccepted_generation_is_blocking_without_degraded_receipt(module) -> N
         "generation_not_accepted",
     ]
     assert warnings == []
+
+
+def test_bound_quorum_demotes_identity_and_recovery_evidence(module) -> None:
+    final_text = "A complete, judgeable ensemble answer."
+    trace = _ensemble_trace(
+        ["model-a", "model-b", "model-c"],
+        "aggregator-a",
+        final_text=final_text,
+        selection_mode="router_dynamic",
+    )
+    row = {
+        "final_text": final_text,
+        "final_text_chars": len(final_text),
+        "final_text_sha256": module.text_sha256(final_text),
+        "ensemble_trace": trace,
+    }
+
+    assert module.row_has_bound_answer_and_proposer_quorum(row) is True
+    blocking, warnings = module.partition_execution_and_audit_reasons(
+        [
+            "wrong_requested_proposer_identity",
+            "g1_attempt_plan_provenance_invalid",
+            "proposer_recovery_physical_attempt_set_mismatch",
+        ],
+        evidence_proven=True,
+    )
+
+    assert blocking == []
+    assert warnings == [
+        "wrong_requested_proposer_identity",
+        "g1_attempt_plan_provenance_invalid",
+        "proposer_recovery_physical_attempt_set_mismatch",
+    ]
+
+
+def test_actual_proposer_quorum_remains_blocking(module) -> None:
+    final_text = "A non-empty answer cannot substitute for ensemble quorum."
+    trace = _ensemble_trace(
+        ["model-a", "model-b", "model-c"],
+        "aggregator-a",
+        final_text=final_text,
+        selection_mode="router_dynamic",
+    )
+    candidates = trace["calls"][0]["candidates"]
+    for candidate in candidates[1:]:
+        candidate.update(
+            {
+                "ok": False,
+                "error": "failed",
+                "content": {"text": "", "chars": 0, "truncated": False},
+            }
+        )
+    row = {
+        "final_text": final_text,
+        "final_text_chars": len(final_text),
+        "final_text_sha256": module.text_sha256(final_text),
+        "ensemble_trace": trace,
+    }
+
+    assert module.row_has_bound_answer_and_proposer_quorum(row) is False
+    blocking, warnings = module.partition_execution_and_audit_reasons(
+        [
+            "wrong_requested_proposer_identity",
+            "insufficient_actual_proposer_quorum",
+        ],
+        evidence_proven=True,
+    )
+
+    assert blocking == ["insufficient_actual_proposer_quorum"]
+    assert warnings == ["wrong_requested_proposer_identity"]
 
 
 def test_judge_audit_demotion_is_closed_to_missing_usage(module) -> None:

@@ -16411,6 +16411,66 @@ def test_unclosed_stream_and_byok_are_degraded_execution_and_audit_warning(modul
 
 
 @pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+def test_visible_ensemble_answer_survives_provider_and_identity_audit_errors(module) -> None:
+    plan = _k21_router_dynamic_plan()
+    trace = _k21_ensemble_trace(plan)
+    trace["candidates"][1].update(
+        {
+            "provider": "openrouter",
+            "model": "outside-roster",
+            "requested_provider": "openrouter",
+            "requested_model": "outside-roster",
+        }
+    )
+    result = module.RunResult(
+        final_text="answer",
+        done=module.DoneEvent(ensemble_trace=trace),
+        error="ensemble post-call identity evidence mismatch",
+    )
+
+    assert module.generation_retry_reason(
+        result,
+        expected_selection_mode="router_dynamic",
+        expected_selection_plan=plan,
+    ) == ""
+    assert "wrong_requested_proposer_identity" in result.audit_warnings
+    execution = module.execution_status_payload(
+        generation_accepted=True,
+        final_text=result.final_text,
+        run_error=result.error,
+        ensemble_trace=trace,
+    )
+    assert execution["status"] == "degraded_success"
+    assert execution["success"] is True
+    assert "provider_error_after_visible_ensemble_output" in execution["degraded_reasons"]
+
+
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+def test_ensemble_actual_quorum_shortfall_still_blocks_execution(module) -> None:
+    plan = _k21_router_dynamic_plan()
+    trace = _k21_ensemble_trace(plan)
+    for candidate in trace["candidates"][1:]:
+        candidate.update(
+            {
+                "ok": False,
+                "error": "failed",
+                "content": {"text": "", "chars": 0, "truncated": False},
+            }
+        )
+    trace["successful_proposers"] = 1
+    result = module.RunResult(
+        final_text="answer",
+        done=module.DoneEvent(ensemble_trace=trace),
+    )
+
+    assert module.ensemble_generation_retry_reason(
+        result,
+        expected_selection_mode="router_dynamic",
+        expected_selection_plan=plan,
+    ) == "insufficient_actual_proposer_quorum"
+
+
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
 def test_dynamic_partial_proposer_quorum_is_usable_but_not_strict_success(module) -> None:
     plan = {
         "strategy": "router_dynamic",
@@ -16472,6 +16532,16 @@ def test_dynamic_partial_proposer_quorum_is_usable_but_not_strict_success(module
         )
         == []
     )
+    if module is resume_runner:
+        assert module.ensemble_generation_completion_reasons(
+            {
+                "group": "G1",
+                "provider_spec": dict(module.GROUP_SPECS["G1"]),
+                "routing_trace": {"selection_plan": deepcopy(plan)},
+                "final_text": "final answer",
+                "ensemble_trace": deepcopy(trace),
+            }
+        ) == []
 
     tampered = deepcopy(trace)
     tampered["usable_proposers"] = 1
@@ -18658,15 +18728,105 @@ def test_ensemble_call_core_audits_expanded_k21_candidate_slots(
         == []
     )
 
-    wrong_slot = deepcopy(trace)
-    wrong_slot["candidates"][1]["requested_model"] = "p1"
-    assert "wrong_requested_proposer_identity" in (
-        module.ensemble_call_core_reasons(
-            wrong_slot,
-            expected_selection_mode="router_dynamic",
-            expected_selection_plan=plan,
-        )
+    # Post-call validation is roster based.  A frozen proposer or backup may
+    # occupy a different runtime slot after provider-native recovery.
+    moved_selected = deepcopy(trace)
+    moved_selected["candidates"][1].update(
+        {
+            "provider": "openrouter",
+            "model": "p1",
+            "requested_provider": "openrouter",
+            "requested_model": "p1",
+        }
     )
+    assert module.ensemble_call_core_reasons(
+        moved_selected,
+        expected_selection_mode="router_dynamic",
+        expected_selection_plan=plan,
+    ) == []
+
+    recovered_backup = deepcopy(trace)
+    recovered_backup["candidates"][1].update(
+        {
+            "provider": "openrouter",
+            "model": "b0",
+            "requested_provider": "openrouter",
+            "requested_model": "b0",
+        }
+    )
+    recovered_backup["proposer_recovery"] = {
+        "schema": "opensquilla.router-dynamic-proposer-recovery/v1",
+        "executed_proposer_roster_before": [
+            "openrouter:p0",
+            "openrouter:p0",
+            "openrouter:p1",
+        ],
+        "executed_proposer_roster_after": [
+            "openrouter:p0",
+            "openrouter:b0",
+            "openrouter:p1",
+        ],
+        "attempts": [
+            {
+                "sequence": 1,
+                "slot_index": 1,
+                "kind": "backup_replacement",
+                "source_identity": "openrouter:p0",
+                "target_identity": "openrouter:b0",
+                "reason": "frozen_backup_order",
+                "request_started": True,
+                "physical_request_count": 1,
+                "physical_attempt_id": "a" * 32,
+                "stream_closed": True,
+                "usage_reported": True,
+                "usage_missing_count": 0,
+                "outcome": "succeeded",
+            }
+        ],
+    }
+    assert module.ensemble_call_core_reasons(
+        recovered_backup,
+        expected_selection_mode="router_dynamic",
+        expected_selection_plan=plan,
+    ) == []
+    result = module.RunResult(
+        final_text="answer",
+        done=module.DoneEvent(ensemble_trace=recovered_backup),
+    )
+    assert module.ensemble_generation_retry_reason(
+        result,
+        expected_selection_mode="router_dynamic",
+        expected_selection_plan=plan,
+    ) == ""
+    assert result.audit_warnings == []
+
+    outside_roster = deepcopy(trace)
+    outside_roster["candidates"][1].update(
+        {
+            "provider": "openrouter",
+            "model": "outside-roster",
+            "requested_provider": "openrouter",
+            "requested_model": "outside-roster",
+        }
+    )
+    audit_reasons = module.ensemble_call_core_reasons(
+        outside_roster,
+        expected_selection_mode="router_dynamic",
+        expected_selection_plan=plan,
+    )
+    assert "wrong_requested_proposer_identity" in audit_reasons
+    assert "wrong_actual_proposer_identity" in audit_reasons
+    result = module.RunResult(
+        final_text="answer",
+        done=module.DoneEvent(ensemble_trace=outside_roster),
+    )
+    assert module.ensemble_generation_retry_reason(
+        result,
+        expected_selection_mode="router_dynamic",
+        expected_selection_plan=plan,
+    ) == ""
+    assert "wrong_requested_proposer_identity" in result.audit_warnings
+    assert "wrong_actual_proposer_identity" in result.audit_warnings
 
 
 def test_resume_completion_accepts_k21_plan_and_rejects_ambiguous_slots() -> None:

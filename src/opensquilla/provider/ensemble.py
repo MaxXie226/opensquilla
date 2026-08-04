@@ -112,6 +112,7 @@ _PROPOSER_RECOVERY_BUDGET_OVERRUN_CODE = "proposer_recovery_budget_overrun"
 _PROPOSER_RECOVERY_EVIDENCE_UNPROVEN_CODE = (
     "proposer_recovery_evidence_unproven"
 )
+_PROPOSER_EVIDENCE_WARNING_CODE = "proposer_evidence_unverified"
 _ROUTER_DYNAMIC_AGGREGATOR_ONLY_QUORUM_UNPROVEN_CODE = (
     "router_dynamic_aggregator_only_quorum_unproven"
 )
@@ -1080,7 +1081,6 @@ class _CandidateResult:
             "candidate_mode_contract_violation",
             _ROUTER_DYNAMIC_RECOVERY_PLAN_DRIFT_CODE,
             _PROPOSER_RECOVERY_BUDGET_OVERRUN_CODE,
-            _PROPOSER_RECOVERY_EVIDENCE_UNPROVEN_CODE,
             *_PROPOSER_LOCAL_SCHEDULING_CANCELLATION_CODES,
         }:
             return False
@@ -6104,38 +6104,101 @@ class EnsembleProvider:
             if candidate.error_code == _ENSEMBLE_PROPOSER_CLOSE_TIMEOUT_CODE
         ]
         if proposer_close_failures and not recovery_policy_enabled:
-            # Static/non-dynamic ensembles retain their strict cleanup
-            # contract.  The partial-draft exception is owned exclusively by
-            # the frozen router_dynamic execution policy.
-            close_reason = (
-                "ensemble proposer cleanup did not finish; aggregation and "
-                "fallback were not started"
+            strict_successful_count = sum(
+                1 for candidate in candidates if candidate.ok
             )
-            close_rows = _candidate_usage_rows(
-                candidates,
-                profile=self.profile_name,
+            quarantined_indexes: list[int] = []
+            quarantined_attempt_ids: list[str] = []
+            usage_evidence_unverified_indexes: list[int] = []
+            cleanup_can_be_quarantined = bool(
+                strict_successful_count >= self.min_successful_proposers
+                and all(not candidate.ok for candidate in proposer_close_failures)
             )
-            close_missing_count = _candidate_missing_usage_count(candidates)
-            close_trace = self._trace_payload(
-                candidates,
-                successful_count=sum(1 for candidate in candidates if candidate.ok),
-                fallback_used=False,
-                fallback_reason=close_reason,
-                final_request_role="none",
-                selected_candidates=[candidate for candidate in candidates if candidate.ok],
-            )
-            close_trace["usage_missing_count"] = close_missing_count
-            yield _attach_error_request_evidence(
-                ErrorEvent(
-                    message=close_reason,
-                    code=_ENSEMBLE_PROPOSER_CLOSE_TIMEOUT_CODE,
-                    model_usage_breakdown=close_rows,
-                    usage_missing_count=close_missing_count,
-                    ensemble_trace=close_trace,
-                ),
-                close_trace,
-            )
-            return
+            if cleanup_can_be_quarantined:
+                for candidate in proposer_close_failures:
+                    if not self._persist_unclosed_request_usage(candidate):
+                        # Static ensembles do not install the managed
+                        # physical-attempt ledger used by router_dynamic.  A
+                        # missing ledger therefore cannot be repaired here,
+                        # but it also must not discard an already-satisfied
+                        # proposer quorum.  Keep the request quarantined and
+                        # make its cost evidence explicitly unknown.  A ledger
+                        # that exists but is malformed remains a hard error.
+                        attempts = candidate.execution.get("physical_attempts")
+                        scheduler_confirms_unclosed_request = bool(
+                            attempts is None
+                            and candidate.request_started
+                            and not candidate.stream_closed
+                            and candidate.physical_request_count > 0
+                        )
+                        if not scheduler_confirms_unclosed_request:
+                            cleanup_can_be_quarantined = False
+                            break
+                        candidate.usage_missing_count = max(
+                            candidate.usage_missing_count,
+                            candidate.physical_request_count,
+                        )
+                        candidate.execution[
+                            "proposer_cleanup_evidence_warning"
+                        ] = "physical_attempt_ledger_unavailable"
+                        usage_evidence_unverified_indexes.append(candidate.index)
+                    quarantined_indexes.append(candidate.index)
+                    attempts = candidate.execution.get("physical_attempts")
+                    if isinstance(attempts, list):
+                        quarantined_attempt_ids.extend(
+                            str(attempt.get("physical_attempt_id") or "")
+                            for attempt in attempts
+                            if isinstance(attempt, Mapping)
+                            and attempt.get("stream_closed") is not True
+                        )
+            if cleanup_can_be_quarantined:
+                cleanup_quorum_bypass = {
+                    "schema": "opensquilla.proposer-cleanup-quorum-bypass/v1",
+                    "applied": True,
+                    "quorum_required": self.min_successful_proposers,
+                    "successful_proposers": strict_successful_count,
+                    "usable_proposers": strict_successful_count,
+                    "candidate_indexes": sorted(quarantined_indexes),
+                    "physical_attempt_ids": quarantined_attempt_ids,
+                    "usage_evidence_unverified_candidate_indexes": sorted(
+                        usage_evidence_unverified_indexes
+                    ),
+                    "recovery_skipped": True,
+                    "aggregator_tools_disabled": True,
+                }
+            else:
+                close_reason = (
+                    "ensemble proposer cleanup did not finish and the strict "
+                    "proposer quorum was not available; aggregation and "
+                    "fallback were not started"
+                )
+                close_rows = _candidate_usage_rows(
+                    candidates,
+                    profile=self.profile_name,
+                )
+                close_missing_count = _candidate_missing_usage_count(candidates)
+                close_trace = self._trace_payload(
+                    candidates,
+                    successful_count=strict_successful_count,
+                    fallback_used=False,
+                    fallback_reason=close_reason,
+                    final_request_role="none",
+                    selected_candidates=[
+                        candidate for candidate in candidates if candidate.ok
+                    ],
+                )
+                close_trace["usage_missing_count"] = close_missing_count
+                yield _attach_error_request_evidence(
+                    ErrorEvent(
+                        message=close_reason,
+                        code=_ENSEMBLE_PROPOSER_CLOSE_TIMEOUT_CODE,
+                        model_usage_breakdown=close_rows,
+                        usage_missing_count=close_missing_count,
+                        ensemble_trace=close_trace,
+                    ),
+                    close_trace,
+                )
+                return
         if any(
             candidate.error_code
             == _ROUTER_DYNAMIC_RECOVERY_PLAN_DRIFT_CODE
@@ -7682,6 +7745,50 @@ class EnsembleProvider:
             )
         )
 
+    def _record_proposer_evidence_warning(
+        self,
+        trace: dict[str, Any],
+        result: _CandidateResult,
+        *,
+        phase: str,
+    ) -> None:
+        """Keep incomplete billing evidence visible without poisoning execution."""
+
+        represented_usage_rows = sum(
+            1
+            for row in result.model_usage_breakdown
+            if isinstance(row, Mapping)
+        )
+        unrepresented_requests = max(
+            0,
+            result.physical_request_count - represented_usage_rows,
+        )
+        result.usage_missing_count = max(
+            result.usage_missing_count,
+            unrepresented_requests,
+            1 if result.request_started else 0,
+        )
+        result.error = "proposer physical request evidence is incomplete"
+        # This is an audit status, not a candidate protocol failure.  Keeping
+        # a distinct non-hard code lets meaningful text count as a partial
+        # proposer while the unknown usage remains visible for reconciliation.
+        result.error_code = _PROPOSER_EVIDENCE_WARNING_CODE
+        warning = {
+            "schema": "opensquilla.proposer-evidence-warning/v1",
+            "status": "warning",
+            "phase": phase,
+            "candidate_index": result.index,
+            "request_started": result.request_started,
+            "physical_request_count": result.physical_request_count,
+            "represented_usage_rows": represented_usage_rows,
+            "usage_unknown_count": result.usage_missing_count,
+            "usable_text": _visible_answer_looks_usable(result.text),
+        }
+        result.execution["proposer_evidence_warning"] = deepcopy(warning)
+        warnings = trace.setdefault("evidence_warnings", [])
+        if isinstance(warnings, list):
+            warnings.append(warning)
+
     @staticmethod
     def _proposer_was_locally_cancelled(
         candidate: _CandidateResult,
@@ -8178,16 +8285,26 @@ class EnsembleProvider:
                 reason="budget_overrun",
             )
         elif not evidence_valid:
-            attempt.error = (
-                "proposer recovery physical request evidence is incomplete"
-            )
-            attempt.error_code = _PROPOSER_RECOVERY_EVIDENCE_UNPROVEN_CODE
-            self._set_proposer_recovery_terminal(
-                trace,
-                state=state,
-                code=_PROPOSER_RECOVERY_EVIDENCE_UNPROVEN_CODE,
-                reason="evidence_unproven",
-            )
+            if not attempt.request_started:
+                attempt.error = (
+                    "proposer recovery produced output without starting a "
+                    "physical provider request"
+                )
+                attempt.error_code = (
+                    _PROPOSER_RECOVERY_EVIDENCE_UNPROVEN_CODE
+                )
+                self._set_proposer_recovery_terminal(
+                    trace,
+                    state=state,
+                    code=_PROPOSER_RECOVERY_EVIDENCE_UNPROVEN_CODE,
+                    reason="evidence_unproven",
+                )
+            else:
+                self._record_proposer_evidence_warning(
+                    trace,
+                    attempt,
+                    phase="recovery_attempt",
+                )
         receipt: dict[str, Any] = {
             "sequence": len(trace["attempts"]) + 1,
             "slot_index": slot_index,
@@ -8338,18 +8455,35 @@ class EnsembleProvider:
                 self._refresh_proposer_recovery_trace(trace, state, recovered)
                 return recovered
             if not self._proposer_recovery_evidence_proven(candidate):
-                candidate.error = (
-                    "proposer physical request evidence is incomplete"
-                )
-                candidate.error_code = _PROPOSER_RECOVERY_EVIDENCE_UNPROVEN_CODE
-                self._set_proposer_recovery_terminal(
+                # A text-only object that never started a provider request is
+                # still forged execution evidence. Started requests are kept
+                # as audit warnings and may either satisfy partial quorum or
+                # proceed through the bounded frozen-backup recovery path.
+                if not candidate.request_started:
+                    candidate.error = (
+                        "proposer produced output without starting a physical "
+                        "provider request"
+                    )
+                    candidate.error_code = (
+                        _PROPOSER_RECOVERY_EVIDENCE_UNPROVEN_CODE
+                    )
+                    self._set_proposer_recovery_terminal(
+                        trace,
+                        state=state,
+                        code=_PROPOSER_RECOVERY_EVIDENCE_UNPROVEN_CODE,
+                        reason="evidence_unproven",
+                    )
+                    self._refresh_proposer_recovery_trace(
+                        trace,
+                        state,
+                        recovered,
+                    )
+                    return recovered
+                self._record_proposer_evidence_warning(
                     trace,
-                    state=state,
-                    code=_PROPOSER_RECOVERY_EVIDENCE_UNPROVEN_CODE,
-                    reason="evidence_unproven",
+                    candidate,
+                    phase="initial_candidate",
                 )
-                self._refresh_proposer_recovery_trace(trace, state, recovered)
-                return recovered
         if quarantined_cleanup_indexes:
             trace["cleanup_quorum_bypass"] = {
                 "schema": (
@@ -8536,8 +8670,8 @@ class EnsembleProvider:
                             ):
                                 break
                         elif current.error_code in {
-                            "proposer_recovery_budget_overrun",
-                            "proposer_recovery_evidence_unproven",
+                            _PROPOSER_RECOVERY_BUDGET_OVERRUN_CODE,
+                            _PROPOSER_RECOVERY_EVIDENCE_UNPROVEN_CODE,
                         }:
                             self._mark_failed_proposer_identity(
                                 state,
@@ -8576,8 +8710,8 @@ class EnsembleProvider:
                         if trace.get("terminal_reason"):
                             break
                         if current.error_code in {
-                            "proposer_recovery_budget_overrun",
-                            "proposer_recovery_evidence_unproven",
+                            _PROPOSER_RECOVERY_BUDGET_OVERRUN_CODE,
+                            _PROPOSER_RECOVERY_EVIDENCE_UNPROVEN_CODE,
                         }:
                             self._mark_failed_proposer_identity(
                                 state,
@@ -8654,8 +8788,8 @@ class EnsembleProvider:
                 if trace.get("terminal_reason"):
                     break
                 if current.error_code in {
-                    "proposer_recovery_budget_overrun",
-                    "proposer_recovery_evidence_unproven",
+                    _PROPOSER_RECOVERY_BUDGET_OVERRUN_CODE,
+                    _PROPOSER_RECOVERY_EVIDENCE_UNPROVEN_CODE,
                 }:
                     self._mark_failed_proposer_identity(
                         state,
