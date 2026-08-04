@@ -7,8 +7,7 @@ from pathlib import Path
 import pytest
 
 from opensquilla.sandbox.path_validation import MountDecision
-from opensquilla.tools.builtin import filesystem
-from opensquilla.tools.builtin import shell
+from opensquilla.tools.builtin import filesystem, shell
 from opensquilla.tools.types import ToolContext, ToolError, current_tool_context
 
 

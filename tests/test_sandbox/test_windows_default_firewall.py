@@ -3,7 +3,6 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import opensquilla.sandbox.backend.windows_default_firewall as firewall_mod
-
 from opensquilla.sandbox.backend.windows_default_firewall import (
     LOOPBACK_REMOTE_ADDRESSES,
     NON_LOOPBACK_REMOTE_ADDRESSES,
