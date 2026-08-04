@@ -61,6 +61,8 @@ from opensquilla.provider.ensemble import (
     _StreamCloseStatus,
     _summed_float,
     _unrepresented_diagnostic_usage_rows,
+    _visible_answer_is_progress_only,
+    _visible_answer_looks_usable,
     build_ensemble_provider_from_config,
     openrouter_static_capabilities,
 )
@@ -148,6 +150,48 @@ def test_json_safe_serializes_provider_billing_receipt_as_object() -> None:
             "schema_version": 1,
         }
     }
+
+
+def test_finance_progress_narration_is_not_a_deliverable_answer() -> None:
+    progress = (
+        "Pulling the Q1 2024 segment tables and 2025 debt footnotes from primary "
+        "filings to complete the calculations."
+    )
+
+    assert _visible_answer_is_progress_only(progress) is True
+    for status_only in (
+        "Let me search the primary sources.",
+        "Let me check.",
+        "Searching primary sources now.",
+        "正在查询相关数据。",
+    ):
+        assert _visible_answer_is_progress_only(status_only) is True
+    assert _visible_answer_looks_usable(
+        progress,
+        reject_progress_only=True,
+    ) is False
+    assert _visible_answer_is_progress_only(
+        "Based on the filings, the segment margin was 18.4%, with two caveats."
+    ) is False
+    assert _visible_answer_is_progress_only(
+        "Searching primary sources now. The filed segment margin was 18.4%."
+    ) is False
+    assert _visible_answer_is_progress_only(
+        "Checking the filing now: the segment margin was 18.4%."
+    ) is False
+    for substantive in (
+        "Let me check your premise—the filed margin was 18.4%.",
+        "Checking the period before 2024 shows an 18.4% margin.",
+        "We still need two approvals.",
+        "I still need $5 to reach the target.",
+        "I need two days.",
+        "I need the invoice to complete the calculation.",
+        "We still need two approvals before finalizing.",
+        "我还需要两天。",
+        "Let me check and the result is 5.",
+        "Checking is disabled by policy now.",
+    ):
+        assert _visible_answer_is_progress_only(substantive) is False
 
 
 def test_managed_completion_keeps_physical_id_in_usage_evidence() -> None:
@@ -14524,6 +14568,299 @@ async def test_aggregator_only_unready_primary_uses_ranked_top3(
 
 
 @pytest.mark.asyncio
+async def test_partial_quorum_can_recover_a_progress_only_aggregator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    progress = "Pulling primary filings to complete the calculations."
+    final_answer = "The available filings support an 18.4% segment margin."
+    registry = _RecoveryScriptRegistry(
+        {
+            "agg": [
+                [TextDeltaEvent(text=progress), _billed_done("agg", cost=0.3)],
+                [TextDeltaEvent(text=final_answer), _billed_done("agg", cost=0.2)],
+            ]
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    proposers = [_member("p0"), _member("p1")]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        aggregator=_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        proposer_timeout_seconds=1,
+        aggregator_timeout_seconds=1,
+        shuffle_candidates=False,
+        aggregator_tools=True,
+        aggregator_recovery_mode="experiment",
+        selection_plan=_slot_recovery_plan(proposers, []),
+    )
+    scope_id = "router-dynamic-partial-progress-recovery"
+    assert provider.begin_provider_retry_scope(
+        scope_id,
+        max_additional_physical_requests=3,
+    )
+
+    async def fake_run_proposers(*args: Any, **kwargs: Any) -> list[_CandidateResult]:
+        del args, kwargs
+        return [
+            _slot_candidate(
+                index=0,
+                model="p0",
+                text="Complete draft.",
+                physical_attempt_id="a" * 32,
+            ),
+            _slot_candidate(
+                index=1,
+                model="p1",
+                text="A useful partial draft with concrete filing evidence.",
+                error="provider stream ended before DoneEvent",
+                error_code="stream_incomplete",
+                physical_attempt_id="b" * 32,
+            ),
+        ]
+
+    monkeypatch.setattr(provider, "_run_proposers", fake_run_proposers)
+
+    events = await _collect(provider)
+
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert registry.call_counts == {"agg": 2}
+    assert all(call["tools"] is None for call in registry.calls)
+    assert done.ensemble_trace["aggregator_isolated"] is True
+    assert (
+        done.ensemble_trace["proposer_partial_quorum"]["recovery_skipped"]
+        is False
+    )
+    assert done.ensemble_trace["assembled_output"]["text"] == final_answer
+    assert "".join(
+        event.text for event in events if isinstance(event, TextDeltaEvent)
+    ) == final_answer
+    assert (
+        done.ensemble_trace["aggregator_recovery"]["selected_kind"]
+        == "same_model_recovery"
+    )
+    assert provider.end_provider_retry_scope(scope_id)
+
+
+@pytest.mark.asyncio
+async def test_router_dynamic_serving_keeps_short_answer_streaming(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release_done = asyncio.Event()
+    registry = _RecoveryScriptRegistry(
+        {
+            "p0": [[TextDeltaEvent(text="Draft zero."), _billed_done("p0", cost=0.1)]],
+            "p1": [[TextDeltaEvent(text="Draft one."), _billed_done("p1", cost=0.1)]],
+        }
+    )
+
+    class _BlockingAggregator:
+        provider_name = "fake"
+
+        def chat(
+            self,
+            messages: list[Message],
+            tools: list[ToolDefinition] | None = None,
+            config: ChatConfig | None = None,
+        ) -> AsyncIterator[StreamEvent]:
+            del messages, tools, config
+
+            async def _stream() -> AsyncIterator[StreamEvent]:
+                yield TextDeltaEvent(text="Margin: 18.4%")
+                await release_done.wait()
+                yield _billed_done("agg", cost=0.2)
+
+            return _stream()
+
+        async def list_models(self) -> list[Any]:
+            return []
+
+    aggregator = _BlockingAggregator()
+
+    def build_provider(cfg: ProviderConfig) -> Any:
+        if cfg.model == "agg":
+            return aggregator
+        return registry.provider_for(cfg)
+
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", build_provider)
+    proposers = [_member("p0"), _member("p1")]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        aggregator=_member("agg"),
+        min_successful_proposers=2,
+        proposer_timeout_seconds=1,
+        aggregator_timeout_seconds=1,
+        shuffle_candidates=False,
+        aggregator_recovery_mode="serving",
+        selection_plan=_slot_recovery_plan(proposers, []),
+    )
+    scope_id = "router-dynamic-serving-streaming"
+    assert provider.begin_provider_retry_scope(
+        scope_id,
+        max_additional_physical_requests=3,
+    )
+    stream = provider.chat([Message(role="user", content="answer")]).__aiter__()
+
+    while True:
+        event = await asyncio.wait_for(anext(stream), timeout=0.5)
+        if isinstance(event, TextDeltaEvent):
+            break
+
+    assert event.text == "Margin: 18.4%"
+    release_done.set()
+    remaining = [item async for item in stream]
+    assert any(isinstance(item, DoneEvent) for item in remaining)
+    assert provider.end_provider_retry_scope(scope_id)
+
+
+@pytest.mark.asyncio
+async def test_router_dynamic_progress_only_done_forces_final_then_ranked_backup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    progress = (
+        "Pulling the Q1 2024 segment tables and 2025 debt footnotes from primary "
+        "filings to complete the calculations."
+    )
+    final_answer = (
+        "Based on Acadia's filings, the segment margin was 18.4%; the remaining "
+        "figures are unavailable, so this answer states that limitation directly."
+    )
+    registry = _RecoveryScriptRegistry(
+        {
+            "p0": [[TextDeltaEvent(text="Draft zero."), _billed_done("p0", cost=0.1)]],
+            "p1": [[TextDeltaEvent(text="Draft one."), _billed_done("p1", cost=0.1)]],
+            "agg": [
+                [TextDeltaEvent(text=progress), _billed_done("agg", cost=0.3)],
+                [TextDeltaEvent(text=progress), _billed_done("agg", cost=0.2)],
+            ],
+            "agg-backup": [
+                [
+                    TextDeltaEvent(text=final_answer),
+                    _billed_done("agg-backup", cost=0.4),
+                ]
+            ],
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    proposers = [_member("p0"), _member("p1")]
+    aggregator_fallbacks = [_member("agg-backup")]
+    selection_plan = _slot_recovery_plan(proposers, [])
+    selection_plan["aggregator_candidates"] = ["fake:agg", "fake:agg-backup"]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        aggregator=_member("agg"),
+        aggregator_fallbacks=aggregator_fallbacks,
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        proposer_timeout_seconds=1,
+        aggregator_timeout_seconds=1,
+        shuffle_candidates=False,
+        aggregator_tools=True,
+        aggregator_recovery_mode="experiment",
+        aggregator_recovery_top_k=2,
+        selection_plan=selection_plan,
+    )
+    scope_id = "router-dynamic-progress-only-final"
+    assert provider.begin_provider_retry_scope(
+        scope_id,
+        max_additional_physical_requests=3,
+    )
+
+    events = await _collect(provider)
+
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert registry.call_counts == {
+        "p0": 1,
+        "p1": 1,
+        "agg": 2,
+        "agg-backup": 1,
+    }
+    aggregator_calls = [
+        call
+        for call in registry.calls
+        if call["model"] in {"agg", "agg-backup"}
+    ]
+    assert aggregator_calls[0]["tools"] is not None
+    assert all(call["tools"] is None for call in aggregator_calls[1:])
+    assert all(call["config"].tool_choice is None for call in aggregator_calls[1:])
+    assert "output the final answer now" in str(aggregator_calls[1]["messages"][-1].content)
+    trace = done.ensemble_trace
+    assert trace["assembled_output"]["text"] == final_answer
+    assert "".join(
+        event.text for event in events if isinstance(event, TextDeltaEvent)
+    ) == final_answer
+    assert done.billed_cost == pytest.approx(1.1)
+    assert trace["physical_request_count"] == 5
+    recovery = trace["aggregator_recovery"]
+    assert recovery["selected_kind"] == "model_fallback"
+    rejected = [
+        attempt
+        for attempt in recovery["attempts"]
+        if attempt.get("content_outcome") == "progress_only"
+    ]
+    assert len(rejected) == 2
+    assert all(attempt["assembled_output_discarded"] is True for attempt in rejected)
+    aggregator_attempt_ids = [
+        attempt["physical_attempt_id"]
+        for attempt in recovery["attempts"]
+        if attempt.get("request_started") is True
+    ]
+    assert len(aggregator_attempt_ids) == 3
+    assert len(set(aggregator_attempt_ids)) == 3
+    assert provider.end_provider_retry_scope(scope_id)
+
+
+@pytest.mark.asyncio
+async def test_router_dynamic_experiment_keeps_concise_substantive_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    final_answer = "We still need two approvals."
+    registry = _RecoveryScriptRegistry(
+        {
+            "p0": [[TextDeltaEvent(text="Draft zero."), _billed_done("p0", cost=0.1)]],
+            "p1": [[TextDeltaEvent(text="Draft one."), _billed_done("p1", cost=0.1)]],
+            "agg": [
+                [TextDeltaEvent(text=final_answer), _billed_done("agg", cost=0.2)]
+            ],
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    proposers = [_member("p0"), _member("p1")]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        aggregator=_member("agg"),
+        min_successful_proposers=2,
+        proposer_timeout_seconds=1,
+        aggregator_timeout_seconds=1,
+        shuffle_candidates=False,
+        aggregator_recovery_mode="experiment",
+        selection_plan=_slot_recovery_plan(proposers, []),
+    )
+    scope_id = "router-dynamic-concise-answer"
+    assert provider.begin_provider_retry_scope(
+        scope_id,
+        max_additional_physical_requests=3,
+    )
+
+    events = await _collect(provider)
+
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert registry.call_counts["agg"] == 1
+    assert "".join(
+        event.text for event in events if isinstance(event, TextDeltaEvent)
+    ) == final_answer
+    assert done.ensemble_trace["assembled_output"]["text"] == final_answer
+    assert provider.end_provider_retry_scope(scope_id)
+
+
+@pytest.mark.asyncio
 async def test_whitespace_only_done_is_not_a_deliverable_final_answer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -14577,6 +14914,66 @@ async def test_empty_continuation_keeps_existing_prefix_for_recovery(
         content="Part A",
     )
     assert done.ensemble_trace["aggregator_recovery"]["selected_kind"] == ("continuation")
+
+
+@pytest.mark.asyncio
+async def test_progress_only_continuation_is_not_exposed_before_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    progress = "Pulling primary filings to complete the calculations."
+    registry = _RecoveryScriptRegistry(
+        {
+            "p0": [[TextDeltaEvent(text="draft zero"), _billed_done("p0", cost=0.1)]],
+            "p1": [[TextDeltaEvent(text="draft one"), _billed_done("p1", cost=0.1)]],
+            "agg": [
+                [
+                    TextDeltaEvent(text="Part A"),
+                    _billed_done("agg", cost=0.3, stop_reason="length"),
+                ],
+                [TextDeltaEvent(text=progress), _billed_done("agg", cost=0.2)],
+                [TextDeltaEvent(text=" tail"), _billed_done("agg", cost=0.2)],
+            ],
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    proposers = [_member("p0"), _member("p1")]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        aggregator=_member("agg", thinking="high"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        proposer_timeout_seconds=1,
+        aggregator_timeout_seconds=1,
+        shuffle_candidates=False,
+        aggregator_recovery_mode="experiment",
+        aggregator_recovery_top_k=3,
+        aggregator_max_tokens_cap=65_536,
+        aggregator_visible_answer_reserve_tokens=8_192,
+        selection_plan=_slot_recovery_plan(proposers, []),
+    )
+    scope_id = "router-dynamic-progress-only-continuation"
+    assert provider.begin_provider_retry_scope(
+        scope_id,
+        max_additional_physical_requests=3,
+    )
+
+    events = await _collect(provider)
+
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    visible = "".join(event.text for event in events if isinstance(event, TextDeltaEvent))
+    assert visible == "Part A tail"
+    assert progress not in visible
+    assert done.ensemble_trace["assembled_output"]["text"] == visible
+    assert registry.call_counts["agg"] == 3
+    rejected = [
+        attempt
+        for attempt in done.ensemble_trace["aggregator_recovery"]["attempts"]
+        if attempt.get("content_outcome") == "progress_only"
+    ]
+    assert len(rejected) == 1
+    assert rejected[0]["assembled_output_discarded"] is True
+    assert provider.end_provider_retry_scope(scope_id)
 
 
 @pytest.mark.asyncio

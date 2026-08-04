@@ -9,6 +9,7 @@ import json
 import math
 import os
 import random
+import re
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
@@ -156,6 +157,118 @@ _THINKING_LEVEL_PARAMETER_MARKERS = (
     "budget tokens",
     "thinking budget",
     "reasoning budget",
+)
+_STRONG_PROGRESS_ACTION_PREFIXES = (
+    "let me search ",
+    "let me fetch ",
+    "let me check ",
+    "searching ",
+    "fetching ",
+    "retrieving ",
+    "looking up ",
+    "browsing ",
+    "checking ",
+    "i'm checking ",
+    "i am checking ",
+    "i'll check ",
+    "i will check ",
+    "i'll search ",
+    "i will search ",
+    "i'm searching ",
+    "i am searching ",
+    "正在搜索",
+    "正在查询",
+    "正在获取",
+    "正在拉取",
+    "正在查找",
+    "正在检索",
+    "我正在搜索",
+    "我正在查询",
+    "我正在核实",
+    "正在核实",
+    "正在检查",
+    "正在确认",
+)
+_STRONG_PROGRESS_ACTION_EXACT = (
+    "let me search",
+    "let me fetch",
+    "let me check",
+    "searching",
+    "fetching",
+    "retrieving",
+    "browsing",
+    "checking",
+)
+_AMBIGUOUS_PROGRESS_ACTION_PREFIXES = (
+    "pulling ",
+    "verifying ",
+    "confirming ",
+    "cross-checking ",
+    "接下来搜索",
+    "接下来查询",
+)
+_PROGRESS_SUBSTANTIVE_MARKERS = (
+    " the result is ",
+    " result is ",
+    " results are ",
+    " shows ",
+    " showed ",
+    " indicates ",
+    " indicated ",
+    " found ",
+    " confirms ",
+    " confirmed ",
+    " is ",
+    " are ",
+    " was ",
+    " were ",
+    "=",
+    "%",
+    "$",
+    "结果是",
+    "结果为",
+    "显示",
+    "表明",
+    "证明",
+)
+_PROGRESS_DEFER_MARKERS = (
+    " before finalizing",
+    " before answering",
+    " before i can answer",
+    " before giving the final answer",
+    " before providing the final answer",
+    " and then answer",
+    " then answer",
+    " will answer after",
+    "最终回答前",
+    "回答前",
+    "完成分析前",
+    "完成计算前",
+    "核实后再",
+    "确认后再",
+    "然后再回答",
+)
+_PROGRESS_DEFER_SUFFIXES = (
+    " to complete the analysis",
+    " to complete the calculation",
+    " to complete the calculations",
+    " to complete the answer",
+    " to finish the analysis",
+    " to finish the calculation",
+    " to finish the calculations",
+    " to finish the answer",
+)
+_PROGRESS_ONLY_MAX_CHARS = 1_200
+_EMBEDDED_PROGRESS_ACTIONS = (
+    " so i'm searching ",
+    " so i am searching ",
+    " so i'm fetching ",
+    " so i am fetching ",
+    " so i'm pulling ",
+    " so i am pulling ",
+    "所以我正在搜索",
+    "所以我正在查询",
+    "所以我正在获取",
 )
 log = structlog.get_logger(__name__)
 
@@ -2079,15 +2192,71 @@ def _deduplicate_continuation(existing: str, continuation: str) -> str:
     return continuation
 
 
+def _visible_answer_is_progress_only(text: str) -> bool:
+    """Detect a status update that defers, rather than answers, the task.
+
+    This is intentionally deterministic and conservative.  It only rejects a
+    short response when every sentence is framed as an evidence-gathering or
+    verification action.  A response containing even one substantive sentence
+    remains eligible for normal or degraded delivery.
+    """
+
+    candidate = str(text or "").strip()
+    if not candidate or len(candidate) > _PROGRESS_ONLY_MAX_CHARS:
+        return False
+    # Colons and semicolons commonly introduce the actual conclusion after a
+    # short framing phrase (for example, "Checking the filing: margin is
+    # 18.4%").  Prefer one bounded recovery false-negative over discarding a
+    # concise substantive answer.
+    if any(
+        delimiter in candidate
+        for delimiter in (":", ";", "：", "；", "—", "–")
+    ):
+        return False
+    segments = [
+        segment.strip().lstrip("-*\u2022 ")
+        for segment in re.split(r"[\r\n]+|[.!?。！？]+", candidate)
+        if segment.strip().lstrip("-*\u2022 ")
+    ]
+    if not segments:
+        return False
+
+    def is_progress_segment(segment: str) -> bool:
+        normalized = segment.casefold()
+        has_substantive_marker = any(
+            marker in normalized for marker in _PROGRESS_SUBSTANTIVE_MARKERS
+        )
+        if (
+            normalized in _STRONG_PROGRESS_ACTION_EXACT
+            or normalized.startswith(_STRONG_PROGRESS_ACTION_PREFIXES)
+        ):
+            return not has_substantive_marker
+        has_ambiguous_progress_action = normalized.startswith(
+            _AMBIGUOUS_PROGRESS_ACTION_PREFIXES
+        ) or any(
+            marker in normalized for marker in _EMBEDDED_PROGRESS_ACTIONS
+        )
+        if not has_ambiguous_progress_action or has_substantive_marker:
+            return False
+        return any(
+            marker in normalized for marker in _PROGRESS_DEFER_MARKERS
+        ) or normalized.endswith(_PROGRESS_DEFER_SUFFIXES)
+
+    return all(is_progress_segment(segment) for segment in segments)
+
+
 def _visible_answer_looks_usable(
     text: str,
     *,
     minimum_chars: int = 32,
+    reject_progress_only: bool = False,
 ) -> bool:
     """Reject only obviously broken serving fragments without another LLM call."""
 
     candidate = str(text or "").strip()
     if not candidate:
+        return False
+    if reject_progress_only and _visible_answer_is_progress_only(candidate):
         return False
     if candidate.count("```") % 2:
         return False
@@ -6287,7 +6456,9 @@ class EnsembleProvider:
                     "partial_candidate_indexes": [
                         candidate.index for candidate in partial_candidates
                     ],
-                    "recovery_skipped": True,
+                    "recovery_skipped": (
+                        self.aggregator_recovery_mode == "off"
+                    ),
                     "aggregator_isolated": True,
                     "aggregator_tools_disabled": True,
                 }
@@ -6358,10 +6529,7 @@ class EnsembleProvider:
                 }
             )
             provider = None
-            if (
-                self.aggregator_recovery_mode != "off"
-                and not aggregation_isolated
-            ):
+            if self.aggregator_recovery_mode != "off":
                 for fallback_index, fallback_member in enumerate(
                     self.aggregator_fallbacks,
                     start=1,
@@ -6566,7 +6734,7 @@ class EnsembleProvider:
                     initial_fallback_index=initial_aggregator_fallback_index,
                     initial_trigger=initial_aggregator_trigger,
                     initial_unstarted_attempts=initial_unstarted_attempts,
-                    disable_recovery=aggregation_isolated,
+                    disable_recovery=False,
                 ),
                 phase="ensemble_final_aggregator_attempt_relay",
             ) as aggregator_stream:
@@ -6658,7 +6826,7 @@ class EnsembleProvider:
                 initial_fallback_index=initial_aggregator_fallback_index,
                 initial_trigger=initial_aggregator_trigger,
                 initial_unstarted_attempts=initial_unstarted_attempts,
-                disable_recovery=aggregation_isolated,
+                disable_recovery=False,
             ),
             phase="ensemble_soft_deadline_aggregator_relay",
         ) as child_stream:
@@ -10291,6 +10459,18 @@ class EnsembleProvider:
                     "final answer.",
                 ]
             )
+        if self._router_dynamic_selection():
+            lines.extend(
+                [
+                    "A non-tool response must contain a substantive answer to the "
+                    "original request. A message that only says you are searching, "
+                    "fetching, checking, or verifying information is not a valid "
+                    "final answer.",
+                    "If the available evidence is incomplete, answer with the best "
+                    "supported result and state concrete limitations instead of "
+                    "deferring the answer.",
+                ]
+            )
         lines.extend(
             [
                 "Do not mention the ensemble, candidates, or model names unless the "
@@ -10553,8 +10733,26 @@ class EnsembleProvider:
             )
         active_messages = list(messages)
         active_tools = None if initial_fallback_index > 0 else tools
+        if active_tools is None and active_config.tool_choice is not None:
+            active_config = active_config.model_copy(update={"tool_choice": None})
         primary_messages = list(messages)
         recovery_mode = self.aggregator_recovery_mode
+        # The progress-only guard exists to keep benchmark/finalization output
+        # from accepting an explicit "I am still gathering evidence" status
+        # as the answer.  Interactive serving keeps its existing streaming
+        # behavior and is guided by the prompt instead of buffering short
+        # responses until a terminal event arrives.
+        progress_gate_enabled = bool(
+            self._router_dynamic_selection()
+            and recovery_mode == "experiment"
+        )
+
+        def aggregator_visible_answer_looks_usable(text: str) -> bool:
+            return _visible_answer_looks_usable(
+                text,
+                reject_progress_only=progress_gate_enabled,
+            )
+
         # Keep the full ranked chain available in serving mode as well.
         # Unavailable/unbuildable candidates do not consume the one allowed
         # substantive network recovery, so serving may skip Top2 and try Top3
@@ -10820,7 +11018,7 @@ class EnsembleProvider:
                 recovery=True,
                 request_budget_binding=self._member_request_budget_binding(active_member),
                 record_budget_rebound=False,
-            )
+            ).model_copy(update={"tool_choice": None})
             if (
                 recovery_mode == "serving"
                 or requires_physical_attempt_evidence(active_member)
@@ -11692,10 +11890,11 @@ class EnsembleProvider:
             physical_output_text: str,
             assembled_contribution_text: str,
             stop_reason: str = "",
+            delivery_selected_attempt: int | None = None,
         ) -> DoneEvent:
             """Deliver one useful prefix without rewriting physical evidence."""
 
-            selected_attempt = record_abandoned_attempt(
+            recorded_attempt = record_abandoned_attempt(
                 error,
                 trigger=error.code or "aggregator_incomplete",
                 stream_closed=stream_closed,
@@ -11703,6 +11902,23 @@ class EnsembleProvider:
                 physical_output_text=physical_output_text,
                 assembled_contribution_text=assembled_contribution_text,
             )
+            selected_attempt = delivery_selected_attempt or recorded_attempt
+            recorded_attempt_row = next(
+                (
+                    row
+                    for row in recovery_attempts
+                    if isinstance(row, dict)
+                    and row.get("attempt") == recorded_attempt
+                ),
+                None,
+            )
+            if isinstance(recorded_attempt_row, dict):
+                recorded_attempt_row.update(
+                    {
+                        "outcome": "failed",
+                        "completion_observed": completion_observed,
+                    }
+                )
             selected_attempt_row = next(
                 (
                     row
@@ -11715,9 +11931,7 @@ class EnsembleProvider:
             if isinstance(selected_attempt_row, dict):
                 selected_attempt_row.update(
                     {
-                        "outcome": "failed",
                         "delivery_selected": True,
-                        "completion_observed": completion_observed,
                     }
                 )
 
@@ -11737,20 +11951,24 @@ class EnsembleProvider:
                 }
             )
 
-            usage_override = next(
-                (
-                    dict(row)
-                    for row in reversed(abandoned_rows)
-                    if isinstance(row, Mapping)
-                    and (
-                        not current_physical_attempt_id
-                        or str(row.get("physical_attempt_id") or "")
-                        == current_physical_attempt_id
-                    )
-                ),
-                None,
+            usage_override = (
+                next(
+                    (
+                        dict(row)
+                        for row in reversed(abandoned_rows)
+                        if isinstance(row, Mapping)
+                        and (
+                            not current_physical_attempt_id
+                            or str(row.get("physical_attempt_id") or "")
+                            == current_physical_attempt_id
+                        )
+                    ),
+                    None,
+                )
+                if selected_attempt == recorded_attempt
+                else None
             )
-            if usage_override is None:
+            if usage_override is None and selected_attempt == recorded_attempt:
                 usage_override = {
                     "usage_evidence_schema": USAGE_EVIDENCE_SCHEMA,
                     "usage_evidence_source": (
@@ -11782,14 +12000,14 @@ class EnsembleProvider:
                     )
 
             evidence = (
-                error.diagnostic_done
-                or last_partial_done_event
-                or DoneEvent(
-                    model=active_member.provider_config.model,
-                    provider=active_member.provider_config.provider,
-                    requested_model=active_member.provider_config.model,
-                    requested_provider=active_member.provider_config.provider,
-                )
+                last_partial_done_event
+                if selected_attempt != recorded_attempt
+                else error.diagnostic_done or last_partial_done_event
+            ) or DoneEvent(
+                model=active_member.provider_config.model,
+                provider=active_member.provider_config.provider,
+                requested_model=active_member.provider_config.model,
+                requested_provider=active_member.provider_config.provider,
             )
             delivered_event = replace(evidence, stop_reason="end_turn")
             return ensemble_done(
@@ -11802,7 +12020,11 @@ class EnsembleProvider:
                 recovery_success=False,
                 final_request_event=evidence,
                 selected_attempt_override=selected_attempt,
-                selected_kind_override="degraded_delivery",
+                selected_kind_override=(
+                    "degraded_delivery"
+                    if selected_attempt == recorded_attempt
+                    else "partial_salvage"
+                ),
                 final_request_usage_override=usage_override,
             )
 
@@ -11826,6 +12048,7 @@ class EnsembleProvider:
             current_attempt_recorded_sequence = None
             attempt_request_started = False
             current_physical_attempt_id = ""
+            assembled_part_count_before_attempt = len(final_text_parts)
             attempt_timeout_seconds = effective_timeout_seconds
             if absolute_deadline is not None:
                 remaining_to_deadline = absolute_deadline - time.monotonic()
@@ -11847,6 +12070,8 @@ class EnsembleProvider:
                 )
             content_streamed = False
             attempt_text_parts: list[str] = []
+            pending_visible_events: list[TextDeltaEvent] = []
+            buffer_visible_text = progress_gate_enabled
             reasoning_streamed = False
             tool_output_streamed = False
             response_observed = False
@@ -11994,7 +12219,18 @@ class EnsembleProvider:
                             if not attempt_kind.startswith("continuation"):
                                 final_text_parts.append(event.text)
                         if not attempt_kind.startswith("continuation"):
-                            yield event
+                            if buffer_visible_text:
+                                pending_visible_events.append(event)
+                                if (
+                                    len("".join(attempt_text_parts))
+                                    > _PROGRESS_ONLY_MAX_CHARS
+                                ):
+                                    for pending_event in pending_visible_events:
+                                        yield pending_event
+                                    pending_visible_events.clear()
+                                    buffer_visible_text = False
+                            else:
+                                yield event
                     elif isinstance(event, ProviderHeartbeatEvent):
                         yield event
                     elif isinstance(event, ReasoningDeltaEvent):
@@ -12011,12 +12247,20 @@ class EnsembleProvider:
                         response_observed = True
                         content_streamed = True
                         tool_output_streamed = True
+                        for pending_event in pending_visible_events:
+                            yield pending_event
+                        pending_visible_events.clear()
+                        buffer_visible_text = False
                         yield event
                     else:
                         response_observed = True
                         # Unknown non-text output is conservatively treated as
                         # non-replayable.
                         content_streamed = True
+                        for pending_event in pending_visible_events:
+                            yield pending_event
+                        pending_visible_events.clear()
+                        buffer_visible_text = False
                         yield event
             except (GeneratorExit, asyncio.CancelledError):
                 external_close_requested = True
@@ -12100,8 +12344,31 @@ class EnsembleProvider:
                     )
                     if attempt_visible_text:
                         final_text_parts.append(attempt_visible_text)
-                        yield TextDeltaEvent(text=attempt_visible_text)
+                        continuation_event = TextDeltaEvent(text=attempt_visible_text)
+                        if (
+                            buffer_visible_text
+                            and len(attempt_visible_text)
+                            <= _PROGRESS_ONLY_MAX_CHARS
+                        ):
+                            pending_visible_events.append(continuation_event)
+                        else:
+                            buffer_visible_text = False
+                            yield continuation_event
                 if not stream_closed:
+                    discarded_progress_only = False
+                    if pending_visible_events:
+                        discarded_progress_only = bool(
+                            progress_gate_enabled
+                            and _visible_answer_is_progress_only(
+                                attempt_visible_text
+                            )
+                        )
+                        if discarded_progress_only:
+                            del final_text_parts[assembled_part_count_before_attempt:]
+                        else:
+                            for pending_event in pending_visible_events:
+                                yield pending_event
+                        pending_visible_events.clear()
                     close_error = ErrorEvent(
                         message=(
                             "ensemble aggregator completed but its provider stream "
@@ -12115,19 +12382,30 @@ class EnsembleProvider:
                     if (
                         self._router_dynamic_selection()
                         and not tool_output_streamed
-                        and _visible_answer_looks_usable(
+                        and aggregator_visible_answer_looks_usable(
                             "".join(final_text_parts)
                         )
                     ):
+                        selected_prior_attempt = (
+                            last_visible_attempt_sequence
+                            if discarded_progress_only
+                            and attempt_kind.startswith("continuation")
+                            else None
+                        )
                         done_event = degraded_delivery_done(
                             close_error,
                             stream_closed=False,
                             completion_observed=True,
                             physical_output_text="".join(attempt_text_parts),
-                            assembled_contribution_text=attempt_visible_text,
+                            assembled_contribution_text=(
+                                ""
+                                if selected_prior_attempt is not None
+                                else attempt_visible_text
+                            ),
                             stop_reason=str(
                                 completed_provider_event.stop_reason or ""
                             ),
+                            delivery_selected_attempt=selected_prior_attempt,
                         )
                         yield aggregator_progress("aggregator_finish")
                         yield done_event
@@ -12154,15 +12432,26 @@ class EnsembleProvider:
                     and bool(attempt_visible_text.strip())
                     and not tool_output_streamed
                 )
+                progress_only_terminal = bool(
+                    progress_gate_enabled
+                    and attempt_visible_text.strip()
+                    and not tool_output_streamed
+                    and _visible_answer_is_progress_only(attempt_visible_text)
+                )
                 diagnostic_error = ErrorEvent(
                     message=(
-                        "ensemble aggregator produced no deliverable final answer"
+                        "ensemble aggregator returned only evidence-gathering "
+                        "progress instead of a substantive final answer"
+                        if progress_only_terminal
+                        else "ensemble aggregator produced no deliverable final answer"
                         if empty_terminal
                         else "ensemble aggregator exhausted its output budget "
                         "before producing a complete visible answer"
                     ),
                     code=(
-                        "ensemble_aggregator_reasoning_only_length"
+                        "ensemble_aggregator_progress_only_terminal"
+                        if progress_only_terminal
+                        else "ensemble_aggregator_reasoning_only_length"
                         if reasoning_only_length
                         else "ensemble_aggregator_empty_length"
                         if length_capped and not attempt_visible_text
@@ -12177,10 +12466,78 @@ class EnsembleProvider:
                     physical_request_count=1,
                 )
 
+                if progress_only_terminal:
+                    # The provider call completed and is fully auditable, but
+                    # its text is only a status update.  Remove it from the
+                    # authoritative assembled answer, retain the physical
+                    # output in the abandoned-attempt receipt, and spend one
+                    # bounded no-tool recovery before walking the frozen
+                    # ranked aggregator backups.
+                    del final_text_parts[assembled_part_count_before_attempt:]
+                    pending_visible_events.clear()
+                    rejected_attempt = record_abandoned_attempt(
+                        diagnostic_error,
+                        trigger="progress_only_terminal",
+                        stream_closed=True,
+                        stop_reason=stop_reason,
+                        physical_output_text="".join(attempt_text_parts),
+                        assembled_contribution_text="",
+                    )
+                    for recovery_attempt in recovery_attempts:
+                        if recovery_attempt.get("attempt") == rejected_attempt:
+                            recovery_attempt.update(
+                                {
+                                    "content_outcome": "progress_only",
+                                    "assembled_output_discarded": True,
+                                }
+                            )
+                            break
+                    activated_same_model = False
+                    if (
+                        same_model_recoveries < 1
+                        and recovery_budget_available()
+                    ):
+                        same_model_recoveries += 1
+                        activated_same_model = activate_recovery_attempt(
+                            member=active_member,
+                            kind="same_model_recovery",
+                            trigger="progress_only_terminal",
+                            fallback_index=active_fallback_index,
+                        )
+                    activated = activated_same_model or activate_next_fallback(
+                        trigger="progress_only_terminal"
+                    )
+                    if activated:
+                        attempt += 1
+                        trace.setdefault("final_request", {})["retry_count"] = attempt
+                        yield ProviderHeartbeatEvent(
+                            phase=(
+                                "ensemble_aggregator_final_answer_recovery"
+                                if activated_same_model
+                                else "ensemble_aggregator_model_fallback"
+                            ),
+                            message=(
+                                "Ensemble aggregator returned only progress; "
+                                + (
+                                    "retrying once with tools disabled and a "
+                                    "direct final-answer instruction"
+                                    if activated_same_model
+                                    else "switching to the next ranked aggregator"
+                                )
+                            ),
+                        )
+                        continue
+                    terminal_stream_error = diagnostic_error
+
+                if not progress_only_terminal and pending_visible_events:
+                    for pending_event in pending_visible_events:
+                        yield pending_event
+                    pending_visible_events.clear()
+
                 if (
                     self._router_dynamic_selection()
                     and partial_visible_length
-                    and _visible_answer_looks_usable(
+                    and aggregator_visible_answer_looks_usable(
                         "".join(final_text_parts)
                     )
                 ):
@@ -12450,7 +12807,9 @@ class EnsembleProvider:
                     partial_visible_length
                     and recovery_mode == "serving"
                     and terminal_stream_error is None
-                    and _visible_answer_looks_usable("".join(final_text_parts))
+                    and aggregator_visible_answer_looks_usable(
+                        "".join(final_text_parts)
+                    )
                 ):
                     # Keep execution failure distinct from a useful degraded
                     # delivery. The real length-capped request remains the
@@ -12530,6 +12889,18 @@ class EnsembleProvider:
                     yield done_event
                     return
             if terminal_stream_error is not None:
+                if pending_visible_events:
+                    if (
+                        progress_gate_enabled
+                        and _visible_answer_is_progress_only(
+                            "".join(attempt_text_parts)
+                        )
+                    ):
+                        del final_text_parts[assembled_part_count_before_attempt:]
+                    else:
+                        for pending_event in pending_visible_events:
+                            yield pending_event
+                    pending_visible_events.clear()
                 if not stream_closed:
                     terminal_stream_error = replace(
                         terminal_stream_error,
@@ -12552,12 +12923,23 @@ class EnsembleProvider:
                     and attempt_kind.startswith("continuation")
                     and degraded_contribution
                 ):
-                    final_text_parts.append(degraded_contribution)
-                    yield TextDeltaEvent(text=degraded_contribution)
+                    if aggregator_visible_answer_looks_usable(
+                        degraded_contribution
+                    ):
+                        final_text_parts.append(degraded_contribution)
+                        yield TextDeltaEvent(text=degraded_contribution)
+                    else:
+                        # A failed continuation may end with the same kind of
+                        # short status update as a normally completed request.
+                        # Keep the already delivered prefix, but do not leak a
+                        # process-only suffix that cannot be retracted later.
+                        degraded_contribution = ""
                 if (
                     self._router_dynamic_selection()
                     and not tool_output_streamed
-                    and _visible_answer_looks_usable("".join(final_text_parts))
+                    and aggregator_visible_answer_looks_usable(
+                        "".join(final_text_parts)
+                    )
                 ):
                     done_event = degraded_delivery_done(
                         terminal_stream_error,
@@ -12573,7 +12955,9 @@ class EnsembleProvider:
                     recovery_mode == "serving"
                     and final_text_parts
                     and not tool_output_streamed
-                    and _visible_answer_looks_usable("".join(final_text_parts))
+                    and aggregator_visible_answer_looks_usable(
+                        "".join(final_text_parts)
+                    )
                 ):
                     # The strict run failed, but a prior closed attempt already
                     # produced useful visible text. Do not make the user wait
@@ -12645,7 +13029,12 @@ class EnsembleProvider:
                             "".join(final_text_parts),
                             "".join(attempt_text_parts),
                         )
-                        if interrupted_remainder:
+                        if (
+                            interrupted_remainder
+                            and aggregator_visible_answer_looks_usable(
+                                interrupted_remainder
+                            )
+                        ):
                             final_text_parts.append(interrupted_remainder)
                             interrupted_contribution = interrupted_remainder
                             yield TextDeltaEvent(text=interrupted_remainder)
@@ -12766,6 +13155,18 @@ class EnsembleProvider:
                 )
                 yield partial_error(terminal_stream_error)
                 return
+            if pending_visible_events:
+                if (
+                    progress_gate_enabled
+                    and _visible_answer_is_progress_only(
+                        "".join(attempt_text_parts)
+                    )
+                ):
+                    del final_text_parts[assembled_part_count_before_attempt:]
+                else:
+                    for pending_event in pending_visible_events:
+                        yield pending_event
+                pending_visible_events.clear()
             if retry_error is not None and not stream_closed:
                 close_error = replace(
                     retry_error,
@@ -12799,11 +13200,16 @@ class EnsembleProvider:
                         attempt_kind.startswith("continuation")
                         and degraded_contribution
                     ):
-                        final_text_parts.append(degraded_contribution)
-                        yield TextDeltaEvent(text=degraded_contribution)
+                        if aggregator_visible_answer_looks_usable(
+                            degraded_contribution
+                        ):
+                            final_text_parts.append(degraded_contribution)
+                            yield TextDeltaEvent(text=degraded_contribution)
+                        else:
+                            degraded_contribution = ""
                     if (
                         not tool_output_streamed
-                        and _visible_answer_looks_usable(
+                        and aggregator_visible_answer_looks_usable(
                             "".join(final_text_parts)
                         )
                     ):
