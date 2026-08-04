@@ -2,7 +2,6 @@
   <section class="sandbox-settings" aria-labelledby="sandbox-settings-title">
     <header class="sandbox-settings__header">
       <div>
-        <p class="sandbox-settings__eyebrow">{{ t('settings.sandbox.eyebrow') }}</p>
         <h3 id="sandbox-settings-title">{{ t('settings.sandbox.title') }}</h3>
         <p>{{ t('settings.sandbox.subtitle') }}</p>
       </div>
@@ -535,15 +534,6 @@ onMounted(() => void load())
 
 .sandbox-settings__header {
   min-height: 52px;
-}
-
-.sandbox-settings__eyebrow {
-  margin: 0 0 0.25rem;
-  color: var(--accent);
-  font-size: 0.72rem;
-  font-weight: 700;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
 }
 
 .sandbox-settings h3,

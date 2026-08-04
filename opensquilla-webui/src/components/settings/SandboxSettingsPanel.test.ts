@@ -179,6 +179,7 @@ describe('SandboxSettingsPanel', () => {
   it('starts with a quiet overview and keeps rule editors out of sight', async () => {
     const { el } = await mountPanel()
 
+    expect(el.querySelector('.sandbox-settings__eyebrow')).toBeNull()
     expect(el.querySelector('[data-testid="sandbox-overview"]')).toBeTruthy()
     expect(el.querySelectorAll('[data-testid^="sandbox-open-"]')).toHaveLength(4)
     expect(el.querySelector('[data-testid="builtin-file-rules"]')).toBeNull()
