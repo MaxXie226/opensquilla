@@ -8,13 +8,14 @@ import SandboxSetupDialog from './SandboxSetupDialog.vue'
 
 let unmount: (() => void) | null = null
 
-function mountDialog(pending = false, outcome = 'idle') {
+function mountDialog(pending = false, outcome = 'idle', onBackground = vi.fn()) {
   const host = document.createElement('div')
   document.body.appendChild(host)
   const app = createApp(SandboxSetupDialog, {
     open: true,
     pending,
     outcome,
+    onBackground,
   })
   app.use(createI18n({
     legacy: false,
@@ -30,6 +31,7 @@ function mountDialog(pending = false, outcome = 'idle') {
               descriptionWithDuration: 'Administrator approval is required. First-time setup normally takes about 20–30 seconds. Keep OpenSquilla open.',
               continue: 'Start setup',
               configuring: 'Configuring…',
+              runInBackground: 'Run in background',
               requestingApproval: 'Confirm the Windows prompt to continue.',
               configuringProtection: 'OpenSquilla is completing Safe mode setup.',
               takingLonger: 'Setup is still running.',
@@ -75,6 +77,23 @@ describe('SandboxSetupDialog', () => {
     expect(body.textContent).not.toMatch(/\d+%/)
     expect(body.querySelector<HTMLButtonElement>('[data-testid="sandbox-setup-continue"]')?.disabled)
       .toBe(true)
+  })
+
+  it('replaces Cancel with an enabled background action while setup is pending', () => {
+    const onBackground = vi.fn()
+    const body = mountDialog(true, 'idle', onBackground)
+
+    expect(body.textContent).not.toContain('Cancel')
+    const background = body.querySelector<HTMLButtonElement>(
+      '[data-testid="sandbox-setup-background"]',
+    )
+    expect(background?.textContent).toContain('Run in background')
+    expect(background?.disabled).toBe(false)
+    expect(body.querySelector<HTMLButtonElement>('[data-testid="sandbox-setup-continue"]')?.disabled)
+      .toBe(true)
+
+    background?.click()
+    expect(onBackground).toHaveBeenCalledTimes(1)
   })
 
   it('keeps a retryable failure visible', () => {

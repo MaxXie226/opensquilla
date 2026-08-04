@@ -29,7 +29,16 @@
           {{ outcomeMessage }}
         </p>
         <div class="sandbox-setup-dialog__actions">
-          <button type="button" class="btn" :disabled="pending" @click="cancel">
+          <button
+            v-if="pending"
+            type="button"
+            class="btn"
+            data-testid="sandbox-setup-background"
+            @click="$emit('background')"
+          >
+            {{ t('settings.sandbox.setup.runInBackground') }}
+          </button>
+          <button v-else type="button" class="btn" @click="cancel">
             {{ t('common.cancel') }}
           </button>
           <button
@@ -62,6 +71,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   cancel: []
   confirm: []
+  background: []
 }>()
 
 const { t } = useI18n()
