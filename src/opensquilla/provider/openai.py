@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import math
@@ -44,6 +45,8 @@ from .error_redaction import (
 )
 from .failures import retry_after_from_headers
 from .fx import TOKENRHYTHM_CNY_PER_USD, TOKENRHYTHM_CNY_PER_USD_NANOS
+from .model_catalog import shared_catalog
+from .model_identity import model_basename
 from .protocol import ProviderConnectionConfig, ProviderMetadata
 from .reasoning_dialects import (
     ReasoningDisableArgs,
@@ -67,7 +70,18 @@ from .text_tool_normalizer import (
     classify_text_tool_segments,
     warn_for_unauthorized_plain_candidate,
 )
-from .tokenrhythm_correlation import tokenrhythm_correlation_headers
+from .tokenrhythm_catalog import (
+    is_official_tokenrhythm_endpoint,
+    merge_tokenrhythm_catalog,
+    parse_tokenrhythm_declared,
+    tokenrhythm_published_catalog_entries,
+)
+from .tokenrhythm_correlation import (
+    TOKENRHYTHM_INSTALL_ID_HEADER,
+    redact_tokenrhythm_install_ids,
+    tokenrhythm_correlation_headers,
+    tokenrhythm_install_id_headers,
+)
 from .trace_recorder import LLMTraceRecorder
 from .types import (
     ChatConfig,
@@ -376,6 +390,33 @@ def _provider_display_name(provider_kind: str) -> str:
     }.get(provider_kind, "Provider")
 
 
+def _positive_model_listing_int(value: object) -> int:
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, float):
+        if not value.is_integer() or not math.isfinite(value):
+            return 0
+        value = int(value)
+    elif isinstance(value, str):
+        try:
+            value = int(value.strip())
+        except ValueError:
+            return 0
+    return value if isinstance(value, int) and value > 0 else 0
+
+
+def _model_listing_max_output(row: Mapping[str, Any]) -> int:
+    """Preserve the generic OpenAI-compatible nested-field contract.
+
+    TokenRhythm is parsed through its typed declaration parser above, where
+    the provider-specific top-level-before-nested precedence is explicit.
+    Other compatible providers retain the historical ``top_provider`` rule.
+    """
+    raw_top_provider = row.get("top_provider")
+    top_provider = raw_top_provider if isinstance(raw_top_provider, Mapping) else {}
+    return _positive_model_listing_int(top_provider.get("max_completion_tokens"))
+
+
 def _dashscope_endpoint_family(base_url: str) -> str:
     url = base_url.strip().lower()
     if "coding-intl.dashscope.aliyuncs.com" in url:
@@ -603,10 +644,6 @@ def _strip_think_tags(text: str) -> str:
     return result.strip()
 
 
-def _model_basename(model: str) -> str:
-    return model.rsplit("/", 1)[-1].strip().lower()
-
-
 def _on_official_host(policy: OpenAICompatPolicy, base_url: str) -> bool:
     return bool(policy.official_host) and policy.official_host in base_url.lower()
 
@@ -620,7 +657,7 @@ def _uses_max_completion_tokens(
         return False
     if not _on_official_host(policy, base_url):
         return False
-    return _model_basename(model).startswith(policy.max_completion_tokens_model_prefixes)
+    return model_basename(model).startswith(policy.max_completion_tokens_model_prefixes)
 
 
 def _should_use_max_completion_tokens(
@@ -681,7 +718,7 @@ def _should_send_temperature(
 ) -> bool:
     if cfg.temperature is None:
         return False
-    model_name = _model_basename(model)
+    model_name = model_basename(model)
     if (
         policy.fixed_sampling_model_prefixes
         and model_name.startswith(policy.fixed_sampling_model_prefixes)
@@ -709,7 +746,7 @@ def _apply_compat_request_constraints(
 ) -> None:
     """Apply declarative endpoint constraints after generic payload assembly."""
 
-    model_name = _model_basename(model)
+    model_name = model_basename(model)
     force_thinking = model_name in policy.force_thinking_model_ids
     if force_thinking:
         payload["enable_thinking"] = True
@@ -2445,8 +2482,8 @@ def _requires_assistant_reasoning_content(
     *,
     thinking: bool = False,
 ) -> bool:
-    model_name = _model_basename(model)
-    return model.strip().lower() in policy.require_reasoning_content_model_ids or (
+    model_name = model_basename(model)
+    return model_name in policy.require_reasoning_content_model_ids or (
         thinking
         and model_name
         in policy.require_reasoning_content_when_thinking_model_ids
@@ -2459,7 +2496,7 @@ def _effective_policy_thinking(
     *,
     thinking: bool,
 ) -> bool:
-    return thinking or _model_basename(model) in policy.force_thinking_model_ids
+    return thinking or model_basename(model) in policy.force_thinking_model_ids
 
 
 def _requires_tool_call_reasoning_content(
@@ -2470,7 +2507,7 @@ def _requires_tool_call_reasoning_content(
 ) -> bool:
     return (
         thinking
-        and _model_basename(model)
+        and model_basename(model)
         in policy.require_tool_call_reasoning_content_when_thinking_model_ids
     )
 
@@ -2482,7 +2519,7 @@ def _should_replay_reasoning_content(
     caps: ModelCapabilities | None,
     thinking: bool = False,
 ) -> bool:
-    model_name = _model_basename(model)
+    model_name = model_basename(model)
     effective_thinking = _effective_policy_thinking(
         policy, model, thinking=thinking
     )
@@ -2892,7 +2929,30 @@ class OpenAIProvider:
         config: ChatConfig | None = None,
     ) -> AsyncIterator[StreamEvent]:
         cfg = config or ChatConfig()
-        return self._stream(messages, tools, cfg)
+        return self._stream_with_detached_cancellation(messages, tools, cfg)
+
+    async def _stream_with_detached_cancellation(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition] | None,
+        cfg: ChatConfig,
+    ) -> AsyncIterator[StreamEvent]:
+        """Preserve cancellation without retaining the physical request frame."""
+
+        cancelled = False
+        event: StreamEvent | None = None
+        try:
+            async for event in self._stream(messages, tools, cfg):
+                yield event
+        except asyncio.CancelledError:
+            # The inner stream owns request headers and HTTPX response state.
+            # Drop its cancellation traceback and any last echoed event before
+            # propagating a fresh cancellation from this metadata-only frame.
+            event = None
+            cancelled = True
+
+        if cancelled:
+            raise asyncio.CancelledError from None
 
     async def _stream(
         self,
@@ -2938,7 +2998,7 @@ class OpenAIProvider:
             }
         if (
             include_reasoning_content
-            and _model_basename(self._model)
+            and model_basename(self._model)
             in self._compat.preserve_thinking_model_ids
         ) or (
             self._provider_kind == "dashscope" and include_reasoning_content
@@ -3052,7 +3112,7 @@ class OpenAIProvider:
                 elif not cfg.thinking_budget_explicit:
                     payload.pop("thinking_budget", None)
         elif (
-            _model_basename(self._model) in self._compat.force_thinking_model_ids
+            model_basename(self._model) in self._compat.force_thinking_model_ids
             or (
                 self._compat.thinking_required_model_prefixes
                 and self._model.strip().lower().startswith(
@@ -3150,6 +3210,13 @@ class OpenAIProvider:
         if self._api_key:
             headers["Authorization"] = f"Bearer {self._api_key}"
         headers.update(provider_app_headers(self._base_url))
+        headers.update(
+            tokenrhythm_install_id_headers(
+                self._provider_kind,
+                self._base_url,
+                proxy=self._proxy,
+            )
+        )
         headers.update(
             tokenrhythm_correlation_headers(
                 self._provider_kind,
@@ -3313,6 +3380,14 @@ class OpenAIProvider:
                 proxy=self._proxy,
                 follow_redirects=False,
             ) as client:
+                headers.pop(TOKENRHYTHM_INSTALL_ID_HEADER, None)
+                headers.update(
+                    tokenrhythm_install_id_headers(
+                        self._provider_kind,
+                        self._base_url,
+                        proxy=self._proxy,
+                    )
+                )
                 async with client.stream(
                     "POST",
                     endpoint,
@@ -4810,6 +4885,14 @@ class OpenAIProvider:
         cache_shape = _payload_cache_shape(fallback_payload, tools=tools)
         fallback_headers = dict(headers)
         fallback_headers["Accept"] = "application/json"
+        fallback_headers.pop(TOKENRHYTHM_INSTALL_ID_HEADER, None)
+        fallback_headers.update(
+            tokenrhythm_install_id_headers(
+                self._provider_kind,
+                self._base_url,
+                proxy=self._proxy,
+            )
+        )
         endpoint = self._api_url("/v1/chat/completions")
         trace = LLMTraceRecorder(
             provider=self._provider_kind,
@@ -4841,6 +4924,17 @@ class OpenAIProvider:
                 proxy=self._proxy,
                 follow_redirects=False,
             ) as client:
+                # ``AsyncClient.__aenter__`` is an await boundary. Refresh at
+                # the final send point so a privacy toggle that lands while
+                # the fallback client is opening cannot forward a stale id.
+                fallback_headers.pop(TOKENRHYTHM_INSTALL_ID_HEADER, None)
+                fallback_headers.update(
+                    tokenrhythm_install_id_headers(
+                        self._provider_kind,
+                        self._base_url,
+                        proxy=self._proxy,
+                    )
+                )
                 response = await client.post(
                     endpoint,
                     headers=fallback_headers,
@@ -5464,16 +5558,43 @@ class OpenAIProvider:
             else {}
         )
         headers.update(provider_app_headers(self._base_url))
+        safe_request_error: Exception | None = None
+        cancelled_request_error: asyncio.CancelledError | None = None
+        client: Any = None
+        resp: Any = None
+        data: Any = None
+        rows: Any = None
+        excluded_model_ids: Any = None
+        models: list[ModelInfo] | None = None
+        raw_message = ""
+        raw_state = ""
         try:
             async with httpx.AsyncClient(
                 timeout=10.0,
                 trust_env=_trust_env(),
                 proxy=self._proxy,
+                follow_redirects=False,
             ) as client:
+                headers.update(
+                    tokenrhythm_install_id_headers(
+                        self._provider_kind,
+                        self._base_url,
+                        proxy=self._proxy,
+                    )
+                )
                 resp = await client.get(self._api_url("/v1/models"), headers=headers)
                 resp.raise_for_status()
-                data = resp.json()
-                rows = data.get("data", [])
+                data = (
+                    resp.json(parse_float=Decimal)
+                    if self._provider_kind == "tokenrhythm"
+                    else resp.json()
+                )
+                raw_rows = data.get("data", [])
+                rows = (
+                    [row for row in raw_rows if isinstance(row, Mapping)]
+                    if isinstance(raw_rows, list)
+                    else []
+                )
                 if self._compat.model_listing_excluded_ids:
                     excluded_model_ids = {
                         model_id.lower()
@@ -5484,22 +5605,201 @@ class OpenAIProvider:
                         for row in rows
                         if str(row.get("id", "")).lower() not in excluded_model_ids
                     ]
-                return [
-                    ModelInfo(
-                        provider=self._provider_kind,
-                        model_id=m["id"],
-                        display_name=m.get("name", m.get("id", "")),
-                        context_window=m.get("context_length", 0),
-                        max_output_tokens=(m.get("top_provider") or {}).get("max_completion_tokens")
-                        or 0,
+                if self._provider_kind == "tokenrhythm":
+                    declared = parse_tokenrhythm_declared(
+                        {"data": rows},
+                        known_secret=self._api_key,
                     )
-                    for m in rows
-                ]
+                    catalog = shared_catalog()
+                    official_endpoint = is_official_tokenrhythm_endpoint(
+                        self._base_url
+                    )
+                    published = (
+                        catalog.tokenrhythm_published_snapshot()
+                        if official_endpoint
+                        else {}
+                    )
+                    merged = merge_tokenrhythm_catalog(published, declared)
+                    published_entries = tokenrhythm_published_catalog_entries(
+                        published
+                    )
+                    published_fields = {
+                        model_id.lower(): fields
+                        for model_id, fields in published_entries.items()
+                    }
+                    result: list[ModelInfo] = []
+                    for model in merged.values():
+                        limits = (
+                            catalog.resolve_deployment_limits(
+                                model.model_id,
+                                provider="tokenrhythm",
+                                api_key=self._api_key,
+                                base_url=self._base_url,
+                                proxy=self._proxy or "",
+                            )
+                            if official_endpoint
+                            else None
+                        )
+                        capabilities = (
+                            catalog.resolve_deployment_capabilities(
+                                model.model_id,
+                                provider="tokenrhythm",
+                                api_key=self._api_key,
+                                base_url=self._base_url,
+                            )
+                            if official_endpoint
+                            else ModelCapabilities()
+                        )
+                        price_fields = published_fields.get(
+                            model.model_id.lower(), {}
+                        )
+                        declared_metadata = model.metadata.declared
+                        if declared_metadata is None:  # merge contract, defensive only
+                            continue
+                        declared_capabilities = declared_metadata.capabilities
+                        published_capabilities = (
+                            model.metadata.published.capabilities
+                            if model.metadata.published is not None
+                            else None
+                        )
+                        streaming = declared_capabilities.streaming
+                        if streaming is None and published_capabilities is not None:
+                            streaming = published_capabilities.streaming
+                        tools = declared_capabilities.tools
+                        if tools is None and published_capabilities is not None:
+                            tools = published_capabilities.tools
+                        vision = declared_capabilities.vision
+                        if vision is None and published_capabilities is not None:
+                            vision = published_capabilities.vision
+                        reasoning = declared_capabilities.reasoning
+                        if reasoning is None and published_capabilities is not None:
+                            reasoning = published_capabilities.reasoning
+                        result.append(
+                            ModelInfo(
+                                provider=self._provider_kind,
+                                model_id=model.model_id,
+                                display_name=model.display_name,
+                                context_window=(
+                                    model.context_window
+                                    or (
+                                        limits.context_window
+                                        if limits is not None
+                                        else 0
+                                    )
+                                ),
+                                max_output_tokens=(
+                                    model.max_output_tokens
+                                    or (
+                                        limits.max_output_tokens
+                                        if limits is not None
+                                        else 0
+                                    )
+                                ),
+                                supports_reasoning=(
+                                    False
+                                    if reasoning is False
+                                    else capabilities.supports_reasoning
+                                ),
+                                supports_tools=(
+                                    tools
+                                    if tools is not None
+                                    else capabilities.supports_tools
+                                ),
+                                supports_streaming=(
+                                    streaming
+                                    if streaming is not None
+                                    else capabilities.supports_streaming
+                                ),
+                                supports_vision=(
+                                    vision
+                                    if vision is not None
+                                    else capabilities.supports_vision
+                                ),
+                                input_cost_per_1k=(
+                                    float(
+                                        price_fields.get("input_cost_per_mtok")
+                                        or 0.0
+                                    )
+                                    / 1000.0
+                                ),
+                                output_cost_per_1k=(
+                                    float(
+                                        price_fields.get("output_cost_per_mtok")
+                                        or 0.0
+                                    )
+                                    / 1000.0
+                                ),
+                                metadata=model.metadata.to_wire(),
+                            )
+                        )
+                    models = result
+                else:
+                    models = [
+                        ModelInfo(
+                            provider=self._provider_kind,
+                            model_id=m["id"],
+                            display_name=m.get("name", m.get("id", "")),
+                            context_window=m.get("context_length", 0),
+                            max_output_tokens=_model_listing_max_output(m),
+                        )
+                        for m in rows
+                        if m.get("id")
+                    ]
+        except asyncio.CancelledError:
+            cancelled_request_error = asyncio.CancelledError()
         except httpx.HTTPError as exc:
             if raise_on_error:
-                raise redacted_httpx_error(exc, api_key=self._api_key) from None
-            return []
-        except Exception:
+                safe_request_error = redacted_httpx_error(
+                    exc,
+                    api_key=self._api_key,
+                )
+        except Exception as exc:
             if raise_on_error:
-                raise
-            return []
+                if isinstance(exc, json.JSONDecodeError):
+                    safe_document = redact_tokenrhythm_install_ids(exc.doc)
+                    if safe_document != exc.doc:
+                        safe_request_error = RuntimeError(
+                            "Provider model catalog returned invalid JSON"
+                        )
+                if safe_request_error is None:
+                    raw_message = str(exc)
+                    safe_message = redact_tokenrhythm_install_ids(raw_message)
+                    raw_state = repr(getattr(exc, "__dict__", {}))
+                    if (
+                        safe_message != raw_message
+                        or redact_tokenrhythm_install_ids(raw_state) != raw_state
+                    ):
+                        safe_request_error = RuntimeError(
+                            safe_message
+                            if safe_message != raw_message
+                            else "Provider model catalog parsing failed"
+                        )
+                    else:
+                        exc.__cause__ = None
+                        exc.__context__ = None
+                        exc.__traceback__ = None
+                        safe_request_error = exc
+
+        if cancelled_request_error is not None:
+            headers.clear()
+            client = None
+            resp = None
+            data = None
+            rows = None
+            excluded_model_ids = None
+            models = None
+            raw_message = ""
+            raw_state = ""
+            raise cancelled_request_error
+        if safe_request_error is not None:
+            headers.clear()
+            client = None
+            resp = None
+            data = None
+            rows = None
+            excluded_model_ids = None
+            models = None
+            raw_message = ""
+            raw_state = ""
+            raise safe_request_error
+        return models or []

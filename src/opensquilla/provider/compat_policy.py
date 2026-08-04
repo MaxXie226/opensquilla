@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from typing import Literal
 
+from .model_identity import DEEPSEEK_V4_MODEL_IDS
 from .qwen_token_plan import (
     QWEN_TOKEN_PLAN_DEEPSEEK_V4_MODEL_IDS,
     QWEN_TOKEN_PLAN_FORCE_THINKING_MODEL_IDS,
@@ -245,8 +246,6 @@ _ARK_UNSUPPORTED_TOOL_SCHEMA_KEYWORDS = frozenset(
     }
 )
 
-_DEEPSEEK_V4_MODEL_IDS = frozenset({"deepseek-v4-flash", "deepseek-v4-pro"})
-
 # TokenHub's hy3 family documents interleaved thinking: assistant turns must
 # carry reasoning_content back (an empty string when there is none), or the
 # reasoning context is lost across tool-call rounds.
@@ -302,8 +301,8 @@ _POLICIES_BY_KIND: dict[str, OpenAICompatPolicy] = {
         default_reasoning_format="deepseek",
         # Reasoning replay is gated on the exact V4 ids (below), not on the
         # capability format: non-V4 DeepSeek models must not get replay.
-        thinking_toggle_model_ids=_DEEPSEEK_V4_MODEL_IDS,
-        require_reasoning_content_model_ids=_DEEPSEEK_V4_MODEL_IDS,
+        thinking_toggle_model_ids=DEEPSEEK_V4_MODEL_IDS,
+        require_reasoning_content_model_ids=DEEPSEEK_V4_MODEL_IDS,
     ),
     "gemini": OpenAICompatPolicy(display_name="Gemini"),
     "dashscope": OpenAICompatPolicy(
@@ -320,7 +319,7 @@ _POLICIES_BY_KIND: dict[str, OpenAICompatPolicy] = {
         stream_timeout_fallback=True,
         thinking_required_model_prefixes=("qwen3.8-",),
         thinking_tool_choice_auto_only=True,
-        implicit_thinking_tool_choice_model_ids=_DEEPSEEK_V4_MODEL_IDS,
+        implicit_thinking_tool_choice_model_ids=DEEPSEEK_V4_MODEL_IDS,
     ),
     "bailian_coding": OpenAICompatPolicy(display_name="Bailian Coding"),
     "qwen_token_plan": OpenAICompatPolicy(
@@ -406,7 +405,7 @@ _POLICIES_BY_KIND: dict[str, OpenAICompatPolicy] = {
                 ),
             ),
         ),
-        require_reasoning_content_model_ids=_DEEPSEEK_V4_MODEL_IDS,
+        require_reasoning_content_model_ids=DEEPSEEK_V4_MODEL_IDS,
         allow_post_terminal_noop_choice=True,
         allow_post_terminal_null_usage_noop_choice=True,
         post_terminal_metadata_keys=frozenset(

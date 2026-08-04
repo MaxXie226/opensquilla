@@ -378,6 +378,12 @@ class _ResolvedCatalog:
     max_tokens: int
     context_window: int
     capabilities: ModelCapabilities | None
+    # Provider/model ceiling resolved without the global llm.max_tokens
+    # override. Physical fallback uses it only when ``auto_max_tokens_known``
+    # is true, so unknown/self-hosted models are never capped by a generic
+    # default.
+    auto_max_tokens: int = 0
+    auto_max_tokens_known: bool = False
     temperature: float | None = None
     top_p: float | None = None
     # Explicit provider-request proof budget (chars); 0 keeps the derived path.
@@ -746,8 +752,40 @@ class AgentBootstrapStage:
             max_provider_retries=inp.max_provider_retries,
         )
 
-        # 2. Resolve max_tokens, context_window, capabilities from catalog
-        catalog = self._model_catalog.lookup(inp.resolved_model, inp.active_provider_id)
+        # 2. Resolve max_tokens, context_window, capabilities from catalog.
+        # Prefer the exact in-process ProviderConfig when the selector wrapper
+        # exposes it; provider/model route metadata cannot distinguish two
+        # TokenRhythm credentials serving the same model id.
+        deployment_lookup = getattr(
+            self._model_catalog,
+            "lookup_deployment",
+            None,
+        )
+        active_deployment_config = getattr(
+            inp.provider,
+            "active_deployment_config",
+            None,
+        )
+        deployment = (
+            active_deployment_config()
+            if callable(active_deployment_config)
+            else None
+        )
+        if (
+            deployment is not None
+            and callable(deployment_lookup)
+            and str(getattr(deployment, "model", "") or "").strip()
+            == inp.resolved_model
+        ):
+            catalog = deployment_lookup(
+                deployment,
+                include_global_overrides=True,
+            )
+        else:
+            catalog = self._model_catalog.lookup(
+                inp.resolved_model,
+                inp.active_provider_id,
+            )
 
         # 3. Build AgentConfig auxiliaries (thinking, projection, store, mem cfg)
         aux = self._agent_config_builder.build_auxiliaries(
@@ -759,8 +797,55 @@ class AgentBootstrapStage:
         agent_metadata = inp.turn.metadata
         fallback_capabilities: dict[
             tuple[str, str],
-            tuple[int, ModelCapabilities | None],
+            tuple[int, int, ModelCapabilities | None],
         ] = {}
+        private_fallback_limits: list[tuple[Any, int, int]] = []
+        fallback_deployment_configs = getattr(
+            inp.provider,
+            "fallback_deployment_configs",
+            None,
+        )
+        if callable(fallback_deployment_configs):
+            for deployment in fallback_deployment_configs():
+                fallback_model = str(
+                    getattr(deployment, "model", "") or ""
+                ).strip()
+                fallback_provider = str(
+                    getattr(deployment, "provider", "") or ""
+                ).strip()
+                if not fallback_model or not fallback_provider:
+                    continue
+                fallback_catalog = (
+                    deployment_lookup(
+                        deployment,
+                        include_global_overrides=False,
+                    )
+                    if callable(deployment_lookup)
+                    else self._model_catalog.lookup(
+                        fallback_model,
+                        fallback_provider,
+                    )
+                )
+                effective_max_tokens = (
+                    fallback_catalog.auto_max_tokens
+                    if fallback_catalog.auto_max_tokens_known
+                    else 0
+                )
+                private_fallback_limits.append(
+                    (
+                        deployment,
+                        fallback_catalog.context_window,
+                        effective_max_tokens,
+                    )
+                )
+                fallback_capabilities.setdefault(
+                    (fallback_provider, fallback_model),
+                    (
+                        fallback_catalog.context_window,
+                        effective_max_tokens,
+                        fallback_catalog.capabilities,
+                    ),
+                )
         route_provider = str(
             agent_metadata.get("routed_provider")
             or inp.active_provider_id
@@ -782,14 +867,44 @@ class AgentBootstrapStage:
                 fallback_provider = str(
                     raw_fallback.get("provider") or route_provider
                 ).strip()
+                if (fallback_provider, fallback_model) in fallback_capabilities:
+                    continue
                 fallback_catalog = self._model_catalog.lookup(
                     fallback_model,
                     fallback_provider,
                 )
                 fallback_capabilities[(fallback_provider, fallback_model)] = (
                     fallback_catalog.context_window,
+                    (
+                        fallback_catalog.auto_max_tokens
+                        if fallback_catalog.auto_max_tokens_known
+                        else 0
+                    ),
                     fallback_catalog.capabilities,
                 )
+        configure_private_fallback_limits = getattr(
+            inp.provider,
+            "configure_fallback_deployment_limits",
+            None,
+        )
+        if callable(configure_private_fallback_limits):
+            configure_private_fallback_limits(private_fallback_limits)
+        configure_fallback_limits = getattr(
+            inp.provider,
+            "configure_fallback_limits",
+            None,
+        )
+        if callable(configure_fallback_limits):
+            configure_fallback_limits(
+                {
+                    identity: (context_window, effective_max_tokens)
+                    for identity, (
+                        context_window,
+                        effective_max_tokens,
+                        _capabilities,
+                    ) in fallback_capabilities.items()
+                }
+            )
         pin_route_plan(
             inp.turn,
             turn_id=inp.turn_id,

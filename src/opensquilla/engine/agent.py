@@ -169,6 +169,7 @@ from opensquilla.provider import (
 )
 from opensquilla.provider.correlation_context import bind_provider_request_correlation
 from opensquilla.provider.failures import ProviderFailureKind, classify_provider_error
+from opensquilla.provider.model_identity import is_deepseek_v4_model_id
 from opensquilla.provider.protocol import (
     project_provider_message_count,
     validate_provider_chat_request,
@@ -1097,11 +1098,6 @@ def _meta_empty_final_text_fallback(skill_name: str, inputs: Mapping[str, Any]) 
 def _is_deepseek_model_id(model_id: str | None) -> bool:
     normalized = (model_id or "").strip().lower()
     return normalized.startswith("deepseek") or "/deepseek" in normalized
-
-
-def _is_direct_deepseek_v4_model_id(model_id: str | None) -> bool:
-    normalized = (model_id or "").strip().lower()
-    return normalized in {"deepseek-v4-flash", "deepseek-v4-pro"}
 
 
 _LARGE_JSON_TOOL_FIELD_KEYS: frozenset[str] = frozenset({"body", "body_base64"})
@@ -5033,7 +5029,7 @@ class Agent:
             else ""
         )
         preserve_reasoning_content = bool(
-            _is_direct_deepseek_v4_model_id(self.config.model_id)
+            is_deepseek_v4_model_id(self.config.model_id)
             or (
                 thinking_enabled
                 and caps_reasoning_format == "deepseek"
@@ -10019,7 +10015,15 @@ class Agent:
                         ):
                             yield event
                         mutex_result = results_by_id.get(tc.tool_use_id)
-                        if mutex_result is not None and mutex_result.terminates_turn:
+                        # A structured-input attempt owns the remainder of the
+                        # provider response even when its arguments are invalid.
+                        # Keep the error non-terminal so the next provider
+                        # iteration can correct it, but never let a tail call in
+                        # the same response (notably submit_plan) race past it.
+                        if mutex_result is not None and (
+                            mutex_result.terminates_turn
+                            or tc.tool_name == "request_user_input"
+                        ):
                             dispatch_boundary = mutex_result
                         if _plan_run_checkpoint_enters_delivery_phase(mutex_result):
                             plan_run_delivery_only = True

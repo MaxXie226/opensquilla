@@ -72,6 +72,11 @@ class _FakeSessionManager:
     def __init__(self) -> None:
         self.created = []
         self.rows = {}
+        self._storage = SimpleNamespace(bind_session_workspace=self._bind_session_workspace)
+        self.workspace_bindings = []
+
+    async def _bind_session_workspace(self, session_key, workspace_id):
+        self.workspace_bindings.append((session_key, workspace_id))
 
     async def get_or_create(self, **kwargs):
         self.created.append(kwargs)
@@ -116,6 +121,33 @@ class _FakeTurnRunner:
             yield SimpleNamespace(kind="done")
 
         return events()
+
+
+@pytest.mark.asyncio
+async def test_agent_run_binds_the_isolated_session_to_the_job_workspace() -> None:
+    session_manager = _FakeSessionManager()
+    turn_runner = _FakeTurnRunner(session_manager)
+    job = CronJob(
+        id="project-check",
+        name="Project check",
+        handler_key="agent_run",
+        payload={
+            "kind": AGENT_TURN_KIND,
+            "task": "inspect the project",
+            "agent_id": "main",
+            "_workspace_id": "project-123",
+        },
+        session_target=SessionTarget.ISOLATED,
+    )
+    handler = make_agent_run_handler(
+        DeliveryChain(),
+        turn_runner_ref=lambda: turn_runner,
+        session_manager_ref=lambda: session_manager,
+    )
+
+    result = await handler(job)
+
+    assert session_manager.workspace_bindings == [(result.session_key, "project-123")]
 
 
 class _FakeTaskRuntime:
@@ -495,12 +527,22 @@ def test_delivery_sanitizes_reply_directives_across_cron_outputs() -> None:
             session_key=CRON_SESSION_KEY,
         )
     )
+    asyncio.run(
+        chain.notify_finished(
+            job,
+            success=True,
+            summary="[[reply_to_current]]Here is the scheduled reply",
+            session_key=CRON_SESSION_KEY,
+            run_id="run-1",
+        )
+    )
 
     assert report.channel_status == "delivered"
-    assert report.ws_status == "delivered"
+    assert report.ws_status == "skipped"
     assert report.session_status == "skipped"
     assert cm.adapter.sent[0].content == "Here is the scheduled reply"
     assert ws_events[0][2]["summary"] == "Here is the scheduled reply"
+    assert ws_events[0][2]["runId"] == "run-1"
     assert forward_calls == []
 
     forward_job = CronJob(

@@ -122,13 +122,20 @@ export interface ChatStreamSegment {
   raw?: string
   html?: string
   dirty?: boolean
+  presentation?: 'intermediate' | 'answer'
   groupId?: string
   operationKey?: string
   approvalId?: string
 }
 
 export type ChatStreamTimelineItem =
-  | { type: 'text'; key: string; html: string; rawText?: string }
+  | {
+      type: 'text'
+      key: string
+      html: string
+      rawText?: string
+      presentation?: 'intermediate' | 'answer'
+    }
   | { type: 'tool-group'; key: string; group: ChatToolCallGroup }
   | {
       type: 'interrupt'
@@ -219,6 +226,7 @@ export interface RawToolCallPayload extends Record<string, unknown> {
   tool_name?: string
   input?: unknown
   result?: unknown
+  user_input_request?: unknown
   content?: unknown
   output?: unknown
   sources?: unknown

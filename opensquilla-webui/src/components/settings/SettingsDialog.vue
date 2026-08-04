@@ -111,6 +111,7 @@
               @update-llm-timeout="updateLlmTimeout"
               @update-context-window="updateContextWindow"
               @probe-connection="probeProviderConnection"
+              @refresh-models="refreshProviderModels"
               @save-provider="saveProvider"
               @cancel-provider-edit="cancelProviderEdit"
               @apply-preset="applyProviderPreset"
@@ -121,6 +122,7 @@
               @add-provider="requestAddProvider"
               @probe-configured-provider="probeConfiguredProvider"
               @activate-provider="activateProvider"
+              @update-image-generation-opt-in="setProviderImageGenerationOptIn"
             />
             <SetupBehaviorPanel
               v-else-if="section === 'behavior'"
@@ -131,6 +133,7 @@
               v-else-if="section === 'privacy'"
               :panel="privacyPanel"
               @update-disable-network-observability="setDisableNetworkObservability"
+              @update-memory-auto-capture="setMemoryAutoCapture"
             />
             <SetupModelStrategyPanel
               v-else-if="section === 'modelStrategy'"
@@ -158,13 +161,9 @@
               :panel="capabilitiesPanel"
               @update-field="updateCapabilityField"
               @search-provider-change="onSearchProviderChange"
-              @memory-provider-change="onMemoryProviderChange"
               @image-provider-change="onImageProviderChange"
-              @save-search="saveSearch"
-              @save-memory="saveMemory"
-              @save-image="saveImage"
-              @save-audio="saveAudio"
-              @copy="copyCommand"
+              @use-image-recommendation="useImageRecommendation"
+              @reset-capability="resetCapability"
             />
             <SettingsAppearancePanel v-else-if="section === 'appearance'" />
             <SettingsKeyboardPanel v-else-if="section === 'keyboard'" />
@@ -283,6 +282,8 @@ const {
   cancelProviderEdit,
   setAutoSessionTitles,
   setDisableNetworkObservability,
+  setMemoryAutoCapture,
+  setProviderImageGenerationOptIn,
   setModelStrategy,
   setFixedProvider,
   setFixedModel,
@@ -303,6 +304,7 @@ const {
   updateLlmTimeout,
   updateContextWindow,
   probeProviderConnection,
+  refreshProviderModels,
   probeConfiguredProvider,
   activateProvider,
   removeProviderProfile,
@@ -310,13 +312,10 @@ const {
   updateCapabilityField,
   onProviderChange,
   onSearchProviderChange,
-  onMemoryProviderChange,
   onImageProviderChange,
+  useImageRecommendation,
   saveProvider,
-  saveSearch,
-  saveMemory,
-  saveImage,
-  saveAudio,
+  resetCapability,
   copyCommand,
   copyConfigPath,
 } = useSetupCatalog()

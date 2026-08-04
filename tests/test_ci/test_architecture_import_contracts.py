@@ -155,6 +155,10 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("persistence", "observability"),
     ("persistence", "skills"),
     ("provider", "engine"),
+    # Official TokenRhythm transports reuse the passive install identity and
+    # its shared privacy policy; observability remains a leaf and never imports
+    # provider back.
+    ("provider", "observability"),
     ("provider", "safety"),
     # Provider argument repair reuses the tool alias/schema helpers (lazy import).
     ("provider", "tools"),

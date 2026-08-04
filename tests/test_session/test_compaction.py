@@ -1,5 +1,7 @@
 """Tests for context window compaction logic."""
 
+import asyncio
+
 import pytest
 
 from opensquilla.provider.types import ProviderRequestCorrelation
@@ -751,13 +753,18 @@ async def test_call_compaction_llm_adds_openrouter_app_attribution(monkeypatch) 
 @pytest.mark.asyncio
 async def test_call_compaction_llm_adds_tokenrhythm_app_attribution(monkeypatch) -> None:
     captured: dict[str, object] = {}
+    install_id = "synthetic-install-id"
 
     class FakeResponse:
         def raise_for_status(self) -> None:
             return None
 
         def json(self) -> dict:
-            return {"choices": [{"message": {"content": "summary"}}]}
+            return {
+                "choices": [
+                    {"message": {"content": f"summary echoed {install_id}"}}
+                ]
+            }
 
     class FakeClient:
         async def __aenter__(self):
@@ -775,6 +782,16 @@ async def test_call_compaction_llm_adds_tokenrhythm_app_attribution(monkeypatch)
         "opensquilla.session.compaction.httpx.AsyncClient",
         lambda **kwargs: FakeClient(),
     )
+    monkeypatch.setattr(
+        "opensquilla.session.compaction.tokenrhythm_install_id_headers",
+        lambda _provider_kind, _base_url: {
+            "X-OpenSquilla-Install-Id": install_id
+        },
+    )
+    monkeypatch.setattr(
+        "opensquilla.session.compaction.redact_tokenrhythm_install_ids",
+        lambda text: text.replace(install_id, "***"),
+    )
 
     result = await call_compaction_llm(
         chunk_text="old conversation",
@@ -791,7 +808,7 @@ async def test_call_compaction_llm_adds_tokenrhythm_app_attribution(monkeypatch)
         ),
     )
 
-    assert result == "summary"
+    assert result == "summary echoed ***"
     assert captured["url"] == "https://tokenrhythm.studio/v1/chat/completions"
     headers = captured["headers"]
     assert isinstance(headers, dict)
@@ -801,6 +818,156 @@ async def test_call_compaction_llm_adds_tokenrhythm_app_attribution(monkeypatch)
     assert headers["X-OpenSquilla-Execution-Id"] == "compaction-1"
     assert headers["X-OpenSquilla-Call-Kind"] == "auxiliary.compaction"
     assert headers["X-Title"] == "OpenSquilla"
+    assert headers["X-OpenSquilla-Install-Id"] == install_id
+
+
+@pytest.mark.asyncio
+async def test_call_compaction_llm_cancellation_does_not_retain_install_id(
+    monkeypatch,
+) -> None:
+    install_id = "synthetic-cancelled-compaction-install-id"
+    sent_headers: dict[str, str] = {}
+    usage_reasons: list[str] = []
+
+    class RetainingResponse:
+        text = ""
+
+        def __init__(self, headers: dict[str, str]) -> None:
+            self.request_headers = dict(headers)
+
+        def __repr__(self) -> str:
+            return f"RetainingResponse(headers={self.request_headers!r})"
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {
+                "choices": [{"message": {"content": "unused"}}],
+                "echo": install_id,
+            }
+
+    class RetainingClient:
+        def __init__(self) -> None:
+            self.request_headers: dict[str, str] = {}
+
+        def __repr__(self) -> str:
+            return f"RetainingClient(headers={self.request_headers!r})"
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+        async def post(self, url, *, json, headers):
+            self.request_headers = dict(headers)
+            sent_headers.update(headers)
+            return RetainingResponse(headers)
+
+    class CancellingUsage:
+        async def finalize_openai_response(self, data, *, raw_json) -> None:
+            raise asyncio.CancelledError
+
+        async def mark_unknown(self, reason: str) -> None:
+            usage_reasons.append(reason)
+
+    async def reserve_direct_usage_call(**_kwargs):
+        return CancellingUsage()
+
+    monkeypatch.setattr(
+        "opensquilla.session.compaction.httpx.AsyncClient",
+        lambda **_kwargs: RetainingClient(),
+    )
+    monkeypatch.setattr(
+        "opensquilla.session.compaction.tokenrhythm_install_id_headers",
+        lambda _provider_kind, _base_url: {
+            "X-OpenSquilla-Install-Id": install_id
+        },
+    )
+    monkeypatch.setattr(
+        "opensquilla.engine.usage_http.reserve_direct_usage_call",
+        reserve_direct_usage_call,
+    )
+
+    task = asyncio.create_task(
+        call_compaction_llm(
+            chunk_text="old conversation",
+            identifier_instruction="",
+            model="deepseek-v4-flash",
+            api_key="test-key",
+            base_url="https://tokenrhythm.studio/v1",
+            provider="tokenrhythm",
+        )
+    )
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await task
+
+    assert task.cancelled()
+    assert usage_reasons == ["cancelled"]
+    assert sent_headers["X-OpenSquilla-Install-Id"] == install_id
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+    traceback = caught.value.__traceback__
+    production_locals: list[str] = []
+    while traceback is not None:
+        frame = traceback.tb_frame
+        if (
+            frame.f_globals.get("__name__") == "opensquilla.session.compaction"
+            and frame.f_code.co_name == "call_compaction_llm"
+        ):
+            production_locals.append(repr(frame.f_locals))
+        traceback = traceback.tb_next
+    assert len(production_locals) == 1
+    assert install_id not in production_locals[0]
+
+
+@pytest.mark.asyncio
+async def test_call_compaction_llm_redacts_install_id_from_failure_log(monkeypatch) -> None:
+    install_id = "i7"
+    warnings: list[tuple[str, dict]] = []
+
+    class FailingClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+        async def post(self, url, *, json, headers):
+            raise RuntimeError(f"upstream echoed {install_id}")
+
+    class CapturingLog:
+        def warning(self, event: str, **kwargs) -> None:
+            warnings.append((event, kwargs))
+
+    monkeypatch.setattr(
+        "opensquilla.session.compaction.httpx.AsyncClient",
+        lambda **_kwargs: FailingClient(),
+    )
+    monkeypatch.setattr("opensquilla.session.compaction.log", CapturingLog())
+    monkeypatch.setattr(
+        "opensquilla.session.compaction.redact_tokenrhythm_install_ids",
+        lambda text: text.replace(install_id, "***"),
+    )
+
+    result = await call_compaction_llm(
+        chunk_text="old conversation",
+        identifier_instruction="",
+        model="deepseek-v4-flash",
+        api_key="test-key",
+        base_url="https://tokenrhythm.studio/v1",
+        provider="tokenrhythm",
+    )
+
+    assert result is None
+    assert warnings == [
+        (
+            "compaction.llm_call_failed",
+            {"model": "deepseek-v4-flash", "error": "upstream echoed ***"},
+        )
+    ]
 
 
 @pytest.mark.asyncio

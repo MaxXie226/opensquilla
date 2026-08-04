@@ -97,6 +97,7 @@
     "tests/test_ci/test_pr_body_lint.py": 0.197,
     "tests/test_ci/test_router_artifact_manifest.py": 0.092,
     "tests/test_ci/test_session_storage_connection_contract.py": 0.01,
+    "tests/test_ci/test_windows_duration_governance.py": 0.01,
     "tests/test_ci/test_windows_test_shards.py": 1.015,
     "tests/test_ci/test_workflows.py": 1.956,
     "tests/test_cli/test_agent_cmd.py": 1.117,
@@ -424,6 +425,7 @@
     "tests/test_gateway/test_memory_repair_storage_gate.py": 0.01,
     "tests/test_gateway/test_meta_skill_config_auto_trigger.py": 0.01,
     "tests/test_gateway/test_metrics_counters.py": 0.129,
+    "tests/test_gateway/test_model_catalog_refresh.py": 0.01,
     "tests/test_gateway/test_no_head_blocking.py": 0.059,
     "tests/test_gateway/test_no_split_brain_lock.py": 0.055,
     "tests/test_gateway/test_origin_guard.py": 1.496,
@@ -687,6 +689,8 @@
     "tests/test_provider/test_shared_catalog.py": 0.01,
     "tests/test_provider/test_spec_substrate.py": 0.01,
     "tests/test_provider/test_stream_goldens.py": 0.057,
+    "tests/test_provider/test_tokenrhythm_catalog.py": 0.01,
+    "tests/test_provider/test_tokenrhythm_traceback_boundaries.py": 0.01,
     "tests/test_provider/test_trace_recorder.py": 0.011,
     "tests/test_provider_anthropic_sse_nospace.py": 0.01,
     "tests/test_provider_anthropic_usage.py": 0.05,
@@ -841,6 +845,7 @@
     "tests/test_scheduler/test_exact_and_retry_classification.py": 0.308,
     "tests/test_scheduler/test_failure_destination.py": 0.315,
     "tests/test_scheduler/test_heartbeat_service.py": 0.01,
+    "tests/test_scheduler/test_job_lifecycle.py": 0.05,
     "tests/test_scheduler/test_ops_strict_schedule.py": 0.74,
     "tests/test_scheduler/test_parser.py": 0.02,
     "tests/test_scheduler/test_parser_tz.py": 0.418,
@@ -1184,6 +1189,8 @@
     "tests/test_gateway/test_websocket_request_concurrency.py": 0.01,
     "tests/test_cli/test_gateway_client_steer.py": 0.01,
     "tests/test_engine/test_route_plan.py": 0.01,
-    "tests/test_gateway/test_steer_restart_recovery.py": 0.01
+    "tests/test_gateway/test_steer_restart_recovery.py": 0.01,
+    "tests/test_gateway/test_rpc_capability_reset.py": 0.01,
+    "tests/test_onboarding/test_image_generation_model_discovery.py": 0.01
   }
 }

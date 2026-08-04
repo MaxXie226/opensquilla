@@ -237,8 +237,13 @@ def _build_cli_dream(agent: str, *, force: bool = False, need_provider: bool = T
 
     from opensquilla.gateway.config import GatewayConfig
     from opensquilla.memory.dream_factory import build_dream_factory
+    from opensquilla.provider.tokenrhythm_correlation import (
+        prewarm_tokenrhythm_install_id,
+    )
 
     gw = GatewayConfig.load(os.environ.get("OPENSQUILLA_GATEWAY_CONFIG_PATH"))
+    if need_provider:
+        prewarm_tokenrhythm_install_id(config=gw)
 
     dream = build_dream_factory(
         config=gw,
