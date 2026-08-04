@@ -113,8 +113,9 @@ function preferredRunMode(
 }
 
 export function useChatRunModePreference(options: UseChatRunModePreferenceOptions) {
-  // Start fail-safe until the principal-specific backend policy arrives.
-  const runMode = ref<SandboxRunMode>('safe')
+  // Full Access is the product default until the principal-specific backend
+  // preference arrives. Sandbox readiness is reconciled separately by ChatView.
+  const runMode = ref<SandboxRunMode>('full')
   const runModeUserSelected = ref(false)
   const runModeHydrated = ref(false)
   let writeSequence = 0
@@ -126,7 +127,7 @@ export function useChatRunModePreference(options: UseChatRunModePreferenceOption
 
   const runModePolicyDefault = computed<SandboxRunMode>(() => {
     const raw = currentRunModePolicy.value?.defaultRunMode
-    return isRecognizedSandboxRunMode(raw) ? normalizeSandboxRunMode(raw) : 'safe'
+    return isRecognizedSandboxRunMode(raw) ? normalizeSandboxRunMode(raw) : 'full'
   })
 
   const allowedRunModes = computed<SandboxRunMode[]>(() => {

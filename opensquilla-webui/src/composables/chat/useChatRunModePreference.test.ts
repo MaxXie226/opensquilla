@@ -40,6 +40,16 @@ afterEach(() => {
 })
 
 describe('useChatRunModePreference', () => {
+  it('starts in Full Access before the principal policy arrives', () => {
+    const policy = ref<RunModePolicy | null>(null)
+
+    const { api, scope } = runInScope(policy)
+
+    expect(api.runMode.value).toBe('full')
+    expect(api.runModeUserSelected.value).toBe(false)
+    scope.stop()
+  })
+
   it('uses policy default on a fresh browser with no saved user preference', () => {
     const policy = ref<RunModePolicy | null>({
       defaultRunMode: 'full',
