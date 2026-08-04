@@ -76,6 +76,36 @@ def test_gateway_boot_bridges_compaction_notifications_to_session_stream() -> No
     assert "_compaction_listener_remove" in source
 
 
+def test_shared_service_boot_prewarms_tokenrhythm_install_id_after_config_load() -> None:
+    source = Path("src/opensquilla/gateway/boot.py").read_text(encoding="utf-8")
+    build_start = source.index("async def build_services(")
+    config_load = source.index("GatewayConfig.load(", build_start)
+    prewarm = source.index("_prewarm_tokenrhythm_install_id(config)", build_start)
+    provider_setup = source.index("# ── Provider selector", build_start)
+    live_catalog = source.index("await refresh_live_model_catalog(", build_start)
+
+    # build_services is shared by Gateway, one-shot agents, and --standalone.
+    assert config_load < prewarm < provider_setup < live_catalog
+
+
+def test_tokenrhythm_install_id_prewarm_never_breaks_boot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.gateway import boot
+    from opensquilla.provider import tokenrhythm_correlation
+
+    def fail_prewarm(**_kwargs: Any) -> None:
+        raise RuntimeError("synthetic resolver failure")
+
+    monkeypatch.setattr(
+        tokenrhythm_correlation,
+        "prewarm_tokenrhythm_install_id",
+        fail_prewarm,
+    )
+
+    boot._prewarm_tokenrhythm_install_id(GatewayConfig())
+
+
 def test_gateway_startup_phase_log_uses_bounded_fields(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

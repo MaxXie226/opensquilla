@@ -9,6 +9,8 @@ fallback so model selection remains useful offline and on older deployments.
 
 from __future__ import annotations
 
+import asyncio
+import json
 from typing import Any
 
 import httpx
@@ -20,8 +22,13 @@ from opensquilla.onboarding.image_generation_specs import (
     get_image_generation_provider_setup_spec,
 )
 from opensquilla.provider.app_attribution import provider_app_headers
+from opensquilla.provider.error_redaction import redacted_httpx_error
 from opensquilla.provider.image_generation_policy import (
     IMAGE_GENERATION_OFFICIAL_BASE_URLS,
+)
+from opensquilla.provider.tokenrhythm_correlation import (
+    redact_tokenrhythm_install_ids,
+    tokenrhythm_install_id_headers,
 )
 
 log = structlog.get_logger(__name__)
@@ -164,19 +171,89 @@ async def _fetch_openrouter_image_models() -> list[dict[str, Any]]:
 
 
 async def _fetch_tokenrhythm_image_models() -> list[dict[str, Any]]:
-    async with httpx.AsyncClient(
-        timeout=_DISCOVERY_TIMEOUT_SECONDS,
-        trust_env=_trust_env(),
-    ) as client:
-        response = await client.get(
-            _TOKENRHYTHM_IMAGE_MODELS_URL,
-            headers={
-                "Accept": "application/json",
-                **provider_app_headers(_TOKENRHYTHM_IMAGE_MODELS_URL),
-            },
-        )
-        response.raise_for_status()
-        return parse_tokenrhythm_image_models(response.json())
+    safe_request_error: Exception | None = None
+    cancelled_request_error: asyncio.CancelledError | None = None
+    headers: dict[str, str] = {
+        "Accept": "application/json",
+        **provider_app_headers(_TOKENRHYTHM_IMAGE_MODELS_URL),
+    }
+    client: Any = None
+    response: Any = None
+    payload: Any = None
+    parsed: list[dict[str, Any]] | None = None
+    raw_message = ""
+    raw_state = ""
+    try:
+        async with httpx.AsyncClient(
+            timeout=_DISCOVERY_TIMEOUT_SECONDS,
+            trust_env=_trust_env(),
+            follow_redirects=False,
+        ) as client:
+            headers.update(
+                tokenrhythm_install_id_headers(
+                    "tokenrhythm",
+                    _TOKENRHYTHM_IMAGE_MODELS_URL,
+                )
+            )
+            response = await client.get(
+                _TOKENRHYTHM_IMAGE_MODELS_URL,
+                headers=headers,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            parsed = parse_tokenrhythm_image_models(payload)
+    except asyncio.CancelledError:
+        cancelled_request_error = asyncio.CancelledError()
+    except httpx.HTTPError as exc:
+        safe_request_error = redacted_httpx_error(exc, api_key="")
+    except json.JSONDecodeError as exc:
+        if redact_tokenrhythm_install_ids(exc.doc) == exc.doc:
+            exc.__cause__ = None
+            exc.__context__ = None
+            exc.__traceback__ = None
+            safe_request_error = exc
+        else:
+            safe_request_error = ValueError(
+                "TokenRhythm image catalog returned invalid JSON"
+            )
+    except Exception as exc:
+        raw_message = str(exc)
+        safe_message = redact_tokenrhythm_install_ids(raw_message)
+        raw_state = repr(getattr(exc, "__dict__", {}))
+        if (
+            safe_message != raw_message
+            or redact_tokenrhythm_install_ids(raw_state) != raw_state
+        ):
+            safe_request_error = RuntimeError(
+                safe_message
+                if safe_message != raw_message
+                else "TokenRhythm image catalog parsing failed"
+            )
+        else:
+            exc.__cause__ = None
+            exc.__context__ = None
+            exc.__traceback__ = None
+            safe_request_error = exc
+
+    if cancelled_request_error is not None:
+        headers.clear()
+        client = None
+        response = None
+        payload = None
+        parsed = None
+        raw_message = ""
+        raw_state = ""
+        raise cancelled_request_error
+    if safe_request_error is not None:
+        headers.clear()
+        client = None
+        response = None
+        payload = None
+        parsed = None
+        raw_message = ""
+        raw_state = ""
+        raise safe_request_error
+    return parsed or []
 
 
 async def discover_image_generation_models(provider_id: str) -> dict[str, Any]:

@@ -5035,6 +5035,10 @@ async def _write_exec_stdin(proc: Any, stdin_bytes: bytes | None) -> None:
                 await wait_closed()
 
 
+def _use_windows_blocking_exec_stdin() -> bool:
+    return os.name == "nt"
+
+
 async def _wait_exec_stdin_writer(
     proc: Any, writer_task: asyncio.Task[None], timeout: float
 ) -> bool:
@@ -5065,13 +5069,15 @@ async def _cancel_exec_stdin_writer(proc: Any, writer_task: asyncio.Task[None] |
     if proc.stdin is not None and not proc.stdin.is_closing():
         proc.stdin.close()
     writer_task.cancel()
+    done, _pending = await asyncio.wait({writer_task}, timeout=0.05)
+    if writer_task not in done:
+        return
     with contextlib.suppress(
-        TimeoutError,
         asyncio.CancelledError,
         BrokenPipeError,
         ConnectionResetError,
     ):
-        await asyncio.wait_for(writer_task, timeout=0.05)
+        await writer_task
 
 
 async def _await_bg_output_task(output_task: asyncio.Task[None]) -> None:
@@ -5081,6 +5087,91 @@ async def _await_bg_output_task(output_task: asyncio.Task[None]) -> None:
         output_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await output_task
+
+
+def _create_windows_host_shell_process(command: str, **kwargs: Any) -> Any:
+    return subprocess.Popen(_windows_direct_powershell_argv(command), **kwargs)
+
+
+def _terminate_windows_host_shell_process(proc: Any) -> None:
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=_EXEC_TERMINATE_TIMEOUT)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    proc.kill()
+    try:
+        proc.wait(timeout=_EXEC_KILL_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        log.warning("exec_command_termination_timeout", pid=proc.pid)
+
+
+async def _communicate_windows_host_shell_process(
+    proc: Any,
+    stdin_bytes: bytes,
+    timeout: float,
+) -> bool:
+    """Write finite Windows stdin outside Proactor and bound the worker wait."""
+
+    communicate_task = asyncio.create_task(
+        asyncio.to_thread(proc.communicate, input=stdin_bytes)
+    )
+    done, _pending = await asyncio.wait(
+        {communicate_task},
+        timeout=max(0.0, timeout),
+    )
+    if communicate_task in done:
+        await communicate_task
+        return True
+
+    await asyncio.to_thread(_terminate_windows_host_shell_process, proc)
+    done, _pending = await asyncio.wait(
+        {communicate_task},
+        timeout=_EXEC_TERMINATE_TIMEOUT + _EXEC_KILL_TIMEOUT,
+    )
+    if communicate_task in done:
+        with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+            await communicate_task
+    return False
+
+
+async def _run_windows_host_shell_command_with_stdin(
+    command: str,
+    *,
+    cwd: str | None,
+    env: dict[str, str],
+    stdin_bytes: bytes,
+    effective_timeout: float,
+) -> str:
+    try:
+        with tempfile.TemporaryFile() as output_file:
+            creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            proc = _create_windows_host_shell_process(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=output_file,
+                stderr=subprocess.STDOUT,
+                cwd=cwd,
+                env=env,
+                creationflags=creationflags,
+            )
+            completed = await _communicate_windows_host_shell_process(
+                proc,
+                stdin_bytes,
+                effective_timeout,
+            )
+            output_file.flush()
+            output_file.seek(0)
+            raw_output = output_file.read()
+            if not completed:
+                return _exec_timeout_output(effective_timeout, command, raw_output)
+            output = decode_subprocess_output(raw_output)
+            return f"exit_code={proc.returncode}\n{output}"
+    except Exception as exc:
+        return f"[error] {exc}"
 
 
 def _exec_timeout_output(effective_timeout: float, command: str, raw: bytes | str) -> str:
@@ -5109,6 +5200,14 @@ async def _run_host_shell_command(
     stdin_bytes: bytes | None,
     effective_timeout: float,
 ) -> str:
+    if _use_windows_blocking_exec_stdin() and stdin_bytes is not None:
+        return await _run_windows_host_shell_command_with_stdin(
+            command,
+            cwd=cwd,
+            env=env,
+            stdin_bytes=stdin_bytes,
+            effective_timeout=effective_timeout,
+        )
     try:
         with tempfile.TemporaryFile() as output_file:
             subprocess_kwargs: dict[str, Any] = {

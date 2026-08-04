@@ -4,6 +4,7 @@ import { useSetupCapabilitiesForm } from '@/composables/setup/useSetupCapabiliti
 import { useSetupBehaviorForm } from '@/composables/setup/useSetupBehaviorForm'
 import {
   hasEffectiveProvider,
+  normalizeCatalogSyncStatus,
   normalizeDiscoveredModels,
   normalizeProbeTimings,
   useSetupProviderForm,
@@ -449,7 +450,6 @@ const promotedForm = useSettingsPromotedForm()
 
 const tierModelCatalogs = ref<DiscoveredModelsByProvider>({})
 const tierModelDiscoveries = new Map<string, Promise<void>>()
-const tierModelDiscoveryCompleted = new Set<string>()
 let tierModelDiscoveryEpoch = 0
 type ImageModelCatalogSource = 'live' | 'catalog' | 'none'
 interface ImageModelCatalog {
@@ -487,7 +487,6 @@ function resetTierModelDiscovery() {
   tierModelDiscoveryEpoch += 1
   tierModelCatalogs.value = {}
   tierModelDiscoveries.clear()
-  tierModelDiscoveryCompleted.clear()
 }
 
 function resetImageModelDiscovery() {
@@ -598,7 +597,6 @@ function discoverTierProviderModels(providerId: string): Promise<void> {
   if (provider === selectedProvider) {
     // Keep using the provider form's discovery state for the selected provider
     // so its live catalog feeds both Model Service and Model Routing.
-    if (providerForm.connection.value.models.length > 0) return Promise.resolve()
     // A selected stored profile has write-only credentials/endpoint state, so
     // the legacy form RPC cannot reconstruct its deployment. Resolve that
     // provider through the profile RPC just like non-selected routing members.
@@ -609,10 +607,8 @@ function discoverTierProviderModels(providerId: string): Promise<void> {
 
   const existing = tierModelDiscoveries.get(provider)
   if (existing) return existing
-  if (tierModelDiscoveryCompleted.has(provider)) return Promise.resolve()
 
   const epoch = tierModelDiscoveryEpoch
-  tierModelDiscoveryCompleted.add(provider)
   const request = (async () => {
     try {
       // Deliberately provider-only. Never forward the selected provider's
@@ -621,8 +617,9 @@ function discoverTierProviderModels(providerId: string): Promise<void> {
         ok?: boolean
         source?: string
         models?: unknown
+        catalog?: unknown
       }>('onboarding.llmProfile.models.discover', { providerId: provider })
-      let res: { ok?: boolean; source?: string; models?: unknown }
+      let res: { ok?: boolean; source?: string; models?: unknown; catalog?: unknown }
       if (provider === normalizeProviderId(config.value.llm?.provider)) {
         // The current provider lives in [llm], not llm_profiles. This branch
         // matters when Model Service is currently editing a different saved
@@ -632,6 +629,7 @@ function discoverTierProviderModels(providerId: string): Promise<void> {
           ok?: boolean
           source?: string
           models?: unknown
+          catalog?: unknown
         }>('onboarding.models.discover', { providerId: provider })
       } else {
         try {
@@ -645,6 +643,7 @@ function discoverTierProviderModels(providerId: string): Promise<void> {
             ok?: boolean
             source?: string
             models?: unknown
+            catalog?: unknown
           }>('onboarding.models.discover', { providerId: provider })
         }
       }
@@ -656,6 +655,7 @@ function discoverTierProviderModels(providerId: string): Promise<void> {
           ? {
               models: normalizeDiscoveredModels(res.models),
               source,
+              catalog: normalizeCatalogSyncStatus(res.catalog),
             }
           : { models: [], source: 'none' },
       }
@@ -695,8 +695,16 @@ async function maybeDiscoverModelsForStrategy(): Promise<void> {
   await Promise.all(Array.from(providers, provider => discoverTierProviderModels(provider)))
 }
 
+function maybeDiscoverProviderModels(): Promise<void> {
+  if (section.value !== 'provider' || !loaded.value) return Promise.resolve()
+  return providerForm.discoverModels({
+    storedProfile: providerSelectionKind.value === 'profile',
+  })
+}
+
 watch(section, value => {
   if (value === 'modelStrategy') providerOwnsFixedModelDraft.value = false
+  void maybeDiscoverProviderModels()
   void maybeDiscoverModelsForStrategy()
   void maybeDiscoverImageGenerationModels()
 })
@@ -1145,6 +1153,25 @@ const effectiveMaxTokens = computed<EffectiveMaxTokens | null>(() => {
     value: Math.floor(value),
     source: source as EffectiveMaxTokens['source'],
   }
+})
+
+const effectiveMaxTokensPending = computed(() => {
+  const selectedProvider = normalizeProviderId(providerForm.selectedProvider.value)
+  const selectedModel = currentFormModelValue()
+  if (!selectedProvider || !selectedModel) return false
+  if (selectedNewProfile.value) return true
+  if (selectedStoredProfile.value) return providerForm.isDirty.value
+
+  // Pending means that this provider/model is an unsaved candidate. Do not
+  // infer it from config.effective: older gateways may omit that optional RPC,
+  // which makes the effective value unknown rather than the saved form dirty.
+  const savedProvider = normalizeProviderId(config.value.llm?.provider)
+  const savedModel = String(config.value.llm?.model || '').trim()
+  return (
+    providerForm.isDirty.value
+    || selectedProvider !== savedProvider
+    || selectedModel !== savedModel
+  )
 })
 
 const providerSummary = computed(() => {
@@ -1647,6 +1674,7 @@ const providerFormPanel = providerForm.createPanel({
   contextWindowTokens: promotedForm.contextWindowTokens,
   contextWindowGlobal,
   effectiveMaxTokens,
+  effectiveMaxTokensPending,
   providerIsLocal,
   configuredProviders,
   editingPrimary: editingPrimaryProvider,
@@ -2671,6 +2699,8 @@ async function removeProviderCredential() {
 async function probeProviderConnection() {
   if (providerInteractionLocked()) return
   if (!providerCredentialPanel.value?.probeReady) return
+  const storedProfileDraft = selectedStoredProfile.value && providerForm.isDirty.value
+  const persistedStoredProfile = selectedStoredProfile.value && !storedProfileDraft
   await providerForm.probeConnection({
     defaultModel: selectedStoredProfile.value
       ? providerProbeModel.value
@@ -2678,11 +2708,22 @@ async function probeProviderConnection() {
     modelOverride: editingPrimaryProvider.value && hasConfiguredPrimaryProvider.value
       ? currentFormModelValue()
       : undefined,
-    draftProfile: selectedStoredProfile.value,
+    storedProfile: persistedStoredProfile,
+    draftProfile: storedProfileDraft,
   })
   // Verification is deliberately non-mutating. The editor keeps the verified
   // draft visible so the user can review the discovered model and then commit
   // it with the explicit Save changes action.
+}
+
+async function refreshProviderModels() {
+  if (providerInteractionLocked()) return
+  const storedProfileDraft = selectedStoredProfile.value && providerForm.isDirty.value
+  await providerForm.discoverModels({
+    storedProfile: selectedStoredProfile.value && !storedProfileDraft,
+    draftProfile: storedProfileDraft,
+    forceRefresh: true,
+  })
 }
 
 function imageGenerationUsesProfileCredential(providerId: string): boolean {
@@ -3738,6 +3779,7 @@ async function copyConfigPath() {
     updateLlmTimeout,
     updateContextWindow,
     probeProviderConnection,
+    refreshProviderModels,
     probeConfiguredProvider,
     activateProvider,
     removeProviderProfile,

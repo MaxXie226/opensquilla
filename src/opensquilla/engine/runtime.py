@@ -44,6 +44,7 @@ from opensquilla.attachment_workspace import (
     workspace_attachment_budget_from_config,
 )
 from opensquilla.bootstrap_types import BootstrapFileReport
+from opensquilla.context_budget import ContextBudgetGovernor
 from opensquilla.contracts.attachments import (
     ALLOWED_MEDIA_TYPES as _ALLOWED_ENGINE_MEDIA_TYPES,
 )
@@ -1463,6 +1464,27 @@ def _drop_unpaired_tool_use_segments(segments: list[dict[str, Any]]) -> list[dic
     ]
 
 
+@dataclass(frozen=True, slots=True)
+class _FallbackDeploymentIdentity:
+    """Private limit-relevant deployment identity; secrets never leave it."""
+
+    provider: str
+    model: str
+    api_key: str = field(repr=False)
+    base_url: str = ""
+    proxy: str = field(default="", repr=False)
+
+
+def _fallback_deployment_identity(config: Any) -> _FallbackDeploymentIdentity:
+    return _FallbackDeploymentIdentity(
+        provider=str(getattr(config, "provider", "") or "").strip().lower(),
+        model=str(getattr(config, "model", "") or "").strip(),
+        api_key=str(getattr(config, "api_key", "") or "").strip(),
+        base_url=str(getattr(config, "base_url", "") or "").strip(),
+        proxy=str(getattr(config, "proxy", "") or "").strip(),
+    )
+
+
 class _SelectorFallbackProvider:
     """Provider wrapper that switches to selector fallback on pre-content errors."""
 
@@ -1482,6 +1504,10 @@ class _SelectorFallbackProvider:
         # no-op, keeping the default fallback path byte-identical.
         self._health_ledger = health_ledger
         self._used_fallback = False
+        self._fallback_limits: dict[tuple[str, str], tuple[int, int]] = {}
+        self._fallback_deployment_limits: dict[
+            _FallbackDeploymentIdentity, tuple[int, int]
+        ] = {}
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._provider, name)
@@ -1567,34 +1593,201 @@ class _SelectorFallbackProvider:
 
     def _active_deployment(self) -> tuple[str, str]:
         """(provider id, model) of the selector's currently-active chain link."""
-        provider_id = str(
-            getattr(self._selector, "active_provider_id", "") or self.provider_name
-        )
         current_config = getattr(self._selector, "current_config", None)
+        provider_id = str(
+            getattr(self._selector, "active_provider_id", "")
+            or getattr(current_config, "provider", "")
+            or self.provider_name
+        )
         model = str(getattr(current_config, "model", "") or "")
         return provider_id, model
 
+    def fallback_deployment_configs(self) -> tuple[Any, ...]:
+        """Return private physical fallback configs without metadata projection."""
+
+        remaining_chain = getattr(self._selector, "remaining_chain", None)
+        if not callable(remaining_chain):
+            return ()
+        try:
+            chain = tuple(remaining_chain())
+        except Exception:  # noqa: BLE001 - optional private lookup seam
+            return ()
+        return chain[1:] if len(chain) > 1 else ()
+
+    def active_deployment_config(self) -> Any | None:
+        """Return the private ProviderConfig for the current physical head."""
+
+        return getattr(self._selector, "current_config", None)
+
+    def configure_fallback_deployment_limits(
+        self,
+        limits: Sequence[tuple[Any, int, int]],
+    ) -> None:
+        """Install exact limit-relevant deployment budgets in private memory."""
+
+        normalized: dict[_FallbackDeploymentIdentity, tuple[int, int]] = {}
+        for item in limits:
+            if not isinstance(item, tuple) or len(item) != 3:
+                continue
+            deployment, raw_context, raw_max = item
+            identity = _fallback_deployment_identity(deployment)
+            if not identity.provider or not identity.model:
+                continue
+            try:
+                context_window = max(0, int(raw_context or 0))
+                effective_max_tokens = max(0, int(raw_max or 0))
+            except (TypeError, ValueError):
+                continue
+            normalized[identity] = (context_window, effective_max_tokens)
+        self._fallback_deployment_limits = normalized
+
+    def configure_fallback_limits(
+        self,
+        limits: Mapping[tuple[str, str], tuple[int, int]],
+    ) -> None:
+        """Install immutable per-deployment fallback budgets for this turn.
+
+        Provider ids are case-insensitive registry identities; model ids remain
+        exact because upstream aggregators may expose case-sensitive names.
+        Invalid/unknown values become zero and therefore never introduce a
+        generic hard cap for self-hosted deployments.
+        """
+
+        normalized: dict[tuple[str, str], tuple[int, int]] = {}
+        for raw_identity, raw_limits in limits.items():
+            if not isinstance(raw_identity, tuple) or len(raw_identity) != 2:
+                continue
+            provider_id = str(raw_identity[0] or "").strip().lower()
+            model = str(raw_identity[1] or "").strip()
+            if not provider_id or not model:
+                continue
+            try:
+                context_window = max(0, int(raw_limits[0] or 0))
+                effective_max_tokens = max(0, int(raw_limits[1] or 0))
+            except (IndexError, TypeError, ValueError):
+                continue
+            normalized[(provider_id, model)] = (
+                context_window,
+                effective_max_tokens,
+            )
+        self._fallback_limits = normalized
+
+    def _active_fallback_limits(self) -> tuple[int, int]:
+        provider_id, model = self._active_deployment()
+        current_config = getattr(self._selector, "current_config", None)
+        if current_config is not None:
+            deployment_limits = self._fallback_deployment_limits.get(
+                _fallback_deployment_identity(current_config)
+            )
+            if deployment_limits is not None:
+                return deployment_limits
+        identity = (provider_id.strip().lower(), model.strip())
+        # A TokenRhythm provider/model pair is not a deployment identity: two
+        # keys may declare different ceilings for the same model. Embedded
+        # callers and dynamically injected plugin fallbacks that do not have
+        # an exact private limit must preserve the original request rather
+        # than consult another authority's provider/model-only value.
+        if identity[0] == "tokenrhythm":
+            return 0, 0
+
+        direct = self._fallback_limits.get(identity)
+        if direct is not None:
+            return direct
+
+        # RoutePlan is persisted telemetry, so use it only as an additive
+        # compatibility fallback when an embedded caller did not run the
+        # bootstrap configurator above.
+        route_plan = (
+            self._turn_metadata.get("route_plan")
+            if isinstance(self._turn_metadata, dict)
+            else None
+        )
+        fallback_chain = (
+            route_plan.get("fallback_chain")
+            if isinstance(route_plan, Mapping)
+            else None
+        )
+        if isinstance(fallback_chain, list):
+            for candidate in fallback_chain:
+                if not isinstance(candidate, Mapping):
+                    continue
+                candidate_identity = (
+                    str(candidate.get("provider") or "").strip().lower(),
+                    str(candidate.get("model") or "").strip(),
+                )
+                if candidate_identity != identity:
+                    continue
+                capabilities = candidate.get("capabilities")
+                if not isinstance(capabilities, Mapping):
+                    return 0, 0
+                try:
+                    return (
+                        max(0, int(capabilities.get("context_window") or 0)),
+                        max(
+                            0,
+                            int(capabilities.get("effective_max_tokens") or 0),
+                        ),
+                    )
+                except (TypeError, ValueError):
+                    return 0, 0
+        return 0, 0
+
     def _config_for_active_leg(self, config: Any) -> Any:
-        """Mark selector fallback legs without changing their logical identity."""
+        """Bind one physical fallback to its own correlation and model budget."""
 
         if not self._used_fallback:
             return config
+        updates: dict[str, Any] = {}
         correlation = getattr(config, "provider_request_correlation", None)
-        if not isinstance(
-            correlation,
-            ProviderRequestCorrelation,
-        ) or correlation.call_kind.endswith(".provider_fallback"):
+        if isinstance(correlation, ProviderRequestCorrelation) and not (
+            correlation.call_kind.endswith(".provider_fallback")
+        ):
+            updates["provider_request_correlation"] = (
+                derive_provider_request_correlation(
+                    correlation,
+                    call_kind=f"{correlation.call_kind}.provider_fallback",
+                )
+            )
+
+        context_window, effective_max_tokens = self._active_fallback_limits()
+        try:
+            original_max_tokens = max(0, int(getattr(config, "max_tokens", 0) or 0))
+        except (TypeError, ValueError):
+            original_max_tokens = 0
+        physical_max_tokens = original_max_tokens
+        if effective_max_tokens > 0 and original_max_tokens > effective_max_tokens:
+            physical_max_tokens = effective_max_tokens
+            updates["max_tokens"] = physical_max_tokens
+
+        try:
+            inherited_proof_cap = max(
+                0,
+                int(getattr(config, "provider_request_max_chars", 0) or 0),
+            )
+        except (TypeError, ValueError):
+            inherited_proof_cap = 0
+        if context_window > 0 and physical_max_tokens > 0 and inherited_proof_cap > 0:
+            thinking_budget_tokens = (
+                max(0, int(getattr(config, "thinking_budget_tokens", 0) or 0))
+                if bool(getattr(config, "thinking", False))
+                else 0
+            )
+            fallback_proof_cap = ContextBudgetGovernor.from_values(
+                context_window_tokens=context_window,
+                max_output_tokens=physical_max_tokens,
+                thinking_budget_tokens=thinking_budget_tokens,
+                context_overflow_threshold=0.85,
+            ).snapshot().provider_request_max_chars
+            rebound_proof_cap = min(inherited_proof_cap, fallback_proof_cap)
+            if rebound_proof_cap < inherited_proof_cap:
+                updates["provider_request_max_chars"] = rebound_proof_cap
+
+        if not updates:
             return config
-        fallback_correlation = derive_provider_request_correlation(
-            correlation,
-            call_kind=f"{correlation.call_kind}.provider_fallback",
-        )
         model_copy = getattr(config, "model_copy", None)
         if not callable(model_copy):
             return config
-        return model_copy(
-            update={"provider_request_correlation": fallback_correlation},
-        )
+        return model_copy(update=updates)
 
     def _record_health_failure(self, event: ProviderErrorEvent) -> None:
         """Feed one pre-content provider error into the opt-in health ledger."""
