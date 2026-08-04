@@ -51,6 +51,11 @@ describe('effectiveComposerRunMode', () => {
     expect(composerRunModeSelectionAction('safe', { ...status, state: 'ready' }, false)).toBe('persist')
   })
 
+  it('ignores Safe selection until the initial setup check resolves', () => {
+    expect(composerRunModeSelectionAction('safe', null, false, false)).toBe('ignore')
+    expect(composerRunModeSelectionAction('full', null, false, false)).toBe('persist')
+  })
+
   it('persists Safe only after setup succeeds', async () => {
     const persist = vi.fn().mockResolvedValue(undefined)
 

@@ -18,7 +18,9 @@ export function composerRunModeSelectionAction(
   mode: SandboxRunMode,
   setupStatus: SandboxSetupStatusPayload | null,
   canSetup: boolean,
+  setupResolved = true,
 ): ComposerRunModeSelectionAction {
+  if (mode === 'safe' && !setupResolved) return 'ignore'
   if (mode === 'full' || setupStatus === null || setupStatus.state === 'ready') return 'persist'
   return canSetup ? 'setup' : 'ignore'
 }

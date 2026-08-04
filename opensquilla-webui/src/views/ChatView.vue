@@ -970,6 +970,9 @@ const runMode = computed<SandboxRunMode>(() => effectiveComposerRunMode(
   sandboxSetupRecovery.resolved.value,
 ))
 const composerAllowedRunModes = computed<SandboxRunMode[]>(() => {
+  if (!sandboxSetupRecovery.resolved.value) {
+    return allowedRunModes.value.filter((mode) => mode !== 'safe')
+  }
   const status = sandboxSetupStatus.value
   if (
     status !== null
@@ -2732,6 +2735,7 @@ async function setComposerRunMode(mode: SandboxRunMode): Promise<void> {
     mode,
     sandboxSetupStatus.value,
     composerSafeSetupAvailable.value,
+    sandboxSetupRecovery.resolved.value,
   )
   if (action === 'ignore') return
   if (action === 'setup') {
