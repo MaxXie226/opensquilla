@@ -44,6 +44,7 @@ async function mountPanel(options: {
 } = {}) {
   vi.resetModules()
   document.body.innerHTML = ''
+  let currentRunMode: 'safe' | 'full' = 'full'
   const call = vi.fn(async (method: string, params?: Record<string, unknown>) => {
     if (method === 'sandbox.capability.status') {
       if (typeof options.capability === 'function') return options.capability(params)
@@ -96,7 +97,7 @@ async function mountPanel(options: {
     }
     if (method === 'sandbox.tokens.list') return { tokens: [] }
     if (method === 'sandbox.run_mode.preference.get') {
-      return { runMode: 'full', source: 'default' }
+      return { runMode: currentRunMode, source: 'preference' }
     }
     if (method === 'config.get') {
       return {
@@ -124,7 +125,8 @@ async function mountPanel(options: {
     }
     if (method === 'sandbox.tokens.revoke') return { revoked: true }
     if (method === 'sandbox.run_mode.preference.set') {
-      return { runMode: params?.runMode, source: 'preference' }
+      currentRunMode = params?.runMode === 'safe' ? 'safe' : 'full'
+      return { runMode: currentRunMode, source: 'preference' }
     }
     if (method === 'config.patch') return { restartRequired: true }
     throw new Error(`unexpected method: ${method}`)
@@ -144,12 +146,14 @@ async function mountPanel(options: {
   }))
 
   const { createApp } = await import('vue')
+  const { createPinia } = await import('pinia')
   const i18n = (await import('@/i18n')).default
   i18n.global.locale.value = 'en'
   const Component = (await import('./SandboxSettingsPanel.vue')).default
   const el = document.createElement('div')
   document.body.appendChild(el)
   const app = createApp(Component)
+  app.use(createPinia())
   app.use(i18n)
   app.mount(el)
   mounted.push(app)
@@ -180,6 +184,7 @@ describe('SandboxSettingsPanel', () => {
     expect(el.querySelector('[data-testid="builtin-file-rules"]')).toBeNull()
     expect(el.querySelector('[data-testid="create-sandbox-token"]')).toBeNull()
     expect(el.querySelector('[data-testid="sandbox-open-advanced"]')).toBeNull()
+    expect(el.querySelector('[data-testid="save-sandbox-section"]')).toBeNull()
   })
 
   it('opens focused details and returns without saving', async () => {
@@ -200,7 +205,7 @@ describe('SandboxSettingsPanel', () => {
       .toBe(false)
   })
 
-  it('loads immutable file rules and saves a versioned custom rule', async () => {
+  it('loads immutable file rules and immediately saves an added custom rule', async () => {
     const { el, call } = await mountPanel()
     el.querySelector<HTMLButtonElement>('[data-testid="sandbox-open-files"]')!.click()
     await settle()
@@ -211,13 +216,6 @@ describe('SandboxSettingsPanel', () => {
     input.value = 'D:\\Secrets'
     input.dispatchEvent(new Event('input', { bubbles: true }))
     input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
-    await settle()
-
-    const save = [...el.querySelectorAll<HTMLButtonElement>(
-      '[data-testid="save-sandbox-section"]',
-    )].find(button => !button.disabled)!
-    expect(save).toBeTruthy()
-    save.click()
     await settle()
 
     expect(call).toHaveBeenCalledWith('sandbox.policy.update', expect.objectContaining({
@@ -231,18 +229,14 @@ describe('SandboxSettingsPanel', () => {
   })
 
   it('clamps the recursive-delete backup quota to the visible 0.1 GiB minimum', async () => {
+    vi.useFakeTimers()
     const { el, call } = await mountPanel()
     el.querySelector<HTMLButtonElement>('[data-testid="sandbox-open-files"]')!.click()
     await settle()
     const input = el.querySelector<HTMLInputElement>('[data-testid="sandbox-backup-quota"]')!
     input.value = '0'
     input.dispatchEvent(new Event('input', { bubbles: true }))
-    await settle()
-
-    const save = [...el.querySelectorAll<HTMLButtonElement>(
-      '[data-testid="save-sandbox-section"]',
-    )].find(button => !button.disabled)!
-    save.click()
+    await vi.advanceTimersByTimeAsync(500)
     await settle()
 
     expect(call).toHaveBeenCalledWith('sandbox.policy.update', expect.objectContaining({
@@ -272,6 +266,20 @@ describe('SandboxSettingsPanel', () => {
       .toBe(true)
     expect(el.querySelector<HTMLButtonElement>('[data-testid="sandbox-open-files"]')?.disabled)
       .toBe(false)
+  })
+
+  it('immediately persists an available Safe mode selection without Save or Discard', async () => {
+    const { el, call } = await mountPanel()
+
+    el.querySelector<HTMLButtonElement>('[data-testid="sandbox-safe-mode"]')!.click()
+    await settle()
+
+    expect(call).toHaveBeenCalledWith('sandbox.run_mode.preference.set', { runMode: 'safe' })
+    expect(el.querySelector('[data-testid="save-sandbox-section"]')).toBeNull()
+    await vi.waitFor(() => {
+      expect(el.querySelector('[data-testid="sandbox-safe-mode"]')?.classList.contains('is-selected'))
+        .toBe(true)
+    })
   })
 
   it('does not retry an unavailable live capability in the background', async () => {
@@ -395,7 +403,6 @@ describe('SandboxSettingsPanel', () => {
     await settle()
 
     expect(document.body.querySelector('[data-testid="sandbox-setup-progress"]')).toBeNull()
-    expect(vi.getTimerCount()).toBe(0)
   })
 
   it('keeps the original setup progress active after same-tick repeated Continue clicks', async () => {
@@ -436,10 +443,40 @@ describe('SandboxSettingsPanel', () => {
     await settle()
 
     expect(document.body.querySelector('[data-testid="sandbox-setup-progress"]')).toBeNull()
-    expect(vi.getTimerCount()).toBe(0)
   })
 
-  it('forces live verification after setup and selects only the unsaved safe draft', async () => {
+  it('closes only the dialog when setup is moved to the background', async () => {
+    let resolveEnsure!: (value: unknown) => void
+    const ensure = new Promise<unknown>((resolve) => {
+      resolveEnsure = resolve
+    })
+    const { el, call } = await mountPanel({ setupState: 'not_setup', ensure })
+
+    el.querySelector<HTMLButtonElement>('[data-testid="sandbox-safe-mode"]')!.click()
+    await settle()
+    document.body.querySelector<HTMLButtonElement>('[data-testid="sandbox-setup-continue"]')!.click()
+    await settle()
+
+    expect(document.body.querySelector('[data-testid="sandbox-setup-background"]')).toBeTruthy()
+    expect(document.body.textContent).not.toContain('Cancel')
+    document.body.querySelector<HTMLButtonElement>('[data-testid="sandbox-setup-background"]')!.click()
+    await settle()
+
+    expect(document.body.querySelector('[data-testid="sandbox-setup-confirm"]')).toBeNull()
+    expect(call.mock.calls.filter(([method]) => method === 'sandbox.setup.ensure')).toHaveLength(1)
+
+    resolveEnsure({
+      state: 'ready',
+      platform: 'win32',
+      message: 'Sandbox setup is ready.',
+      requiresAdmin: false,
+    })
+    await settle()
+
+    expect(call.mock.calls.filter(([method]) => method === 'sandbox.setup.ensure')).toHaveLength(1)
+  })
+
+  it('forces live verification after setup and persists Safe mode automatically', async () => {
     const { el, call } = await mountPanel({ setupState: 'not_setup' })
 
     el.querySelector<HTMLButtonElement>('[data-testid="sandbox-safe-mode"]')!.click()
@@ -451,10 +488,11 @@ describe('SandboxSettingsPanel', () => {
     expect(call.mock.calls.some(([method, params]) => (
       method === 'sandbox.capability.status' && params?.refresh === true
     ))).toBe(true)
-    expect(el.querySelector('[data-testid="sandbox-safe-mode"]')?.classList.contains('is-selected'))
-      .toBe(true)
-    expect(call.mock.calls.some(([method]) => method === 'sandbox.run_mode.preference.set'))
-      .toBe(false)
+    await vi.waitFor(() => {
+      expect(el.querySelector('[data-testid="sandbox-safe-mode"]')?.classList.contains('is-selected'))
+        .toBe(true)
+    })
+    expect(call).toHaveBeenCalledWith('sandbox.run_mode.preference.set', { runMode: 'safe' })
   })
 
   it('soft-lands a cancelled UAC request without exposing helper details', async () => {

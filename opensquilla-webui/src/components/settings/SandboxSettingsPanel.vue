@@ -48,19 +48,12 @@
               type="button"
               :class="{ 'is-selected': defaultRunMode === 'full' }"
               data-testid="sandbox-full-mode"
-              @click="defaultRunMode = 'full'"
+              @click="void selectFullMode()"
             >
               {{ t('settings.sandbox.mode.full') }}
             </button>
           </div>
         </section>
-        <SectionActions
-          :dirty="defaultRunMode !== defaultRunModeBaseline"
-          :pending="defaultRunModePending"
-          :error="defaultRunModeError"
-          @save="void saveDefaultRunMode()"
-          @discard="discardDefaultRunMode"
-        />
         <p
           v-if="sandboxSetupOutcomeMessage"
           class="sandbox-setup-result"
@@ -107,7 +100,7 @@
           {{ t('settings.sandbox.files.readsAllowed') }}
         </span>
         <label v-else-if="activeView === 'runtimes'" class="sandbox-switch sandbox-detail-control">
-          <input v-model="draft.runtimes.enabled" type="checkbox" />
+          <input v-model="draft.runtimes.enabled" type="checkbox" @change="void flushSectionSave('runtimes')" />
           <span aria-hidden="true"></span>
         </label>
       </header>
@@ -123,8 +116,13 @@
             :key="`custom-${index}`"
             class="sandbox-rule sandbox-rule--editable"
           >
-            <input v-model="draft.files.customDenyWritePaths[index]" :aria-label="t('settings.sandbox.files.customPath')" />
-            <button type="button" class="btn btn--ghost" @click="removeAt(draft.files.customDenyWritePaths, index)">
+            <input
+              v-model="draft.files.customDenyWritePaths[index]"
+              :aria-label="t('settings.sandbox.files.customPath')"
+              @input="scheduleSectionSave('files')"
+              @blur="void flushSectionSave('files')"
+            />
+            <button type="button" class="btn btn--ghost" @click="removeAt(draft.files.customDenyWritePaths, index, 'files')">
               {{ t('settings.sandbox.actions.remove') }}
             </button>
           </div>
@@ -133,12 +131,12 @@
           <input
             v-model="newFilePath"
             :placeholder="t('settings.sandbox.files.pathPlaceholder')"
-            @keydown.enter.prevent="addTextRule(draft.files.customDenyWritePaths, newFilePath, value => { newFilePath = value })"
+            @keydown.enter.prevent="addTextRule(draft.files.customDenyWritePaths, newFilePath, value => { newFilePath = value }, 'files')"
           />
           <button
             type="button"
             class="btn"
-            @click="addTextRule(draft.files.customDenyWritePaths, newFilePath, value => { newFilePath = value })"
+            @click="addTextRule(draft.files.customDenyWritePaths, newFilePath, value => { newFilePath = value }, 'files')"
           >
             {{ t('settings.sandbox.actions.add') }}
           </button>
@@ -150,7 +148,7 @@
             <p>{{ t('settings.sandbox.files.backupDescription') }}</p>
           </div>
           <label class="sandbox-switch">
-            <input v-model="draft.files.recursiveDeleteBackupEnabled" type="checkbox" />
+            <input v-model="draft.files.recursiveDeleteBackupEnabled" type="checkbox" @change="void flushSectionSave('files')" />
             <span aria-hidden="true"></span>
           </label>
         </div>
@@ -162,23 +160,18 @@
             type="number"
             min="0.1"
             step="0.5"
+            @input="scheduleSectionSave('files')"
+            @blur="void flushSectionSave('files')"
           />
           <span>GiB</span>
         </label>
         <p class="sandbox-warning">{{ t('settings.sandbox.files.recursiveWarning') }}</p>
-        <SectionActions
-          :dirty="sectionDirty('files')"
-          :pending="sectionPending.files"
-          :error="sectionError.files"
-          @save="void saveSection('files')"
-          @discard="discardSection('files')"
-        />
       </article>
 
       <article v-if="activeView === 'commands'" class="sandbox-card">
         <label class="sandbox-field">
           <span>{{ t('settings.sandbox.commands.systemTools') }}</span>
-          <select v-model="draft.commands.systemTools">
+          <select v-model="draft.commands.systemTools" @change="void flushSectionSave('commands')">
             <option value="auto">{{ t('settings.sandbox.commands.systemToolsAuto') }}</option>
             <option value="prompt">{{ t('settings.sandbox.commands.systemToolsPrompt') }}</option>
             <option value="disabled">{{ t('settings.sandbox.commands.systemToolsDisabled') }}</option>
@@ -190,23 +183,16 @@
           :title="t('settings.sandbox.commands.approvalPrefixes')"
           :placeholder="t('settings.sandbox.commands.prefixPlaceholder')"
           :rules="draft.commands.requireApprovalPrefixes"
-          @add="addPrefix(draft.commands.requireApprovalPrefixes, approvalPrefix, value => { approvalPrefix = value })"
-          @remove="removeAt(draft.commands.requireApprovalPrefixes, $event)"
+          @add="addPrefix(draft.commands.requireApprovalPrefixes, approvalPrefix, value => { approvalPrefix = value }, 'commands')"
+          @remove="removeAt(draft.commands.requireApprovalPrefixes, $event, 'commands')"
         />
         <RuleEditor
           v-model="autoPrefix"
           :title="t('settings.sandbox.commands.autoPrefixes')"
           :placeholder="t('settings.sandbox.commands.prefixPlaceholder')"
           :rules="draft.commands.autoAllowPrefixes"
-          @add="addPrefix(draft.commands.autoAllowPrefixes, autoPrefix, value => { autoPrefix = value })"
-          @remove="removeAt(draft.commands.autoAllowPrefixes, $event)"
-        />
-        <SectionActions
-          :dirty="sectionDirty('commands')"
-          :pending="sectionPending.commands"
-          :error="sectionError.commands"
-          @save="void saveSection('commands')"
-          @discard="discardSection('commands')"
+          @add="addPrefix(draft.commands.autoAllowPrefixes, autoPrefix, value => { autoPrefix = value }, 'commands')"
+          @remove="removeAt(draft.commands.autoAllowPrefixes, $event, 'commands')"
         />
       </article>
 
@@ -217,7 +203,7 @@
             <p>{{ t('settings.sandbox.network.blockAllDescription') }}</p>
           </div>
           <label class="sandbox-switch">
-            <input v-model="draft.network.blockAllNetwork" type="checkbox" />
+            <input v-model="draft.network.blockAllNetwork" type="checkbox" @change="void flushSectionSave('network')" />
             <span aria-hidden="true"></span>
           </label>
         </div>
@@ -226,40 +212,26 @@
           :title="t('settings.sandbox.network.allowDomains')"
           placeholder="api.example.com"
           :rules="draft.network.allowDomains"
-          @add="addTextRule(draft.network.allowDomains, allowDomain, value => { allowDomain = value })"
-          @remove="removeAt(draft.network.allowDomains, $event)"
+          @add="addTextRule(draft.network.allowDomains, allowDomain, value => { allowDomain = value }, 'network')"
+          @remove="removeAt(draft.network.allowDomains, $event, 'network')"
         />
         <TextRuleEditor
           v-model="denyDomain"
           :title="t('settings.sandbox.network.denyDomains')"
           placeholder="telemetry.example.com"
           :rules="draft.network.denyDomains"
-          @add="addTextRule(draft.network.denyDomains, denyDomain, value => { denyDomain = value })"
-          @remove="removeAt(draft.network.denyDomains, $event)"
-        />
-        <SectionActions
-          :dirty="sectionDirty('network')"
-          :pending="sectionPending.network"
-          :error="sectionError.network"
-          @save="void saveSection('network')"
-          @discard="discardSection('network')"
+          @add="addTextRule(draft.network.denyDomains, denyDomain, value => { denyDomain = value }, 'network')"
+          @remove="removeAt(draft.network.denyDomains, $event, 'network')"
         />
       </article>
 
       <article v-if="activeView === 'runtimes'" class="sandbox-card">
         <div class="sandbox-runtime-grid">
-          <label><span>Python <small>{{ runtimeVersions.python?.version ?? '—' }}</small></span><input v-model="draft.runtimes.python" type="checkbox" :disabled="!draft.runtimes.enabled" /></label>
-          <label><span>Node.js <small>{{ runtimeVersions.node?.version ?? '—' }}</small></span><input v-model="draft.runtimes.node" type="checkbox" :disabled="!draft.runtimes.enabled" /></label>
-          <label><span>Git Bash <small>{{ runtimeVersions.gitBash?.version ?? '—' }}</small></span><input v-model="draft.runtimes.gitBash" type="checkbox" :disabled="!draft.runtimes.enabled || !runtimeVersions.gitBash" /></label>
+          <label><span>Python <small>{{ runtimeVersions.python?.version ?? '—' }}</small></span><input v-model="draft.runtimes.python" type="checkbox" :disabled="!draft.runtimes.enabled" @change="void flushSectionSave('runtimes')" /></label>
+          <label><span>Node.js <small>{{ runtimeVersions.node?.version ?? '—' }}</small></span><input v-model="draft.runtimes.node" type="checkbox" :disabled="!draft.runtimes.enabled" @change="void flushSectionSave('runtimes')" /></label>
+          <label><span>Git Bash <small>{{ runtimeVersions.gitBash?.version ?? '—' }}</small></span><input v-model="draft.runtimes.gitBash" type="checkbox" :disabled="!draft.runtimes.enabled || !runtimeVersions.gitBash" @change="void flushSectionSave('runtimes')" /></label>
         </div>
         <p v-if="runtimeTarget" class="sandbox-detail">{{ t('settings.sandbox.runtimes.target') }}: <code>{{ runtimeTarget }}</code></p>
-        <SectionActions
-          :dirty="sectionDirty('runtimes')"
-          :pending="sectionPending.runtimes"
-          :error="sectionError.runtimes"
-          @save="void saveSection('runtimes')"
-          @discard="discardSection('runtimes')"
-        />
       </article>
 
     </template>
@@ -269,6 +241,7 @@
       :pending="sandboxSetupPending"
       :outcome="sandboxSetupOutcome"
       @cancel="cancelSandboxSetup"
+      @background="runSandboxSetupInBackground"
       @confirm="void continueSandboxSetup()"
     />
   </section>
@@ -277,9 +250,14 @@
 <script setup lang="ts">
 import { computed, defineComponent, h, onMounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { storeToRefs } from 'pinia'
 
 import SandboxSetupDialog from '@/components/sandbox/SandboxSetupDialog.vue'
-import { useSandboxSettings } from '@/composables/settings/useSandboxSettings'
+import {
+  useSandboxSettings,
+  type SandboxPolicySection,
+} from '@/composables/settings/useSandboxSettings'
+import { useSandboxSetupStore } from '@/stores/sandboxSetup'
 
 const { t } = useI18n()
 const {
@@ -288,27 +266,24 @@ const {
   capabilityCheckFailed,
   loadError,
   capability,
-  sandboxSetupPending,
-  sandboxSetupOutcome,
   canRequestSandboxSetup,
   draft,
   builtinDenyWritePaths,
   runtimeTarget,
   runtimeVersions,
   defaultRunMode,
-  defaultRunModeBaseline,
-  defaultRunModePending,
-  defaultRunModeError,
-  sectionPending,
-  sectionError,
-  sectionDirty,
   load,
-  ensureSandboxSetupForSafeMode,
-  saveDefaultRunMode,
-  discardDefaultRunMode,
-  saveSection,
-  discardSection,
+  setDefaultRunMode,
+  adoptSavedDefaultRunMode,
+  scheduleSectionSave,
+  flushSectionSave,
 } = useSandboxSettings()
+const sandboxSetupStore = useSandboxSetupStore()
+const {
+  ensuring: sandboxSetupPending,
+  outcome: sandboxSetupOutcome,
+  intendedMode: sandboxSetupIntendedMode,
+} = storeToRefs(sandboxSetupStore)
 
 const newFilePath = ref('')
 const approvalPrefix = ref('')
@@ -329,12 +304,18 @@ const sandboxSetupOutcomeMessage = computed(() => {
 })
 
 function selectSafeMode(): void {
-  sandboxSetupOutcome.value = 'idle'
+  sandboxSetupStore.resetOutcome()
+  sandboxSetupStore.noteRunModeSelection('safe')
   if (capability.value?.available) {
-    defaultRunMode.value = 'safe'
+    void setDefaultRunMode('safe')
     return
   }
   if (canRequestSandboxSetup.value) sandboxSetupConfirmOpen.value = true
+}
+
+function selectFullMode(): Promise<boolean> {
+  sandboxSetupStore.noteRunModeSelection('full')
+  return setDefaultRunMode('full')
 }
 
 function cancelSandboxSetup(): void {
@@ -344,11 +325,16 @@ function cancelSandboxSetup(): void {
 
 async function continueSandboxSetup(): Promise<void> {
   if (sandboxSetupPending.value) return
-  const ready = await ensureSandboxSetupForSafeMode()
+  const ready = await sandboxSetupStore.startSafeSetup()
   if (ready) {
     sandboxSetupConfirmOpen.value = false
-    defaultRunMode.value = 'safe'
+    if (sandboxSetupIntendedMode.value === 'safe') adoptSavedDefaultRunMode('safe')
+    await load()
   }
+}
+
+function runSandboxSetupInBackground(): void {
+  sandboxSetupConfirmOpen.value = false
 }
 
 const backupQuotaGiB = computed({
@@ -426,51 +412,38 @@ const CommandIcon = createLineIcon(['M5 7l4 5-4 5', 'M11 17h8'])
 const NetworkIcon = createLineIcon(['M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18z', 'M3 12h18', 'M12 3c2.5 2.5 3.5 5.5 3.5 9s-1 6.5-3.5 9c-2.5-2.5-3.5-5.5-3.5-9s1-6.5 3.5-9z'])
 const RuntimeIcon = createLineIcon(['M8 3h8', 'M9 3v5l-4 8a3 3 0 0 0 2.7 4h8.6a3 3 0 0 0 2.7-4l-4-8V3', 'M7.5 15h9'])
 
-function removeAt<T>(values: T[], index: number): void {
+function removeAt<T>(values: T[], index: number, section: SandboxPolicySection): void {
   values.splice(index, 1)
+  void flushSectionSave(section)
 }
 
-function addTextRule(values: string[], raw: string, clear: (value: string) => void): void {
+function addTextRule(
+  values: string[],
+  raw: string,
+  clear: (value: string) => void,
+  section: SandboxPolicySection,
+): void {
   const value = raw.trim()
-  if (value && !values.includes(value)) values.push(value)
-  clear('')
-}
-
-function addPrefix(values: string[][], raw: string, clear: (value: string) => void): void {
-  const prefix = raw.trim().split(/\s+/).filter(Boolean)
-  if (prefix.length && !values.some(value => JSON.stringify(value) === JSON.stringify(prefix))) {
-    values.push(prefix)
+  if (value && !values.includes(value)) {
+    values.push(value)
+    void flushSectionSave(section)
   }
   clear('')
 }
 
-const SectionActions = defineComponent({
-  props: {
-    dirty: { type: Boolean, required: true },
-    pending: { type: Boolean, required: true },
-    error: { type: String, required: true },
-  },
-  emits: ['save', 'discard'],
-  setup(props, { emit }) {
-    return () => (!props.dirty && !props.error) ? null : h('div', { class: 'sandbox-actions' }, [
-      props.error ? h('p', { class: 'sandbox-error', role: 'alert' }, props.error) : null,
-      h('span', { class: 'sandbox-actions__spacer' }),
-      h('button', {
-        type: 'button',
-        class: 'btn',
-        disabled: !props.dirty || props.pending,
-        onClick: () => emit('discard'),
-      }, t('common.discard')),
-      h('button', {
-        type: 'button',
-        class: 'btn btn--primary',
-        disabled: !props.dirty || props.pending,
-        'data-testid': 'save-sandbox-section',
-        onClick: () => emit('save'),
-      }, props.pending ? t('settings.sandbox.actions.saving') : t('common.save')),
-    ])
-  },
-})
+function addPrefix(
+  values: string[][],
+  raw: string,
+  clear: (value: string) => void,
+  section: SandboxPolicySection,
+): void {
+  const prefix = raw.trim().split(/\s+/).filter(Boolean)
+  if (prefix.length && !values.some(value => JSON.stringify(value) === JSON.stringify(prefix))) {
+    values.push(prefix)
+    void flushSectionSave(section)
+  }
+  clear('')
+}
 
 const RuleEditor = defineComponent({
   props: {
@@ -553,7 +526,6 @@ onMounted(() => void load())
 .sandbox-settings__header,
 .sandbox-card__head,
 .sandbox-option,
-.sandbox-actions,
 .sandbox-token-row {
   display: flex;
   align-items: center;
@@ -971,15 +943,6 @@ onMounted(() => void load())
   padding: 0.7rem;
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
-}
-
-.sandbox-actions__spacer {
-  flex: 1;
-}
-
-.sandbox-error {
-  color: var(--danger);
-  font-size: 0.75rem;
 }
 
 .sandbox-lan-rules p {

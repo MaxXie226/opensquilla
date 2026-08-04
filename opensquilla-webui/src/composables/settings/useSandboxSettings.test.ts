@@ -48,8 +48,11 @@ async function createSandboxSettings(options: {
   capabilityError?: boolean
   capabilityResult?: unknown
   setupState?: 'not_setup' | 'ready'
+  policyUpdate?: (params: Record<string, unknown>) => unknown | Promise<unknown>
+  runModeSetError?: Error
 } = {}) {
   vi.resetModules()
+  const pushToast = vi.fn()
   const call = vi.fn(async (method: string, params?: Record<string, unknown>) => {
     if (method === 'sandbox.policy.get') return structuredClone(policy)
     if (method === 'sandbox.policy.defaults') return {}
@@ -75,6 +78,16 @@ async function createSandboxSettings(options: {
         requiresAdmin: false,
       }
     }
+    if (method === 'sandbox.run_mode.preference.set') {
+      if (options.runModeSetError) throw options.runModeSetError
+      return { runMode: params?.runMode, source: 'preference' }
+    }
+    if (method === 'sandbox.policy.update') {
+      if (options.policyUpdate) return options.policyUpdate(params ?? {})
+      const saved = structuredClone(params?.policy as typeof policy)
+      saved.policyVersion = Number(params?.basePolicyVersion) + 1
+      return saved
+    }
     throw new Error(`unexpected method: ${method} ${JSON.stringify(params)}`)
   })
   vi.doMock('@/stores/rpc', () => ({
@@ -89,12 +102,15 @@ async function createSandboxSettings(options: {
       settings: {},
     }),
   }))
+  vi.doMock('@/composables/useToasts', () => ({
+    useToasts: () => ({ pushToast }),
+  }))
 
   const { effectScope } = await import('vue')
   const { useSandboxSettings } = await import('./useSandboxSettings')
   const scope: EffectScope = effectScope()
   const settings = scope.run(() => useSandboxSettings())!
-  return { call, scope, settings }
+  return { call, pushToast, scope, settings }
 }
 
 function capabilityCalls(call: ReturnType<typeof vi.fn>) {
@@ -104,8 +120,115 @@ function capabilityCalls(call: ReturnType<typeof vi.fn>) {
 afterEach(() => {
   vi.doUnmock('@/stores/rpc')
   vi.doUnmock('@/platform')
+  vi.doUnmock('@/composables/useToasts')
   vi.restoreAllMocks()
   vi.useRealTimers()
+})
+
+describe('useSandboxSettings auto-save', () => {
+  it('persists a default mode selection without a separate save action', async () => {
+    const { call, scope, settings } = await createSandboxSettings()
+    await settings.load()
+
+    await settings.setDefaultRunMode('safe')
+
+    expect(call).toHaveBeenCalledWith('sandbox.run_mode.preference.set', { runMode: 'safe' })
+    expect(settings.defaultRunMode.value).toBe('safe')
+    expect(settings.defaultRunModeBaseline.value).toBe('safe')
+    scope.stop()
+  })
+
+  it('adopts a mode already persisted by the shared setup task without writing it twice', async () => {
+    const { call, scope, settings } = await createSandboxSettings()
+    await settings.load()
+
+    settings.adoptSavedDefaultRunMode('safe')
+
+    expect(settings.defaultRunMode.value).toBe('safe')
+    expect(settings.defaultRunModeBaseline.value).toBe('safe')
+    expect(call.mock.calls.filter(([method]) => method === 'sandbox.run_mode.preference.set'))
+      .toHaveLength(0)
+    scope.stop()
+  })
+
+  it('debounces free-form section edits for 500 milliseconds', async () => {
+    vi.useFakeTimers()
+    const { call, scope, settings } = await createSandboxSettings()
+    await settings.load()
+    settings.draft.value!.network.blockAllNetwork = true
+
+    settings.scheduleSectionSave('network')
+    await vi.advanceTimersByTimeAsync(499)
+    expect(call.mock.calls.some(([method]) => method === 'sandbox.policy.update')).toBe(false)
+
+    await vi.advanceTimersByTimeAsync(1)
+    await settle()
+    expect(call).toHaveBeenCalledWith('sandbox.policy.update', expect.objectContaining({
+      basePolicyVersion: 0,
+      policy: expect.objectContaining({
+        network: expect.objectContaining({ blockAllNetwork: true }),
+      }),
+    }))
+    scope.stop()
+  })
+
+  it('rolls back only the failed section and shows one toast', async () => {
+    const { pushToast, scope, settings } = await createSandboxSettings({
+      policyUpdate: async () => { throw new Error('save rejected') },
+    })
+    await settings.load()
+    settings.draft.value!.network.blockAllNetwork = true
+    settings.draft.value!.files.customDenyWritePaths.push('D:\\keep-this-draft')
+
+    await expect(settings.flushSectionSave('network')).resolves.toBe(false)
+
+    expect(settings.draft.value!.network.blockAllNetwork).toBe(false)
+    expect(settings.draft.value!.files.customDenyWritePaths).toEqual(['D:\\keep-this-draft'])
+    expect(pushToast).toHaveBeenCalledTimes(1)
+    expect(pushToast).toHaveBeenCalledWith(expect.any(String), { tone: 'danger' })
+    scope.stop()
+  })
+
+  it('preserves edits made to the same section during an in-flight save', async () => {
+    let resolveFirst!: (value: unknown) => void
+    const first = new Promise(resolve => { resolveFirst = resolve })
+    let updateCount = 0
+    const { call, scope, settings } = await createSandboxSettings({
+      policyUpdate: async (params) => {
+        updateCount += 1
+        if (updateCount === 1) return first
+        const saved = structuredClone(params.policy as typeof policy)
+        saved.policyVersion = Number(params.basePolicyVersion) + 1
+        return saved
+      },
+    })
+    await settings.load()
+    settings.draft.value!.network.blockAllNetwork = true
+    const saving = settings.flushSectionSave('network')
+    await settle()
+
+    settings.draft.value!.network.denyDomains.push('telemetry.example.com')
+    const firstSaved = structuredClone(policy)
+    firstSaved.policyVersion = 1
+    firstSaved.network.blockAllNetwork = true
+    resolveFirst(firstSaved)
+
+    await expect(saving).resolves.toBe(true)
+    await settle()
+
+    expect(settings.draft.value!.network.denyDomains).toEqual(['telemetry.example.com'])
+    expect(call.mock.calls.filter(([method]) => method === 'sandbox.policy.update')).toHaveLength(2)
+    expect(call.mock.calls.filter(([method]) => method === 'sandbox.policy.update')[1]?.[1])
+      .toEqual(expect.objectContaining({
+        basePolicyVersion: 1,
+        policy: expect.objectContaining({
+          network: expect.objectContaining({
+            denyDomains: ['telemetry.example.com'],
+          }),
+        }),
+      }))
+    scope.stop()
+  })
 })
 
 describe('useSandboxSettings capability checks', () => {

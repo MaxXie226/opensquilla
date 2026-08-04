@@ -1,5 +1,7 @@
 import { computed, onScopeDispose, reactive, ref } from 'vue'
 
+import i18n from '@/i18n'
+import { useToasts } from '@/composables/useToasts'
 import { usePlatform } from '@/platform'
 import { useRpcStore } from '@/stores/rpc'
 import {
@@ -18,6 +20,8 @@ import type {
 export type SandboxPolicySection = 'files' | 'commands' | 'network' | 'runtimes'
 export type { SandboxSetupOutcome } from '@/composables/sandboxSetupCoordinator'
 
+const SECTION_SAVE_DELAY_MS = 500
+
 function clonePolicy(policy: SandboxPolicy): SandboxPolicy {
   return JSON.parse(JSON.stringify(policy)) as SandboxPolicy
 }
@@ -29,6 +33,7 @@ function errorMessage(error: unknown): string {
 export function useSandboxSettings() {
   const rpc = useRpcStore()
   const platform = usePlatform()
+  const { pushToast } = useToasts()
   const loading = ref(false)
   const capabilityLoading = ref(false)
   const capabilityCheckFailed = ref(false)
@@ -61,7 +66,9 @@ export function useSandboxSettings() {
     network: '',
     runtimes: '',
   })
-  let saveQueue = Promise.resolve()
+  let saveQueue: Promise<void> = Promise.resolve()
+  let defaultRunModeSequence = 0
+  const sectionSaveTimers: Partial<Record<SandboxPolicySection, ReturnType<typeof setTimeout>>> = {}
   let disposed = false
   let capabilityRequestGeneration = 0
 
@@ -180,6 +187,9 @@ export function useSandboxSettings() {
   onScopeDispose(() => {
     disposed = true
     capabilityRequestGeneration += 1
+    for (const timer of Object.values(sectionSaveTimers)) {
+      if (timer) clearTimeout(timer)
+    }
   })
 
   async function loadDesktopPreference(): Promise<void> {
@@ -196,26 +206,62 @@ export function useSandboxSettings() {
     }
   }
 
-  async function saveDefaultRunMode(): Promise<void> {
-    if (defaultRunMode.value === defaultRunModeBaseline.value) return
-    defaultRunModePending.value = true
+  function queueSave<T>(operation: () => Promise<T>): Promise<T> {
+    const queued = saveQueue.then(operation)
+    saveQueue = queued.then(() => undefined, () => undefined)
+    return queued
+  }
+
+  function reportSaveFailure(): void {
+    pushToast(i18n.global.t('errors.saveFailed'), { tone: 'danger' })
+  }
+
+  async function setDefaultRunMode(mode: SandboxRunMode): Promise<boolean> {
+    const sequence = ++defaultRunModeSequence
+    const hadPendingSelection = defaultRunModePending.value
+    defaultRunMode.value = mode
     defaultRunModeError.value = ''
-    try {
-      const payload = await rpc.call<{ runMode?: unknown }>(
+    if (mode === defaultRunModeBaseline.value && !hadPendingSelection) return true
+    defaultRunModePending.value = true
+    return queueSave(async () => {
+      try {
+        const payload = await rpc.call<{ runMode?: unknown }>(
         'sandbox.run_mode.preference.set',
-        { runMode: defaultRunMode.value },
-      )
-      defaultRunModeBaseline.value = payload.runMode === 'full' ? 'full' : 'safe'
-      defaultRunMode.value = defaultRunModeBaseline.value
-    } catch (error) {
-      defaultRunModeError.value = errorMessage(error)
-      throw error
-    } finally {
-      defaultRunModePending.value = false
-    }
+          { runMode: mode },
+        )
+        if (sequence === defaultRunModeSequence) {
+          const savedMode: SandboxRunMode = payload.runMode === 'full' ? 'full' : 'safe'
+          defaultRunModeBaseline.value = savedMode
+          defaultRunMode.value = savedMode
+        }
+        return true
+      } catch (error) {
+        if (sequence === defaultRunModeSequence) {
+          defaultRunModeError.value = errorMessage(error)
+          defaultRunMode.value = defaultRunModeBaseline.value
+          reportSaveFailure()
+        }
+        return false
+      } finally {
+        if (sequence === defaultRunModeSequence) defaultRunModePending.value = false
+      }
+    })
+  }
+
+  async function saveDefaultRunMode(): Promise<void> {
+    await setDefaultRunMode(defaultRunMode.value)
+  }
+
+  function adoptSavedDefaultRunMode(mode: SandboxRunMode): void {
+    defaultRunModeSequence += 1
+    defaultRunModeBaseline.value = mode
+    defaultRunMode.value = mode
+    defaultRunModeError.value = ''
+    defaultRunModePending.value = false
   }
 
   function discardDefaultRunMode(): void {
+    defaultRunModeSequence += 1
     defaultRunMode.value = defaultRunModeBaseline.value
     defaultRunModeError.value = ''
   }
@@ -236,41 +282,75 @@ export function useSandboxSettings() {
     }
   }
 
-  async function performSectionSave(section: SandboxPolicySection): Promise<void> {
-    if (!baseline.value || !draft.value || !sectionDirty(section)) return
+  async function performSectionSave(section: SandboxPolicySection): Promise<boolean> {
+    if (!baseline.value || !draft.value || !sectionDirty(section)) return true
     sectionPending[section] = true
     sectionError[section] = ''
+    const submittedSection = JSON.parse(JSON.stringify(draft.value[section]))
     try {
-      const sectionValue = JSON.parse(JSON.stringify(draft.value[section]))
       const candidate = clonePolicy(baseline.value)
-      Object.assign(candidate, { [section]: sectionValue })
+      Object.assign(candidate, { [section]: submittedSection })
       const saved = await rpc.call<SandboxPolicy>('sandbox.policy.update', {
         basePolicyVersion: baseline.value.policyVersion,
         policy: candidate,
       })
-      const otherDrafts = clonePolicy(draft.value)
+      const currentDraft = clonePolicy(draft.value)
+      const sectionChangedWhileSaving = (
+        JSON.stringify(currentDraft[section]) !== JSON.stringify(submittedSection)
+      )
       baseline.value = clonePolicy(saved)
       draft.value = clonePolicy(saved)
       for (const other of ['files', 'commands', 'network', 'runtimes'] as const) {
-        if (other !== section) Object.assign(draft.value, { [other]: otherDrafts[other] })
+        if (other !== section) Object.assign(draft.value, { [other]: currentDraft[other] })
       }
+      if (sectionChangedWhileSaving) {
+        Object.assign(draft.value, { [section]: currentDraft[section] })
+        void flushSectionSave(section)
+      }
+      return true
     } catch (error) {
       sectionError[section] = errorMessage(error)
-      throw error
+      if (baseline.value && draft.value) {
+        Object.assign(draft.value, {
+          [section]: JSON.parse(JSON.stringify(baseline.value[section])),
+        })
+      }
+      reportSaveFailure()
+      return false
     } finally {
       sectionPending[section] = false
     }
   }
 
+  function clearSectionSaveTimer(section: SandboxPolicySection): void {
+    const timer = sectionSaveTimers[section]
+    if (timer) clearTimeout(timer)
+    delete sectionSaveTimers[section]
+  }
+
+  function flushSectionSave(section: SandboxPolicySection): Promise<boolean> {
+    clearSectionSaveTimer(section)
+    return queueSave(() => performSectionSave(section))
+  }
+
+  function scheduleSectionSave(section: SandboxPolicySection): void {
+    clearSectionSaveTimer(section)
+    sectionSaveTimers[section] = setTimeout(() => {
+      delete sectionSaveTimers[section]
+      void flushSectionSave(section)
+    }, SECTION_SAVE_DELAY_MS)
+  }
+
   function saveSection(section: SandboxPolicySection): Promise<void> {
-    const queued = saveQueue.then(() => performSectionSave(section))
-    saveQueue = queued.catch(() => undefined)
-    return queued
+    return flushSectionSave(section).then(() => undefined)
   }
 
   function discardSection(section: SandboxPolicySection): void {
     if (!baseline.value || !draft.value) return
-    draft.value[section] = JSON.parse(JSON.stringify(baseline.value[section]))
+    clearSectionSaveTimer(section)
+    Object.assign(draft.value, {
+      [section]: JSON.parse(JSON.stringify(baseline.value[section])),
+    })
     sectionError[section] = ''
   }
 
@@ -304,9 +384,13 @@ export function useSandboxSettings() {
     loadCapability,
     loadSetupStatus,
     ensureSandboxSetupForSafeMode,
+    setDefaultRunMode,
+    adoptSavedDefaultRunMode,
     saveDefaultRunMode,
     discardDefaultRunMode,
     resetSandboxUnavailableWarning,
+    scheduleSectionSave,
+    flushSectionSave,
     saveSection,
     discardSection,
   }

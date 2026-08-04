@@ -45,7 +45,10 @@ describe('ChatComposer control hierarchy', () => {
     expect(viewSource).toContain('<SandboxSetupDialog')
     expect(viewSource).toContain(':open="composerSandboxSetupOpen"')
     expect(viewSource).toContain('@confirm="void confirmComposerSandboxSetup()"')
-    expect(viewSource).toContain('completeComposerSafeSetup')
+    expect(viewSource).toContain('@background="runComposerSandboxSetupInBackground"')
+    expect(viewSource).toContain('useSandboxSetupStore')
+    expect(viewSource).toContain('sandboxSetupStore.startSafeSetup()')
+    expect(viewSource).not.toContain('completeComposerSafeSetup')
     expect(viewSource).toContain('composerRunModeSelectionAction')
   })
 

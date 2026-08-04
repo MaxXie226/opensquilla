@@ -535,9 +535,10 @@
     />
     <SandboxSetupDialog
       :open="composerSandboxSetupOpen"
-      :pending="sandboxSetupRecovery.ensuring.value"
-      :outcome="sandboxSetupRecovery.outcome.value"
+      :pending="sandboxSetupPending"
+      :outcome="sandboxSetupOutcome"
       @cancel="cancelComposerSandboxSetup"
+      @background="runComposerSandboxSetupInBackground"
       @confirm="void confirmComposerSandboxSetup()"
     />
     <ProjectWorkspacePickerDialog
@@ -594,9 +595,11 @@
 import { ref, computed, onMounted, onUnmounted, nextTick, watch, watchEffect } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
+import { storeToRefs } from 'pinia'
 import { useRpcStore } from '@/stores/rpc'
 import { useRpcCall } from '@/composables/useRpc'
 import { useAppStore } from '@/stores/app'
+import { useSandboxSetupStore } from '@/stores/sandboxSetup'
 import { useWorkbenchStore } from '@/workbench/store'
 import { usePlatform } from '@/platform'
 import ApprovalCard from '@/components/chat/ApprovalCard.vue'
@@ -655,7 +658,6 @@ import { useChatRpcEventHandlers } from '@/composables/chat/useChatRpcEventHandl
 import { useChatRpcSubscriptions } from '@/composables/chat/useChatRpcSubscriptions'
 import { useChatSend, type ChatSendOutcome } from '@/composables/chat/useChatSend'
 import {
-  completeComposerSafeSetup,
   composerRunModeSelectionAction,
   effectiveComposerRunMode,
 } from '@/composables/chat/composerRunMode'
@@ -821,6 +823,11 @@ const toolResultModal = ref<{
 /* ── Stores / Router ───────────────────────────────────────────────── */
 
 const rpc = useRpcStore()
+const sandboxSetupStore = useSandboxSetupStore()
+const {
+  ensuring: sandboxSetupPending,
+  outcome: sandboxSetupOutcome,
+} = storeToRefs(sandboxSetupStore)
 // Setup runs before this view's/ancestor children's mounted hooks. Holding the
 // admission gate here prevents global onboarding/workspace metadata calls from
 // entering the serialized Gateway queue ahead of session recovery.
@@ -2732,6 +2739,7 @@ async function persistComposerRunMode(mode: SandboxRunMode): Promise<void> {
 
 async function setComposerRunMode(mode: SandboxRunMode): Promise<void> {
   if (runModeLocked.value) return
+  sandboxSetupStore.noteRunModeSelection(mode)
   const action = composerRunModeSelectionAction(
     mode,
     sandboxSetupStatus.value,
@@ -2740,7 +2748,7 @@ async function setComposerRunMode(mode: SandboxRunMode): Promise<void> {
   )
   if (action === 'ignore') return
   if (action === 'setup') {
-    sandboxSetupRecovery.outcome.value = 'idle'
+    sandboxSetupStore.resetOutcome()
     composerSandboxSetupOpen.value = true
     return
   }
@@ -2752,21 +2760,22 @@ async function setComposerRunMode(mode: SandboxRunMode): Promise<void> {
 }
 
 function cancelComposerSandboxSetup(): void {
-  if (sandboxSetupRecovery.ensuring.value) return
+  if (sandboxSetupPending.value) return
   composerSandboxSetupOpen.value = false
 }
 
 async function confirmComposerSandboxSetup(): Promise<void> {
-  if (sandboxSetupRecovery.ensuring.value) return
-  try {
-    const ready = await completeComposerSafeSetup(
-      () => sandboxSetupRecovery.ensureSetup(),
-      persistComposerRunMode,
-    )
-    if (ready) composerSandboxSetupOpen.value = false
-  } catch (cause) {
-    reportRunModePersistenceError(cause)
+  if (sandboxSetupPending.value) return
+  const ready = await sandboxSetupStore.startSafeSetup()
+  if (ready) {
+    composerSandboxSetupOpen.value = false
+    await refreshRunModePreference()
+    await sandboxSetupRecovery.refresh()
   }
+}
+
+function runComposerSandboxSetupInBackground(): void {
+  composerSandboxSetupOpen.value = false
 }
 
 async function setComposerModelRoutingMode(mode: ModelRoutingMode) {
