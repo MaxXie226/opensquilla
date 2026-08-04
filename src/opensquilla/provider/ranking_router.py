@@ -1216,6 +1216,7 @@ def _validate_ranking_config(
         },
         ("aggregator",): {
             *(("candidate_count",) if has_roster_policy else ()),
+            *(("prompt_version",) if "prompt_version" in aggregator_config else ()),
             "task_match_weight",
             "role_fit_weight",
             "same_model_penalty",
@@ -1230,6 +1231,16 @@ def _validate_ranking_config(
         }
     for object_path, expected_keys in fixed_object_keys.items():
         _require_exact_config_keys(config, object_path, expected_keys)
+    if "prompt_version" in aggregator_config:
+        from .aggregator_prompt import AGGREGATOR_PROMPT_VERSIONS
+
+        prompt_version = _ranking_string(config, "aggregator", "prompt_version")
+        if prompt_version not in AGGREGATOR_PROMPT_VERSIONS:
+            supported = ", ".join(sorted(AGGREGATOR_PROMPT_VERSIONS))
+            raise DynamicRankingError(
+                "router_dynamic ranking config aggregator.prompt_version must be one "
+                f"of {supported}"
+            )
     if has_thinking_policy:
         _thinking_assignment_policy(
             config,

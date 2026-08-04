@@ -21,6 +21,11 @@ from typing import Any, Literal
 import structlog
 
 from opensquilla.context_budget import ContextBudgetGovernor
+from opensquilla.provider.aggregator_prompt import (
+    AGGREGATOR_PROMPT_VERSION_CURRENT,
+    aggregator_prompt_additional_instructions,
+    aggregator_prompt_version_evidence,
+)
 from opensquilla.safety.injection_guard import wrap_untrusted
 from opensquilla.usage_evidence import (
     USAGE_EVIDENCE_SCHEMA,
@@ -3373,6 +3378,7 @@ class EnsembleProvider:
         aggregator_recovery_top_k: int = 3,
         aggregator_max_tokens_cap: int = 65_536,
         aggregator_visible_answer_reserve_tokens: int = 8_192,
+        aggregator_prompt_version: str = AGGREGATOR_PROMPT_VERSION_CURRENT,
         proposer_backups: Sequence[EnsembleMemberConfig] = (),
         proposer_recovery_max_additional_calls: int = 3,
         proposer_max_tokens_cap: int = 65_536,
@@ -3429,6 +3435,12 @@ class EnsembleProvider:
         self.aggregator_visible_answer_reserve_tokens = int(
             aggregator_visible_answer_reserve_tokens or 0
         )
+        self.aggregator_prompt_evidence = aggregator_prompt_version_evidence(
+            aggregator_prompt_version
+        )
+        self.aggregator_prompt_version = str(
+            self.aggregator_prompt_evidence["version"]
+        )
         self.proposer_backups = [
             _detached_ensemble_member(member)
             for member in proposer_backups
@@ -3473,6 +3485,15 @@ class EnsembleProvider:
         )
         if not isinstance(normalized_selection_plan, dict):
             raise ValueError("llm ensemble selection plan must be a mapping")
+        declared_prompt = normalized_selection_plan.get("aggregator_prompt")
+        if (
+            declared_prompt is not None
+            and declared_prompt != self.aggregator_prompt_evidence
+        ):
+            raise ValueError(
+                "llm ensemble selection plan aggregator prompt evidence does not "
+                "match the executable prompt version"
+            )
         self.selection_plan = normalized_selection_plan
         self._router_dynamic_declared_at_init = bool(
             self.selection_plan.get("strategy") == "router_dynamic"
@@ -10661,6 +10682,9 @@ class EnsembleProvider:
                 ]
             )
         lines.extend(
+            aggregator_prompt_additional_instructions(self.aggregator_prompt_version)
+        )
+        lines.extend(
             [
                 "Do not mention the ensemble, candidates, or model names unless the "
                 "user explicitly asks.",
@@ -10807,6 +10831,10 @@ class EnsembleProvider:
                 for candidate in candidates
             ],
         }
+        if "aggregator_prompt" in self.selection_plan:
+            trace["aggregator_prompt"] = _json_safe(
+                self.aggregator_prompt_evidence
+            )
         if self.selection_plan:
             trace["selection_plan"] = _json_safe(
                 self._selection_plan_execution_snapshot()
@@ -17173,6 +17201,25 @@ def build_ensemble_provider_from_config(
         )
     else:
         raise ValueError(f"unknown llm_ensemble.selection_mode {selection_mode!r}")
+    aggregator_prompt_version = AGGREGATOR_PROMPT_VERSION_CURRENT
+    if selection_mode == "router_dynamic":
+        ranking_parameters = selection_plan.get("ranking_parameters")
+        aggregator_policy = (
+            ranking_parameters.get("aggregator")
+            if isinstance(ranking_parameters, Mapping)
+            else None
+        )
+        aggregator_prompt_version = str(
+            (
+                aggregator_policy.get("prompt_version")
+                if isinstance(aggregator_policy, Mapping)
+                else None
+            )
+            or AGGREGATOR_PROMPT_VERSION_CURRENT
+        )
+        selection_plan["aggregator_prompt"] = aggregator_prompt_version_evidence(
+            aggregator_prompt_version
+        )
     is_custom_b5 = selection_mode == CUSTOM_B5_SELECTION_MODE
     # Static and custom lineups share the fixed-lineup defaults family
     # (quorum replacement, 300/480s timeouts, no shuffle, quorum grace);
@@ -17457,6 +17504,7 @@ def build_ensemble_provider_from_config(
             )
             or 8_192
         ),
+        aggregator_prompt_version=aggregator_prompt_version,
         proposer_backups=proposer_backups,
         proposer_recovery_max_additional_calls=(
             proposer_recovery_max_additional_calls

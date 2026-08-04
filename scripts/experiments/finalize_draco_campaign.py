@@ -6380,6 +6380,11 @@ def ensemble_gate(
         if isinstance(routing, Mapping) and isinstance(routing.get("selection_plan"), Mapping)
         else {}
     )
+    planned_prompt = selection_plan.get("aggregator_prompt")
+    if planned_prompt is not None and trace.get("aggregator_prompt") != planned_prompt:
+        reasons = ["g1_aggregator_prompt_trace_mismatch"]
+    else:
+        reasons = []
     raw_proposers = selection_plan.get("proposer_models")
     planned_proposers = (
         tuple(str(item) for item in raw_proposers) if isinstance(raw_proposers, list) else ()
@@ -6387,7 +6392,6 @@ def ensemble_gate(
     planned_aggregator = str(selection_plan.get("aggregator_model") or "")
     proposers = tuple(expected_proposers) if expected_proposers is not None else planned_proposers
     aggregator = expected_aggregator or planned_aggregator
-    reasons: list[str] = []
     if not proposers:
         reasons.append("missing_proposer_models")
     if not aggregator:
@@ -6525,6 +6529,41 @@ def legacy_managed_v3_source_authenticated(
     )
 
 
+def g1_aggregator_prompt_plan_reason(plan: Mapping[str, Any]) -> str:
+    """Authenticate the exact prompt policy selected by the frozen ranker."""
+
+    from opensquilla.provider.aggregator_prompt import (
+        AGGREGATOR_PROMPT_VERSION_CURRENT,
+        valid_aggregator_prompt_evidence,
+    )
+
+    ranking_parameters = plan.get("ranking_parameters")
+    aggregator_policy = (
+        ranking_parameters.get("aggregator")
+        if isinstance(ranking_parameters, Mapping)
+        else None
+    )
+    configured_version = (
+        aggregator_policy.get("prompt_version")
+        if isinstance(aggregator_policy, Mapping)
+        else None
+    )
+    evidence = plan.get("aggregator_prompt")
+    # Archived pre-P0-35 plans did not record this additive field. New plans
+    # always include it, including the byte-equivalent v1 baseline.
+    if evidence is None and configured_version is None:
+        return ""
+    expected_version = configured_version or AGGREGATOR_PROMPT_VERSION_CURRENT
+    return (
+        ""
+        if valid_aggregator_prompt_evidence(
+            evidence,
+            expected_version=expected_version,
+        )
+        else "wrong_g1_aggregator_prompt"
+    )
+
+
 def g1_registry_plan_reasons(
     plan: Any,
     *,
@@ -6641,6 +6680,9 @@ def g1_registry_plan_reasons(
     ):
         reasons.append("wrong_g1_ranking_config")
     ranking_parameters = plan.get("ranking_parameters")
+    prompt_reason = g1_aggregator_prompt_plan_reason(plan)
+    if prompt_reason:
+        reasons.append(prompt_reason)
     ranking_parameters = ranking_parameters if isinstance(ranking_parameters, Mapping) else {}
     proposer_count_policy = ranking_parameters.get("proposer_count")
     proposer_count_policy = (
@@ -6840,6 +6882,7 @@ _G1_LIFECYCLE_PLAN_MATCH_FIELDS = (
     "aggregator_recovery_top_k",
     "aggregator_max_tokens_cap",
     "aggregator_visible_answer_reserve_tokens",
+    "aggregator_prompt",
     "task_analyzer",
     "task_profile",
     "task_profile_hash",
