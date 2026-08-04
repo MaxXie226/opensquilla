@@ -484,7 +484,10 @@
         "elapsed": "{seconds}s elapsed",
         "cancelled": "Setup was cancelled. Full Access is unchanged; you can try again anytime.",
         "failed": "Safe mode could not be configured. Full Access is unchanged; please try again.",
-        "verificationFailed": "Setup finished, but the live safety check did not pass. Full Access is unchanged; please try again."
+        "verificationFailed": "Setup finished, but the live safety check did not pass. Full Access is unchanged; please try again.",
+        "runInBackground": "Run in background",
+        "readyToast": "Safe mode is ready.",
+        "failedToast": "Safe mode setup could not finish. Try again from Safe mode."
       },
       "files": {
         "title": "File safety",

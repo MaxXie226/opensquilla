@@ -464,7 +464,8 @@
       "setup": {
         "title": "Safe-Modus einrichten", "description": "OpenSquilla benötigt einmalig eine Administratorfreigabe, um ein isoliertes Konto sowie Datei- und Netzwerkschutz einzurichten.", "descriptionWithDuration": "OpenSquilla benötigt einmalig eine Administratorfreigabe, um ein isoliertes Konto und Schutzmaßnahmen einzurichten. Die Ersteinrichtung dauert normalerweise etwa 20–30 Sekunden. Lassen Sie OpenSquilla geöffnet.",
         "continue": "Weiter", "configuring": "Wird eingerichtet…", "requestingApproval": "Bestätigen Sie die Windows-Abfrage, um fortzufahren.", "configuringProtection": "OpenSquilla richtet den Safe-Modus fertig ein. Lassen Sie die App geöffnet.", "takingLonger": "Die Ersteinrichtung kann einige Minuten dauern. Die Überprüfung läuft automatisch.", "elapsed": "{seconds} s vergangen", "cancelled": "Einrichtung abgebrochen. Der Vollzugriff bleibt unverändert; Sie können es jederzeit erneut versuchen.",
-        "failed": "Safe-Modus konnte nicht eingerichtet werden. Der Vollzugriff bleibt unverändert.", "verificationFailed": "Die Einrichtung ist fertig, aber die Sicherheitsprüfung ist fehlgeschlagen. Der Vollzugriff bleibt unverändert."
+        "failed": "Safe-Modus konnte nicht eingerichtet werden. Der Vollzugriff bleibt unverändert.", "verificationFailed": "Die Einrichtung ist fertig, aber die Sicherheitsprüfung ist fehlgeschlagen. Der Vollzugriff bleibt unverändert.",
+        "runInBackground": "Im Hintergrund einrichten", "readyToast": "Der Safe-Modus ist bereit.", "failedToast": "Die Einrichtung des Safe-Modus konnte nicht abgeschlossen werden. Versuchen Sie es erneut über den Safe-Modus."
       },
       "files": {
         "title": "Dateisicherheit", "description": "Normale Dateien sind lesbar. Änderungen an geschützten Pfaden erfordern eine Freigabe.", "readsAllowed": "Lesen erlaubt",

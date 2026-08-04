@@ -484,7 +484,10 @@
         "elapsed": "已等待 {seconds} 秒",
         "cancelled": "已取消配置。完全访问没有变化，你可以随时重试。",
         "failed": "暂时无法配置安全模式。完全访问没有变化，请稍后重试。",
-        "verificationFailed": "配置已完成，但实时安全检测未通过。完全访问没有变化，请重试。"
+        "verificationFailed": "配置已完成，但实时安全检测未通过。完全访问没有变化，请重试。",
+        "runInBackground": "后台配置",
+        "readyToast": "安全模式已配置完成。",
+        "failedToast": "安全模式配置未能完成，请从安全模式重新尝试。"
       },
       "files": {
         "title": "文件安全",

@@ -464,7 +464,8 @@
       "setup": {
         "title": "Configurar el modo Seguro", "description": "OpenSquilla necesita una autorización de administrador para crear una cuenta aislada y configurar la protección de archivos y red.", "descriptionWithDuration": "OpenSquilla necesita una autorización de administrador para crear una cuenta aislada y configurar las protecciones. La primera configuración suele tardar unos 20–30 segundos. Mantén OpenSquilla abierto.",
         "continue": "Continuar", "configuring": "Configurando…", "requestingApproval": "Confirma el aviso de Windows para continuar.", "configuringProtection": "OpenSquilla está completando la configuración del modo Seguro. Mantén la aplicación abierta.", "takingLonger": "La primera configuración puede tardar unos minutos. La verificación se ejecutará automáticamente.", "elapsed": "{seconds} s transcurridos", "cancelled": "Configuración cancelada. El acceso completo no cambia; puedes volver a intentarlo.",
-        "failed": "No se pudo configurar el modo Seguro. El acceso completo no cambia.", "verificationFailed": "La configuración terminó, pero falló la comprobación de seguridad. El acceso completo no cambia."
+        "failed": "No se pudo configurar el modo Seguro. El acceso completo no cambia.", "verificationFailed": "La configuración terminó, pero falló la comprobación de seguridad. El acceso completo no cambia.",
+        "runInBackground": "Configurar en segundo plano", "readyToast": "El modo Seguro está listo.", "failedToast": "No se pudo completar la configuración del modo Seguro. Vuelve a intentarlo desde el modo Seguro."
       },
       "files": {
         "title": "Seguridad de archivos", "description": "Los archivos normales son legibles. Los cambios en rutas protegidas requieren aprobación.", "readsAllowed": "Lectura permitida",
