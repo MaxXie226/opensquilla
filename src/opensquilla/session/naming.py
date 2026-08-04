@@ -42,7 +42,9 @@ from opensquilla.provider.protocol import (
     provider_connection_config,
 )
 from opensquilla.provider.tokenrhythm_correlation import (
+    redact_tokenrhythm_install_ids,
     tokenrhythm_correlation_headers,
+    tokenrhythm_install_id_headers,
 )
 from opensquilla.router_tiers import DEFAULT_TEXT_TIER, normalize_text_tier
 
@@ -386,12 +388,18 @@ async def call_naming_llm(
         base_url=url,
     )
 
+    cancelled = False
+    client: httpx.AsyncClient | None = None
+    resp: httpx.Response | None = None
+    data: Any = None
+    raw: str | None = None
     try:
         async with httpx.AsyncClient(
             timeout=timeout,
             trust_env=_trust_env(),
             follow_redirects=False,
         ) as client:
+            headers.update(tokenrhythm_install_id_headers(provider, url))
             resp = await client.post(url, json=payload, headers=headers)
             resp.raise_for_status()
             data = resp.json()
@@ -401,14 +409,46 @@ async def call_naming_llm(
             )
             raw = data["choices"][0]["message"]["content"]
     except asyncio.CancelledError:
-        await usage.mark_unknown("cancelled")
-        raise
+        # A propagated cancellation retains this frame. Scrub request state before
+        # accounting and raise a fresh exception outside the handler so neither the
+        # original traceback nor its context can expose the installation header.
+        headers.clear()
+        client = None
+        resp = None
+        data = None
+        raw = None
+        cancelled = True
+        try:
+            await usage.mark_unknown("cancelled")
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
     except Exception as exc:  # noqa: BLE001 - naming is best-effort
-        await usage.mark_unknown("direct_request_failed")
-        log.warning("session_naming.llm_call_failed", model=model, error=str(exc))
-        return None
+        safe_error = redact_tokenrhythm_install_ids(str(exc))
+        headers.clear()
+        client = None
+        resp = None
+        data = None
+        raw = None
+        try:
+            await usage.mark_unknown("direct_request_failed")
+        except asyncio.CancelledError:
+            cancelled = True
+        except Exception:
+            pass
+        if not cancelled:
+            log.warning(
+                "session_naming.llm_call_failed",
+                model=model,
+                error=safe_error,
+            )
+            return None
 
-    return _sanitize_title(raw, max_chars)
+    if cancelled:
+        raise asyncio.CancelledError from None
+    safe_raw = redact_tokenrhythm_install_ids(raw) if isinstance(raw, str) else raw
+    return _sanitize_title(safe_raw, max_chars)
 
 
 async def generate_session_title(
@@ -506,4 +546,8 @@ async def generate_session_title(
         )
         log.info("session_naming.titled", session_key=session_key, title=title)
     except Exception as exc:  # noqa: BLE001 - never disturb the spawning turn
-        log.warning("session_naming.failed", session_key=session_key, error=str(exc))
+        log.warning(
+            "session_naming.failed",
+            session_key=session_key,
+            error=redact_tokenrhythm_install_ids(str(exc)),
+        )

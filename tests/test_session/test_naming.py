@@ -433,12 +433,23 @@ async def test_call_naming_llm_skips_when_request_framing_cannot_fit(monkeypatch
 @pytest.mark.asyncio
 async def test_call_naming_llm_adds_tokenrhythm_app_attribution(monkeypatch):
     captured: dict = {}
+    install_id = "synthetic-install-id"
     monkeypatch.setattr(
         "opensquilla.session.naming.httpx.AsyncClient",
-        lambda **kwargs: _fake_client(captured),
+        lambda **kwargs: _fake_client(captured, content=f'"Echo {install_id}"'),
+    )
+    monkeypatch.setattr(
+        "opensquilla.session.naming.tokenrhythm_install_id_headers",
+        lambda _provider_kind, _base_url: {
+            "X-OpenSquilla-Install-Id": install_id
+        },
+    )
+    monkeypatch.setattr(
+        "opensquilla.session.naming.redact_tokenrhythm_install_ids",
+        lambda text: text.replace(install_id, "***"),
     )
 
-    await call_naming_llm(
+    title = await call_naming_llm(
         "Help me reset my password please",
         model="deepseek-v4-flash",
         api_key="test-key",
@@ -459,6 +470,155 @@ async def test_call_naming_llm_adds_tokenrhythm_app_attribution(monkeypatch):
     assert captured["headers"]["X-OpenSquilla-Turn-Id"] == "turn-1"
     assert captured["headers"]["X-OpenSquilla-Execution-Id"] == "naming-1"
     assert captured["headers"]["X-OpenSquilla-Call-Kind"] == "auxiliary.naming"
+    assert captured["headers"]["X-OpenSquilla-Install-Id"] == install_id
+    assert install_id not in str(captured["json"])
+    # Title sanitization removes the trailing redaction marker as punctuation.
+    assert title == "Echo"
+
+
+@pytest.mark.asyncio
+async def test_call_naming_llm_cancellation_does_not_retain_install_id(monkeypatch):
+    install_id = "synthetic-cancelled-naming-install-id"
+    sent_headers: dict[str, str] = {}
+    usage_reasons: list[str] = []
+
+    class RetainingResponse:
+        text = ""
+
+        def __init__(self, headers: dict[str, str]) -> None:
+            self.request_headers = dict(headers)
+
+        def __repr__(self) -> str:
+            return f"RetainingResponse(headers={self.request_headers!r})"
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {
+                "choices": [{"message": {"content": "unused"}}],
+                "echo": install_id,
+            }
+
+    class RetainingClient:
+        def __init__(self) -> None:
+            self.request_headers: dict[str, str] = {}
+
+        def __repr__(self) -> str:
+            return f"RetainingClient(headers={self.request_headers!r})"
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+        async def post(self, url, *, json, headers):
+            self.request_headers = dict(headers)
+            sent_headers.update(headers)
+            return RetainingResponse(headers)
+
+    class CancellingUsage:
+        async def finalize_openai_response(self, data, *, raw_json) -> None:
+            raise asyncio.CancelledError
+
+        async def mark_unknown(self, reason: str) -> None:
+            usage_reasons.append(reason)
+
+    async def reserve_direct_usage_call(**_kwargs):
+        return CancellingUsage()
+
+    monkeypatch.setattr(
+        "opensquilla.session.naming.httpx.AsyncClient",
+        lambda **_kwargs: RetainingClient(),
+    )
+    monkeypatch.setattr(
+        "opensquilla.session.naming.tokenrhythm_install_id_headers",
+        lambda _provider_kind, _base_url: {
+            "X-OpenSquilla-Install-Id": install_id
+        },
+    )
+    monkeypatch.setattr(
+        "opensquilla.engine.usage_http.reserve_direct_usage_call",
+        reserve_direct_usage_call,
+    )
+
+    task = asyncio.create_task(
+        call_naming_llm(
+            "Help me reset my password please",
+            model="deepseek-v4-flash",
+            api_key="test-key",
+            base_url="https://tokenrhythm.studio/v1",
+            provider="tokenrhythm",
+        )
+    )
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await task
+
+    assert task.cancelled()
+    assert usage_reasons == ["cancelled"]
+    assert sent_headers["X-OpenSquilla-Install-Id"] == install_id
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+    traceback = caught.value.__traceback__
+    production_locals: list[str] = []
+    while traceback is not None:
+        frame = traceback.tb_frame
+        if (
+            frame.f_globals.get("__name__") == "opensquilla.session.naming"
+            and frame.f_code.co_name == "call_naming_llm"
+        ):
+            production_locals.append(repr(frame.f_locals))
+        traceback = traceback.tb_next
+    assert len(production_locals) == 1
+    assert install_id not in production_locals[0]
+
+
+@pytest.mark.asyncio
+async def test_call_naming_llm_redacts_install_id_from_failure_log(monkeypatch):
+    install_id = "i7"
+    warnings: list[tuple[str, dict]] = []
+
+    class FailingClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+        async def post(self, url, *, json, headers):
+            raise RuntimeError(f"upstream echoed {install_id}")
+
+    class CapturingLog:
+        def warning(self, event: str, **kwargs) -> None:
+            warnings.append((event, kwargs))
+
+    monkeypatch.setattr(
+        "opensquilla.session.naming.httpx.AsyncClient",
+        lambda **_kwargs: FailingClient(),
+    )
+    monkeypatch.setattr("opensquilla.session.naming.log", CapturingLog())
+    monkeypatch.setattr(
+        "opensquilla.session.naming.redact_tokenrhythm_install_ids",
+        lambda text: text.replace(install_id, "***"),
+    )
+
+    title = await call_naming_llm(
+        "Help me reset my password please",
+        model="deepseek-v4-flash",
+        api_key="test-key",
+        base_url="https://tokenrhythm.studio/v1",
+        provider="tokenrhythm",
+    )
+
+    assert title is None
+    assert warnings == [
+        (
+            "session_naming.llm_call_failed",
+            {"model": "deepseek-v4-flash", "error": "upstream echoed ***"},
+        )
+    ]
 
 
 @pytest.mark.asyncio

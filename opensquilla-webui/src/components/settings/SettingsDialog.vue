@@ -111,6 +111,7 @@
               @update-llm-timeout="updateLlmTimeout"
               @update-context-window="updateContextWindow"
               @probe-connection="probeProviderConnection"
+              @refresh-models="refreshProviderModels"
               @save-provider="saveProvider"
               @cancel-provider-edit="cancelProviderEdit"
               @apply-preset="applyProviderPreset"
@@ -303,6 +304,7 @@ const {
   updateLlmTimeout,
   updateContextWindow,
   probeProviderConnection,
+  refreshProviderModels,
   probeConfiguredProvider,
   activateProvider,
   removeProviderProfile,

@@ -5,6 +5,7 @@ import io
 import json
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from PIL import Image
 
@@ -148,8 +149,6 @@ def test_image_generation_reports_an_exhausted_profile_key_pool(monkeypatch) -> 
 def test_image_generation_reports_pool_failure_through_gateway_capability(
     monkeypatch,
 ) -> None:
-    import httpx
-
     from opensquilla.gateway.config import GatewayConfig
     from opensquilla.gateway.llm_runtime import reset_profile_credential_pools
     from opensquilla.provider.image_generation_credentials import (
@@ -936,6 +935,70 @@ async def test_invalid_provider_image_triggers_fallback_and_requested_format_con
     assert result.mime_type == "image/webp"
     with Image.open(io.BytesIO(result.image_bytes)) as image:
         assert image.format == "WEBP"
+
+
+@pytest.mark.asyncio
+async def test_image_generation_fallback_redacts_install_id_from_attempts_and_error(
+    monkeypatch,
+) -> None:
+    from opensquilla.provider import image_generation
+
+    install_id = "i7"
+
+    class FakeProvider:
+        provider_id = "synthetic_redaction"
+        default_model = "image-model"
+        auth_env_vars: tuple[str, ...] = ()
+
+        async def generate(
+            self,
+            request: ImageGenerationRequest,
+        ) -> ImageGenerationResult:
+            if request.model == "working":
+                return ImageGenerationResult(
+                    image_bytes=_test_png_bytes(),
+                    mime_type="image/png",
+                    model=request.model,
+                    provider=self.provider_id,
+                )
+            raise RuntimeError(f"upstream echoed {install_id}")
+
+    monkeypatch.setattr(
+        image_generation,
+        "redact_tokenrhythm_install_ids",
+        lambda text: text.replace(install_id, "***"),
+    )
+    image_generation.register_image_generation_provider(FakeProvider())
+    request = ImageGenerationRequest(
+        prompt="draw a squid",
+        model="synthetic_redaction/broken",
+        size="1024x1024",
+    )
+    try:
+        result = await image_generation.generate_with_fallbacks(
+            request=request,
+            candidates=[
+                "synthetic_redaction/broken",
+                "synthetic_redaction/working",
+            ],
+        )
+        with pytest.raises(RuntimeError) as raised:
+            await image_generation.generate_with_fallbacks(
+                request=request,
+                candidates=[
+                    "synthetic_redaction/broken-a",
+                    "synthetic_redaction/broken-b",
+                ],
+            )
+    finally:
+        image_generation.reset_image_generation_providers()
+
+    assert len(result.attempts) == 1
+    assert result.attempts[0].error == "upstream echoed ***"
+    assert install_id not in repr(result.attempts)
+    assert install_id not in str(raised.value)
+    assert install_id not in repr(raised.value)
+    assert "upstream echoed ***" in str(raised.value)
 
 
 @pytest.mark.parametrize(
@@ -2020,6 +2083,12 @@ async def test_tokenrhythm_image_provider_uses_images_api_and_b64_response(
         "opensquilla.provider.image_generation.httpx.AsyncClient",
         lambda **_kwargs: FakeClient(),
     )
+    monkeypatch.setattr(
+        "opensquilla.provider.image_generation.tokenrhythm_install_id_headers",
+        lambda _provider_kind, _base_url: {
+            "X-OpenSquilla-Install-Id": "synthetic-install-id"
+        },
+    )
 
     result = await TokenRhythmImageGenerationProvider(
         api_key="synthetic-tokenrhythm-key"
@@ -2041,11 +2110,178 @@ async def test_tokenrhythm_image_provider_uses_images_api_and_b64_response(
     assert headers[TOKENRHYTHM_TURN_ID_HEADER] == "turn-1"
     assert headers[TOKENRHYTHM_EXECUTION_ID_HEADER] == "image-execution-1"
     assert headers[TOKENRHYTHM_CALL_KIND_HEADER] == "auxiliary.image_generation"
+    assert headers["X-OpenSquilla-Install-Id"] == "synthetic-install-id"
+    assert "synthetic-install-id" not in str(captured["json"])
     assert result.provider == "tokenrhythm"
     assert result.model == "qwen-image-2.0"
     assert result.image_bytes == image_bytes
     assert result.mime_type == "image/png"
     assert result.revised_prompt == "a friendly squid"
+
+
+@pytest.mark.asyncio
+async def test_direct_image_provider_redacts_only_errors_that_echo_install_id(
+    monkeypatch,
+) -> None:
+    install_id = "i7"
+    leaking_error = ValueError(f"upstream echoed {install_id}")
+    ordinary_error = ValueError("ordinary upstream failure")
+    errors = iter((leaking_error, ordinary_error))
+
+    class FailingClient:
+        def __init__(self, error: Exception) -> None:
+            self.error = error
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+        async def post(self, url, *, headers, json):
+            raise self.error
+
+    monkeypatch.setattr(
+        "opensquilla.provider.image_generation.httpx.AsyncClient",
+        lambda **_kwargs: FailingClient(next(errors)),
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.image_generation.redact_tokenrhythm_install_ids",
+        lambda text: text.replace(install_id, "***"),
+    )
+    provider = TokenRhythmImageGenerationProvider(
+        api_key="synthetic-tokenrhythm-key"
+    )
+
+    with pytest.raises(RuntimeError) as redacted:
+        await provider.generate(_tokenrhythm_image_request())
+    with pytest.raises(ValueError) as unchanged:
+        await provider.generate(_tokenrhythm_image_request())
+
+    assert str(redacted.value) == "upstream echoed ***"
+    assert install_id not in repr(redacted.value)
+    assert unchanged.value is ordinary_error
+
+
+@pytest.mark.asyncio
+async def test_tokenrhythm_image_http_error_drops_retained_install_id(
+    monkeypatch,
+) -> None:
+    install_id = "i7"
+    original_errors: list[httpx.HTTPStatusError] = []
+
+    class FailingClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+        async def post(self, url, *, headers, json):
+            request = httpx.Request("POST", url, headers=headers, json=json)
+            response = httpx.Response(
+                502,
+                request=request,
+                headers={"X-Upstream-Echo": install_id},
+                json={"error": f"upstream echoed {install_id}"},
+            )
+            error = httpx.HTTPStatusError(
+                "upstream rejected the request",
+                request=request,
+                response=response,
+            )
+            original_errors.append(error)
+            raise error
+
+    monkeypatch.setattr(
+        "opensquilla.provider.image_generation.httpx.AsyncClient",
+        lambda **_kwargs: FailingClient(),
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.image_generation.tokenrhythm_install_id_headers",
+        lambda *_args, **_kwargs: {
+            "X-OpenSquilla-Install-Id": install_id
+        },
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.error_redaction.redact_tokenrhythm_install_ids",
+        lambda text: text.replace(install_id, "***"),
+    )
+
+    provider = TokenRhythmImageGenerationProvider(
+        api_key="synthetic-tokenrhythm-key"
+    )
+    with pytest.raises(httpx.HTTPStatusError) as raised:
+        await provider.generate(_tokenrhythm_image_request())
+
+    assert raised.value.__context__ is None
+    assert raised.value.request.headers["X-OpenSquilla-Install-Id"] == "[PRESENT]"
+    assert raised.value.response.request is raised.value.request
+    retained = " ".join(
+        (
+            str(raised.value),
+            repr(raised.value),
+            repr(raised.value.request.headers),
+            raised.value.response.text,
+            repr(original_errors[0].__dict__),
+        )
+    )
+    assert install_id not in retained
+
+
+@pytest.mark.asyncio
+async def test_tokenrhythm_image_invalid_json_drops_retained_install_id(
+    monkeypatch,
+) -> None:
+    from opensquilla.provider import image_generation
+
+    install_id = "i7"
+
+    class InvalidJsonClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+        async def post(self, url, *, headers, json):
+            request = httpx.Request("POST", url, headers=headers, json=json)
+            return httpx.Response(
+                200,
+                request=request,
+                text=f'{{"echo":"{install_id}"',
+            )
+
+    monkeypatch.setattr(
+        "opensquilla.provider.image_generation.httpx.AsyncClient",
+        lambda **_kwargs: InvalidJsonClient(),
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.image_generation.tokenrhythm_install_id_headers",
+        lambda *_args, **_kwargs: {
+            "X-OpenSquilla-Install-Id": install_id
+        },
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.image_generation.redact_tokenrhythm_install_ids",
+        lambda text: text.replace(install_id, "***"),
+    )
+    image_generation.register_image_generation_provider(
+        TokenRhythmImageGenerationProvider(api_key="synthetic-tokenrhythm-key")
+    )
+    try:
+        with pytest.raises(RuntimeError) as raised:
+            await image_generation.generate_with_fallbacks(
+                request=_tokenrhythm_image_request(),
+                candidates=["tokenrhythm/qwen-image-2.0"],
+            )
+    finally:
+        image_generation.reset_image_generation_providers()
+
+    assert str(raised.value) == "Image generation provider returned invalid JSON"
+    assert raised.value.__context__ is None
+    assert not hasattr(raised.value, "doc")
+    assert install_id not in repr(raised.value.__dict__)
 
 
 @pytest.mark.asyncio

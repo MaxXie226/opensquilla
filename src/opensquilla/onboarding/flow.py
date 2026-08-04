@@ -1205,6 +1205,11 @@ def run_interactive_image_generation_configure(
     questionary = _styled(_qmod)
 
     cfg = load_config(config_path)
+    from opensquilla.provider.tokenrhythm_correlation import (
+        prewarm_tokenrhythm_install_id,
+    )
+
+    prewarm_tokenrhythm_install_id(config=cfg)
     spec, provider_id = _ask_image_generation_choice(questionary, cfg)
     _print_image_generation_intro(spec)
     answers = _ask_image_generation_fields(questionary, spec, cfg)
@@ -2409,7 +2414,13 @@ def _migration_result_path(
 
 def _reload_after_migration(config_path: Path, fallback: Any):
     try:
-        return load_config(config_path)
+        config = load_config(config_path)
+        from opensquilla.provider.tokenrhythm_correlation import (
+            prewarm_tokenrhythm_install_id,
+        )
+
+        prewarm_tokenrhythm_install_id(config=config)
+        return config
     except Exception as exc:
         console.print(
             warning_panel(
@@ -2776,6 +2787,11 @@ def _restore_reset_backup(reset_backup: tuple[Path, Path]) -> None:
 
 def run_interactive_onboard(options: OnboardOptions) -> PersistResult:
     cfg = load_config(options.config_path)
+    from opensquilla.provider.tokenrhythm_correlation import (
+        prewarm_tokenrhythm_install_id,
+    )
+
+    prewarm_tokenrhythm_install_id(config=cfg)
     status = get_onboarding_status(cfg)
     if options.if_needed and status.has_config and not status.needs_onboarding:
         return persist_config(

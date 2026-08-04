@@ -117,6 +117,22 @@ def _start_background_install_telemetry(config: GatewayConfig) -> None:
         log.debug("gateway.install_telemetry_skipped", exc_info=True)
 
 
+def _prewarm_tokenrhythm_install_id(config: GatewayConfig) -> None:
+    """Prime the optional TokenRhythm install header without delaying boot."""
+
+    try:
+        from opensquilla.provider.tokenrhythm_correlation import (
+            prewarm_tokenrhythm_install_id,
+        )
+
+        prewarm_tokenrhythm_install_id(config=config)
+    except Exception:
+        # Install identity is best-effort request metadata.  A resolver or
+        # thread-start failure must never make the gateway/standalone runtime
+        # unavailable.
+        log.debug("gateway.tokenrhythm_install_id_prewarm_skipped", exc_info=True)
+
+
 def _auto_propose_usage_execution_context(
     agent_id: str,
     usage_event_sink: Any | None,
@@ -642,6 +658,7 @@ class ServiceContainer:
     )
     cron_scheduler: SchedulerEngine | None = None
     model_catalog: ModelCatalog | None = None
+    model_catalog_refresh_coordinator: Any = None
     agent_registry: Any = None
     memory_managers: dict[str, MemoryManager] = field(default_factory=dict)
     # Legacy per-tier dicts. These are derived views over
@@ -665,6 +682,7 @@ class ServiceContainer:
     heartbeat_watcher: Any = None
     daily_usage_telemetry_task: asyncio.Task[Any] | None = field(default=None, repr=False)
     deferred_warmups: list[Callable[[], Any]] = field(default_factory=list)
+    deferred_warmup_task: asyncio.Task[Any] | None = field(default=None, repr=False)
     _compaction_listener_remove: Callable[[], None] | None = None
     _approval_listener_remove: Callable[[], None] | None = None
     _approval_channel_notifier_remove: Callable[[], None] | None = None
@@ -682,6 +700,37 @@ class ServiceContainer:
         an in-flight cron job or heartbeat tick can drive TurnRunner ->
         TurnCaptureService.capture_turn against an already-closed store.
         """
+        # Desktop warmups may enter the catalog refresh boundary after first
+        # paint. Stop that producer before closing the coordinator so a task
+        # which has not started yet cannot recreate a fresh global coordinator
+        # during shutdown.
+        deferred_warmup_task = self.deferred_warmup_task
+        self.deferred_warmup_task = None
+        if deferred_warmup_task is not None:
+            deferred_warmup_task.cancel()
+            try:
+                await deferred_warmup_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                log.debug("gateway.deferred_warmup_close_failed", exc_info=True)
+
+        model_catalog_refresh_coordinator = self.model_catalog_refresh_coordinator
+        self.model_catalog_refresh_coordinator = None
+        if model_catalog_refresh_coordinator is not None:
+            try:
+                await model_catalog_refresh_coordinator.close()
+            except Exception:
+                log.debug("gateway.model_catalog_refresh_close_failed", exc_info=True)
+            try:
+                from opensquilla.gateway.model_catalog_refresh import (
+                    install_tokenrhythm_catalog_coordinator,
+                )
+
+                install_tokenrhythm_catalog_coordinator(None)
+            except Exception:
+                pass
+
         profile_import_maintenance_task = self.profile_import_maintenance_task
         self.profile_import_maintenance_task = None
         if profile_import_maintenance_task is not None:
@@ -2405,6 +2454,7 @@ async def build_services(
         config = GatewayConfig.load(os.environ.get("OPENSQUILLA_GATEWAY_CONFIG_PATH"))
         if config.config_path:
             log.info("build_services.config_loaded", path=config.config_path)
+    _prewarm_tokenrhythm_install_id(config)
     deferred_warmups: list[Callable[[], Any]] = []
     sandbox_setup_task: asyncio.Task[Any] | None = None
     _warn_workspace_state_mismatch(config)
@@ -2623,6 +2673,18 @@ async def build_services(
     # instance exists, so resolve_model_price/get_capabilities honor them
     # from the first turn onward.
     apply_model_catalog_overrides(model_catalog, config)
+
+    from opensquilla.gateway.model_catalog_refresh import (
+        TokenRhythmCatalogCoordinator,
+        install_tokenrhythm_catalog_coordinator,
+    )
+
+    model_catalog_refresh_coordinator = TokenRhythmCatalogCoordinator(model_catalog)
+    install_tokenrhythm_catalog_coordinator(model_catalog_refresh_coordinator)
+    # Hydration is disk-only. It exposes a matching last-good entitlement
+    # before warmup while preserving the keyless/custom-endpoint zero-network
+    # boot contract.
+    await model_catalog_refresh_coordinator.hydrate(config)
 
     async def _warm_model_catalog_and_pricing() -> None:
         # Registry-driven live listing first. The shared refresh boundary
@@ -3143,6 +3205,7 @@ async def build_services(
         usage_event_sink=usage_event_sink,
         cron_scheduler=cron_scheduler,
         model_catalog=model_catalog,
+        model_catalog_refresh_coordinator=model_catalog_refresh_coordinator,
         agent_registry=agent_registry,
         memory_managers=memory_managers,
         memory_stores=memory_stores,
@@ -4460,7 +4523,7 @@ async def start_gateway_server(
             )
         log.info("gateway.started", host=config.host, port=config.port)
         if _desktop_fast_start_enabled():
-            create_background_task(_run_deferred_warmups(svc))
+            svc.deferred_warmup_task = create_background_task(_run_deferred_warmups(svc))
 
     # Start channels (after app is ready to receive webhooks)
     if channel_manager is not None:

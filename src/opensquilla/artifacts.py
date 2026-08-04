@@ -24,6 +24,7 @@ from urllib.parse import unquote, urlsplit
 
 from opensquilla.attachment_refs import _atomic_write_bytes, _link_or_copy, _validate_sha256
 from opensquilla.paths import native_io_path
+from opensquilla.profile_import_io import reparse_tag_redirects
 
 _log = logging.getLogger(__name__)
 
@@ -536,11 +537,13 @@ def _is_sensitive_bundle_path(logical_path: str) -> bool:
 
 def _is_reparse_point(path: Path) -> bool:
     try:
-        attributes = getattr(native_io_path(path).lstat(), "st_file_attributes", 0)
-        flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
-        return bool(flag and attributes & flag)
+        value = native_io_path(path).lstat()
     except OSError:
         return False
+    attributes = int(getattr(value, "st_file_attributes", 0))
+    if not attributes & 0x400:
+        return False
+    return reparse_tag_redirects(int(getattr(value, "st_reparse_tag", 0)))
 
 
 def _read_regular_bundle_file(path: Path) -> bytes:

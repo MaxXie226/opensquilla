@@ -476,9 +476,41 @@ class _TurnRunnerModelCatalogAdapter(ModelCatalogPort):
         if runner._model_catalog is not None:
             provider_name = provider or getattr(llm_cfg, "provider", "openrouter")
             base_url = getattr(llm_cfg, "base_url", "")
-            max_tokens = runner._model_catalog.resolve_max_tokens(
-                model_id, user_override=user_max_tokens, provider=provider_name
+            max_tokens_with_source = getattr(
+                runner._model_catalog,
+                "resolve_max_tokens_with_source",
+                None,
             )
+            if callable(max_tokens_with_source):
+                max_tokens, _max_tokens_source = max_tokens_with_source(
+                    model_id,
+                    user_override=user_max_tokens,
+                    provider=provider_name,
+                )
+                auto_max_tokens, auto_max_tokens_source = max_tokens_with_source(
+                    model_id,
+                    user_override=0,
+                    provider=provider_name,
+                )
+            else:
+                # Preserve the existing duck-typed catalog contract used by
+                # embedders and lightweight test doubles.  Older catalogs only
+                # expose the value API, so a positive auto value is the best
+                # available evidence that the physical ceiling is known.
+                resolve_max_tokens = runner._model_catalog.resolve_max_tokens
+                max_tokens = resolve_max_tokens(
+                    model_id,
+                    user_override=user_max_tokens,
+                    provider=provider_name,
+                )
+                auto_max_tokens = resolve_max_tokens(
+                    model_id,
+                    user_override=0,
+                    provider=provider_name,
+                )
+                auto_max_tokens_source = (
+                    "catalog" if _positive_int_or_zero(auto_max_tokens) else "default"
+                )
             # Per-model [models.*] context_window overrides beat the global
             # llm.context_window_tokens value; the global still beats the catalog.
             context_window, _context_window_source = resolve_effective_context_window(
@@ -492,6 +524,8 @@ class _TurnRunnerModelCatalogAdapter(ModelCatalogPort):
             )
         else:
             max_tokens = user_max_tokens if user_max_tokens > 0 else 16384
+            auto_max_tokens = 0
+            auto_max_tokens_source = "default"
             context_window = user_context_window if user_context_window > 0 else 200_000
             capabilities = None
         return _ResolvedCatalog(
@@ -499,9 +533,96 @@ class _TurnRunnerModelCatalogAdapter(ModelCatalogPort):
             context_window=context_window,
             capabilities=capabilities,
             context_window_tokens_global_override=user_context_window,
+            auto_max_tokens=auto_max_tokens,
+            auto_max_tokens_known=auto_max_tokens_source in {"catalog", "override"},
             temperature=getattr(llm_cfg, "temperature", None),
             top_p=getattr(llm_cfg, "top_p", None),
             provider_request_proof_max_chars=user_proof_max_chars,
+        )
+
+    def lookup_deployment(
+        self,
+        deployment: Any,
+        *,
+        include_global_overrides: bool = False,
+    ) -> _ResolvedCatalog:
+        """Resolve one selector leg against its exact in-process config.
+
+        This path is used only for private physical-fallback budgeting.  It
+        deliberately accepts the limit-relevant private ProviderConfig fields
+        rather than reconstructing an identity from sanitized route metadata.
+        """
+
+        runner = self._runner
+        model_id = str(getattr(deployment, "model", "") or "").strip()
+        provider_name = str(
+            getattr(deployment, "provider", "") or ""
+        ).strip()
+        if not model_id:
+            return self.lookup(model_id, provider_name)
+        catalog = runner._model_catalog
+        resolver = getattr(catalog, "resolve_deployment_limits", None)
+        if catalog is None or not callable(resolver):
+            return self.lookup(model_id, provider_name)
+        llm_cfg = getattr(runner._config, "llm", None) if runner._config else None
+        configured_max_tokens = _positive_int_or_zero(
+            getattr(llm_cfg, "max_tokens", 0)
+        )
+        limits = resolver(
+            model_id,
+            provider=provider_name,
+            api_key=str(getattr(deployment, "api_key", "") or ""),
+            base_url=str(getattr(deployment, "base_url", "") or ""),
+            proxy=str(getattr(deployment, "proxy", "") or ""),
+            logical_max_tokens_override=(
+                configured_max_tokens if include_global_overrides else 0
+            ),
+        )
+        base_url = str(getattr(deployment, "base_url", "") or "")
+        deployment_capabilities = getattr(
+            catalog,
+            "resolve_deployment_capabilities",
+            None,
+        )
+        capabilities = (
+            deployment_capabilities(
+                model_id,
+                provider=provider_name,
+                api_key=str(getattr(deployment, "api_key", "") or ""),
+                base_url=base_url,
+            )
+            if callable(deployment_capabilities)
+            else catalog.get_capabilities(
+                model_id,
+                provider_name=provider_name,
+                base_url=base_url,
+            )
+        )
+        context_window = limits.context_window
+        if include_global_overrides:
+            per_model_context = catalog.user_context_window_override(
+                model_id,
+                provider_name,
+            )
+            global_context = _positive_int_or_zero(
+                getattr(llm_cfg, "context_window_tokens", 0)
+            )
+            if per_model_context is None and global_context > 0:
+                context_window = global_context
+        max_tokens = limits.max_output_tokens
+        if include_global_overrides and configured_max_tokens > 0:
+            max_tokens = min(configured_max_tokens, context_window)
+        return _ResolvedCatalog(
+            max_tokens=max_tokens,
+            context_window=context_window,
+            capabilities=capabilities,
+            auto_max_tokens=limits.max_output_tokens,
+            auto_max_tokens_known=limits.max_output_tokens_known,
+            temperature=getattr(llm_cfg, "temperature", None),
+            top_p=getattr(llm_cfg, "top_p", None),
+            provider_request_proof_max_chars=_positive_int_or_zero(
+                getattr(llm_cfg, "provider_request_proof_max_chars", 0)
+            ),
         )
 
 class _TurnRunnerAgentConfigBuilderAdapter(AgentConfigBuilderPort):

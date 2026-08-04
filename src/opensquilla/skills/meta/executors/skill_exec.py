@@ -26,6 +26,7 @@ import structlog
 
 from opensquilla.skills.meta.templating import _JINJA_ENV, render_with_args
 from opensquilla.skills.meta.types import MetaStep
+from opensquilla.subprocess_encoding import apply_utf8_child_env, decode_subprocess_output
 
 log = structlog.get_logger(__name__)
 
@@ -268,6 +269,7 @@ async def run_skill_exec_step(
             rendered_value = _render(value.replace("{baseDir}", base_dir))
             if rendered_value:
                 child_env[rendered_key] = rendered_value
+    apply_utf8_child_env(child_env)
 
     # Optional stdin: render Jinja template and pipe to the subprocess.
     stdin_raw = entrypoint.get("stdin")
@@ -343,8 +345,8 @@ async def run_skill_exec_step(
     returncode = completed.returncode
     stdout_bytes = completed.stdout
     stderr_bytes = completed.stderr
-    stdout_text = (stdout_bytes or b"").decode("utf-8", errors="replace")
-    stderr_text = (stderr_bytes or b"").decode("utf-8", errors="replace")
+    stdout_text = decode_subprocess_output(stdout_bytes)
+    stderr_text = decode_subprocess_output(stderr_bytes)
     if returncode != 0:
         raise RuntimeError(
             f"skill {effective_skill!r} exited {returncode}: "

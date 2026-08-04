@@ -174,6 +174,7 @@ from opensquilla.provider import (
 )
 from opensquilla.provider.correlation_context import bind_provider_request_correlation
 from opensquilla.provider.failures import ProviderFailureKind, classify_provider_error
+from opensquilla.provider.model_identity import is_deepseek_v4_model_id
 from opensquilla.provider.protocol import (
     project_provider_final_request,
     project_provider_message_count,
@@ -1125,11 +1126,6 @@ def _meta_empty_final_text_fallback(skill_name: str, inputs: Mapping[str, Any]) 
 def _is_deepseek_model_id(model_id: str | None) -> bool:
     normalized = (model_id or "").strip().lower()
     return normalized.startswith("deepseek") or "/deepseek" in normalized
-
-
-def _is_direct_deepseek_v4_model_id(model_id: str | None) -> bool:
-    normalized = (model_id or "").strip().lower()
-    return normalized in {"deepseek-v4-flash", "deepseek-v4-pro"}
 
 
 _LARGE_JSON_TOOL_FIELD_KEYS: frozenset[str] = frozenset({"body", "body_base64"})
@@ -3098,7 +3094,7 @@ class Agent:
             else ""
         )
         preserve_reasoning_content = bool(
-            _is_direct_deepseek_v4_model_id(effective_model_id)
+            is_deepseek_v4_model_id(effective_model_id)
             or (
                 thinking_enabled
                 and caps_reasoning_format == "deepseek"
@@ -5926,7 +5922,7 @@ class Agent:
             else ""
         )
         preserve_reasoning_content = bool(
-            _is_direct_deepseek_v4_model_id(self.config.model_id)
+            is_deepseek_v4_model_id(self.config.model_id)
             or (
                 thinking_enabled
                 and caps_reasoning_format == "deepseek"

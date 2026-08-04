@@ -9,10 +9,12 @@ computed for the abandoned model no longer apply.
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
 from types import SimpleNamespace
 from typing import Any
 
+from opensquilla.context_budget import ContextBudgetGovernor
 from opensquilla.engine.agent import Agent
 from opensquilla.engine.agent_injection import ListPendingInputProvider
 from opensquilla.engine.pipeline import TurnContext
@@ -162,6 +164,9 @@ def test_fallback_leg_rebinds_request_budget_and_model_capabilities(
         object(),
         _StubSelector("fallback/model"),
     )
+    wrapper.configure_fallback_limits(
+        {("fallback-provider", "fallback/model"): (8_192, 2_048)}
+    )
     original = ChatConfig(
         max_tokens=64_000,
         provider_request_max_chars=500_000,
@@ -206,23 +211,12 @@ def test_fallback_leg_replaces_a_cap_derived_for_the_previous_leg(
             return ModelCapabilities()
 
     monkeypatch.setattr("opensquilla.engine.runtime.shared_catalog", lambda: _Catalog())
-    seen_global_overrides: list[int] = []
-
-    def _resolve_context_window(
-        *_args: Any,
-        global_override: int = 0,
-        **_kwargs: Any,
-    ) -> tuple[int, str]:
-        seen_global_overrides.append(global_override)
-        return 32_000, "catalog"
-
-    monkeypatch.setattr(
-        "opensquilla.engine.runtime.resolve_effective_context_window",
-        _resolve_context_window,
-    )
     wrapper = _SelectorFallbackProvider(
         object(),
         _StubSelector("fallback/model"),
+    )
+    wrapper.configure_fallback_limits(
+        {("fallback-provider", "fallback/model"): (32_000, 2_048)}
     )
     original = ChatConfig(
         max_tokens=2_048,
@@ -236,7 +230,6 @@ def test_fallback_leg_replaces_a_cap_derived_for_the_previous_leg(
     assert rebound.provider_request_max_chars > original.provider_request_max_chars
     assert rebound.context_window_tokens_global_override == 0
     assert rebound.provider_request_max_chars_explicit_cap == 0
-    assert seen_global_overrides == [0]
 
 
 def test_fallback_leg_preserves_global_context_window_override(
@@ -259,29 +252,13 @@ def test_fallback_leg_preserves_global_context_window_override(
         ) -> ModelCapabilities:
             return ModelCapabilities()
 
-    seen_global_overrides: list[int] = []
-
-    def _resolve_context_window(
-        _catalog: Any,
-        _model: str,
-        *,
-        provider: str = "",
-        global_override: int = 0,
-    ) -> tuple[int, str]:
-        assert provider == "fallback-provider"
-        seen_global_overrides.append(global_override)
-        if global_override > 0:
-            return global_override, "config"
-        return 32_000, "catalog"
-
     monkeypatch.setattr("opensquilla.engine.runtime.shared_catalog", lambda: _Catalog())
-    monkeypatch.setattr(
-        "opensquilla.engine.runtime.resolve_effective_context_window",
-        _resolve_context_window,
-    )
     wrapper = _SelectorFallbackProvider(
         object(),
         _StubSelector("fallback/model"),
+    )
+    wrapper.configure_fallback_limits(
+        {("fallback-provider", "fallback/model"): (8_192, 2_048)}
     )
     agent = Agent(
         provider=wrapper,
@@ -304,7 +281,6 @@ def test_fallback_leg_preserves_global_context_window_override(
     assert rebound.provider_request_max_chars == 17_408
     assert rebound.context_window_tokens_global_override == 8_192
     assert rebound.provider_request_max_chars_explicit_cap == 0
-    assert seen_global_overrides == [8_192]
 
 
 def test_global_context_window_override_prevents_catalog_only_escalation(
@@ -375,6 +351,9 @@ def test_fallback_leg_never_enlarges_an_explicit_request_cap(
         object(),
         _StubSelector("fallback/model"),
     )
+    wrapper.configure_fallback_limits(
+        {("fallback-provider", "fallback/model"): (32_000, 2_048)}
+    )
     original = ChatConfig(
         max_tokens=2_048,
         provider_request_max_chars=12_345,
@@ -385,6 +364,227 @@ def test_fallback_leg_never_enlarges_an_explicit_request_cap(
 
     assert rebound.provider_request_max_chars == 12_345
     assert rebound.provider_request_max_chars_explicit_cap == 12_345
+
+
+def test_fallback_leg_clamps_output_and_proof_budget_without_correlation() -> None:
+    wrapper = _SelectorFallbackProvider(object(), _StubSelector("fallback/model"))
+    wrapper.configure_fallback_limits(
+        {("FALLBACK-PROVIDER", "fallback/model"): (32_000, 8_192)}
+    )
+    config = ChatConfig(
+        max_tokens=131_072,
+        provider_request_max_chars=500_000,
+    )
+
+    assert wrapper.fallback_after_invalid_response("upstream 503") is True
+    fallback_config = wrapper._config_for_active_leg(config)
+
+    expected_proof_cap = ContextBudgetGovernor.from_values(
+        context_window_tokens=32_000,
+        max_output_tokens=8_192,
+        thinking_budget_tokens=0,
+        context_overflow_threshold=0.85,
+    ).snapshot().provider_request_max_chars
+    assert fallback_config is not config
+    assert fallback_config.max_tokens == 8_192
+    assert fallback_config.provider_request_max_chars == expected_proof_cap
+    assert fallback_config.provider_request_correlation is None
+
+
+def test_fallback_leg_never_increases_small_explicit_output_limit() -> None:
+    wrapper = _SelectorFallbackProvider(object(), _StubSelector("fallback/model"))
+    wrapper.configure_fallback_limits(
+        {("fallback-provider", "fallback/model"): (32_000, 8_192)}
+    )
+    config = ChatConfig(max_tokens=4_096)
+
+    assert wrapper.fallback_after_invalid_response("upstream 503") is True
+    fallback_config = wrapper._config_for_active_leg(config)
+
+    assert fallback_config is config
+    assert fallback_config.max_tokens == 4_096
+
+
+def test_unknown_fallback_limit_does_not_apply_generic_default() -> None:
+    wrapper = _SelectorFallbackProvider(object(), _StubSelector("unknown/model"))
+    config = ChatConfig(max_tokens=131_072)
+
+    assert wrapper.fallback_after_invalid_response("upstream 503") is True
+
+    assert wrapper._config_for_active_leg(config) is config
+
+
+def test_each_hop_uses_the_active_physical_models_own_output_limit() -> None:
+    class _MultiHopSelector:
+        def __init__(self) -> None:
+            self._remaining = [
+                SimpleNamespace(provider="fallback-provider", model="middle/model"),
+                SimpleNamespace(provider="fallback-provider", model="last/model"),
+            ]
+            self.current_config = SimpleNamespace(
+                provider="primary-provider", model="primary/model"
+            )
+
+        @property
+        def active_provider_id(self) -> str:
+            return str(self.current_config.provider)
+
+        def next_fallback_after_failure(self, exc: Exception) -> object:
+            del exc
+            self.current_config = self._remaining.pop(0)
+            return object()
+
+    selector = _MultiHopSelector()
+    wrapper = _SelectorFallbackProvider(object(), selector)
+    wrapper.configure_fallback_limits(
+        {
+            ("fallback-provider", "middle/model"): (64_000, 32_768),
+            ("fallback-provider", "last/model"): (16_000, 4_096),
+        }
+    )
+    original = ChatConfig(
+        max_tokens=131_072,
+        provider_request_max_chars=500_000,
+    )
+
+    assert wrapper.fallback_after_invalid_response("first failure") is True
+    middle = wrapper._config_for_active_leg(original)
+    assert middle.max_tokens == 32_768
+
+    assert wrapper.fallback_after_invalid_response("second failure") is True
+    last = wrapper._config_for_active_leg(original)
+    assert last.max_tokens == 4_096
+    assert last.provider_request_max_chars < middle.provider_request_max_chars
+
+
+def test_tokenrhythm_same_model_fallback_uses_exact_private_config_identity() -> None:
+    primary = SimpleNamespace(
+        provider="tokenrhythm",
+        model="shared/model",
+        api_key="synthetic-key-a",
+        base_url="https://tokenrhythm.studio/v1",
+        proxy="",
+    )
+    fallback_same_model = SimpleNamespace(
+        provider="tokenrhythm",
+        model="shared/model",
+        api_key="synthetic-key-b",
+        base_url="https://tokenrhythm.studio/v1",
+        proxy="http://127.0.0.1:8118",
+    )
+    fallback_other_model = SimpleNamespace(
+        provider="tokenrhythm",
+        model="other/model",
+        api_key="synthetic-key-c",
+        base_url="https://tokenrhythm.studio/v1",
+        proxy="",
+    )
+
+    class _AuthoritySelector:
+        def __init__(self) -> None:
+            self._chain = [primary, fallback_same_model, fallback_other_model]
+            self._index = 0
+
+        @property
+        def current_config(self):
+            return self._chain[self._index]
+
+        @property
+        def active_provider_id(self) -> str:
+            return str(self.current_config.provider)
+
+        def remaining_chain(self):
+            return list(self._chain[self._index :])
+
+        def next_fallback_after_failure(self, _exc: Exception) -> object:
+            self._index += 1
+            return object()
+
+    metadata: dict[str, Any] = {
+        "route_plan": {
+            "fallback_chain": [
+                {
+                    "provider": "tokenrhythm",
+                    "model": "shared/model",
+                    "capabilities": {
+                        "context_window": 1_000_000,
+                        "effective_max_tokens": 131_072,
+                    },
+                }
+            ]
+        }
+    }
+    selector = _AuthoritySelector()
+    wrapper = _SelectorFallbackProvider(
+        object(),
+        selector,
+        turn_metadata=metadata,
+    )
+    wrapper.configure_fallback_deployment_limits(
+        [
+            (fallback_same_model, 64_000, 8_192),
+            (fallback_other_model, 32_000, 4_096),
+        ]
+    )
+    # A sanitized provider/model-only compatibility limit would be wrong for B.
+    wrapper.configure_fallback_limits(
+        {("tokenrhythm", "shared/model"): (1_000_000, 131_072)}
+    )
+    original = ChatConfig(max_tokens=131_072)
+
+    assert wrapper.fallback_after_invalid_response("first failure") is True
+    assert wrapper._config_for_active_leg(original).max_tokens == 8_192
+    assert wrapper.fallback_after_invalid_response("second failure") is True
+    assert wrapper._config_for_active_leg(original).max_tokens == 4_096
+
+    serialized = json.dumps(metadata, sort_keys=True)
+    assert "synthetic-key-a" not in serialized
+    assert "synthetic-key-b" not in serialized
+    assert "synthetic-key-c" not in serialized
+    assert "authority_identity" not in serialized
+    assert "transport_fingerprint" not in serialized
+
+
+def test_dynamic_tokenrhythm_fallback_without_exact_limit_is_not_cross_clamped() -> None:
+    primary = SimpleNamespace(
+        provider="tokenrhythm",
+        model="shared/model",
+        api_key="synthetic-known-key",
+        base_url="https://tokenrhythm.studio/v1",
+        proxy="",
+    )
+    dynamically_injected = SimpleNamespace(
+        provider="tokenrhythm",
+        model="shared/model",
+        api_key="synthetic-dynamic-key",
+        base_url="https://tokenrhythm.studio/v1",
+        proxy="",
+    )
+
+    class _DynamicPluginSelector:
+        def __init__(self) -> None:
+            self.current_config = primary
+
+        @property
+        def active_provider_id(self) -> str:
+            return "tokenrhythm"
+
+        def next_fallback_after_failure(self, _exc: Exception) -> object:
+            # Models introduced by a plugin failover hook after bootstrap have
+            # no exact authority limit in the wrapper's private map.
+            self.current_config = dynamically_injected
+            return object()
+
+    selector = _DynamicPluginSelector()
+    wrapper = _SelectorFallbackProvider(object(), selector)
+    wrapper.configure_fallback_deployment_limits([(primary, 64_000, 8_192)])
+    wrapper.configure_fallback_limits(
+        {("tokenrhythm", "shared/model"): (64_000, 8_192)}
+    )
+    original = ChatConfig(max_tokens=131_072)
+
+    assert wrapper.fallback_after_invalid_response("dynamic plugin fallback") is True
+    assert wrapper._config_for_active_leg(original) is original
 
 
 PRIMARY_MODEL = "routed-primary"

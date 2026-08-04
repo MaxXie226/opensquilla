@@ -56,6 +56,7 @@ interface ProviderPanelContract {
     value: number
     source: 'config' | 'catalog' | 'default'
   } | null
+  effectiveMaxTokensPending?: boolean
   providerIsLocal: boolean
   configuredProviders: Array<{
     providerId: string
@@ -124,6 +125,7 @@ const emit = defineEmits<{
   updateLlmTimeout: [value: number]
   updateContextWindow: [value: string]
   probeConnection: []
+  refreshModels: []
   saveProvider: []
   cancelProviderEdit: []
   applyPreset: []
@@ -625,6 +627,9 @@ const contextWindowReadout = computed(() => t('setup.provider.contextWindowReado
 }))
 
 const effectiveMaxTokensReadout = computed(() => {
+  if (props.panel.effectiveMaxTokensPending) {
+    return t('setup.provider.effectiveMaxTokensAfterSave')
+  }
   const record = props.panel.effectiveMaxTokens
   if (!record) return ''
   const sourceKey = {
@@ -636,6 +641,18 @@ const effectiveMaxTokensReadout = computed(() => {
     tokens: new Intl.NumberFormat(locale.value).format(record.value),
     source: t(sourceKey),
   })
+})
+
+const catalogSyncReadout = computed(() => {
+  const catalog = props.panel.connection.catalog
+  if (!catalog) return ''
+  const ago = localizedRelativeTime(catalog.lastSyncedAt, locale.value)
+  if (catalog.stale) {
+    return ago
+      ? t('setup.provider.modelCatalogStaleSince', { ago })
+      : t('setup.provider.modelCatalogStale')
+  }
+  return ago ? t('setup.provider.modelCatalogSynced', { ago }) : ''
 })
 
 const showContextWindowWarning = computed(() => (
@@ -912,6 +929,24 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
         data-testid="setup-effective-max-tokens"
         aria-live="polite"
       >{{ effectiveMaxTokensReadout }}</p>
+      <div v-if="panel.providerSelected" class="setup-model-catalog-sync">
+        <span
+          v-if="catalogSyncReadout"
+          class="setup-model-catalog-sync__status"
+          :class="{ 'is-stale': panel.connection.catalog?.stale }"
+          data-testid="setup-model-catalog-sync"
+          aria-live="polite"
+        >{{ catalogSyncReadout }}</span>
+        <button
+          type="button"
+          class="btn btn--ghost setup-model-catalog-sync__refresh"
+          data-testid="setup-refresh-models"
+          @click="emit('refreshModels')"
+        >
+          <Icon name="refresh" :size="14" aria-hidden="true" />
+          {{ t('setup.provider.refreshModels') }}
+        </button>
+      </div>
     </section>
 
     <details class="setup-provider-options" :open="panel.providerAdvancedOpen">
@@ -1658,6 +1693,30 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
    margin absorbs it; the read-only routing card has none, so restore a gap. */
 .setup-provider-model__routing-owner + .setup-effective-output {
   margin-top: var(--sp-2);
+}
+
+.setup-model-catalog-sync {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  justify-content: space-between;
+  margin: var(--sp-1) 0 var(--sp-2);
+}
+
+.setup-model-catalog-sync__status {
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+}
+
+.setup-model-catalog-sync__status.is-stale {
+  color: var(--warning-text, var(--text-muted));
+}
+
+.setup-model-catalog-sync__refresh {
+  align-items: center;
+  display: inline-flex;
+  gap: var(--sp-1);
 }
 
 .setup-provider-profile-model-hint {
