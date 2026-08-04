@@ -15,12 +15,12 @@ afterEach(() => {
 })
 
 describe('session bootstrap admission', () => {
-  it('bounds optional metadata without recycling the shared stream connection', () => {
+  it('allows ordinary metadata latency before recovering a stuck connection', () => {
     expect(OPTIONAL_SESSION_RPC_TIMEOUT_MS).toBe(10_000)
     expect(optionalSessionRpcCallOptions).toEqual({
       timeoutMs: 10_000,
-      timeoutAction: 'reject',
-      abortAction: 'reject',
+      timeoutAction: 'reconnect',
+      abortAction: 'reconnect',
     })
   })
 

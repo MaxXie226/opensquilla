@@ -16,10 +16,11 @@ export const OPTIONAL_SESSION_RPC_TIMEOUT_MS = 10_000
 
 export const optionalSessionRpcCallOptions: RpcCallOptions = {
   timeoutMs: OPTIONAL_SESSION_RPC_TIMEOUT_MS,
-  // Optional metadata must never retire the shared socket carrying a live
-  // model stream. Let the caller degrade the optional surface independently.
-  timeoutAction: 'reject',
-  abortAction: 'reject',
+  // Give ordinary metadata latency enough room to avoid interrupting an
+  // active stream. If a request is genuinely stuck, the Gateway's serialized
+  // dispatcher cannot serve later frames, so reconnect as a last resort.
+  timeoutAction: 'reconnect',
+  abortAction: 'reconnect',
 }
 
 type OptionalSessionRpcClient = {

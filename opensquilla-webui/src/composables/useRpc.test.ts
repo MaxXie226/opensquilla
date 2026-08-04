@@ -48,8 +48,8 @@ describe('useRpcCall session bootstrap admission', () => {
       optionalSessionRpcCallOptions,
     )
     expect(optionalSessionRpcCallOptions).toMatchObject({
-      timeoutAction: 'reject',
-      abortAction: 'reject',
+      timeoutAction: 'reconnect',
+      abortAction: 'reconnect',
     })
     app.unmount()
   })
