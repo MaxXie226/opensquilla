@@ -1,0 +1,1104 @@
+{
+  "schema": "opensquilla.draco-p0-p05-campaign-plan/v1",
+  "run_id": "p0-p05-20260804-234508",
+  "created_at": "2026-08-04T23:45:08+08:00",
+  "source_plan": {
+    "repository": "opensquilla/agentic-routing-docs",
+    "path": "Agentic-Routing-Step2-Tuning-Plan.md",
+    "commit": "5d6c2e1ee9a68a3ecdc092599e3fb63ff11d9ce9",
+    "blob_sha": "bbd91d8b23785f03962ddb5af05ca5d312694195"
+  },
+  "freeze": {
+    "snapshot_commit": "TODO_FREEZE_AFTER_SUPPORT_PATCHES",
+    "snapshot_tree": "TODO_FREEZE_AFTER_SUPPORT_PATCHES",
+    "ranking_thinking_assignment_enabled": false,
+    "inputs": {
+      "benchmark_input_raw_sha256": "1eb4e618c8df8e7f68bded3d2b6f77a541744aa1072eb338835b776183188a8d",
+      "reference_config_raw_sha256": "TODO_FREEZE_REFERENCE_CONFIG_SHA256"
+    },
+    "sources": {
+      "launcher_raw_sha256": "TODO_FREEZE_LAUNCHER_SHA256",
+      "controller_raw_sha256": "TODO_FREEZE_CONTROLLER_SHA256",
+      "reporter_raw_sha256": "TODO_FREEZE_REPORTER_SHA256",
+      "main_runner_raw_sha256": "TODO_FREEZE_MAIN_RUNNER_SHA256",
+      "resume_runner_raw_sha256": "TODO_FREEZE_RESUME_RUNNER_SHA256"
+    },
+    "model_registry": {
+      "path": "src/opensquilla/provider/router_dynamic_model_profiles.json",
+      "raw_sha256": "TODO_FREEZE_REGISTRY_RAW_SHA256",
+      "full_snapshot_version": "TODO_FREEZE_REGISTRY_FULL_VERSION",
+      "full_canonical_sha256": "TODO_FREEZE_REGISTRY_FULL_CANONICAL_SHA256",
+      "formal_snapshot_version": "TODO_FREEZE_REGISTRY_FORMAL_VERSION",
+      "formal_canonical_sha256": "TODO_FREEZE_REGISTRY_FORMAL_CANONICAL_SHA256",
+      "model_count": 79,
+      "full_model_count": 79,
+      "formal_model_count": 79,
+      "full_identities_sha256": "TODO_FREEZE_REGISTRY_FULL_IDENTITIES_SHA256",
+      "formal_identities_sha256": "TODO_FREEZE_REGISTRY_FORMAL_IDENTITIES_SHA256"
+    },
+    "ranking_config": {
+      "path": "src/opensquilla/provider/router_dynamic_ranking_config.json",
+      "raw_sha256": "TODO_FREEZE_RANKING_RAW_SHA256",
+      "packaged_schema_version": "TODO_FREEZE_RANKING_PACKAGED_SCHEMA",
+      "packaged_config_version": "TODO_FREEZE_RANKING_PACKAGED_VERSION",
+      "packaged_canonical_sha256": "TODO_FREEZE_RANKING_PACKAGED_CANONICAL_SHA256",
+      "formal_schema_version": "TODO_FREEZE_RANKING_FORMAL_SCHEMA",
+      "formal_config_version": "TODO_FREEZE_RANKING_FORMAL_VERSION",
+      "formal_canonical_sha256": "TODO_FREEZE_RANKING_FORMAL_CANONICAL_SHA256"
+    }
+  },
+  "paths": {
+    "run_root": "/home/codex/draco-runs/p0-p05-20260804-234508",
+    "snapshot": "/home/codex/draco-runs/p0-p05-20260804-234508/snapshot",
+    "report_root": "/home/codex/code/opensquilla-agentic-routing/reports/draco/p0-p05-20260804-234508",
+    "reference_repo": "/home/codex/code/opensquilla",
+    "python": "/home/codex/code/opensquilla-agentic-routing/.venv/bin/python",
+    "reporter": "/home/codex/draco-runs/p0-p05-20260804-234508/generate_reports.py",
+    "experiment_config_relative": "configs/benchmarks/draco_b2_g12.json",
+    "launcher_relative": "scripts/experiments/run_draco_mini_b0_b1_b2_b4_g1_campaign.sh"
+  },
+  "benchmark": {
+    "name": "DRACO mini",
+    "input_sha256": "1eb4e618c8df8e7f68bded3d2b6f77a541744aa1072eb338835b776183188a8d",
+    "task_count": 10,
+    "task_ids": [
+      "0c2c668a-c3bf-41af-93c9-b5614ff63508",
+      "a78eed67-ebe3-425e-a467-d54ee8949c8b",
+      "ce522bc2-e8a2-436b-971f-dd4972f23d39",
+      "3b5505fb-dab6-44cb-9a14-746b1cd82d25",
+      "cd19ee22-ded0-4fee-b1a0-51f074d72b8b",
+      "ca0edd2d-c9b8-4b85-9b40-754f4865579a",
+      "f004b46b-c0e7-4e86-a072-c7491328d538",
+      "f6de7687-7cff-4f68-93ea-f632bf6266af",
+      "e1f2c310-d311-49da-b0e4-ee855603469d",
+      "aca95495-b0fe-4330-90fc-d2fd1e2c709e"
+    ],
+    "groups": [
+      "G1"
+    ]
+  },
+  "execution": {
+    "serial_arms": true,
+    "task_concurrency": 6,
+    "judge_concurrency": 6,
+    "generation_max_attempts": 3,
+    "continue_after_arm_failure": true,
+    "restart_policy": "skip_only_execution-complete_10-row_G1_outputs; never overwrite incomplete output",
+    "controller_unit": "draco-p0-p05-20260804-234508.service",
+    "private_tmp": false,
+    "global_openrouter_lock": "/tmp/opensquilla-draco-openrouter.lock"
+  },
+  "runtime_contract": {
+    "frozen_replay": {
+      "mode_path": [
+        "g1_routing",
+        "task_analysis_execution",
+        "mode"
+      ],
+      "mode_value": "frozen_replay",
+      "payload_path": [
+        "g1_routing",
+        "task_analysis_execution"
+      ],
+      "artifact_projection_key": "replay_payload",
+      "schema": "opensquilla.draco.frozen-task-analysis/v1",
+      "expected_physical_analyzer_requests": 0
+    },
+    "live_analyzer": {
+      "mode": "live",
+      "minimum_physical_analyzer_requests_per_task": 1,
+      "retry_policy": "ranking task_analyzer.max_retries remains effective"
+    },
+    "selected_generation_cost": {
+      "priority": [
+        "actual_usd",
+        "cache_aware_token_estimate",
+        "ignored_when_money_and_tokens_missing"
+      ],
+      "exclude_judge": true,
+      "exclude_failed_or_replaced_generation_attempts": true
+    },
+    "offline_effect": {
+      "runner_mode": "main_runner_dry_run_frozen_replay",
+      "comparison": "ordered selected P/A, recovery rosters, quorum, shuffle behavior, prompt contract, and production-resolved request-visible member config",
+      "production_budget_gate_experiments": [
+        "P0.5-10",
+        "P0.5-38",
+        "P0.5-39"
+      ],
+      "required_replicate_arm_ids": [
+        "common-E0-R2",
+        "common-E0-R3",
+        "P0.5-11-E1-R1",
+        "P0.5-11-E1-R2",
+        "P0.5-11-E1-R3",
+        "P0.5-36-E1-R1",
+        "P0.5-36-E1-R2",
+        "P0.5-36-E1-R3"
+      ],
+      "no_op_policy": "delete any non-Analyzer arm only when all ten frozen tasks have byte-identical behavior projections; uncertainty always runs"
+    }
+  },
+  "excluded": [
+    {
+      "id": "P0-01",
+      "reason": "already completed; preserve existing evidence and do not rerun"
+    },
+    {
+      "id": "P0-02",
+      "reason": "already completed; preserve existing evidence and do not rerun"
+    },
+    {
+      "id": "P0.5-31",
+      "reason": "already completed; preserve existing evidence and do not rerun"
+    },
+    {
+      "id": "P0-15",
+      "reason": "source plan marks experiment stopped; preserve evidence and do not rerun"
+    }
+  ],
+  "common_e0": [
+    {
+      "arm_id": "common-E0-R1",
+      "variant": "E0-current-G1-C-source",
+      "replicate": 1,
+      "analyzer_mode": "live",
+      "override": {}
+    },
+    {
+      "arm_id": "common-E0-R2",
+      "variant": "E0-current-G1-C-replay",
+      "replicate": 2,
+      "analyzer_mode": "frozen_replay",
+      "override": {}
+    },
+    {
+      "arm_id": "common-E0-R3",
+      "variant": "E0-current-G1-C-replay",
+      "replicate": 3,
+      "analyzer_mode": "frozen_replay",
+      "override": {}
+    }
+  ],
+  "no_op_experiments": [
+    {
+      "id": "P0.5-07",
+      "title": "Analyzer temperature",
+      "provider_kind": "openrouter",
+      "model": "anthropic/claude-opus-4.8",
+      "requested_values": [
+        0.0,
+        0.2
+      ],
+      "decision": "delete after producing a code-bound no-op receipt",
+      "reason": "OpenRouter compatibility policy omits temperature for this model on the official host"
+    }
+  ],
+  "experiments": [
+    {
+      "id": "P0-03",
+      "directory_name": "P0-03",
+      "title": "Analyzer model/upstream provider",
+      "control_arm_id": "common-E0-R1",
+      "variants": [
+        {
+          "id": "E1",
+          "analyzer_mode": "live",
+          "override": {
+            "router_dynamic_ranking_override": {
+              "task_analyzer": {
+                "provider": "openrouter",
+                "model": "z-ai/glm-5.2",
+                "upstream_provider": "z-ai"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "P0-12",
+      "directory_name": "P0-12",
+      "title": "Task-match capability/domain/tier weights",
+      "variants": [
+        {
+          "id": "E1",
+          "override": {
+            "router_dynamic_ranking_override": {
+              "task_match": {
+                "capability_weight": 0.55,
+                "domain_weight": 0.2,
+                "tier_weight": 0.25
+              }
+            }
+          }
+        },
+        {
+          "id": "E2",
+          "override": {
+            "router_dynamic_ranking_override": {
+              "task_match": {
+                "capability_weight": 0.4,
+                "domain_weight": 0.2,
+                "tier_weight": 0.4
+              }
+            }
+          }
+        },
+        {
+          "id": "E3",
+          "override": {
+            "router_dynamic_ranking_override": {
+              "task_match": {
+                "capability_weight": 0.6,
+                "domain_weight": 0.0,
+                "tier_weight": 0.4
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "P0-20",
+      "directory_name": "P0-20",
+      "title": "Proposer-count policy",
+      "variants": [
+        {
+          "id": "E2",
+          "override": {
+            "router_dynamic_ranking_override": {
+              "proposer_count": {
+                "by_tier": {
+                  "3": {
+                    "min": 2,
+                    "max": 4
+                  },
+                  "4": {
+                    "min": 4,
+                    "max": 5
+                  }
+                },
+                "high_risk": {
+                  "min": 5,
+                  "max": 5
+                },
+                "constrained_max": 2
+              }
+            }
+          }
+        },
+        {
+          "id": "E3",
+          "override": {
+            "router_dynamic_ranking_override": {
+              "proposer_count": {
+                "by_tier": {
+                  "3": {
+                    "min": 2,
+                    "max": 2
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "P0-22",
+      "directory_name": "P0-22",
+      "title": "Rerank quality weight",
+      "variants": [
+        {
+          "id": "E1",
+          "override": {
+            "router_dynamic_ranking_override": {
+              "rerank": {
+                "quality_weight": 0.45
+              }
+            }
+          }
+        },
+        {
+          "id": "E2",
+          "override": {
+            "router_dynamic_ranking_override": {
+              "rerank": {
+                "quality_weight": 0.65
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "P0-23",
+      "directory_name": "P0-23",
+      "title": "Rerank coverage-gain weight",
+      "variants": [
+        {
+          "id": "E1",
+          "override": {
+            "router_dynamic_ranking_override": {
+              "rerank": {
+                "coverage_gain_weight": 0.2
+              }
+            }
+          }
+        },
+        {
+          "id": "E2",
+          "override": {
+            "router_dynamic_ranking_override": {
+              "rerank": {
+                "coverage_gain_weight": 0.4
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "P0-32",
+      "directory_name": "P0-32",
+      "title": "Aggregator task/role weights",
+      "variants": [
+        {
+          "id": "E1",
+          "override": {
+            "router_dynamic_ranking_override": {
+              "aggregator": {
+                "task_match_weight": 0.9,
+                "role_fit_weight": 0.1
+              }
+            }
+          }
+        },
+        {
+          "id": "E2",
+          "override": {
+            "router_dynamic_ranking_override": {
+              "aggregator": {
+                "task_match_weight": 0.6,
+                "role_fit_weight": 0.4
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "P0-35",
+      "directory_name": "P0-35",
+      "title": "Aggregator prompt version",
+      "variants": [
+        {
+          "id": "E1",
+          "override": {
+            "router_dynamic_ranking_override": {
+              "aggregator": {
+                "prompt_version": "aggregator-v2-verify-first"
+              }
+            }
+          }
+        },
+        {
+          "id": "E2",
+          "override": {
+            "router_dynamic_ranking_override": {
+              "aggregator": {
+                "prompt_version": "aggregator-v3-preserve-best"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "P0.5-05",
+      "directory_name": "P0-5-05",
+      "title": "Analyzer thinking",
+      "variants": [
+        {
+          "id": "E1",
+          "analyzer_mode": "live",
+          "override": {
+            "router_dynamic_ranking_override": {
+              "task_analyzer": {
+                "thinking": true
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "P0.5-06",
+      "directory_name": "P0-5-06",
+      "title": "Analyzer max output tokens",
+      "variants": [
+        {
+          "id": "E1",
+          "analyzer_mode": "live",
+          "dynamic": {
+            "kind": "analyzer_p99_scale",
+            "path": [
+              "router_dynamic_ranking_override",
+              "task_analyzer",
+              "max_output_tokens"
+            ],
+            "quantile": 0.99,
+            "quantile_method": "linear_type7",
+            "scale": 0.8,
+            "round": "floor"
+          }
+        },
+        {
+          "id": "E2",
+          "analyzer_mode": "live",
+          "dynamic": {
+            "kind": "analyzer_p99_scale",
+            "path": [
+              "router_dynamic_ranking_override",
+              "task_analyzer",
+              "max_output_tokens"
+            ],
+            "quantile": 0.99,
+            "quantile_method": "linear_type7",
+            "scale": 1.1,
+            "round": "ceil"
+          }
+        }
+      ]
+    },
+    {
+      "id": "P0.5-10",
+      "directory_name": "P0-5-10",
+      "title": "Generation max tokens",
+      "variants": [
+        {
+          "id": "E1",
+          "wire_gate": "resolved_selected_generation_budget",
+          "override": {
+            "generation": {
+              "max_tokens": 8192
+            }
+          }
+        },
+        {
+          "id": "E2",
+          "wire_gate": "resolved_selected_generation_budget",
+          "override": {
+            "generation": {
+              "max_tokens": 12288
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "P0.5-11",
+      "directory_name": "P0-5-11",
+      "title": "Generation temperature",
+      "control_arm_ids": [
+        "common-E0-R1",
+        "common-E0-R2",
+        "common-E0-R3"
+      ],
+      "analysis_scope": "only models for which temperature is actually present on the wire",
+      "variants": [
+        {
+          "id": "E1",
+          "replicates": 3,
+          "override": {
+            "generation": {
+              "temperature": 0.2
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "P0.5-13",
+      "directory_name": "P0-5-13",
+      "title": "Proposer task/role weights",
+      "variants": [
+        {
+          "id": "E1",
+          "override": {
+            "router_dynamic_ranking_override": {
+              "task_match": {
+                "proposer_task_weight": 0.9,
+                "proposer_role_fit_weight": 0.1
+              }
+            }
+          }
+        },
+        {
+          "id": "E2",
+          "override": {
+            "router_dynamic_ranking_override": {
+              "task_match": {
+                "proposer_task_weight": 0.7,
+                "proposer_role_fit_weight": 0.3
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "P0.5-14",
+      "directory_name": "P0-5-14",
+      "title": "Format base/strength multipliers",
+      "variants": [
+        {
+          "id": "E1",
+          "override": {
+            "router_dynamic_ranking_override": {
+              "task_match": {
+                "format_base_multiplier": 1.0,
+                "format_strength_multiplier": 0.0
+              }
+            }
+          }
+        },
+        {
+          "id": "E2",
+          "override": {
+            "router_dynamic_ranking_override": {
+              "task_match": {
+                "format_base_multiplier": 0.8,
+                "format_strength_multiplier": 0.2
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "P0.5-16",
+      "directory_name": "P0-5-16",
+      "title": "Task latency penalty weights",
+      "variants": [
+        {
+          "id": "E1",
+          "override": {
+            "router_dynamic_ranking_override": {
+              "penalties": {
+                "task_latency_weights": {
+                  "interactive": 0.11,
+                  "normal": 0.04,
+                  "batch": 0.015,
+                  "hard_timeout": 0.14
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "E2",
+          "override": {
+            "router_dynamic_ranking_override": {
+              "penalties": {
+                "task_latency_weights": {
+                  "interactive": 0.33,
+                  "normal": 0.12,
+                  "batch": 0.045,
+                  "hard_timeout": 0.42
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "P0.5-17",
+      "directory_name": "P0-5-17",
+      "title": "Price normalization reference",
+      "variants": [
+        {
+          "id": "E1",
+          "override": {
+            "router_dynamic_ranking_override": {
+              "normalization": {
+                "price_reference_usd_per_million": 20.0
+              }
+            }
+          }
+        },
+        {
+          "id": "E2",
+          "override": {
+            "router_dynamic_ranking_override": {
+              "normalization": {
+                "price_reference_usd_per_million": 80.0
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "P0.5-18",
+      "directory_name": "P0-5-18",
+      "title": "Latency normalization reference",
+      "variants": [
+        {
+          "id": "E1",
+          "override": {
+            "router_dynamic_ranking_override": {
+              "normalization": {
+                "latency_reference_ms": 15000.0
+              }
+            }
+          }
+        },
+        {
+          "id": "E2",
+          "override": {
+            "router_dynamic_ranking_override": {
+              "normalization": {
+                "latency_reference_ms": 60000.0
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "P0.5-19",
+      "directory_name": "P0-5-19",
+      "title": "Input/output price weights",
+      "variants": [
+        {
+          "id": "E1",
+          "override": {
+            "router_dynamic_ranking_override": {
+              "normalization": {
+                "price_input_weight": 0.2,
+                "price_output_weight": 0.8
+              }
+            }
+          }
+        },
+        {
+          "id": "E2",
+          "override": {
+            "router_dynamic_ranking_override": {
+              "normalization": {
+                "price_input_weight": 0.5,
+                "price_output_weight": 0.5
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "P0.5-21",
+      "directory_name": "P0-5-21",
+      "title": "Effective-tier rounding offset",
+      "variants": [
+        {
+          "id": "E1",
+          "override": {
+            "router_dynamic_ranking_override": {
+              "proposer_count": {
+                "effective_tier_rounding_offset": 0.25
+              }
+            }
+          }
+        },
+        {
+          "id": "E2",
+          "override": {
+            "router_dynamic_ranking_override": {
+              "proposer_count": {
+                "effective_tier_rounding_offset": 0.75
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "P0.5-24",
+      "directory_name": "P0-5-24",
+      "title": "Similarity penalty weight",
+      "variants": [
+        {
+          "id": "E1",
+          "override": {
+            "router_dynamic_ranking_override": {
+              "rerank": {
+                "similarity_penalty_weight": 0.15
+              }
+            }
+          }
+        },
+        {
+          "id": "E2",
+          "override": {
+            "router_dynamic_ranking_override": {
+              "rerank": {
+                "similarity_penalty_weight": 0.35
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "P0.5-25",
+      "directory_name": "P0-5-25",
+      "title": "Top-L minimum",
+      "variants": [
+        {
+          "id": "E1",
+          "override": {
+            "router_dynamic_ranking_override": {
+              "rerank": {
+                "top_l_min": 5
+              }
+            }
+          }
+        },
+        {
+          "id": "E2",
+          "override": {
+            "router_dynamic_ranking_override": {
+              "rerank": {
+                "top_l_min": 12
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "P0.5-26",
+      "directory_name": "P0-5-26",
+      "title": "Top-L multiplier",
+      "variants": [
+        {
+          "id": "E1",
+          "override": {
+            "router_dynamic_ranking_override": {
+              "rerank": {
+                "top_l_multiplier": 1
+              }
+            }
+          }
+        },
+        {
+          "id": "E2",
+          "override": {
+            "router_dynamic_ranking_override": {
+              "rerank": {
+                "top_l_multiplier": 3
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "P0.5-27",
+      "directory_name": "P0-5-27",
+      "title": "Similarity capability/lineage weights",
+      "variants": [
+        {
+          "id": "E1",
+          "override": {
+            "router_dynamic_ranking_override": {
+              "rerank": {
+                "similarity": {
+                  "capability_weight": 0.7,
+                  "lineage_weight": 0.3
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "E2",
+          "override": {
+            "router_dynamic_ranking_override": {
+              "rerank": {
+                "similarity": {
+                  "capability_weight": 0.3,
+                  "lineage_weight": 0.7
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "P0.5-28",
+      "directory_name": "P0-5-28",
+      "title": "Same-family similarity score",
+      "variants": [
+        {
+          "id": "E1",
+          "override": {
+            "router_dynamic_ranking_override": {
+              "rerank": {
+                "similarity": {
+                  "same_family_score": 0.75
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "P0.5-29",
+      "directory_name": "P0-5-29",
+      "title": "Same-vendor similarity score",
+      "variants": [
+        {
+          "id": "E1",
+          "override": {
+            "router_dynamic_ranking_override": {
+              "rerank": {
+                "similarity": {
+                  "same_vendor_score": 0.25
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "E2",
+          "override": {
+            "router_dynamic_ranking_override": {
+              "rerank": {
+                "similarity": {
+                  "same_vendor_score": 0.75
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "P0.5-30",
+      "directory_name": "P0-5-30",
+      "title": "Quality-floor margins by risk",
+      "variants": [
+        {
+          "id": "E1",
+          "override": {
+            "router_dynamic_ranking_override": {
+              "rerank": {
+                "quality_floor_margin_by_risk": {
+                  "low": 0.2,
+                  "medium": 0.12,
+                  "high": 0.04
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "E2",
+          "override": {
+            "router_dynamic_ranking_override": {
+              "rerank": {
+                "quality_floor_margin_by_risk": {
+                  "low": 0.36,
+                  "medium": 0.28,
+                  "high": 0.2
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "P0.5-33",
+      "directory_name": "P0-5-33",
+      "title": "Aggregator same-model penalty",
+      "variants": [
+        {
+          "id": "E1",
+          "override": {
+            "router_dynamic_ranking_override": {
+              "aggregator": {
+                "same_model_penalty": 0.0
+              }
+            }
+          }
+        },
+        {
+          "id": "E2",
+          "override": {
+            "router_dynamic_ranking_override": {
+              "aggregator": {
+                "same_model_penalty": 0.16
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "P0.5-34",
+      "directory_name": "P0-5-34",
+      "title": "Aggregator same-family/vendor penalty",
+      "variants": [
+        {
+          "id": "E1",
+          "override": {
+            "router_dynamic_ranking_override": {
+              "aggregator": {
+                "same_family_or_vendor_penalty": 0.0
+              }
+            }
+          }
+        },
+        {
+          "id": "E2",
+          "override": {
+            "router_dynamic_ranking_override": {
+              "aggregator": {
+                "same_family_or_vendor_penalty": 0.1
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "P0.5-36",
+      "directory_name": "P0-5-36",
+      "title": "Candidate shuffle",
+      "control_arm_ids": [
+        "common-E0-R1",
+        "common-E0-R2",
+        "common-E0-R3"
+      ],
+      "analysis_scope": "diagnostic; primary analysis restricted to tasks whose A/P sets do not overlap",
+      "variants": [
+        {
+          "id": "E1",
+          "replicates": 3,
+          "override": {
+            "ensemble": {
+              "shuffle_candidates": true
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "P0.5-37",
+      "directory_name": "P0-5-37",
+      "title": "Unrelated-model similarity score",
+      "variants": [
+        {
+          "id": "E1",
+          "override": {
+            "router_dynamic_ranking_override": {
+              "rerank": {
+                "similarity": {
+                  "unrelated_score": 0.25
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "E2",
+          "override": {
+            "router_dynamic_ranking_override": {
+              "rerank": {
+                "similarity": {
+                  "unrelated_score": 0.5
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "P0.5-38",
+      "directory_name": "P0-5-38",
+      "title": "Aggregator output-token cap",
+      "variants": [
+        {
+          "id": "E1",
+          "wire_gate": "resolved_selected_generation_budget",
+          "override": {
+            "ensemble": {
+              "aggregator_max_tokens_cap": 32768
+            }
+          }
+        },
+        {
+          "id": "E2",
+          "wire_gate": "resolved_selected_generation_budget",
+          "override": {
+            "ensemble": {
+              "aggregator_max_tokens_cap": 16384
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "P0.5-39",
+      "directory_name": "P0-5-39",
+      "title": "Aggregator visible-answer reserve",
+      "variants": [
+        {
+          "id": "E1",
+          "wire_gate": "resolved_selected_generation_budget",
+          "override": {
+            "ensemble": {
+              "aggregator_visible_answer_reserve_tokens": 4096
+            }
+          }
+        },
+        {
+          "id": "E2",
+          "wire_gate": "resolved_selected_generation_budget",
+          "override": {
+            "ensemble": {
+              "aggregator_visible_answer_reserve_tokens": 16384
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "reporting": {
+    "mini_is_diagnostic_only": true,
+    "automatic_winner_promotion": false,
+    "independent_safety_gate_available": false,
+    "terminal_hook": {
+      "enabled": true,
+      "mode": "frozen_python_reporter",
+      "strict": true
+    },
+    "required_outputs": [
+      "one EXPERIMENT_RESULTS.md per experiment group",
+      "one root EXPERIMENT_RESULTS.md",
+      "machine-readable completion/audit/policy/cost receipts"
+    ],
+    "pairing": {
+      "key": "task_id",
+      "bootstrap_repetitions": 20000,
+      "missing_tasks_must_not_be_reported_as_complete": true
+    }
+  }
+}
