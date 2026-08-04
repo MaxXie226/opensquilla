@@ -19,41 +19,43 @@ const scriptDir = dirname(fileURLToPath(import.meta.url))
 const packageRoot = resolve(scriptDir, '..')
 const repoRoot = resolve(packageRoot, '../..')
 
+// Every locale exercises the repair page with the schema-too-new fixture, so
+// the expected heading is the update-specific title, not the generic one.
 const LOCALES = {
   en: {
     title: 'Starting OpenSquilla',
     bootAria: 'OpenSquilla startup',
-    repairTitle: 'Your primary profile needs recovery',
+    repairTitle: 'Update OpenSquilla to open this profile',
     retry: 'Retry',
   },
   'zh-Hans': {
     title: '正在启动 OpenSquilla',
     bootAria: 'OpenSquilla 启动',
-    repairTitle: '主配置需要恢复',
+    repairTitle: '请更新 OpenSquilla 以打开此配置',
     retry: '重试',
   },
   ja: {
     title: 'OpenSquilla を起動しています',
     bootAria: 'OpenSquilla の起動',
-    repairTitle: 'プライマリプロファイルの復旧が必要です',
+    repairTitle: 'このプロファイルを開くには OpenSquilla の更新が必要です',
     retry: '再試行',
   },
   fr: {
     title: "Démarrage d'OpenSquilla",
     bootAria: "Démarrage d'OpenSquilla",
-    repairTitle: 'Le profil principal doit être récupéré',
+    repairTitle: 'Mettez à jour OpenSquilla pour ouvrir ce profil',
     retry: 'Réessayer',
   },
   de: {
     title: 'OpenSquilla wird gestartet',
     bootAria: 'OpenSquilla-Start',
-    repairTitle: 'Das Hauptprofil muss wiederhergestellt werden',
+    repairTitle: 'Aktualisieren Sie OpenSquilla, um dieses Profil zu öffnen',
     retry: 'Wiederholen',
   },
   es: {
     title: 'Iniciando OpenSquilla',
     bootAria: 'Inicio de OpenSquilla',
-    repairTitle: 'El perfil principal necesita recuperación',
+    repairTitle: 'Actualiza OpenSquilla para abrir este perfil',
     retry: 'Reintentar',
   },
 }
@@ -261,6 +263,7 @@ for (const [locale, expected] of Object.entries(LOCALES)) {
     assert.equal(await page.evaluate(() => document.activeElement?.id), 'recoveryTitle')
     assert.equal(await page.locator('#recoveryRetry').innerText(), expected.retry)
     assert.equal(await page.locator('#recoveryRetry').isVisible(), true)
+    assert.equal(await page.locator('#recoveryUpdate').isVisible(), true)
 
     for (const removedId of REMOVED_PROFILE_CONTROLS) {
       assert.equal(await page.locator(`#${removedId}`).count(), 0, `${locale}: ${removedId}`)
@@ -270,6 +273,7 @@ for (const [locale, expected] of Object.entries(LOCALES)) {
       chooseWorkspace: typeof window.opensquillaDesktop.chooseRecoveryWorkspace,
       recoverTransaction: typeof window.opensquillaDesktop.recoverProfileTransaction,
       abandonCleanup: typeof window.opensquillaDesktop.abandonCleanupTransaction,
+      openDownload: typeof window.opensquillaDesktop.openLatestDownloadPage,
       retryStartup: typeof window.opensquillaDesktop.retryStartup,
       launchSafeProfile: typeof window.opensquillaDesktop.launchSafeProfile,
       retryPrimaryProfile: typeof window.opensquillaDesktop.retryPrimaryProfile,
@@ -280,6 +284,7 @@ for (const [locale, expected] of Object.entries(LOCALES)) {
     assert.equal(bridgeShape.chooseWorkspace, 'function')
     assert.equal(bridgeShape.recoverTransaction, 'function')
     assert.equal(bridgeShape.abandonCleanup, 'undefined')
+    assert.equal(bridgeShape.openDownload, 'function')
     assert.equal(bridgeShape.retryStartup, 'function')
     assert.equal(bridgeShape.launchSafeProfile, 'undefined')
     assert.equal(bridgeShape.retryPrimaryProfile, 'undefined')

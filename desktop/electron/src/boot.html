@@ -567,6 +567,12 @@
           </div>
         </div>
 
+        <div class="recovery-group" id="updateGroup" hidden>
+          <div class="recovery-row">
+            <button id="recoveryUpdate" class="primary" type="button" data-i18n="openDownloadPage">Get the latest version</button>
+          </div>
+        </div>
+
         <p class="recovery-status" id="recoveryStatus" role="status" aria-live="polite"></p>
         <div class="actions">
           <button id="revealProfile" type="button" data-i18n="revealProfile">Show profile location</button>
@@ -601,6 +607,10 @@
         resetFailed: 'Reset failed',
         recoveryTitle: 'Your primary profile needs recovery',
         recoveryIntro: 'OpenSquilla paused the primary gateway because it could not prove that writing is safe. Primary data and any completed consolidation backups remain preserved.',
+        recoveryTitleLockBusy: 'Another OpenSquilla process is using this profile',
+        recoveryTitleUpdate: 'Update OpenSquilla to open this profile',
+        recoveryIntroUpdate: 'This configuration was created by a newer version of OpenSquilla. Update the app to continue — your data stays untouched.',
+        openDownloadPage: 'Get the latest version',
         workspaceLabel: 'Choose a verified workspace', chooseWorkspace: 'Use selected workspace', browseWorkspace: 'Browse…',
         recoverTransaction: 'Safely recover interrupted operation', revealProfile: 'Show profile location', revealBackups: 'Show backup location',
         copyDiagnostics: 'Copy diagnostics', diagnosticsCopied: 'Sanitized diagnostics copied.', recoveryWorking: 'Working…', noWorkspaceCandidates: 'No verified candidates; browse for a workspace.',
@@ -621,6 +631,10 @@
         resetFailed: '重置失败',
         recoveryTitle: '主配置需要恢复',
         recoveryIntro: 'OpenSquilla 无法确认主配置可安全写入，因此已暂停主网关。主配置数据及已完成的聚合备份均会保留。',
+        recoveryTitleLockBusy: '另一个 OpenSquilla 进程正在使用此配置',
+        recoveryTitleUpdate: '请更新 OpenSquilla 以打开此配置',
+        recoveryIntroUpdate: '此配置由更新版本的 OpenSquilla 创建。请将应用更新到最新版本后继续，你的数据不会受到影响。',
+        openDownloadPage: '获取最新版本',
         workspaceLabel: '选择已验证的工作区', chooseWorkspace: '使用所选工作区', browseWorkspace: '浏览…',
         recoverTransaction: '安全恢复中断的操作', revealProfile: '显示配置位置', revealBackups: '显示备份位置',
         copyDiagnostics: '复制诊断信息', diagnosticsCopied: '已复制脱敏诊断信息。', recoveryWorking: '正在处理…', noWorkspaceCandidates: '没有已验证候选；请浏览选择工作区。',
@@ -641,6 +655,10 @@
         resetFailed: 'リセットに失敗しました',
         recoveryTitle: 'プライマリプロファイルの復旧が必要です',
         recoveryIntro: '安全な書き込みを確認できないため、プライマリゲートウェイを一時停止しました。プライマリデータと完了済みの統合バックアップは保持されています。',
+        recoveryTitleLockBusy: '別の OpenSquilla プロセスがこのプロファイルを使用しています',
+        recoveryTitleUpdate: 'このプロファイルを開くには OpenSquilla の更新が必要です',
+        recoveryIntroUpdate: 'この設定は新しいバージョンの OpenSquilla で作成されています。アプリを最新版に更新すると続行できます。データはそのまま保持されます。',
+        openDownloadPage: '最新バージョンを入手',
         workspaceLabel: '検証済みワークスペースを選択', chooseWorkspace: '選択したワークスペースを使用', browseWorkspace: '参照…',
         recoverTransaction: '中断した操作を安全に復旧', revealProfile: 'プロファイルの場所を表示', revealBackups: 'バックアップの場所を表示',
         copyDiagnostics: '診断情報をコピー', diagnosticsCopied: 'サニタイズ済み診断情報をコピーしました。', recoveryWorking: '処理中…', noWorkspaceCandidates: '検証済み候補がありません。ワークスペースを参照してください。',
@@ -661,6 +679,10 @@
         resetFailed: 'Échec de la réinitialisation',
         recoveryTitle: 'Le profil principal doit être récupéré',
         recoveryIntro: 'OpenSquilla a suspendu la passerelle principale car une écriture sûre ne pouvait pas être garantie. Les données principales et les sauvegardes de consolidation terminées restent préservées.',
+        recoveryTitleLockBusy: 'Un autre processus OpenSquilla utilise ce profil',
+        recoveryTitleUpdate: 'Mettez à jour OpenSquilla pour ouvrir ce profil',
+        recoveryIntroUpdate: 'Cette configuration a été créée par une version plus récente d’OpenSquilla. Mettez l’application à jour pour continuer — vos données restent intactes.',
+        openDownloadPage: 'Obtenir la dernière version',
         workspaceLabel: 'Choisir un espace de travail vérifié', chooseWorkspace: 'Utiliser l’espace sélectionné', browseWorkspace: 'Parcourir…',
         recoverTransaction: 'Récupérer l’opération interrompue en toute sécurité', revealProfile: 'Afficher l’emplacement du profil', revealBackups: 'Afficher les sauvegardes',
         copyDiagnostics: 'Copier le diagnostic', diagnosticsCopied: 'Diagnostic expurgé copié.', recoveryWorking: 'Traitement…', noWorkspaceCandidates: 'Aucun candidat vérifié ; parcourez les dossiers.',
@@ -681,6 +703,10 @@
         resetFailed: 'Zurücksetzen fehlgeschlagen',
         recoveryTitle: 'Das Hauptprofil muss wiederhergestellt werden',
         recoveryIntro: 'OpenSquilla hat das Haupt-Gateway angehalten, weil sicheres Schreiben nicht bestätigt werden konnte. Hauptdaten und abgeschlossene Konsolidierungssicherungen bleiben erhalten.',
+        recoveryTitleLockBusy: 'Ein anderer OpenSquilla-Prozess verwendet dieses Profil',
+        recoveryTitleUpdate: 'Aktualisieren Sie OpenSquilla, um dieses Profil zu öffnen',
+        recoveryIntroUpdate: 'Diese Konfiguration wurde von einer neueren OpenSquilla-Version erstellt. Aktualisieren Sie die App, um fortzufahren — Ihre Daten bleiben unverändert.',
+        openDownloadPage: 'Neueste Version laden',
         workspaceLabel: 'Geprüften Arbeitsbereich wählen', chooseWorkspace: 'Auswahl verwenden', browseWorkspace: 'Durchsuchen…',
         recoverTransaction: 'Unterbrochenen Vorgang sicher wiederherstellen', revealProfile: 'Profilordner anzeigen', revealBackups: 'Sicherungsordner anzeigen',
         copyDiagnostics: 'Diagnose kopieren', diagnosticsCopied: 'Bereinigte Diagnose kopiert.', recoveryWorking: 'Wird ausgeführt…', noWorkspaceCandidates: 'Keine geprüften Kandidaten; bitte Arbeitsbereich auswählen.',
@@ -701,6 +727,10 @@
         resetFailed: 'Error al restablecer',
         recoveryTitle: 'El perfil principal necesita recuperación',
         recoveryIntro: 'OpenSquilla pausó la pasarela principal porque no pudo demostrar que fuera seguro escribir. Los datos principales y las copias de consolidación completadas permanecen conservados.',
+        recoveryTitleLockBusy: 'Otro proceso de OpenSquilla está usando este perfil',
+        recoveryTitleUpdate: 'Actualiza OpenSquilla para abrir este perfil',
+        recoveryIntroUpdate: 'Esta configuración fue creada por una versión más reciente de OpenSquilla. Actualiza la aplicación para continuar; tus datos permanecen intactos.',
+        openDownloadPage: 'Obtener la última versión',
         workspaceLabel: 'Elegir un espacio verificado', chooseWorkspace: 'Usar el espacio seleccionado', browseWorkspace: 'Examinar…',
         recoverTransaction: 'Recuperar de forma segura la operación interrumpida', revealProfile: 'Mostrar ubicación del perfil', revealBackups: 'Mostrar copias de seguridad',
         copyDiagnostics: 'Copiar diagnóstico', diagnosticsCopied: 'Diagnóstico depurado copiado.', recoveryWorking: 'Procesando…', noWorkspaceCandidates: 'No hay candidatos verificados; busca un espacio de trabajo.',
@@ -813,12 +843,26 @@
       errorPanel.classList.remove('visible');
       recoveryPanel.classList.add('visible');
       if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
-      recoveryCode.textContent = String(inspection.stable_code || 'recovery_required');
+      const stableCode = String(inspection.stable_code || 'recovery_required');
+      recoveryCode.textContent = stableCode;
       const detail = typeof inspection.detail === 'string' ? inspection.detail : '';
       recoveryDetail.textContent = detail;
       recoveryDetail.hidden = !detail;
-      recoveryTitle.textContent = msg.recoveryTitle;
-      recoveryIntro.textContent = msg.recoveryIntro;
+      // The two conditions a user can act on directly get plain-language
+      // copy instead of the generic recovery framing: a config authored by a
+      // newer build (update the app) and a profile still held by another
+      // OpenSquilla process (let it finish or quit it).
+      const needsAppUpdate = stableCode === 'config_schema_too_new';
+      if (needsAppUpdate) {
+        recoveryTitle.textContent = msg.recoveryTitleUpdate;
+        recoveryIntro.textContent = msg.recoveryIntroUpdate;
+      } else if (stableCode === 'profile_lock_busy') {
+        recoveryTitle.textContent = msg.recoveryTitleLockBusy;
+        recoveryIntro.textContent = msg.profileInUse;
+      } else {
+        recoveryTitle.textContent = msg.recoveryTitle;
+        recoveryIntro.textContent = msg.recoveryIntro;
+      }
 
       const candidates = Array.isArray(inspection.candidates)
         ? inspection.candidates.filter((item) => (
@@ -849,6 +893,7 @@
 
       document.getElementById('workspaceGroup').hidden = !mayChooseWorkspace;
       document.getElementById('transactionRecoveryGroup').hidden = !allowedActions.has('recover-transaction');
+      document.getElementById('updateGroup').hidden = !needsAppUpdate;
       document.getElementById('revealBackups').hidden = !allowedActions.has('show-backups');
       document.getElementById('copyDiagnostics').hidden = !allowedActions.has('copy-diagnostics');
       recoveryStatus.textContent = state.error ? String(state.error) : (state.busy ? msg.recoveryWorking : '');
@@ -961,6 +1006,12 @@
       document.getElementById('recoverTransaction').addEventListener('click', () => runRecoveryAction(() => (
         api.recoverProfileTransaction()
       )));
+      const updateButton = document.getElementById('recoveryUpdate');
+      if (typeof api.openLatestDownloadPage === 'function') {
+        updateButton.addEventListener('click', () => api.openLatestDownloadPage());
+      } else {
+        updateButton.style.display = 'none';
+      }
       document.getElementById('revealProfile').addEventListener('click', () => (
         api.revealRecoveryPath({ target: 'primary' })
       ));

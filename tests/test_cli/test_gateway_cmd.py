@@ -395,7 +395,7 @@ def test_gateway_run_emits_stable_profile_in_use_error_without_sensitive_path(
     lock_error = getattr(recovery, lock_error_name)
 
     @contextlib.contextmanager
-    def busy_profile_guard():
+    def busy_profile_guard(**_kwargs):
         raise lock_error(
             f"profile is in use by another writer: {sensitive_profile}"
         )

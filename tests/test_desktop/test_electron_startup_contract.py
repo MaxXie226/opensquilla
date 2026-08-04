@@ -445,6 +445,7 @@ def test_primary_repair_ui_is_accessible_without_profile_choices() -> None:
         "recoverProfileTransaction",
         "revealRecoveryPath",
         "copyRecoveryDiagnostics",
+        "openLatestDownloadPage",
     ):
         assert bridge_name in boot_html
     assert "abandonPartialCleanup" not in boot_html
@@ -470,7 +471,11 @@ def test_primary_repair_ui_scaffold_has_all_six_locales() -> None:
     boot_html = _read("desktop/electron/src/boot.html")
     locale_keys = (
         "recoveryTitle",
+        "recoveryTitleLockBusy",
+        "recoveryTitleUpdate",
         "recoveryIntro",
+        "recoveryIntroUpdate",
+        "openDownloadPage",
         "workspaceLabel",
         "chooseWorkspace",
         "browseWorkspace",
@@ -503,6 +508,61 @@ def test_primary_repair_ui_scaffold_has_all_six_locales() -> None:
         "returnPrimary",
     ):
         assert f"{removed_key}:" not in boot_html
+
+
+def test_primary_repair_ui_gives_actionable_copy_for_user_resolvable_blockers() -> None:
+    """The two blockers a user can act on directly drop the generic framing.
+
+    A profile held by another OpenSquilla process resolves by letting that
+    process finish (or quitting it); a config authored by a newer build
+    resolves by updating the app, so that state alone surfaces a download
+    entry pointing at the canonical releases page.
+    """
+
+    boot_html = _read("desktop/electron/src/boot.html")
+    main_ts = _read("desktop/electron/src/main.ts")
+    preload = _read("desktop/electron/src/preload.cts")
+    render_recovery = _section(
+        boot_html,
+        "function renderRecoveryState(state, moveFocus = true)",
+        "async function runRecoveryAction",
+    )
+
+    assert "const needsAppUpdate = stableCode === 'config_schema_too_new'" in render_recovery
+    assert "recoveryTitle.textContent = msg.recoveryTitleUpdate" in render_recovery
+    assert "recoveryIntro.textContent = msg.recoveryIntroUpdate" in render_recovery
+    assert "stableCode === 'profile_lock_busy'" in render_recovery
+    assert "recoveryTitle.textContent = msg.recoveryTitleLockBusy" in render_recovery
+    assert "recoveryIntro.textContent = msg.profileInUse" in render_recovery
+    assert "document.getElementById('updateGroup').hidden = !needsAppUpdate" in render_recovery
+
+    assert 'id="updateGroup"' in boot_html
+    assert 'id="recoveryUpdate"' in boot_html
+    assert "api.openLatestDownloadPage()" in boot_html
+
+    assert "ipcRenderer.invoke('desktop:recovery:open-download')" in preload
+    assert "ipcMain.handle('desktop:recovery:open-download'" in main_ts
+    open_download = _section(
+        main_ts,
+        "ipcMain.handle('desktop:recovery:open-download'",
+        "ipcMain.handle('desktop:boot:state'",
+    )
+    assert "trustedRecoveryIpc(event)" in open_download
+    assert (
+        "`https://github.com/${GITHUB_UPDATE_OWNER}/${GITHUB_UPDATE_REPO}/releases/latest`"
+        in open_download
+    )
+
+
+def test_mutating_recovery_commands_wait_briefly_for_a_busy_profile_writer() -> None:
+    """Startup passes a bounded --lock-timeout so a transient writer (an
+    exiting gateway, a finishing cron tick) resolves on its own instead of
+    stranding the user on the manual recovery page."""
+
+    main_ts = _read("desktop/electron/src/main.ts")
+
+    assert "const RECOVERY_LOCK_TIMEOUT_SECONDS = 5" in main_ts
+    assert main_ts.count("'--lock-timeout', String(RECOVERY_LOCK_TIMEOUT_SECONDS)") == 5
 
 
 def test_desktop_runtime_is_primary_only_with_safe_legacy_enumeration() -> None:
@@ -2552,7 +2612,8 @@ def test_python_recovery_engine_replaces_typescript_layout_relocation() -> None:
         "ensureGatewayStarted()"
     )
     assert "inspection.allowed_actions.includes('reconcile')" in inspect
-    assert "'reconcile', '--home', active.home, '--json'" in inspect
+    assert "'reconcile', '--home', active.home," in inspect
+    assert "'--lock-timeout', String(RECOVERY_LOCK_TIMEOUT_SECONDS), '--json'," in inspect
     assert "inspection.outcome !== 'recovery_required'" in inspect
 
 
@@ -3169,7 +3230,8 @@ def test_blocked_consolidation_defers_only_after_primary_is_bootable() -> None:
     # A corrupt config is repaired automatically from its newest valid backup
     # (defaults otherwise) after the corrupt file is preserved beside itself.
     assert "inspection.allowed_actions.includes('recover-config')" in startup
-    assert "'recover-config', '--home', active.home, '--json'," in startup
+    assert "'recover-config', '--home', active.home," in startup
+    assert "'--lock-timeout', String(RECOVERY_LOCK_TIMEOUT_SECONDS), '--json'," in startup
     assert "'config_auto_recovery_failed'" in startup
 
 

@@ -51,7 +51,11 @@ import {
   type TrustedDesktopCleanupPreview,
 } from './desktop-cleanup.js'
 import { secretStorageBackendForPolicy, shouldUseChromiumMockKeychainForPolicy } from './secret-storage-policy.js'
-import { parseOpenSquillaReleaseTag } from './update-feed-resolver.js'
+import {
+  GITHUB_UPDATE_OWNER,
+  GITHUB_UPDATE_REPO,
+  parseOpenSquillaReleaseTag,
+} from './update-feed-resolver.js'
 import {
   candidateFromUpdateChannel,
   orderedUpdateSources,
@@ -6394,6 +6398,11 @@ async function probeOnboardingProvider(
 const RECOVERY_PROTOCOL_SCHEMA_VERSION = 1
 const RECOVERY_STDOUT_LIMIT = 2 * 1024 * 1024
 const RECOVERY_COMMAND_TIMEOUT_MS = 60_000
+// Mutating recovery commands fail closed with profile_lock_busy the moment
+// another writer holds the profile locks. A short in-CLI wait lets a transient
+// writer (an exiting gateway, a cron tick) finish instead of stranding startup
+// on the manual recovery page.
+const RECOVERY_LOCK_TIMEOUT_SECONDS = 5
 const RECOVERY_OUTCOMES = new Set<RecoveryOutcome>([
   'ready',
   'attention',
@@ -6990,6 +6999,7 @@ async function recoverInspectedProfileTransaction(
     '--home', profile.home,
     '--transaction-id', inspection.transaction_id,
     '--expected-revision', String(inspection.revision),
+    '--lock-timeout', String(RECOVERY_LOCK_TIMEOUT_SECONDS),
     '--json',
   ])
 }
@@ -8217,6 +8227,7 @@ async function inspectActiveProfileBeforeStartup(): Promise<boolean> {
         '--profile-kind', 'desktop-primary',
         '--transaction-id', inspection.transaction_id,
         '--expected-revision', String(inspection.revision),
+        '--lock-timeout', String(RECOVERY_LOCK_TIMEOUT_SECONDS),
         '--json',
       ])
     } catch (error) {
@@ -8231,7 +8242,8 @@ async function inspectActiveProfileBeforeStartup(): Promise<boolean> {
     if (gatewayProcess && gatewayState.owned) await stopOwnedGatewayAndWait()
     try {
       inspection = await runRecoveryCli(active, [
-        'recover-settings', '--home', active.home, '--json',
+        'recover-settings', '--home', active.home,
+        '--lock-timeout', String(RECOVERY_LOCK_TIMEOUT_SECONDS), '--json',
       ])
     } catch (error) {
       desktopLog('settings_transaction_recovery_failed', {
@@ -8263,7 +8275,8 @@ async function inspectActiveProfileBeforeStartup(): Promise<boolean> {
       // restores the newest valid backup (or minimal defaults), so the
       // automatic path never destroys evidence.
       inspection = await runRecoveryCli(active, [
-        'recover-config', '--home', active.home, '--json',
+        'recover-config', '--home', active.home,
+        '--lock-timeout', String(RECOVERY_LOCK_TIMEOUT_SECONDS), '--json',
       ])
     } catch (error) {
       desktopLog('config_auto_recovery_failed', {
@@ -8281,7 +8294,8 @@ async function inspectActiveProfileBeforeStartup(): Promise<boolean> {
     if (gatewayProcess && gatewayState.owned) await stopOwnedGatewayAndWait()
     try {
       inspection = await runRecoveryCli(active, [
-        'reconcile', '--home', active.home, '--json',
+        'reconcile', '--home', active.home,
+        '--lock-timeout', String(RECOVERY_LOCK_TIMEOUT_SECONDS), '--json',
       ])
     } catch (error) {
       desktopLog('recovery_reconcile_failed', {
@@ -12216,6 +12230,16 @@ ipcMain.handle('desktop:recovery:reveal-path', async (
 ipcMain.handle('desktop:recovery:copy-diagnostics', async (event) => {
   if (!trustedRecoveryIpc(event)) return false
   clipboard.writeText(sanitizedRecoveryDiagnostics())
+  return true
+})
+ipcMain.handle('desktop:recovery:open-download', async (event) => {
+  // A config authored by a newer build blocks startup until the app is
+  // updated. The recovery page offers the canonical download entry because
+  // the in-app updater is unavailable on unmanaged installs.
+  if (!trustedRecoveryIpc(event)) return false
+  await shell.openExternal(
+    `https://github.com/${GITHUB_UPDATE_OWNER}/${GITHUB_UPDATE_REPO}/releases/latest`,
+  )
   return true
 })
 
