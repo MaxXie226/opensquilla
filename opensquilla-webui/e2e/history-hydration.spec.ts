@@ -321,7 +321,9 @@ test('recovers from stuck automatic metadata before sending', async ({ page }) =
 
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
   await expect.poll(() => heldConfigRequests).toBeGreaterThan(0)
-  await expect.poll(() => socketCount, { timeout: 10_000 }).toBeGreaterThan(1)
+  // The optional metadata budget is 10 seconds; leave time for the timeout
+  // handler to retire the stuck socket and finish the replacement handshake.
+  await expect.poll(() => socketCount, { timeout: 15_000 }).toBeGreaterThan(1)
 
   const composer = page.getByRole('textbox', { name: 'Message to send' })
   const send = page.getByRole('button', { name: 'Send', exact: true })
