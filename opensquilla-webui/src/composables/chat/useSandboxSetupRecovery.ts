@@ -1,7 +1,11 @@
 import { computed, onScopeDispose, ref, watch, type Ref } from 'vue'
+import {
+  ensureSandboxReady,
+  normalizeSandboxSetupStatus,
+  type SandboxSetupOutcome,
+} from '@/composables/sandboxSetupCoordinator'
 import type {
   SandboxRunMode,
-  SandboxSetupState,
   SandboxSetupStatusPayload,
 } from '@/types/sandbox'
 
@@ -21,26 +25,13 @@ export interface UseSandboxSetupRecoveryOptions {
   ) => void | Promise<void>
 }
 
-function normalizeStatus(payload: unknown): SandboxSetupStatusPayload | null {
-  if (!payload || typeof payload !== 'object') return null
-  const raw = payload as Record<string, unknown>
-  const state = String(raw.state || '') as SandboxSetupState
-  if (!['not_setup', 'setting_up', 'ready', 'failed', 'unavailable'].includes(state)) return null
-  return {
-    state,
-    platform: String(raw.platform || ''),
-    message: String(raw.message || ''),
-    requiresAdmin: raw.requiresAdmin === true || raw.requires_admin === true,
-    detail: typeof raw.detail === 'string' ? raw.detail : undefined,
-  }
-}
-
 export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions) {
   const status = ref<SandboxSetupStatusPayload | null>(null)
   const loading = ref(false)
   const ensuring = ref(false)
   const dismissed = ref(false)
   const error = ref('')
+  const outcome = ref<SandboxSetupOutcome>('idle')
   let requestGeneration = 0
   let pollTimer: ReturnType<typeof setTimeout> | null = null
   let lastState = ''
@@ -99,7 +90,7 @@ export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions)
     loading.value = status.value === null
     clearPoll()
     try {
-      const payload = normalizeStatus(await options.rpc.call('sandbox.setup.status'))
+      const payload = normalizeSandboxSetupStatus(await options.rpc.call('sandbox.setup.status'))
       if (generation !== requestGeneration) return
       if (!payload) {
         // Keep following an already-authoritative setting_up state when a
@@ -124,20 +115,18 @@ export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions)
     }
   }
 
-  async function ensureSetup() {
-    if (!canSetup.value || ensuring.value) return
+  async function ensureSetup(): Promise<boolean> {
+    if (!canSetup.value || ensuring.value) return false
     const generation = ++requestGeneration
     ensuring.value = true
     error.value = ''
     clearPoll()
     try {
-      const payload = normalizeStatus(await options.rpc.call('sandbox.setup.ensure'))
-      if (generation !== requestGeneration || !payload) return
-      applyStatus(payload)
-    } catch (cause) {
-      if (generation === requestGeneration) {
-        error.value = cause instanceof Error ? cause.message : String(cause)
-      }
+      const result = await ensureSandboxReady(options.rpc.call)
+      if (generation !== requestGeneration) return false
+      if (result.status) applyStatus(result.status)
+      outcome.value = result.outcome
+      return result.ready
     } finally {
       if (generation === requestGeneration) ensuring.value = false
     }
@@ -184,6 +173,7 @@ export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions)
     ensuring,
     dismissed,
     error,
+    outcome,
     visible,
     canSetup,
     refresh,

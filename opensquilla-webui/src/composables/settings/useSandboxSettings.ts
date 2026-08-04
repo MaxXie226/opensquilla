@@ -2,17 +2,21 @@ import { computed, onScopeDispose, reactive, ref } from 'vue'
 
 import { usePlatform } from '@/platform'
 import { useRpcStore } from '@/stores/rpc'
+import {
+  ensureSandboxReady,
+  normalizeSandboxSetupStatus,
+  type SandboxSetupOutcome,
+} from '@/composables/sandboxSetupCoordinator'
 import type {
   SandboxCapabilityReport,
   SandboxPolicy,
   SandboxPolicyDefaults,
   SandboxRunMode,
-  SandboxSetupState,
   SandboxSetupStatusPayload,
 } from '@/types/sandbox'
 
 export type SandboxPolicySection = 'files' | 'commands' | 'network' | 'runtimes'
-export type SandboxSetupOutcome = 'idle' | 'ready' | 'cancelled' | 'failed' | 'verification_failed'
+export type { SandboxSetupOutcome } from '@/composables/sandboxSetupCoordinator'
 
 function clonePolicy(policy: SandboxPolicy): SandboxPolicy {
   return JSON.parse(JSON.stringify(policy)) as SandboxPolicy
@@ -20,20 +24,6 @@ function clonePolicy(policy: SandboxPolicy): SandboxPolicy {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
-}
-
-function normalizeSetupStatus(payload: unknown): SandboxSetupStatusPayload | null {
-  if (!payload || typeof payload !== 'object') return null
-  const raw = payload as Record<string, unknown>
-  const state = String(raw.state || '') as SandboxSetupState
-  if (!['not_setup', 'setting_up', 'ready', 'failed', 'unavailable'].includes(state)) return null
-  return {
-    state,
-    platform: String(raw.platform || ''),
-    message: String(raw.message || ''),
-    requiresAdmin: raw.requiresAdmin === true || raw.requires_admin === true,
-    detail: typeof raw.detail === 'string' ? raw.detail : undefined,
-  }
 }
 
 export function useSandboxSettings() {
@@ -151,7 +141,7 @@ export function useSandboxSettings() {
     if (!platform.capabilities.isDesktop || disposed) return null
     try {
       await rpc.waitForConnection()
-      const status = normalizeSetupStatus(await rpc.call('sandbox.setup.status'))
+      const status = normalizeSandboxSetupStatus(await rpc.call('sandbox.setup.status'))
       if (!disposed && status) sandboxSetupStatus.value = status
       return status
     } catch {
@@ -174,28 +164,13 @@ export function useSandboxSettings() {
     sandboxSetupPending.value = true
     sandboxSetupOutcome.value = 'idle'
     try {
-      const status = normalizeSetupStatus(await rpc.call('sandbox.setup.ensure'))
-      if (!status) {
-        sandboxSetupOutcome.value = 'failed'
-        return false
-      }
-      sandboxSetupStatus.value = status
-      if (status.state !== 'ready') {
-        sandboxSetupOutcome.value = status.detail?.toLowerCase().includes('cancel')
-          ? 'cancelled'
-          : 'failed'
-        return false
-      }
-      const report = await loadCapability(true)
-      if (!report?.available) {
-        sandboxSetupOutcome.value = 'verification_failed'
-        return false
-      }
-      sandboxSetupOutcome.value = 'ready'
-      return true
-    } catch {
-      sandboxSetupOutcome.value = 'failed'
-      return false
+      const result = await ensureSandboxReady(
+        (method, params) => rpc.call(method, params),
+        () => loadCapability(true),
+      )
+      if (result.status) sandboxSetupStatus.value = result.status
+      sandboxSetupOutcome.value = result.outcome
+      return result.ready
     } finally {
       sandboxSetupPending.value = false
     }
