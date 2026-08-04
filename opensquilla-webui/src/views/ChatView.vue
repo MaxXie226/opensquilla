@@ -949,6 +949,7 @@ const sandboxSetupRecovery = useSandboxSetupRecovery({
   rpc: {
     call: (method, params) =>
       rpc.call(method, params, sandboxSetupRpcCallOptions),
+    waitForConnection: () => rpc.waitForConnection(10_000),
   },
   connectionState: computed(() => rpc.state),
   runMode: requestedRunMode,

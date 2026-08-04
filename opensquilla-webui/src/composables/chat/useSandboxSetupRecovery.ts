@@ -13,6 +13,7 @@ const SETUP_POLL_MS = 2000
 
 type SandboxSetupRpc = {
   call: (method: string, params?: Record<string, unknown>) => Promise<unknown>
+  waitForConnection?: () => Promise<unknown>
 }
 
 export interface UseSandboxSetupRecoveryOptions {
@@ -126,7 +127,11 @@ export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions)
     error.value = ''
     clearPoll()
     try {
-      const result = await ensureSandboxReady(options.rpc.call)
+      const result = await ensureSandboxReady(
+        options.rpc.call,
+        null,
+        options.rpc.waitForConnection ?? null,
+      )
       if (generation !== requestGeneration) return false
       if (result.status) applyStatus(result.status)
       outcome.value = result.outcome

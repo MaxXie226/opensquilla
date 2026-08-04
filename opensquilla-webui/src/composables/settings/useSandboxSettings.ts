@@ -167,6 +167,7 @@ export function useSandboxSettings() {
       const result = await ensureSandboxReady(
         (method, params) => rpc.call(method, params),
         () => loadCapability(true),
+        () => rpc.waitForConnection(10_000),
       )
       if (result.status) sandboxSetupStatus.value = result.status
       sandboxSetupOutcome.value = result.outcome

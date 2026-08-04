@@ -12,6 +12,8 @@ export type SandboxSetupCall = (
   params?: Record<string, unknown>,
 ) => Promise<unknown>
 
+export type SandboxSetupConnectionWait = () => Promise<unknown>
+
 export interface SandboxSetupResult {
   ready: boolean
   status: SandboxSetupStatusPayload | null
@@ -35,10 +37,9 @@ export function normalizeSandboxSetupStatus(payload: unknown): SandboxSetupStatu
 export async function ensureSandboxReady(
   call: SandboxSetupCall,
   verifyCapability: (() => Promise<Pick<SandboxCapabilityReport, 'available'> | null>) | null = null,
+  waitForConnection: SandboxSetupConnectionWait | null = null,
 ): Promise<SandboxSetupResult> {
-  try {
-    const status = normalizeSandboxSetupStatus(await call('sandbox.setup.ensure'))
-    if (!status) return { ready: false, status: null, outcome: 'failed' }
+  const finish = async (status: SandboxSetupStatusPayload): Promise<SandboxSetupResult> => {
     if (status.state !== 'ready') {
       return {
         ready: false,
@@ -52,7 +53,24 @@ export async function ensureSandboxReady(
     return report?.available === true
       ? { ready: true, status, outcome: 'ready' }
       : { ready: false, status, outcome: 'verification_failed' }
+  }
+
+  try {
+    const status = normalizeSandboxSetupStatus(await call('sandbox.setup.ensure'))
+    if (!status) return { ready: false, status: null, outcome: 'failed' }
+    return await finish(status)
   } catch {
-    return { ready: false, status: null, outcome: 'failed' }
+    if (!waitForConnection) return { ready: false, status: null, outcome: 'failed' }
+    try {
+      // The elevated Windows helper can finish successfully after the browser's
+      // original response socket has gone away. Reconnect and ask the Gateway
+      // for authoritative state instead of making the user repeat UAC.
+      await waitForConnection()
+      const status = normalizeSandboxSetupStatus(await call('sandbox.setup.status'))
+      if (!status) return { ready: false, status: null, outcome: 'failed' }
+      return await finish(status)
+    } catch {
+      return { ready: false, status: null, outcome: 'failed' }
+    }
   }
 }
