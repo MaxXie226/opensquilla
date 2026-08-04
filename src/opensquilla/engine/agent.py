@@ -9136,6 +9136,10 @@ class Agent:
                             continue
                         if failure_kind == ProviderFailureKind.CONTEXT_OVERFLOW:
                             self._record_provider_context_overflow_reason(provider_error)
+                            provider_budget_proof = (
+                                self._provider_request_budget_proof(provider_error)
+                            )
+                            durable_projection = None
                             durable_consumer_overflow_proven: bool | None = None
                             if provider_error.code == "provider_request_budget_exhausted":
                                 durable_projection = (
@@ -9214,6 +9218,24 @@ class Agent:
                                 terminal_error = self._context_overflow_error()
                                 yield terminal_error
                                 break
+                            compaction_budget_proof = provider_budget_proof
+                            if (
+                                durable_consumer_overflow_proven is True
+                                and durable_projection is not None
+                            ):
+                                # Durable pressure must be recovered against the
+                                # stable consumer's exact final-envelope budget,
+                                # including output/thinking reserve.  Using the
+                                # model's total context window here can make a
+                                # request that already exceeded the provider's
+                                # admissible input look "within budget" and turn
+                                # automatic compaction into a no-op.
+                                compaction_budget_proof = durable_projection.proof
+                            provider_request_window_tokens = self._positive_int(
+                                (compaction_budget_proof or {}).get(
+                                    "effective_proof_token_budget"
+                                )
+                            )
                             provider_compaction_window_tokens = (
                                 max(
                                     1,
@@ -9222,7 +9244,21 @@ class Agent:
                                 if durable_consumer_overflow_proven is True
                                 else None
                             )
-                            provider_estimated_tokens = None
+                            provider_request_window_chars = self._positive_int(
+                                (compaction_budget_proof or {}).get(
+                                    "effective_proof_budget"
+                                )
+                            )
+                            provider_estimated_tokens = self._positive_int(
+                                (compaction_budget_proof or {}).get(
+                                    "estimated_tokens"
+                                )
+                            )
+                            provider_estimated_chars = self._positive_int(
+                                (compaction_budget_proof or {}).get(
+                                    "estimated_chars"
+                                )
+                            )
                             provider_compaction_refusal_reason = (
                                 self._last_compaction_refusal_reason
                             )
@@ -9256,6 +9292,9 @@ class Agent:
                                 runtime_context_insert_index=runtime_context_insert_index,
                                 protected_turn_start_index=current_turn_start_index,
                                 compaction_window_tokens=provider_compaction_window_tokens,
+                                request_window_tokens=provider_request_window_tokens,
+                                request_window_chars=provider_request_window_chars,
+                                estimated_context_chars=provider_estimated_chars,
                                 durable_consumer_overflow_proven=(
                                     durable_consumer_overflow_proven
                                 ),
@@ -9400,6 +9439,34 @@ class Agent:
                                         active_config=next_chat_cfg,
                                     )
                                 )
+                                admission_proof = (
+                                    durable_next_projection.proof
+                                    if durable_next_projection is not None
+                                    else {}
+                                )
+                                logger.debug(
+                                    "compaction.consumer_admission_projection",
+                                    consumer="durable",
+                                    ephemeral_only=overflow_outcome.ephemeral_only,
+                                    active_user_found=next_active_user_index is not None,
+                                    fits=(
+                                        durable_next_projection.fits
+                                        if durable_next_projection is not None
+                                        else None
+                                    ),
+                                    estimated_tokens=admission_proof.get(
+                                        "estimated_tokens"
+                                    ),
+                                    effective_token_budget=admission_proof.get(
+                                        "effective_proof_token_budget"
+                                    ),
+                                    estimated_chars=admission_proof.get(
+                                        "estimated_chars"
+                                    ),
+                                    effective_char_budget=admission_proof.get(
+                                        "effective_proof_budget"
+                                    ),
+                                )
                                 if (
                                     next_active_user_index is None
                                     or durable_next_projection is None
@@ -9414,14 +9481,41 @@ class Agent:
                                         )
                                         else current_turn_start_index
                                     )
+                                    stable_source_messages = overflow_outcome.messages
+                                    stable_source_request_index = (
+                                        next_request_context_insert_index
+                                    )
+                                    stable_source_runtime_index = (
+                                        next_runtime_context_insert_index
+                                    )
+                                    stable_keep_recent_rounds = 2
+                                    if overflow_outcome.ephemeral_only:
+                                        # The first request-scoped summary keeps
+                                        # two raw rounds. If exact final-envelope
+                                        # admission still fails, retry within the
+                                        # same compaction deadline/call budget by
+                                        # summarizing one more completed round.
+                                        stable_source_messages = turn_messages
+                                        stable_protected_start = (
+                                            current_turn_start_index
+                                        )
+                                        stable_source_request_index = (
+                                            request_context_insert_index
+                                        )
+                                        stable_source_runtime_index = (
+                                            runtime_context_insert_index
+                                        )
+                                        stable_keep_recent_rounds = 1
                                     if (
-                                        not overflow_outcome.ephemeral_only
-                                        and next_active_user_index is not None
+                                        next_active_user_index is not None
                                         and durable_next_projection is not None
                                         and self._live_turn_compaction_boundary(
-                                            overflow_outcome.messages,
+                                            stable_source_messages,
                                             protected_turn_start_index=(
                                                 stable_protected_start
+                                            ),
+                                            keep_recent_rounds=(
+                                                stable_keep_recent_rounds
                                             ),
                                         )
                                         is not None
@@ -9429,22 +9523,31 @@ class Agent:
                                         try:
                                             stable_live_recovery = (
                                                 await self._recover_live_turn_request_overflow(
-                                                    overflow_outcome.messages,
+                                                    stable_source_messages,
                                                     protected_turn_start_index=(
                                                         stable_protected_start
                                                     ),
-                                                    context_window_tokens=max(
-                                                        1,
-                                                        int(
-                                                            self._durable_consumer_window_tokens
-                                                            or self.config.context_window_tokens
-                                                        ),
+                                                    context_window_tokens=(
+                                                        provider_request_window_tokens
+                                                        or max(
+                                                            1,
+                                                            int(
+                                                                self._durable_consumer_window_tokens
+                                                                or self.config.context_window_tokens
+                                                            ),
+                                                        )
+                                                    ),
+                                                    context_window_chars=(
+                                                        provider_request_window_chars
+                                                    ),
+                                                    keep_recent_rounds=(
+                                                        stable_keep_recent_rounds
                                                     ),
                                                     request_context_insert_index=(
-                                                        next_request_context_insert_index
+                                                        stable_source_request_index
                                                     ),
                                                     runtime_context_insert_index=(
-                                                        next_runtime_context_insert_index
+                                                        stable_source_runtime_index
                                                     ),
                                                     shared_compaction_config=(
                                                         overflow_outcome
@@ -9661,16 +9764,39 @@ class Agent:
                                     is not None
                                     else current_turn_start_index
                                 )
+                                routed_source_messages = overflow_outcome.messages
+                                routed_source_request_index = (
+                                    next_request_context_insert_index
+                                )
+                                routed_source_runtime_index = (
+                                    next_runtime_context_insert_index
+                                )
+                                routed_keep_recent_rounds = 2
+                                if overflow_outcome.ephemeral_only:
+                                    routed_source_messages = turn_messages
+                                    routed_protected_start = current_turn_start_index
+                                    routed_source_request_index = (
+                                        request_context_insert_index
+                                    )
+                                    routed_source_runtime_index = (
+                                        runtime_context_insert_index
+                                    )
+                                    routed_keep_recent_rounds = 1
                                 if (
                                     routed_recovery is None
-                                    and durable_consumer_overflow_proven is True
-                                    and not overflow_outcome.ephemeral_only
                                     and next_active_user_index is not None
                                     and next_projection is not None
+                                    and (
+                                        overflow_outcome.ephemeral_only
+                                        or durable_consumer_overflow_proven is True
+                                    )
                                     and self._live_turn_compaction_boundary(
-                                        overflow_outcome.messages,
+                                        routed_source_messages,
                                         protected_turn_start_index=(
                                             routed_protected_start
+                                        ),
+                                        keep_recent_rounds=(
+                                            routed_keep_recent_rounds
                                         ),
                                     )
                                     is not None
@@ -9678,18 +9804,25 @@ class Agent:
                                     try:
                                         routed_recovery = (
                                             await self._recover_live_turn_request_overflow(
-                                                overflow_outcome.messages,
+                                                routed_source_messages,
                                                 protected_turn_start_index=(
                                                     routed_protected_start
                                                 ),
                                                 context_window_tokens=(
-                                                    self.config.context_window_tokens
+                                                    provider_request_window_tokens
+                                                    or self.config.context_window_tokens
+                                                ),
+                                                context_window_chars=(
+                                                    provider_request_window_chars
+                                                ),
+                                                keep_recent_rounds=(
+                                                    routed_keep_recent_rounds
                                                 ),
                                                 request_context_insert_index=(
-                                                    next_request_context_insert_index
+                                                    routed_source_request_index
                                                 ),
                                                 runtime_context_insert_index=(
-                                                    next_runtime_context_insert_index
+                                                    routed_source_runtime_index
                                                 ),
                                                 shared_compaction_config=(
                                                     overflow_outcome
@@ -15352,6 +15485,7 @@ class Agent:
         messages: list[Message],
         *,
         protected_turn_start_index: int,
+        keep_recent_rounds: int = 2,
     ) -> tuple[int, int] | None:
         """Return the active-user index and raw-tail start for a live tool loop."""
 
@@ -15372,9 +15506,12 @@ class Agent:
             for index in range(active_user_index + 1, len(messages))
             if messages[index].role == "assistant"
         ]
-        # Preserve the latest two complete physical rounds. At least one older
-        # round must exist before a live-turn summary is worthwhile.
-        if len(assistant_starts) < 3:
+        protected_round_count = max(1, int(keep_recent_rounds))
+        # Preserve two complete physical rounds by default. Final-envelope
+        # admission may retry once with one raw round when the first summary is
+        # still too large. At least one older round must exist before a live
+        # summary is worthwhile.
+        if len(assistant_starts) <= protected_round_count:
             return None
 
         rounds: list[tuple[int, int, bool]] = []
@@ -15396,7 +15533,7 @@ class Agent:
             )
             rounds.append((start, end, critical))
 
-        keep_round = max(0, len(rounds) - 2)
+        keep_round = max(0, len(rounds) - protected_round_count)
         critical_rounds = [
             index for index, (_, _, critical) in enumerate(rounds) if critical
         ]
@@ -15429,6 +15566,8 @@ class Agent:
         *,
         protected_turn_start_index: int,
         context_window_tokens: int,
+        context_window_chars: int | None = None,
+        keep_recent_rounds: int = 2,
         request_context_insert_index: int | None,
         runtime_context_insert_index: int | None,
         shared_compaction_config: CompactionConfig | None = None,
@@ -15438,6 +15577,7 @@ class Agent:
         boundary = self._live_turn_compaction_boundary(
             messages,
             protected_turn_start_index=protected_turn_start_index,
+            keep_recent_rounds=keep_recent_rounds,
         )
         if boundary is None:
             return None
@@ -15473,6 +15613,7 @@ class Agent:
                         summary_messages
                     ),
                     context_window_tokens=context_window_tokens,
+                    context_window_chars=context_window_chars,
                     config=config,
                     forced_prefix_cut=len(summary_messages),
                     trigger="message_count",
@@ -16188,6 +16329,9 @@ class Agent:
         runtime_context_insert_index: int | None = None,
         protected_turn_start_index: int | None = None,
         compaction_window_tokens: int | None = None,
+        request_window_tokens: int | None = None,
+        request_window_chars: int | None = None,
+        estimated_context_chars: int | None = None,
         durable_consumer_overflow_proven: bool | None = None,
     ) -> CompactionOutcome | None:
         """Check if estimated live context tokens exceed the overflow threshold.
@@ -16197,8 +16341,19 @@ class Agent:
         """
         self._last_compaction_refusal_reason = None
         window_tokens = compaction_window_tokens or self.config.context_window_tokens
-        threshold = self.config.context_overflow_threshold * window_tokens
-        if estimated_context_tokens <= threshold:
+        pressure_window_tokens = request_window_tokens or window_tokens
+        threshold = self.config.context_overflow_threshold * pressure_window_tokens
+        char_threshold = (
+            self.config.context_overflow_threshold * request_window_chars
+            if request_window_chars is not None
+            else None
+        )
+        within_character_budget = bool(
+            char_threshold is None
+            or estimated_context_chars is None
+            or estimated_context_chars <= char_threshold
+        )
+        if estimated_context_tokens <= threshold and within_character_budget:
             return CompactionOutcome(
                 messages=messages,
                 request_context_insert_index=request_context_insert_index,
@@ -16232,7 +16387,8 @@ class Agent:
                     ephemeral = await self._recover_live_turn_request_overflow(
                         messages,
                         protected_turn_start_index=protected_turn_start_index,
-                        context_window_tokens=window_tokens,
+                        context_window_tokens=pressure_window_tokens,
+                        context_window_chars=request_window_chars,
                         request_context_insert_index=request_context_insert_index,
                         runtime_context_insert_index=runtime_context_insert_index,
                     )
@@ -16272,12 +16428,31 @@ class Agent:
                     messages[protected_tail_start:]
                 )
             )
-            if protected_tail_tokens > threshold:
+            protected_tail_chars = len(
+                json.dumps(
+                    [
+                        self._live_request_jsonable(message)
+                        for message in messages[protected_tail_start:]
+                    ],
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+            protected_tail_over_character_budget = bool(
+                char_threshold is not None
+                and protected_tail_chars > char_threshold
+            )
+            if (
+                protected_tail_tokens > threshold
+                or protected_tail_over_character_budget
+            ):
                 try:
                     ephemeral = await self._recover_live_turn_request_overflow(
                         messages,
                         protected_turn_start_index=protected_tail_start,
-                        context_window_tokens=window_tokens,
+                        context_window_tokens=pressure_window_tokens,
+                        context_window_chars=request_window_chars,
                         request_context_insert_index=request_context_insert_index,
                         runtime_context_insert_index=runtime_context_insert_index,
                     )
@@ -16296,8 +16471,14 @@ class Agent:
                 logger.warning(
                     "compaction.protected_tail_too_large",
                     protected_tail_tokens=protected_tail_tokens,
+                    protected_tail_chars=protected_tail_chars,
                     threshold_tokens=int(threshold),
-                    context_window_tokens=window_tokens,
+                    threshold_chars=(
+                        int(char_threshold)
+                        if char_threshold is not None
+                        else None
+                    ),
+                    context_window_tokens=pressure_window_tokens,
                     protected_message_count=len(messages) - protected_tail_start,
                 )
                 return None

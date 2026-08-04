@@ -5946,6 +5946,159 @@ async def test_stable_consumer_retries_with_completed_live_round_summary(
 
 
 @pytest.mark.asyncio
+async def test_live_turn_recovery_uses_stable_consumer_input_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _ExactBudgetToolLoopProvider:
+        provider_name = "fake"
+        final_request_admission_guaranteed = True
+
+        def __init__(self) -> None:
+            self.calls: list[list[Message]] = []
+            self.tool_rounds_emitted = 0
+
+        def project_final_request(
+            self,
+            messages: list[Message],
+            tools: list[Any] | None = None,
+            config: ChatConfig | None = None,
+            *,
+            message_limit: int | None = None,
+        ) -> ProviderFinalRequestProjection:
+            del tools, config
+            estimated_chars = session_payload_chars(messages)
+            estimated_tokens = max(1, (estimated_chars + 3) // 4)
+            effective_char_budget = 11_000
+            effective_token_budget = effective_char_budget // 4
+            fits_message_count = (
+                None if message_limit is None else len(messages) <= message_limit
+            )
+            fits = (
+                estimated_chars <= effective_char_budget
+                and estimated_tokens <= effective_token_budget
+                and fits_message_count is not False
+            )
+            proof = {
+                "fits": fits,
+                "estimated_chars": estimated_chars,
+                "estimated_tokens": estimated_tokens,
+                "effective_proof_budget": effective_char_budget,
+                "effective_proof_token_budget": effective_token_budget,
+                "fallback_reason": (
+                    None if fits else "provider_request_budget_exhausted"
+                ),
+            }
+            return ProviderFinalRequestProjection(
+                payload={"messages": [message.model_dump() for message in messages]},
+                proof=proof,
+                wire_message_count=len(messages),
+                message_limit=message_limit,
+                fits_message_count=fits_message_count,
+                fits=fits,
+            )
+
+        def chat(
+            self,
+            messages: list[Message],
+            tools: list[Any] | None = None,
+            config: ChatConfig | None = None,
+        ) -> AsyncIterator[Any]:
+            self.calls.append(messages)
+            projection = self.project_final_request(messages, tools, config)
+            return self._stream(projection)
+
+        async def _stream(
+            self,
+            projection: ProviderFinalRequestProjection,
+        ) -> AsyncIterator[Any]:
+            if self.tool_rounds_emitted < 3:
+                # Model a provider adapter whose request-only reducer can admit
+                # the first three physical tool calls even though its raw,
+                # unshaped projection becomes oversized after round two. Once
+                # all three protected results exist, the adapter reports the
+                # hard budget failure that live-turn compaction must recover.
+                self.tool_rounds_emitted += 1
+                tool_id = f"exact-budget-{self.tool_rounds_emitted}"
+                yield ProviderToolUseStart(
+                    tool_use_id=tool_id,
+                    tool_name="read_file",
+                )
+                yield ProviderToolUseEnd(
+                    tool_use_id=tool_id,
+                    tool_name="read_file",
+                    arguments={"path": f"part-{self.tool_rounds_emitted}.txt"},
+                )
+                yield ProviderDone(
+                    stop_reason="tool_calls",
+                    input_tokens=1,
+                    output_tokens=1,
+                )
+                return
+            if not projection.fits:
+                yield ProviderError(
+                    message=json.dumps(projection.proof),
+                    code="provider_request_budget_exhausted",
+                )
+                return
+            yield ProviderText(text="finished after exact-budget recovery")
+            yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
+
+        async def list_models(self) -> list[Any]:
+            return []
+
+    compact_requests: list[Any] = []
+
+    async def _compact(request: Any) -> CompactionResult:
+        compact_requests.append(request)
+        assert request.forced_prefix_cut is not None
+        cut = int(request.forced_prefix_cut)
+        return CompactionResult(
+            summary="first completed tool round",
+            kept_entries=request.entries[cut:],
+            removed_count=cut,
+            kept_start_index=cut,
+            chunks_processed=1,
+            tokens_before=5_000,
+            tokens_after=100,
+        )
+
+    async def _tool(call: Any) -> ToolResult:
+        return ToolResult(
+            tool_use_id=call.tool_use_id,
+            tool_name=call.tool_name,
+            content="result " + ("x" * 6_000),
+        )
+
+    monkeypatch.setattr("opensquilla.engine.agent.compact_context", _compact)
+    provider = _ExactBudgetToolLoopProvider()
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            context_window_tokens=10_000,
+            context_overflow_threshold=0.85,
+            max_overflow_retries=1,
+            max_provider_retries=0,
+            flush_enabled=False,
+        ),
+        tool_handler=_tool,
+    )
+
+    events = [event async for event in agent.run_turn("finish all three reads")]
+
+    assert any(
+        isinstance(event, DoneEvent)
+        and event.text == "finished after exact-budget recovery"
+        for event in events
+    )
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    assert len(provider.calls) == 5
+    assert len(compact_requests) == 2
+    assert all(request.context_window_tokens == 2_750 for request in compact_requests)
+    assert all(request.context_window_chars == 11_000 for request in compact_requests)
+    assert all(request.forced_prefix_cut is not None for request in compact_requests)
+
+
+@pytest.mark.asyncio
 async def test_inline_overflow_rejects_compactor_cut_through_protected_turn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
