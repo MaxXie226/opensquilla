@@ -2040,6 +2040,8 @@ def test_windows_filesystem_operation_request_uses_stdin_and_shared_profile(
     assert mounts[str(worker_temp)] == "rw"
     assert request.env["TEMP"] == str(worker_temp)
     assert request.env["TMP"] == str(worker_temp)
+    assert request.env["PYTHONUTF8"] == "1"
+    assert request.env["PYTHONIOENCODING"] == "utf-8"
     assert request.policy.file_system is operation.file_system_profile
     assert request.policy.tmp_writable is False
     assert request.argv == (

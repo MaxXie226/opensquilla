@@ -383,6 +383,8 @@ def _filesystem_operation_request(
     env = {
         "PATH": str(_python_executable().parent),
         "PYTHONPATH": _pythonpath_for_worker(),
+        "PYTHONUTF8": "1",
+        "PYTHONIOENCODING": "utf-8",
         "TEMP": str(worker_temp),
         "TMP": str(worker_temp),
         "TMPDIR": str(worker_temp),

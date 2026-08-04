@@ -866,6 +866,8 @@ def _preflight_write_parent(path: Path, states: dict[Path, str]) -> None:
 def _preflight_planned_writes(planned: list[PlannedPatchWrite]) -> None:
     states: dict[Path, str] = {}
     for item in planned:
+        if item.after_content is not None:
+            item.after_content.encode("utf-8")
         state = states.get(item.resolved)
         if item.after_content is None:
             if state is None:
